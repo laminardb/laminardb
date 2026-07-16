@@ -552,6 +552,24 @@ struct GrpcState {
 type ActiveLeaderState = Option<(NodeId, watch::Receiver<Vec<NodeInfo>>, Arc<AtomicBool>)>;
 
 #[cfg(feature = "cluster")]
+fn leader_proof_challenge_from_wire(bytes: &[u8]) -> Result<uuid::Uuid, tonic::Status> {
+    let challenge = uuid::Uuid::from_slice(bytes).map_err(|_| {
+        tonic::Status::invalid_argument("Leader proof challenge must contain exactly 16 bytes")
+    })?;
+    if challenge.is_nil() {
+        return Err(tonic::Status::invalid_argument(
+            "Leader proof challenge must be nonzero",
+        ));
+    }
+    Ok(challenge)
+}
+
+#[cfg(feature = "cluster")]
+fn leader_proof_ack_matches(challenge: uuid::Uuid, acknowledged: &[u8]) -> bool {
+    acknowledged == challenge.as_bytes()
+}
+
+#[cfg(feature = "cluster")]
 pub(crate) type LocalLeaderProofProvider =
     Arc<dyn Fn() -> Option<super::LeaderProof> + Send + Sync>;
 
@@ -787,37 +805,27 @@ impl GrpcBarrierServer {
 #[cfg(feature = "cluster")]
 #[tonic::async_trait]
 impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
-    async fn capture_leader_proof(
+    async fn confirm_leader_proof(
         &self,
-        request: tonic::Request<barrier_v1::LeaderProofRequest>,
-    ) -> Result<tonic::Response<barrier_v1::LeaderProofResponse>, tonic::Status> {
+        request: tonic::Request<barrier_v1::LeaderProofChallenge>,
+    ) -> Result<tonic::Response<barrier_v1::LeaderProofAck>, tonic::Status> {
         let requested = request.into_inner();
-        let boot = uuid::Uuid::from_slice(&requested.boot_id).map_err(|_| {
-            tonic::Status::invalid_argument(
-                "Leader proof request boot identity must contain exactly 16 bytes",
-            )
-        })?;
-        if requested.node_id == 0 || boot.is_nil() || requested.process_term == 0 {
-            return Err(tonic::Status::invalid_argument(
-                "Leader proof request identity and process term must be nonzero",
-            ));
-        }
+        let expected = leader_proof_from_wire(requested.expected_proof)?
+            .ok_or_else(|| tonic::Status::invalid_argument("Leader proof challenge is missing"))?;
+        leader_proof_challenge_from_wire(&requested.challenge_id)?;
         let provider = self.local_leader_proof.lock().clone().ok_or_else(|| {
             tonic::Status::failed_precondition("Local leader proof provider is not installed")
         })?;
-        let proof = provider().ok_or_else(|| {
+        let local = provider().ok_or_else(|| {
             tonic::Status::failed_precondition("No process-local leader grant is live")
         })?;
-        if proof.owner.node_id != requested.node_id
-            || proof.owner.boot_id != boot
-            || proof.owner.process_term != requested.process_term
-        {
+        if local != expected {
             return Err(tonic::Status::failed_precondition(
-                "Live leader grant does not match the requested process term",
+                "Live process-local leader grant does not match the durable proof challenge",
             ));
         }
-        Ok(tonic::Response::new(barrier_v1::LeaderProofResponse {
-            proof: leader_proof_to_wire(Some(&proof)),
+        Ok(tonic::Response::new(barrier_v1::LeaderProofAck {
+            challenge_id: requested.challenge_id,
         }))
     }
 
@@ -1438,18 +1446,23 @@ impl BarrierCoordinator {
         Ok(local_addr)
     }
 
-    /// Ask one exact remote process to capture its live process-local leader grant.
+    /// Ask one exact remote process to confirm a proof already read from durable authority.
+    ///
+    /// The response echoes only a fresh challenge id. It never returns a process-local or durable
+    /// fencing token.
+    ///
+    /// # Errors
+    /// Fails when the proof, peer address, RPC, acknowledgement, or deadline is invalid.
     #[cfg(feature = "cluster")]
-    pub async fn capture_remote_leader_proof(
+    pub async fn confirm_remote_leader_proof(
         &self,
-        participant: super::CheckpointParticipant,
-        process_term: u64,
+        proof: &super::LeaderProof,
         deadline: tokio::time::Instant,
-    ) -> Result<Option<super::LeaderProof>, String> {
-        let peer = NodeId(participant.node_id);
-        if peer.is_unassigned() || participant.boot_incarnation.is_nil() || process_term == 0 {
-            return Err("remote leader proof request is not canonical".into());
+    ) -> Result<bool, String> {
+        if !proof.is_canonical() {
+            return Err("remote leader proof challenge is not canonical".into());
         }
+        let peer = NodeId(proof.owner.node_id);
         let state = self
             .grpc
             .lock()
@@ -1457,55 +1470,50 @@ impl BarrierCoordinator {
             .ok_or_else(|| "cluster control RPC server is not started".to_string())?;
         let clients = Arc::clone(&state.clients);
         let request_timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let challenge = uuid::Uuid::new_v4();
         let result = tokio::time::timeout_at(deadline, async {
             let mut client = get_barrier_client(peer, &clients, &self.kv)
                 .await
                 .ok_or_else(|| {
                     format!("cluster control address for peer {} is unavailable", peer.0)
                 })?;
-            let mut request = tonic::Request::new(barrier_v1::LeaderProofRequest {
-                node_id: participant.node_id,
-                boot_id: participant.boot_incarnation.as_bytes().to_vec(),
-                process_term,
+            let mut request = tonic::Request::new(barrier_v1::LeaderProofChallenge {
+                expected_proof: leader_proof_to_wire(Some(proof)),
+                challenge_id: challenge.as_bytes().to_vec(),
             });
             request.set_timeout(request_timeout);
-            match client.capture_leader_proof(request).await {
-                Ok(response) => leader_proof_from_wire(response.into_inner().proof)
-                    .map_err(|error| error.to_string()),
+            match client.confirm_leader_proof(request).await {
+                Ok(response) => {
+                    let acknowledged = response.into_inner().challenge_id;
+                    if !leader_proof_ack_matches(challenge, &acknowledged) {
+                        return Err("remote leader proof acknowledgement challenge mismatch".into());
+                    }
+                    Ok(true)
+                }
                 Err(status) if status.code() == tonic::Code::FailedPrecondition => {
                     // The stable node id may now advertise a replacement process. Do not pin
                     // subsequent proof attempts to a still-responsive channel for the old boot.
                     clients.lock().remove(&peer);
-                    Ok(None)
+                    Ok(false)
                 }
                 Err(status) => Err(status.to_string()),
             }
         })
         .await;
-        let proof = match result {
-            Ok(Ok(proof)) => proof,
+        match result {
+            Ok(Ok(confirmed)) => Ok(confirmed),
             Ok(Err(error)) => {
                 clients.lock().remove(&peer);
-                return Err(error);
+                Err(error)
             }
             Err(_) => {
                 clients.lock().remove(&peer);
-                return Err(format!(
+                Err(format!(
                     "remote leader proof request for peer {} timed out",
                     peer.0
-                ));
+                ))
             }
-        };
-        if proof.as_ref().is_some_and(|proof| {
-            proof.owner.node_id != participant.node_id
-                || proof.owner.boot_id != participant.boot_incarnation
-                || proof.owner.process_term != process_term
-        }) {
-            return Err(
-                "remote leader proof response does not match the requested process term".into(),
-            );
         }
-        Ok(proof)
     }
 
     /// Leader-side announce.
@@ -1945,6 +1953,24 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[test]
+    fn leader_proof_challenge_and_ack_require_one_exact_fresh_id() {
+        let challenge = uuid::Uuid::from_u128(17);
+        assert_eq!(
+            leader_proof_challenge_from_wire(challenge.as_bytes()).unwrap(),
+            challenge
+        );
+        assert!(leader_proof_ack_matches(challenge, challenge.as_bytes()));
+        assert!(!leader_proof_ack_matches(
+            challenge,
+            uuid::Uuid::from_u128(18).as_bytes()
+        ));
+        assert!(!leader_proof_ack_matches(challenge, &[1; 15]));
+        assert!(leader_proof_challenge_from_wire(&[0; 16]).is_err());
+        assert!(leader_proof_challenge_from_wire(&[1; 15]).is_err());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
     fn wire_watermark_requires_an_exact_status_value_shape() {
         use barrier_v1::CheckpointWatermarkStatus as WireStatus;
 
@@ -2193,6 +2219,116 @@ mod tests {
             let coordinator = BarrierCoordinator::new(kv);
             coordinator.set_leader_lease_store(store);
             coordinator
+        }
+
+        fn proof(
+            node_id: u64,
+            boot: u128,
+            process_term: u64,
+            token: u64,
+        ) -> crate::cluster::control::LeaderProof {
+            crate::cluster::control::LeaderProof {
+                owner: crate::checkpoint::LeaderProofOwner {
+                    node_id,
+                    boot_id: uuid::Uuid::from_u128(boot),
+                    process_term,
+                },
+                fencing_token: token,
+            }
+        }
+
+        #[tokio::test]
+        async fn remote_proof_confirmation_acknowledges_only_the_exact_live_provider_value() {
+            let caller_kv = kv(NodeId(1));
+            let remote_kv = kv(NodeId(2));
+            let caller = BarrierCoordinator::new(caller_kv.clone());
+            let remote = BarrierCoordinator::new(remote_kv);
+            let expected = proof(2, 22, 7, 41);
+
+            caller
+                .start_server(
+                    "127.0.0.1:0".parse().unwrap(),
+                    None,
+                    Arc::new(parking_lot::RwLock::new(None)),
+                )
+                .await
+                .unwrap();
+            let remote_addr = remote
+                .start_server(
+                    "127.0.0.1:0".parse().unwrap(),
+                    None,
+                    Arc::new(parking_lot::RwLock::new(None)),
+                )
+                .await
+                .unwrap();
+            caller_kv.seed(NodeId(2), BARRIER_ADDR_KEY, remote_addr.to_string());
+            caller_kv.seed(NodeId(3), BARRIER_ADDR_KEY, remote_addr.to_string());
+
+            let deadline = || tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+            assert!(
+                !caller
+                    .confirm_remote_leader_proof(&expected, deadline())
+                    .await
+                    .unwrap(),
+                "an absent provider must fail closed"
+            );
+
+            let live = Arc::new(parking_lot::Mutex::new(Some(expected.clone())));
+            let provider = Arc::clone(&live);
+            remote.set_local_leader_proof_provider(Arc::new(move || provider.lock().clone()));
+            assert!(caller
+                .confirm_remote_leader_proof(&expected, deadline())
+                .await
+                .unwrap());
+
+            let mut wrong_token = expected.clone();
+            wrong_token.fencing_token += 1;
+            assert!(
+                !caller
+                    .confirm_remote_leader_proof(&wrong_token, deadline())
+                    .await
+                    .unwrap(),
+                "the acknowledgement must bind the fencing token"
+            );
+
+            let mut wrong_process = expected.clone();
+            wrong_process.owner.process_term += 1;
+            assert!(
+                !caller
+                    .confirm_remote_leader_proof(&wrong_process, deadline())
+                    .await
+                    .unwrap(),
+                "the acknowledgement must bind the process term"
+            );
+
+            let mut wrong_boot = expected.clone();
+            wrong_boot.owner.boot_id = uuid::Uuid::from_u128(23);
+            assert!(
+                !caller
+                    .confirm_remote_leader_proof(&wrong_boot, deadline())
+                    .await
+                    .unwrap(),
+                "the acknowledgement must bind the boot incarnation"
+            );
+
+            let mut wrong_node = expected.clone();
+            wrong_node.owner.node_id = 3;
+            assert!(
+                !caller
+                    .confirm_remote_leader_proof(&wrong_node, deadline())
+                    .await
+                    .unwrap(),
+                "the acknowledgement must bind the stable node identity"
+            );
+
+            *live.lock() = None;
+            assert!(
+                !caller
+                    .confirm_remote_leader_proof(&expected, deadline())
+                    .await
+                    .unwrap(),
+                "an expired process-local grant must fail closed"
+            );
         }
 
         /// Observation is latest-wins (non-destructive), so wait for the

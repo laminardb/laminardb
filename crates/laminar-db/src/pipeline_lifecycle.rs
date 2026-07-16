@@ -5821,7 +5821,8 @@ mod cluster_fault_watcher_tests {
     use laminar_core::cluster::control::{
         CatalogManifest, CatalogManifestEntry, CatalogManifestStore, CatalogObjectKind,
         CheckpointParticipant, ClusterController, ClusterKv, InMemoryKv, LeaderLeaseOwner,
-        LeaderLeaseStore, LeaseDeadline, LeaseOutcome, RecoverPhase,
+        LeaderLeaseStore, LeaseDeadline, LeaseOutcome, ProcessLeaseAuthority, ProcessLeaseOutcome,
+        RecoverPhase,
     };
     use laminar_core::cluster::discovery::{NodeId, NodeInfo};
     use laminar_core::state::{
@@ -5938,11 +5939,26 @@ mod cluster_fault_watcher_tests {
         controller.publish_recovery_incarnation().await.unwrap();
         let checkpoint_store: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::memory::InMemory::new());
+        let process_authority = Arc::new(
+            ProcessLeaseAuthority::new(Arc::clone(&checkpoint_store), Duration::from_secs(60))
+                .unwrap(),
+        );
+        let ProcessLeaseOutcome::Acquired(process_lease) = process_authority
+            .store_for(node_id)
+            .try_acquire(controller.recovery_incarnation(), 0)
+            .await
+            .unwrap()
+        else {
+            panic!("empty test authority must grant the local process lease");
+        };
+        controller
+            .set_process_lease_authority(process_authority)
+            .unwrap();
         let authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&checkpoint_store), 10_000));
         let owner = LeaderLeaseOwner {
             node: node_id,
             boot: controller.recovery_incarnation(),
-            process_term: 1,
+            process_term: process_lease.term,
         };
         let LeaseOutcome::Acquired(lease) = authority.try_acquire(&owner, 0).await.unwrap() else {
             panic!("empty test authority must grant leadership");

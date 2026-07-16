@@ -14,6 +14,292 @@ fn test_cluster_checkpoint_store() -> Arc<dyn object_store::ObjectStore> {
     Arc::new(object_store::memory::InMemory::new())
 }
 
+#[cfg(feature = "cluster")]
+async fn install_test_process_and_leader_authority(
+    controller: &laminar_core::cluster::control::ClusterController,
+    store: Arc<dyn object_store::ObjectStore>,
+) -> laminar_core::checkpoint::LeaderProof {
+    use laminar_core::cluster::control::{
+        LeaderLeaseOwner, LeaderLeaseStore, LeaseDeadline, LeaseOutcome, ProcessLeaseAuthority,
+        ProcessLeaseOutcome,
+    };
+
+    let node = controller.instance_id();
+    let boot = controller.recovery_incarnation();
+    let lease_duration = std::time::Duration::from_secs(30);
+    let process_authority =
+        Arc::new(ProcessLeaseAuthority::new(Arc::clone(&store), lease_duration).unwrap());
+    let ProcessLeaseOutcome::Acquired(process_lease) = process_authority
+        .store_for(node)
+        .try_acquire(boot, 0)
+        .await
+        .unwrap()
+    else {
+        panic!("empty process authority must grant the local test process");
+    };
+    controller.set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(lease_duration)));
+    controller
+        .set_process_lease_authority(process_authority)
+        .unwrap();
+
+    let leader_authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&store), 30_000));
+    let leader_owner = LeaderLeaseOwner {
+        node,
+        boot,
+        process_term: process_lease.term,
+    };
+    let LeaseOutcome::Acquired(leader_lease) = leader_authority
+        .try_acquire(&leader_owner, 0)
+        .await
+        .unwrap()
+    else {
+        panic!("empty leader authority must grant the local test process");
+    };
+    let proof = leader_lease.proof();
+    let (_leader_tx, leader_rx) = tokio::sync::watch::channel(Some(leader_lease));
+    controller
+        .set_leader_lease_watch(
+            leader_rx,
+            leader_owner,
+            Arc::new(LeaseDeadline::live_for(lease_duration)),
+        )
+        .unwrap();
+    controller.set_leader_lease_store(leader_authority);
+    proof
+}
+
+#[cfg(feature = "cluster")]
+#[derive(Debug)]
+struct FaultAuditKv {
+    inner: laminar_core::cluster::control::InMemoryKv,
+    fault_scan_mode: std::sync::atomic::AtomicU8,
+    fault_scan_started: tokio::sync::Notify,
+}
+
+#[cfg(feature = "cluster")]
+impl FaultAuditKv {
+    const NORMAL: u8 = 0;
+    const FAIL: u8 = 1;
+    const STALL: u8 = 2;
+
+    fn new(local_id: laminar_core::cluster::discovery::NodeId) -> Self {
+        Self {
+            inner: laminar_core::cluster::control::InMemoryKv::new(local_id),
+            fault_scan_mode: std::sync::atomic::AtomicU8::new(0),
+            fault_scan_started: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn fail_fault_scans(&self) {
+        self.fault_scan_mode
+            .store(Self::FAIL, std::sync::atomic::Ordering::Release);
+    }
+
+    fn stall_fault_scans(&self) {
+        self.fault_scan_mode
+            .store(Self::STALL, std::sync::atomic::Ordering::Release);
+    }
+
+    fn restore_fault_scans(&self) {
+        self.fault_scan_mode
+            .store(Self::NORMAL, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[async_trait::async_trait]
+impl laminar_core::cluster::control::ClusterKv for FaultAuditKv {
+    async fn write(&self, key: &str, value: String) {
+        laminar_core::cluster::control::ClusterKv::write(&self.inner, key, value).await;
+    }
+
+    async fn read_from(
+        &self,
+        who: laminar_core::cluster::discovery::NodeId,
+        key: &str,
+    ) -> Option<String> {
+        laminar_core::cluster::control::ClusterKv::read_from(&self.inner, who, key).await
+    }
+
+    async fn scan(&self, key: &str) -> Vec<(laminar_core::cluster::discovery::NodeId, String)> {
+        laminar_core::cluster::control::ClusterKv::scan(&self.inner, key).await
+    }
+
+    async fn scan_checked(
+        &self,
+        key: &str,
+    ) -> Result<Vec<(laminar_core::cluster::discovery::NodeId, String)>, String> {
+        if key == "control:fault-report" {
+            match self
+                .fault_scan_mode
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                Self::FAIL => {
+                    self.fault_scan_started.notify_one();
+                    return Err("injected fault audit failure".into());
+                }
+                Self::STALL => {
+                    self.fault_scan_started.notify_one();
+                    return std::future::pending().await;
+                }
+                _ => {}
+            }
+        }
+        Ok(laminar_core::cluster::control::ClusterKv::scan(&self.inner, key).await)
+    }
+}
+
+#[cfg(feature = "cluster")]
+struct FaultAuditActivationFixture {
+    db: Arc<LaminarDB>,
+    controller: Arc<laminar_core::cluster::control::ClusterController>,
+    recovery: Arc<FaultAuditKv>,
+    sender: Arc<laminar_core::shuffle::ShuffleSender>,
+    receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
+    fence: laminar_core::checkpoint::CheckpointAssignmentFence,
+}
+
+#[cfg(feature = "cluster")]
+async fn fault_audit_activation_fixture() -> FaultAuditActivationFixture {
+    use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+    use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+    use laminar_core::cluster::discovery::{NodeId, NodeInfo};
+    use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
+    use laminar_core::state::{InProcessBackend, NodeId as StateNodeId, VnodeRegistry};
+
+    let node_id = NodeId(1);
+    let boot = uuid::Uuid::from_u128(11);
+    let control: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node_id));
+    let recovery = Arc::new(FaultAuditKv::new(node_id));
+    let recovery_kv: Arc<dyn ClusterKv> = recovery.clone();
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
+    let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
+        node_id,
+        control,
+        recovery_kv,
+        None,
+        members_rx,
+        boot,
+    ));
+    controller.publish_recovery_incarnation().await.unwrap();
+    controller.set_active(true);
+
+    let authority_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    install_test_process_and_leader_authority(&controller, Arc::clone(&authority_store)).await;
+
+    let registry = Arc::new(VnodeRegistry::single_owner(1, StateNodeId(node_id.0)));
+    let fence = CheckpointAssignmentFence::from_owner_map(
+        registry.assignment_version(),
+        &[node_id.0],
+        vec![CheckpointParticipant {
+            node_id: node_id.0,
+            boot_incarnation: boot,
+        }],
+    )
+    .unwrap();
+    let receiver = Arc::new(
+        ShuffleReceiver::bind(node_id.0, "127.0.0.1:0".parse().unwrap(), boot)
+            .await
+            .unwrap(),
+    );
+    let sender = Arc::new(ShuffleSender::new(node_id.0, boot));
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&controller))
+        .cluster_checkpoint_object_store(authority_store)
+        .state_backend(Arc::new(InProcessBackend::new(1)))
+        .vnode_registry(registry)
+        .shuffle_sender(Arc::clone(&sender))
+        .shuffle_receiver(Arc::clone(&receiver))
+        .build()
+        .await
+        .unwrap();
+    db.set_source_gate(false);
+
+    FaultAuditActivationFixture {
+        db,
+        controller,
+        recovery,
+        sender,
+        receiver,
+        fence,
+    }
+}
+
+#[cfg(feature = "cluster")]
+fn assert_fault_audit_withdrew_authority(
+    fixture: &FaultAuditActivationFixture,
+    initial_revision: u64,
+) {
+    assert!(fixture.db.cluster_intake_fenced());
+    assert!(!fixture.controller.is_recovering());
+    assert_eq!(
+        fixture
+            .controller
+            .checkpoint_assignment_fence(fixture.fence.assignment_version),
+        None
+    );
+    assert_eq!(fixture.controller.checkpoint_drain_transition(), None);
+    assert_eq!(fixture.sender.assignment_version(), 0);
+    assert_eq!(fixture.receiver.assignment_version(), 0);
+    assert_eq!(fixture.sender.active_assignment_digest(), None);
+    assert_eq!(fixture.receiver.active_assignment_digest(), None);
+    assert!(
+        fixture
+            .db
+            .assignment_authority_revision
+            .load(std::sync::atomic::Ordering::Acquire)
+            > initial_revision
+    );
+}
+
+#[cfg(feature = "cluster")]
+async fn assert_fault_audit_retry_reopens(fixture: &FaultAuditActivationFixture) {
+    fixture.recovery.restore_fault_scans();
+    let revision = fixture
+        .db
+        .assignment_authority_revision
+        .load(std::sync::atomic::Ordering::Acquire);
+    let activation = fixture
+        .db
+        .activate_assignment_authority(
+            &fixture.fence,
+            None,
+            revision,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+    assert!(activation.installed);
+    assert!(activation.intake_open);
+    assert!(!fixture.db.cluster_intake_fenced());
+    assert!(!fixture.controller.is_recovering());
+    // Same-version reactivation fails after invalidation, so success also checks sequence retention.
+    assert_eq!(
+        fixture.sender.assignment_version(),
+        fixture.fence.assignment_version
+    );
+    assert_eq!(
+        fixture.receiver.assignment_version(),
+        fixture.fence.assignment_version
+    );
+    assert_eq!(
+        fixture
+            .controller
+            .checkpoint_assignment_fence(fixture.fence.assignment_version),
+        Some(fixture.fence.clone())
+    );
+    assert_eq!(
+        fixture.sender.active_assignment_digest(),
+        Some(fixture.fence.digest())
+    );
+    assert_eq!(
+        fixture.receiver.active_assignment_digest(),
+        Some(fixture.fence.digest())
+    );
+}
+
 #[tokio::test]
 async fn test_open_default() {
     let db = LaminarDB::open().unwrap();
@@ -338,8 +624,7 @@ async fn shuffle_assignment_pair_install_is_exact_and_fail_closed() {
 #[tokio::test]
 async fn assignment_activation_installs_transport_before_controller_publication() {
     use laminar_core::checkpoint::{
-        AssignmentDrainTransition, CheckpointAssignmentFence, CheckpointParticipant, LeaderProof,
-        LeaderProofOwner,
+        AssignmentDrainTransition, CheckpointAssignmentFence, CheckpointParticipant,
     };
     use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
     use laminar_core::cluster::discovery::{NodeId, NodeInfo};
@@ -358,6 +643,10 @@ async fn assignment_activation_installs_transport_before_controller_publication(
     ));
     controller.publish_recovery_incarnation().await.unwrap();
     controller.set_active(true);
+    let authority_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let leader_proof =
+        install_test_process_and_leader_authority(&controller, Arc::clone(&authority_store)).await;
     let registry = Arc::new(VnodeRegistry::single_owner(1, StateNodeId(node_id.0)));
     let fence = CheckpointAssignmentFence::from_owner_map(
         registry.assignment_version(),
@@ -376,7 +665,7 @@ async fn assignment_activation_installs_transport_before_controller_publication(
     let sender = Arc::new(ShuffleSender::new(node_id.0, boot));
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
-        .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
+        .cluster_checkpoint_object_store(Arc::clone(&authority_store))
         .state_backend(Arc::new(InProcessBackend::new(1)))
         .vnode_registry(registry)
         .shuffle_sender(Arc::clone(&sender))
@@ -412,19 +701,8 @@ async fn assignment_activation_installs_transport_before_controller_publication(
         predecessor.participants.clone(),
     )
     .unwrap();
-    let transition = AssignmentDrainTransition::new(
-        predecessor.clone(),
-        target,
-        LeaderProof {
-            owner: LeaderProofOwner {
-                node_id: node_id.0,
-                boot_id: boot,
-                process_term: 1,
-            },
-            fencing_token: 1,
-        },
-    )
-    .unwrap();
+    let transition =
+        AssignmentDrainTransition::new(predecessor.clone(), target, leader_proof.clone()).unwrap();
     let draining = db
         .activate_assignment_authority(
             &predecessor,
@@ -443,7 +721,34 @@ async fn assignment_activation_installs_transport_before_controller_publication(
         Some(transition.clone())
     );
 
-    db.set_source_gate(true);
+    let mut superseded_proof = leader_proof;
+    superseded_proof.fencing_token = superseded_proof.fencing_token.checked_add(1).unwrap();
+    let superseded = AssignmentDrainTransition::new(
+        predecessor.clone(),
+        transition.target.clone(),
+        superseded_proof,
+    )
+    .unwrap();
+    let error = db
+        .activate_assignment_authority(
+            &predecessor,
+            Some(superseded),
+            db.assignment_authority_revision
+                .load(std::sync::atomic::Ordering::Acquire),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("drain-bound expected proof"),
+        "{error}"
+    );
+    assert!(db.cluster_intake_fenced());
+    assert_eq!(controller.checkpoint_assignment_fence(1), None);
+    assert_eq!(controller.checkpoint_drain_transition(), None);
+    assert!(sender.active_assignment_digest().is_none());
+    assert!(receiver.active_assignment_digest().is_none());
+
     let target_only = db
         .activate_assignment_authority(
             &predecessor,
@@ -458,6 +763,76 @@ async fn assignment_activation_installs_transport_before_controller_publication(
     assert!(!target_only.intake_open);
     assert!(db.cluster_intake_fenced());
     assert_eq!(controller.checkpoint_drain_transition(), Some(transition));
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn assignment_activation_withdraws_partial_authority_when_fault_audit_fails() {
+    let fixture = fault_audit_activation_fixture().await;
+    let initial_revision = fixture
+        .db
+        .assignment_authority_revision
+        .load(std::sync::atomic::Ordering::Acquire);
+    fixture.recovery.fail_fault_scans();
+
+    let error = fixture
+        .db
+        .activate_assignment_authority(
+            &fixture.fence,
+            None,
+            initial_revision,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("injected fault audit failure"));
+    assert_fault_audit_withdrew_authority(&fixture, initial_revision);
+    assert_fault_audit_retry_reopens(&fixture).await;
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test(start_paused = true)]
+async fn assignment_activation_withdraws_partial_authority_when_fault_audit_times_out() {
+    let fixture = fault_audit_activation_fixture().await;
+    let initial_revision = fixture
+        .db
+        .assignment_authority_revision
+        .load(std::sync::atomic::Ordering::Acquire);
+    fixture.recovery.stall_fault_scans();
+    let db = Arc::clone(&fixture.db);
+    let fence = fixture.fence.clone();
+    let activation = tokio::spawn(async move {
+        db.activate_assignment_authority(
+            &fence,
+            None,
+            initial_revision,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+    });
+
+    fixture.recovery.fault_scan_started.notified().await;
+    assert_eq!(
+        fixture.sender.active_assignment_digest(),
+        Some(fixture.fence.digest())
+    );
+    assert_eq!(
+        fixture.receiver.active_assignment_digest(),
+        Some(fixture.fence.digest())
+    );
+    assert_eq!(
+        fixture
+            .controller
+            .checkpoint_assignment_fence(fixture.fence.assignment_version),
+        Some(fixture.fence.clone())
+    );
+
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    let error = activation.await.unwrap().unwrap_err();
+    assert!(error.to_string().contains("fault audit timed out"));
+    assert_fault_audit_withdrew_authority(&fixture, initial_revision);
+    assert_fault_audit_retry_reopens(&fixture).await;
 }
 
 #[cfg(feature = "cluster")]

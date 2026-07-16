@@ -1109,7 +1109,7 @@ impl LaminarDB {
         }
     }
 
-    /// Close shuffle admission during a transient durable-assignment read failure without
+    /// Close shuffle admission during temporary assignment-authority uncertainty without
     /// destroying the retained certificate's delivery sequence domain.
     #[cfg(feature = "cluster")]
     pub(crate) fn suspend_shuffle_assignment_fence(&self) {
@@ -1121,6 +1121,17 @@ impl LaminarDB {
         if let Some(sender) = self.shuffle_sender.lock().as_ref() {
             sender.suspend_assignment_fence();
         }
+    }
+
+    #[cfg(feature = "cluster")]
+    fn withdraw_assignment_authority(
+        &self,
+        controller: &laminar_core::cluster::control::ClusterController,
+    ) {
+        self.set_source_gate(true);
+        controller.publish_checkpoint_drain_transition(None);
+        controller.publish_checkpoint_assignment_fence(None);
+        self.suspend_shuffle_assignment_fence();
     }
 
     #[cfg(feature = "cluster")]
@@ -1352,9 +1363,7 @@ impl LaminarDB {
             .load(std::sync::atomic::Ordering::Acquire)
             != expected_revision
         {
-            controller.publish_checkpoint_drain_transition(None);
-            controller.publish_checkpoint_assignment_fence(None);
-            self.suspend_shuffle_assignment_fence();
+            self.withdraw_assignment_authority(&controller);
             return Ok(AssignmentAuthorityActivation {
                 installed: false,
                 intake_open: false,
@@ -1365,6 +1374,7 @@ impl LaminarDB {
         }
 
         let source_drain_active = drain_transition.is_some();
+        let expected_drain_transition = drain_transition.clone();
         controller.publish_checkpoint_drain_transition(drain_transition);
         controller.publish_checkpoint_assignment_fence(Some(fence.clone()));
         if self
@@ -1372,9 +1382,7 @@ impl LaminarDB {
             .load(std::sync::atomic::Ordering::Acquire)
             != expected_revision
         {
-            controller.publish_checkpoint_drain_transition(None);
-            controller.publish_checkpoint_assignment_fence(None);
-            self.suspend_shuffle_assignment_fence();
+            self.withdraw_assignment_authority(&controller);
             return Ok(AssignmentAuthorityActivation {
                 installed: false,
                 intake_open: false,
@@ -1394,13 +1402,13 @@ impl LaminarDB {
                 match tokio::time::timeout_at(deadline, controller.read_fault_reports()).await {
                     Ok(Ok(reports)) => reports,
                     Ok(Err(error)) => {
-                        controller.set_recovering(true);
+                        self.withdraw_assignment_authority(&controller);
                         return Err(DbError::Checkpoint(format!(
                         "could not audit recovery faults before opening assignment intake: {error}"
                     )));
                     }
                     Err(_) => {
-                        controller.set_recovering(true);
+                        self.withdraw_assignment_authority(&controller);
                         return Err(DbError::Checkpoint(
                             "recovery fault audit timed out before opening assignment intake"
                                 .into(),
@@ -1415,23 +1423,54 @@ impl LaminarDB {
                     revision: expected_revision,
                 });
             }
+
+            let expected_leader = expected_drain_transition
+                .as_ref()
+                .filter(|_| preserve_predecessor_execution)
+                .map(|transition| transition.leader.clone());
+            let audited_leader = match controller
+                .audit_assignment_leader_authority(fence, expected_leader.as_ref(), deadline)
+                .await
+            {
+                Ok(proof) => proof,
+                Err(error) => {
+                    self.withdraw_assignment_authority(&controller);
+                    return Err(DbError::Checkpoint(format!(
+                        "assignment leader authority audit failed before opening intake: {error}"
+                    )));
+                }
+            };
+            let authority_unchanged = || {
+                tokio::time::Instant::now() < deadline
+                    && self
+                        .assignment_authority_revision
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        == expected_revision
+                    && !controller.is_recovering()
+                    && controller.process_lease_is_live()
+                    && controller.current_leader().map(|leader| leader.0)
+                        == Some(audited_leader.owner.node_id)
+                    && controller
+                        .checkpoint_assignment_fence(fence.assignment_version)
+                        .as_ref()
+                        == Some(fence)
+                    && controller.checkpoint_drain_transition() == expected_drain_transition
+            };
+            if !authority_unchanged() {
+                self.withdraw_assignment_authority(&controller);
+                return Ok(AssignmentAuthorityActivation {
+                    installed: false,
+                    intake_open: false,
+                    revision: self
+                        .assignment_authority_revision
+                        .load(std::sync::atomic::Ordering::Acquire),
+                });
+            }
             self.set_source_gate(false);
-            let unchanged = self
-                .assignment_authority_revision
-                .load(std::sync::atomic::Ordering::Acquire)
-                == expected_revision
-                && !controller.is_recovering()
-                && controller
-                    .checkpoint_assignment_fence(fence.assignment_version)
-                    .as_ref()
-                    == Some(fence);
-            if unchanged {
+            if authority_unchanged() {
                 intake_open = true;
             } else {
-                self.set_source_gate(true);
-                controller.publish_checkpoint_drain_transition(None);
-                controller.publish_checkpoint_assignment_fence(None);
-                self.suspend_shuffle_assignment_fence();
+                self.withdraw_assignment_authority(&controller);
                 return Ok(AssignmentAuthorityActivation {
                     installed: false,
                     intake_open: false,

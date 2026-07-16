@@ -2279,20 +2279,160 @@ impl ClusterController {
             .await
     }
 
-    /// Capture the live process-local leader grant from one exact remote assignment process.
+    /// Confirm that one exact remote process still holds a proof read from durable authority.
+    ///
+    /// The RPC returns only a challenge acknowledgement and never returns authority material.
     ///
     /// # Errors
     /// Fails closed when the control RPC is unavailable, malformed, or misses `deadline`.
     #[cfg(feature = "cluster")]
-    pub async fn capture_remote_leader_proof(
+    pub async fn confirm_remote_leader_proof(
         &self,
-        participant: CheckpointParticipant,
-        process_term: u64,
+        proof: &LeaderProof,
         deadline: tokio::time::Instant,
-    ) -> Result<Option<LeaderProof>, String> {
+    ) -> Result<bool, String> {
         self.barrier
-            .capture_remote_leader_proof(participant, process_term, deadline)
+            .confirm_remote_leader_proof(proof, deadline)
             .await
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn confirm_assignment_leader_proof(
+        &self,
+        leader: NodeId,
+        proof: &LeaderProof,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), String> {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("assignment leader authority audit deadline expired".into());
+        }
+        if proof.owner.node_id != leader.0 {
+            return Err("assignment leader proof does not match the current leader".into());
+        }
+        let confirmed = if leader == self.instance_id {
+            self.capture_leader_proof().as_ref() == Some(proof)
+        } else {
+            self.confirm_remote_leader_proof(proof, deadline).await?
+        };
+        if !confirmed {
+            return Err(format!(
+                "assignment leader process {} has no live exact grant",
+                leader.0
+            ));
+        }
+        Ok(())
+    }
+
+    /// Audit one exact assignment leader against durable and process-local authority.
+    ///
+    /// This is a single bounded attempt intended for a caller that already holds its assignment
+    /// and execution locks. `expected_proof` binds predecessor execution during an active drain;
+    /// a stable assignment passes `None` and adopts the current durable grant. The audit never
+    /// waits for convergence and never mutates assignment, lease, or source-gate state.
+    ///
+    /// # Errors
+    /// Fails closed when the installed assignment, elected participant, leader authority, live
+    /// local/remote grant, or durable process term changes or cannot be verified before `deadline`.
+    #[cfg(feature = "cluster")]
+    pub async fn audit_assignment_leader_authority(
+        &self,
+        fence: &CheckpointAssignmentFence,
+        expected_proof: Option<&LeaderProof>,
+        deadline: tokio::time::Instant,
+    ) -> Result<LeaderProof, String> {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("assignment leader authority audit deadline expired".into());
+        }
+        if !fence.is_canonical()
+            || self
+                .checkpoint_assignment_fence(fence.assignment_version)
+                .as_ref()
+                != Some(fence)
+        {
+            return Err(
+                "assignment leader authority audit requires the exact installed fence".into(),
+            );
+        }
+        if expected_proof.is_some_and(|proof| !proof.is_canonical()) {
+            return Err("assignment leader authority audit expected proof is not canonical".into());
+        }
+
+        let leader = self
+            .current_leader()
+            .ok_or_else(|| "assignment leader authority audit has no current leader".to_string())?;
+        let participant = fence
+            .participants
+            .iter()
+            .find(|participant| participant.node_id == leader.0)
+            .copied()
+            .ok_or_else(|| {
+                "current leader is not a participant in the exact assignment fence".to_string()
+            })?;
+        let authority = self
+            .checkpoint_authority()
+            .map_err(|error| format!("assignment leader authority is unavailable: {error}"))?;
+        let initial = tokio::time::timeout_at(deadline, authority.load())
+            .await
+            .map_err(|_| "assignment leader authority initial read timed out".to_string())?
+            .map_err(|error| format!("assignment leader authority initial read failed: {error}"))?
+            .ok_or_else(|| "assignment leader authority has no durable grant".to_string())?;
+        if initial.owner.node != leader || initial.owner.boot != participant.boot_incarnation {
+            return Err(
+                "durable leader grant does not match the elected assignment participant".into(),
+            );
+        }
+        let proof = match expected_proof {
+            Some(expected) if initial.matches_proof(expected) => expected.clone(),
+            Some(_) => {
+                return Err(
+                    "durable leader grant does not match the drain-bound expected proof".into(),
+                );
+            }
+            None => initial.proof(),
+        };
+
+        self.confirm_assignment_leader_proof(leader, &proof, deadline)
+            .await?;
+        let process_authority = self
+            .process_lease_authority
+            .get()
+            .ok_or_else(|| "process lease authority is not installed".to_string())?;
+        let process_current = process_authority
+            .verify_current_participant_term(participant, proof.owner.process_term, deadline)
+            .await
+            .map_err(|error| {
+                format!("assignment leader process-term verification failed: {error}")
+            })?;
+        if !process_current {
+            return Err("assignment leader durable process term is no longer current".to_string());
+        }
+        self.confirm_assignment_leader_proof(leader, &proof, deadline)
+            .await?;
+
+        let final_grant = tokio::time::timeout_at(deadline, authority.load())
+            .await
+            .map_err(|_| "assignment leader authority final read timed out".to_string())?
+            .map_err(|error| format!("assignment leader authority final read failed: {error}"))?
+            .ok_or_else(|| "assignment leader authority grant disappeared".to_string())?;
+        if final_grant.owner != initial.owner
+            || final_grant.token != initial.token
+            || final_grant.seq < initial.seq
+            || !final_grant.matches_proof(&proof)
+        {
+            return Err("assignment leader durable grant changed during the audit".into());
+        }
+        if self.current_leader() != Some(leader)
+            || self
+                .checkpoint_assignment_fence(fence.assignment_version)
+                .as_ref()
+                != Some(fence)
+        {
+            return Err("assignment leader or exact fence changed during the audit".into());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("assignment leader authority audit deadline expired".into());
+        }
+        Ok(proof)
     }
 
     /// Leader-side announce.
@@ -3311,6 +3451,284 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn assignment_leader_audit_accepts_only_the_exact_local_grant_and_process_term() {
+        use crate::cluster::control::{
+            LeaderLeaseOwner, LeaderLeaseStore, LeaseDeadline, LeaseOutcome, ProcessLeaseAuthority,
+            ProcessLeaseOutcome,
+        };
+
+        let node = NodeId(1);
+        let boot = Uuid::from_u128(11);
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
+        let (_members_tx, members_rx) = watch::channel(Vec::new());
+        let controller = ClusterController::new_with_recovery_incarnation(
+            node,
+            Arc::clone(&kv),
+            kv,
+            None,
+            members_rx,
+            boot,
+        );
+        controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(30))));
+
+        let backing: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let process_authority = Arc::new(
+            ProcessLeaseAuthority::new(Arc::clone(&backing), Duration::from_millis(1)).unwrap(),
+        );
+        let process_store = process_authority.store_for(node);
+        let ProcessLeaseOutcome::Acquired(process_lease) =
+            process_store.try_acquire(boot, 0).await.unwrap()
+        else {
+            panic!("empty process authority must be acquired");
+        };
+        controller
+            .set_process_lease_authority(process_authority)
+            .unwrap();
+
+        let leader_authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&backing), 1));
+        let owner = LeaderLeaseOwner {
+            node,
+            boot,
+            process_term: process_lease.term,
+        };
+        let LeaseOutcome::Acquired(leader_lease) =
+            leader_authority.try_acquire(&owner, 0).await.unwrap()
+        else {
+            panic!("empty leader authority must be acquired");
+        };
+        controller.set_leader_lease_store(Arc::clone(&leader_authority));
+        let (_leader_tx, leader_rx) = watch::channel(Some(leader_lease.clone()));
+        controller
+            .set_leader_lease_watch(
+                leader_rx,
+                owner,
+                Arc::new(LeaseDeadline::live_for(Duration::from_secs(30))),
+            )
+            .unwrap();
+
+        let fence = CheckpointAssignmentFence::from_owner_map(
+            1,
+            &[node.0],
+            vec![CheckpointParticipant {
+                node_id: node.0,
+                boot_incarnation: boot,
+            }],
+        )
+        .unwrap();
+        controller.publish_checkpoint_assignment_fence(Some(fence.clone()));
+        let deadline = || tokio::time::Instant::now() + Duration::from_secs(1);
+
+        let proof = controller
+            .audit_assignment_leader_authority(&fence, None, deadline())
+            .await
+            .unwrap();
+        assert_eq!(proof, leader_lease.proof());
+        assert_eq!(
+            controller
+                .audit_assignment_leader_authority(&fence, Some(&proof), deadline())
+                .await
+                .unwrap(),
+            proof
+        );
+
+        let mut stale = proof.clone();
+        stale.fencing_token += 1;
+        let stale_error = controller
+            .audit_assignment_leader_authority(&fence, Some(&stale), deadline())
+            .await
+            .unwrap_err();
+        assert!(
+            stale_error.contains("drain-bound expected proof"),
+            "{stale_error}"
+        );
+
+        let other_fence = CheckpointAssignmentFence::from_owner_map(
+            2,
+            &[node.0],
+            vec![CheckpointParticipant {
+                node_id: node.0,
+                boot_incarnation: boot,
+            }],
+        )
+        .unwrap();
+        let fence_error = controller
+            .audit_assignment_leader_authority(&other_fence, None, deadline())
+            .await
+            .unwrap_err();
+        assert!(
+            fence_error.contains("exact installed fence"),
+            "{fence_error}"
+        );
+
+        let observation = process_store.observe_rival(&process_lease).unwrap();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert!(matches!(
+            process_store
+                .try_takeover(Uuid::from_u128(12), &observation, 2)
+                .await
+                .unwrap(),
+            ProcessLeaseOutcome::Acquired(_)
+        ));
+        let process_error = controller
+            .audit_assignment_leader_authority(&fence, None, deadline())
+            .await
+            .unwrap_err();
+        assert!(
+            process_error.contains("process term is no longer current"),
+            "{process_error}"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn assignment_leader_audit_rejects_takeover_after_second_remote_confirmation() {
+        use crate::cluster::control::{
+            LeaderLeaseOwner, LeaderLeaseStore, LeaseOutcome, ProcessLeaseAuthority,
+            ProcessLeaseOutcome,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let leader_node = NodeId(1);
+        let observer_node = NodeId(2);
+        let leader_boot = Uuid::from_u128(11);
+        let observer_boot = Uuid::from_u128(22);
+        let observer_kv = Arc::new(InMemoryKv::new(observer_node));
+        let observer_control: Arc<dyn ClusterKv> = observer_kv.clone();
+        let (_members_tx, members_rx) = watch::channel(vec![info(leader_node.0)]);
+        let observer = Arc::new(ClusterController::new_with_recovery_incarnation(
+            observer_node,
+            Arc::clone(&observer_control),
+            observer_control,
+            None,
+            members_rx,
+            observer_boot,
+        ));
+
+        let backing: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let process_authority = Arc::new(
+            ProcessLeaseAuthority::new(Arc::clone(&backing), Duration::from_millis(1)).unwrap(),
+        );
+        let ProcessLeaseOutcome::Acquired(process_lease) = process_authority
+            .store_for(leader_node)
+            .try_acquire(leader_boot, 0)
+            .await
+            .unwrap()
+        else {
+            panic!("leader process authority must be acquired");
+        };
+        observer
+            .set_process_lease_authority(process_authority)
+            .unwrap();
+
+        let leader_authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&backing), 1));
+        let initial_owner = LeaderLeaseOwner {
+            node: leader_node,
+            boot: leader_boot,
+            process_term: process_lease.term,
+        };
+        let LeaseOutcome::Acquired(initial_lease) = leader_authority
+            .try_acquire(&initial_owner, 0)
+            .await
+            .unwrap()
+        else {
+            panic!("leader authority must be acquired");
+        };
+        observer.set_leader_lease_store(Arc::clone(&leader_authority));
+        let fence = CheckpointAssignmentFence::from_owner_map(
+            1,
+            &[leader_node.0],
+            vec![CheckpointParticipant {
+                node_id: leader_node.0,
+                boot_incarnation: leader_boot,
+            }],
+        )
+        .unwrap();
+        observer.publish_checkpoint_assignment_fence(Some(fence.clone()));
+
+        observer
+            .start_barrier_server("127.0.0.1:0".parse().unwrap(), None)
+            .await
+            .unwrap();
+        let remote = BarrierCoordinator::new(Arc::new(InMemoryKv::new(leader_node)));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (second_tx, mut second_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let provider_calls = Arc::clone(&calls);
+        let provider_release = Arc::clone(&release);
+        let provider_proof = initial_lease.proof();
+        remote.set_local_leader_proof_provider(Arc::new(move || {
+            if provider_calls.fetch_add(1, Ordering::AcqRel) == 1 {
+                let _ = second_tx.send(());
+                let (lock, ready) = &*provider_release;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = ready.wait(released).unwrap();
+                }
+            }
+            Some(provider_proof.clone())
+        }));
+        let remote_addr = remote
+            .start_server(
+                "127.0.0.1:0".parse().unwrap(),
+                None,
+                Arc::new(parking_lot::RwLock::new(None)),
+            )
+            .await
+            .unwrap();
+        observer_kv.seed(leader_node, BARRIER_ADDR_KEY, remote_addr.to_string());
+
+        let successor = LeaderLeaseOwner {
+            node: observer_node,
+            boot: observer_boot,
+            process_term: 1,
+        };
+        let observation = leader_authority
+            .observe_rival(&successor, &initial_lease)
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let audit = {
+            let observer = Arc::clone(&observer);
+            let fence = fence.clone();
+            tokio::spawn(async move {
+                observer
+                    .audit_assignment_leader_authority(
+                        &fence,
+                        None,
+                        tokio::time::Instant::now() + Duration::from_secs(2),
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), second_rx.recv())
+            .await
+            .unwrap()
+            .expect("the audit must reach its second live confirmation");
+        assert!(matches!(
+            leader_authority
+                .try_takeover(&successor, &observation, 2)
+                .await
+                .unwrap(),
+            LeaseOutcome::Acquired(_)
+        ));
+        {
+            let (lock, ready) = &*release;
+            *lock.lock().unwrap() = true;
+            ready.notify_all();
+        }
+
+        let error = audit.await.unwrap().unwrap_err();
+        assert!(
+            error.contains("durable grant changed during the audit"),
+            "{error}"
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 2);
     }
 
     #[cfg(feature = "cluster")]
