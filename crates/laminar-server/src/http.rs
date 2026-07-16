@@ -2,8 +2,10 @@
 
 use std::io::Write as _;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+use std::{future::Future as _, future::IntoFuture as _, task::Poll};
 
 use prometheus::Registry;
 
@@ -29,7 +31,7 @@ use crate::server::ServerError;
 #[cfg(feature = "cluster")]
 #[derive(Clone)]
 pub struct ClusterComponents {
-    /// Leader-election / membership controller (gossip discovery only).
+    /// Leader-election / membership controller.
     pub controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
     /// Durable vnode-assignment snapshot store.
     pub snapshot_store: Option<Arc<laminar_core::cluster::control::AssignmentSnapshotStore>>,
@@ -46,10 +48,22 @@ pub struct AppState {
     pub registry: Arc<Registry>,
     pub server_metrics: ServerMetrics,
     pub(crate) ws_slots: Arc<tokio::sync::Semaphore>,
+    pub(crate) startup_ready: AtomicBool,
     /// Cluster control-plane handles (cluster mode only). `None` in
     /// single-node mode; the cluster endpoints 404 when absent.
     #[cfg(feature = "cluster")]
     pub cluster: Option<ClusterComponents>,
+}
+
+impl AppState {
+    /// Open the one-way startup gate after the runtime has established serving authority.
+    pub(crate) fn open_startup_gate(&self) {
+        self.startup_ready.store(true, Ordering::Release);
+    }
+
+    fn startup_gate_is_open(&self) -> bool {
+        self.startup_ready.load(Ordering::Acquire)
+    }
 }
 
 pub(crate) fn ws_connection_slots() -> Arc<tokio::sync::Semaphore> {
@@ -96,9 +110,30 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     public
         .merge(protected)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            startup_gate_middleware,
+        ))
         .layer(cors)
         .layer(axum::middleware::from_fn(request_logging))
         .with_state(state)
+}
+
+async fn startup_gate_middleware(
+    State(state): State<Arc<AppState>>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = req.uri().path();
+    let startup_probe = matches!(path, "/health" | "/ready" | "/metrics");
+    if !startup_probe && !state.startup_gate_is_open() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server startup is not complete",
+        )
+        .into_response();
+    }
+    next.run(req).await
 }
 
 /// Build the CORS policy from config. With an explicit allow-list of console
@@ -197,12 +232,30 @@ pub async fn bind_listener(bind: &str) -> Result<tokio::net::TcpListener, Server
 pub fn serve_listener(
     router: Router,
     listener: tokio::net::TcpListener,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, router).await {
-            tracing::error!("HTTP server error: {e}");
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::spawn(async move {
+        let mut server = Box::pin(axum::serve(listener, router).into_future());
+        let stopped = std::future::poll_fn(|context| match server.as_mut().poll(context) {
+            Poll::Pending => Poll::Ready(None),
+            Poll::Ready(result) => Poll::Ready(Some(result)),
+        })
+        .await;
+        if let Some(result) = stopped {
+            if let Err(error) = result {
+                tracing::error!(%error, "HTTP server stopped before its accept loop started");
+            }
+            return;
         }
-    })
+        let _ = started_tx.send(());
+        if let Err(error) = server.await {
+            tracing::error!(%error, "HTTP server error");
+        }
+    });
+    (handle, started_rx)
 }
 
 /// Health check response.
@@ -345,6 +398,13 @@ async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 async fn readiness_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if !state.startup_gate_is_open() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server startup is not complete",
+        )
+        .into_response();
+    }
     let pipeline_state = state.db.pipeline_state();
     if pipeline_state == "Running" {
         (
@@ -1594,6 +1654,7 @@ mod tests {
             registry,
             server_metrics,
             ws_slots: ws_connection_slots(),
+            startup_ready: AtomicBool::new(true),
             #[cfg(feature = "cluster")]
             cluster: None,
         })
@@ -1640,6 +1701,7 @@ mod tests {
             registry,
             server_metrics,
             ws_slots: ws_connection_slots(),
+            startup_ready: AtomicBool::new(true),
             #[cfg(feature = "cluster")]
             cluster: None,
         })
@@ -1732,6 +1794,153 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn startup_gate_preserves_probes_and_rejects_every_other_route() {
+        let state = test_state();
+        state
+            .current_config
+            .write()
+            .server
+            .console_cors_allowed_origins = Some(vec!["https://console.example".into()]);
+        state.startup_ready.store(false, Ordering::Release);
+        let app = build_router(state);
+
+        for path in ["/health", "/metrics"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "probe {path}");
+        }
+
+        let readiness = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(readiness.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(readiness.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("server startup is not complete"));
+
+        for path in ["/api/v1/sources", "/not-a-route"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header(axum::http::header::ORIGIN, "https://console.example")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "non-probe {path}"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .and_then(|value| value.to_str().ok()),
+                Some("https://console.example"),
+                "closed startup response must retain CORS headers for {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_gate_completes_closed_requests_instead_of_replaying_them() {
+        let state = test_state_with_token("supersecret-token");
+        state.startup_ready.store(false, Ordering::Release);
+        let app = build_router(Arc::clone(&state));
+        let request = || {
+            Request::builder()
+                .uri("/api/v1/sources")
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let closed = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.clone().oneshot(request()),
+        )
+        .await
+        .expect("a closed gate must answer immediately")
+        .unwrap();
+        assert_eq!(closed.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        state.open_startup_gate();
+        assert_eq!(closed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let after_open = app.oneshot(request()).await.unwrap();
+        assert_eq!(after_open.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    async fn tcp_get(addr: std::net::SocketAddr, path: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        String::from_utf8(response).unwrap()
+    }
+
+    #[tokio::test]
+    async fn live_listener_rejects_closed_gate_then_serves_after_open() {
+        let state = test_state();
+        state.startup_ready.store(false, Ordering::Release);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (server, started) = serve_listener(build_router(Arc::clone(&state)), listener);
+        tokio::time::timeout(std::time::Duration::from_secs(1), started)
+            .await
+            .expect("HTTP accept loop must start promptly")
+            .expect("HTTP serve task must remain live after its first poll");
+
+        let closed = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tcp_get(addr, "/api/v1/sources"),
+        )
+        .await
+        .expect("a live listener must answer a closed gate immediately");
+        assert!(
+            closed.starts_with("HTTP/1.1 503 "),
+            "closed gate response: {closed}"
+        );
+        assert!(closed.contains("server startup is not complete"));
+
+        state.open_startup_gate();
+        let open = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tcp_get(addr, "/api/v1/sources"),
+        )
+        .await
+        .expect("the open gate must serve the next request promptly");
+        assert!(
+            open.starts_with("HTTP/1.1 200 "),
+            "open gate response: {open}"
+        );
+
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
@@ -2006,6 +2215,7 @@ mod tests {
             registry,
             server_metrics,
             ws_slots: ws_connection_slots(),
+            startup_ready: AtomicBool::new(true),
             #[cfg(feature = "cluster")]
             cluster: None,
         });

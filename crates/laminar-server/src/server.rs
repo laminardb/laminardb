@@ -375,7 +375,7 @@ pub(crate) async fn start_http_api(
     config: ServerConfig,
     #[cfg(feature = "cluster")] cluster: Option<ClusterComponents>,
 ) -> Result<(Arc<http::AppState>, tokio::task::JoinHandle<()>), ServerError> {
-    Ok(prepare_http_api(
+    let prepared = prepare_http_api(
         db,
         registry,
         config_path,
@@ -383,8 +383,9 @@ pub(crate) async fn start_http_api(
         #[cfg(feature = "cluster")]
         cluster,
     )
-    .await?
-    .start())
+    .await?;
+    prepared.app_state.open_startup_gate();
+    prepared.start().await
 }
 
 pub(crate) struct PreparedHttpApi {
@@ -394,11 +395,49 @@ pub(crate) struct PreparedHttpApi {
     bind: String,
 }
 
+struct StartingHttpServer {
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl StartingHttpServer {
+    fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    fn into_handle(mut self) -> tokio::task::JoinHandle<()> {
+        self.handle
+            .take()
+            .expect("starting HTTP server handle is present until disarmed")
+    }
+}
+
+impl Drop for StartingHttpServer {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+}
+
 impl PreparedHttpApi {
-    pub(crate) fn start(self) -> (Arc<http::AppState>, tokio::task::JoinHandle<()>) {
-        let handle = http::serve_listener(self.router, self.listener);
+    pub(crate) async fn start(
+        self,
+    ) -> Result<(Arc<http::AppState>, tokio::task::JoinHandle<()>), ServerError> {
+        let (handle, started) = http::serve_listener(self.router, self.listener);
+        let starting = StartingHttpServer::new(handle);
+        if started.await.is_err() {
+            let handle = starting.into_handle();
+            handle.abort();
+            let _ = handle.await;
+            return Err(ServerError::Http(
+                "HTTP serve task stopped before entering its accept loop".into(),
+            ));
+        }
+        let handle = starting.into_handle();
         info!("HTTP API listening on {}", self.bind);
-        (self.app_state, handle)
+        Ok((self.app_state, handle))
     }
 }
 
@@ -421,6 +460,7 @@ pub(crate) async fn prepare_http_api(
         registry,
         server_metrics,
         ws_slots: http::ws_connection_slots(),
+        startup_ready: std::sync::atomic::AtomicBool::new(false),
         #[cfg(feature = "cluster")]
         cluster,
     });
@@ -685,6 +725,60 @@ mod tests {
         assert!(file_url_to_path("file://checkpoint-host/path").is_none());
     }
     use crate::config::*;
+
+    #[tokio::test]
+    async fn cancelling_http_start_does_not_detach_the_listener() {
+        let mut server = ServerSection::default();
+        server.bind = "127.0.0.1:0".into();
+        let config = ServerConfig {
+            server,
+            state: StateBackendConfig::default(),
+            checkpoint: CheckpointSection::default(),
+            supervision: Default::default(),
+            sources: vec![],
+            lookups: vec![],
+            pipelines: vec![],
+            sinks: vec![],
+            sql: None,
+            discovery: None,
+            node_id: None,
+            ai: Default::default(),
+            models: Default::default(),
+        };
+        let registry = Arc::new(crate::metrics::build_registry([
+            ("instance".into(), "test".into()),
+            ("pipeline".into(), "test".into()),
+        ]));
+        let prepared = prepare_http_api(
+            LaminarDB::open().unwrap(),
+            registry,
+            PathBuf::from("unused.toml"),
+            config,
+            #[cfg(feature = "cluster")]
+            None,
+        )
+        .await
+        .unwrap();
+        let address = prepared.listener.local_addr().unwrap();
+
+        {
+            let start = prepared.start();
+            tokio::pin!(start);
+            assert!(futures::poll!(start.as_mut()).is_pending());
+        }
+
+        let rebound = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Ok(listener) = tokio::net::TcpListener::bind(address).await {
+                    return listener;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelling HTTP startup must release its listener");
+        drop(rebound);
+    }
 
     fn make_source(name: &str, connector: &str) -> SourceConfig {
         SourceConfig {

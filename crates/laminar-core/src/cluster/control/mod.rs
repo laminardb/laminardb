@@ -64,4 +64,4 @@ pub use query::{
 #[cfg(feature = "cluster")]
 pub mod tls;
 #[cfg(feature = "cluster")]
-pub use tls::{set_cluster_tls, ClusterTls};
+pub use tls::{claim_cluster_plaintext, set_cluster_tls, ClusterTls};

@@ -881,6 +881,38 @@ async fn acquire_process_lease(
     }
 }
 
+async fn start_cluster_http_api_before_activation(
+    db: Arc<LaminarDB>,
+    registry: Arc<prometheus::Registry>,
+    config_path: PathBuf,
+    config: ServerConfig,
+    cluster: crate::http::ClusterComponents,
+    controller: &laminar_core::cluster::control::ClusterController,
+) -> Result<(Arc<crate::http::AppState>, tokio::task::JoinHandle<()>), ClusterStartupError> {
+    let local = controller.instance_id();
+    if controller.live_instances().contains(&local) {
+        return Err(ClusterStartupError::EngineConstruction(
+            "cluster HTTP listener must bind before local activation".into(),
+        ));
+    }
+
+    let prepared = server::prepare_http_api(db, registry, config_path, config, Some(cluster))
+        .await
+        .map_err(|error| ClusterStartupError::HttpStartup(error.to_string()))?;
+    let (app_state, api_handle) = prepared
+        .start()
+        .await
+        .map_err(|error| ClusterStartupError::HttpStartup(error.to_string()))?;
+    if controller.live_instances().contains(&local) {
+        api_handle.abort();
+        let _ = api_handle.await;
+        return Err(ClusterStartupError::EngineConstruction(
+            "local activation raced cluster HTTP listener startup".into(),
+        ));
+    }
+    Ok((app_state, api_handle))
+}
+
 /// Start a LaminarDB server in cluster (multi-node) mode.
 pub async fn start_cluster(
     config: ServerConfig,
@@ -926,9 +958,6 @@ pub async fn start_cluster(
         bind_host.to_string()
     };
 
-    // Install control-plane mTLS (if configured) before any server/client binds.
-    install_cluster_tls(&cluster_cfg.discovery)?;
-
     // Claim the stable node identity before discovery can publish a duplicate member. The
     // durable recovery authority is deliberately not published until the database runtime exists.
     if !laminar_core::state::StateBackendDurability::for_storage_url(&config.checkpoint.url)
@@ -944,6 +973,7 @@ pub async fn start_cluster(
                 .into(),
         )
     })?;
+    install_cluster_tls(&cluster_cfg.discovery)?;
     let process_incarnation = uuid::Uuid::new_v4();
     let process_lease_config = laminar_core::cluster::control::ProcessLeaseConfig::default();
     let process_lease_ttl_ms =
@@ -1634,11 +1664,70 @@ pub async fn start_cluster(
         ));
     }
 
-    // The pipeline and shuffle receiver are ready, but source intake remains fenced. Publish
-    // readiness now so every owner can certify the same assignment before any node emits.
+    let startup_controller = cluster_controller
+        .as_ref()
+        .expect("cluster controller was required before database construction");
+    let Some(leader_authority_timeout) =
+        startup_leader_authority_timeout(lease_cfg, OBJECT_STORE_CONTROL_IO_TIMEOUT)
+    else {
+        let mut left = local_node.clone();
+        left.state = NodeState::Left;
+        let _ = discovery.announce(left).await;
+        if let Some(token) = &lease_shutdown_token {
+            token.cancel();
+        }
+        let _ = db.shutdown().await;
+        let _ = discovery.stop().await;
+        return Err(ClusterStartupError::EngineConstruction(
+            "leader authority convergence timeout exceeds the monotonic timer range".into(),
+        ));
+    };
+
+    // Bind and begin serving before this process can become an assignment owner. The startup
+    // gate answers data/control requests with 503 until authority and recovery are established;
+    // accepting now avoids holding requests in the kernel listen backlog for later replay.
+    let cluster_components = crate::http::ClusterComponents {
+        controller: cluster_controller.clone(),
+        snapshot_store: snapshot_store.clone(),
+        membership_rx: discovery.membership_watch(),
+    };
+    let (app_state, api_handle) = match start_cluster_http_api_before_activation(
+        Arc::clone(&db),
+        registry,
+        config_path.clone(),
+        config,
+        cluster_components,
+        startup_controller,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            db.fence_cluster_startup();
+            startup_controller.set_active(false);
+            let mut left = local_node.clone();
+            left.state = NodeState::Left;
+            let _ = discovery.announce(left).await;
+            if let Some(token) = &lease_shutdown_token {
+                token.cancel();
+            }
+            let _ = db.shutdown().await;
+            let _ = discovery.stop().await;
+            return Err(error);
+        }
+    };
+
+    // The pipeline, shuffle receiver, and gated HTTP listener are live. Only now publish
+    // assignment eligibility so an occupied API port can never leave an Active ghost node.
     let mut active = local_node.clone();
     active.state = NodeState::Active;
     if let Err(error) = discovery.announce(active.clone()).await {
+        api_handle.abort();
+        let _ = api_handle.await;
+        startup_controller.set_active(false);
+        let mut left = local_node.clone();
+        left.state = NodeState::Left;
+        let _ = discovery.announce(left).await;
         if let Some(token) = &lease_shutdown_token {
             token.cancel();
         }
@@ -1648,28 +1737,24 @@ pub async fn start_cluster(
             "announce cluster runtime readiness: {error}"
         )));
     }
-    if let Some(ref controller) = cluster_controller {
-        controller.set_active(true);
-    }
+    startup_controller.set_active(true);
 
     // Rebalance and assignment certification use the same durable snapshot in every discovery
     // mode.
     let rebalance_shutdown = Arc::new(tokio::sync::Notify::new());
     let mut rebalance_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    if let (Some(snap_store), Some(controller)) =
-        (snapshot_store.clone(), cluster_controller.as_ref())
-    {
+    if let Some(snap_store) = snapshot_store.clone() {
         rebalance_tasks.push(laminar_db::rebalance::spawn_snapshot_watcher(
             Arc::clone(&db),
             Arc::clone(&snap_store),
             Arc::clone(&vnode_registry),
             Arc::clone(&rebalance_shutdown),
             rebalance_config,
-            Some(Arc::clone(controller)),
+            Some(Arc::clone(startup_controller)),
         ));
         rebalance_tasks.push(laminar_db::rebalance::spawn_rebalance_controller(
             Arc::clone(&db),
-            Arc::clone(controller),
+            Arc::clone(startup_controller),
             snap_store,
             Arc::clone(&vnode_registry),
             Arc::clone(&rebalance_shutdown),
@@ -1678,66 +1763,11 @@ pub async fn start_cluster(
         info!("Rebalance control plane started");
     }
 
-    // Reserve the API address while intake is still fenced. Serving starts only after startup
-    // recovery establishes the final data-plane disposition.
-    let cluster_components = crate::http::ClusterComponents {
-        controller: cluster_controller.clone(),
-        snapshot_store: snapshot_store.clone(),
-        membership_rx: discovery.membership_watch(),
-    };
-    let prepared_api = match server::prepare_http_api(
-        Arc::clone(&db),
-        registry,
-        config_path.clone(),
-        config,
-        Some(cluster_components),
-    )
-    .await
-    {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            db.fence_cluster_startup();
-            if let Some(controller) = cluster_controller.as_ref() {
-                controller.set_active(false);
-            }
-            let mut left = active.clone();
-            left.state = NodeState::Left;
-            let _ = discovery.announce(left).await;
-            rebalance_shutdown.notify_waiters();
-            for task in &rebalance_tasks {
-                task.abort();
-            }
-            for task in rebalance_tasks.drain(..) {
-                let _ = task.await;
-            }
-            if let Some(token) = &lease_shutdown_token {
-                token.cancel();
-            }
-            let _ = db.shutdown().await;
-            let _ = discovery.stop().await;
-            return Err(ClusterStartupError::HttpStartup(error.to_string()));
-        }
-    };
-
-    let startup_controller = cluster_controller
-        .as_ref()
-        .expect("cluster controller was required before database construction");
-    let leader_authority_timeout =
-        startup_leader_authority_timeout(lease_cfg, OBJECT_STORE_CONTROL_IO_TIMEOUT).ok_or_else(
-            || {
-                ClusterStartupError::EngineConstruction(
-                    "leader authority convergence timeout exceeds the monotonic timer range".into(),
-                )
-            },
-        )?;
     let startup_gate = async {
         wait_for_startup_assignment_fence(startup_controller, &vnode_registry).await?;
         wait_for_startup_leader_authority(
-            &db,
             startup_controller,
             &vnode_registry,
-            &lease_store,
-            &process_lease_authority,
             leader_authority_timeout,
         )
         .await?;
@@ -1758,6 +1788,8 @@ pub async fn start_cluster(
     let startup_disposition = match startup_gate {
         Ok(disposition) => disposition,
         Err(error) => {
+            api_handle.abort();
+            let _ = api_handle.await;
             db.fence_cluster_startup();
             startup_controller.set_active(false);
             let mut left = active.clone();
@@ -1795,6 +1827,8 @@ pub async fn start_cluster(
             .await
             .is_err()
             {
+                api_handle.abort();
+                let _ = api_handle.await;
                 db.fence_cluster_startup();
                 startup_controller.set_active(false);
                 let mut left = active.clone();
@@ -1821,7 +1855,7 @@ pub async fn start_cluster(
 
     // An idle worker serves control-plane readiness while its data plane remains fenced until the
     // watcher grants ownership.
-    let (app_state, api_handle) = prepared_api.start();
+    app_state.open_startup_gate();
     let watcher_handle = server::spawn_config_watcher(&app_state, config_path);
     let membership_rx = discovery.membership_watch();
     let membership_handle = spawn_membership_watcher(&node_id_str, membership_rx);
@@ -1867,47 +1901,24 @@ const STARTUP_LEADER_AUTHORITY_MAX_BACKOFF: std::time::Duration =
 const STARTUP_LEADER_AUTHORITY_MAX_SLEEP: std::time::Duration =
     std::time::Duration::from_millis(375);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct CertifiedLeaderCandidate {
-    assignment_version: u64,
-    assignment_digest: [u8; 32],
-    participant: laminar_core::checkpoint::CheckpointParticipant,
-}
-
-impl CertifiedLeaderCandidate {
-    fn same_assignment_process(&self, other: &Self) -> bool {
-        self.assignment_version == other.assignment_version
-            && self.assignment_digest == other.assignment_digest
-            && self.participant == other.participant
-    }
-}
-
-fn certified_leader_candidate(
+fn exact_startup_assignment_fence(
     controller: &laminar_core::cluster::control::ClusterController,
     registry: &laminar_core::state::VnodeRegistry,
-) -> Option<CertifiedLeaderCandidate> {
+) -> Option<laminar_core::checkpoint::CheckpointAssignmentFence> {
     let assignment = registry.versioned_snapshot();
     let owners: Vec<u64> = assignment.owners().iter().map(|owner| owner.0).collect();
     let fence = controller.checkpoint_assignment_fence(assignment.version())?;
-    if !fence.matches_owner_map(&owners) {
-        return None;
-    }
-    let leader = controller.current_leader()?;
-    let participant = fence
-        .participants
-        .iter()
-        .find(|participant| participant.node_id == leader.0)
-        .copied()?;
-    Some(CertifiedLeaderCandidate {
-        assignment_version: fence.assignment_version,
-        assignment_digest: fence.assignment_digest,
-        participant,
-    })
+    fence.matches_owner_map(&owners).then_some(fence)
 }
 
-fn startup_control_operation_deadline(overall: tokio::time::Instant) -> tokio::time::Instant {
+fn startup_leader_audit_deadline(overall: tokio::time::Instant) -> tokio::time::Instant {
+    // The exact controller audit serializes five bounded control operations under one deadline:
+    // durable head, live proof, process term, live proof, and final durable head.
+    let audit_budget = OBJECT_STORE_CONTROL_IO_TIMEOUT
+        .checked_mul(5)
+        .expect("the fixed startup authority audit budget fits Duration");
     tokio::time::Instant::now()
-        .checked_add(OBJECT_STORE_CONTROL_IO_TIMEOUT)
+        .checked_add(audit_budget)
         .map_or(overall, |deadline| deadline.min(overall))
 }
 
@@ -1926,36 +1937,11 @@ fn startup_leader_authority_timeout(
         .checked_add(STARTUP_LEADER_AUTHORITY_MAX_SLEEP)
 }
 
-async fn capture_startup_leader_proof(
-    controller: &laminar_core::cluster::control::ClusterController,
-    candidate: CertifiedLeaderCandidate,
-    lease: &laminar_core::cluster::control::LeaderLease,
-    deadline: tokio::time::Instant,
-) -> Result<Option<laminar_core::cluster::control::LeaderProof>, String> {
-    if lease.owner.node.0 != candidate.participant.node_id
-        || lease.owner.boot != candidate.participant.boot_incarnation
-    {
-        return Ok(None);
-    }
-    let proof = if candidate.participant.node_id == controller.instance_id().0 {
-        controller.capture_leader_proof()
-    } else {
-        controller
-            .capture_remote_leader_proof(candidate.participant, lease.owner.process_term, deadline)
-            .await?
-    };
-    Ok(proof.filter(|proof| lease.matches_proof(proof)))
-}
-
 async fn wait_for_startup_leader_authority(
-    db: &LaminarDB,
     controller: &laminar_core::cluster::control::ClusterController,
     registry: &laminar_core::state::VnodeRegistry,
-    authority: &laminar_core::cluster::control::LeaderLeaseStore,
-    process_authority: &laminar_core::cluster::control::process_lease::ProcessLeaseAuthority,
     timeout: std::time::Duration,
 ) -> Result<(), ClusterStartupError> {
-    db.fence_cluster_startup();
     let deadline = tokio::time::Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| {
@@ -1963,125 +1949,57 @@ async fn wait_for_startup_leader_authority(
                 "leader authority convergence deadline exceeds the monotonic timer range".into(),
             )
         })?;
-    let mut last_candidate = None;
-    let mut last_owner = None;
-    let mut last_read_error = None;
+    let mut last_expected = None;
+    let mut last_audit_error = None;
     let mut backoff = STARTUP_LEADER_AUTHORITY_MIN_BACKOFF;
     let mut previous_candidate = None;
     let wait = async {
         loop {
-            let candidate = certified_leader_candidate(controller, registry);
+            let fence = exact_startup_assignment_fence(controller, registry);
+            let candidate = fence.as_ref().and_then(|fence| {
+                let leader = controller.current_leader()?;
+                let participant = fence
+                    .participants
+                    .iter()
+                    .find(|participant| participant.node_id == leader.0)?;
+                Some((
+                    fence.assignment_version,
+                    fence.assignment_digest,
+                    *participant,
+                ))
+            });
             if candidate != previous_candidate {
                 backoff = STARTUP_LEADER_AUTHORITY_MIN_BACKOFF;
                 previous_candidate = candidate;
             }
-            last_candidate = candidate;
-            if let Some(candidate) = candidate {
-                let operation_deadline = startup_control_operation_deadline(deadline);
-                match tokio::time::timeout_at(operation_deadline, authority.load()).await {
-                    Ok(Ok(current)) => {
-                        last_read_error = None;
-                        last_owner = current.as_ref().map(|lease| lease.owner.clone());
-                        let captured = if let Some(lease) = current.as_ref() {
-                            capture_startup_leader_proof(
-                                controller,
-                                candidate,
-                                lease,
-                                startup_control_operation_deadline(deadline),
-                            )
-                            .await
-                        } else {
-                            Ok(None)
-                        };
-                        match (current, captured) {
-                            (Some(lease), Ok(Some(proof))) => {
-                                let process_deadline = startup_control_operation_deadline(deadline);
-                                match process_authority
-                                    .verify_current_participant_term(
-                                        candidate.participant,
-                                        lease.owner.process_term,
-                                        process_deadline,
-                                    )
-                                    .await
-                                {
-                                    Ok(true) => {
-                                        let recaptured = capture_startup_leader_proof(
-                                            controller,
-                                            candidate,
-                                            &lease,
-                                            startup_control_operation_deadline(deadline),
-                                        )
-                                        .await;
-                                        if matches!(recaptured, Ok(Some(ref current)) if current == &proof)
-                                        {
-                                            let audit_deadline =
-                                                startup_control_operation_deadline(deadline);
-                                            match tokio::time::timeout_at(
-                                                audit_deadline,
-                                                authority.load(),
-                                            )
-                                            .await
-                                            {
-                                                Ok(Ok(Some(after)))
-                                                    if after.owner == lease.owner
-                                                        && after.token == lease.token
-                                                        && after.seq >= lease.seq
-                                                        && certified_leader_candidate(
-                                                            controller, registry,
-                                                        )
-                                                        .is_some_and(|current| {
-                                                            current
-                                                                .same_assignment_process(&candidate)
-                                                        })
-                                                        && after.matches_proof(&proof) =>
-                                                {
-                                                    return;
-                                                }
-                                                Ok(Ok(after)) => {
-                                                    last_owner =
-                                                        after.map(|lease| lease.owner.clone());
-                                                }
-                                                Ok(Err(error)) => {
-                                                    last_read_error = Some(error.to_string());
-                                                }
-                                                Err(_) => {
-                                                    last_read_error = Some(
-                                                        "final leader authority audit timed out"
-                                                            .into(),
-                                                    );
-                                                }
-                                            }
-                                        } else {
-                                            last_read_error = Some(match recaptured {
-                                                Ok(_) => "process-local leader grant expired during startup audit".into(),
-                                                Err(error) => error,
-                                            });
-                                        }
-                                    }
-                                    Ok(false) => {
-                                        last_read_error = Some(
-                                            "durable leader owner is not the current process lease term"
-                                                .into(),
-                                        );
-                                    }
-                                    Err(error) => last_read_error = Some(error.to_string()),
-                                }
-                            }
-                            (_, Err(error)) => last_read_error = Some(error),
-                            (Some(_), Ok(None)) => {
-                                last_read_error =
-                                    Some("nominated process has no live local leader grant".into());
-                            }
-                            (None, Ok(_)) => {}
-                        }
-                    }
-                    Ok(Err(error)) => last_read_error = Some(error.to_string()),
-                    Err(_) => {
-                        last_read_error = Some("leader authority read timed out".into());
-                    }
+            if let Some((version, _, participant)) = candidate {
+                last_expected = Some(format!(
+                    "assignment {version} candidate {} boot {}",
+                    participant.node_id, participant.boot_incarnation
+                ));
+            } else if let Some(fence) = fence.as_ref() {
+                last_expected = Some(format!(
+                    "assignment {} has no certified current leader participant",
+                    fence.assignment_version
+                ));
+            } else {
+                last_expected = Some("no exact assignment fence is currently installed".into());
+            }
+
+            if let Some(fence) = fence {
+                match controller
+                    .audit_assignment_leader_authority(
+                        &fence,
+                        None,
+                        startup_leader_audit_deadline(deadline),
+                    )
+                    .await
+                {
+                    Ok(_) => return,
+                    Err(error) => last_audit_error = Some(error),
                 }
             } else {
-                last_read_error = Some("no assignment-certified leader candidate".into());
+                last_audit_error = Some("no exact assignment fence is currently installed".into());
             }
             use rand::RngExt as _;
             let base_ms = u64::try_from(backoff.as_millis()).unwrap_or(250);
@@ -2097,32 +2015,13 @@ async fn wait_for_startup_leader_authority(
         return Ok(());
     }
 
-    db.fence_cluster_startup();
-    let expected = last_candidate.map_or_else(
-        || "no assignment-certified leader candidate".to_string(),
-        |candidate| {
-            format!(
-                "assignment {} candidate {} boot {}",
-                candidate.assignment_version,
-                candidate.participant.node_id,
-                candidate.participant.boot_incarnation
-            )
-        },
-    );
-    let observed = last_owner.map_or_else(
-        || "no durable leader owner".to_string(),
-        |owner| {
-            format!(
-                "durable owner {} boot {} term {}",
-                owner.node.0, owner.boot, owner.process_term
-            )
-        },
-    );
-    let read_error = last_read_error
+    let expected =
+        last_expected.unwrap_or_else(|| "no assignment-certified leader candidate".to_string());
+    let audit_error = last_audit_error
         .map(|error| format!("; last authority audit failed: {error}"))
         .unwrap_or_default();
     Err(ClusterStartupError::EngineConstruction(format!(
-        "durable leader authority did not converge with a live certified grant within {timeout:?}: {expected}; {observed}{read_error}"
+        "durable leader authority did not converge with a live certified grant within {timeout:?}: {expected}{audit_error}"
     )))
 }
 
@@ -2529,17 +2428,30 @@ impl laminar_core::cluster::control::ClusterKv for StaticClusterKv {
     }
 }
 
-/// Load control-plane mTLS material and install it process-wide before any
-/// server/client binds. No-op when unconfigured; validation guarantees the
-/// fields are all-or-nothing.
+/// Resolve the process-wide control-plane transport before any server/client
+/// binds. Install mTLS when configured; otherwise atomically claim plaintext.
 fn install_cluster_tls(d: &DiscoverySection) -> Result<(), ClusterStartupError> {
-    let (Some(cert), Some(key), Some(ca), Some(name)) = (
+    let configured = (
         &d.cluster_tls_cert,
         &d.cluster_tls_key,
         &d.cluster_tls_client_ca,
         &d.cluster_tls_server_name,
-    ) else {
-        return Ok(());
+    );
+    let (cert, key, ca, name) = match configured {
+        (Some(cert), Some(key), Some(ca), Some(name)) => (cert, key, ca, name),
+        (None, None, None, None) => {
+            laminar_core::cluster::control::claim_cluster_plaintext().map_err(|error| {
+                ClusterStartupError::EngineConstruction(format!(
+                    "select plaintext cluster transport before startup: {error}"
+                ))
+            })?;
+            return Ok(());
+        }
+        _ => {
+            return Err(ClusterStartupError::EngineConstruction(
+                "cluster control-plane TLS requires cert, key, client CA, and server name".into(),
+            ));
+        }
     };
     let read = |p: &std::path::Path| {
         std::fs::read(p).map_err(|e| {
@@ -2552,7 +2464,11 @@ fn install_cluster_tls(d: &DiscoverySection) -> Result<(), ClusterStartupError> 
         &read(ca)?,
         name,
     );
-    laminar_core::cluster::control::set_cluster_tls(tls);
+    laminar_core::cluster::control::set_cluster_tls(tls).map_err(|error| {
+        ClusterStartupError::EngineConstruction(format!(
+            "install cluster control-plane TLS before transport startup: {error}"
+        ))
+    })?;
     info!("cluster control-plane mTLS enabled (server_name={name})");
     Ok(())
 }
@@ -3736,6 +3652,63 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains('1'));
         assert!(msg.contains('3'));
+    }
+
+    #[tokio::test]
+    async fn occupied_http_port_fails_before_local_cluster_activation() {
+        use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let bind = occupied.local_addr().unwrap().to_string();
+        let node = NodeId(41);
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
+        let (_members_tx, members_rx) = watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(node, kv, None, members_rx));
+        controller.set_active(false);
+
+        let mut server_config = crate::config::ServerSection::default();
+        server_config.bind = bind;
+        let config = ServerConfig {
+            server: server_config,
+            state: laminar_core::state::StateBackendConfig::default(),
+            checkpoint: crate::config::CheckpointSection::default(),
+            supervision: Default::default(),
+            sources: Vec::new(),
+            lookups: Vec::new(),
+            pipelines: Vec::new(),
+            sinks: Vec::new(),
+            sql: None,
+            discovery: None,
+            node_id: None,
+            ai: Default::default(),
+            models: Default::default(),
+        };
+        let registry = Arc::new(crate::metrics::build_registry([
+            ("instance".into(), "test".into()),
+            ("pipeline".into(), "test".into()),
+        ]));
+        let (_cluster_members_tx, cluster_members_rx) = watch::channel(Vec::new());
+        let cluster = crate::http::ClusterComponents {
+            controller: Some(Arc::clone(&controller)),
+            snapshot_store: None,
+            membership_rx: cluster_members_rx,
+        };
+
+        let result = start_cluster_http_api_before_activation(
+            LaminarDB::open().unwrap(),
+            registry,
+            PathBuf::from("unused.toml"),
+            config,
+            cluster,
+            &controller,
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("occupied HTTP port unexpectedly bound"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, ClusterStartupError::HttpStartup(_)));
+        assert!(!controller.live_instances().contains(&node));
     }
 
     #[tokio::test]
@@ -4997,6 +4970,9 @@ mod tests {
         else {
             panic!("empty process authority must be acquired");
         };
+        controller
+            .set_process_lease_authority(Arc::clone(&process_authority))
+            .unwrap();
         let authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&backing), 1));
         let stale_owner = LeaderLeaseOwner {
             node,
@@ -5025,24 +5001,17 @@ mod tests {
         let observation = authority
             .observe_rival(&certified_owner, &stale_lease)
             .unwrap();
-        let db = LaminarDB::builder().build().await.unwrap();
-        assert!(!db.cluster_intake_fenced());
-
         let error = wait_for_startup_leader_authority(
-            &db,
             &controller,
             &registry,
-            &authority,
-            &process_authority,
             std::time::Duration::from_millis(100),
         )
         .await
         .unwrap_err();
         assert!(
-            error.to_string().contains(&stale_boot.to_string()),
+            error.to_string().contains(&certified_boot.to_string()),
             "{error}"
         );
-        assert!(db.cluster_intake_fenced());
 
         let LeaseOutcome::Acquired(takeover) = authority
             .try_takeover(&certified_owner, &observation, 10)
@@ -5053,11 +5022,8 @@ mod tests {
         };
 
         let no_grant = wait_for_startup_leader_authority(
-            &db,
             &controller,
             &registry,
-            &authority,
-            &process_authority,
             std::time::Duration::from_millis(100),
         )
         .await
@@ -5066,21 +5032,16 @@ mod tests {
             no_grant.to_string().contains("live certified grant"),
             "{no_grant}"
         );
-        assert!(db.cluster_intake_fenced());
 
         leader_tx.send_replace(Some(takeover));
 
         wait_for_startup_leader_authority(
-            &db,
             &controller,
             &registry,
-            &authority,
-            &process_authority,
             std::time::Duration::from_secs(1),
         )
         .await
         .unwrap();
-        assert!(db.cluster_intake_fenced());
     }
 
     #[tokio::test]
@@ -5174,6 +5135,9 @@ mod tests {
         else {
             panic!("remote process lease must be acquired");
         };
+        observer
+            .set_process_lease_authority(Arc::clone(&process_authority))
+            .unwrap();
         let authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&backing), 1_000));
         let owner = LeaderLeaseOwner {
             node: leader_node,
@@ -5194,14 +5158,9 @@ mod tests {
                 Arc::new(LeaseDeadline::live_for(std::time::Duration::from_secs(30))),
             )
             .unwrap();
-        let db = LaminarDB::builder().build().await.unwrap();
-
         let no_grant = wait_for_startup_leader_authority(
-            &db,
             &observer,
             &registry,
-            &authority,
-            &process_authority,
             std::time::Duration::from_millis(100),
         )
         .await
@@ -5212,11 +5171,8 @@ mod tests {
             "control/leader-lease/v0000000000000001.json",
         ));
         let unrelated_wait = wait_for_startup_leader_authority(
-            &db,
             &observer,
             &registry,
-            &authority,
-            &process_authority,
             std::time::Duration::from_millis(250),
         );
         tokio::pin!(unrelated_wait);
@@ -5242,24 +5198,14 @@ mod tests {
         );
 
         leader_grant_tx.send_replace(Some(after_catalog));
-        wait_for_startup_leader_authority(
-            &db,
-            &observer,
-            &registry,
-            &authority,
-            &process_authority,
-            std::time::Duration::from_secs(1),
-        )
-        .await
-        .unwrap();
+        wait_for_startup_leader_authority(&observer, &registry, std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
 
         leader_grant_tx.send_replace(None);
         let dead_process = wait_for_startup_leader_authority(
-            &db,
             &observer,
             &registry,
-            &authority,
-            &process_authority,
             std::time::Duration::from_millis(100),
         )
         .await
@@ -5283,11 +5229,8 @@ mod tests {
             ])
             .unwrap();
         let reset = wait_for_startup_leader_authority(
-            &db,
             &observer,
             &registry,
-            &authority,
-            &process_authority,
             std::time::Duration::from_millis(100),
         )
         .await
