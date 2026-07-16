@@ -174,15 +174,29 @@ fn log_line_reports_recovery(line: &str, checkpoint: DurableCheckpointStatus) ->
             .iter()
             .any(|needle| {
                 line.match_indices(needle).any(|(offset, _)| {
-                    line.as_bytes()
-                        .get(offset + needle.len())
-                        .is_none_or(|next| !next.is_ascii_digit())
+                    let bytes = line.as_bytes();
+                    let starts_at_field_boundary = offset == 0
+                        || bytes.get(offset - 1).is_some_and(|previous| {
+                            !previous.is_ascii_alphanumeric() && *previous != b'_'
+                        });
+                    starts_at_field_boundary
+                        && bytes
+                            .get(offset + needle.len())
+                            .is_none_or(|next| !next.is_ascii_digit())
                 })
             })
     };
     line.contains("Recovered from unified checkpoint")
         && has_field("checkpoint_id", checkpoint.checkpoint_id)
         && has_field("epoch", checkpoint.epoch)
+}
+
+fn remove_marker(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("failed to remove soak marker '{}': {error}", path.display()),
+    }
 }
 
 impl Node {
@@ -199,6 +213,7 @@ impl Node {
                 "RUST_LOG",
                 "laminardb=info,laminar_server=info,laminar_db=info,laminar_core=info",
             )
+            .env("NO_COLOR", "1")
             .stdout(Stdio::from(log.try_clone().expect("clone log handle")))
             .stderr(Stdio::from(log));
         match &self.fault_trigger_path {
@@ -295,11 +310,20 @@ impl Node {
         }
     }
 
-    fn http_get(&self, path: &str) -> Option<String> {
+    fn http_request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        timeout: Duration,
+    ) -> Option<String> {
         let mut stream = TcpStream::connect(("127.0.0.1", self.http_port)).ok()?;
-        stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-        let request =
-            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        stream.set_read_timeout(Some(timeout)).ok()?;
+        let body = body.unwrap_or_default();
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
         stream.write_all(request.as_bytes()).ok()?;
         let mut response = String::new();
         stream.read_to_string(&mut response).ok()?;
@@ -308,6 +332,21 @@ impl Node {
             return None;
         }
         Some(body.to_owned())
+    }
+
+    fn http_get(&self, path: &str) -> Option<String> {
+        self.http_request("GET", path, None, Duration::from_secs(2))
+    }
+
+    fn sql(&self, statement: &str) -> Option<serde_json::Value> {
+        let request = serde_json::to_string(&serde_json::json!({ "sql": statement })).ok()?;
+        serde_json::from_str(&self.http_request(
+            "POST",
+            "/api/v1/sql",
+            Some(&request),
+            Duration::from_secs(6),
+        )?)
+        .ok()
     }
 
     /// Scrape one gauge/counter from `/metrics`; `None` while the node is down or booting.
@@ -360,8 +399,8 @@ impl Node {
             .checkpoint_gate_path
             .as_ref()
             .expect("checkpoint kill gate was not configured for this node");
-        let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(path.with_extension("ready"));
+        remove_marker(path);
+        remove_marker(&path.with_extension("ready"));
         std::fs::write(path, role).expect("arm checkpoint kill gate");
     }
 
@@ -374,8 +413,8 @@ impl Node {
 
     fn disarm_checkpoint_kill(&self) {
         if let Some(path) = &self.checkpoint_gate_path {
-            let _ = std::fs::remove_file(path);
-            let _ = std::fs::remove_file(path.with_extension("ready"));
+            remove_marker(path);
+            remove_marker(&path.with_extension("ready"));
         }
     }
 
@@ -1056,9 +1095,40 @@ fn wait_for(what: &str, deadline: Duration, mut pred: impl FnMut() -> bool) {
     panic!("soak: timed out after {deadline:?} waiting for: {what}");
 }
 
-/// Require the complete materialized aggregate for a finite deterministic source prefix. A Tail
-/// subscription is seeded from the recovered snapshot, so this validates restored state even when
-/// the source is already exhausted and cannot hide a rollback by advancing beyond a baseline.
+fn validate_local_exact_snapshot(
+    rows: &[serde_json::Value],
+    produced_count: u64,
+    groups: u64,
+    span: u64,
+) -> BTreeMap<u64, (u64, u64)> {
+    let mut observed = BTreeMap::new();
+    for row in rows {
+        let key = json_u64_field(row, "k");
+        let count = json_u64_field(row, "n");
+        let high_seq = json_u64_field(row, "hi");
+        assert!(key < groups, "local aggregate key {key} is out of range");
+        assert!(count > 0, "local aggregate key {key} emitted zero rows");
+        assert_eq!(
+            high_seq,
+            aggregate_high_seq(key, count, groups, span),
+            "local exact aggregate diverged for key {key} at generator seq {high_seq}"
+        );
+        let final_count = expected_aggregate_count(produced_count, key, groups, span);
+        assert!(
+            count <= final_count,
+            "local exact aggregate key {key} inflated to {count}; frozen prefix requires {final_count}"
+        );
+        assert!(
+            observed.insert(key, (count, high_seq)).is_none(),
+            "local exact aggregate snapshot contains duplicate key {key}"
+        );
+    }
+    observed
+}
+
+/// Require the complete materialized aggregate for a finite deterministic source prefix. A
+/// snapshot query reads recovered MV state even after the finite source is exhausted, so rollback
+/// cannot be hidden by waiting for a future subscription update.
 fn assert_local_exact_prefix(
     node: &mut Node,
     produced_count: u64,
@@ -1066,56 +1136,20 @@ fn assert_local_exact_prefix(
     span: u64,
     deadline: Duration,
 ) {
-    use std::io::ErrorKind;
-    use tungstenite::stream::MaybeTlsStream;
-    use tungstenite::{Error, Message};
-
     let start = Instant::now();
-    let url = format!("ws://127.0.0.1:{}/ws/local_exact_agg", node.http_port);
-    let (mut socket, _) = loop {
-        node.assert_running();
-        match tungstenite::connect(url.as_str()) {
-            Ok(connected) => break connected,
-            Err(_) if start.elapsed() < deadline => {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(error) => panic!("failed to connect local aggregate oracle: {error}"),
-        }
-    };
-    if let MaybeTlsStream::Plain(stream) = socket.get_mut() {
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("set local aggregate WebSocket read timeout");
-    }
-
     let mut latest = BTreeMap::new();
     while start.elapsed() < deadline {
         node.assert_running();
-        match socket.read() {
-            Ok(Message::Text(text)) => {
-                let envelope: serde_json::Value =
-                    serde_json::from_str(text.as_str()).expect("local aggregate WebSocket JSON");
-                let Some(rows) = envelope.get("data").and_then(serde_json::Value::as_array) else {
-                    continue;
-                };
-                for row in rows {
-                    let key = json_u64_field(row, "k");
-                    let count = json_u64_field(row, "n");
-                    let high_seq = json_u64_field(row, "hi");
-                    assert!(key < groups, "local aggregate key {key} is out of range");
-                    assert!(count > 0, "local aggregate key {key} emitted zero rows");
-                    assert_eq!(
-                        high_seq,
-                        aggregate_high_seq(key, count, groups, span),
-                        "local exact aggregate diverged for key {key} at generator seq {high_seq}"
-                    );
-                    let final_count = expected_aggregate_count(produced_count, key, groups, span);
-                    assert!(
-                        count <= final_count,
-                        "local exact aggregate key {key} inflated to {count}; frozen prefix requires {final_count}"
-                    );
-                    latest.insert(key, (count, high_seq));
-                }
+        if let Some(response) = node.sql("SELECT k, n, hi FROM local_exact_agg") {
+            assert_eq!(
+                response
+                    .get("result_type")
+                    .and_then(serde_json::Value::as_str),
+                Some("query"),
+                "local aggregate oracle returned a non-query response: {response}"
+            );
+            if let Some(rows) = response.get("data").and_then(serde_json::Value::as_array) {
+                latest = validate_local_exact_snapshot(rows, produced_count, groups, span);
                 if (0..groups).all(|key| {
                     let count = expected_aggregate_count(produced_count, key, groups, span);
                     latest.get(&key) == Some(&(count, aggregate_high_seq(key, count, groups, span)))
@@ -1123,17 +1157,8 @@ fn assert_local_exact_prefix(
                     return;
                 }
             }
-            Ok(Message::Ping(payload)) => socket
-                .send(Message::Pong(payload))
-                .expect("local aggregate WebSocket pong"),
-            Ok(Message::Close(frame)) => {
-                panic!("local aggregate oracle closed unexpectedly: {frame:?}")
-            }
-            Ok(_) => {}
-            Err(Error::Io(error))
-                if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
-            Err(error) => panic!("local aggregate oracle failed: {error}"),
         }
+        std::thread::sleep(Duration::from_millis(100));
     }
     let mismatches: Vec<_> = (0..groups)
         .filter_map(|key| {
@@ -2290,6 +2315,10 @@ fn recovery_log_match_binds_checkpoint_and_epoch() {
         "Recovered from unified checkpoint checkpoint_id=410 epoch=43",
         expected
     ));
+    assert!(!log_line_reports_recovery(
+        "Recovered from unified checkpoint previous_checkpoint_id=41 epoch=43",
+        expected
+    ));
 }
 
 #[test]
@@ -2330,4 +2359,18 @@ fn aggregate_prefix_formula_matches_sequential_source() {
             }
         }
     }
+}
+
+#[test]
+fn exact_prefix_snapshot_accepts_complete_unordered_state() {
+    let rows = serde_json::json!([
+        { "k": 2, "n": 4, "hi": 11 },
+        { "k": 0, "n": 4, "hi": 7 },
+        { "k": 1, "n": 4, "hi": 9 }
+    ]);
+    let observed = validate_local_exact_snapshot(rows.as_array().expect("snapshot rows"), 12, 3, 2);
+    assert_eq!(
+        observed,
+        BTreeMap::from([(0, (4, 7)), (1, (4, 9)), (2, (4, 11))])
+    );
 }
