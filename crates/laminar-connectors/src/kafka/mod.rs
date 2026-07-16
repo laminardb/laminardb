@@ -5,9 +5,9 @@ pub mod avro;
 pub mod config;
 pub mod metrics;
 mod offsets;
-pub mod partition_assignment;
 pub mod rebalance;
 pub mod source;
+mod vnode_routing;
 
 // Sink modules
 pub mod avro_serializer;
@@ -37,6 +37,31 @@ pub use partitioner::{
 pub use sink::KafkaSink;
 pub use sink_config::{Acks, CompressionType, KafkaSinkConfig, PartitionStrategy};
 pub use sink_metrics::KafkaSinkMetrics;
+
+/// Test-only access to Kafka-specific routing probes.
+#[cfg(feature = "testing")]
+pub mod testing {
+    use crate::error::ConnectorError;
+
+    /// Map a complete Kafka topic inventory to engine vnodes.
+    ///
+    /// # Errors
+    /// Returns a configuration error when the Kafka route identity, partition
+    /// inventory, or vnode count is invalid.
+    pub fn partition_vnodes(
+        source_identity: &str,
+        topic: &str,
+        total_partitions: i32,
+        vnode_count: u32,
+    ) -> Result<Vec<u32>, ConnectorError> {
+        super::vnode_routing::partition_vnodes(
+            source_identity,
+            topic,
+            total_partitions,
+            vnode_count,
+        )
+    }
+}
 
 // Shared re-exports
 pub use schema_registry::{CachedSchema, CompatibilityResult, SchemaRegistryClient, SchemaType};

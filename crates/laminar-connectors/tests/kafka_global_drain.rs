@@ -4,9 +4,9 @@
 //! Needs a real broker. It skips when the default local address is absent, but a
 //! configured `LAMINAR_KAFKA_BROKERS` must be reachable. Run with:
 //!   LAMINAR_KAFKA_BROKERS=127.0.0.1:19092 \
-//!     cargo test -p laminar-connectors --features kafka --test kafka_global_drain -- --nocapture
+//!     cargo test -p laminar-connectors --features kafka,testing --test kafka_global_drain -- --nocapture
 
-#![cfg(feature = "kafka")]
+#![cfg(all(feature = "kafka", feature = "testing"))]
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,7 +24,7 @@ use laminar_connectors::connector::{
     DeliveryGuarantee, SourceConnector, SourceDrainOutcome, SourceDrainRequest,
     SourceDrainResolution, SourcePosition, SourceStart,
 };
-use laminar_connectors::kafka::partition_assignment::partition_vnode;
+use laminar_connectors::kafka::testing::partition_vnodes;
 use laminar_connectors::kafka::{KafkaSource, KafkaSourceConfig, StartupMode, TopicSubscription};
 use laminar_core::checkpoint::AssignmentDrainId;
 use laminar_core::state::{NodeId, VnodeRegistry};
@@ -209,11 +209,7 @@ async fn source_holds_global_cuts_across_abort_and_commit() {
     let (source_identity, routes) = (0..1_024)
         .find_map(|salt| {
             let identity = format!("global_drain_source_{salt}");
-            let routes: Vec<u32> = (0..PARTS)
-                .map(|partition| {
-                    partition_vnode(&identity, &topic, partition, PARTS as u32).unwrap()
-                })
-                .collect();
+            let routes = partition_vnodes(&identity, &topic, PARTS, PARTS as u32).unwrap();
             (routes.iter().any(|route| *route != routes[0])).then_some((identity, routes))
         })
         .expect("test input must cover retained and removed target inputs");

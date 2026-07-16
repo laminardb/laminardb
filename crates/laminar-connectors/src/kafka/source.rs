@@ -260,20 +260,8 @@ fn kafka_partition_routes(
                 topic
             )));
         }
-        let mut topic_routes = Vec::with_capacity(usize::try_from(*count).map_err(|_| {
-            ConnectorError::ConfigurationError(format!(
-                "Kafka topic '{}' partition count cannot be represented on this platform",
-                topic
-            ))
-        })?);
-        for partition in 0..*count {
-            topic_routes.push(super::partition_assignment::partition_vnode(
-                source_identity,
-                topic,
-                partition,
-                vnode_count,
-            )?);
-        }
+        let topic_routes =
+            super::vnode_routing::partition_vnodes(source_identity, topic, *count, vnode_count)?;
         if routes
             .insert(Arc::clone(topic), topic_routes.into())
             .is_some()
@@ -2223,7 +2211,7 @@ fn build_vnode_assignment_tpl(
 ) -> Result<TopicPartitionList, ConnectorError> {
     let mut tpl = TopicPartitionList::new();
     for (topic, count) in topic_meta {
-        for partition in super::partition_assignment::owned_partitions_in_assignment(
+        for partition in super::vnode_routing::owned_partitions_in_assignment(
             source_identity,
             topic.as_ref(),
             *count,
@@ -5235,7 +5223,7 @@ mod tests {
         )
         .unwrap();
         let expected: KafkaPartitionSet =
-            crate::kafka::partition_assignment::owned_partitions_in_assignment(
+            crate::kafka::vnode_routing::owned_partitions_in_assignment(
                 "events_source",
                 "events",
                 4,
@@ -5309,7 +5297,7 @@ mod tests {
         }
 
         let expected: KafkaPartitionSet =
-            crate::kafka::partition_assignment::owned_partitions_in_assignment(
+            crate::kafka::vnode_routing::owned_partitions_in_assignment(
                 "events_source",
                 "events",
                 4,
@@ -5432,7 +5420,7 @@ mod tests {
         let assignment = [node1, node2];
         let owned_partition = (0..100)
             .find(|partition| {
-                crate::kafka::partition_assignment::partition_vnode(
+                crate::kafka::vnode_routing::partition_vnode(
                     "events_source",
                     "events",
                     *partition,
@@ -5444,7 +5432,7 @@ mod tests {
             .unwrap();
         let revoked_partition = (0..100)
             .find(|partition| {
-                crate::kafka::partition_assignment::partition_vnode(
+                crate::kafka::vnode_routing::partition_vnode(
                     "events_source",
                     "events",
                     *partition,
@@ -5458,7 +5446,7 @@ mod tests {
         assert!(vnode_payload_is_current(
             Some((&assignment, node1)),
             Some(
-                crate::kafka::partition_assignment::partition_vnode(
+                crate::kafka::vnode_routing::partition_vnode(
                     "events_source",
                     "events",
                     owned_partition,
@@ -5473,7 +5461,7 @@ mod tests {
         assert!(!vnode_payload_is_current(
             Some((&assignment, node1)),
             Some(
-                crate::kafka::partition_assignment::partition_vnode(
+                crate::kafka::vnode_routing::partition_vnode(
                     "events_source",
                     "events",
                     owned_partition,
@@ -5491,7 +5479,7 @@ mod tests {
         assert!(!vnode_payload_is_current(
             Some((&assignment, node1)),
             Some(
-                crate::kafka::partition_assignment::partition_vnode(
+                crate::kafka::vnode_routing::partition_vnode(
                     "events_source",
                     "events",
                     revoked_partition,
@@ -5555,7 +5543,7 @@ mod tests {
         let expected: KafkaPartitionSet = topics
             .iter()
             .flat_map(|(topic, count)| {
-                crate::kafka::partition_assignment::owned_partitions_in_assignment(
+                crate::kafka::vnode_routing::owned_partitions_in_assignment(
                     "source",
                     topic,
                     *count,
@@ -5707,18 +5695,17 @@ mod tests {
         source
             .reconciled_assignment_version
             .store(version, Ordering::Release);
-        let owned: KafkaPartitionSet =
-            crate::kafka::partition_assignment::owned_partitions_in_assignment(
-                "events_source",
-                "events",
-                4,
-                &registry.snapshot(),
-                node1,
-            )
-            .unwrap()
-            .into_iter()
-            .map(|partition| ("events".to_string(), partition))
-            .collect();
+        let owned: KafkaPartitionSet = crate::kafka::vnode_routing::owned_partitions_in_assignment(
+            "events_source",
+            "events",
+            4,
+            &registry.snapshot(),
+            node1,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|partition| ("events".to_string(), partition))
+        .collect();
         *lock_or_recover(&source.assignment_publication) =
             Arc::new(KafkaAssignmentPublication::new(
                 version,

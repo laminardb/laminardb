@@ -1,4 +1,4 @@
-//! Deterministic Kafka partition-to-vnode assignment.
+//! Deterministic Kafka partition-to-vnode routing.
 //!
 //! Cluster sources use a stable source and input identity to map each external
 //! partition to one engine vnode. The resulting vnode is then resolved through
@@ -52,24 +52,21 @@ fn vnode_from_prefix(
     partition: i32,
     vnode_count: u32,
 ) -> Result<u32, ConnectorError> {
-    if partition < 0 {
-        return Err(invalid_assignment(format!(
-            "Kafka partition id must be nonnegative, got {partition}"
-        )));
-    }
     if vnode_count == 0 {
         return Err(invalid_assignment(
             "Kafka vnode assignment cannot use an empty owner map",
         ));
     }
-    let partition = u32::try_from(partition)
-        .map_err(|_| invalid_assignment("Kafka partition id is outside the u32 route domain"))?;
+    let partition = u32::try_from(partition).map_err(|_| {
+        invalid_assignment(format!(
+            "Kafka partition id must be nonnegative, got {partition}"
+        ))
+    })?;
     prefix.extend_from_slice(&partition.to_le_bytes());
     let hash = key_hash(prefix);
     prefix.truncate(prefix.len() - 4);
     let vnode = hash % u64::from(vnode_count);
-    u32::try_from(vnode)
-        .map_err(|_| invalid_assignment("Kafka vnode count exceeds the supported u32 range"))
+    Ok(vnode as u32)
 }
 
 /// Map one Kafka input partition to an engine vnode.
@@ -81,7 +78,8 @@ fn vnode_from_prefix(
 /// # Errors
 /// Returns a configuration error for an empty identity/topic/owner map or a
 /// negative partition id.
-pub fn partition_vnode(
+#[cfg(test)]
+pub(super) fn partition_vnode(
     source_identity: &str,
     topic: &str,
     partition: i32,
@@ -89,6 +87,38 @@ pub fn partition_vnode(
 ) -> Result<u32, ConnectorError> {
     let mut prefix = route_prefix(source_identity, topic)?;
     vnode_from_prefix(&mut prefix, partition, vnode_count)
+}
+
+/// Map a complete Kafka topic inventory to engine vnodes.
+///
+/// # Errors
+/// Returns a configuration error for a negative partition count, empty
+/// identity/topic/owner map, or a count unsupported by the current platform.
+pub(super) fn partition_vnodes(
+    source_identity: &str,
+    topic: &str,
+    total_partitions: i32,
+    vnode_count: u32,
+) -> Result<Vec<u32>, ConnectorError> {
+    if total_partitions < 0 {
+        return Err(invalid_assignment(format!(
+            "Kafka partition count must be nonnegative, got {total_partitions}"
+        )));
+    }
+    if vnode_count == 0 {
+        return Err(invalid_assignment(
+            "Kafka vnode assignment cannot use an empty owner map",
+        ));
+    }
+    let capacity = usize::try_from(total_partitions).map_err(|_| {
+        invalid_assignment("Kafka partition count cannot be represented on this platform")
+    })?;
+    let mut prefix = route_prefix(source_identity, topic)?;
+    let mut routes = Vec::with_capacity(capacity);
+    for partition in 0..total_partitions {
+        routes.push(vnode_from_prefix(&mut prefix, partition, vnode_count)?);
+    }
+    Ok(routes)
 }
 
 /// Kafka partitions owned under one immutable vnode-owner publication.
@@ -99,7 +129,7 @@ pub fn partition_vnode(
 /// # Errors
 /// Returns a configuration error when the external inventory or owner map is
 /// not canonical.
-pub(crate) fn owned_partitions_in_assignment(
+pub(super) fn owned_partitions_in_assignment(
     source_identity: &str,
     topic: &str,
     total_partitions: i32,
@@ -115,6 +145,11 @@ pub(crate) fn owned_partitions_in_assignment(
         return Err(invalid_assignment(
             "Kafka vnode assignment cannot use an empty owner map",
         ));
+    }
+    if let Some(vnode) = assignment.iter().position(NodeId::is_unassigned) {
+        return Err(invalid_assignment(format!(
+            "Kafka vnode owner map contains an unassigned owner at vnode {vnode}"
+        )));
     }
     if self_id.is_unassigned() {
         return Err(invalid_assignment(
@@ -148,10 +183,25 @@ mod tests {
 
     #[test]
     fn mapping_has_hard_coded_abi_vectors() {
+        assert_eq!(laminar_core::state::PARTITIONING_ABI_VERSION, 1);
         let actual: Vec<u32> = (0..8)
             .map(|partition| partition_vnode(SOURCE, TOPIC, partition, 256).unwrap())
             .collect();
         assert_eq!(actual, [106, 108, 234, 55, 225, 196, 217, 62]);
+        assert_eq!(partition_vnodes(SOURCE, TOPIC, 8, 256).unwrap(), actual);
+    }
+
+    #[test]
+    fn batch_mapping_matches_scalar_mapping() {
+        for vnode_count in [1, 2, 7, 256, u32::MAX] {
+            let batch = partition_vnodes(SOURCE, TOPIC, 257, vnode_count).unwrap();
+            let scalar: Vec<u32> = (0..257)
+                .map(|partition| partition_vnode(SOURCE, TOPIC, partition, vnode_count).unwrap())
+                .collect();
+            assert_eq!(batch, scalar, "vnode count {vnode_count}");
+        }
+        assert!(partition_vnodes(SOURCE, TOPIC, -1, 8).is_err());
+        assert!(partition_vnodes(SOURCE, TOPIC, 0, 0).is_err());
     }
 
     #[test]
@@ -210,20 +260,39 @@ mod tests {
     }
 
     #[test]
+    fn owner_map_rejects_unassigned_vnode_with_its_index() {
+        let error = owned_partitions_in_assignment(
+            SOURCE,
+            TOPIC,
+            16,
+            &[NodeId(1), NodeId::UNASSIGNED, NodeId(2)],
+            NodeId(1),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unassigned owner at vnode 1"));
+    }
+
+    #[test]
+    fn valid_idle_worker_has_an_empty_partition_assignment() {
+        let assignment = [NodeId(2), NodeId(3), NodeId(2), NodeId(3)];
+        assert!(
+            owned_partitions_in_assignment(SOURCE, TOPIC, 64, &assignment, NodeId(1))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn malformed_inputs_are_rejected() {
         assert!(partition_vnode("", TOPIC, 0, 8).is_err());
         assert!(partition_vnode(SOURCE, "", 0, 8).is_err());
         assert!(partition_vnode(SOURCE, TOPIC, -1, 8).is_err());
         assert!(partition_vnode(SOURCE, TOPIC, 0, 0).is_err());
         assert!(owned_partitions_in_assignment(SOURCE, TOPIC, 1, &[], NodeId(1)).is_err());
-        assert!(owned_partitions_in_assignment(
-            SOURCE,
-            TOPIC,
-            1,
-            &[NodeId::UNASSIGNED],
-            NodeId::UNASSIGNED
-        )
-        .is_err());
+        assert!(
+            owned_partitions_in_assignment(SOURCE, TOPIC, 1, &[NodeId(1)], NodeId::UNASSIGNED)
+                .is_err()
+        );
         assert!(
             owned_partitions_in_assignment(SOURCE, TOPIC, -1, &[NodeId(1)], NodeId(1)).is_err()
         );
