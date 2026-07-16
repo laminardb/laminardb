@@ -19,6 +19,9 @@ data:
     mode = "{{ if $isCluster }}cluster{{ else }}{{ .Values.laminardb.mode }}{{ end }}"
     delivery = "{{ .Values.laminardb.delivery }}"
     bind = "{{ .Values.laminardb.httpBind }}"
+    {{- if $isCluster }}
+    key_groups = {{ $cluster.keyGroups }}
+    {{- end }}
     workers = {{ .Values.laminardb.workers }}
     log_level = "{{ .Values.laminardb.logLevel }}"
     {{- if (.Values.laminardb.consoleToken | default dict).existingSecret }}
@@ -53,7 +56,6 @@ data:
 
     [state]
     backend = "{{ .Values.laminardb.state.backend }}"
-    vnode_capacity = {{ .Values.laminardb.state.vnodeCapacity | default 256 }}
     {{- if eq .Values.laminardb.state.backend "local" }}
     path = "{{ .Values.laminardb.state.path }}"
     {{- else if eq .Values.laminardb.state.backend "object_store" }}

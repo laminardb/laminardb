@@ -26,7 +26,9 @@
 //! - `LAMINAR_SOAK_S3_ENDPOINT` / `_ACCESS_KEY` / `_SECRET_KEY` / `_REGION`  forwarded into both
 //!   storage maps
 //! - `LAMINAR_SOAK_KAFKA_SOURCE_BROKERS`  required shared Kafka/Redpanda source broker
+//! - `LAMINAR_SOAK_KAFKA_PARTITIONS`  source topic partition count (default 96)
 //! - `LAMINAR_SOAK_RPS`  source production rate
+//! - `LAMINAR_SOAK_KEY_GROUPS`  stable cluster key-group count (default 64)
 //! - `LAMINAR_SOAK_FAULT_INJECT_ROLE`  trigger one fatal cycle fault after steady state on the
 //!   observed `leader` or a `follower`
 //! - `LAMINAR_SOAK_MAX_RECOVERY_MS`  maximum time for each failover or restarted-node recovery
@@ -45,7 +47,8 @@ use std::time::{Duration, Instant};
 const NODES: usize = 3;
 /// Per-node ports: http = BASE + i, gossip = BASE + 100 + i.
 const BASE_PORT: u16 = 19310;
-const DEFAULT_CLUSTER_VNODES: u32 = 64;
+const DEFAULT_CLUSTER_KEY_GROUPS: u32 = 64;
+const DEFAULT_KAFKA_PARTITIONS: u64 = 96;
 const OUTPUT_TOPIC_PARTITIONS: i32 = 1;
 const RECOVERY_LIVENESS_WINDOW: Duration = Duration::from_secs(90);
 const DEFAULT_MAX_RECOVERY_MS: u64 = 90_000;
@@ -65,14 +68,28 @@ fn env_u64(name: &str, default: u64) -> u64 {
     }
 }
 
-fn cluster_vnode_count() -> u32 {
-    let vnodes = env_u64("LAMINAR_SOAK_VNODES", u64::from(DEFAULT_CLUSTER_VNODES));
-    let vnodes = u32::try_from(vnodes).expect("LAMINAR_SOAK_VNODES must fit in a u32");
-    assert!(
-        (1..=65_535).contains(&vnodes),
-        "LAMINAR_SOAK_VNODES must be in 1..=65535"
+fn cluster_key_group_count() -> u32 {
+    let key_groups = env_u64(
+        "LAMINAR_SOAK_KEY_GROUPS",
+        u64::from(DEFAULT_CLUSTER_KEY_GROUPS),
     );
-    vnodes
+    let key_groups = u32::try_from(key_groups).expect("LAMINAR_SOAK_KEY_GROUPS must fit in a u32");
+    assert!(
+        (1..=65_535).contains(&key_groups),
+        "LAMINAR_SOAK_KEY_GROUPS must be in 1..=65535"
+    );
+    key_groups
+}
+
+fn cluster_kafka_partition_count() -> i32 {
+    let partitions = env_u64("LAMINAR_SOAK_KAFKA_PARTITIONS", DEFAULT_KAFKA_PARTITIONS);
+    let partitions = i32::try_from(partitions)
+        .expect("LAMINAR_SOAK_KAFKA_PARTITIONS must fit in Kafka's signed partition count");
+    assert!(
+        partitions > 0,
+        "LAMINAR_SOAK_KAFKA_PARTITIONS must be greater than zero"
+    );
+    partitions
 }
 
 fn recovery_ceiling() -> Duration {
@@ -857,7 +874,7 @@ fn write_config(
     dir: &Path,
     id: usize,
     interval_ms: u64,
-    vnodes: u32,
+    key_groups: u32,
     checkpoint_url: &str,
     brokers: &str,
     input_topic: &str,
@@ -907,6 +924,7 @@ node_id = "n{id}"
 mode = "cluster"
 bind = "127.0.0.1:{http}"
 delivery = "at_least_once"
+key_groups = {key_groups}
 [discovery]
 strategy = "{discovery}"
 seeds = [{seeds}]
@@ -916,7 +934,6 @@ advertise_host = "127.0.0.1"
 [state]
 backend = "object_store"
 url = "{state_url}"
-vnode_capacity = {vnodes}
 
 [state.storage]
 {storage}
@@ -981,8 +998,6 @@ fn write_local_exact_config(
     std::fs::create_dir_all(&state_dir).unwrap();
     std::fs::create_dir_all(&checkpoint_dir).unwrap();
     let portable = |path: &Path| path.display().to_string().replace('\\', "/");
-    let vnodes = env_u64("LAMINAR_SOAK_VNODES", 64).max(1);
-    assert!(vnodes <= 65_535, "LAMINAR_SOAK_VNODES must be in 1..=65535");
     let checkpoint_path = portable(&checkpoint_dir);
     let checkpoint_url = if checkpoint_path.starts_with('/') {
         format!("file://{checkpoint_path}")
@@ -1008,7 +1023,6 @@ delivery = "exactly_once"
 [state]
 backend = "local"
 path = "{state_path}"
-vnode_capacity = {vnodes}
 
 [checkpoint]
 url = "{checkpoint_url}"
@@ -1723,9 +1737,8 @@ fn three_node_kill9_soak() {
     );
     let recovery_ceiling = recovery_ceiling();
     validate_checkpoint_liveness(interval_ms, recovery_ceiling);
-    let vnode_count = cluster_vnode_count();
-    let kafka_partitions = i32::try_from(vnode_count)
-        .expect("LAMINAR_SOAK_VNODES must fit in Kafka's signed partition count");
+    let key_group_count = cluster_key_group_count();
+    let kafka_partitions = cluster_kafka_partition_count();
 
     let dir = tempfile::tempdir().expect("tempdir");
     let url = std::env::var("LAMINAR_SOAK_CHECKPOINT_URL").expect(
@@ -1736,9 +1749,9 @@ fn three_node_kill9_soak() {
     let input_topic = format!("soak-cluster-in-{}", std::process::id());
     let output_topic = format!("soak-cluster-out-{}", std::process::id());
     let consumer_group = format!("soak-cluster-{}", std::process::id());
-    // Kafka ownership is `partition % vnode_count`. One partition per vnode ensures every owned
-    // vnode receives work instead of relying on vnodes 0..NODES covering every process. The
-    // producer below assigns records round-robin so partition coverage is deterministic.
+    // Kafka partitioning is independent from engine key-group cardinality. The provider hashes
+    // each source/topic/partition identity onto the current key-group topology; the producer below
+    // assigns records round-robin so every external partition receives deterministic traffic.
     kafka_create_topic(&brokers, &input_topic, kafka_partitions);
     kafka_create_topic(&brokers, &output_topic, OUTPUT_TOPIC_PARTITIONS);
     let commit_oracle =
@@ -1780,7 +1793,7 @@ fn three_node_kill9_soak() {
                 dir.path(),
                 id,
                 interval_ms,
-                vnode_count,
+                key_group_count,
                 &url,
                 &brokers,
                 &input_topic,

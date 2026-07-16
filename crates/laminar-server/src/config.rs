@@ -7,7 +7,10 @@ use std::path::Path;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use laminar_core::state::{StateBackendConfig, StateBackendDurability, MAX_VNODE_CAPACITY};
+use laminar_core::state::{
+    KeyGroupCount, StateBackendConfig, StateBackendDurability, DEFAULT_CLUSTER_KEY_GROUP_COUNT,
+    LOCAL_KEY_GROUP_COUNT,
+};
 use laminar_db::DeliveryGuarantee;
 use regex::Regex;
 use serde::Deserialize;
@@ -212,11 +215,11 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         }
     }
 
-    let vnode_capacity = config.state.vnode_capacity();
-    if !(1..=MAX_VNODE_CAPACITY).contains(&vnode_capacity) {
-        errors.push(format!(
-            "state.vnode_capacity must be between 1 and {MAX_VNODE_CAPACITY}, got {vnode_capacity}"
-        ));
+    if config.server.mode == ServerMode::Single && config.server.key_groups.is_some() {
+        errors.push(
+            "server.key_groups is cluster-only; single mode always uses exactly 1 key group"
+                .to_string(),
+        );
     }
 
     if config.server.mode == ServerMode::Cluster {
@@ -375,6 +378,9 @@ pub enum ServerMode {
 pub struct ServerSection {
     #[serde(default)]
     pub mode: ServerMode,
+    /// Stable hash partitions. Configurable only in cluster mode.
+    #[serde(default)]
+    pub key_groups: Option<KeyGroupCount>,
     #[serde(default = "default_bind")]
     pub bind: String,
     /// End-to-end pipeline delivery contract. Connector protocols are derived from this value.
@@ -434,6 +440,7 @@ impl Default for ServerSection {
     fn default() -> Self {
         Self {
             mode: ServerMode::default(),
+            key_groups: None,
             bind: default_bind(),
             delivery: default_delivery(),
             incremental_emit: default_incremental_emit(),
@@ -448,6 +455,17 @@ impl Default for ServerSection {
             pgwire_tls_min_version: default_pgwire_tls_min_version(),
             console_token: None,
             console_cors_allowed_origins: None,
+        }
+    }
+}
+
+impl ServerSection {
+    /// Key-group topology selected by the runtime mode.
+    #[must_use]
+    pub(crate) fn resolved_key_groups(&self) -> KeyGroupCount {
+        match self.mode {
+            ServerMode::Single => LOCAL_KEY_GROUP_COUNT,
+            ServerMode::Cluster => self.key_groups.unwrap_or(DEFAULT_CLUSTER_KEY_GROUP_COUNT),
         }
     }
 }
@@ -1196,11 +1214,11 @@ node_id = "star-1"
 mode = "cluster"
 bind = "0.0.0.0:8080"
 delivery = "at_least_once"
+key_groups = 256
 
 [state]
 backend = "object_store"
 url = "s3://bucket/state"
-vnode_capacity = 256
 
 [checkpoint]
 url = "s3://bucket/checkpoints"
@@ -1233,6 +1251,7 @@ connector = "kafka"
         assert_eq!(config.node_id.as_deref(), Some("star-1"));
         assert_eq!(config.server.mode, ServerMode::Cluster);
         assert_eq!(config.server.delivery, DeliveryGuarantee::AtLeastOnce);
+        assert_eq!(config.server.resolved_key_groups().get(), 256);
         assert!(matches!(
             &config.state,
             StateBackendConfig::ObjectStore { .. }
@@ -1829,28 +1848,49 @@ alice = "wonderland-key"
 
         assert_eq!(config.server.mode, ServerMode::Single);
         assert_eq!(config.server.bind, "127.0.0.1:8080");
-        assert!(matches!(config.state, StateBackendConfig::InProcess { .. }));
+        assert!(matches!(config.state, StateBackendConfig::InProcess));
         assert_eq!(config.checkpoint.interval, Duration::from_secs(10));
         assert_eq!(config.checkpoint.timeout, Duration::from_secs(120));
     }
 
     #[test]
-    fn test_validate_vnode_capacity_persisted_range() {
-        for vnode_capacity in [0, MAX_VNODE_CAPACITY + 1] {
-            let toml =
-                format!("[state]\nbackend = \"in_process\"\nvnode_capacity = {vnode_capacity}\n");
-            let config: ServerConfig = toml::from_str(&toml).unwrap();
+    fn key_groups_are_mode_scoped_and_typed() {
+        let single: ServerConfig = toml::from_str("[server]\n").unwrap();
+        assert_eq!(single.server.resolved_key_groups(), LOCAL_KEY_GROUP_COUNT);
+
+        for explicit in [1, 256] {
+            let input = format!("[server]\nmode = \"single\"\nkey_groups = {explicit}\n");
+            let config: ServerConfig = toml::from_str(&input).unwrap();
             let ConfigError::ValidationErrors { errors } = validate_config(&config).unwrap_err()
             else {
-                panic!("expected vnode capacity validation error");
+                panic!("expected a cluster-only key_groups validation error");
             };
-            assert!(
-                errors
-                    .iter()
-                    .any(|error| error.contains("state.vnode_capacity must be between")),
-                "errors: {errors:?}"
-            );
+            assert!(errors.iter().any(|error| error.contains("cluster-only")));
         }
+
+        let cluster: ServerConfig = toml::from_str("[server]\nmode = \"cluster\"\n").unwrap();
+        assert_eq!(
+            cluster.server.resolved_key_groups(),
+            DEFAULT_CLUSTER_KEY_GROUP_COUNT
+        );
+
+        let configured: ServerConfig =
+            toml::from_str("[server]\nmode = \"cluster\"\nkey_groups = 1024\n").unwrap();
+        assert_eq!(configured.server.resolved_key_groups().get(), 1024);
+
+        for invalid in [0_u32, u32::from(u16::MAX) + 1] {
+            let input = format!("[server]\nmode = \"cluster\"\nkey_groups = {invalid}\n");
+            assert!(toml::from_str::<ServerConfig>(&input).is_err());
+        }
+    }
+
+    #[test]
+    fn state_rejects_retired_vnode_capacity() {
+        let error = toml::from_str::<ServerConfig>(
+            "[state]\nbackend = \"in_process\"\nvnode_capacity = 256\n",
+        )
+        .expect_err("key-group topology must not be configured per state backend");
+        assert!(error.to_string().contains("vnode_capacity"), "{error}");
     }
 
     #[test]

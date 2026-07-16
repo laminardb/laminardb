@@ -26,6 +26,7 @@ const STATE_ABI_VERSION: u32 = crate::operator_graph::GRAPH_CHECKPOINT_VERSION;
 struct CanonicalPipeline {
     canonical_version: u16,
     state_abi_version: u32,
+    partitioning_abi_version: u16,
     state_layout: &'static str,
     vnode_count: u16,
     delivery_guarantee: String,
@@ -157,6 +158,7 @@ pub(crate) fn compute(context: &PipelineIdentityContext<'_>) -> Result<PipelineI
     let payload = CanonicalPipeline {
         canonical_version: PIPELINE_IDENTITY_VERSION,
         state_abi_version: STATE_ABI_VERSION,
+        partitioning_abi_version: laminar_core::state::PARTITIONING_ABI_VERSION,
         state_layout: state_layout(context.clustered),
         vnode_count: context.vnode_count,
         delivery_guarantee: context.config.delivery_guarantee.to_string(),
@@ -384,6 +386,31 @@ fn duration_millis(duration: std::time::Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_identity_digest_changes_with_the_partitioning_abi() {
+        let payload = |partitioning_abi_version| CanonicalPipeline {
+            canonical_version: PIPELINE_IDENTITY_VERSION,
+            state_abi_version: STATE_ABI_VERSION,
+            partitioning_abi_version,
+            state_layout: "local",
+            vnode_count: 1,
+            delivery_guarantee: "best_effort".into(),
+            sources: Vec::new(),
+            streams: Vec::new(),
+            tables: Vec::new(),
+            sinks: Vec::new(),
+        };
+
+        let current = Sha256::digest(
+            serde_json::to_vec(&payload(laminar_core::state::PARTITIONING_ABI_VERSION)).unwrap(),
+        );
+        let changed = Sha256::digest(
+            serde_json::to_vec(&payload(laminar_core::state::PARTITIONING_ABI_VERSION + 1))
+                .unwrap(),
+        );
+        assert_ne!(current, changed);
+    }
 
     #[test]
     fn connector_property_order_is_canonical_and_credentials_are_ignored() {

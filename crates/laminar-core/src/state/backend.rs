@@ -685,6 +685,15 @@ pub enum StateBackendError {
 /// return [`StateBackendError::Conflict`] and must never overwrite the winner.
 #[async_trait]
 pub trait StateBackend: Send + Sync + 'static {
+    /// Number of stable key groups this backend can address.
+    ///
+    /// Hosts must validate this value against the runtime's [`VnodeRegistry`] before installing
+    /// the backend. The raw representation is intentional: custom backends can report an invalid
+    /// value and be rejected at admission instead of forcing construction-time panics.
+    ///
+    /// [`VnodeRegistry`]: crate::state::VnodeRegistry
+    fn key_group_capacity(&self) -> u32;
+
     /// Bind this storage root to one deployment and logical pipeline before recovery or writes.
     ///
     /// Durable custom backends must override this with an atomic create-once binding. Volatile

@@ -63,7 +63,7 @@ message PrepareRequest {
   uint64 assignment_version = 4;
   repeated CheckpointParticipant assignment_participants = 5;
   uint32 assignment_vnode_count = 6;
-  // SHA-256 of the vnode count and ordered vnode-to-owner map.
+  // SHA-256 of the partitioning ABI, key-group count, and ordered owner map.
   bytes assignment_map_digest = 7;
   LeaderProof leader_proof = 20;
 }
@@ -123,8 +123,8 @@ message Ack {
   // Present only when watermark_status is CHECKPOINT_WATERMARK_ACTIVE.
   optional int64 local_watermark_ms = 4;
   uint64 checkpoint_id = 5;
-  // SHA-256 of the full assignment certificate (version, map identity,
-  // vnode count, and exact participant boot roster). Empty only when the
+  // SHA-256 of the full assignment certificate (version, partitioning ABI,
+  // map identity, key-group count, and exact participant boot roster). Empty only when the
   // corresponding announcement has no assignment fence.
   bytes assignment_digest = 6;
   CheckpointWatermarkStatus watermark_status = 7;

@@ -70,6 +70,7 @@ FROM vwap_solusdt;
 [server]
 mode = "cluster"
 bind = "127.0.0.1:8000"
+key_groups = 256
 pgwire_bind = "127.0.0.1:5433"
 console_token = "change-me-min-8-chars" # placeholder secret
 console_cors_allowed_origins = [
@@ -80,7 +81,6 @@ console_cors_allowed_origins = [
 [state]
 backend = "object_store"
 url = "${LAMINAR_STATE_URL:-s3://laminardb-dev/binance-state}"
-vnode_capacity = 256
 
 [checkpoint]
 url = "${LAMINAR_CHECKPOINT_URL:-s3://laminardb-dev/binance-checkpoints}"

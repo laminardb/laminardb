@@ -20,6 +20,10 @@ async fn test_open_default() {
     assert!(!db.is_closed());
     assert!(db.sources().is_empty());
     assert!(db.sinks().is_empty());
+    assert_eq!(
+        db.checkpoint_key_groups(),
+        laminar_core::state::LOCAL_KEY_GROUP_COUNT
+    );
 }
 
 #[tokio::test]
@@ -403,12 +407,26 @@ async fn assignment_activation_installs_transport_before_controller_publication(
 #[tokio::test]
 async fn assignment_adoption_rejects_smaller_and_larger_vnode_maps() {
     use laminar_core::checkpoint::{CheckpointParticipant, LeaderProof, LeaderProofOwner};
-    use laminar_core::cluster::control::AssignmentSnapshot;
+    use laminar_core::cluster::control::{
+        AssignmentSnapshot, ClusterController, ClusterKv, InMemoryKv,
+    };
+    use laminar_core::cluster::discovery::{NodeId as ClusterNodeId, NodeInfo};
     use laminar_core::state::{InProcessBackend, NodeId, VnodeRegistry};
     use uuid::Uuid;
 
+    let cluster_node_id = ClusterNodeId(1);
+    let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(cluster_node_id));
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
+    let controller = Arc::new(ClusterController::new(
+        cluster_node_id,
+        kv,
+        None,
+        members_rx,
+    ));
     let registry = Arc::new(VnodeRegistry::single_owner(2, NodeId(1)));
     let db = LaminarDB::builder()
+        .cluster_controller(controller)
+        .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
         .state_backend(Arc::new(InProcessBackend::new(2)))
         .vnode_registry(registry)
         .build()
@@ -5938,8 +5956,8 @@ async fn live_topology_ddl_is_fenced_in_a_configured_one_owner_cluster() {
 
     // Source DDL has no live coordinator wiring even in a local single-node runtime.
     let single_owner = LaminarDB::builder()
-        .state_backend(Arc::new(InProcessBackend::new(4)))
-        .vnode_registry(Arc::new(VnodeRegistry::single_owner(4, NodeId(1))))
+        .state_backend(Arc::new(InProcessBackend::new(1)))
+        .vnode_registry(Arc::new(VnodeRegistry::single_owner(1, NodeId(1))))
         .build()
         .await
         .unwrap();

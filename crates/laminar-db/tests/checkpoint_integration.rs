@@ -103,6 +103,14 @@ mod disk_persistence {
         let manifest = manifest.unwrap();
         assert_eq!(manifest.checkpoint_id, 1);
         assert_eq!(manifest.epoch, 1);
+        assert_eq!(
+            manifest.vnode_count,
+            laminar_core::state::LOCAL_KEY_GROUP_COUNT.get()
+        );
+        assert_eq!(
+            manifest.partitioning_abi_version,
+            laminar_core::state::PARTITIONING_ABI_VERSION
+        );
 
         db.close();
     }

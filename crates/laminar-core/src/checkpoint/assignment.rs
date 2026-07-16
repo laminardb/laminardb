@@ -3,6 +3,7 @@
 use uuid::Uuid;
 
 use super::LeaderProof;
+use crate::state::{KeyGroupCount, PARTITIONING_ABI_VERSION};
 
 /// Canonical wire version for source-drain receipts.
 pub const SOURCE_DRAIN_RECEIPT_VERSION: u16 = 1;
@@ -25,15 +26,45 @@ pub struct CheckpointParticipant {
 
 /// One process's exact adopted assignment identity, published into its control-plane slot.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "UncheckedCheckpointAssignmentAdoption")]
 pub struct CheckpointAssignmentAdoption {
     /// Reporting process.
     pub participant: CheckpointParticipant,
     /// Adopted assignment version.
     pub assignment_version: u64,
+    /// Key encoding, hashing, and key-group mapping contract that was adopted.
+    pub partitioning_abi_version: u16,
     /// Adopted vnode count.
     pub vnode_count: u32,
-    /// Digest of the adopted ordered vnode-owner map.
+    /// Digest of the adopted partitioning ABI and ordered vnode-owner map.
     pub assignment_digest: [u8; 32],
+}
+
+#[derive(serde::Deserialize)]
+struct UncheckedCheckpointAssignmentAdoption {
+    participant: CheckpointParticipant,
+    assignment_version: u64,
+    partitioning_abi_version: u16,
+    vnode_count: u32,
+    assignment_digest: [u8; 32],
+}
+
+impl TryFrom<UncheckedCheckpointAssignmentAdoption> for CheckpointAssignmentAdoption {
+    type Error = &'static str;
+
+    fn try_from(unchecked: UncheckedCheckpointAssignmentAdoption) -> Result<Self, Self::Error> {
+        let adoption = Self {
+            participant: unchecked.participant,
+            assignment_version: unchecked.assignment_version,
+            partitioning_abi_version: unchecked.partitioning_abi_version,
+            vnode_count: unchecked.vnode_count,
+            assignment_digest: unchecked.assignment_digest,
+        };
+        adoption
+            .is_canonical()
+            .then_some(adoption)
+            .ok_or("checkpoint assignment adoption is not canonical")
+    }
 }
 
 impl CheckpointAssignmentAdoption {
@@ -43,7 +74,8 @@ impl CheckpointAssignmentAdoption {
         self.participant.node_id != 0
             && !self.participant.boot_incarnation.is_nil()
             && self.assignment_version != 0
-            && self.vnode_count != 0
+            && self.partitioning_abi_version == PARTITIONING_ABI_VERSION
+            && KeyGroupCount::try_from(self.vnode_count).is_ok()
             && self.assignment_digest != [0; 32]
     }
 
@@ -51,6 +83,7 @@ impl CheckpointAssignmentAdoption {
     #[must_use]
     pub fn matches_fence(&self, fence: &CheckpointAssignmentFence) -> bool {
         self.assignment_version == fence.assignment_version
+            && self.partitioning_abi_version == fence.partitioning_abi_version
             && self.vnode_count == fence.vnode_count
             && self.assignment_digest == fence.assignment_digest
             && fence.participant_incarnation(self.participant.node_id)
@@ -64,9 +97,11 @@ impl CheckpointAssignmentAdoption {
 pub struct CheckpointAssignmentFence {
     /// Exact vnode-assignment version covered by this proof.
     pub assignment_version: u64,
+    /// Key encoding, hashing, and key-group mapping contract covered by this proof.
+    pub partitioning_abi_version: u16,
     /// Number of vnodes in the ordered owner map.
     pub vnode_count: u32,
-    /// SHA-256 of `vnode_count` and the ordered vnode-to-owner map.
+    /// SHA-256 of the partitioning ABI, `vnode_count`, and ordered vnode-to-owner map.
     pub assignment_digest: [u8; 32],
     /// Canonical participants, sorted by node id and bound to exact boot incarnations.
     pub participants: Vec<CheckpointParticipant>,
@@ -75,6 +110,7 @@ pub struct CheckpointAssignmentFence {
 #[derive(serde::Deserialize)]
 struct UncheckedCheckpointAssignmentFence {
     assignment_version: u64,
+    partitioning_abi_version: u16,
     vnode_count: u32,
     assignment_digest: [u8; 32],
     participants: Vec<CheckpointParticipant>,
@@ -86,6 +122,7 @@ impl TryFrom<UncheckedCheckpointAssignmentFence> for CheckpointAssignmentFence {
     fn try_from(unchecked: UncheckedCheckpointAssignmentFence) -> Result<Self, Self::Error> {
         let fence = Self {
             assignment_version: unchecked.assignment_version,
+            partitioning_abi_version: unchecked.partitioning_abi_version,
             vnode_count: unchecked.vnode_count,
             assignment_digest: unchecked.assignment_digest,
             participants: unchecked.participants,
@@ -115,8 +152,15 @@ impl CheckpointAssignmentFence {
         }
         let vnode_count = u32::try_from(owners.len())
             .map_err(|_| "checkpoint assignment has more than u32::MAX vnodes".to_string())?;
+        KeyGroupCount::try_from(vnode_count).map_err(|_| {
+            format!(
+                "checkpoint assignment key-group count must be between 1 and {}, got {vnode_count}",
+                crate::state::MAX_KEY_GROUP_COUNT
+            )
+        })?;
         let fence = Self {
             assignment_version,
+            partitioning_abi_version: PARTITIONING_ABI_VERSION,
             vnode_count,
             assignment_digest: Self::owner_map_digest(vnode_count, owners),
             participants,
@@ -130,13 +174,22 @@ impl CheckpointAssignmentFence {
         Ok(fence)
     }
 
-    /// Stable digest of a canonical ordered vnode-to-owner map.
+    /// Stable digest of the current partitioning ABI and a canonical ordered vnode-owner map.
     #[must_use]
     pub fn owner_map_digest(vnode_count: u32, owners: &[u64]) -> [u8; 32] {
+        Self::owner_map_digest_for_abi(PARTITIONING_ABI_VERSION, vnode_count, owners)
+    }
+
+    fn owner_map_digest_for_abi(
+        partitioning_abi_version: u16,
+        vnode_count: u32,
+        owners: &[u64],
+    ) -> [u8; 32] {
         use sha2::{Digest, Sha256};
 
         let mut hash = Sha256::new();
-        hash.update(b"laminardb-vnode-owner-map-v1\0");
+        hash.update(b"laminardb-vnode-owner-map-v2\0");
+        hash.update(partitioning_abi_version.to_le_bytes());
         hash.update(vnode_count.to_le_bytes());
         hash.update(
             u64::try_from(owners.len())
@@ -153,7 +206,8 @@ impl CheckpointAssignmentFence {
     #[must_use]
     pub fn is_canonical(&self) -> bool {
         self.assignment_version != 0
-            && self.vnode_count != 0
+            && self.partitioning_abi_version == PARTITIONING_ABI_VERSION
+            && KeyGroupCount::try_from(self.vnode_count).is_ok()
             && self.assignment_digest != [0; 32]
             && !self.participants.is_empty()
             && self.participants.len() <= MAX_CHECKPOINT_PARTICIPANTS
@@ -195,7 +249,8 @@ impl CheckpointAssignmentFence {
     /// Whether this certificate binds the supplied exact ordered owner map.
     #[must_use]
     pub fn matches_owner_map(&self, owners: &[u64]) -> bool {
-        usize::try_from(self.vnode_count).ok() == Some(owners.len())
+        self.partitioning_abi_version == PARTITIONING_ABI_VERSION
+            && usize::try_from(self.vnode_count).ok() == Some(owners.len())
             && self.assignment_digest == Self::owner_map_digest(self.vnode_count, owners)
     }
 
@@ -205,8 +260,9 @@ impl CheckpointAssignmentFence {
         use sha2::{Digest, Sha256};
 
         let mut hash = Sha256::new();
-        hash.update(b"laminardb-checkpoint-assignment-v2\0");
+        hash.update(b"laminardb-checkpoint-assignment-v3\0");
         hash.update(self.assignment_version.to_le_bytes());
+        hash.update(self.partitioning_abi_version.to_le_bytes());
         hash.update(self.vnode_count.to_le_bytes());
         hash.update(self.assignment_digest);
         hash.update(
@@ -460,7 +516,7 @@ pub fn source_drain_plan_digest(source_ids: &[[u8; 32]]) -> Result<[u8; 32], Str
 
     let mut sorted = source_ids.to_vec();
     sorted.sort_unstable();
-    if sorted.iter().any(|identity| *identity == [0; 32]) {
+    if sorted.contains(&[0; 32]) {
         return Err("source drain plan contains an empty source identity".into());
     }
     if !sorted.windows(2).all(|pair| pair[0] != pair[1]) {
@@ -559,10 +615,12 @@ impl NodeDrainReceiptAggregate {
 mod tests {
     use super::{
         source_drain_source_id, source_drain_vnode_digest, AssignmentDrainTransition,
-        CheckpointAssignmentFence, CheckpointParticipant, NodeDrainReceiptAggregate,
-        SourceDrainReceipt, MAX_CHECKPOINT_PARTICIPANTS, SOURCE_DRAIN_RECEIPT_VERSION,
+        CheckpointAssignmentAdoption, CheckpointAssignmentFence, CheckpointParticipant,
+        NodeDrainReceiptAggregate, SourceDrainReceipt, MAX_CHECKPOINT_PARTICIPANTS,
+        SOURCE_DRAIN_RECEIPT_VERSION,
     };
     use crate::checkpoint::{LeaderProof, LeaderProofOwner};
+    use crate::state::{MAX_KEY_GROUP_COUNT, PARTITIONING_ABI_VERSION};
     use uuid::Uuid;
 
     fn participant(node_id: u64, boot: u128) -> CheckpointParticipant {
@@ -610,6 +668,73 @@ mod tests {
     }
 
     #[test]
+    fn certificate_digest_binds_partitioning_abi() {
+        let fence = CheckpointAssignmentFence::from_owner_map(
+            7,
+            &[1, 2],
+            vec![participant(1, 11), participant(2, 22)],
+        )
+        .unwrap();
+        let mut wrong_abi = fence.clone();
+        wrong_abi.partitioning_abi_version = PARTITIONING_ABI_VERSION + 1;
+
+        assert_ne!(fence.digest(), wrong_abi.digest());
+        assert_ne!(
+            CheckpointAssignmentFence::owner_map_digest(2, &[1, 2]),
+            CheckpointAssignmentFence::owner_map_digest_for_abi(
+                PARTITIONING_ABI_VERSION + 1,
+                2,
+                &[1, 2]
+            )
+        );
+        assert!(!wrong_abi.is_canonical());
+        assert!(!wrong_abi.matches_owner_map(&[1, 2]));
+    }
+
+    #[test]
+    fn certificate_and_adoption_require_current_partitioning_abi() {
+        let fence =
+            CheckpointAssignmentFence::from_owner_map(7, &[1], vec![participant(1, 11)]).unwrap();
+        let mut missing_fence = serde_json::to_value(&fence).unwrap();
+        missing_fence
+            .as_object_mut()
+            .unwrap()
+            .remove("partitioning_abi_version");
+        assert!(serde_json::from_value::<CheckpointAssignmentFence>(missing_fence).is_err());
+
+        let mut wrong_fence = fence.clone();
+        wrong_fence.partitioning_abi_version = PARTITIONING_ABI_VERSION + 1;
+        assert!(serde_json::from_value::<CheckpointAssignmentFence>(
+            serde_json::to_value(wrong_fence).unwrap()
+        )
+        .is_err());
+
+        let adoption = CheckpointAssignmentAdoption {
+            participant: participant(1, 11),
+            assignment_version: fence.assignment_version,
+            partitioning_abi_version: PARTITIONING_ABI_VERSION,
+            vnode_count: fence.vnode_count,
+            assignment_digest: fence.assignment_digest,
+        };
+        assert!(adoption.is_canonical());
+        assert!(adoption.matches_fence(&fence));
+
+        let mut missing_adoption = serde_json::to_value(&adoption).unwrap();
+        missing_adoption
+            .as_object_mut()
+            .unwrap()
+            .remove("partitioning_abi_version");
+        assert!(serde_json::from_value::<CheckpointAssignmentAdoption>(missing_adoption).is_err());
+
+        let mut wrong_adoption = adoption;
+        wrong_adoption.partitioning_abi_version = PARTITIONING_ABI_VERSION + 1;
+        assert!(serde_json::from_value::<CheckpointAssignmentAdoption>(
+            serde_json::to_value(wrong_adoption).unwrap()
+        )
+        .is_err());
+    }
+
+    #[test]
     fn malformed_or_incomplete_certificates_fail_closed() {
         assert!(
             CheckpointAssignmentFence::from_owner_map(7, &[1, 2], vec![participant(1, 11)])
@@ -624,6 +749,17 @@ mod tests {
         assert!(
             CheckpointAssignmentFence::from_owner_map(0, &[1], vec![participant(1, 11)]).is_err()
         );
+    }
+
+    #[test]
+    fn certificate_rejects_more_than_the_partitioning_abi_limit() {
+        let owner_count = usize::try_from(MAX_KEY_GROUP_COUNT).unwrap() + 1;
+        let owners = vec![1; owner_count];
+
+        assert!(matches!(
+            CheckpointAssignmentFence::from_owner_map(7, &owners, vec![participant(1, 11)]),
+            Err(message) if message.contains("key-group count")
+        ));
     }
 
     #[test]

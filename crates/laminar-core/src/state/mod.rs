@@ -14,13 +14,12 @@ pub use backend::{
     SealedCommitDescriptorWriter, SealedVnodePartial, SealedVnodeWriter, StateBackend,
     StateBackendDurability, StateBackendError,
 };
-pub use config::{
-    StateBackendBuildError, StateBackendConfig, DEFAULT_VNODE_CAPACITY, MAX_VNODE_CAPACITY,
-};
+pub use config::{StateBackendBuildError, StateBackendConfig};
 pub use in_process::InProcessBackend;
 pub use object_store::ObjectStoreBackend;
 pub use vnode::{
     key_hash, owned_vnodes, owners_per_domain, peer_owners, rendezvous_assignment,
     InvalidKeyGroupCount, KeyGroupCount, Locality, NodeId, VnodeAssignmentReadGuard,
-    VnodeAssignmentSnapshot, VnodeLifecycleState, VnodeRegistry, PARTITIONING_ABI_VERSION,
+    VnodeAssignmentSnapshot, VnodeLifecycleState, VnodeRegistry, DEFAULT_CLUSTER_KEY_GROUP_COUNT,
+    LOCAL_KEY_GROUP_COUNT, MAX_KEY_GROUP_COUNT, PARTITIONING_ABI_VERSION,
 };

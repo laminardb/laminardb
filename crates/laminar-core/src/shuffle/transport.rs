@@ -347,7 +347,7 @@ mod grpc {
     const MAX_DECODED_SCHEMA_MEMORY_BYTES: usize = 1024 * 1024;
     const MAX_DECODED_ARRAY_STRUCTURE_BYTES: usize = 2 * MAX_DECODED_SCHEMA_MEMORY_BYTES;
     const MAX_ROUTE_METADATA_BYTES: usize =
-        crate::state::MAX_VNODE_CAPACITY as usize * std::mem::size_of::<u32>();
+        crate::state::MAX_KEY_GROUP_COUNT as usize * std::mem::size_of::<u32>();
     /// Frame envelopes, collection allocations, and protobuf bookkeeping beyond exact payload,
     /// schema, stage, and route bytes.
     const FRAME_METADATA_BYTES: usize = 64 * 1024;
@@ -736,7 +736,7 @@ mod grpc {
                 if !routes_are_canonical
                     || routed_vnodes.is_empty()
                     || routed_vnodes.len()
-                        > usize::try_from(crate::state::MAX_VNODE_CAPACITY).unwrap_or(usize::MAX)
+                        > usize::try_from(crate::state::MAX_KEY_GROUP_COUNT).unwrap_or(usize::MAX)
                 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -1133,7 +1133,7 @@ mod grpc {
                 || fragment.stage.len() > MAX_STAGE_NAME_BYTES
                 || !routes_are_canonical
                 || fragment.routed_vnodes.len()
-                    > usize::try_from(crate::state::MAX_VNODE_CAPACITY).unwrap_or(usize::MAX)
+                    > usize::try_from(crate::state::MAX_KEY_GROUP_COUNT).unwrap_or(usize::MAX)
                 || fragment.routed_vnodes.is_empty()
             {
                 return Err("shuffle fragment-zero metadata is empty or non-canonical".into());
@@ -6051,6 +6051,21 @@ mod tests {
 
         let error = sender
             .install_assignment_fence(&fence, &[1, 2])
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(sender.assignment_version(), 0);
+    }
+
+    #[test]
+    fn shuffle_assignment_admission_rejects_a_partitioning_abi_mismatch() {
+        let owners = assignment_owners(&[1, 2]);
+        let mut fence = assignment_fence(1, &[1, 2]);
+        fence.partitioning_abi_version = crate::state::PARTITIONING_ABI_VERSION.saturating_add(1);
+        let sender = ShuffleSender::new(1, Uuid::from_u128(2));
+
+        let error = sender
+            .install_assignment_fence(&fence, &owners)
             .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);

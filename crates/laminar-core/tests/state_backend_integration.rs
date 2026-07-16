@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use laminar_core::state::{
-    CheckpointAttempt, ObjectStoreBackend, StateBackend, StateBackendConfig, StateBackendDurability,
+    CheckpointAttempt, ObjectStoreBackend, StateBackend, StateBackendConfig,
+    StateBackendDurability, LOCAL_KEY_GROUP_COUNT,
 };
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
@@ -15,7 +16,7 @@ use tempfile::tempdir;
 async fn config_roundtrip_in_process_local_object_store() {
     let attempt = CheckpointAttempt::new(1, 1);
     let c = StateBackendConfig::in_process();
-    let b = c.build().await.unwrap();
+    let b = c.build(LOCAL_KEY_GROUP_COUNT).unwrap();
     assert_eq!(b.durability_scope(), StateBackendDurability::Volatile);
     b.write_partial(attempt, 0, 0, Bytes::from_static(b"a"))
         .await
@@ -27,7 +28,7 @@ async fn config_roundtrip_in_process_local_object_store() {
 
     let dir = tempdir().unwrap();
     let c = StateBackendConfig::local(dir.path());
-    let b = c.build().await.unwrap();
+    let b = c.build(LOCAL_KEY_GROUP_COUNT).unwrap();
     assert_eq!(b.durability_scope(), StateBackendDurability::NodeDurable);
     b.write_partial(attempt, 0, 0, Bytes::from_static(b"b"))
         .await
@@ -43,7 +44,7 @@ async fn config_roundtrip_in_process_local_object_store() {
         dir.path().display().to_string().replace('\\', "/")
     );
     let c = StateBackendConfig::object_store(url);
-    let b = c.build().await.unwrap();
+    let b = c.build(LOCAL_KEY_GROUP_COUNT).unwrap();
     assert_eq!(b.durability_scope(), StateBackendDurability::NodeDurable);
     b.write_partial(attempt, 0, 0, Bytes::from_static(b"c"))
         .await

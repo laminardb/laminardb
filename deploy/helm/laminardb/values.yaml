@@ -54,8 +54,6 @@ laminardb:
     path: /var/lib/laminardb/state
     # -- URL for shared storage (required when backend=object_store, e.g. "s3://bucket/prefix")
     url: ""
-    # -- Number of vnodes the backend should size for
-    vnodeCapacity: 256
   # -- Checkpoint configuration
   checkpoint:
     # -- Checkpoint interval (Go/humantime duration)
@@ -113,6 +111,8 @@ laminardb:
   cluster:
     # -- Node ID (auto-generated from pod name if empty)
     nodeId: ""
+    # -- Stable key groups distributed across cluster nodes
+    keyGroups: 256
     discovery:
       # -- Discovery strategy: "gossip" (recommended) or "static"
       strategy: gossip

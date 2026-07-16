@@ -192,11 +192,11 @@ pub(crate) fn assemble_capsule(
             attempt.checkpoint_id, attempt.epoch
         )));
     }
-    if fence.vnode_count > laminar_core::state::MAX_VNODE_CAPACITY {
+    if fence.vnode_count > laminar_core::state::MAX_KEY_GROUP_COUNT {
         return Err(DbError::Checkpoint(format!(
             "[LDB-6041] checkpoint assignment vnode count {} exceeds the production limit {}",
             fence.vnode_count,
-            laminar_core::state::MAX_VNODE_CAPACITY
+            laminar_core::state::MAX_KEY_GROUP_COUNT
         )));
     }
     if !inventory

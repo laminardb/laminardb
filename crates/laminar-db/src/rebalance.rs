@@ -491,6 +491,7 @@ pub fn spawn_snapshot_watcher(
                     },
                     assignment_version: version,
                     vnode_count: registry.vnode_count(),
+                    partitioning_abi_version: laminar_core::state::PARTITIONING_ABI_VERSION,
                     assignment_digest: CheckpointAssignmentFence::owner_map_digest(
                         registry.vnode_count(),
                         &owner_ids,
@@ -2172,6 +2173,7 @@ mod tests {
                 participant,
                 assignment_version: version,
                 vnode_count,
+                partitioning_abi_version: laminar_core::state::PARTITIONING_ABI_VERSION,
                 assignment_digest: CheckpointAssignmentFence::owner_map_digest(vnode_count, owners),
             }
         }

@@ -606,6 +606,12 @@ docker run -d -p 8080:8080 laminardb/laminardb-server:latest
             <td>Run mode. <code>"single"</code> (standalone) or <code>"cluster"</code> (multi-node deployment).</td>
           </tr>
           <tr>
+            <td class="field-name">key_groups</td>
+            <td class="field-type">u16</td>
+            <td class="field-default">256 (cluster)</td>
+            <td>Stable hash partitions for cluster placement and rescaling. Optional in cluster mode; rejected in single mode, which always uses one key group.</td>
+          </tr>
+          <tr>
             <td class="field-name">bind</td>
             <td class="field-type">String</td>
             <td class="field-default">"127.0.0.1:8080"</td>
@@ -767,6 +773,10 @@ log_level = "info"</code></pre>
         <div class="toml-header">laminardb.toml (Cluster sections)</div>
         <pre><code class="language-toml">node_id = "node-1"
 
+[server]
+mode = "cluster"
+key_groups = 256
+
 [discovery]
 strategy = "gossip"
 gossip_port = 7946
@@ -784,17 +794,6 @@ seeds = ["10.0.0.1:7946", "10.0.0.2:7946"]</code></pre>
 
       <h3>In-Process State (Non-durable, in-memory)</h3>
       <p>Configure with <code>backend = "in_process"</code> (the default).</p>
-      <table class="config-table">
-        <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
-        <tbody>
-          <tr>
-            <td class="field-name">vnode_capacity</td>
-            <td class="field-type">u32</td>
-            <td class="field-default">256</td>
-            <td>Number of virtual nodes to divide the hash ring into.</td>
-          </tr>
-        </tbody>
-      </table>
 
       <h3>Local State (Node-durable filesystem)</h3>
       <p>Configure with <code>backend = "local"</code>. This survives a same-node process restart and is valid for embedded/single-node exactly-once, but it is not visible to another cluster node.</p>
@@ -806,12 +805,6 @@ seeds = ["10.0.0.1:7946", "10.0.0.2:7946"]</code></pre>
             <td class="field-type">String</td>
             <td class="field-required">required</td>
             <td>Local directory path where state partitions are stored.</td>
-          </tr>
-          <tr>
-            <td class="field-name">vnode_capacity</td>
-            <td class="field-type">u32</td>
-            <td class="field-default">256</td>
-            <td>Number of virtual nodes.</td>
           </tr>
         </tbody>
       </table>
@@ -826,12 +819,6 @@ seeds = ["10.0.0.1:7946", "10.0.0.2:7946"]</code></pre>
             <td class="field-type">String</td>
             <td class="field-required">required</td>
             <td>State URL: <code>s3://</code>, <code>gs://</code>, <code>az://</code>/<code>abfs://</code>, or node-local <code>file://</code>.</td>
-          </tr>
-          <tr>
-            <td class="field-name">vnode_capacity</td>
-            <td class="field-type">u32</td>
-            <td class="field-default">256</td>
-            <td>Total virtual nodes for the cluster layout.</td>
           </tr>
         </tbody>
       </table>
@@ -946,7 +933,7 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
       <h3>Cluster Management Endpoints</h3>
       <ul>
         <li><code>GET /api/v1/cluster/nodes</code> &mdash; Returns list of cluster members, including their node IDs, network addresses, and states (<code>Active</code>, <code>Draining</code>, <code>Suspected</code>, <code>Left</code>).</li>
-        <li><code>GET /api/v1/cluster/vnodes</code> &mdash; Returns the current assignment map mapping the 256 virtual nodes (vnodes) to active cluster nodes.</li>
+        <li><code>GET /api/v1/cluster/vnodes</code> &mdash; Returns the current key-group assignment map for active cluster nodes.</li>
         <li><code>GET /api/v1/cluster/leader</code> &mdash; Returns node details for the active durable leader-lease holder.</li>
         <li><code>GET /api/v1/cluster/checkpoints</code> &mdash; Returns history and completion metadata of recent coordinator checkpoints.</li>
       </ul>
@@ -1036,7 +1023,7 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
         <div class="endpoint-row">
           <span class="endpoint-method method-get">GET</span>
           <span class="endpoint-path">/api/v1/cluster/vnodes</span>
-          <span class="endpoint-desc">Get current vnode instance assignments</span>
+          <span class="endpoint-desc">Get current key-group assignments</span>
         </div>
         <div class="endpoint-row">
           <span class="endpoint-method method-get">GET</span>

@@ -462,29 +462,7 @@ impl LaminarDbBuilder {
         Self::validate_cluster_delivery(runtime_mode, self.config.delivery_guarantee)?;
 
         Self::validate_backpressure(&self.config)?;
-        // state_backend and vnode_registry must be paired or both absent.
-        match (&self.state_backend, &self.vnode_registry) {
-            (Some(_), None) => {
-                return Err(DbError::Config(
-                    "state_backend is set but vnode_registry is missing".into(),
-                ));
-            }
-            (None, Some(_)) => {
-                return Err(DbError::Config(
-                    "vnode_registry is set but state_backend is missing".into(),
-                ));
-            }
-            _ => {}
-        }
-        if let Some(registry) = self.vnode_registry.as_ref() {
-            let vnode_count = registry.vnode_count();
-            if !(1..=laminar_core::state::MAX_VNODE_CAPACITY).contains(&vnode_count) {
-                return Err(DbError::Config(format!(
-                    "vnode_registry count must be between 1 and {}, got {vnode_count}",
-                    laminar_core::state::MAX_VNODE_CAPACITY
-                )));
-            }
-        }
+        self.validate_state_topology(runtime_mode)?;
 
         self.profile.apply_defaults(&mut self.config);
 
@@ -549,6 +527,56 @@ impl LaminarDbBuilder {
             db.set_vnode_registry(registry);
         }
         Ok(Arc::new(db))
+    }
+
+    fn validate_state_topology(&self, runtime_mode: RuntimeMode) -> Result<(), DbError> {
+        match (&self.state_backend, &self.vnode_registry) {
+            (Some(_), None) => {
+                return Err(DbError::Config(
+                    "state_backend is set but vnode_registry is missing".into(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(DbError::Config(
+                    "vnode_registry is set but state_backend is missing".into(),
+                ));
+            }
+            _ => {}
+        }
+        if let (Some(backend), Some(registry)) =
+            (self.state_backend.as_ref(), self.vnode_registry.as_ref())
+        {
+            let backend_capacity = backend.key_group_capacity();
+            let backend_key_groups =
+                laminar_core::state::KeyGroupCount::try_from(backend_capacity).map_err(|_| {
+                    DbError::Config(format!(
+                        "state_backend key-group capacity must be between 1 and {}, got {backend_capacity}",
+                        laminar_core::state::MAX_KEY_GROUP_COUNT
+                    ))
+                })?;
+            let registry_count = registry.vnode_count();
+            let registry_key_groups = laminar_core::state::KeyGroupCount::try_from(registry_count)
+                .map_err(|_| {
+                    DbError::Config(format!(
+                        "vnode_registry count must be between 1 and {}, got {registry_count}",
+                        laminar_core::state::MAX_KEY_GROUP_COUNT
+                    ))
+                })?;
+            if backend_key_groups != registry_key_groups {
+                return Err(DbError::Config(format!(
+                    "state_backend key-group capacity {backend_key_groups} does not match vnode_registry count {registry_key_groups}"
+                )));
+            }
+            if !runtime_mode.is_cluster()
+                && registry_key_groups != laminar_core::state::LOCAL_KEY_GROUP_COUNT
+            {
+                return Err(DbError::Config(format!(
+                    "local runtime requires exactly {} key group; got {registry_key_groups}. Multi-key-group ownership requires cluster mode",
+                    laminar_core::state::LOCAL_KEY_GROUP_COUNT
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn validate_backpressure(config: &LaminarConfig) -> Result<(), DbError> {
@@ -808,6 +836,24 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[tokio::test]
+    async fn stateless_cluster_uses_default_key_group_topology() {
+        let db = LaminarDbBuilder::new()
+            .cluster_controller(test_cluster_controller())
+            .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.checkpoint_key_groups(),
+            laminar_core::state::DEFAULT_CLUSTER_KEY_GROUP_COUNT
+        );
+        assert!(db.state_backend.lock().is_none());
+        assert!(db.vnode_registry.lock().is_none());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
     async fn fresh_cluster_database_keeps_intake_fenced() {
         let db = LaminarDbBuilder::new()
             .cluster_controller(test_cluster_controller())
@@ -936,11 +982,9 @@ mod tests {
 
     #[tokio::test]
     async fn injected_vnode_registry_must_fit_checkpoint_abi() {
-        let vnode_count = laminar_core::state::MAX_VNODE_CAPACITY + 1;
+        let vnode_count = laminar_core::state::MAX_KEY_GROUP_COUNT + 1;
         let error = LaminarDbBuilder::new()
-            .state_backend(Arc::new(laminar_core::state::InProcessBackend::new(
-                vnode_count,
-            )))
+            .state_backend(Arc::new(laminar_core::state::InProcessBackend::new(1)))
             .vnode_registry(Arc::new(laminar_core::state::VnodeRegistry::new(
                 vnode_count,
             )))
@@ -951,6 +995,52 @@ mod tests {
             error
                 .to_string()
                 .contains("vnode_registry count must be between 1"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn injected_state_backend_capacity_must_fit_checkpoint_abi() {
+        let error = LaminarDbBuilder::new()
+            .state_backend(Arc::new(laminar_core::state::InProcessBackend::new(0)))
+            .vnode_registry(Arc::new(laminar_core::state::VnodeRegistry::new(1)))
+            .build()
+            .await
+            .expect_err("invalid backend topology must be rejected at admission");
+        assert!(
+            error
+                .to_string()
+                .contains("state_backend key-group capacity must be between 1"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn state_backend_capacity_must_match_registry() {
+        let error = LaminarDbBuilder::new()
+            .state_backend(Arc::new(laminar_core::state::InProcessBackend::new(2)))
+            .vnode_registry(Arc::new(laminar_core::state::VnodeRegistry::new(1)))
+            .build()
+            .await
+            .expect_err("backend and registry must describe one topology");
+        assert!(
+            error.to_string().contains(
+                "state_backend key-group capacity 2 does not match vnode_registry count 1"
+            ),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_runtime_rejects_multi_key_group_registry() {
+        let error = LaminarDbBuilder::new()
+            .state_backend(Arc::new(laminar_core::state::InProcessBackend::new(2)))
+            .vnode_registry(Arc::new(laminar_core::state::VnodeRegistry::new(2)))
+            .build()
+            .await
+            .expect_err("local runtime must not expose cluster rescaling dimensions");
+        assert!(
+            error.to_string().contains("requires exactly 1 key group"),
             "{error}"
         );
     }

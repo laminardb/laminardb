@@ -154,7 +154,7 @@ fn build_checkpoint_store(
         laminar_core::storage::object_store_builder::build_object_store(url, &cp.storage)
             .map_err(|e| anyhow::anyhow!("checkpoint url '{url}': {e}"))?;
 
-    let vnode_count = u16::try_from(config.state.vnode_capacity()).unwrap_or(u16::MAX);
+    let key_group_count = config.server.resolved_key_groups();
     let participant = if config.server.mode == config::ServerMode::Cluster {
         #[cfg(feature = "cluster")]
         {
@@ -186,7 +186,7 @@ fn build_checkpoint_store(
             laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
                 std::path::Path::new(path),
             )
-            .with_vnode_count(vnode_count)
+            .with_key_group_count(key_group_count)
             .with_participant_id(participant_id),
         ))
     } else {
@@ -196,7 +196,7 @@ fn build_checkpoint_store(
                 obj_store,
                 participant.map_or_else(String::new, |id| format!("nodes/{id}/")),
             )
-            .with_vnode_count(vnode_count)
+            .with_key_group_count(key_group_count)
             .with_participant_id(participant_id),
         ))
     }
@@ -204,7 +204,9 @@ fn build_checkpoint_store(
 
 #[cfg(test)]
 mod tests {
-    use super::{checkpoint_validation_outcome, CheckpointValidationOutcome};
+    use super::{
+        build_checkpoint_store, checkpoint_validation_outcome, CheckpointValidationOutcome,
+    };
     use laminar_core::storage::checkpoint_store::RecoveryReport;
 
     fn report(chosen_id: Option<u64>, examined: usize) -> RecoveryReport {
@@ -236,5 +238,34 @@ mod tests {
     fn validation_outcome_rejects_nonempty_unusable_history() {
         let error = checkpoint_validation_outcome(&report(None, 2)).unwrap_err();
         assert!(error.to_string().contains("[LDB-6041]"));
+    }
+
+    #[test]
+    fn checkpoint_store_uses_the_runtime_key_group_topology() {
+        let root = tempfile::tempdir().unwrap();
+        let normalized = root.path().to_string_lossy().replace('\\', "/");
+        let checkpoint_url = if normalized.starts_with('/') {
+            format!("file://{normalized}")
+        } else {
+            format!("file:///{normalized}")
+        };
+
+        let mut config: crate::config::ServerConfig = toml::from_str("").unwrap();
+        config.checkpoint.url = checkpoint_url;
+        let store = build_checkpoint_store(&config).unwrap();
+        assert_eq!(
+            store.key_group_count(),
+            laminar_core::state::LOCAL_KEY_GROUP_COUNT
+        );
+
+        #[cfg(feature = "cluster")]
+        {
+            let key_groups = laminar_core::state::KeyGroupCount::try_from(64_u16).unwrap();
+            config.server.mode = crate::config::ServerMode::Cluster;
+            config.server.key_groups = Some(key_groups);
+            config.node_id = Some("checkpoint-validator".into());
+            let store = build_checkpoint_store(&config).unwrap();
+            assert_eq!(store.key_group_count(), key_groups);
+        }
     }
 }

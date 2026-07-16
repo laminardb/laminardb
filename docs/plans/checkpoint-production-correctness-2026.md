@@ -94,11 +94,12 @@ reading that cursor.
 
 Keep public choices to runtime mode, requested delivery, source scope/start policy, connection and
 security data, durable storage location and namespace, checkpoint cadence and end-to-end deadline,
-recovery objective, deterministic sink keys, and hard memory/local-cache budgets. State exposes one
-optional `state.key_groups` expert setting in cluster mode only. Embedded and single-node runtimes
-resolve to one key group; cluster defaults to 256 and may override it only before the deployment
-namespace is created. Persist the resolved value and reject every later mismatch. Do not expose the
-hash, encoder, seed, source partition count, placement, gossip consistency, compaction strategy, or
+recovery objective, deterministic sink keys, and hard memory/local-cache budgets. The server
+exposes one optional `server.key_groups` expert setting in cluster mode only. Embedded and
+single-node runtimes resolve to one key group; cluster defaults to 256 and may override it only
+before the deployment namespace is created. Persist the resolved value and reject every later
+mismatch. Do not expose the hash, encoder, seed, source partition count, placement, gossip
+consistency, compaction strategy, or
 separate backend-specific vnode-capacity matrices.
 
 Consistency, topology, and sink input mode remain typed internal connector contracts because they
@@ -119,7 +120,7 @@ checkpoint surface.
    generation across process terms, and fail unknown gossip lifecycle state closed. These are
    recovery-cut prerequisites, not state-engine work.
 2. **Freeze the immutable deployment and partition contract.** Replace duplicated state/checkpoint
-   roots with one durable storage URL and deployment namespace. Resolve `state.key_groups` once from
+   roots with one durable storage URL and deployment namespace. Resolve `server.key_groups` once from
    runtime mode, persist it, and remove backend-specific vnode capacities and unchecked numeric
    fallbacks. Version the canonical Arrow-key encoding, ordered key fields, hash, global key group,
    and source-split mapping as one partitioning ABI. Bind that ABI to catalog/runtime identity,

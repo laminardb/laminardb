@@ -3859,13 +3859,27 @@ impl LaminarDB {
         checkpoint_participant_for_runtime(self)
     }
 
+    /// Stable logical partition count used by checkpoint and state identity.
+    /// Local runtimes have one key group. Cluster runtimes use their exact registry or the
+    /// fixed cluster default when no keyed state topology is installed.
+    pub(crate) fn checkpoint_key_groups(&self) -> laminar_core::state::KeyGroupCount {
+        let runtime_default = match self.runtime_mode() {
+            RuntimeMode::Local => laminar_core::state::LOCAL_KEY_GROUP_COUNT,
+            RuntimeMode::Cluster => laminar_core::state::DEFAULT_CLUSTER_KEY_GROUP_COUNT,
+        };
+        self.vnode_registry
+            .lock()
+            .as_ref()
+            .map_or(runtime_default, |registry| {
+                laminar_core::state::KeyGroupCount::try_from(registry.vnode_count())
+                    .expect("builder validated the vnode registry key-group count")
+            })
+    }
+
     /// Return a checkpoint store for the current configuration, if any.
     pub fn checkpoint_store(&self) -> Option<Box<dyn laminar_core::storage::CheckpointStore>> {
         let cp_config = self.config.checkpoint.as_ref()?;
-        let vnode_count = self.vnode_registry.lock().as_ref().map_or(
-            laminar_core::storage::checkpoint_manifest::DEFAULT_VNODE_COUNT,
-            |r| u16::try_from(r.vnode_count()).unwrap_or(u16::MAX),
-        );
+        let key_group_count = self.checkpoint_key_groups();
         let participant = self.checkpoint_participant();
         let participant_id = participant.unwrap_or(0);
 
@@ -3880,7 +3894,7 @@ impl LaminarDB {
                     obj_store,
                     participant.map_or_else(String::new, |id| format!("nodes/{id}/")),
                 )
-                .with_vnode_count(vnode_count)
+                .with_key_group_count(key_group_count)
                 .with_participant_id(participant_id),
             ))
         } else {
@@ -3896,7 +3910,7 @@ impl LaminarDB {
                 laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
                     checkpoint_dir,
                 )
-                .with_vnode_count(vnode_count)
+                .with_key_group_count(key_group_count)
                 .with_participant_id(participant_id),
             ))
         }

@@ -753,7 +753,7 @@ impl<'a> RecoveryManager<'a> {
             let validation = artifacts.validate(
                 outcome.checkpoint_id,
                 storage_participant,
-                self.store.vnode_count(),
+                self.store.key_group_count(),
             );
             if !validation.valid {
                 reject_candidate(format!(
@@ -918,7 +918,7 @@ impl<'a> RecoveryManager<'a> {
                 continue;
             }
 
-            let validation = manifest.validate(self.store.vnode_count());
+            let validation = manifest.validate(self.store.key_group_count());
             if !validation.is_empty() {
                 return Err(DbError::Checkpoint(format!(
                     "[LDB-6041] prepared checkpoint {} epoch {} is invalid and cannot be used to mint an Abort outcome: {}",
@@ -1426,8 +1426,11 @@ impl<'a> RecoveryManager<'a> {
             );
             return true;
         }
-        let validation =
-            artifacts.validate(storage_id, storage_participant, self.store.vnode_count());
+        let validation = artifacts.validate(
+            storage_id,
+            storage_participant,
+            self.store.key_group_count(),
+        );
         if !validation.valid {
             error!(
                 checkpoint_id = manifest.checkpoint_id,
@@ -3442,6 +3445,10 @@ mod rehydration_tests {
 
     #[async_trait]
     impl StateBackend for CorruptReadBackend {
+        fn key_group_capacity(&self) -> u32 {
+            self.inner.key_group_capacity()
+        }
+
         async fn write_partial(
             &self,
             attempt: CheckpointAttempt,

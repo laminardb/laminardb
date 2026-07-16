@@ -140,7 +140,7 @@ LaminarDB supports multi-node cluster deployments. In this mode, streaming pipel
 
 * **Membership & Discovery**: Nodes discover one another using either a gossip-based protocol (Chitchat peer-to-peer membership over a configured `gossip_port`) or a static seeds list.
 * **Coordination**: Membership selects a leader candidate, while a renewable shared-store lease fences leader-only control paths. Vnode assignments are CAS-published through `AssignmentSnapshotStore`; there is no embedded Raft service.
-* **Dynamic Rebalancing**: A total of 256 virtual nodes (vnodes) are dynamically distributed across active cluster nodes. When a new node joins or an existing node departs (or fails), the leader automatically rebalances the vnode assignments. When shutting down gracefully, a node announces a `Draining` state, letting the leader reallocate its vnodes before the node terminates.
+* **Dynamic Rebalancing**: Stable key groups (256 by default) are dynamically distributed across active cluster nodes. When a new node joins or an existing node departs (or fails), the leader automatically rebalances the assignments. When shutting down gracefully, a node announces a `Draining` state, letting the leader reallocate its key groups before the node terminates.
 * **Distributed Checkpoints**: Checkpoint barriers flow through the distributed operator graph and state is sealed in shared storage. Cluster delivery is currently admitted only as `at_least_once`.
 * **State Store**: Requires a cluster-shared `object_store` backend (S3, GCS, or Azure Blob) so another node can read and recover state partitions. Local paths and `file://` URLs are node-durable, not cluster-shared.
 
@@ -160,6 +160,7 @@ node_id = "node-1" # Required and unique per node
 mode = "cluster"
 bind = "0.0.0.0:8080"
 delivery = "at_least_once"
+key_groups = 256
 
 [discovery]
 strategy = "gossip" # "gossip" or "static"
@@ -170,7 +171,6 @@ seeds = ["10.0.0.1:7946", "10.0.0.2:7946"]
 [state]
 backend = "object_store"
 url = "s3://my-bucket/laminardb/state"
-vnode_capacity = 256
 
 [checkpoint]
 url = "s3://my-bucket/laminardb/checkpoints"
@@ -436,7 +436,7 @@ The HTTP API binds to `bind` configured under `[server]`. It serves the followin
 * **Lineage & Dependency Graph**: `GET /api/v1/graph` traces upstream and downstream relationship edges (`source -> stream -> MV -> sink`) to generate dependency DAGs.
 * **Cluster Management**:
   * `GET /api/v1/cluster/nodes` returns the list of active/draining/suspected nodes.
-  * `GET /api/v1/cluster/vnodes` returns the 256 vnode partition assignments.
+  * `GET /api/v1/cluster/vnodes` returns the configured key-group assignments.
   * `GET /api/v1/cluster/leader` returns the current durable leader-lease holder.
   * `GET /api/v1/cluster/checkpoints` returns completed checkpoint metadata.
 * **Pipeline Administration**:
@@ -586,7 +586,7 @@ graph TD
         E1["Streaming Engine"]:::engineClass
         Control1["Lease-Fenced<br/>Control Plane"]:::controlClass
         Gossip1["Chitchat Gossip"]:::gossipClass
-        VNodes1["Virtual Nodes<br/>(VNodes 1 - 128)"]:::vnodeClass
+        VNodes1["Owned Key Groups<br/>(Dynamic Subset)"]:::vnodeClass
         E1 <--> VNodes1
     end
 
@@ -595,7 +595,7 @@ graph TD
         E2["Streaming Engine"]:::engineClass
         Control2["Cluster Control<br/>Follower"]:::controlClass
         Gossip2["Chitchat Gossip"]:::gossipClass
-        VNodes2["Virtual Nodes<br/>(VNodes 129 - 256)"]:::vnodeClass
+        VNodes2["Owned Key Groups<br/>(Dynamic Subset)"]:::vnodeClass
         E2 <--> VNodes2
     end
 

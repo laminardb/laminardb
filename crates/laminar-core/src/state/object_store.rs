@@ -42,7 +42,7 @@ const STATE_PRUNE_FLOOR_VERSION: u32 = 1;
 const STATE_PRUNE_FLOOR_MAX_BYTES: u64 = 512;
 const STATE_NAMESPACE_VERSION: u32 = 1;
 const STATE_NAMESPACE_MAX_BYTES: u64 = 512;
-// MAX_VNODE_CAPACITY (65,535) at a conservative 768 encoded bytes of provenance per
+// MAX_KEY_GROUP_COUNT (65,535) at a conservative 768 encoded bytes of provenance per
 // vnode is under 48 MiB; 64 MiB leaves over 16 MiB for the assignment and descriptors.
 const MAX_CHECKPOINT_SEAL_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -167,12 +167,6 @@ impl ObjectStoreBackend {
             authoritative_version: Arc::new(AtomicU64::new(0)),
             prune_floor_update_lock: tokio::sync::Mutex::new(()),
         }
-    }
-
-    /// Vnode range this backend is configured for.
-    #[must_use]
-    pub fn vnode_capacity(&self) -> u32 {
-        self.vnode_capacity
     }
 
     /// Shared handle to the authoritative version counter, cloneable by a
@@ -954,6 +948,10 @@ impl ObjectStoreBackend {
 
 #[async_trait]
 impl StateBackend for ObjectStoreBackend {
+    fn key_group_capacity(&self) -> u32 {
+        self.vnode_capacity
+    }
+
     async fn bind_state_namespace(
         &self,
         deployment_id: &str,
@@ -2234,7 +2232,7 @@ mod tests {
 
     #[test]
     fn checkpoint_seal_size_ceiling_covers_the_maximum_vnode_inventory() {
-        assert!(MAX_CHECKPOINT_SEAL_BYTES >= u64::from(crate::state::MAX_VNODE_CAPACITY) * 768);
+        assert!(MAX_CHECKPOINT_SEAL_BYTES >= u64::from(crate::state::MAX_KEY_GROUP_COUNT) * 768);
         let path = ObjectStoreBackend::seal_path(attempt(1));
         ObjectStoreBackend::check_seal_encoded_size(&path, MAX_CHECKPOINT_SEAL_BYTES).unwrap();
 

@@ -642,6 +642,7 @@ fn assignment_fence_from_wire(
         .collect::<Result<Vec<_>, tonic::Status>>()?;
     let fence = super::CheckpointAssignmentFence {
         assignment_version: version,
+        partitioning_abi_version: crate::state::PARTITIONING_ABI_VERSION,
         vnode_count,
         assignment_digest,
         participants,

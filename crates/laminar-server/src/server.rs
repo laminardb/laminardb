@@ -148,13 +148,13 @@ pub async fn run_server(
 
     // Build the state backend + single-owner vnode registry from config so
     // the checkpoint coordinator's durability gate runs with real markers.
+    let key_groups = config.server.resolved_key_groups();
     let state_backend = config
         .state
-        .build()
-        .await
+        .build(key_groups)
         .map_err(|e| ServerError::Build(format!("state backend: {e}")))?;
     let vnode_registry = Arc::new(laminar_core::state::VnodeRegistry::single_owner(
-        config.state.vnode_capacity(),
+        u32::from(key_groups),
         laminar_core::state::NodeId(0),
     ));
     builder = builder

@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow_array::{Int64Array, RecordBatch};
+use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use laminar_core::checkpoint::{
     CheckpointAssignmentFence, CheckpointBarrier, CheckpointParticipant,
@@ -24,6 +24,21 @@ fn loopback() -> SocketAddr {
 fn batch(values: Vec<i64>) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
     RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))]).unwrap()
+}
+
+fn fragmented_batch(rows: usize) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("x", DataType::Int64, false),
+        Field::new("y", DataType::Int64, false),
+        Field::new("z", DataType::Int64, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        (0..3)
+            .map(|_| Arc::new(Int64Array::from(vec![11; rows])) as ArrayRef)
+            .collect(),
+    )
+    .unwrap()
 }
 
 fn assignment_fence() -> CheckpointAssignmentFence {
@@ -171,6 +186,8 @@ async fn unregistered_peer_returns_not_found() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fragmented_batch_is_delivered_before_its_barrier() {
+    const ROWS: usize = 60_000;
+
     let receiver = ShuffleReceiver::bind(2, loopback(), Uuid::from_u128(2))
         .await
         .unwrap();
@@ -187,7 +204,7 @@ async fn fragmented_batch_is_delivered_before_its_barrier() {
     sender
         .send_to(
             2,
-            &ShuffleMessage::checkpointed("large".into(), 7, batch(vec![11; 200_000])),
+            &ShuffleMessage::checkpointed("large".into(), 7, fragmented_batch(ROWS)),
         )
         .await
         .unwrap();
@@ -211,7 +228,7 @@ async fn fragmented_batch_is_delivered_before_its_barrier() {
     };
     assert_eq!(stage, "large");
     assert_eq!(&**routed_vnodes, &[7]);
-    assert_eq!(batch.num_rows(), 200_000);
+    assert_eq!(batch.num_rows(), ROWS);
 
     let received = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
         .await

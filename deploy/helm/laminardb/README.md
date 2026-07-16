@@ -51,6 +51,7 @@ laminardb:
     url: "az://laminardb-checkpoints/cluster"
     
   cluster:
+    keyGroups: 256
     discovery:
       strategy: gossip
       gossipPort: 7946
@@ -169,6 +170,7 @@ prometheusRule:
 | `laminardb.checkpoint.interval` | Checkpoint frequency | `30s` |
 | `laminardb.checkpoint.url` | Checkpoint storage: object store (`s3://`, `gs://`, `az://`) or local `file://`. Empty = local default. | `""` |
 | `laminardb.configWatch` | Hot-reload config on file change. Off in K8s (config changes roll pods via the checksum annotation); sets `LAMINAR_DISABLE_FILE_WATCH=1`. | `false` |
+| `laminardb.cluster.keyGroups` | Stable hash partitions used for cluster placement and rescaling | `256` |
 | `laminardb.cluster.discovery.strategy` | Discovery method (`gossip`, `static`) | `gossip` |
 | `persistence.state.enabled` | Keep local state in Persistent Volume | `true` |
 | `persistence.state.storageClass` | K8s storage class for state PVC | `""` (default) |

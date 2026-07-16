@@ -60,6 +60,19 @@ async fn make_coordinator(dir: &std::path::Path) -> CheckpointCoordinator {
     make_coordinator_with_decision_store(dir).await.0
 }
 
+async fn make_coordinator_with_key_groups(
+    dir: &std::path::Path,
+    key_group_capacity: u32,
+) -> CheckpointCoordinator {
+    let key_group_count = laminar_core::state::KeyGroupCount::try_from(key_group_capacity).unwrap();
+    let store = Box::new(FileSystemCheckpointStore::new(dir).with_key_group_count(key_group_count));
+    let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
+        .await
+        .unwrap();
+    bind_in_memory_decision_store(&mut coord).await;
+    coord
+}
+
 #[cfg(feature = "cluster")]
 fn one_vnode_full_state(bytes: &'static [u8]) -> StagedVnodeStates {
     std::collections::HashMap::from([(
@@ -238,7 +251,21 @@ async fn make_cluster_coordinator(
     dir: &std::path::Path,
     participant_id: u64,
 ) -> ClusterTestCoordinator {
-    let store = Box::new(FileSystemCheckpointStore::new(dir).with_participant_id(participant_id));
+    make_cluster_coordinator_with_key_groups(dir, participant_id, 1).await
+}
+
+#[cfg(feature = "cluster")]
+async fn make_cluster_coordinator_with_key_groups(
+    dir: &std::path::Path,
+    participant_id: u64,
+    key_group_capacity: u32,
+) -> ClusterTestCoordinator {
+    let key_group_count = laminar_core::state::KeyGroupCount::try_from(key_group_capacity).unwrap();
+    let store = Box::new(
+        FileSystemCheckpointStore::new(dir)
+            .with_key_group_count(key_group_count)
+            .with_participant_id(participant_id),
+    );
     let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
         .await
         .unwrap();
@@ -249,7 +276,11 @@ async fn make_cluster_coordinator(
     coord.set_decision_store(decisions).unwrap();
     coord.bind_deployment_id(deployment_id).unwrap();
     coord.set_assignment_version(1);
-    coord.set_state_backend(Arc::new(laminar_core::state::InProcessBackend::new(1)));
+    coord
+        .set_state_backend(Arc::new(laminar_core::state::InProcessBackend::new(
+            key_group_capacity,
+        )))
+        .unwrap();
     ClusterTestCoordinator {
         coordinator: coord,
         checkpoint_store,
@@ -625,6 +656,24 @@ async fn test_coordinator_new() {
 }
 
 #[tokio::test]
+async fn state_backend_capacity_must_match_checkpoint_store_before_installation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut coord = make_coordinator(dir.path()).await;
+
+    let error = coord
+        .set_state_backend(Arc::new(laminar_core::state::InProcessBackend::new(2)))
+        .expect_err("a two-key-group backend must not bind to the local one-key-group store");
+
+    assert!(matches!(
+        error,
+        DbError::Config(message)
+            if message
+                == "state backend key-group capacity 2 does not match checkpoint store key-group count 1"
+    ));
+    assert!(coord.state_backend.is_none());
+}
+
+#[tokio::test]
 async fn coordinator_construction_rejects_exhausted_manifest_epoch() {
     let dir = tempfile::tempdir().unwrap();
     let store = FileSystemCheckpointStore::new(dir.path());
@@ -962,11 +1011,12 @@ async fn test_checkpoint_no_sources_no_sinks() {
 }
 
 #[tokio::test]
-async fn checkpoint_manifest_uses_the_configured_vnode_count() {
-    const VNODE_COUNT: u16 = 64;
+async fn checkpoint_manifest_uses_the_configured_key_group_count() {
+    let key_group_count = laminar_core::state::KeyGroupCount::try_from(64_u16).unwrap();
 
     let dir = tempfile::tempdir().unwrap();
-    let store = Box::new(FileSystemCheckpointStore::new(dir.path()).with_vnode_count(VNODE_COUNT));
+    let store =
+        Box::new(FileSystemCheckpointStore::new(dir.path()).with_key_group_count(key_group_count));
     let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
         .await
         .unwrap();
@@ -979,7 +1029,7 @@ async fn checkpoint_manifest_uses_the_configured_vnode_count() {
     assert!(result.success);
 
     let finalized = coord.store().load_latest().await.unwrap().unwrap();
-    assert_eq!(finalized.vnode_count, VNODE_COUNT);
+    assert_eq!(finalized.vnode_count, key_group_count.get());
     assert_eq!(
         finalized.durable_phase,
         laminar_core::storage::checkpoint_manifest::DurableCheckpointPhase::Finalized
@@ -1282,9 +1332,9 @@ async fn durability_gate_skipped_when_vnode_set_empty() {
 async fn bridge_writes_markers_and_gate_passes() {
     use laminar_core::state::InProcessBackend;
     let dir = tempfile::tempdir().unwrap();
-    let mut coord = make_coordinator(dir.path()).await;
+    let mut coord = make_coordinator_with_key_groups(dir.path(), 4).await;
     let backend = Arc::new(InProcessBackend::new(4));
-    coord.set_state_backend(backend.clone());
+    coord.set_state_backend(backend.clone()).unwrap();
     coord.set_vnode_set(vec![0, 1, 2, 3]);
 
     let result = coord
@@ -1367,7 +1417,7 @@ async fn reconcile_announces_commit_when_marker_present() {
         Some(capsule),
     )
     .await;
-    coord.set_state_backend(backend);
+    coord.set_state_backend(backend).unwrap();
 
     coord.reconcile_prepared_on_init().await.unwrap();
 
@@ -1502,7 +1552,7 @@ async fn reconcile_rolls_back_participant_excluded_from_exact_decision() {
         Some(capsule),
     )
     .await;
-    coordinator.set_state_backend(backend);
+    coordinator.set_state_backend(backend).unwrap();
 
     coordinator.reconcile_prepared_on_init().await.unwrap();
 
@@ -1524,12 +1574,12 @@ async fn follower_checkpoint_commits_on_leader_commit() {
     use laminar_core::cluster::discovery::{NodeId, NodeInfo, NodeMetadata, NodeState};
     use tokio::sync::watch;
 
-    const VNODE_COUNT: u16 = 64;
+    let key_group_count = laminar_core::state::KeyGroupCount::try_from(64_u16).unwrap();
 
     let dir = tempfile::tempdir().unwrap();
     let store = Box::new(
         FileSystemCheckpointStore::new(dir.path())
-            .with_vnode_count(VNODE_COUNT)
+            .with_key_group_count(key_group_count)
             .with_participant_id(7),
     );
     let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
@@ -1544,9 +1594,11 @@ async fn follower_checkpoint_commits_on_leader_commit() {
         .unwrap();
     coord.bind_deployment_id(deployment_id).unwrap();
     coord.set_assignment_version(1);
-    coord.set_state_backend(Arc::new(laminar_core::state::InProcessBackend::new(
-        u32::from(VNODE_COUNT),
-    )));
+    coord
+        .set_state_backend(Arc::new(laminar_core::state::InProcessBackend::new(
+            u32::from(key_group_count),
+        )))
+        .unwrap();
 
     let leader_id = NodeId(1);
     let follower_id = NodeId(7);
@@ -1637,7 +1689,7 @@ async fn follower_checkpoint_commits_on_leader_commit() {
     // Follower's manifest is on disk at the leader's epoch.
     let stored = coord.store().load_latest().await.unwrap().unwrap();
     assert_eq!(stored.epoch, 1);
-    assert_eq!(stored.vnode_count, VNODE_COUNT);
+    assert_eq!(stored.vnode_count, key_group_count.get());
 }
 
 #[cfg(feature = "cluster")]
@@ -1656,12 +1708,10 @@ async fn follower_commit_prunes_its_local_manifests_without_advancing_shared_gc(
     let decision_store = in_memory_decision_store_on(Arc::clone(&authority_store));
     let deployment_id = decision_store.load_or_create_deployment_id().await.unwrap();
     let pipeline_identity = PipelineIdentity::empty();
-    let writer = FileSystemCheckpointStore::new(dir.path())
-        .with_vnode_count(1)
-        .with_participant_id(PARTICIPANT_ID);
+    let writer = FileSystemCheckpointStore::new(dir.path()).with_participant_id(PARTICIPANT_ID);
     let mut retained_manifest = None;
     for epoch in 1..=4 {
-        let mut manifest = CheckpointManifest::new_with_vnode_count(epoch, epoch, 1);
+        let mut manifest = CheckpointManifest::new(epoch, epoch);
         manifest.participant_id = PARTICIPANT_ID;
         manifest.deployment_id.clone_from(&deployment_id);
         manifest.pipeline_identity.clone_from(&pipeline_identity);
@@ -1676,11 +1726,8 @@ async fn follower_commit_prunes_its_local_manifests_without_advancing_shared_gc(
         max_retained: 1,
         ..CheckpointConfig::default()
     };
-    let store = Box::new(
-        FileSystemCheckpointStore::new(dir.path())
-            .with_vnode_count(1)
-            .with_participant_id(PARTICIPANT_ID),
-    );
+    let store =
+        Box::new(FileSystemCheckpointStore::new(dir.path()).with_participant_id(PARTICIPANT_ID));
     let mut coord = CheckpointCoordinator::new(config, store).await.unwrap();
     coord
         .set_decision_store(Arc::clone(&decision_store))
@@ -1809,7 +1856,9 @@ async fn follower_commit_prunes_its_local_manifests_without_advancing_shared_gc(
             .unwrap(),
         3
     );
-    coord.set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>);
+    coord
+        .set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>)
+        .unwrap();
 
     assert!(coord.follower_finish(4, 4, true).await.unwrap());
     assert_eq!(
@@ -1827,9 +1876,7 @@ async fn follower_commit_prunes_its_local_manifests_without_advancing_shared_gc(
         "follower retention must only read, never advance, the shared floor"
     );
 
-    let reader = FileSystemCheckpointStore::new(dir.path())
-        .with_vnode_count(1)
-        .with_participant_id(PARTICIPANT_ID);
+    let reader = FileSystemCheckpointStore::new(dir.path()).with_participant_id(PARTICIPANT_ID);
     let ids = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let ids = match reader.list_ids().await {
@@ -2690,7 +2737,9 @@ async fn leader_loss_after_durable_decision_never_finalizes_or_reports_success()
     publish_test_assignment_fence(&controller, 1);
     coord.set_cluster_controller(Arc::clone(&controller));
     coord.set_assignment_version(1);
-    coord.set_state_backend(Arc::new(laminar_core::state::InProcessBackend::new(1)));
+    coord
+        .set_state_backend(Arc::new(laminar_core::state::InProcessBackend::new(1)))
+        .unwrap();
     coord.set_vnode_set(vec![0]);
 
     let decision_store =
@@ -2805,7 +2854,7 @@ async fn follower_prepare_failure_overwrites_capture_ack() {
     use tokio::sync::watch;
 
     let dir = tempfile::tempdir().unwrap();
-    let mut coord = make_coordinator(dir.path()).await;
+    let mut coord = make_coordinator_with_key_groups(dir.path(), 2).await;
 
     let leader_id = NodeId(1);
     let follower_id = NodeId(7);
@@ -2836,7 +2885,9 @@ async fn follower_prepare_failure_overwrites_capture_ack() {
     coord.set_cluster_controller(controller);
     // Backend sized for 2 vnodes but the follower claims vnode 99 —
     // `write_vnode_partials` (the last prepare step) fails.
-    coord.set_state_backend(Arc::new(InProcessBackend::new(2)));
+    coord
+        .set_state_backend(Arc::new(InProcessBackend::new(2)))
+        .unwrap();
     coord.set_vnode_set(vec![99]);
 
     let ann = BarrierAnnouncement {
@@ -2898,7 +2949,7 @@ async fn cluster_watermark_remains_decision_bound_across_commit_and_recovery() {
     coord.bind_deployment_id(deployment_id).unwrap();
     coord.set_assignment_version(1);
     let state_backend = Arc::new(laminar_core::state::InProcessBackend::new(1));
-    coord.set_state_backend(state_backend.clone());
+    coord.set_state_backend(state_backend.clone()).unwrap();
     coord.set_vnode_set(vec![0]);
 
     let self_id = NodeId(1);
@@ -2959,7 +3010,9 @@ async fn cluster_watermark_remains_decision_bound_across_commit_and_recovery() {
         .bind_deployment_id(coord.expected_deployment_id().unwrap().to_owned())
         .unwrap();
     recovered_coord.set_assignment_version(1);
-    recovered_coord.set_state_backend(state_backend.clone());
+    recovered_coord
+        .set_state_backend(state_backend.clone())
+        .unwrap();
 
     let recovery_kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(self_id));
     let (_recovery_tx, recovery_rx) = watch::channel(Vec::new());
@@ -3007,7 +3060,9 @@ async fn cluster_watermark_remains_decision_bound_across_commit_and_recovery() {
         .bind_deployment_id(coord.expected_deployment_id().unwrap().to_owned())
         .unwrap();
     idle_recovered_coord.set_assignment_version(1);
-    idle_recovered_coord.set_state_backend(state_backend);
+    idle_recovered_coord
+        .set_state_backend(state_backend)
+        .unwrap();
 
     let idle_recovery_kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(self_id));
     let (_idle_recovery_tx, idle_recovery_rx) = watch::channel(Vec::new());
@@ -3090,7 +3145,9 @@ async fn leader_announces_prepare_and_commit_on_solo_cluster() {
         .unwrap();
     coord.bind_deployment_id(deployment_id).unwrap();
     coord.set_assignment_version(1);
-    coord.set_state_backend(Arc::new(laminar_core::state::InProcessBackend::new(1)));
+    coord
+        .set_state_backend(Arc::new(laminar_core::state::InProcessBackend::new(1)))
+        .unwrap();
     coord.set_vnode_set(vec![0]);
 
     let self_id = NodeId(1);
@@ -3156,9 +3213,9 @@ async fn gate_checks_full_registry_not_just_owned() {
     // gate must fail even though the leader wrote its own.
     use laminar_core::state::InProcessBackend;
     let dir = tempfile::tempdir().unwrap();
-    let mut coord = make_coordinator(dir.path()).await;
+    let mut coord = make_coordinator_with_key_groups(dir.path(), 4).await;
     let backend = Arc::new(InProcessBackend::new(4));
-    coord.set_state_backend(backend.clone());
+    coord.set_state_backend(backend.clone()).unwrap();
     coord.set_vnode_set(vec![0, 1]); // leader's owned subset
     coord.set_gate_vnode_set(vec![0, 1, 2, 3]); // full cluster registry
     let attempt = CheckpointAttempt::new(1, 1);
@@ -3193,9 +3250,9 @@ async fn source_offset_handoff_round_trip() {
     use bytes::Bytes;
     use laminar_core::state::{InProcessBackend, StateBackend};
     let dir = tempfile::tempdir().unwrap();
-    let mut coord = make_cluster_coordinator(dir.path(), 1).await;
+    let mut coord = make_cluster_coordinator_with_key_groups(dir.path(), 1, 4).await;
     let backend = Arc::new(InProcessBackend::new(4));
-    coord.set_state_backend(backend.clone());
+    coord.set_state_backend(backend.clone()).unwrap();
     coord.set_assignment_version(1);
     coord.set_vnode_set(vec![0, 1, 2, 3]);
     let _leader_lease = attach_cluster_controller(&mut coord, 1, &[]).await;
@@ -3319,7 +3376,7 @@ async fn source_handoff_ignores_a_newer_undecided_seal() {
     let decided = CheckpointAttempt::new(4, 5);
     let prepared = CheckpointAttempt::new(8, 9);
     let backend = Arc::new(laminar_core::state::InProcessBackend::new(1));
-    coord.set_state_backend(backend.clone());
+    coord.set_state_backend(backend.clone()).unwrap();
     coord.set_assignment_version(1);
     coord.set_vnode_set(vec![0]);
     let _leader_lease = attach_cluster_controller(&mut coord, 1, &[]).await;
@@ -3388,7 +3445,7 @@ async fn source_handoff_rejects_a_highest_decision_without_its_exact_seal() {
     let valid = CheckpointAttempt::new(4, 5);
     let missing = CheckpointAttempt::new(8, 9);
     let backend = Arc::new(laminar_core::state::InProcessBackend::new(1));
-    coord.set_state_backend(backend.clone());
+    coord.set_state_backend(backend.clone()).unwrap();
     coord.set_assignment_version(1);
     coord.set_vnode_set(vec![0]);
     let _leader_lease = attach_cluster_controller(&mut coord, 1, &[]).await;
@@ -3444,9 +3501,9 @@ async fn recovery_capsules_preserve_each_decided_source_cut() {
     use bytes::Bytes;
     use laminar_core::state::{InProcessBackend, StateBackend};
     let dir = tempfile::tempdir().unwrap();
-    let mut coord = make_cluster_coordinator(dir.path(), 1).await;
+    let mut coord = make_cluster_coordinator_with_key_groups(dir.path(), 1, 4).await;
     let backend = Arc::new(InProcessBackend::new(4));
-    coord.set_state_backend(backend.clone());
+    coord.set_state_backend(backend.clone()).unwrap();
     coord.set_assignment_version(1);
     coord.set_vnode_set(vec![0, 1, 2, 3]);
     let _leader_lease = attach_cluster_controller(&mut coord, 1, &[]).await;
@@ -3561,7 +3618,7 @@ async fn seal_requires_readiness_from_zero_vnode_participants() {
     let dir = tempfile::tempdir().unwrap();
     let mut coord = make_cluster_coordinator(dir.path(), 1).await;
     let backend = Arc::new(InProcessBackend::new(1));
-    coord.set_state_backend(backend.clone());
+    coord.set_state_backend(backend.clone()).unwrap();
     coord.set_assignment_version(9);
     coord.set_vnode_set(vec![0]);
     let _leader_lease = attach_cluster_controller(&mut coord, 1, &[2]).await;
@@ -3691,7 +3748,7 @@ async fn readiness_rejects_overlapping_vnode_ownership() {
     let dir = tempfile::tempdir().unwrap();
     let mut coord = make_cluster_coordinator(dir.path(), 1).await;
     let backend = Arc::new(InProcessBackend::new(1));
-    coord.set_state_backend(backend.clone());
+    coord.set_state_backend(backend.clone()).unwrap();
     coord.set_assignment_version(9);
     coord.set_vnode_set(vec![0]);
     let _leader_lease = attach_cluster_controller(&mut coord, 1, &[2]).await;
@@ -3849,7 +3906,7 @@ async fn recovery_rejects_decision_with_a_different_sealed_assignment() {
     let mut coord = make_cluster_coordinator(dir.path(), 1).await;
     let decisions = Arc::clone(coord.decision_store.as_ref().unwrap());
     let backend = Arc::new(InProcessBackend::new(1));
-    coord.set_state_backend(backend.clone());
+    coord.set_state_backend(backend.clone()).unwrap();
     coord.set_assignment_version(2);
     coord.set_vnode_set(vec![0]);
     let _leader_lease = attach_cluster_controller(&mut coord, 1, &[]).await;
@@ -3932,7 +3989,7 @@ async fn restorable_gate_waits_for_async_follower_uploads() {
     use bytes::Bytes;
     use laminar_core::state::InProcessBackend;
     let dir = tempfile::tempdir().unwrap();
-    let mut coord = make_coordinator(dir.path()).await;
+    let mut coord = make_coordinator_with_key_groups(dir.path(), 4).await;
     let backend = Arc::new(InProcessBackend::new(4));
     // Leader's own partials are present; the "follower's" vnodes
     // {2, 3} land only after a delay, simulating its background
@@ -3955,7 +4012,7 @@ async fn restorable_gate_waits_for_async_follower_uploads() {
                 .unwrap();
         }
     });
-    coord.set_state_backend(backend);
+    coord.set_state_backend(backend).unwrap();
     coord.set_vnode_set(vec![0, 1]);
     coord.set_gate_vnode_set(vec![0, 1, 2, 3]);
 
@@ -3984,7 +4041,7 @@ async fn restorable_gate_exits_when_assignment_fence_changes_while_waiting() {
     use tokio::sync::watch;
 
     let dir = tempfile::tempdir().unwrap();
-    let mut coord = make_coordinator(dir.path()).await;
+    let mut coord = make_coordinator_with_key_groups(dir.path(), 2).await;
     coord.set_assignment_version(1);
     let backend = Arc::new(FaultBackend {
         inner: laminar_core::state::InProcessBackend::new(2),
@@ -4000,7 +4057,7 @@ async fn restorable_gate_exits_when_assignment_fence_changes_while_waiting() {
         .write_partial(attempt, 0, 1, Bytes::from_static(b"leader"))
         .await
         .unwrap();
-    coord.set_state_backend(backend);
+    coord.set_state_backend(backend).unwrap();
     coord.set_gate_vnode_set(vec![0, 1]);
 
     let self_id = NodeId(1);
@@ -4046,7 +4103,7 @@ async fn restorable_gate_rejects_same_version_roster_replacement() {
     use tokio::sync::watch;
 
     let dir = tempfile::tempdir().unwrap();
-    let mut coord = make_coordinator(dir.path()).await;
+    let mut coord = make_coordinator_with_key_groups(dir.path(), 2).await;
     coord.set_assignment_version(1);
     let backend = Arc::new(FaultBackend {
         inner: laminar_core::state::InProcessBackend::new(2),
@@ -4062,7 +4119,7 @@ async fn restorable_gate_rejects_same_version_roster_replacement() {
         .write_partial(attempt, 0, 1, Bytes::from_static(b"leader"))
         .await
         .unwrap();
-    coord.set_state_backend(backend);
+    coord.set_state_backend(backend).unwrap();
     coord.set_gate_vnode_set(vec![0, 1]);
 
     let self_id = NodeId(1);
@@ -4111,7 +4168,7 @@ async fn gate_passes_when_all_registry_markers_present() {
     use bytes::Bytes;
     use laminar_core::state::InProcessBackend;
     let dir = tempfile::tempdir().unwrap();
-    let mut coord = make_coordinator(dir.path()).await;
+    let mut coord = make_coordinator_with_key_groups(dir.path(), 4).await;
     let backend = Arc::new(InProcessBackend::new(4));
     // Simulate the follower's prior write on vnodes {2, 3} for the
     // epoch the leader is about to use (fresh store starts at 1).
@@ -4124,7 +4181,7 @@ async fn gate_passes_when_all_registry_markers_present() {
         .write_partial(attempt, 3, 0, Bytes::from_static(b"follower"))
         .await
         .unwrap();
-    coord.set_state_backend(backend);
+    coord.set_state_backend(backend).unwrap();
     coord.set_vnode_set(vec![0, 1]);
     coord.set_gate_vnode_set(vec![0, 1, 2, 3]);
 
@@ -4139,10 +4196,12 @@ async fn gate_passes_when_all_registry_markers_present() {
 async fn marker_write_failure_aborts_checkpoint() {
     use laminar_core::state::InProcessBackend;
     let dir = tempfile::tempdir().unwrap();
-    let mut coord = make_coordinator(dir.path()).await;
+    let mut coord = make_coordinator_with_key_groups(dir.path(), 2).await;
     // Backend is sized for 2 vnodes, but we claim to own vnode 99 →
     // bridge fails its write, checkpoint aborts cleanly.
-    coord.set_state_backend(Arc::new(InProcessBackend::new(2)));
+    coord
+        .set_state_backend(Arc::new(InProcessBackend::new(2)))
+        .unwrap();
     coord.set_vnode_set(vec![0, 99]);
 
     let result = coord
@@ -4170,11 +4229,15 @@ async fn unchanged_vnode_state_becomes_reference_partial() {
         max_retained: 3, // reference age cap = 3 epochs
         ..CheckpointConfig::default()
     };
-    let store = Box::new(FileSystemCheckpointStore::new(dir.path()));
+    let key_group_count = laminar_core::state::KeyGroupCount::try_from(2_u32).unwrap();
+    let store =
+        Box::new(FileSystemCheckpointStore::new(dir.path()).with_key_group_count(key_group_count));
     let mut coord = CheckpointCoordinator::new(config, store).await.unwrap();
     bind_in_memory_decision_store(&mut coord).await;
     let backend = Arc::new(InProcessBackend::new(2));
-    coord.set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>);
+    coord
+        .set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>)
+        .unwrap();
     coord.set_vnode_set(vec![0]);
 
     let slices = || {
@@ -4289,7 +4352,9 @@ async fn allocator_epoch_jump_rejects_delta_before_prepared_artifacts() {
     let mut coord = make_coordinator(dir.path()).await;
     coord.configure_state_ancestry(Some(2));
     let backend = Arc::new(InProcessBackend::new(1));
-    coord.set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>);
+    coord
+        .set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>)
+        .unwrap();
     coord.set_vnode_set(vec![0]);
 
     coord.set_pending_vnode_states(one_vnode_full_state(b"full"));
@@ -4372,7 +4437,9 @@ async fn coordinator_rejects_delta_depth_beyond_runtime_bound() {
     let mut coord = make_coordinator(dir.path()).await;
     coord.configure_state_ancestry(Some(1));
     let backend = Arc::new(InProcessBackend::new(1));
-    coord.set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>);
+    coord
+        .set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>)
+        .unwrap();
     coord.set_vnode_set(vec![0]);
 
     coord.set_pending_vnode_states(one_vnode_full_state(b"full"));
@@ -4440,7 +4507,9 @@ async fn reference_resets_bounded_delta_depth_without_hiding_its_root() {
     let mut coord = make_coordinator(dir.path()).await;
     coord.configure_state_ancestry(Some(1));
     let backend = Arc::new(InProcessBackend::new(1));
-    coord.set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>);
+    coord
+        .set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>)
+        .unwrap();
     coord.set_vnode_set(vec![0]);
 
     coord.set_pending_vnode_states(one_vnode_full_state(b"stable-full"));
@@ -4508,7 +4577,9 @@ async fn unsealed_staged_delta_cannot_parent_the_next_capture() {
     let mut coord = make_coordinator(dir.path()).await;
     coord.configure_state_ancestry(Some(2));
     let backend = Arc::new(InProcessBackend::new(1));
-    coord.set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>);
+    coord
+        .set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>)
+        .unwrap();
     coord.set_vnode_set(vec![0]);
 
     coord.set_pending_vnode_states(one_vnode_full_state(b"full"));
@@ -4564,7 +4635,9 @@ async fn mixed_delta_partial_cannot_seed_a_reference_chain() {
     let mut coord = make_coordinator(dir.path()).await;
     coord.configure_state_ancestry(Some(2));
     let backend = Arc::new(InProcessBackend::new(1));
-    coord.set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>);
+    coord
+        .set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>)
+        .unwrap();
     coord.set_vnode_set(vec![0]);
 
     coord.set_pending_vnode_states(one_vnode_full_state(b"agg-full"));
@@ -4705,6 +4778,10 @@ impl Drop for WriteProbeGuard {
 
 #[async_trait::async_trait]
 impl StateBackend for FaultBackend {
+    fn key_group_capacity(&self) -> u32 {
+        self.inner.key_group_capacity()
+    }
+
     async fn write_partial(
         &self,
         attempt: CheckpointAttempt,
@@ -4888,8 +4965,10 @@ async fn vnode_partial_write_fanout_is_bounded() {
         descriptor_error_after_write: false,
     });
     let dir = tempfile::tempdir().unwrap();
-    let mut coord = make_coordinator(dir.path()).await;
-    coord.set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>);
+    let mut coord = make_coordinator_with_key_groups(dir.path(), vnode_count_u32).await;
+    coord
+        .set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>)
+        .unwrap();
     coord.set_vnode_set((0..vnode_count_u32).collect());
 
     let attempt = CheckpointAttempt::new(1, 1);
@@ -4954,11 +5033,7 @@ async fn vnode_partial_write_fanout_is_bounded() {
 #[allow(clippy::too_many_lines)] // four-epoch fault sequence reads better unsplit
 async fn overlapping_epoch_failure_is_isolated() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Box::new(FileSystemCheckpointStore::new(dir.path()));
-    let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
-        .await
-        .unwrap();
-    bind_in_memory_decision_store(&mut coord).await;
+    let mut coord = make_coordinator_with_key_groups(dir.path(), 2).await;
     let backend = Arc::new(FaultBackend {
         inner: laminar_core::state::InProcessBackend::new(2),
         fail: parking_lot::Mutex::new(std::collections::HashSet::new()),
@@ -4968,7 +5043,9 @@ async fn overlapping_epoch_failure_is_isolated() {
         #[cfg(feature = "cluster")]
         descriptor_error_after_write: false,
     });
-    coord.set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>);
+    coord
+        .set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>)
+        .unwrap();
     coord.set_vnode_set(vec![0, 1]);
 
     let allocator = coord.epoch_allocator();
@@ -5687,7 +5764,9 @@ async fn landed_follower_readiness_with_lost_ack_never_rolls_back() {
         #[cfg(feature = "cluster")]
         descriptor_error_after_write: true,
     });
-    coord.set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>);
+    coord
+        .set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>)
+        .unwrap();
 
     let rollbacks = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
@@ -6604,8 +6683,10 @@ async fn coordinated_sink_idle_epoch_still_seals() {
     use laminar_core::state::{InProcessBackend, StateBackend};
 
     let dir = tempfile::tempdir().unwrap();
-    let mut coord = make_coordinator(dir.path()).await;
-    coord.set_state_backend(Arc::new(InProcessBackend::new(2)) as Arc<dyn StateBackend>);
+    let mut coord = make_coordinator_with_key_groups(dir.path(), 2).await;
+    coord
+        .set_state_backend(Arc::new(InProcessBackend::new(2)) as Arc<dyn StateBackend>)
+        .unwrap();
 
     let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
     let (event_tx, _rx) = laminar_core::streaming::channel::channel::<crate::sink_task::SinkEvent>(
@@ -6682,9 +6763,11 @@ async fn coordinated_sink_descriptor_persisted_and_gated() {
     use laminar_core::state::{InProcessBackend, StateBackend};
 
     let dir = tempfile::tempdir().unwrap();
-    let mut coord = make_coordinator(dir.path()).await;
+    let mut coord = make_coordinator_with_key_groups(dir.path(), 2).await;
     let backend = Arc::new(InProcessBackend::new(2));
-    coord.set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>);
+    coord
+        .set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>)
+        .unwrap();
 
     let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
     let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<

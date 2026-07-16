@@ -7,21 +7,15 @@
 
 use std::collections::HashMap;
 
-/// Default virtual partition count for state key distribution.
-///
-/// Manifests are written with this value unless the caller overrides via
-/// [`CheckpointManifest::new_with_vnode_count`]. `CheckpointStore`
-/// impls pass the runtime value into [`CheckpointManifest::validate`]
-/// so a manifest written with a different count is flagged on restore.
-pub const DEFAULT_VNODE_COUNT: u16 = 256;
+use crate::state::{KeyGroupCount, LOCAL_KEY_GROUP_COUNT, PARTITIONING_ABI_VERSION};
 
 /// Current checkpoint manifest format. Older manifests are rejected rather
 /// than guessed at recovery time.
-/// Version 5 adds a typed, provider-neutral source-assignment cut.
-pub const CHECKPOINT_MANIFEST_VERSION: u32 = 5;
+/// Version 6 binds recovery to the durable key-partitioning ABI.
+pub const CHECKPOINT_MANIFEST_VERSION: u32 = 6;
 
 /// Canonical pipeline-identity payload version.
-pub const PIPELINE_IDENTITY_VERSION: u16 = 2;
+pub const PIPELINE_IDENTITY_VERSION: u16 = 3;
 
 /// SHA-256 identity of the logical pipeline and recovery-state ABI.
 ///
@@ -142,6 +136,8 @@ pub struct CheckpointManifest {
     pub deployment_id: String,
 
     // ── Metadata ──
+    /// Durable key encoding, hashing, and key-group mapping contract.
+    pub partitioning_abi_version: u16,
     /// Virtual partition count for state key distribution.
     #[serde(default)]
     pub vnode_count: u16,
@@ -171,15 +167,17 @@ impl std::fmt::Display for ManifestValidationError {
 impl CheckpointManifest {
     /// Validates manifest consistency before recovery.
     ///
-    /// `expected_vnode_count` is the runtime's configured vnode count;
+    /// `expected_key_group_count` is the runtime's configured key-group count;
     /// a manifest written with a different count can't be safely restored
-    /// because state keys won't map to the same shards. Pass
-    /// [`DEFAULT_VNODE_COUNT`] if the runtime hasn't overridden it.
+    /// because state keys won't map to the same shards.
     ///
     /// Returns a list of issues found. An empty list means the manifest is valid.
     /// Every returned issue makes the manifest ineligible for recovery.
     #[must_use]
-    pub fn validate(&self, expected_vnode_count: u16) -> Vec<ManifestValidationError> {
+    pub fn validate(
+        &self,
+        expected_key_group_count: KeyGroupCount,
+    ) -> Vec<ManifestValidationError> {
         let mut errors = Vec::new();
 
         if self.version != CHECKPOINT_MANIFEST_VERSION {
@@ -187,6 +185,15 @@ impl CheckpointManifest {
                 message: format!(
                     "unsupported manifest version {}; expected {CHECKPOINT_MANIFEST_VERSION}",
                     self.version
+                ),
+            });
+        }
+
+        if self.partitioning_abi_version != PARTITIONING_ABI_VERSION {
+            errors.push(ManifestValidationError {
+                message: format!(
+                    "partitioning ABI mismatch: checkpoint has {}, runtime expects {PARTITIONING_ABI_VERSION}",
+                    self.partitioning_abi_version
                 ),
             });
         }
@@ -237,10 +244,10 @@ impl CheckpointManifest {
             errors.push(ManifestValidationError {
                 message: "vnode_count is 0 (missing or legacy checkpoint)".into(),
             });
-        } else if self.vnode_count != expected_vnode_count {
+        } else if self.vnode_count != expected_key_group_count.get() {
             errors.push(ManifestValidationError {
                 message: format!(
-                    "vnode_count mismatch: checkpoint has {}, runtime expects {expected_vnode_count}",
+                    "vnode_count mismatch: checkpoint has {}, runtime expects {expected_key_group_count}",
                     self.vnode_count,
                 ),
             });
@@ -255,17 +262,19 @@ impl CheckpointManifest {
         errors
     }
 
-    /// Creates a new manifest with the given ID and epoch, using the
-    /// default vnode count. Use [`Self::new_with_vnode_count`] when a
-    /// pipeline runs with a non-default vnode count.
+    /// Creates a new manifest for an embedded or single-node runtime.
     #[must_use]
     pub fn new(checkpoint_id: u64, epoch: u64) -> Self {
-        Self::new_with_vnode_count(checkpoint_id, epoch, DEFAULT_VNODE_COUNT)
+        Self::new_with_key_group_count(checkpoint_id, epoch, LOCAL_KEY_GROUP_COUNT)
     }
 
-    /// Creates a new manifest with an explicit vnode count.
+    /// Creates a new manifest with an explicit stable key-group count.
     #[must_use]
-    pub fn new_with_vnode_count(checkpoint_id: u64, epoch: u64, vnode_count: u16) -> Self {
+    pub fn new_with_key_group_count(
+        checkpoint_id: u64,
+        epoch: u64,
+        key_group_count: KeyGroupCount,
+    ) -> Self {
         #[allow(clippy::cast_possible_truncation)] // u64 millis won't overflow until year 584M
         let timestamp_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -289,7 +298,8 @@ impl CheckpointManifest {
             sink_names: Vec::new(),
             pipeline_identity: PipelineIdentity::empty(),
             deployment_id: String::new(),
-            vnode_count,
+            partitioning_abi_version: PARTITIONING_ABI_VERSION,
+            vnode_count: key_group_count.get(),
             state_checksum: None,
         }
     }
@@ -483,12 +493,24 @@ mod tests {
     fn test_manifest_new() {
         let m = CheckpointManifest::new(1, 5);
         assert_eq!(m.version, CHECKPOINT_MANIFEST_VERSION);
+        assert_eq!(m.partitioning_abi_version, PARTITIONING_ABI_VERSION);
         assert_eq!(m.durable_phase, DurableCheckpointPhase::Prepared);
         assert_eq!(m.checkpoint_id, 1);
         assert_eq!(m.epoch, 5);
+        assert_eq!(m.vnode_count, LOCAL_KEY_GROUP_COUNT.get());
         assert!(m.timestamp_ms > 0);
         assert!(m.source_offsets.is_empty());
         assert!(m.operator_states.is_empty());
+    }
+
+    #[test]
+    fn test_manifest_new_with_explicit_key_group_count() {
+        let key_group_count = KeyGroupCount::try_from(256_u16).unwrap();
+        let manifest = CheckpointManifest::new_with_key_group_count(1, 5, key_group_count);
+
+        assert_eq!(manifest.vnode_count, key_group_count.get());
+        assert!(manifest.validate(key_group_count).is_empty());
+        assert!(!manifest.validate(LOCAL_KEY_GROUP_COUNT).is_empty());
     }
 
     #[test]
@@ -525,7 +547,7 @@ mod tests {
         manifest.version = CHECKPOINT_MANIFEST_VERSION - 1;
         let restored: CheckpointManifest =
             serde_json::from_str(&serde_json::to_string(&manifest).unwrap()).unwrap();
-        let errors = restored.validate(DEFAULT_VNODE_COUNT);
+        let errors = restored.validate(LOCAL_KEY_GROUP_COUNT);
         let previous = CHECKPOINT_MANIFEST_VERSION - 1;
         assert!(
             errors.iter().any(|error| error
@@ -626,13 +648,38 @@ mod tests {
     }
 
     #[test]
+    fn test_manifest_requires_partitioning_abi() {
+        let manifest = CheckpointManifest::new(5, 3);
+        let mut value = serde_json::to_value(manifest).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("partitioning_abi_version");
+        assert!(serde_json::from_value::<CheckpointManifest>(value).is_err());
+    }
+
+    #[test]
+    fn test_manifest_rejects_wrong_partitioning_abi() {
+        let mut manifest = CheckpointManifest::new(5, 3);
+        manifest.partitioning_abi_version = PARTITIONING_ABI_VERSION + 1;
+
+        let errors = manifest.validate(LOCAL_KEY_GROUP_COUNT);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("partitioning ABI mismatch")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
     fn test_validate_orphaned_source_offset() {
         let mut m = CheckpointManifest::new(1, 1);
         m.source_names = vec!["a".into(), "b".into()];
         m.source_offsets
             .insert("c".into(), ConnectorCheckpoint::new());
 
-        let errors = m.validate(DEFAULT_VNODE_COUNT);
+        let errors = m.validate(LOCAL_KEY_GROUP_COUNT);
         assert!(
             errors
                 .iter()

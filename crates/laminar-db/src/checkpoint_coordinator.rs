@@ -1776,8 +1776,26 @@ impl CheckpointCoordinator {
     }
 
     /// Wire a state backend to enable per-vnode markers and the durability gate.
-    pub fn set_state_backend(&mut self, backend: Arc<dyn StateBackend>) {
+    ///
+    /// # Errors
+    /// Returns [`DbError::Config`] when the backend's key-group capacity is invalid or does not
+    /// match the checkpoint store topology.
+    pub fn set_state_backend(&mut self, backend: Arc<dyn StateBackend>) -> Result<(), DbError> {
+        let capacity = backend.key_group_capacity();
+        let key_groups = laminar_core::state::KeyGroupCount::try_from(capacity).map_err(|_| {
+            DbError::Config(format!(
+                "state backend key-group capacity must be between 1 and {}, got {capacity}",
+                laminar_core::state::MAX_KEY_GROUP_COUNT
+            ))
+        })?;
+        let store_key_groups = self.store.key_group_count();
+        if key_groups != store_key_groups {
+            return Err(DbError::Config(format!(
+                "state backend key-group capacity {key_groups} does not match checkpoint store key-group count {store_key_groups}"
+            )));
+        }
         self.state_backend = Some(backend);
+        Ok(())
     }
 
     /// Install the private runtime-derived ancestry policy for cluster-shared vnode state.
@@ -5250,10 +5268,10 @@ impl CheckpointCoordinator {
             }
         }
 
-        let mut manifest = CheckpointManifest::new_with_vnode_count(
+        let mut manifest = CheckpointManifest::new_with_key_group_count(
             checkpoint_id,
             epoch,
-            self.store.vnode_count(),
+            self.store.key_group_count(),
         );
         manifest.participant_id = self.store.participant_id();
         manifest.source_offsets = source_offset_overrides;
@@ -5442,10 +5460,10 @@ impl CheckpointCoordinator {
             return Ok(self.fail_after_irrevocable_work(checkpoint_id, epoch, start, error));
         }
 
-        let mut manifest = CheckpointManifest::new_with_vnode_count(
+        let mut manifest = CheckpointManifest::new_with_key_group_count(
             checkpoint_id,
             epoch,
-            self.store.vnode_count(),
+            self.store.key_group_count(),
         );
         manifest.participant_id = self.store.participant_id();
         manifest.source_offsets = source_offsets;

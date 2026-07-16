@@ -53,12 +53,6 @@ impl InProcessBackend {
         }
     }
 
-    /// Vnode range this backend is configured for.
-    #[must_use]
-    pub fn vnode_capacity(&self) -> u32 {
-        self.vnode_capacity
-    }
-
     fn check_vnode(&self, v: u32) -> Result<(), StateBackendError> {
         if v >= self.vnode_capacity {
             Err(StateBackendError::Io(format!(
@@ -149,6 +143,10 @@ impl InProcessBackend {
 
 #[async_trait]
 impl StateBackend for InProcessBackend {
+    fn key_group_capacity(&self) -> u32 {
+        self.vnode_capacity
+    }
+
     async fn bind_state_namespace(
         &self,
         deployment_id: &str,

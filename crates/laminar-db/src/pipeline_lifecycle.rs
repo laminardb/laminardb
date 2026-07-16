@@ -1817,10 +1817,7 @@ impl LaminarDB {
                     "checkpoint.timeout_ms must be greater than zero".into(),
                 ));
             }
-            let vnode_count = self.vnode_registry.lock().as_ref().map_or(
-                laminar_core::storage::checkpoint_manifest::DEFAULT_VNODE_COUNT,
-                |r| u16::try_from(r.vnode_count()).unwrap_or(u16::MAX),
-            );
+            let key_group_count = self.checkpoint_key_groups();
 
             let data_dir = cp_config
                 .data_dir
@@ -1872,7 +1869,7 @@ impl LaminarDB {
                 &self.catalog,
                 &self.connector_registry,
                 identity_registrations,
-                vnode_count,
+                key_group_count.get(),
                 participant.is_some(),
             );
             let pipeline_identity = crate::pipeline_identity::compute(&identity_context)?;
@@ -1885,7 +1882,7 @@ impl LaminarDB {
                     Arc::clone(obj),
                     participant.map_or_else(String::new, |id| format!("nodes/{id}/")),
                 )
-                .with_vnode_count(vnode_count)
+                .with_key_group_count(key_group_count)
                 .with_participant_id(participant_id);
                 (Box::new(cs), Arc::clone(obj))
             } else if let Some(ref url) = self.config.object_store_url {
@@ -1898,7 +1895,7 @@ impl LaminarDB {
                     Arc::clone(&obj),
                     participant.map_or_else(String::new, |id| format!("nodes/{id}/")),
                 )
-                .with_vnode_count(vnode_count)
+                .with_key_group_count(key_group_count)
                 .with_participant_id(participant_id);
                 (Box::new(cs), obj)
             } else {
@@ -1915,7 +1912,7 @@ impl LaminarDB {
                 let cs = laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
                     checkpoint_dir,
                 )
-                .with_vnode_count(vnode_count)
+                .with_key_group_count(key_group_count)
                 .with_participant_id(participant_id);
                 (Box::new(cs), obj)
             };
@@ -2015,7 +2012,7 @@ impl LaminarDB {
                 };
                 let version = registry.assignment_version();
                 backend.set_authoritative_version(version);
-                coord.set_state_backend(backend);
+                coord.set_state_backend(backend)?;
                 coord.set_assignment_version(version);
                 coord.set_vnode_set(laminar_core::state::owned_vnodes(&registry, owner));
                 coord.set_gate_vnode_set((0..registry.vnode_count()).collect());
@@ -5369,7 +5366,7 @@ mod exact_deployment_lock_tests {
         std::fs::create_dir_all(state_dir).unwrap();
         let store: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::local::LocalFileSystem::new_with_prefix(state_dir).unwrap());
-        let backend = Arc::new(ObjectStoreBackend::node_durable(store, "node-0", 4));
+        let backend = Arc::new(ObjectStoreBackend::node_durable(store, "node-0", 1));
         crate::db::LaminarDB::builder()
             .storage_dir(checkpoint_dir)
             .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
@@ -5379,7 +5376,7 @@ mod exact_deployment_lock_tests {
             })
             .delivery_guarantee(DeliveryGuarantee::ExactlyOnce)
             .state_backend(backend)
-            .vnode_registry(Arc::new(VnodeRegistry::single_owner(4, NodeId(0))))
+            .vnode_registry(Arc::new(VnodeRegistry::single_owner(1, NodeId(0))))
     }
 
     fn exact_builder(root: &std::path::Path) -> crate::builder::LaminarDbBuilder {
@@ -5448,7 +5445,7 @@ mod exact_deployment_lock_tests {
 
         // Retain committed N and model a crash after a distinct N+1 Prepared manifest became
         // durable but before its create-once terminal outcome became visible.
-        let manifest_store = FileSystemCheckpointStore::new(&checkpoint_dir).with_vnode_count(4);
+        let manifest_store = FileSystemCheckpointStore::new(&checkpoint_dir);
         let committed_manifest = manifest_store
             .load_by_id(committed.checkpoint_id)
             .await

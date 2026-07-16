@@ -12,13 +12,13 @@ node_id = "star-1"
 mode = "cluster"
 bind = "0.0.0.0:8080"
 delivery = "at_least_once"
+key_groups = 256
 metrics_bind = "0.0.0.0:9090"
 workers = 8
 
 [state]
 backend = "object_store"
 url = "s3://laminardb-checkpoints/prod-state"
-vnode_capacity = 256
 
 [checkpoint]
 url = "s3://laminardb-checkpoints/prod"

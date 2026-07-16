@@ -880,13 +880,17 @@ mod two_pc {
         controller: Arc<laminar_core::cluster::control::ClusterController>,
         decision_store: Arc<CheckpointDecisionStore>,
     ) -> CheckpointCoordinator {
+        let key_group_count =
+            laminar_core::state::KeyGroupCount::try_from(backend.key_group_capacity()).unwrap();
         let store = Box::new(
-            FileSystemCheckpointStore::new(dir).with_participant_id(controller.instance_id().0),
+            FileSystemCheckpointStore::new(dir)
+                .with_key_group_count(key_group_count)
+                .with_participant_id(controller.instance_id().0),
         );
         let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
             .await
             .unwrap();
-        coord.set_state_backend(backend);
+        coord.set_state_backend(backend).unwrap();
         coord.set_vnode_set(vnodes);
         coord.set_assignment_version(assignment_fence.assignment_version);
         controller.publish_checkpoint_assignment_fence(Some(assignment_fence.clone()));
@@ -1265,7 +1269,7 @@ mod minio {
     use laminar_core::cluster::testing::MiniCluster;
     use laminar_core::state::{
         owned_vnodes, rendezvous_assignment, CheckpointAttempt, NodeId, ObjectStoreBackend,
-        VnodeRegistry,
+        StateBackend, VnodeRegistry,
     };
     use laminar_core::storage::checkpoint_store::FileSystemCheckpointStore;
     use laminar_db::checkpoint_coordinator::{
@@ -1295,13 +1299,17 @@ mod minio {
         assignment_fence: &CheckpointAssignmentFence,
         controller: Arc<laminar_core::cluster::control::ClusterController>,
     ) -> CheckpointCoordinator {
+        let key_group_count =
+            laminar_core::state::KeyGroupCount::try_from(backend.key_group_capacity()).unwrap();
         let store = Box::new(
-            FileSystemCheckpointStore::new(dir).with_participant_id(controller.instance_id().0),
+            FileSystemCheckpointStore::new(dir)
+                .with_key_group_count(key_group_count)
+                .with_participant_id(controller.instance_id().0),
         );
         let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
             .await
             .unwrap();
-        coord.set_state_backend(backend);
+        coord.set_state_backend(backend).unwrap();
         coord.set_vnode_set(vnodes);
         coord.set_gate_vnode_set(gate_vnodes);
         coord.set_assignment_version(assignment_fence.assignment_version);

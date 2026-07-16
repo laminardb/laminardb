@@ -2443,6 +2443,7 @@ mod tests {
                 boot_incarnation: c.recovery_incarnation(),
             },
             assignment_version: 7,
+            partitioning_abi_version: crate::state::PARTITIONING_ABI_VERSION,
             vnode_count: u32::try_from(owners.len()).unwrap(),
             assignment_digest: CheckpointAssignmentFence::owner_map_digest(3, &owners),
         };

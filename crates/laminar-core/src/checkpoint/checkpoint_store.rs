@@ -28,6 +28,7 @@ use tracing::warn;
 
 use crate::checkpoint::checkpoint_manifest::{CheckpointManifest, DurableCheckpointPhase};
 use crate::durable_fs::{durable_rename, DurableRenameMode};
+use crate::state::{KeyGroupCount, LOCAL_KEY_GROUP_COUNT};
 
 /// Fsync a file to ensure its contents are durable on disk.
 async fn sync_file(path: &Path) -> Result<(), std::io::Error> {
@@ -81,7 +82,7 @@ pub enum CheckpointStoreError {
 /// an incompatible runtime contract from corrupt persisted bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationIssue {
-    /// Fatal manifest-level incompatibility (for example a vnode-count mismatch).
+    /// Fatal manifest-level incompatibility (for example a key-group-count mismatch).
     ManifestIncompatibility(String),
     /// Fatal: manifest is missing/corrupt, or the sidecar integrity
     /// check (checksum, presence) failed.
@@ -141,11 +142,11 @@ impl CheckpointArtifacts {
         &self,
         checkpoint_id: u64,
         participant_id: u64,
-        vnode_count: u16,
+        key_group_count: KeyGroupCount,
     ) -> ValidationResult {
         let manifest = &self.manifest;
         let mut issues = manifest
-            .validate(vnode_count)
+            .validate(key_group_count)
             .into_iter()
             .map(|error| {
                 ValidationIssue::ManifestIncompatibility(format!("manifest validation: {error}"))
@@ -352,13 +353,11 @@ fn requires_state_data(manifest: &CheckpointManifest) -> bool {
 /// manifest is fully written and synced.
 #[async_trait]
 pub trait CheckpointStore: Send + Sync {
-    /// Runtime vnode count that manifests written by this store are
-    /// expected to use. Consulted when validating loaded manifests —
-    /// a mismatch is reported as a manifest warning. Defaults to
-    /// [`crate::checkpoint::checkpoint_manifest::DEFAULT_VNODE_COUNT`] when the
-    /// implementation has no configured value.
-    fn vnode_count(&self) -> u16 {
-        crate::checkpoint::checkpoint_manifest::DEFAULT_VNODE_COUNT
+    /// Runtime key-group count that manifests written by this store are
+    /// expected to use. Consulted when validating loaded manifests. Embedded
+    /// and single-node stores default to one key group.
+    fn key_group_count(&self) -> KeyGroupCount {
+        LOCAL_KEY_GROUP_COUNT
     }
 
     /// Participant whose manifests belong in this store namespace.
@@ -478,7 +477,7 @@ pub trait CheckpointStore: Send + Sync {
             )));
         }
         self.ensure_manifest_participant(&manifest)?;
-        let errors = manifest.validate(self.vnode_count());
+        let errors = manifest.validate(self.key_group_count());
         if !errors.is_empty() {
             return Err(CheckpointStoreError::Invalid(
                 errors
@@ -598,7 +597,7 @@ pub trait CheckpointStore: Send + Sync {
             }
             Err(error) => return Err(error),
         };
-        Ok(artifacts.validate(id, self.participant_id(), self.vnode_count()))
+        Ok(artifacts.validate(id, self.participant_id(), self.key_group_count()))
     }
 
     /// Walk backward from latest to find the first valid checkpoint.
@@ -623,7 +622,7 @@ pub trait CheckpointStore: Send + Sync {
         for id in &ids {
             let (result, durable_phase) = match self.load_checkpoint_artifacts(*id).await {
                 Ok(Some(artifacts)) => (
-                    artifacts.validate(*id, self.participant_id(), self.vnode_count()),
+                    artifacts.validate(*id, self.participant_id(), self.key_group_count()),
                     Some(artifacts.manifest.durable_phase),
                 ),
                 Ok(None) => (
@@ -748,7 +747,7 @@ fn stamp_checksum(
 /// for Windows compatibility.
 pub struct FileSystemCheckpointStore {
     base_dir: PathBuf,
-    vnode_count: u16,
+    key_group_count: KeyGroupCount,
     participant_id: u64,
 }
 
@@ -758,23 +757,21 @@ impl FileSystemCheckpointStore {
     /// The `base_dir` is the parent directory; checkpoints are stored under
     /// `{base_dir}/checkpoints/`. The directory is created lazily on first save.
     ///
-    /// The store's `vnode_count` defaults to
-    /// [`crate::checkpoint::checkpoint_manifest::DEFAULT_VNODE_COUNT`]. Hosts that run
-    /// with a non-default value should chain [`Self::with_vnode_count`] so
-    /// manifest validation checks the right invariant.
+    /// Embedded and single-node stores default to one key group. Cluster hosts
+    /// must chain [`Self::with_key_group_count`] with their durable topology.
     #[must_use]
     pub fn new(base_dir: impl Into<PathBuf>) -> Self {
         Self {
             base_dir: base_dir.into(),
-            vnode_count: crate::checkpoint::checkpoint_manifest::DEFAULT_VNODE_COUNT,
+            key_group_count: LOCAL_KEY_GROUP_COUNT,
             participant_id: 0,
         }
     }
 
-    /// Override the `vnode_count` used during manifest validation.
+    /// Override the stable key-group count used during manifest validation.
     #[must_use]
-    pub fn with_vnode_count(mut self, vnode_count: u16) -> Self {
-        self.vnode_count = vnode_count;
+    pub fn with_key_group_count(mut self, key_group_count: KeyGroupCount) -> Self {
+        self.key_group_count = key_group_count;
         self
     }
 
@@ -896,8 +893,8 @@ impl FileSystemCheckpointStore {
 
 #[async_trait]
 impl CheckpointStore for FileSystemCheckpointStore {
-    fn vnode_count(&self) -> u16 {
-        self.vnode_count
+    fn key_group_count(&self) -> KeyGroupCount {
+        self.key_group_count
     }
 
     fn participant_id(&self) -> u64 {
@@ -983,7 +980,7 @@ impl CheckpointStore for FileSystemCheckpointStore {
                 "checkpoint recovery pointer references non-finalized checkpoint {checkpoint_id}"
             )));
         }
-        let errors = manifest.validate(self.vnode_count());
+        let errors = manifest.validate(self.key_group_count());
         if !errors.is_empty() {
             return Err(CheckpointStoreError::Invalid(format!(
                 "checkpoint recovery pointer {checkpoint_id} references an invalid manifest: {}",
@@ -1010,7 +1007,7 @@ impl CheckpointStore for FileSystemCheckpointStore {
         let manifest: CheckpointManifest = serde_json::from_str(&json)?;
         self.ensure_manifest_participant(&manifest)?;
 
-        let errors = manifest.validate(self.vnode_count());
+        let errors = manifest.validate(self.key_group_count());
         if !errors.is_empty() {
             tracing::warn!(
                 checkpoint_id = id,
@@ -1182,7 +1179,7 @@ struct LatestPointer {
 pub struct ObjectStoreCheckpointStore {
     store: Arc<dyn ObjectStore>,
     prefix: String,
-    vnode_count: u16,
+    key_group_count: KeyGroupCount,
     participant_id: u64,
 }
 
@@ -1192,23 +1189,22 @@ impl ObjectStoreCheckpointStore {
     /// `prefix` is prepended to all object paths (e.g., `"nodes/abc123/"`).
     /// It should end with `/` or be empty.
     ///
-    /// The store's `vnode_count` defaults to
-    /// [`crate::checkpoint::checkpoint_manifest::DEFAULT_VNODE_COUNT`]. Hosts that run
-    /// with a non-default value should chain [`Self::with_vnode_count`].
+    /// Embedded and single-node stores default to one key group. Cluster hosts
+    /// must chain [`Self::with_key_group_count`] with their durable topology.
     #[must_use]
     pub fn new(store: Arc<dyn ObjectStore>, prefix: String) -> Self {
         Self {
             store,
             prefix,
-            vnode_count: crate::checkpoint::checkpoint_manifest::DEFAULT_VNODE_COUNT,
+            key_group_count: LOCAL_KEY_GROUP_COUNT,
             participant_id: 0,
         }
     }
 
-    /// Override the `vnode_count` used during manifest validation.
+    /// Override the stable key-group count used during manifest validation.
     #[must_use]
-    pub fn with_vnode_count(mut self, vnode_count: u16) -> Self {
-        self.vnode_count = vnode_count;
+    pub fn with_key_group_count(mut self, key_group_count: KeyGroupCount) -> Self {
+        self.key_group_count = key_group_count;
         self
     }
 
@@ -1427,8 +1423,8 @@ impl ObjectStoreCheckpointStore {
 
 #[async_trait]
 impl CheckpointStore for ObjectStoreCheckpointStore {
-    fn vnode_count(&self) -> u16 {
-        self.vnode_count
+    fn key_group_count(&self) -> KeyGroupCount {
+        self.key_group_count
     }
 
     fn participant_id(&self) -> u64 {
@@ -1514,7 +1510,7 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
             )));
         }
         self.ensure_manifest_participant(&manifest)?;
-        let errors = manifest.validate(self.vnode_count());
+        let errors = manifest.validate(self.key_group_count());
         if !errors.is_empty() {
             return Err(CheckpointStoreError::Invalid(
                 errors
@@ -1579,7 +1575,7 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
                     pointer.checkpoint_id
                 )));
             }
-            let errors = manifest.validate(self.vnode_count());
+            let errors = manifest.validate(self.key_group_count());
             if !errors.is_empty() {
                 return Err(CheckpointStoreError::Invalid(format!(
                     "checkpoint recovery pointer {} references an invalid manifest: {}",
@@ -1780,6 +1776,35 @@ mod tests {
         let mut manifest = CheckpointManifest::new(id, epoch);
         manifest.durable_phase = DurableCheckpointPhase::Finalized;
         manifest
+    }
+
+    #[test]
+    fn checkpoint_stores_default_to_local_key_group_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let filesystem = FileSystemCheckpointStore::new(dir.path());
+        let object_store = ObjectStoreCheckpointStore::new(
+            Arc::new(object_store::memory::InMemory::new()),
+            String::new(),
+        );
+
+        assert_eq!(filesystem.key_group_count(), LOCAL_KEY_GROUP_COUNT);
+        assert_eq!(object_store.key_group_count(), LOCAL_KEY_GROUP_COUNT);
+    }
+
+    #[test]
+    fn checkpoint_stores_accept_explicit_key_group_count() {
+        let key_group_count = KeyGroupCount::try_from(256_u16).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let filesystem =
+            FileSystemCheckpointStore::new(dir.path()).with_key_group_count(key_group_count);
+        let object_store = ObjectStoreCheckpointStore::new(
+            Arc::new(object_store::memory::InMemory::new()),
+            String::new(),
+        )
+        .with_key_group_count(key_group_count);
+
+        assert_eq!(filesystem.key_group_count(), key_group_count);
+        assert_eq!(object_store.key_group_count(), key_group_count);
     }
 
     #[derive(Debug)]
@@ -2065,7 +2090,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(artifacts.validate(7, 11, store.vnode_count()).valid);
+        assert!(artifacts.validate(7, 11, store.key_group_count()).valid);
     }
 
     #[tokio::test]
@@ -2431,7 +2456,7 @@ mod tests {
             .unwrap();
         assert!(
             artifacts
-                .validate(7, 22, participant_11.vnode_count())
+                .validate(7, 22, participant_11.key_group_count())
                 .valid
         );
 
@@ -2449,7 +2474,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let validation = artifacts.validate(7, 22, participant_11.vnode_count());
+        let validation = artifacts.validate(7, 22, participant_11.key_group_count());
         assert!(!validation.valid);
         assert!(validation
             .issues
@@ -2487,7 +2512,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(artifacts.state_data.as_deref(), Some(state.as_slice()));
-        assert!(artifacts.validate(7, 22, reader.vnode_count()).valid);
+        assert!(artifacts.validate(7, 22, reader.key_group_count()).valid);
         assert_eq!(counting.counts(), (1, 1));
 
         raw.put_opts(
@@ -2503,7 +2528,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let validation = artifacts.validate(7, 22, reader.vnode_count());
+        let validation = artifacts.validate(7, 22, reader.key_group_count());
         assert!(!validation.valid);
         assert!(validation
             .issues
@@ -2536,7 +2561,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let validation = artifacts.validate(8, 22, reader.vnode_count());
+        let validation = artifacts.validate(8, 22, reader.key_group_count());
         assert!(validation.valid, "inline artifact: {:?}", validation.issues);
         assert_eq!(counting.counts(), (1, 0));
 
@@ -2559,7 +2584,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let validation = artifacts.validate(8, 22, reader.vnode_count());
+        let validation = artifacts.validate(8, 22, reader.key_group_count());
         assert!(!validation.valid);
         assert!(validation
             .issues
@@ -2778,7 +2803,7 @@ mod tests {
         let validation = artifacts.validate(
             7,
             artifacts.manifest.participant_id,
-            artifacts.manifest.vnode_count,
+            KeyGroupCount::try_from(artifacts.manifest.vnode_count).unwrap(),
         );
 
         assert!(!validation.valid);
@@ -2809,11 +2834,19 @@ mod tests {
 
         assert!(
             artifacts
-                .validate(9, 0, artifacts.manifest.vnode_count)
+                .validate(
+                    9,
+                    0,
+                    KeyGroupCount::try_from(artifacts.manifest.vnode_count).unwrap(),
+                )
                 .valid
         );
         artifacts.state_data = Some(b"tampered".to_vec());
-        let validation = artifacts.validate(9, 0, artifacts.manifest.vnode_count);
+        let validation = artifacts.validate(
+            9,
+            0,
+            KeyGroupCount::try_from(artifacts.manifest.vnode_count).unwrap(),
+        );
         assert!(!validation.valid);
         assert!(validation
             .issues

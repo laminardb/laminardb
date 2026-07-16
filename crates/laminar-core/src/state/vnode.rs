@@ -41,6 +41,18 @@ pub const PARTITIONING_ABI_VERSION: u16 = 1;
 #[serde(transparent)]
 pub struct KeyGroupCount(NonZeroU16);
 
+/// Fixed key-group count for embedded and single-node runtimes.
+pub const LOCAL_KEY_GROUP_COUNT: KeyGroupCount = KeyGroupCount(NonZeroU16::MIN);
+
+/// Default key-group count for cluster runtimes.
+pub const DEFAULT_CLUSTER_KEY_GROUP_COUNT: KeyGroupCount = match NonZeroU16::new(256) {
+    Some(value) => KeyGroupCount(value),
+    None => unreachable!(),
+};
+
+/// Largest key-group count representable by the persisted checkpoint ABI.
+pub const MAX_KEY_GROUP_COUNT: u32 = u16::MAX as u32;
+
 impl KeyGroupCount {
     /// Build from a nonzero value.
     #[must_use]

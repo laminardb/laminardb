@@ -21,6 +21,7 @@ use crate::checkpoint::{
     MAX_CHECKPOINT_PARTICIPANTS,
 };
 use crate::cluster::discovery::NodeId;
+use crate::state::{KeyGroupCount, PARTITIONING_ABI_VERSION};
 
 const SNAPSHOT_PREFIX: &str = "control/assignment-snapshots/";
 const DRAIN_FINALIZATION_PREFIX: &str = "control/assignment-drain-finalizations/";
@@ -54,6 +55,8 @@ fn current_time_millis() -> i64 {
 pub struct AssignmentSnapshot {
     /// Monotonic version. Writers bump on each update.
     pub version: u64,
+    /// Key encoding, hashing, and key-group mapping contract used by this owner map.
+    pub partitioning_abi_version: u16,
     /// Vnode id → owning instance. `BTreeMap` (not `Vec`) so snapshots
     /// with different `vnode_count` are still deserializable — sparse
     /// indices surface as missing keys the caller can diagnose.
@@ -144,6 +147,7 @@ impl AssignmentSnapshot {
     pub fn empty() -> Self {
         Self {
             version: 0,
+            partitioning_abi_version: PARTITIONING_ABI_VERSION,
             vnodes: BTreeMap::new(),
             participants: Vec::new(),
             updated_at_ms: 0,
@@ -170,6 +174,7 @@ impl AssignmentSnapshot {
             .ok_or_else(|| SnapshotError::Invalid("assignment snapshot version overflow".into()))?;
         let next = Self {
             version,
+            partitioning_abi_version: self.partitioning_abi_version,
             vnodes,
             participants,
             updated_at_ms: current_time_millis(),
@@ -181,12 +186,27 @@ impl AssignmentSnapshot {
     }
 
     fn validate_assignment(&self) -> Result<(), SnapshotError> {
+        if self.partitioning_abi_version != PARTITIONING_ABI_VERSION {
+            return Err(SnapshotError::Invalid(format!(
+                "assignment snapshot partitioning ABI {} does not match runtime ABI {PARTITIONING_ABI_VERSION}",
+                self.partitioning_abi_version
+            )));
+        }
         if self.participants.len() > MAX_CHECKPOINT_PARTICIPANTS {
             return Err(SnapshotError::Invalid(format!(
                 "assignment snapshot has {} participants; maximum is {MAX_CHECKPOINT_PARTICIPANTS}",
                 self.participants.len()
             )));
         }
+        let vnode_count = u32::try_from(self.vnodes.len()).map_err(|_| {
+            SnapshotError::Invalid("assignment snapshot has more than u32::MAX key groups".into())
+        })?;
+        KeyGroupCount::try_from(vnode_count).map_err(|_| {
+            SnapshotError::Invalid(format!(
+                "assignment snapshot key-group count must be between 1 and {}, got {vnode_count}",
+                crate::state::MAX_KEY_GROUP_COUNT
+            ))
+        })?;
         let dense = !self.vnodes.is_empty()
             && self
                 .vnodes
@@ -860,6 +880,51 @@ mod tests {
         assert!(restarted.has_canonical_participants());
     }
 
+    #[test]
+    fn assignment_snapshot_requires_partitioning_abi() {
+        let snapshot = snapshot(BTreeMap::from([(0, NodeId(1))]));
+        assert_eq!(snapshot.partitioning_abi_version, PARTITIONING_ABI_VERSION);
+
+        let mut value = serde_json::to_value(snapshot).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("partitioning_abi_version");
+        assert!(serde_json::from_value::<AssignmentSnapshot>(value).is_err());
+    }
+
+    #[test]
+    fn assignment_snapshot_rejects_more_than_the_partitioning_abi_limit() {
+        let vnodes = (0..=u32::from(u16::MAX))
+            .map(|key_group| (key_group, NodeId(1)))
+            .collect();
+
+        assert!(matches!(
+            AssignmentSnapshot::empty()
+                .next_for_participants(vnodes, vec![participant(1, 11)]),
+            Err(SnapshotError::Invalid(message)) if message.contains("key-group count")
+        ));
+    }
+
+    #[tokio::test]
+    async fn durable_assignment_rejects_wrong_partitioning_abi() {
+        let dir = tempdir().unwrap();
+        let store = store_in(dir.path());
+        let mut snapshot = snapshot(BTreeMap::from([(0, NodeId(1))]));
+        snapshot.partitioning_abi_version = PARTITIONING_ABI_VERSION + 1;
+
+        assert!(matches!(
+            store.save_if_absent(&snapshot).await,
+            Err(SnapshotError::Invalid(message)) if message.contains("partitioning ABI")
+        ));
+
+        put_raw(&store, snapshot_path(1), &snapshot).await;
+        assert!(matches!(
+            store.load().await,
+            Err(SnapshotError::Invalid(message)) if message.contains("partitioning ABI")
+        ));
+    }
+
     #[tokio::test]
     async fn save_if_absent_then_load_roundtrip() {
         let dir = tempdir().unwrap();
@@ -961,6 +1026,7 @@ mod tests {
             .collect();
         let oversized = AssignmentSnapshot {
             version: 1,
+            partitioning_abi_version: PARTITIONING_ABI_VERSION,
             vnodes: BTreeMap::from([(0, NodeId(1))]),
             participants,
             updated_at_ms: 1,

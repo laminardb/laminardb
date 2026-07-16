@@ -1114,10 +1114,6 @@ pub async fn start_cluster(
         builder = builder.storage_dir(path);
     }
 
-    config
-        .state
-        .validate()
-        .map_err(|e| ClusterStartupError::EngineConstruction(format!("state backend: {e}")))?;
     if !config
         .state
         .durability_scope()
@@ -1140,21 +1136,8 @@ pub async fn start_cluster(
                 "cluster mode requires an object-store-backed state namespace".into(),
             )
         })?;
-    let state_vnode_capacity = match &config.state {
-        laminar_core::state::StateBackendConfig::ObjectStore { vnode_capacity, .. } => {
-            *vnode_capacity
-        }
-        _ => {
-            return Err(ClusterStartupError::EngineConstruction(
-                "cluster mode requires an object-store-backed state namespace".into(),
-            ));
-        }
-    };
-    let state_backend = cluster_state_backend(
-        Arc::clone(&state_proof_store),
-        node_id,
-        state_vnode_capacity,
-    );
+    let key_groups = config.server.resolved_key_groups();
+    let state_backend = cluster_state_backend(Arc::clone(&state_proof_store), node_id, key_groups);
 
     // Build the vnode registry. If a shared `AssignmentSnapshot` already exists,
     // every node adopts it; otherwise the first peer CAS-creates it and losers
@@ -1162,7 +1145,7 @@ pub async fn start_cluster(
     let (vnode_registry, snapshot_store) = resolve_vnode_assignment(
         node_id,
         &peers,
-        config.state.vnode_capacity(),
+        u32::from(key_groups),
         Some(Arc::clone(&control_store)),
         &startup_participants,
     )
@@ -1794,12 +1777,12 @@ pub async fn start_cluster(
 fn cluster_state_backend(
     store: Arc<dyn object_store::ObjectStore>,
     node_id: NodeId,
-    vnode_capacity: u32,
+    key_groups: laminar_core::state::KeyGroupCount,
 ) -> Arc<dyn laminar_core::state::StateBackend> {
     Arc::new(laminar_core::state::ObjectStoreBackend::cluster_shared(
         store,
         node_id.to_string(),
-        vnode_capacity,
+        u32::from(key_groups),
     ))
 }
 
@@ -3410,7 +3393,11 @@ mod tests {
         let store: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::memory::InMemory::new());
         let node_id = NodeId(73);
-        let backend = cluster_state_backend(Arc::clone(&store), node_id, 1);
+        let backend = cluster_state_backend(
+            Arc::clone(&store),
+            node_id,
+            laminar_core::state::LOCAL_KEY_GROUP_COUNT,
+        );
         let attempt = laminar_core::state::CheckpointAttempt::new(9, 17);
 
         backend
