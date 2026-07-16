@@ -21,8 +21,8 @@ use super::metrics::NatsSourceMetrics;
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::ConnectorConfig;
 use crate::connector::{
-    PartitionInfo, SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourcePosition,
-    SourceStart, SourceTopology,
+    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourcePosition, SourceStart,
+    SourceTopology,
 };
 use crate::error::ConnectorError;
 use crate::serde::{self, RecordDeserializer};
@@ -34,9 +34,7 @@ const MAX_ACK_BACKLOG: usize = 16_384;
 
 /// `ack` is `Some` only on the `JetStream` path.
 struct Incoming {
-    subject: String,
     payload: Bytes,
-    stream_seq: Option<u64>,
     ack: Option<jetstream::Message>,
 }
 
@@ -269,7 +267,6 @@ impl SourceConnector for NatsSource {
         };
 
         let mut payloads: Vec<Bytes> = Vec::new();
-        let mut partition: Option<PartitionInfo> = None;
         let mut new_acks: Vec<jetstream::Message> = Vec::new();
         let mut reader_disconnected = false;
 
@@ -287,11 +284,6 @@ impl SourceConnector for NatsSource {
                     break;
                 }
             };
-            if let Some(seq) = incoming.stream_seq {
-                if partition.is_none() {
-                    partition = Some(PartitionInfo::new(&incoming.subject, seq.to_string()));
-                }
-            }
             payloads.push(incoming.payload);
             if let Some(msg) = incoming.ack {
                 new_acks.push(msg);
@@ -321,10 +313,7 @@ impl SourceConnector for NatsSource {
         self.metrics
             .record_poll(batch.num_rows() as u64, bytes_total);
 
-        Ok(Some(SourceBatch {
-            records: batch,
-            partition,
-        }))
+        Ok(Some(SourceBatch::new(batch)))
     }
 
     fn schema(&self) -> SchemaRef {
@@ -699,13 +688,9 @@ impl JsReader {
                         continue;
                     }
                 };
-                let subject = msg.subject.to_string();
                 let payload = msg.payload.clone();
-                let stream_seq = msg.info().ok().map(|info| info.stream_sequence);
                 let incoming = Incoming {
-                    subject,
                     payload,
-                    stream_seq,
                     ack: requires_ack.then_some(msg),
                 };
                 let send_result = tokio::select! {
@@ -775,9 +760,7 @@ impl CoreReader {
                 },
             };
             let incoming = Incoming {
-                subject: msg.subject.to_string(),
                 payload: msg.payload,
-                stream_seq: None,
                 ack: None,
             };
             let send_result = tokio::select! {
@@ -844,9 +827,7 @@ mod tests {
         let (tx, rx) = mpsc::bounded_async::<Incoming>(2);
         assert!(tx
             .try_send(Incoming {
-                subject: "core.events".into(),
                 payload: Bytes::from_static(b"one"),
-                stream_seq: None,
                 ack: None,
             })
             .is_ok());

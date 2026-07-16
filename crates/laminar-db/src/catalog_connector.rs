@@ -90,10 +90,7 @@ impl SourceConnector for CatalogSourceConnector {
                 .map_err(|e| ConnectorError::ReadError(format!("Failed to concat batches: {e}")))?
         };
 
-        Ok(Some(SourceBatch {
-            records,
-            partition: None,
-        }))
+        Ok(Some(SourceBatch::new(records)))
     }
 
     fn schema(&self) -> SchemaRef {

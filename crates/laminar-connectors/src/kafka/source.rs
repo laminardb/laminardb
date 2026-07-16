@@ -19,9 +19,9 @@ use tracing::{debug, info, warn};
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{
-    DeliveryGuarantee, PartitionInfo, SourceBatch, SourceConnector, SourceConsistency,
-    SourceContract, SourceDrainOutcome, SourceDrainRequest, SourceDrainResolution, SourcePosition,
-    SourceStart, SourceTopology,
+    DeliveryGuarantee, SourceBatch, SourceConnector, SourceConsistency, SourceContract,
+    SourceDrainOutcome, SourceDrainRequest, SourceDrainResolution, SourcePosition, SourceStart,
+    SourceTopology,
 };
 use crate::error::ConnectorError;
 use crate::serde::{self, Format, RecordDeserializer};
@@ -3848,9 +3848,6 @@ impl SourceConnector for KafkaSource {
         self.poll_meta_headers.clear();
 
         let mut total_bytes: u64 = 0;
-        let mut last_topic = String::new();
-        let mut last_partition_id: i32 = 0;
-        let mut last_offset: i64 = -1;
         let include_metadata = self.config.include_metadata;
         let include_headers = self.config.include_headers;
 
@@ -4008,12 +4005,6 @@ impl SourceConnector for KafkaSource {
             if include_headers {
                 self.poll_meta_headers.push(kp.headers_json);
             }
-
-            if last_topic.as_str() != &*kp.topic || last_partition_id != kp.partition {
-                last_topic = kp.topic.to_string();
-                last_partition_id = kp.partition;
-            }
-            last_offset = kp.offset;
         }
 
         // Sync rebalance counter → metrics (bridge from rdkafka background thread).
@@ -4044,18 +4035,6 @@ impl SourceConnector for KafkaSource {
         if self.poll_payload_offsets.is_empty() {
             return Ok(None);
         }
-
-        // PartitionInfo reflects the last topic-partition seen in this batch.
-        // Per-partition offsets are tracked correctly in `self.offsets` and
-        // persisted via checkpoint(); this field is informational only.
-        let last_partition = if last_offset >= 0 {
-            Some(PartitionInfo::new(
-                format!("{last_topic}-{last_partition_id}"),
-                last_offset.to_string(),
-            ))
-        } else {
-            None
-        };
 
         // Resolve Avro schemas from Schema Registry before deserialization.
         // Also detect schema evolution when new schema IDs appear.
@@ -4301,19 +4280,13 @@ impl SourceConnector for KafkaSource {
         let num_rows = batch.num_rows();
         self.metrics.record_poll(num_rows as u64, total_bytes);
 
-        let source_batch = if let Some(partition) = last_partition {
-            SourceBatch::with_partition(batch, partition)
-        } else {
-            SourceBatch::new(batch)
-        };
-
         debug!(
             records = num_rows,
             bytes = total_bytes,
             "polled batch from Kafka"
         );
 
-        Ok(Some(source_batch))
+        Ok(Some(SourceBatch::new(batch)))
     }
 
     fn schema(&self) -> SchemaRef {

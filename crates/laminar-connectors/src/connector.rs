@@ -1,6 +1,5 @@
 //! Connector traits — async `SourceConnector` / `SinkConnector`.
 
-use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -248,59 +247,19 @@ impl SinkContract {
 pub struct SourceBatch {
     /// Arrow batch carrying the records.
     pub records: RecordBatch,
-    /// The partition this batch came from, if the source is partitioned.
-    pub partition: Option<PartitionInfo>,
 }
 
 impl SourceBatch {
-    /// Construct without partition metadata.
+    /// Construct a source batch.
     #[must_use]
     pub fn new(records: RecordBatch) -> Self {
-        Self {
-            records,
-            partition: None,
-        }
-    }
-
-    /// Construct with partition metadata attached.
-    #[must_use]
-    pub fn with_partition(records: RecordBatch, partition: PartitionInfo) -> Self {
-        Self {
-            records,
-            partition: Some(partition),
-        }
+        Self { records }
     }
 
     /// Record count in the batch.
     #[must_use]
     pub fn num_rows(&self) -> usize {
         self.records.num_rows()
-    }
-}
-
-/// Provider-defined source split identity and its current replay cursor.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct PartitionInfo {
-    /// Provider-defined split identifier.
-    pub id: String,
-    /// Provider-defined replay cursor for this split.
-    pub offset: String,
-}
-
-impl PartitionInfo {
-    /// Construct from id/offset strings or anything that converts.
-    #[must_use]
-    pub fn new(id: impl Into<String>, offset: impl Into<String>) -> Self {
-        Self {
-            id: id.into(),
-            offset: offset.into(),
-        }
-    }
-}
-
-impl fmt::Display for PartitionInfo {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}@{}", self.id, self.offset)
     }
 }
 
@@ -1175,22 +1134,6 @@ mod tests {
     fn test_source_batch() {
         let batch = SourceBatch::new(test_batch(10));
         assert_eq!(batch.num_rows(), 10);
-        assert!(batch.partition.is_none());
-    }
-
-    #[test]
-    fn test_source_batch_with_partition() {
-        let partition = PartitionInfo::new("0", "1234");
-        let batch = SourceBatch::with_partition(test_batch(5), partition);
-        assert_eq!(batch.num_rows(), 5);
-        assert_eq!(batch.partition.as_ref().unwrap().id, "0");
-        assert_eq!(batch.partition.as_ref().unwrap().offset, "1234");
-    }
-
-    #[test]
-    fn test_partition_info_display() {
-        let p = PartitionInfo::new("3", "42");
-        assert_eq!(p.to_string(), "3@42");
     }
 
     #[test]

@@ -474,14 +474,6 @@ async fn commit_boundary_feedback_and_checkpoint_resume() {
     let committed_lsn = checkpoint_lsn(&committed_checkpoint);
     assert!(committed_lsn > initial_checkpoint_lsn);
     assert!(committed_lsn >= update_lsn);
-    assert_eq!(
-        transaction
-            .partition
-            .as_ref()
-            .expect("partition metadata")
-            .offset,
-        committed_lsn.to_string()
-    );
 
     sleep(Duration::from_millis(500)).await;
     assert_eq!(

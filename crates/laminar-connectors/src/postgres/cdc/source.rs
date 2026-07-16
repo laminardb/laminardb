@@ -15,9 +15,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{
-    PartitionInfo, SourceBatch, SourceConnector, SourceContract, SourcePosition, SourceStart,
+    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourcePosition, SourceStart,
+    SourceTopology,
 };
-use crate::connector::{SourceConsistency, SourceTopology};
 use crate::error::ConnectorError;
 
 use super::changelog::{
@@ -1870,7 +1870,6 @@ impl SourceConnector for PostgresCdcSource {
 
         // Drain buffered events into a RecordBatch.
         // Configured Arrow-column extractors derive event-time watermarks from `_ts_ms`.
-        // The LSN in PartitionInfo tracks replication progress for offset management.
         let result = match self.drain_events(max_records)? {
             Some(batch) => {
                 self.metrics
@@ -1878,9 +1877,7 @@ impl SourceConnector for PostgresCdcSource {
                 self.metrics
                     .set_replication_lag_bytes(self.replication_lag_bytes());
 
-                let lsn_str = self.polled_lsn.to_string();
-                let partition = PartitionInfo::new(&self.config.slot_name, lsn_str);
-                Ok(Some(SourceBatch::with_partition(batch, partition)))
+                Ok(Some(SourceBatch::new(batch)))
             }
             None => Ok(None),
         };
@@ -3290,8 +3287,8 @@ mod tests {
         src.enqueue_wal_data(PostgresCdcSource::build_begin_message(0x300, 0, 2));
         src.enqueue_wal_data(PostgresCdcSource::build_insert_message(100, &[Some("2")]));
 
-        let batch = src.poll_batch(100).await.unwrap().unwrap();
-        assert_eq!(batch.partition.unwrap().offset, "0/200");
+        src.poll_batch(100).await.unwrap().unwrap();
+        assert_eq!(src.checkpoint().get_offset("lsn"), Some("0/200"));
         assert!(src.current_txn.is_some());
 
         src.process_wal_payload(WalPayload::KeepAlive { wal_end: 0x500 })
@@ -3317,7 +3314,6 @@ mod tests {
 
         let first = src.poll_batch(2).await.unwrap().unwrap();
         assert_eq!(first.num_rows(), 3);
-        assert_eq!(first.partition.unwrap().offset, "0/500");
         assert_eq!(src.checkpoint().get_offset("lsn"), Some("0/500"));
         assert!(src.poll_batch(2).await.unwrap().is_none());
     }
@@ -3345,10 +3341,10 @@ mod tests {
 
         let first = src.poll_batch(3).await.unwrap().unwrap();
         assert_eq!(first.num_rows(), 2);
-        assert_eq!(first.partition.unwrap().offset, "0/200");
+        assert_eq!(src.checkpoint().get_offset("lsn"), Some("0/200"));
         let second = src.poll_batch(3).await.unwrap().unwrap();
         assert_eq!(second.num_rows(), 2);
-        assert_eq!(second.partition.unwrap().offset, "0/400");
+        assert_eq!(src.checkpoint().get_offset("lsn"), Some("0/400"));
     }
 
     #[tokio::test]
@@ -3373,12 +3369,14 @@ mod tests {
         let ready = src.data_ready_notify().unwrap();
 
         let first = src.poll_batch(1).await.unwrap().unwrap();
-        assert_eq!(first.partition.unwrap().offset, "0/100");
+        assert_eq!(first.num_rows(), 1);
+        assert_eq!(src.checkpoint().get_offset("lsn"), Some("0/100"));
         tokio::time::timeout(std::time::Duration::from_millis(25), ready.notified())
             .await
             .expect("a buffered committed transaction must retain a readiness permit");
         let second = src.poll_batch(1).await.unwrap().unwrap();
-        assert_eq!(second.partition.unwrap().offset, "0/200");
+        assert_eq!(second.num_rows(), 1);
+        assert_eq!(src.checkpoint().get_offset("lsn"), Some("0/200"));
     }
 
     #[tokio::test]
@@ -3478,9 +3476,9 @@ mod tests {
 
         let first = src.poll_batch(1).await.unwrap().unwrap();
         assert_eq!(first.num_rows(), 2);
-        assert_eq!(first.partition.unwrap().offset, "0/200");
+        assert_eq!(src.checkpoint().get_offset("lsn"), Some("0/200"));
         let second = src.poll_batch(1).await.unwrap().unwrap();
-        assert_eq!(second.partition.unwrap().offset, "0/300");
+        assert_eq!(second.num_rows(), 1);
         assert_eq!(src.checkpoint().get_offset("lsn"), Some("0/300"));
     }
 
@@ -3658,29 +3656,6 @@ mod tests {
         let batch = src.poll_batch(100).await.unwrap().unwrap();
         assert_eq!(batch.num_rows(), 3);
         assert_eq!(src.buffered_events(), 0);
-    }
-
-    // ── Partition info ──
-
-    #[tokio::test]
-    async fn test_partition_info() {
-        let mut src = running_source();
-        let committed_lsn = "1/ABCD".parse().unwrap();
-        src.write_lsn = committed_lsn;
-
-        src.inject_event(ChangeEvent {
-            table: "t".to_string(),
-            op: CdcOperation::Insert,
-            lsn: committed_lsn,
-            ts_ms: 0,
-            before: None,
-            after: Some("{}".to_string()),
-        });
-
-        let batch = src.poll_batch(100).await.unwrap().unwrap();
-        let partition = batch.partition.unwrap();
-        assert_eq!(partition.id, "laminar_slot");
-        assert_eq!(partition.offset, "1/ABCD");
     }
 
     // ── Replication lag ──
