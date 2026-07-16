@@ -3,12 +3,10 @@
 
 use std::collections::HashMap;
 
-use arrow_array::RecordBatch;
-use arrow_schema::{DataType, SchemaRef};
-use async_trait::async_trait;
-
 use super::error::SchemaResult;
 use super::types::RawRecord;
+use arrow_array::RecordBatch;
+use arrow_schema::{DataType, SchemaRef};
 
 // ── FormatDecoder ──────────────────────────────────────────────────
 
@@ -64,35 +62,6 @@ pub trait FormatEncoder: Send + Sync {
 
     /// Returns the name of the format this encoder produces (e.g., `"json"`).
     fn format_name(&self) -> &str;
-}
-
-// ── SchemaProvider ─────────────────────────────────────────────────
-
-/// A connector that can provide its schema from the source system.
-///
-/// Examples: `PostgreSQL` CDC reading `information_schema`, a Kafka topic
-/// with an embedded Avro schema, or a file source with a header row.
-#[async_trait]
-pub trait SchemaProvider: Send + Sync {
-    /// Fetches the schema from the source system.
-    ///
-    /// # Errors
-    ///
-    /// Returns a schema error if the schema cannot be retrieved.
-    async fn provide_schema(&self) -> SchemaResult<SchemaRef>;
-
-    /// Returns `true` if this provider's schema is authoritative
-    /// (i.e., should take precedence over inference).
-    fn is_authoritative(&self) -> bool {
-        false
-    }
-
-    /// Returns per-field metadata for the provided schema.
-    ///
-    /// Default returns an empty map.
-    async fn field_metadata(&self) -> SchemaResult<HashMap<String, super::types::FieldMeta>> {
-        Ok(HashMap::new())
-    }
 }
 
 // ── Inference types ────────────────────────────────────────────────
@@ -249,90 +218,6 @@ pub struct InferenceWarning {
 
 pub use laminar_core::error_codes::WarningSeverity;
 
-// ── SchemaRegistryAware ────────────────────────────────────────────
-
-/// A connector that integrates with a schema registry.
-///
-/// Supports fetching, registering, and checking compatibility of schemas
-/// against an external registry (e.g., Confluent Schema Registry).
-#[async_trait]
-pub trait SchemaRegistryAware: Send + Sync {
-    /// Fetches the latest schema for a subject.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SchemaError::RegistryError`](super::error::SchemaError::RegistryError)
-    /// if the registry is unreachable or the subject is not found.
-    async fn fetch_schema(&self, subject: &str) -> SchemaResult<RegisteredSchema>;
-
-    /// Fetches a schema by its numeric ID.
-    ///
-    /// # Errors
-    ///
-    /// Returns a schema error if the ID is not found.
-    async fn fetch_schema_by_id(&self, schema_id: i32) -> SchemaResult<RegisteredSchema>;
-
-    /// Checks whether `proposed` is compatible with the existing schema
-    /// for `subject` under the configured compatibility mode.
-    ///
-    /// # Errors
-    ///
-    /// Returns a schema error if the compatibility check itself fails.
-    async fn check_compatibility(&self, subject: &str, proposed: &SchemaRef) -> SchemaResult<bool>;
-
-    /// Registers a new schema version for a subject.
-    ///
-    /// # Errors
-    ///
-    /// Returns a schema error if registration fails.
-    async fn register_schema(
-        &self,
-        subject: &str,
-        schema: &SchemaRef,
-    ) -> SchemaResult<RegisteredSchema>;
-
-    /// Builds a [`FormatDecoder`] configured for the registry schema.
-    ///
-    /// This is a sync method because the decoder construction itself
-    /// is not async — the registry lookup should happen beforehand.
-    ///
-    /// # Errors
-    ///
-    /// Returns a schema error if the decoder cannot be constructed
-    /// (e.g., unsupported schema type).
-    fn build_registry_decoder(
-        &self,
-        schema: &RegisteredSchema,
-    ) -> SchemaResult<Box<dyn FormatDecoder>>;
-}
-
-/// Configuration for connecting to a schema registry.
-#[derive(Debug, Clone)]
-pub struct RegistryConfig {
-    /// Registry URL.
-    pub url: String,
-
-    /// Schema type/format used by the registry.
-    pub schema_type: RegistrySchemaType,
-
-    /// Compatibility mode.
-    pub compatibility: CompatibilityMode,
-
-    /// Optional credentials.
-    pub credentials: Option<RegistryCredentials>,
-}
-
-/// Schema type stored in the registry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RegistrySchemaType {
-    /// Apache Avro.
-    Avro,
-    /// JSON Schema.
-    JsonSchema,
-    /// Protocol Buffers.
-    Protobuf,
-}
-
 /// Compatibility mode for schema evolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompatibilityMode {
@@ -350,34 +235,6 @@ pub enum CompatibilityMode {
     ForwardTransitive,
     /// Fully compatible with all previous versions.
     FullTransitive,
-}
-
-/// Credentials for schema registry authentication.
-#[derive(Debug, Clone)]
-pub struct RegistryCredentials {
-    /// Username or API key.
-    pub username: String,
-    /// Password or API secret.
-    pub password: String,
-}
-
-/// A schema registered in a schema registry.
-#[derive(Debug, Clone)]
-pub struct RegisteredSchema {
-    /// Numeric schema ID assigned by the registry.
-    pub id: i32,
-
-    /// Schema version within its subject.
-    pub version: i32,
-
-    /// The subject this schema belongs to.
-    pub subject: String,
-
-    /// The Arrow schema.
-    pub schema: SchemaRef,
-
-    /// The schema type in the registry.
-    pub schema_type: RegistrySchemaType,
 }
 
 /// A single schema change detected by schema diffing.
@@ -453,68 +310,12 @@ pub struct ColumnProjection {
     pub target_schema: SchemaRef,
 }
 
-// ── Connector config schema (self-describing connectors) ───────────
-
-/// Self-describing connector configuration schema.
-///
-/// Allows connectors to declare the configuration options they accept,
-/// enabling UI generation and validation.
-#[derive(Debug, Clone)]
-pub struct ConnectorConfigSchema {
-    /// The connector type name.
-    pub connector_type: String,
-
-    /// Configuration options.
-    pub options: Vec<ConfigOption>,
-}
-
-/// A single configuration option in a connector's config schema.
-#[derive(Debug, Clone)]
-pub struct ConfigOption {
-    /// The option key.
-    pub key: String,
-
-    /// Human-readable description.
-    pub description: String,
-
-    /// Whether this option is required.
-    pub required: bool,
-
-    /// The expected value type.
-    pub value_type: ConfigValueType,
-
-    /// Default value, if any.
-    pub default: Option<String>,
-}
-
-/// The expected type of a configuration value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConfigValueType {
-    /// A string value.
-    String,
-    /// An integer value.
-    Integer,
-    /// A floating-point value.
-    Float,
-    /// A boolean value.
-    Boolean,
-    /// A duration (e.g., `"30s"`, `"5m"`).
-    Duration,
-    /// A URL.
-    Url,
-    /// A file path.
-    Path,
-}
-
 // ── Object-safety assertions ───────────────────────────────────────
 
-// Compile-time checks that all six traits are object-safe.
+// Compile-time checks that the codec traits are object-safe.
 const _: () = {
     fn _assert_format_decoder_object_safe(_: &dyn FormatDecoder) {}
     fn _assert_format_encoder_object_safe(_: &dyn FormatEncoder) {}
-    fn _assert_schema_provider_object_safe(_: &dyn SchemaProvider) {}
-
-    fn _assert_schema_registry_aware_object_safe(_: &dyn SchemaRegistryAware) {}
 };
 
 #[cfg(test)]
@@ -651,47 +452,5 @@ mod tests {
         };
         assert_eq!(w.severity, WarningSeverity::Warning);
         assert_eq!(w.field.as_deref(), Some("price"));
-    }
-
-    #[test]
-    fn test_registry_config() {
-        let cfg = RegistryConfig {
-            url: "http://localhost:8081".into(),
-            schema_type: RegistrySchemaType::Avro,
-            compatibility: CompatibilityMode::Backward,
-            credentials: Some(RegistryCredentials {
-                username: "user".into(),
-                password: "pass".into(),
-            }),
-        };
-        assert_eq!(cfg.schema_type, RegistrySchemaType::Avro);
-        assert_eq!(cfg.compatibility, CompatibilityMode::Backward);
-        assert!(cfg.credentials.is_some());
-    }
-
-    #[test]
-    fn test_connector_config_schema() {
-        let schema = ConnectorConfigSchema {
-            connector_type: "kafka".into(),
-            options: vec![
-                ConfigOption {
-                    key: "bootstrap.servers".into(),
-                    description: "Kafka broker addresses".into(),
-                    required: true,
-                    value_type: ConfigValueType::String,
-                    default: None,
-                },
-                ConfigOption {
-                    key: "batch.size".into(),
-                    description: "Batch size".into(),
-                    required: false,
-                    value_type: ConfigValueType::Integer,
-                    default: Some("1000".into()),
-                },
-            ],
-        };
-        assert_eq!(schema.options.len(), 2);
-        assert!(schema.options[0].required);
-        assert!(!schema.options[1].required);
     }
 }

@@ -634,16 +634,6 @@ pub trait SourceConnector: Send {
         None
     }
 
-    /// Returns this connector as a [`SchemaProvider`](crate::schema::SchemaProvider), if supported.
-    fn as_schema_provider(&self) -> Option<&dyn crate::schema::SchemaProvider> {
-        None
-    }
-
-    /// Returns this connector as a [`SchemaRegistryAware`](crate::schema::SchemaRegistryAware), if supported.
-    fn as_schema_registry_aware(&self) -> Option<&dyn crate::schema::SchemaRegistryAware> {
-        None
-    }
-
     /// Declare recovery and placement semantics for this exact configuration.
     ///
     /// The fail-closed default is an ephemeral singleton. Durable or
@@ -808,12 +798,6 @@ pub trait SinkConnector: Send {
 
     /// Close the sink and release resources.
     async fn close(&mut self) -> Result<(), ConnectorError>;
-
-    /// Return a [`SchemaRegistryAware`](crate::schema::SchemaRegistryAware)
-    /// view, if the sink speaks a schema registry protocol.
-    fn as_schema_registry_aware(&self) -> Option<&dyn crate::schema::SchemaRegistryAware> {
-        None
-    }
 
     /// Leader-side committer for a checkpoint-committable contract; `None`
     /// for every weaker contract.

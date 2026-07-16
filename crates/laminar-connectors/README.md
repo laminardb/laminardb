@@ -91,7 +91,7 @@ requirements:
 
 | Sub-module | Description |
 |------------|-------------|
-| `schema::traits` | `SchemaProvider`, `SchemaInferable`, `SchemaRegistryAware`, `SchemaEvolvable` traits |
+| `schema::traits` | Format codec traits and schema inference/evolution types |
 | `schema::resolver` | Schema resolution and merge engine |
 | `schema::inference` | Format inference registry |
 | `schema::json` | JSON format decoder with type inference |
