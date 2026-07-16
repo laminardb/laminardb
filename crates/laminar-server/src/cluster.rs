@@ -1549,14 +1549,15 @@ pub async fn start_cluster(
             match tokio::time::timeout_at(adoption_deadline, snap_store.load()).await {
                 Ok(Ok(Some(durable_head))) => {
                     let recovering_drain = durable_head.draining;
-                    let snapshot = match tokio::time::timeout_at(
-                        adoption_deadline,
-                        startup_committed_assignment(
+                    let snapshot = match tokio::time::timeout_at(adoption_deadline, async {
+                        laminar_db::rebalance::startup_committed_assignment(
                             snap_store.as_ref(),
                             Some(startup_controller),
                             durable_head,
-                        ),
-                    )
+                        )
+                        .await
+                        .map_err(ClusterStartupError::EngineConstruction)
+                    })
                     .await
                     {
                         Ok(Ok(snapshot)) => snapshot,
@@ -2075,18 +2076,7 @@ fn num_cpus() -> u32 {
         .unwrap_or(1)
 }
 
-/// Boot-time vnode assignment. If an `AssignmentSnapshot` exists in
-/// shared storage (written by a prior cluster incarnation or a peer
-/// that raced here first), every node adopts it — the fresh node
-/// doesn't fight over vnodes that are already claimed. Otherwise we
-/// compute a round-robin split of this node's known peers and
-/// CAS-create the snapshot; losers of the CAS race re-load and adopt.
-///
-/// Returns the registry plus the snapshot store (when one is
-/// available) so the `ClusterController` can watch for future
-/// rotations. `None` store means the deployment is on a non-object-
-/// store state backend (in-process), where no snapshot is possible
-/// or needed.
+/// Verify advertised startup process incarnations against their durable stable-node leases.
 async fn assignment_seed_participants(
     self_id: laminar_core::state::NodeId,
     self_incarnation: uuid::Uuid,
@@ -2178,58 +2168,9 @@ fn advertised_startup_participants(
         .collect())
 }
 
-async fn startup_committed_assignment(
-    store: &laminar_core::cluster::control::AssignmentSnapshotStore,
-    controller: Option<&laminar_core::cluster::control::ClusterController>,
-    head: laminar_core::cluster::control::AssignmentSnapshot,
-) -> Result<laminar_core::cluster::control::AssignmentSnapshot, ClusterStartupError> {
-    laminar_db::rebalance::audit_assignment_snapshot_authority(store, controller, &head)
-        .await
-        .map_err(|error| {
-            ClusterStartupError::EngineConstruction(format!(
-                "audit startup assignment {} authority: {error}",
-                head.version
-            ))
-        })?;
-    if !head.draining {
-        return Ok(head);
-    }
-    let prior_version = head.version.checked_sub(1).ok_or_else(|| {
-        ClusterStartupError::EngineConstruction(
-            "draining assignment has no retained committed predecessor".into(),
-        )
-    })?;
-    let prior = store
-        .load_version(prior_version)
-        .await
-        .map_err(|error| {
-            ClusterStartupError::EngineConstruction(format!(
-                "load retained assignment {prior_version} before draining head {}: {error}",
-                head.version
-            ))
-        })?
-        .ok_or_else(|| {
-            ClusterStartupError::EngineConstruction(format!(
-                "draining assignment {} has no retained committed predecessor {prior_version}",
-                head.version
-            ))
-        })?;
-    if prior.draining {
-        return Err(ClusterStartupError::EngineConstruction(format!(
-            "draining assignment {} has a draining predecessor {prior_version}",
-            head.version
-        )));
-    }
-    laminar_db::rebalance::audit_assignment_snapshot_authority(store, controller, &prior)
-        .await
-        .map_err(|error| {
-            ClusterStartupError::EngineConstruction(format!(
-                "audit retained assignment {prior_version} authority: {error}"
-            ))
-        })?;
-    Ok(prior)
-}
-
+/// Resolve the boot-time vnode registry and shared assignment store.
+/// Existing clusters boot unassigned and adopt the audited committed head after `db.start()`.
+/// A new cluster CAS-creates its rendezvous assignment and CAS losers install the winner.
 async fn resolve_vnode_assignment(
     self_id: laminar_core::cluster::discovery::NodeId,
     peers: &[laminar_core::cluster::discovery::NodeInfo],
@@ -4750,7 +4691,7 @@ mod tests {
             .await
             .unwrap();
 
-        let selected = startup_committed_assignment(&store, None, draining)
+        let selected = laminar_db::rebalance::startup_committed_assignment(&store, None, draining)
             .await
             .unwrap();
         assert_eq!(selected, committed);

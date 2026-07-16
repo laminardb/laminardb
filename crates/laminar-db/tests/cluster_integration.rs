@@ -1199,6 +1199,28 @@ mod rebalance {
             .expect("initial cluster checkpoint");
         assert!(first.success, "initial checkpoint: {:?}", first.error);
 
+        let predecessor = harness.nodes[0]
+            .assignment_snapshot_store
+            .load()
+            .await
+            .expect("load durable predecessor")
+            .expect("durable predecessor assignment");
+        let predecessor_fence = predecessor
+            .assignment_fence()
+            .expect("canonical predecessor assignment");
+        let first_outcome = harness.cluster.nodes[harness.leader_idx()]
+            .controller
+            .checkpoint_authority()
+            .expect("cluster checkpoint authority")
+            .cluster_outcome(first.epoch)
+            .await
+            .expect("initial cluster outcome read")
+            .expect("initial checkpoint outcome");
+        assert_eq!(
+            first_outcome.assignment_fence,
+            Some(predecessor_fence.clone())
+        );
+
         let (shared_dir, checkpoint_dirs) = harness.shutdown_keep_dirs().await;
         let mut restarted = ClusterEngineHarness::spawn_with_dirs(
             N_NODES,
@@ -1207,7 +1229,109 @@ mod rebalance {
             checkpoint_dirs,
         )
         .await;
+        assert_eq!(
+            restarted.nodes[0]
+                .assignment_snapshot_store
+                .load()
+                .await
+                .expect("load assignment after process respawn")
+                .expect("durable assignment after process respawn"),
+            predecessor,
+            "process construction must not advance the durable assignment head"
+        );
         restarted.start_all().await;
+
+        let successor = restarted.nodes[0]
+            .assignment_snapshot_store
+            .load()
+            .await
+            .expect("load durable restart successor")
+            .expect("durable restart successor");
+        assert_eq!(successor.version, predecessor.version + 1);
+        assert_eq!(successor.vnodes, predecessor.vnodes);
+        assert!(!successor.draining);
+
+        let owner_ids = successor
+            .vnodes
+            .values()
+            .map(|owner| owner.0)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut replacement_roster = restarted
+            .cluster
+            .nodes
+            .iter()
+            .filter(|node| owner_ids.contains(&node.instance_id.0))
+            .map(|node| laminar_core::checkpoint::CheckpointParticipant {
+                node_id: node.instance_id.0,
+                boot_incarnation: node.controller.recovery_incarnation(),
+            })
+            .collect::<Vec<_>>();
+        replacement_roster.sort_unstable_by_key(|participant| participant.node_id);
+        assert_eq!(successor.participants, replacement_roster);
+        assert!(
+            successor
+                .participants
+                .iter()
+                .zip(&predecessor.participants)
+                .all(|(replacement, prior)| {
+                    replacement.node_id == prior.node_id
+                        && replacement.boot_incarnation != prior.boot_incarnation
+                }),
+            "every predecessor owner must be replaced by its current process incarnation"
+        );
+
+        let successor_fence = successor
+            .assignment_fence()
+            .expect("canonical restart successor");
+        let leader_idx = restarted.leader_idx();
+        let authority = restarted.cluster.nodes[leader_idx]
+            .controller
+            .checkpoint_authority()
+            .expect("cluster checkpoint authority");
+        let decision = authority
+            .assignment_recovery_decision(successor.version)
+            .await
+            .expect("restart recovery decision read")
+            .expect("authorized restart recovery decision");
+        assert_eq!(decision.predecessor, predecessor_fence);
+        assert_eq!(decision.target, successor_fence);
+        assert_eq!(
+            restarted.nodes[leader_idx]
+                .assignment_snapshot_store
+                .load_recovery_proposal(&decision.proposal)
+                .await
+                .expect("load authorized restart proposal"),
+            successor
+        );
+
+        for (runtime, cluster_node) in restarted.nodes.iter().zip(&restarted.cluster.nodes) {
+            assert_eq!(
+                runtime.vnode_registry.assignment_version(),
+                successor.version
+            );
+            assert_eq!(
+                cluster_node
+                    .controller
+                    .checkpoint_assignment_fence(successor.version),
+                Some(successor_fence.clone())
+            );
+            let active = successor_fence.contains(runtime.instance_id.0);
+            let active_version = if active { successor.version } else { 0 };
+            let active_digest = active.then_some(successor_fence.digest());
+            assert_eq!(runtime.shuffle_sender.assignment_version(), active_version);
+            assert_eq!(
+                runtime.shuffle_receiver.assignment_version(),
+                active_version
+            );
+            assert_eq!(
+                runtime.shuffle_sender.active_assignment_digest(),
+                active_digest
+            );
+            assert_eq!(
+                runtime.shuffle_receiver.active_assignment_digest(),
+                active_digest
+            );
+        }
 
         let second = restarted.nodes[restarted.leader_idx()]
             .db

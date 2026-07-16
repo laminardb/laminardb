@@ -14,9 +14,9 @@ use async_trait::async_trait;
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::config::{ConnectorConfig, ConnectorInfo};
 use laminar_connectors::connector::{
-    PartitionInfo, SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology,
-    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceDrainRequest,
-    SourceDrainResolution, SourcePosition, SourceStart, SourceTopology, WriteResult,
+    SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology, SourceBatch,
+    SourceConnector, SourceConsistency, SourceContract, SourceDrainRequest, SourceDrainResolution,
+    SourcePosition, SourceStart, SourceTopology, WriteResult,
 };
 use laminar_connectors::error::ConnectorError;
 use laminar_core::changelog::WEIGHT_COLUMN;
@@ -25,7 +25,7 @@ use laminar_core::cluster::control::process_lease::ProcessLeaseAuthority;
 use laminar_core::cluster::control::{
     AssignmentSnapshot, AssignmentSnapshotStore, CatalogManifestStore, CheckpointDecisionStore,
     CheckpointParticipant, LeaderLeaseConfig, LeaderLeaseManager, LeaderLeaseStore, ProcessLease,
-    ProcessLeaseConfig, ProcessLeaseManager, ProcessLeaseOutcome, ProcessLeaseStore, RotateOutcome,
+    ProcessLeaseConfig, ProcessLeaseManager, ProcessLeaseOutcome, ProcessLeaseStore,
 };
 use laminar_core::cluster::testing::MiniCluster;
 use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
@@ -40,6 +40,7 @@ use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
 const CONVERGENCE_DEADLINE: Duration = Duration::from_secs(10);
+const ASSIGNMENT_CERTIFICATION_DEADLINE: Duration = Duration::from_secs(60);
 const TEST_LEASE_TTL: Duration = Duration::from_secs(2);
 const TEST_LEASE_RENEW_INTERVAL: Duration = Duration::from_millis(500);
 pub const TEST_SOURCE_DDL: &str =
@@ -234,10 +235,7 @@ impl SourceConnector for ScriptedClusterHarnessSource {
             ],
         )
         .map_err(|error| ConnectorError::Internal(format!("scripted source batch: {error}")))?;
-        Ok(Some(SourceBatch::with_partition(
-            records,
-            PartitionInfo::new("scripted-log", self.cursor.to_string()),
-        )))
+        Ok(Some(SourceBatch::new(records)))
     }
 
     fn schema(&self) -> SchemaRef {
@@ -629,6 +627,7 @@ impl ClusterEngineHarness {
         // it before the DB is built is safe because the query service reads the handler slot per
         // request; `LaminarDB::builder().build()` registers the handler below.
         for node in &cluster.nodes {
+            node.controller.install_local_leader_proof_provider();
             node.controller
                 .start_barrier_server(
                     "127.0.0.1:0".parse().expect("loopback control-plane bind"),
@@ -654,8 +653,8 @@ impl ClusterEngineHarness {
         participants.sort_unstable_by_key(|participant| participant.node_id);
 
         // Resolve one cluster-wide vnode assignment; every node shares it.
-        let (assignment, snapshot_version) =
-            resolve_assignment(&snapshot_store, vnode_count, &peer_ids, participants).await;
+        let initial_assignment =
+            resolve_initial_assignment(&snapshot_store, vnode_count, &peer_ids, participants).await;
         let source_log = Arc::new(ScriptedClusterHarnessLog::default());
         let sink_state = Arc::new(ClusterHarnessSinkState::default());
 
@@ -698,7 +697,9 @@ impl ClusterEngineHarness {
                 ));
 
             let registry = Arc::new(VnodeRegistry::new_unassigned(vnode_count));
-            registry.set_assignment_and_version(Arc::clone(&assignment), snapshot_version);
+            if let Some((assignment, version)) = &initial_assignment {
+                registry.set_assignment_and_version(Arc::clone(assignment), *version);
+            }
 
             let cp_cfg = StreamCheckpointConfig {
                 // Cluster at-least-once admission requires a periodic coordinator. Keep the
@@ -816,6 +817,31 @@ impl ClusterEngineHarness {
         }
         // Fast timings so tests don't wait the 5s production debounce.
         let cfg = laminar_db::rebalance::RebalanceConfig::test_defaults();
+        for (node, cluster_node) in self.nodes.iter().zip(&self.cluster.nodes) {
+            if node.vnode_registry.assignment_version() != 0 {
+                continue;
+            }
+            let deadline = tokio::time::Instant::now() + cfg.checkpoint_timeout;
+            let head = node
+                .assignment_snapshot_store
+                .load()
+                .await
+                .expect("load retained startup assignment")
+                .expect("retained startup assignment");
+            let committed = laminar_db::rebalance::startup_committed_assignment(
+                node.assignment_snapshot_store.as_ref(),
+                Some(cluster_node.controller.as_ref()),
+                head,
+            )
+            .await
+            .expect("audit retained startup assignment");
+            let adoption = node
+                .db
+                .adopt_assignment_snapshot(committed, deadline)
+                .await
+                .expect("adopt retained startup assignment");
+            assert!(adoption.adopted, "retained startup assignment was deferred");
+        }
         for (idx, nh) in self.cluster.nodes.iter().enumerate() {
             let node = &mut self.nodes[idx];
             let watcher = laminar_db::rebalance::spawn_snapshot_watcher(
@@ -874,7 +900,7 @@ impl ClusterEngineHarness {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let deadline = std::time::Instant::now() + ASSIGNMENT_CERTIFICATION_DEADLINE;
         loop {
             let assignments_ready =
                 self.nodes
@@ -912,10 +938,30 @@ impl ClusterEngineHarness {
             if assignments_ready {
                 break;
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "shuffle assignment certificates never became active",
-            );
+            if std::time::Instant::now() >= deadline {
+                let mut details = Vec::with_capacity(self.nodes.len());
+                for (runtime, cluster_node) in self.nodes.iter().zip(&self.cluster.nodes) {
+                    details.push(format!(
+                        "node {}: recovering={}, leader={:?}, fence={:?}, sender=({}, {:?}), receiver=({}, {:?}), adoptions={:?}",
+                        runtime.instance_id.0,
+                        cluster_node.controller.is_recovering(),
+                        cluster_node.controller.current_leader(),
+                        cluster_node.controller.checkpoint_assignment_fence(
+                            runtime.vnode_registry.assignment_version(),
+                        ),
+                        runtime.shuffle_sender.assignment_version(),
+                        runtime.shuffle_sender.active_assignment_digest(),
+                        runtime.shuffle_receiver.assignment_version(),
+                        runtime.shuffle_receiver.active_assignment_digest(),
+                        cluster_node.controller.read_adopted_assignments().await,
+                    ));
+                }
+                panic!(
+                    "shuffle assignment certificates never became active within {:?}: {}",
+                    ASSIGNMENT_CERTIFICATION_DEADLINE,
+                    details.join("; "),
+                );
+            }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
@@ -1143,41 +1189,18 @@ fn unix_time_millis() -> i64 {
     i64::try_from(millis).expect("current Unix time fits i64 milliseconds")
 }
 
-/// Load the shared assignment (with its version), or CAS-create one on first boot.
-async fn resolve_assignment(
+/// CAS-create the first assignment. Existing clusters boot unassigned and adopt after start.
+async fn resolve_initial_assignment(
     store: &AssignmentSnapshotStore,
     vnode_count: u32,
     peer_ids: &[NodeId],
     participants: Vec<CheckpointParticipant>,
-) -> (Arc<[NodeId]>, u64) {
-    if let Some(mut snap) = store.load().await.expect("load snapshot") {
-        let owner_ids: std::collections::BTreeSet<u64> =
-            snap.vnodes.values().map(|owner| owner.0).collect();
-        let owner_participants: Vec<_> = participants
-            .iter()
-            .filter(|participant| owner_ids.contains(&participant.node_id))
-            .cloned()
-            .collect();
-        assert_eq!(owner_participants.len(), owner_ids.len());
-        if snap.participants != owner_participants {
-            let next = snap
-                .next_for_participants(snap.vnodes.clone(), owner_participants)
-                .expect("restart participant snapshot");
-            snap = match store
-                .save_if_version(&next, snap.version)
-                .await
-                .expect("save restart participant snapshot")
-            {
-                RotateOutcome::Rotated => next,
-                RotateOutcome::Conflict(winner) => winner,
-            };
-        }
-        return (
-            snap.to_vnode_vec(vnode_count)
-                .expect("snapshot cardinality")
-                .into(),
-            snap.version,
-        );
+) -> Option<(Arc<[NodeId]>, u64)> {
+    if let Some(snapshot) = store.load().await.expect("load snapshot") {
+        snapshot
+            .to_vnode_vec(vnode_count)
+            .expect("snapshot cardinality");
+        return None;
     }
 
     let fresh = rendezvous_assignment(vnode_count, peer_ids);
@@ -1193,23 +1216,20 @@ async fn resolve_assignment(
             owner_participants,
         )
         .expect("canonical assignment snapshot");
-    match store.save_if_absent(&snap).await.expect("save_if_absent") {
-        Some(winner) => (fresh, winner.version),
-        None => {
-            let loaded = store
-                .load()
-                .await
-                .expect("load after CAS loss")
-                .expect("snapshot present after CAS loss");
-            (
-                loaded
-                    .to_vnode_vec(vnode_count)
-                    .expect("snapshot cardinality")
-                    .into(),
-                loaded.version,
-            )
-        }
-    }
+    let winner = match store.save_if_absent(&snap).await.expect("save_if_absent") {
+        Some(winner) => winner,
+        None => store
+            .load()
+            .await
+            .expect("load after CAS loss")
+            .expect("snapshot present after CAS loss"),
+    };
+    let version = winner.version;
+    let assignment = winner
+        .to_vnode_vec(vnode_count)
+        .expect("snapshot cardinality")
+        .into();
+    Some((assignment, version))
 }
 
 /// Diagnostic tuple `(instance_id, owned_vnodes)`.

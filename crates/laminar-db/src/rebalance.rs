@@ -914,6 +914,91 @@ pub async fn audit_assignment_snapshot_authority(
         .map(|_| ())
 }
 
+/// Select the last committed assignment that a cluster process may adopt during startup.
+/// A draining head has not transferred ownership, so startup retains its audited predecessor.
+///
+/// # Errors
+///
+/// Returns an error when the head or retained predecessor lacks valid durable authority.
+pub async fn startup_committed_assignment(
+    store: &AssignmentSnapshotStore,
+    controller: Option<&ClusterController>,
+    head: AssignmentSnapshot,
+) -> Result<AssignmentSnapshot, String> {
+    audit_assignment_snapshot_authority(store, controller, &head)
+        .await
+        .map_err(|error| {
+            format!(
+                "audit startup assignment {} authority: {error}",
+                head.version
+            )
+        })?;
+    if !head.draining {
+        return Ok(head);
+    }
+
+    let transition = store
+        .load_drain_transition(head.version)
+        .await
+        .map_err(|error| {
+            format!(
+                "load startup assignment {} drain transition: {error}",
+                head.version
+            )
+        })?
+        .ok_or_else(|| {
+            format!(
+                "draining startup assignment {} has no exact transition",
+                head.version
+            )
+        })?;
+    if head.drain_transition.as_ref() != Some(&transition) {
+        return Err(format!(
+            "draining startup assignment {} does not match its durable transition",
+            head.version
+        ));
+    }
+    let prior_version = head
+        .version
+        .checked_sub(1)
+        .ok_or_else(|| "draining assignment has no retained committed predecessor".to_string())?;
+    let prior = store
+        .load_version(prior_version)
+        .await
+        .map_err(|error| {
+            format!(
+                "load retained assignment {prior_version} before draining head {}: {error}",
+                head.version
+            )
+        })?
+        .ok_or_else(|| {
+            format!(
+                "draining assignment {} has no retained committed predecessor {prior_version}",
+                head.version
+            )
+        })?;
+    if prior.draining {
+        return Err(format!(
+            "draining assignment {} has a draining predecessor {prior_version}",
+            head.version
+        ));
+    }
+    if prior
+        .assignment_fence()
+        .map_err(|error| error.to_string())?
+        != transition.predecessor
+    {
+        return Err(format!(
+            "draining assignment {} does not bind retained predecessor {prior_version}",
+            head.version
+        ));
+    }
+    audit_assignment_snapshot_authority(store, controller, &prior)
+        .await
+        .map_err(|error| format!("audit retained assignment {prior_version} authority: {error}"))?;
+    Ok(prior)
+}
+
 async fn audit_assignment_snapshot_authority_outcome(
     store: &AssignmentSnapshotStore,
     controller: Option<&ClusterController>,
@@ -3844,6 +3929,39 @@ mod tests {
             .expect_err("a bare stable successor must never pass authority audit");
         assert!(
             error.contains("no drain transition or recovery authority decision"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_rejects_drain_that_does_not_bind_retained_predecessor() {
+        let durable = Arc::new(store());
+        let retained = snapshot(BTreeMap::from([(0, NodeId(1))]));
+        durable.save_if_absent(&retained).await.unwrap();
+
+        let different_predecessor = snapshot(BTreeMap::from([(0, NodeId(2))]));
+        let forged_head = draining_snapshot(
+            &different_predecessor,
+            BTreeMap::from([(0, NodeId(3))]),
+            vec![CheckpointParticipant {
+                node_id: 3,
+                boot_incarnation: uuid::Uuid::from_u128(3),
+            }],
+        );
+        assert!(matches!(
+            durable
+                .save_if_version(&forged_head, retained.version)
+                .await
+                .unwrap(),
+            RotateOutcome::Rotated
+        ));
+
+        let head = durable.load().await.unwrap().unwrap();
+        let error = startup_committed_assignment(&durable, None, head)
+            .await
+            .expect_err("startup must reject a transition over another predecessor");
+        assert!(
+            error.contains("does not bind retained predecessor"),
             "{error}"
         );
     }
