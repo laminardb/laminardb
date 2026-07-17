@@ -347,6 +347,11 @@ impl Node {
         self.http_request("GET", path, None, Duration::from_secs(2))
     }
 
+    #[cfg(feature = "kafka")]
+    fn is_ready(&self) -> bool {
+        self.http_get("/ready").is_some()
+    }
+
     fn sql(&self, statement: &str) -> Option<serde_json::Value> {
         let request = serde_json::to_string(&serde_json::json!({ "sql": statement })).ok()?;
         serde_json::from_str(&self.http_request(
@@ -1036,7 +1041,6 @@ connector = "kafka"
 "bootstrap.servers" = "{brokers}"
 topic = "{output_topic}"
 format = "json"
-acks = "all"
 "key.column" = "seq"
 "#,
         seeds = seeds.join(", "),
@@ -1877,13 +1881,13 @@ fn three_node_kill9_soak() {
     // On boot failure dump the node log tails so the cause is visible in test output.
     let boot = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         wait_for(
-            "all nodes serving /metrics",
+            "all nodes to complete startup authority and become ready",
             Duration::from_secs(60),
             || {
                 producer.assert_running();
                 nodes.iter_mut().all(|n| {
                     n.assert_running();
-                    n.epoch().is_some()
+                    n.epoch().is_some() && n.is_ready()
                 })
             },
         );

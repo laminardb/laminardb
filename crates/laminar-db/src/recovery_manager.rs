@@ -420,6 +420,23 @@ enum RecoveryOutcomeAuthority<'a> {
     },
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ClusterPreparedDominance {
+    highest_terminal_epoch: u64,
+    highest_terminal_checkpoint_id: u64,
+}
+
+impl ClusterPreparedDominance {
+    fn from_outcomes(outcome_floor: Option<u64>, outcomes: &[CheckpointOutcome]) -> Option<Self> {
+        outcome_floor?;
+        let terminal = outcomes.last()?;
+        Some(Self {
+            highest_terminal_epoch: terminal.epoch,
+            highest_terminal_checkpoint_id: terminal.checkpoint_id,
+        })
+    }
+}
+
 impl<'a> RecoveryOutcomeAuthority<'a> {
     const fn scope(self) -> CheckpointScope {
         match self {
@@ -857,6 +874,24 @@ impl<'a> RecoveryManager<'a> {
             })
     }
 
+    #[cfg(feature = "cluster")]
+    async fn validated_cluster_prepared_dominance(
+        &self,
+        authority: &laminar_core::cluster::control::LeaderLeaseStore,
+        capsule_store: &laminar_core::checkpoint_decision::CheckpointDecisionStore,
+    ) -> Result<u64, DbError> {
+        authority
+            .validated_cluster_outcome_retention_boundary(|outcome| async move {
+                self.preflight_cluster_committed_outcome(&outcome, capsule_store)
+                    .await
+                    .map(drop)
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .map(|boundary| boundary.before_epoch)
+            .map_err(|error| DbError::Checkpoint(error.to_string()))
+    }
+
     async fn settle_local_prepared_attempts(
         &self,
         decision_store: &laminar_core::checkpoint_decision::CheckpointDecisionStore,
@@ -981,6 +1016,7 @@ impl<'a> RecoveryManager<'a> {
         &self,
         selected: &CheckpointOutcome,
         outcomes: &[CheckpointOutcome],
+        cluster_dominance: Option<ClusterPreparedDominance>,
     ) -> Result<(), DbError> {
         let checkpoint_ids = self.store.list_ids().await.map_err(DbError::from)?;
         for checkpoint_id in checkpoint_ids {
@@ -999,21 +1035,52 @@ impl<'a> RecoveryManager<'a> {
                 })?;
             if manifest.epoch <= selected.epoch && manifest.checkpoint_id <= selected.checkpoint_id
             {
-                continue;
+                if cluster_dominance.is_none() {
+                    continue;
+                }
+                if manifest.epoch < selected.epoch
+                    && manifest.checkpoint_id < selected.checkpoint_id
+                {
+                    if manifest.durable_phase == DurableCheckpointPhase::Prepared
+                        && !outcomes
+                            .iter()
+                            .any(|outcome| outcome.epoch == manifest.epoch)
+                    {
+                        self.validate_dominated_prepared_manifest(checkpoint_id, &manifest)?;
+                    }
+                    continue;
+                }
             }
-            let outcome = outcomes
+            let Some(outcome) = outcomes
                 .iter()
                 .find(|outcome| outcome.epoch == manifest.epoch)
-                .ok_or_else(|| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6041] newer {:?} checkpoint {} epoch {} is not settled by an exact terminal outcome; refusing to restore older checkpoint {} epoch {}",
-                        manifest.durable_phase,
-                        manifest.checkpoint_id,
-                        manifest.epoch,
-                        selected.checkpoint_id,
-                        selected.epoch
-                    ))
-                })?;
+            else {
+                if let Some(outcome) = outcomes
+                    .iter()
+                    .find(|outcome| outcome.checkpoint_id == manifest.checkpoint_id)
+                {
+                    return Err(DbError::Checkpoint(format!(
+                        "[LDB-6041] checkpoint {} is reused by manifest epoch {} and terminal outcome epoch {}",
+                        manifest.checkpoint_id, manifest.epoch, outcome.epoch
+                    )));
+                }
+                let dominated = cluster_dominance.is_some_and(|boundary| {
+                    manifest.epoch < boundary.highest_terminal_epoch
+                        && manifest.checkpoint_id < boundary.highest_terminal_checkpoint_id
+                });
+                if manifest.durable_phase == DurableCheckpointPhase::Prepared && dominated {
+                    self.validate_dominated_prepared_manifest(checkpoint_id, &manifest)?;
+                    continue;
+                }
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6041] newer {:?} checkpoint {} epoch {} is not settled by an exact terminal outcome; refusing to restore older checkpoint {} epoch {}",
+                    manifest.durable_phase,
+                    manifest.checkpoint_id,
+                    manifest.epoch,
+                    selected.checkpoint_id,
+                    selected.epoch
+                )));
+            };
             let expected_verdict = match manifest.durable_phase {
                 DurableCheckpointPhase::Prepared => CheckpointVerdict::Abort,
                 DurableCheckpointPhase::Finalized => CheckpointVerdict::Commit,
@@ -1030,6 +1097,44 @@ impl<'a> RecoveryManager<'a> {
                     outcome.verdict
                 )));
             }
+        }
+        Ok(())
+    }
+
+    fn validate_dominated_prepared_manifest(
+        &self,
+        storage_id: u64,
+        manifest: &CheckpointManifest,
+    ) -> Result<(), DbError> {
+        if manifest.checkpoint_id != storage_id {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6041] storage checkpoint {storage_id} contains dominated Prepared manifest checkpoint {}",
+                manifest.checkpoint_id
+            )));
+        }
+        let validation = manifest.validate(self.store.key_group_count());
+        if !validation.is_empty() {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6041] dominated Prepared checkpoint {} epoch {} is invalid: {}",
+                manifest.checkpoint_id,
+                manifest.epoch,
+                validation
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )));
+        }
+        if manifest.participant_id != self.store.participant_id()
+            || manifest.deployment_id != self.expected_deployment_id
+            || manifest.pipeline_identity != self.expected_pipeline_identity
+        {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6043] dominated Prepared checkpoint {} epoch {} does not belong to storage participant {} and the active deployment/pipeline identity",
+                manifest.checkpoint_id,
+                manifest.epoch,
+                self.store.participant_id()
+            )));
         }
         Ok(())
     }
@@ -1124,9 +1229,9 @@ impl<'a> RecoveryManager<'a> {
         // highest commit first and require an exact participant-bound manifest. Corruption or
         // storage loss for an included participant is fatal rather than a reason to rewind.
         if let Some(authority) = authority {
-            let mut outcomes = authority.outcomes().await?;
-            match authority {
+            let (outcomes, cluster_outcome_floor) = match authority {
                 RecoveryOutcomeAuthority::Local(decision_store) => {
+                    let mut outcomes = authority.outcomes().await?;
                     // Prepared is the sole local pre-outcome durable phase: state is sealed and
                     // coordinated sinks may have phase-1 side effects, but Finalized is written
                     // only after Commit. Settle every outcome-less Prepared attempt before
@@ -1134,17 +1239,28 @@ impl<'a> RecoveryManager<'a> {
                     self.settle_local_prepared_attempts(decision_store, &outcomes)
                         .await?;
                     outcomes = authority.outcomes().await?;
+                    (outcomes, None)
                 }
                 #[cfg(feature = "cluster")]
-                RecoveryOutcomeAuthority::Cluster { .. } => {}
-            }
+                RecoveryOutcomeAuthority::Cluster {
+                    outcomes: cluster_authority,
+                    capsules,
+                } => {
+                    let floor = self
+                        .validated_cluster_prepared_dominance(cluster_authority, capsules)
+                        .await?;
+                    (authority.outcomes().await?, Some(floor))
+                }
+            };
+            let cluster_dominance =
+                ClusterPreparedDominance::from_outcomes(cluster_outcome_floor, &outcomes);
             let outcome = outcomes
                 .iter()
                 .rev()
                 .find(|outcome| outcome.is_commit())
                 .cloned();
             if let Some(outcome) = outcome {
-                self.validate_newer_durable_attempts(&outcome, &outcomes)
+                self.validate_newer_durable_attempts(&outcome, &outcomes, cluster_dominance)
                     .await?;
                 return self.restore_committed_outcome(&outcome, authority).await;
             }
@@ -1208,16 +1324,27 @@ impl<'a> RecoveryManager<'a> {
         if let Some(authority) = authority {
             // Audit the immutable outcome history before selecting a target. Abort closes an
             // attempt but never creates a recovery cut; the newest retained Commit is authoritative.
-            let mut outcomes = authority.outcomes().await?;
-            match authority {
+            let (outcomes, cluster_outcome_floor) = match authority {
                 RecoveryOutcomeAuthority::Local(decision_store) => {
+                    let mut outcomes = authority.outcomes().await?;
                     self.settle_local_prepared_attempts(decision_store, &outcomes)
                         .await?;
                     outcomes = authority.outcomes().await?;
+                    (outcomes, None)
                 }
                 #[cfg(feature = "cluster")]
-                RecoveryOutcomeAuthority::Cluster { .. } => {}
-            }
+                RecoveryOutcomeAuthority::Cluster {
+                    outcomes: cluster_authority,
+                    capsules,
+                } => {
+                    let floor = self
+                        .validated_cluster_prepared_dominance(cluster_authority, capsules)
+                        .await?;
+                    (authority.outcomes().await?, Some(floor))
+                }
+            };
+            let cluster_dominance =
+                ClusterPreparedDominance::from_outcomes(cluster_outcome_floor, &outcomes);
             let committed = outcomes
                 .iter()
                 .rev()
@@ -1225,7 +1352,11 @@ impl<'a> RecoveryManager<'a> {
                 .cloned();
             return match committed {
                 Some(outcome) if outcome.epoch == target_epoch => {
-                    self.validate_newer_durable_attempts(&outcome, &outcomes)
+                    self.validate_newer_durable_attempts(
+                        &outcome,
+                        &outcomes,
+                        cluster_dominance,
+                    )
                         .await?;
                     self.restore_committed_outcome(&outcome, authority).await
                 }
@@ -1902,6 +2033,27 @@ mod tests {
             portable_state_sha256,
         };
         record_cluster_capsule_commit(store, fence, &capsule).await;
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn record_cluster_abort(
+        store: &ClusterDecisions,
+        epoch: u64,
+        checkpoint_id: u64,
+        fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
+    ) {
+        store
+            .authority
+            .record_cluster_outcome(
+                &store.proof,
+                epoch,
+                checkpoint_id,
+                fence.clone(),
+                CheckpointVerdict::Abort,
+                None,
+            )
+            .await
+            .unwrap();
     }
 
     #[cfg(feature = "cluster")]
@@ -2702,6 +2854,188 @@ mod tests {
                 .unwrap()
                 .fencing_token,
             1
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn outcome_floor_does_not_dominate_a_newer_prepared_checkpoint_id() {
+        let backing: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        let offline =
+            ObjectStoreCheckpointStore::new(std::sync::Arc::clone(&backing), "nodes/1/".into())
+                .with_participant_id(1);
+        let donor =
+            ObjectStoreCheckpointStore::new(std::sync::Arc::clone(&backing), "nodes/2/".into())
+                .with_participant_id(2);
+        let fence = assignment_fence(4, &[2]);
+        let decisions = cluster_decisions(std::sync::Arc::clone(&backing), &fence, 2).await;
+        let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
+
+        record_cluster_commit(&decisions, 5, 1, &fence, 2, None).await;
+        let mut retained = CheckpointManifest::new(3, 7);
+        retained.participant_id = 2;
+        retained.deployment_id.clone_from(&deployment_id);
+        donor.save(&retained).await.unwrap();
+        record_cluster_commit(&decisions, 7, 3, &fence, 2, Some(&retained)).await;
+        decisions
+            .authority
+            .prune_cluster_outcomes_before(&decisions.proof, 7, |_| async { Ok(()) })
+            .await
+            .unwrap();
+        assert_eq!(
+            decisions
+                .authority
+                .cluster_outcome_retention_boundary()
+                .await
+                .unwrap()
+                .before_epoch,
+            7
+        );
+        assert!(decisions
+            .authority
+            .cluster_outcome(5)
+            .await
+            .unwrap()
+            .is_none());
+
+        let mut stale = CheckpointManifest::new(99, 6);
+        stale.participant_id = 1;
+        stale.deployment_id.clone_from(&deployment_id);
+        offline.save(&stale).await.unwrap();
+
+        let error = RecoveryManager::new(&offline)
+            .with_deployment_id(&deployment_id)
+            .with_outcome_scope(CheckpointScope::Cluster)
+            .recover_cluster(&decisions.authority, &decisions.capsules)
+            .await
+            .expect_err("an outcome floor cannot settle an incomparable Prepared attempt");
+        assert!(
+            error
+                .to_string()
+                .contains("checkpoint 99 epoch 6 is not settled by an exact terminal outcome"),
+            "{error}"
+        );
+        assert_eq!(
+            offline.load_by_id(99).await.unwrap().unwrap().durable_phase,
+            DurableCheckpointPhase::Prepared
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn later_terminal_strictly_dominates_missing_prepared_attempt() {
+        let backing: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        let store =
+            ObjectStoreCheckpointStore::new(std::sync::Arc::clone(&backing), "nodes/1/".into())
+                .with_participant_id(1);
+        let fence = assignment_fence(4, &[1]);
+        let decisions = cluster_decisions(backing, &fence, 1).await;
+        let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
+
+        let mut committed = CheckpointManifest::new(5, 5);
+        committed.participant_id = 1;
+        committed.deployment_id.clone_from(&deployment_id);
+        store.save(&committed).await.unwrap();
+        record_cluster_commit(&decisions, 5, 5, &fence, 1, Some(&committed)).await;
+        let mut prepared = CheckpointManifest::new(6, 6);
+        prepared.participant_id = 1;
+        prepared.deployment_id.clone_from(&deployment_id);
+        store.save(&prepared).await.unwrap();
+        record_cluster_abort(&decisions, 7, 7, &fence).await;
+
+        let recovered = RecoveryManager::new(&store)
+            .with_deployment_id(&deployment_id)
+            .with_outcome_scope(CheckpointScope::Cluster)
+            .recover_cluster(&decisions.authority, &decisions.capsules)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            (recovered.epoch(), recovered.manifest.checkpoint_id),
+            (5, 5)
+        );
+        assert_eq!(
+            store.load_by_id(6).await.unwrap().unwrap().durable_phase,
+            DurableCheckpointPhase::Prepared
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn incomparable_missing_prepared_attempt_remains_fatal() {
+        let backing: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        let store =
+            ObjectStoreCheckpointStore::new(std::sync::Arc::clone(&backing), "nodes/1/".into())
+                .with_participant_id(1);
+        let fence = assignment_fence(4, &[1]);
+        let decisions = cluster_decisions(backing, &fence, 1).await;
+        let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
+
+        let mut committed = CheckpointManifest::new(5, 5);
+        committed.participant_id = 1;
+        committed.deployment_id.clone_from(&deployment_id);
+        store.save(&committed).await.unwrap();
+        record_cluster_commit(&decisions, 5, 5, &fence, 1, Some(&committed)).await;
+        let mut incomparable = CheckpointManifest::new(8, 6);
+        incomparable.participant_id = 1;
+        incomparable.deployment_id.clone_from(&deployment_id);
+        store.save(&incomparable).await.unwrap();
+        record_cluster_abort(&decisions, 7, 7, &fence).await;
+
+        let error = RecoveryManager::new(&store)
+            .with_deployment_id(&deployment_id)
+            .with_outcome_scope(CheckpointScope::Cluster)
+            .recover_cluster(&decisions.authority, &decisions.capsules)
+            .await
+            .expect_err("incomparable dimensions cannot be inferred closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("checkpoint 8 epoch 6 is not settled by an exact terminal outcome"),
+            "{error}"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn dominated_prepared_attempt_with_foreign_provenance_remains_fatal() {
+        let backing: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        let store =
+            ObjectStoreCheckpointStore::new(std::sync::Arc::clone(&backing), "nodes/1/".into())
+                .with_participant_id(1);
+        let fence = assignment_fence(4, &[1]);
+        let decisions = cluster_decisions(backing, &fence, 1).await;
+        let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
+
+        let mut committed = CheckpointManifest::new(5, 5);
+        committed.participant_id = 1;
+        committed.deployment_id.clone_from(&deployment_id);
+        store.save(&committed).await.unwrap();
+        record_cluster_commit(&decisions, 5, 5, &fence, 1, Some(&committed)).await;
+        let mut foreign = CheckpointManifest::new(6, 6);
+        foreign.participant_id = 1;
+        foreign.deployment_id = uuid::Uuid::new_v4().to_string();
+        store.save(&foreign).await.unwrap();
+        record_cluster_abort(&decisions, 7, 7, &fence).await;
+
+        let error = RecoveryManager::new(&store)
+            .with_deployment_id(&deployment_id)
+            .with_outcome_scope(CheckpointScope::Cluster)
+            .recover_cluster(&decisions.authority, &decisions.capsules)
+            .await
+            .expect_err("dominance cannot hide foreign recovery inventory");
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not belong to storage participant 1 and the active deployment/pipeline identity"),
+            "{error}"
         );
     }
 

@@ -309,6 +309,16 @@ pub struct LaminarDB {
     /// Cleared by the owning lifecycle thread only after its future actually finishes.
     #[cfg(feature = "cluster")]
     pub(crate) coordinated_lifecycle_active: Arc<std::sync::atomic::AtomicBool>,
+    /// Persistent ownership fence from the first observed recovery fault through the committed
+    /// recovery release. Unlike `coordinated_lifecycle_active`, this spans the gap between a
+    /// completed stop and its durable stopped report, so an operator start cannot invalidate the
+    /// report's quiescence claim.
+    #[cfg(feature = "cluster")]
+    pub(crate) coordinated_recovery_fenced: Arc<std::sync::atomic::AtomicBool>,
+    /// Stable sequence for a local fault whose durable recovery report has not yet been
+    /// acknowledged. The database-owned recovery monitor retries this exact value.
+    #[cfg(feature = "cluster")]
+    pub(crate) pending_recovery_fault: Arc<std::sync::atomic::AtomicU64>,
     /// Epoch the most recent start restored from (`None` = started fresh). A rejoin fault
     /// is reported only when prior local state existed — a fresh joiner lost no window.
     #[cfg(feature = "cluster")]
@@ -1040,6 +1050,10 @@ impl LaminarDB {
             recovery_monitor: parking_lot::Mutex::new(None),
             #[cfg(feature = "cluster")]
             coordinated_lifecycle_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "cluster")]
+            coordinated_recovery_fenced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "cluster")]
+            pending_recovery_fault: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "cluster")]
             last_recovery_epoch: parking_lot::Mutex::new(None),
             #[cfg(feature = "cluster")]
@@ -2835,6 +2849,7 @@ impl LaminarDB {
 
         let _topology_ddl = self.topology_ddl_lock.write().await;
         self.ensure_catalog_cleanup_unfenced("cluster catalog bootstrap")?;
+        self.ensure_coordinated_recovery_mutation_unfenced("cluster catalog bootstrap")?;
         if DbState::load(&self.state) != DbState::Created {
             return Err(DbError::InvalidOperation(
                 "cluster catalog bootstrap is only valid before pipeline startup".into(),
@@ -2970,17 +2985,24 @@ impl LaminarDB {
         if is_topology_ddl(statement) {
             let _topology_ddl = self.topology_ddl_lock.write().await;
             self.ensure_catalog_cleanup_unfenced("database mutation")?;
+            #[cfg(feature = "cluster")]
+            self.ensure_coordinated_recovery_mutation_unfenced("database mutation")?;
             self.execute_parsed_single(sql, statement).await
         } else if reads_catalog(statement) {
             let _topology_read = self.topology_ddl_lock.read().await;
             if mutates_database(statement) {
                 self.ensure_catalog_cleanup_unfenced("database mutation")?;
+                #[cfg(feature = "cluster")]
+                self.ensure_coordinated_recovery_mutation_unfenced("database mutation")?;
             }
             self.execute_parsed_single(sql, statement).await
+        } else if mutates_database(statement) {
+            let _topology_read = self.topology_ddl_lock.read().await;
+            self.ensure_catalog_cleanup_unfenced("database mutation")?;
+            #[cfg(feature = "cluster")]
+            self.ensure_coordinated_recovery_mutation_unfenced("database mutation")?;
+            self.execute_parsed_single(sql, statement).await
         } else {
-            if mutates_database(statement) {
-                self.ensure_catalog_cleanup_unfenced("database mutation")?;
-            }
             self.execute_parsed_single(sql, statement).await
         }
     }
@@ -4111,6 +4133,8 @@ impl LaminarDB {
         &self,
     ) -> Result<crate::checkpoint_coordinator::CheckpointResult, DbError> {
         self.ensure_catalog_cleanup_unfenced("manual checkpoint")?;
+        #[cfg(feature = "cluster")]
+        self.ensure_coordinated_recovery_mutation_unfenced("manual checkpoint")?;
         if self.config.checkpoint.is_none() {
             return Err(DbError::Checkpoint(
                 "checkpointing is not enabled".to_string(),

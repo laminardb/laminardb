@@ -510,17 +510,45 @@ fn validate_kafka_assignment(
     ))
 }
 
+fn kafka_bootstrap_is_unassigned(
+    published: &laminar_core::state::VnodeAssignmentSnapshot,
+    self_id: laminar_core::state::NodeId,
+) -> Result<bool, ConnectorError> {
+    if self_id.is_unassigned() {
+        return Err(ConnectorError::ConfigurationError(
+            "Kafka vnode ownership requires a nonzero node identity".into(),
+        ));
+    }
+    if published.owners().is_empty() {
+        return Err(ConnectorError::ConfigurationError(
+            "Kafka vnode assignment cannot use an empty owner map".into(),
+        ));
+    }
+    if published.version() != 0 {
+        super::vnode_routing::validate_owner_map(published.owners(), self_id)?;
+        return Ok(false);
+    }
+    if published.has_committed_handoff()
+        || !published
+            .owners()
+            .iter()
+            .all(laminar_core::state::NodeId::is_unassigned)
+    {
+        return Err(ConnectorError::ConfigurationError(
+            "Kafka vnode assignment version 0 must be the fully unassigned bootstrap publication"
+                .into(),
+        ));
+    }
+    Ok(true)
+}
+
 fn kafka_owned_partition_sets(
     routes: &KafkaPartitionRoutes,
     published: &laminar_core::state::VnodeAssignmentSnapshot,
     self_id: laminar_core::state::NodeId,
     reconciled_version: u64,
 ) -> Result<(KafkaPartitionSet, KafkaPartitionSet), ConnectorError> {
-    if self_id.is_unassigned() {
-        return Err(ConnectorError::ConfigurationError(
-            "Kafka vnode ownership requires a nonzero node identity".into(),
-        ));
-    }
+    super::vnode_routing::validate_owner_map(published.owners(), self_id)?;
     let mut owned = KafkaPartitionSet::new();
     let mut reacquired = KafkaPartitionSet::new();
     for (topic, topic_routes) in routes {
@@ -3703,27 +3731,36 @@ impl SourceConnector for KafkaSource {
                 // Metadata and watermark I/O above must not delay assignment writers.
                 let published = registry.read_assignment();
                 let assignment_version = published.version();
-                let tpl = build_vnode_assignment_tpl(
-                    self.source_name.as_ref(),
-                    published.owners(),
-                    self_id,
-                    &topic_meta,
-                    VnodeResumeCursors {
-                        local_offsets: &self.offsets,
-                        handoff_offsets: &no_resume,
-                        local_baselines: &self.manual_partition_baselines,
-                        handoff_baselines: &no_resume_baselines,
-                    },
-                    default_offset,
-                )?;
+                let boot_unassigned = kafka_bootstrap_is_unassigned(&published, self_id)?;
+                let tpl = if boot_unassigned {
+                    TopicPartitionList::new()
+                } else {
+                    build_vnode_assignment_tpl(
+                        self.source_name.as_ref(),
+                        published.owners(),
+                        self_id,
+                        &topic_meta,
+                        VnodeResumeCursors {
+                            local_offsets: &self.offsets,
+                            handoff_offsets: &no_resume,
+                            local_baselines: &self.manual_partition_baselines,
+                            handoff_baselines: &no_resume_baselines,
+                        },
+                        default_offset,
+                    )?
+                };
                 let owned_partitions = Arc::new(
                     kafka_partition_set(&tpl).map_err(ConnectorError::ConfigurationError)?,
                 );
                 // Incremental from empty so rebinds can stay incremental — librdkafka
                 // rejects mixing a full assign() with incremental_assign/unassign.
-                consumer.incremental_assign(&tpl).map_err(|e| {
-                    ConnectorError::ConnectionFailed(format!("vnode partition assign failed: {e}"))
-                })?;
+                if tpl.count() > 0 {
+                    consumer.incremental_assign(&tpl).map_err(|e| {
+                        ConnectorError::ConnectionFailed(format!(
+                            "vnode partition assign failed: {e}"
+                        ))
+                    })?;
+                }
                 validate_kafka_partition_results("initial incremental assign", &tpl)
                     .map_err(ConnectorError::ConnectionFailed)?;
                 let active = consumer.assignment().map_err(|error| {
@@ -3745,10 +3782,16 @@ impl SourceConnector for KafkaSource {
                 self.reconciled_assignment_version
                     .store(assignment_version, Ordering::Release);
                 drop(published);
-                info!(
-                    owned_partitions = owned_partitions.len(),
-                    "Kafka source assigned vnode-owned partitions (engine-controlled)"
-                );
+                if boot_unassigned {
+                    info!(
+                        "Kafka source started fenced with no partitions until durable vnode adoption"
+                    );
+                } else {
+                    info!(
+                        owned_partitions = owned_partitions.len(),
+                        "Kafka source assigned vnode-owned partitions (engine-controlled)"
+                    );
+                }
                 true
             } else {
                 return Err(ConnectorError::ConfigurationError(
@@ -5675,6 +5718,95 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn vnode_bootstrap_starts_empty_then_reconciles_durable_assignment() {
+        let cluster = MockCluster::new(1).expect("create in-process Kafka mock cluster");
+        cluster
+            .create_topic("events", 4, 1)
+            .expect("create explicit topic inventory");
+
+        let node1 = laminar_core::state::NodeId(1);
+        let node2 = laminar_core::state::NodeId(2);
+        let registry = Arc::new(laminar_core::state::VnodeRegistry::new_unassigned(8));
+        let mut config = test_config();
+        config.bootstrap_servers = cluster.bootstrap_servers();
+        config.group_id = "vnode-bootstrap".into();
+        config.startup_mode = StartupMode::Earliest;
+        let mut source = KafkaSource::new(test_schema(), config, None);
+        source
+            .set_vnode_assignment("events_source", Arc::clone(&registry), node1)
+            .unwrap();
+
+        source
+            .start(SourceStart {
+                config: ConnectorConfig::new("kafka"),
+                position: SourcePosition::Initial,
+                delivery: DeliveryGuarantee::AtLeastOnce,
+            })
+            .await
+            .expect("canonical unassigned bootstrap must start fenced");
+
+        let active = source
+            .consumer
+            .as_ref()
+            .expect("active consumer")
+            .assignment()
+            .expect("read bootstrap assignment");
+        assert_eq!(active.count(), 0);
+        assert!(!source.checkpoint_ready().unwrap());
+        assert!(source.try_checkpoint().unwrap().is_none());
+        let publication = Arc::clone(&lock_or_recover(&source.assignment_publication));
+        assert_eq!(publication.assignment_version, 0);
+        assert!(publication.owned_partitions.is_empty());
+
+        registry.set_assignment_and_version(
+            [node1, node2, node1, node2, node2, node1, node2, node1].into(),
+            1,
+        );
+        source.drive_control_plane();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !source.checkpoint_ready().unwrap() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Kafka bootstrap assignment did not reconcile"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let expected: KafkaPartitionSet =
+            crate::kafka::vnode_routing::owned_partitions_in_assignment(
+                "events_source",
+                "events",
+                4,
+                &registry.snapshot(),
+                node1,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|partition| ("events".to_string(), partition))
+            .collect();
+        let active = kafka_partition_set(
+            &source
+                .consumer
+                .as_ref()
+                .expect("active consumer")
+                .assignment()
+                .expect("read adopted assignment"),
+        )
+        .unwrap();
+        assert_eq!(active, expected);
+        assert_eq!(
+            source
+                .try_checkpoint()
+                .unwrap()
+                .expect("adopted assignment checkpoint")
+                .assignment_version(),
+            NonZeroU64::new(1)
+        );
+
+        source.close().await.expect("close mock consumer");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn vnode_rotation_reconciles_only_the_verified_target_assignment() {
         let cluster = MockCluster::new(1).expect("create in-process Kafka mock cluster");
         cluster
@@ -5944,6 +6076,25 @@ mod tests {
         assert_eq!(reacquired, owned);
         let (_, reacquired) = kafka_owned_partition_sets(&routes, &published, self_id, 3).unwrap();
         assert!(reacquired.is_empty());
+    }
+
+    #[test]
+    fn vnode_reconciliation_rejects_noncanonical_unassigned_maps() {
+        let self_id = laminar_core::state::NodeId(1);
+        let registry = laminar_core::state::VnodeRegistry::new_unassigned(2);
+        assert!(kafka_bootstrap_is_unassigned(&registry.versioned_snapshot(), self_id).unwrap());
+
+        registry.set_assignment_and_version(
+            [self_id, laminar_core::state::NodeId::UNASSIGNED].into(),
+            1,
+        );
+        let published = registry.versioned_snapshot();
+        let error = kafka_bootstrap_is_unassigned(&published, self_id).unwrap_err();
+        assert!(error.to_string().contains("unassigned owner at vnode 1"));
+        let routes =
+            kafka_partition_routes("events_source", 2, &[(Arc::from("events"), 2)]).unwrap();
+        let error = kafka_owned_partition_sets(&routes, &published, self_id, 0).unwrap_err();
+        assert!(error.to_string().contains("unassigned owner at vnode 1"));
     }
 
     #[test]

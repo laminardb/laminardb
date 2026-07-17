@@ -165,12 +165,13 @@ impl AppState {
             return Some(reason);
         }
         #[cfg(feature = "cluster")]
-        if self
-            .cluster
-            .as_ref()
-            .is_some_and(|cluster| !cluster.controller.process_lease_is_live())
-        {
-            return Some("server process lease is no longer live");
+        if let Some(cluster) = self.cluster.as_ref() {
+            if !cluster.controller.process_lease_is_live() {
+                return Some("server process lease is no longer live");
+            }
+            if cluster.controller.is_recovering() || self.db.coordinated_recovery_in_progress() {
+                return Some("server is completing coordinated recovery");
+            }
         }
         None
     }
@@ -2191,6 +2192,54 @@ mod tests {
             assert!(
                 String::from_utf8_lossy(&body).contains("server process lease is no longer live"),
                 "deadline rejection for {path}: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn recovering_cluster_rejects_readiness_and_serving_routes() {
+        use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+
+        let node = laminar_core::cluster::discovery::NodeId(43);
+        let control: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
+        let assignment_store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let snapshot_store = Arc::new(
+            laminar_core::cluster::control::AssignmentSnapshotStore::new(assignment_store),
+        );
+        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(
+            node,
+            control,
+            Some(Arc::clone(&snapshot_store)),
+            members_rx.clone(),
+        ));
+        controller.set_recovering(true);
+
+        let mut state = test_state_with_gate(ready_serving_gate());
+        Arc::get_mut(&mut state).unwrap().cluster = Some(ClusterComponents {
+            controller,
+            snapshot_store,
+            membership_rx: members_rx,
+        });
+        let app = build_router(state);
+
+        for path in ["/ready", "/api/v1/sources"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&body)
+                    .contains("server is completing coordinated recovery"),
+                "recovery rejection for {path}: {}",
                 String::from_utf8_lossy(&body)
             );
         }

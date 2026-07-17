@@ -21,6 +21,9 @@ pub mod checkpoint_store;
 /// Object store factory — builds S3, GCS, Azure, or local backends from URL schemes.
 pub mod object_store_builder;
 
+/// Compact inventory evidence for unresolved prepared checkpoints.
+pub mod prepared_witness;
+
 /// Canonical recovery image selected by a committed cluster checkpoint.
 pub mod recovery_capsule;
 
@@ -41,6 +44,7 @@ pub use checkpoint_store::{
     CheckpointStore, CheckpointStoreError, FileSystemCheckpointStore, ObjectStoreCheckpointStore,
     RecoveryReport, ValidationIssue, ValidationResult,
 };
+pub use prepared_witness::{PreparedCheckpointWitness, MAX_PREPARED_CHECKPOINT_WITNESSES};
 pub use recovery_capsule::{
     canonical_json_bytes, canonical_json_sha256, CheckpointWatermark, ClusterRecoveryCapsule,
     CommittedSourceHandoff, ParticipantRecoveryRef, RecoveryCapsuleRef, SourceHandoffState,

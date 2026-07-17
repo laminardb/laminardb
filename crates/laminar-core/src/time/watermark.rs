@@ -666,7 +666,7 @@ impl WatermarkTracker {
 
 /// Watermark generator for sources with embedded watermarks.
 ///
-/// Some sources (like Kafka with EOS) may provide watermarks directly.
+/// Some sources provide a durable upstream event-time frontier directly.
 /// This generator tracks both event timestamps and explicit watermarks.
 pub struct SourceProvidedGenerator {
     /// Last watermark from the source

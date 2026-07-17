@@ -12,7 +12,8 @@ use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::connector::CoordinatedCommitNamespace;
 #[cfg(feature = "cluster")]
 use laminar_core::checkpoint::{
-    canonical_json_sha256, ClusterRecoveryCapsule, CommittedSourceHandoff, RecoveryCapsuleRef,
+    canonical_json_sha256, ClusterRecoveryCapsule, CommittedSourceHandoff,
+    PreparedCheckpointWitness, RecoveryCapsuleRef, MAX_PREPARED_CHECKPOINT_WITNESSES,
 };
 use laminar_core::checkpoint::{CheckpointWatermark, LeaderProof};
 #[cfg(feature = "cluster")]
@@ -1908,6 +1909,181 @@ impl CheckpointCoordinator {
     #[cfg(feature = "cluster")]
     pub(crate) fn participant_id(&self) -> u64 {
         self.store.participant_id()
+    }
+
+    #[cfg(feature = "cluster")]
+    fn prepared_witness_from_local_manifest(
+        &self,
+        storage_id: u64,
+        manifest: CheckpointManifest,
+    ) -> Result<Option<PreparedCheckpointWitness>, DbError> {
+        if manifest.checkpoint_id != storage_id {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6041] storage checkpoint {storage_id} contains manifest checkpoint {}",
+                manifest.checkpoint_id
+            )));
+        }
+        if manifest.durable_phase
+            != laminar_core::storage::checkpoint_manifest::DurableCheckpointPhase::Prepared
+        {
+            return Ok(None);
+        }
+        self.store
+            .ensure_manifest_participant(&manifest)
+            .map_err(DbError::from)?;
+        let validation_errors = manifest.validate(self.store.key_group_count());
+        if !validation_errors.is_empty() {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6041] prepared checkpoint {storage_id} is invalid: {}",
+                validation_errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )));
+        }
+        let expected_deployment_id = self.expected_deployment_id()?;
+        if manifest.deployment_id != expected_deployment_id {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6043] prepared checkpoint {storage_id} belongs to deployment {}, runtime deployment is {expected_deployment_id}",
+                manifest.deployment_id
+            )));
+        }
+        let expected_pipeline_identity = self.expected_pipeline_identity();
+        if manifest.pipeline_identity != expected_pipeline_identity {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6043] prepared checkpoint {storage_id} belongs to pipeline identity {}, runtime identity is {}",
+                manifest.pipeline_identity.sha256, expected_pipeline_identity.sha256
+            )));
+        }
+
+        PreparedCheckpointWitness::new(
+            CheckpointAttempt::new(manifest.epoch, manifest.checkpoint_id),
+            manifest.participant_id,
+            manifest.deployment_id,
+            manifest.pipeline_identity,
+        )
+        .map(Some)
+        .map_err(|error| {
+            DbError::Checkpoint(format!(
+                "[LDB-6041] prepared checkpoint {storage_id} cannot form canonical recovery evidence: {error}"
+            ))
+        })
+    }
+
+    /// Return every unresolved participant-local prepare that still needs a cluster outcome.
+    ///
+    /// The inventory is bounded recovery evidence. It never creates an outcome and fails closed
+    /// on corrupt, foreign, or non-monotonic local manifest history.
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn prepared_checkpoint_witnesses(
+        &self,
+    ) -> Result<Vec<PreparedCheckpointWitness>, DbError> {
+        let participant_id = self.store.participant_id();
+        let ids = self.store.list_ids().await.map_err(DbError::from)?;
+        if ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(DbError::Checkpoint(
+                "[LDB-6041] participant-local checkpoint IDs are not strictly ascending".into(),
+            ));
+        }
+
+        let (outcomes, boundary) = self.cluster_outcome_inventory().await?;
+        let highest_terminal = outcomes.last().or(boundary.terminal_anchor.as_ref());
+        if let Some(terminal) = highest_terminal {
+            self.validate_cluster_outcome_provenance(terminal)?;
+        }
+
+        let mut witnesses = Vec::new();
+        for storage_id in ids {
+            let manifest = self
+                .store
+                .load_by_id(storage_id)
+                .await
+                .map_err(DbError::from)?
+                .ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6041] listed participant-local checkpoint {storage_id} disappeared during prepared inventory"
+                    ))
+                })?;
+            let Some(witness) = self.prepared_witness_from_local_manifest(storage_id, manifest)?
+            else {
+                continue;
+            };
+
+            let attempt = witness.attempt;
+            if let Some(outcome) = outcomes
+                .iter()
+                .find(|outcome| outcome.epoch == attempt.epoch)
+            {
+                self.validate_prepared_outcome(outcome, attempt)?;
+                continue;
+            }
+            if highest_terminal.is_some_and(|terminal| {
+                terminal.epoch > attempt.epoch && terminal.checkpoint_id > attempt.checkpoint_id
+            }) {
+                continue;
+            }
+
+            witnesses.push(witness);
+            if witnesses.len() > MAX_PREPARED_CHECKPOINT_WITNESSES {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6040] participant {participant_id} has more than {MAX_PREPARED_CHECKPOINT_WITNESSES} unresolved prepared checkpoints"
+                )));
+            }
+        }
+        witnesses.sort_unstable_by_key(|witness| {
+            (
+                witness.attempt.epoch,
+                witness.attempt.checkpoint_id,
+                witness.participant_id,
+            )
+        });
+        self.validate_prepared_checkpoint_witnesses(&witnesses)?;
+        Ok(witnesses)
+    }
+
+    /// Validate peer prepared evidence before any successor outcome is written.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn validate_prepared_checkpoint_witnesses(
+        &self,
+        witnesses: &[PreparedCheckpointWitness],
+    ) -> Result<(), DbError> {
+        if witnesses.len() > MAX_PREPARED_CHECKPOINT_WITNESSES {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6040] prepared checkpoint inventory has {} witnesses; maximum is {MAX_PREPARED_CHECKPOINT_WITNESSES}",
+                witnesses.len()
+            )));
+        }
+        let expected_deployment_id = self.expected_deployment_id()?;
+        let expected_pipeline_identity = self.expected_pipeline_identity();
+        let mut attempts = Vec::with_capacity(witnesses.len());
+        for witness in witnesses {
+            if !witness.is_canonical() {
+                return Err(DbError::Checkpoint(
+                    "[LDB-6041] prepared checkpoint inventory contains a non-canonical witness"
+                        .into(),
+                ));
+            }
+            if witness.deployment_id != expected_deployment_id
+                || witness.pipeline_identity != expected_pipeline_identity
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6043] prepared checkpoint witness for participant {} does not match the active deployment and pipeline",
+                    witness.participant_id
+                )));
+            }
+            attempts.push(witness.attempt);
+        }
+        attempts.sort_unstable_by_key(|attempt| (attempt.epoch, attempt.checkpoint_id));
+        attempts.dedup();
+        if attempts.windows(2).any(|pair| {
+            pair[0].epoch >= pair[1].epoch || pair[0].checkpoint_id >= pair[1].checkpoint_id
+        }) {
+            return Err(DbError::Checkpoint(
+                "[LDB-6041] prepared checkpoint witnesses are not monotonically compatible".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Set the assignment generation forwarded to `write_partial` for the split-brain fence.
@@ -3927,38 +4103,126 @@ impl CheckpointCoordinator {
             })
     }
 
+    #[cfg(feature = "cluster")]
+    async fn cluster_outcome_inventory(
+        &self,
+    ) -> Result<
+        (
+            Vec<laminar_core::checkpoint_decision::CheckpointOutcome>,
+            laminar_core::cluster::control::ClusterOutcomeRetentionBoundary,
+        ),
+        DbError,
+    > {
+        let controller = self.cluster_controller.as_ref().ok_or_else(|| {
+            DbError::Checkpoint(
+                "[LDB-6050] cluster outcome inventory requires the cluster controller".into(),
+            )
+        })?;
+        let authority = controller.checkpoint_authority().map_err(|error| {
+            DbError::Checkpoint(format!(
+                "[LDB-6050] cluster outcome inventory requires the exact checkpoint authority: {error}"
+            ))
+        })?;
+        tokio::time::timeout(self.config.checkpoint_timeout, async {
+            let outcomes = authority
+                .cluster_outcomes()
+                .await
+                .map_err(|error| DbError::Checkpoint(format!("[LDB-6040] {error}")))?;
+            let boundary = authority
+                .cluster_outcome_retention_boundary()
+                .await
+                .map_err(|error| DbError::Checkpoint(format!("[LDB-6040] {error}")))?;
+            Ok((outcomes, boundary))
+        })
+        .await
+        .map_err(|_| {
+            DbError::Checkpoint(format!(
+                "[LDB-6040] cluster outcome inventory timed out after {:?}",
+                self.config.checkpoint_timeout
+            ))
+        })?
+    }
+
+    fn validate_cluster_outcome_provenance(
+        &self,
+        outcome: &laminar_core::checkpoint_decision::CheckpointOutcome,
+    ) -> Result<(), DbError> {
+        if outcome.deployment_id != self.expected_deployment_id()?
+            || outcome.scope != self.active_outcome_scope()
+        {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6041] cluster outcome for checkpoint {} epoch {} does not match the active outcome provenance",
+                outcome.checkpoint_id, outcome.epoch
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_prepared_outcome(
+        &self,
+        outcome: &laminar_core::checkpoint_decision::CheckpointOutcome,
+        attempt: CheckpointAttempt,
+    ) -> Result<(), DbError> {
+        self.validate_cluster_outcome_provenance(outcome)?;
+        if outcome.epoch != attempt.epoch || outcome.checkpoint_id != attempt.checkpoint_id {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6041] prepared checkpoint {} epoch {} does not match its durable outcome",
+                attempt.checkpoint_id, attempt.epoch
+            )));
+        }
+        Ok(())
+    }
+
     async fn prepared_outcome(
         &self,
         epoch: u64,
         checkpoint_id: u64,
-    ) -> Result<laminar_core::checkpoint_decision::CheckpointOutcome, DbError> {
+    ) -> Result<Option<laminar_core::checkpoint_decision::CheckpointOutcome>, DbError> {
+        let attempt = CheckpointAttempt::new(epoch, checkpoint_id);
+        #[cfg(feature = "cluster")]
+        if self.cluster_controller.is_some() {
+            let (outcomes, boundary) = self.cluster_outcome_inventory().await?;
+            if let Some(outcome) = outcomes.iter().find(|outcome| outcome.epoch == epoch) {
+                self.validate_prepared_outcome(outcome, attempt)?;
+                return Ok(Some(outcome.clone()));
+            }
+
+            let highest_terminal = outcomes.last().or(boundary.terminal_anchor.as_ref());
+            if let Some(terminal) = highest_terminal {
+                self.validate_cluster_outcome_provenance(terminal)?;
+            }
+            let strictly_dominated = highest_terminal.is_some_and(|terminal| {
+                terminal.epoch > epoch && terminal.checkpoint_id > checkpoint_id
+            });
+            if strictly_dominated {
+                warn!(
+                    epoch,
+                    checkpoint_id,
+                    retention_floor = boundary.before_epoch,
+                    highest_terminal_epoch = highest_terminal.map(|outcome| outcome.epoch),
+                    highest_terminal_checkpoint_id =
+                        highest_terminal.map(|outcome| outcome.checkpoint_id),
+                    "prepared checkpoint is irreversibly dominated by cluster outcome continuity"
+                );
+                return Ok(None);
+            }
+
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6040] prepared checkpoint {checkpoint_id} epoch {epoch} has no immutable terminal outcome; leaving it prepared"
+            )));
+        }
+
         let outcome = tokio::time::timeout(
             self.config.checkpoint_timeout,
-            async {
-                #[cfg(feature = "cluster")]
-                if let Some(controller) = self.cluster_controller.as_ref() {
-                    let authority = controller.checkpoint_authority().map_err(|error| {
-                        DbError::Checkpoint(format!(
-                            "[LDB-6050] prepared-checkpoint reconciliation requires the exact checkpoint authority: {error}"
-                        ))
-                    })?;
-                    return authority
-                        .cluster_outcome(epoch)
-                        .await
-                        .map_err(|error| DbError::Checkpoint(format!("[LDB-6040] {error}")));
-                }
-                self.decision_store
-                    .as_ref()
-                    .ok_or_else(|| {
-                        DbError::Checkpoint(
-                            "[LDB-6050] prepared-checkpoint reconciliation requires the durable decision store"
-                                .into(),
-                        )
-                    })?
-                    .outcome(epoch)
-                    .await
-                    .map_err(|error| DbError::Checkpoint(format!("[LDB-6040] {error}")))
-            },
+            self.decision_store
+                .as_ref()
+                .ok_or_else(|| {
+                    DbError::Checkpoint(
+                        "[LDB-6050] prepared-checkpoint reconciliation requires the durable decision store"
+                            .into(),
+                    )
+                })?
+                .outcome(epoch),
         )
         .await
         .map_err(|_| {
@@ -3966,21 +4230,15 @@ impl CheckpointCoordinator {
                 "[LDB-6040] outcome read for prepared epoch {epoch} timed out after {:?}",
                 self.config.checkpoint_timeout
             ))
-        })??;
-        let outcome = outcome.ok_or_else(|| {
+        })?
+        .map_err(|error| DbError::Checkpoint(format!("[LDB-6040] {error}")))?
+        .ok_or_else(|| {
             DbError::Checkpoint(format!(
                 "[LDB-6040] prepared checkpoint {checkpoint_id} epoch {epoch} has no immutable terminal outcome; leaving it prepared"
             ))
         })?;
-        if outcome.checkpoint_id != checkpoint_id
-            || outcome.deployment_id != self.expected_deployment_id()?
-            || outcome.scope != self.active_outcome_scope()
-        {
-            return Err(DbError::Checkpoint(format!(
-                "[LDB-6041] prepared checkpoint {checkpoint_id} epoch {epoch} does not match its durable outcome"
-            )));
-        }
-        Ok(outcome)
+        self.validate_prepared_outcome(&outcome, attempt)?;
+        Ok(Some(outcome))
     }
 
     async fn finish_prepared_reconciliation(
@@ -4068,7 +4326,8 @@ impl CheckpointCoordinator {
     ///
     /// The exact decision is the sole commit authority. External sink publication is re-driven
     /// by the coordinated committer from sealed participant descriptors; the checkpoint
-    /// coordinator only finalizes a decided manifest or force-rolls back an undecided prepare.
+    /// coordinator finalizes an exact Commit, rolls back an exact Abort, or rolls back a prepare
+    /// that immutable outcome continuity proves can no longer receive a decision.
     pub async fn reconcile_prepared_on_init(&self) -> Result<(), DbError> {
         let Some(last) = load_highest(self.store.as_ref())
             .await
@@ -4084,6 +4343,32 @@ impl CheckpointCoordinator {
                 last.checkpoint_id, last.pipeline_identity.sha256, expected_identity.sha256
             )));
         }
+        let expected_deployment_id = self.expected_deployment_id()?;
+        if last.deployment_id != expected_deployment_id {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6043] prepared checkpoint {} belongs to deployment {}, runtime deployment is {}; explicit checkpoint reset is required",
+                last.checkpoint_id, last.deployment_id, expected_deployment_id
+            )));
+        }
+        let expected_participant_id = self.store.participant_id();
+        if last.participant_id != expected_participant_id {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6041] prepared checkpoint {} claims participant {}, checkpoint namespace belongs to participant {}",
+                last.checkpoint_id, last.participant_id, expected_participant_id
+            )));
+        }
+        let validation_errors = last.validate(self.store.key_group_count());
+        if !validation_errors.is_empty() {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6041] prepared checkpoint {} is invalid: {}",
+                last.checkpoint_id,
+                validation_errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )));
+        }
         if last.durable_phase
             == laminar_core::storage::checkpoint_manifest::DurableCheckpointPhase::Finalized
         {
@@ -4093,7 +4378,9 @@ impl CheckpointCoordinator {
         let epoch = last.epoch;
         let checkpoint_id = last.checkpoint_id;
 
-        let outcome = self.prepared_outcome(epoch, checkpoint_id).await?;
+        let Some(outcome) = self.prepared_outcome(epoch, checkpoint_id).await? else {
+            return self.rollback_sinks(epoch).await;
+        };
         self.finish_prepared_reconciliation(epoch, checkpoint_id, outcome)
             .await
     }

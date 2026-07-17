@@ -1434,9 +1434,7 @@ async fn reconcile_announces_commit_when_marker_present() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn reconcile_does_not_announce_uncertified_abort_when_marker_missing() {
-    // Decision store is wired but has no marker for this epoch —
-    // the "leader crashed before commit point" case.
+async fn certified_successor_does_not_synthesize_an_orphaned_outcome() {
     use laminar_core::cluster::control::{
         CheckpointDecisionStore, ClusterController, ClusterKv, InMemoryKv, ANNOUNCEMENT_KEY,
     };
@@ -1456,33 +1454,321 @@ async fn reconcile_does_not_announce_uncertified_abort_when_marker_missing() {
     orphan.participant_id = 1;
     store.save_with_state(&orphan, None).await.unwrap();
 
-    let coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
-        .await
-        .unwrap();
     let self_id = NodeId(1);
     let kv = Arc::new(InMemoryKv::new(self_id));
     let kv_trait: Arc<dyn ClusterKv> = kv.clone();
     let (_tx, rx) = watch::channel(Vec::new());
     let controller = Arc::new(ClusterController::new(self_id, kv_trait, None, rx));
-    let _leader_lease = install_test_leader_lease_on_store(&controller, decision_os).await;
-    let mut coord = coord;
-    coord.set_cluster_controller(controller);
+    controller.set_active(true);
+    let fence = laminar_core::checkpoint::CheckpointAssignmentFence::from_owner_map(
+        2,
+        &[1],
+        vec![laminar_core::checkpoint::CheckpointParticipant {
+            node_id: 1,
+            boot_incarnation: controller.recovery_incarnation(),
+        }],
+    )
+    .unwrap();
+    let _lease_watch = install_test_leader_lease_on_store(&controller, decision_os).await;
+    controller.publish_checkpoint_assignment_fence(Some(fence.clone()));
+    assert!(controller.capture_leader_proof().is_some());
+
+    let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
+        .await
+        .unwrap();
+    coord.set_cluster_controller(Arc::clone(&controller));
     coord
         .set_decision_store(Arc::clone(&decision_store))
         .unwrap();
+    coord.bind_deployment_id(deployment_id).unwrap();
+    coord.set_assignment_version(fence.assignment_version);
+
+    let witnesses = coord.prepared_checkpoint_witnesses().await.unwrap();
+    assert_eq!(witnesses.len(), 1);
+    assert_eq!(witnesses[0].attempt, CheckpointAttempt::new(3, 11));
+    assert_eq!(witnesses[0].participant_id, 1);
 
     let error = coord
         .reconcile_prepared_on_init()
         .await
-        .expect_err("an undecided prepare must remain in doubt");
+        .expect_err("one participant's Prepared manifest cannot authorize a cluster outcome");
     assert!(
-        error.to_string().contains("no immutable terminal outcome"),
+        error
+            .to_string()
+            .contains("has no immutable terminal outcome"),
         "unexpected error: {error}"
     );
 
+    assert!(controller
+        .checkpoint_authority()
+        .unwrap()
+        .cluster_outcome(3)
+        .await
+        .unwrap()
+        .is_none());
     assert!(
         kv.read_from(self_id, ANNOUNCEMENT_KEY).await.is_none(),
-        "startup must not invent an assignment certificate for an undecided prepare"
+        "reconciliation must not publish a terminal hint without an immutable outcome"
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn prepared_inventory_rejects_foreign_deployment_without_creating_outcome() {
+    use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+    use laminar_core::cluster::discovery::NodeId;
+    use tokio::sync::watch;
+
+    let checkpoint_dir = tempfile::tempdir().unwrap();
+    let store =
+        Box::new(FileSystemCheckpointStore::new(checkpoint_dir.path()).with_participant_id(1));
+    let authority_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let decision_store = in_memory_decision_store_on(Arc::clone(&authority_store));
+    let deployment_id = decision_store.load_or_create_deployment_id().await.unwrap();
+    let mut foreign = CheckpointManifest::new(11, 3);
+    foreign.participant_id = 1;
+    foreign.deployment_id = uuid::Uuid::from_u128(99).to_string();
+    store.save(&foreign).await.unwrap();
+
+    let self_id = NodeId(1);
+    let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(self_id));
+    let (_tx, rx) = watch::channel(Vec::new());
+    let controller = Arc::new(ClusterController::new(self_id, kv, None, rx));
+    let fence = test_assignment_fence(1, &[1]);
+    install_test_fence_authority(&controller, &fence, 1, authority_store).await;
+
+    let mut coordinator = CheckpointCoordinator::new(CheckpointConfig::default(), store)
+        .await
+        .unwrap();
+    coordinator.set_cluster_controller(Arc::clone(&controller));
+    coordinator
+        .set_decision_store(Arc::clone(&decision_store))
+        .unwrap();
+    coordinator.bind_deployment_id(deployment_id).unwrap();
+
+    let error = coordinator
+        .prepared_checkpoint_witnesses()
+        .await
+        .expect_err("foreign deployment evidence must fail closed");
+    assert!(error.to_string().contains("LDB-6043"), "{error}");
+    let reconcile_error = coordinator
+        .reconcile_prepared_on_init()
+        .await
+        .expect_err("foreign deployment evidence cannot be reconciled");
+    assert!(
+        reconcile_error.to_string().contains("LDB-6043"),
+        "{reconcile_error}"
+    );
+    assert!(controller
+        .checkpoint_authority()
+        .unwrap()
+        .cluster_outcomes()
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn prepared_inventory_rejects_invalid_manifest_without_creating_outcome() {
+    use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+    use laminar_core::cluster::discovery::NodeId;
+    use tokio::sync::watch;
+
+    let checkpoint_dir = tempfile::tempdir().unwrap();
+    let store =
+        Box::new(FileSystemCheckpointStore::new(checkpoint_dir.path()).with_participant_id(1));
+    let authority_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let decision_store = in_memory_decision_store_on(Arc::clone(&authority_store));
+    let deployment_id = decision_store.load_or_create_deployment_id().await.unwrap();
+    let mut invalid = CheckpointManifest::new(12, 4);
+    invalid.participant_id = 1;
+    invalid.deployment_id.clone_from(&deployment_id);
+    invalid.vnode_count = 0;
+    store.save(&invalid).await.unwrap();
+
+    let self_id = NodeId(1);
+    let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(self_id));
+    let (_tx, rx) = watch::channel(Vec::new());
+    let controller = Arc::new(ClusterController::new(self_id, kv, None, rx));
+    let fence = test_assignment_fence(1, &[1]);
+    install_test_fence_authority(&controller, &fence, 1, authority_store).await;
+
+    let mut coordinator = CheckpointCoordinator::new(CheckpointConfig::default(), store)
+        .await
+        .unwrap();
+    coordinator.set_cluster_controller(Arc::clone(&controller));
+    coordinator
+        .set_decision_store(Arc::clone(&decision_store))
+        .unwrap();
+    coordinator.bind_deployment_id(deployment_id).unwrap();
+
+    let error = coordinator
+        .prepared_checkpoint_witnesses()
+        .await
+        .expect_err("an invalid Prepared manifest must fail closed");
+    assert!(error.to_string().contains("vnode_count is 0"), "{error}");
+    let reconcile_error = coordinator
+        .reconcile_prepared_on_init()
+        .await
+        .expect_err("an invalid Prepared manifest cannot be reconciled");
+    assert!(
+        reconcile_error.to_string().contains("vnode_count is 0"),
+        "{reconcile_error}"
+    );
+    assert!(controller
+        .checkpoint_authority()
+        .unwrap()
+        .cluster_outcomes()
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn prepared_witness_validation_rejects_incomparable_attempts() {
+    use laminar_core::checkpoint::PreparedCheckpointWitness;
+
+    let checkpoint_dir = tempfile::tempdir().unwrap();
+    let store =
+        Box::new(FileSystemCheckpointStore::new(checkpoint_dir.path()).with_participant_id(1));
+    let mut coordinator = CheckpointCoordinator::new(CheckpointConfig::default(), store)
+        .await
+        .unwrap();
+    let deployment_id = uuid::Uuid::from_u128(7).to_string();
+    coordinator
+        .bind_deployment_id(deployment_id.clone())
+        .unwrap();
+    let pipeline_identity = PipelineIdentity::empty();
+    let witnesses = vec![
+        PreparedCheckpointWitness::new(
+            CheckpointAttempt::new(2, 3),
+            1,
+            deployment_id.clone(),
+            pipeline_identity.clone(),
+        )
+        .unwrap(),
+        PreparedCheckpointWitness::new(
+            CheckpointAttempt::new(3, 2),
+            2,
+            deployment_id,
+            pipeline_identity,
+        )
+        .unwrap(),
+    ];
+
+    let error = coordinator
+        .validate_prepared_checkpoint_witnesses(&witnesses)
+        .expect_err("epoch and checkpoint dimensions must advance together");
+    assert!(
+        error.to_string().contains("monotonically compatible"),
+        "{error}"
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn compacted_prepared_attempt_requires_two_dimensional_dominance() {
+    use laminar_core::checkpoint_decision::CheckpointVerdict;
+    use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+    use laminar_core::cluster::discovery::NodeId;
+    use laminar_core::storage::checkpoint_manifest::DurableCheckpointPhase;
+    use tokio::sync::watch;
+
+    let checkpoint_dir = tempfile::tempdir().unwrap();
+    let store =
+        Box::new(FileSystemCheckpointStore::new(checkpoint_dir.path()).with_participant_id(1));
+    let authority_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let decision_store = in_memory_decision_store_on(Arc::clone(&authority_store));
+    let deployment_id = decision_store.load_or_create_deployment_id().await.unwrap();
+    let mut old_prepare = CheckpointManifest::new(2, 2);
+    old_prepare.participant_id = 1;
+    old_prepare.deployment_id.clone_from(&deployment_id);
+    store.save(&old_prepare).await.unwrap();
+
+    let self_id = NodeId(1);
+    let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(self_id));
+    let (_tx, rx) = watch::channel(Vec::new());
+    let controller = Arc::new(ClusterController::new(self_id, kv, None, rx));
+    let fence = test_assignment_fence(1, &[1]);
+    let lease = install_test_fence_authority(&controller, &fence, 1, authority_store).await;
+    let capsule =
+        create_test_recovery_capsule(decision_store.as_ref(), 5, 5, &fence, None, None).await;
+    record_follower_outcome_with_capsule(
+        controller.as_ref(),
+        5,
+        5,
+        &fence,
+        CheckpointVerdict::Commit,
+        Some(capsule),
+    )
+    .await;
+    let authority = controller.checkpoint_authority().unwrap();
+
+    let mut coordinator = CheckpointCoordinator::new(CheckpointConfig::default(), store)
+        .await
+        .unwrap();
+    coordinator.set_cluster_controller(Arc::clone(&controller));
+    coordinator
+        .set_decision_store(Arc::clone(&decision_store))
+        .unwrap();
+    coordinator
+        .bind_deployment_id(deployment_id.clone())
+        .unwrap();
+
+    assert_eq!(
+        authority
+            .cluster_outcome_retention_boundary()
+            .await
+            .unwrap()
+            .before_epoch,
+        0
+    );
+    assert!(
+        coordinator
+            .prepared_checkpoint_witnesses()
+            .await
+            .unwrap()
+            .is_empty(),
+        "a strictly newer terminal attempt dominates an outcome gap"
+    );
+
+    assert_eq!(
+        authority
+            .prune_cluster_outcomes_before(&lease.proof(), 4, |_| async { Ok::<(), String>(()) })
+            .await
+            .unwrap(),
+        4
+    );
+    assert!(coordinator
+        .prepared_checkpoint_witnesses()
+        .await
+        .unwrap()
+        .is_empty());
+    coordinator.reconcile_prepared_on_init().await.unwrap();
+    let stored = coordinator.store().load_by_id(2).await.unwrap().unwrap();
+    assert_eq!(stored.durable_phase, DurableCheckpointPhase::Prepared);
+    assert!(authority.cluster_outcome(2).await.unwrap().is_none());
+
+    let mut incomparable = CheckpointManifest::new(99, 3);
+    incomparable.participant_id = 1;
+    incomparable.deployment_id = deployment_id;
+    coordinator.store().save(&incomparable).await.unwrap();
+
+    let witnesses = coordinator.prepared_checkpoint_witnesses().await.unwrap();
+    assert_eq!(witnesses.len(), 1);
+    assert_eq!(witnesses[0].attempt, CheckpointAttempt::new(3, 99));
+    let error = coordinator
+        .reconcile_prepared_on_init()
+        .await
+        .expect_err("the retention floor cannot settle an incomparable Prepared attempt");
+    assert!(
+        error.to_string().contains("no immutable terminal outcome"),
+        "{error}"
     );
 }
 

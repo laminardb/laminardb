@@ -15,6 +15,28 @@ fn invalid_assignment(message: impl Into<String>) -> ConnectorError {
     ConnectorError::ConfigurationError(message.into())
 }
 
+pub(super) fn validate_owner_map(
+    assignment: &[NodeId],
+    self_id: NodeId,
+) -> Result<(), ConnectorError> {
+    if assignment.is_empty() {
+        return Err(invalid_assignment(
+            "Kafka vnode assignment cannot use an empty owner map",
+        ));
+    }
+    if let Some(vnode) = assignment.iter().position(NodeId::is_unassigned) {
+        return Err(invalid_assignment(format!(
+            "Kafka vnode owner map contains an unassigned owner at vnode {vnode}"
+        )));
+    }
+    if self_id.is_unassigned() {
+        return Err(invalid_assignment(
+            "Kafka vnode ownership requires a nonzero node identity",
+        ));
+    }
+    Ok(())
+}
+
 fn route_prefix(source_identity: &str, topic: &str) -> Result<Vec<u8>, ConnectorError> {
     if source_identity.is_empty() {
         return Err(invalid_assignment(
@@ -141,21 +163,7 @@ pub(super) fn owned_partitions_in_assignment(
             "Kafka partition count must be nonnegative, got {total_partitions}"
         )));
     }
-    if assignment.is_empty() {
-        return Err(invalid_assignment(
-            "Kafka vnode assignment cannot use an empty owner map",
-        ));
-    }
-    if let Some(vnode) = assignment.iter().position(NodeId::is_unassigned) {
-        return Err(invalid_assignment(format!(
-            "Kafka vnode owner map contains an unassigned owner at vnode {vnode}"
-        )));
-    }
-    if self_id.is_unassigned() {
-        return Err(invalid_assignment(
-            "Kafka vnode ownership requires a nonzero node identity",
-        ));
-    }
+    validate_owner_map(assignment, self_id)?;
     let vnode_count = u32::try_from(assignment.len())
         .map_err(|_| invalid_assignment("Kafka vnode owner map exceeds the supported u32 range"))?;
     let mut prefix = route_prefix(source_identity, topic)?;

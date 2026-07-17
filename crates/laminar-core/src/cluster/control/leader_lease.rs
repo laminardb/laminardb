@@ -27,7 +27,9 @@ use crate::cluster::discovery::NodeId;
 use super::catalog_manifest::{
     CatalogManifest, CatalogManifestError, CatalogManifestRef, CatalogSealOutcome,
 };
-use super::controller::{RecoverPhase, RecoveryAnnouncement, RecoveryReleaseId};
+use super::controller::{
+    RecoverPhase, RecoveryAnnouncement, RecoveryReleaseId, MAX_RECOVERY_ANNOUNCEMENT_BYTES,
+};
 use super::lease_deadline::LeaseDeadline;
 use super::process_lease::{ProcessLease, ProcessLeaseFence};
 use super::snapshot::{
@@ -38,7 +40,7 @@ const LEASE_PREFIX: &str = "control/leader-lease/";
 const RECOVERY_RELEASE_TERMINAL_PREFIX: &str = "control/recovery-release-terminals/v1/";
 const AUTHORITY_RECORD_VERSION: u32 = 6;
 const MAX_AUTHORITY_RECORD_BYTES: u64 = 256 * 1024;
-const MAX_RECOVERY_RELEASE_TERMINAL_BYTES: u64 = 256 * 1024;
+const MAX_RECOVERY_RELEASE_TERMINAL_BYTES: u64 = MAX_RECOVERY_ANNOUNCEMENT_BYTES as u64;
 const MAX_LEASE_HEAD_READ_ATTEMPTS: usize = 4;
 const MAX_LIVE_AUTHORITY_LINKS: usize = 4096;
 const LEADER_LEASE_HISTORY_TO_RETAIN: usize = 2;
@@ -4059,6 +4061,7 @@ mod tests {
             generation,
             lease.proof(),
             assignment_fence(&lease.owner),
+            Vec::new(),
             vec![RecoveryFault {
                 reporter: lease.owner.node,
                 sequence: generation,

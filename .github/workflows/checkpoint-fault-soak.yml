@@ -115,7 +115,7 @@ jobs:
 
       - name: Verify Kafka global source handoff
         if: matrix.discovery == 'static'
-        run: cargo test --profile soak -p laminar-connectors --no-default-features --features kafka --test kafka_global_drain -- --nocapture
+        run: cargo test --profile soak -p laminar-connectors --no-default-features --features "kafka,testing" --test kafka_global_drain -- --nocapture
         env:
           RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
           LAMINAR_KAFKA_BROKERS: 127.0.0.1:19092

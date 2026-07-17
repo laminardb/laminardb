@@ -49,6 +49,13 @@ const CLUSTER_BEST_EFFORT: &str =
     "cluster mode requires at_least_once delivery; best_effort has no defined \
      rebalance/state-loss contract";
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PipelineLifecycleAuthority {
+    Public,
+    #[cfg(feature = "cluster")]
+    CoordinatedRecovery,
+}
+
 #[derive(Clone, Copy)]
 enum StartupFailureKind {
     Config,
@@ -158,13 +165,17 @@ impl StartupAttempt {
 #[cfg(feature = "cluster")]
 async fn report_cluster_compute_fault(
     controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
-) -> bool {
+    pending: Arc<std::sync::atomic::AtomicU64>,
+) {
     let Some(controller) = controller else {
-        return false;
+        tracing::error!("cluster compute fault has no recovery controller; intake remains fenced");
+        return;
     };
-    crate::coordinated_recovery::report_local_fault(&controller)
-        .await
-        .is_ok()
+    if let Err(error) =
+        crate::coordinated_recovery::request_local_fault(&controller, &pending).await
+    {
+        tracing::warn!(%error, "cluster compute fault queued for monitor retry");
+    }
 }
 
 /// Validate source durability and placement before the connector performs I/O.
@@ -1048,6 +1059,22 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
         .unwrap_or("unknown panic")
 }
 
+fn publish_runtime_fault_state(state: &std::sync::atomic::AtomicU8) -> bool {
+    loop {
+        let observed = DbState::load(state);
+        match observed {
+            DbState::Starting | DbState::Running => {
+                if DbState::compare_exchange(observed, DbState::Faulted, state).is_ok() {
+                    return true;
+                }
+            }
+            DbState::Faulted | DbState::Created | DbState::ShuttingDown | DbState::Stopped => {
+                return false;
+            }
+        }
+    }
+}
+
 impl LaminarDB {
     /// Fence new work and wake the running pipeline without waiting for teardown.
     pub fn close(&self) {
@@ -1180,6 +1207,51 @@ impl LaminarDB {
         }
     }
 
+    /// Retain exclusive lifecycle ownership across a coordinated stop/report/start/release round.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn fence_coordinated_recovery_lifecycle(&self) {
+        let _lifecycle_claim = self.startup_attempt.lock();
+        self.set_source_gate(true);
+        self.coordinated_recovery_fenced
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Release recovery lifecycle ownership only after the durable release terminal is consumed.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn release_coordinated_recovery_lifecycle(&self) {
+        let _lifecycle_claim = self.startup_attempt.lock();
+        self.coordinated_recovery_fenced
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    fn ensure_pipeline_lifecycle_authorized(
+        &self,
+        authority: PipelineLifecycleAuthority,
+        operation: &str,
+    ) -> Result<(), DbError> {
+        #[cfg(feature = "cluster")]
+        if self
+            .coordinated_recovery_fenced
+            .load(std::sync::atomic::Ordering::Acquire)
+            && authority == PipelineLifecycleAuthority::Public
+        {
+            return Err(DbError::InvalidOperation(format!(
+                "pipeline {operation} is fenced by coordinated recovery"
+            )));
+        }
+        #[cfg(not(feature = "cluster"))]
+        let _ = (authority, operation);
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) fn ensure_coordinated_recovery_mutation_unfenced(
+        &self,
+        operation: &str,
+    ) -> Result<(), DbError> {
+        self.ensure_pipeline_lifecycle_authorized(PipelineLifecycleAuthority::Public, operation)
+    }
+
     /// Permanently withdraw this process's clustered data-plane authority after lease loss.
     #[cfg(feature = "cluster")]
     pub fn revoke_cluster_authority(&self) {
@@ -1214,6 +1286,16 @@ impl LaminarDB {
                     .lock()
                     .as_ref()
                     .is_none_or(|controller| !controller.process_lease_is_live()))
+    }
+
+    /// Whether a clustered runtime is held by coordinated recovery lifecycle authority.
+    #[cfg(feature = "cluster")]
+    #[must_use]
+    pub fn coordinated_recovery_in_progress(&self) -> bool {
+        self.is_cluster_runtime()
+            && self
+                .coordinated_recovery_fenced
+                .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Finish clustered startup after the exact assignment fence is available.
@@ -1321,7 +1403,10 @@ impl LaminarDB {
                 tracing::error!(%error, "startup recovery authority is not currently valid");
                 tokio::time::timeout_at(
                     deadline,
-                    crate::coordinated_recovery::report_local_fault(&controller),
+                    crate::coordinated_recovery::request_local_fault(
+                        &controller,
+                        &self.pending_recovery_fault,
+                    ),
                 )
                     .await
                     .map_err(|_| {
@@ -1347,7 +1432,10 @@ impl LaminarDB {
             {
                 tokio::time::timeout_at(
                     deadline,
-                    crate::coordinated_recovery::report_local_fault(&controller),
+                    crate::coordinated_recovery::request_local_fault(
+                        &controller,
+                        &self.pending_recovery_fault,
+                    ),
                 )
                 .await
                 .map_err(|_| {
@@ -1360,7 +1448,10 @@ impl LaminarDB {
             controller.set_recovering(true);
             tokio::time::timeout_at(
                 deadline,
-                crate::coordinated_recovery::report_local_fault(&controller),
+                crate::coordinated_recovery::request_local_fault(
+                    &controller,
+                    &self.pending_recovery_fault,
+                ),
             )
             .await
             .map_err(|_| {
@@ -1760,14 +1851,33 @@ impl LaminarDB {
     ///
     /// Returns an error if the pipeline cannot be started.
     pub async fn start(self: &Arc<Self>) -> Result<(), DbError> {
+        self.start_with_lifecycle_authority(PipelineLifecycleAuthority::Public)
+            .await
+    }
+
+    /// Recovery-owned restart after an exact stopped quorum. The persistent recovery lifecycle
+    /// fence rejects public starts until the round's committed release, while this path alone may
+    /// rebuild the still-gated data plane for `Start`.
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn start_for_coordinated_recovery(self: &Arc<Self>) -> Result<(), DbError> {
+        self.start_with_lifecycle_authority(PipelineLifecycleAuthority::CoordinatedRecovery)
+            .await
+    }
+
+    async fn start_with_lifecycle_authority(
+        self: &Arc<Self>,
+        authority: PipelineLifecycleAuthority,
+    ) -> Result<(), DbError> {
         if self.is_closed() {
             return Err(DbError::Shutdown);
         }
         self.ensure_catalog_cleanup_unfenced("pipeline start")?;
+        self.ensure_pipeline_lifecycle_authorized(authority, "start")?;
         self.connector_registry.freeze();
         let runtime = self.control_runtime.handle()?;
         let attempt = {
             let mut owned = self.startup_attempt.lock();
+            self.ensure_pipeline_lifecycle_authorized(authority, "start")?;
             loop {
                 // Cleanup may publish Created/Faulted just before the owner publishes its sticky
                 // result. The registered incomplete attempt remains authoritative through that
@@ -1797,6 +1907,10 @@ impl LaminarDB {
                         ));
                     }
                     claimed @ (DbState::Created | DbState::Faulted) => {
+                        // A compute fault publishes the cluster recovery fence before Faulted.
+                        // Re-read that fence after observing the state so a public restart cannot
+                        // slip through the fence-before-state publication window.
+                        self.ensure_pipeline_lifecycle_authorized(authority, "start")?;
                         let attempt = Arc::new(StartupAttempt::new());
                         // Publish ownership before Starting so stop/shutdown can always find the
                         // exact attempt they must await.
@@ -2396,6 +2510,41 @@ impl LaminarDB {
             }
 
             *self.coordinator.lock().await = Some(coord);
+        }
+
+        #[cfg(feature = "cluster")]
+        if startup_runtime == RuntimeMode::Cluster {
+            let prepared_witnesses = {
+                let coordinator = self.coordinator.lock().await;
+                match coordinator.as_ref() {
+                    Some(coordinator) => coordinator.prepared_checkpoint_witnesses().await?,
+                    None => Vec::new(),
+                }
+            };
+            if !prepared_witnesses.is_empty() {
+                let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
+                    DbError::Checkpoint(
+                        "cluster Prepared recovery requires an installed controller".into(),
+                    )
+                })?;
+                self.fence_coordinated_recovery_lifecycle();
+                controller.set_recovering(true);
+                crate::coordinated_recovery::request_local_fault(
+                    &controller,
+                    &self.pending_recovery_fault,
+                )
+                    .await
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "could not request coordinated recovery for Prepared checkpoint inventory: {error}"
+                        ))
+                    })?;
+                tracing::warn!(
+                    prepared_attempts = prepared_witnesses.len(),
+                    "connector startup deferred until coordinated recovery settles Prepared checkpoints"
+                );
+                return Ok(());
+            }
         }
 
         if has_external || !stream_regs.is_empty() {
@@ -3172,9 +3321,8 @@ impl LaminarDB {
         {
             let guard = self.coordinator.lock().await;
             if let Some(ref coord) = *guard {
-                // Cluster recovery never synthesizes a decision. Resolve the highest Prepared
-                // participant artifact against the shared authority before selecting a
-                // coordinated cut (especially a targeted rewind).
+                // Stopped-quorum recovery records Abort before recovery-owned Start. Reconcile
+                // that terminal decision before selecting the coordinated cut.
                 if runtime_mode == RuntimeMode::Cluster {
                     coord.reconcile_prepared_on_init().await?;
                 }
@@ -4102,6 +4250,16 @@ impl LaminarDB {
             let fault_slot = Arc::clone(&self.last_fault);
             let fault_state = Arc::clone(&self.state);
             let fault_metrics = self.engine_metrics.lock().clone();
+            #[cfg(feature = "cluster")]
+            let compute_fault_source_gate = Arc::clone(&self.source_gate);
+            #[cfg(feature = "cluster")]
+            let compute_fault_recovery_fence = Arc::clone(&self.coordinated_recovery_fenced);
+            #[cfg(feature = "cluster")]
+            let compute_fault_is_cluster = runtime_mode == RuntimeMode::Cluster;
+            #[cfg(feature = "cluster")]
+            let compute_fault_controller = self.cluster_controller.lock().clone();
+            #[cfg(feature = "cluster")]
+            let compute_fault_pending = Arc::clone(&self.pending_recovery_fault);
             match std::thread::Builder::new()
                 .name("laminar-compute".into())
                 .spawn(move || {
@@ -4148,7 +4306,23 @@ impl LaminarDB {
                             // watcher-scheduled window in which start() could otherwise report
                             // Running after the compute loop had already exited.
                             *fault_slot.lock() = Some(reason.clone());
-                            DbState::Faulted.store(&fault_state);
+                            #[cfg(feature = "cluster")]
+                            if compute_fault_is_cluster {
+                                // The public start path rechecks this bit while holding the
+                                // startup claim. Publish it before Faulted so no local restart can
+                                // claim the failed cluster generation ahead of the monitor.
+                                compute_fault_source_gate
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                                compute_fault_recovery_fence
+                                    .store(true, std::sync::atomic::Ordering::Release);
+                                if let Some(controller) = compute_fault_controller.as_deref() {
+                                    crate::coordinated_recovery::queue_local_fault(
+                                        controller,
+                                        &compute_fault_pending,
+                                    );
+                                }
+                            }
+                            publish_runtime_fault_state(&fault_state);
                             if let Some(ref m) = fault_metrics {
                                 m.pipeline_faults_total.inc();
                             }
@@ -4196,6 +4370,16 @@ impl LaminarDB {
             let watcher_metrics = self.engine_metrics.lock().clone();
             #[cfg(feature = "cluster")]
             let watcher_controller = self.cluster_controller.lock().clone();
+            #[cfg(feature = "cluster")]
+            let watcher_source_gate = Arc::clone(&self.source_gate);
+            #[cfg(feature = "cluster")]
+            let watcher_recovery_fence = Arc::clone(&self.coordinated_recovery_fenced);
+            #[cfg(feature = "cluster")]
+            let watcher_is_cluster = runtime_mode == RuntimeMode::Cluster;
+            #[cfg(feature = "cluster")]
+            let watcher_pending_compute_fault = Arc::clone(&self.pending_recovery_fault);
+            #[cfg(feature = "cluster")]
+            let watcher_runtime_shutdown = runtime_shutdown.clone();
             let handle = tokio::spawn(async move {
                 let exit = done_rx.await.unwrap_or_else(|_| {
                     crate::pipeline::ExitReason::Fault(
@@ -4211,13 +4395,29 @@ impl LaminarDB {
                     crate::pipeline::ExitReason::Fault(reason) => {
                         tracing::error!(%reason, "laminar-compute thread exited with a recoverable fault");
                         watcher_fault.lock().get_or_insert(reason);
-                        DbState::Faulted.store(&watcher_state);
+                        #[cfg(feature = "cluster")]
+                        if watcher_is_cluster {
+                            // Also cover a lost terminal channel or a compute-thread exit before
+                            // its normal fault publication reached this watcher.
+                            watcher_source_gate.store(true, std::sync::atomic::Ordering::SeqCst);
+                            watcher_recovery_fence
+                                .store(true, std::sync::atomic::Ordering::Release);
+                        }
+                        publish_runtime_fault_state(&watcher_state);
                         watcher_shutdown.notify_one();
                         // Cluster mode: report the fault and let the leader drive a global
                         // restart; the monitor restores this node. A local restart would rewind
                         // only this node while peers advanced — an inconsistent cut.
                         #[cfg(feature = "cluster")]
-                        if report_cluster_compute_fault(watcher_controller).await {
+                        if watcher_is_cluster {
+                            tokio::select! {
+                                biased;
+                                () = watcher_runtime_shutdown.cancelled() => {}
+                                _ = report_cluster_compute_fault(
+                                    watcher_controller,
+                                    watcher_pending_compute_fault,
+                                ) => {}
+                            }
                             return;
                         }
                         // Auto-restart if supervised; otherwise the pipeline stays Faulted.
@@ -4429,16 +4629,32 @@ impl LaminarDB {
     /// # Errors
     /// Returns [`DbError::InvalidOperation`] if the pipeline is still starting
     /// or the coordinator does not exit within the stop timeout.
+    pub async fn stop_pipeline(&self) -> Result<(), DbError> {
+        self.stop_pipeline_with_lifecycle_authority(PipelineLifecycleAuthority::Public)
+            .await
+    }
+
+    /// Recovery-owned stop after the lifecycle fence is published.
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn stop_pipeline_for_coordinated_recovery(&self) -> Result<(), DbError> {
+        self.stop_pipeline_with_lifecycle_authority(PipelineLifecycleAuthority::CoordinatedRecovery)
+            .await
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "restartable stop owns one bounded lifecycle and fence transition"
     )]
-    pub async fn stop_pipeline(&self) -> Result<(), DbError> {
+    async fn stop_pipeline_with_lifecycle_authority(
+        &self,
+        authority: PipelineLifecycleAuthority,
+    ) -> Result<(), DbError> {
         const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
         let deadline = tokio::time::Instant::now() + STOP_TIMEOUT;
         let first_stop = loop {
             let startup = {
                 let owned = self.startup_attempt.lock();
+                self.ensure_pipeline_lifecycle_authorized(authority, "stop")?;
                 if let Some(in_flight) = owned.as_ref().filter(|attempt| !attempt.is_complete()) {
                     Arc::clone(in_flight)
                 } else {
@@ -4939,6 +5155,166 @@ mod connector_admission_tests {
             .expect("trailing stop failed");
         assert_eq!(DbState::load(&db.state), DbState::Stopped);
         *db.stop_after_claim_gate.lock() = None;
+    }
+
+    #[test]
+    fn runtime_fault_publication_preserves_lifecycle_ownership() {
+        let state = std::sync::atomic::AtomicU8::new(0);
+        for initial in [DbState::Starting, DbState::Running] {
+            initial.store(&state);
+            assert!(super::publish_runtime_fault_state(&state));
+            assert_eq!(DbState::load(&state), DbState::Faulted);
+        }
+        for preserved in [
+            DbState::Faulted,
+            DbState::Created,
+            DbState::ShuttingDown,
+            DbState::Stopped,
+        ] {
+            preserved.store(&state);
+            assert!(!super::publish_runtime_fault_state(&state));
+            assert_eq!(DbState::load(&state), preserved);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_fault_cannot_steal_a_stop_transition() {
+        let db = LaminarDB::open().unwrap();
+        db.start().await.unwrap();
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *db.stop_after_claim_gate.lock() = Some((Arc::clone(&entered), Arc::clone(&release)));
+        let stopping_db = Arc::clone(&db);
+        let stopping = tokio::spawn(async move { stopping_db.stop_pipeline().await });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .expect("stop did not claim lifecycle ownership");
+
+        assert_eq!(DbState::load(&db.state), DbState::ShuttingDown);
+        assert!(!super::publish_runtime_fault_state(&db.state));
+        assert!(!super::publish_runtime_fault_state(&db.state));
+        assert_eq!(DbState::load(&db.state), DbState::ShuttingDown);
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), stopping)
+            .await
+            .expect("stop remained blocked")
+            .expect("stop task panicked")
+            .expect("stop failed after racing runtime fault");
+        assert_eq!(DbState::load(&db.state), DbState::Created);
+        *db.stop_after_claim_gate.lock() = None;
+
+        db.start().await.unwrap();
+        assert_eq!(DbState::load(&db.state), DbState::Running);
+        db.shutdown().await.unwrap();
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovery_fence_linearizes_before_a_public_start_claim() {
+        let db = LaminarDB::open().unwrap();
+        let lifecycle_claim = db.startup_attempt.lock();
+        let starting_db = Arc::clone(&db);
+        let starting = tokio::spawn(async move { starting_db.start().await });
+
+        db.set_source_gate(true);
+        db.coordinated_recovery_fenced
+            .store(true, Ordering::Release);
+        drop(lifecycle_claim);
+
+        let error = tokio::time::timeout(Duration::from_secs(2), starting)
+            .await
+            .expect("public start remained blocked behind the recovery fence")
+            .expect("public start task panicked")
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("pipeline start is fenced by coordinated recovery"));
+        assert_eq!(DbState::load(&db.state), DbState::Created);
+
+        db.release_coordinated_recovery_lifecycle();
+        db.shutdown().await.unwrap();
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_recovery_authority_can_stop_or_start_while_fenced() {
+        let db = LaminarDB::open().unwrap();
+        db.start().await.unwrap();
+        db.fence_coordinated_recovery_lifecycle();
+
+        let stop_error = db.stop_pipeline().await.unwrap_err();
+        assert!(stop_error
+            .to_string()
+            .contains("pipeline stop is fenced by coordinated recovery"));
+        assert_eq!(DbState::load(&db.state), DbState::Running);
+
+        db.stop_pipeline_for_coordinated_recovery().await.unwrap();
+        assert_eq!(DbState::load(&db.state), DbState::Created);
+
+        let start_error = db.start().await.unwrap_err();
+        assert!(start_error
+            .to_string()
+            .contains("pipeline start is fenced by coordinated recovery"));
+        db.start_for_coordinated_recovery().await.unwrap();
+        assert_eq!(DbState::load(&db.state), DbState::Running);
+
+        db.release_coordinated_recovery_lifecycle();
+        db.shutdown().await.unwrap();
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn topology_ddl_is_rejected_while_recovery_owns_lifecycle() {
+        let db = LaminarDB::open().unwrap();
+        db.fence_coordinated_recovery_lifecycle();
+
+        let error = db
+            .execute("CREATE SOURCE blocked_source (id BIGINT)")
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("pipeline database mutation is fenced by coordinated recovery"));
+
+        db.release_coordinated_recovery_lifecycle();
+        db.execute("CREATE SOURCE blocked_source (id BIGINT)")
+            .await
+            .unwrap();
+        db.shutdown().await.unwrap();
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn all_public_database_mutations_are_rejected_while_recovery_owns_lifecycle() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE TABLE retained (id BIGINT PRIMARY KEY)")
+            .await
+            .unwrap();
+        db.fence_coordinated_recovery_lifecycle();
+
+        for sql in [
+            "INSERT INTO retained VALUES (1)",
+            "SET application_name = 'blocked'",
+            "CHECKPOINT",
+        ] {
+            let error = db.execute(sql).await.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("pipeline database mutation is fenced by coordinated recovery"),
+                "{sql}: {error}"
+            );
+        }
+        let error = db.checkpoint().await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("pipeline manual checkpoint is fenced by coordinated recovery"));
+
+        db.release_coordinated_recovery_lifecycle();
+        db.execute("INSERT INTO retained VALUES (1)").await.unwrap();
+        db.shutdown().await.unwrap();
     }
 
     #[cfg(feature = "cluster")]
@@ -6724,6 +7100,7 @@ mod cluster_fault_watcher_tests {
     };
     use laminar_connectors::error::ConnectorError;
     use laminar_core::checkpoint::CheckpointAssignmentFence;
+    use laminar_core::checkpoint_decision::{CheckpointVerdict, RecordOutcomeResult};
     use laminar_core::cluster::control::controller::{
         RecoveryAnnouncement, RecoveryFault, RecoveryRound,
     };
@@ -6735,13 +7112,19 @@ mod cluster_fault_watcher_tests {
     };
     use laminar_core::cluster::discovery::{NodeId, NodeInfo, NodeMetadata, NodeState};
     use laminar_core::state::{
-        InProcessBackend, NodeId as StateNodeId, ObjectStoreBackend, VnodeRegistry,
+        InProcessBackend, KeyGroupCount, NodeId as StateNodeId, ObjectStoreBackend, VnodeRegistry,
     };
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use laminar_core::storage::checkpoint_manifest::DurableCheckpointPhase;
+    use laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore;
+    use laminar_core::storage::CheckpointStore;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
-    struct IdleClusterTestSource;
+    #[derive(Default)]
+    struct IdleClusterTestSource {
+        assignment_version: Option<std::num::NonZeroU64>,
+    }
 
     static REJECTING_SPLITTABLE_STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -6767,7 +7150,11 @@ mod cluster_fault_watcher_tests {
         }
 
         fn checkpoint(&self) -> SourceCheckpoint {
-            SourceCheckpoint::new()
+            let mut checkpoint = SourceCheckpoint::new();
+            if let Some(version) = self.assignment_version {
+                checkpoint.bind_assignment_version(version);
+            }
+            checkpoint
         }
 
         fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
@@ -6780,9 +7167,10 @@ mod cluster_fault_watcher_tests {
         fn set_vnode_assignment(
             &mut self,
             _source_identity: &str,
-            _registry: Arc<VnodeRegistry>,
+            registry: Arc<VnodeRegistry>,
             _self_id: StateNodeId,
         ) -> Result<(), ConnectorError> {
+            self.assignment_version = std::num::NonZeroU64::new(registry.assignment_version());
             Ok(())
         }
 
@@ -6831,6 +7219,7 @@ mod cluster_fault_watcher_tests {
         Arc<LaminarDB>,
         Arc<ClusterController>,
         Arc<InMemoryKv>,
+        tokio::sync::watch::Sender<Vec<NodeInfo>>,
         RecoveryRound,
         Arc<CatalogManifestStore>,
         laminar_core::checkpoint::LeaderProof,
@@ -6838,7 +7227,7 @@ mod cluster_fault_watcher_tests {
         let node_id = NodeId(7);
         let kv = Arc::new(InMemoryKv::new(node_id));
         let controller_kv: Arc<dyn ClusterKv> = kv.clone();
-        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
+        let (members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
         let controller = Arc::new(ClusterController::new(
             node_id,
             controller_kv,
@@ -6900,6 +7289,7 @@ mod cluster_fault_watcher_tests {
                 }],
             )
             .unwrap(),
+            Vec::new(),
             vec![RecoveryFault {
                 reporter: node_id,
                 sequence: 1,
@@ -6928,7 +7318,7 @@ mod cluster_fault_watcher_tests {
                         is_sink: false,
                         config_keys: vec![],
                     },
-                    Arc::new(|_| Ok(Box::new(IdleClusterTestSource))),
+                    Arc::new(|_| Ok(Box::<IdleClusterTestSource>::default())),
                 )?;
                 registry.register_source(
                     "rejecting-splittable-test",
@@ -6947,12 +7337,20 @@ mod cluster_fault_watcher_tests {
             .await
             .unwrap();
         db.fence_cluster_startup();
-        (db, controller, kv, round, manifest_store, lease.proof())
+        (
+            db,
+            controller,
+            kv,
+            members_tx,
+            round,
+            manifest_store,
+            lease.proof(),
+        )
     }
 
     #[tokio::test]
     async fn fresh_certified_cluster_startup_opens_intake() {
-        let (db, controller, _kv, _round, _manifest_store, _proof) = startup_db().await;
+        let (db, controller, _kv, _members, _round, _manifest_store, _proof) = startup_db().await;
 
         assert_eq!(
             db.finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(1))
@@ -6966,7 +7364,7 @@ mod cluster_fault_watcher_tests {
 
     #[tokio::test]
     async fn durable_fault_before_startup_audit_keeps_intake_closed() {
-        let (db, controller, _kv, _round, _manifest_store, _proof) = startup_db().await;
+        let (db, controller, _kv, _members, _round, _manifest_store, _proof) = startup_db().await;
         controller.report_fault(9).await.unwrap();
 
         assert_eq!(
@@ -7053,7 +7451,7 @@ mod cluster_fault_watcher_tests {
     #[tokio::test]
     async fn splittable_source_without_assignment_hook_fails_before_start() {
         REJECTING_SPLITTABLE_STARTED.store(false, Ordering::Release);
-        let (db, _controller, _kv, _round, manifest_store, proof) = startup_db().await;
+        let (db, _controller, _kv, _members, _round, manifest_store, proof) = startup_db().await;
         let state_store: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::memory::InMemory::new());
         *db.state_backend.lock() = Some(Arc::new(ObjectStoreBackend::cluster_shared(
@@ -7100,7 +7498,7 @@ mod cluster_fault_watcher_tests {
 
     #[tokio::test]
     async fn manifest_replay_cleanup_fault_remains_terminal_after_start_returns() {
-        let (db, _controller, _kv, _round, manifest_store, proof) = startup_db().await;
+        let (db, _controller, _kv, _members, _round, manifest_store, proof) = startup_db().await;
         manifest_store
             .seal(
                 &CatalogManifest::new(vec![
@@ -7153,7 +7551,7 @@ mod cluster_fault_watcher_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn assignment_closure_wins_while_startup_waits_to_open_intake() {
-        let (db, controller, _kv, _round, _manifest_store, _proof) = startup_db().await;
+        let (db, controller, _kv, _members, _round, _manifest_store, _proof) = startup_db().await;
         let execution = Arc::clone(&db.rotation_execution_fence).read_owned().await;
         let starting = {
             let db = Arc::clone(&db);
@@ -7188,7 +7586,7 @@ mod cluster_fault_watcher_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pipeline_startup_holds_generation_fence_until_graph_publication() {
-        let (db, _controller, _kv, _round, manifest_store, proof) = startup_db().await;
+        let (db, _controller, _kv, _members, _round, manifest_store, proof) = startup_db().await;
         let state_store: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::memory::InMemory::new());
         *db.state_backend.lock() = Some(Arc::new(ObjectStoreBackend::cluster_shared(
@@ -7249,8 +7647,118 @@ mod cluster_fault_watcher_tests {
     }
 
     #[tokio::test]
+    async fn cluster_startup_defers_source_actor_until_prepared_outcome_is_terminal() {
+        let (db, controller, _kv, _members, round, manifest_store, proof) = startup_db().await;
+        let state_store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        *db.state_backend.lock() = Some(Arc::new(ObjectStoreBackend::cluster_shared(
+            state_store,
+            "node-7",
+            1,
+        )));
+        manifest_store
+            .seal(
+                &CatalogManifest::new(vec![
+                    CatalogManifestEntry {
+                        canonical_name: "trades".into(),
+                        kind: CatalogObjectKind::Source,
+                        ddl: "CREATE SOURCE trades (id BIGINT) WITH ('connector' = 'idle-cluster-test')"
+                            .into(),
+                    },
+                    CatalogManifestEntry {
+                        canonical_name: "out".into(),
+                        kind: CatalogObjectKind::Stream,
+                        ddl: "CREATE STREAM out AS SELECT id FROM trades".into(),
+                    },
+                ])
+                .unwrap(),
+                &proof,
+            )
+            .await
+            .unwrap();
+
+        db.start().await.unwrap();
+        assert_eq!(
+            db.finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(2))
+                .await
+                .unwrap(),
+            ClusterStartupDisposition::Serving
+        );
+        let committed = db.checkpoint().await.unwrap_or_else(|error| {
+            panic!(
+                "initial cluster checkpoint failed: {error}; runtime fault: {:?}",
+                db.last_fault()
+            )
+        });
+        assert!(committed.success, "{:?}", committed.error);
+        db.stop_pipeline().await.unwrap();
+        assert!(db.owned_source_tasks.lock().is_empty());
+
+        let participant_store = ObjectStoreCheckpointStore::new(
+            db.cluster_checkpoint_object_store().unwrap(),
+            "nodes/7/".into(),
+        )
+        .with_key_group_count(KeyGroupCount::try_from(1_u16).unwrap())
+        .with_participant_id(7);
+        let mut prepared = participant_store
+            .load_by_id(committed.checkpoint_id)
+            .await
+            .unwrap()
+            .unwrap();
+        prepared.checkpoint_id = committed.checkpoint_id + 1;
+        prepared.epoch = committed.epoch + 1;
+        prepared.durable_phase = DurableCheckpointPhase::Prepared;
+        participant_store.save(&prepared).await.unwrap();
+
+        db.start().await.unwrap();
+        assert_eq!(DbState::load(&db.state), DbState::Running);
+        assert!(db.owned_source_tasks.lock().is_empty());
+        assert!(db.runtime_handle.lock().await.is_none());
+        assert!(db.coordinated_recovery_in_progress());
+        assert!(db.cluster_intake_fenced());
+        assert!(controller.is_recovering());
+        assert!(controller
+            .read_local_fault_report()
+            .await
+            .unwrap()
+            .is_some());
+
+        let authority = controller.checkpoint_authority().unwrap();
+        assert!(authority
+            .cluster_outcome(prepared.epoch)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            authority
+                .record_cluster_outcome(
+                    &proof,
+                    prepared.epoch,
+                    prepared.checkpoint_id,
+                    round.assignment_fence,
+                    CheckpointVerdict::Abort,
+                    None,
+                )
+                .await
+                .unwrap(),
+            RecordOutcomeResult::Created(_)
+        ));
+
+        db.stop_pipeline_for_coordinated_recovery().await.unwrap();
+        db.start_for_coordinated_recovery().await.unwrap();
+        assert!(!db.owned_source_tasks.lock().is_empty());
+        assert!(db.runtime_handle.lock().await.is_some());
+        assert!(db.cluster_intake_fenced());
+
+        db.release_coordinated_recovery_lifecycle();
+        controller.set_recovering(false);
+        db.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn restored_or_active_recovery_startup_stays_fenced_and_reports() {
-        let (restored, controller, _kv, _round, _manifest_store, _proof) = startup_db().await;
+        let (restored, controller, _kv, _members, _round, _manifest_store, _proof) =
+            startup_db().await;
         *restored.last_recovery_epoch.lock() = Some(9);
         assert_eq!(
             restored
@@ -7264,7 +7772,8 @@ mod cluster_fault_watcher_tests {
             .load(std::sync::atomic::Ordering::Acquire));
         assert!(!controller.read_fault_reports().await.unwrap().is_empty());
 
-        let (active, controller, _kv, round, _manifest_store, _proof) = startup_db().await;
+        let (active, controller, _kv, _members, round, _manifest_store, _proof) =
+            startup_db().await;
         controller.announce_recover_prepare(&round).await.unwrap();
         assert_eq!(
             active
@@ -7281,7 +7790,7 @@ mod cluster_fault_watcher_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn active_recovery_does_not_block_compute_fault_handoff() {
-        let (_db, controller, _kv, round, _manifest_store, _proof) = startup_db().await;
+        let (_db, controller, _kv, _members, round, _manifest_store, _proof) = startup_db().await;
         controller.announce_recover_prepare(&round).await.unwrap();
         assert_eq!(
             controller.observe_recover().await.unwrap(),
@@ -7291,14 +7800,16 @@ mod cluster_fault_watcher_tests {
             })
         );
 
-        let handed_off = tokio::time::timeout(
+        tokio::time::timeout(
             Duration::from_secs(1),
-            report_cluster_compute_fault(Some(Arc::clone(&controller))),
+            report_cluster_compute_fault(
+                Some(Arc::clone(&controller)),
+                Arc::new(AtomicU64::new(0)),
+            ),
         )
         .await
         .expect("fault handoff waited for the active recovery round to clear");
 
-        assert!(handed_off);
         assert!(controller
             .read_fault_reports()
             .await

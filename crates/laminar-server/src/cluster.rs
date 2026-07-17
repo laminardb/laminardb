@@ -3001,6 +3001,7 @@ async fn wait_for_startup_assignment_fence(
     registry: &laminar_core::state::VnodeRegistry,
 ) -> Result<(), ClusterStartupError> {
     let mut fence_rx = controller.checkpoint_assignment_watch();
+    let mut members_rx = controller.members_watch();
     let wait = async {
         loop {
             let assignment = registry.versioned_snapshot();
@@ -3012,11 +3013,18 @@ async fn wait_for_startup_assignment_fence(
             {
                 return Ok(());
             }
-            fence_rx.changed().await.map_err(|_| {
-                ClusterStartupError::EngineConstruction(
-                    "cluster assignment certification channel closed during startup".into(),
-                )
-            })?;
+            tokio::select! {
+                result = fence_rx.changed() => result.map_err(|_| {
+                    ClusterStartupError::EngineConstruction(
+                        "cluster assignment certification channel closed during startup".into(),
+                    )
+                })?,
+                result = members_rx.changed() => result.map_err(|_| {
+                    ClusterStartupError::EngineConstruction(
+                        "cluster membership channel closed during assignment certification".into(),
+                    )
+                })?,
+            }
         }
     };
     tokio::time::timeout(STARTUP_ASSIGNMENT_TIMEOUT, wait)
@@ -5299,6 +5307,7 @@ mod tests {
             61,
             old_leader.proof(),
             CheckpointAssignmentFence::from_owner_map(7, &[node.0], vec![old_participant]).unwrap(),
+            Vec::new(),
             vec![RecoveryFault {
                 reporter: node,
                 sequence: 1,
@@ -5394,6 +5403,7 @@ mod tests {
             replacement_leader.proof(),
             CheckpointAssignmentFence::from_owner_map(8, &[node.0], vec![replacement_participant])
                 .unwrap(),
+            Vec::new(),
             vec![RecoveryFault {
                 reporter: node,
                 sequence: 2,
@@ -6239,6 +6249,70 @@ mod tests {
         .await
         .expect("startup wait did not observe the assignment certificate")
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_rechecks_assignment_certificate_when_membership_becomes_active() {
+        use laminar_core::checkpoint::CheckpointAssignmentFence;
+        use laminar_core::cluster::control::{
+            CheckpointParticipant, ClusterController, ClusterKv, InMemoryKv,
+        };
+        use laminar_core::state::{NodeId as StateNodeId, VnodeRegistry};
+
+        let node = NodeId(7);
+        let peer = NodeId(8);
+        let peer_boot = uuid::Uuid::from_u128(88);
+        let joining_peer = NodeInfo {
+            id: peer,
+            name: "peer".into(),
+            rpc_address: String::new(),
+            raft_address: String::new(),
+            state: NodeState::Joining,
+            metadata: NodeMetadata::default(),
+            last_heartbeat_ms: 0,
+        };
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
+        let (members_tx, members_rx) = watch::channel(vec![joining_peer.clone()]);
+        let controller = Arc::new(ClusterController::new(node, kv, None, members_rx));
+        controller.set_active(true);
+        let registry = VnodeRegistry::new_unassigned(2);
+        registry
+            .set_assignment_and_version(vec![StateNodeId(node.0), StateNodeId(peer.0)].into(), 1);
+        controller.publish_checkpoint_assignment_fence(Some(
+            CheckpointAssignmentFence::from_owner_map(
+                1,
+                &[node.0, peer.0],
+                vec![
+                    CheckpointParticipant {
+                        node_id: node.0,
+                        boot_incarnation: controller.recovery_incarnation(),
+                    },
+                    CheckpointParticipant {
+                        node_id: peer.0,
+                        boot_incarnation: peer_boot,
+                    },
+                ],
+            )
+            .unwrap(),
+        ));
+
+        let wait = wait_for_startup_assignment_fence(&controller, &registry);
+        tokio::pin!(wait);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut wait)
+                .await
+                .is_err(),
+            "a Joining assignment participant must keep startup fenced"
+        );
+
+        let mut active_peer = joining_peer;
+        active_peer.state = NodeState::Active;
+        members_tx.send_replace(vec![active_peer]);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), wait)
+            .await
+            .expect("membership-only activation did not wake assignment certification")
+            .unwrap();
     }
 
     #[test]

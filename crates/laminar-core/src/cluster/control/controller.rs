@@ -17,7 +17,8 @@ use super::leader::leader_of;
 use super::snapshot::AssignmentSnapshotStore;
 use crate::checkpoint::{
     AssignmentDrainId, AssignmentDrainTransition, CheckpointAssignmentAdoption,
-    CheckpointAssignmentFence, CheckpointParticipant, LeaderProof,
+    CheckpointAssignmentFence, CheckpointParticipant, LeaderProof, PreparedCheckpointWitness,
+    MAX_CHECKPOINT_PARTICIPANTS, MAX_PREPARED_CHECKPOINT_WITNESSES,
 };
 use crate::cluster::discovery::{assignable_node_ids, NodeId, NodeInfo, NodeState};
 use crate::state::{CheckpointAttempt, Locality};
@@ -27,6 +28,13 @@ const DRAIN_ACK_KEY: &str = "control:drain-ack";
 const DRAIN_ACK_PROTOCOL_VERSION: u16 = 1;
 const RELEASE_READY_ACK_KEY: &str = "control:recovery-release-ready";
 const RELEASE_READY_PROTOCOL_VERSION: u16 = 1;
+const RECOVERY_STOPPED_REPORT_KEY: &str = "control:recovery-stopped";
+/// Current wire version for a recovery stopped report.
+const RECOVERY_STOPPED_REPORT_PROTOCOL_VERSION: u16 = 2;
+/// Maximum encoded size of one recovery stopped report.
+const MAX_RECOVERY_STOPPED_REPORT_BYTES: usize = 32 * 1_024;
+/// Shared ceiling for mutable recovery intents and immutable release terminals.
+pub(super) const MAX_RECOVERY_ANNOUNCEMENT_BYTES: usize = 256 * 1_024;
 const RECOVERY_CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_DRAIN_ACK_BYTES: usize = 1_024;
 const MAX_RELEASE_READY_ACK_BYTES: usize = 1_024;
@@ -50,7 +58,7 @@ pub struct RecoveryRoundId {
     pub driver: NodeId,
 }
 
-/// Frozen recovery quorum, assignment certificate, and durable driver term.
+/// Frozen recovery round, assignment certificate, and durable driver term.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryRound {
@@ -60,6 +68,11 @@ pub struct RecoveryRound {
     pub leader_proof: LeaderProof,
     /// Exact owner-complete assignment cut from which the quorum was frozen.
     pub assignment_fence: CheckpointAssignmentFence,
+    /// Exact non-owner processes whose fault evidence must be inventoried before recovery starts.
+    ///
+    /// These participants stop and report Prepared checkpoint evidence, but do not join the
+    /// assignment-owner restore or release quorum.
+    pub evidence_participants: Vec<CheckpointParticipant>,
     /// Canonical nonzero fault reports covered by this round's terminal `Release`.
     pub faults: Vec<RecoveryFault>,
 }
@@ -83,6 +96,7 @@ impl RecoveryRound {
         generation: u64,
         leader_proof: LeaderProof,
         assignment_fence: CheckpointAssignmentFence,
+        evidence_participants: Vec<CheckpointParticipant>,
         faults: Vec<RecoveryFault>,
     ) -> Result<Self, String> {
         let driver = NodeId(leader_proof.owner.node_id);
@@ -94,21 +108,22 @@ impl RecoveryRound {
             },
             leader_proof,
             assignment_fence,
+            evidence_participants,
             faults,
         };
         round.validate()?;
         Ok(round)
     }
 
-    /// Whether `node` belongs to the immutable recovery quorum.
+    /// Whether `node` belongs to the immutable assignment-owner quorum.
     #[must_use]
-    pub fn contains(&self, node: NodeId) -> bool {
+    pub fn contains_owner(&self, node: NodeId) -> bool {
         self.assignment_fence.contains(node.0)
     }
 
-    /// Frozen quorum as runtime node identifiers.
+    /// Frozen assignment owners as runtime node identifiers.
     #[must_use]
-    pub fn participants(&self) -> Vec<NodeId> {
+    pub fn owners(&self) -> Vec<NodeId> {
         self.assignment_fence
             .participants
             .iter()
@@ -116,10 +131,52 @@ impl RecoveryRound {
             .collect()
     }
 
-    /// Frozen boot identity for `node`.
+    /// Frozen assignment-owner boot identity for `node`.
     #[must_use]
-    pub fn participant_incarnation(&self, node: NodeId) -> Option<Uuid> {
+    pub(crate) fn owner_incarnation(&self, node: NodeId) -> Option<Uuid> {
         self.assignment_fence.participant_incarnation(node.0)
+    }
+
+    /// Whether `node` must stop and report evidence for this round.
+    #[must_use]
+    pub fn contains_stopped_participant(&self, node: NodeId) -> bool {
+        self.contains_owner(node)
+            || self
+                .evidence_participants
+                .binary_search_by_key(&node.0, |participant| participant.node_id)
+                .is_ok()
+    }
+
+    /// Frozen stopped roster as sorted runtime node identifiers.
+    #[must_use]
+    pub fn stopped_participants(&self) -> Vec<NodeId> {
+        self.stopped_roster()
+            .into_iter()
+            .map(|participant| NodeId(participant.node_id))
+            .collect()
+    }
+
+    /// Frozen stopped-roster boot identity for `node`.
+    #[must_use]
+    pub(crate) fn stopped_participant_incarnation(&self, node: NodeId) -> Option<Uuid> {
+        self.assignment_fence
+            .participant_incarnation(node.0)
+            .or_else(|| {
+                self.evidence_participants
+                    .binary_search_by_key(&node.0, |participant| participant.node_id)
+                    .ok()
+                    .map(|index| self.evidence_participants[index].boot_incarnation)
+            })
+    }
+
+    fn stopped_roster(&self) -> Vec<CheckpointParticipant> {
+        let mut roster = Vec::with_capacity(
+            self.assignment_fence.participants.len() + self.evidence_participants.len(),
+        );
+        roster.extend(self.assignment_fence.participants.iter().copied());
+        roster.extend(self.evidence_participants.iter().copied());
+        roster.sort_unstable_by_key(|participant| participant.node_id);
+        roster
     }
 
     /// Exact fault sequence this round covers for `node`.
@@ -148,10 +205,10 @@ impl RecoveryRound {
         if !self.assignment_fence.is_canonical() {
             return Err("recovery assignment certificate is not canonical".into());
         }
-        if !self.contains(self.id.driver) {
+        if !self.contains_owner(self.id.driver) {
             return Err("recovery driver is absent from the frozen quorum".into());
         }
-        if self.participant_incarnation(self.id.driver) != Some(self.leader_proof.owner.boot_id) {
+        if self.owner_incarnation(self.id.driver) != Some(self.leader_proof.owner.boot_id) {
             return Err("recovery leader proof is not bound to the frozen driver process".into());
         }
         if self.faults.is_empty()
@@ -166,6 +223,41 @@ impl RecoveryRound {
         {
             return Err("recovery fault set is not canonical".into());
         }
+        if self
+            .evidence_participants
+            .iter()
+            .any(|participant| participant.node_id == 0 || participant.boot_incarnation.is_nil())
+            || self
+                .evidence_participants
+                .windows(2)
+                .any(|pair| pair[0].node_id >= pair[1].node_id)
+        {
+            return Err("recovery evidence participant roster is not canonical".into());
+        }
+        if self.assignment_fence.participants.len() + self.evidence_participants.len()
+            > MAX_CHECKPOINT_PARTICIPANTS
+        {
+            return Err(format!(
+                "recovery stopped roster has {} participants; maximum is {MAX_CHECKPOINT_PARTICIPANTS}",
+                self.assignment_fence.participants.len() + self.evidence_participants.len()
+            ));
+        }
+        if self.evidence_participants.iter().any(|participant| {
+            self.assignment_fence.contains(participant.node_id)
+                || self
+                    .faults
+                    .binary_search_by_key(&NodeId(participant.node_id), |fault| fault.reporter)
+                    .is_err()
+        }) {
+            return Err("recovery evidence participants must be non-owner fault reporters".into());
+        }
+        let largest_terminal = RecoveryAnnouncement {
+            round: self.clone(),
+            phase: RecoverPhase::ReleaseCommitted { epoch: u64::MAX },
+        };
+        let encoded = serde_json::to_vec(&largest_terminal)
+            .map_err(|error| format!("could not encode recovery round: {error}"))?;
+        validate_recovery_announcement_size(encoded.len())?;
         Ok(())
     }
 }
@@ -195,6 +287,7 @@ pub enum RecoverPhase {
 
 /// Durable announcement for one exact recovery round.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecoveryAnnouncement {
     /// Frozen round identity and quorum.
     pub round: RecoveryRound,
@@ -204,20 +297,156 @@ pub struct RecoveryAnnouncement {
 
 impl RecoveryAnnouncement {
     pub(crate) fn validate(&self) -> Result<(), String> {
-        self.round.validate()
+        self.round.validate()?;
+        let encoded = serde_json::to_vec(self)
+            .map_err(|error| format!("could not encode recovery announcement: {error}"))?;
+        validate_recovery_announcement_size(encoded.len())
+    }
+}
+
+/// Boot-bound phase-one acknowledgement and unresolved prepared-checkpoint inventory.
+///
+/// The report is recovery evidence, not a checkpoint outcome. Its exact round and publisher bind
+/// it to one frozen process quorum; every prepared witness still requires an immutable outcome.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryStoppedReport {
+    /// Wire format version. Only [`RECOVERY_STOPPED_REPORT_PROTOCOL_VERSION`] is accepted.
+    protocol_version: u16,
+    /// Compact identity of the frozen recovery round for which the publisher stopped.
+    round_id: RecoveryRoundId,
+    /// Canonical SHA-256 digest of the exact full recovery round.
+    round_sha256: String,
+    /// Stable node slot and boot incarnation that published this report.
+    publisher: CheckpointParticipant,
+    /// Canonically ordered unresolved prepared-checkpoint evidence visible to the publisher.
+    prepared_witnesses: Vec<PreparedCheckpointWitness>,
+}
+
+impl RecoveryStoppedReport {
+    /// Construct a canonical stopped report.
+    ///
+    /// # Errors
+    /// Returns an error when the round, publisher, inventory ordering, count, or encoded size is
+    /// invalid.
+    pub fn new(
+        round: &RecoveryRound,
+        publisher: CheckpointParticipant,
+        prepared_witnesses: Vec<PreparedCheckpointWitness>,
+    ) -> Result<Self, String> {
+        let report = Self {
+            protocol_version: RECOVERY_STOPPED_REPORT_PROTOCOL_VERSION,
+            round_id: round.id,
+            round_sha256: recovery_round_sha256(round)?,
+            publisher,
+            prepared_witnesses,
+        };
+        report.validate(round)?;
+        Ok(report)
+    }
+
+    /// Exact recovery-round identity bound into this report.
+    #[must_use]
+    pub const fn round_id(&self) -> RecoveryRoundId {
+        self.round_id
+    }
+
+    /// Exact process that published this report.
+    #[must_use]
+    pub const fn publisher(&self) -> CheckpointParticipant {
+        self.publisher
+    }
+
+    /// Canonically ordered unresolved prepared-checkpoint evidence.
+    #[must_use]
+    pub fn prepared_witnesses(&self) -> &[PreparedCheckpointWitness] {
+        &self.prepared_witnesses
+    }
+
+    /// Validate all semantic and encoded-size invariants of this report.
+    ///
+    /// # Errors
+    /// Returns an error describing the first non-canonical invariant.
+    pub fn validate(&self, round: &RecoveryRound) -> Result<(), String> {
+        self.validate_semantics(round)?;
+        let encoded = serde_json::to_vec(self)
+            .map_err(|error| format!("could not encode recovery stopped report: {error}"))?;
+        validate_stopped_report_size(encoded.len())
+    }
+
+    fn validate_shape(&self) -> Result<(), String> {
+        if self.protocol_version != RECOVERY_STOPPED_REPORT_PROTOCOL_VERSION {
+            return Err(format!(
+                "unsupported recovery stopped report version {}; expected {RECOVERY_STOPPED_REPORT_PROTOCOL_VERSION}",
+                self.protocol_version
+            ));
+        }
+        if self.round_id.generation == 0
+            || self.round_id.nonce.is_nil()
+            || self.round_id.driver.is_unassigned()
+        {
+            return Err("recovery stopped report round identity is not canonical".into());
+        }
+        if !is_sha256_hex(&self.round_sha256) {
+            return Err("recovery stopped report round digest is not canonical".into());
+        }
+        if self.publisher.node_id == 0 || self.publisher.boot_incarnation.is_nil() {
+            return Err("recovery stopped report publisher is not canonical".into());
+        }
+        if self.prepared_witnesses.len() > MAX_PREPARED_CHECKPOINT_WITNESSES {
+            return Err(format!(
+                "recovery stopped report has {} prepared witnesses; maximum is {MAX_PREPARED_CHECKPOINT_WITNESSES}",
+                self.prepared_witnesses.len()
+            ));
+        }
+        for witness in &self.prepared_witnesses {
+            witness.validate()?;
+            if witness.participant_id != self.publisher.node_id {
+                return Err(format!(
+                    "prepared checkpoint witness participant {} does not match report publisher {}",
+                    witness.participant_id, self.publisher.node_id
+                ));
+            }
+        }
+        if self
+            .prepared_witnesses
+            .windows(2)
+            .any(|pair| pair[0].ordering_key() >= pair[1].ordering_key())
+        {
+            return Err(
+                "recovery stopped report witnesses must be uniquely sorted by epoch, checkpoint ID, and participant"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_semantics(&self, round: &RecoveryRound) -> Result<(), String> {
+        self.validate_shape()?;
+        round.validate()?;
+        if self.round_id != round.id || self.round_sha256 != recovery_round_sha256(round)? {
+            return Err("recovery stopped report does not match the exact frozen round".into());
+        }
+        if round.stopped_participant_incarnation(NodeId(self.publisher.node_id))
+            != Some(self.publisher.boot_incarnation)
+        {
+            return Err("recovery stopped report publisher does not match the frozen round".into());
+        }
+        Ok(())
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct RecoveryRoundAck {
-    round: RecoveryRound,
-    incarnation: Uuid,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RecoveryAnnouncementAck {
     announcement: RecoveryAnnouncement,
     incarnation: Uuid,
+}
+
+#[derive(serde::Serialize)]
+struct RecoveryStoppedRoundDigestInput<'a> {
+    protocol: &'static str,
+    round: &'a RecoveryRound,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -369,6 +598,15 @@ fn sha256_hex(encoded: &[u8]) -> String {
     hex
 }
 
+fn recovery_round_sha256(round: &RecoveryRound) -> Result<String, String> {
+    let encoded = serde_json::to_vec(&RecoveryStoppedRoundDigestInput {
+        protocol: "laminardb-recovery-stopped-round-v2",
+        round,
+    })
+    .map_err(|error| format!("could not encode recovery stopped round identity: {error}"))?;
+    Ok(sha256_hex(&encoded))
+}
+
 fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64
         && value
@@ -457,22 +695,89 @@ fn parse_recovery_announcement(raw: &str) -> Result<Option<RecoveryAnnouncement>
     if raw.is_empty() {
         return Ok(None);
     }
+    validate_recovery_announcement_size(raw.len())?;
     let announcement: RecoveryAnnouncement = serde_json::from_str(raw)
         .map_err(|error| format!("invalid recovery announcement: {error}"))?;
     announcement.validate()?;
+    if encode_recovery_announcement(&announcement)? != raw {
+        return Err("recovery announcement is not canonically encoded".into());
+    }
     Ok(Some(announcement))
 }
 
-fn parse_recovery_round_ack(raw: &str, publisher: NodeId) -> Result<RecoveryRound, String> {
-    let ack: RecoveryRoundAck =
-        serde_json::from_str(raw).map_err(|error| format!("invalid recovery ack: {error}"))?;
-    ack.round.validate()?;
-    if ack.round.participant_incarnation(publisher) != Some(ack.incarnation) {
+fn validate_recovery_announcement_size(encoded_len: usize) -> Result<(), String> {
+    if encoded_len == 0 || encoded_len > MAX_RECOVERY_ANNOUNCEMENT_BYTES {
         return Err(format!(
-            "recovery acknowledgement from {publisher} has a stale process incarnation"
+            "recovery announcement is {encoded_len} bytes; maximum is {MAX_RECOVERY_ANNOUNCEMENT_BYTES}"
         ));
     }
-    Ok(ack.round)
+    Ok(())
+}
+
+fn encode_recovery_announcement(announcement: &RecoveryAnnouncement) -> Result<String, String> {
+    announcement.round.validate()?;
+    let encoded = serde_json::to_string(announcement)
+        .map_err(|error| format!("could not encode recovery announcement: {error}"))?;
+    validate_recovery_announcement_size(encoded.len())?;
+    Ok(encoded)
+}
+
+fn validate_stopped_report_size(encoded_len: usize) -> Result<(), String> {
+    if encoded_len > MAX_RECOVERY_STOPPED_REPORT_BYTES {
+        return Err(format!(
+            "recovery stopped report is {encoded_len} bytes; maximum is {MAX_RECOVERY_STOPPED_REPORT_BYTES}"
+        ));
+    }
+    Ok(())
+}
+
+fn encode_recovery_stopped_report(
+    report: &RecoveryStoppedReport,
+    round: &RecoveryRound,
+) -> Result<String, String> {
+    report.validate_semantics(round)?;
+    encode_recovery_stopped_report_shape(report)
+}
+
+fn encode_recovery_stopped_report_shape(report: &RecoveryStoppedReport) -> Result<String, String> {
+    report.validate_shape()?;
+    let encoded = serde_json::to_string(report)
+        .map_err(|error| format!("could not encode recovery stopped report: {error}"))?;
+    validate_stopped_report_size(encoded.len())?;
+    Ok(encoded)
+}
+
+#[cfg(test)]
+fn parse_recovery_stopped_report(
+    raw: &str,
+    publisher: NodeId,
+    round: &RecoveryRound,
+) -> Result<RecoveryStoppedReport, String> {
+    let report = parse_recovery_stopped_report_shape(raw, publisher)?;
+    report.validate_semantics(round)?;
+    Ok(report)
+}
+
+fn parse_recovery_stopped_report_shape(
+    raw: &str,
+    publisher: NodeId,
+) -> Result<RecoveryStoppedReport, String> {
+    validate_stopped_report_size(raw.len())?;
+    let report: RecoveryStoppedReport = serde_json::from_str(raw)
+        .map_err(|error| format!("invalid recovery stopped report from {publisher}: {error}"))?;
+    report.validate_shape()?;
+    if report.publisher.node_id != publisher.0 {
+        return Err(format!(
+            "recovery stopped report from {publisher} names publisher {}",
+            report.publisher.node_id
+        ));
+    }
+    if encode_recovery_stopped_report_shape(&report)? != raw {
+        return Err(format!(
+            "recovery stopped report from {publisher} is not canonically encoded"
+        ));
+    }
+    Ok(report)
 }
 
 fn parse_recovery_announcement_ack(
@@ -482,7 +787,7 @@ fn parse_recovery_announcement_ack(
     let ack: RecoveryAnnouncementAck = serde_json::from_str(raw)
         .map_err(|error| format!("invalid recovery phase acknowledgement: {error}"))?;
     ack.announcement.validate()?;
-    if ack.announcement.round.participant_incarnation(publisher) != Some(ack.incarnation) {
+    if ack.announcement.round.owner_incarnation(publisher) != Some(ack.incarnation) {
         return Err(format!(
             "recovery phase acknowledgement from {publisher} has a stale process incarnation"
         ));
@@ -1485,15 +1790,85 @@ impl ClusterController {
             .await
     }
 
-    async fn read_recovery_round_map(
+    async fn read_recovery_stopped_reports(
         &self,
-        key: &str,
-    ) -> Result<Vec<(NodeId, RecoveryRound)>, String> {
-        self.scan_recovery_values(key)
-            .await?
-            .into_iter()
-            .map(|(node, raw)| parse_recovery_round_ack(&raw, node).map(|round| (node, round)))
-            .collect()
+        round: &RecoveryRound,
+        roster: &[CheckpointParticipant],
+    ) -> Result<Vec<RecoveryStoppedReport>, RecoveryControlError> {
+        round.validate().map_err(RecoveryControlError::Conflict)?;
+        if roster
+            .windows(2)
+            .any(|pair| pair[0].node_id >= pair[1].node_id)
+            || roster.iter().any(|participant| {
+                round.stopped_participant_incarnation(NodeId(participant.node_id))
+                    != Some(participant.boot_incarnation)
+            })
+        {
+            return Err(RecoveryControlError::Conflict(
+                "recovery stopped-report read roster is not a canonical round subset".into(),
+            ));
+        }
+        let reads = futures::stream::iter(roster.iter().copied().map(|participant| async move {
+            let value = self
+                .read_recovery_value(NodeId(participant.node_id), RECOVERY_STOPPED_REPORT_KEY)
+                .await;
+            (participant, value)
+        }))
+        .buffer_unordered(CONTROL_ROSTER_IO_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+        let mut reports = Vec::new();
+        for (participant, value) in reads {
+            let Some(raw) = value.map_err(RecoveryControlError::Uncertain)? else {
+                continue;
+            };
+            let publisher = NodeId(participant.node_id);
+            let report = parse_recovery_stopped_report_shape(&raw, publisher)
+                .map_err(RecoveryControlError::Conflict)?;
+            if report.round_id.generation < round.id.generation {
+                continue;
+            }
+            if report.round_id.generation > round.id.generation {
+                // A slot alone is not authority: corroborate that its exact publishing boot
+                // durably adopted at least this generation. A stale or partially written newer
+                // value remains pending for the old round instead of forcing abandon loops.
+                let adopted = self
+                    .read_recovery_value(publisher, "control:recovery-gen")
+                    .await
+                    .map_err(RecoveryControlError::Uncertain)?;
+                let incarnation = self
+                    .read_recovery_value(publisher, RECOVERY_INCARNATION_KEY)
+                    .await
+                    .map_err(RecoveryControlError::Uncertain)?;
+                let Some((adopted, incarnation)) = adopted.zip(incarnation) else {
+                    continue;
+                };
+                let adopted = adopted.parse::<u64>().map_err(|error| {
+                    RecoveryControlError::Conflict(format!(
+                        "invalid replicated recovery generation from {publisher}: {error}"
+                    ))
+                })?;
+                let incarnation = Uuid::parse_str(&incarnation).map_err(|error| {
+                    RecoveryControlError::Conflict(format!(
+                        "invalid recovery incarnation published by {publisher}: {error}"
+                    ))
+                })?;
+                if adopted >= report.round_id.generation
+                    && incarnation == report.publisher.boot_incarnation
+                {
+                    reports.push(report);
+                }
+                continue;
+            }
+            report.validate_semantics(round).map_err(|error| {
+                RecoveryControlError::Conflict(format!(
+                    "same-generation recovery stopped report from {publisher} conflicts with the exact frozen round: {error}"
+                ))
+            })?;
+            reports.push(report);
+        }
+        reports.sort_unstable_by_key(|report| report.publisher.node_id);
+        Ok(reports)
     }
 
     async fn read_recovery_announcement_map(
@@ -1638,7 +2013,7 @@ impl ClusterController {
             .collect())
     }
 
-    /// Whether every current participant boot identity still equals the frozen round.
+    /// Whether every current assignment-owner boot identity still equals the frozen round.
     ///
     /// # Errors
     /// Returns an error when the current incarnation roster is unavailable or malformed.
@@ -1649,12 +2024,37 @@ impl ClusterController {
             == round.assignment_fence.participants)
     }
 
+    /// Whether every owner and evidence reporter still has the boot identity frozen for stopping.
+    ///
+    /// This check belongs only to the Prepare/stopped-evidence boundary. Evidence reporters do not
+    /// join restore or release liveness quorums after their stopped reports are durable.
+    ///
+    /// # Errors
+    /// Returns an error when the current incarnation roster is unavailable or malformed.
+    pub async fn recovery_stopped_incarnations_match(
+        &self,
+        round: &RecoveryRound,
+    ) -> Result<bool, RecoveryControlError> {
+        self.recovery_roster_incarnations_match_control(&round.stopped_roster())
+            .await
+    }
+
     async fn recovery_incarnations_match_control(
         &self,
         round: &RecoveryRound,
     ) -> Result<bool, RecoveryControlError> {
-        let participants = round.assignment_fence.participant_ids();
-        let expected: std::collections::BTreeSet<u64> = participants.iter().copied().collect();
+        self.recovery_roster_incarnations_match_control(&round.assignment_fence.participants)
+            .await
+    }
+
+    async fn recovery_roster_incarnations_match_control(
+        &self,
+        roster: &[CheckpointParticipant],
+    ) -> Result<bool, RecoveryControlError> {
+        let expected: std::collections::BTreeSet<u64> = roster
+            .iter()
+            .map(|participant| participant.node_id)
+            .collect();
         let mut reported = std::collections::BTreeMap::new();
         for (node, raw) in self
             .scan_recovery_values(RECOVERY_INCARNATION_KEY)
@@ -1675,16 +2075,12 @@ impl ClusterController {
                 )));
             }
         }
-        if reported.len() != participants.len() {
+        if reported.len() != roster.len() {
             return Ok(false);
         }
-        Ok(round
-            .assignment_fence
-            .participants
-            .iter()
-            .all(|participant| {
-                reported.get(&participant.node_id) == Some(&participant.boot_incarnation)
-            }))
+        Ok(roster.iter().all(|participant| {
+            reported.get(&participant.node_id) == Some(&participant.boot_incarnation)
+        }))
     }
 
     /// Publish this node's fault sequence so the leader drives a recovery round.
@@ -1833,11 +2229,10 @@ impl ClusterController {
         if !matches!(start.phase, RecoverPhase::Start { .. }) {
             return Err("restore acknowledgement must bind a Start target".into());
         }
-        if !start.round.contains(self.instance_id) {
+        if !start.round.contains_owner(self.instance_id) {
             return Err("node outside recovery quorum cannot acknowledge restore".into());
         }
-        if start.round.participant_incarnation(self.instance_id) != Some(self.recovery_incarnation)
-        {
+        if start.round.owner_incarnation(self.instance_id) != Some(self.recovery_incarnation) {
             return Err("restore acknowledgement has a stale local process incarnation".into());
         }
         if !self.recovery_incarnation_is_current().await? {
@@ -1874,9 +2269,7 @@ impl ClusterController {
     ) -> Result<(), RecoveryControlError> {
         let release_id =
             RecoveryReleaseId::for_pending(release).map_err(RecoveryControlError::Conflict)?;
-        if release.round.participant_incarnation(self.instance_id)
-            != Some(self.recovery_incarnation)
-        {
+        if release.round.owner_incarnation(self.instance_id) != Some(self.recovery_incarnation) {
             return Err(RecoveryControlError::Superseded(
                 "release readiness has a stale local process incarnation".into(),
             ));
@@ -2658,7 +3051,26 @@ impl ClusterController {
         Ok(())
     }
 
-    /// Announce phase 1 with the immutable assignment-certified quorum.
+    async fn recovery_evidence_roster_matches(
+        &self,
+        round: &RecoveryRound,
+    ) -> Result<bool, String> {
+        let candidates = round
+            .faults
+            .iter()
+            .filter(|fault| !round.assignment_fence.contains(fault.reporter.0))
+            .map(|fault| fault.reporter.0)
+            .collect::<Vec<_>>();
+        let available = if candidates.is_empty() {
+            Vec::new()
+        } else {
+            self.available_recovery_participant_incarnations(&candidates)
+                .await?
+        };
+        Ok(available == round.evidence_participants)
+    }
+
+    /// Announce phase 1 with the immutable stopped/evidence roster.
     ///
     /// # Errors
     /// Returns an error unless this node is the round's current leader and driver.
@@ -2669,18 +3081,27 @@ impl ClusterController {
         }
         self.require_recovery_driver_proof(round, "Prepare preflight")
             .await?;
-        if !self.recovery_incarnations_match(round).await? {
-            return Err("recovery process-incarnation roster changed before Prepare".into());
+        if !self.recovery_evidence_roster_matches(round).await? {
+            return Err("available recovery evidence roster changed before Prepare".into());
+        }
+        if !self
+            .recovery_stopped_incarnations_match(round)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            return Err("recovery stopped-process roster changed before Prepare".into());
         }
         let _guard = self.recovery_writes.lock().await;
         self.require_recovery_driver_proof(round, "Prepare publication")
             .await?;
+        if !self.recovery_evidence_roster_matches(round).await? {
+            return Err("available recovery evidence roster changed during Prepare".into());
+        }
         let announcement = RecoveryAnnouncement {
             round: round.clone(),
             phase: RecoverPhase::Prepare,
         };
-        let encoded = serde_json::to_string(&announcement)
-            .map_err(|error| format!("could not encode recovery prepare: {error}"))?;
+        let encoded = encode_recovery_announcement(&announcement)?;
         self.write_recovery_value_exact("control:recover", encoded)
             .await?;
         self.require_recovery_driver_proof(round, "Prepare read-back")
@@ -2724,8 +3145,7 @@ impl ClusterController {
             round: round.clone(),
             phase: RecoverPhase::Start { epoch },
         };
-        let encoded = serde_json::to_string(&announcement)
-            .map_err(|error| format!("could not encode recovery start: {error}"))?;
+        let encoded = encode_recovery_announcement(&announcement)?;
         self.write_recovery_value_exact("control:recover", encoded)
             .await?;
         self.require_recovery_driver_proof(round, "Start read-back")
@@ -2769,8 +3189,7 @@ impl ClusterController {
             round: round.clone(),
             phase: RecoverPhase::Release { epoch },
         };
-        let encoded = serde_json::to_string(&release)
-            .map_err(|error| format!("could not encode recovery Release: {error}"))?;
+        let encoded = encode_recovery_announcement(&release)?;
         self.write_recovery_value_exact("control:recover", encoded)
             .await?;
         self.require_recovery_driver_proof(round, "Release read-back")
@@ -3095,43 +3514,84 @@ impl ClusterController {
         self.current_leader() == Some(round.id.driver)
     }
 
-    /// Whether the frozen round names this exact process, not only its stable node id.
+    /// Whether the assignment-owner quorum names this exact process, not only its stable node id.
     #[must_use]
     pub fn recovery_round_contains_current_process(&self, round: &RecoveryRound) -> bool {
-        round.participant_incarnation(self.instance_id) == Some(self.recovery_incarnation)
+        round.owner_incarnation(self.instance_id) == Some(self.recovery_incarnation)
+    }
+
+    /// Whether this exact owner or evidence-reporter process must stop for the round's Prepare.
+    #[must_use]
+    pub fn recovery_round_requires_current_process_stop(&self, round: &RecoveryRound) -> bool {
+        round.stopped_participant_incarnation(self.instance_id) == Some(self.recovery_incarnation)
     }
 
     /// Ack phase 1 for the exact frozen round.
     ///
     /// # Errors
-    /// Returns an error for invalid state or when this node is outside the quorum.
-    pub async fn announce_stopped(&self, round: &RecoveryRound) -> Result<(), String> {
+    /// Returns an error for invalid state or when this node is outside the stopped roster.
+    pub async fn announce_stopped(
+        &self,
+        round: &RecoveryRound,
+        prepared_witnesses: Vec<PreparedCheckpointWitness>,
+    ) -> Result<(), String> {
         round.validate()?;
-        if !round.contains(self.instance_id) {
-            return Err("node outside recovery quorum cannot acknowledge Prepare".into());
+        if !round.contains_stopped_participant(self.instance_id) {
+            return Err("node outside recovery stopped roster cannot acknowledge Prepare".into());
         }
-        if !self.recovery_round_contains_current_process(round) {
+        if !self.recovery_round_requires_current_process_stop(round) {
             return Err("Prepare acknowledgement has a stale local process incarnation".into());
         }
         if !self.recovery_incarnation_is_current().await? {
             return Err("Prepare acknowledgement came from a superseded local process".into());
         }
-        let encoded = serde_json::to_string(&RecoveryRoundAck {
-            round: round.clone(),
-            incarnation: self.recovery_incarnation,
-        })
-        .map_err(|error| format!("could not encode recovery ack: {error}"))?;
-        self.write_recovery_value_exact("control:recovery-stopped", encoded)
+        let report = RecoveryStoppedReport::new(
+            round,
+            CheckpointParticipant {
+                node_id: self.instance_id.0,
+                boot_incarnation: self.recovery_incarnation,
+            },
+            prepared_witnesses,
+        )?;
+        let encoded = encode_recovery_stopped_report(&report, round)?;
+        self.write_recovery_value_exact(RECOVERY_STOPPED_REPORT_KEY, encoded)
             .await
     }
 
-    /// Each visible node's exact stopped-for round.
+    /// Point-read only the still-missing members of an exact stopped roster.
     ///
     /// # Errors
-    /// Fails closed when any visible acknowledgement is malformed.
-    pub async fn read_stopped(&self) -> Result<Vec<(NodeId, RecoveryRound)>, String> {
-        self.read_recovery_round_map("control:recovery-stopped")
-            .await
+    /// Returns a conflict for a noncanonical or out-of-round subset and preserves the same
+    /// uncertainty/conflict/supersession classification used by recovery quorum polling.
+    pub async fn read_stopped(
+        &self,
+        round: &RecoveryRound,
+        participants: &[NodeId],
+    ) -> Result<Vec<RecoveryStoppedReport>, RecoveryControlError> {
+        if participants.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+            || participants.iter().any(NodeId::is_unassigned)
+        {
+            return Err(RecoveryControlError::Conflict(
+                "recovery stopped-report subset requires canonical participants".into(),
+            ));
+        }
+        let roster = participants
+            .iter()
+            .map(|node| {
+                round
+                    .stopped_participant_incarnation(*node)
+                    .map(|boot_incarnation| CheckpointParticipant {
+                        node_id: node.0,
+                        boot_incarnation,
+                    })
+                    .ok_or_else(|| {
+                        RecoveryControlError::Conflict(format!(
+                            "node {node} is outside the recovery stopped roster"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.read_recovery_stopped_reports(round, &roster).await
     }
 
     /// Clear only this driver's still-identical recovery announcement. The per-controller lock
@@ -5146,6 +5606,22 @@ mod tests {
         leader_proof: &LeaderProof,
         participants: &[u64],
     ) -> RecoveryRound {
+        recovery_round_with_evidence(
+            controller,
+            generation,
+            leader_proof,
+            participants,
+            Vec::new(),
+        )
+    }
+
+    fn recovery_round_with_evidence(
+        controller: &ClusterController,
+        generation: u64,
+        leader_proof: &LeaderProof,
+        participants: &[u64],
+        evidence_participants: Vec<CheckpointParticipant>,
+    ) -> RecoveryRound {
         let participant_roster = participants
             .iter()
             .map(|node_id| CheckpointParticipant {
@@ -5158,15 +5634,57 @@ mod tests {
                     Uuid::from_u128((u128::from(generation) << 64) | u128::from(*node_id))
                 },
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let mut faults = vec![RecoveryFault {
+            reporter: NodeId(leader_proof.owner.node_id),
+            sequence: generation,
+        }];
+        faults.extend(
+            evidence_participants
+                .iter()
+                .map(|participant| RecoveryFault {
+                    reporter: NodeId(participant.node_id),
+                    sequence: generation,
+                }),
+        );
+        faults.sort_unstable_by_key(|fault| fault.reporter);
+        faults.dedup_by_key(|fault| fault.reporter);
         RecoveryRound::new(
             generation,
             leader_proof.clone(),
             CheckpointAssignmentFence::from_owner_map(7, participants, participant_roster).unwrap(),
-            vec![RecoveryFault {
-                reporter: NodeId(leader_proof.owner.node_id),
-                sequence: generation,
-            }],
+            evidence_participants,
+            faults,
+        )
+        .unwrap()
+    }
+
+    fn prepared_witness(
+        epoch: u64,
+        checkpoint_id: u64,
+        participant_id: u64,
+    ) -> PreparedCheckpointWitness {
+        PreparedCheckpointWitness::new(
+            CheckpointAttempt::new(epoch, checkpoint_id),
+            participant_id,
+            Uuid::from_u128(500).to_string(),
+            crate::checkpoint::PipelineIdentity::empty(),
+        )
+        .unwrap()
+    }
+
+    fn stopped_report(
+        controller: &ClusterController,
+        round: &RecoveryRound,
+        prepared_witnesses: Vec<PreparedCheckpointWitness>,
+    ) -> RecoveryStoppedReport {
+        RecoveryStoppedReport::new(
+            round,
+            CheckpointParticipant {
+                node_id: controller.instance_id().0,
+                boot_incarnation: controller.recovery_incarnation(),
+            },
+            prepared_witnesses,
         )
         .unwrap()
     }
@@ -5801,6 +6319,476 @@ mod tests {
         assert!(error.contains("injected durable write failure"), "{error}");
     }
 
+    #[test]
+    fn recovery_round_separates_owners_from_bounded_evidence_participants() {
+        let controller = ctl(1, Vec::new());
+        let proof = test_leader_proof(1, controller.recovery_incarnation(), 1);
+        let evidence = CheckpointParticipant {
+            node_id: 2,
+            boot_incarnation: Uuid::from_u128(2),
+        };
+        let round = recovery_round_with_evidence(&controller, 41, &proof, &[1], vec![evidence]);
+
+        assert_eq!(round.owners(), vec![NodeId(1)]);
+        assert_eq!(round.stopped_participants(), vec![NodeId(1), NodeId(2)]);
+        assert!(round.contains_owner(NodeId(1)));
+        assert!(!round.contains_owner(NodeId(2)));
+        assert!(round.contains_stopped_participant(NodeId(2)));
+        assert_eq!(round.owner_incarnation(NodeId(2)), None);
+        assert_eq!(
+            round.stopped_participant_incarnation(NodeId(2)),
+            Some(evidence.boot_incarnation)
+        );
+
+        let owner_evidence = RecoveryRound::new(
+            42,
+            proof.clone(),
+            round.assignment_fence.clone(),
+            vec![round.assignment_fence.participants[0]],
+            vec![RecoveryFault {
+                reporter: NodeId(1),
+                sequence: 42,
+            }],
+        )
+        .unwrap_err();
+        assert!(
+            owner_evidence.contains("non-owner fault reporters"),
+            "{owner_evidence}"
+        );
+
+        let missing_fault = RecoveryRound::new(
+            43,
+            proof.clone(),
+            round.assignment_fence.clone(),
+            vec![evidence],
+            vec![RecoveryFault {
+                reporter: NodeId(1),
+                sequence: 43,
+            }],
+        )
+        .unwrap_err();
+        assert!(
+            missing_fault.contains("non-owner fault reporters"),
+            "{missing_fault}"
+        );
+
+        let unsorted = RecoveryRound::new(
+            43,
+            proof.clone(),
+            round.assignment_fence.clone(),
+            vec![
+                CheckpointParticipant {
+                    node_id: 3,
+                    boot_incarnation: Uuid::from_u128(3),
+                },
+                evidence,
+            ],
+            vec![
+                RecoveryFault {
+                    reporter: NodeId(1),
+                    sequence: 43,
+                },
+                RecoveryFault {
+                    reporter: NodeId(2),
+                    sequence: 43,
+                },
+                RecoveryFault {
+                    reporter: NodeId(3),
+                    sequence: 43,
+                },
+            ],
+        )
+        .unwrap_err();
+        assert!(unsorted.contains("roster is not canonical"), "{unsorted}");
+
+        let owner_count = MAX_CHECKPOINT_PARTICIPANTS;
+        let owners = (1..=u64::try_from(owner_count).unwrap()).collect::<Vec<_>>();
+        let participants = owners
+            .iter()
+            .map(|node_id| CheckpointParticipant {
+                node_id: *node_id,
+                boot_incarnation: Uuid::from_u128(u128::from(*node_id)),
+            })
+            .collect::<Vec<_>>();
+        let full_fence =
+            CheckpointAssignmentFence::from_owner_map(8, &owners, participants).unwrap();
+        let outsider = CheckpointParticipant {
+            node_id: u64::try_from(owner_count).unwrap() + 1,
+            boot_incarnation: Uuid::from_u128(u128::try_from(owner_count).unwrap() + 1),
+        };
+        let oversized = RecoveryRound::new(
+            44,
+            test_leader_proof(1, Uuid::from_u128(1), 1),
+            full_fence,
+            vec![outsider],
+            vec![
+                RecoveryFault {
+                    reporter: NodeId(1),
+                    sequence: 44,
+                },
+                RecoveryFault {
+                    reporter: NodeId(outsider.node_id),
+                    sequence: 44,
+                },
+            ],
+        )
+        .unwrap_err();
+        assert!(oversized.contains("stopped roster has"), "{oversized}");
+
+        let oversized_fault_count = MAX_RECOVERY_ANNOUNCEMENT_BYTES / 16;
+        let too_many_faults = (1..=u64::try_from(oversized_fault_count).unwrap())
+            .map(|node_id| RecoveryFault {
+                reporter: NodeId(node_id),
+                sequence: 44,
+            })
+            .collect();
+        let oversized_fault_set = RecoveryRound::new(
+            44,
+            proof,
+            round.assignment_fence,
+            Vec::new(),
+            too_many_faults,
+        )
+        .unwrap_err();
+        assert!(
+            oversized_fault_set.contains("maximum"),
+            "{oversized_fault_set}"
+        );
+    }
+
+    #[test]
+    fn recovery_announcement_wire_is_bounded_strict_and_canonical() {
+        let controller = ctl(1, Vec::new());
+        let proof = test_leader_proof(1, controller.recovery_incarnation(), 1);
+        let announcement = RecoveryAnnouncement {
+            round: recovery_round(&controller, 45, &proof, &[1]),
+            phase: RecoverPhase::Prepare,
+        };
+        let canonical = encode_recovery_announcement(&announcement).unwrap();
+        assert_eq!(
+            parse_recovery_announcement(&canonical).unwrap(),
+            Some(announcement)
+        );
+
+        let mut unknown = serde_json::from_str::<serde_json::Value>(&canonical).unwrap();
+        unknown["unknown"] = serde_json::json!(true);
+        let error =
+            parse_recovery_announcement(&serde_json::to_string(&unknown).unwrap()).unwrap_err();
+        assert!(error.contains("unknown field"), "{error}");
+
+        let error = parse_recovery_announcement(&format!(" {canonical}")).unwrap_err();
+        assert!(error.contains("not canonically encoded"), "{error}");
+
+        let oversized = " ".repeat(MAX_RECOVERY_ANNOUNCEMENT_BYTES + 1);
+        let error = parse_recovery_announcement(&oversized).unwrap_err();
+        assert!(error.contains("maximum"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn evidence_boot_incarnation_is_part_of_the_frozen_stopped_roster() {
+        let owner = NodeId(1);
+        let kv = Arc::new(InMemoryKv::new(owner));
+        let (_members_tx, members_rx) = watch::channel(Vec::new());
+        let controller = ClusterController::new(owner, kv.clone(), None, members_rx);
+        controller.publish_recovery_incarnation().await.unwrap();
+        let proof = test_leader_proof(1, controller.recovery_incarnation(), 1);
+        let evidence = CheckpointParticipant {
+            node_id: 2,
+            boot_incarnation: Uuid::from_u128(2),
+        };
+        let round = recovery_round_with_evidence(&controller, 41, &proof, &[1], vec![evidence]);
+        kv.seed(
+            NodeId(evidence.node_id),
+            RECOVERY_INCARNATION_KEY,
+            evidence.boot_incarnation.to_string(),
+        );
+
+        assert!(controller
+            .recovery_stopped_incarnations_match(&round)
+            .await
+            .unwrap());
+        kv.seed(
+            NodeId(evidence.node_id),
+            RECOVERY_INCARNATION_KEY,
+            Uuid::new_v4().to_string(),
+        );
+        assert!(!controller
+            .recovery_stopped_incarnations_match(&round)
+            .await
+            .unwrap());
+        assert!(
+            controller
+                .recovery_incarnations_match(&round)
+                .await
+                .unwrap(),
+            "evidence reporters do not join the owner restore/release quorum"
+        );
+    }
+
+    #[tokio::test]
+    async fn stopped_report_point_reads_ignore_outsiders_and_admit_evidence_publishers() {
+        let evidence_node = NodeId(2);
+        let kv = Arc::new(InMemoryKv::new(evidence_node));
+        let (_members_tx, members_rx) = watch::channel(Vec::new());
+        let controller = ClusterController::new(evidence_node, kv.clone(), None, members_rx);
+        controller.publish_recovery_incarnation().await.unwrap();
+        let owner_boot = Uuid::from_u128(1);
+        let proof = test_leader_proof(1, owner_boot, 1);
+        let evidence = CheckpointParticipant {
+            node_id: evidence_node.0,
+            boot_incarnation: controller.recovery_incarnation(),
+        };
+        let round = recovery_round_with_evidence(&controller, 41, &proof, &[1], vec![evidence]);
+        controller
+            .announce_stopped(&round, vec![prepared_witness(7, 42, evidence_node.0)])
+            .await
+            .unwrap();
+        kv.seed(
+            NodeId(99),
+            RECOVERY_STOPPED_REPORT_KEY,
+            "malformed outsider report".into(),
+        );
+
+        let reports = controller
+            .read_stopped(&round, &round.stopped_participants())
+            .await
+            .unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].publisher, evidence);
+
+        kv.seed(
+            NodeId(1),
+            RECOVERY_STOPPED_REPORT_KEY,
+            "malformed exact-roster report".into(),
+        );
+        let error = controller
+            .read_stopped(&round, &round.stopped_participants())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                RecoveryControlError::Conflict(reason)
+                    if reason.contains("invalid recovery stopped report from node-1")
+            ),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stopped_report_announcement_reads_back_exact_publisher_and_inventory() {
+        let node = NodeId(1);
+        let kv = Arc::new(InMemoryKv::new(node));
+        let (_members_tx, members_rx) = watch::channel(Vec::new());
+        let controller = ClusterController::new(node, kv, None, members_rx);
+        controller.publish_recovery_incarnation().await.unwrap();
+        let proof = test_leader_proof(1, controller.recovery_incarnation(), 1);
+        let round = recovery_round(&controller, 41, &proof, &[1]);
+        let witnesses = vec![prepared_witness(7, 42, 1)];
+
+        controller
+            .announce_stopped(&round, witnesses.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            controller
+                .read_stopped(&round, &round.stopped_participants())
+                .await
+                .unwrap(),
+            vec![stopped_report(&controller, &round, witnesses)]
+        );
+    }
+
+    #[tokio::test]
+    async fn stopped_report_point_reads_require_an_adopted_newer_generation() {
+        let node = NodeId(1);
+        let kv = Arc::new(InMemoryKv::new(node));
+        let (_members_tx, members_rx) = watch::channel(Vec::new());
+        let controller = ClusterController::new(node, kv.clone(), None, members_rx);
+        let proof = test_leader_proof(1, controller.recovery_incarnation(), 1);
+        let old_round = recovery_round(&controller, 40, &proof, &[1]);
+        let current_round = recovery_round(&controller, 41, &proof, &[1]);
+        let newer_round = recovery_round(&controller, 42, &proof, &[1]);
+
+        let old = stopped_report(&controller, &old_round, Vec::new());
+        kv.seed(
+            node,
+            RECOVERY_STOPPED_REPORT_KEY,
+            encode_recovery_stopped_report(&old, &old_round).unwrap(),
+        );
+        assert!(controller
+            .read_stopped(&current_round, &current_round.stopped_participants())
+            .await
+            .unwrap()
+            .is_empty());
+
+        let newer = stopped_report(&controller, &newer_round, Vec::new());
+        kv.seed(
+            node,
+            RECOVERY_STOPPED_REPORT_KEY,
+            encode_recovery_stopped_report(&newer, &newer_round).unwrap(),
+        );
+        assert!(controller
+            .read_stopped(&current_round, &current_round.stopped_participants())
+            .await
+            .unwrap()
+            .is_empty());
+        kv.seed(
+            node,
+            RECOVERY_INCARNATION_KEY,
+            controller.recovery_incarnation().to_string(),
+        );
+        kv.seed(node, "control:recovery-gen", "42".into());
+        let reports = controller
+            .read_stopped(&current_round, &current_round.stopped_participants())
+            .await
+            .unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].round_id, newer_round.id);
+    }
+
+    #[test]
+    fn stopped_report_wire_round_trips_empty_and_bounded_inventory() {
+        let controller = ctl(1, Vec::new());
+        let proof = test_leader_proof(1, controller.recovery_incarnation(), 1);
+        let round = recovery_round(&controller, 41, &proof, &[1]);
+
+        let empty = stopped_report(&controller, &round, Vec::new());
+        let raw = encode_recovery_stopped_report(&empty, &round).unwrap();
+        assert!(
+            raw.len() < 512,
+            "compact empty stopped report was {} bytes",
+            raw.len()
+        );
+        assert_eq!(
+            parse_recovery_stopped_report(&raw, NodeId(1), &round).unwrap(),
+            empty
+        );
+        let mut divergent_round = round.clone();
+        divergent_round.faults[0].sequence += 1;
+        let error = parse_recovery_stopped_report(&raw, NodeId(1), &divergent_round).unwrap_err();
+        assert!(error.contains("exact frozen round"), "{error}");
+
+        let witnesses = (1..=MAX_PREPARED_CHECKPOINT_WITNESSES as u64)
+            .map(|attempt| prepared_witness(attempt, attempt, 1))
+            .collect();
+        let full = stopped_report(&controller, &round, witnesses);
+        let raw = encode_recovery_stopped_report(&full, &round).unwrap();
+        assert!(raw.len() <= MAX_RECOVERY_STOPPED_REPORT_BYTES);
+        assert!(!raw.contains("assignment_fence"));
+        assert!(!raw.contains("evidence_participants"));
+        assert!(!raw.contains("faults"));
+        assert_eq!(
+            parse_recovery_stopped_report(&raw, NodeId(1), &round).unwrap(),
+            full
+        );
+    }
+
+    #[test]
+    fn stopped_report_rejects_stale_boot_and_wrong_slot_publisher() {
+        let controller = ctl(1, Vec::new());
+        let proof = test_leader_proof(1, controller.recovery_incarnation(), 1);
+        let round = recovery_round(&controller, 41, &proof, &[1]);
+        let report = stopped_report(&controller, &round, Vec::new());
+
+        let raw = encode_recovery_stopped_report(&report, &round).unwrap();
+        let error = parse_recovery_stopped_report(&raw, NodeId(2), &round).unwrap_err();
+        assert!(error.contains("names publisher 1"), "{error}");
+
+        let mut stale = report;
+        stale.publisher.boot_incarnation = Uuid::new_v4();
+        let raw = serde_json::to_string(&stale).unwrap();
+        let error = parse_recovery_stopped_report(&raw, NodeId(1), &round).unwrap_err();
+        assert!(error.contains("does not match the frozen round"), "{error}");
+    }
+
+    #[test]
+    fn stopped_report_rejects_unsorted_duplicate_and_excess_inventory() {
+        let controller = ctl(1, Vec::new());
+        let proof = test_leader_proof(1, controller.recovery_incarnation(), 1);
+        let round = recovery_round(&controller, 41, &proof, &[1]);
+
+        let error = RecoveryStoppedReport::new(
+            &round,
+            CheckpointParticipant {
+                node_id: 1,
+                boot_incarnation: controller.recovery_incarnation(),
+            },
+            vec![prepared_witness(1, 1, 2)],
+        )
+        .unwrap_err();
+        assert!(error.contains("does not match report publisher"), "{error}");
+
+        let error = RecoveryStoppedReport::new(
+            &round,
+            CheckpointParticipant {
+                node_id: 1,
+                boot_incarnation: controller.recovery_incarnation(),
+            },
+            vec![prepared_witness(2, 2, 1), prepared_witness(1, 1, 1)],
+        )
+        .unwrap_err();
+        assert!(error.contains("uniquely sorted"), "{error}");
+
+        let duplicate = prepared_witness(1, 1, 1);
+        let error = RecoveryStoppedReport::new(
+            &round,
+            CheckpointParticipant {
+                node_id: 1,
+                boot_incarnation: controller.recovery_incarnation(),
+            },
+            vec![duplicate.clone(), duplicate],
+        )
+        .unwrap_err();
+        assert!(error.contains("uniquely sorted"), "{error}");
+
+        let witnesses = (1..=(MAX_PREPARED_CHECKPOINT_WITNESSES + 1) as u64)
+            .map(|attempt| prepared_witness(attempt, attempt, 1))
+            .collect();
+        let error = RecoveryStoppedReport::new(
+            &round,
+            CheckpointParticipant {
+                node_id: 1,
+                boot_incarnation: controller.recovery_incarnation(),
+            },
+            witnesses,
+        )
+        .unwrap_err();
+        assert!(error.contains("prepared witnesses; maximum"), "{error}");
+    }
+
+    #[test]
+    fn stopped_report_wire_rejects_oversize_and_unknown_fields() {
+        let controller = ctl(1, Vec::new());
+        let proof = test_leader_proof(1, controller.recovery_incarnation(), 1);
+        let round = recovery_round(&controller, 41, &proof, &[1]);
+        let report = stopped_report(&controller, &round, Vec::new());
+        let raw = encode_recovery_stopped_report(&report, &round).unwrap();
+
+        let oversize = format!(
+            "{raw}{}",
+            " ".repeat(MAX_RECOVERY_STOPPED_REPORT_BYTES + 1 - raw.len())
+        );
+        let error = parse_recovery_stopped_report(&oversize, NodeId(1), &round).unwrap_err();
+        assert!(error.contains("bytes; maximum"), "{error}");
+
+        let mut value = serde_json::to_value(report).unwrap();
+        value["unknown"] = serde_json::json!(true);
+        let raw = serde_json::to_string(&value).unwrap();
+        let error = parse_recovery_stopped_report(&raw, NodeId(1), &round).unwrap_err();
+        assert!(error.contains("unknown field"), "{error}");
+
+        let unsupported_round = recovery_round(&controller, 42, &proof, &[1]);
+        let mut unsupported = stopped_report(&controller, &unsupported_round, Vec::new());
+        unsupported.protocol_version = RECOVERY_STOPPED_REPORT_PROTOCOL_VERSION + 1;
+        let raw = serde_json::to_string(&unsupported).unwrap();
+        let error = parse_recovery_stopped_report(&raw, NodeId(1), &unsupported_round).unwrap_err();
+        assert!(
+            error.contains("unsupported recovery stopped report version"),
+            "{error}"
+        );
+    }
+
     #[tokio::test]
     async fn superseded_same_id_process_cannot_ack_an_old_round() {
         let node = NodeId(1);
@@ -5815,7 +6803,10 @@ mod tests {
         let replacement = ClusterController::new(node, kv, None, new_rx);
         replacement.publish_recovery_incarnation().await.unwrap();
 
-        let error = old.announce_stopped(&old_round).await.unwrap_err();
+        let error = old
+            .announce_stopped(&old_round, Vec::new())
+            .await
+            .unwrap_err();
         assert!(error.contains("superseded local process"), "{error}");
     }
 }

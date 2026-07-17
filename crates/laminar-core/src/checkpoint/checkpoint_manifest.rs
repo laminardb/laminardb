@@ -40,7 +40,7 @@ impl PipelineIdentity {
     }
 
     /// Validate the persisted identity format.
-    fn validation_error(&self) -> Option<String> {
+    pub(crate) fn validation_error(&self) -> Option<String> {
         if self.canonical_version != PIPELINE_IDENTITY_VERSION {
             return Some(format!(
                 "unsupported pipeline identity version {}; expected {PIPELINE_IDENTITY_VERSION}",
@@ -56,6 +56,12 @@ impl PipelineIdentity {
             return Some("pipeline identity must be 64 lowercase hexadecimal characters".into());
         }
         None
+    }
+
+    /// Whether this identity uses the current canonical version and digest encoding.
+    #[must_use]
+    pub(crate) fn is_canonical(&self) -> bool {
+        self.validation_error().is_none()
     }
 }
 

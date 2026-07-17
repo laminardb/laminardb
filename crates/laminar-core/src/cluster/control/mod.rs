@@ -20,7 +20,7 @@ pub use barrier::{
 };
 pub use controller::{
     ClusterController, RecoverPhase, RecoveryAnnouncement, RecoveryControlError, RecoveryFault,
-    RecoveryRound, RecoveryRoundId, ReleaseCommitStatus,
+    RecoveryRound, RecoveryRoundId, RecoveryStoppedReport, ReleaseCommitStatus,
 };
 // Re-exported from `crate::checkpoint_decision` (lives outside the
 // cluster gate because single-instance also relies on it for crash-safe
