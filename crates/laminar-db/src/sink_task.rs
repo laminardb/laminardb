@@ -15,6 +15,8 @@ use laminar_connectors::connector::{
     SinkContract,
 };
 use laminar_connectors::error::ConnectorError;
+#[cfg(feature = "cluster")]
+use laminar_core::cluster::control::ClusterController;
 use laminar_core::streaming::Producer;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -32,26 +34,141 @@ pub(crate) const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) const SINK_EVENT_CHANNEL_CAPACITY: usize = 1024;
 const SINK_CLOSE_TIMEOUT: Duration = Duration::from_secs(15);
 
+enum ConnectorOperationOutcome<T> {
+    Completed(T),
+    Deadline(Option<T>),
+    #[cfg(feature = "cluster")]
+    ProcessAuthorityLost(Option<T>),
+}
+
+async fn await_connector_operation_local<T>(
+    deadline: Instant,
+    cancellation_policy: ConnectorCancellationPolicy,
+    future: impl std::future::Future<Output = T>,
+) -> ConnectorOperationOutcome<T> {
+    if Instant::now() >= deadline {
+        return ConnectorOperationOutcome::Deadline(None);
+    }
+    let mut future = std::pin::pin!(future);
+    match tokio::time::timeout_at(deadline, future.as_mut()).await {
+        Ok(result) => ConnectorOperationOutcome::Completed(result),
+        Err(_) if cancellation_policy == ConnectorCancellationPolicy::CompleteStarted => {
+            ConnectorOperationOutcome::Deadline(Some(future.await))
+        }
+        Err(_) => ConnectorOperationOutcome::Deadline(None),
+    }
+}
+
+#[cfg(feature = "cluster")]
+async fn await_connector_operation_fenced<T>(
+    controller: &ClusterController,
+    deadline: Instant,
+    cancellation_policy: ConnectorCancellationPolicy,
+    future: impl std::future::Future<Output = T>,
+) -> ConnectorOperationOutcome<T> {
+    let started = AtomicBool::new(false);
+    let operation = async {
+        started.store(true, Ordering::Release);
+        future.await
+    };
+    tokio::pin!(operation);
+
+    tokio::select! {
+        biased;
+        () = controller.wait_for_process_lease_loss() => {
+            let completion = if cancellation_policy == ConnectorCancellationPolicy::CompleteStarted
+                && started.load(Ordering::Acquire)
+            {
+                Some(operation.await)
+            } else {
+                None
+            };
+            ConnectorOperationOutcome::ProcessAuthorityLost(completion)
+        }
+        () = tokio::time::sleep_until(deadline) => {
+            let completion = if cancellation_policy == ConnectorCancellationPolicy::CompleteStarted
+                && started.load(Ordering::Acquire)
+            {
+                Some(operation.await)
+            } else {
+                None
+            };
+            ConnectorOperationOutcome::Deadline(completion)
+        }
+        result = &mut operation => {
+            if controller.process_lease_is_live() {
+                ConnectorOperationOutcome::Completed(result)
+            } else {
+                ConnectorOperationOutcome::ProcessAuthorityLost(Some(result))
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cluster")]
+async fn await_connector_operation<T, F, Fut>(
+    deadline: Instant,
+    cancellation_policy: ConnectorCancellationPolicy,
+    process_authority: Option<Arc<ClusterController>>,
+    make_future: F,
+) -> ConnectorOperationOutcome<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let Some(controller) = process_authority else {
+        return await_connector_operation_local(deadline, cancellation_policy, make_future()).await;
+    };
+    if !controller.process_lease_is_live() {
+        return ConnectorOperationOutcome::ProcessAuthorityLost(None);
+    }
+    await_connector_operation_fenced(
+        controller.as_ref(),
+        deadline,
+        cancellation_policy,
+        make_future(),
+    )
+    .await
+}
+
+#[cfg(not(feature = "cluster"))]
+async fn await_connector_operation<T, F, Fut>(
+    deadline: Instant,
+    cancellation_policy: ConnectorCancellationPolicy,
+    make_future: F,
+) -> ConnectorOperationOutcome<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    await_connector_operation_local(deadline, cancellation_policy, make_future()).await
+}
+
 async fn bounded_connector_operation<T, F, Fut>(
     sink_name: &str,
     operation: &str,
     deadline: Instant,
     cancellation_policy: ConnectorCancellationPolicy,
+    #[cfg(feature = "cluster")] process_authority: Option<Arc<ClusterController>>,
     make_future: F,
 ) -> Result<T, ConnectorError>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<T, ConnectorError>>,
 {
-    if deadline <= Instant::now() {
-        return Err(protocol_deadline_error(sink_name, operation));
-    }
-    let mut future = std::pin::pin!(make_future());
-    match tokio::time::timeout_at(deadline, future.as_mut()).await {
-        Ok(result) => result,
-        Err(_) => {
-            if cancellation_policy == ConnectorCancellationPolicy::CompleteStarted {
-                match future.await {
+    match await_connector_operation(
+        deadline,
+        cancellation_policy,
+        #[cfg(feature = "cluster")]
+        process_authority,
+        make_future,
+    )
+    .await
+    {
+        ConnectorOperationOutcome::Completed(result) => result,
+        ConnectorOperationOutcome::Deadline(completion) => {
+            if let Some(completion) = completion {
+                match completion {
                     Ok(_) => tracing::warn!(
                         sink = sink_name,
                         operation,
@@ -67,6 +184,33 @@ where
             }
             Err(protocol_deadline_error(sink_name, operation))
         }
+        #[cfg(feature = "cluster")]
+        ConnectorOperationOutcome::ProcessAuthorityLost(completion) => {
+            if let Some(completion) = completion {
+                match completion {
+                    Ok(_) => tracing::warn!(
+                        sink = sink_name,
+                        operation,
+                        "connector operation completed after process lease loss"
+                    ),
+                    Err(error) => tracing::warn!(
+                        sink = sink_name,
+                        operation,
+                        %error,
+                        "connector operation failed after process lease loss"
+                    ),
+                }
+            }
+            Err(process_authority_error(sink_name, operation))
+        }
+    }
+}
+
+#[cfg(feature = "cluster")]
+fn process_authority_error(sink_name: &str, operation: &str) -> ConnectorError {
+    ConnectorError::InvalidState {
+        expected: "live cluster process lease".into(),
+        actual: format!("sink '{sink_name}' lost process authority before {operation}"),
     }
 }
 
@@ -137,6 +281,8 @@ pub(crate) struct SinkTaskConfig {
     pub flush_interval: Duration,
     pub write_timeout: Duration,
     pub event_tx: Producer<SinkEvent>,
+    #[cfg(feature = "cluster")]
+    pub process_authority: Option<Arc<ClusterController>>,
 }
 
 pub(crate) struct SinkCommand {
@@ -263,6 +409,8 @@ pub(crate) struct SinkTaskHandle {
     /// Sticky for the current epoch. Shared with the actor so a write rejected before enqueue
     /// cannot be hidden from the checkpoint protocol.
     epoch_poisoned: Arc<AtomicBool>,
+    #[cfg(feature = "cluster")]
+    process_authority: Option<Arc<ClusterController>>,
 }
 
 impl SinkTaskHandle {
@@ -294,6 +442,8 @@ impl SinkTaskHandle {
             flush_interval,
             write_timeout,
             event_tx,
+            #[cfg(feature = "cluster")]
+            process_authority,
         } = config;
         let (tx, rx) = mpsc::bounded_async::<SinkCommand>(channel_capacity);
         let cancellation_policy = connector.cancellation_policy();
@@ -301,6 +451,7 @@ impl SinkTaskHandle {
         let task_event_tx = event_tx.clone();
         let task_name = name.clone();
         let epoch_poisoned = Arc::new(AtomicBool::new(false));
+        let admission = Arc::new(tokio::sync::Mutex::new(()));
         let runtime = tokio::runtime::Handle::current();
         let handle = runtime.spawn(run_sink_task(
             SinkTaskInner {
@@ -313,6 +464,10 @@ impl SinkTaskHandle {
                 contract,
                 requires_recovery_on_error,
                 event_tx: task_event_tx,
+                #[cfg(feature = "cluster")]
+                process_authority: process_authority.clone(),
+                #[cfg(feature = "cluster")]
+                admission: Arc::clone(&admission),
             },
             Arc::clone(&epoch_poisoned),
         ));
@@ -326,12 +481,14 @@ impl SinkTaskHandle {
             write_timeout,
             cancellation_policy,
             closing: Arc::new(AtomicBool::new(false)),
-            admission: Arc::new(tokio::sync::Mutex::new(())),
+            admission,
             task: Arc::new(parking_lot::Mutex::new(Some(handle))),
             close_state: Arc::new(SinkCloseState::new()),
             runtime,
             event_tx,
             epoch_poisoned,
+            #[cfg(feature = "cluster")]
+            process_authority,
         }
     }
 
@@ -354,10 +511,15 @@ impl SinkTaskHandle {
 
     fn ensure_open(&self) -> Result<(), ConnectorError> {
         if self.closing.load(Ordering::Acquire) {
-            Err(self.closed_err())
-        } else {
-            Ok(())
+            return Err(self.closed_err());
         }
+        #[cfg(feature = "cluster")]
+        if let Some(controller) = self.process_authority.as_ref() {
+            if !controller.process_lease_is_live() {
+                return Err(process_authority_error(&self.name, "command admission"));
+            }
+        }
+        Ok(())
     }
 
     async fn request<T>(
@@ -436,23 +598,59 @@ impl SinkTaskHandle {
 
     /// Send a batch; backpressures when the sink is behind.
     pub async fn write_batch(&self, batch: RecordBatch) -> Result<(), ConnectorError> {
+        self.write_batch_before(
+            batch,
+            operation_deadline(self.write_timeout),
+            self.write_timeout,
+        )
+        .await
+    }
+
+    /// Send a batch with queue admission and the actor command clamped to the caller's deadline.
+    pub async fn write_batch_until(
+        &self,
+        batch: RecordBatch,
+        supplied_deadline: Instant,
+    ) -> Result<(), ConnectorError> {
+        let started = Instant::now();
+        let deadline = operation_deadline(self.write_timeout).min(supplied_deadline);
+        let effective_timeout = deadline.saturating_duration_since(started);
+        self.write_batch_before(batch, deadline, effective_timeout)
+            .await
+    }
+
+    async fn write_batch_before(
+        &self,
+        batch: RecordBatch,
+        deadline: Instant,
+        effective_timeout: Duration,
+    ) -> Result<(), ConnectorError> {
         let rows = batch.num_rows();
-        let deadline = operation_deadline(self.write_timeout);
-        let admission = match tokio::time::timeout_at(deadline, self.admission.lock()).await {
-            Ok(admission) => admission,
-            Err(_) => {
-                self.poison_epoch_if_recovery_required();
-                let _ = self.event_tx.try_push(SinkEvent::WriteEnqueueTimeout {
-                    sink_id: Arc::clone(&self.sink_id),
-                    rows,
-                    timeout: self.write_timeout,
-                });
-                return Err(command_deadline_error(
-                    &self.name,
-                    "write admission",
-                    self.write_timeout,
-                ));
-            }
+        if effective_timeout.is_zero() {
+            self.poison_epoch_if_recovery_required();
+            let _ = self.event_tx.try_push(SinkEvent::WriteEnqueueTimeout {
+                sink_id: Arc::clone(&self.sink_id),
+                rows,
+                timeout: effective_timeout,
+            });
+            return Err(command_deadline_error(
+                &self.name,
+                "write admission",
+                effective_timeout,
+            ));
+        }
+        let Ok(admission) = tokio::time::timeout_at(deadline, self.admission.lock()).await else {
+            self.poison_epoch_if_recovery_required();
+            let _ = self.event_tx.try_push(SinkEvent::WriteEnqueueTimeout {
+                sink_id: Arc::clone(&self.sink_id),
+                rows,
+                timeout: effective_timeout,
+            });
+            return Err(command_deadline_error(
+                &self.name,
+                "write admission",
+                effective_timeout,
+            ));
         };
         self.ensure_open()?;
         let command = SinkCommand {
@@ -480,12 +678,12 @@ impl SinkTaskHandle {
                 let _ = self.event_tx.try_push(SinkEvent::WriteEnqueueTimeout {
                     sink_id: Arc::clone(&self.sink_id),
                     rows,
-                    timeout: self.write_timeout,
+                    timeout: effective_timeout,
                 });
                 Err(command_deadline_error(
                     &self.name,
                     "write enqueue",
-                    self.write_timeout,
+                    effective_timeout,
                 ))
             }
         }
@@ -668,15 +866,14 @@ fn spawn_sink_close_driver(
             handle,
             Arc::clone(&state),
         );
-        match std::panic::AssertUnwindSafe(close).catch_unwind().await {
-            Ok(outcome) => state.finish(outcome),
-            Err(_) => {
-                // The actor JoinHandle was inside the unwound future, so terminal completion is
-                // no longer provable. Fail closed: keep the generation fence permanently set.
-                state.set_phase("terminal driver panic");
-                state.notify.notify_waiters();
-                tracing::error!(sink = %name, "sink terminal close driver panicked; replacement remains fenced");
-            }
+        if let Ok(outcome) = std::panic::AssertUnwindSafe(close).catch_unwind().await {
+            state.finish(outcome);
+        } else {
+            // The actor JoinHandle was inside the unwound future, so terminal completion is
+            // no longer provable. Fail closed: keep the generation fence permanently set.
+            state.set_phase("terminal driver panic");
+            state.notify.notify_waiters();
+            tracing::error!(sink = %name, "sink terminal close driver panicked; replacement remains fenced");
         }
     });
     drop(supervisor); // detached by design; shared state and the DB registry retain ownership
@@ -788,20 +985,19 @@ async fn drive_sink_close(
             ))
         })
     } else {
-        match tokio::time::timeout_at(first_deadline, &mut handle).await {
-            Ok(result) => result.map_err(|error| {
+        if let Ok(result) = tokio::time::timeout_at(first_deadline, &mut handle).await {
+            result.map_err(|error| {
                 ConnectorError::Internal(format!(
                     "sink task '{name}' failed while joining after close: {error}"
                 ))
-            }),
-            Err(_) => {
-                // CancelSafe is an audited promise that dropping the connector future cannot
-                // leave an external mutation in flight. The stable driver, rather than the
-                // public caller, owns the unbounded terminal observation after abort.
-                handle.abort();
-                let _ = handle.await;
-                Err(close_deadline_error(&name, "join"))
-            }
+            })
+        } else {
+            // CancelSafe is an audited promise that dropping the connector future cannot
+            // leave an external mutation in flight. The stable driver, rather than the
+            // public caller, owns the unbounded terminal observation after abort.
+            handle.abort();
+            let _ = handle.await;
+            Err(close_deadline_error(&name, "join"))
         }
     };
 
@@ -841,11 +1037,25 @@ struct SinkTaskInner {
     contract: SinkContract,
     requires_recovery_on_error: bool,
     event_tx: Producer<SinkEvent>,
+    #[cfg(feature = "cluster")]
+    process_authority: Option<Arc<ClusterController>>,
+    #[cfg(feature = "cluster")]
+    admission: Arc<tokio::sync::Mutex<()>>,
 }
 
 // In replay-required modes, `epoch_poisoned` rejects checkpoint Flush/PreCommit so no durable cut
 // can pass a dropped write. Local best-effort mode reports loss without permanently fencing state.
-async fn run_sink_task(mut inner: SinkTaskInner, epoch_poisoned: Arc<AtomicBool>) {
+async fn run_sink_task(inner: SinkTaskInner, epoch_poisoned: Arc<AtomicBool>) {
+    #[cfg(feature = "cluster")]
+    if let Some(controller) = inner.process_authority.clone() {
+        run_process_fenced_sink_task(inner, epoch_poisoned, controller).await;
+        return;
+    }
+
+    run_local_sink_task(inner, epoch_poisoned).await;
+}
+
+async fn run_local_sink_task(mut inner: SinkTaskInner, epoch_poisoned: Arc<AtomicBool>) {
     let mut flush_timer = tokio::time::interval(inner.flush_interval);
     flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     flush_timer.tick().await; // skip the first immediate tick
@@ -855,29 +1065,7 @@ async fn run_sink_task(mut inner: SinkTaskInner, epoch_poisoned: Arc<AtomicBool>
         tokio::select! {
             cmd = inner.rx.recv() => {
                 let Ok(cmd) = cmd else {
-                    tracing::debug!(sink = %inner.name, "Sink command channel closed");
-                    if !inner.contract.is_checkpoint_committable() {
-                        if let Err(e) = bounded_connector_operation(
-                            &inner.name,
-                            "flush on channel close",
-                            operation_deadline(inner.write_timeout),
-                            inner.sink.cancellation_policy(),
-                            || inner.sink.flush(),
-                        ).await {
-                            tracing::warn!(sink = %inner.name, error = %e,
-                                "Sink flush failed on channel close");
-                        }
-                    }
-                    if let Err(e) = bounded_connector_operation(
-                        &inner.name,
-                        "connector close",
-                        operation_deadline(SINK_CLOSE_TIMEOUT),
-                        inner.sink.cancellation_policy(),
-                        || inner.sink.close(),
-                    ).await {
-                        tracing::warn!(sink = %inner.name, error = %e,
-                            "Sink close failed on channel close");
-                    }
+                    close_disconnected_sink(&mut inner).await;
                     break;
                 };
                 let stop = handle_sink_command(
@@ -893,24 +1081,244 @@ async fn run_sink_task(mut inner: SinkTaskInner, epoch_poisoned: Arc<AtomicBool>
                 }
             }
             _ = flush_timer.tick() => {
-                if !inner.contract.is_checkpoint_committable() {
-                    if let Err(error) = bounded_connector_operation(
-                        &inner.name,
-                        "periodic flush",
-                        operation_deadline(inner.write_timeout),
-                        inner.sink.cancellation_policy(),
-                        || inner.sink.flush(),
-                    ).await {
-                        record_flush_error(
-                            &inner,
-                            current_epoch,
-                            "periodic flush",
-                            &error,
-                            epoch_poisoned.as_ref(),
-                        );
-                    }
+                flush_sink_periodically(&mut inner, current_epoch, epoch_poisoned.as_ref()).await;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cluster")]
+async fn run_process_fenced_sink_task(
+    mut inner: SinkTaskInner,
+    epoch_poisoned: Arc<AtomicBool>,
+    controller: Arc<ClusterController>,
+) {
+    let mut flush_timer = tokio::time::interval(inner.flush_interval);
+    flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    flush_timer.tick().await;
+
+    let mut current_epoch = 0;
+    loop {
+        if !controller.process_lease_is_live() {
+            terminate_after_process_authority_loss(
+                &mut inner,
+                current_epoch,
+                epoch_poisoned.as_ref(),
+                None,
+            )
+            .await;
+            return;
+        }
+
+        tokio::select! {
+            biased;
+            () = controller.wait_for_process_lease_loss() => {
+                terminate_after_process_authority_loss(
+                    &mut inner,
+                    current_epoch,
+                    epoch_poisoned.as_ref(),
+                    None,
+                ).await;
+                return;
+            }
+            command = inner.rx.recv() => {
+                let Ok(command) = command else {
+                    close_disconnected_sink(&mut inner).await;
+                    return;
+                };
+                if !controller.process_lease_is_live() {
+                    terminate_after_process_authority_loss(
+                        &mut inner,
+                        current_epoch,
+                        epoch_poisoned.as_ref(),
+                        Some(command.operation),
+                    ).await;
+                    return;
+                }
+                let stop = handle_sink_command(
+                    &mut inner,
+                    command.operation,
+                    command.deadline,
+                    &mut current_epoch,
+                    epoch_poisoned.as_ref(),
+                ).await;
+                if !controller.process_lease_is_live() {
+                    terminate_after_process_authority_loss(
+                        &mut inner,
+                        current_epoch,
+                        epoch_poisoned.as_ref(),
+                        None,
+                    ).await;
+                    return;
+                }
+                if stop {
+                    return;
                 }
             }
+            _ = flush_timer.tick() => {
+                flush_sink_periodically(
+                    &mut inner,
+                    current_epoch,
+                    epoch_poisoned.as_ref(),
+                ).await;
+                if !controller.process_lease_is_live() {
+                    terminate_after_process_authority_loss(
+                        &mut inner,
+                        current_epoch,
+                        epoch_poisoned.as_ref(),
+                        None,
+                    ).await;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn flush_sink_periodically(
+    inner: &mut SinkTaskInner,
+    current_epoch: u64,
+    epoch_poisoned: &AtomicBool,
+) {
+    if inner.contract.is_checkpoint_committable() {
+        return;
+    }
+    if let Err(error) = bounded_connector_operation(
+        &inner.name,
+        "periodic flush",
+        operation_deadline(inner.write_timeout),
+        inner.sink.cancellation_policy(),
+        #[cfg(feature = "cluster")]
+        inner.process_authority.clone(),
+        || inner.sink.flush(),
+    )
+    .await
+    {
+        record_flush_error(
+            inner,
+            current_epoch,
+            "periodic flush",
+            &error,
+            epoch_poisoned,
+        );
+    }
+}
+
+async fn close_disconnected_sink(inner: &mut SinkTaskInner) {
+    tracing::debug!(sink = %inner.name, "Sink command channel closed");
+    if !inner.contract.is_checkpoint_committable() {
+        if let Err(error) = bounded_connector_operation(
+            &inner.name,
+            "flush on channel close",
+            operation_deadline(inner.write_timeout),
+            inner.sink.cancellation_policy(),
+            #[cfg(feature = "cluster")]
+            inner.process_authority.clone(),
+            || inner.sink.flush(),
+        )
+        .await
+        {
+            tracing::warn!(sink = %inner.name, %error, "Sink flush failed on channel close");
+        }
+    }
+    #[cfg(feature = "cluster")]
+    if inner
+        .process_authority
+        .as_ref()
+        .is_some_and(|controller| !controller.process_lease_is_live())
+    {
+        return;
+    }
+    if let Err(error) = bounded_connector_operation(
+        &inner.name,
+        "connector close",
+        operation_deadline(SINK_CLOSE_TIMEOUT),
+        inner.sink.cancellation_policy(),
+        #[cfg(feature = "cluster")]
+        inner.process_authority.clone(),
+        || inner.sink.close(),
+    )
+    .await
+    {
+        tracing::warn!(sink = %inner.name, %error, "Sink close failed on channel close");
+    }
+}
+
+#[cfg(feature = "cluster")]
+async fn terminate_after_process_authority_loss(
+    inner: &mut SinkTaskInner,
+    current_epoch: u64,
+    epoch_poisoned: &AtomicBool,
+    first: Option<SinkOperation>,
+) {
+    if inner.requires_recovery_on_error {
+        epoch_poisoned.store(true, Ordering::Release);
+    }
+    if let Some(operation) = first {
+        reject_unstarted_sink_operation(inner, operation, current_epoch, epoch_poisoned);
+    }
+    while let Ok(command) = inner.rx.try_recv() {
+        reject_unstarted_sink_operation(inner, command.operation, current_epoch, epoch_poisoned);
+    }
+
+    let admission = Arc::clone(&inner.admission);
+    let _admission = admission.lock().await;
+    while let Ok(command) = inner.rx.try_recv() {
+        reject_unstarted_sink_operation(inner, command.operation, current_epoch, epoch_poisoned);
+    }
+    tracing::warn!(sink = %inner.name, "sink actor stopped after cluster process lease loss");
+}
+
+#[cfg(feature = "cluster")]
+fn reject_unstarted_sink_operation(
+    inner: &SinkTaskInner,
+    operation: SinkOperation,
+    current_epoch: u64,
+    epoch_poisoned: &AtomicBool,
+) {
+    match operation {
+        SinkOperation::WriteBatch { batch } => {
+            let error = process_authority_error(&inner.name, "queued write");
+            record_write_error(
+                &inner.name,
+                &inner.sink_id,
+                inner.requires_recovery_on_error,
+                &inner.event_tx,
+                current_epoch,
+                batch.num_rows(),
+                &error,
+                epoch_poisoned,
+            );
+        }
+        SinkOperation::BeginEpoch { ack, .. } => {
+            ack.send(Err(process_authority_error(&inner.name, "begin-epoch")));
+        }
+        SinkOperation::Flush { ack } => {
+            ack.send(Err(process_authority_error(&inner.name, "flush")));
+        }
+        SinkOperation::PreCommit { ack, .. } => {
+            ack.send(Err(process_authority_error(&inner.name, "pre-commit")));
+        }
+        SinkOperation::CommitAggregated { ack, .. } => {
+            ack.send(Err(process_authority_error(
+                &inner.name,
+                "coordinated external commit",
+            )));
+        }
+        SinkOperation::CommittedCursor { ack, .. } => {
+            ack.send(Err(process_authority_error(
+                &inner.name,
+                "external commit cursor read",
+            )));
+        }
+        SinkOperation::RollbackEpoch { ack, .. } => {
+            ack.send(Err(process_authority_error(&inner.name, "rollback")));
+        }
+        SinkOperation::Sync { ack } => {
+            ack.send(Err(process_authority_error(&inner.name, "sync")));
+        }
+        SinkOperation::Close { ack } => {
+            ack.send(Err(process_authority_error(&inner.name, "close")));
         }
     }
 }
@@ -946,6 +1354,8 @@ async fn handle_sink_command(
                     batch,
                     deadline,
                     cancellation_policy,
+                    #[cfg(feature = "cluster")]
+                    inner.process_authority.clone(),
                 )
                 .await,
             );
@@ -960,6 +1370,8 @@ async fn handle_sink_command(
                     &namespace,
                     deadline,
                     cancellation_policy,
+                    #[cfg(feature = "cluster")]
+                    inner.process_authority.clone(),
                 )
                 .await,
             );
@@ -996,6 +1408,8 @@ async fn begin_sink_epoch(
         "begin_epoch",
         deadline,
         inner.sink.cancellation_policy(),
+        #[cfg(feature = "cluster")]
+        inner.process_authority.clone(),
         || inner.sink.begin_epoch(epoch),
     )
     .await;
@@ -1023,6 +1437,8 @@ async fn flush_checkpoint_sink(
             "checkpoint flush",
             deadline,
             inner.sink.cancellation_policy(),
+            #[cfg(feature = "cluster")]
+            inner.process_authority.clone(),
             || inner.sink.flush(),
         )
         .await
@@ -1053,6 +1469,8 @@ async fn pre_commit_sink(
             "pre_commit",
             deadline,
             inner.sink.cancellation_policy(),
+            #[cfg(feature = "cluster")]
+            inner.process_authority.clone(),
             || inner.sink.pre_commit(epoch),
         )
         .await
@@ -1065,6 +1483,7 @@ async fn commit_aggregated_sink(
     batch: CoordinatedCommitBatch,
     deadline: Instant,
     cancellation_policy: ConnectorCancellationPolicy,
+    #[cfg(feature = "cluster")] process_authority: Option<Arc<ClusterController>>,
 ) -> Result<(), ConnectorError> {
     match committer {
         Some(committer) => {
@@ -1074,6 +1493,8 @@ async fn commit_aggregated_sink(
                 "coordinated external commit",
                 deadline,
                 cancellation_policy,
+                #[cfg(feature = "cluster")]
+                process_authority,
                 || committer.commit_aggregated(batch, context),
             )
             .await
@@ -1091,6 +1512,7 @@ async fn committed_cursor(
     namespace: &CoordinatedCommitNamespace,
     deadline: Instant,
     cancellation_policy: ConnectorCancellationPolicy,
+    #[cfg(feature = "cluster")] process_authority: Option<Arc<ClusterController>>,
 ) -> Result<Option<CoordinatedCommitCursor>, ConnectorError> {
     match committer {
         Some(committer) => {
@@ -1099,6 +1521,8 @@ async fn committed_cursor(
                 "external commit cursor read",
                 deadline,
                 cancellation_policy,
+                #[cfg(feature = "cluster")]
+                process_authority,
                 || committer.committed_cursor(namespace),
             )
             .await
@@ -1120,8 +1544,8 @@ async fn close_sink_connector(
     deadline: Instant,
 ) -> Result<(), ConnectorError> {
     // Checkpoint-committable sinks finalize only through checkpoint protocol; close aborts their
-    // open transaction. Weaker sinks must first land every queued write. Always call connector
-    // close even when flush fails so resources are not leaked.
+    // open transaction. Weaker sinks must first land every queued write. While process authority
+    // remains live, always call close even when flush fails so resources are not leaked.
     let cancellation_policy = inner.sink.cancellation_policy();
     let flush_result = if inner.contract.is_checkpoint_committable() {
         Ok(())
@@ -1131,10 +1555,23 @@ async fn close_sink_connector(
             "shutdown flush",
             deadline,
             cancellation_policy,
+            #[cfg(feature = "cluster")]
+            inner.process_authority.clone(),
             || inner.sink.flush(),
         )
         .await
     };
+    #[cfg(feature = "cluster")]
+    if inner
+        .process_authority
+        .as_ref()
+        .is_some_and(|controller| !controller.process_lease_is_live())
+    {
+        return match flush_result {
+            Ok(()) => Err(process_authority_error(&inner.name, "connector close")),
+            Err(error) => Err(error),
+        };
+    }
     // A cancellation-unsafe flush may legitimately finish after the command's
     // protocol deadline. Connector teardown is still mandatory and receives a
     // fresh terminal budget rather than inheriting an already-expired instant.
@@ -1143,6 +1580,8 @@ async fn close_sink_connector(
         "connector close",
         operation_deadline(SINK_CLOSE_TIMEOUT),
         cancellation_policy,
+        #[cfg(feature = "cluster")]
+        inner.process_authority.clone(),
         || inner.sink.close(),
     )
     .await;
@@ -1198,6 +1637,34 @@ fn record_flush_error(
     });
 }
 
+fn record_write_error(
+    sink_name: &str,
+    sink_id: &Arc<str>,
+    requires_recovery_on_error: bool,
+    event_tx: &Producer<SinkEvent>,
+    current_epoch: u64,
+    rows: usize,
+    error: &ConnectorError,
+    epoch_poisoned: &AtomicBool,
+) {
+    if requires_recovery_on_error {
+        epoch_poisoned.store(true, Ordering::Release);
+    }
+    tracing::warn!(
+        sink = %sink_name,
+        %error,
+        rows,
+        requires_recovery = requires_recovery_on_error,
+        "Sink write error"
+    );
+    let _ = event_tx.try_push(SinkEvent::WriteError {
+        sink_id: Arc::clone(sink_id),
+        epoch: current_epoch,
+        rows,
+        error: error.to_string(),
+    });
+}
+
 /// Write a batch before the enqueue-time deadline; reports every error and poisons replay-required
 /// modes so their durable cut cannot advance.
 async fn handle_write_batch(
@@ -1207,6 +1674,20 @@ async fn handle_write_batch(
     current_epoch: u64,
     epoch_poisoned: &AtomicBool,
 ) {
+    #[cfg(feature = "cluster")]
+    if let Some(controller) = inner.process_authority.clone() {
+        handle_process_fenced_write_batch(
+            inner,
+            batch,
+            deadline,
+            current_epoch,
+            epoch_poisoned,
+            controller,
+        )
+        .await;
+        return;
+    }
+
     let rows = batch.num_rows();
     if deadline <= Instant::now() {
         record_write_timeout(
@@ -1276,20 +1757,136 @@ async fn handle_write_batch(
     match write_result {
         Ok(_) => {}
         Err(e) => {
-            if inner.requires_recovery_on_error {
-                epoch_poisoned.store(true, Ordering::Release);
-            }
-            tracing::warn!(
-                sink = %inner.name, error = %e, rows,
-                requires_recovery = inner.requires_recovery_on_error,
-                "Sink write error"
-            );
-            let _ = inner.event_tx.try_push(SinkEvent::WriteError {
-                sink_id: Arc::clone(&inner.sink_id),
-                epoch: current_epoch,
+            record_write_error(
+                &inner.name,
+                &inner.sink_id,
+                inner.requires_recovery_on_error,
+                &inner.event_tx,
+                current_epoch,
                 rows,
-                error: e.to_string(),
-            });
+                &e,
+                epoch_poisoned,
+            );
+        }
+    }
+}
+
+#[cfg(feature = "cluster")]
+async fn handle_process_fenced_write_batch(
+    inner: &mut SinkTaskInner,
+    batch: RecordBatch,
+    deadline: Instant,
+    current_epoch: u64,
+    epoch_poisoned: &AtomicBool,
+    controller: Arc<ClusterController>,
+) {
+    let rows = batch.num_rows();
+    if !controller.process_lease_is_live() {
+        let error = process_authority_error(&inner.name, "write");
+        record_write_error(
+            &inner.name,
+            &inner.sink_id,
+            inner.requires_recovery_on_error,
+            &inner.event_tx,
+            current_epoch,
+            rows,
+            &error,
+            epoch_poisoned,
+        );
+        return;
+    }
+    if deadline <= Instant::now() {
+        record_write_timeout(
+            &inner.name,
+            &inner.sink_id,
+            inner.write_timeout,
+            inner.requires_recovery_on_error,
+            &inner.event_tx,
+            current_epoch,
+            rows,
+            epoch_poisoned,
+        );
+        return;
+    }
+
+    let cancellation_policy = inner.sink.cancellation_policy();
+    let sink_name = inner.name.clone();
+    let sink_id = Arc::clone(&inner.sink_id);
+    let requires_recovery = inner.requires_recovery_on_error;
+    let event_tx = inner.event_tx.clone();
+    let write_timeout = inner.write_timeout;
+    let started = AtomicBool::new(false);
+    let operation = async {
+        started.store(true, Ordering::Release);
+        inner.sink.write_batch(&batch).await
+    };
+    tokio::pin!(operation);
+
+    tokio::select! {
+        biased;
+        () = controller.wait_for_process_lease_loss() => {
+            let error = process_authority_error(&sink_name, "write");
+            record_write_error(
+                &sink_name,
+                &sink_id,
+                requires_recovery,
+                &event_tx,
+                current_epoch,
+                rows,
+                &error,
+                epoch_poisoned,
+            );
+            if cancellation_policy == ConnectorCancellationPolicy::CompleteStarted
+                && started.load(Ordering::Acquire)
+            {
+                let _ = operation.await;
+            }
+        }
+        () = tokio::time::sleep_until(deadline) => {
+            record_write_timeout(
+                &sink_name,
+                &sink_id,
+                write_timeout,
+                requires_recovery,
+                &event_tx,
+                current_epoch,
+                rows,
+                epoch_poisoned,
+            );
+            if cancellation_policy == ConnectorCancellationPolicy::CompleteStarted
+                && started.load(Ordering::Acquire)
+            {
+                match operation.await {
+                    Ok(_) => tracing::warn!(sink = %sink_name, rows, "sink write completed after its deadline"),
+                    Err(error) => tracing::warn!(sink = %sink_name, rows, %error, "sink write failed after its deadline"),
+                }
+            }
+        }
+        result = &mut operation => {
+            if !controller.process_lease_is_live() {
+                let error = process_authority_error(&sink_name, "write");
+                record_write_error(
+                    &sink_name,
+                    &sink_id,
+                    requires_recovery,
+                    &event_tx,
+                    current_epoch,
+                    rows,
+                    &error,
+                    epoch_poisoned,
+                );
+            } else if let Err(error) = result {
+                record_write_error(
+                    &sink_name,
+                    &sink_id,
+                    requires_recovery,
+                    &event_tx,
+                    current_epoch,
+                    rows,
+                    &error,
+                    epoch_poisoned,
+                );
+            }
         }
     }
 }
@@ -1333,6 +1930,8 @@ async fn handle_rollback_epoch(
         "rollback_epoch",
         deadline,
         inner.sink.cancellation_policy(),
+        #[cfg(feature = "cluster")]
+        inner.process_authority.clone(),
         || inner.sink.rollback_epoch(epoch),
     )
     .await;
@@ -1355,6 +1954,9 @@ mod tests {
     };
     use laminar_core::streaming::AsyncConsumer;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[cfg(feature = "cluster")]
+    use crossfire::AsyncTxTrait as _;
 
     /// Minimal mock sink for testing the task infrastructure.
     struct CountingSink {
@@ -1416,6 +2018,281 @@ mod tests {
         fn suggested_write_timeout(&self) -> Duration {
             Duration::from_secs(5)
         }
+    }
+
+    #[cfg(feature = "cluster")]
+    struct InFlightWriteGuard {
+        cancellations: Arc<AtomicU64>,
+        completed: bool,
+    }
+
+    #[cfg(feature = "cluster")]
+    impl Drop for InFlightWriteGuard {
+        fn drop(&mut self) {
+            if !self.completed {
+                self.cancellations.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    struct AuthorityBlockingSink {
+        policy: ConnectorCancellationPolicy,
+        writes: Arc<AtomicU64>,
+        flushes: Arc<AtomicU64>,
+        completions: Arc<AtomicU64>,
+        cancellations: Arc<AtomicU64>,
+        gate: Arc<tokio::sync::Semaphore>,
+        schema: arrow::datatypes::SchemaRef,
+    }
+
+    #[cfg(feature = "cluster")]
+    #[async_trait::async_trait]
+    impl SinkConnector for AuthorityBlockingSink {
+        fn cancellation_policy(&self) -> ConnectorCancellationPolicy {
+            self.policy
+        }
+
+        async fn open(
+            &mut self,
+            _config: &laminar_connectors::config::ConnectorConfig,
+        ) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
+        async fn write_batch(
+            &mut self,
+            _batch: &RecordBatch,
+        ) -> Result<WriteResult, ConnectorError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            let mut guard = InFlightWriteGuard {
+                cancellations: Arc::clone(&self.cancellations),
+                completed: false,
+            };
+            let permit = self.gate.acquire().await.unwrap();
+            permit.forget();
+            guard.completed = true;
+            self.completions.fetch_add(1, Ordering::SeqCst);
+            Ok(WriteResult::new(1, 0))
+        }
+
+        async fn flush(&mut self) -> Result<(), ConnectorError> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn close(&mut self) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn suggested_write_timeout(&self) -> Duration {
+            Duration::from_secs(60)
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    struct AuthoritySinkProbe {
+        handle: SinkTaskHandle,
+        events: AsyncConsumer<SinkEvent>,
+        controller: Arc<ClusterController>,
+        writes: Arc<AtomicU64>,
+        flushes: Arc<AtomicU64>,
+        completions: Arc<AtomicU64>,
+        cancellations: Arc<AtomicU64>,
+        gate: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[cfg(feature = "cluster")]
+    fn authority_sink_probe(node: u64, policy: ConnectorCancellationPolicy) -> AuthoritySinkProbe {
+        use laminar_core::cluster::control::{ClusterKv, InMemoryKv, LeaseDeadline};
+
+        let node_id = laminar_core::state::NodeId(node);
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node_id));
+        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(node_id, kv, None, members_rx));
+        controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+            .unwrap();
+        let writes = Arc::new(AtomicU64::new(0));
+        let flushes = Arc::new(AtomicU64::new(0));
+        let completions = Arc::new(AtomicU64::new(0));
+        let cancellations = Arc::new(AtomicU64::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let sink = AuthorityBlockingSink {
+            policy,
+            writes: Arc::clone(&writes),
+            flushes: Arc::clone(&flushes),
+            completions: Arc::clone(&completions),
+            cancellations: Arc::clone(&cancellations),
+            gate: Arc::clone(&gate),
+            schema: Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)])),
+        };
+        let (event_tx, events) =
+            laminar_core::streaming::channel::channel::<SinkEvent>(SINK_EVENT_CHANNEL_CAPACITY);
+        let handle = SinkTaskHandle::spawn(SinkTaskConfig {
+            name: "authority-probe".into(),
+            sink_id: Arc::from("authority-probe"),
+            connector: Box::new(sink),
+            contract: at_least_once_contract(),
+            requires_recovery_on_error: true,
+            channel_capacity: 8,
+            flush_interval: Duration::from_secs(60),
+            write_timeout: Duration::from_secs(60),
+            event_tx,
+            process_authority: Some(Arc::clone(&controller)),
+        });
+        AuthoritySinkProbe {
+            handle,
+            events,
+            controller,
+            writes,
+            flushes,
+            completions,
+            cancellations,
+            gate,
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn wait_for_actor_queue(handle: &SinkTaskHandle, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.tx.len() < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("sink command did not reach the actor queue");
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn wait_for_actor_exit(handle: &SinkTaskHandle) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let finished = handle
+                    .task
+                    .lock()
+                    .as_ref()
+                    .is_none_or(tokio::task::JoinHandle::is_finished);
+                if finished {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("sink actor did not terminate after process lease loss");
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn wait_for_connector_write(writes: &AtomicU64) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while writes.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("sink connector write did not start");
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn receive_authority_write_error(events: &mut AsyncConsumer<SinkEvent>) {
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("sink did not report process authority loss")
+            .expect("sink event channel closed unexpectedly");
+        assert!(matches!(
+            event,
+            SinkEvent::WriteError {
+                sink_id,
+                epoch: 0,
+                rows: 3,
+                error,
+            } if &*sink_id == "authority-probe" && error.contains("process authority")
+        ));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn process_lease_loss_wakes_idle_sink_actor() {
+        let probe = authority_sink_probe(31, ConnectorCancellationPolicy::CancelSafe);
+
+        probe.controller.fence_process_lease();
+        wait_for_actor_exit(&probe.handle).await;
+
+        assert_eq!(probe.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.flushes.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.completions.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.cancellations.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn process_lease_loss_cancels_cancel_safe_write_and_rejects_queued_commands() {
+        let mut probe = authority_sink_probe(32, ConnectorCancellationPolicy::CancelSafe);
+        probe.handle.write_batch(test_batch()).await.unwrap();
+        wait_for_connector_write(&probe.writes).await;
+
+        probe.handle.write_batch(test_batch()).await.unwrap();
+        let flush_handle = probe.handle.clone();
+        let queued_flush = tokio::spawn(async move { flush_handle.flush().await });
+        wait_for_actor_queue(&probe.handle, 2).await;
+
+        probe.controller.fence_process_lease();
+        wait_for_actor_exit(&probe.handle).await;
+
+        let error = queued_flush.await.unwrap().unwrap_err().to_string();
+        assert!(error.contains("process authority"), "{error}");
+        receive_authority_write_error(&mut probe.events).await;
+        receive_authority_write_error(&mut probe.events).await;
+        assert_eq!(probe.writes.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.flushes.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.completions.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.cancellations.load(Ordering::SeqCst), 1);
+        assert!(probe.handle.epoch_poisoned.load(Ordering::Acquire));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn process_lease_loss_finishes_started_write_then_rejects_queued_commands() {
+        let mut probe = authority_sink_probe(33, ConnectorCancellationPolicy::CompleteStarted);
+        probe.handle.write_batch(test_batch()).await.unwrap();
+        wait_for_connector_write(&probe.writes).await;
+
+        probe.handle.write_batch(test_batch()).await.unwrap();
+        let flush_handle = probe.handle.clone();
+        let queued_flush = tokio::spawn(async move { flush_handle.flush().await });
+        wait_for_actor_queue(&probe.handle, 2).await;
+
+        probe.controller.fence_process_lease();
+        tokio::task::yield_now().await;
+        assert!(
+            !probe
+                .handle
+                .task
+                .lock()
+                .as_ref()
+                .is_none_or(tokio::task::JoinHandle::is_finished),
+            "complete-started write was dropped on process lease loss"
+        );
+        assert_eq!(probe.completions.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.cancellations.load(Ordering::SeqCst), 0);
+
+        probe.gate.add_permits(1);
+        wait_for_actor_exit(&probe.handle).await;
+
+        let error = queued_flush.await.unwrap().unwrap_err().to_string();
+        assert!(error.contains("process authority"), "{error}");
+        receive_authority_write_error(&mut probe.events).await;
+        receive_authority_write_error(&mut probe.events).await;
+        assert_eq!(probe.writes.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.flushes.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.completions.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.cancellations.load(Ordering::SeqCst), 0);
+        assert!(probe.handle.epoch_poisoned.load(Ordering::Acquire));
     }
 
     struct ShutdownFailureSink {
@@ -1572,6 +2449,8 @@ mod tests {
             flush_interval: Duration::from_secs(5),
             write_timeout: Duration::from_secs(5),
             event_tx,
+            #[cfg(feature = "cluster")]
+            process_authority: None,
         });
         (handle, event_rx, flushes)
     }
@@ -1593,6 +2472,8 @@ mod tests {
             flush_interval: DEFAULT_FLUSH_INTERVAL,
             write_timeout,
             event_tx,
+            #[cfg(feature = "cluster")]
+            process_authority: None,
         });
         (handle, event_rx)
     }
@@ -1802,6 +2683,8 @@ mod tests {
             flush_interval: DEFAULT_FLUSH_INTERVAL,
             write_timeout: Duration::from_secs(5),
             event_tx,
+            #[cfg(feature = "cluster")]
+            process_authority: None,
         });
 
         handle.write_batch(test_batch()).await.unwrap();
@@ -1849,6 +2732,8 @@ mod tests {
             flush_interval: Duration::from_millis(250),
             write_timeout: Duration::from_secs(5),
             event_tx,
+            #[cfg(feature = "cluster")]
+            process_authority: None,
         });
 
         handle.write_batch(test_batch()).await.unwrap();
@@ -1961,6 +2846,8 @@ mod tests {
             flush_interval: Duration::from_millis(5),
             write_timeout: Duration::from_secs(5),
             event_tx,
+            #[cfg(feature = "cluster")]
+            process_authority: None,
         });
 
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -2471,6 +3358,8 @@ mod tests {
             flush_interval: DEFAULT_FLUSH_INTERVAL,
             write_timeout: Duration::from_millis(100),
             event_tx,
+            #[cfg(feature = "cluster")]
+            process_authority: None,
         });
         handle.write_batch(test_batch()).await.unwrap();
         while !write_started.load(Ordering::Acquire) {
@@ -2577,6 +3466,8 @@ mod tests {
             flush_interval: DEFAULT_FLUSH_INTERVAL,
             write_timeout: Duration::from_millis(25),
             event_tx,
+            #[cfg(feature = "cluster")]
+            process_authority: None,
         });
 
         let started = Instant::now();
@@ -2601,6 +3492,8 @@ mod tests {
             flush_interval: DEFAULT_FLUSH_INTERVAL,
             write_timeout: Duration::from_secs(5),
             event_tx,
+            #[cfg(feature = "cluster")]
+            process_authority: None,
         });
 
         let started = Instant::now();
@@ -2630,6 +3523,24 @@ mod tests {
         assert!(error.contains("end-to-end deadline"), "{error}");
         handle.sync().await.unwrap();
         assert_eq!(flushes.load(Ordering::SeqCst), 0);
+        handle.close().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_write_deadline_never_enqueues_batch() {
+        let (sink, writes, _flushes) = CountingSink::new();
+        let (handle, _events) =
+            spawn_with_defaults("expired-write", Box::new(sink), Duration::from_secs(5));
+
+        let error = handle
+            .write_batch_until(test_batch(), Instant::now())
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("end-to-end deadline"), "{error}");
+        handle.sync().await.unwrap();
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
         handle.close().await.unwrap();
     }
 
@@ -2665,6 +3576,8 @@ mod tests {
             runtime: tokio::runtime::Handle::current(),
             event_tx,
             epoch_poisoned: Arc::clone(&epoch_poisoned),
+            #[cfg(feature = "cluster")]
+            process_authority: None,
         };
 
         let error = handle.write_batch(test_batch()).await.unwrap_err();
@@ -2732,6 +3645,8 @@ mod tests {
             runtime: tokio::runtime::Handle::current(),
             event_tx,
             epoch_poisoned: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "cluster")]
+            process_authority: None,
         };
 
         let close = tokio::spawn({
@@ -2809,6 +3724,8 @@ mod tests {
             runtime: tokio::runtime::Handle::current(),
             event_tx,
             epoch_poisoned: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "cluster")]
+            process_authority: None,
         };
 
         // A disconnected actor must reject the write, poison the replay-required epoch, and

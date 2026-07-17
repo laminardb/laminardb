@@ -11,8 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow_array::RecordBatch;
-use crossfire::{mpsc, AsyncRx};
-use futures::FutureExt;
+use crossfire::{mpsc, AsyncRx, MAsyncTx};
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::connector::SourceBatch;
 use laminar_connectors::connector::{
@@ -28,6 +27,8 @@ use laminar_core::checkpoint::{
     AssignmentDrainId, AssignmentDrainTransition, CheckpointParticipant,
 };
 use laminar_core::checkpoint::{CheckpointBarrier, CheckpointBarrierInjector};
+#[cfg(feature = "cluster")]
+use laminar_core::cluster::control::ClusterController;
 use laminar_core::state::{CheckpointAttempt, CheckpointAttemptRelation};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -39,8 +40,89 @@ use super::config::PipelineConfig;
 use crate::error::DbError;
 
 type SourceMsgRx = AsyncRx<mpsc::Array<SourceMsg>>;
+type SourceMsgTx = MAsyncTx<mpsc::Array<SourceMsg>>;
 type ControlMsgRx = AsyncRx<mpsc::Array<super::ControlMsg>>;
 type ForceCheckpointReply = crate::db::ForceCheckpointReply;
+
+#[cfg(feature = "cluster")]
+struct SourceProcessAuthority {
+    controller: Arc<ClusterController>,
+    lost: tokio_util::sync::CancellationToken,
+    watcher_abort: Option<tokio::task::AbortHandle>,
+}
+
+#[cfg(feature = "cluster")]
+impl Drop for SourceProcessAuthority {
+    fn drop(&mut self) {
+        if let Some(watcher) = &self.watcher_abort {
+            watcher.abort();
+        }
+    }
+}
+
+/// Shared process-lease observation for every source task in one coordinator.
+///
+/// One watcher owns the deadline timer. Per-poll code selects only on the retained cancellation
+/// token and rechecks the controller's monotonic deadline at publication boundaries.
+#[cfg(feature = "cluster")]
+impl SourceProcessAuthority {
+    fn new(controller: Arc<ClusterController>) -> Arc<Self> {
+        let lost = tokio_util::sync::CancellationToken::new();
+        if !controller.process_lease_is_live() {
+            lost.cancel();
+        }
+        let watcher_abort = if lost.is_cancelled() {
+            None
+        } else {
+            let task_controller = Arc::clone(&controller);
+            let task_lost = lost.clone();
+            let watcher = tokio::spawn(async move {
+                task_controller.wait_for_process_lease_loss().await;
+                task_lost.cancel();
+            });
+            Some(watcher.abort_handle())
+        };
+        Arc::new(Self {
+            controller,
+            lost,
+            watcher_abort,
+        })
+    }
+
+    #[inline]
+    fn is_live(&self) -> bool {
+        !self.lost.is_cancelled() && self.controller.process_lease_is_live()
+    }
+
+    async fn cancelled(&self) {
+        self.lost.cancelled().await;
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[inline]
+fn source_process_authority_is_live(authority: Option<&SourceProcessAuthority>) -> bool {
+    authority.is_none_or(SourceProcessAuthority::is_live)
+}
+
+/// Wait for coordinator batching or idle work without letting process-lease loss remain hidden
+/// behind the timer.
+async fn wait_coordinator_delay(
+    duration: Duration,
+    #[cfg(feature = "cluster")] process_authority: Option<&SourceProcessAuthority>,
+) -> bool {
+    #[cfg(feature = "cluster")]
+    if let Some(authority) = process_authority {
+        return tokio::select! {
+            biased;
+            () = authority.cancelled() => true,
+            () = tokio::time::sleep(duration) => false,
+        };
+    }
+
+    tokio::time::sleep(duration).await;
+    false
+}
 
 /// Message from a source task to the coordinator; carries the [`SourceCheckpoint`]
 /// captured at production time so no offset is checkpointed for unprocessed data.
@@ -48,7 +130,7 @@ enum SourceMsg {
     Batch {
         source_idx: usize,
         batch: RecordBatch,
-        /// Committed to `committed_offsets` only after a successful `execute_cycle`.
+        /// Committed to `committed_offsets` only after successful cycle publication.
         checkpoint: SourceCheckpoint,
     },
     Barrier {
@@ -56,6 +138,36 @@ enum SourceMsg {
         barrier: CheckpointBarrier,
         checkpoint: SourceCheckpoint,
     },
+}
+
+/// Publish into the bounded source FIFO without allowing backpressure to hide terminal shutdown or
+/// process-lease loss. Process authority is revalidated after a successful send because its fence
+/// may cross while the queue wakes the producer.
+async fn send_source_msg(
+    tx: &SourceMsgTx,
+    msg: SourceMsg,
+    shutdown: &tokio::sync::Notify,
+    #[cfg(feature = "cluster")] process_authority: Option<&SourceProcessAuthority>,
+) -> bool {
+    #[cfg(feature = "cluster")]
+    if let Some(authority) = process_authority {
+        if !authority.is_live() {
+            return false;
+        }
+        let sent = tokio::select! {
+            biased;
+            () = authority.cancelled() => false,
+            () = shutdown.notified() => false,
+            result = tx.send(msg) => result.is_ok(),
+        };
+        return sent && authority.is_live();
+    }
+
+    tokio::select! {
+        biased;
+        () = shutdown.notified() => false,
+        result = tx.send(msg) => result.is_ok(),
+    }
 }
 
 /// Fatal source-task control event. Faults use a dedicated unbounded side channel so they cannot
@@ -644,6 +756,7 @@ pub struct StreamingCoordinator {
     source_handles: Vec<SourceHandle>,
     source_names: Vec<Arc<str>>,
     shutdown: Arc<tokio::sync::Notify>,
+    terminal_shutdown: tokio_util::sync::CancellationToken,
     pending_barrier: PendingBarrier,
     last_checkpoint: Instant,
     source_batches_buf: FxHashMap<Arc<str>, Vec<RecordBatch>>,
@@ -654,7 +767,7 @@ pub struct StreamingCoordinator {
     /// Sources that delivered a barrier this drain cycle. A later batch from one of these sources
     /// violates the source hold protocol and faults the pipeline.
     barrier_seen: FxHashSet<usize>,
-    /// Per-source offset merged from `pending_offsets` after a successful `execute_cycle`.
+    /// Per-source offset merged from `pending_offsets` after successful cycle publication.
     committed_offsets: Vec<Option<SourceCheckpoint>>,
     /// Offsets staged by `process_msg`; a replay-preserving deferral retains them until the graph
     /// consumes its buffered work, while a fault discards them.
@@ -680,6 +793,8 @@ pub struct StreamingCoordinator {
     max_staged_bytes: u64,
     /// Shared exact external-commit bound, checked before ID reservation/barrier injection.
     coordinated_commit_admission: Option<crate::checkpoint_coordinator::CoordinatedCommitAdmission>,
+    #[cfg(feature = "cluster")]
+    process_authority: Option<Arc<SourceProcessAuthority>>,
 }
 
 /// Public checkpoint callers attached to one exact attempt at admission time.
@@ -831,14 +946,19 @@ fn try_source_checkpoint(
 
 /// Apply the newest durable commit notification while no source poll borrows
 /// the connector. Non-best-effort pipelines fault if upstream acknowledgement
-/// fails because silently continuing can exhaust broker retention/headroom.
+/// fails because silently continuing can exhaust upstream retention or acknowledgement headroom.
 async fn acknowledge_latest_source_commit(
     connector: &mut dyn SourceConnector,
     epoch_committed_rx: &mut tokio::sync::watch::Receiver<Option<(u64, SourceCheckpoint)>>,
     delivery_guarantee: DeliveryGuarantee,
     src_name: &str,
     fault_tx: &tokio::sync::mpsc::UnboundedSender<SourceFault>,
+    #[cfg(feature = "cluster")] process_authority: Option<&SourceProcessAuthority>,
 ) -> bool {
+    #[cfg(feature = "cluster")]
+    if !source_process_authority_is_live(process_authority) {
+        return false;
+    }
     let Some((epoch, checkpoint)) = epoch_committed_rx.borrow_and_update().clone() else {
         return true;
     };
@@ -856,6 +976,10 @@ async fn acknowledge_latest_source_commit(
             source: Arc::from(src_name),
             error: format!("commit notification failed at epoch {epoch}: {error}"),
         });
+        return false;
+    }
+    #[cfg(feature = "cluster")]
+    if !source_process_authority_is_live(process_authority) {
         return false;
     }
     true
@@ -1142,6 +1266,114 @@ fn source_drain_held(active: &Option<ActiveSourceDrain>) -> bool {
     active.as_ref().is_some_and(|drain| drain.ready)
 }
 
+enum SourcePollOutcome {
+    Completed(Result<Option<SourceBatch>, ConnectorError>),
+    Shutdown(Option<Result<Option<SourceBatch>, ConnectorError>>),
+    #[cfg(feature = "cluster")]
+    ProcessAuthorityLost,
+}
+
+enum SourceStartOutcome {
+    Completed(Result<(), ConnectorError>),
+    TimedOut(Option<Result<(), ConnectorError>>),
+    #[cfg(feature = "cluster")]
+    ProcessAuthorityLost(Option<Result<(), ConnectorError>>),
+}
+
+async fn start_source_once(
+    connector: &mut dyn SourceConnector,
+    request: SourceStart,
+    deadline: tokio::time::Instant,
+    #[cfg(feature = "cluster")] process_authority: Option<&SourceProcessAuthority>,
+) -> SourceStartOutcome {
+    let complete_started =
+        connector.cancellation_policy() == ConnectorCancellationPolicy::CompleteStarted;
+    let mut start = std::pin::pin!(connector.start(request));
+
+    #[cfg(feature = "cluster")]
+    if let Some(authority) = process_authority {
+        return tokio::select! {
+            biased;
+            () = authority.cancelled() => {
+                let completion = if complete_started {
+                    Some(start.as_mut().await)
+                } else {
+                    None
+                };
+                SourceStartOutcome::ProcessAuthorityLost(completion)
+            }
+            result = start.as_mut() => SourceStartOutcome::Completed(result),
+            () = tokio::time::sleep_until(deadline) => {
+                let completion = if complete_started {
+                    Some(start.as_mut().await)
+                } else {
+                    None
+                };
+                SourceStartOutcome::TimedOut(completion)
+            }
+        };
+    }
+
+    tokio::select! {
+        biased;
+        result = start.as_mut() => SourceStartOutcome::Completed(result),
+        () = tokio::time::sleep_until(deadline) => {
+            let completion = if complete_started {
+                Some(start.as_mut().await)
+            } else {
+                None
+            };
+            SourceStartOutcome::TimedOut(completion)
+        }
+    }
+}
+
+async fn poll_source_once(
+    connector: &mut dyn SourceConnector,
+    max_records: usize,
+    shutdown: &tokio::sync::Notify,
+    #[cfg(feature = "cluster")] process_authority: Option<&SourceProcessAuthority>,
+) -> SourcePollOutcome {
+    let cancellation_policy = connector.cancellation_policy();
+    let mut poll = std::pin::pin!(connector.poll_batch(max_records));
+    if cancellation_policy == ConnectorCancellationPolicy::CompleteStarted {
+        #[cfg(feature = "cluster")]
+        if let Some(authority) = process_authority {
+            return tokio::select! {
+                biased;
+                () = authority.cancelled() => {
+                    let _ = poll.await;
+                    SourcePollOutcome::ProcessAuthorityLost
+                }
+                () = shutdown.notified() => SourcePollOutcome::Shutdown(Some(poll.await)),
+                result = poll.as_mut() => SourcePollOutcome::Completed(result),
+            };
+        }
+        return tokio::select! {
+            biased;
+            () = shutdown.notified() => SourcePollOutcome::Shutdown(Some(poll.await)),
+            result = poll.as_mut() => SourcePollOutcome::Completed(result),
+        };
+    }
+
+    #[cfg(feature = "cluster")]
+    if let Some(authority) = process_authority {
+        return tokio::select! {
+            biased;
+            () = authority.cancelled() => {
+                SourcePollOutcome::ProcessAuthorityLost
+            }
+            () = shutdown.notified() => SourcePollOutcome::Shutdown(None),
+            result = poll.as_mut() => SourcePollOutcome::Completed(result),
+        };
+    }
+    tokio::select! {
+        biased;
+        () = shutdown.notified() => SourcePollOutcome::Shutdown(None),
+        result = poll.as_mut() => SourcePollOutcome::Completed(result),
+    }
+}
+
 /// Backoff between completed polls while still servicing durable commit
 /// notifications immediately. This never races a live `poll_batch` future.
 async fn wait_source_idle(
@@ -1152,9 +1384,43 @@ async fn wait_source_idle(
     fault_tx: &tokio::sync::mpsc::UnboundedSender<SourceFault>,
     shutdown: &tokio::sync::Notify,
     control_wake: Option<&tokio::sync::Notify>,
+    #[cfg(feature = "cluster")] process_authority: Option<&SourceProcessAuthority>,
     poll_interval: Duration,
 ) -> bool {
     let data_ready = connector.data_ready_notify();
+    #[cfg(feature = "cluster")]
+    if let Some(authority) = process_authority {
+        return tokio::select! {
+            biased;
+            () = authority.cancelled() => false,
+            () = shutdown.notified() => false,
+            changed = epoch_committed_rx.changed() => match changed {
+                Ok(()) => acknowledge_latest_source_commit(
+                    connector,
+                    epoch_committed_rx,
+                    delivery_guarantee,
+                    src_name,
+                    fault_tx,
+                    Some(authority),
+                ).await,
+                Err(_) => false,
+            },
+            () = async move {
+                match data_ready {
+                    Some(notify) => notify.notified().await,
+                    None => std::future::pending().await,
+                }
+            } => true,
+            () = async move {
+                match control_wake {
+                    Some(notify) => notify.notified().await,
+                    None => std::future::pending().await,
+                }
+            } => true,
+            () = tokio::time::sleep(poll_interval) => true,
+        };
+    }
+
     tokio::select! {
         biased;
         () = shutdown.notified() => false,
@@ -1165,6 +1431,8 @@ async fn wait_source_idle(
                 delivery_guarantee,
                 src_name,
                 fault_tx,
+                #[cfg(feature = "cluster")]
+                None,
             ).await,
             Err(_) => false,
         },
@@ -1193,8 +1461,30 @@ async fn wait_source_drain_hold(
     fault_tx: &tokio::sync::mpsc::UnboundedSender<SourceFault>,
     shutdown: &tokio::sync::Notify,
     control_wake: &tokio::sync::Notify,
+    process_authority: Option<&SourceProcessAuthority>,
     poll_interval: Duration,
 ) -> bool {
+    if let Some(authority) = process_authority {
+        return tokio::select! {
+            biased;
+            () = authority.cancelled() => false,
+            () = shutdown.notified() => false,
+            changed = epoch_committed_rx.changed() => match changed {
+                Ok(()) => acknowledge_latest_source_commit(
+                    connector,
+                    epoch_committed_rx,
+                    delivery_guarantee,
+                    src_name,
+                    fault_tx,
+                    Some(authority),
+                ).await,
+                Err(_) => false,
+            },
+            () = control_wake.notified() => true,
+            () = tokio::time::sleep(poll_interval) => true,
+        };
+    }
+
     tokio::select! {
         biased;
         () = shutdown.notified() => false,
@@ -1205,6 +1495,7 @@ async fn wait_source_drain_hold(
                 delivery_guarantee,
                 src_name,
                 fault_tx,
+                None,
             ).await,
             Err(_) => false,
         },
@@ -1232,11 +1523,16 @@ async fn wait_source_barrier_release(
     src_name: &str,
     fault_tx: &tokio::sync::mpsc::UnboundedSender<SourceFault>,
     shutdown: &tokio::sync::Notify,
+    #[cfg(feature = "cluster")] process_authority: Option<&SourceProcessAuthority>,
     poll_interval: Duration,
     barrier: CheckpointBarrier,
 ) -> bool {
     let attempt = CheckpointAttempt::new(barrier.epoch, barrier.checkpoint_id);
     loop {
+        #[cfg(feature = "cluster")]
+        if !source_process_authority_is_live(process_authority) {
+            return false;
+        }
         let signal = *barrier_release_rx.borrow_and_update();
         match signal {
             Some(SourceBarrierSignal::Release(released))
@@ -1249,6 +1545,37 @@ async fn wait_source_barrier_release(
         }
 
         connector.drive_control_plane();
+        #[cfg(feature = "cluster")]
+        if let Some(authority) = process_authority {
+            tokio::select! {
+                biased;
+                () = authority.cancelled() => return false,
+                () = shutdown.notified() => return false,
+                changed = barrier_release_rx.changed() => {
+                    if changed.is_err() {
+                        return false;
+                    }
+                }
+                changed = epoch_committed_rx.changed() => match changed {
+                    Ok(()) => {
+                        if !acknowledge_latest_source_commit(
+                            connector,
+                            epoch_committed_rx,
+                            delivery_guarantee,
+                            src_name,
+                            fault_tx,
+                            Some(authority),
+                        ).await {
+                            return false;
+                        }
+                    }
+                    Err(_) => return false,
+                },
+                () = tokio::time::sleep(poll_interval) => {}
+            }
+            continue;
+        }
+
         tokio::select! {
             biased;
             () = shutdown.notified() => return false,
@@ -1265,6 +1592,8 @@ async fn wait_source_barrier_release(
                         delivery_guarantee,
                         src_name,
                         fault_tx,
+                        #[cfg(feature = "cluster")]
+                        None,
                     ).await {
                         return false;
                     }
@@ -1277,6 +1606,22 @@ async fn wait_source_barrier_release(
 }
 
 impl StreamingCoordinator {
+    #[cfg(feature = "cluster")]
+    #[inline]
+    fn require_process_authority(&self, boundary: &str) -> Result<(), CycleError> {
+        if self
+            .process_authority
+            .as_deref()
+            .is_none_or(SourceProcessAuthority::is_live)
+        {
+            Ok(())
+        } else {
+            Err(CycleError::Recovery(format!(
+                "cluster process lease expired before {boundary}"
+            )))
+        }
+    }
+
     async fn close_startup_source(source: &mut SourceRegistration, cleanup_timeout: Duration) {
         let cleanup_deadline = tokio::time::Instant::now() + cleanup_timeout;
         let cancellation_policy = source.connector.cancellation_policy();
@@ -1342,7 +1687,7 @@ impl StreamingCoordinator {
         task.log_terminal_outcome();
     }
 
-    /// Notify every source of a committed epoch so they can ack to their broker.
+    /// Notify every source of a committed epoch so it can release retained upstream data.
     fn broadcast_epoch_committed(
         &self,
         epoch: u64,
@@ -1406,8 +1751,10 @@ impl StreamingCoordinator {
             shutdown,
             control_rx,
             source_gate,
+            #[cfg(feature = "cluster")]
+            None,
             Arc::new(parking_lot::Mutex::new(Vec::new())),
-            false,
+            crate::db::RuntimeMode::Local,
         )
         .await
     }
@@ -1419,8 +1766,9 @@ impl StreamingCoordinator {
         shutdown: Arc<tokio::sync::Notify>,
         control_rx: ControlMsgRx,
         source_gate: Arc<std::sync::atomic::AtomicBool>,
+        #[cfg(feature = "cluster")] source_process_authority: Option<Arc<ClusterController>>,
         owned_source_tasks: OwnedSourceTasks,
-        _cluster_source_drain: bool,
+        _runtime_mode: crate::db::RuntimeMode,
     ) -> Result<Self, DbError> {
         if config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
             for src in &sources {
@@ -1474,6 +1822,29 @@ impl StreamingCoordinator {
             ));
         }
 
+        #[cfg(feature = "cluster")]
+        if _runtime_mode.is_cluster() {
+            let controller = source_process_authority.as_ref().ok_or_else(|| {
+                DbError::Config(
+                    "cluster source runtime requires a cluster controller with process lease authority"
+                        .into(),
+                )
+            })?;
+            if controller.process_lease_deadline().is_none() {
+                return Err(DbError::Config(
+                    "cluster source runtime requires one shared process lease deadline before construction"
+                        .into(),
+                ));
+            }
+        } else if source_process_authority.is_some() {
+            return Err(DbError::Config(
+                "local source runtime cannot install cluster process lease authority".into(),
+            ));
+        }
+
+        #[cfg(feature = "cluster")]
+        let source_process_authority = source_process_authority.map(SourceProcessAuthority::new);
+
         let source_count = sources.len();
         let mut prepared_sources = Vec::with_capacity(source_count);
         let mut committed_offsets = Vec::with_capacity(source_count);
@@ -1520,29 +1891,71 @@ impl StreamingCoordinator {
                 position: start_position.clone(),
                 delivery: config.delivery_guarantee,
             };
-            let cancellation_policy = src.connector.cancellation_policy();
-            let start_error = {
-                let mut start = std::pin::pin!(src.connector.start(start));
-                match tokio::time::timeout_at(source_start_deadline, start.as_mut()).await {
-                    Ok(Ok(())) => None,
-                    Ok(Err(error)) => Some(error.to_string()),
-                    Err(_) => {
-                        if cancellation_policy == ConnectorCancellationPolicy::CompleteStarted {
-                            match start.as_mut().await {
-                                Ok(()) => tracing::warn!(
-                                    source = %src_name,
-                                    "cancellation-unsafe source start completed after its deadline"
-                                ),
-                                Err(error) => tracing::warn!(
-                                    source = %src_name,
-                                    %error,
-                                    "cancellation-unsafe source start failed after its deadline"
-                                ),
-                            }
+            let source_start_authorized = {
+                #[cfg(feature = "cluster")]
+                {
+                    source_process_authority_is_live(source_process_authority.as_deref())
+                }
+                #[cfg(not(feature = "cluster"))]
+                {
+                    true
+                }
+            };
+            let start_error = if !source_start_authorized {
+                Some("process lease expired before source start began".to_owned())
+            } else {
+                match start_source_once(
+                    src.connector.as_mut(),
+                    start,
+                    source_start_deadline,
+                    #[cfg(feature = "cluster")]
+                    source_process_authority.as_deref(),
+                )
+                .await
+                {
+                    SourceStartOutcome::Completed(Ok(())) => {
+                        #[cfg(feature = "cluster")]
+                        if !source_process_authority_is_live(source_process_authority.as_deref()) {
+                            Some("process lease expired as source start completed".to_owned())
+                        } else {
+                            None
+                        }
+                        #[cfg(not(feature = "cluster"))]
+                        None
+                    }
+                    SourceStartOutcome::Completed(Err(error)) => Some(error.to_string()),
+                    SourceStartOutcome::TimedOut(completion) => {
+                        match completion {
+                            Some(Ok(())) => tracing::warn!(
+                                source = %src_name,
+                                "cancellation-unsafe source start completed after its deadline"
+                            ),
+                            Some(Err(error)) => tracing::warn!(
+                                source = %src_name,
+                                %error,
+                                "cancellation-unsafe source start failed after its deadline"
+                            ),
+                            None => {}
                         }
                         Some(format!(
                             "exceeded the shared {source_start_timeout:?} source-start stage deadline"
                         ))
+                    }
+                    #[cfg(feature = "cluster")]
+                    SourceStartOutcome::ProcessAuthorityLost(completion) => {
+                        match completion {
+                            Some(Ok(())) => tracing::warn!(
+                                source = %src_name,
+                                "cancellation-unsafe source start completed after process lease loss"
+                            ),
+                            Some(Err(error)) => tracing::warn!(
+                                source = %src_name,
+                                %error,
+                                "cancellation-unsafe source start failed after process lease loss"
+                            ),
+                            None => {}
+                        }
+                        Some("process lease expired while source start was in flight".to_owned())
                     }
                 }
             };
@@ -1583,6 +1996,8 @@ impl StreamingCoordinator {
             let task_tx = tx.clone();
             let task_fault_tx = source_fault_tx.clone();
             let task_gate = Arc::clone(&source_gate);
+            #[cfg(feature = "cluster")]
+            let task_process_authority = source_process_authority.clone();
             let max_poll = config.max_poll_records;
             let poll_interval = config.fallback_poll_interval;
             let delivery_guarantee = config.delivery_guarantee;
@@ -1593,7 +2008,7 @@ impl StreamingCoordinator {
             let mut connector = src.connector;
 
             #[cfg(feature = "cluster")]
-            let drain_control = _cluster_source_drain.then(|| {
+            let drain_control = _runtime_mode.is_cluster().then(|| {
                 let (command_tx, _) =
                     tokio::sync::watch::channel::<Option<SourceDrainCommand>>(None);
                 let (status_tx, _) = tokio::sync::watch::channel(SourceDrainTaskStatus::Idle);
@@ -1639,6 +2054,22 @@ impl StreamingCoordinator {
                 // task behind this one-shot fence prevents a fast poll/commit failure from being
                 // queued before the dedicated compute loop can publish its readiness boundary.
                 // Cancellation before activation closes the connector without polling it.
+                #[cfg(feature = "cluster")]
+                let activated = if let Some(authority) = task_process_authority.as_deref() {
+                    tokio::select! {
+                        biased;
+                        () = authority.cancelled() => false,
+                        () = task_shutdown_clone.notified() => false,
+                        activation = startup_activation_rx => activation.is_ok(),
+                    }
+                } else {
+                    tokio::select! {
+                        biased;
+                        () = task_shutdown_clone.notified() => false,
+                        activation = startup_activation_rx => activation.is_ok(),
+                    }
+                };
+                #[cfg(not(feature = "cluster"))]
                 let activated = tokio::select! {
                     biased;
                     () = task_shutdown_clone.notified() => false,
@@ -1656,10 +2087,18 @@ impl StreamingCoordinator {
                 let mut pending_batch: Option<SourceBatch> = None;
                 #[cfg(feature = "cluster")]
                 let mut active_source_drain: Option<ActiveSourceDrain> = None;
+                #[cfg(feature = "cluster")]
+                let mut process_authority_lost = false;
 
-                // Ack a fresh commit before polling more — keeps
-                // max_ack_pending headroom for the broker.
+                // Acknowledge a fresh commit before polling more to preserve upstream retention
+                // and acknowledgement headroom.
                 loop {
+                    #[cfg(feature = "cluster")]
+                    if !source_process_authority_is_live(task_process_authority.as_deref()) {
+                        process_authority_lost = true;
+                        break;
+                    }
+
                     #[cfg(feature = "cluster")]
                     if let (Some(control), Some(command_rx)) =
                         (task_drain_control.as_ref(), task_drain_command_rx.as_mut())
@@ -1712,6 +2151,12 @@ impl StreamingCoordinator {
                         }
                     }
 
+                    #[cfg(feature = "cluster")]
+                    if !source_process_authority_is_live(task_process_authority.as_deref()) {
+                        process_authority_lost = true;
+                        break;
+                    }
+
                     match epoch_committed_rx.has_changed() {
                         Ok(true) => {
                             if !acknowledge_latest_source_commit(
@@ -1720,9 +2165,17 @@ impl StreamingCoordinator {
                                 delivery_guarantee,
                                 &src_name,
                                 &task_fault_tx,
+                                #[cfg(feature = "cluster")]
+                                task_process_authority.as_deref(),
                             )
                             .await
                             {
+                                break;
+                            }
+                            #[cfg(feature = "cluster")]
+                            if !source_process_authority_is_live(task_process_authority.as_deref())
+                            {
+                                process_authority_lost = true;
                                 break;
                             }
                             continue;
@@ -1760,6 +2213,8 @@ impl StreamingCoordinator {
                             &task_fault_tx,
                             &task_shutdown_clone,
                             task_control_wake.as_deref(),
+                            #[cfg(feature = "cluster")]
+                            task_process_authority.as_deref(),
                             poll_interval,
                         )
                         .await
@@ -1781,7 +2236,15 @@ impl StreamingCoordinator {
                                     batch: batch.records,
                                     checkpoint,
                                 };
-                                if task_tx.send(msg).await.is_err() {
+                                if !send_source_msg(
+                                    &task_tx,
+                                    msg,
+                                    &task_shutdown_clone,
+                                    #[cfg(feature = "cluster")]
+                                    task_process_authority.as_deref(),
+                                )
+                                .await
+                                {
                                     break;
                                 }
                             }
@@ -1795,6 +2258,8 @@ impl StreamingCoordinator {
                                     &task_fault_tx,
                                     &task_shutdown_clone,
                                     task_control_wake.as_deref(),
+                                    #[cfg(feature = "cluster")]
+                                    task_process_authority.as_deref(),
                                     poll_interval,
                                 )
                                 .await
@@ -1853,7 +2318,15 @@ impl StreamingCoordinator {
                                         barrier,
                                         checkpoint,
                                     };
-                                    if task_tx.send(msg).await.is_err() {
+                                    if !send_source_msg(
+                                        &task_tx,
+                                        msg,
+                                        &task_shutdown_clone,
+                                        #[cfg(feature = "cluster")]
+                                        task_process_authority.as_deref(),
+                                    )
+                                    .await
+                                    {
                                         break;
                                     }
                                     if !wait_source_barrier_release(
@@ -1864,6 +2337,8 @@ impl StreamingCoordinator {
                                         &src_name,
                                         &task_fault_tx,
                                         &task_shutdown_clone,
+                                        #[cfg(feature = "cluster")]
+                                        task_process_authority.as_deref(),
                                         poll_interval,
                                         barrier,
                                     )
@@ -1882,6 +2357,8 @@ impl StreamingCoordinator {
                                         &task_fault_tx,
                                         &task_shutdown_clone,
                                         task_control_wake.as_deref(),
+                                        #[cfg(feature = "cluster")]
+                                        task_process_authority.as_deref(),
                                         poll_interval,
                                     )
                                     .await
@@ -1914,6 +2391,7 @@ impl StreamingCoordinator {
                             &task_fault_tx,
                             &task_shutdown_clone,
                             &control.wake,
+                            task_process_authority.as_deref(),
                             poll_interval,
                         )
                         .await
@@ -1942,7 +2420,15 @@ impl StreamingCoordinator {
                                         barrier,
                                         checkpoint,
                                     };
-                                    if task_tx.send(msg).await.is_err() {
+                                    if !send_source_msg(
+                                        &task_tx,
+                                        msg,
+                                        &task_shutdown_clone,
+                                        #[cfg(feature = "cluster")]
+                                        task_process_authority.as_deref(),
+                                    )
+                                    .await
+                                    {
                                         break;
                                     }
                                     if !wait_source_barrier_release(
@@ -1953,6 +2439,8 @@ impl StreamingCoordinator {
                                         &src_name,
                                         &task_fault_tx,
                                         &task_shutdown_clone,
+                                        #[cfg(feature = "cluster")]
+                                        task_process_authority.as_deref(),
                                         poll_interval,
                                         barrier,
                                     )
@@ -1980,6 +2468,8 @@ impl StreamingCoordinator {
                             &task_fault_tx,
                             &task_shutdown_clone,
                             task_control_wake.as_deref(),
+                            #[cfg(feature = "cluster")]
+                            task_process_authority.as_deref(),
                             poll_interval,
                         )
                         .await
@@ -1988,33 +2478,46 @@ impl StreamingCoordinator {
                         }
                         continue;
                     }
-                    let cancellation_policy = connector.cancellation_policy();
-                    let poll_result =
-                        if cancellation_policy == ConnectorCancellationPolicy::CompleteStarted {
-                            let mut poll = std::pin::pin!(connector.poll_batch(max_poll));
-                            tokio::select! {
-                                biased;
-                                () = task_shutdown_clone.notified() => {
-                                    match poll.await {
-                                        Ok(Some(batch)) => pending_batch = Some(batch),
-                                        Ok(None) => {}
-                                        Err(error) => tracing::warn!(
-                                            source = %src_name,
-                                            %error,
-                                            "source poll failed while completing for shutdown"
-                                        ),
-                                    }
-                                    break;
-                                }
-                                result = poll.as_mut() => result,
-                            }
-                        } else {
-                            tokio::select! {
-                                biased;
-                                () = task_shutdown_clone.notified() => break,
-                                result = connector.poll_batch(max_poll) => result,
-                            }
-                        };
+                    #[cfg(feature = "cluster")]
+                    if !source_process_authority_is_live(task_process_authority.as_deref()) {
+                        process_authority_lost = true;
+                        break;
+                    }
+                    let poll_result = match poll_source_once(
+                        connector.as_mut(),
+                        max_poll,
+                        &task_shutdown_clone,
+                        #[cfg(feature = "cluster")]
+                        task_process_authority.as_deref(),
+                    )
+                    .await
+                    {
+                        SourcePollOutcome::Completed(result) => result,
+                        SourcePollOutcome::Shutdown(Some(Ok(Some(batch)))) => {
+                            pending_batch = Some(batch);
+                            break;
+                        }
+                        SourcePollOutcome::Shutdown(Some(Err(error))) => {
+                            tracing::warn!(
+                                source = %src_name,
+                                %error,
+                                "source poll failed while completing for shutdown"
+                            );
+                            break;
+                        }
+                        SourcePollOutcome::Shutdown(Some(Ok(None)) | None) => break,
+                        #[cfg(feature = "cluster")]
+                        SourcePollOutcome::ProcessAuthorityLost => {
+                            process_authority_lost = true;
+                            break;
+                        }
+                    };
+
+                    #[cfg(feature = "cluster")]
+                    if !source_process_authority_is_live(task_process_authority.as_deref()) {
+                        process_authority_lost = true;
+                        break;
+                    }
 
                     match poll_result {
                         Ok(Some(batch)) => {
@@ -2040,7 +2543,15 @@ impl StreamingCoordinator {
                                 batch: batch.records,
                                 checkpoint,
                             };
-                            if task_tx.send(msg).await.is_err() {
+                            if !send_source_msg(
+                                &task_tx,
+                                msg,
+                                &task_shutdown_clone,
+                                #[cfg(feature = "cluster")]
+                                task_process_authority.as_deref(),
+                            )
+                            .await
+                            {
                                 break; // Coordinator dropped
                             }
                         }
@@ -2077,6 +2588,8 @@ impl StreamingCoordinator {
                                 &task_fault_tx,
                                 &task_shutdown_clone,
                                 task_control_wake.as_deref(),
+                                #[cfg(feature = "cluster")]
+                                task_process_authority.as_deref(),
                                 poll_interval,
                             )
                             .await
@@ -2105,6 +2618,8 @@ impl StreamingCoordinator {
                                 &task_fault_tx,
                                 &task_shutdown_clone,
                                 task_control_wake.as_deref(),
+                                #[cfg(feature = "cluster")]
+                                task_process_authority.as_deref(),
                                 poll_interval,
                             )
                             .await
@@ -2135,7 +2650,15 @@ impl StreamingCoordinator {
                                         barrier,
                                         checkpoint,
                                     };
-                                    if task_tx.send(msg).await.is_err() {
+                                    if !send_source_msg(
+                                        &task_tx,
+                                        msg,
+                                        &task_shutdown_clone,
+                                        #[cfg(feature = "cluster")]
+                                        task_process_authority.as_deref(),
+                                    )
+                                    .await
+                                    {
                                         break;
                                     }
                                     if !wait_source_barrier_release(
@@ -2146,6 +2669,8 @@ impl StreamingCoordinator {
                                         &src_name,
                                         &task_fault_tx,
                                         &task_shutdown_clone,
+                                        #[cfg(feature = "cluster")]
+                                        task_process_authority.as_deref(),
                                         poll_interval,
                                         barrier,
                                     )
@@ -2168,7 +2693,12 @@ impl StreamingCoordinator {
                 }
 
                 #[cfg(feature = "cluster")]
-                let may_flush_on_shutdown = active_source_drain.is_none();
+                if !source_process_authority_is_live(task_process_authority.as_deref()) {
+                    process_authority_lost = true;
+                }
+                #[cfg(feature = "cluster")]
+                let may_flush_on_shutdown =
+                    !process_authority_lost && active_source_drain.is_none();
                 #[cfg(not(feature = "cluster"))]
                 let may_flush_on_shutdown = true;
 
@@ -2189,6 +2719,11 @@ impl StreamingCoordinator {
                     }
                     let deadline = Instant::now() + SHUTDOWN_DRAIN_BUDGET;
                     while Instant::now() < deadline {
+                        #[cfg(feature = "cluster")]
+                        if !source_process_authority_is_live(task_process_authority.as_deref()) {
+                            process_authority_lost = true;
+                            break;
+                        }
                         let remaining = deadline.saturating_duration_since(Instant::now());
                         let poll_result = {
                             let cancellation_policy = connector.cancellation_policy();
@@ -2204,6 +2739,11 @@ impl StreamingCoordinator {
                                 Err(_) => None,
                             }
                         };
+                        #[cfg(feature = "cluster")]
+                        if !source_process_authority_is_live(task_process_authority.as_deref()) {
+                            process_authority_lost = true;
+                            break;
+                        }
                         match poll_result {
                             Some(Ok(Some(batch))) => {
                                 let Ok(Some(checkpoint)) =
@@ -2228,18 +2768,28 @@ impl StreamingCoordinator {
                     }
                 }
 
-                // Drain EpochCommitted broadcasts before close so a durable tail settled
-                // during shutdown is acknowledged to the broker.
-                while let Ok(()) = epoch_committed_rx.changed().await {
-                    let snapshot = epoch_committed_rx.borrow_and_update().clone();
-                    if let Some((e, cp)) = snapshot {
-                        if let Err(err) = connector.notify_epoch_committed(e, &cp).await {
-                            tracing::warn!(
-                                source = %src_name,
-                                error = %err,
-                                epoch = e,
-                                "notify_epoch_committed failed",
-                            );
+                #[cfg(feature = "cluster")]
+                let may_ack_on_shutdown = !process_authority_lost;
+                #[cfg(not(feature = "cluster"))]
+                let may_ack_on_shutdown = true;
+                if may_ack_on_shutdown {
+                    // Drain EpochCommitted broadcasts before close so a durable tail settled
+                    // during shutdown is acknowledged upstream.
+                    while let Ok(()) = epoch_committed_rx.changed().await {
+                        #[cfg(feature = "cluster")]
+                        if !source_process_authority_is_live(task_process_authority.as_deref()) {
+                            break;
+                        }
+                        let snapshot = epoch_committed_rx.borrow_and_update().clone();
+                        if let Some((e, cp)) = snapshot {
+                            if let Err(err) = connector.notify_epoch_committed(e, &cp).await {
+                                tracing::warn!(
+                                    source = %src_name,
+                                    error = %err,
+                                    epoch = e,
+                                    "notify_epoch_committed failed",
+                                );
+                            }
                         }
                     }
                 }
@@ -2281,6 +2831,7 @@ impl StreamingCoordinator {
             source_handles,
             source_names,
             shutdown,
+            terminal_shutdown: tokio_util::sync::CancellationToken::new(),
             pending_barrier: PendingBarrier::new(),
             last_checkpoint: Instant::now(),
             source_batches_buf: FxHashMap::default(),
@@ -2300,6 +2851,8 @@ impl StreamingCoordinator {
             staged_bytes: Arc::new(AtomicU64::new(0)),
             max_staged_bytes: u64::MAX,
             coordinated_commit_admission: None,
+            #[cfg(feature = "cluster")]
+            process_authority: source_process_authority,
         })
     }
 
@@ -2334,6 +2887,14 @@ impl StreamingCoordinator {
 
     pub(crate) fn with_force_checkpoint_rx(mut self, rx: crate::db::ForceCheckpointRx) -> Self {
         self.force_ckpt_rx = Some(rx);
+        self
+    }
+
+    pub(crate) fn with_terminal_shutdown(
+        mut self,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        self.terminal_shutdown = shutdown;
         self
     }
 
@@ -2621,6 +3182,15 @@ impl StreamingCoordinator {
                         callback.record_checkpoint_failure(attempt.checkpoint_id, &reason);
                         return Some(reason);
                     }
+                    #[cfg(feature = "cluster")]
+                    if let Err(error) =
+                        self.require_process_authority("durable checkpoint publication")
+                    {
+                        let reason = error.to_string();
+                        callback.abort_subscription_cut(attempt);
+                        self.fail_manual_attempt(attempt, &reason);
+                        return Some(reason);
+                    }
                     let continuation_error = result.continuation_error().map(str::to_owned);
                     // Ordering is semantic: N reached its durable point, so source and public
                     // acknowledgements for N must be published even when N+1 cannot be opened.
@@ -2676,14 +3246,23 @@ impl StreamingCoordinator {
             .map(SourceHandle::barrier_control)
             .collect();
         callback.set_barrier_injectors(injectors);
+        let cancelled_before_ready = self.terminal_shutdown.is_cancelled();
         if let Some(ready) = ready {
-            ready.send(Ok(()));
+            if cancelled_before_ready {
+                ready.send(Err(
+                    "pipeline runtime generation was cancelled before readiness".into(),
+                ));
+            } else {
+                ready.send(Ok(()));
+            }
         }
-        // Readiness is the linearization point: source tasks are released only after it is
-        // published, so none can enqueue a batch, barrier, or fault on the pre-ready side.
-        for handle in &mut self.source_handles {
-            if let Some(activation) = handle.startup_activation.take() {
-                activation.send(());
+        if !cancelled_before_ready && !self.terminal_shutdown.is_cancelled() {
+            // Readiness is the linearization point: source tasks are released only after it is
+            // published, so none can enqueue a batch, barrier, or fault on the pre-ready side.
+            for handle in &mut self.source_handles {
+                if let Some(activation) = handle.startup_activation.take() {
+                    activation.send(());
+                }
             }
         }
 
@@ -2695,12 +3274,16 @@ impl StreamingCoordinator {
         let mut barriers_buf: Vec<(usize, CheckpointBarrier, SourceCheckpoint)> = Vec::new();
         // Set by a fatal replay-guaranteed error; gates the open-epoch shutdown drain.
         let mut fault: Option<String> = None;
+        let mut halted = false;
         // A pipeline without connectors is valid for source-less checkpoints. `new()`
         // intentionally has no channel sender in that case, so selecting the disconnected
         // receiver would make the live control loop exit immediately.
         let source_channel_expected = !self.source_names.is_empty();
 
         loop {
+            if self.terminal_shutdown.is_cancelled() {
+                break;
+            }
             if let Err(error) = callback.prepare_source_intake() {
                 fault = Some(format!(
                     "source recovery handoff could not be installed before intake: {error}"
@@ -2725,6 +3308,7 @@ impl StreamingCoordinator {
             let mut retrying_replay = false;
             let msg = tokio::select! {
                 biased;
+                () = self.terminal_shutdown.cancelled() => break,
                 () = self.shutdown.notified() => break,
                 Some(source_fault) = self.source_fault_rx.recv() => {
                     fault = Some(format!(
@@ -2772,7 +3356,19 @@ impl StreamingCoordinator {
                 msg = self.rx.recv(), if source_channel_expected && !external_commit_paused && !intake_paused => {
                     if let Ok(message) = msg {
                         if !batch_window.is_zero() {
-                            tokio::time::sleep(batch_window).await;
+                            let authority_lost = wait_coordinator_delay(
+                                batch_window,
+                                #[cfg(feature = "cluster")]
+                                self.process_authority.as_deref(),
+                            )
+                            .await;
+                            if authority_lost {
+                                fault = Some(
+                                    "cluster process lease expired during source batch window"
+                                        .into(),
+                                );
+                                break;
+                            }
                         }
                         Some(message)
                     } else {
@@ -2783,7 +3379,17 @@ impl StreamingCoordinator {
                         break;
                     }
                 }
-                () = tokio::time::sleep(IDLE_TIMEOUT) => None,
+                authority_lost = wait_coordinator_delay(
+                    IDLE_TIMEOUT,
+                    #[cfg(feature = "cluster")]
+                    self.process_authority.as_deref(),
+                ) => {
+                    if authority_lost {
+                        fault = Some("cluster process lease expired while coordinator was idle".into());
+                        break;
+                    }
+                    None
+                },
             };
 
             // A progress wake is edge-triggered; recompute the gate on the next loop before
@@ -2874,6 +3480,12 @@ impl StreamingCoordinator {
                 self.discard_pending_offsets();
                 break;
             }
+            #[cfg(feature = "cluster")]
+            if let Err(error) = self.require_process_authority("folding a drained source cycle") {
+                self.discard_pending_offsets();
+                fault = Some(error.to_string());
+                break;
+            }
 
             for (name, batch) in self.pending_watermark_batches.drain(..) {
                 callback.extract_watermark(&name, &batch);
@@ -2890,6 +3502,12 @@ impl StreamingCoordinator {
                 || callback.has_deferred_input()
             {
                 let wm = callback.current_watermark();
+                #[cfg(feature = "cluster")]
+                if let Err(error) = self.require_process_authority("operator execution") {
+                    self.discard_pending_offsets();
+                    fault = Some(error.to_string());
+                    break;
+                }
                 match callback.execute_cycle(&self.source_batches_buf, wm).await {
                     Ok(out) => {
                         // Exactly-once / coordinated recovery rewinds the whole pipeline, so
@@ -2932,6 +3550,7 @@ impl StreamingCoordinator {
                             // Shutdown already signaled; restarting would just re-trip it.
                             CycleError::Halt(msg) => {
                                 tracing::warn!(reason = %msg, "[LDB-3022] cycle halted");
+                                break;
                             }
                             // Continuing would drop the drained rows (EO gap), so fault for
                             // recovery under exactly-once or coordinated recovery.
@@ -2989,22 +3608,29 @@ impl StreamingCoordinator {
 
             // Barriers are cheap (O(num_sources) lookups) and must not be skipped.
             for (source_idx, barrier, cp) in &barriers_buf {
-                if let Err(error) = self
+                match self
                     .handle_barrier(*source_idx, barrier, cp, &mut callback)
                     .await
                 {
-                    fault = Some(error);
-                    break;
+                    Ok(()) => {}
+                    Err(CycleError::Halt(reason)) => {
+                        tracing::warn!(%reason, "[LDB-3022] checkpoint drain halted the pipeline");
+                        halted = true;
+                        break;
+                    }
+                    Err(CycleError::Fatal(reason) | CycleError::Recovery(reason)) => {
+                        fault = Some(reason);
+                        break;
+                    }
                 }
             }
-            if fault.is_some() {
+            if halted || fault.is_some() {
                 break;
             }
 
-            // A stop notification may arrive while SQL or barrier work is running. Observe its
-            // stored permit before admission so this cycle cannot originate a fresh attempt on
-            // its way out.
-            if self.shutdown.notified().now_or_never().is_some() {
+            // Cancellation may arrive while SQL or barrier work is running. Recheck the runtime
+            // generation before this cycle can originate a fresh attempt on its way out.
+            if self.terminal_shutdown.is_cancelled() {
                 break;
             }
 
@@ -3026,7 +3652,15 @@ impl StreamingCoordinator {
 
             // DDL after checkpoint so newly added queries don't appear in the same snapshot.
             while let Ok(msg) = self.control_rx.try_recv() {
+                #[cfg(feature = "cluster")]
+                if let Err(error) = self.require_process_authority("pipeline control mutation") {
+                    fault = Some(error.to_string());
+                    break;
+                }
                 callback.apply_control(msg);
+            }
+            if fault.is_some() {
+                break;
             }
 
             if self.pending_barrier.active
@@ -3120,6 +3754,7 @@ impl StreamingCoordinator {
         }
 
         let source_deadline = tokio::time::Instant::now() + SHUTDOWN_JOIN_TIMEOUT;
+        let mut source_channel_closed = false;
         while stopping_sources.iter().any(|task| !task.is_finished())
             && tokio::time::Instant::now() < source_deadline
         {
@@ -3142,6 +3777,12 @@ impl StreamingCoordinator {
 
             let tick = SHUTDOWN_COMPLETION_TICK
                 .min(source_deadline.saturating_duration_since(tokio::time::Instant::now()));
+            if source_channel_closed {
+                // A disconnected receive is immediately ready. Keep yielding so the stable task
+                // supervisors can publish terminal completion on a current-thread runtime.
+                tokio::time::sleep(tick).await;
+                continue;
+            }
             match tokio::time::timeout(tick, self.rx.recv()).await {
                 Ok(Ok(msg)) if fault.is_none() && !intake_fenced => {
                     if let Some(reason) =
@@ -3153,7 +3794,8 @@ impl StreamingCoordinator {
                         self.discard_pending_offsets();
                     }
                 }
-                Ok(Ok(_) | Err(_)) | Err(_) => {}
+                Ok(Err(_)) => source_channel_closed = true,
+                Ok(Ok(_)) | Err(_) => {}
             }
         }
 
@@ -3173,6 +3815,17 @@ impl StreamingCoordinator {
             }
         }
 
+        #[cfg(feature = "cluster")]
+        if fault.is_none() && !intake_fenced {
+            if let Err(error) = self.require_process_authority("folding the shutdown source drain")
+            {
+                self.source_batches_buf.clear();
+                self.pending_watermark_batches.clear();
+                self.discard_pending_offsets();
+                fault = Some(error.to_string());
+            }
+        }
+
         if fault.is_none() && !intake_fenced {
             for (name, batch) in self.pending_watermark_batches.drain(..) {
                 callback.extract_watermark(&name, &batch);
@@ -3184,46 +3837,55 @@ impl StreamingCoordinator {
             {
                 let cycle_start = Instant::now();
                 let wm = callback.current_watermark();
-                match callback.execute_cycle(&self.source_batches_buf, wm).await {
-                    Ok(out) if out.any_failed && callback.fault_on_cycle_error() => {
-                        self.discard_pending_offsets();
-                        fault = Some(
+                #[cfg(feature = "cluster")]
+                if let Err(error) = self.require_process_authority(
+                    "operator execution during the shutdown source drain",
+                ) {
+                    self.discard_pending_offsets();
+                    fault = Some(error.to_string());
+                }
+                if fault.is_none() {
+                    match callback.execute_cycle(&self.source_batches_buf, wm).await {
+                        Ok(out) if out.any_failed && callback.fault_on_cycle_error() => {
+                            self.discard_pending_offsets();
+                            fault = Some(
                             "isolated domain fault during shutdown drain under replay guarantee"
                                 .to_string(),
                         );
-                    }
-                    Ok(out) => match self.publish_cycle_outputs(&mut callback, &out).await {
-                        Ok(()) => {
-                            if out.any_failed {
-                                callback.note_cycle_error();
-                            }
                         }
-                        Err(error) => {
-                            fault = Some(format!(
+                        Ok(out) => match self.publish_cycle_outputs(&mut callback, &out).await {
+                            Ok(()) => {
+                                if out.any_failed {
+                                    callback.note_cycle_error();
+                                }
+                            }
+                            Err(error) => {
+                                fault = Some(format!(
                                 "cycle output publication failed during shutdown drain: {error}"
                             ));
+                            }
+                        },
+                        Err(CycleError::Halt(reason)) => {
+                            self.discard_pending_offsets();
+                            tracing::warn!(%reason, "[LDB-3022] cycle halted during shutdown drain");
                         }
-                    },
-                    Err(CycleError::Halt(reason)) => {
-                        self.discard_pending_offsets();
-                        tracing::warn!(%reason, "[LDB-3022] cycle halted during shutdown drain");
-                    }
-                    Err(CycleError::Recovery(reason)) => {
-                        self.discard_pending_offsets();
-                        fault = Some(format!(
+                        Err(CycleError::Recovery(reason)) => {
+                            self.discard_pending_offsets();
+                            fault = Some(format!(
                             "shared pipeline infrastructure failed during shutdown drain: {reason}"
                         ));
-                    }
-                    Err(CycleError::Fatal(reason)) if callback.fault_on_cycle_error() => {
-                        self.discard_pending_offsets();
-                        fault = Some(format!(
-                            "fatal SQL cycle error during shutdown drain: {reason}"
-                        ));
-                    }
-                    Err(CycleError::Fatal(reason)) => {
-                        self.discard_pending_offsets();
-                        callback.note_cycle_error();
-                        tracing::warn!(%reason, "[LDB-3020] SQL cycle error during shutdown drain");
+                        }
+                        Err(CycleError::Fatal(reason)) if callback.fault_on_cycle_error() => {
+                            self.discard_pending_offsets();
+                            fault = Some(format!(
+                                "fatal SQL cycle error during shutdown drain: {reason}"
+                            ));
+                        }
+                        Err(CycleError::Fatal(reason)) => {
+                            self.discard_pending_offsets();
+                            callback.note_cycle_error();
+                            tracing::warn!(%reason, "[LDB-3020] SQL cycle error during shutdown drain");
+                        }
                     }
                 }
                 #[allow(clippy::cast_possible_truncation)]
@@ -3455,7 +4117,7 @@ impl StreamingCoordinator {
             .collect()
     }
 
-    /// Merge staged offsets into `committed_offsets` after a successful cycle.
+    /// Merge staged offsets into `committed_offsets` after successful cycle publication.
     fn commit_pending_offsets(&mut self) {
         for (i, pending) in self.pending_offsets.iter_mut().enumerate() {
             if let Some(cp) = pending.take() {
@@ -3464,18 +4126,28 @@ impl StreamingCoordinator {
         }
     }
 
-    /// Publish all externally visible cycle output before advancing source cursors or writing
-    /// sinks. Publication failure is a shared-runtime consistency fault, so every mode recovers.
+    /// Publish materialized views, streams, and sink work before advancing source cursors.
+    /// Publication failure is a shared-runtime consistency fault, so every mode recovers.
     async fn publish_cycle_outputs(
         &mut self,
         callback: &mut impl PipelineCallback,
         outcome: &CycleOutcome,
     ) -> Result<(), CycleError> {
+        #[cfg(feature = "cluster")]
+        if let Err(error) = self.require_process_authority("materialized-view publication") {
+            self.discard_pending_offsets();
+            return Err(error);
+        }
         if let Err(error) = callback.update_mv_stores(&outcome.results) {
             self.discard_pending_offsets();
             return Err(CycleError::Recovery(format!(
                 "materialized-view publication failed: {error}"
             )));
+        }
+        #[cfg(feature = "cluster")]
+        if let Err(error) = self.require_process_authority("stream publication") {
+            self.discard_pending_offsets();
+            return Err(error);
         }
         if let Err(error) = callback.push_to_streams(&outcome.results) {
             self.discard_pending_offsets();
@@ -3484,11 +4156,26 @@ impl StreamingCoordinator {
             )));
         }
 
-        // Healthy sources advance, replay-preserved sources retain their cursor, and faulted
-        // best-effort domains deliberately drop this cycle only after publication succeeds.
+        #[cfg(feature = "cluster")]
+        if let Err(error) = self.require_process_authority("sink publication") {
+            self.discard_pending_offsets();
+            return Err(error);
+        }
+        if let Err(error) = callback.write_to_sinks(&outcome.results, None).await {
+            self.discard_pending_offsets();
+            return Err(error);
+        }
+
+        // A sink command admitted under authority may still be queued, and a CompleteStarted
+        // connector may finish after lease loss. Recheck before advancing the in-memory source
+        // cursor; the checkpoint path separately FIFO-fences every sink before persisting it.
+        #[cfg(feature = "cluster")]
+        if let Err(error) = self.require_process_authority("source cursor advancement") {
+            self.discard_pending_offsets();
+            return Err(error);
+        }
         self.settle_pending_offsets(&outcome.failed_sources, &outcome.deferred_sources);
         self.replay_pending = outcome.any_deferred;
-        callback.write_to_sinks(&outcome.results).await;
         Ok(())
     }
 
@@ -3525,7 +4212,7 @@ impl StreamingCoordinator {
         }
     }
 
-    /// Discard staged offsets when `execute_cycle` fails.
+    /// Discard staged offsets when cycle execution or publication fails.
     fn discard_pending_offsets(&mut self) {
         for slot in &mut self.pending_offsets {
             *slot = None;
@@ -3573,6 +4260,15 @@ impl StreamingCoordinator {
         match outcome {
             BarrierOutcome::Committed(epoch) => {
                 if epoch == attempt.epoch {
+                    #[cfg(feature = "cluster")]
+                    if let Err(error) =
+                        self.require_process_authority("aligned checkpoint publication")
+                    {
+                        let reason = error.to_string();
+                        callback.abort_subscription_cut(attempt);
+                        self.fail_manual_attempt(attempt, &reason);
+                        return Err(reason);
+                    }
                     let publication_error = callback.publish_barrier(attempt).err();
                     self.broadcast_epoch_committed(epoch, source_checkpoints);
                     self.finish_manual_success(
@@ -3660,12 +4356,15 @@ impl StreamingCoordinator {
         barrier: &CheckpointBarrier,
         barrier_checkpoint: &SourceCheckpoint,
         callback: &mut impl PipelineCallback,
-    ) -> Result<(), String> {
+    ) -> Result<(), CycleError> {
         let barrier_attempt = CheckpointAttempt::new(barrier.epoch, barrier.checkpoint_id);
         if !self.pending_barrier.active || self.pending_barrier.attempt != Some(barrier_attempt) {
             self.release_source_barrier_for(source_idx, barrier_attempt);
             return Ok(());
         }
+        #[cfg(feature = "cluster")]
+        self.require_process_authority("source barrier handling")
+            .map_err(|error| CycleError::Recovery(error.to_string()))?;
 
         self.capture_replayable_barrier_cursor(source_idx, barrier_checkpoint);
 
@@ -3685,7 +4384,13 @@ impl StreamingCoordinator {
                 .drain_checkpoint_edges_until(attempt_deadline)
                 .await
             {
-                let error = error.to_string();
+                let error = match error {
+                    CycleError::Halt(error) => CycleError::Halt(error),
+                    CycleError::Fatal(error) | CycleError::Recovery(error) => {
+                        CycleError::Recovery(error)
+                    }
+                };
+                let reason = error.to_string();
                 self.handle_aligned_checkpoint_outcome(
                     callback,
                     BarrierOutcome::Failed,
@@ -3695,8 +4400,27 @@ impl StreamingCoordinator {
                     &fan_out,
                 )
                 .await
-                .map_err(|cleanup| format!("{error}; checkpoint cleanup failed: {cleanup}"))?;
+                .map_err(|cleanup| {
+                    CycleError::Recovery(format!("{reason}; checkpoint cleanup failed: {cleanup}"))
+                })?;
                 return Err(error);
+            }
+            #[cfg(feature = "cluster")]
+            if let Err(error) = self.require_process_authority("aligned checkpoint capture") {
+                let reason = error.to_string();
+                let cleanup = Self::cleanup_checkpoint_attempt(
+                    callback,
+                    attempt,
+                    &reason,
+                    assignment_fence.clone(),
+                )
+                .await;
+                self.fail_manual_attempt(attempt, &reason);
+                self.release_source_barrier_attempt(attempt);
+                cleanup.map_err(|cleanup| {
+                    CycleError::Recovery(format!("{reason}; checkpoint cleanup failed: {cleanup}"))
+                })?;
+                return Err(CycleError::Recovery(reason));
             }
             if let Err(error) = callback.reserve_subscription_cut(attempt) {
                 self.handle_aligned_checkpoint_outcome(
@@ -3708,8 +4432,28 @@ impl StreamingCoordinator {
                     &fan_out,
                 )
                 .await
-                .map_err(|cleanup| format!("{error}; checkpoint cleanup failed: {cleanup}"))?;
-                return Err(error);
+                .map_err(|cleanup| {
+                    CycleError::Recovery(format!("{error}; checkpoint cleanup failed: {cleanup}"))
+                })?;
+                return Err(CycleError::Recovery(error));
+            }
+            #[cfg(feature = "cluster")]
+            if let Err(error) = self.require_process_authority("aligned checkpoint capture start") {
+                let reason = error.to_string();
+                callback.abort_subscription_cut(attempt);
+                let cleanup = Self::cleanup_checkpoint_attempt(
+                    callback,
+                    attempt,
+                    &reason,
+                    assignment_fence.clone(),
+                )
+                .await;
+                self.fail_manual_attempt(attempt, &reason);
+                self.release_source_barrier_attempt(attempt);
+                cleanup.map_err(|cleanup| {
+                    CycleError::Recovery(format!("{reason}; checkpoint cleanup failed: {cleanup}"))
+                })?;
+                return Err(CycleError::Recovery(reason));
             }
             let outcome = callback
                 .checkpoint_with_barrier(
@@ -3727,9 +4471,10 @@ impl StreamingCoordinator {
                 assignment_fence,
                 &fan_out,
             )
-            .await?;
+            .await
+            .map_err(CycleError::Recovery)?;
             if let Some(error) = callback.take_pipeline_fault() {
-                return Err(error);
+                return Err(CycleError::Recovery(error));
             }
             // Capture or exact cleanup has completed. A cleanup failure or sticky replay fault
             // returns above and deliberately leaves the sources held for coordinated recovery.
@@ -3821,6 +4566,17 @@ impl StreamingCoordinator {
         attempt_started: Instant,
     ) -> Result<CheckpointAttempt, String> {
         let attempt = callback.reserve_checkpoint_attempt(attempt_started).await?;
+        #[cfg(feature = "cluster")]
+        if let Err(error) = self.require_process_authority("checkpoint prepare publication") {
+            let reason = error.to_string();
+            callback
+                .abandon_checkpoint_attempt(attempt, &reason, admission.assignment_fence.clone())
+                .await
+                .map_err(|cleanup| {
+                    format!("{reason}; reserved checkpoint cleanup failed: {cleanup}")
+                })?;
+            return Err(reason);
+        }
         if let Err(error) = callback
             .publish_checkpoint_prepare(
                 attempt,
@@ -3839,6 +4595,17 @@ impl StreamingCoordinator {
             }
             return Err(error);
         }
+        #[cfg(feature = "cluster")]
+        if let Err(error) = self.require_process_authority("checkpoint prepare completion") {
+            let reason = error.to_string();
+            callback
+                .abandon_checkpoint_attempt(attempt, &reason, admission.assignment_fence.clone())
+                .await
+                .map_err(|cleanup| {
+                    format!("{reason}; prepared checkpoint cleanup failed: {cleanup}")
+                })?;
+            return Err(reason);
+        }
         Ok(attempt)
     }
 
@@ -3851,6 +4618,15 @@ impl StreamingCoordinator {
     ) -> Result<(), String> {
         match outcome {
             BarrierOutcome::Committed(epoch) if epoch == attempt.epoch => {
+                #[cfg(feature = "cluster")]
+                if let Err(error) =
+                    self.require_process_authority("source-less checkpoint publication")
+                {
+                    let reason = error.to_string();
+                    callback.abort_subscription_cut(attempt);
+                    self.fail_manual_attempt(attempt, &reason);
+                    return Err(reason);
+                }
                 let publication_error = callback.publish_barrier(attempt).err();
                 self.broadcast_epoch_committed(epoch, &FxHashMap::default());
                 self.finish_manual_success(
@@ -3954,6 +4730,22 @@ impl StreamingCoordinator {
                 return;
             }
         };
+        self.complete_prepared_source_less_checkpoint(
+            callback,
+            admission,
+            attempt,
+            attempt_started,
+        )
+        .await;
+    }
+
+    async fn complete_prepared_source_less_checkpoint(
+        &mut self,
+        callback: &mut impl PipelineCallback,
+        admission: &CheckpointAdmission,
+        attempt: CheckpointAttempt,
+        attempt_started: Instant,
+    ) {
         if admission.manual {
             self.activate_manual_attempt(attempt);
         }
@@ -3981,6 +4773,27 @@ impl StreamingCoordinator {
             self.last_checkpoint = Instant::now();
             return;
         }
+        #[cfg(feature = "cluster")]
+        if let Err(error) = self.require_process_authority("source-less checkpoint capture") {
+            let reason = error.to_string();
+            let cleanup = Self::cleanup_checkpoint_attempt(
+                callback,
+                attempt,
+                &reason,
+                admission.assignment_fence.clone(),
+            )
+            .await;
+            self.fail_manual_attempt(attempt, &reason);
+            callback.record_checkpoint_failure(attempt.checkpoint_id, &reason);
+            if let Err(cleanup_error) = cleanup {
+                callback.record_checkpoint_failure(
+                    attempt.checkpoint_id,
+                    &format!("{reason}; checkpoint cleanup failed: {cleanup_error}"),
+                );
+            }
+            self.last_checkpoint = Instant::now();
+            return;
+        }
         if let Err(error) = callback.reserve_subscription_cut(attempt) {
             tracing::error!(%error, "source-less subscription cut reservation failed");
             if let Err(cleanup_error) = self
@@ -3995,6 +4808,28 @@ impl StreamingCoordinator {
                 callback.record_checkpoint_failure(
                     attempt.checkpoint_id,
                     &format!("{error}; checkpoint cleanup failed: {cleanup_error}"),
+                );
+            }
+            self.last_checkpoint = Instant::now();
+            return;
+        }
+        #[cfg(feature = "cluster")]
+        if let Err(error) = self.require_process_authority("source-less checkpoint capture start") {
+            let reason = error.to_string();
+            callback.abort_subscription_cut(attempt);
+            let cleanup = Self::cleanup_checkpoint_attempt(
+                callback,
+                attempt,
+                &reason,
+                admission.assignment_fence.clone(),
+            )
+            .await;
+            self.fail_manual_attempt(attempt, &reason);
+            callback.record_checkpoint_failure(attempt.checkpoint_id, &reason);
+            if let Err(cleanup_error) = cleanup {
+                callback.record_checkpoint_failure(
+                    attempt.checkpoint_id,
+                    &format!("{reason}; checkpoint cleanup failed: {cleanup_error}"),
                 );
             }
             self.last_checkpoint = Instant::now();
@@ -4050,8 +4885,39 @@ impl StreamingCoordinator {
                 return;
             }
         };
+        self.inject_prepared_source_barrier_attempt(callback, admission, attempt, attempt_started)
+            .await;
+    }
+
+    async fn inject_prepared_source_barrier_attempt(
+        &mut self,
+        callback: &mut impl PipelineCallback,
+        admission: &CheckpointAdmission,
+        attempt: CheckpointAttempt,
+        attempt_started: Instant,
+    ) {
         if admission.manual {
             self.activate_manual_attempt(attempt);
+        }
+        #[cfg(feature = "cluster")]
+        if let Err(error) = self.require_process_authority("source barrier injection") {
+            let reason = error.to_string();
+            let cleanup = Self::cleanup_checkpoint_attempt(
+                callback,
+                attempt,
+                &reason,
+                admission.assignment_fence.clone(),
+            )
+            .await;
+            self.fail_manual_attempt(attempt, &reason);
+            callback.record_checkpoint_failure(attempt.checkpoint_id, &reason);
+            if let Err(cleanup_error) = cleanup {
+                callback.record_checkpoint_failure(
+                    attempt.checkpoint_id,
+                    &format!("{reason}; checkpoint cleanup failed: {cleanup_error}"),
+                );
+            }
+            return;
         }
         self.pending_barrier.reset_with_assignment(
             attempt,
@@ -4097,6 +4963,11 @@ impl StreamingCoordinator {
     /// Service periodic, manual, or leader-announced checkpoint admission.
     async fn maybe_checkpoint(&mut self, callback: &mut impl PipelineCallback) {
         self.drain_manual_requests();
+        #[cfg(feature = "cluster")]
+        if let Err(error) = self.require_process_authority("checkpoint admission") {
+            self.fail_waiting_manual(&error.to_string());
+            return;
+        }
 
         // Followers do not originate attempts. Preserve their resource cap while servicing the
         // leader's exact control announcement; leader/local admission applies its own cap below.
@@ -4107,10 +4978,22 @@ impl StreamingCoordinator {
             if !self.checkpoint_capacity_available() {
                 return;
             }
-            match callback
+            let outcome = callback
                 .service_checkpoint_control(self.current_source_offsets())
-                .await
+                .await;
+            #[cfg(feature = "cluster")]
+            if let Err(error) =
+                self.require_process_authority("follower checkpoint control application")
             {
+                let reason = error.to_string();
+                if let CheckpointControlOutcome::Started { attempt, .. }
+                | CheckpointControlOutcome::Failed { attempt, .. } = &outcome
+                {
+                    callback.record_checkpoint_failure(attempt.checkpoint_id, &reason);
+                }
+                return;
+            }
+            match outcome {
                 CheckpointControlOutcome::Idle => {}
                 CheckpointControlOutcome::Started { attempt, captured } => {
                     if !captured {
@@ -4127,6 +5010,11 @@ impl StreamingCoordinator {
         let Some(admission) = self.checkpoint_admission(callback).await else {
             return;
         };
+        #[cfg(feature = "cluster")]
+        if let Err(error) = self.require_process_authority("checkpoint attempt creation") {
+            self.fail_waiting_manual(&error.to_string());
+            return;
+        }
         if self.source_handles.is_empty() {
             self.admit_source_less_checkpoint(callback, &admission)
                 .await;
@@ -4323,6 +5211,16 @@ mod tests {
         assignment_ready: bool,
     }
 
+    #[cfg(feature = "cluster")]
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ProcessAuthorityFencePoint {
+        Watermark,
+        CheckpointDrain,
+        PreparePublication,
+        SubscriptionCut,
+        CheckpointControl,
+    }
+
     /// Minimal mock callback for testing the coordinator loop.
     struct MockCallback {
         cycle_count: u32,
@@ -4340,7 +5238,7 @@ mod tests {
         )>,
         prepare_error: Option<String>,
         checkpoint_order: Arc<Mutex<Vec<&'static str>>>,
-        checkpoint_drain_error: Option<String>,
+        checkpoint_drain_error: Option<CycleError>,
         abandon_error: Option<String>,
         abandoned_attempts: Arc<Mutex<Vec<(CheckpointAttempt, String)>>>,
         abandoned_fences:
@@ -4349,6 +5247,8 @@ mod tests {
         barrier_outcome: Option<BarrierOutcome>,
         results: Vec<FxHashMap<Arc<str>, Vec<RecordBatch>>>,
         watermark: i64,
+        /// Halt cleanly on this 1-based cycle number.
+        halt_at_cycle: Option<u32>,
         /// Fail on this 1-based cycle number.
         fatal_at_cycle: Option<u32>,
         /// Require recovery on this 1-based cycle number, independent of delivery guarantee.
@@ -4364,14 +5264,21 @@ mod tests {
         pipeline_fault: Option<String>,
         /// Exact downstream checkpoint identities published by async completions.
         published_barriers: Arc<Mutex<Vec<(u64, u64)>>>,
+        reserved_subscription_cuts: Arc<Mutex<Vec<CheckpointAttempt>>>,
+        aborted_subscription_cuts: Arc<Mutex<Vec<CheckpointAttempt>>>,
         publish_barrier_error: Arc<Mutex<Option<String>>>,
         publication_error: Arc<Mutex<Option<String>>>,
+        sink_publication_error: Arc<Mutex<Option<String>>>,
         written_rows: Arc<AtomicU64>,
         published_barriers_observed_at_close: Arc<AtomicU64>,
         invalidated_subscriptions: Arc<Mutex<Vec<String>>>,
         close_error: Option<String>,
         barrier_control_installed: Arc<AtomicBool>,
         intake_gate: Arc<AtomicBool>,
+        #[cfg(feature = "cluster")]
+        process_authority_fence:
+            Arc<Mutex<Option<(ProcessAuthorityFencePoint, Arc<ClusterController>)>>>,
+        control_checkpoint_outcome: Option<CheckpointControlOutcome>,
     }
 
     impl MockCallback {
@@ -4401,6 +5308,7 @@ mod tests {
                 barrier_outcome: None,
                 results: Vec::new(),
                 watermark: 0,
+                halt_at_cycle: None,
                 fatal_at_cycle: None,
                 recovery_at_cycle: None,
                 defer_at_cycle: None,
@@ -4410,14 +5318,38 @@ mod tests {
                 fault_on_error: false,
                 pipeline_fault: None,
                 published_barriers: Arc::new(Mutex::new(Vec::new())),
+                reserved_subscription_cuts: Arc::new(Mutex::new(Vec::new())),
+                aborted_subscription_cuts: Arc::new(Mutex::new(Vec::new())),
                 publish_barrier_error: Arc::new(Mutex::new(None)),
                 publication_error: Arc::new(Mutex::new(None)),
+                sink_publication_error: Arc::new(Mutex::new(None)),
                 written_rows: Arc::new(AtomicU64::new(0)),
                 published_barriers_observed_at_close: Arc::new(AtomicU64::new(0)),
                 invalidated_subscriptions: Arc::new(Mutex::new(Vec::new())),
                 close_error: None,
                 barrier_control_installed: Arc::new(AtomicBool::new(false)),
                 intake_gate: Arc::new(AtomicBool::new(false)),
+                #[cfg(feature = "cluster")]
+                process_authority_fence: Arc::new(Mutex::new(None)),
+                control_checkpoint_outcome: None,
+            }
+        }
+
+        #[cfg(feature = "cluster")]
+        fn fence_process_authority_at(&self, point: ProcessAuthorityFencePoint) {
+            let controller = {
+                let mut configured = self.process_authority_fence.lock();
+                if configured
+                    .as_ref()
+                    .is_some_and(|(configured, _)| *configured == point)
+                {
+                    configured.take().map(|(_, controller)| controller)
+                } else {
+                    None
+                }
+            };
+            if let Some(controller) = controller {
+                controller.fence_process_lease();
             }
         }
     }
@@ -4435,6 +5367,12 @@ mod tests {
                 .map(RecordBatch::num_rows)
                 .sum();
             self.cycle_input_rows.lock().push(input_rows);
+            if self.halt_at_cycle == Some(self.cycle_count) {
+                return Err(CycleError::Halt(format!(
+                    "injected halt at cycle {}",
+                    self.cycle_count
+                )));
+            }
             if self.recovery_at_cycle == Some(self.cycle_count) {
                 return Err(CycleError::Recovery(format!(
                     "injected recovery at cycle {}",
@@ -4476,10 +5414,9 @@ mod tests {
             _deadline: tokio::time::Instant,
         ) -> Result<(), CycleError> {
             self.checkpoint_order.lock().push("drain");
-            match self.checkpoint_drain_error.take() {
-                Some(error) => Err(CycleError::Recovery(error)),
-                None => Ok(()),
-            }
+            #[cfg(feature = "cluster")]
+            self.fence_process_authority_at(ProcessAuthorityFencePoint::CheckpointDrain);
+            self.checkpoint_drain_error.take().map_or(Ok(()), Err)
         }
 
         fn note_cycle_error(&self) {
@@ -4535,6 +5472,8 @@ mod tests {
             assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
         ) -> Result<(), String> {
             self.prepared_attempts.push((attempt, assignment_fence));
+            #[cfg(feature = "cluster")]
+            self.fence_process_authority_at(ProcessAuthorityFencePoint::PreparePublication);
             match self.prepare_error.take() {
                 Some(error) => Err(error),
                 None => Ok(()),
@@ -4580,7 +5519,14 @@ mod tests {
                 None => Ok(()),
             }
         }
-        async fn write_to_sinks(&mut self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
+        async fn write_to_sinks(
+            &mut self,
+            results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+            _deadline: Option<tokio::time::Instant>,
+        ) -> Result<(), CycleError> {
+            if let Some(error) = self.sink_publication_error.lock().take() {
+                return Err(CycleError::Recovery(error));
+            }
             let rows = results
                 .values()
                 .flat_map(|batches| batches.iter())
@@ -4588,9 +5534,12 @@ mod tests {
                 .sum::<usize>();
             self.written_rows
                 .fetch_add(u64::try_from(rows).unwrap(), Ordering::SeqCst);
+            Ok(())
         }
 
         fn extract_watermark(&mut self, _source_name: &str, batch: &RecordBatch) {
+            #[cfg(feature = "cluster")]
+            self.fence_process_authority_at(ProcessAuthorityFencePoint::Watermark);
             // Use row count as a simple watermark proxy.
             #[allow(clippy::cast_possible_wrap)]
             {
@@ -4616,6 +5565,17 @@ mod tests {
             Ok(())
         }
 
+        fn reserve_subscription_cut(&self, attempt: CheckpointAttempt) -> Result<(), String> {
+            self.reserved_subscription_cuts.lock().push(attempt);
+            #[cfg(feature = "cluster")]
+            self.fence_process_authority_at(ProcessAuthorityFencePoint::SubscriptionCut);
+            Ok(())
+        }
+
+        fn abort_subscription_cut(&self, attempt: CheckpointAttempt) {
+            self.aborted_subscription_cuts.lock().push(attempt);
+        }
+
         async fn service_checkpoint_control(
             &mut self,
             _source_offsets: FxHashMap<String, SourceCheckpoint>,
@@ -4623,7 +5583,11 @@ mod tests {
             self.control_checkpoint_calls += 1;
             self.control_checkpoint_call_audit
                 .fetch_add(1, Ordering::SeqCst);
-            CheckpointControlOutcome::Idle
+            #[cfg(feature = "cluster")]
+            self.fence_process_authority_at(ProcessAuthorityFencePoint::CheckpointControl);
+            self.control_checkpoint_outcome
+                .take()
+                .unwrap_or(CheckpointControlOutcome::Idle)
         }
 
         async fn checkpoint_with_barrier(
@@ -4725,6 +5689,7 @@ mod tests {
             source_handles: Vec::new(),
             source_names: vec![Arc::from("test_source")],
             shutdown,
+            terminal_shutdown: tokio_util::sync::CancellationToken::new(),
             pending_barrier: PendingBarrier::new(),
             last_checkpoint: Instant::now(),
             source_batches_buf: FxHashMap::default(),
@@ -4744,6 +5709,8 @@ mod tests {
             staged_bytes: Arc::new(AtomicU64::new(0)),
             max_staged_bytes: u64::MAX,
             coordinated_commit_admission: None,
+            #[cfg(feature = "cluster")]
+            process_authority: None,
         }
     }
 
@@ -5155,6 +6122,241 @@ mod tests {
         coordinator
     }
 
+    #[cfg(feature = "cluster")]
+    fn install_test_process_authority(
+        coordinator: &mut StreamingCoordinator,
+        node: u64,
+    ) -> Arc<ClusterController> {
+        use laminar_core::cluster::control::{ClusterKv, InMemoryKv, LeaseDeadline};
+
+        let node_id = laminar_core::state::NodeId(node);
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node_id));
+        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(node_id, kv, None, members_rx));
+        controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+            .unwrap();
+        coordinator.process_authority = Some(SourceProcessAuthority::new(Arc::clone(&controller)));
+        controller
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn process_lease_loss_wakes_coordinator_delay() {
+        let mut coordinator = admission_coordinator(Vec::new());
+        install_test_process_authority(&mut coordinator, 40);
+        let authority = coordinator.process_authority.as_ref().unwrap();
+        let lost = authority.lost.clone();
+        let wait = wait_coordinator_delay(Duration::from_secs(60), Some(authority));
+        tokio::pin!(wait);
+        tokio::task::yield_now().await;
+        lost.cancel();
+
+        assert!(tokio::time::timeout(Duration::from_millis(100), wait)
+            .await
+            .expect("process lease loss remained hidden behind coordinator delay"));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn process_lease_loss_after_prepare_abandons_the_exact_attempt() {
+        let mut coordinator = admission_coordinator(Vec::new());
+        let controller = install_test_process_authority(&mut coordinator, 41);
+        let attempt = CheckpointAttempt::new(41, 4_041);
+        let admission = CheckpointAdmission {
+            manual: false,
+            assignment_fence: None,
+        };
+        let mut callback = MockCallback::new();
+        callback.attempt_to_reserve = attempt;
+        *callback.process_authority_fence.lock() =
+            Some((ProcessAuthorityFencePoint::PreparePublication, controller));
+        let abandoned = Arc::clone(&callback.abandoned_attempts);
+
+        let error = coordinator
+            .reserve_prepared_checkpoint_attempt(&mut callback, &admission, Instant::now())
+            .await
+            .expect_err("lease loss after Prepare publication must abandon the attempt");
+
+        assert!(error.contains("checkpoint prepare completion"), "{error}");
+        assert_eq!(callback.prepared_attempts.len(), 1);
+        let abandoned = abandoned.lock();
+        assert_eq!(abandoned.len(), 1);
+        assert_eq!(abandoned[0].0, attempt);
+        assert!(abandoned[0].1.contains("checkpoint prepare completion"));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn source_less_checkpoint_rechecks_authority_after_each_async_cut_boundary() {
+        for (node, point, boundary, cut_reserved) in [
+            (
+                42,
+                ProcessAuthorityFencePoint::CheckpointDrain,
+                "source-less checkpoint capture",
+                false,
+            ),
+            (
+                43,
+                ProcessAuthorityFencePoint::SubscriptionCut,
+                "source-less checkpoint capture start",
+                true,
+            ),
+        ] {
+            let mut coordinator = admission_coordinator(Vec::new());
+            let controller = install_test_process_authority(&mut coordinator, node);
+            let attempt = CheckpointAttempt::new(node, 4_000 + node);
+            let admission = CheckpointAdmission {
+                manual: false,
+                assignment_fence: None,
+            };
+            let mut callback = MockCallback::new();
+            callback.attempt_to_reserve = attempt;
+            *callback.process_authority_fence.lock() = Some((point, controller));
+            let abandoned = Arc::clone(&callback.abandoned_attempts);
+            let reserved = Arc::clone(&callback.reserved_subscription_cuts);
+            let aborted = Arc::clone(&callback.aborted_subscription_cuts);
+
+            coordinator
+                .admit_source_less_checkpoint(&mut callback, &admission)
+                .await;
+
+            assert!(callback.barrier_captures.is_empty());
+            assert_eq!(
+                reserved.lock().as_slice(),
+                cut_reserved.then_some(attempt).as_slice()
+            );
+            assert_eq!(
+                aborted.lock().as_slice(),
+                cut_reserved.then_some(attempt).as_slice()
+            );
+            let abandoned = abandoned.lock();
+            assert_eq!(abandoned.len(), 1);
+            assert_eq!(abandoned[0].0, attempt);
+            assert!(abandoned[0].1.contains(boundary), "{:?}", *abandoned);
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn aligned_checkpoint_rechecks_authority_after_each_async_cut_boundary() {
+        for (node, point, boundary, cut_reserved) in [
+            (
+                44,
+                ProcessAuthorityFencePoint::CheckpointDrain,
+                "aligned checkpoint capture",
+                false,
+            ),
+            (
+                45,
+                ProcessAuthorityFencePoint::SubscriptionCut,
+                "aligned checkpoint capture start",
+                true,
+            ),
+        ] {
+            let (source, _poll) = checkpoint_source_handle("source");
+            let mut release_rx = source.barrier_release_tx.subscribe();
+            let mut coordinator = admission_coordinator(vec![source]);
+            let controller = install_test_process_authority(&mut coordinator, node);
+            let attempt = CheckpointAttempt::new(node, 4_000 + node);
+            coordinator.pending_barrier.reset(attempt, 1);
+            let barrier = CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch);
+            let mut callback = MockCallback::new();
+            *callback.process_authority_fence.lock() = Some((point, controller));
+            let abandoned = Arc::clone(&callback.abandoned_attempts);
+            let reserved = Arc::clone(&callback.reserved_subscription_cuts);
+            let aborted = Arc::clone(&callback.aborted_subscription_cuts);
+
+            let error = coordinator
+                .handle_barrier(0, &barrier, &checkpoint_at(node), &mut callback)
+                .await
+                .expect_err("lease loss must stop aligned checkpoint capture");
+
+            assert!(error.to_string().contains(boundary), "{error}");
+            assert!(!coordinator.pending_barrier.active);
+            assert!(callback.barrier_captures.is_empty());
+            assert_eq!(
+                reserved.lock().as_slice(),
+                cut_reserved.then_some(attempt).as_slice()
+            );
+            assert_eq!(
+                aborted.lock().as_slice(),
+                cut_reserved.then_some(attempt).as_slice()
+            );
+            let abandoned = abandoned.lock();
+            assert_eq!(abandoned.len(), 1);
+            assert_eq!(abandoned[0].0, attempt);
+            assert!(abandoned[0].1.contains(boundary), "{:?}", *abandoned);
+            assert_eq!(
+                *release_rx.borrow_and_update(),
+                Some(SourceBarrierSignal::Release(attempt))
+            );
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn follower_control_outcome_is_not_applied_after_process_lease_loss() {
+        let mut coordinator = admission_coordinator(Vec::new());
+        let controller = install_test_process_authority(&mut coordinator, 46);
+        let attempt = CheckpointAttempt::new(46, 4_046);
+        let mut callback = MockCallback::new();
+        callback.runtime.leader = false;
+        callback.control_checkpoint_outcome = Some(CheckpointControlOutcome::Started {
+            attempt,
+            captured: false,
+        });
+        *callback.process_authority_fence.lock() =
+            Some((ProcessAuthorityFencePoint::CheckpointControl, controller));
+
+        coordinator.maybe_checkpoint(&mut callback).await;
+
+        assert_eq!(callback.control_checkpoint_calls, 1);
+        assert!(!coordinator.pending_barrier.active);
+        assert!(callback
+            .checkpoint_failures
+            .iter()
+            .any(|(id, reason)| *id == attempt.checkpoint_id
+                && reason.contains("follower checkpoint control application")));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn source_barrier_state_is_not_installed_after_process_lease_loss() {
+        let (source, poll) = checkpoint_source_handle("source");
+        let mut coordinator = admission_coordinator(vec![source]);
+        let controller = install_test_process_authority(&mut coordinator, 47);
+        let attempt = CheckpointAttempt::new(47, 4_047);
+        let (reply_tx, reply_rx) = crossfire::oneshot::oneshot();
+        coordinator.manual_waiting.push(reply_tx);
+        let admission = CheckpointAdmission {
+            manual: true,
+            assignment_fence: None,
+        };
+        let mut callback = MockCallback::new();
+        let abandoned = Arc::clone(&callback.abandoned_attempts);
+        controller.fence_process_lease();
+
+        coordinator
+            .inject_prepared_source_barrier_attempt(
+                &mut callback,
+                &admission,
+                attempt,
+                Instant::now(),
+            )
+            .await;
+
+        assert!(!coordinator.pending_barrier.active);
+        assert!(coordinator.manual_active.is_none());
+        assert!(poll.poll().is_none());
+        let error = reply_rx.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("source barrier injection"));
+        let abandoned = abandoned.lock();
+        assert_eq!(abandoned.len(), 1);
+        assert_eq!(abandoned[0].0, attempt);
+        assert!(abandoned[0].1.contains("source barrier injection"));
+    }
+
     #[test]
     fn durable_completion_publication_requires_strict_identity_progress() {
         let mut coordinator = admission_coordinator(Vec::new());
@@ -5225,6 +6427,46 @@ mod tests {
         );
         assert!(callback.checkpoint_failures.is_empty());
         assert_eq!(coordinator.last_published_checkpoint, Some(attempt));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn durable_completion_does_not_publish_or_ack_after_process_lease_loss() {
+        use laminar_core::cluster::control::{ClusterKv, InMemoryKv, LeaseDeadline};
+
+        let (source, _poll) = checkpoint_source_handle("source");
+        let committed_rx = source.epoch_committed_tx.subscribe();
+        let mut coordinator = admission_coordinator(vec![source]);
+        let node_id = laminar_core::state::NodeId(36);
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node_id));
+        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(node_id, kv, None, members_rx));
+        controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::fenced()))
+            .unwrap();
+        coordinator.process_authority = Some(SourceProcessAuthority::new(controller));
+        let mut callback = MockCallback::new();
+        let published = Arc::clone(&callback.published_barriers);
+        let aborted = Arc::clone(&callback.aborted_subscription_cuts);
+        let attempt = CheckpointAttempt::new(14, 140);
+        let mut source_checkpoints = FxHashMap::default();
+        source_checkpoints.insert("source".to_owned(), checkpoint_at(140));
+        let completion = CheckpointCompletion::validated(
+            attempt,
+            successful_checkpoint_result(attempt),
+            source_checkpoints,
+        )
+        .unwrap();
+
+        let error = coordinator
+            .handle_checkpoint_completion(completion, &mut callback)
+            .expect("lease loss must fault local durable-completion publication");
+
+        assert!(error.contains("cluster process lease expired"));
+        assert!(published.lock().is_empty());
+        assert!(committed_rx.borrow().is_none());
+        assert_eq!(aborted.lock().as_slice(), &[attempt]);
+        assert_eq!(coordinator.last_published_checkpoint, None);
     }
 
     #[test]
@@ -5529,7 +6771,8 @@ mod tests {
         coordinator.pending_barrier.reset(attempt, 1);
         let barrier = CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch);
         let mut callback = MockCallback::new();
-        callback.checkpoint_drain_error = Some("injected graph drain failure".into());
+        callback.checkpoint_drain_error =
+            Some(CycleError::Recovery("injected graph drain failure".into()));
         let order = Arc::clone(&callback.checkpoint_order);
 
         let error = coordinator
@@ -5537,9 +6780,46 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.contains("injected graph drain failure"));
+        assert!(error.to_string().contains("injected graph drain failure"));
         assert_eq!(order.lock().as_slice(), &["drain", "cleanup"]);
         assert_eq!(*release.borrow(), None);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_drain_halt_cleans_up_and_exits_without_recovery() {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let (source_tx, source_rx) = mpsc::bounded_async::<SourceMsg>(1);
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
+        let mut coordinator = test_coordinator(
+            source_rx,
+            control_rx,
+            shutdown,
+            DeliveryGuarantee::AtLeastOnce,
+            Some(Duration::from_secs(60)),
+        );
+        let attempt = CheckpointAttempt::new(64, 9_064);
+        coordinator.pending_barrier.reset(attempt, 1);
+        let mut callback = MockCallback::new();
+        callback.checkpoint_drain_error = Some(CycleError::Halt(
+            "injected terminal checkpoint drain".into(),
+        ));
+        let order = Arc::clone(&callback.checkpoint_order);
+        source_tx
+            .send(SourceMsg::Barrier {
+                source_idx: 0,
+                barrier: CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch),
+                checkpoint: checkpoint_at(attempt.epoch),
+            })
+            .await
+            .unwrap();
+
+        let exit = tokio::time::timeout(Duration::from_secs(1), coordinator.run(callback))
+            .await
+            .expect("terminal checkpoint drain must stop the coordinator");
+
+        assert!(matches!(exit, ExitReason::Shutdown));
+        assert_eq!(order.lock().as_slice(), &["drain", "cleanup"]);
+        drop(source_tx);
     }
 
     #[tokio::test]
@@ -5560,7 +6840,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.contains("injected rollback failure"));
+        assert!(error.to_string().contains("injected rollback failure"));
         assert_eq!(order.lock().as_slice(), &["drain", "capture", "cleanup"]);
         assert_eq!(*release.borrow(), None);
     }
@@ -5586,7 +6866,9 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.contains("recovery from the last committed checkpoint is required"));
+        assert!(error
+            .to_string()
+            .contains("recovery from the last committed checkpoint is required"));
         assert_eq!(order.lock().as_slice(), &["drain", "capture", "cleanup"]);
         assert_eq!(*release.borrow(), None);
     }
@@ -5875,8 +7157,11 @@ mod tests {
 
     #[derive(Default)]
     struct BarrierHoldProbeState {
+        starts: AtomicU64,
         polls: AtomicU64,
         control_drives: AtomicU64,
+        commit_notifications: AtomicU64,
+        closes: AtomicU64,
         data_ready: Arc<tokio::sync::Notify>,
         #[cfg(feature = "cluster")]
         drain_begins: AtomicU64,
@@ -5888,9 +7173,28 @@ mod tests {
         state: Arc<BarrierHoldProbeState>,
     }
 
+    #[cfg(feature = "cluster")]
+    fn barrier_hold_probe_source(
+        name: &str,
+        state: Arc<BarrierHoldProbeState>,
+    ) -> SourceRegistration {
+        SourceRegistration {
+            name: name.into(),
+            connector: Box::new(BarrierHoldProbeSource { state }),
+            config: laminar_connectors::config::ConnectorConfig::new(name),
+            contract: laminar_connectors::connector::SourceContract::new(
+                laminar_connectors::connector::SourceConsistency::Replayable,
+                laminar_connectors::connector::SourceTopology::Singleton,
+            ),
+            assignment_scoped: false,
+            position: SourcePosition::Initial,
+        }
+    }
+
     #[async_trait::async_trait]
     impl SourceConnector for BarrierHoldProbeSource {
         async fn start(&mut self, _request: SourceStart) -> Result<(), ConnectorError> {
+            self.state.starts.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
@@ -5922,6 +7226,17 @@ mod tests {
             Some(Arc::clone(&self.state.data_ready))
         }
 
+        async fn notify_epoch_committed(
+            &mut self,
+            _epoch: u64,
+            _checkpoint: &SourceCheckpoint,
+        ) -> Result<(), ConnectorError> {
+            self.state
+                .commit_notifications
+                .fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
         #[cfg(feature = "cluster")]
         fn begin_drain(
             &mut self,
@@ -5948,6 +7263,7 @@ mod tests {
         }
 
         async fn close(&mut self) -> Result<(), ConnectorError> {
+            self.state.closes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -6297,21 +7613,167 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[tokio::test]
-    async fn ready_global_source_drain_holds_polling_but_still_emits_barriers() {
-        let state = Arc::new(BarrierHoldProbeState::default());
-        let source = SourceRegistration {
-            name: "global-drain-probe".into(),
-            connector: Box::new(BarrierHoldProbeSource {
-                state: Arc::clone(&state),
-            }),
-            config: laminar_connectors::config::ConnectorConfig::new("global-drain-probe"),
-            contract: laminar_connectors::connector::SourceContract::new(
-                laminar_connectors::connector::SourceConsistency::Replayable,
-                laminar_connectors::connector::SourceTopology::Singleton,
-            ),
-            assignment_scoped: false,
-            position: SourcePosition::Initial,
+    async fn dropping_process_lease_authority_aborts_its_watcher() {
+        use laminar_core::cluster::control::{ClusterKv, InMemoryKv, LeaseDeadline};
+
+        let node_id = laminar_core::state::NodeId(37);
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node_id));
+        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(node_id, kv, None, members_rx));
+        controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+            .unwrap();
+        let controller_weak = Arc::downgrade(&controller);
+        let authority = SourceProcessAuthority::new(Arc::clone(&controller));
+        let watcher = authority
+            .watcher_abort
+            .as_ref()
+            .expect("a live authority must own its watcher")
+            .clone();
+        drop(controller);
+
+        drop(authority);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !watcher.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping process authority did not terminate its watcher");
+        assert!(controller_weak.upgrade().is_none());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn cluster_source_runtime_requires_installed_process_lease_authority() {
+        use laminar_core::cluster::control::{ClusterKv, InMemoryKv, LeaseDeadline};
+
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
+        let result = StreamingCoordinator::new_with_source_registry(
+            Vec::new(),
+            PipelineConfig::default(),
+            Arc::new(tokio::sync::Notify::new()),
+            control_rx,
+            Arc::new(AtomicBool::new(false)),
+            None,
+            Arc::new(parking_lot::Mutex::new(Vec::new())),
+            crate::db::RuntimeMode::Cluster,
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("cluster source runtime accepted a missing authority controller");
         };
+        assert!(
+            error.to_string().contains("process lease authority"),
+            "{error}"
+        );
+
+        let node_id = laminar_core::state::NodeId(38);
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node_id));
+        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(node_id, kv, None, members_rx));
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
+        let result = StreamingCoordinator::new_with_source_registry(
+            Vec::new(),
+            PipelineConfig::default(),
+            Arc::new(tokio::sync::Notify::new()),
+            control_rx,
+            Arc::new(AtomicBool::new(false)),
+            Some(Arc::clone(&controller)),
+            Arc::new(parking_lot::Mutex::new(Vec::new())),
+            crate::db::RuntimeMode::Cluster,
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("cluster source runtime accepted a controller without a lease deadline");
+        };
+        assert!(
+            error.to_string().contains("shared process lease deadline"),
+            "{error}"
+        );
+
+        controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+            .unwrap();
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
+        let result = StreamingCoordinator::new_with_source_registry(
+            Vec::new(),
+            PipelineConfig::default(),
+            Arc::new(tokio::sync::Notify::new()),
+            control_rx,
+            Arc::new(AtomicBool::new(false)),
+            Some(controller),
+            Arc::new(parking_lot::Mutex::new(Vec::new())),
+            crate::db::RuntimeMode::Local,
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("local source runtime accepted cluster process authority");
+        };
+        assert!(
+            error.to_string().contains("local source runtime"),
+            "{error}"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn expired_process_lease_rejects_source_start_and_closes_connector() {
+        use laminar_core::cluster::control::{ClusterKv, InMemoryKv, LeaseDeadline};
+
+        let state = Arc::new(BarrierHoldProbeState::default());
+        let source = barrier_hold_probe_source("expired-process-lease-probe", Arc::clone(&state));
+        let node_id = laminar_core::state::NodeId(31);
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node_id));
+        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(node_id, kv, None, members_rx));
+        controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::fenced()))
+            .unwrap();
+
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
+        let result = StreamingCoordinator::new_with_source_registry(
+            vec![source],
+            PipelineConfig {
+                fallback_poll_interval: Duration::from_millis(1),
+                checkpoint_interval: None,
+                ..PipelineConfig::default()
+            },
+            Arc::new(tokio::sync::Notify::new()),
+            control_rx,
+            Arc::new(AtomicBool::new(false)),
+            Some(controller),
+            Arc::new(parking_lot::Mutex::new(Vec::new())),
+            crate::db::RuntimeMode::Cluster,
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("expired process authority unexpectedly started the source");
+        };
+
+        assert!(error.to_string().contains("process lease expired"));
+        assert_eq!(state.starts.load(Ordering::SeqCst), 0);
+        assert_eq!(state.polls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.control_drives.load(Ordering::SeqCst), 0);
+        assert_eq!(state.commit_notifications.load(Ordering::SeqCst), 0);
+        assert_eq!(state.closes.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn lease_loss_before_activation_closes_without_polling_or_acknowledging() {
+        use laminar_core::cluster::control::{ClusterKv, InMemoryKv, LeaseDeadline};
+
+        let state = Arc::new(BarrierHoldProbeState::default());
+        let source = barrier_hold_probe_source("fenced-source-task", Arc::clone(&state));
+        let node_id = laminar_core::state::NodeId(32);
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node_id));
+        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(node_id, kv, None, members_rx));
+        controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+            .unwrap();
+
         let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
         let mut coordinator = StreamingCoordinator::new_with_source_registry(
             vec![source],
@@ -6323,8 +7785,194 @@ mod tests {
             Arc::new(tokio::sync::Notify::new()),
             control_rx,
             Arc::new(AtomicBool::new(false)),
+            Some(Arc::clone(&controller)),
             Arc::new(parking_lot::Mutex::new(Vec::new())),
-            true,
+            crate::db::RuntimeMode::Cluster,
+        )
+        .await
+        .unwrap();
+
+        controller.fence_process_lease();
+        let task = coordinator.source_handles[0].task.clone();
+        coordinator.source_handles[0]
+            .epoch_committed_tx
+            .send(Some((1, SourceCheckpoint::new())))
+            .unwrap();
+        coordinator.source_handles[0]
+            .startup_activation
+            .take()
+            .unwrap()
+            .send(());
+        tokio::time::timeout(Duration::from_secs(2), task.wait())
+            .await
+            .expect("fenced process authority did not terminate the source task");
+
+        assert_eq!(state.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(state.polls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.control_drives.load(Ordering::SeqCst), 0);
+        assert_eq!(state.commit_notifications.load(Ordering::SeqCst), 0);
+        assert_eq!(state.closes.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn process_lease_loss_wakes_a_source_blocked_on_the_bounded_fifo() {
+        use laminar_core::cluster::control::{ClusterKv, InMemoryKv, LeaseDeadline};
+
+        let (tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+        tx.send(SourceMsg::Batch {
+            source_idx: 0,
+            batch: int_batch(1),
+            checkpoint: checkpoint_at(1),
+        })
+        .await
+        .unwrap();
+        let node_id = laminar_core::state::NodeId(34);
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node_id));
+        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(node_id, kv, None, members_rx));
+        controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+            .unwrap();
+        let authority = SourceProcessAuthority::new(Arc::clone(&controller));
+        let shutdown = tokio::sync::Notify::new();
+        let mut blocked = std::pin::pin!(send_source_msg(
+            &tx,
+            SourceMsg::Batch {
+                source_idx: 0,
+                batch: int_batch(2),
+                checkpoint: checkpoint_at(2),
+            },
+            &shutdown,
+            Some(&authority),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut blocked)
+                .await
+                .is_err(),
+            "source publication did not block on the full FIFO"
+        );
+
+        controller.fence_process_lease();
+        assert!(!tokio::time::timeout(Duration::from_secs(1), blocked)
+            .await
+            .expect("process lease loss did not wake the blocked source publication"));
+        assert!(rx.recv().await.is_ok());
+        assert!(matches!(rx.try_recv(), Err(crossfire::TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn shutdown_wakes_a_source_blocked_on_the_bounded_fifo_without_cluster_authority() {
+        let (tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+        tx.send(SourceMsg::Batch {
+            source_idx: 0,
+            batch: int_batch(1),
+            checkpoint: checkpoint_at(1),
+        })
+        .await
+        .unwrap();
+        let shutdown = tokio::sync::Notify::new();
+        let mut blocked = std::pin::pin!(send_source_msg(
+            &tx,
+            SourceMsg::Batch {
+                source_idx: 0,
+                batch: int_batch(2),
+                checkpoint: checkpoint_at(2),
+            },
+            &shutdown,
+            #[cfg(feature = "cluster")]
+            None,
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut blocked)
+                .await
+                .is_err(),
+            "source publication did not block on the full FIFO"
+        );
+
+        shutdown.notify_one();
+        assert!(!tokio::time::timeout(Duration::from_secs(1), blocked)
+            .await
+            .expect("shutdown did not wake the blocked source publication"));
+        assert!(rx.recv().await.is_ok());
+        assert!(matches!(rx.try_recv(), Err(crossfire::TryRecvError::Empty)));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn process_lease_loss_between_drain_and_execute_prevents_cycle_publication() {
+        use laminar_core::cluster::control::{ClusterKv, InMemoryKv, LeaseDeadline};
+
+        let (tx, rx) = mpsc::bounded_async::<SourceMsg>(4);
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let mut coordinator = test_coordinator(
+            rx,
+            control_rx,
+            shutdown,
+            DeliveryGuarantee::AtLeastOnce,
+            None,
+        );
+        let node_id = laminar_core::state::NodeId(35);
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node_id));
+        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(node_id, kv, None, members_rx));
+        controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+            .unwrap();
+        coordinator.process_authority = Some(SourceProcessAuthority::new(Arc::clone(&controller)));
+
+        let callback = MockCallback::new();
+        *callback.process_authority_fence.lock() =
+            Some((ProcessAuthorityFencePoint::Watermark, controller));
+        let cycle_input_rows = Arc::clone(&callback.cycle_input_rows);
+        let written_rows = Arc::clone(&callback.written_rows);
+        tx.send(SourceMsg::Batch {
+            source_idx: 0,
+            batch: int_batch(1),
+            checkpoint: checkpoint_at(1),
+        })
+        .await
+        .unwrap();
+
+        let exit = tokio::time::timeout(Duration::from_secs(1), coordinator.run(callback))
+            .await
+            .expect("process authority loss did not stop the drained cycle");
+        assert!(matches!(exit, ExitReason::Fault(ref reason)
+            if reason.contains("cluster process lease expired before operator execution")));
+        assert!(cycle_input_rows.lock().is_empty());
+        assert_eq!(written_rows.load(Ordering::Acquire), 0);
+        drop(tx);
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn ready_global_source_drain_holds_polling_but_still_emits_barriers() {
+        use laminar_core::cluster::control::{ClusterKv, InMemoryKv, LeaseDeadline};
+
+        let state = Arc::new(BarrierHoldProbeState::default());
+        let source = barrier_hold_probe_source("global-drain-probe", Arc::clone(&state));
+        let node_id = laminar_core::state::NodeId(36);
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node_id));
+        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(node_id, kv, None, members_rx));
+        controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+            .unwrap();
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
+        let mut coordinator = StreamingCoordinator::new_with_source_registry(
+            vec![source],
+            PipelineConfig {
+                fallback_poll_interval: Duration::from_millis(1),
+                checkpoint_interval: None,
+                ..PipelineConfig::default()
+            },
+            Arc::new(tokio::sync::Notify::new()),
+            control_rx,
+            Arc::new(AtomicBool::new(false)),
+            Some(controller),
+            Arc::new(parking_lot::Mutex::new(Vec::new())),
+            crate::db::RuntimeMode::Cluster,
         )
         .await
         .unwrap();
@@ -6885,6 +8533,7 @@ mod tests {
         poll_calls: AtomicU64,
         cancelled_polls: AtomicU64,
         commit_notification_calls: AtomicU64,
+        closes: AtomicU64,
         first_poll_started: tokio::sync::Notify,
         release_first_poll: tokio::sync::Notify,
     }
@@ -6908,6 +8557,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl laminar_connectors::connector::SourceConnector for CancellationSafePollSource {
+        fn cancellation_policy(&self) -> ConnectorCancellationPolicy {
+            ConnectorCancellationPolicy::CancelSafe
+        }
+
         async fn start(&mut self, _request: SourceStart) -> Result<(), ConnectorError> {
             Ok(())
         }
@@ -6949,6 +8602,7 @@ mod tests {
         }
 
         async fn close(&mut self) -> Result<(), ConnectorError> {
+            self.state.closes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -7220,6 +8874,43 @@ mod tests {
 
         shutdown.notify_one();
         assert!(matches!(run.await.unwrap(), ExitReason::Shutdown));
+        assert_eq!(state.close_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_runtime_generation_fails_readiness_without_source_activation() {
+        let state = Arc::new(StartupSourceState::default());
+        let source = startup_source(
+            "cancelled-before-ready",
+            Arc::clone(&state),
+            false,
+            false,
+            SourcePosition::Initial,
+        );
+        let coordinator = startup_result(vec![source]).await.unwrap();
+        let terminal_shutdown = tokio_util::sync::CancellationToken::new();
+        terminal_shutdown.cancel();
+        let coordinator = coordinator.with_terminal_shutdown(terminal_shutdown);
+        let (ready_tx, ready_rx) = crossfire::oneshot::oneshot::<Result<(), String>>();
+
+        let run = tokio::spawn(async move {
+            coordinator
+                .run_with_ready(MockCallback::new(), ready_tx)
+                .await
+        });
+        let (readiness, exit) = tokio::time::timeout(Duration::from_secs(1), async {
+            let readiness = ready_rx
+                .await
+                .expect("coordinator retained readiness sender")
+                .expect_err("a cancelled runtime generation must not publish readiness");
+            (readiness, run.await.unwrap())
+        })
+        .await
+        .expect("pre-activation shutdown exceeded the sub-second latency bound");
+
+        assert!(readiness.contains("cancelled before readiness"));
+        assert!(matches!(exit, ExitReason::Shutdown));
+        assert_eq!(state.poll_calls.load(Ordering::SeqCst), 0);
         assert_eq!(state.close_calls.load(Ordering::SeqCst), 1);
     }
 
@@ -7841,6 +9532,73 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn process_lease_loss_cancels_an_in_flight_cancel_safe_poll() {
+        use laminar_core::cluster::control::{ClusterKv, InMemoryKv, LeaseDeadline};
+
+        let state = Arc::new(CancellationSafePollState::default());
+        let source = SourceRegistration {
+            name: "lease-fenced-cancel-safe-source".into(),
+            connector: Box::new(CancellationSafePollSource {
+                state: Arc::clone(&state),
+            }),
+            config: laminar_connectors::config::ConnectorConfig::new(
+                "lease-fenced-cancel-safe-source",
+            ),
+            contract: laminar_connectors::connector::SourceContract::new(
+                laminar_connectors::connector::SourceConsistency::Replayable,
+                laminar_connectors::connector::SourceTopology::Singleton,
+            ),
+            assignment_scoped: false,
+            position: SourcePosition::Initial,
+        };
+        let node_id = laminar_core::state::NodeId(33);
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node_id));
+        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(node_id, kv, None, members_rx));
+        controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+            .unwrap();
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
+        let mut coordinator = StreamingCoordinator::new_with_source_registry(
+            vec![source],
+            PipelineConfig {
+                delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
+                checkpoint_interval: Some(Duration::from_secs(60)),
+                fallback_poll_interval: Duration::from_millis(1),
+                ..PipelineConfig::default()
+            },
+            Arc::new(tokio::sync::Notify::new()),
+            control_rx,
+            Arc::new(AtomicBool::new(false)),
+            Some(Arc::clone(&controller)),
+            Arc::new(parking_lot::Mutex::new(Vec::new())),
+            crate::db::RuntimeMode::Cluster,
+        )
+        .await
+        .unwrap();
+        let task = coordinator.source_handles[0].task.clone();
+        coordinator.source_handles[0]
+            .startup_activation
+            .take()
+            .unwrap()
+            .send(());
+
+        tokio::time::timeout(Duration::from_secs(2), state.first_poll_started.notified())
+            .await
+            .expect("source never entered its first poll");
+        controller.fence_process_lease();
+        tokio::time::timeout(Duration::from_secs(2), task.wait())
+            .await
+            .expect("lease loss did not stop the in-flight poll");
+
+        assert_eq!(state.poll_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.cancelled_polls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.commit_notification_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.closes.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn epoch_commit_waits_for_in_flight_poll_without_cancelling_it() {
         let state = Arc::new(CancellationSafePollState::default());
@@ -8005,6 +9763,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn halt_cycle_error_exits_cleanly() {
+        let (tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
+        let coordinator = test_coordinator(
+            rx,
+            control_rx,
+            Arc::new(tokio::sync::Notify::new()),
+            DeliveryGuarantee::AtLeastOnce,
+            Some(Duration::from_secs(60)),
+        );
+        let mut callback = MockCallback::new();
+        callback.halt_at_cycle = Some(1);
+        tx.send(SourceMsg::Batch {
+            source_idx: 0,
+            batch: int_batch(1),
+            checkpoint: checkpoint_at(1),
+        })
+        .await
+        .unwrap();
+
+        let exit = tokio::time::timeout(Duration::from_secs(1), coordinator.run(callback))
+            .await
+            .expect("halt must stop the coordinator");
+
+        assert!(matches!(exit, ExitReason::Shutdown));
+        drop(tx);
+    }
+
+    #[tokio::test]
     async fn publication_failure_does_not_settle_offsets_or_write_sinks_and_faults_all_modes() {
         let shutdown = Arc::new(tokio::sync::Notify::new());
         let (_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
@@ -8061,6 +9848,41 @@ mod tests {
                 if reason.contains("injected subscription admission failure")));
             assert_eq!(written_rows.load(Ordering::SeqCst), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn sink_publication_failure_does_not_advance_source_cursor() {
+        let (_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
+        let mut coordinator = test_coordinator(
+            rx,
+            control_rx,
+            Arc::new(tokio::sync::Notify::new()),
+            DeliveryGuarantee::AtLeastOnce,
+            None,
+        );
+        coordinator.committed_offsets[0] = Some(checkpoint_at(3));
+        coordinator.pending_offsets[0] = Some(checkpoint_at(7));
+        let mut callback = MockCallback::new();
+        *callback.sink_publication_error.lock() = Some("injected sink rejection".into());
+        let mut results = FxHashMap::default();
+        results.insert(Arc::from("test_source"), vec![int_batch(1)]);
+
+        let error = coordinator
+            .publish_cycle_outputs(&mut callback, &CycleOutcome::clean(results))
+            .await
+            .expect_err("sink publication must fail the cycle");
+
+        assert!(matches!(error, CycleError::Recovery(ref reason)
+            if reason.contains("injected sink rejection")));
+        assert!(coordinator.pending_offsets[0].is_none());
+        assert_eq!(
+            coordinator.committed_offsets[0]
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.get_offset("test_position")),
+            Some("3")
+        );
+        assert_eq!(callback.written_rows.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -8217,6 +10039,7 @@ mod tests {
             source_handles: Vec::new(),
             source_names: vec![Arc::from("test_source")],
             shutdown: Arc::clone(&shutdown),
+            terminal_shutdown: tokio_util::sync::CancellationToken::new(),
             pending_barrier: PendingBarrier::new(),
             last_checkpoint: Instant::now(),
             source_batches_buf: FxHashMap::default(),
@@ -8236,6 +10059,8 @@ mod tests {
             staged_bytes: Arc::new(AtomicU64::new(0)),
             max_staged_bytes: u64::MAX,
             coordinated_commit_admission: None,
+            #[cfg(feature = "cluster")]
+            process_authority: None,
         };
 
         let callback = MockCallback::new();
@@ -8581,6 +10406,7 @@ mod tests {
             source_handles: Vec::new(),
             source_names: vec![Arc::from("test_source")],
             shutdown: Arc::clone(&shutdown),
+            terminal_shutdown: tokio_util::sync::CancellationToken::new(),
             pending_barrier: PendingBarrier::new(),
             last_checkpoint: Instant::now(),
             source_batches_buf: FxHashMap::default(),
@@ -8600,6 +10426,8 @@ mod tests {
             staged_bytes: Arc::new(AtomicU64::new(0)),
             max_staged_bytes: u64::MAX,
             coordinated_commit_admission: None,
+            #[cfg(feature = "cluster")]
+            process_authority: None,
         };
 
         let callback = MockCallback::new();
@@ -8839,6 +10667,7 @@ mod tests {
             source_handles: Vec::new(),
             source_names: vec![Arc::from("s0"), Arc::from("s1")],
             shutdown: Arc::clone(&shutdown),
+            terminal_shutdown: tokio_util::sync::CancellationToken::new(),
             pending_barrier: PendingBarrier::new(),
             last_checkpoint: Instant::now(),
             source_batches_buf: FxHashMap::default(),
@@ -8858,6 +10687,8 @@ mod tests {
             staged_bytes: Arc::new(AtomicU64::new(0)),
             max_staged_bytes: u64::MAX,
             coordinated_commit_admission: None,
+            #[cfg(feature = "cluster")]
+            process_authority: None,
         };
 
         let mut callback = MockCallback::new();
@@ -9026,6 +10857,7 @@ mod tests {
             source_handles: Vec::new(),
             source_names: vec![Arc::from("s0"), Arc::from("s1")],
             shutdown,
+            terminal_shutdown: tokio_util::sync::CancellationToken::new(),
             pending_barrier: PendingBarrier::new(),
             last_checkpoint: Instant::now(),
             source_batches_buf: FxHashMap::default(),
@@ -9045,6 +10877,8 @@ mod tests {
             staged_bytes: Arc::new(AtomicU64::new(0)),
             max_staged_bytes: u64::MAX,
             coordinated_commit_admission: None,
+            #[cfg(feature = "cluster")]
+            process_authority: None,
         };
 
         let mut failed: FxHashSet<Arc<str>> = FxHashSet::default();
@@ -9197,8 +11031,12 @@ mod tests {
         ) -> Result<(), CycleError> {
             self.inner.push_to_streams(r)
         }
-        async fn write_to_sinks(&mut self, r: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
-            self.inner.write_to_sinks(r).await;
+        async fn write_to_sinks(
+            &mut self,
+            r: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+            deadline: Option<tokio::time::Instant>,
+        ) -> Result<(), CycleError> {
+            self.inner.write_to_sinks(r, deadline).await
         }
         fn extract_watermark(&mut self, s: &str, b: &RecordBatch) {
             self.inner.extract_watermark(s, b);
@@ -9300,6 +11138,7 @@ mod tests {
             source_handles: Vec::new(),
             source_names: vec![Arc::from("src")],
             shutdown: Arc::clone(&shutdown),
+            terminal_shutdown: tokio_util::sync::CancellationToken::new(),
             pending_barrier: PendingBarrier::new(),
             last_checkpoint: Instant::now(),
             source_batches_buf: FxHashMap::default(),
@@ -9319,6 +11158,8 @@ mod tests {
             staged_bytes: Arc::new(AtomicU64::new(0)),
             max_staged_bytes: u64::MAX,
             coordinated_commit_admission: None,
+            #[cfg(feature = "cluster")]
+            process_authority: None,
         };
 
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));

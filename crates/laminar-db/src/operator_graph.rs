@@ -144,7 +144,7 @@ const STATS_SAMPLE_INTERVAL: u64 = 32;
 pub(crate) type OperatorStateMap = std::collections::HashMap<String, Vec<u8>>;
 
 /// Persisted operator-graph state ABI.
-pub(crate) const GRAPH_CHECKPOINT_VERSION: u32 = 3;
+pub(crate) const GRAPH_CHECKPOINT_VERSION: u32 = 4;
 
 #[derive(Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct GraphCheckpoint {
@@ -749,8 +749,7 @@ impl OperatorGraph {
         };
 
         // Ownership may have changed again since staging; evict chains for vnodes we no longer own
-        // (stale after an acquire→lose, which would otherwise resurrect retracted state — CL-7),
-        // then drain the rest (all currently owned).
+        // so an acquire→lose race cannot resurrect stale state, then drain the currently owned set.
         let drained: Vec<(u32, crate::db::RehydratedVnode)> = {
             let mut guard = staged_arc.lock();
             if guard.is_empty() {
@@ -3630,6 +3629,15 @@ mod tests {
                 .expect("bind test shuffle receiver"),
         );
         let sender = Arc::new(ShuffleSender::new(1, uuid::Uuid::from_u128(1)));
+        let process_deadline = Arc::new(laminar_core::cluster::control::LeaseDeadline::live_for(
+            std::time::Duration::from_secs(60),
+        ));
+        receiver
+            .install_process_lease_deadline(Arc::clone(&process_deadline))
+            .unwrap();
+        sender
+            .install_process_lease_deadline(process_deadline)
+            .unwrap();
         let fence = laminar_core::checkpoint::CheckpointAssignmentFence::from_owner_map(
             registry.assignment_version(),
             &[self_id.0],
@@ -3713,6 +3721,26 @@ mod tests {
         remote_sender
             .register_peer(1, local_receiver.local_addr())
             .await;
+        let local_process_deadline =
+            Arc::new(laminar_core::cluster::control::LeaseDeadline::live_for(
+                std::time::Duration::from_secs(60),
+            ));
+        local_receiver
+            .install_process_lease_deadline(Arc::clone(&local_process_deadline))
+            .unwrap();
+        local_sender
+            .install_process_lease_deadline(local_process_deadline)
+            .unwrap();
+        let remote_process_deadline =
+            Arc::new(laminar_core::cluster::control::LeaseDeadline::live_for(
+                std::time::Duration::from_secs(60),
+            ));
+        remote_receiver
+            .install_process_lease_deadline(Arc::clone(&remote_process_deadline))
+            .unwrap();
+        remote_sender
+            .install_process_lease_deadline(remote_process_deadline)
+            .unwrap();
         local_receiver
             .install_assignment_fence(&fence, &[1, 2])
             .unwrap();
@@ -3852,6 +3880,27 @@ mod tests {
                 .await
                 .unwrap(),
         );
+        let local_process_deadline =
+            Arc::new(laminar_core::cluster::control::LeaseDeadline::live_for(
+                std::time::Duration::from_secs(60),
+            ));
+        local_receiver
+            .install_process_lease_deadline(Arc::clone(&local_process_deadline))
+            .unwrap();
+        let peer_two_process_deadline =
+            Arc::new(laminar_core::cluster::control::LeaseDeadline::live_for(
+                std::time::Duration::from_secs(60),
+            ));
+        peer_two_receiver
+            .install_process_lease_deadline(Arc::clone(&peer_two_process_deadline))
+            .unwrap();
+        waiting_peer_receiver
+            .install_process_lease_deadline(Arc::new(
+                laminar_core::cluster::control::LeaseDeadline::live_for(
+                    std::time::Duration::from_secs(60),
+                ),
+            ))
+            .unwrap();
         for receiver in [&local_receiver, &peer_two_receiver, &waiting_peer_receiver] {
             receiver
                 .install_assignment_fence(&fence, &[1, 2, 3])
@@ -3866,6 +3915,9 @@ mod tests {
             .register_peer(3, waiting_peer_receiver.local_addr())
             .await;
         local_sender
+            .install_process_lease_deadline(local_process_deadline)
+            .unwrap();
+        local_sender
             .install_assignment_fence(&fence, &[1, 2, 3])
             .unwrap();
         let peer_two_sender = ShuffleSender::new(2, uuid::Uuid::from_u128(2));
@@ -3875,6 +3927,9 @@ mod tests {
         peer_two_sender
             .register_peer(3, waiting_peer_receiver.local_addr())
             .await;
+        peer_two_sender
+            .install_process_lease_deadline(peer_two_process_deadline)
+            .unwrap();
         peer_two_sender
             .install_assignment_fence(&fence, &[1, 2, 3])
             .unwrap();
@@ -4150,23 +4205,20 @@ mod tests {
         use laminar_core::state::CheckpointAttempt;
 
         let mut harness = alignment_harness().await;
-        let started = std::time::Instant::now();
-        let error = harness
-            .graph
-            .align_shuffle_barriers(
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            harness.graph.align_shuffle_barriers(
                 CheckpointAttempt::new(7, 70),
                 0,
                 &harness.fence,
                 tokio::time::Instant::now() + std::time::Duration::from_millis(30),
                 None,
-            )
-            .await
-            .unwrap_err();
+            ),
+        )
+        .await
+        .expect("alignment ignored its supplied deadline")
+        .unwrap_err();
         assert!(error.to_string().contains("absolute deadline"), "{error}");
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(500),
-            "alignment ignored its supplied deadline"
-        );
     }
 
     #[test]

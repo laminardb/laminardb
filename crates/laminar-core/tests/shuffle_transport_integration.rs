@@ -12,6 +12,7 @@ use arrow_schema::{DataType, Field, Schema};
 use laminar_core::checkpoint::{
     CheckpointAssignmentFence, CheckpointBarrier, CheckpointParticipant,
 };
+use laminar_core::cluster::control::LeaseDeadline;
 use laminar_core::shuffle::{ShuffleMessage, ShuffleReceiver, ShuffleSender};
 use uuid::Uuid;
 
@@ -68,6 +69,14 @@ async fn two_nodes_exchange_data_bidirectionally() {
     let recv_b = ShuffleReceiver::bind(2, loopback(), Uuid::from_u128(2))
         .await
         .unwrap();
+    let process_a_deadline = Arc::new(LeaseDeadline::live_for(Duration::from_secs(60)));
+    let process_b_deadline = Arc::new(LeaseDeadline::live_for(Duration::from_secs(60)));
+    recv_a
+        .install_process_lease_deadline(Arc::clone(&process_a_deadline))
+        .unwrap();
+    recv_b
+        .install_process_lease_deadline(Arc::clone(&process_b_deadline))
+        .unwrap();
     let fence = assignment_fence();
     recv_a
         .install_assignment_fence(&fence, &ASSIGNMENT_OWNERS)
@@ -81,6 +90,12 @@ async fn two_nodes_exchange_data_bidirectionally() {
     let send_a = ShuffleSender::new(1, Uuid::from_u128(1));
     let send_b = ShuffleSender::new(2, Uuid::from_u128(2));
     send_a
+        .install_process_lease_deadline(process_a_deadline)
+        .unwrap();
+    send_b
+        .install_process_lease_deadline(process_b_deadline)
+        .unwrap();
+    send_a
         .install_assignment_fence(&fence, &ASSIGNMENT_OWNERS)
         .unwrap();
     send_b
@@ -93,14 +108,14 @@ async fn two_nodes_exchange_data_bidirectionally() {
     send_a
         .send_to(
             2,
-            &ShuffleMessage::checkpointed("s".into(), 0, batch(vec![1, 2, 3])),
+            &ShuffleMessage::checkpointed("s".into(), 1, batch(vec![1, 2, 3])),
         )
         .await
         .unwrap();
     send_a
         .send_to(
             2,
-            &ShuffleMessage::checkpointed("s".into(), 0, batch(vec![4, 5, 6])),
+            &ShuffleMessage::checkpointed("s".into(), 1, batch(vec![4, 5, 6])),
         )
         .await
         .unwrap();
@@ -112,7 +127,7 @@ async fn two_nodes_exchange_data_bidirectionally() {
     send_a
         .send_to(
             2,
-            &ShuffleMessage::checkpointed("s".into(), 0, batch(vec![7, 8, 9])),
+            &ShuffleMessage::checkpointed("s".into(), 1, batch(vec![7, 8, 9])),
         )
         .await
         .unwrap();
@@ -158,6 +173,9 @@ async fn two_nodes_exchange_data_bidirectionally() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unregistered_peer_returns_not_found() {
     let sender = ShuffleSender::new(1, Uuid::from_u128(1));
+    sender
+        .install_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+        .unwrap();
     let fence = CheckpointAssignmentFence::from_owner_map(
         1,
         &[1, 42],
@@ -191,11 +209,17 @@ async fn fragmented_batch_is_delivered_before_its_barrier() {
     let receiver = ShuffleReceiver::bind(2, loopback(), Uuid::from_u128(2))
         .await
         .unwrap();
+    receiver
+        .install_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+        .unwrap();
     let fence = assignment_fence();
     receiver
         .install_assignment_fence(&fence, &ASSIGNMENT_OWNERS)
         .unwrap();
     let sender = ShuffleSender::new(1, Uuid::from_u128(1));
+    sender
+        .install_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+        .unwrap();
     sender
         .install_assignment_fence(&fence, &ASSIGNMENT_OWNERS)
         .unwrap();

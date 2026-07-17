@@ -148,6 +148,8 @@ struct ScriptedClusterHarnessSource {
     cursor: usize,
     vnode_registry: Option<Arc<VnodeRegistry>>,
     self_id: Option<NodeId>,
+    source_identity: Option<String>,
+    reconciled_assignment_version: u64,
 }
 
 impl ScriptedClusterHarnessSource {
@@ -156,6 +158,76 @@ impl ScriptedClusterHarnessSource {
             .as_ref()
             .zip(self.self_id)
             .is_some_and(|(registry, self_id)| registry.owner(0) == self_id)
+    }
+
+    fn checked_cursor(&self, raw_cursor: &str, context: &str) -> Result<usize, ConnectorError> {
+        let cursor = raw_cursor.parse::<usize>().map_err(|error| {
+            ConnectorError::ConfigurationError(format!(
+                "scripted source {context} cursor '{raw_cursor}' is invalid: {error}"
+            ))
+        })?;
+        if cursor > self.log.len() {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "scripted source {context} cursor {cursor} exceeds durable log length {}",
+                self.log.len()
+            )));
+        }
+        Ok(cursor)
+    }
+
+    fn reconcile_assignment_handoff(&mut self) -> Result<(), ConnectorError> {
+        let Some((registry, self_id, source_identity)) = self
+            .vnode_registry
+            .as_ref()
+            .zip(self.self_id)
+            .zip(self.source_identity.as_deref())
+            .map(|((registry, self_id), source_identity)| (registry, self_id, source_identity))
+        else {
+            return Ok(());
+        };
+        let published = registry.versioned_snapshot();
+        if published.version() == self.reconciled_assignment_version {
+            return Ok(());
+        }
+        let acquired = published.owners().first().copied() == Some(self_id)
+            && published
+                .owner_changed_version(0)
+                .is_some_and(|changed| changed > self.reconciled_assignment_version);
+        if acquired {
+            let handoff = published.committed_source_handoff().ok_or_else(|| {
+                ConnectorError::ConfigurationError(format!(
+                    "scripted source '{source_identity}' acquired its split without a committed handoff"
+                ))
+            })?;
+            let state = handoff.source(source_identity).ok_or_else(|| {
+                ConnectorError::ConfigurationError(format!(
+                    "committed checkpoint {:?} has no handoff state for scripted source '{source_identity}'",
+                    handoff.attempt()
+                ))
+            })?;
+            let checkpoint = state.checkpoint();
+            if checkpoint
+                .source_assignment_version
+                .map(std::num::NonZeroU64::get)
+                != Some(handoff.checkpoint_assignment_version())
+            {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "scripted source '{source_identity}' handoff assignment does not match its checkpoint fence"
+                )));
+            }
+            let raw_cursor = checkpoint.offsets.get("cursor").ok_or_else(|| {
+                ConnectorError::ConfigurationError(format!(
+                    "scripted source '{source_identity}' handoff is missing cursor"
+                ))
+            })?;
+            self.cursor = self.checked_cursor(raw_cursor, "handoff")?;
+            self.state.last_resume_cursor.store(
+                u64::try_from(self.cursor).expect("source cursor fits u64"),
+                std::sync::atomic::Ordering::Release,
+            );
+        }
+        self.reconciled_assignment_version = published.version();
+        Ok(())
     }
 }
 
@@ -172,17 +244,7 @@ impl SourceConnector for ScriptedClusterHarnessSource {
                         "scripted source recovery checkpoint is missing cursor".into(),
                     )
                 })?;
-                let cursor = raw_cursor.parse::<usize>().map_err(|error| {
-                    ConnectorError::ConfigurationError(format!(
-                        "scripted source recovery cursor '{raw_cursor}' is invalid: {error}"
-                    ))
-                })?;
-                if cursor > self.log.len() {
-                    return Err(ConnectorError::ConfigurationError(format!(
-                        "scripted source recovery cursor {cursor} exceeds durable log length {}",
-                        self.log.len()
-                    )));
-                }
+                let cursor = self.checked_cursor(raw_cursor, "recovery")?;
                 self.cursor = cursor;
                 self.state.last_resume_cursor.store(
                     u64::try_from(cursor).expect("source cursor fits u64"),
@@ -194,6 +256,10 @@ impl SourceConnector for ScriptedClusterHarnessSource {
                 self.log.wait_for_resume_release().await;
             }
         }
+        self.reconciled_assignment_version = self
+            .vnode_registry
+            .as_ref()
+            .map_or(0, |registry| registry.assignment_version());
         Ok(())
     }
 
@@ -201,6 +267,7 @@ impl SourceConnector for ScriptedClusterHarnessSource {
         &mut self,
         max_records: usize,
     ) -> Result<Option<SourceBatch>, ConnectorError> {
+        self.reconcile_assignment_handoff()?;
         if !self.owns_shared_split() {
             return Ok(None);
         }
@@ -273,12 +340,13 @@ impl SourceConnector for ScriptedClusterHarnessSource {
 
     fn set_vnode_assignment(
         &mut self,
-        _source_identity: &str,
+        source_identity: &str,
         registry: Arc<VnodeRegistry>,
         self_id: NodeId,
     ) -> Result<(), ConnectorError> {
         self.vnode_registry = Some(registry);
         self.self_id = Some(self_id);
+        self.source_identity = Some(source_identity.to_owned());
         Ok(())
     }
 
@@ -451,7 +519,7 @@ pub struct NodeRuntime {
     pub shuffle_receiver: Arc<ShuffleReceiver>,
     pub assignment_snapshot_store: Arc<AssignmentSnapshotStore>,
     pub source_state: Arc<ClusterHarnessSourceState>,
-    pub rebalance_shutdown: Arc<tokio::sync::Notify>,
+    pub rebalance_shutdown: CancellationToken,
     pub rebalance_tasks: Vec<tokio::task::JoinHandle<()>>,
     control_leases: ControlLeaseRuntime,
 }
@@ -550,6 +618,20 @@ impl ClusterEngineHarness {
         }))
         .await;
 
+        let process_authorities: Vec<_> = process_leases
+            .iter()
+            .map(|(_, lease, _)| (lease.node, lease.owner, lease.term))
+            .collect();
+        let peer_ids: Vec<NodeId> = cluster.nodes.iter().map(|node| node.instance_id).collect();
+        let mut participants: Vec<CheckpointParticipant> = process_leases
+            .iter()
+            .map(|(_, lease, _)| CheckpointParticipant {
+                node_id: lease.node.0,
+                boot_incarnation: lease.owner,
+            })
+            .collect();
+        participants.sort_unstable_by_key(|participant| participant.node_id);
+
         let leader_config = LeaderLeaseConfig {
             ttl: TEST_LEASE_TTL,
             renew_interval: TEST_LEASE_RENEW_INTERVAL,
@@ -560,9 +642,16 @@ impl ClusterEngineHarness {
         ));
         let catalog_store = Arc::new(CatalogManifestStore::new(Arc::clone(&leader_store)));
         let mut control_leases = Vec::with_capacity(n);
+        let mut leader_managers = Vec::with_capacity(n);
         for (node, (process_store, process_lease, acquisition_started_at)) in
             cluster.nodes.iter().zip(process_leases.into_iter())
         {
+            assert_eq!(process_lease.node, node.instance_id);
+            assert_eq!(
+                process_lease.owner,
+                node.controller.recovery_incarnation(),
+                "process lease must bind the runtime controller"
+            );
             node.controller
                 .set_process_lease_authority(Arc::clone(&process_lease_authority))
                 .expect("install shared process lease authority");
@@ -575,7 +664,8 @@ impl ClusterEngineHarness {
             )
             .expect("process lease manager");
             node.controller
-                .set_process_lease_deadline(process_manager.deadline());
+                .set_process_lease_deadline(process_manager.deadline())
+                .expect("install process lease deadline");
             node.controller
                 .publish_leased_recovery_incarnation(&process_lease)
                 .await
@@ -597,27 +687,91 @@ impl ClusterEngineHarness {
             let process_shutdown = CancellationToken::new();
             let process_task = process_manager.spawn(process_shutdown.clone());
             let leader_shutdown = CancellationToken::new();
-            let leader_task = leader_manager.spawn(
-                leader_shutdown.clone(),
-                node.controller.leader_candidacy_watch(),
-            );
             control_leases.push(ControlLeaseRuntime {
                 process_shutdown,
                 process_task: Some(process_task),
                 leader_shutdown,
-                leader_task: Some(leader_task),
+                leader_task: None,
             });
+            leader_managers.push(leader_manager);
         }
 
-        let deadline = std::time::Instant::now() + CONVERGENCE_DEADLINE;
-        while cluster.nodes[0]
-            .controller
-            .capture_catalog_bootstrap_proof()
-            .is_none()
+        // Resolve the assignment before starting leader contenders. A one-vnode assignment can
+        // exclude the cold-start node, so granting that node a term first creates a real but
+        // transient mismatch between elected assignment leader and durable lease owner.
+        let initial_assignment =
+            resolve_initial_assignment(&snapshot_store, vnode_count, &peer_ids, participants).await;
+        let retained_snapshot = snapshot_store
+            .load()
+            .await
+            .expect("load resolved assignment")
+            .expect("resolved assignment is durable");
+        if initial_assignment.is_some() {
+            let fence = retained_snapshot
+                .assignment_fence()
+                .expect("canonical initial assignment fence");
+            assert!(fence.participants.iter().all(|participant| {
+                process_authorities.iter().any(|(node, boot, _)| {
+                    node.0 == participant.node_id && *boot == participant.boot_incarnation
+                })
+            }));
+            for node in &cluster.nodes {
+                node.controller
+                    .publish_checkpoint_assignment_fence(Some(fence.clone()));
+            }
+        }
+
+        for ((node, leader_manager), runtime) in cluster
+            .nodes
+            .iter()
+            .zip(leader_managers)
+            .zip(&mut control_leases)
         {
+            runtime.leader_task = Some(leader_manager.spawn(
+                runtime.leader_shutdown.clone(),
+                node.controller.leader_candidacy_watch(),
+            ));
+        }
+
+        let expected_leader = cluster.nodes[0]
+            .controller
+            .current_leader()
+            .expect("assignment elects one leader");
+        assert!(cluster
+            .nodes
+            .iter()
+            .all(|node| node.controller.current_leader() == Some(expected_leader)));
+        let (_, expected_boot, expected_process_term) = process_authorities
+            .iter()
+            .find(|(node, _, _)| *node == expected_leader)
+            .copied()
+            .expect("elected leader has a process lease");
+        let expected_controller = cluster
+            .nodes
+            .iter()
+            .find(|node| node.instance_id == expected_leader)
+            .expect("elected leader has a runtime controller");
+        let deadline = std::time::Instant::now() + CONVERGENCE_DEADLINE;
+        loop {
+            if let Some(proof) = expected_controller
+                .controller
+                .capture_catalog_bootstrap_proof()
+            {
+                let durable = leader_store
+                    .load()
+                    .await
+                    .expect("read durable test leader grant");
+                if proof.owner.node_id == expected_leader.0
+                    && proof.owner.boot_id == expected_boot
+                    && proof.owner.process_term == expected_process_term
+                    && durable.is_some_and(|grant| grant.matches_proof(&proof))
+                {
+                    break;
+                }
+            }
             assert!(
                 std::time::Instant::now() < deadline,
-                "durable test leader lease was not acquired",
+                "assignment-elected process did not acquire the exact durable leader grant",
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -637,24 +791,6 @@ impl ClusterEngineHarness {
                 .expect("cluster control-plane server start");
         }
 
-        let peer_ids: Vec<NodeId> = cluster
-            .nodes
-            .iter()
-            .map(|nh| NodeId(nh.instance_id.0))
-            .collect();
-        let mut participants: Vec<CheckpointParticipant> = cluster
-            .nodes
-            .iter()
-            .map(|node| CheckpointParticipant {
-                node_id: node.instance_id.0,
-                boot_incarnation: node.controller.recovery_incarnation(),
-            })
-            .collect();
-        participants.sort_unstable_by_key(|participant| participant.node_id);
-
-        // Resolve one cluster-wide vnode assignment; every node shares it.
-        let initial_assignment =
-            resolve_initial_assignment(&snapshot_store, vnode_count, &peer_ids, participants).await;
         let source_log = Arc::new(ScriptedClusterHarnessLog::default());
         let sink_state = Arc::new(ClusterHarnessSinkState::default());
 
@@ -750,6 +886,8 @@ impl ClusterEngineHarness {
                                 cursor: 0,
                                 vnode_registry: None,
                                 self_id: None,
+                                source_identity: None,
+                                reconciled_assignment_version: 0,
                             }))
                         }),
                     )?;
@@ -786,7 +924,7 @@ impl ClusterEngineHarness {
                 shuffle_receiver: Arc::clone(&receivers[idx]),
                 assignment_snapshot_store: Arc::clone(&snapshot_store),
                 source_state,
-                rebalance_shutdown: Arc::new(tokio::sync::Notify::new()),
+                rebalance_shutdown: CancellationToken::new(),
                 rebalance_tasks: Vec::new(),
                 control_leases: control_leases.next().expect("one lease runtime per node"),
             });
@@ -848,7 +986,7 @@ impl ClusterEngineHarness {
                 Arc::clone(&node.db),
                 Arc::clone(&node.assignment_snapshot_store),
                 Arc::clone(&node.vnode_registry),
-                Arc::clone(&node.rebalance_shutdown),
+                node.rebalance_shutdown.clone(),
                 cfg,
                 Some(Arc::clone(&nh.controller)),
             );
@@ -857,7 +995,7 @@ impl ClusterEngineHarness {
                 Arc::clone(&nh.controller),
                 Arc::clone(&node.assignment_snapshot_store),
                 Arc::clone(&node.vnode_registry),
-                Arc::clone(&node.rebalance_shutdown),
+                node.rebalance_shutdown.clone(),
                 cfg,
             );
             node.rebalance_tasks.push(watcher);
@@ -1090,19 +1228,7 @@ impl ClusterEngineHarness {
             .source_state
             .failure_requested
             .store(true, std::sync::atomic::Ordering::Release);
-        runtime.rebalance_shutdown.notify_waiters();
-        for task in &runtime.rebalance_tasks {
-            task.abort();
-        }
-        for task in runtime.rebalance_tasks.drain(..) {
-            let _ = task.await;
-        }
-
         let source_state = Arc::clone(&runtime.source_state);
-        let instance_id = cluster_node.instance_id;
-        cluster_node.crash().await;
-        drop(runtime);
-
         tokio::time::timeout(Duration::from_secs(2), async {
             while !source_state
                 .failure_observed
@@ -1112,7 +1238,19 @@ impl ClusterEngineHarness {
             }
         })
         .await
-        .expect("failed source data plane must stop without DB shutdown");
+        .expect("source must observe the injected terminal failure before runtime crash");
+
+        runtime.rebalance_shutdown.cancel();
+        for task in &runtime.rebalance_tasks {
+            task.abort();
+        }
+        for task in runtime.rebalance_tasks.drain(..) {
+            let _ = task.await;
+        }
+
+        let instance_id = cluster_node.instance_id;
+        cluster_node.crash().await;
+        drop(runtime);
 
         instance_id
     }
@@ -1129,7 +1267,7 @@ impl ClusterEngineHarness {
             sink_state: _,
         } = self;
         for mut node in nodes {
-            node.rebalance_shutdown.notify_waiters();
+            node.rebalance_shutdown.cancel();
             for task in &node.rebalance_tasks {
                 task.abort();
             }

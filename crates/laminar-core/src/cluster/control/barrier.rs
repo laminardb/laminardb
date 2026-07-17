@@ -2117,7 +2117,7 @@ mod tests {
             boot: uuid::Uuid::from_u128(71),
             process_term: 2,
         };
-        let original_lease = match store.try_acquire(&original, 1).await.unwrap() {
+        let original_lease = match store.begin_new_term(&original, 1).await.unwrap() {
             super::super::LeaseOutcome::Acquired(lease) => lease,
             super::super::LeaseOutcome::Held(_) => unreachable!(),
         };
@@ -2205,7 +2205,7 @@ mod tests {
                 boot: uuid::Uuid::from_u128(1),
                 process_term: 1,
             };
-            let lease = match store.try_acquire(&owner, 1).await.unwrap() {
+            let lease = match store.begin_new_term(&owner, 1).await.unwrap() {
                 crate::cluster::control::LeaseOutcome::Acquired(lease) => lease,
                 crate::cluster::control::LeaseOutcome::Held(_) => unreachable!(),
             };
@@ -2720,7 +2720,7 @@ mod tests {
                 boot: uuid::Uuid::from_u128(1),
                 process_term: 1,
             };
-            let lease = match store.try_acquire(&owner, 1).await.unwrap() {
+            let lease = match store.begin_new_term(&owner, 1).await.unwrap() {
                 crate::cluster::control::LeaseOutcome::Acquired(lease) => lease,
                 crate::cluster::control::LeaseOutcome::Held(_) => unreachable!(),
             };

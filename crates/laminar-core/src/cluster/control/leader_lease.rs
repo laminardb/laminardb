@@ -243,7 +243,7 @@ impl LeaderLeaseOwner {
 pub struct LeaderLease {
     /// Append-only compare-and-set sequence.
     pub seq: u64,
-    /// Fencing token, stable across renewals and advanced on takeover.
+    /// Fencing token, stable across uninterrupted renewals and advanced for each authority term.
     pub token: u64,
     /// Exact process incarnation holding the lease.
     pub owner: LeaderLeaseOwner,
@@ -1045,11 +1045,61 @@ enum AuthorityCreateOutcome {
     Contended(LeaderAuthorityRecord),
 }
 
+#[derive(Clone, Copy)]
+enum SameOwnerToken {
+    #[cfg(test)]
+    Preserve,
+    Rotate,
+    Exact(u64),
+}
+
 /// Candidate-local proof that one exact rival record remained current for a full TTL.
 #[derive(Debug)]
 pub struct LeaderLeaseObservation {
     lease: LeaderLease,
     started: Instant,
+}
+
+/// Coalescing-safe local candidacy state. A generation change means a published grant was lost
+/// and must never reuse its fencing token, even when the current state is eligible again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaderCandidacy {
+    eligible: bool,
+    generation: u64,
+}
+
+impl LeaderCandidacy {
+    pub(crate) const fn initial(eligible: bool) -> Self {
+        Self {
+            eligible,
+            generation: 1,
+        }
+    }
+
+    pub(crate) fn transition(self, eligible: bool) -> Option<Self> {
+        let generation = if self.eligible && !eligible {
+            self.generation.checked_add(1)?
+        } else {
+            self.generation
+        };
+        Some(Self {
+            eligible,
+            generation,
+        })
+    }
+
+    pub(crate) const fn terminal() -> Self {
+        Self {
+            eligible: false,
+            generation: u64::MAX,
+        }
+    }
+
+    /// Whether this process is currently eligible to contend for the leader lease.
+    #[must_use]
+    pub const fn is_eligible(self) -> bool {
+        self.eligible
+    }
 }
 
 /// Leader lease storage or validation failure.
@@ -1061,6 +1111,9 @@ pub enum LeaseError {
     /// Malformed configuration, owner, or durable record.
     #[error("invalid leader lease: {0}")]
     Invalid(String),
+    /// A newer durable authority term superseded an exact renewal.
+    #[error("leader lease fenced: {0}")]
+    Fenced(String),
     /// JSON encoding or decoding failure.
     #[error("JSON: {0}")]
     Json(#[from] serde_json::Error),
@@ -3354,15 +3407,55 @@ impl LeaderLeaseStore {
         }
     }
 
-    /// Acquire an empty authority or renew an exact owner. Rival wall clocks never authorize
+    /// Acquire an empty authority as a new term, or rotate the fencing token when this exact
+    /// process incarnation already owns the durable head. Rival wall clocks never authorize
     /// takeover.
     ///
     /// # Errors
     /// Fails closed on invalid input, object-store I/O, or arithmetic exhaustion.
-    pub async fn try_acquire(
+    pub async fn begin_new_term(
         &self,
         owner: &LeaderLeaseOwner,
         now_ms: i64,
+    ) -> Result<LeaseOutcome, LeaseError> {
+        self.acquire_or_renew_current_term_for_test_inner(owner, now_ms, SameOwnerToken::Rotate)
+            .await
+    }
+
+    /// Renew only the exact durable authority term identified by `token`.
+    ///
+    /// # Errors
+    /// Returns [`LeaseError::Fenced`] if the durable head is absent or belongs to another owner or
+    /// term. Also fails closed on invalid input, object-store I/O, or arithmetic exhaustion.
+    pub async fn renew_exact(
+        &self,
+        owner: &LeaderLeaseOwner,
+        token: u64,
+        now_ms: i64,
+    ) -> Result<LeaseOutcome, LeaseError> {
+        self.acquire_or_renew_current_term_for_test_inner(
+            owner,
+            now_ms,
+            SameOwnerToken::Exact(token),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn acquire_or_renew_current_term_for_test(
+        &self,
+        owner: &LeaderLeaseOwner,
+        now_ms: i64,
+    ) -> Result<LeaseOutcome, LeaseError> {
+        self.acquire_or_renew_current_term_for_test_inner(owner, now_ms, SameOwnerToken::Preserve)
+            .await
+    }
+
+    async fn acquire_or_renew_current_term_for_test_inner(
+        &self,
+        owner: &LeaderLeaseOwner,
+        now_ms: i64,
+        same_owner_token: SameOwnerToken,
     ) -> Result<LeaseOutcome, LeaseError> {
         owner.validate()?;
         self.ttl()?;
@@ -3370,35 +3463,79 @@ impl LeaderLeaseStore {
         loop {
             let current = self.load_record().await?;
             let candidate = match current {
-                None => LeaderAuthorityRecord::initial(LeaderLease {
-                    seq: 1,
-                    token: 1,
-                    owner: owner.clone(),
-                    expires_at_ms,
-                    catalog_manifest: None,
-                }),
+                None => {
+                    if matches!(same_owner_token, SameOwnerToken::Exact(_)) {
+                        return Err(LeaseError::Fenced(
+                            "exact leader renewal lost the durable authority head".into(),
+                        ));
+                    }
+                    LeaderAuthorityRecord::initial(LeaderLease {
+                        seq: 1,
+                        token: 1,
+                        owner: owner.clone(),
+                        expires_at_ms,
+                        catalog_manifest: None,
+                    })
+                }
                 Some(record) if record.lease.owner == *owner => {
+                    let token = match same_owner_token {
+                        #[cfg(test)]
+                        SameOwnerToken::Preserve => record.lease.token,
+                        SameOwnerToken::Rotate => {
+                            record.lease.token.checked_add(1).ok_or_else(|| {
+                                LeaseError::Invalid("leader fencing token exhausted".into())
+                            })?
+                        }
+                        SameOwnerToken::Exact(expected) if expected == record.lease.token => {
+                            expected
+                        }
+                        SameOwnerToken::Exact(_) => {
+                            return Err(LeaseError::Fenced(
+                                "exact leader renewal was superseded by a newer local term".into(),
+                            ));
+                        }
+                    };
                     let lease = LeaderLease {
                         seq: record.lease.seq.checked_add(1).ok_or_else(|| {
                             LeaseError::Invalid("lease sequence exhausted".into())
                         })?,
-                        token: record.lease.token,
+                        token,
                         owner: owner.clone(),
                         expires_at_ms,
                         catalog_manifest: record.lease.catalog_manifest.clone(),
                     };
                     record.preserve_with_lease(lease)
                 }
-                Some(record) => return Ok(LeaseOutcome::Held(record.lease)),
+                Some(record) => {
+                    if matches!(same_owner_token, SameOwnerToken::Exact(_)) {
+                        return Err(LeaseError::Fenced(
+                            "exact leader renewal was superseded by a rival owner".into(),
+                        ));
+                    }
+                    return Ok(LeaseOutcome::Held(record.lease));
+                }
             };
             match self.create_authority_record(&candidate).await? {
                 AuthorityCreateOutcome::Created => {
                     return Ok(LeaseOutcome::Acquired(candidate.lease));
                 }
                 AuthorityCreateOutcome::Contended(winner) if winner.lease.owner == *owner => {
+                    if matches!(
+                        same_owner_token,
+                        SameOwnerToken::Exact(expected) if winner.lease.token != expected
+                    ) {
+                        return Err(LeaseError::Fenced(
+                            "exact leader renewal lost a same-owner CAS race".into(),
+                        ));
+                    }
                     tokio::task::yield_now().await;
                 }
                 AuthorityCreateOutcome::Contended(winner) => {
+                    if matches!(same_owner_token, SameOwnerToken::Exact(_)) {
+                        return Err(LeaseError::Fenced(
+                            "exact leader renewal lost a rival-owner CAS race".into(),
+                        ));
+                    }
                     return Ok(LeaseOutcome::Held(winner.lease));
                 }
             }
@@ -3593,7 +3730,7 @@ impl LeaderLeaseManager {
             owner,
             config,
             lease_tx,
-            deadline: Arc::new(LeaseDeadline::fenced()),
+            deadline: Arc::new(LeaseDeadline::uninitialized()),
         })
     }
 
@@ -3616,6 +3753,12 @@ impl LeaderLeaseManager {
     }
 
     #[cfg(feature = "cluster")]
+    fn withdraw(&self) {
+        self.deadline.withdraw();
+        self.lease_tx.send_replace(None);
+    }
+
+    #[cfg(feature = "cluster")]
     fn fence(&self) {
         self.deadline.fence();
         self.lease_tx.send_replace(None);
@@ -3625,9 +3768,10 @@ impl LeaderLeaseManager {
     async fn attempt_lease(
         &self,
         shutdown: &tokio_util::sync::CancellationToken,
-        candidate: &mut watch::Receiver<bool>,
+        candidate: &mut watch::Receiver<LeaderCandidacy>,
         valid_until: Option<tokio::time::Instant>,
         observation: Option<&LeaderLeaseObservation>,
+        held_token: Option<u64>,
     ) -> LeaseOperationEvent {
         let Some(attempt_valid_until) = tokio::time::Instant::now().checked_add(self.config.ttl)
         else {
@@ -3641,8 +3785,12 @@ impl LeaderLeaseManager {
                 self.store
                     .try_takeover(&self.owner, observation, now_millis())
                     .await
+            } else if let Some(token) = held_token {
+                self.store
+                    .renew_exact(&self.owner, token, now_millis())
+                    .await
             } else {
-                self.store.try_acquire(&self.owner, now_millis()).await
+                self.store.begin_new_term(&self.owner, now_millis()).await
             }
         };
         tokio::select! {
@@ -3661,7 +3809,7 @@ impl LeaderLeaseManager {
     async fn wait_for_candidacy_change(
         &self,
         shutdown: &tokio_util::sync::CancellationToken,
-        candidate: &mut watch::Receiver<bool>,
+        candidate: &mut watch::Receiver<LeaderCandidacy>,
     ) -> bool {
         tokio::select! {
             biased;
@@ -3683,18 +3831,31 @@ impl LeaderLeaseManager {
     async fn run(
         self,
         shutdown: tokio_util::sync::CancellationToken,
-        mut candidate: watch::Receiver<bool>,
+        mut candidate: watch::Receiver<LeaderCandidacy>,
     ) {
         let mut ticker = tokio::time::interval(self.config.renew_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut valid_until: Option<tokio::time::Instant> = None;
         let mut observation: Option<LeaderLeaseObservation> = None;
+        // A newly constructed manager and every locally withdrawn grant need a new durable
+        // fencing token. Only uninterrupted renewals may preserve the current token.
+        let mut held_token = None;
+        let mut candidacy_generation = candidate.borrow().generation;
 
         loop {
-            if !*candidate.borrow_and_update() {
-                self.fence();
+            let candidacy = *candidate.borrow_and_update();
+            if candidacy.generation != candidacy_generation {
+                self.withdraw();
                 observation = None;
                 valid_until = None;
+                held_token = None;
+                candidacy_generation = candidacy.generation;
+            }
+            if !candidacy.eligible {
+                self.withdraw();
+                observation = None;
+                valid_until = None;
+                held_token = None;
                 if !self
                     .wait_for_candidacy_change(&shutdown, &mut candidate)
                     .await
@@ -3715,9 +3876,6 @@ impl LeaderLeaseManager {
                         self.fence();
                         return;
                     }
-                    if !*candidate.borrow_and_update() {
-                        self.fence();
-                    }
                     continue;
                 }
                 () = wait_for_deadline(valid_until) => {
@@ -3728,7 +3886,13 @@ impl LeaderLeaseManager {
             }
 
             let (result, attempt_valid_until) = match self
-                .attempt_lease(&shutdown, &mut candidate, valid_until, observation.as_ref())
+                .attempt_lease(
+                    &shutdown,
+                    &mut candidate,
+                    valid_until,
+                    observation.as_ref(),
+                    held_token,
+                )
                 .await
             {
                 LeaseOperationEvent::Shutdown | LeaseOperationEvent::Deadline => {
@@ -3739,9 +3903,6 @@ impl LeaderLeaseManager {
                     if changed.is_err() {
                         self.fence();
                         return;
-                    }
-                    if !*candidate.borrow_and_update() {
-                        self.fence();
                     }
                     continue;
                 }
@@ -3771,6 +3932,7 @@ impl LeaderLeaseManager {
                     }
                     observation = None;
                     valid_until = Some(attempt_valid_until);
+                    held_token = Some(lease.token);
                     self.deadline.extend_until(attempt_valid_until.into_std());
                     self.lease_tx.send_replace(Some(lease));
                 }
@@ -3779,8 +3941,9 @@ impl LeaderLeaseManager {
                     return;
                 }
                 Ok(LeaseOutcome::Held(rival)) => {
-                    self.fence();
+                    self.withdraw();
                     valid_until = None;
+                    held_token = None;
                     let unchanged = observation
                         .as_ref()
                         .is_some_and(|observed| observed.lease == rival);
@@ -3794,6 +3957,11 @@ impl LeaderLeaseManager {
                         }
                     }
                 }
+                Err(LeaseError::Fenced(error)) => {
+                    tracing::warn!(%error, "leader lease renewal was fenced");
+                    self.fence();
+                    return;
+                }
                 Err(error) => {
                     tracing::warn!(%error, "leader lease operation failed");
                 }
@@ -3801,15 +3969,15 @@ impl LeaderLeaseManager {
         }
     }
 
-    /// Spawn the renewal loop. Loss of candidacy or shutdown fences synchronously with the
-    /// corresponding watch/cancellation notification. A missed renewal fences at the last local
-    /// monotonic deadline and terminates the manager.
+    /// Spawn the renewal loop. Loss of candidacy withdraws the current local grant so this
+    /// manager can contend again later. Shutdown, a missed renewal, or an invalid lease outcome
+    /// terminally fences the manager.
     #[cfg(feature = "cluster")]
     #[must_use]
     pub fn spawn(
         self,
         shutdown: tokio_util::sync::CancellationToken,
-        candidate: watch::Receiver<bool>,
+        candidate: watch::Receiver<LeaderCandidacy>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(self.run(shutdown, candidate))
     }
@@ -4140,10 +4308,12 @@ mod tests {
     async fn exact_owner_renews_without_advancing_token() {
         let store = store(1_000);
         let owner = owner(1, 1, 4);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&owner, 10).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store.begin_new_term(&owner, 10).await.unwrap() else {
             panic!("empty authority must be acquired");
         };
-        let LeaseOutcome::Acquired(second) = store.try_acquire(&owner, 500).await.unwrap() else {
+        let LeaseOutcome::Acquired(second) =
+            store.renew_exact(&owner, first.token, 500).await.unwrap()
+        else {
             panic!("exact owner must renew");
         };
         assert_eq!((first.seq, first.token), (1, 1));
@@ -4151,12 +4321,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_renewal_rejects_a_missing_or_newer_authority_term() {
+        let empty = store(1_000);
+        let owner = owner(1, 1, 4);
+        assert!(empty.renew_exact(&owner, 1, 10).await.is_err());
+
+        let store = store(1_000);
+        let LeaseOutcome::Acquired(first) = store.begin_new_term(&owner, 10).await.unwrap() else {
+            panic!("empty authority must be acquired");
+        };
+        let LeaseOutcome::Acquired(new_term) = store.begin_new_term(&owner, 20).await.unwrap()
+        else {
+            panic!("same-owner reacquisition must rotate its term");
+        };
+        let error = store
+            .renew_exact(&owner, first.token, 30)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, LeaseError::Fenced(_)));
+        assert!(new_term.token > first.token);
+    }
+
+    #[tokio::test]
     async fn fast_rival_clock_cannot_steal() {
         let store = store(30);
         let incumbent = owner(1, 1, 1);
         let rival = owner(2, 2, 1);
-        store.try_acquire(&incumbent, 0).await.unwrap();
-        let LeaseOutcome::Held(current) = store.try_acquire(&rival, i64::MAX - 30).await.unwrap()
+        store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap();
+        let LeaseOutcome::Held(current) = store
+            .acquire_or_renew_current_term_for_test(&rival, i64::MAX - 30)
+            .await
+            .unwrap()
         else {
             panic!("wall time must not authorize a takeover");
         };
@@ -4175,12 +4373,22 @@ mod tests {
         let store = store(20);
         let incumbent = owner(1, 1, 1);
         let rival = owner(2, 2, 1);
-        store.try_acquire(&incumbent, 10_000).await.unwrap();
-        let LeaseOutcome::Held(first) = store.try_acquire(&rival, 0).await.unwrap() else {
+        store
+            .acquire_or_renew_current_term_for_test(&incumbent, 10_000)
+            .await
+            .unwrap();
+        let LeaseOutcome::Held(first) = store
+            .acquire_or_renew_current_term_for_test(&rival, 0)
+            .await
+            .unwrap()
+        else {
             panic!("rival must observe the incumbent");
         };
         let observation = store.observe_rival(&rival, &first).unwrap();
-        store.try_acquire(&incumbent, -10_000).await.unwrap();
+        store
+            .acquire_or_renew_current_term_for_test(&incumbent, -10_000)
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(25)).await;
         let LeaseOutcome::Held(current) =
             store.try_takeover(&rival, &observation, 0).await.unwrap()
@@ -4196,8 +4404,15 @@ mod tests {
         let store = store(15);
         let incumbent = owner(1, 1, 1);
         let rival = owner(2, 2, 1);
-        store.try_acquire(&incumbent, 0).await.unwrap();
-        let LeaseOutcome::Held(current) = store.try_acquire(&rival, 0).await.unwrap() else {
+        store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap();
+        let LeaseOutcome::Held(current) = store
+            .acquire_or_renew_current_term_for_test(&rival, 0)
+            .await
+            .unwrap()
+        else {
             panic!("rival must be held");
         };
         let observation = store.observe_rival(&rival, &current).unwrap();
@@ -4219,8 +4434,15 @@ mod tests {
         let store = store(10);
         let old = owner(7, 1, 3);
         let replacement = owner(7, 2, 4);
-        store.try_acquire(&old, 0).await.unwrap();
-        let LeaseOutcome::Held(current) = store.try_acquire(&replacement, 0).await.unwrap() else {
+        store
+            .acquire_or_renew_current_term_for_test(&old, 0)
+            .await
+            .unwrap();
+        let LeaseOutcome::Held(current) = store
+            .acquire_or_renew_current_term_for_test(&replacement, 0)
+            .await
+            .unwrap()
+        else {
             panic!("new boot cannot renew an old boot's token");
         };
         let observation = store.observe_rival(&replacement, &current).unwrap();
@@ -4242,9 +4464,17 @@ mod tests {
         let left_owner = owner(1, 1, 1);
         let right_owner = owner(2, 2, 1);
         let left_store = Arc::clone(&store);
-        let left = tokio::spawn(async move { left_store.try_acquire(&left_owner, 0).await });
+        let left = tokio::spawn(async move {
+            left_store
+                .acquire_or_renew_current_term_for_test(&left_owner, 0)
+                .await
+        });
         let right_store = Arc::clone(&store);
-        let right = tokio::spawn(async move { right_store.try_acquire(&right_owner, 0).await });
+        let right = tokio::spawn(async move {
+            right_store
+                .acquire_or_renew_current_term_for_test(&right_owner, 0)
+                .await
+        });
         tokio::time::timeout(Duration::from_secs(1), raw.entered.acquire_many(2))
             .await
             .unwrap()
@@ -4269,6 +4499,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_renewal_is_fenced_when_a_rival_wins_its_cas_sequence() {
+        let (raw, store) = blocking_once_at(10, lease_path(2));
+        let incumbent = owner(1, 1, 1);
+        let rival = owner(2, 2, 1);
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
+            panic!("initial leader acquisition");
+        };
+        let observation = store.observe_rival(&rival, &first).unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        let renewing_store = Arc::clone(&store);
+        let renewing_owner = incumbent.clone();
+        let renewal = tokio::spawn(async move {
+            renewing_store
+                .renew_exact(&renewing_owner, first.token, 1)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), raw.entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+
+        let LeaseOutcome::Acquired(replacement) =
+            store.try_takeover(&rival, &observation, 2).await.unwrap()
+        else {
+            panic!("observed rival must win the blocked renewal sequence");
+        };
+        raw.release.add_permits(1);
+        let error = renewal.await.unwrap().unwrap_err();
+
+        assert!(matches!(error, LeaseError::Fenced(_)));
+        assert_eq!(store.load().await.unwrap(), Some(replacement));
+    }
+
+    #[tokio::test]
     async fn local_filesystem_supports_create_only_renewal() {
         let temp = tempfile::tempdir().unwrap();
         let filesystem: Arc<dyn ObjectStore> =
@@ -4276,11 +4545,17 @@ mod tests {
         let store = LeaderLeaseStore::new(filesystem, 1_000);
         let owner = owner(1, 1, 1);
         assert!(matches!(
-            store.try_acquire(&owner, 0).await.unwrap(),
+            store
+                .acquire_or_renew_current_term_for_test(&owner, 0)
+                .await
+                .unwrap(),
             LeaseOutcome::Acquired(LeaderLease { seq: 1, .. })
         ));
         assert!(matches!(
-            store.try_acquire(&owner, 1).await.unwrap(),
+            store
+                .acquire_or_renew_current_term_for_test(&owner, 1)
+                .await
+                .unwrap(),
             LeaseOutcome::Acquired(LeaderLease { seq: 2, .. })
         ));
     }
@@ -4291,13 +4566,19 @@ mod tests {
         let owner = owner(1, 1, 1);
         for now in 0..8 {
             assert!(matches!(
-                store.try_acquire(&owner, now).await.unwrap(),
+                store
+                    .acquire_or_renew_current_term_for_test(&owner, now)
+                    .await
+                    .unwrap(),
                 LeaseOutcome::Acquired(_)
             ));
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
         assert!(matches!(
-            store.try_acquire(&owner, 9).await.unwrap(),
+            store
+                .acquire_or_renew_current_term_for_test(&owner, 9)
+                .await
+                .unwrap(),
             LeaseOutcome::Acquired(_)
         ));
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -4765,7 +5046,11 @@ mod tests {
     async fn committed_recovery_release_survives_renewal_and_takeover() {
         let store = Arc::new(store(1));
         let incumbent = owner(1, 11, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let proof = first.proof();
@@ -4781,7 +5066,10 @@ mod tests {
                 .unwrap(),
             RecordRecoveryReleaseCommitResult::Created(_)
         ));
-        let LeaseOutcome::Acquired(renewed) = store.try_acquire(&incumbent, 1).await.unwrap()
+        let LeaseOutcome::Acquired(renewed) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 1)
+            .await
+            .unwrap()
         else {
             unreachable!()
         };
@@ -4814,7 +5102,11 @@ mod tests {
         let (raw, store) = blocking_once_at(10, lease_path(2));
         let incumbent = owner(1, 11, 1);
         let successor = owner(2, 22, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let proof = first.proof();
@@ -4861,7 +5153,11 @@ mod tests {
     async fn ambiguous_recovery_release_create_reconciles_the_exact_winner() {
         let (raw, store) = ambiguous_once_at(1_000, lease_path(2));
         let incumbent = owner(1, 11, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let terminal = recovery_release_terminal(&first, 7, 4);
@@ -4889,7 +5185,11 @@ mod tests {
     async fn recovery_release_generation_has_one_exact_winner() {
         let store = store(1_000);
         let incumbent = owner(1, 11, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let proof = first.proof();
@@ -4938,7 +5238,11 @@ mod tests {
         let object_store: Arc<dyn ObjectStore> = raw.clone();
         let store = LeaderLeaseStore::new(Arc::clone(&object_store), 1_000);
         let incumbent = owner(1, 11, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let terminal = recovery_release_terminal(&first, 7, 4);
@@ -4984,7 +5288,11 @@ mod tests {
         let object_store: Arc<dyn ObjectStore> = raw.clone();
         let store = LeaderLeaseStore::new(object_store, 1_000);
         let incumbent = owner(1, 11, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let terminal = recovery_release_terminal(&first, 7, 4);
@@ -5010,7 +5318,11 @@ mod tests {
         let object_store: Arc<dyn ObjectStore> = raw.clone();
         let store = LeaderLeaseStore::new(Arc::clone(&object_store), 1_000);
         let incumbent = owner(1, 11, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let terminal = recovery_release_terminal(&first, 7, 4);
@@ -5030,7 +5342,10 @@ mod tests {
             .unwrap();
         for now in 1..=4 {
             assert!(matches!(
-                store.try_acquire(&incumbent, now).await.unwrap(),
+                store
+                    .acquire_or_renew_current_term_for_test(&incumbent, now)
+                    .await
+                    .unwrap(),
                 LeaseOutcome::Acquired(_)
             ));
         }
@@ -5094,7 +5409,11 @@ mod tests {
         let incumbent = owner(1, 11, 1);
         let failed_two = owner(2, 22, 1);
         let failed_three = owner(3, 33, 1);
-        let LeaseOutcome::Acquired(lease) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(lease) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let proof = lease.proof();
@@ -5152,7 +5471,11 @@ mod tests {
         let (raw, store) = blocking_store_at(1_000, lease_path(2));
         let incumbent = owner(1, 11, 1);
         let failed = owner(2, 22, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let proof = first.proof();
@@ -5246,7 +5569,11 @@ mod tests {
         let store = store(1_000);
         let incumbent = owner(1, 11, 1);
         let failed = owner(2, 22, 1);
-        let LeaseOutcome::Acquired(lease) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(lease) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let proof = lease.proof();
@@ -5302,7 +5629,11 @@ mod tests {
         let store = store(1_000);
         let incumbent = owner(1, 11, 1);
         let failed = owner(2, 22, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let proof = first.proof();
@@ -5453,7 +5784,11 @@ mod tests {
         let incumbent = owner(1, 11, 1);
         let successor = owner(1, 12, 2);
         let failed = owner(2, 22, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let old_proof = first.proof();
@@ -5524,7 +5859,11 @@ mod tests {
     async fn competing_assignment_drain_decisions_have_one_immutable_winner() {
         let (raw, store) = blocking_store_at(1_000, lease_path(2));
         let incumbent = owner(1, 1, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let proof = first.proof();
@@ -5599,7 +5938,11 @@ mod tests {
         let (raw, store) = blocking_once_at(10, lease_path(2));
         let incumbent = owner(1, 1, 1);
         let successor = owner(2, 2, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let old_proof = first.proof();
@@ -5668,7 +6011,11 @@ mod tests {
     async fn assignment_drain_floor_compacts_history_and_rejects_stale_versions() {
         let store = store(1);
         let incumbent = owner(1, 1, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let proof = first.proof();
@@ -5752,7 +6099,10 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                let _ = store.try_acquire(&incumbent, 10).await.unwrap();
+                let _ = store
+                    .acquire_or_renew_current_term_for_test(&incumbent, 10)
+                    .await
+                    .unwrap();
                 let mut compacted_absent = true;
                 for target_version in [2, 3] {
                     if read_authority_record(
@@ -5791,7 +6141,11 @@ mod tests {
     async fn assignment_drain_floor_rejects_a_rewritten_anchor_link() {
         let store = store(1_000);
         let incumbent = owner(1, 1, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let proof = first.proof();
@@ -5844,7 +6198,11 @@ mod tests {
         let (raw, store) = blocking_once_at(10, lease_path(2));
         let incumbent = owner(1, 1, 1);
         let successor = owner(2, 2, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let observation = store.observe_rival(&successor, &first).unwrap();
@@ -5883,7 +6241,11 @@ mod tests {
     async fn delayed_cluster_decision_retries_after_renewal_wins_next_sequence() {
         let (raw, store) = blocking_once_at(1_000, lease_path(2));
         let incumbent = owner(1, 1, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let proof = first.proof();
@@ -5900,7 +6262,10 @@ mod tests {
             .unwrap()
             .forget();
 
-        let LeaseOutcome::Acquired(renewal) = store.try_acquire(&incumbent, 1).await.unwrap()
+        let LeaseOutcome::Acquired(renewal) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 1)
+            .await
+            .unwrap()
         else {
             unreachable!()
         };
@@ -5918,7 +6283,11 @@ mod tests {
     async fn delayed_cluster_decision_retries_after_catalog_seal_wins_next_sequence() {
         let (raw, store) = blocking_once_at(1_000, lease_path(2));
         let incumbent = owner(1, 1, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let proof = first.proof();
@@ -5967,7 +6336,11 @@ mod tests {
     async fn delayed_cluster_decision_retries_after_floor_advance_wins_next_sequence() {
         let (raw, store) = blocking_once_at(1_000, lease_path(4));
         let incumbent = owner(1, 1, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let proof = first.proof();
@@ -6032,7 +6405,11 @@ mod tests {
     async fn ambiguous_cluster_decision_reconciles_exact_canonical_winner() {
         let (raw, store) = ambiguous_once_at(1_000, lease_path(2));
         let incumbent = owner(1, 1, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let result = store
@@ -6064,7 +6441,11 @@ mod tests {
     async fn cluster_decision_rejects_foreign_owner_and_fencing_token() {
         let store = store(1_000);
         let incumbent = owner(1, 1, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let fence = assignment_fence(&incumbent);
@@ -6101,7 +6482,11 @@ mod tests {
         let (raw, store) = blocking_once_at(10, lease_path(2));
         let incumbent = owner(1, 1, 1);
         let successor = owner(2, 2, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let observation = store.observe_rival(&successor, &first).unwrap();
@@ -6146,7 +6531,11 @@ mod tests {
     async fn delayed_catalog_seal_retries_after_same_term_renewal_wins_the_sequence() {
         let (raw, store) = blocking_once_at(1_000, lease_path(2));
         let incumbent = owner(1, 1, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let proof = first.proof();
@@ -6161,7 +6550,10 @@ mod tests {
             .unwrap()
             .forget();
 
-        let LeaseOutcome::Acquired(renewal) = store.try_acquire(&incumbent, 1).await.unwrap()
+        let LeaseOutcome::Acquired(renewal) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 1)
+            .await
+            .unwrap()
         else {
             panic!("same owner must renew through the unblocked sequence");
         };
@@ -6185,7 +6577,11 @@ mod tests {
         let store = store(10);
         let incumbent = owner(1, 1, 1);
         let successor = owner(2, 2, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let manifest = catalog("events");
@@ -6220,7 +6616,11 @@ mod tests {
     async fn assert_invalid_selected_cut_blocks_prune(corrupt: bool) {
         let store = store(1_000);
         let incumbent = owner(1, 1, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             panic!("empty authority must be acquired");
         };
         let proof = first.proof();
@@ -6304,7 +6704,11 @@ mod tests {
     async fn ambiguous_floor_create_revalidates_the_winner_cut() {
         let (raw, store) = ambiguous_once_at(1_000, lease_path(4));
         let incumbent = owner(1, 1, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             panic!("empty authority must be acquired");
         };
         let proof = first.proof();
@@ -6351,7 +6755,11 @@ mod tests {
         let (raw, store) =
             blocking_once_at(1_000, OsPath::from("control/never-block-capsule-sweep"));
         let incumbent = owner(1, 1, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             panic!("empty authority must be acquired");
         };
         let proof = first.proof();
@@ -6516,7 +6924,11 @@ mod tests {
         let store = store(10);
         let incumbent = owner(1, 1, 1);
         let successor = owner(2, 2, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let proof = first.proof();
@@ -6556,7 +6968,10 @@ mod tests {
             .seal_catalog(&proof, &catalog("events"))
             .await
             .unwrap();
-        let LeaseOutcome::Acquired(renewed) = store.try_acquire(&incumbent, 1).await.unwrap()
+        let LeaseOutcome::Acquired(renewed) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 1)
+            .await
+            .unwrap()
         else {
             unreachable!()
         };
@@ -6622,7 +7037,11 @@ mod tests {
     async fn history_prune_keeps_live_outcome_chain_and_drops_only_compacted_records() {
         let store = store(1);
         let incumbent = owner(1, 1, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let proof = first.proof();
@@ -6652,7 +7071,10 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                let _ = store.try_acquire(&incumbent, 10).await.unwrap();
+                let _ = store
+                    .acquire_or_renew_current_term_for_test(&incumbent, 10)
+                    .await
+                    .unwrap();
                 let compacted_absent =
                     read_authority_record(store.store.as_ref(), *by_epoch.get(&1).unwrap())
                         .await
@@ -6704,7 +7126,11 @@ mod tests {
     async fn floor_anchor_rejects_same_attempt_with_a_different_authority_sequence() {
         let store = store(1_000);
         let incumbent = owner(1, 1, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&incumbent, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let proof = first.proof();
@@ -6745,7 +7171,11 @@ mod tests {
     async fn renewals_copy_only_the_bounded_catalog_reference() {
         let store = store(1_000);
         let owner = owner(1, 1, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&owner, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&owner, 0)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let manifest = CatalogManifest::new(vec![super::super::CatalogManifestEntry {
@@ -6759,7 +7189,11 @@ mod tests {
         .unwrap();
         store.seal_catalog(&first.proof(), &manifest).await.unwrap();
 
-        let LeaseOutcome::Acquired(renewed) = store.try_acquire(&owner, 1).await.unwrap() else {
+        let LeaseOutcome::Acquired(renewed) = store
+            .acquire_or_renew_current_term_for_test(&owner, 1)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let reference = renewed
@@ -6777,7 +7211,11 @@ mod tests {
     async fn preexisting_manifest_blob_must_match_exact_content() {
         let store = store(1_000);
         let owner = owner(1, 1, 1);
-        let LeaseOutcome::Acquired(first) = store.try_acquire(&owner, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&owner, 0)
+            .await
+            .unwrap()
+        else {
             unreachable!()
         };
         let manifest = catalog("events");
@@ -6821,6 +7259,25 @@ mod tests {
     }
 
     #[cfg(feature = "cluster")]
+    fn candidacy_channel(
+        eligible: bool,
+    ) -> (
+        watch::Sender<LeaderCandidacy>,
+        watch::Receiver<LeaderCandidacy>,
+    ) {
+        watch::channel(LeaderCandidacy::initial(eligible))
+    }
+
+    #[cfg(feature = "cluster")]
+    fn set_candidacy(candidate: &watch::Sender<LeaderCandidacy>, eligible: bool) {
+        candidate.send_modify(|current| {
+            *current = current
+                .transition(eligible)
+                .expect("leader candidacy generation");
+        });
+    }
+
+    #[cfg(feature = "cluster")]
     #[tokio::test]
     async fn delayed_durable_acquisition_response_fails_closed_at_attempt_deadline() {
         let ttl = Duration::from_millis(40);
@@ -6837,7 +7294,7 @@ mod tests {
         .unwrap();
         let deadline = manager.deadline();
         let lease = manager.lease_watch();
-        let (_candidate_tx, candidate_rx) = watch::channel(true);
+        let (_candidate_tx, candidate_rx) = candidacy_channel(true);
         let task = manager.spawn(tokio_util::sync::CancellationToken::new(), candidate_rx);
 
         tokio::time::timeout(Duration::from_secs(1), raw.entered.acquire())
@@ -6861,11 +7318,11 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[tokio::test]
-    async fn candidacy_loss_interrupts_hung_renewal_and_fences() {
+    async fn candidacy_loss_interrupts_hung_renewal_and_withdraws_the_grant() {
         let (raw, store) = blocking_store(80);
         let owner = owner(1, 1, 1);
         let manager = LeaderLeaseManager::new(
-            store,
+            Arc::clone(&store),
             &process(&owner),
             LeaderLeaseConfig {
                 ttl: Duration::from_millis(80),
@@ -6875,7 +7332,7 @@ mod tests {
         .unwrap();
         let deadline = manager.deadline();
         let mut lease = manager.lease_watch();
-        let (candidate_tx, candidate_rx) = watch::channel(true);
+        let (candidate_tx, candidate_rx) = candidacy_channel(true);
         let shutdown = tokio_util::sync::CancellationToken::new();
         let task = manager.spawn(shutdown.clone(), candidate_rx);
         wait_for_lease(&mut lease).await;
@@ -6884,7 +7341,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .forget();
-        candidate_tx.send(false).unwrap();
+        set_candidacy(&candidate_tx, false);
         tokio::time::timeout(Duration::from_millis(40), lease.changed())
             .await
             .unwrap()
@@ -6892,6 +7349,134 @@ mod tests {
         assert!(lease.borrow().is_none());
         assert!(!deadline.is_live());
         raw.release.add_permits(1);
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn candidacy_reacquisition_rotates_the_durable_fencing_token() {
+        let owner = owner(1, 1, 1);
+        let store = Arc::new(store(500));
+        let manager = LeaderLeaseManager::new(
+            Arc::clone(&store),
+            &process(&owner),
+            LeaderLeaseConfig {
+                ttl: Duration::from_millis(500),
+                renew_interval: Duration::from_millis(20),
+            },
+        )
+        .unwrap();
+        let deadline = manager.deadline();
+        let mut lease = manager.lease_watch();
+        let (candidate_tx, candidate_rx) = candidacy_channel(true);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let task = manager.spawn(shutdown.clone(), candidate_rx);
+
+        wait_for_lease(&mut lease).await;
+        let first = lease.borrow().clone().expect("initial leader grant");
+        let stale_proof = first.proof();
+        set_candidacy(&candidate_tx, false);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while lease.borrow_and_update().is_some() {
+                lease.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("candidacy loss did not withdraw the local grant");
+        assert!(!lease_grants_proof(
+            &lease.borrow().clone(),
+            &owner,
+            &deadline,
+            &stale_proof,
+        ));
+
+        set_candidacy(&candidate_tx, true);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if lease
+                    .borrow_and_update()
+                    .as_ref()
+                    .is_some_and(|current| current.token > first.token)
+                {
+                    break;
+                }
+                lease.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("candidacy reacquisition did not publish a new fencing token");
+        let reacquired = lease.borrow().clone().expect("reacquired leader grant");
+        assert!(reacquired.token > first.token);
+        assert_eq!(
+            store
+                .load()
+                .await
+                .unwrap()
+                .expect("durable leader grant")
+                .token,
+            reacquired.token
+        );
+        assert!(!lease_grants_proof(
+            &Some(reacquired),
+            &owner,
+            &deadline,
+            &stale_proof,
+        ));
+
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn coalesced_candidacy_loss_still_rotates_the_fencing_token() {
+        let owner = owner(1, 2, 1);
+        let store = Arc::new(store(500));
+        let manager = LeaderLeaseManager::new(
+            Arc::clone(&store),
+            &process(&owner),
+            LeaderLeaseConfig {
+                ttl: Duration::from_millis(500),
+                renew_interval: Duration::from_millis(20),
+            },
+        )
+        .unwrap();
+        let deadline = manager.deadline();
+        let mut lease = manager.lease_watch();
+        let (candidate_tx, candidate_rx) = candidacy_channel(true);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let task = manager.spawn(shutdown.clone(), candidate_rx);
+        wait_for_lease(&mut lease).await;
+        let first = lease.borrow().clone().expect("initial leader grant");
+        let stale_proof = first.proof();
+
+        // No await between these updates: the receiver observes only the final eligible value.
+        set_candidacy(&candidate_tx, false);
+        set_candidacy(&candidate_tx, true);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if lease
+                    .borrow_and_update()
+                    .as_ref()
+                    .is_some_and(|current| current.token > first.token)
+                {
+                    break;
+                }
+                lease.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("coalesced candidacy loss reused the old fencing token");
+        let current = lease.borrow().clone().expect("rotated leader grant");
+        assert!(!lease_grants_proof(
+            &Some(current),
+            &owner,
+            &deadline,
+            &stale_proof,
+        ));
+
         shutdown.cancel();
         task.await.unwrap();
     }
@@ -6912,7 +7497,7 @@ mod tests {
         .unwrap();
         let deadline = manager.deadline();
         let mut lease = manager.lease_watch();
-        let (_candidate_tx, candidate_rx) = watch::channel(true);
+        let (_candidate_tx, candidate_rx) = candidacy_channel(true);
         let task = manager.spawn(tokio_util::sync::CancellationToken::new(), candidate_rx);
         wait_for_lease(&mut lease).await;
         tokio::time::timeout(Duration::from_secs(1), raw.entered.acquire())
@@ -6941,7 +7526,7 @@ mod tests {
             LeaderLeaseManager::new(Arc::new(store(100)), &process(&owner), config).unwrap();
         let deadline = manager.deadline();
         let mut lease = manager.lease_watch();
-        let (_candidate_tx, candidate_rx) = watch::channel(true);
+        let (_candidate_tx, candidate_rx) = candidacy_channel(true);
         let shutdown = tokio_util::sync::CancellationToken::new();
         let task = manager.spawn(shutdown.clone(), candidate_rx);
         wait_for_lease(&mut lease).await;

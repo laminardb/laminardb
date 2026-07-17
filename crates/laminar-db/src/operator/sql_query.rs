@@ -64,9 +64,6 @@ impl std::fmt::Debug for ClusterShuffleConfig {
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct AggOpCheckpoint {
     agg: Option<AggStateCheckpoint>,
-    // Per-vnode `-1`-weight retraction batches stashed at revoke but not yet emitted; persisted so a
-    // crash between revoke and the next emit still retracts the moved groups from the MV.
-    revoke_retractions: Vec<(u32, Vec<u8>)>,
     // Pre-barrier remote rows are channel state. They must be replayed after the cut rather than
     // folded into aggregate state before its corresponding output is emitted.
     aligned_replay: Vec<(u64, i64, Vec<u8>)>,
@@ -84,8 +81,6 @@ fn serialize_agg_cp(cp: &AggStateCheckpoint, op_name: &str) -> Result<Vec<u8>, D
         })
 }
 
-// Orthogonal capability flags wired independently at build; an enum would couple them.
-#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct SqlQueryOperator {
     op_name: Arc<str>,
     sql: String,
@@ -121,20 +116,11 @@ pub(crate) struct SqlQueryOperator {
     // Deltas seen during restart (state Uninit), replayed after `lazy_init` restores the base.
     #[cfg(feature = "cluster")]
     pending_restore_deltas: Vec<crate::aggregate_state::AggVnodeDelta>,
-    // Vnodes whose chain landed while Uninit: the fold restores `last_emitted` (suppressing
-    // their first emit), so `lazy_init` force-re-emits them — the Uninit twin of the Agg arm.
-    #[cfg(feature = "cluster")]
-    pending_restore_reemit: rustc_hash::FxHashSet<u32>,
     // Vnodes revoked while still Uninit: their groups sit in `pending_restore`/`pending_restore_deltas`
     // and can't be dropped yet. Re-applied via `drop_vnodes` once `lazy_init` folds the restore so
     // ownership loss is reflected before any output or later re-acquire.
     #[cfg(feature = "cluster")]
     deferred_revoke_vnodes: rustc_hash::FxHashSet<u32>,
-    // Per-vnode `-1`-weight retraction batches captured when a vnode is revoked, keyed by vnode.
-    // Prepended (retract-before-insert) to the next emit so the losing node's MV snapshot drops the
-    // moved groups; cancelled per-vnode on a same-cycle reacquire.
-    #[cfg(feature = "cluster")]
-    pending_revoke_retractions: rustc_hash::FxHashMap<u32, RecordBatch>,
     #[cfg(feature = "cluster")]
     aligned_replay: VecDeque<(u64, i64, crate::operator::RetainedBatch)>,
 }
@@ -174,11 +160,7 @@ impl SqlQueryOperator {
             #[cfg(feature = "cluster")]
             pending_restore_deltas: Vec::new(),
             #[cfg(feature = "cluster")]
-            pending_restore_reemit: rustc_hash::FxHashSet::default(),
-            #[cfg(feature = "cluster")]
             deferred_revoke_vnodes: rustc_hash::FxHashSet::default(),
-            #[cfg(feature = "cluster")]
-            pending_revoke_retractions: rustc_hash::FxHashMap::default(),
             #[cfg(feature = "cluster")]
             aligned_replay: VecDeque::new(),
         }
@@ -296,53 +278,10 @@ impl SqlQueryOperator {
                         ))
                     })?;
                 }
-                // Chains folded while Uninit re-emit here, or the restored `last_emitted` leaves
-                // their MV rows stale until new input. Skip deferred-revoke vnodes: the drop
-                // below needs their `last_emitted` intact to build retractions.
-                #[cfg(feature = "cluster")]
-                {
-                    if !self.pending_restore_reemit.is_empty() {
-                        let vc = self
-                            .cluster_shuffle
-                            .as_ref()
-                            .map(|c| c.registry.vnode_count())
-                            .ok_or_else(|| {
-                                DbError::Checkpoint(format!(
-                                    "aggregate '{}' cannot re-emit restored vnodes without cluster ownership",
-                                    self.op_name
-                                ))
-                            })?;
-                        let mut skipped = 0usize;
-                        let total = self.pending_restore_reemit.len();
-                        for &v in &self.pending_restore_reemit {
-                            if self.deferred_revoke_vnodes.contains(&v) {
-                                skipped += 1;
-                            } else {
-                                agg_state.force_reemit_acquired_vnode(v, vc);
-                            }
-                        }
-                        if skipped > 0 {
-                            tracing::warn!(
-                                query = %self.op_name,
-                                reemit_vnodes = total,
-                                reemit_skipped = skipped,
-                                "lazy_init fold: deferred revoke intersects re-acquired vnodes"
-                            );
-                        } else {
-                            tracing::info!(
-                                query = %self.op_name,
-                                reemit_vnodes = total,
-                                "lazy_init fold: force-emitting restored vnodes"
-                            );
-                        }
-                    }
-                }
                 // Vnodes revoked while we were Uninit: drop them now that the restore is folded in,
                 // before any output or later re-acquire can expose state this node no longer owns.
                 #[cfg(feature = "cluster")]
-                let staged_retractions = if self.deferred_revoke_vnodes.is_empty() {
-                    ahash::AHashMap::new()
-                } else {
+                if !self.deferred_revoke_vnodes.is_empty() {
                     let vc = self
                         .cluster_shuffle
                         .as_ref()
@@ -358,15 +297,8 @@ impl SqlQueryOperator {
                         vnodes = self.deferred_revoke_vnodes.len(),
                         "lazy_init fold: dropping deferred-revoked vnodes"
                     );
-                    agg_state
-                        .drop_vnodes(&self.deferred_revoke_vnodes, vc)
-                        .map_err(|error| {
-                            DbError::Checkpoint(format!(
-                                "aggregate '{}' deferred vnode revocation failed: {error}",
-                                self.op_name
-                            ))
-                        })?
-                };
+                    agg_state.drop_vnodes(&self.deferred_revoke_vnodes, vc);
+                }
 
                 self.pending_restore = None;
                 #[cfg(feature = "cluster")]
@@ -374,9 +306,7 @@ impl SqlQueryOperator {
                     self.pending_restore_slices.clear();
                     self.pending_restore_slice_fingerprint = None;
                     self.pending_restore_deltas.clear();
-                    self.pending_restore_reemit.clear();
                     self.deferred_revoke_vnodes.clear();
-                    self.pending_revoke_retractions.extend(staged_retractions);
                 }
                 #[cfg(feature = "cluster")]
                 if self.delta_chain_bound.is_some() {
@@ -707,22 +637,8 @@ impl SqlQueryOperator {
             }
         }
 
-        // Retract-before-insert: moved-away groups' `-1` batches lead the emit so a distributed read
-        // never double-counts a rebalanced group.
         #[cfg(feature = "cluster")]
-        let result = if self.pending_revoke_retractions.is_empty() {
-            batches
-        } else {
-            let mut prefixed: Vec<RecordBatch> =
-                std::mem::take(&mut self.pending_revoke_retractions)
-                    .into_values()
-                    .collect();
-            prefixed.extend(batches);
-            prefixed
-        };
-
-        #[cfg(feature = "cluster")]
-        return self.suppress_restoring_output(result, num_group_cols);
+        return self.suppress_restoring_output(batches, num_group_cols);
         #[cfg(not(feature = "cluster"))]
         Ok(batches)
     }
@@ -1011,18 +927,6 @@ impl GraphOperator for SqlQueryOperator {
             }
         };
         #[cfg(feature = "cluster")]
-        let revoke_retractions: Vec<(u32, Vec<u8>)> = self
-            .pending_revoke_retractions
-            .iter()
-            .map(|(v, batch)| {
-                laminar_core::serialization::serialize_batch_stream(batch)
-                    .map(|blob| (*v, blob))
-                    .map_err(|e| DbError::Pipeline(format!("revoke retraction checkpoint: {e}")))
-            })
-            .collect::<Result<_, DbError>>()?;
-        #[cfg(not(feature = "cluster"))]
-        let revoke_retractions: Vec<(u32, Vec<u8>)> = Vec::new();
-        #[cfg(feature = "cluster")]
         let aligned_replay = self
             .aligned_replay
             .iter()
@@ -1040,12 +944,11 @@ impl GraphOperator for SqlQueryOperator {
         #[cfg(not(feature = "cluster"))]
         let aligned_replay = Vec::new();
 
-        if agg.is_none() && revoke_retractions.is_empty() && aligned_replay.is_empty() {
+        if agg.is_none() && aligned_replay.is_empty() {
             return Ok(None);
         }
         let cp = AggOpCheckpoint {
             agg,
-            revoke_retractions,
             aligned_replay,
         };
         let data = rkyv::to_bytes::<rkyv::rancor::Error>(&cp)
@@ -1070,18 +973,8 @@ impl GraphOperator for SqlQueryOperator {
             ))
         })?;
 
-        #[cfg(not(feature = "cluster"))]
-        if !cp.revoke_retractions.is_empty() {
-            return Err(DbError::Checkpoint(format!(
-                "aggregate '{}' checkpoint requires cluster support ({} pending vnode retractions)",
-                self.op_name,
-                cp.revoke_retractions.len()
-            )));
-        }
-
         let AggOpCheckpoint {
             agg,
-            revoke_retractions,
             aligned_replay,
         } = cp;
 
@@ -1116,35 +1009,6 @@ impl GraphOperator for SqlQueryOperator {
         #[cfg(not(feature = "cluster"))]
         let _ = aligned_replay;
 
-        #[cfg(feature = "cluster")]
-        let decoded_retractions = {
-            let mut decoded = rustc_hash::FxHashMap::default();
-            for (vnode, blob) in revoke_retractions {
-                let batch = laminar_core::serialization::deserialize_batch_stream(&blob).map_err(
-                    |error| DbError::Checkpoint(format!("revoke retraction restore: {error}")),
-                )?;
-                if decoded.insert(vnode, batch).is_some() {
-                    return Err(DbError::Checkpoint(format!(
-                        "aggregate '{}' checkpoint contains duplicate revoke state for vnode {vnode}",
-                        self.op_name
-                    )));
-                }
-            }
-            decoded
-        };
-        #[cfg(not(feature = "cluster"))]
-        let _ = revoke_retractions;
-
-        #[cfg(feature = "cluster")]
-        if decoded_retractions
-            .keys()
-            .any(|vnode| self.pending_revoke_retractions.contains_key(vnode))
-        {
-            return Err(DbError::Checkpoint(format!(
-                "aggregate '{}' checkpoint revoke state was applied more than once",
-                self.op_name
-            )));
-        }
         #[cfg(feature = "cluster")]
         if !self.aligned_replay.is_empty() && !decoded_aligned_replay.is_empty() {
             return Err(DbError::Checkpoint(format!(
@@ -1192,8 +1056,6 @@ impl GraphOperator for SqlQueryOperator {
             }
         }
 
-        #[cfg(feature = "cluster")]
-        self.pending_revoke_retractions.extend(decoded_retractions);
         #[cfg(feature = "cluster")]
         self.aligned_replay.extend(decoded_aligned_replay);
         Ok(())
@@ -1350,27 +1212,6 @@ impl GraphOperator for SqlQueryOperator {
         // No deltas → the base alone is the recovered state (full / reference / simple acquire).
         if deltas.is_empty() {
             self.apply_vnode_state(vnode, base)?;
-            // A same-cycle reacquire keeps its restored last_emitted (cancel the retraction), while a genuine gainer force-emits the
-            // restored groups so they don't vanish from the MV (CL-4).
-            if self.pending_revoke_retractions.remove(&vnode).is_none() {
-                if let Some(vc) = self
-                    .cluster_shuffle
-                    .as_ref()
-                    .map(|c| c.registry.vnode_count())
-                {
-                    match self.state {
-                        QueryState::Agg(ref mut agg_state) => {
-                            agg_state.force_reemit_acquired_vnode(vnode, vc);
-                        }
-                        // Stashed into pending_restore — force-emit after lazy_init folds it,
-                        // or the restored last_emitted suppresses the first emit (stale MV row).
-                        QueryState::Uninit => {
-                            self.pending_restore_reemit.insert(vnode);
-                        }
-                        _ => {}
-                    }
-                }
-            }
             return Ok(());
         }
         // Deserialize the chain before touching `self.state` (avoids borrowing `self` twice).
@@ -1400,18 +1241,6 @@ impl GraphOperator for SqlQueryOperator {
         match self.state {
             QueryState::Agg(ref mut agg_state) => {
                 let merged = agg_state.apply_vnode_chain(&base_cp, &delta_objs)?;
-                // Same-cycle reacquire keeps the restored `last_emitted` and cancels its retraction;
-                // a genuine gainer (no pending retraction) force-emits the restored groups instead, or
-                // the restored `last_emitted` suppresses its first emit and the group vanishes (CL-4).
-                if self.pending_revoke_retractions.remove(&vnode).is_none() {
-                    if let Some(vc) = self
-                        .cluster_shuffle
-                        .as_ref()
-                        .map(|c| c.registry.vnode_count())
-                    {
-                        agg_state.force_reemit_acquired_vnode(vnode, vc);
-                    }
-                }
                 // Info so a soak can compare the merged baseline against expectations per vnode.
                 tracing::info!(
                     query = %self.op_name, vnode, groups = merged, deltas = delta_objs.len(),
@@ -1423,7 +1252,6 @@ impl GraphOperator for SqlQueryOperator {
                 // and performs one columnar merge across the complete recovered set.
                 self.stage_uninit_vnode_slice(vnode, &base_cp, base)?;
                 self.pending_restore_deltas.extend(delta_objs);
-                self.pending_restore_reemit.insert(vnode);
             }
             _ => {
                 return Err(DbError::Pipeline(format!(
@@ -1452,13 +1280,7 @@ impl GraphOperator for SqlQueryOperator {
                         self.op_name
                     ))
                 })?;
-                let retractions = agg_state.drop_vnodes(revoked, vc).map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "aggregate '{}' vnode revocation failed: {error}",
-                        self.op_name
-                    ))
-                })?;
-                self.pending_revoke_retractions.extend(retractions);
+                agg_state.drop_vnodes(revoked, vc);
             }
             // Uninit: the revoked vnode's groups are still in `pending_restore`; defer the drop until
             // `lazy_init` folds them in, else this node could expose state it no longer owns.
@@ -1610,12 +1432,11 @@ mod checkpoint_tests {
 
     #[cfg(not(feature = "cluster"))]
     #[test]
-    fn cluster_aggregate_checkpoint_is_rejected_without_support() {
+    fn cluster_shuffle_checkpoint_is_rejected_without_support() {
         let (context, _) = context_and_batch();
         let checkpoint = AggOpCheckpoint {
             agg: None,
-            revoke_retractions: vec![(3, Vec::new())],
-            aligned_replay: Vec::new(),
+            aligned_replay: vec![(3, i64::MIN, Vec::new())],
         };
         let data = rkyv::to_bytes::<rkyv::rancor::Error>(&checkpoint)
             .unwrap()
@@ -1638,6 +1459,7 @@ mod delta_primary_tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use laminar_core::cluster::control::LeaseDeadline;
     use laminar_core::state::{NodeId, VnodeRegistry};
 
     async fn single_owner_shuffle() -> (ClusterShuffleConfig, u64) {
@@ -1657,6 +1479,14 @@ mod delta_primary_tests {
             self_id.0,
             incarnation,
         ));
+        let process_deadline =
+            Arc::new(LeaseDeadline::live_for(std::time::Duration::from_secs(60)));
+        receiver
+            .install_process_lease_deadline(Arc::clone(&process_deadline))
+            .unwrap();
+        sender
+            .install_process_lease_deadline(process_deadline)
+            .unwrap();
         let version = registry.assignment_version();
         let fence = laminar_core::checkpoint::CheckpointAssignmentFence::from_owner_map(
             version,
@@ -1966,17 +1796,12 @@ mod delta_primary_tests {
         );
         operator.pending_restore = Some(base);
         operator.deferred_revoke_vnodes.insert(3);
-        operator.pending_restore_reemit.insert(2);
 
         let error = operator.lazy_init().await.unwrap_err();
         assert!(matches!(error, DbError::Checkpoint(_)));
         assert!(error.to_string().contains("without cluster ownership"));
         assert!(operator.pending_restore.is_some());
         assert!(operator.deferred_revoke_vnodes.contains(&3));
-        assert!(
-            operator.pending_restore_reemit.contains(&2),
-            "a late revoke failure must not consume earlier staged re-emission work"
-        );
         assert!(matches!(operator.state, QueryState::Uninit));
     }
 
@@ -2367,10 +2192,10 @@ mod delta_primary_tests {
         );
     }
 
-    // A chain applied while Uninit folds via `restore_groups`, which restores `last_emitted` —
-    // without the deferred force-emit the groups never reach the MV until new input.
+    // A chain applied while Uninit preserves its last-emitted baseline. Physical ownership
+    // movement emits nothing; the next real update replaces the prior logical row exactly once.
     #[tokio::test]
-    async fn uninit_chain_restore_reemits_groups_after_init() {
+    async fn uninit_chain_restore_is_silent_until_real_change() {
         async fn changelog_op() -> SqlQueryOperator {
             let schema = Arc::new(Schema::new(vec![
                 Field::new("key", DataType::Utf8, false),
@@ -2446,25 +2271,38 @@ mod delta_primary_tests {
             .unwrap()
             .expect("per-vnode slices");
 
-        // Subject: apply the chains while Uninit (the boot-staging shape), then init.
+        // Apply the chains while Uninit (the boot-staging shape), then initialize without input.
         let mut subject = changelog_op().await;
         for (v, s) in &slices {
             if let crate::checkpoint_coordinator::StagedSlice::Bytes(b) = s {
                 subject.apply_vnode_chain(*v, b, &[]).unwrap();
             }
         }
-        let reemitted: usize = subject
-            .process(&[], &[i64::MIN])
-            .await
+        assert!(subject.process(&[], &[i64::MIN]).await.unwrap().is_empty());
+        let update = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["a"])),
+                Arc::new(Int64Array::from(vec![3_i64])),
+            ],
+        )
+        .unwrap();
+        let changed = subject.process(&[vec![update]], &[i64::MIN]).await.unwrap();
+        assert_eq!(changed.len(), 1);
+        let totals = changed[0]
+            .column_by_name("total")
             .unwrap()
-            .iter()
-            .map(RecordBatch::num_rows)
-            .sum();
-        assert_eq!(
-            reemitted, 2,
-            "chain-restored groups must force-emit after lazy_init (restored last_emitted would \
-             otherwise suppress them and the MV row stays stale)"
-        );
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let weights = changed[0]
+            .column_by_name(laminar_core::changelog::WEIGHT_COLUMN)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(totals.values(), &[1, 4]);
+        assert_eq!(weights.values(), &[-1, 1]);
     }
 
     // The soak signature: chains for MANY vnodes applied while Uninit fold into ONE concatenated
@@ -2563,17 +2401,14 @@ mod delta_primary_tests {
             applied >= 7,
             "expected slices for ~all 8 vnodes, got {applied}"
         );
-        let reemitted: usize = subject
-            .process(&[], &[i64::MIN])
-            .await
-            .unwrap()
-            .iter()
-            .map(RecordBatch::num_rows)
-            .sum();
+        assert!(subject.process(&[], &[i64::MIN]).await.unwrap().is_empty());
+        let QueryState::Agg(ref mut aggregate) = subject.state else {
+            panic!("expected restored aggregate state");
+        };
         assert_eq!(
-            reemitted, GROUPS,
-            "the Uninit fold must restore and force-emit EVERY donor group across all vnodes; \
-             a partial fold is the soak's one-burst loss"
+            aggregate.checkpoint_groups().unwrap().last_updated_ms.len(),
+            GROUPS,
+            "the Uninit fold must restore every donor group across all vnodes without emitting"
         );
     }
 }

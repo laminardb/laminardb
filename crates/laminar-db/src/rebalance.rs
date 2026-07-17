@@ -14,12 +14,15 @@ use laminar_core::cluster::control::{
     CheckpointAssignmentFence, CheckpointParticipant, ClusterController, LeaderLeaseStore,
     RecordAssignmentDrainDecisionResult, RecordAssignmentRecoveryDecisionResult, RotateOutcome,
 };
+use laminar_core::cluster::discovery::NodeState;
 use laminar_core::state::{
     owners_per_domain, rendezvous_assignment, Locality, NodeId, VnodeRegistry,
 };
+#[cfg(test)]
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::db::{LaminarDB, SnapshotAdoption};
@@ -199,7 +202,7 @@ pub fn spawn_snapshot_watcher(
     db: Arc<LaminarDB>,
     store: Arc<AssignmentSnapshotStore>,
     registry: Arc<VnodeRegistry>,
-    shutdown: Arc<Notify>,
+    shutdown: CancellationToken,
     config: RebalanceConfig,
     controller: Option<Arc<ClusterController>>,
 ) -> JoinHandle<()> {
@@ -221,7 +224,7 @@ pub fn spawn_snapshot_watcher(
         loop {
             tokio::select! {
                 biased;
-                () = Arc::clone(&shutdown).notified_owned() => return,
+                () = shutdown.cancelled() => return,
                 _ = ticker.tick() => {}
             }
             let local = registry.assignment_version();
@@ -235,7 +238,7 @@ pub fn spawn_snapshot_watcher(
             // before local adoption.
             let audit = tokio::select! {
                 biased;
-                () = Arc::clone(&shutdown).notified_owned() => return,
+                () = shutdown.cancelled() => return,
                 result = tokio::time::timeout_at(head_deadline, store.load()) => result,
             };
             let mut audited_terminal = None;
@@ -1451,7 +1454,7 @@ pub fn spawn_rebalance_controller(
     controller: Arc<ClusterController>,
     store: Arc<AssignmentSnapshotStore>,
     registry: Arc<VnodeRegistry>,
-    shutdown: Arc<Notify>,
+    shutdown: CancellationToken,
     config: RebalanceConfig,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -1461,7 +1464,7 @@ pub fn spawn_rebalance_controller(
         loop {
             let membership_changed = tokio::select! {
                 biased;
-                () = Arc::clone(&shutdown).notified_owned() => return,
+                () = shutdown.cancelled() => return,
                 res = members.changed() => {
                     if res.is_err() {
                         warn!("membership watch sender dropped; rebalance controller exiting");
@@ -1477,7 +1480,7 @@ pub fn spawn_rebalance_controller(
                 loop {
                     tokio::select! {
                         biased;
-                        () = Arc::clone(&shutdown).notified_owned() => return,
+                        () = shutdown.cancelled() => return,
                         res = tokio::time::timeout(
                             config.rebalance_debounce, members.changed()
                         ) => {
@@ -1520,7 +1523,7 @@ pub fn spawn_rebalance_controller(
                         warn!(error = %e, "rebalance failed; retrying after backoff");
                         tokio::select! {
                             biased;
-                            () = Arc::clone(&shutdown).notified_owned() => return,
+                            () = shutdown.cancelled() => return,
                             () = tokio::time::sleep(config.retry_delay) => {}
                         }
                     }
@@ -2271,7 +2274,6 @@ async fn predecessor_cut_unavailability(
         }
     }
 
-    use laminar_core::cluster::discovery::NodeState;
     let members = controller.members_watch().borrow().clone();
     let owners: std::collections::BTreeSet<NodeId> = current_owners.iter().copied().collect();
     for owner in owners {
@@ -2445,7 +2447,7 @@ async fn finalize_drain_snapshot(
         .ok_or_else(|| "drain finalization requires a current leader proof".to_string())?;
     let requested =
         AssignmentDrainDecision::new(transition, deciding_proof.clone(), requested_verdict)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.clone())?;
     let authority = controller
         .checkpoint_authority()
         .map_err(|error| error.to_string())?;
@@ -2725,14 +2727,20 @@ mod tests {
         let control: Arc<dyn ClusterKv> = kv.clone();
         let recovery: Arc<dyn ClusterKv> = kv;
         let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
-        Arc::new(ClusterController::new_with_recovery_incarnation(
+        let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
             node,
             control,
             recovery,
             assignment_store,
             members_rx,
             boot,
-        ))
+        ));
+        controller
+            .set_process_lease_deadline(Arc::new(
+                laminar_core::cluster::control::LeaseDeadline::live_for(Duration::from_secs(60)),
+            ))
+            .unwrap();
+        controller
     }
 
     async fn grant_test_leadership(
@@ -2746,7 +2754,8 @@ mod tests {
             boot: controller.recovery_incarnation(),
             process_term: 1,
         };
-        let LeaseOutcome::Acquired(lease) = authority.try_acquire(&owner, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap()
+        else {
             panic!("empty test authority must grant leadership");
         };
         install_test_leadership(controller, authority, owner, lease)
@@ -2785,8 +2794,13 @@ mod tests {
         use laminar_core::cluster::control::LeaseDeadline;
 
         let (lease_tx, lease_rx) = tokio::sync::watch::channel(Some(lease));
-        controller
-            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))));
+        if controller.process_lease_deadline().is_none() {
+            controller
+                .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(
+                    60,
+                ))))
+                .unwrap();
+        }
         controller
             .set_leader_lease_watch(
                 lease_rx,
@@ -2951,7 +2965,7 @@ mod tests {
             process_term: 1,
         };
         let laminar_core::cluster::control::LeaseOutcome::Acquired(leader_lease) = leader_authority
-            .try_acquire(&leader_owner, 0)
+            .begin_new_term(&leader_owner, 0)
             .await
             .unwrap()
         else {
@@ -3636,7 +3650,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn assignment_closure_cancels_shuffle_before_waiting_for_execution_drain() {
         use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointBarrier};
-        use laminar_core::shuffle::ShuffleSender;
+        use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
         use uuid::Uuid;
 
         let local_boot = Uuid::from_u128(11);
@@ -3652,7 +3666,25 @@ mod tests {
         ];
         let assignment =
             CheckpointAssignmentFence::from_owner_map(1, &[1, 2], participants).unwrap();
+        let controller = test_cluster_controller(NodeId(1), local_boot, None);
+        let process_deadline = controller
+            .process_lease_deadline()
+            .expect("test controller process lease deadline");
+        let receiver = Arc::new(
+            ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap(), local_boot)
+                .await
+                .unwrap(),
+        );
         let sender = Arc::new(ShuffleSender::new(1, local_boot));
+        receiver
+            .install_process_lease_deadline(Arc::clone(&process_deadline))
+            .unwrap();
+        sender
+            .install_process_lease_deadline(process_deadline)
+            .unwrap();
+        receiver
+            .install_assignment_fence(&assignment, &[1, 2])
+            .unwrap();
         sender
             .install_assignment_fence(&assignment, &[1, 2])
             .unwrap();
@@ -3673,11 +3705,12 @@ mod tests {
 
         let registry = Arc::new(VnodeRegistry::single_owner(1, NodeId(1)));
         let db = LaminarDB::builder()
-            .cluster_controller(test_cluster_controller(NodeId(1), local_boot, None))
+            .cluster_controller(controller)
             .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
             .state_backend(Arc::new(InProcessBackend::new(1)))
             .vnode_registry(registry)
             .shuffle_sender(Arc::clone(&sender))
+            .shuffle_receiver(receiver)
             .build()
             .await
             .unwrap();
@@ -3720,7 +3753,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn assignment_suspension_reasserts_closure_after_serialization_race() {
         use laminar_core::checkpoint::CheckpointAssignmentFence;
-        use laminar_core::shuffle::ShuffleSender;
+        use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
         use uuid::Uuid;
 
         let local_boot = Uuid::from_u128(11);
@@ -3729,16 +3762,35 @@ mod tests {
             boot_incarnation: local_boot,
         }];
         let assignment = CheckpointAssignmentFence::from_owner_map(1, &[1], participants).unwrap();
+        let controller = test_cluster_controller(NodeId(1), local_boot, None);
+        let process_deadline = controller
+            .process_lease_deadline()
+            .expect("test controller process lease deadline");
+        let receiver = Arc::new(
+            ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap(), local_boot)
+                .await
+                .unwrap(),
+        );
         let sender = Arc::new(ShuffleSender::new(1, local_boot));
+        receiver
+            .install_process_lease_deadline(Arc::clone(&process_deadline))
+            .unwrap();
+        sender
+            .install_process_lease_deadline(process_deadline)
+            .unwrap();
+        receiver
+            .install_assignment_fence(&assignment, &[1])
+            .unwrap();
         sender.install_assignment_fence(&assignment, &[1]).unwrap();
 
         let registry = Arc::new(VnodeRegistry::single_owner(1, NodeId(1)));
         let db = LaminarDB::builder()
-            .cluster_controller(test_cluster_controller(NodeId(1), local_boot, None))
+            .cluster_controller(controller)
             .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
             .state_backend(Arc::new(InProcessBackend::new(1)))
             .vnode_registry(registry)
             .shuffle_sender(Arc::clone(&sender))
+            .shuffle_receiver(receiver)
             .build()
             .await
             .unwrap();
@@ -3861,7 +3913,7 @@ mod tests {
             process_term: 1,
         };
         let laminar_core::cluster::control::LeaseOutcome::Acquired(lease) =
-            authority.try_acquire(&owner, 0).await.unwrap()
+            authority.begin_new_term(&owner, 0).await.unwrap()
         else {
             panic!("test authority acquisition must succeed");
         };
@@ -3998,8 +4050,15 @@ mod tests {
             members_rx,
             boot,
         ));
+        controller
+            .set_process_lease_deadline(Arc::new(
+                laminar_core::cluster::control::LeaseDeadline::live_for(Duration::from_secs(60)),
+            ))
+            .unwrap();
         controller.publish_recovery_incarnation().await.unwrap();
         controller.set_active(true);
+        let _process_authority = install_test_process_authority(&controller, &[process]).await;
+        let _leader_lease = grant_test_leadership(&controller).await;
 
         let registry = Arc::new(VnodeRegistry::single_owner(1, self_id));
         let receiver = Arc::new(
@@ -4020,7 +4079,7 @@ mod tests {
             .await
             .unwrap();
         db.set_source_gate(true);
-        let shutdown = Arc::new(Notify::new());
+        let shutdown = CancellationToken::new();
         let mut config = RebalanceConfig::test_defaults();
         config.watcher_poll = Duration::from_millis(10);
         config.checkpoint_timeout = Duration::from_millis(100);
@@ -4028,7 +4087,7 @@ mod tests {
             Arc::clone(&db),
             Arc::clone(&durable),
             Arc::clone(&registry),
-            Arc::clone(&shutdown),
+            shutdown.clone(),
             config,
             Some(Arc::clone(&controller)),
         );
@@ -4110,7 +4169,7 @@ mod tests {
         controller.publish_checkpoint_drain_transition(None);
         controller.publish_checkpoint_assignment_fence(None);
         db.suspend_shuffle_assignment_fence();
-        shutdown.notify_one();
+        shutdown.cancel();
         drop(execution);
         tokio::time::timeout(Duration::from_secs(1), watcher)
             .await
@@ -4195,7 +4254,7 @@ mod tests {
             process_term: new_lease.term,
         };
         let laminar_core::cluster::control::LeaseOutcome::Acquired(leader_lease) = leader_authority
-            .try_acquire(&leader_owner, 0)
+            .begin_new_term(&leader_owner, 0)
             .await
             .unwrap()
         else {
@@ -4511,7 +4570,8 @@ mod tests {
             boot: old_boot,
             process_term: 1,
         };
-        let LeaseOutcome::Acquired(old_lease) = authority.try_acquire(&old_owner, 0).await.unwrap()
+        let LeaseOutcome::Acquired(old_lease) =
+            authority.begin_new_term(&old_owner, 0).await.unwrap()
         else {
             panic!("empty authority must grant the predecessor term");
         };
@@ -4643,7 +4703,8 @@ mod tests {
             boot: old_boot,
             process_term: 1,
         };
-        let LeaseOutcome::Acquired(old_lease) = authority.try_acquire(&old_owner, 0).await.unwrap()
+        let LeaseOutcome::Acquired(old_lease) =
+            authority.begin_new_term(&old_owner, 0).await.unwrap()
         else {
             panic!("empty authority must grant the predecessor term");
         };

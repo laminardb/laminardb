@@ -463,6 +463,8 @@ impl LaminarDbBuilder {
 
         Self::validate_backpressure(&self.config)?;
         self.validate_state_topology(runtime_mode)?;
+        #[cfg(feature = "cluster")]
+        self.bind_cluster_process_lease(runtime_mode)?;
 
         self.profile.apply_defaults(&mut self.config);
 
@@ -579,6 +581,45 @@ impl LaminarDbBuilder {
         Ok(())
     }
 
+    #[cfg(feature = "cluster")]
+    fn bind_cluster_process_lease(&self, runtime_mode: RuntimeMode) -> Result<(), DbError> {
+        if !runtime_mode.is_cluster() {
+            return Ok(());
+        }
+        let controller = self.cluster_controller.as_ref().ok_or_else(|| {
+            DbError::Config("cluster runtime requires a cluster controller".into())
+        })?;
+        let deadline = controller.process_lease_deadline().ok_or_else(|| {
+            DbError::Config(
+                "cluster runtime requires one shared process lease deadline before construction"
+                    .into(),
+            )
+        })?;
+        if !deadline.is_live() {
+            return Err(DbError::Config(
+                "cluster runtime process lease deadline is already expired".into(),
+            ));
+        }
+        match (&self.shuffle_sender, &self.shuffle_receiver) {
+            (Some(sender), Some(receiver)) => {
+                sender
+                    .bind_process_lease_deadline_pair(receiver, deadline)
+                    .map_err(|error| {
+                        DbError::Config(format!(
+                            "shuffle process lease does not match the controller: {error}"
+                        ))
+                    })?;
+            }
+            (None, None) => {}
+            _ => {
+                return Err(DbError::Config(
+                    "cluster shuffle sender and receiver must be installed together".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn validate_backpressure(config: &LaminarConfig) -> Result<(), DbError> {
         use crate::config::BackpressurePolicy;
         use laminar_connectors::connector::DeliveryGuarantee;
@@ -660,11 +701,9 @@ impl LaminarDbBuilder {
 
     /// Validate delivery semantics whose correctness depends on the runtime mode.
     ///
-    /// A durable leader lease currently fences leader election, but checkpoint decisions and
-    /// sink commits are separate unconditional operations: neither can atomically validate the
-    /// lease token. Boundary rechecks reduce the stale-leader window but cannot prove exactly-once
-    /// across a term change, so cluster EO remains closed until those storage protocols accept a
-    /// real fencing precondition.
+    /// Checkpoint decisions are term-fenced. Cluster exactly-once remains closed until supported
+    /// connectors also provide certified term-fenced source handoff and external sink cursor
+    /// commit across reassignment.
     fn validate_cluster_delivery(
         runtime_mode: RuntimeMode,
         guarantee: laminar_connectors::connector::DeliveryGuarantee,
@@ -723,7 +762,8 @@ mod tests {
     use super::*;
 
     #[cfg(feature = "cluster")]
-    fn test_cluster_controller() -> Arc<laminar_core::cluster::control::ClusterController> {
+    fn test_cluster_controller_without_deadline(
+    ) -> Arc<laminar_core::cluster::control::ClusterController> {
         use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
         use laminar_core::cluster::discovery::{NodeId, NodeInfo};
 
@@ -731,6 +771,19 @@ mod tests {
         let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
         let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
         Arc::new(ClusterController::new(node, kv, None, members_rx))
+    }
+
+    #[cfg(feature = "cluster")]
+    fn test_cluster_controller() -> Arc<laminar_core::cluster::control::ClusterController> {
+        use laminar_core::cluster::control::LeaseDeadline;
+
+        let controller = test_cluster_controller_without_deadline();
+        controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
+                std::time::Duration::from_secs(60),
+            )))
+            .unwrap();
+        controller
     }
 
     #[cfg(feature = "cluster")]
@@ -832,6 +885,98 @@ mod tests {
             db.config.delivery_guarantee,
             laminar_connectors::connector::DeliveryGuarantee::AtLeastOnce
         );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn cluster_runtime_rejects_a_controller_without_process_lease_authority() {
+        let error = LaminarDbBuilder::new()
+            .cluster_controller(test_cluster_controller_without_deadline())
+            .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
+            .build()
+            .await
+            .expect_err("cluster construction must not fail open without a process lease clock");
+
+        assert!(
+            error.to_string().contains("shared process lease deadline"),
+            "{error}"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn cluster_builder_binds_shuffle_to_the_controller_deadline() {
+        use laminar_core::cluster::control::LeaseDeadline;
+
+        let controller = test_cluster_controller();
+        let sender = Arc::new(laminar_core::shuffle::ShuffleSender::new(
+            1,
+            uuid::Uuid::from_u128(1),
+        ));
+        let receiver = Arc::new(
+            laminar_core::shuffle::ShuffleReceiver::bind(
+                1,
+                "127.0.0.1:0".parse().unwrap(),
+                uuid::Uuid::from_u128(1),
+            )
+            .await
+            .unwrap(),
+        );
+        let _db = LaminarDbBuilder::new()
+            .cluster_controller(controller)
+            .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
+            .shuffle_sender(Arc::clone(&sender))
+            .shuffle_receiver(Arc::clone(&receiver))
+            .build()
+            .await
+            .unwrap();
+        let different = Arc::new(LeaseDeadline::live_for(std::time::Duration::from_secs(60)));
+
+        assert!(sender
+            .install_process_lease_deadline(Arc::clone(&different))
+            .is_err());
+        assert!(receiver.install_process_lease_deadline(different).is_err());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn cluster_shuffle_binding_failure_does_not_partially_bind_sender() {
+        use laminar_core::cluster::control::LeaseDeadline;
+
+        let sender = Arc::new(laminar_core::shuffle::ShuffleSender::new(
+            1,
+            uuid::Uuid::from_u128(1),
+        ));
+        let receiver = Arc::new(
+            laminar_core::shuffle::ShuffleReceiver::bind(
+                1,
+                "127.0.0.1:0".parse().unwrap(),
+                uuid::Uuid::from_u128(1),
+            )
+            .await
+            .unwrap(),
+        );
+        receiver
+            .install_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
+                std::time::Duration::from_secs(60),
+            )))
+            .unwrap();
+
+        let error = LaminarDbBuilder::new()
+            .cluster_controller(test_cluster_controller())
+            .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
+            .shuffle_sender(Arc::clone(&sender))
+            .shuffle_receiver(receiver)
+            .build()
+            .await
+            .expect_err("an incompatible receiver lease must reject the pair");
+        assert!(error.to_string().contains("already installed"), "{error}");
+
+        sender
+            .install_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
+                std::time::Duration::from_secs(60),
+            )))
+            .expect("failed pair validation must leave the sender unbound");
     }
 
     #[cfg(feature = "cluster")]

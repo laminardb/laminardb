@@ -278,7 +278,7 @@ mod tests {
             process_term: 1,
         };
         let super::super::LeaseOutcome::Acquired(lease) =
-            authority.try_acquire(&owner, 0).await.unwrap()
+            authority.begin_new_term(&owner, 0).await.unwrap()
         else {
             unreachable!()
         };

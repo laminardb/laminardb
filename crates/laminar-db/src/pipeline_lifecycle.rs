@@ -575,14 +575,108 @@ async fn close_opened_sinks(sinks: &mut [PreparedSink], cleanup_timeout: std::ti
     }
 }
 
+enum SinkOpenOutcome<T> {
+    Completed(T),
+    Deadline(Option<T>),
+    #[cfg(feature = "cluster")]
+    ProcessAuthorityLost(Option<T>),
+}
+
+enum SinkOpenFailure {
+    Connector(String),
+    #[cfg(feature = "cluster")]
+    ProcessAuthorityLost,
+}
+
+async fn await_sink_open<T>(
+    deadline: tokio::time::Instant,
+    cancellation_policy: ConnectorCancellationPolicy,
+    #[cfg(feature = "cluster")] process_authority: Option<
+        &laminar_core::cluster::control::ClusterController,
+    >,
+    future: impl std::future::Future<Output = T>,
+) -> SinkOpenOutcome<T> {
+    if tokio::time::Instant::now() >= deadline {
+        return SinkOpenOutcome::Deadline(None);
+    }
+    let started = std::sync::atomic::AtomicBool::new(false);
+    let operation = async {
+        started.store(true, std::sync::atomic::Ordering::Release);
+        future.await
+    };
+    let mut operation = std::pin::pin!(operation);
+
+    #[cfg(feature = "cluster")]
+    if let Some(controller) = process_authority {
+        if !controller.process_lease_is_live() {
+            return SinkOpenOutcome::ProcessAuthorityLost(None);
+        }
+        return tokio::select! {
+            biased;
+            () = controller.wait_for_process_lease_loss() => {
+                let completion = if cancellation_policy
+                    == ConnectorCancellationPolicy::CompleteStarted
+                    && started.load(std::sync::atomic::Ordering::Acquire)
+                {
+                    Some(operation.await)
+                } else {
+                    None
+                };
+                SinkOpenOutcome::ProcessAuthorityLost(completion)
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                let completion = if cancellation_policy
+                    == ConnectorCancellationPolicy::CompleteStarted
+                    && started.load(std::sync::atomic::Ordering::Acquire)
+                {
+                    Some(operation.await)
+                } else {
+                    None
+                };
+                SinkOpenOutcome::Deadline(completion)
+            }
+            result = &mut operation => {
+                if controller.process_lease_is_live() {
+                    SinkOpenOutcome::Completed(result)
+                } else {
+                    SinkOpenOutcome::ProcessAuthorityLost(Some(result))
+                }
+            }
+        };
+    }
+
+    match tokio::time::timeout_at(deadline, operation.as_mut()).await {
+        Ok(result) => SinkOpenOutcome::Completed(result),
+        Err(_)
+            if cancellation_policy == ConnectorCancellationPolicy::CompleteStarted
+                && started.load(std::sync::atomic::Ordering::Acquire) =>
+        {
+            SinkOpenOutcome::Deadline(Some(operation.await))
+        }
+        Err(_) => SinkOpenOutcome::Deadline(None),
+    }
+}
+
 async fn open_prepared_sinks(
     sinks: &mut [PreparedSink],
     open_timeout: std::time::Duration,
+    #[cfg(feature = "cluster")] process_authority: Option<
+        &laminar_core::cluster::control::ClusterController,
+    >,
 ) -> Result<(), DbError> {
     let open_deadline = tokio::time::Instant::now() + open_timeout;
     let mut index = 0;
     while index < sinks.len() {
         if tokio::time::Instant::now() >= open_deadline {
+            #[cfg(feature = "cluster")]
+            if process_authority.is_some_and(|controller| !controller.process_lease_is_live()) {
+                // A generic close may publish. Cluster startup therefore drops the unopened
+                // generation instead of beginning cleanup that could cross the authority fence.
+                return Err(DbError::Connector(format!(
+                    "Failed to open sink '{}': cluster process lease expired during sink open",
+                    sinks[index].name
+                )));
+            }
             // Tokio's timeout polls its inner future once even at an expired deadline. Do not
             // construct or poll another connector open after the shared startup budget is gone.
             close_opened_sinks(
@@ -599,13 +693,23 @@ async fn open_prepared_sinks(
         let name = prepared.name.clone();
         let cancellation_policy = prepared.connector.cancellation_policy();
         let open_error = {
-            let mut open = std::pin::pin!(prepared.connector.open(&prepared.config));
-            match tokio::time::timeout_at(open_deadline, open.as_mut()).await {
-                Ok(Ok(())) => None,
-                Ok(Err(error)) => Some(error.to_string()),
-                Err(_) => {
-                    if cancellation_policy == ConnectorCancellationPolicy::CompleteStarted {
-                        match open.as_mut().await {
+            let open = prepared.connector.open(&prepared.config);
+            match await_sink_open(
+                open_deadline,
+                cancellation_policy,
+                #[cfg(feature = "cluster")]
+                process_authority,
+                open,
+            )
+            .await
+            {
+                SinkOpenOutcome::Completed(Ok(())) => None,
+                SinkOpenOutcome::Completed(Err(error)) => {
+                    Some(SinkOpenFailure::Connector(error.to_string()))
+                }
+                SinkOpenOutcome::Deadline(completion) => {
+                    if let Some(completion) = completion {
+                        match completion {
                             Ok(()) => tracing::warn!(
                                 sink = %name,
                                 "cancellation-unsafe sink open completed after its deadline"
@@ -617,24 +721,65 @@ async fn open_prepared_sinks(
                             ),
                         }
                     }
-                    Some(format!(
+                    Some(SinkOpenFailure::Connector(format!(
                         "exceeded the shared {open_timeout:?} sink-open stage deadline"
-                    ))
+                    )))
+                }
+                #[cfg(feature = "cluster")]
+                SinkOpenOutcome::ProcessAuthorityLost(completion) => {
+                    if let Some(completion) = completion {
+                        match completion {
+                            Ok(()) => tracing::warn!(
+                                sink = %name,
+                                "cancellation-unsafe sink open completed after process lease loss"
+                            ),
+                            Err(error) => tracing::warn!(
+                                sink = %name,
+                                %error,
+                                "cancellation-unsafe sink open failed after process lease loss"
+                            ),
+                        }
+                    }
+                    Some(SinkOpenFailure::ProcessAuthorityLost)
                 }
             }
         };
-        if let Some(error) = open_error {
-            // A failed/cancelled open may already hold resources, so include the current sink.
-            close_opened_sinks(
-                &mut sinks[..=index],
-                crate::pipeline::PipelineConfig::CONNECTOR_STARTUP_CLEANUP_TIMEOUT,
-            )
-            .await;
-            return Err(DbError::Connector(format!(
-                "Failed to open sink '{name}': {error}"
-            )));
+        match open_error {
+            Some(SinkOpenFailure::Connector(error)) => {
+                #[cfg(feature = "cluster")]
+                if process_authority.is_some_and(|controller| !controller.process_lease_is_live()) {
+                    return Err(DbError::Connector(format!(
+                        "Failed to open sink '{name}': cluster process lease expired during sink open"
+                    )));
+                }
+                // A failed/cancelled open may already hold resources, so include the current sink.
+                close_opened_sinks(
+                    &mut sinks[..=index],
+                    crate::pipeline::PipelineConfig::CONNECTOR_STARTUP_CLEANUP_TIMEOUT,
+                )
+                .await;
+                return Err(DbError::Connector(format!(
+                    "Failed to open sink '{name}': {error}"
+                )));
+            }
+            #[cfg(feature = "cluster")]
+            Some(SinkOpenFailure::ProcessAuthorityLost) => {
+                // Generic close may flush or publish. Once cluster authority is gone, drop the
+                // connector generation without invoking any further connector operation.
+                return Err(DbError::Connector(format!(
+                    "Failed to open sink '{name}': cluster process lease expired during sink open"
+                )));
+            }
+            None => {}
         }
         index += 1;
+    }
+
+    #[cfg(feature = "cluster")]
+    if process_authority.is_some_and(|controller| !controller.process_lease_is_live()) {
+        return Err(DbError::Connector(
+            "cluster process lease expired after the sink-open stage".into(),
+        ));
     }
     Ok(())
 }
@@ -880,10 +1025,13 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
 }
 
 impl LaminarDB {
-    /// Shut down the database gracefully.
+    /// Fence new work and wake the running pipeline without waiting for teardown.
     pub fn close(&self) {
+        let runtime_shutdown = self.runtime_shutdown.write();
         self.shutdown
             .store(true, std::sync::atomic::Ordering::Release);
+        runtime_shutdown.cancel();
+        self.shutdown_signal.notify_one();
     }
 
     /// Stage each boot-owned vnode's chain at the exact recovered attempt the source offsets
@@ -971,8 +1119,30 @@ impl LaminarDB {
     /// the restore quorum, so no node re-shuffles its replay into a peer that hasn't rebound.
     #[cfg(feature = "cluster")]
     pub(crate) fn set_source_gate(&self, closed: bool) {
-        self.source_gate
-            .store(closed, std::sync::atomic::Ordering::SeqCst);
+        if closed {
+            self.source_gate
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
+        let _transition = self.cluster_authority_transition.lock();
+        let process_authority_live = !self.is_cluster_runtime()
+            || self
+                .cluster_controller
+                .lock()
+                .as_ref()
+                .is_some_and(|controller| controller.process_lease_is_live());
+        if !process_authority_live {
+            self.source_gate
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
+        if !self
+            .cluster_authority_revoked
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.source_gate
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     /// Keep clustered source intake closed while startup restores state and certifies assignment.
@@ -986,11 +1156,40 @@ impl LaminarDB {
         }
     }
 
+    /// Permanently withdraw this process's clustered data-plane authority after lease loss.
+    #[cfg(feature = "cluster")]
+    pub fn revoke_cluster_authority(&self) {
+        if !self.is_cluster_runtime() {
+            return;
+        }
+        let _transition = self.cluster_authority_transition.lock();
+        let first_revocation = !self
+            .cluster_authority_revoked
+            .swap(true, std::sync::atomic::Ordering::AcqRel);
+        self.source_gate
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if first_revocation {
+            self.invalidate_shuffle_assignment_fence();
+        }
+        let controller = self.cluster_controller.lock().clone();
+        if let Some(controller) = controller.as_ref() {
+            controller.fence_process_lease();
+        }
+    }
+
     /// Whether clustered source and shuffle intake is still fenced.
     #[cfg(feature = "cluster")]
     #[must_use]
     pub fn cluster_intake_fenced(&self) -> bool {
-        self.source_gate.load(std::sync::atomic::Ordering::Acquire)
+        self.cluster_authority_revoked
+            .load(std::sync::atomic::Ordering::Acquire)
+            || self.source_gate.load(std::sync::atomic::Ordering::Acquire)
+            || (self.is_cluster_runtime()
+                && self
+                    .cluster_controller
+                    .lock()
+                    .as_ref()
+                    .is_none_or(|controller| !controller.process_lease_is_live()))
     }
 
     /// Finish clustered startup after the exact assignment fence is available.
@@ -1431,6 +1630,26 @@ impl LaminarDB {
     /// the watcher reinforces it. Ignoring a lost CAS here would let coordinated recovery
     /// acknowledge a process whose compute loop has already died.
     fn finish_start_transition(&self) -> Result<(), DbError> {
+        // Hold the generation read lock through publication. Every cancellation path takes the
+        // write lock, so cancellation and `Starting -> Running` have one linearization order.
+        let runtime_shutdown = self.runtime_shutdown.read();
+        if self.is_closed() || runtime_shutdown.is_cancelled() {
+            return match DbState::compare_exchange(
+                DbState::Starting,
+                DbState::Created,
+                &self.state,
+            ) {
+                Ok(_) | Err(DbState::Created) => Err(DbError::Shutdown),
+                Err(DbState::Faulted) => Err(DbError::Pipeline(format!(
+                    "pipeline faulted while its cancelled generation was leaving startup: {}",
+                    self.last_fault()
+                        .unwrap_or_else(|| "compute loop exited without a fault reason".into())
+                ))),
+                Err(observed) => Err(DbError::InvalidOperation(format!(
+                    "cancelled pipeline startup completed from an unexpected lifecycle state: {observed:?}"
+                ))),
+            };
+        }
         match DbState::compare_exchange(DbState::Starting, DbState::Running, &self.state) {
             Ok(_) => Ok(()),
             Err(DbState::Faulted) => Err(DbError::Pipeline(format!(
@@ -1715,6 +1934,13 @@ impl LaminarDB {
 
     #[allow(clippy::too_many_lines)]
     async fn start_inner(&self) -> Result<(), DbError> {
+        let runtime_shutdown = tokio_util::sync::CancellationToken::new();
+        *self.runtime_shutdown.write() = runtime_shutdown.clone();
+        if self.is_closed() {
+            runtime_shutdown.cancel();
+            return Err(DbError::Shutdown);
+        }
+
         let (source_regs, sink_regs, stream_regs, table_regs, has_external) = {
             let mgr = self.connector_manager.lock();
             (
@@ -2093,6 +2319,7 @@ impl LaminarDB {
                 stream_regs,
                 table_regs,
                 has_external,
+                runtime_shutdown,
             )
             .await?;
         } else {
@@ -2143,6 +2370,7 @@ impl LaminarDB {
         stream_regs: HashMap<String, crate::connector_manager::StreamRegistration>,
         table_regs: HashMap<String, crate::connector_manager::TableRegistration>,
         has_external: bool,
+        runtime_shutdown: tokio_util::sync::CancellationToken,
     ) -> Result<(), DbError> {
         use crate::connector_manager::{
             build_sink_config, build_source_config, build_table_config,
@@ -2710,9 +2938,37 @@ impl LaminarDB {
             });
         }
 
+        #[cfg(feature = "cluster")]
+        let callback_controller = self.cluster_controller.lock().clone();
+        #[cfg(feature = "cluster")]
+        let sink_process_authority = if runtime_mode == RuntimeMode::Cluster {
+            let controller = callback_controller.clone().ok_or_else(|| {
+                DbError::Config(
+                    "cluster sink runtime requires a cluster controller with process lease authority"
+                        .into(),
+                )
+            })?;
+            if controller.process_lease_deadline().is_none() {
+                return Err(DbError::Config(
+                    "cluster sink runtime requires one shared process lease deadline before open"
+                        .into(),
+                ));
+            }
+            Some(controller)
+        } else {
+            None
+        };
+
         // Opening is one atomic startup stage: a slow connector consumes the remaining shared
-        // checkpoint-derived budget rather than receiving a fresh timeout of its own.
-        open_prepared_sinks(&mut prepared_sinks, pipeline_checkpoint_timeout).await?;
+        // checkpoint-derived budget rather than receiving a fresh timeout of its own. Cluster
+        // opens use the exact authority later installed in the actor and callback.
+        open_prepared_sinks(
+            &mut prepared_sinks,
+            pipeline_checkpoint_timeout,
+            #[cfg(feature = "cluster")]
+            sink_process_authority.as_deref(),
+        )
+        .await?;
 
         #[allow(clippy::type_complexity)]
         let mut sinks: Vec<(
@@ -2746,6 +3002,8 @@ impl LaminarDB {
                     flush_interval,
                     write_timeout,
                     event_tx: sink_event_tx.clone(),
+                    #[cfg(feature = "cluster")]
+                    process_authority: sink_process_authority.clone(),
                 });
             {
                 let mut owned = self.owned_sink_handles.lock();
@@ -3589,7 +3847,9 @@ impl LaminarDB {
         // within the struct literal below would deadlock (the first guard lives until
         // the statement ends).
         #[cfg(feature = "cluster")]
-        let callback_controller = self.cluster_controller.lock().clone();
+        let source_process_authority = (runtime_mode == RuntimeMode::Cluster)
+            .then(|| callback_controller.clone())
+            .flatten();
         #[cfg(feature = "cluster")]
         let callback_vnode_registry = self.vnode_registry.lock().clone();
         #[cfg(feature = "cluster")]
@@ -3694,10 +3954,13 @@ impl LaminarDB {
                 Arc::clone(&shutdown),
                 control_rx,
                 source_gate,
+                #[cfg(feature = "cluster")]
+                source_process_authority,
                 Arc::clone(&self.owned_source_tasks),
-                runtime_mode == RuntimeMode::Cluster,
+                runtime_mode,
             )
             .await?
+            .with_terminal_shutdown(runtime_shutdown.clone())
             .with_force_checkpoint_rx(force_ckpt_rx)
             .with_checkpoint_complete_rx(checkpoint_complete_rx)
             .with_checkpoint_admission(checkpoint_in_flight, staged_bytes, max_staged_bytes)
@@ -3774,8 +4037,16 @@ impl LaminarDB {
 
             match startup_rx.await {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => return Err(DbError::Config(e)),
+                Ok(Err(_)) if runtime_shutdown.is_cancelled() || self.is_closed() => {
+                    let _ = done_rx.await;
+                    return Err(DbError::Shutdown);
+                }
+                Ok(Err(e)) => {
+                    let _ = done_rx.await;
+                    return Err(DbError::Config(e));
+                }
                 Err(_) => {
+                    let _ = done_rx.await;
                     return Err(DbError::Config(
                         "compute thread exited before entering the runtime control loop".into(),
                     ));
@@ -3947,6 +4218,7 @@ impl LaminarDB {
             self.await_startup_attempt_until(&startup, deadline, "pipeline shutdown")
                 .await?;
         };
+        self.runtime_shutdown.write().cancel();
         if first_shutdown {
             *self.force_ckpt_tx.lock() = None;
             self.shutdown_signal.notify_one();
@@ -4061,6 +4333,7 @@ impl LaminarDB {
                 .await
                 .map_err(|error| DbError::InvalidOperation(error.to_string()))?;
         };
+        self.runtime_shutdown.write().cancel();
         if first_stop {
             *self.force_ckpt_tx.lock() = None;
             // Clear up front so DDL during/after shutdown registers for the next start()
@@ -4249,6 +4522,18 @@ mod connector_admission_tests {
         assert_eq!(DbState::load(&db.state), DbState::Faulted);
     }
 
+    #[test]
+    fn cancelled_runtime_generation_cannot_publish_running() {
+        let db = LaminarDB::open().unwrap();
+        DbState::Starting.store(&db.state);
+        db.runtime_shutdown.read().cancel();
+
+        let error = db.finish_start_transition().unwrap_err();
+
+        assert!(matches!(error, crate::error::DbError::Shutdown));
+        assert_eq!(DbState::load(&db.state), DbState::Created);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_and_concurrent_start_wait_for_one_owned_attempt() {
         let db = LaminarDB::open().unwrap();
@@ -4289,6 +4574,37 @@ mod connector_admission_tests {
             .expect("concurrent start task panicked")
             .expect("owned startup failed");
         assert_eq!(DbState::load(&db.state), DbState::Running);
+        db.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn synchronous_close_wakes_the_running_pipeline() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE input (id BIGINT)").await.unwrap();
+        db.execute("CREATE STREAM output AS SELECT id FROM input")
+            .await
+            .unwrap();
+        db.start().await.unwrap();
+        assert!(db.runtime_handle.lock().await.is_some());
+
+        db.close();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let finished = db
+                    .runtime_handle
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(tokio::task::JoinHandle::is_finished);
+                if finished {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("synchronous shutdown request did not wake the pipeline runtime");
         db.shutdown().await.unwrap();
     }
 
@@ -4804,9 +5120,14 @@ mod connector_admission_tests {
             ),
         ];
 
-        let error = open_prepared_sinks(&mut sinks, Duration::from_secs(10))
-            .await
-            .expect_err("the second sink must consume the remaining shared startup budget");
+        let error = open_prepared_sinks(
+            &mut sinks,
+            Duration::from_secs(10),
+            #[cfg(feature = "cluster")]
+            None,
+        )
+        .await
+        .expect_err("the second sink must consume the remaining shared startup budget");
 
         let message = error.to_string();
         assert!(
@@ -4814,6 +5135,50 @@ mod connector_admission_tests {
                 && message.contains("shared 10s sink-open stage deadline"),
             "unexpected error: {error}"
         );
+        assert_eq!(prior_open.load(Ordering::SeqCst), 1);
+        assert_eq!(current_open.load(Ordering::SeqCst), 1);
+        assert_eq!(prior_close.load(Ordering::SeqCst), 1);
+        assert_eq!(current_close.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(start_paused = true)]
+    async fn live_cluster_authority_rolls_back_timed_out_sink_startup() {
+        let prior_open = Arc::new(AtomicU64::new(0));
+        let prior_close = Arc::new(AtomicU64::new(0));
+        let current_open = Arc::new(AtomicU64::new(0));
+        let current_close = Arc::new(AtomicU64::new(0));
+        let mut sinks = vec![
+            prepared_startup_probe(
+                "prior",
+                Duration::from_secs(6),
+                Arc::clone(&prior_open),
+                Arc::clone(&prior_close),
+            ),
+            prepared_startup_probe(
+                "current",
+                Duration::from_secs(6),
+                Arc::clone(&current_open),
+                Arc::clone(&current_close),
+            ),
+        ];
+        let controller = sink_open_authority(40);
+
+        let error = open_prepared_sinks(
+            &mut sinks,
+            Duration::from_secs(10),
+            Some(controller.as_ref()),
+        )
+        .await
+        .expect_err("the second sink must consume the remaining shared startup budget");
+
+        assert!(
+            error
+                .to_string()
+                .contains("shared 10s sink-open stage deadline"),
+            "{error}"
+        );
+        assert!(controller.process_lease_is_live());
         assert_eq!(prior_open.load(Ordering::SeqCst), 1);
         assert_eq!(current_open.load(Ordering::SeqCst), 1);
         assert_eq!(prior_close.load(Ordering::SeqCst), 1);
@@ -4831,9 +5196,14 @@ mod connector_admission_tests {
             Arc::clone(&close_calls),
         )];
 
-        let error = open_prepared_sinks(&mut sinks, Duration::ZERO)
-            .await
-            .expect_err("an expired shared budget must reject before polling open");
+        let error = open_prepared_sinks(
+            &mut sinks,
+            Duration::ZERO,
+            #[cfg(feature = "cluster")]
+            None,
+        )
+        .await
+        .expect_err("an expired shared budget must reject before polling open");
 
         assert!(
             error
@@ -4859,9 +5229,14 @@ mod connector_admission_tests {
         )];
         let started = tokio::time::Instant::now();
 
-        let error = open_prepared_sinks(&mut sinks, Duration::from_secs(10))
-            .await
-            .expect_err("late open must still fail the startup stage");
+        let error = open_prepared_sinks(
+            &mut sinks,
+            Duration::from_secs(10),
+            #[cfg(feature = "cluster")]
+            None,
+        )
+        .await
+        .expect_err("late open must still fail the startup stage");
 
         assert!(error
             .to_string()
@@ -4872,6 +5247,134 @@ mod connector_admission_tests {
         );
         assert_eq!(open_calls.load(Ordering::SeqCst), 1);
         assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "cluster")]
+    fn sink_open_authority(node: u64) -> Arc<laminar_core::cluster::control::ClusterController> {
+        use laminar_core::cluster::control::{ClusterKv, InMemoryKv, LeaseDeadline};
+        use laminar_core::state::NodeId;
+
+        let node = NodeId(node);
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
+        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
+        let controller = Arc::new(laminar_core::cluster::control::ClusterController::new(
+            node, kv, None, members_rx,
+        ));
+        controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+            .unwrap();
+        controller
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(start_paused = true)]
+    async fn cluster_process_lease_loss_cancels_cancel_safe_sink_open() {
+        let open_calls = Arc::new(AtomicU64::new(0));
+        let close_calls = Arc::new(AtomicU64::new(0));
+        let mut sinks = vec![prepared_startup_probe(
+            "fenced-open",
+            Duration::from_secs(60),
+            Arc::clone(&open_calls),
+            Arc::clone(&close_calls),
+        )];
+        let controller = sink_open_authority(41);
+        let fencer = Arc::clone(&controller);
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            fencer.fence_process_lease();
+        });
+        let started = tokio::time::Instant::now();
+
+        let error = open_prepared_sinks(
+            &mut sinks,
+            Duration::from_secs(60),
+            Some(controller.as_ref()),
+        )
+        .await
+        .expect_err("process lease loss must reject sink startup");
+
+        assert!(
+            error.to_string().contains("process lease expired"),
+            "{error}"
+        );
+        assert!(tokio::time::Instant::now() - started < Duration::from_secs(60));
+        assert_eq!(open_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            close_calls.load(Ordering::SeqCst),
+            0,
+            "a fenced process must not invoke generic close because close may publish"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(start_paused = true)]
+    async fn cluster_process_lease_loss_finishes_complete_started_sink_open_before_cleanup() {
+        let open_calls = Arc::new(AtomicU64::new(0));
+        let close_calls = Arc::new(AtomicU64::new(0));
+        let mut sinks = vec![prepared_lifecycle_probe_with_policy(
+            "complete-started-authority",
+            Duration::from_secs(12),
+            Duration::ZERO,
+            Arc::clone(&open_calls),
+            Arc::clone(&close_calls),
+            ConnectorCancellationPolicy::CompleteStarted,
+        )];
+        let controller = sink_open_authority(42);
+        let fencer = Arc::clone(&controller);
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            fencer.fence_process_lease();
+        });
+        let started = tokio::time::Instant::now();
+
+        let error = open_prepared_sinks(
+            &mut sinks,
+            Duration::from_secs(60),
+            Some(controller.as_ref()),
+        )
+        .await
+        .expect_err("lease loss must reject even a completed cancellation-unsafe open");
+
+        assert!(
+            error.to_string().contains("process lease expired"),
+            "{error}"
+        );
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_secs(12)
+        );
+        assert_eq!(open_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(close_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn expired_cluster_process_lease_never_polls_sink_open() {
+        let open_calls = Arc::new(AtomicU64::new(0));
+        let close_calls = Arc::new(AtomicU64::new(0));
+        let mut sinks = vec![prepared_startup_probe(
+            "expired-authority",
+            Duration::ZERO,
+            Arc::clone(&open_calls),
+            Arc::clone(&close_calls),
+        )];
+        let controller = sink_open_authority(43);
+        controller.fence_process_lease();
+
+        let error = open_prepared_sinks(
+            &mut sinks,
+            Duration::from_secs(10),
+            Some(controller.as_ref()),
+        )
+        .await
+        .expect_err("expired authority must reject before polling sink open");
+
+        assert!(
+            error.to_string().contains("process lease expired"),
+            "{error}"
+        );
+        assert_eq!(open_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(close_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -5824,7 +6327,7 @@ mod cluster_fault_watcher_tests {
         LeaderLeaseStore, LeaseDeadline, LeaseOutcome, ProcessLeaseAuthority, ProcessLeaseOutcome,
         RecoverPhase,
     };
-    use laminar_core::cluster::discovery::{NodeId, NodeInfo};
+    use laminar_core::cluster::discovery::{NodeId, NodeInfo, NodeMetadata, NodeState};
     use laminar_core::state::{
         InProcessBackend, NodeId as StateNodeId, ObjectStoreBackend, VnodeRegistry,
     };
@@ -5960,12 +6463,14 @@ mod cluster_fault_watcher_tests {
             boot: controller.recovery_incarnation(),
             process_term: process_lease.term,
         };
-        let LeaseOutcome::Acquired(lease) = authority.try_acquire(&owner, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap()
+        else {
             panic!("empty test authority must grant leadership");
         };
         let (_lease_tx, lease_rx) = tokio::sync::watch::channel(Some(lease.clone()));
         controller
-            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))));
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+            .unwrap();
         controller
             .set_leader_lease_watch(
                 lease_rx,
@@ -6072,9 +6577,22 @@ mod cluster_fault_watcher_tests {
     async fn zero_vnode_worker_finishes_startup_idle_and_data_plane_fenced() {
         let local = StateNodeId(7);
         let owner = StateNodeId(8);
+        let owner_boot = uuid::Uuid::from_u128(88);
         let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(local));
-        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
+        let owner_member = NodeInfo {
+            id: NodeId(owner.0),
+            name: "owner".into(),
+            rpc_address: String::new(),
+            raft_address: String::new(),
+            state: NodeState::Active,
+            metadata: NodeMetadata::default(),
+            last_heartbeat_ms: 0,
+        };
+        let (_members_tx, members_rx) = tokio::sync::watch::channel(vec![owner_member]);
         let controller = Arc::new(ClusterController::new(local, kv, None, members_rx));
+        controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+            .unwrap();
         controller.publish_recovery_incarnation().await.unwrap();
         controller.set_active(true);
         let fence = CheckpointAssignmentFence::from_owner_map(
@@ -6082,7 +6600,7 @@ mod cluster_fault_watcher_tests {
             &[owner.0],
             vec![CheckpointParticipant {
                 node_id: owner.0,
-                boot_incarnation: uuid::Uuid::from_u128(88),
+                boot_incarnation: owner_boot,
             }],
         )
         .unwrap();
@@ -6091,12 +6609,22 @@ mod cluster_fault_watcher_tests {
             local.0,
             controller.recovery_incarnation(),
         ));
+        let receiver = Arc::new(
+            laminar_core::shuffle::ShuffleReceiver::bind(
+                local.0,
+                "127.0.0.1:0".parse().unwrap(),
+                controller.recovery_incarnation(),
+            )
+            .await
+            .unwrap(),
+        );
         let db = LaminarDB::builder()
             .cluster_controller(Arc::clone(&controller))
             .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
             .state_backend(Arc::new(InProcessBackend::new(1)))
             .vnode_registry(Arc::new(VnodeRegistry::single_owner(1, owner)))
             .shuffle_sender(Arc::clone(&sender))
+            .shuffle_receiver(receiver)
             .build()
             .await
             .unwrap();

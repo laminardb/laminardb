@@ -167,7 +167,6 @@ impl ReceivedBatch {
 
     /// Split the decoded batch from its admission so a retaining consumer can
     /// keep the charge for exactly as long as shallow Arrow views remain live.
-    #[must_use]
     pub fn into_parts(self) -> (arrow_array::RecordBatch, ShuffleBatchAdmission) {
         (self.batch, ShuffleBatchAdmission(self.reservation))
     }
@@ -263,7 +262,6 @@ impl ReceivedShuffle {
 
     /// Split the message from any decoded-data admission after its transport
     /// scope has been validated.
-    #[must_use]
     pub fn into_parts(self) -> (ShuffleMessage, ShuffleBatchAdmission) {
         (self.message, ShuffleBatchAdmission(self.reservation))
     }
@@ -300,7 +298,7 @@ mod grpc {
     use std::io;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, OnceLock};
 
     use arrow_array::RecordBatch;
     use bytes::Bytes;
@@ -327,7 +325,7 @@ mod grpc {
         ShufflePeerId, SHUFFLE_ADDR_KEY, SHUFFLE_RECV_QUEUE,
     };
     use crate::checkpoint::{CheckpointAssignmentFence, CheckpointBarrier};
-    use crate::cluster::control::ClusterKv;
+    use crate::cluster::control::{ClusterKv, LeaseDeadline};
     use crate::serialization::{serialize_batch_stream_bounded, BatchStreamDecoder};
 
     const SEND_QUEUE: usize = 256;
@@ -381,6 +379,7 @@ mod grpc {
     const MAX_PENDING_HANDSHAKES: usize = 4096;
     const HANDSHAKE_TOKEN_TTL: std::time::Duration = std::time::Duration::from_secs(30);
     const SCOPE_CANCELLED: &str = "shuffle assignment or recovery scope was cancelled";
+    const PROCESS_LEASE_EXPIRED: &str = "shuffle process lease is no longer live";
 
     type InboundRx = AsyncRx<mpsc::Array<Inbound>>;
     type InboundTx = MAsyncTx<mpsc::Array<Inbound>>;
@@ -397,19 +396,217 @@ mod grpc {
         tonic::Status::cancelled(SCOPE_CANCELLED)
     }
 
+    fn process_lease_expired_io() -> io::Error {
+        io::Error::new(io::ErrorKind::PermissionDenied, PROCESS_LEASE_EXPIRED)
+    }
+
+    fn process_lease_expired_status() -> tonic::Status {
+        tonic::Status::failed_precondition(PROCESS_LEASE_EXPIRED)
+    }
+
+    struct ProcessLeaseGate {
+        deadline: OnceLock<Arc<LeaseDeadline>>,
+        cancelled: CancellationToken,
+        watcher: Mutex<Option<tokio::task::AbortHandle>>,
+    }
+
+    impl Default for ProcessLeaseGate {
+        fn default() -> Self {
+            Self {
+                deadline: OnceLock::new(),
+                cancelled: CancellationToken::new(),
+                watcher: Mutex::new(None),
+            }
+        }
+    }
+
+    impl ProcessLeaseGate {
+        fn is_installed_deadline(&self, deadline: &Arc<LeaseDeadline>) -> bool {
+            self.deadline
+                .get()
+                .is_some_and(|current| Arc::ptr_eq(current, deadline))
+        }
+
+        fn install(&self, deadline: Arc<LeaseDeadline>) -> io::Result<()> {
+            if !deadline.is_live() {
+                return Err(process_lease_expired_io());
+            }
+            let mut watcher_slot = self.watcher.lock();
+            if let Some(current) = self.deadline.get() {
+                return if Arc::ptr_eq(current, &deadline) {
+                    Ok(())
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "shuffle process lease deadline is already installed",
+                    ))
+                };
+            }
+            let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
+                io::Error::other(format!(
+                    "shuffle process lease requires a Tokio runtime: {error}"
+                ))
+            })?;
+            self.deadline.set(Arc::clone(&deadline)).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "shuffle process lease deadline is already installed",
+                )
+            })?;
+            let cancelled = self.cancelled.clone();
+            let watcher = runtime.spawn(async move {
+                deadline.wait_until_expired().await;
+                cancelled.cancel();
+            });
+            *watcher_slot = Some(watcher.abort_handle());
+            Ok(())
+        }
+
+        fn install_pair(
+            first: &Self,
+            second: &Self,
+            deadline: Arc<LeaseDeadline>,
+        ) -> io::Result<()> {
+            let mut first_watcher = first.watcher.lock();
+            let mut second_watcher = second.watcher.lock();
+            if !deadline.is_live() {
+                return Err(process_lease_expired_io());
+            }
+            for gate in [first, second] {
+                if gate
+                    .deadline
+                    .get()
+                    .is_some_and(|current| !Arc::ptr_eq(current, &deadline))
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "shuffle process lease deadline is already installed",
+                    ));
+                }
+            }
+
+            let install_first = first.deadline.get().is_none();
+            let install_second = second.deadline.get().is_none();
+            let runtime = if install_first || install_second {
+                Some(tokio::runtime::Handle::try_current().map_err(|error| {
+                    io::Error::other(format!(
+                        "shuffle process lease requires a Tokio runtime: {error}"
+                    ))
+                })?)
+            } else {
+                None
+            };
+
+            if install_first {
+                assert!(
+                    first.deadline.set(Arc::clone(&deadline)).is_ok(),
+                    "first shuffle lease gate changed while its watcher lock was held"
+                );
+            }
+            if install_second {
+                assert!(
+                    second.deadline.set(Arc::clone(&deadline)).is_ok(),
+                    "second shuffle lease gate changed while its watcher lock was held"
+                );
+            }
+
+            if let Some(runtime) = runtime {
+                if install_first {
+                    let cancelled = first.cancelled.clone();
+                    let first_deadline = Arc::clone(&deadline);
+                    let watcher = runtime.spawn(async move {
+                        first_deadline.wait_until_expired().await;
+                        cancelled.cancel();
+                    });
+                    *first_watcher = Some(watcher.abort_handle());
+                }
+                if install_second {
+                    let cancelled = second.cancelled.clone();
+                    let watcher = runtime.spawn(async move {
+                        deadline.wait_until_expired().await;
+                        cancelled.cancel();
+                    });
+                    *second_watcher = Some(watcher.abort_handle());
+                }
+            }
+            Ok(())
+        }
+
+        fn require_live_io(&self) -> io::Result<()> {
+            match self.deadline.get() {
+                Some(deadline) if deadline.is_live() => Ok(()),
+                Some(_) => Err(process_lease_expired_io()),
+                None => Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "shuffle process lease deadline is not installed",
+                )),
+            }
+        }
+
+        fn require_live_status(&self) -> Result<(), tonic::Status> {
+            match self.deadline.get() {
+                Some(deadline) if deadline.is_live() => Ok(()),
+                Some(_) => Err(process_lease_expired_status()),
+                None => Err(tonic::Status::failed_precondition(
+                    "shuffle process lease deadline is not installed",
+                )),
+            }
+        }
+
+        async fn wait_until_lost(&self) {
+            let Some(deadline) = self.deadline.get() else {
+                return;
+            };
+            if !deadline.is_live() {
+                return;
+            }
+            tokio::select! {
+                biased;
+                () = self.cancelled.cancelled() => {}
+                () = deadline.wait_until_expired() => {}
+            }
+        }
+
+        fn scope_token(&self, active: bool) -> CancellationToken {
+            let token = self.cancelled.child_token();
+            if !active || self.require_live_io().is_err() {
+                token.cancel();
+            }
+            token
+        }
+
+        #[cfg(test)]
+        fn install_live_for_test(&self) {
+            self.deadline
+                .set(Arc::new(LeaseDeadline::live_for(
+                    std::time::Duration::from_secs(60),
+                )))
+                .expect("test process lease is installed once");
+        }
+    }
+
+    impl Drop for ProcessLeaseGate {
+        fn drop(&mut self) {
+            if let Some(watcher) = self.watcher.get_mut().take() {
+                watcher.abort();
+            }
+        }
+    }
+
     fn cancelled_token() -> CancellationToken {
         let token = CancellationToken::new();
         token.cancel();
         token
     }
 
-    fn rotate_scope_token(slot: &RwLock<CancellationToken>, active: bool) {
+    fn rotate_scope_token(
+        slot: &RwLock<CancellationToken>,
+        process_lease: &ProcessLeaseGate,
+        active: bool,
+    ) {
         let mut token = slot.write();
         token.cancel();
-        *token = CancellationToken::new();
-        if !active {
-            token.cancel();
-        }
+        *token = process_lease.scope_token(active);
     }
 
     /// A message prepared before its sequence is fixed and inserted into the ordered queue.
@@ -819,9 +1016,7 @@ mod grpc {
         F: FnOnce() + Send + 'static,
     {
         match msg {
-            ShuffleMessage::Barrier(barrier) => {
-                Ok((PreparedMessage::Barrier(barrier.clone()), budget))
-            }
+            ShuffleMessage::Barrier(barrier) => Ok((PreparedMessage::Barrier(*barrier), budget)),
             ShuffleMessage::Data {
                 stage,
                 routed_vnodes,
@@ -1363,12 +1558,16 @@ mod grpc {
                     let first = index == 0;
                     frames.push_back(ShuffleFrame {
                         kind: Some(shuffle_frame::Kind::Data(RoutedData {
-                            stage: first
-                                .then(|| std::mem::take(&mut stage))
-                                .unwrap_or_default(),
-                            routed_vnodes: first
-                                .then(|| std::mem::take(&mut routes))
-                                .unwrap_or_default(),
+                            stage: if first {
+                                std::mem::take(&mut stage)
+                            } else {
+                                String::new()
+                            },
+                            routed_vnodes: if first {
+                                std::mem::take(&mut routes)
+                            } else {
+                                Vec::new()
+                            },
                             arrow_ipc: arrow_ipc.slice(start..end),
                             recovery_gen: gen,
                             seq,
@@ -1447,6 +1646,7 @@ mod grpc {
         assignment: Arc<RwLock<Option<Arc<InstalledAssignment>>>>,
         assignment_version: Arc<AtomicU64>,
         scope_cancel: Arc<RwLock<CancellationToken>>,
+        process_lease: Arc<ProcessLeaseGate>,
         /// True only for a transient durable-authority outage. The exact retained certificate
         /// may be reactivated without resetting its sequence domain.
         assignment_suspended: AtomicBool,
@@ -1486,6 +1686,7 @@ mod grpc {
                 assignment: Arc::new(RwLock::new(None)),
                 assignment_version: Arc::new(AtomicU64::new(0)),
                 scope_cancel: Arc::new(RwLock::new(cancelled_token())),
+                process_lease: Arc::new(ProcessLeaseGate::default()),
                 assignment_suspended: AtomicBool::new(false),
                 recovery_gen: Arc::new(AtomicU64::new(0)),
                 seqs: Mutex::new(FxHashMap::default()),
@@ -1500,6 +1701,73 @@ mod grpc {
         #[must_use]
         pub const fn local_id(&self) -> ShufflePeerId {
             self.local_id
+        }
+
+        /// Bind outbound admission to this process's renewable cluster lease.
+        ///
+        /// This must be installed before an assignment certificate is activated.
+        ///
+        /// # Errors
+        /// Returns an error for an expired lease, a different previously installed deadline, or
+        /// an already-active assignment.
+        pub fn install_process_lease_deadline(
+            &self,
+            deadline: Arc<LeaseDeadline>,
+        ) -> io::Result<()> {
+            let _assignment = self.assignment.write();
+            if self.assignment_version.load(Ordering::Acquire) != 0
+                && !self.process_lease.is_installed_deadline(&deadline)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "shuffle process lease must be installed before assignment activation",
+                ));
+            }
+            self.process_lease.install(deadline)
+        }
+
+        /// Bind both directions of one local shuffle fabric to the same process lease.
+        ///
+        /// Validation and installation are serialized across both handles, so an incompatible
+        /// receiver cannot leave only the sender bound.
+        ///
+        /// # Errors
+        /// Returns an error without changing either handle when the deadline is expired, either
+        /// handle is already bound to a different deadline, or an active assignment prevents a
+        /// new binding.
+        pub fn bind_process_lease_deadline_pair(
+            &self,
+            receiver: &ShuffleReceiver,
+            deadline: Arc<LeaseDeadline>,
+        ) -> io::Result<()> {
+            let _sender_assignment = self.assignment.write();
+            let _receiver_assignment = receiver.assignment.write();
+            if self.assignment_version.load(Ordering::Acquire) != 0
+                && !self.process_lease.is_installed_deadline(&deadline)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "shuffle process lease must be installed before outbound assignment activation",
+                ));
+            }
+            if receiver.assignment_version.load(Ordering::Acquire) != 0
+                && !receiver.process_lease.is_installed_deadline(&deadline)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "shuffle process lease must be installed before inbound assignment activation",
+                ));
+            }
+            ProcessLeaseGate::install_pair(
+                self.process_lease.as_ref(),
+                receiver.process_lease.as_ref(),
+                deadline,
+            )
+        }
+
+        #[cfg(test)]
+        pub(crate) fn install_live_process_lease_for_test(&self) {
+            self.process_lease.install_live_for_test();
         }
 
         /// Install the exact assignment certificate accepted by outbound shuffle streams.
@@ -1522,6 +1790,7 @@ mod grpc {
             // Publish and reset under one scope lock and the same lock order used by connection
             // installation / sequence allocation. A new-scope frame cannot reuse sequence zero.
             let mut assignment = self.assignment.write();
+            self.process_lease.require_live_io()?;
             if let Some(current) = assignment.as_ref() {
                 if next.fence.assignment_version < current.fence.assignment_version {
                     return Ok(false);
@@ -1537,7 +1806,7 @@ mod grpc {
                             return Ok(false);
                         }
                         if self.assignment_suspended.load(Ordering::Acquire) {
-                            rotate_scope_token(&self.scope_cancel, true);
+                            rotate_scope_token(&self.scope_cancel, &self.process_lease, true);
                             self.pool.lock().clear();
                             self.connect_locks.lock().clear();
                             self.assignment_suspended.store(false, Ordering::Release);
@@ -1556,7 +1825,7 @@ mod grpc {
                     ));
                 }
             }
-            rotate_scope_token(&self.scope_cancel, false);
+            rotate_scope_token(&self.scope_cancel, &self.process_lease, false);
             let mut pool = self.pool.lock();
             let mut seqs = self.seqs.lock();
             pool.clear();
@@ -1568,7 +1837,7 @@ mod grpc {
             let version = next.fence.assignment_version;
             *assignment = Some(next);
             self.assignment_suspended.store(false, Ordering::Release);
-            rotate_scope_token(&self.scope_cancel, true);
+            rotate_scope_token(&self.scope_cancel, &self.process_lease, true);
             self.assignment_version.store(version, Ordering::Release);
             Ok(true)
         }
@@ -1581,7 +1850,7 @@ mod grpc {
             if assignment.is_none() || self.assignment_version.load(Ordering::Acquire) == 0 {
                 return;
             }
-            rotate_scope_token(&self.scope_cancel, false);
+            rotate_scope_token(&self.scope_cancel, &self.process_lease, false);
             self.pool.lock().clear();
             self.connect_locks.lock().clear();
             self.assignment_suspended.store(true, Ordering::Release);
@@ -1593,7 +1862,7 @@ mod grpc {
         /// monotonic conflict floor; it is inactive while [`Self::assignment_version`] is zero.
         pub fn invalidate_assignment_fence(&self) {
             let _assignment = self.assignment.write();
-            rotate_scope_token(&self.scope_cancel, false);
+            rotate_scope_token(&self.scope_cancel, &self.process_lease, false);
             let mut pool = self.pool.lock();
             let mut seqs = self.seqs.lock();
             self.assignment_suspended.store(false, Ordering::Release);
@@ -1630,7 +1899,7 @@ mod grpc {
             if gen <= previous {
                 return;
             }
-            rotate_scope_token(&self.scope_cancel, false);
+            rotate_scope_token(&self.scope_cancel, &self.process_lease, false);
             let mut pool = self.pool.lock();
             let mut seqs = self.seqs.lock();
             self.recovery_gen.store(gen, Ordering::Release);
@@ -1639,6 +1908,7 @@ mod grpc {
             self.connect_locks.lock().clear();
             rotate_scope_token(
                 &self.scope_cancel,
+                &self.process_lease,
                 self.assignment_version.load(Ordering::Acquire) != 0,
             );
         }
@@ -1864,15 +2134,24 @@ mod grpc {
                 _budget: budget,
             };
             self.validate_scope(&scope, expected_assignment_version)?;
-            tokio::select! {
-                biased;
-                () = scope.cancel.cancelled() => Err(scope_cancelled_io()),
-                result = conn.tx.send(out) => result.map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        format!("shuffle stream to peer {peer} closed"),
-                    )
-                }),
+            match conn.tx.try_send(out) {
+                Ok(()) => self.process_lease.require_live_io(),
+                Err(crossfire::TrySendError::Full(out)) => tokio::select! {
+                    biased;
+                    () = self.process_lease.wait_until_lost() => Err(process_lease_expired_io()),
+                    () = scope.cancel.cancelled() => Err(scope_cancelled_io()),
+                    result = conn.tx.send(out) => {
+                        result.map_err(|_| io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            format!("shuffle stream to peer {peer} closed"),
+                        ))?;
+                        self.process_lease.require_live_io()
+                    },
+                },
+                Err(crossfire::TrySendError::Disconnected(_)) => Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    format!("shuffle stream to peer {peer} closed"),
+                )),
             }
         }
 
@@ -1893,6 +2172,7 @@ mod grpc {
         }
 
         fn current_assignment(&self) -> io::Result<Arc<InstalledAssignment>> {
+            self.process_lease.require_live_io()?;
             let assignment = self.assignment.read().clone().ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::NotConnected,
@@ -1921,6 +2201,7 @@ mod grpc {
             let version = self.assignment_version.load(Ordering::Acquire);
             let recovery_gen = self.recovery_gen.load(Ordering::Acquire);
             let cancel = self.scope_cancel.read().clone();
+            self.process_lease.require_live_io()?;
             if version == 0
                 || version != installed.fence.assignment_version
                 || cancel.is_cancelled()
@@ -1955,6 +2236,7 @@ mod grpc {
             expected: Option<u64>,
             current: &Arc<InstalledAssignment>,
         ) -> io::Result<()> {
+            self.process_lease.require_live_io()?;
             if scope.cancel.is_cancelled() {
                 return Err(scope_cancelled_io());
             }
@@ -2092,6 +2374,9 @@ mod grpc {
                 .clone();
             let _connect_guard = tokio::select! {
                 biased;
+                () = self.process_lease.wait_until_lost() => {
+                    return Err(process_lease_expired_io());
+                }
                 () = scope.cancel.cancelled() => return Err(scope_cancelled_io()),
                 guard = connect_lock.lock() => guard,
             };
@@ -2114,6 +2399,9 @@ mod grpc {
             // to a statically registered address when there's no KV.
             let discovered = tokio::select! {
                 biased;
+                () = self.process_lease.wait_until_lost() => {
+                    return Err(process_lease_expired_io());
+                }
                 () = scope.cancel.cancelled() => return Err(scope_cancelled_io()),
                 discovered = self.discover_peer(peer) => discovered,
             };
@@ -2389,6 +2677,8 @@ mod grpc {
         deferred_recv_ready: AtomicBool,
         #[cfg(test)]
         recv_deferred_pause: Mutex<Option<Arc<tokio::sync::Notify>>>,
+        #[cfg(test)]
+        assignment_wait_pause: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
         server: JoinHandle<()>,
         holdover: Arc<Holdover>,
         /// Inbound data frames stamped below this are pre-rewind and discarded.
@@ -2397,6 +2687,7 @@ mod grpc {
         assignment: Arc<RwLock<Option<Arc<InstalledAssignment>>>>,
         assignment_version: Arc<AtomicU64>,
         scope_cancel: Arc<RwLock<CancellationToken>>,
+        process_lease: Arc<ProcessLeaseGate>,
         /// True only while an exact retained certificate is closed by a transient authority read
         /// failure. Delivery expectations remain intact for same-version reactivation.
         assignment_suspended: AtomicBool,
@@ -2449,6 +2740,7 @@ mod grpc {
             let assignment = Arc::new(RwLock::new(None));
             let assignment_version = Arc::new(AtomicU64::new(0));
             let scope_cancel = Arc::new(RwLock::new(cancelled_token()));
+            let process_lease = Arc::new(ProcessLeaseGate::default());
             let pending_handshakes = Arc::new(PendingHandshakes::default());
             let delivery = Arc::new(DeliveryTracker::default());
             let inbound_budget = Arc::new(InboundBudget::new(INBOUND_NODE_BUDGET_BYTES));
@@ -2460,6 +2752,7 @@ mod grpc {
                 assignment: Arc::clone(&assignment),
                 assignment_version: Arc::clone(&assignment_version),
                 scope_cancel: Arc::clone(&scope_cancel),
+                process_lease: Arc::clone(&process_lease),
                 pending_handshakes: Arc::clone(&pending_handshakes),
                 tx,
                 recovery_gen: Arc::clone(&recovery_gen),
@@ -2506,6 +2799,8 @@ mod grpc {
                 deferred_recv_ready: AtomicBool::new(false),
                 #[cfg(test)]
                 recv_deferred_pause: Mutex::new(None),
+                #[cfg(test)]
+                assignment_wait_pause: Mutex::new(None),
                 server,
                 holdover: Arc::new(Holdover::new(SHUFFLE_RECV_QUEUE)),
                 recovery_gen,
@@ -2513,6 +2808,7 @@ mod grpc {
                 assignment,
                 assignment_version,
                 scope_cancel,
+                process_lease,
                 assignment_suspended: AtomicBool::new(false),
                 assignment_resumed: tokio::sync::Notify::new(),
                 pending_handshakes,
@@ -2520,6 +2816,29 @@ mod grpc {
                 #[cfg(test)]
                 active_streams,
             })
+        }
+
+        /// Bind inbound admission to this process's renewable cluster lease.
+        ///
+        /// This must be installed before an assignment certificate is activated.
+        ///
+        /// # Errors
+        /// Returns an error for an expired lease, a different previously installed deadline, or
+        /// an already-active assignment.
+        pub fn install_process_lease_deadline(
+            &self,
+            deadline: Arc<LeaseDeadline>,
+        ) -> io::Result<()> {
+            let _assignment = self.assignment.write();
+            if self.assignment_version.load(Ordering::Acquire) != 0
+                && !self.process_lease.is_installed_deadline(&deadline)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "shuffle process lease must be installed before assignment activation",
+                ));
+            }
+            self.process_lease.install(deadline)
         }
 
         /// Install the exact assignment certificate accepted by inbound streams. Existing
@@ -2540,6 +2859,7 @@ mod grpc {
                 self.receiver_incarnation,
             )?;
             let mut assignment = self.assignment.write();
+            self.process_lease.require_live_io()?;
             if let Some(current) = assignment.as_ref() {
                 if next.fence.assignment_version < current.fence.assignment_version {
                     return Ok(false);
@@ -2555,7 +2875,7 @@ mod grpc {
                             return Ok(false);
                         }
                         if self.assignment_suspended.load(Ordering::Acquire) {
-                            rotate_scope_token(&self.scope_cancel, true);
+                            rotate_scope_token(&self.scope_cancel, &self.process_lease, true);
                             self.pending_handshakes.clear();
                             self.assignment_suspended.store(false, Ordering::Release);
                             self.assignment_version
@@ -2574,13 +2894,13 @@ mod grpc {
                     ));
                 }
             }
-            rotate_scope_token(&self.scope_cancel, false);
+            rotate_scope_token(&self.scope_cancel, &self.process_lease, false);
             self.pending_handshakes.clear();
             self.delivery.reset_assignment();
             let version = next.fence.assignment_version;
             *assignment = Some(next);
             self.assignment_suspended.store(false, Ordering::Release);
-            rotate_scope_token(&self.scope_cancel, true);
+            rotate_scope_token(&self.scope_cancel, &self.process_lease, true);
             self.assignment_version.store(version, Ordering::Release);
             self.assignment_resumed.notify_waiters();
             Ok(true)
@@ -2594,7 +2914,7 @@ mod grpc {
             if assignment.is_none() || self.assignment_version.load(Ordering::Acquire) == 0 {
                 return;
             }
-            rotate_scope_token(&self.scope_cancel, false);
+            rotate_scope_token(&self.scope_cancel, &self.process_lease, false);
             self.pending_handshakes.clear();
             self.assignment_suspended.store(true, Ordering::Release);
             self.assignment_version.store(0, Ordering::Release);
@@ -2604,7 +2924,7 @@ mod grpc {
         /// certificate. Pending tokens and sequence expectations cannot cross this boundary.
         pub fn invalidate_assignment_fence(&self) {
             let _assignment = self.assignment.write();
-            rotate_scope_token(&self.scope_cancel, false);
+            rotate_scope_token(&self.scope_cancel, &self.process_lease, false);
             self.assignment_suspended.store(false, Ordering::Release);
             self.assignment_version.store(0, Ordering::Release);
             self.pending_handshakes.clear();
@@ -2638,12 +2958,13 @@ mod grpc {
             if gen <= previous {
                 return;
             }
-            rotate_scope_token(&self.scope_cancel, false);
+            rotate_scope_token(&self.scope_cancel, &self.process_lease, false);
             self.pending_handshakes.clear();
             self.delivery.prepare_recovery(gen);
             self.recovery_gen.store(gen, Ordering::Release);
             rotate_scope_token(
                 &self.scope_cancel,
+                &self.process_lease,
                 self.assignment_version.load(Ordering::Acquire) != 0,
             );
             // The next admitted Hello carries the new generation and re-baselines only that peer.
@@ -2683,6 +3004,16 @@ mod grpc {
         }
 
         #[cfg(test)]
+        pub(super) fn assignment_fence_for_test(&self) -> CheckpointAssignmentFence {
+            self.assignment
+                .read()
+                .as_ref()
+                .expect("test assignment")
+                .fence
+                .clone()
+        }
+
+        #[cfg(test)]
         pub(crate) fn pause_next_recv_after_defer_for_test(&self) -> Arc<tokio::sync::Notify> {
             let entered = Arc::new(tokio::sync::Notify::new());
             let replaced = self
@@ -2696,13 +3027,51 @@ mod grpc {
             entered
         }
 
-        async fn wait_while_assignment_suspended(&self) {
+        #[cfg(test)]
+        pub(super) fn pause_next_assignment_wait_for_test(
+            &self,
+        ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let replaced = self
+                .assignment_wait_pause
+                .lock()
+                .replace((Arc::clone(&entered), Arc::clone(&release)));
+            assert!(
+                replaced.is_none(),
+                "shuffle assignment wait pause already installed"
+            );
+            (entered, release)
+        }
+
+        #[cfg(test)]
+        pub(super) async fn wait_while_assignment_suspended_for_test(&self) -> bool {
+            self.wait_while_assignment_suspended().await
+        }
+
+        async fn wait_while_assignment_suspended(&self) -> bool {
             loop {
                 let resumed = self.assignment_resumed.notified();
-                if !self.assignment_suspended.load(Ordering::Acquire) {
-                    return;
+                tokio::pin!(resumed);
+                resumed.as_mut().enable();
+                if self.process_lease.require_live_io().is_err() {
+                    return false;
                 }
-                resumed.await;
+                if !self.assignment_suspended.load(Ordering::Acquire) {
+                    return true;
+                }
+                #[cfg(test)]
+                let assignment_wait_pause = { self.assignment_wait_pause.lock().take() };
+                #[cfg(test)]
+                if let Some((entered, release)) = assignment_wait_pause {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+                tokio::select! {
+                    biased;
+                    () = self.process_lease.wait_until_lost() => return false,
+                    () = &mut resumed => {}
+                }
             }
         }
 
@@ -2791,6 +3160,9 @@ mod grpc {
             assignment_version: u64,
             recovery_gen: u64,
         ) -> bool {
+            if self.process_lease.require_live_io().is_err() {
+                return false;
+            }
             let Some(assignment) = self.consumption_scope() else {
                 return false;
             };
@@ -2821,6 +3193,9 @@ mod grpc {
                     assignment_version,
                     recovery_gen,
                 );
+            if self.process_lease.require_live_io().is_err() {
+                return false;
+            }
             if !current {
                 self.delivery.note_loss(peer, 1, "queued-stream-scope");
             }
@@ -2852,13 +3227,19 @@ mod grpc {
         /// cancellation-safe.
         pub async fn recv(&self) -> Option<ReceivedShuffle> {
             loop {
-                self.wait_while_assignment_suspended().await;
+                if !self.wait_while_assignment_suspended().await {
+                    return None;
+                }
 
                 // The receiver lease serializes deferred and live queue admission. A
                 // cancelled receive can therefore require at most one deferred slot.
                 let taken = { self.rx.lock().take() };
                 let Some(rx) = taken else {
-                    self.rx_returned.notified().await;
+                    tokio::select! {
+                        biased;
+                        () = self.process_lease.wait_until_lost() => return None,
+                        () = self.rx_returned.notified() => {}
+                    }
                     continue;
                 };
                 let mut guard = RxReturnGuard {
@@ -2880,7 +3261,11 @@ mod grpc {
                     }
                     continue;
                 }
-                let inbound = guard.rx.as_mut()?.recv().await.ok()?;
+                let inbound = tokio::select! {
+                    biased;
+                    () = self.process_lease.wait_until_lost() => return None,
+                    result = guard.rx.as_mut()?.recv() => result.ok()?,
+                };
                 let pending = PendingInbound {
                     slot: &self.deferred_recv,
                     ready: &self.deferred_recv_ready,
@@ -3502,6 +3887,7 @@ mod grpc {
         assignment: Arc<RwLock<Option<Arc<InstalledAssignment>>>>,
         assignment_version: Arc<AtomicU64>,
         scope_cancel: Arc<RwLock<CancellationToken>>,
+        process_lease: Arc<ProcessLeaseGate>,
         pending_handshakes: Arc<PendingHandshakes>,
         tx: InboundTx,
         recovery_gen: Arc<AtomicU64>,
@@ -3516,6 +3902,7 @@ mod grpc {
         assignment_version: &AtomicU64,
         recovery_gen: &AtomicU64,
         scope_cancel: &RwLock<CancellationToken>,
+        process_lease: &ProcessLeaseGate,
     ) -> Result<ScopeLease, tonic::Status> {
         let assignment = assignment.read();
         let installed = assignment.as_ref().ok_or_else(|| {
@@ -3524,6 +3911,7 @@ mod grpc {
         let version = assignment_version.load(Ordering::Acquire);
         let recovery_gen = recovery_gen.load(Ordering::Acquire);
         let cancel = scope_cancel.read().clone();
+        process_lease.require_live_status()?;
         if version == 0 || version != installed.fence.assignment_version || cancel.is_cancelled() {
             return Err(scope_cancelled_status());
         }
@@ -3560,6 +3948,7 @@ mod grpc {
                 &self.assignment_version,
                 &self.recovery_gen,
                 &self.scope_cancel,
+                &self.process_lease,
             )?;
             if request.recovery_gen != scope.recovery_gen {
                 return Err(tonic::Status::failed_precondition(
@@ -3603,12 +3992,16 @@ mod grpc {
                 },
             );
             drop(pending);
-            if scope.cancel.is_cancelled() {
+            if scope.cancel.is_cancelled() || self.process_lease.require_live_status().is_err() {
                 self.pending_handshakes
                     .0
                     .lock()
                     .remove(&request.sender_node_id);
-                return Err(scope_cancelled_status());
+                return if scope.cancel.is_cancelled() {
+                    Err(scope_cancelled_status())
+                } else {
+                    Err(process_lease_expired_status())
+                };
             }
             Ok(tonic::Response::new(HandshakeResponse {
                 receiver_node_id: self.local_id,
@@ -3653,6 +4046,7 @@ mod grpc {
         assignment_version: &AtomicU64,
         recovery_gen: &AtomicU64,
         scope_cancel: &RwLock<CancellationToken>,
+        process_lease: &ProcessLeaseGate,
         pending_handshakes: &PendingHandshakes,
         delivery: &DeliveryTracker,
         active_streams: &Arc<Semaphore>,
@@ -3666,10 +4060,18 @@ mod grpc {
         ),
         tonic::Status,
     > {
-        let scope =
-            active_receiver_scope(assignment, assignment_version, recovery_gen, scope_cancel)?;
+        let scope = active_receiver_scope(
+            assignment,
+            assignment_version,
+            recovery_gen,
+            scope_cancel,
+            process_lease,
+        )?;
         let first = tokio::select! {
             biased;
+            () = process_lease.wait_until_lost() => {
+                return Err(process_lease_expired_status());
+            }
             () = scope.cancel.cancelled() => return Err(scope_cancelled_status()),
             first = stream.message() => first?,
         }
@@ -3703,12 +4105,23 @@ mod grpc {
         let ingress = delivery.ingress_lock(fence.sender_node_id)?;
         let ingress_guard = tokio::select! {
             biased;
+            () = process_lease.wait_until_lost() => {
+                return Err(process_lease_expired_status());
+            }
             () = scope.cancel.cancelled() => return Err(scope_cancelled_status()),
             guard = ingress.lock() => guard,
         };
         delivery.observe_hello(fence)?;
         let mut active_stream = active_stream_registry.replace(&fence, &scope.cancel);
-        active_stream.acquire_permit(active_streams).await?;
+        tokio::select! {
+            biased;
+            () = process_lease.wait_until_lost() => {
+                return Err(process_lease_expired_status());
+            }
+            () = scope.cancel.cancelled() => return Err(scope_cancelled_status()),
+            result = active_stream.acquire_permit(active_streams) => result?,
+        }
+        process_lease.require_live_status()?;
         drop(ingress_guard);
         Ok((fence, ingress, scope, active_stream))
     }
@@ -3719,7 +4132,9 @@ mod grpc {
         delivery: &DeliveryTracker,
         fence: &StreamFence,
         cancel: &CancellationToken,
+        process_lease: &ProcessLeaseGate,
     ) -> Result<(), tonic::Status> {
+        process_lease.require_live_status()?;
         if cancel.is_cancelled() {
             return Err(scope_cancelled_status());
         }
@@ -3757,10 +4172,25 @@ mod grpc {
         assignment_digest: [u8; 32],
         last_seq: u64,
         cancel: &CancellationToken,
+        process_lease: &ProcessLeaseGate,
     ) -> Result<bool, tonic::Status> {
-        validate_active_stream_scope(assignment_version, recovery_gen, delivery, &fence, cancel)?;
+        validate_active_stream_scope(
+            assignment_version,
+            recovery_gen,
+            delivery,
+            &fence,
+            cancel,
+            process_lease,
+        )?;
         let reservation = delivery.prepare_barrier(&fence, last_seq)?;
-        validate_active_stream_scope(assignment_version, recovery_gen, delivery, &fence, cancel)?;
+        validate_active_stream_scope(
+            assignment_version,
+            recovery_gen,
+            delivery,
+            &fence,
+            cancel,
+            process_lease,
+        )?;
         delivery.commit_barrier(reservation)?;
         tokio::select! {
             biased;
@@ -3787,6 +4217,7 @@ mod grpc {
             assignment,
             assignment_version,
             scope_cancel,
+            process_lease,
             pending_handshakes,
             tx,
             recovery_gen,
@@ -3803,6 +4234,7 @@ mod grpc {
             assignment_version,
             recovery_gen,
             scope_cancel,
+            process_lease,
             pending_handshakes,
             delivery,
             active_streams,
@@ -3823,6 +4255,7 @@ mod grpc {
             let Some(frame) = frame else {
                 break;
             };
+            process_lease.require_live_status()?;
             let Some(kind) = frame.kind else {
                 return Err(reject_stream_protocol(
                     delivery,
@@ -3900,6 +4333,7 @@ mod grpc {
                         assignment_digest,
                         b.last_seq,
                         stream_cancel,
+                        process_lease,
                     )
                     .await?
                     {
@@ -3935,6 +4369,7 @@ mod grpc {
                     } else {
                         None
                     };
+                    process_lease.require_live_status()?;
                     if assignment_version.load(Ordering::Acquire) != fence.assignment_version
                         || recovery_gen.load(Ordering::Acquire) != fence.recovery_gen
                     {
@@ -3983,6 +4418,7 @@ mod grpc {
                         delivery,
                         &fence,
                         stream_cancel,
+                        process_lease,
                     )?;
                     let Some(reservation) = delivery.prepare_data(&fence, seq)? else {
                         continue; // already committed duplicate
@@ -4001,6 +4437,7 @@ mod grpc {
                         decoded_bytes,
                         seq,
                         stream_cancel,
+                        process_lease,
                     )
                     .await;
                     match forwarded {
@@ -4025,6 +4462,7 @@ mod grpc {
                         delivery,
                         &fence,
                         stream_cancel,
+                        process_lease,
                     )?;
                 }
             }
@@ -4054,7 +4492,9 @@ mod grpc {
         decoded_bytes: usize,
         checkpoint_sequence: u64,
         cancel: &CancellationToken,
+        process_lease: &ProcessLeaseGate,
     ) -> Result<bool, tonic::Status> {
+        process_lease.require_live_status()?;
         if routed_vnodes.is_empty() || !routed_vnodes.windows(2).all(|pair| pair[0] < pair[1]) {
             return Err(tonic::Status::invalid_argument(
                 "shuffle route set is empty or non-canonical",
@@ -4105,6 +4545,12 @@ mod grpc {
         use super::*;
 
         const ACQUIRE: Ordering = Ordering::Acquire;
+
+        fn live_process_lease() -> ProcessLeaseGate {
+            let gate = ProcessLeaseGate::default();
+            gate.install_live_for_test();
+            gate
+        }
 
         fn fence(sender: u128, receiver: u128, stream: u128, version: u64) -> StreamFence {
             StreamFence {
@@ -4353,6 +4799,7 @@ mod grpc {
             let assignment = AtomicU64::new(stream.assignment_version);
             let recovery = AtomicU64::new(stream.recovery_gen);
             let cancel = CancellationToken::new();
+            let process_lease = live_process_lease();
             let (tx, rx) = mpsc::bounded_async::<Inbound>(1);
             let publish = publish_barrier(
                 &tx,
@@ -4364,6 +4811,7 @@ mod grpc {
                 [1; 32],
                 1,
                 &cancel,
+                &process_lease,
             );
             let consume = async {
                 let received = rx.recv().await.unwrap();
@@ -4447,6 +4895,7 @@ mod grpc {
             let d = DeliveryTracker::default();
             let stream = fence(1, 10, 100, 1);
             let cancel = CancellationToken::new();
+            let process_lease = live_process_lease();
             d.observe_hello(stream).unwrap();
             let admission =
                 DataAdmission::new(&d, d.prepare_data(&stream, 0).unwrap().unwrap(), &cancel);
@@ -4496,6 +4945,7 @@ mod grpc {
                 decoded_bytes,
                 0,
                 &cancel,
+                &process_lease,
             )
             .await
             .unwrap());
@@ -4522,6 +4972,7 @@ mod grpc {
         async fn foreign_route_is_rejected_before_queue_publication() {
             let stream = fence(1, 10, 100, 1);
             let cancel = CancellationToken::new();
+            let process_lease = live_process_lease();
             let owners = [10, 20];
             let assignment_fence = CheckpointAssignmentFence::from_owner_map(
                 1,
@@ -4571,6 +5022,7 @@ mod grpc {
                 decoded_bytes,
                 0,
                 &cancel,
+                &process_lease,
             )
             .await
             .unwrap_err();
@@ -4586,6 +5038,7 @@ mod grpc {
 
             let stream = fence(1, 10, 100, 1);
             let cancel = CancellationToken::new();
+            let process_lease = live_process_lease();
             let owners = [10, 20];
             let assignment_fence = CheckpointAssignmentFence::from_owner_map(
                 1,
@@ -4637,6 +5090,7 @@ mod grpc {
                 decoded_bytes,
                 0,
                 &cancel,
+                &process_lease,
             )
             .await
             .unwrap_err();
@@ -5920,19 +6374,29 @@ mod tests {
 
     use super::*;
     use crate::checkpoint::{CheckpointAssignmentFence, CheckpointBarrier, CheckpointParticipant};
+    use crate::cluster::control::LeaseDeadline;
     use uuid::Uuid;
 
     fn assignment_owners(nodes: &[ShufflePeerId]) -> Vec<ShufflePeerId> {
         let mut participants = nodes.to_vec();
         participants.sort_unstable();
         participants.dedup();
-        let owner = participants
+        let first_owner = participants
             .iter()
             .copied()
             .find(|node| *node == 2)
             .or_else(|| participants.last().copied())
             .expect("test assignment has a participant");
-        vec![owner; 8]
+        let mut rotation = Vec::with_capacity(participants.len());
+        rotation.push(first_owner);
+        rotation.extend(
+            participants
+                .iter()
+                .copied()
+                .filter(|node| *node != first_owner),
+        );
+        let vnode_count = 8.max(rotation.len());
+        rotation.into_iter().cycle().take(vnode_count).collect()
     }
 
     fn assignment_fence(version: u64, nodes: &[ShufflePeerId]) -> CheckpointAssignmentFence {
@@ -5973,6 +6437,11 @@ mod tests {
         let receiver = ShuffleReceiver::bind(local_id, "127.0.0.1:0".parse().unwrap(), incarnation)
             .await
             .expect("bind");
+        receiver
+            .install_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
+                std::time::Duration::from_secs(60),
+            )))
+            .expect("install receiver process lease");
         let mut nodes = vec![1, local_id];
         if local_id == 1 {
             nodes.push(2);
@@ -5998,6 +6467,7 @@ mod tests {
 
     fn sender(local_id: ShufflePeerId) -> ShuffleSender {
         let sender = ShuffleSender::new(local_id, Uuid::from_u128(u128::from(local_id) + 1));
+        sender.install_live_process_lease_for_test();
         let fence = assignment_fence(1, &[1, 2]);
         sender
             .install_assignment_fence(&fence, &assignment_owners(&[1, 2]))
@@ -6011,6 +6481,199 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![value]))],
         )
         .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sender_natural_process_lease_expiry_cancels_blocked_admission() {
+        let receiver = bind_on_loopback(2).await;
+        let sender = ShuffleSender::new(1, Uuid::from_u128(2));
+        let deadline = Arc::new(LeaseDeadline::live_for(std::time::Duration::from_millis(
+            250,
+        )));
+        sender
+            .install_process_lease_deadline(Arc::clone(&deadline))
+            .unwrap();
+        let fence = assignment_fence(1, &[1, 2]);
+        sender
+            .install_assignment_fence(&fence, &assignment_owners(&[1, 2]))
+            .unwrap();
+        sender.register_peer(2, receiver.local_addr()).await;
+        let held_budget = sender.hold_outbound_budget_for_test(2).await.unwrap();
+        let message = ShuffleMessage::checkpointed("stage".into(), 0, one_row(1));
+        let mut blocked = Box::pin(sender.send_to(2, &message));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut blocked)
+                .await
+                .is_err(),
+            "send did not block on its exhausted byte admission"
+        );
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), blocked)
+            .await
+            .expect("process lease expiry did not wake blocked shuffle admission")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(sender.assignment_version(), 1);
+        drop(held_budget);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn receiver_process_lease_expiry_rejects_handshake_without_assignment_invalidation() {
+        use super::shuffle_v1::shuffle_transport_client::ShuffleTransportClient;
+        use super::shuffle_v1::HandshakeRequest;
+
+        let receiver = ShuffleReceiver::bind(2, "127.0.0.1:0".parse().unwrap(), Uuid::from_u128(3))
+            .await
+            .unwrap();
+        let deadline = Arc::new(LeaseDeadline::live_for(std::time::Duration::from_secs(60)));
+        receiver
+            .install_process_lease_deadline(Arc::clone(&deadline))
+            .unwrap();
+        let fence = assignment_fence(1, &[1, 2]);
+        receiver
+            .install_assignment_fence(&fence, &assignment_owners(&[1, 2]))
+            .unwrap();
+        deadline.fence();
+
+        let endpoint =
+            crate::cluster::control::tls::client_endpoint(&receiver.local_addr().to_string())
+                .unwrap();
+        let channel = endpoint.connect().await.unwrap();
+        let mut client = ShuffleTransportClient::new(channel);
+        let stream_id = Uuid::new_v4();
+        let error = client
+            .handshake(tonic::Request::new(HandshakeRequest {
+                sender_node_id: 1,
+                sender_incarnation: Uuid::from_u128(2).as_bytes().to_vec(),
+                stream_id: stream_id.as_bytes().to_vec(),
+                assignment_version: fence.assignment_version,
+                recovery_gen: 0,
+                assignment_certificate_digest: fence.digest().to_vec(),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(error.message(), "shuffle process lease is no longer live");
+        assert_eq!(receiver.assignment_version(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn receiver_process_lease_expiry_discards_already_queued_frames() {
+        let receiver = ShuffleReceiver::bind(2, "127.0.0.1:0".parse().unwrap(), Uuid::from_u128(3))
+            .await
+            .unwrap();
+        let deadline = Arc::new(LeaseDeadline::live_for(std::time::Duration::from_secs(60)));
+        receiver
+            .install_process_lease_deadline(Arc::clone(&deadline))
+            .unwrap();
+        let fence = assignment_fence(1, &[1, 2]);
+        receiver
+            .install_assignment_fence(&fence, &assignment_owners(&[1, 2]))
+            .unwrap();
+        let sender = sender(1);
+        sender.register_peer(2, receiver.local_addr()).await;
+        sender
+            .send_to(
+                2,
+                &ShuffleMessage::checkpointed("stage".into(), 0, one_row(1)),
+            )
+            .await
+            .unwrap();
+        wait_until(|| receiver.committed_sequence_for_test(1) == Some(1)).await;
+
+        deadline.fence();
+
+        assert!(receiver.drain_available().is_empty());
+        assert_eq!(receiver.assignment_version(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn receiver_natural_process_lease_expiry_wakes_an_idle_consumer() {
+        let receiver = ShuffleReceiver::bind(2, "127.0.0.1:0".parse().unwrap(), Uuid::from_u128(3))
+            .await
+            .unwrap();
+        let deadline = Arc::new(LeaseDeadline::live_for(std::time::Duration::from_millis(
+            100,
+        )));
+        receiver
+            .install_process_lease_deadline(Arc::clone(&deadline))
+            .unwrap();
+        let fence = assignment_fence(1, &[1, 2]);
+        receiver
+            .install_assignment_fence(&fence, &assignment_owners(&[1, 2]))
+            .unwrap();
+        let mut waiting = Box::pin(receiver.recv());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err(),
+            "empty receiver unexpectedly completed"
+        );
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+                .await
+                .expect("process lease expiry did not wake the idle consumer")
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn receiver_renewal_supersedes_the_old_idle_wait_deadline() {
+        let receiver = ShuffleReceiver::bind(2, "127.0.0.1:0".parse().unwrap(), Uuid::from_u128(3))
+            .await
+            .unwrap();
+        let deadline = Arc::new(LeaseDeadline::live_for(std::time::Duration::from_millis(
+            100,
+        )));
+        receiver
+            .install_process_lease_deadline(Arc::clone(&deadline))
+            .unwrap();
+        let fence = assignment_fence(1, &[1, 2]);
+        receiver
+            .install_assignment_fence(&fence, &assignment_owners(&[1, 2]))
+            .unwrap();
+        let mut waiting = Box::pin(receiver.recv());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err()
+        );
+
+        deadline.extend(std::time::Duration::from_millis(300));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(120), &mut waiting)
+                .await
+                .is_err(),
+            "idle receiver retained the superseded lease deadline"
+        );
+        deadline.fence();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+                .await
+                .expect("terminal fence did not wake the renewed receiver")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn assignment_activation_requires_an_installed_process_lease() {
+        let fence = assignment_fence(1, &[1, 2]);
+        let owners = assignment_owners(&[1, 2]);
+        let sender = ShuffleSender::new(1, Uuid::from_u128(2));
+        let sender_error = sender
+            .install_assignment_fence(&fence, &owners)
+            .expect_err("unwired outbound shuffle must fail closed");
+        assert_eq!(sender_error.kind(), io::ErrorKind::PermissionDenied);
+
+        let receiver = ShuffleReceiver::bind(2, "127.0.0.1:0".parse().unwrap(), Uuid::from_u128(3))
+            .await
+            .unwrap();
+        let receiver_error = receiver
+            .install_assignment_fence(&fence, &owners)
+            .expect_err("unwired inbound shuffle must fail closed");
+        assert_eq!(receiver_error.kind(), io::ErrorKind::PermissionDenied);
     }
 
     async fn wait_until(mut ready: impl FnMut() -> bool) {
@@ -6154,6 +6817,39 @@ mod tests {
             receiver.delivery_loss_incidents().load(O::Acquire),
             0,
             "same-version reactivation must preserve the sender and receiver sequence domain"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn assignment_resume_cannot_be_lost_before_the_waiter_is_polled() {
+        let receiver = Arc::new(bind_on_loopback(2).await);
+        let installed = receiver.assignment_fence_for_test();
+        let participants: Vec<_> = installed
+            .participants
+            .iter()
+            .map(|participant| participant.node_id)
+            .collect();
+        let owners = assignment_owners(&participants);
+        receiver.suspend_assignment_fence();
+        let (entered, release) = receiver.pause_next_assignment_wait_for_test();
+        let waiting = {
+            let receiver = Arc::clone(&receiver);
+            tokio::spawn(async move { receiver.wait_while_assignment_suspended_for_test().await })
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("assignment waiter did not reach the pre-poll boundary");
+        assert!(receiver
+            .install_assignment_fence(&installed, &owners)
+            .unwrap());
+        release.notify_one();
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+                .await
+                .expect("same-version resume notification was lost")
+                .unwrap()
         );
     }
 
@@ -7200,6 +7896,7 @@ mod tests {
         let kv = Arc::new(InMemoryKv::new(NodeId(1)));
         kv.seed(NodeId(2), SHUFFLE_ADDR_KEY, recv.local_addr().to_string());
         let sender = ShuffleSender::with_kv(1, kv as Arc<dyn ClusterKv>, Uuid::from_u128(2));
+        sender.install_live_process_lease_for_test();
         let fence = assignment_fence(1, &[1, 2]);
         sender
             .install_assignment_fence(&fence, &assignment_owners(&[1, 2]))

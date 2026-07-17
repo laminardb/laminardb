@@ -273,6 +273,9 @@ pub struct LaminarDB {
     /// the stable supervisor has observed actual task exit, including after Tokio cancellation.
     pub(crate) owned_source_tasks: crate::pipeline::streaming_coordinator::OwnedSourceTasks,
     pub(crate) shutdown_signal: Arc<tokio::sync::Notify>,
+    /// Persistent terminal cancellation for the currently installed compute runtime. Unlike a
+    /// notification permit, cancellation cannot be lost while the coordinator is between awaits.
+    pub(crate) runtime_shutdown: parking_lot::RwLock<tokio_util::sync::CancellationToken>,
     pub(crate) engine_metrics:
         parking_lot::Mutex<Option<Arc<crate::engine_metrics::EngineMetrics>>>,
     pub(crate) prometheus_registry: parking_lot::Mutex<Option<Arc<prometheus::Registry>>>,
@@ -314,13 +317,19 @@ pub struct LaminarDB {
     /// peer whose receiver isn't up yet and the fire-and-forget frames are lost.
     #[cfg(feature = "cluster")]
     pub(crate) source_gate: Arc<std::sync::atomic::AtomicBool>,
+    /// One-way local data-plane fence after stable process-lease loss.
+    #[cfg(feature = "cluster")]
+    pub(crate) cluster_authority_revoked: std::sync::atomic::AtomicBool,
+    /// Serializes source/shuffle authority grants with terminal revocation.
+    #[cfg(feature = "cluster")]
+    pub(crate) cluster_authority_transition: parking_lot::Mutex<()>,
     /// Paired with `vnode_registry`; the coordinator gates commits when both are installed.
     pub(crate) state_backend:
         parking_lot::Mutex<Option<Arc<dyn laminar_core::state::StateBackend>>>,
     pub(crate) vnode_registry: parking_lot::Mutex<Option<Arc<laminar_core::state::VnodeRegistry>>>,
     pub(crate) physical_optimizer_rules:
         Arc<[Arc<dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync>]>,
-    /// `target_partitions` override; cluster mode sets this to `vnode_count`.
+    /// `target_partitions` override. Streaming plans currently require one reusable partition.
     pub(crate) pipeline_target_partitions: Option<usize>,
     #[cfg(feature = "cluster")]
     pub(crate) shuffle_sender:
@@ -1009,6 +1018,7 @@ impl LaminarDB {
             owned_sink_handles: Arc::new(parking_lot::Mutex::new(Vec::new())),
             owned_source_tasks: Arc::new(parking_lot::Mutex::new(Vec::new())),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
+            runtime_shutdown: parking_lot::RwLock::new(tokio_util::sync::CancellationToken::new()),
             engine_metrics: parking_lot::Mutex::new(None),
             prometheus_registry: parking_lot::Mutex::new(None),
             start_time: std::time::Instant::now(),
@@ -1033,6 +1043,10 @@ impl LaminarDB {
             source_gate: Arc::new(std::sync::atomic::AtomicBool::new(
                 runtime_mode.is_cluster(),
             )),
+            #[cfg(feature = "cluster")]
+            cluster_authority_revoked: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "cluster")]
+            cluster_authority_transition: parking_lot::Mutex::new(()),
             state_backend: parking_lot::Mutex::new(None),
             vnode_registry: parking_lot::Mutex::new(None),
             physical_optimizer_rules: physical_rules.into(),
@@ -1139,9 +1153,24 @@ impl LaminarDB {
         &self,
         fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
     ) -> Result<(), DbError> {
+        let _transition = self.cluster_authority_transition.lock();
+        if self
+            .cluster_authority_revoked
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(DbError::Checkpoint(
+                "shuffle assignment install has terminally revoked process authority".into(),
+            ));
+        }
         let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
             DbError::Checkpoint("shuffle assignment install has no cluster controller".into())
         })?;
+        if !controller.process_lease_is_live() {
+            self.invalidate_shuffle_assignment_fence();
+            return Err(DbError::Checkpoint(
+                "shuffle assignment install has no live process lease".into(),
+            ));
+        }
         let registry = self.vnode_registry.lock().clone().ok_or_else(|| {
             DbError::Checkpoint("shuffle assignment install has no vnode registry".into())
         })?;
@@ -1177,6 +1206,12 @@ impl LaminarDB {
                 && endpoint.active_assignment_digest() == Some(expected_digest)
         });
         if receiver_exact && sender_exact {
+            if !controller.process_lease_is_live() {
+                self.invalidate_shuffle_assignment_fence();
+                return Err(DbError::Checkpoint(
+                    "shuffle assignment install lost its process lease".into(),
+                ));
+            }
             return Ok(());
         }
         let endpoint_conflict = receiver.as_ref().is_some_and(|endpoint| {
@@ -1236,6 +1271,12 @@ impl LaminarDB {
             }
             Ok(())
         })();
+        if result.is_ok() && !controller.process_lease_is_live() {
+            self.invalidate_shuffle_assignment_fence();
+            return Err(DbError::Checkpoint(
+                "shuffle assignment install lost its process lease".into(),
+            ));
+        }
         if result.is_err() {
             // Keep watcher caches coherent with a partial endpoint install. Direct endpoint
             // invalidation would close transport authority without advancing the shared revision.
@@ -1302,6 +1343,16 @@ impl LaminarDB {
         let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
             DbError::Checkpoint("assignment activation has no cluster controller".into())
         })?;
+        if !controller.process_lease_is_live() {
+            self.revoke_cluster_authority();
+            return Ok(AssignmentAuthorityActivation {
+                installed: false,
+                intake_open: false,
+                revision: self
+                    .assignment_authority_revision
+                    .load(std::sync::atomic::Ordering::Acquire),
+            });
+        }
         let registry = self.vnode_registry.lock().clone().ok_or_else(|| {
             DbError::Checkpoint("assignment activation has no vnode registry".into())
         })?;
@@ -1347,6 +1398,25 @@ impl LaminarDB {
             };
             controller.publish_checkpoint_drain_transition(drain_transition);
             controller.publish_checkpoint_assignment_fence(Some(fence.clone()));
+            if !controller.process_lease_is_live()
+                || self
+                    .assignment_authority_revision
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    != revision
+            {
+                if controller.process_lease_is_live() {
+                    self.withdraw_assignment_authority(&controller);
+                } else {
+                    self.revoke_cluster_authority();
+                }
+                return Ok(AssignmentAuthorityActivation {
+                    installed: false,
+                    intake_open: false,
+                    revision: self
+                        .assignment_authority_revision
+                        .load(std::sync::atomic::Ordering::Acquire),
+                });
+            }
             return Ok(AssignmentAuthorityActivation {
                 installed: true,
                 intake_open: false,

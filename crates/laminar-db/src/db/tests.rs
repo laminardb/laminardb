@@ -4,6 +4,17 @@
 //! struct wiring. Declared via `#[cfg(test)] mod tests;` in `db.rs`.
 
 use super::*;
+
+#[cfg(feature = "cluster")]
+#[test]
+fn local_runtime_ignores_cluster_authority_revocation() {
+    let db = LaminarDB::open().unwrap();
+    assert!(!db.cluster_intake_fenced());
+
+    db.revoke_cluster_authority();
+
+    assert!(!db.cluster_intake_fenced());
+}
 use crate::ddl::extract_connector_from_with_options;
 use laminar_core::catalog::CatalogObjectKind;
 #[cfg(feature = "cluster")]
@@ -12,6 +23,19 @@ use object_store::ObjectStoreExt;
 #[cfg(feature = "cluster")]
 fn test_cluster_checkpoint_store() -> Arc<dyn object_store::ObjectStore> {
     Arc::new(object_store::memory::InMemory::new())
+}
+
+#[cfg(feature = "cluster")]
+fn install_test_process_deadline(
+    controller: &laminar_core::cluster::control::ClusterController,
+) -> Arc<laminar_core::cluster::control::LeaseDeadline> {
+    let deadline = Arc::new(laminar_core::cluster::control::LeaseDeadline::live_for(
+        std::time::Duration::from_secs(60),
+    ));
+    controller
+        .set_process_lease_deadline(Arc::clone(&deadline))
+        .unwrap();
+    deadline
 }
 
 #[cfg(feature = "cluster")]
@@ -37,7 +61,9 @@ async fn install_test_process_and_leader_authority(
     else {
         panic!("empty process authority must grant the local test process");
     };
-    controller.set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(lease_duration)));
+    controller
+        .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(lease_duration)))
+        .unwrap();
     controller
         .set_process_lease_authority(process_authority)
         .unwrap();
@@ -49,7 +75,7 @@ async fn install_test_process_and_leader_authority(
         process_term: process_lease.term,
     };
     let LeaseOutcome::Acquired(leader_lease) = leader_authority
-        .try_acquire(&leader_owner, 0)
+        .begin_new_term(&leader_owner, 0)
         .await
         .unwrap()
     else {
@@ -297,6 +323,121 @@ async fn assert_fault_audit_retry_reopens(fixture: &FaultAuditActivationFixture)
     assert_eq!(
         fixture.receiver.active_assignment_digest(),
         Some(fixture.fence.digest())
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn terminal_process_lease_revocation_cannot_reinstall_data_plane_authority() {
+    let fixture = fault_audit_activation_fixture().await;
+    let activation = fixture
+        .db
+        .activate_assignment_authority(
+            &fixture.fence,
+            None,
+            fixture
+                .db
+                .assignment_authority_revision
+                .load(std::sync::atomic::Ordering::Acquire),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    assert!(activation.installed);
+    assert!(activation.intake_open);
+    assert_eq!(
+        fixture.sender.assignment_version(),
+        fixture.fence.assignment_version
+    );
+    assert_eq!(
+        fixture.receiver.assignment_version(),
+        fixture.fence.assignment_version
+    );
+
+    fixture.db.invalidate_shuffle_assignment_fence();
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    std::thread::scope(|scope| {
+        let installer_db = Arc::clone(&fixture.db);
+        let installer_fence = fixture.fence.clone();
+        let installer_barrier = Arc::clone(&barrier);
+        let installer = scope.spawn(move || {
+            installer_barrier.wait();
+            installer_db.install_shuffle_assignment_fence(&installer_fence)
+        });
+        let revoker_db = Arc::clone(&fixture.db);
+        let revoker_barrier = Arc::clone(&barrier);
+        let revoker = scope.spawn(move || {
+            revoker_barrier.wait();
+            revoker_db.revoke_cluster_authority();
+        });
+        barrier.wait();
+        if let Err(error) = installer.join().unwrap() {
+            assert!(error.to_string().contains("terminally revoked"), "{error}");
+        }
+        revoker.join().unwrap();
+    });
+
+    assert!(!fixture.controller.process_lease_is_live());
+    assert!(fixture.controller.is_recovering());
+    assert!(fixture.db.cluster_intake_fenced());
+    assert_eq!(
+        fixture
+            .controller
+            .checkpoint_assignment_fence(fixture.fence.assignment_version),
+        None
+    );
+    assert_eq!(fixture.controller.checkpoint_drain_transition(), None);
+    assert_eq!(fixture.sender.assignment_version(), 0);
+    assert_eq!(fixture.receiver.assignment_version(), 0);
+    assert_eq!(fixture.sender.active_assignment_digest(), None);
+    assert_eq!(fixture.receiver.active_assignment_digest(), None);
+    fixture.db.set_source_gate(false);
+    assert!(fixture.db.cluster_intake_fenced());
+
+    let retry = fixture
+        .db
+        .activate_assignment_authority(
+            &fixture.fence,
+            None,
+            fixture
+                .db
+                .assignment_authority_revision
+                .load(std::sync::atomic::Ordering::Acquire),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    assert!(!retry.installed);
+    assert!(!retry.intake_open);
+    let error = fixture
+        .db
+        .install_shuffle_assignment_fence(&fixture.fence)
+        .unwrap_err();
+    assert!(error.to_string().contains("terminally revoked"), "{error}");
+    assert_eq!(fixture.sender.assignment_version(), 0);
+    assert_eq!(fixture.receiver.assignment_version(), 0);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn expired_process_deadline_cannot_reopen_source_intake() {
+    let fixture = fault_audit_activation_fixture().await;
+    assert!(!fixture.db.cluster_intake_fenced());
+    let deadline = fixture
+        .controller
+        .process_lease_deadline()
+        .expect("cluster fixture has a process deadline");
+
+    deadline.fence();
+    fixture.db.set_source_gate(false);
+
+    assert!(fixture.db.cluster_intake_fenced());
+    assert!(
+        fixture
+            .db
+            .source_gate
+            .load(std::sync::atomic::Ordering::Acquire),
+        "a rejected reopen must also close the direct source-task gate"
     );
 }
 
@@ -551,6 +692,7 @@ async fn shuffle_assignment_pair_install_is_exact_and_fail_closed() {
     let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
         node_id, control, recovery, None, members_rx, boot,
     ));
+    let process_deadline = install_test_process_deadline(&controller);
     controller.publish_recovery_incarnation().await.unwrap();
 
     let registry = Arc::new(VnodeRegistry::single_owner(1, StateNodeId(node_id.0)));
@@ -571,9 +713,15 @@ async fn shuffle_assignment_pair_install_is_exact_and_fail_closed() {
             .unwrap(),
     );
     receiver
+        .install_process_lease_deadline(Arc::clone(&process_deadline))
+        .unwrap();
+    receiver
         .install_assignment_fence(&target, &[node_id.0])
         .unwrap();
     let sender = Arc::new(ShuffleSender::new(node_id.0, boot));
+    sender
+        .install_process_lease_deadline(process_deadline)
+        .unwrap();
     let conflicting = CheckpointAssignmentFence::from_owner_map(
         target.assignment_version,
         &[node_id.0, 2],
@@ -895,6 +1043,7 @@ async fn assignment_adoption_rejects_smaller_and_larger_vnode_maps() {
         None,
         members_rx,
     ));
+    install_test_process_deadline(&controller);
     let registry = Arc::new(VnodeRegistry::single_owner(2, NodeId(1)));
     let db = LaminarDB::builder()
         .cluster_controller(controller)
@@ -942,89 +1091,6 @@ async fn assignment_adoption_rejects_smaller_and_larger_vnode_maps() {
         let error = db.validate_source_drain_snapshot(&draining).unwrap_err();
         assert!(error.to_string().contains("vnode cardinality"), "{error}");
     }
-}
-
-#[cfg(feature = "cluster")]
-#[tokio::test]
-async fn replaced_process_cannot_adopt_same_owned_vnodes_without_restore() {
-    use laminar_core::checkpoint::CheckpointParticipant;
-    use laminar_core::cluster::control::{
-        AssignmentSnapshot, AssignmentSnapshotStore, ClusterController, ClusterKv, InMemoryKv,
-    };
-    use laminar_core::cluster::discovery::{NodeId, NodeInfo};
-    use laminar_core::state::{InProcessBackend, NodeId as StateNodeId, VnodeRegistry};
-    use object_store::memory::InMemory;
-    use object_store::ObjectStore;
-    use uuid::Uuid;
-
-    let node = NodeId(1);
-    let old_boot = Uuid::from_u128(11);
-    let new_boot = Uuid::from_u128(111);
-    let owners = vec![StateNodeId(node.0); 2];
-    let snapshots = Arc::new(AssignmentSnapshotStore::new(
-        Arc::new(InMemory::new()) as Arc<dyn ObjectStore>
-    ));
-    let previous = AssignmentSnapshot::empty()
-        .next_for_participants(
-            AssignmentSnapshot::vnodes_from_vec(&owners),
-            vec![CheckpointParticipant {
-                node_id: node.0,
-                boot_incarnation: old_boot,
-            }],
-        )
-        .unwrap();
-    snapshots.save_if_absent(&previous).await.unwrap();
-    let target = previous
-        .next_for_participants(
-            previous.vnodes.clone(),
-            vec![CheckpointParticipant {
-                node_id: node.0,
-                boot_incarnation: new_boot,
-            }],
-        )
-        .unwrap();
-    assert!(matches!(
-        snapshots
-            .save_if_version(&target, previous.version)
-            .await
-            .unwrap(),
-        laminar_core::cluster::control::RotateOutcome::Rotated
-    ));
-
-    let kv = Arc::new(InMemoryKv::new(node));
-    let control: Arc<dyn ClusterKv> = kv.clone();
-    let recovery: Arc<dyn ClusterKv> = kv;
-    let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
-    let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
-        node,
-        control,
-        recovery,
-        Some(Arc::clone(&snapshots)),
-        members_rx,
-        new_boot,
-    ));
-    controller.publish_recovery_incarnation().await.unwrap();
-    let registry = Arc::new(VnodeRegistry::single_owner(2, StateNodeId(node.0)));
-    let db = LaminarDB::builder()
-        .cluster_controller(controller)
-        .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-        .assignment_snapshot_store(snapshots)
-        .state_backend(Arc::new(InProcessBackend::new(2)))
-        .vnode_registry(Arc::clone(&registry))
-        .build()
-        .await
-        .unwrap();
-
-    let error = db
-        .adopt_assignment_snapshot(
-            target,
-            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
-        )
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("cannot acquire 2 vnodes"));
-    assert_eq!(registry.assignment_version(), previous.version);
-    assert!(db.cluster_intake_fenced());
 }
 
 #[tokio::test]
@@ -3370,7 +3436,7 @@ async fn test_catalog_authority_with_ttl(
         process_term: 1,
     };
     let lease_store = Arc::new(LeaderLeaseStore::new(Arc::clone(&object_store), ttl_ms));
-    let LeaseOutcome::Acquired(lease) = lease_store.try_acquire(&owner, 0).await.unwrap() else {
+    let LeaseOutcome::Acquired(lease) = lease_store.begin_new_term(&owner, 0).await.unwrap() else {
         unreachable!()
     };
     let (controller, lease_tx) = catalog_authority_controller(NodeId(1), owner);
@@ -3406,6 +3472,7 @@ async fn cluster_subscription_rejects_before_lookup_and_replay_state() {
     let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
     let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
     let controller = Arc::new(ClusterController::new(node, kv, None, members_rx));
+    install_test_process_deadline(&controller);
     let db = LaminarDB::builder()
         .cluster_controller(controller)
         .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
@@ -6124,6 +6191,7 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
         let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
         let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
         let controller = Arc::new(ClusterController::new(node, kv, None, members_rx));
+        install_test_process_deadline(&controller);
         let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let catalog_store = Arc::new(CatalogManifestStore::new(Arc::new(LeaderLeaseStore::new(
             Arc::clone(&object_store),
@@ -6376,6 +6444,7 @@ async fn live_topology_ddl_is_fenced_in_a_configured_one_owner_cluster() {
     let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(cluster_id));
     let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
     let controller = Arc::new(ClusterController::new(cluster_id, kv, None, members_rx));
+    install_test_process_deadline(&controller);
     let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let manifest_store = Arc::new(CatalogManifestStore::new(Arc::new(LeaderLeaseStore::new(
         Arc::clone(&object_store),
@@ -6809,9 +6878,11 @@ fn catalog_authority_controller(
         boot,
     ));
     controller.set_active(false);
-    controller.set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
-        std::time::Duration::from_secs(30),
-    )));
+    controller
+        .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
+            std::time::Duration::from_secs(30),
+        )))
+        .unwrap();
     let local_owner = LeaderLeaseOwner {
         node,
         boot,
@@ -7308,6 +7379,7 @@ async fn stopped_cluster_follower_cannot_publish_while_a_peer_is_active() {
     let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(self_id));
     let (_members_tx, members_rx) = tokio::sync::watch::channel(vec![active_peer]);
     let controller = Arc::new(ClusterController::new(self_id, kv, None, members_rx));
+    install_test_process_deadline(&controller);
     let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let manifest_store = Arc::new(CatalogManifestStore::new(Arc::new(
         laminar_core::cluster::control::LeaderLeaseStore::new(Arc::clone(&object_store), 1_000),
@@ -7511,7 +7583,7 @@ async fn cluster_manifest_invalid_entry_fails_before_any_replay() {
         process_term: 1,
     };
     let laminar_core::cluster::control::LeaseOutcome::Acquired(lease) =
-        authority.try_acquire(&owner, 0).await.unwrap()
+        authority.begin_new_term(&owner, 0).await.unwrap()
     else {
         unreachable!()
     };

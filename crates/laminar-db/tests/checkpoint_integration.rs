@@ -232,7 +232,13 @@ mod exactly_once {
             Ok(())
         }
 
-        async fn write_to_sinks(&mut self, _results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {}
+        async fn write_to_sinks(
+            &mut self,
+            _results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+            _deadline: Option<tokio::time::Instant>,
+        ) -> Result<(), CycleError> {
+            Ok(())
+        }
 
         fn extract_watermark(&mut self, _source_name: &str, _batch: &RecordBatch) {}
 

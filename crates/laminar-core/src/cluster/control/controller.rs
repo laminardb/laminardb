@@ -547,6 +547,8 @@ pub struct ClusterController {
     /// Locally audited drain transition. While present, the predecessor fence remains usable only
     /// for a checkpoint carrying the transition's exact leader term.
     checkpoint_drain_transition: watch::Sender<Option<AssignmentDrainTransition>>,
+    /// Serialises every local authority grant with terminal process fencing.
+    process_authority_transition: parking_lot::Mutex<()>,
     /// Process-unique recovery identity, published before this node becomes Active.
     recovery_incarnation: Uuid,
     /// Cluster-wide minimum watermark from the leader's `Commit`; operators read this instead
@@ -569,8 +571,9 @@ pub struct ClusterController {
     /// Whether this node may be elected leader. A certified leader may retain coordination while
     /// draining so it can checkpoint its own predecessor cut.
     leader_eligible: Arc<AtomicBool>,
-    /// Wakes the leader candidacy relay when local eligibility changes.
-    leader_eligibility_changes: watch::Sender<bool>,
+    /// Coalescing-safe local candidacy generation. Every observed loss advances the generation
+    /// synchronously, so a rapid loss/reacquire cannot reuse a prior leader token.
+    leader_candidacy: watch::Sender<super::LeaderCandidacy>,
     /// Last certified assignment roster. Retained across transient certificate suspension so an
     /// ownerless worker cannot displace an available data owner. If every certified owner is
     /// unavailable, a durably lease-fenced idle worker may lead placement repair only.
@@ -655,7 +658,7 @@ impl ClusterController {
             members_rx.clone(),
             Arc::clone(&leader_eligible),
         );
-        Self {
+        let controller = Self {
             instance_id,
             barrier,
             kv,
@@ -665,6 +668,7 @@ impl ClusterController {
             // A new leader must not checkpoint until it proves exact assignment convergence.
             checkpoint_assignment_fence: watch::channel(None).0,
             checkpoint_drain_transition: watch::channel(None).0,
+            process_authority_transition: parking_lot::Mutex::new(()),
             recovery_incarnation,
             cluster_min_watermark: Arc::new(AtomicI64::new(i64::MIN)),
             draining: Arc::new(AtomicBool::new(false)),
@@ -674,7 +678,7 @@ impl ClusterController {
             process_lease_deadline: std::sync::OnceLock::new(),
             process_lease_authority: std::sync::OnceLock::new(),
             leader_eligible,
-            leader_eligibility_changes: watch::channel(false).0,
+            leader_candidacy: watch::channel(super::LeaderCandidacy::initial(false)).0,
             leadership_participants: parking_lot::RwLock::new(None),
             recovery_writes: tokio::sync::Mutex::new(()),
             unresponsive: Arc::new(parking_lot::Mutex::new(rustc_hash::FxHashMap::default())),
@@ -685,7 +689,9 @@ impl ClusterController {
             query_client_pool: Arc::new(parking_lot::Mutex::new(rustc_hash::FxHashMap::default())),
             #[cfg(feature = "cluster")]
             leader_lease: std::sync::OnceLock::new(),
-        }
+        };
+        controller.notify_leader_eligibility_change();
+        controller
     }
 
     /// Register the handler serving cross-node `RemoteScan`.
@@ -971,8 +977,17 @@ impl ClusterController {
     }
 
     fn notify_leader_eligibility_change(&self) {
-        self.leader_eligibility_changes.send_modify(|signal| {
-            *signal = !*signal;
+        let eligible = self.is_leader_lease_candidate();
+        self.leader_candidacy.send_if_modified(|published| {
+            let next = published
+                .transition(eligible)
+                .unwrap_or_else(super::LeaderCandidacy::terminal);
+            if next == *published {
+                false
+            } else {
+                *published = next;
+                true
+            }
         });
     }
 
@@ -993,25 +1008,21 @@ impl ClusterController {
     /// Evented lease candidacy, including cold cluster formation and normal gossip leadership.
     #[cfg(feature = "cluster")]
     #[must_use]
-    pub fn leader_candidacy_watch(self: &Arc<Self>) -> watch::Receiver<bool> {
-        let (candidate_tx, candidate_rx) = watch::channel(self.is_leader_lease_candidate());
+    pub fn leader_candidacy_watch(self: &Arc<Self>) -> watch::Receiver<super::LeaderCandidacy> {
         let mut members = self.members_rx.clone();
-        let mut eligibility = self.leader_eligibility_changes.subscribe();
+        members.borrow_and_update();
+        self.notify_leader_eligibility_change();
+        let candidacy = self.leader_candidacy.clone();
+        let candidate_rx = candidacy.subscribe();
         let controller = Arc::downgrade(self);
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     biased;
-                    () = candidate_tx.closed() => return,
+                    () = candidacy.closed() => return,
                     changed = members.changed() => {
                         if changed.is_err() {
-                            candidate_tx.send_replace(false);
-                            return;
-                        }
-                    }
-                    changed = eligibility.changed() => {
-                        if changed.is_err() {
-                            candidate_tx.send_replace(false);
+                            candidacy.send_replace(super::LeaderCandidacy::terminal());
                             return;
                         }
                     }
@@ -1019,7 +1030,7 @@ impl ClusterController {
                 let Some(controller) = controller.upgrade() else {
                     return;
                 };
-                candidate_tx.send_replace(controller.is_leader_lease_candidate());
+                controller.notify_leader_eligibility_change();
             }
         });
         candidate_rx
@@ -1027,6 +1038,7 @@ impl ClusterController {
 
     /// Mark this node's active status.
     pub fn set_active(&self, active: bool) {
+        let _transition = self.process_authority_transition.lock();
         let active = active && self.process_lease_is_live();
         self.active.store(active, Ordering::SeqCst);
         let eligible = active && !self.is_draining();
@@ -1037,15 +1049,19 @@ impl ClusterController {
 
     /// Permanently fence controller mutations after stable-node lease loss.
     pub fn fence_process_lease(&self) {
+        let _transition = self.process_authority_transition.lock();
         self.process_lease_live.store(false, Ordering::SeqCst);
         if let Some(deadline) = self.process_lease_deadline.get() {
             deadline.fence();
         }
         self.active.store(false, Ordering::SeqCst);
-        if self.leader_eligible.swap(false, Ordering::SeqCst) {
+        self.recovering.store(true, Ordering::SeqCst);
+        let roster_changed = self.leadership_participants.write().take().is_some();
+        if self.leader_eligible.swap(false, Ordering::SeqCst) || roster_changed {
             self.notify_leader_eligibility_change();
         }
-        self.recovering.store(true, Ordering::SeqCst);
+        self.checkpoint_assignment_fence.send_replace(None);
+        self.checkpoint_drain_transition.send_replace(None);
     }
 
     /// Whether this process still owns its stable node identity.
@@ -1058,9 +1074,47 @@ impl ClusterController {
                 .is_none_or(|deadline| deadline.is_live())
     }
 
+    /// Wait until the process-local lease deadline expires or is explicitly fenced.
+    pub async fn wait_for_process_lease_loss(&self) {
+        if !self.process_lease_live.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(deadline) = self.process_lease_deadline.get() else {
+            std::future::pending::<()>().await;
+            return;
+        };
+        deadline.wait_until_expired().await;
+    }
+
     /// Install the stable-node lease deadline before the runtime starts.
-    pub fn set_process_lease_deadline(&self, deadline: Arc<super::LeaseDeadline>) {
-        let _ = self.process_lease_deadline.set(deadline);
+    ///
+    /// Reinstalling the same shared deadline is idempotent. A different deadline, or installation
+    /// after terminal process fencing, is rejected so controller and data-plane gates cannot
+    /// silently follow different lease clocks.
+    pub fn set_process_lease_deadline(
+        &self,
+        deadline: Arc<super::LeaseDeadline>,
+    ) -> Result<(), String> {
+        let _transition = self.process_authority_transition.lock();
+        if !self.process_lease_live.load(Ordering::Acquire) {
+            return Err("process lease authority is already terminally fenced".into());
+        }
+        if let Some(current) = self.process_lease_deadline.get() {
+            return if Arc::ptr_eq(current, &deadline) {
+                Ok(())
+            } else {
+                Err("process lease deadline is already installed".into())
+            };
+        }
+        self.process_lease_deadline
+            .set(deadline)
+            .map_err(|_| "process lease deadline is already installed".to_string())
+    }
+
+    /// Shared process-local lease deadline, when cluster runtime wiring is complete.
+    #[must_use]
+    pub fn process_lease_deadline(&self) -> Option<Arc<super::LeaseDeadline>> {
+        self.process_lease_deadline.get().cloned()
     }
 
     /// Install the shared stable-node fencing authority before recovery starts.
@@ -1328,6 +1382,8 @@ impl ClusterController {
 
     /// Set or clear the coordinated-recovery fence.
     pub fn set_recovering(&self, recovering: bool) {
+        let _transition = self.process_authority_transition.lock();
+        let recovering = recovering || !self.process_lease_is_live();
         self.recovering.store(recovering, Ordering::SeqCst);
     }
 
@@ -2065,7 +2121,9 @@ impl ClusterController {
         if !transition.is_canonical() {
             return Err("drain quorum requires a canonical assignment transition".into());
         }
-        if self.checkpoint_drain_transition.borrow().as_ref() != Some(transition)
+        let locally_audited =
+            self.checkpoint_drain_transition.borrow().as_ref() == Some(transition);
+        if !locally_audited
             || !self
                 .drain_transition_authority_is_current(transition)
                 .await?
@@ -2162,6 +2220,12 @@ impl ClusterController {
     /// Publish this node's version-bound checkpoint fence. Called off the hot path by the snapshot
     /// watcher; admission and recovery revalidate it locally against current membership.
     pub fn publish_checkpoint_assignment_fence(&self, fence: Option<CheckpointAssignmentFence>) {
+        let _transition = self.process_authority_transition.lock();
+        let fence = if self.process_lease_is_live() {
+            fence
+        } else {
+            None
+        };
         if let Some(fence) = fence.as_ref().filter(|fence| fence.is_canonical()) {
             let participants = fence.participant_ids();
             let changed = {
@@ -2186,6 +2250,12 @@ impl ClusterController {
         &self,
         transition: Option<AssignmentDrainTransition>,
     ) {
+        let _transition = self.process_authority_transition.lock();
+        let transition = if self.process_lease_is_live() {
+            transition
+        } else {
+            None
+        };
         self.checkpoint_drain_transition.send_replace(transition);
     }
 
@@ -3329,6 +3399,25 @@ mod tests {
         ClusterController::new(NodeId(self_id), kv, None, rx)
     }
 
+    fn checkpoint_fence_and_drain(
+        controller: &ClusterController,
+    ) -> (CheckpointAssignmentFence, AssignmentDrainTransition) {
+        let participant = CheckpointParticipant {
+            node_id: controller.instance_id().0,
+            boot_incarnation: controller.recovery_incarnation(),
+        };
+        let predecessor =
+            CheckpointAssignmentFence::from_owner_map(7, &[participant.node_id], vec![participant])
+                .unwrap();
+        let target =
+            CheckpointAssignmentFence::from_owner_map(8, &[participant.node_id], vec![participant])
+                .unwrap();
+        let leader = test_leader_proof(participant.node_id, participant.boot_incarnation, 1);
+        let transition =
+            AssignmentDrainTransition::new(predecessor.clone(), target, leader).unwrap();
+        (predecessor, transition)
+    }
+
     #[cfg(feature = "cluster")]
     #[test]
     fn checkpoint_authority_access_is_exact_and_fails_closed_when_unwired() {
@@ -3374,7 +3463,8 @@ mod tests {
             boot: controller.recovery_incarnation(),
             process_term: 1,
         };
-        let LeaseOutcome::Acquired(lease) = authority.try_acquire(&owner, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap()
+        else {
             panic!("empty leader authority must be acquired");
         };
         controller.set_leader_lease_store(Arc::clone(&authority));
@@ -3474,7 +3564,8 @@ mod tests {
             boot,
         );
         controller
-            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(30))));
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(30))))
+            .unwrap();
 
         let backing: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::memory::InMemory::new());
@@ -3498,7 +3589,7 @@ mod tests {
             process_term: process_lease.term,
         };
         let LeaseOutcome::Acquired(leader_lease) =
-            leader_authority.try_acquire(&owner, 0).await.unwrap()
+            leader_authority.begin_new_term(&owner, 0).await.unwrap()
         else {
             panic!("empty leader authority must be acquired");
         };
@@ -3634,7 +3725,7 @@ mod tests {
             process_term: process_lease.term,
         };
         let LeaseOutcome::Acquired(initial_lease) = leader_authority
-            .try_acquire(&initial_owner, 0)
+            .begin_new_term(&initial_owner, 0)
             .await
             .unwrap()
         else {
@@ -3766,7 +3857,8 @@ mod tests {
             boot: leader_boot,
             process_term: 3,
         };
-        let LeaseOutcome::Acquired(lease) = authority.try_acquire(&owner, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap()
+        else {
             panic!("empty test authority must be acquired");
         };
         controller.set_leader_lease_store(authority);
@@ -3879,7 +3971,8 @@ mod tests {
             c.capture_leader_proof().is_none(),
             "durable proof also requires the stable-node process deadline"
         );
-        c.set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(10))));
+        c.set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(10))))
+            .unwrap();
         assert_eq!(c.leader_fencing_token(), Some(1));
         let proof = c.capture_leader_proof().unwrap();
         assert_eq!(proof.fencing_token, 1);
@@ -3917,7 +4010,8 @@ mod tests {
         let expected = owner(1, 7);
         let deadline = Arc::new(LeaseDeadline::live_for(Duration::from_secs(10)));
         let c = ctl(1, vec![info(5)]);
-        c.set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(10))));
+        c.set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(10))))
+            .unwrap();
         let (tx, rx) = watch::channel(Some(lease(11, expected.clone())));
         c.set_leader_lease_watch(rx, expected.clone(), deadline)
             .unwrap();
@@ -4026,6 +4120,128 @@ mod tests {
         );
     }
 
+    #[test]
+    fn process_lease_fence_withdraws_checkpoint_authority() {
+        let controller = ctl(1, Vec::new());
+        let (fence, transition) = checkpoint_fence_and_drain(&controller);
+        controller.publish_checkpoint_assignment_fence(Some(fence.clone()));
+        controller.publish_checkpoint_drain_transition(Some(transition.clone()));
+
+        assert_eq!(controller.checkpoint_assignment_fence(7), Some(fence));
+        assert_eq!(controller.checkpoint_drain_transition(), Some(transition));
+
+        controller.fence_process_lease();
+
+        assert!(!controller.process_lease_is_live());
+        assert_eq!(
+            controller.checkpoint_assignment_watch().borrow().clone(),
+            None
+        );
+        assert_eq!(controller.checkpoint_drain_transition(), None);
+    }
+
+    #[test]
+    fn terminal_process_fence_rejects_checkpoint_authority_republication() {
+        let controller = ctl(1, Vec::new());
+        let (fence, transition) = checkpoint_fence_and_drain(&controller);
+        controller.fence_process_lease();
+
+        controller.publish_checkpoint_assignment_fence(Some(fence));
+        controller.publish_checkpoint_drain_transition(Some(transition));
+        controller.set_active(true);
+        controller.set_recovering(false);
+
+        assert_eq!(
+            controller.checkpoint_assignment_watch().borrow().clone(),
+            None
+        );
+        assert_eq!(controller.checkpoint_drain_transition(), None);
+        assert!(controller.leadership_participants.read().is_none());
+        assert!(!controller.active.load(Ordering::Acquire));
+        assert!(!controller.leader_eligible.load(Ordering::Acquire));
+        assert!(controller.is_recovering());
+    }
+
+    #[test]
+    fn expired_process_deadline_rejects_authority_publication_before_async_fencing() {
+        let controller = ctl(1, Vec::new());
+        controller
+            .set_process_lease_deadline(Arc::new(super::super::LeaseDeadline::fenced()))
+            .unwrap();
+        let (fence, transition) = checkpoint_fence_and_drain(&controller);
+
+        controller.publish_checkpoint_assignment_fence(Some(fence));
+        controller.publish_checkpoint_drain_transition(Some(transition));
+
+        assert_eq!(
+            controller.checkpoint_assignment_watch().borrow().clone(),
+            None
+        );
+        assert_eq!(controller.checkpoint_drain_transition(), None);
+        assert!(controller.leadership_participants.read().is_none());
+    }
+
+    #[test]
+    fn process_deadline_installation_is_idempotent_only_for_the_same_clock() {
+        let controller = ctl(1, Vec::new());
+        let deadline = Arc::new(super::super::LeaseDeadline::live_for(Duration::from_secs(
+            10,
+        )));
+
+        controller
+            .set_process_lease_deadline(Arc::clone(&deadline))
+            .unwrap();
+        controller
+            .set_process_lease_deadline(Arc::clone(&deadline))
+            .unwrap();
+        let error = controller
+            .set_process_lease_deadline(Arc::new(super::super::LeaseDeadline::live_for(
+                Duration::from_secs(10),
+            )))
+            .unwrap_err();
+
+        assert!(error.contains("already installed"), "{error}");
+        assert!(Arc::ptr_eq(
+            &controller.process_lease_deadline().unwrap(),
+            &deadline
+        ));
+    }
+
+    #[test]
+    fn terminal_process_fence_wins_concurrent_authority_publication() {
+        let controller = Arc::new(ctl(1, Vec::new()));
+        let (fence, transition) = checkpoint_fence_and_drain(&controller);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        std::thread::scope(|scope| {
+            let publisher = Arc::clone(&controller);
+            let publisher_barrier = Arc::clone(&barrier);
+            scope.spawn(move || {
+                publisher_barrier.wait();
+                publisher.publish_checkpoint_assignment_fence(Some(fence));
+                publisher.publish_checkpoint_drain_transition(Some(transition));
+                publisher.set_active(true);
+                publisher.set_recovering(false);
+            });
+            let fencer = Arc::clone(&controller);
+            let fencer_barrier = Arc::clone(&barrier);
+            scope.spawn(move || {
+                fencer_barrier.wait();
+                fencer.fence_process_lease();
+            });
+            barrier.wait();
+        });
+
+        assert_eq!(
+            controller.checkpoint_assignment_watch().borrow().clone(),
+            None
+        );
+        assert_eq!(controller.checkpoint_drain_transition(), None);
+        assert!(controller.leadership_participants.read().is_none());
+        assert!(!controller.active.load(Ordering::Acquire));
+        assert!(!controller.leader_eligible.load(Ordering::Acquire));
+        assert!(controller.is_recovering());
+    }
+
     #[cfg(feature = "cluster")]
     #[tokio::test]
     async fn certified_leader_retains_local_candidacy_to_coordinate_its_drain() {
@@ -4033,7 +4249,7 @@ mod tests {
 
         let self_id = NodeId(1);
         let idle = NodeId(2);
-        let (_members_tx, members_rx) = watch::channel(vec![info(idle.0)]);
+        let (members_tx, members_rx) = watch::channel(vec![info(idle.0)]);
         let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(self_id));
         let c = Arc::new(ClusterController::new(self_id, kv, None, members_rx));
         let fence = CheckpointAssignmentFence::from_owner_map(
@@ -4070,7 +4286,15 @@ mod tests {
         idle_observer.publish_checkpoint_assignment_fence(Some(fence));
         assert_eq!(idle_observer.current_leader(), Some(self_id));
         let mut candidacy = c.leader_candidacy_watch();
-        assert!(*candidacy.borrow_and_update());
+        assert!(candidacy.borrow_and_update().is_eligible());
+        for _ in 0..64 {
+            members_tx.send_replace(vec![info(idle.0)]);
+        }
+        tokio::task::yield_now().await;
+        assert!(
+            !candidacy.has_changed().unwrap(),
+            "unchanged membership must not starve leader renewal with candidacy wakeups"
+        );
 
         assert!(c.begin_drain());
         let mut advertised_draining = info(self_id.0);
@@ -4086,6 +4310,48 @@ mod tests {
             !candidacy.has_changed().unwrap(),
             "coordinating the predecessor cut must not revoke the current leader's lease"
         );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn coalesced_controller_candidacy_loss_advances_the_generation() {
+        let self_id = NodeId(1);
+        let peer = NodeId(2);
+        let (_members_tx, members_rx) = watch::channel(Vec::new());
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(self_id));
+        let controller = Arc::new(ClusterController::new(self_id, kv, None, members_rx));
+        let mut candidacy = controller.leader_candidacy_watch();
+        let initial = *candidacy.borrow_and_update();
+        assert!(initial.is_eligible());
+
+        let peer_fence = CheckpointAssignmentFence::from_owner_map(
+            1,
+            &[peer.0],
+            vec![CheckpointParticipant {
+                node_id: peer.0,
+                boot_incarnation: Uuid::new_v4(),
+            }],
+        )
+        .unwrap();
+        let local_fence = CheckpointAssignmentFence::from_owner_map(
+            2,
+            &[self_id.0],
+            vec![CheckpointParticipant {
+                node_id: self_id.0,
+                boot_incarnation: controller.recovery_incarnation(),
+            }],
+        )
+        .unwrap();
+
+        // No await between loss and reacquisition: a watch receiver observes only the final
+        // eligible value, but its generation must still fence the prior leader token.
+        controller.publish_checkpoint_assignment_fence(Some(peer_fence));
+        controller.publish_checkpoint_assignment_fence(Some(local_fence));
+
+        assert!(candidacy.has_changed().unwrap());
+        let resumed = *candidacy.borrow_and_update();
+        assert!(resumed.is_eligible());
+        assert_ne!(resumed, initial);
     }
 
     #[test]
@@ -4128,7 +4394,7 @@ mod tests {
         let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(self_id));
         let c = Arc::new(ClusterController::new(self_id, kv, None, members_rx));
         let mut candidacy = c.leader_candidacy_watch();
-        assert!(*candidacy.borrow_and_update());
+        assert!(candidacy.borrow_and_update().is_eligible());
         assert_eq!(c.current_leader(), Some(self_id));
 
         let fence = CheckpointAssignmentFence::from_owner_map(
@@ -4149,7 +4415,7 @@ mod tests {
             .await
             .expect("leader candidacy relay did not observe the assignment roster")
             .unwrap();
-        assert!(!*candidacy.borrow_and_update());
+        assert!(!candidacy.borrow_and_update().is_eligible());
 
         c.publish_checkpoint_assignment_fence(None);
         assert_eq!(
@@ -4196,14 +4462,14 @@ mod tests {
         let mut candidacy = c.leader_candidacy_watch();
 
         assert_eq!(c.current_leader(), Some(owner));
-        assert!(!*candidacy.borrow_and_update());
+        assert!(!candidacy.borrow_and_update().is_eligible());
         c.note_unresponsive(&[owner]);
         tokio::time::timeout(Duration::from_secs(1), candidacy.changed())
             .await
             .expect("placement fallback candidacy did not update")
             .unwrap();
 
-        assert!(*candidacy.borrow_and_update());
+        assert!(candidacy.borrow_and_update().is_eligible());
         assert_eq!(c.current_leader(), Some(self_id));
         assert!(c.is_leader());
         assert!(!c
@@ -4506,7 +4772,7 @@ mod tests {
             process_term: 1,
         };
         let super::super::LeaseOutcome::Acquired(lease) =
-            authority.try_acquire(&owner, 1).await.unwrap()
+            authority.begin_new_term(&owner, 1).await.unwrap()
         else {
             panic!("empty authority must be acquired");
         };
@@ -4708,7 +4974,7 @@ mod tests {
                 boot: c.recovery_incarnation(),
                 process_term: 1,
             };
-            let lease = match store.try_acquire(&owner, 1).await.unwrap() {
+            let lease = match store.begin_new_term(&owner, 1).await.unwrap() {
                 LeaseOutcome::Acquired(lease) => lease,
                 LeaseOutcome::Held(_) => unreachable!(),
             };
@@ -4847,12 +5113,15 @@ mod tests {
             boot: controller.recovery_incarnation(),
             process_term: 1,
         };
-        let LeaseOutcome::Acquired(lease) = authority.try_acquire(&owner, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap()
+        else {
             panic!("empty recovery authority must be acquired");
         };
         let (_lease_tx, lease_rx) = watch::channel(Some(lease.clone()));
         let deadline = Arc::new(LeaseDeadline::live_for(Duration::from_secs(10)));
-        controller.set_process_lease_deadline(Arc::clone(&deadline));
+        controller
+            .set_process_lease_deadline(Arc::clone(&deadline))
+            .unwrap();
         controller
             .set_leader_lease_watch(lease_rx, owner, deadline)
             .unwrap();
@@ -5333,13 +5602,15 @@ mod tests {
             boot: controller.recovery_incarnation(),
             process_term: 1,
         };
-        let LeaseOutcome::Acquired(old_lease) = authority.try_acquire(&owner, 0).await.unwrap()
+        let LeaseOutcome::Acquired(old_lease) = authority.begin_new_term(&owner, 0).await.unwrap()
         else {
             panic!("empty recovery authority must be acquired");
         };
         let (lease_tx, lease_rx) = watch::channel(Some(old_lease.clone()));
         let deadline = Arc::new(LeaseDeadline::live_for(Duration::from_secs(10)));
-        controller.set_process_lease_deadline(Arc::clone(&deadline));
+        controller
+            .set_process_lease_deadline(Arc::clone(&deadline))
+            .unwrap();
         controller
             .set_leader_lease_watch(lease_rx, owner.clone(), deadline)
             .unwrap();
@@ -5437,13 +5708,15 @@ mod tests {
             boot: controller.recovery_incarnation(),
             process_term: 1,
         };
-        let LeaseOutcome::Acquired(old_lease) = authority.try_acquire(&owner, 0).await.unwrap()
+        let LeaseOutcome::Acquired(old_lease) = authority.begin_new_term(&owner, 0).await.unwrap()
         else {
             panic!("empty recovery authority must be acquired");
         };
         let (_lease_tx, lease_rx) = watch::channel(Some(old_lease.clone()));
         let deadline = Arc::new(LeaseDeadline::live_for(Duration::from_secs(10)));
-        controller.set_process_lease_deadline(Arc::clone(&deadline));
+        controller
+            .set_process_lease_deadline(Arc::clone(&deadline))
+            .unwrap();
         controller
             .set_leader_lease_watch(lease_rx, owner, deadline)
             .unwrap();
@@ -5495,7 +5768,9 @@ mod tests {
         let replacement = ClusterController::new(rival.node, delayed.clone(), None, replacement_rx);
         let (_rival_lease_tx, rival_lease_rx) = watch::channel(Some(rival_lease));
         let rival_deadline = Arc::new(LeaseDeadline::live_for(Duration::from_secs(10)));
-        replacement.set_process_lease_deadline(Arc::clone(&rival_deadline));
+        replacement
+            .set_process_lease_deadline(Arc::clone(&rival_deadline))
+            .unwrap();
         replacement
             .set_leader_lease_watch(rival_lease_rx, rival, rival_deadline)
             .unwrap();

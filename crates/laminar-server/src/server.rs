@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::signal;
-use tracing::info;
+use tracing::{info, warn};
 
 use laminar_core::streaming::checkpoint::StreamCheckpointConfig;
 use laminar_db::{DbError, EngineMetrics, LaminarDB, Profile};
@@ -19,52 +19,128 @@ use crate::http;
 use crate::http::ClusterComponents;
 use crate::metrics::ServerMetrics;
 use crate::reload::ReloadGuard;
-#[cfg(all(test, any(feature = "otel", feature = "kafka", feature = "cluster")))]
+#[cfg(test)]
 use laminar_core::state::StateBackendConfig;
 use laminar_core::state::StateBackendDurability;
 
 /// Handle to a running LaminarDB server. Call `wait_for_shutdown` to block until Ctrl-C.
-pub enum ServerHandle {
-    Single {
-        db: Arc<LaminarDB>,
-        api_handle: tokio::task::JoinHandle<()>,
-        pgwire_handle: Option<tokio::task::JoinHandle<()>>,
-        watcher_handle: Option<tokio::task::JoinHandle<()>>,
-    },
+pub struct ServerHandle {
+    runtime: ServerRuntime,
+}
+
+enum ServerRuntime {
+    Single(SingleServerRuntime),
     #[cfg(feature = "cluster")]
     Cluster(Box<crate::cluster::ClusterHandle>),
+}
+
+struct SingleServerRuntime {
+    db: Arc<LaminarDB>,
+    db_shutdown_complete: bool,
+    serving_gate: Arc<http::ServingGate>,
+    api_handle: tokio::task::JoinHandle<()>,
+    pgwire_handle: Option<tokio::task::JoinHandle<()>>,
+    watcher_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+const SERVER_TASK_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn abort_and_join_server_task<T>(
+    task: &mut tokio::task::JoinHandle<T>,
+    task_name: &'static str,
+) -> bool {
+    task.abort();
+    match tokio::time::timeout(SERVER_TASK_SHUTDOWN_TIMEOUT, task).await {
+        Ok(Ok(_)) => true,
+        Ok(Err(error)) if error.is_cancelled() => true,
+        Ok(Err(error)) => {
+            warn!(task = task_name, %error, "Server task failed during shutdown");
+            false
+        }
+        Err(_) => {
+            warn!(
+                task = task_name,
+                timeout = ?SERVER_TASK_SHUTDOWN_TIMEOUT,
+                "Server task did not stop within the shutdown bound"
+            );
+            false
+        }
+    }
+}
+
+impl SingleServerRuntime {
+    async fn wait_for_shutdown(&mut self) -> Result<(), ServerError> {
+        wait_for_termination_signal().await?;
+
+        info!("Received shutdown signal, shutting down...");
+        self.serving_gate.fence();
+
+        let watcher_handle = &mut self.watcher_handle;
+        let pgwire_handle = &mut self.pgwire_handle;
+        let api_handle = &mut self.api_handle;
+        let (watcher_stopped, pgwire_stopped, api_stopped) = tokio::join!(
+            async {
+                if let Some(handle) = watcher_handle.as_mut() {
+                    abort_and_join_server_task(handle, "configuration watcher").await
+                } else {
+                    true
+                }
+            },
+            async {
+                if let Some(handle) = pgwire_handle.as_mut() {
+                    abort_and_join_server_task(handle, "PostgreSQL wire server").await
+                } else {
+                    true
+                }
+            },
+            abort_and_join_server_task(api_handle, "HTTP API server"),
+        );
+
+        let shutdown_result = self.db.shutdown().await;
+        self.db_shutdown_complete = shutdown_result.is_ok();
+        shutdown_result.map_err(|error| ServerError::Shutdown(error.to_string()))?;
+        if !(watcher_stopped && pgwire_stopped && api_stopped) {
+            return Err(ServerError::Shutdown(
+                "one or more server tasks did not terminate cleanly".into(),
+            ));
+        }
+
+        info!("Shutdown complete");
+        Ok(())
+    }
+}
+
+impl Drop for SingleServerRuntime {
+    fn drop(&mut self) {
+        self.serving_gate.fence();
+        if !self.db_shutdown_complete {
+            self.db.close();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                let db = Arc::clone(&self.db);
+                let _ = runtime.spawn(async move {
+                    if let Err(error) = db.shutdown().await {
+                        warn!(%error, "Database cleanup after server handle drop failed");
+                    }
+                });
+            }
+        }
+        if let Some(handle) = &self.watcher_handle {
+            handle.abort();
+        }
+        if let Some(handle) = &self.pgwire_handle {
+            handle.abort();
+        }
+        self.api_handle.abort();
+    }
 }
 
 impl ServerHandle {
     /// Block until SIGINT/SIGTERM, then gracefully shut down.
     pub async fn wait_for_shutdown(self) -> Result<(), ServerError> {
-        match self {
-            Self::Single {
-                db,
-                api_handle,
-                pgwire_handle,
-                watcher_handle,
-            } => {
-                wait_for_termination_signal().await?;
-
-                info!("Received shutdown signal, shutting down...");
-
-                if let Some(wh) = &watcher_handle {
-                    wh.abort();
-                }
-                if let Some(pg) = &pgwire_handle {
-                    pg.abort();
-                }
-                db.shutdown()
-                    .await
-                    .map_err(|e| ServerError::Shutdown(e.to_string()))?;
-                api_handle.abort();
-
-                info!("Shutdown complete");
-                Ok(())
-            }
+        match self.runtime {
+            ServerRuntime::Single(mut runtime) => runtime.wait_for_shutdown().await,
             #[cfg(feature = "cluster")]
-            Self::Cluster(handle) => (*handle)
+            ServerRuntime::Cluster(handle) => (*handle)
                 .wait_for_shutdown()
                 .await
                 .map_err(|e| ServerError::Cluster(e.to_string())),
@@ -72,7 +148,7 @@ impl ServerHandle {
     }
 }
 
-async fn wait_for_termination_signal() -> Result<(), ServerError> {
+pub(crate) async fn wait_for_termination_signal() -> Result<(), ServerError> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
@@ -109,7 +185,9 @@ pub async fn run_server(
             let handle = crate::cluster::start_cluster(config, cluster_cfg, config_path)
                 .await
                 .map_err(|e| ServerError::Cluster(e.to_string()))?;
-            return Ok(ServerHandle::Cluster(Box::new(handle)));
+            return Ok(ServerHandle {
+                runtime: ServerRuntime::Cluster(Box::new(handle)),
+            });
         }
     }
     #[cfg(not(feature = "cluster"))]
@@ -208,7 +286,7 @@ pub async fn run_server(
             .expect("pgwire_tls_min_version validated at config load");
     let pgwire_max_connections = config.server.pgwire_max_connections;
     let pgwire_max_auth_failures = config.server.pgwire_max_auth_failures_per_min;
-    let (app_state, api_handle) = start_http_api(
+    let http_runtime = start_http_api(
         Arc::clone(&db),
         registry,
         config_path.clone(),
@@ -217,8 +295,15 @@ pub async fn run_server(
         #[cfg(feature = "cluster")]
         None,
     )
-    .await?;
-    let watcher_handle = spawn_config_watcher(&app_state, config_path);
+    .await;
+    let (app_state, mut api_handle) = match http_runtime {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = db.shutdown().await;
+            return Err(error);
+        }
+    };
+    let mut watcher_handle = spawn_config_watcher(&app_state, config_path);
 
     let pgwire_handle = if let Some(bind) = pgwire_bind {
         let tls = match (&pgwire_tls_cert, &pgwire_tls_key) {
@@ -245,10 +330,14 @@ pub async fn run_server(
             Err(e) => {
                 // Roll back: stop the HTTP server, the file watcher, and the
                 // pipeline before propagating the bind failure.
-                if let Some(wh) = &watcher_handle {
-                    wh.abort();
-                }
-                api_handle.abort();
+                tokio::join!(
+                    async {
+                        if let Some(handle) = watcher_handle.as_mut() {
+                            abort_and_join_server_task(handle, "configuration watcher").await;
+                        }
+                    },
+                    abort_and_join_server_task(&mut api_handle, "HTTP API server"),
+                );
                 let _ = db.shutdown().await;
                 return Err(e);
             }
@@ -257,11 +346,15 @@ pub async fn run_server(
         None
     };
 
-    Ok(ServerHandle::Single {
-        db,
-        api_handle,
-        pgwire_handle,
-        watcher_handle,
+    Ok(ServerHandle {
+        runtime: ServerRuntime::Single(SingleServerRuntime {
+            db,
+            db_shutdown_complete: false,
+            serving_gate: Arc::clone(&app_state.serving_gate),
+            api_handle,
+            pgwire_handle,
+            watcher_handle,
+        }),
     })
 }
 
@@ -375,16 +468,33 @@ pub(crate) async fn start_http_api(
     config: ServerConfig,
     #[cfg(feature = "cluster")] cluster: Option<ClusterComponents>,
 ) -> Result<(Arc<http::AppState>, tokio::task::JoinHandle<()>), ServerError> {
+    let serving_gate = Arc::new(http::ServingGate::starting());
+    #[cfg(feature = "cluster")]
+    if let Some(cluster) = cluster.as_ref() {
+        let deadline = cluster.controller.process_lease_deadline().ok_or_else(|| {
+            ServerError::Http(
+                "cluster HTTP serving requires the shared process lease deadline".into(),
+            )
+        })?;
+        serving_gate
+            .install_process_lease_deadline(deadline)
+            .map_err(|error| ServerError::Http(error.into()))?;
+    }
     let prepared = prepare_http_api(
         db,
         registry,
         config_path,
         config,
+        serving_gate,
         #[cfg(feature = "cluster")]
         cluster,
     )
     .await?;
-    prepared.app_state.open_startup_gate();
+    if !prepared.app_state.open_startup_gate() {
+        return Err(ServerError::Http(
+            "HTTP serving authority was fenced during startup".into(),
+        ));
+    }
     prepared.start().await
 }
 
@@ -446,6 +556,7 @@ pub(crate) async fn prepare_http_api(
     registry: Arc<prometheus::Registry>,
     config_path: PathBuf,
     config: ServerConfig,
+    serving_gate: Arc<http::ServingGate>,
     #[cfg(feature = "cluster")] cluster: Option<ClusterComponents>,
 ) -> Result<PreparedHttpApi, ServerError> {
     let bind = config.server.bind.clone();
@@ -460,7 +571,7 @@ pub(crate) async fn prepare_http_api(
         registry,
         server_metrics,
         ws_slots: http::ws_connection_slots(),
-        startup_ready: std::sync::atomic::AtomicBool::new(false),
+        serving_gate,
         #[cfg(feature = "cluster")]
         cluster,
     });
@@ -754,6 +865,7 @@ mod tests {
             registry,
             PathBuf::from("unused.toml"),
             config,
+            Arc::new(http::ServingGate::starting()),
             #[cfg(feature = "cluster")]
             None,
         )
@@ -778,6 +890,58 @@ mod tests {
         .await
         .expect("cancelling HTTP startup must release its listener");
         drop(rebound);
+    }
+
+    #[tokio::test]
+    async fn aborted_server_task_is_joined_before_cleanup_returns() {
+        let mut task = tokio::spawn(std::future::pending::<()>());
+        let observer = task.abort_handle();
+
+        assert!(abort_and_join_server_task(&mut task, "test task").await);
+
+        assert!(observer.is_finished());
+    }
+
+    #[tokio::test]
+    async fn dropping_single_server_handle_fences_and_aborts_owned_tasks() {
+        let serving_gate = Arc::new(http::ServingGate::starting());
+        assert!(serving_gate.open());
+        let api_handle = tokio::spawn(std::future::pending::<()>());
+        let api_abort = api_handle.abort_handle();
+        let pgwire_handle = tokio::spawn(std::future::pending::<()>());
+        let pgwire_abort = pgwire_handle.abort_handle();
+        let watcher_handle = tokio::spawn(std::future::pending::<()>());
+        let watcher_abort = watcher_handle.abort_handle();
+        let db = LaminarDB::open().unwrap();
+        let handle = ServerHandle {
+            runtime: ServerRuntime::Single(SingleServerRuntime {
+                db: Arc::clone(&db),
+                db_shutdown_complete: false,
+                serving_gate: Arc::clone(&serving_gate),
+                api_handle,
+                pgwire_handle: Some(pgwire_handle),
+                watcher_handle: Some(watcher_handle),
+            }),
+        };
+
+        drop(handle);
+
+        assert_eq!(
+            serving_gate.rejection_message(),
+            Some("server serving authority is fenced")
+        );
+        assert!(db.is_closed());
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !(api_abort.is_finished()
+                && pgwire_abort.is_finished()
+                && watcher_abort.is_finished())
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped server handle left an owned task running");
+        db.shutdown().await.unwrap();
     }
 
     fn make_source(name: &str, connector: &str) -> SourceConfig {
@@ -823,7 +987,8 @@ mod tests {
             process_term: 1,
         };
         let authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&object_store), 1_000));
-        let LeaseOutcome::Acquired(lease) = authority.try_acquire(&owner, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap()
+        else {
             unreachable!()
         };
         let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
@@ -837,9 +1002,11 @@ mod tests {
             boot,
         ));
         controller.set_active(false);
-        controller.set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
-            std::time::Duration::from_secs(30),
-        )));
+        controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
+                std::time::Duration::from_secs(30),
+            )))
+            .unwrap();
         let (_lease_tx, lease_rx) = tokio::sync::watch::channel(Some(lease));
         controller
             .set_leader_lease_watch(

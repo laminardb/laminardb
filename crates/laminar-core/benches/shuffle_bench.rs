@@ -14,6 +14,7 @@ use arrow_array::{Float64Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+use laminar_core::cluster::control::LeaseDeadline;
 use laminar_core::shuffle::{ShuffleMessage, ShuffleReceiver, ShuffleSender};
 use tokio::runtime::Runtime;
 
@@ -50,6 +51,11 @@ async fn harness() -> Harness {
         .await
         .unwrap();
     let sender = ShuffleSender::new(1, uuid::Uuid::from_u128(1));
+    recv.install_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+        .unwrap();
+    sender
+        .install_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+        .unwrap();
     let fence = CheckpointAssignmentFence::from_owner_map(
         1,
         &[1, 2],
@@ -87,7 +93,7 @@ async fn drain_to(h: &Harness, target: u64) {
 fn bench_shuffle(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let h = rt.block_on(harness());
-    let msg = ShuffleMessage::checkpointed("s".into(), 0, batch());
+    let msg = ShuffleMessage::checkpointed("s".into(), 1, batch());
     rt.block_on(async {
         h.sender.send_to(2, &msg).await.unwrap();
         drain_to(&h, 1).await;

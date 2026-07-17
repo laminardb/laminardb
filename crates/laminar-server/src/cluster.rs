@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use object_store::ObjectStoreExt;
-use tokio::signal;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
@@ -15,6 +14,8 @@ use laminar_core::cluster::discovery::{
 };
 
 const PROCESS_INCARNATION_TAG: &str = "laminardb.process-incarnation";
+const DISCOVERY_ANNOUNCEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const CLUSTER_TASK_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Enum dispatch — `Discovery` trait uses `async fn` (not dyn-compatible).
 enum DiscoveryImpl {
     Static(StaticDiscovery),
@@ -155,6 +156,8 @@ pub enum ClusterStartupError {
     HttpStartup(String),
     #[error("engine shutdown failed: {0}")]
     EngineShutdown(String),
+    #[error("cluster authority lost: {0}")]
+    AuthorityLost(String),
 }
 
 struct ProcessLeaseRuntime {
@@ -162,8 +165,140 @@ struct ProcessLeaseRuntime {
     deadline: Arc<laminar_core::cluster::control::LeaseDeadline>,
     live_rx: watch::Receiver<bool>,
     shutdown: tokio_util::sync::CancellationToken,
+    terminal: tokio_util::sync::CancellationToken,
     renewal_task: tokio::task::JoinHandle<()>,
+    terminal_task: tokio::task::JoinHandle<()>,
     fence_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+fn spawn_process_lease_terminal_monitor(
+    mut live_rx: watch::Receiver<bool>,
+    deadline: Arc<laminar_core::cluster::control::LeaseDeadline>,
+    terminal: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            () = deadline.wait_until_expired() => {}
+            () = async {
+                loop {
+                    if !*live_rx.borrow_and_update() {
+                        break;
+                    }
+                    if live_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            } => {}
+        }
+        terminal.cancel();
+    })
+}
+
+struct LeaderLeaseRuntime {
+    shutdown: tokio_util::sync::CancellationToken,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl LeaderLeaseRuntime {
+    fn new(
+        shutdown: tokio_util::sync::CancellationToken,
+        task: tokio::task::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            shutdown,
+            task: Some(task),
+        }
+    }
+
+    fn cancel(&self) {
+        self.shutdown.cancel();
+    }
+
+    fn shutdown_token(&self) -> tokio_util::sync::CancellationToken {
+        self.shutdown.clone()
+    }
+
+    async fn stop(&mut self) {
+        self.cancel();
+        let Some(mut task) = self.task.take() else {
+            return;
+        };
+        match tokio::time::timeout(PROCESS_LEASE_IO_TIMEOUT, &mut task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if error.is_cancelled() => {}
+            Ok(Err(error)) => warn!(%error, "Leader lease task failed during shutdown"),
+            Err(_) => {
+                task.abort();
+                match tokio::time::timeout(PROCESS_LEASE_IO_TIMEOUT, &mut task).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) if error.is_cancelled() => {}
+                    Ok(Err(error)) => {
+                        warn!(%error, "Leader lease task failed after shutdown abort")
+                    }
+                    Err(_) => warn!(
+                        timeout = ?PROCESS_LEASE_IO_TIMEOUT,
+                        "Leader lease task did not stop after abort"
+                    ),
+                }
+            }
+        }
+    }
+}
+
+impl Drop for LeaderLeaseRuntime {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
+fn revoke_process_authority(
+    db: &LaminarDB,
+    serving_gate: &crate::http::ServingGate,
+    leader_lease_shutdown: &tokio_util::sync::CancellationToken,
+    terminal: &tokio_util::sync::CancellationToken,
+) {
+    serving_gate.fence();
+    db.revoke_cluster_authority();
+    leader_lease_shutdown.cancel();
+    terminal.cancel();
+}
+
+async fn cleanup_cluster_startup(
+    discovery: &mut DiscoveryImpl,
+    db: &LaminarDB,
+    leader_lease: &mut LeaderLeaseRuntime,
+    terminal: &tokio_util::sync::CancellationToken,
+    force_terminal: bool,
+) {
+    let mut authority_lost = force_terminal || terminal.is_cancelled();
+    let shutdown = db.shutdown();
+    tokio::pin!(shutdown);
+    let mut shutdown_result = None;
+    if !authority_lost {
+        tokio::select! {
+            biased;
+            () = terminal.cancelled() => authority_lost = true,
+            result = &mut shutdown => shutdown_result = Some(result),
+        }
+    }
+
+    if authority_lost {
+        db.revoke_cluster_authority();
+        let _ = stop_discovery_with_bound(discovery).await;
+        leader_lease.stop().await;
+    }
+
+    if shutdown_result.is_none() {
+        let _ = shutdown.await;
+    }
+    if !authority_lost {
+        leader_lease.stop().await;
+        let _ = stop_discovery_with_bound(discovery).await;
+    }
 }
 
 impl ProcessLeaseRuntime {
@@ -171,27 +306,37 @@ impl ProcessLeaseRuntime {
         self.deadline.is_live() && *self.live_rx.borrow() && !self.renewal_task.is_finished()
     }
 
+    fn terminal_token(&self) -> tokio_util::sync::CancellationToken {
+        self.terminal.clone()
+    }
+
+    fn disarm_for_shutdown(&mut self) -> bool {
+        if let Some(task) = self.fence_task.take() {
+            task.abort();
+        }
+        self.terminal_task.abort();
+
+        let was_live = self.deadline.is_live()
+            && *self.live_rx.borrow()
+            && !self.terminal.is_cancelled()
+            && !self.renewal_task.is_finished();
+
+        self.shutdown.cancel();
+        self.renewal_task.abort();
+        was_live
+    }
+
     fn install_fence(
         &mut self,
         db: Arc<LaminarDB>,
         controller: Arc<laminar_core::cluster::control::ClusterController>,
-        leader_lease_shutdown: Option<tokio_util::sync::CancellationToken>,
+        serving_gate: Arc<crate::http::ServingGate>,
+        leader_lease_shutdown: tokio_util::sync::CancellationToken,
     ) {
-        let mut live_rx = self.live_rx.clone();
+        let terminal = self.terminal.clone();
         self.fence_task = Some(tokio::spawn(async move {
-            loop {
-                if !*live_rx.borrow_and_update() {
-                    break;
-                }
-                if live_rx.changed().await.is_err() {
-                    break;
-                }
-            }
-            controller.fence_process_lease();
-            db.fence_cluster_startup();
-            if let Some(token) = leader_lease_shutdown {
-                token.cancel();
-            }
+            terminal.cancelled().await;
+            revoke_process_authority(&db, &serving_gate, &leader_lease_shutdown, &terminal);
             tracing::error!(
                 node = controller.instance_id().0,
                 "stable node identity lease lost; database intake and cluster control fenced"
@@ -249,54 +394,229 @@ async fn wait_for_catalog_startup_authority(
 
 impl Drop for ProcessLeaseRuntime {
     fn drop(&mut self) {
-        self.shutdown.cancel();
-        self.renewal_task.abort();
-        if let Some(task) = &self.fence_task {
+        if let Some(task) = self.fence_task.take() {
             task.abort();
         }
+        self.terminal_task.abort();
+        self.shutdown.cancel();
+        self.renewal_task.abort();
+        self.deadline.fence();
+        self.terminal.cancel();
     }
 }
 
 pub struct ClusterHandle {
     db: Arc<LaminarDB>,
+    db_shutdown_complete: bool,
     discovery: DiscoveryImpl,
+    serving_gate: Arc<crate::http::ServingGate>,
     api_handle: tokio::task::JoinHandle<()>,
     watcher_handle: Option<tokio::task::JoinHandle<()>>,
     membership_handle: tokio::task::JoinHandle<()>,
     /// This node's own membership record. Cloned and re-announced with
     /// [`NodeState::Draining`] on shutdown so peers stop routing to us.
     local_node: NodeInfo,
-    /// Cluster control plane (gossip discovery only). `begin_drain` is
-    /// called on shutdown so the leader excludes us from vnode
-    /// assignment.
-    cluster_controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
+    /// Cluster control plane. `begin_drain` is called on shutdown so the leader excludes us from
+    /// vnode assignment.
+    cluster_controller: Arc<laminar_core::cluster::control::ClusterController>,
     /// Durable vnode assignment snapshot. Polled on shutdown to block
     /// until the leader has reassigned every vnode we own.
-    snapshot_store: Option<Arc<laminar_core::cluster::control::AssignmentSnapshotStore>>,
+    snapshot_store: Arc<laminar_core::cluster::control::AssignmentSnapshotStore>,
     /// Fixed vnode cardinality used to validate the durable drain head before shutdown.
     vnode_count: u32,
     /// Cancels the leader-lease renewal loop on shutdown so a draining
     /// node stops renewing and its lease expires promptly.
-    lease_shutdown_token: Option<tokio_util::sync::CancellationToken>,
+    leader_lease: LeaderLeaseRuntime,
     /// Keeps the stable-node process lease renewed for the lifetime of this runtime.
-    _process_lease: ProcessLeaseRuntime,
-    /// Snapshot watcher + leader rebalance controller tasks. Empty
-    /// if the deployment has no `AssignmentSnapshotStore` (non-cluster
-    /// or pre-configured legacy).
+    process_lease: ProcessLeaseRuntime,
+    /// Snapshot watcher + leader rebalance controller tasks.
     rebalance_tasks: Vec<tokio::task::JoinHandle<()>>,
-    /// Shutdown signal shared with [`Self::rebalance_tasks`]. Notified
-    /// on [`Self::wait_for_shutdown`] so those loops observe the
-    /// request and exit cleanly before we abort.
-    rebalance_shutdown: Arc<tokio::sync::Notify>,
+    /// Persistent shutdown signal shared with [`Self::rebalance_tasks`].
+    rebalance_shutdown: tokio_util::sync::CancellationToken,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClusterShutdownTrigger {
+    Signal,
+    ProcessLeaseLost,
+}
+
+async fn wait_for_cluster_shutdown_trigger(
+    terminal: &tokio_util::sync::CancellationToken,
+) -> Result<ClusterShutdownTrigger, ClusterStartupError> {
+    tokio::select! {
+        biased;
+        () = terminal.cancelled() => Ok(ClusterShutdownTrigger::ProcessLeaseLost),
+        signal = server::wait_for_termination_signal() => {
+            signal.map_err(|e| {
+                ClusterStartupError::Discovery(format!("signal handler: {e}"))
+            })?;
+            Ok(ClusterShutdownTrigger::Signal)
+        }
+    }
+}
+
+async fn abort_and_join_cluster_task(
+    task: &mut tokio::task::JoinHandle<()>,
+    task_name: &'static str,
+) -> bool {
+    task.abort();
+    match tokio::time::timeout(CLUSTER_TASK_SHUTDOWN_TIMEOUT, task).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) if error.is_cancelled() => true,
+        Ok(Err(error)) => {
+            warn!(task = task_name, %error, "Cluster task failed during shutdown");
+            false
+        }
+        Err(_) => {
+            warn!(
+                task = task_name,
+                timeout = ?CLUSTER_TASK_SHUTDOWN_TIMEOUT,
+                "Cluster task did not stop within the shutdown bound"
+            );
+            false
+        }
+    }
+}
+
+async fn announce_node_state_with_bound(
+    discovery: &DiscoveryImpl,
+    info: NodeInfo,
+    terminal: &tokio_util::sync::CancellationToken,
+    operation: &'static str,
+) -> bool {
+    let announcement = tokio::select! {
+        biased;
+        () = terminal.cancelled() => return true,
+        result = tokio::time::timeout(
+            DISCOVERY_ANNOUNCEMENT_TIMEOUT,
+            discovery.announce(info),
+        ) => result,
+    };
+
+    match announcement {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!(%error, operation, "Discovery announcement failed"),
+        Err(_) => warn!(
+            operation,
+            timeout = ?DISCOVERY_ANNOUNCEMENT_TIMEOUT,
+            "Discovery announcement timed out"
+        ),
+    }
+    terminal.is_cancelled()
+}
+
+async fn stop_discovery_with_bound(discovery: &mut DiscoveryImpl) -> bool {
+    // Discovery owns a five-second graceful join plus a one-second abort settle. The outer bound
+    // is deliberately longer so it cannot cancel that forced cleanup at its own boundary.
+    let timeout = CLUSTER_TASK_SHUTDOWN_TIMEOUT + std::time::Duration::from_secs(2);
+    match tokio::time::timeout(timeout, discovery.stop()).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            warn!(%error, "Discovery stop error");
+            false
+        }
+        Err(_) => {
+            warn!(?timeout, "Discovery did not stop within the shutdown bound");
+            false
+        }
+    }
+}
+
+fn log_rebalance_task_result(result: Result<(), tokio::task::JoinError>) -> bool {
+    if let Err(error) = result {
+        if !error.is_cancelled() {
+            warn!(%error, "Rebalance task failed during shutdown");
+            return false;
+        }
+    }
+    true
+}
+
+async fn stop_rebalance_tasks(
+    tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> bool {
+    shutdown.cancel();
+    let mut stopped_cleanly = true;
+    let graceful_deadline = tokio::time::Instant::now() + CLUSTER_TASK_SHUTDOWN_TIMEOUT;
+    while !tasks.is_empty() {
+        match tokio::time::timeout_at(graceful_deadline, &mut tasks[0]).await {
+            Ok(result) => {
+                stopped_cleanly &= log_rebalance_task_result(result);
+                tasks.swap_remove(0);
+            }
+            Err(_) => break,
+        }
+    }
+
+    if tasks.is_empty() {
+        return stopped_cleanly;
+    }
+
+    for task in tasks.iter() {
+        task.abort();
+    }
+    let abort_deadline = tokio::time::Instant::now() + CLUSTER_TASK_SHUTDOWN_TIMEOUT;
+    while !tasks.is_empty() {
+        match tokio::time::timeout_at(abort_deadline, &mut tasks[0]).await {
+            Ok(result) => {
+                stopped_cleanly &= log_rebalance_task_result(result);
+                tasks.swap_remove(0);
+            }
+            Err(_) => {
+                warn!(
+                    remaining = tasks.len(),
+                    timeout = ?CLUSTER_TASK_SHUTDOWN_TIMEOUT,
+                    "Rebalance tasks did not stop within the shutdown bound"
+                );
+                stopped_cleanly = false;
+                break;
+            }
+        }
+    }
+    stopped_cleanly && tasks.is_empty()
+}
+
+async fn stop_cluster_advertisement_and_admission(
+    discovery: &mut DiscoveryImpl,
+    membership_handle: &mut tokio::task::JoinHandle<()>,
+    mut watcher_handle: Option<&mut tokio::task::JoinHandle<()>>,
+    api_handle: &mut tokio::task::JoinHandle<()>,
+) -> bool {
+    membership_handle.abort();
+    if let Some(watcher) = watcher_handle.as_ref() {
+        watcher.abort();
+    }
+    api_handle.abort();
+
+    let (discovery_stopped, membership_stopped, watcher_stopped, api_stopped) = tokio::join!(
+        stop_discovery_with_bound(discovery),
+        abort_and_join_cluster_task(membership_handle, "membership watcher"),
+        async {
+            if let Some(watcher) = watcher_handle.take() {
+                abort_and_join_cluster_task(watcher, "configuration watcher").await
+            } else {
+                true
+            }
+        },
+        abort_and_join_cluster_task(api_handle, "HTTP API server"),
+    );
+    discovery_stopped && membership_stopped && watcher_stopped && api_stopped
 }
 
 impl ClusterHandle {
     pub async fn wait_for_shutdown(mut self) -> Result<(), ClusterStartupError> {
-        signal::ctrl_c()
-            .await
-            .map_err(|e| ClusterStartupError::Discovery(format!("signal handler: {e}")))?;
+        let terminal = self.process_lease.terminal_token();
+        let mut authority_lost = wait_for_cluster_shutdown_trigger(&terminal).await?
+            == ClusterShutdownTrigger::ProcessLeaseLost;
+        self.serving_gate.fence();
 
-        info!("Received shutdown signal, shutting down cluster node...");
+        if authority_lost {
+            warn!("Stable node identity lease lost; stopping cluster node");
+        } else {
+            info!("Received shutdown signal, shutting down cluster node...");
+        }
 
         // Graceful drain. Discovery and the rebalance control plane must
         // stay alive here: peers need to observe our Draining state and
@@ -304,99 +624,232 @@ impl ClusterHandle {
         //
         // 1. Announce Draining so peers stop routing to us and the
         //    leader's `assignable_instances` drops us from assignment.
-        let mut draining = self.local_node.clone();
-        draining.state = NodeState::Draining;
-        if let Err(e) = self.discovery.announce(draining).await {
-            warn!("Failed to announce draining state: {e}");
-        }
+        if !authority_lost {
+            let mut draining = self.local_node.clone();
+            draining.state = NodeState::Draining;
+            authority_lost = announce_node_state_with_bound(
+                &self.discovery,
+                draining,
+                &terminal,
+                "announce draining state",
+            )
+            .await;
 
-        // 2. Flip the local draining flag so that if we are the leader,
-        //    our own rebalance controller excludes us from assignment.
-        let retains_drain_leadership = self
-            .cluster_controller
-            .as_ref()
-            .is_some_and(|controller| controller.begin_drain());
-        // A non-leader yields immediately. The certified current leader must keep renewing until
-        // it checkpoints its own predecessor cut; the target roster excludes it and transfers
-        // candidacy after the committed assignment is adopted.
-        if !retains_drain_leadership {
-            if let Some(token) = &self.lease_shutdown_token {
-                token.cancel();
-            }
-        }
+            if !authority_lost {
+                // 2. Flip the local draining flag so that if we are the leader,
+                //    our own rebalance controller excludes us from assignment.
+                let retains_drain_leadership = self.cluster_controller.begin_drain();
+                // A non-leader yields immediately. The certified current leader must keep
+                // renewing until it checkpoints its own predecessor cut; the target roster
+                // excludes it and transfers candidacy after the committed assignment is adopted.
+                if !retains_drain_leadership {
+                    self.leader_lease.cancel();
+                }
 
-        // 3. Block until the leader has reassigned every vnode we own,
-        //    bounded so a stuck cluster can't wedge shutdown forever.
-        if let Some(store) = &self.snapshot_store {
-            if let Some(controller) = &self.cluster_controller {
+                // 3. Block until the leader has reassigned every vnode we own,
+                //    bounded so a stuck cluster can't wedge shutdown forever.
                 let me = laminar_core::state::NodeId(self.local_node.id.0);
-                let drained = match controller.checkpoint_authority() {
-                    Ok(authority) => {
-                        laminar_db::rebalance::wait_until_drained(
-                            store,
-                            Some(&authority),
-                            me,
-                            self.vnode_count,
-                            std::time::Duration::from_secs(1),
-                            std::time::Duration::from_secs(30),
-                        )
-                        .await
-                    }
-                    Err(error) => {
-                        warn!(%error, "Drain cannot certify assignment authority");
-                        false
+                let drain = async {
+                    match self.cluster_controller.checkpoint_authority() {
+                        Ok(authority) => {
+                            laminar_db::rebalance::wait_until_drained(
+                                &self.snapshot_store,
+                                Some(&authority),
+                                me,
+                                self.vnode_count,
+                                std::time::Duration::from_secs(1),
+                                std::time::Duration::from_secs(30),
+                            )
+                            .await
+                        }
+                        Err(error) => {
+                            warn!(%error, "Drain cannot certify assignment authority");
+                            false
+                        }
                     }
                 };
-                if drained {
+                let drained = tokio::select! {
+                    biased;
+                    () = terminal.cancelled() => {
+                        authority_lost = true;
+                        false
+                    }
+                    drained = drain => drained,
+                };
+                if authority_lost {
+                    warn!("Process lease lost while draining; switching to terminal shutdown");
+                } else if drained {
                     info!("Drain complete: all owned vnodes reassigned");
                 } else {
                     warn!("Drain timed out after 30s; proceeding with shutdown");
                 }
-            } else {
-                info!("Control plane is inactive; skipping drain");
             }
         }
-        if let Some(token) = &self.lease_shutdown_token {
-            token.cancel();
+        authority_lost |= terminal.is_cancelled();
+        self.leader_lease.cancel();
+
+        let mut external_runtime_stopped = false;
+        let mut runtime_tasks_clean = true;
+        if authority_lost {
+            runtime_tasks_clean &= stop_cluster_advertisement_and_admission(
+                &mut self.discovery,
+                &mut self.membership_handle,
+                self.watcher_handle.as_mut(),
+                &mut self.api_handle,
+            )
+            .await;
+            external_runtime_stopped = true;
         }
 
-        // Tell rebalance tasks to exit at their next select point.
-        // Fire all aborts before awaiting any so a slow responder
-        // doesn't serialise the others.
-        self.rebalance_shutdown.notify_waiters();
+        runtime_tasks_clean &=
+            stop_rebalance_tasks(&mut self.rebalance_tasks, &self.rebalance_shutdown).await;
+
+        authority_lost |= terminal.is_cancelled();
+        if authority_lost && !external_runtime_stopped {
+            runtime_tasks_clean &= stop_cluster_advertisement_and_admission(
+                &mut self.discovery,
+                &mut self.membership_handle,
+                self.watcher_handle.as_mut(),
+                &mut self.api_handle,
+            )
+            .await;
+            external_runtime_stopped = true;
+        }
+
+        let stop = self.leader_lease.stop();
+        tokio::pin!(stop);
+        if authority_lost {
+            stop.await;
+        } else {
+            let mut leader_stopped = false;
+            tokio::select! {
+                biased;
+                () = terminal.cancelled() => authority_lost = true,
+                () = &mut stop => leader_stopped = true,
+            }
+            if authority_lost {
+                runtime_tasks_clean &= stop_cluster_advertisement_and_admission(
+                    &mut self.discovery,
+                    &mut self.membership_handle,
+                    self.watcher_handle.as_mut(),
+                    &mut self.api_handle,
+                )
+                .await;
+                external_runtime_stopped = true;
+            }
+            if !leader_stopped {
+                stop.await;
+            }
+        }
+
+        authority_lost |= terminal.is_cancelled();
+
+        if authority_lost && !external_runtime_stopped {
+            runtime_tasks_clean &= stop_cluster_advertisement_and_admission(
+                &mut self.discovery,
+                &mut self.membership_handle,
+                self.watcher_handle.as_mut(),
+                &mut self.api_handle,
+            )
+            .await;
+            external_runtime_stopped = true;
+        }
+
+        let shutdown = self.db.shutdown();
+        tokio::pin!(shutdown);
+        let mut shutdown_result = None;
+        if !authority_lost {
+            tokio::select! {
+                biased;
+                () = terminal.cancelled() => authority_lost = true,
+                result = &mut shutdown => shutdown_result = Some(result),
+            }
+        }
+
+        if authority_lost && !external_runtime_stopped {
+            runtime_tasks_clean &= stop_cluster_advertisement_and_admission(
+                &mut self.discovery,
+                &mut self.membership_handle,
+                self.watcher_handle.as_mut(),
+                &mut self.api_handle,
+            )
+            .await;
+            external_runtime_stopped = true;
+        }
+
+        let shutdown_result = match shutdown_result {
+            Some(result) => result,
+            None => shutdown.await,
+        };
+        self.db_shutdown_complete = shutdown_result.is_ok();
+
+        // A graceful stop lets checkpoint tails settle before withdrawing discovery. Terminal
+        // lease loss does the reverse: stop all external admission and advertisement first.
+        if !external_runtime_stopped {
+            runtime_tasks_clean &= stop_cluster_advertisement_and_admission(
+                &mut self.discovery,
+                &mut self.membership_handle,
+                self.watcher_handle.as_mut(),
+                &mut self.api_handle,
+            )
+            .await;
+        }
+
+        authority_lost |= terminal.is_cancelled();
+        authority_lost |= !self.process_lease.disarm_for_shutdown();
+        if authority_lost {
+            self.db.revoke_cluster_authority();
+        }
+
+        if authority_lost {
+            if let Err(error) = shutdown_result {
+                warn!(%error, "Database shutdown after authority loss failed");
+            }
+            if !runtime_tasks_clean {
+                warn!("Cluster runtime cleanup was incomplete after authority loss");
+            }
+            Err(ClusterStartupError::AuthorityLost(
+                "stable node identity lease expired or was superseded".into(),
+            ))
+        } else {
+            shutdown_result
+                .map_err(|error| ClusterStartupError::EngineShutdown(error.to_string()))?;
+            if !runtime_tasks_clean {
+                return Err(ClusterStartupError::EngineShutdown(
+                    "one or more cluster runtime tasks did not terminate cleanly".into(),
+                ));
+            }
+            info!("Cluster node shutdown complete");
+            Ok(())
+        }
+    }
+}
+
+impl Drop for ClusterHandle {
+    fn drop(&mut self) {
+        let _ = self.process_lease.disarm_for_shutdown();
+        self.serving_gate.fence();
+        self.db.revoke_cluster_authority();
+        if !self.db_shutdown_complete {
+            self.db.close();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                let db = Arc::clone(&self.db);
+                let _ = runtime.spawn(async move {
+                    if let Err(error) = db.shutdown().await {
+                        warn!(%error, "Database cleanup after cluster handle drop failed");
+                    }
+                });
+            }
+        }
+        self.leader_lease.cancel();
         for task in &self.rebalance_tasks {
             task.abort();
         }
-        for task in self.rebalance_tasks.drain(..) {
-            let _ = task.await;
-        }
-
-        // Settle checkpoint tails while the lease, membership, and discovery control plane are
-        // still live. Tearing those down first can manufacture a leadership loss in the middle
-        // of an otherwise clean durable cut.
-        self.db
-            .shutdown()
-            .await
-            .map_err(|error| ClusterStartupError::EngineShutdown(error.to_string()))?;
-
-        // Stop membership watcher
         self.membership_handle.abort();
-
-        // Stop discovery
-        if let Err(e) = self.discovery.stop().await {
-            warn!("Discovery stop error: {e}");
+        if let Some(watcher) = &self.watcher_handle {
+            watcher.abort();
         }
-
-        // Abort config watcher
-        if let Some(wh) = &self.watcher_handle {
-            wh.abort();
-        }
-
-        // Abort HTTP
         self.api_handle.abort();
-
-        info!("Cluster node shutdown complete");
-        Ok(())
     }
 }
 
@@ -776,13 +1229,21 @@ fn start_process_lease_runtime(
     let live_rx = manager.live_watch();
     let deadline = manager.deadline();
     let shutdown = tokio_util::sync::CancellationToken::new();
+    let terminal = tokio_util::sync::CancellationToken::new();
     let renewal_task = manager.spawn(shutdown.clone());
+    let terminal_task = spawn_process_lease_terminal_monitor(
+        live_rx.clone(),
+        Arc::clone(&deadline),
+        terminal.clone(),
+    );
     Ok(ProcessLeaseRuntime {
         acquired,
         deadline,
         live_rx,
         shutdown,
+        terminal,
         renewal_task,
+        terminal_task,
         fence_task: None,
     })
 }
@@ -886,9 +1347,10 @@ async fn start_cluster_http_api_before_activation(
     registry: Arc<prometheus::Registry>,
     config_path: PathBuf,
     config: ServerConfig,
+    serving_gate: Arc<crate::http::ServingGate>,
     cluster: crate::http::ClusterComponents,
-    controller: &laminar_core::cluster::control::ClusterController,
 ) -> Result<(Arc<crate::http::AppState>, tokio::task::JoinHandle<()>), ClusterStartupError> {
+    let controller = Arc::clone(&cluster.controller);
     let local = controller.instance_id();
     if controller.live_instances().contains(&local) {
         return Err(ClusterStartupError::EngineConstruction(
@@ -896,16 +1358,22 @@ async fn start_cluster_http_api_before_activation(
         ));
     }
 
-    let prepared = server::prepare_http_api(db, registry, config_path, config, Some(cluster))
-        .await
-        .map_err(|error| ClusterStartupError::HttpStartup(error.to_string()))?;
-    let (app_state, api_handle) = prepared
+    let prepared = server::prepare_http_api(
+        db,
+        registry,
+        config_path,
+        config,
+        serving_gate,
+        Some(cluster),
+    )
+    .await
+    .map_err(|error| ClusterStartupError::HttpStartup(error.to_string()))?;
+    let (app_state, mut api_handle) = prepared
         .start()
         .await
         .map_err(|error| ClusterStartupError::HttpStartup(error.to_string()))?;
     if controller.live_instances().contains(&local) {
-        api_handle.abort();
-        let _ = api_handle.await;
+        let _ = abort_and_join_cluster_task(&mut api_handle, "HTTP API server").await;
         return Err(ClusterStartupError::EngineConstruction(
             "local activation raced cluster HTTP listener startup".into(),
         ));
@@ -958,6 +1426,45 @@ pub async fn start_cluster(
         bind_host.to_string()
     };
 
+    if !matches!(cluster_cfg.discovery.strategy.as_str(), "gossip" | "static") {
+        return Err(ClusterStartupError::Discovery(format!(
+            "unsupported discovery strategy {:?}; expected \"gossip\" or \"static\"",
+            cluster_cfg.discovery.strategy
+        )));
+    }
+    if cluster_cfg.discovery.seeds.is_empty() {
+        return Err(ClusterStartupError::Discovery(
+            "cluster mode requires [discovery].seeds — list every node's \
+             gossip address including this one (e.g. [\"node-0:7946\", \
+             \"node-1:7946\"]); expected membership is derived from it"
+                .into(),
+        ));
+    }
+    if !config
+        .state
+        .durability_scope()
+        .satisfies(laminar_core::state::StateBackendDurability::ClusterShared)
+    {
+        return Err(ClusterStartupError::EngineConstruction(
+            "cluster mode requires ClusterShared state storage".into(),
+        ));
+    }
+    let state_proof_store = config
+        .state
+        .build_object_store()
+        .map_err(|error| {
+            ClusterStartupError::EngineConstruction(format!(
+                "state namespace proof object store: {error}"
+            ))
+        })?
+        .ok_or_else(|| {
+            ClusterStartupError::EngineConstruction(
+                "cluster mode requires an object-store-backed state namespace".into(),
+            )
+        })?;
+    let key_groups = config.server.resolved_key_groups();
+    let state_backend = cluster_state_backend(Arc::clone(&state_proof_store), node_id, key_groups);
+
     // Claim the stable node identity before discovery can publish a duplicate member. The
     // durable recovery authority is deliberately not published until the database runtime exists.
     if !laminar_core::state::StateBackendDurability::for_storage_url(&config.checkpoint.url)
@@ -967,12 +1474,7 @@ pub async fn start_cluster(
             "cluster mode requires ClusterShared checkpoint storage".into(),
         ));
     }
-    let control_store = build_control_store(&config)?.ok_or_else(|| {
-        ClusterStartupError::EngineConstruction(
-            "cluster mode requires shared durable control storage; configure a checkpoint object-store URL"
-                .into(),
-        )
-    })?;
+    let control_store = build_control_store(&config)?;
     install_cluster_tls(&cluster_cfg.discovery)?;
     let process_incarnation = uuid::Uuid::new_v4();
     let process_lease_config = laminar_core::cluster::control::ProcessLeaseConfig::default();
@@ -1000,6 +1502,7 @@ pub async fn start_cluster(
         process_lease_config,
     )
     .await?;
+    let process_lease_terminal = process_lease.terminal_token();
     info!(
         term = process_lease.acquired.term,
         ttl_seconds = process_lease_config.ttl.as_secs(),
@@ -1010,11 +1513,18 @@ pub async fn start_cluster(
     let bind_addr: std::net::SocketAddr = format!("{bind_host}:0").parse().map_err(|e| {
         ClusterStartupError::EngineConstruction(format!("invalid shuffle bind host: {e}"))
     })?;
-    let shuffle_receiver = Arc::new(
+    let shuffle_receiver =
         laminar_core::shuffle::ShuffleReceiver::bind(node_id.0, bind_addr, process_incarnation)
             .await
-            .map_err(|e| ClusterStartupError::EngineConstruction(format!("shuffle bind: {e}")))?,
-    );
+            .map_err(|e| ClusterStartupError::EngineConstruction(format!("shuffle bind: {e}")))?;
+    shuffle_receiver
+        .install_process_lease_deadline(Arc::clone(&process_lease.deadline))
+        .map_err(|error| {
+            ClusterStartupError::EngineConstruction(format!(
+                "install inbound shuffle process lease: {error}"
+            ))
+        })?;
+    let shuffle_receiver = Arc::new(shuffle_receiver);
     let shuffle_advertise = shuffle_advertise_addr(shuffle_receiver.local_addr(), &advertise_host);
 
     let mut local_node = NodeInfo {
@@ -1085,29 +1595,45 @@ pub async fn start_cluster(
         }
     };
 
-    discovery
-        .start()
-        .await
-        .map_err(|e| ClusterStartupError::Discovery(e.to_string()))?;
+    let discovery_start = tokio::select! {
+        biased;
+        () = process_lease_terminal.cancelled() => None,
+        result = discovery.start() => Some(result),
+    };
+    match discovery_start {
+        Some(Ok(())) => {}
+        Some(Err(error)) => {
+            let _ = discovery.stop().await;
+            return Err(ClusterStartupError::Discovery(error.to_string()));
+        }
+        None => {
+            let _ = discovery.stop().await;
+            return Err(ClusterStartupError::AuthorityLost(
+                "stable node identity lease was lost while starting discovery".into(),
+            ));
+        }
+    }
     info!("Discovery layer started");
 
     // 2. Wait for expected membership. Seeds include self by
     // convention (every node lists the full cluster), so the target
-    // is `seeds.len() - 1`. An empty seed list is always a config
-    // error in cluster mode — fail fast instead of hanging.
-    if cluster_cfg.discovery.seeds.is_empty() {
-        return Err(ClusterStartupError::Discovery(
-            "cluster mode requires [discovery].seeds — list every node's \
-             gossip address including this one (e.g. [\"node-0:7946\", \
-             \"node-1:7946\"]); expected membership is derived from it"
-                .into(),
-        ));
-    }
+    // is `seeds.len() - 1`.
     let expected_peers = cluster_cfg.discovery.seeds.len().saturating_sub(1);
     let deadline = std::time::Instant::now() + cluster_cfg.formation_timeout;
     let mut last_seen = 0usize;
     let peers: Vec<NodeInfo> = loop {
-        if let Ok(discovered) = discovery.peers().await {
+        let discovered = tokio::select! {
+            biased;
+            () = process_lease_terminal.cancelled() => None,
+            result = discovery.peers() => Some(result),
+        };
+        let Some(discovered) = discovered else {
+            let _ = discovery.stop().await;
+            return Err(ClusterStartupError::AuthorityLost(
+                "stable node identity lease was lost during cluster formation".into(),
+            ));
+        };
+        if let Ok(discovered) = discovered {
             let eligible: Vec<NodeInfo> = discovered
                 .into_iter()
                 .filter(|peer| matches!(peer.state, NodeState::Joining | NodeState::Active))
@@ -1118,12 +1644,22 @@ pub async fn start_cluster(
             }
         }
         if std::time::Instant::now() >= deadline {
+            let _ = discovery.stop().await;
             return Err(ClusterStartupError::FormationTimeout {
                 found: last_seen,
                 needed: expected_peers,
             });
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tokio::select! {
+            biased;
+            () = process_lease_terminal.cancelled() => {
+                let _ = discovery.stop().await;
+                return Err(ClusterStartupError::AuthorityLost(
+                    "stable node identity lease was lost during cluster formation".into(),
+                ));
+            }
+            () = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+        }
     };
     info!(
         "Discovered {} peer(s) (expected {})",
@@ -1133,18 +1669,27 @@ pub async fn start_cluster(
     let roster_timeout = cluster_cfg
         .formation_timeout
         .min(NAMESPACE_PROOF_MAX_TIMEOUT);
-    let startup_participants = match tokio::time::timeout(
-        roster_timeout,
-        assignment_seed_participants(
-            laminar_core::state::NodeId(node_id.0),
-            process_incarnation,
-            &peers,
-            &control_store,
-            process_lease_ttl_ms,
-        ),
-    )
-    .await
-    {
+    let roster = tokio::select! {
+        biased;
+        () = process_lease_terminal.cancelled() => None,
+        result = tokio::time::timeout(
+            roster_timeout,
+            assignment_seed_participants(
+                laminar_core::state::NodeId(node_id.0),
+                process_incarnation,
+                &peers,
+                &control_store,
+                process_lease_ttl_ms,
+            ),
+        ) => Some(result),
+    };
+    let Some(roster) = roster else {
+        let _ = discovery.stop().await;
+        return Err(ClusterStartupError::AuthorityLost(
+            "stable node identity lease was lost during startup roster validation".into(),
+        ));
+    };
+    let startup_participants = match roster {
         Ok(Ok(participants)) => participants,
         Ok(Err(error)) => {
             let _ = discovery.stop().await;
@@ -1178,78 +1723,58 @@ pub async fn start_cluster(
         builder = builder.storage_dir(path);
     }
 
-    if !config
-        .state
-        .durability_scope()
-        .satisfies(laminar_core::state::StateBackendDurability::ClusterShared)
-    {
-        return Err(ClusterStartupError::EngineConstruction(
-            "cluster mode requires ClusterShared state storage".into(),
-        ));
-    }
-    let state_proof_store = config
-        .state
-        .build_object_store()
-        .map_err(|e| {
-            ClusterStartupError::EngineConstruction(format!(
-                "state namespace proof object store: {e}"
-            ))
-        })?
-        .ok_or_else(|| {
-            ClusterStartupError::EngineConstruction(
-                "cluster mode requires an object-store-backed state namespace".into(),
-            )
-        })?;
-    let key_groups = config.server.resolved_key_groups();
-    let state_backend = cluster_state_backend(Arc::clone(&state_proof_store), node_id, key_groups);
-
     // Build the vnode registry. If a shared `AssignmentSnapshot` already exists,
     // every node adopts it; otherwise the first peer CAS-creates it and losers
     // re-load and adopt the winner.
-    let (vnode_registry, snapshot_store) = resolve_vnode_assignment(
-        node_id,
-        &peers,
-        u32::from(key_groups),
-        Some(Arc::clone(&control_store)),
-        &startup_participants,
-    )
-    .await?;
+    let assignment = tokio::select! {
+        biased;
+        () = process_lease_terminal.cancelled() => None,
+        result = resolve_vnode_assignment(
+            node_id,
+            &peers,
+            u32::from(key_groups),
+            Arc::clone(&control_store),
+            &startup_participants,
+            process_lease.deadline.as_ref(),
+        ) => Some(result),
+    };
+    let Some(assignment) = assignment else {
+        let _ = discovery.stop().await;
+        return Err(ClusterStartupError::AuthorityLost(
+            "stable node identity lease was lost while resolving the initial assignment".into(),
+        ));
+    };
+    let (vnode_registry, snapshot_store) = match assignment {
+        Ok(assignment) => assignment,
+        Err(error) => {
+            let _ = discovery.stop().await;
+            return Err(error);
+        }
+    };
 
     // Discovery/barrier traffic stays on the low-latency KV. Coordinated recovery always uses
     // the shared object store so generation, phases, and acknowledgements survive process loss.
     use laminar_core::cluster::control::{ChitchatKv, ClusterKv};
-    let (controller_kv, recovery_kv): (Option<Arc<dyn ClusterKv>>, Option<Arc<dyn ClusterKv>>) =
-        match discovery {
-            DiscoveryImpl::Gossip(ref gossip) => {
-                let fast = gossip
-                    .chitchat_handle()
-                    .map(|handle| Arc::new(ChitchatKv::from_handle(handle)) as Arc<dyn ClusterKv>);
-                let durable = Arc::new(ObjectStoreClusterKv::new(
-                    process_lease.acquired.clone(),
-                    Arc::clone(&process_lease.deadline),
-                    process_lease_ttl_ms,
-                    Arc::clone(&control_store),
-                    discovery.membership_watch(),
-                )) as Arc<dyn ClusterKv>;
-                (fast, Some(durable))
-            }
-            DiscoveryImpl::Static(_) => {
-                let durable = Arc::new(ObjectStoreClusterKv::new(
-                    process_lease.acquired.clone(),
-                    Arc::clone(&process_lease.deadline),
-                    process_lease_ttl_ms,
-                    Arc::clone(&control_store),
-                    discovery.membership_watch(),
-                )) as Arc<dyn ClusterKv>;
-                (Some(Arc::clone(&durable)), Some(durable))
-            }
-        };
-
-    let namespace_control = controller_kv.as_ref().cloned().ok_or_else(|| {
-        ClusterStartupError::EngineConstruction(
-            "cluster discovery did not provide a namespace-proof control channel".into(),
-        )
-    })?;
+    let recovery_kv = Arc::new(ObjectStoreClusterKv::new(
+        process_lease.acquired.clone(),
+        Arc::clone(&process_lease.deadline),
+        process_lease_ttl_ms,
+        Arc::clone(&control_store),
+        discovery.membership_watch(),
+    )) as Arc<dyn ClusterKv>;
+    let controller_kv = match &discovery {
+        DiscoveryImpl::Gossip(gossip) => gossip
+            .chitchat_handle()
+            .map(|handle| Arc::new(ChitchatKv::from_handle(handle)) as Arc<dyn ClusterKv>),
+        DiscoveryImpl::Static(_) => Some(Arc::clone(&recovery_kv)),
+    };
+    let Some(controller_kv) = controller_kv else {
+        let _ = discovery.stop().await;
+        return Err(ClusterStartupError::EngineConstruction(
+            "gossip discovery started without its control channel".into(),
+        ));
+    };
+    let namespace_control = Arc::clone(&controller_kv);
     let local_participant = laminar_core::checkpoint::CheckpointParticipant {
         node_id: node_id.0,
         boot_incarnation: process_incarnation,
@@ -1260,18 +1785,30 @@ pub async fn start_cluster(
             "stable node identity lease was lost before shared-namespace proof".into(),
         ));
     }
-    if let Err(error) = prove_shared_object_store_namespaces(
-        local_participant,
-        &startup_participants,
-        namespace_control,
-        Arc::clone(&control_store),
-        state_proof_store,
-        cluster_cfg.formation_timeout,
-    )
-    .await
-    {
-        let _ = discovery.stop().await;
-        return Err(error);
+    let namespace_proof = tokio::select! {
+        biased;
+        () = process_lease_terminal.cancelled() => None,
+        result = prove_shared_object_store_namespaces(
+            local_participant,
+            &startup_participants,
+            namespace_control,
+            Arc::clone(&control_store),
+            state_proof_store,
+            cluster_cfg.formation_timeout,
+        ) => Some(result),
+    };
+    match namespace_proof {
+        Some(Ok(())) => {}
+        Some(Err(error)) => {
+            let _ = discovery.stop().await;
+            return Err(error);
+        }
+        None => {
+            let _ = discovery.stop().await;
+            return Err(ClusterStartupError::AuthorityLost(
+                "stable node identity lease was lost during shared-namespace proof".into(),
+            ));
+        }
     }
     if !process_lease.is_live() {
         let _ = discovery.stop().await;
@@ -1284,44 +1821,46 @@ pub async fn start_cluster(
         "Shared checkpoint and state namespaces verified"
     );
 
-    let cluster_controller = match (controller_kv, recovery_kv) {
-        (Some(kv), Some(recovery_kv)) => {
-            let controller = install_cluster_controller(
-                node_id,
-                kv,
-                recovery_kv,
-                snapshot_store.clone(),
-                discovery.membership_watch(),
-                bind_host,
-                &advertise_host,
-                process_incarnation,
-            )
-            .await?;
-            // Hand the controller this node's own locality so the topology-
-            // aware rebalancer can place self correctly (peers' localities
-            // arrive via gossip; self is folded in by id only).
-            controller.set_self_locality(laminar_core::state::Locality::parse(
-                local_node.metadata.failure_domain.as_deref().unwrap_or(""),
-            ));
-            controller.set_process_lease_deadline(Arc::clone(&process_lease.deadline));
-            controller
-                .set_process_lease_authority(Arc::clone(&process_lease_authority))
-                .map_err(ClusterStartupError::EngineConstruction)?;
-            builder = builder.cluster_controller(Arc::clone(&controller));
-            Some(controller)
-        }
-        (None, None) => {
-            return Err(ClusterStartupError::EngineConstruction(
-                "cluster mode requires shared durable control storage; configure a checkpoint object-store URL"
-                    .into(),
-            ));
-        }
-        _ => {
-            return Err(ClusterStartupError::EngineConstruction(
-                "cluster control requires both a discovery KV and durable recovery storage".into(),
-            ));
+    let controller = tokio::select! {
+        biased;
+        () = process_lease_terminal.cancelled() => None,
+        result = install_cluster_controller(
+            node_id,
+            controller_kv,
+            recovery_kv,
+            Arc::clone(&snapshot_store),
+            discovery.membership_watch(),
+            bind_host,
+            &advertise_host,
+            process_incarnation,
+            Arc::clone(&process_lease.deadline),
+        ) => Some(result),
+    };
+    let Some(controller) = controller else {
+        let _ = discovery.stop().await;
+        return Err(ClusterStartupError::AuthorityLost(
+            "stable node identity lease was lost while installing cluster control".into(),
+        ));
+    };
+    let cluster_controller = match controller {
+        Ok(controller) => controller,
+        Err(error) => {
+            let _ = discovery.stop().await;
+            return Err(error);
         }
     };
+    // Hand the controller this node's own locality so the topology-aware rebalancer can place
+    // self correctly (peers' localities arrive via discovery; self is folded in by id only).
+    cluster_controller.set_self_locality(laminar_core::state::Locality::parse(
+        local_node.metadata.failure_domain.as_deref().unwrap_or(""),
+    ));
+    if let Err(error) =
+        cluster_controller.set_process_lease_authority(Arc::clone(&process_lease_authority))
+    {
+        let _ = discovery.stop().await;
+        return Err(ClusterStartupError::EngineConstruction(error));
+    }
+    builder = builder.cluster_controller(Arc::clone(&cluster_controller));
 
     // LaminarDB derives the participant namespace from the installed controller. Keep the base
     // URL shared so durable commit decisions remain visible to every node.
@@ -1344,19 +1883,21 @@ pub async fn start_cluster(
 
     // Hand the builder the same snapshot store resolved in `resolve_vnode_assignment`
     // so the snapshot watcher and rebalance controller share one backing object.
-    if let Some(snap_store) = snapshot_store.clone() {
-        builder = builder.assignment_snapshot_store(snap_store);
-    }
+    builder = builder.assignment_snapshot_store(Arc::clone(&snapshot_store));
 
     // Catalog sealing and leader fencing share one append-only CAS sequence. A catalog write can
     // therefore linearize before a takeover or be rejected by it; there is no check-then-write
     // gap across independent objects.
     let lease_cfg = laminar_core::cluster::control::LeaderLeaseConfig::default();
-    let ttl_ms = i64::try_from(lease_cfg.ttl.as_millis()).map_err(|_| {
-        ClusterStartupError::EngineConstruction(
-            "leader lease TTL exceeds the durable diagnostic range".into(),
-        )
-    })?;
+    let ttl_ms = match i64::try_from(lease_cfg.ttl.as_millis()) {
+        Ok(ttl_ms) => ttl_ms,
+        Err(_) => {
+            let _ = discovery.stop().await;
+            return Err(ClusterStartupError::EngineConstruction(
+                "leader lease TTL exceeds the durable diagnostic range".into(),
+            ));
+        }
+    };
     let lease_store = Arc::new(laminar_core::cluster::control::LeaderLeaseStore::new(
         Arc::clone(&control_store),
         ttl_ms,
@@ -1367,14 +1908,31 @@ pub async fn start_cluster(
     builder = builder.catalog_manifest_store(Arc::clone(&catalog_store));
 
     // Shuffle fabric. ShuffleReceiver was bound at startup.
-    let shuffle_sender = build_shuffle_sender(
-        node_id.0,
-        &discovery,
-        shuffle_advertise.clone(),
-        discovery.membership_watch(),
-        process_incarnation,
-    )
-    .await;
+    let shuffle_sender = tokio::select! {
+        biased;
+        () = process_lease_terminal.cancelled() => None,
+        sender = build_shuffle_sender(
+            node_id.0,
+            &discovery,
+            shuffle_advertise.clone(),
+            discovery.membership_watch(),
+            process_incarnation,
+        ) => Some(sender),
+    };
+    let Some(shuffle_sender) = shuffle_sender else {
+        let _ = discovery.stop().await;
+        return Err(ClusterStartupError::AuthorityLost(
+            "stable node identity lease was lost while building the shuffle fabric".into(),
+        ));
+    };
+    if let Err(error) =
+        shuffle_sender.install_process_lease_deadline(Arc::clone(&process_lease.deadline))
+    {
+        let _ = discovery.stop().await;
+        return Err(ClusterStartupError::EngineConstruction(format!(
+            "install outbound shuffle process lease: {error}"
+        )));
+    }
 
     // Streaming aggregates go through the row-shuffle bridge driven by
     // `IncrementalAggState`; the DataFusion-native aggregate-rewrite path was removed.
@@ -1383,28 +1941,60 @@ pub async fn start_cluster(
         .shuffle_receiver(Arc::clone(&shuffle_receiver))
         .target_partitions(1);
 
-    let db = builder
-        .build()
-        .await
-        .map_err(|e| ClusterStartupError::EngineConstruction(e.to_string()))?;
+    let db = tokio::select! {
+        biased;
+        () = process_lease_terminal.cancelled() => None,
+        result = builder.build() => Some(result),
+    };
+    let Some(db) = db else {
+        let _ = discovery.stop().await;
+        return Err(ClusterStartupError::AuthorityLost(
+            "stable node identity lease was lost while constructing the database runtime".into(),
+        ));
+    };
+    let db = match db {
+        Ok(db) => db,
+        Err(error) => {
+            let _ = discovery.stop().await;
+            return Err(ClusterStartupError::EngineConstruction(error.to_string()));
+        }
+    };
 
-    let startup_controller = cluster_controller
-        .as_ref()
-        .expect("cluster controller was required before database construction");
+    let startup_controller = &cluster_controller;
     if !process_lease.is_live() {
+        db.revoke_cluster_authority();
+        let _ = db.shutdown().await;
+        let _ = discovery.stop().await;
         return Err(ClusterStartupError::EngineConstruction(
             "stable node identity lease was lost while constructing the database runtime".into(),
         ));
     }
-    startup_controller
-        .publish_leased_recovery_incarnation(&process_lease.acquired)
-        .await
-        .map_err(|error| {
-            ClusterStartupError::EngineConstruction(format!(
-                "publish leased recovery process incarnation: {error}"
-            ))
-        })?;
+    let recovery_identity = tokio::select! {
+        biased;
+        () = process_lease_terminal.cancelled() => None,
+        result = startup_controller.publish_leased_recovery_incarnation(&process_lease.acquired) => {
+            Some(result)
+        }
+    };
+    let Some(recovery_identity) = recovery_identity else {
+        db.revoke_cluster_authority();
+        let _ = db.shutdown().await;
+        let _ = discovery.stop().await;
+        return Err(ClusterStartupError::AuthorityLost(
+            "stable node identity lease was lost during recovery identity publication".into(),
+        ));
+    };
+    if let Err(error) = recovery_identity {
+        let _ = db.shutdown().await;
+        let _ = discovery.stop().await;
+        return Err(ClusterStartupError::EngineConstruction(format!(
+            "publish leased recovery process incarnation: {error}"
+        )));
+    }
     if !process_lease.is_live() {
+        db.revoke_cluster_authority();
+        let _ = db.shutdown().await;
+        let _ = discovery.stop().await;
         return Err(ClusterStartupError::EngineConstruction(
             "stable node identity lease was lost during recovery identity publication".into(),
         ));
@@ -1423,67 +2013,107 @@ pub async fn start_cluster(
     ]));
     let engine_metrics = Arc::new(laminar_db::EngineMetrics::new(&registry));
     db.set_engine_metrics(engine_metrics);
-    db.set_prometheus_registry(Arc::clone(&registry))
-        .map_err(|error| ClusterStartupError::EngineConstruction(error.to_string()))?;
+    if let Err(error) = db.set_prometheus_registry(Arc::clone(&registry)) {
+        let _ = db.shutdown().await;
+        let _ = discovery.stop().await;
+        return Err(ClusterStartupError::EngineConstruction(error.to_string()));
+    }
 
     // Fenced leader lease. Wiring the watch into the controller makes
     // `is_leader()` lease-aware, so every leader-gated path (checkpoint, 2PC,
     // rebalance, committer) inherits fencing: a stale candidate whose lease
     // expired stops being the leader. Renewal is gated on `is_gossip_leader` so
     // the lease owner converges to the gossip candidate. Wired before `start()`.
-    let lease_shutdown_token: Option<tokio_util::sync::CancellationToken> = match cluster_controller
-        .as_ref()
-    {
-        Some(controller) => {
-            controller.set_leader_lease_store(Arc::clone(&lease_store));
-            let manager = laminar_core::cluster::control::LeaderLeaseManager::new(
-                Arc::clone(&lease_store),
-                &process_lease.acquired,
-                lease_cfg,
-            )
-            .map_err(|error| {
-                ClusterStartupError::EngineConstruction(format!("leader lease manager: {error}"))
-            })?;
-            controller
-                .set_leader_lease_watch(
-                    manager.lease_watch(),
-                    manager.owner().clone(),
-                    manager.deadline(),
-                )
-                .map_err(ClusterStartupError::EngineConstruction)?;
-            let token = tokio_util::sync::CancellationToken::new();
-            let candidacy = controller.leader_candidacy_watch();
-            let _lease_handle = manager.spawn(token.clone(), candidacy);
-            info!(
-                "Leader lease manager started (ttl={}s)",
-                lease_cfg.ttl.as_secs()
-            );
-            Some(token)
+    cluster_controller.set_leader_lease_store(Arc::clone(&lease_store));
+    let manager = match laminar_core::cluster::control::LeaderLeaseManager::new(
+        Arc::clone(&lease_store),
+        &process_lease.acquired,
+        lease_cfg,
+    ) {
+        Ok(manager) => manager,
+        Err(error) => {
+            let _ = db.shutdown().await;
+            let _ = discovery.stop().await;
+            return Err(ClusterStartupError::EngineConstruction(format!(
+                "leader lease manager: {error}"
+            )));
         }
-        None => None,
     };
+    if let Err(error) = cluster_controller.set_leader_lease_watch(
+        manager.lease_watch(),
+        manager.owner().clone(),
+        manager.deadline(),
+    ) {
+        let _ = db.shutdown().await;
+        let _ = discovery.stop().await;
+        return Err(ClusterStartupError::EngineConstruction(error));
+    }
+    let token = tokio_util::sync::CancellationToken::new();
+    let candidacy = cluster_controller.leader_candidacy_watch();
+    let task = manager.spawn(token.clone(), candidacy);
+    info!(
+        "Leader lease manager started (ttl={}s)",
+        lease_cfg.ttl.as_secs()
+    );
+    let mut leader_lease = LeaderLeaseRuntime::new(token, task);
 
+    let serving_gate = Arc::new(crate::http::ServingGate::starting());
+    if let Err(error) =
+        serving_gate.install_process_lease_deadline(Arc::clone(&process_lease.deadline))
+    {
+        cleanup_cluster_startup(
+            &mut discovery,
+            &db,
+            &mut leader_lease,
+            &process_lease_terminal,
+            true,
+        )
+        .await;
+        return Err(ClusterStartupError::AuthorityLost(error.into()));
+    }
     process_lease.install_fence(
         Arc::clone(&db),
         Arc::clone(startup_controller),
-        lease_shutdown_token.clone(),
+        Arc::clone(&serving_gate),
+        leader_lease.shutdown_token(),
     );
     if !process_lease.is_live() {
+        revoke_process_authority(
+            &db,
+            &serving_gate,
+            &leader_lease.shutdown,
+            &process_lease_terminal,
+        );
+        cleanup_cluster_startup(
+            &mut discovery,
+            &db,
+            &mut leader_lease,
+            &process_lease_terminal,
+            true,
+        )
+        .await;
         return Err(ClusterStartupError::EngineConstruction(
             "stable node identity lease was lost before pipeline startup".into(),
         ));
     }
 
-    let catalog_startup = async {
-        let authority =
-            wait_for_catalog_startup_authority(startup_controller, cluster_cfg.formation_timeout)
-                .await?;
-        server::execute_config_ddl(&db, &config, true)
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok::<_, String>(authority)
-    }
-    .await;
+    let catalog_startup = tokio::select! {
+        biased;
+        () = process_lease_terminal.cancelled() => {
+            Err("stable node identity lease was lost during catalog bootstrap".to_string())
+        }
+        result = async {
+            let authority = wait_for_catalog_startup_authority(
+                startup_controller,
+                cluster_cfg.formation_timeout,
+            )
+            .await?;
+            server::execute_config_ddl(&db, &config, true)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>(authority)
+        } => result,
+    };
     match catalog_startup {
         Ok(CatalogStartupAuthority::DurableLease) => {
             info!("Cluster catalog sealed under the durable leader lease");
@@ -1492,22 +2122,28 @@ pub async fn start_cluster(
             info!("Cluster catalog replayed after observing an active peer");
         }
         Err(error) => {
-            if let Some(token) = &lease_shutdown_token {
-                token.cancel();
-            }
-            let _ = db.shutdown().await;
-            let _ = discovery.stop().await;
+            cleanup_cluster_startup(
+                &mut discovery,
+                &db,
+                &mut leader_lease,
+                &process_lease_terminal,
+                false,
+            )
+            .await;
             return Err(ClusterStartupError::EngineConstruction(format!(
                 "cluster catalog startup: {error}"
             )));
         }
     }
     if !process_lease.is_live() {
-        if let Some(token) = &lease_shutdown_token {
-            token.cancel();
-        }
-        let _ = db.shutdown().await;
-        let _ = discovery.stop().await;
+        cleanup_cluster_startup(
+            &mut discovery,
+            &db,
+            &mut leader_lease,
+            &process_lease_terminal,
+            true,
+        )
+        .await;
         return Err(ClusterStartupError::EngineConstruction(
             "stable node identity lease was lost during catalog bootstrap".into(),
         ));
@@ -1516,21 +2152,53 @@ pub async fn start_cluster(
     // Coordinated recovery is the only cluster fault path. Before start() so an early
     // fault is observed.
     db.fence_cluster_startup();
-    db.enable_coordinated_recovery().map_err(|error| {
-        ClusterStartupError::EngineConstruction(format!(
-            "cluster recovery monitor initialization: {error}"
-        ))
-    })?;
-
-    if let Err(error) = db.start().await {
-        if let Some(token) = &lease_shutdown_token {
-            token.cancel();
-        }
-        let _ = db.shutdown().await;
-        let _ = discovery.stop().await;
+    if let Err(error) = db.enable_coordinated_recovery() {
+        cleanup_cluster_startup(
+            &mut discovery,
+            &db,
+            &mut leader_lease,
+            &process_lease_terminal,
+            false,
+        )
+        .await;
         return Err(ClusterStartupError::EngineConstruction(format!(
-            "pipeline start: {error}"
+            "cluster recovery monitor initialization: {error}"
         )));
+    }
+
+    let pipeline_start = tokio::select! {
+        biased;
+        () = process_lease_terminal.cancelled() => None,
+        result = db.start() => Some(result),
+    };
+    match pipeline_start {
+        Some(Ok(())) => {}
+        Some(Err(error)) => {
+            cleanup_cluster_startup(
+                &mut discovery,
+                &db,
+                &mut leader_lease,
+                &process_lease_terminal,
+                false,
+            )
+            .await;
+            return Err(ClusterStartupError::EngineConstruction(format!(
+                "pipeline start: {error}"
+            )));
+        }
+        None => {
+            cleanup_cluster_startup(
+                &mut discovery,
+                &db,
+                &mut leader_lease,
+                &process_lease_terminal,
+                true,
+            )
+            .await;
+            return Err(ClusterStartupError::AuthorityLost(
+                "stable node identity lease was lost while starting the pipeline".into(),
+            ));
+        }
     }
     info!("Pipeline started");
 
@@ -1541,15 +2209,38 @@ pub async fn start_cluster(
 
     // Re-acquire the stored assignment through the standard adopt path (a restart boots
     // unassigned). Re-load each attempt so a shed that raced the boot wins; bounded retry so a
-    // deferred adoption can't strand a static-discovery node (no snapshot watcher there).
-    if let Some(snap_store) = snapshot_store.clone() {
-        for attempt in 0u32..5 {
-            let adoption_deadline =
-                tokio::time::Instant::now() + rebalance_config.checkpoint_timeout;
-            match tokio::time::timeout_at(adoption_deadline, snap_store.load()).await {
-                Ok(Ok(Some(durable_head))) => {
-                    let recovering_drain = durable_head.draining;
-                    let snapshot = match tokio::time::timeout_at(adoption_deadline, async {
+    // transient object-store failure cannot strand the node before its watcher starts.
+    let snap_store = Arc::clone(&snapshot_store);
+    let mut assignment_ready = false;
+    for attempt in 0u32..5 {
+        let adoption_deadline = tokio::time::Instant::now() + rebalance_config.checkpoint_timeout;
+        let snapshot_load = tokio::select! {
+            biased;
+            () = process_lease_terminal.cancelled() => None,
+            result = tokio::time::timeout_at(adoption_deadline, snap_store.load()) => {
+                Some(result)
+            }
+        };
+        let Some(snapshot_load) = snapshot_load else {
+            cleanup_cluster_startup(
+                &mut discovery,
+                &db,
+                &mut leader_lease,
+                &process_lease_terminal,
+                true,
+            )
+            .await;
+            return Err(ClusterStartupError::AuthorityLost(
+                "stable node identity lease was lost during startup assignment adoption".into(),
+            ));
+        };
+        match snapshot_load {
+            Ok(Ok(Some(durable_head))) => {
+                let recovering_drain = durable_head.draining;
+                let authority_audit = tokio::select! {
+                    biased;
+                    () = process_lease_terminal.cancelled() => None,
+                    result = tokio::time::timeout_at(adoption_deadline, async {
                         laminar_db::rebalance::startup_committed_assignment(
                             snap_store.as_ref(),
                             Some(startup_controller),
@@ -1557,128 +2248,268 @@ pub async fn start_cluster(
                         )
                         .await
                         .map_err(ClusterStartupError::EngineConstruction)
-                    })
-                    .await
-                    {
-                        Ok(Ok(snapshot)) => snapshot,
-                        Ok(Err(error)) => {
-                            if let Some(token) = &lease_shutdown_token {
-                                token.cancel();
-                            }
-                            let _ = db.shutdown().await;
-                            let _ = discovery.stop().await;
-                            return Err(error);
-                        }
-                        Err(_) => {
-                            if let Some(token) = &lease_shutdown_token {
-                                token.cancel();
-                            }
-                            let _ = db.shutdown().await;
-                            let _ = discovery.stop().await;
-                            return Err(ClusterStartupError::EngineConstruction(
-                                "startup assignment authority audit timed out".into(),
-                            ));
-                        }
-                    };
-                    if vnode_registry.assignment_version() >= snapshot.version {
-                        break; // already adopted (watcher raced us)
+                    }) => Some(result),
+                };
+                let Some(authority_audit) = authority_audit else {
+                    cleanup_cluster_startup(
+                        &mut discovery,
+                        &db,
+                        &mut leader_lease,
+                        &process_lease_terminal,
+                        true,
+                    )
+                    .await;
+                    return Err(ClusterStartupError::AuthorityLost(
+                        "stable node identity lease was lost during startup assignment audit"
+                            .into(),
+                    ));
+                };
+                let snapshot = match authority_audit {
+                    Ok(Ok(snapshot)) => snapshot,
+                    Ok(Err(error)) => {
+                        cleanup_cluster_startup(
+                            &mut discovery,
+                            &db,
+                            &mut leader_lease,
+                            &process_lease_terminal,
+                            false,
+                        )
+                        .await;
+                        return Err(error);
                     }
-                    let committed_version = snapshot.version;
-                    let adoption = match db
-                        .adopt_assignment_snapshot(snapshot, adoption_deadline)
-                        .await
-                    {
-                        Ok(adoption) => adoption,
-                        Err(error) => {
-                            if let Some(token) = &lease_shutdown_token {
-                                token.cancel();
-                            }
-                            let _ = db.shutdown().await;
-                            let _ = discovery.stop().await;
-                            return Err(ClusterStartupError::EngineConstruction(format!(
-                                "assignment state recovery: {error}"
-                            )));
-                        }
-                    };
-                    info!(
-                        version = adoption.version,
-                        adopted = adoption.adopted,
-                        newly_acquired = adoption.newly_acquired.len(),
-                        rehydrated = adoption.rehydrated,
-                        "startup assignment adoption"
-                    );
-                    if adoption.adopted {
-                        if recovering_drain {
-                            info!(
+                    Err(_) => {
+                        cleanup_cluster_startup(
+                            &mut discovery,
+                            &db,
+                            &mut leader_lease,
+                            &process_lease_terminal,
+                            false,
+                        )
+                        .await;
+                        return Err(ClusterStartupError::EngineConstruction(
+                            "startup assignment authority audit timed out".into(),
+                        ));
+                    }
+                };
+                if vnode_registry.assignment_version() >= snapshot.version {
+                    assignment_ready = true;
+                    break; // already adopted (watcher raced us)
+                }
+                let committed_version = snapshot.version;
+                let adoption = tokio::select! {
+                    biased;
+                    () = process_lease_terminal.cancelled() => None,
+                    result = db.adopt_assignment_snapshot(snapshot, adoption_deadline) => {
+                        Some(result)
+                    }
+                };
+                let Some(adoption) = adoption else {
+                    cleanup_cluster_startup(
+                        &mut discovery,
+                        &db,
+                        &mut leader_lease,
+                        &process_lease_terminal,
+                        true,
+                    )
+                    .await;
+                    return Err(ClusterStartupError::AuthorityLost(
+                        "stable node identity lease was lost while adopting startup state".into(),
+                    ));
+                };
+                let adoption = match adoption {
+                    Ok(adoption) => adoption,
+                    Err(error) => {
+                        cleanup_cluster_startup(
+                            &mut discovery,
+                            &db,
+                            &mut leader_lease,
+                            &process_lease_terminal,
+                            false,
+                        )
+                        .await;
+                        return Err(ClusterStartupError::EngineConstruction(format!(
+                            "assignment state recovery: {error}"
+                        )));
+                    }
+                };
+                info!(
+                    version = adoption.version,
+                    adopted = adoption.adopted,
+                    newly_acquired = adoption.newly_acquired.len(),
+                    rehydrated = adoption.rehydrated,
+                    "startup assignment adoption"
+                );
+                if adoption.adopted {
+                    assignment_ready = true;
+                    if recovering_drain {
+                        info!(
                                 committed_version,
                                 "startup adopted the retained committed assignment; durable drain abort remains fenced"
                             );
-                        }
-                        break;
                     }
+                    break;
                 }
-                Ok(Ok(None)) => break,
-                Ok(Err(e)) => {
-                    tracing::warn!(error = %e, attempt, "startup snapshot load failed");
-                }
-                Err(_) => tracing::warn!(
-                    attempt,
-                    timeout = ?rebalance_config.checkpoint_timeout,
-                    "startup snapshot load timed out"
-                ),
             }
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            Ok(Ok(None)) => {
+                cleanup_cluster_startup(
+                    &mut discovery,
+                    &db,
+                    &mut leader_lease,
+                    &process_lease_terminal,
+                    false,
+                )
+                .await;
+                return Err(ClusterStartupError::EngineConstruction(
+                    "durable assignment snapshot disappeared during startup".into(),
+                ));
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, attempt, "startup snapshot load failed");
+            }
+            Err(_) => tracing::warn!(
+                attempt,
+                timeout = ?rebalance_config.checkpoint_timeout,
+                "startup snapshot load timed out"
+            ),
+        }
+        if attempt < 4 {
+            tokio::select! {
+                biased;
+                () = process_lease_terminal.cancelled() => {
+                    cleanup_cluster_startup(
+                        &mut discovery,
+                        &db,
+                        &mut leader_lease,
+                        &process_lease_terminal,
+                        true,
+                    )
+                    .await;
+                    return Err(ClusterStartupError::AuthorityLost(
+                        "stable node identity lease was lost during startup assignment retry"
+                            .into(),
+                    ));
+                }
+                () = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+            }
         }
     }
+    if !assignment_ready {
+        cleanup_cluster_startup(
+            &mut discovery,
+            &db,
+            &mut leader_lease,
+            &process_lease_terminal,
+            false,
+        )
+        .await;
+        return Err(ClusterStartupError::EngineConstruction(
+            "durable startup assignment could not be adopted after five attempts".into(),
+        ));
+    }
 
-    match catalog_store.load().await {
+    let catalog_verification = tokio::select! {
+        biased;
+        () = process_lease_terminal.cancelled() => None,
+        result = tokio::time::timeout(
+            rebalance_config.checkpoint_timeout,
+            catalog_store.load(),
+        ) => Some(result),
+    };
+    let Some(catalog_verification) = catalog_verification else {
+        cleanup_cluster_startup(
+            &mut discovery,
+            &db,
+            &mut leader_lease,
+            &process_lease_terminal,
+            true,
+        )
+        .await;
+        return Err(ClusterStartupError::AuthorityLost(
+            "stable node identity lease was lost while verifying the cluster catalog".into(),
+        ));
+    };
+    let catalog_verification = match catalog_verification {
+        Ok(result) => result,
+        Err(_) => {
+            cleanup_cluster_startup(
+                &mut discovery,
+                &db,
+                &mut leader_lease,
+                &process_lease_terminal,
+                false,
+            )
+            .await;
+            return Err(ClusterStartupError::EngineConstruction(format!(
+                "cluster catalog verification exceeded {:?}",
+                rebalance_config.checkpoint_timeout
+            )));
+        }
+    };
+    match catalog_verification {
         Ok(Some(_)) => {}
         Ok(None) => {
-            if let Some(token) = &lease_shutdown_token {
-                token.cancel();
-            }
-            let _ = db.shutdown().await;
-            let _ = discovery.stop().await;
+            cleanup_cluster_startup(
+                &mut discovery,
+                &db,
+                &mut leader_lease,
+                &process_lease_terminal,
+                false,
+            )
+            .await;
             return Err(ClusterStartupError::EngineConstruction(
                 "cluster catalog is not sealed before readiness announcement".into(),
             ));
         }
         Err(error) => {
-            if let Some(token) = &lease_shutdown_token {
-                token.cancel();
-            }
-            let _ = db.shutdown().await;
-            let _ = discovery.stop().await;
+            cleanup_cluster_startup(
+                &mut discovery,
+                &db,
+                &mut leader_lease,
+                &process_lease_terminal,
+                false,
+            )
+            .await;
             return Err(ClusterStartupError::EngineConstruction(format!(
                 "verify sealed cluster catalog before readiness announcement: {error}"
             )));
         }
     }
     if !process_lease.is_live() {
-        if let Some(token) = &lease_shutdown_token {
-            token.cancel();
-        }
-        let _ = db.shutdown().await;
-        let _ = discovery.stop().await;
+        cleanup_cluster_startup(
+            &mut discovery,
+            &db,
+            &mut leader_lease,
+            &process_lease_terminal,
+            true,
+        )
+        .await;
         return Err(ClusterStartupError::EngineConstruction(
             "stable node identity lease was lost before announcing cluster readiness".into(),
         ));
     }
 
-    let startup_controller = cluster_controller
-        .as_ref()
-        .expect("cluster controller was required before database construction");
     let Some(leader_authority_timeout) =
         startup_leader_authority_timeout(lease_cfg, OBJECT_STORE_CONTROL_IO_TIMEOUT)
     else {
-        let mut left = local_node.clone();
-        left.state = NodeState::Left;
-        let _ = discovery.announce(left).await;
-        if let Some(token) = &lease_shutdown_token {
-            token.cancel();
+        if !process_lease_terminal.is_cancelled() {
+            let mut left = local_node.clone();
+            left.state = NodeState::Left;
+            let _ = announce_node_state_with_bound(
+                &discovery,
+                left,
+                &process_lease_terminal,
+                "withdraw node after invalid leader authority timeout",
+            )
+            .await;
         }
-        let _ = db.shutdown().await;
-        let _ = discovery.stop().await;
+        cleanup_cluster_startup(
+            &mut discovery,
+            &db,
+            &mut leader_lease,
+            &process_lease_terminal,
+            false,
+        )
+        .await;
         return Err(ClusterStartupError::EngineConstruction(
             "leader authority convergence timeout exceeds the monotonic timer range".into(),
         ));
@@ -1688,52 +2519,138 @@ pub async fn start_cluster(
     // gate answers data/control requests with 503 until authority and recovery are established;
     // accepting now avoids holding requests in the kernel listen backlog for later replay.
     let cluster_components = crate::http::ClusterComponents {
-        controller: cluster_controller.clone(),
-        snapshot_store: snapshot_store.clone(),
+        controller: Arc::clone(&cluster_controller),
+        snapshot_store: Arc::clone(&snapshot_store),
         membership_rx: discovery.membership_watch(),
     };
-    let (app_state, api_handle) = match start_cluster_http_api_before_activation(
-        Arc::clone(&db),
-        registry,
-        config_path.clone(),
-        config,
-        cluster_components,
-        startup_controller,
-    )
-    .await
-    {
+    let http_start = tokio::select! {
+        biased;
+        () = process_lease_terminal.cancelled() => None,
+        result = start_cluster_http_api_before_activation(
+            Arc::clone(&db),
+            registry,
+            config_path.clone(),
+            config,
+            Arc::clone(&serving_gate),
+            cluster_components,
+        ) => Some(result),
+    };
+    let Some(http_start) = http_start else {
+        cleanup_cluster_startup(
+            &mut discovery,
+            &db,
+            &mut leader_lease,
+            &process_lease_terminal,
+            true,
+        )
+        .await;
+        return Err(ClusterStartupError::AuthorityLost(
+            "stable node identity lease was lost while binding the HTTP listener".into(),
+        ));
+    };
+    let (app_state, mut api_handle) = match http_start {
         Ok(prepared) => prepared,
         Err(error) => {
             db.fence_cluster_startup();
             startup_controller.set_active(false);
-            let mut left = local_node.clone();
-            left.state = NodeState::Left;
-            let _ = discovery.announce(left).await;
-            if let Some(token) = &lease_shutdown_token {
-                token.cancel();
+            if !process_lease_terminal.is_cancelled() {
+                let mut left = local_node.clone();
+                left.state = NodeState::Left;
+                let _ = announce_node_state_with_bound(
+                    &discovery,
+                    left,
+                    &process_lease_terminal,
+                    "withdraw node after HTTP startup failure",
+                )
+                .await;
             }
-            let _ = db.shutdown().await;
-            let _ = discovery.stop().await;
+            cleanup_cluster_startup(
+                &mut discovery,
+                &db,
+                &mut leader_lease,
+                &process_lease_terminal,
+                false,
+            )
+            .await;
             return Err(error);
         }
     };
+
+    if !process_lease.is_live() {
+        let _ = abort_and_join_cluster_task(&mut api_handle, "HTTP API server").await;
+        revoke_process_authority(
+            &db,
+            &serving_gate,
+            &leader_lease.shutdown,
+            &process_lease_terminal,
+        );
+        cleanup_cluster_startup(
+            &mut discovery,
+            &db,
+            &mut leader_lease,
+            &process_lease_terminal,
+            true,
+        )
+        .await;
+        return Err(ClusterStartupError::EngineConstruction(
+            "stable node identity lease was lost while binding the HTTP listener".into(),
+        ));
+    }
 
     // The pipeline, shuffle receiver, and gated HTTP listener are live. Only now publish
     // assignment eligibility so an occupied API port can never leave an Active ghost node.
     let mut active = local_node.clone();
     active.state = NodeState::Active;
-    if let Err(error) = discovery.announce(active.clone()).await {
-        api_handle.abort();
-        let _ = api_handle.await;
+    let active_announcement = tokio::select! {
+        biased;
+        () = process_lease_terminal.cancelled() => None,
+        result = tokio::time::timeout(
+            PROCESS_LEASE_IO_TIMEOUT,
+            discovery.announce(active.clone()),
+        ) => Some(result),
+    };
+    let Some(active_announcement) = active_announcement else {
+        let _ = abort_and_join_cluster_task(&mut api_handle, "HTTP API server").await;
+        cleanup_cluster_startup(
+            &mut discovery,
+            &db,
+            &mut leader_lease,
+            &process_lease_terminal,
+            true,
+        )
+        .await;
+        return Err(ClusterStartupError::AuthorityLost(
+            "stable node identity lease was lost while announcing cluster readiness".into(),
+        ));
+    };
+    let active_announcement = match active_announcement {
+        Ok(result) => result.map_err(|error| error.to_string()),
+        Err(_) => Err(format!(
+            "readiness announcement exceeded {PROCESS_LEASE_IO_TIMEOUT:?}"
+        )),
+    };
+    if let Err(error) = active_announcement {
+        let _ = abort_and_join_cluster_task(&mut api_handle, "HTTP API server").await;
         startup_controller.set_active(false);
-        let mut left = local_node.clone();
-        left.state = NodeState::Left;
-        let _ = discovery.announce(left).await;
-        if let Some(token) = &lease_shutdown_token {
-            token.cancel();
+        if !process_lease_terminal.is_cancelled() {
+            let mut left = local_node.clone();
+            left.state = NodeState::Left;
+            let _ = announce_node_state_with_bound(
+                &discovery,
+                left,
+                &process_lease_terminal,
+                "withdraw node after readiness announcement failure",
+            )
+            .await;
         }
-        let _ = db.shutdown().await;
-        let _ = discovery.stop().await;
+        cleanup_cluster_startup(
+            &mut discovery,
+            &db,
+            &mut leader_lease,
+            &process_lease_terminal,
+            false,
+        )
+        .await;
         return Err(ClusterStartupError::EngineConstruction(format!(
             "announce cluster runtime readiness: {error}"
         )));
@@ -1742,72 +2659,83 @@ pub async fn start_cluster(
 
     // Rebalance and assignment certification use the same durable snapshot in every discovery
     // mode.
-    let rebalance_shutdown = Arc::new(tokio::sync::Notify::new());
-    let mut rebalance_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    if let Some(snap_store) = snapshot_store.clone() {
-        rebalance_tasks.push(laminar_db::rebalance::spawn_snapshot_watcher(
+    let rebalance_shutdown = tokio_util::sync::CancellationToken::new();
+    let mut rebalance_tasks = vec![
+        laminar_db::rebalance::spawn_snapshot_watcher(
             Arc::clone(&db),
-            Arc::clone(&snap_store),
+            Arc::clone(&snapshot_store),
             Arc::clone(&vnode_registry),
-            Arc::clone(&rebalance_shutdown),
+            rebalance_shutdown.clone(),
             rebalance_config,
             Some(Arc::clone(startup_controller)),
-        ));
-        rebalance_tasks.push(laminar_db::rebalance::spawn_rebalance_controller(
+        ),
+        laminar_db::rebalance::spawn_rebalance_controller(
             Arc::clone(&db),
             Arc::clone(startup_controller),
-            snap_store,
+            Arc::clone(&snapshot_store),
             Arc::clone(&vnode_registry),
-            Arc::clone(&rebalance_shutdown),
+            rebalance_shutdown.clone(),
             rebalance_config,
-        ));
-        info!("Rebalance control plane started");
-    }
+        ),
+    ];
+    info!("Rebalance control plane started");
 
-    let startup_gate = async {
-        wait_for_startup_assignment_fence(startup_controller, &vnode_registry).await?;
-        wait_for_startup_leader_authority(
-            startup_controller,
-            &vnode_registry,
-            leader_authority_timeout,
-        )
-        .await?;
-        info!(
-            timeout = ?leader_authority_timeout,
-            "Durable leader authority converged with the certified assignment"
-        );
-        let authority_deadline = tokio::time::Instant::now() + rebalance_config.checkpoint_timeout;
-        db.finish_cluster_startup(authority_deadline)
-            .await
-            .map_err(|error| {
-                ClusterStartupError::EngineConstruction(format!(
-                    "cluster startup recovery fence: {error}"
-                ))
-            })
-    }
-    .await;
+    let startup_gate = tokio::select! {
+        biased;
+        () = process_lease_terminal.cancelled() => {
+            Err(ClusterStartupError::AuthorityLost(
+                "stable node identity lease was lost while certifying startup authority".into(),
+            ))
+        }
+        result = async {
+            wait_for_startup_assignment_fence(startup_controller, &vnode_registry).await?;
+            wait_for_startup_leader_authority(
+                startup_controller,
+                &vnode_registry,
+                leader_authority_timeout,
+            )
+            .await?;
+            info!(
+                timeout = ?leader_authority_timeout,
+                "Durable leader authority converged with the certified assignment"
+            );
+            let authority_deadline =
+                tokio::time::Instant::now() + rebalance_config.checkpoint_timeout;
+            db.finish_cluster_startup(authority_deadline)
+                .await
+                .map_err(|error| {
+                    ClusterStartupError::EngineConstruction(format!(
+                        "cluster startup recovery fence: {error}"
+                    ))
+                })
+        } => result,
+    };
     let startup_disposition = match startup_gate {
         Ok(disposition) => disposition,
         Err(error) => {
-            api_handle.abort();
-            let _ = api_handle.await;
+            let _ = abort_and_join_cluster_task(&mut api_handle, "HTTP API server").await;
             db.fence_cluster_startup();
             startup_controller.set_active(false);
-            let mut left = active.clone();
-            left.state = NodeState::Left;
-            let _ = discovery.announce(left).await;
-            rebalance_shutdown.notify_waiters();
-            for task in &rebalance_tasks {
-                task.abort();
+            if !process_lease_terminal.is_cancelled() {
+                let mut left = active.clone();
+                left.state = NodeState::Left;
+                let _ = announce_node_state_with_bound(
+                    &discovery,
+                    left,
+                    &process_lease_terminal,
+                    "withdraw node after startup authority failure",
+                )
+                .await;
             }
-            for task in rebalance_tasks.drain(..) {
-                let _ = task.await;
-            }
-            let _ = db.shutdown().await;
-            if let Some(token) = &lease_shutdown_token {
-                token.cancel();
-            }
-            let _ = discovery.stop().await;
+            let _ = stop_rebalance_tasks(&mut rebalance_tasks, &rebalance_shutdown).await;
+            cleanup_cluster_startup(
+                &mut discovery,
+                &db,
+                &mut leader_lease,
+                &process_lease_terminal,
+                false,
+            )
+            .await;
             return Err(error);
         }
     };
@@ -1820,43 +2748,83 @@ pub async fn start_cluster(
         }
         ClusterStartupDisposition::RecoveryFenced => {
             info!("Cluster source intake remains fenced for coordinated recovery");
-            if tokio::time::timeout(STARTUP_RECOVERY_TIMEOUT, async {
-                while db.cluster_intake_fenced() || startup_controller.is_recovering() {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let recovery_wait = tokio::select! {
+                biased;
+                () = process_lease_terminal.cancelled() => {
+                    Err(ClusterStartupError::AuthorityLost(
+                        "stable node identity lease was lost during coordinated startup recovery"
+                            .into(),
+                    ))
                 }
-            })
-            .await
-            .is_err()
-            {
-                api_handle.abort();
-                let _ = api_handle.await;
+                result = tokio::time::timeout(STARTUP_RECOVERY_TIMEOUT, async {
+                    while db.cluster_intake_fenced() || startup_controller.is_recovering() {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                }) => result.map_err(|_| {
+                    ClusterStartupError::EngineConstruction(format!(
+                        "coordinated startup recovery did not release intake within {STARTUP_RECOVERY_TIMEOUT:?}"
+                    ))
+                }),
+            };
+            if let Err(error) = recovery_wait {
+                let _ = abort_and_join_cluster_task(&mut api_handle, "HTTP API server").await;
                 db.fence_cluster_startup();
                 startup_controller.set_active(false);
-                let mut left = active.clone();
-                left.state = NodeState::Left;
-                let _ = discovery.announce(left).await;
-                rebalance_shutdown.notify_waiters();
-                for task in &rebalance_tasks {
-                    task.abort();
+                if !process_lease_terminal.is_cancelled() {
+                    let mut left = active.clone();
+                    left.state = NodeState::Left;
+                    let _ = announce_node_state_with_bound(
+                        &discovery,
+                        left,
+                        &process_lease_terminal,
+                        "withdraw node after startup recovery failure",
+                    )
+                    .await;
                 }
-                for task in rebalance_tasks.drain(..) {
-                    let _ = task.await;
-                }
-                if let Some(token) = &lease_shutdown_token {
-                    token.cancel();
-                }
-                let _ = db.shutdown().await;
-                let _ = discovery.stop().await;
-                return Err(ClusterStartupError::EngineConstruction(format!(
-                    "coordinated startup recovery did not release intake within {STARTUP_RECOVERY_TIMEOUT:?}"
-                )));
+                let _ = stop_rebalance_tasks(&mut rebalance_tasks, &rebalance_shutdown).await;
+                cleanup_cluster_startup(
+                    &mut discovery,
+                    &db,
+                    &mut leader_lease,
+                    &process_lease_terminal,
+                    false,
+                )
+                .await;
+                return Err(error);
             }
         }
     }
 
     // An idle worker serves control-plane readiness while its data plane remains fenced until the
     // watcher grants ownership.
-    app_state.open_startup_gate();
+    if !app_state.open_startup_gate() || !process_lease.is_live() {
+        let _ = abort_and_join_cluster_task(&mut api_handle, "HTTP API server").await;
+        db.revoke_cluster_authority();
+        startup_controller.set_active(false);
+        if !process_lease_terminal.is_cancelled() {
+            let mut left = active.clone();
+            left.state = NodeState::Left;
+            let _ = announce_node_state_with_bound(
+                &discovery,
+                left,
+                &process_lease_terminal,
+                "withdraw node after serving gate failure",
+            )
+            .await;
+        }
+        let _ = stop_rebalance_tasks(&mut rebalance_tasks, &rebalance_shutdown).await;
+        cleanup_cluster_startup(
+            &mut discovery,
+            &db,
+            &mut leader_lease,
+            &process_lease_terminal,
+            true,
+        )
+        .await;
+        return Err(ClusterStartupError::EngineConstruction(
+            "stable node identity lease was lost before HTTP serving authority opened".into(),
+        ));
+    }
     let watcher_handle = server::spawn_config_watcher(&app_state, config_path);
     let membership_rx = discovery.membership_watch();
     let membership_handle = spawn_membership_watcher(&node_id_str, membership_rx);
@@ -1866,7 +2834,9 @@ pub async fn start_cluster(
 
     Ok(ClusterHandle {
         db,
+        db_shutdown_complete: false,
         discovery,
+        serving_gate,
         api_handle,
         watcher_handle,
         membership_handle,
@@ -1874,8 +2844,8 @@ pub async fn start_cluster(
         cluster_controller,
         snapshot_store,
         vnode_count: vnode_registry.vnode_count(),
-        lease_shutdown_token,
-        _process_lease: process_lease,
+        leader_lease,
+        process_lease,
         rebalance_tasks,
         rebalance_shutdown,
     })
@@ -2175,17 +3145,24 @@ async fn resolve_vnode_assignment(
     self_id: laminar_core::cluster::discovery::NodeId,
     peers: &[laminar_core::cluster::discovery::NodeInfo],
     vnode_count: u32,
-    control_store: Option<Arc<dyn object_store::ObjectStore>>,
+    control_store: Arc<dyn object_store::ObjectStore>,
     startup_participants: &[laminar_core::checkpoint::CheckpointParticipant],
+    process_deadline: &laminar_core::cluster::control::LeaseDeadline,
 ) -> Result<
     (
         Arc<laminar_core::state::VnodeRegistry>,
-        Option<Arc<laminar_core::cluster::control::AssignmentSnapshotStore>>,
+        Arc<laminar_core::cluster::control::AssignmentSnapshotStore>,
     ),
     ClusterStartupError,
 > {
     use laminar_core::cluster::control::{AssignmentSnapshot, AssignmentSnapshotStore};
     use laminar_core::state::{rendezvous_assignment, NodeId, VnodeRegistry};
+
+    if !process_deadline.is_live() {
+        return Err(ClusterStartupError::AuthorityLost(
+            "stable node identity lease expired before assignment resolution".into(),
+        ));
+    }
 
     let peer_ids: Vec<NodeId> = peers
         .iter()
@@ -2194,13 +3171,7 @@ async fn resolve_vnode_assignment(
         .collect();
     let assignment: Arc<[NodeId]> = rendezvous_assignment(vnode_count, &peer_ids);
 
-    let Some(store) = control_store else {
-        // No shared store — fall back to node-local round-robin.
-        let registry = VnodeRegistry::new(vnode_count);
-        registry.set_assignment(Arc::clone(&assignment));
-        return Ok((Arc::new(registry), None));
-    };
-    let snapshot_store = Arc::new(AssignmentSnapshotStore::new(Arc::clone(&store)));
+    let snapshot_store = Arc::new(AssignmentSnapshotStore::new(control_store));
 
     // Snapshot exists → restart or joiner. Boot owning nothing: the stored snapshot may be
     // stale (a shed can race the restart), and acting on assumed ownership bypasses the adopt
@@ -2210,6 +3181,11 @@ async fn resolve_vnode_assignment(
         .await
         .map_err(|e| ClusterStartupError::EngineConstruction(format!("snapshot load: {e}")))?
     {
+        if !process_deadline.is_live() {
+            return Err(ClusterStartupError::AuthorityLost(
+                "stable node identity lease expired while loading the assignment".into(),
+            ));
+        }
         existing.to_vnode_vec(vnode_count).map_err(|error| {
             ClusterStartupError::EngineConstruction(format!("stored assignment: {error}"))
         })?;
@@ -2218,7 +3194,7 @@ async fn resolve_vnode_assignment(
             stored_version = existing.version,
             "found stored assignment snapshot; booting unassigned — adopt runs after start"
         );
-        return Ok((Arc::new(registry), Some(snapshot_store)));
+        return Ok((Arc::new(registry), snapshot_store));
     }
 
     // Nothing stored yet — propose ours and CAS-create. A racing peer
@@ -2243,6 +3219,11 @@ async fn resolve_vnode_assignment(
         .map_err(|error| {
             ClusterStartupError::EngineConstruction(format!("initial assignment snapshot: {error}"))
         })?;
+    if !process_deadline.is_live() {
+        return Err(ClusterStartupError::AuthorityLost(
+            "stable node identity lease expired before the initial assignment CAS".into(),
+        ));
+    }
     let winner = match snapshot_store
         .save_if_absent(&proposal)
         .await
@@ -2268,32 +3249,29 @@ async fn resolve_vnode_assignment(
             w
         }
     };
+    if !process_deadline.is_live() {
+        return Err(ClusterStartupError::AuthorityLost(
+            "stable node identity lease expired while resolving the assignment winner".into(),
+        ));
+    }
     let registry = VnodeRegistry::new_unassigned(vnode_count);
     let winning_assignment = winner.to_vnode_vec(vnode_count).map_err(|error| {
         ClusterStartupError::EngineConstruction(format!("winning assignment: {error}"))
     })?;
     registry.set_assignment_and_version(winning_assignment.into(), winner.version);
-    Ok((Arc::new(registry), Some(snapshot_store)))
+    Ok((Arc::new(registry), snapshot_store))
 }
 
-/// Build the shared, cluster-wide control-plane object store (assignment
-/// snapshot + `ObjectStoreClusterKv`). It must be reachable by every node, so
-/// it comes from the checkpoint bucket — not the per-node `[state]` path. Falls
-/// back to the state backend's store for single-host/local setups.
+/// Build the shared, cluster-wide control-plane object store (assignment snapshot plus
+/// `ObjectStoreClusterKv`) from the cluster-shared checkpoint namespace.
 fn build_control_store(
     config: &ServerConfig,
-) -> Result<Option<Arc<dyn object_store::ObjectStore>>, ClusterStartupError> {
-    if !config.checkpoint.url.is_empty() {
-        let store = laminar_core::storage::object_store_builder::build_object_store(
-            &config.checkpoint.url,
-            &config.checkpoint.storage,
-        )
-        .map_err(|e| {
-            ClusterStartupError::EngineConstruction(format!("control-plane object store: {e}"))
-        })?;
-        return Ok(Some(store));
-    }
-    config.state.build_object_store().map_err(|e| {
+) -> Result<Arc<dyn object_store::ObjectStore>, ClusterStartupError> {
+    laminar_core::storage::object_store_builder::build_object_store(
+        &config.checkpoint.url,
+        &config.checkpoint.storage,
+    )
+    .map_err(|e| {
         ClusterStartupError::EngineConstruction(format!("control-plane object store: {e}"))
     })
 }
@@ -2304,11 +3282,12 @@ async fn install_cluster_controller(
     node_id: NodeId,
     kv: Arc<dyn laminar_core::cluster::control::ClusterKv>,
     recovery_kv: Arc<dyn laminar_core::cluster::control::ClusterKv>,
-    snapshot_store: Option<Arc<laminar_core::cluster::control::AssignmentSnapshotStore>>,
+    snapshot_store: Arc<laminar_core::cluster::control::AssignmentSnapshotStore>,
     members_rx: watch::Receiver<Vec<NodeInfo>>,
     bind_host: &str,
     advertise_host: &str,
     recovery_incarnation: uuid::Uuid,
+    process_deadline: Arc<laminar_core::cluster::control::LeaseDeadline>,
 ) -> Result<Arc<laminar_core::cluster::control::ClusterController>, ClusterStartupError> {
     use laminar_core::cluster::control::ClusterController;
 
@@ -2316,10 +3295,13 @@ async fn install_cluster_controller(
         node_id,
         kv,
         recovery_kv,
-        snapshot_store,
+        Some(snapshot_store),
         members_rx,
         recovery_incarnation,
     ));
+    controller
+        .set_process_lease_deadline(process_deadline)
+        .map_err(ClusterStartupError::EngineConstruction)?;
     controller.set_active(false);
     controller.install_local_leader_proof_provider();
 
@@ -3578,6 +4560,7 @@ mod tests {
             },
             ClusterStartupError::EngineConstruction("build failed".into()),
             ClusterStartupError::HttpStartup("port in use".into()),
+            ClusterStartupError::AuthorityLost("process lease expired".into()),
         ];
         for err in &errors {
             assert!(!err.to_string().is_empty());
@@ -3596,6 +4579,378 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_process_signal_preempts_the_os_shutdown_wait() {
+        let terminal = tokio_util::sync::CancellationToken::new();
+        terminal.cancel();
+
+        let trigger = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            wait_for_cluster_shutdown_trigger(&terminal),
+        )
+        .await
+        .expect("terminal process signal must wake shutdown promptly")
+        .unwrap();
+
+        assert_eq!(trigger, ClusterShutdownTrigger::ProcessLeaseLost);
+    }
+
+    #[tokio::test]
+    async fn process_lease_terminal_monitor_starts_before_resource_fencing() {
+        let (live_tx, live_rx) = watch::channel(true);
+        let terminal = tokio_util::sync::CancellationToken::new();
+        let monitor = spawn_process_lease_terminal_monitor(
+            live_rx,
+            Arc::new(laminar_core::cluster::control::LeaseDeadline::live_for(
+                std::time::Duration::from_secs(10),
+            )),
+            terminal.clone(),
+        );
+
+        live_tx.send_replace(false);
+        tokio::time::timeout(std::time::Duration::from_millis(100), terminal.cancelled())
+            .await
+            .expect("terminal monitor must publish loss without installed resources");
+        monitor.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn process_lease_terminal_monitor_observes_the_monotonic_deadline() {
+        let (_live_tx, live_rx) = watch::channel(true);
+        let terminal = tokio_util::sync::CancellationToken::new();
+        let monitor = spawn_process_lease_terminal_monitor(
+            live_rx,
+            Arc::new(laminar_core::cluster::control::LeaseDeadline::live_for(
+                std::time::Duration::from_millis(20),
+            )),
+            terminal.clone(),
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), terminal.cancelled())
+            .await
+            .expect("monotonic expiry must publish terminal lease loss");
+        monitor.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn intentional_process_lease_disarm_cannot_run_the_loss_fence() {
+        let node = NodeId(49);
+        let owner = uuid::Uuid::from_u128(499);
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let acquired = acquire_test_process_lease(store, node, owner, 10_000).await;
+        let deadline = live_test_process_deadline();
+        let deadline_observer = Arc::clone(&deadline);
+        let (_live_tx, live_rx) = watch::channel(true);
+        let terminal = tokio_util::sync::CancellationToken::new();
+        let terminal_observer = terminal.clone();
+        let terminal_task = spawn_process_lease_terminal_monitor(
+            live_rx.clone(),
+            Arc::clone(&deadline),
+            terminal.clone(),
+        );
+        let terminal_abort = terminal_task.abort_handle();
+        let fence_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fence_terminal = terminal.clone();
+        let fence_ran_task = Arc::clone(&fence_ran);
+        let fence_task = tokio::spawn(async move {
+            fence_terminal.cancelled().await;
+            fence_ran_task.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let fence_abort = fence_task.abort_handle();
+        let renewal_task = tokio::spawn(std::future::pending::<()>());
+        let renewal_abort = renewal_task.abort_handle();
+        let mut process_lease = ProcessLeaseRuntime {
+            acquired,
+            deadline,
+            live_rx,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            terminal,
+            renewal_task,
+            terminal_task,
+            fence_task: Some(fence_task),
+        };
+
+        assert!(process_lease.disarm_for_shutdown());
+        deadline_observer.fence();
+        terminal_observer.cancel();
+
+        let tasks = [terminal_abort, fence_abort, renewal_abort];
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while tasks.iter().any(|task| !task.is_finished()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("disarmed process lease tasks must terminate");
+        assert!(!fence_ran.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn rebalance_tasks_receive_a_graceful_shutdown_before_abort() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        shutdown.cancel();
+        let task_shutdown = shutdown.clone();
+        let task_stopped = Arc::clone(&stopped);
+        let task = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            task_shutdown.cancelled().await;
+            task_stopped.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let mut tasks = vec![task];
+
+        assert!(stop_rebalance_tasks(&mut tasks, &shutdown).await);
+
+        assert!(tasks.is_empty());
+        assert!(stopped.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn leader_lease_runtime_cancels_and_joins_its_task() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_shutdown = shutdown.clone();
+        let task_stopped = Arc::clone(&stopped);
+        let task = tokio::spawn(async move {
+            task_shutdown.cancelled().await;
+            task_stopped.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let mut runtime = LeaderLeaseRuntime::new(shutdown, task);
+
+        runtime.stop().await;
+
+        assert!(stopped.load(std::sync::atomic::Ordering::Acquire));
+        assert!(runtime.task.is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_cluster_handle_fences_authority_and_aborts_owned_tasks() {
+        use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+
+        let node = NodeId(47);
+        let boot = uuid::Uuid::from_u128(477);
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let snapshot_store = Arc::new(
+            laminar_core::cluster::control::AssignmentSnapshotStore::new(Arc::clone(&store)),
+        );
+        let acquired = acquire_test_process_lease(Arc::clone(&store), node, boot, 10_000).await;
+        let control: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
+        let (_members_tx, members_rx) = watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
+            node,
+            Arc::clone(&control),
+            control,
+            Some(Arc::clone(&snapshot_store)),
+            members_rx,
+            boot,
+        ));
+        let deadline = live_test_process_deadline();
+        controller
+            .set_process_lease_deadline(Arc::clone(&deadline))
+            .unwrap();
+        let db = LaminarDB::builder()
+            .cluster_controller(Arc::clone(&controller))
+            .cluster_checkpoint_object_store(Arc::clone(&store))
+            .build()
+            .await
+            .unwrap();
+        let serving_gate = Arc::new(crate::http::ServingGate::starting());
+        assert!(serving_gate.open());
+
+        let local_node = NodeInfo {
+            id: node,
+            name: "drop-test".into(),
+            rpc_address: "127.0.0.1:0".into(),
+            raft_address: String::new(),
+            state: NodeState::Active,
+            metadata: NodeMetadata::default(),
+            last_heartbeat_ms: 0,
+        };
+        let discovery = DiscoveryImpl::Static(StaticDiscovery::new(StaticDiscoveryConfig {
+            local_node: local_node.clone(),
+            seeds: vec!["127.0.0.1:1".into()],
+            heartbeat_interval: std::time::Duration::from_secs(1),
+            suspect_threshold: 3,
+            dead_threshold: 10,
+            listen_address: "127.0.0.1:0".into(),
+            process_generation: acquired.term,
+            process_incarnation: boot,
+        }));
+
+        let pending_task = || tokio::spawn(std::future::pending::<()>());
+        let api_handle = pending_task();
+        let api_abort = api_handle.abort_handle();
+        let watcher_handle = pending_task();
+        let watcher_abort = watcher_handle.abort_handle();
+        let membership_handle = pending_task();
+        let membership_abort = membership_handle.abort_handle();
+        let rebalance_task = pending_task();
+        let rebalance_abort = rebalance_task.abort_handle();
+
+        let leader_shutdown = tokio_util::sync::CancellationToken::new();
+        let leader_task_shutdown = leader_shutdown.clone();
+        let leader_task = tokio::spawn(async move {
+            leader_task_shutdown.cancelled().await;
+        });
+        let leader_abort = leader_task.abort_handle();
+        let leader_lease = LeaderLeaseRuntime::new(leader_shutdown.clone(), leader_task);
+
+        let (live_tx, live_rx) = watch::channel(true);
+        let process_terminal = tokio_util::sync::CancellationToken::new();
+        let process_terminal_observer = process_terminal.clone();
+        let process_deadline_observer = Arc::clone(&deadline);
+        let terminal_task = spawn_process_lease_terminal_monitor(
+            live_rx.clone(),
+            Arc::clone(&deadline),
+            process_terminal.clone(),
+        );
+        let terminal_abort = terminal_task.abort_handle();
+        let renewal_task = pending_task();
+        let renewal_abort = renewal_task.abort_handle();
+        let process_lease = ProcessLeaseRuntime {
+            acquired,
+            deadline,
+            live_rx,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            terminal: process_terminal,
+            renewal_task,
+            terminal_task,
+            fence_task: None,
+        };
+
+        let handle = ClusterHandle {
+            db: Arc::clone(&db),
+            db_shutdown_complete: false,
+            discovery,
+            serving_gate: Arc::clone(&serving_gate),
+            api_handle,
+            watcher_handle: Some(watcher_handle),
+            membership_handle,
+            local_node,
+            cluster_controller: Arc::clone(&controller),
+            snapshot_store,
+            vnode_count: 1,
+            leader_lease,
+            process_lease,
+            rebalance_tasks: vec![rebalance_task],
+            rebalance_shutdown: tokio_util::sync::CancellationToken::new(),
+        };
+        assert!(controller.process_lease_is_live());
+
+        drop(handle);
+        assert!(!process_deadline_observer.is_live());
+        assert!(process_terminal_observer.is_cancelled());
+        drop(live_tx);
+
+        assert!(!serving_gate.open());
+        assert!(!controller.process_lease_is_live());
+        assert!(db.cluster_intake_fenced());
+        assert!(leader_shutdown.is_cancelled());
+        let tasks = [
+            api_abort,
+            watcher_abort,
+            membership_abort,
+            rebalance_abort,
+            leader_abort,
+            terminal_abort,
+            renewal_abort,
+        ];
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while tasks.iter().any(|task| !task.is_finished()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned runtime tasks must terminate");
+    }
+
+    #[tokio::test]
+    async fn process_lease_loss_revokes_http_controller_and_database_authority() {
+        use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+        use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+
+        let node = NodeId(41);
+        let boot = uuid::Uuid::from_u128(411);
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let acquired = acquire_test_process_lease(Arc::clone(&store), node, boot, 10_000).await;
+        let control: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
+        let (_members_tx, members_rx) = watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
+            node,
+            Arc::clone(&control),
+            control,
+            None,
+            members_rx,
+            boot,
+        ));
+        let deadline = live_test_process_deadline();
+        controller
+            .set_process_lease_deadline(Arc::clone(&deadline))
+            .unwrap();
+        let fence = CheckpointAssignmentFence::from_owner_map(
+            1,
+            &[node.0],
+            vec![CheckpointParticipant {
+                node_id: node.0,
+                boot_incarnation: boot,
+            }],
+        )
+        .unwrap();
+        controller.publish_checkpoint_assignment_fence(Some(fence.clone()));
+
+        let db = LaminarDB::builder()
+            .cluster_controller(Arc::clone(&controller))
+            .cluster_checkpoint_object_store(Arc::clone(&store))
+            .build()
+            .await
+            .unwrap();
+        assert!(controller.process_lease_is_live());
+        let serving_gate = Arc::new(crate::http::ServingGate::starting());
+        assert!(serving_gate.open());
+        let (live_tx, live_rx) = watch::channel(true);
+        let terminal = tokio_util::sync::CancellationToken::new();
+        let terminal_task = spawn_process_lease_terminal_monitor(
+            live_rx.clone(),
+            Arc::clone(&deadline),
+            terminal.clone(),
+        );
+        let mut process_lease = ProcessLeaseRuntime {
+            acquired,
+            deadline,
+            live_rx,
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            terminal,
+            renewal_task: tokio::spawn(std::future::pending()),
+            terminal_task,
+            fence_task: None,
+        };
+        let terminal = process_lease.terminal_token();
+        let leader_shutdown = tokio_util::sync::CancellationToken::new();
+        process_lease.install_fence(
+            Arc::clone(&db),
+            Arc::clone(&controller),
+            Arc::clone(&serving_gate),
+            leader_shutdown.clone(),
+        );
+
+        live_tx.send_replace(false);
+        let fence_task = process_lease.fence_task.take().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), fence_task)
+            .await
+            .expect("process fence must run promptly")
+            .unwrap();
+
+        assert!(!controller.process_lease_is_live());
+        assert_eq!(controller.checkpoint_assignment_fence(1), None);
+        assert!(db.cluster_intake_fenced());
+        assert!(!serving_gate.open());
+        assert!(leader_shutdown.is_cancelled());
+        assert!(terminal.is_cancelled());
+    }
+
+    #[tokio::test]
     async fn occupied_http_port_fails_before_local_cluster_activation() {
         use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
 
@@ -3603,8 +4958,18 @@ mod tests {
         let bind = occupied.local_addr().unwrap().to_string();
         let node = NodeId(41);
         let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
+        let assignment_store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let snapshot_store = Arc::new(
+            laminar_core::cluster::control::AssignmentSnapshotStore::new(assignment_store),
+        );
         let (_members_tx, members_rx) = watch::channel(Vec::new());
-        let controller = Arc::new(ClusterController::new(node, kv, None, members_rx));
+        let controller = Arc::new(ClusterController::new(
+            node,
+            kv,
+            Some(Arc::clone(&snapshot_store)),
+            members_rx,
+        ));
         controller.set_active(false);
 
         let mut server_config = crate::config::ServerSection::default();
@@ -3630,8 +4995,8 @@ mod tests {
         ]));
         let (_cluster_members_tx, cluster_members_rx) = watch::channel(Vec::new());
         let cluster = crate::http::ClusterComponents {
-            controller: Some(Arc::clone(&controller)),
-            snapshot_store: None,
+            controller: Arc::clone(&controller),
+            snapshot_store,
             membership_rx: cluster_members_rx,
         };
 
@@ -3640,8 +5005,8 @@ mod tests {
             registry,
             PathBuf::from("unused.toml"),
             config,
+            Arc::new(crate::http::ServingGate::starting()),
             cluster,
-            &controller,
         )
         .await;
         let error = match result {
@@ -3901,7 +5266,9 @@ mod tests {
             members_rx.clone(),
             old_boot,
         ));
-        old_controller.set_process_lease_deadline(Arc::clone(&old_deadline));
+        old_controller
+            .set_process_lease_deadline(Arc::clone(&old_deadline))
+            .unwrap();
         old_controller
             .publish_leased_recovery_incarnation(&old_process)
             .await
@@ -3914,7 +5281,7 @@ mod tests {
             process_term: old_process.term,
         };
         let LeaseOutcome::Acquired(old_leader) =
-            authority.try_acquire(&old_owner, 0).await.unwrap()
+            authority.begin_new_term(&old_owner, 0).await.unwrap()
         else {
             panic!("old process must acquire empty leader authority");
         };
@@ -4000,7 +5367,9 @@ mod tests {
             members_rx,
             replacement_boot,
         );
-        replacement_controller.set_process_lease_deadline(Arc::clone(&replacement_deadline));
+        replacement_controller
+            .set_process_lease_deadline(Arc::clone(&replacement_deadline))
+            .unwrap();
         replacement_controller
             .publish_leased_recovery_incarnation(&replacement_process)
             .await
@@ -4786,12 +6155,15 @@ mod tests {
             .collect();
         let store: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::memory::InMemory::new());
+        let deadline = laminar_core::cluster::control::LeaseDeadline::live_for(
+            std::time::Duration::from_secs(30),
+        );
 
         let (registry, snapshot_store) =
-            resolve_vnode_assignment(nodes[0], &peers, 1, Some(store), &participants)
+            resolve_vnode_assignment(nodes[0], &peers, 1, store, &participants, &deadline)
                 .await
                 .unwrap();
-        let snapshot = snapshot_store.unwrap().load().await.unwrap().unwrap();
+        let snapshot = snapshot_store.load().await.unwrap().unwrap();
         let owner = registry.snapshot()[0];
 
         assert_eq!(snapshot.participants.len(), 1);
@@ -4801,6 +6173,31 @@ mod tests {
             2,
             "one vnode across three live workers must leave two workers idle"
         );
+    }
+
+    #[tokio::test]
+    async fn fenced_process_cannot_create_the_initial_assignment() {
+        use laminar_core::checkpoint::CheckpointParticipant;
+        use laminar_core::cluster::control::{AssignmentSnapshotStore, LeaseDeadline};
+
+        let node = NodeId(7);
+        let participant = CheckpointParticipant {
+            node_id: node.0,
+            boot_incarnation: uuid::Uuid::from_u128(77),
+        };
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let snapshots = AssignmentSnapshotStore::new(Arc::clone(&store));
+        let deadline = LeaseDeadline::fenced();
+
+        let result = resolve_vnode_assignment(node, &[], 1, store, &[participant], &deadline).await;
+        let error = match result {
+            Ok(_) => panic!("a fenced process created an assignment"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, ClusterStartupError::AuthorityLost(_)));
+        assert!(snapshots.load().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -4890,9 +6287,11 @@ mod tests {
             )
             .unwrap(),
         ));
-        controller.set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
-            std::time::Duration::from_secs(30),
-        )));
+        controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
+                std::time::Duration::from_secs(30),
+            )))
+            .unwrap();
         let registry = VnodeRegistry::single_owner(1, StateNodeId(node.0));
 
         let delayed = Arc::new(DelayedControlPutStore::new(Arc::new(
@@ -4921,7 +6320,7 @@ mod tests {
             process_term: 1,
         };
         let LeaseOutcome::Acquired(stale_lease) =
-            authority.try_acquire(&stale_owner, 0).await.unwrap()
+            authority.begin_new_term(&stale_owner, 0).await.unwrap()
         else {
             panic!("empty test authority must be acquired");
         };
@@ -5040,9 +6439,11 @@ mod tests {
                 .start_barrier_server("127.0.0.1:0".parse().unwrap(), None)
                 .await
                 .unwrap();
-            controller.set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
-                std::time::Duration::from_secs(30),
-            )));
+            controller
+                .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
+                    std::time::Duration::from_secs(30),
+                )))
+                .unwrap();
             controller.set_active(true);
         }
 
@@ -5085,7 +6486,8 @@ mod tests {
             boot: leader_boot,
             process_term: process_lease.term,
         };
-        let LeaseOutcome::Acquired(initial_lease) = authority.try_acquire(&owner, 0).await.unwrap()
+        let LeaseOutcome::Acquired(initial_lease) =
+            authority.begin_new_term(&owner, 0).await.unwrap()
         else {
             panic!("remote leader lease must be acquired");
         };

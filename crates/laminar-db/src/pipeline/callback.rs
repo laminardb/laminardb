@@ -336,8 +336,12 @@ pub trait PipelineCallback: Send + 'static {
         Ok(())
     }
 
-    /// Write cycle results to sinks.
-    async fn write_to_sinks(&mut self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>);
+    /// Write cycle results to sinks, bounded by `deadline` when this is a checkpoint drain.
+    async fn write_to_sinks(
+        &mut self,
+        results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<(), CycleError>;
 
     /// Extract watermark from a batch for a given source.
     fn extract_watermark(&mut self, source_name: &str, batch: &RecordBatch);

@@ -1616,6 +1616,8 @@ mod tests {
             flush_interval: Duration::from_secs(5),
             write_timeout: Duration::from_secs(5),
             event_tx,
+            #[cfg(feature = "cluster")]
+            process_authority: None,
         })
     }
 
@@ -1716,20 +1718,29 @@ mod tests {
         let namespace = namespace();
         let mut keys = Vec::new();
         let mut required_vnodes = Vec::new();
-        let vnode_owner =
-            assignment_fence.and_then(|fence| fence.participant_ids().into_iter().next());
-        if let (Some(fence), Some(owner)) = (assignment_fence, vnode_owner) {
-            backend
-                .write_certified_partial(
-                    attempt,
-                    0,
-                    fence,
-                    owner,
-                    Bytes::from_static(b"test-vnode-state"),
-                )
-                .await
-                .unwrap();
-            required_vnodes.push(0);
+        let vnode_owners = assignment_fence.map_or_else(Vec::new, |fence| {
+            let owners = fence.participant_ids();
+            assert!(
+                fence.matches_owner_map(&owners),
+                "test assignment helper uses one vnode per participant"
+            );
+            owners
+        });
+        if let Some(fence) = assignment_fence {
+            for (vnode, &owner) in vnode_owners.iter().enumerate() {
+                let vnode = u32::try_from(vnode).unwrap();
+                backend
+                    .write_certified_partial(
+                        attempt,
+                        vnode,
+                        fence,
+                        owner,
+                        Bytes::from_static(b"test-vnode-state"),
+                    )
+                    .await
+                    .unwrap();
+                required_vnodes.push(vnode);
+            }
         }
         for &(participant_id, payload) in markers {
             let key = descriptor_key(&namespace, participant_id);
@@ -1767,9 +1778,13 @@ mod tests {
                     .clone(),
                 deployment_id: deployment_id(),
                 pipeline_identity: identity(),
-                owned_vnodes: (Some(participant_id) == vnode_owner)
-                    .then_some(vec![0])
-                    .unwrap_or_default(),
+                owned_vnodes: vnode_owners
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(vnode, owner)| {
+                        (*owner == participant_id).then(|| u32::try_from(vnode).unwrap())
+                    })
+                    .collect(),
                 source_offsets: Default::default(),
                 source_metadata: Default::default(),
                 source_assignment_versions: Default::default(),
@@ -1853,7 +1868,8 @@ mod tests {
         let controller = Arc::new(ClusterController::new(owner.node, kv, None, members_rx));
         controller.set_leader_lease_store(authority);
         controller
-            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))));
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+            .unwrap();
         let (_lease_tx, lease_rx) = watch::channel(Some(lease));
         controller
             .set_leader_lease_watch(
@@ -1882,7 +1898,8 @@ mod tests {
                 .expect("test leader belongs to the assignment certificate"),
             process_term: 1,
         };
-        let LeaseOutcome::Acquired(lease) = authority.try_acquire(&owner, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap()
+        else {
             unreachable!("fresh test authority must grant its first lease")
         };
         let proof = lease.proof();
@@ -2286,7 +2303,7 @@ mod tests {
     #[cfg(feature = "cluster")]
     #[tokio::test]
     async fn external_commit_rejects_capsule_bound_to_another_seal_inventory() {
-        let backend = Arc::new(InProcessBackend::new(1));
+        let backend = Arc::new(InProcessBackend::new(2));
         let attempt = CheckpointAttempt::new(1, 11);
         let fence = assignment_fence(3, &[7, 9]);
         let decisions = cluster_decisions(&fence, 7).await;
@@ -2330,7 +2347,7 @@ mod tests {
     #[cfg(feature = "cluster")]
     #[tokio::test]
     async fn current_leader_finishes_commit_selected_by_predecessor_proof() {
-        let backend = Arc::new(InProcessBackend::new(1));
+        let backend = Arc::new(InProcessBackend::new(2));
         let attempt = CheckpointAttempt::new(1, 11);
         let fence = assignment_fence(3, &[7, 9]);
         let mut outcomes = cluster_decisions(&fence, 7).await;
@@ -2759,7 +2776,7 @@ mod tests {
     #[cfg(feature = "cluster")]
     #[tokio::test]
     async fn cluster_commit_rejects_marker_written_by_another_certified_participant() {
-        let backend = Arc::new(InProcessBackend::new(1));
+        let backend = Arc::new(InProcessBackend::new(2));
         let attempt = CheckpointAttempt::new(5, 54);
         let fence = assignment_fence(4, &[7, 9]);
         let decisions = cluster_decisions(&fence, 7).await;
@@ -2770,6 +2787,16 @@ mod tests {
                 0,
                 &fence,
                 7,
+                Bytes::from_static(b"test-vnode-state"),
+            )
+            .await
+            .unwrap();
+        backend
+            .write_certified_partial(
+                attempt,
+                1,
+                &fence,
+                9,
                 Bytes::from_static(b"test-vnode-state"),
             )
             .await
@@ -2799,7 +2826,11 @@ mod tests {
                 assignment_fence: fence.clone(),
                 deployment_id: deployment_id(),
                 pipeline_identity: identity(),
-                owned_vnodes: (participant_id == 7).then_some(vec![0]).unwrap_or_default(),
+                owned_vnodes: match participant_id {
+                    7 => vec![0],
+                    9 => vec![1],
+                    _ => unreachable!("test readiness participant belongs to the assignment"),
+                },
                 source_offsets: Default::default(),
                 source_metadata: Default::default(),
                 source_assignment_versions: Default::default(),
@@ -2823,7 +2854,7 @@ mod tests {
         }
         keys.sort_unstable();
         assert!(backend
-            .seal_checkpoint(attempt, Some(&fence), &[0], &keys)
+            .seal_checkpoint(attempt, Some(&fence), &[0, 1], &keys)
             .await
             .unwrap());
         record_cluster_commit(
@@ -2856,7 +2887,7 @@ mod tests {
     #[cfg(feature = "cluster")]
     #[tokio::test]
     async fn external_commit_rejects_participants_outside_the_outcome() {
-        let backend = Arc::new(InProcessBackend::new(1));
+        let backend = Arc::new(InProcessBackend::new(2));
         let attempt = CheckpointAttempt::new(5, 55);
         let fence = assignment_fence(4, &[7, 9]);
         let decisions = cluster_decisions(&fence, 7).await;
@@ -2894,7 +2925,7 @@ mod tests {
     async fn external_commit_rejects_deleted_sealed_readiness() {
         let raw = Arc::new(InMemory::new());
         let store: Arc<dyn ObjectStore> = raw.clone();
-        let backend = Arc::new(ObjectStoreBackend::cluster_shared(store, "node-7", 1));
+        let backend = Arc::new(ObjectStoreBackend::cluster_shared(store, "node-7", 2));
         let attempt = CheckpointAttempt::new(5, 56);
         let fence = assignment_fence(4, &[7, 9]);
         let decisions = cluster_decisions(&fence, 7).await;
@@ -2936,7 +2967,7 @@ mod tests {
     async fn external_commit_rejects_mutated_sealed_readiness() {
         let raw = Arc::new(InMemory::new());
         let store: Arc<dyn ObjectStore> = raw.clone();
-        let backend = Arc::new(ObjectStoreBackend::cluster_shared(store, "node-7", 1));
+        let backend = Arc::new(ObjectStoreBackend::cluster_shared(store, "node-7", 2));
         let attempt = CheckpointAttempt::new(5, 57);
         let fence = assignment_fence(4, &[7, 9]);
         let decisions = cluster_decisions(&fence, 7).await;

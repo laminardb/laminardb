@@ -262,6 +262,7 @@ mod shuffle_tests {
     use arrow::array::Int64Array;
     use arrow_schema::{DataType, Field, Schema};
     use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+    use laminar_core::cluster::control::LeaseDeadline;
     use laminar_core::shuffle::{ShuffleMessage, ShuffleReceiver, ShuffleSender};
     use uuid::Uuid;
 
@@ -305,9 +306,19 @@ mod shuffle_tests {
             .await
             .unwrap();
         receiver
+            .install_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
+                std::time::Duration::from_secs(60),
+            )))
+            .unwrap();
+        receiver
             .install_assignment_fence(&fence, &[1, 2, 3])
             .unwrap();
         let sender = ShuffleSender::new(1, Uuid::from_u128(1));
+        sender
+            .install_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
+                std::time::Duration::from_secs(60),
+            )))
+            .unwrap();
         sender.install_assignment_fence(&fence, &[1, 2, 3]).unwrap();
         sender.register_peer(2, receiver.local_addr()).await;
         (sender, receiver)

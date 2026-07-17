@@ -21,6 +21,59 @@ const MAX_METADATA_TAG_KEY_BYTES: usize = 128;
 const MAX_METADATA_TAG_VALUE_BYTES: usize = 1_024;
 const MAX_METADATA_TAGS_ENCODED_BYTES: usize = 8 * 1_024;
 const PROCESS_INCARNATION_TAG: &str = "laminardb.process-incarnation";
+const DISCOVERY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct AbortTaskOnDrop(tokio::task::AbortHandle);
+
+impl AbortTaskOnDrop {
+    fn abort(&self) {
+        self.0.abort();
+    }
+}
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
+async fn join_task_bounded<T>(
+    mut task: tokio::task::JoinHandle<T>,
+    timeout: Duration,
+    task_name: &'static str,
+) -> Option<Result<T, tokio::task::JoinError>> {
+    let abort_on_drop = AbortTaskOnDrop(task.abort_handle());
+    if let Ok(result) = tokio::time::timeout(timeout, &mut task).await {
+        Some(result)
+    } else {
+        tracing::warn!(
+            task = task_name,
+            ?timeout,
+            "Discovery task did not stop in time"
+        );
+        abort_on_drop.abort();
+        let _ = tokio::time::timeout(timeout.min(Duration::from_secs(1)), &mut task).await;
+        None
+    }
+}
+
+struct ChitchatShutdownGuard(chitchat::ChitchatHandle);
+
+impl ChitchatShutdownGuard {
+    fn new(handle: chitchat::ChitchatHandle) -> Self {
+        Self(handle)
+    }
+
+    fn handle(&self) -> &chitchat::ChitchatHandle {
+        &self.0
+    }
+}
+
+impl Drop for ChitchatShutdownGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HighestPeerGeneration {
@@ -169,6 +222,7 @@ pub struct GossipDiscovery {
     cancel: CancellationToken,
     started: bool,
     chitchat_handle: Option<chitchat::ChitchatHandle>,
+    membership_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl GossipDiscovery {
@@ -184,6 +238,7 @@ impl GossipDiscovery {
             cancel: CancellationToken::new(),
             started: false,
             chitchat_handle: None,
+            membership_handle: None,
         }
     }
 
@@ -471,13 +526,18 @@ impl GossipDiscovery {
         let chitchat = self.chitchat_handle.as_ref().unwrap().chitchat().clone();
         let local_node_id = self.config.node_id;
 
-        tokio::spawn(async move {
+        self.membership_handle = Some(tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(500));
             loop {
                 tokio::select! {
+                    biased;
                     () = cancel.cancelled() => break,
                     _ = interval.tick() => {
-                        let chitchat_guard = chitchat.lock().await;
+                        let chitchat_guard = tokio::select! {
+                            biased;
+                            () = cancel.cancelled() => break,
+                            guard = chitchat.lock() => guard,
+                        };
                         // Collect the set of live node IDs from the failure
                         // detector so we only include reachable peers (C3 fix).
                         let live_ids: std::collections::HashSet<&chitchat::ChitchatId> =
@@ -537,19 +597,18 @@ impl GossipDiscovery {
                                 .map(|(k, v)| (k.to_string(), v.to_string()))
                                 .collect();
 
-                            match Self::parse_node_info(&cc_id.node_id, &kvs) {
-                                Some(mut info) => {
-                                    // Override self-reported state with failure detector opinion.
-                                    if !live_ids.contains(cc_id) {
-                                        info.state = NodeState::Suspected;
-                                    }
-                                    new_peers.insert(node_id, info);
+                            if let Some(mut info) = Self::parse_node_info(&cc_id.node_id, &kvs) {
+                                // Override self-reported state with failure detector opinion.
+                                if !live_ids.contains(cc_id) {
+                                    info.state = NodeState::Suspected;
                                 }
-                                None => tracing::warn!(
+                                new_peers.insert(node_id, info);
+                            } else {
+                                tracing::warn!(
                                     node_id,
                                     generation = cc_id.generation_id,
                                     "excluding malformed highest gossip generation"
-                                ),
+                                );
                             }
                         }
 
@@ -560,10 +619,53 @@ impl GossipDiscovery {
                     }
                 }
             }
-        });
+        }));
 
         self.started = true;
         Ok(())
+    }
+
+    async fn stop_with_timeout(&mut self, timeout: Duration) {
+        self.cancel.cancel();
+        self.started = false;
+
+        let membership_handle = self.membership_handle.take();
+        let chitchat_handle = self.chitchat_handle.take();
+        let stop_membership = async move {
+            if let Some(handle) = membership_handle {
+                if let Some(Err(error)) =
+                    join_task_bounded(handle, timeout, "gossip-membership").await
+                {
+                    tracing::debug!(%error, "Gossip membership task stopped unexpectedly");
+                }
+            }
+        };
+        let stop_chitchat = async move {
+            if let Some(handle) = chitchat_handle {
+                let handle = ChitchatShutdownGuard::new(handle);
+                if let Err(error) = handle.handle().initiate_shutdown() {
+                    tracing::debug!(%error, "Chitchat server was already stopped");
+                }
+                match tokio::time::timeout(timeout, handle.handle().termination_watcher()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "Chitchat server stopped with an error");
+                    }
+                    Err(_) => {
+                        tracing::warn!(?timeout, "Chitchat server did not stop in time");
+                        handle.handle().abort();
+                        let _ = tokio::time::timeout(
+                            timeout.min(Duration::from_secs(1)),
+                            handle.handle().termination_watcher(),
+                        )
+                        .await;
+                    }
+                }
+            }
+        };
+        tokio::join!(stop_membership, stop_chitchat);
+
+        self.cancel = CancellationToken::new();
     }
 }
 
@@ -603,18 +705,22 @@ impl Discovery for GossipDiscovery {
     }
 
     async fn stop(&mut self) -> Result<(), DiscoveryError> {
+        self.stop_with_timeout(DISCOVERY_SHUTDOWN_TIMEOUT).await;
+        Ok(())
+    }
+}
+
+impl Drop for GossipDiscovery {
+    fn drop(&mut self) {
         self.cancel.cancel();
         self.started = false;
-        // Properly shut down chitchat (W8 fix): send shutdown command
-        // and wait for the background task to exit, releasing the UDP socket.
-        if let Some(handle) = self.chitchat_handle.take() {
-            if let Err(e) = handle.shutdown().await {
-                tracing::warn!("Chitchat shutdown error: {e}");
-            }
+        if let Some(handle) = self.membership_handle.take() {
+            handle.abort();
         }
-        // Fresh token so restart after stop works
-        self.cancel = CancellationToken::new();
-        Ok(())
+        if let Some(handle) = self.chitchat_handle.take() {
+            let _ = handle.initiate_shutdown();
+            handle.abort();
+        }
     }
 }
 
@@ -981,5 +1087,168 @@ mod tests {
             Err(DiscoveryError::Serialization(message))
                 if message.contains("generation must be nonzero")
         ));
+    }
+
+    #[tokio::test]
+    async fn drop_cancels_membership_and_chitchat_tasks() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        drop(socket);
+
+        let mut config = GossipDiscoveryConfig::default();
+        config.gossip_address = address.to_string();
+        let mut discovery = GossipDiscovery::new(config);
+        discovery.start().await.unwrap();
+
+        let cancelled = discovery.cancel.clone();
+        let membership_task = discovery.membership_handle.as_ref().unwrap().abort_handle();
+        let chitchat_terminated = discovery
+            .chitchat_handle
+            .as_ref()
+            .unwrap()
+            .termination_watcher();
+
+        drop(discovery);
+        assert!(cancelled.is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !membership_task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped gossip membership task must terminate");
+        let _ = tokio::time::timeout(Duration::from_secs(1), chitchat_terminated)
+            .await
+            .expect("dropped gossip server task must terminate");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match tokio::net::UdpSocket::bind(address).await {
+                    Ok(socket) => break socket,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(5)).await,
+                }
+            }
+        })
+        .await
+        .expect("dropped gossip discovery must release its socket");
+    }
+
+    #[tokio::test]
+    async fn membership_cancellation_does_not_wait_for_the_chitchat_lock() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        drop(socket);
+
+        let mut config = GossipDiscoveryConfig::default();
+        config.gossip_address = address.to_string();
+        let mut discovery = GossipDiscovery::new(config);
+        discovery.start().await.unwrap();
+
+        let chitchat = discovery
+            .chitchat_handle
+            .as_ref()
+            .unwrap()
+            .chitchat()
+            .clone();
+        let guard = chitchat.lock().await;
+        tokio::time::sleep(Duration::from_millis(550)).await;
+        discovery.cancel.cancel();
+        let membership = discovery.membership_handle.take().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), membership)
+            .await
+            .expect("membership shutdown waited for the chitchat lock")
+            .unwrap();
+
+        drop(guard);
+        discovery.stop_with_timeout(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn stop_aborts_membership_that_exceeds_the_shutdown_bound() {
+        let mut discovery = GossipDiscovery::new(GossipDiscoveryConfig::default());
+        discovery.started = true;
+        let cancelled = discovery.cancel.clone();
+        let membership = tokio::spawn(std::future::pending::<()>());
+        let membership_task = membership.abort_handle();
+        discovery.membership_handle = Some(membership);
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            discovery.stop_with_timeout(Duration::from_millis(10)),
+        )
+        .await
+        .expect("bounded gossip discovery shutdown did not return");
+
+        assert!(cancelled.is_cancelled());
+        assert!(!discovery.cancel.is_cancelled());
+        assert!(!discovery.started);
+        assert!(discovery.membership_handle.is_none());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !membership_task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bounded gossip discovery shutdown left its membership task running");
+    }
+
+    #[tokio::test]
+    async fn cancelling_stop_aborts_taken_membership_and_chitchat_ownership() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        drop(socket);
+
+        let mut config = GossipDiscoveryConfig::default();
+        config.gossip_address = address.to_string();
+        let mut discovery = GossipDiscovery::new(config);
+        discovery.start().await.unwrap();
+
+        let membership = discovery.membership_handle.take().unwrap();
+        membership.abort();
+        let _ = membership.await;
+        let membership = tokio::spawn(std::future::pending::<()>());
+        let membership_task = membership.abort_handle();
+        discovery.membership_handle = Some(membership);
+        let cancelled = discovery.cancel.clone();
+        let chitchat_terminated = discovery
+            .chitchat_handle
+            .as_ref()
+            .unwrap()
+            .termination_watcher();
+
+        let stopping = tokio::spawn(async move {
+            discovery.stop_with_timeout(Duration::from_secs(60)).await;
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !cancelled.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("gossip stop did not publish cancellation");
+        stopping.abort();
+        let _ = stopping.await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !membership_task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelling gossip stop detached its taken membership task");
+        let _ = tokio::time::timeout(Duration::from_secs(1), chitchat_terminated)
+            .await
+            .expect("cancelling gossip stop detached its Chitchat server");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match tokio::net::UdpSocket::bind(address).await {
+                    Ok(socket) => break socket,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(5)).await,
+                }
+            }
+        })
+        .await
+        .expect("cancelled gossip stop did not release its socket");
     }
 }

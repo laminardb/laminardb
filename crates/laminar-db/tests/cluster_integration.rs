@@ -60,7 +60,7 @@ fn test_leader_proof(
 mod durable_backend_gate {
     use std::sync::Arc;
 
-    use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+    use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv, LeaseDeadline};
     use laminar_core::state::{InProcessBackend, NodeId, VnodeRegistry};
     use laminar_db::LaminarDB;
     use tokio::sync::watch;
@@ -73,6 +73,11 @@ mod durable_backend_gate {
         let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(self_id));
         let (_tx, rx) = watch::channel(Vec::new());
         let controller = Arc::new(ClusterController::new(self_id, kv, None, rx));
+        controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
+                std::time::Duration::from_secs(30),
+            )))
+            .expect("install the process authority deadline required by cluster construction");
 
         let db = LaminarDB::builder()
             .cluster_controller(controller)
@@ -146,23 +151,35 @@ mod failures {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn assignment_snapshot_unifies_cluster_view() {
-        let harness_a =
+        let mut harness_a =
             super::cluster_harness::ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
+        setup_stateless_query(&harness_a).await;
+        harness_a.start_all().await;
+        let checkpoint = harness_a.nodes[harness_a.leader_idx()]
+            .db
+            .checkpoint()
+            .await
+            .expect("checkpoint the assignment before restarting its process owners");
+        assert!(
+            checkpoint.success,
+            "assignment checkpoint failed: {:?}",
+            checkpoint.error,
+        );
         let assignment_a: Vec<super::cluster_harness::NodeIdView> = harness_a
             .nodes
             .iter()
             .map(|n| (n.instance_id, n.owned_vnodes()))
             .collect();
-        let (shared_dir, _cp_dirs) = harness_a.shutdown_keep_dirs().await;
+        let (shared_dir, checkpoint_dirs) = harness_a.shutdown_keep_dirs().await;
 
-        let cp_dirs2: Vec<_> = (0..N_NODES).map(|_| tempfile::tempdir().unwrap()).collect();
-        let harness_b = super::cluster_harness::ClusterEngineHarness::spawn_with_dirs(
+        let mut harness_b = super::cluster_harness::ClusterEngineHarness::spawn_with_dirs(
             N_NODES,
             VNODE_COUNT,
             shared_dir,
-            cp_dirs2,
+            checkpoint_dirs,
         )
         .await;
+        harness_b.start_all().await;
         let assignment_b: Vec<super::cluster_harness::NodeIdView> = harness_b
             .nodes
             .iter()
@@ -363,11 +380,15 @@ mod failures {
 }
 
 mod rebalance {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use laminar_core::cluster::control::{AssignmentSnapshotStore, RotateOutcome};
+    use laminar_core::checkpoint::{CheckpointParticipant, LeaderProof};
+    use laminar_core::cluster::control::{
+        AssignmentDrainDecision, AssignmentDrainVerdict, AssignmentSnapshot,
+        AssignmentSnapshotStore, RotateOutcome,
+    };
     use laminar_core::state::{CheckpointAttempt, NodeId};
 
     use super::cluster_harness::{AggregateObservation, ClusterEngineHarness};
@@ -387,13 +408,150 @@ mod rebalance {
         panic!("timed out waiting for: {what}");
     }
 
+    fn successor_participants(
+        predecessor: &AssignmentSnapshot,
+        vnodes: &BTreeMap<u32, NodeId>,
+    ) -> Vec<CheckpointParticipant> {
+        let owners = vnodes
+            .values()
+            .map(|owner| owner.0)
+            .collect::<BTreeSet<_>>();
+        let participants = predecessor
+            .participants
+            .iter()
+            .copied()
+            .filter(|participant| owners.contains(&participant.node_id))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            participants.len(),
+            owners.len(),
+            "every successor owner must retain its exact live process incarnation",
+        );
+        participants
+    }
+
+    fn canonical_successor(
+        predecessor: &AssignmentSnapshot,
+        vnodes: BTreeMap<u32, NodeId>,
+    ) -> AssignmentSnapshot {
+        let participants = successor_participants(predecessor, &vnodes);
+        predecessor
+            .next_for_participants(vnodes, participants)
+            .expect("canonical participant-aware successor")
+    }
+
+    async fn stop_placement_drivers(harness: &mut ClusterEngineHarness) {
+        for node in &mut harness.nodes {
+            let placement_driver = node
+                .rebalance_tasks
+                .pop()
+                .expect("cluster harness starts one placement driver after each watcher");
+            placement_driver.abort();
+            let _ = placement_driver.await;
+        }
+    }
+
+    async fn begin_planned_rotation(
+        harness: &mut ClusterEngineHarness,
+        vnodes: BTreeMap<u32, NodeId>,
+    ) -> (AssignmentSnapshot, LeaderProof) {
+        stop_placement_drivers(harness).await;
+        let leader_idx = harness.leader_idx();
+        let store = Arc::clone(&harness.nodes[leader_idx].assignment_snapshot_store);
+        let predecessor = store
+            .load()
+            .await
+            .expect("load predecessor assignment")
+            .expect("predecessor assignment");
+        let participants = successor_participants(&predecessor, &vnodes);
+        let leader_proof = harness.cluster.nodes[leader_idx]
+            .controller
+            .capture_leader_proof()
+            .expect("planned rotation requires the exact live leader grant");
+        let draining = predecessor
+            .next_draining(vnodes, participants, leader_proof.clone())
+            .expect("canonical planned rotation");
+        assert!(matches!(
+            store
+                .save_if_version(&draining, predecessor.version)
+                .await
+                .expect("publish draining assignment"),
+            RotateOutcome::Rotated,
+        ));
+
+        let transition = draining
+            .drain_transition
+            .as_ref()
+            .expect("draining assignment carries its exact transition")
+            .clone();
+        tokio::time::timeout(POLL_DEADLINE, async {
+            loop {
+                match harness.cluster.nodes[leader_idx]
+                    .controller
+                    .drain_ack_quorum_reached(&transition)
+                    .await
+                {
+                    Ok(true) => break,
+                    Ok(false) => tokio::time::sleep(Duration::from_millis(50)).await,
+                    Err(error) => panic!("drain acknowledgement audit failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("every predecessor must acknowledge the planned source cut");
+
+        (draining, leader_proof)
+    }
+
+    async fn authorize_planned_rotation(
+        harness: &ClusterEngineHarness,
+        draining: &AssignmentSnapshot,
+        leader_proof: &LeaderProof,
+    ) -> AssignmentSnapshot {
+        let transition = draining
+            .drain_transition
+            .as_ref()
+            .expect("draining assignment carries its exact transition");
+        let decision = AssignmentDrainDecision::new(
+            transition,
+            leader_proof.clone(),
+            AssignmentDrainVerdict::Commit,
+        )
+        .expect("canonical planned-rotation decision");
+        harness.cluster.nodes[harness.leader_idx()]
+            .controller
+            .checkpoint_authority()
+            .expect("cluster checkpoint authority")
+            .record_assignment_drain_decision(leader_proof, decision)
+            .await
+            .expect("record immutable planned-rotation decision");
+        draining
+            .committed_target()
+            .expect("materialize committed planned rotation")
+    }
+
+    async fn finalize_planned_rotation(
+        harness: &ClusterEngineHarness,
+        draining: &AssignmentSnapshot,
+        committed: &AssignmentSnapshot,
+    ) {
+        let store = &harness.nodes[harness.leader_idx()].assignment_snapshot_store;
+        assert!(matches!(
+            store
+                .finalize_drain(draining, committed)
+                .await
+                .expect("finalize planned rotation"),
+            RotateOutcome::Rotated,
+        ));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn dead_aggregate_owner_advances_to_a_successor_recovery_quorum() {
         let mut harness = ClusterEngineHarness::spawn(N_NODES, 1).await;
         harness
             .bootstrap_catalog(&[
                 super::cluster_harness::TEST_SOURCE_DDL,
-                "CREATE STREAM totals AS SELECT SUM(value) AS total FROM src",
+                "CREATE STREAM totals AS SELECT SUM(value) AS total FROM src EMIT CHANGES",
                 super::cluster_harness::TEST_AGGREGATE_SINK_DDL,
             ])
             .await
@@ -415,20 +573,41 @@ mod rebalance {
             .expect("aggregate owner belongs to the running harness");
 
         harness.source_log.append(&[(1, 10), (2, 20)]);
-        wait_for(
-            || {
+        let expected_observation = AggregateObservation {
+            node_id: aggregate_owner,
+            total: 30,
+            weight: 1,
+        };
+        if tokio::time::timeout(POLL_DEADLINE, async {
+            while !harness
+                .sink_state
+                .observations()
+                .contains(&expected_observation)
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            panic!(
+                "aggregate owner did not publish {expected_observation:?}; observations={:?}; nodes={:?}",
+                harness.sink_state.observations(),
                 harness
-                    .sink_state
-                    .observations()
-                    .contains(&AggregateObservation {
-                        node_id: aggregate_owner,
-                        total: 30,
-                        weight: 1,
-                    })
-            },
-            "aggregate owner to publish the non-empty total",
-        )
-        .await;
+                    .nodes
+                    .iter()
+                    .map(|node| (
+                        node.instance_id,
+                        node.owned_vnodes(),
+                        node.source_state.polls(),
+                        node.source_state.last_checkpoint_cursor(),
+                        node.db.cluster_intake_fenced(),
+                        node.db.pipeline_state(),
+                        node.db.last_fault(),
+                    ))
+                    .collect::<Vec<_>>(),
+            );
+        }
 
         let committed = harness.nodes[leader]
             .db
@@ -608,10 +787,10 @@ mod rebalance {
             "new ownership must be restored from the last committed cluster cut"
         );
         harness.source_log.append(&[(3, 7)]);
-        wait_for(
-            || {
+        if tokio::time::timeout(POLL_DEADLINE, async {
+            loop {
                 let observations = harness.sink_state.observations();
-                observations.contains(&AggregateObservation {
+                if observations.contains(&AggregateObservation {
                     node_id: survivor_id,
                     total: 30,
                     weight: -1,
@@ -619,11 +798,26 @@ mod rebalance {
                     node_id: survivor_id,
                     total: 37,
                     weight: 1,
-                })
-            },
-            "successor to retract restored total 30 and publish continued total 37",
-        )
-        .await;
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            panic!(
+                "successor did not retract restored total 30 and publish continued total 37; observations={:?}; polls={}; cursor={}; restoring={}; intake_fenced={}; state={:?}; fault={:?}",
+                harness.sink_state.observations(),
+                survivor_source_state.polls(),
+                survivor_source_state.last_checkpoint_cursor(),
+                survivor_registry.is_restoring(0),
+                survivor_db.cluster_intake_fenced(),
+                survivor_db.pipeline_state(),
+                survivor_db.last_fault(),
+            );
+        }
 
         let post_recovery = survivor_db
             .checkpoint()
@@ -664,23 +858,54 @@ mod rebalance {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn snapshot_watcher_adopts_direct_rotation() {
         let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
+        harness
+            .bootstrap_catalog(&[
+                super::cluster_harness::TEST_SOURCE_DDL,
+                "CREATE STREAM totals AS SELECT SUM(value) AS total FROM src EMIT CHANGES",
+                super::cluster_harness::TEST_AGGREGATE_SINK_DDL,
+            ])
+            .await
+            .expect("bootstrap cluster catalog");
         harness.start_all().await;
 
-        let store: Arc<AssignmentSnapshotStore> =
-            Arc::clone(&harness.nodes[0].assignment_snapshot_store);
-        let seed = store.load().await.unwrap().unwrap();
+        let old_owner = harness.nodes[0].vnode_registry.owner(0);
+        let target_owner = harness
+            .nodes
+            .iter()
+            .map(|node| node.instance_id)
+            .find(|node| *node != old_owner)
+            .expect("two-node harness has a distinct transfer target");
+        harness.source_log.append(&[(1, 10), (2, 20)]);
+        wait_for(
+            || {
+                harness
+                    .sink_state
+                    .observations()
+                    .contains(&AggregateObservation {
+                        node_id: old_owner,
+                        total: 30,
+                        weight: 1,
+                    })
+            },
+            "predecessor aggregate output",
+        )
+        .await;
 
-        let leader = NodeId(harness.nodes[harness.leader_idx()].instance_id.0);
         let mut vnodes = BTreeMap::new();
         for v in 0..VNODE_COUNT {
-            vnodes.insert(v, leader);
+            vnodes.insert(v, target_owner);
         }
-        let next = seed.next(vnodes).unwrap();
+        let (draining, leader_proof) = begin_planned_rotation(&mut harness, vnodes).await;
+        let cut = harness.nodes[harness.leader_idx()]
+            .db
+            .checkpoint()
+            .await
+            .expect("checkpoint the acknowledged predecessor cut");
+        assert!(cut.success, "pre-rotation checkpoint: {:?}", cut.error);
+        let observations_before_transfer = harness.sink_state.observations();
+        let next = authorize_planned_rotation(&harness, &draining, &leader_proof).await;
         let expected = next.version;
-        assert!(matches!(
-            store.save_if_version(&next, seed.version).await.unwrap(),
-            RotateOutcome::Rotated,
-        ));
+        finalize_planned_rotation(&harness, &draining, &next).await;
 
         wait_for(
             || {
@@ -692,6 +917,83 @@ mod rebalance {
             "every node to adopt the new version",
         )
         .await;
+        wait_for(
+            || {
+                harness
+                    .nodes
+                    .iter()
+                    .find(|node| node.instance_id == target_owner)
+                    .is_some_and(|node| !node.vnode_registry.is_restoring(0))
+            },
+            "transfer target to apply the restored vnode baseline",
+        )
+        .await;
+        assert_eq!(
+            harness.sink_state.observations(),
+            observations_before_transfer,
+            "physical ownership movement must not change the logical stream"
+        );
+
+        harness.source_log.append(&[(3, 7)]);
+        wait_for(
+            || {
+                let observations = harness.sink_state.observations();
+                observations.contains(&AggregateObservation {
+                    node_id: target_owner,
+                    total: 30,
+                    weight: -1,
+                }) && observations.contains(&AggregateObservation {
+                    node_id: target_owner,
+                    total: 37,
+                    weight: 1,
+                })
+            },
+            "transferred aggregate to continue from its restored baseline",
+        )
+        .await;
+        let post_rotation = harness.nodes[harness.leader_idx()]
+            .db
+            .checkpoint()
+            .await
+            .expect("checkpoint after transferred input");
+        assert!(
+            post_rotation.success,
+            "post-rotation checkpoint: {:?}",
+            post_rotation.error
+        );
+        let committed = harness.cluster.nodes[harness.leader_idx()]
+            .controller
+            .checkpoint_authority()
+            .expect("cluster checkpoint authority")
+            .cluster_outcome(post_rotation.epoch)
+            .await
+            .expect("cluster outcome read")
+            .expect("post-rotation checkpoint outcome");
+        assert!(committed.is_commit());
+        assert_eq!(
+            committed
+                .assignment_fence
+                .as_ref()
+                .map(|fence| fence.assignment_version),
+            Some(expected),
+            "post-rotation checkpoint must certify the adopted assignment generation"
+        );
+        assert_eq!(
+            &harness.sink_state.observations()[observations_before_transfer.len()..],
+            &[
+                AggregateObservation {
+                    node_id: target_owner,
+                    total: 30,
+                    weight: -1,
+                },
+                AggregateObservation {
+                    node_id: target_owner,
+                    total: 37,
+                    weight: 1,
+                },
+            ],
+            "the transfer and committed source handoff must produce one logical continuation"
+        );
 
         for node in &harness.nodes {
             let backend_v = node.state_backend.authoritative_version();
@@ -700,9 +1002,21 @@ mod rebalance {
             assert_eq!(backend_v, registry_v);
         }
         assert_eq!(
-            harness.nodes[harness.leader_idx()].owned_vnodes().len(),
+            harness
+                .nodes
+                .iter()
+                .find(|node| node.instance_id == target_owner)
+                .expect("transfer target remains live")
+                .owned_vnodes()
+                .len(),
             VNODE_COUNT as usize,
         );
+        let mut relation = BTreeMap::<i64, i64>::new();
+        for observation in harness.sink_state.observations() {
+            *relation.entry(observation.total).or_default() += observation.weight;
+        }
+        relation.retain(|_, weight| *weight != 0);
+        assert_eq!(relation, BTreeMap::from([(37, 1)]));
 
         harness.shutdown().await;
     }
@@ -722,14 +1036,7 @@ mod rebalance {
         harness.start_all().await;
         // This test drives the durable assignment head directly. Retain the watchers under test
         // and stop the independent placement drivers so they cannot abort the injected drain.
-        for node in &mut harness.nodes {
-            let placement_driver = node
-                .rebalance_tasks
-                .pop()
-                .expect("cluster harness starts one placement driver after each watcher");
-            placement_driver.abort();
-            let _ = placement_driver.await;
-        }
+        stop_placement_drivers(&mut harness).await;
 
         let store: Arc<AssignmentSnapshotStore> =
             Arc::clone(&harness.nodes[0].assignment_snapshot_store);
@@ -853,7 +1160,7 @@ mod rebalance {
             Arc::clone(&harness.nodes[leader_idx].db),
             Arc::clone(&harness.nodes[leader_idx].assignment_snapshot_store),
             Arc::clone(&harness.nodes[leader_idx].vnode_registry),
-            Arc::clone(&harness.nodes[leader_idx].rebalance_shutdown),
+            harness.nodes[leader_idx].rebalance_shutdown.clone(),
             laminar_db::rebalance::RebalanceConfig::test_defaults(),
             Some(Arc::clone(&harness.cluster.nodes[leader_idx].controller)),
         );
@@ -915,8 +1222,7 @@ mod rebalance {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_rotation_picks_single_winner() {
-        let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
-        harness.start_all().await;
+        let harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
 
         let store: Arc<AssignmentSnapshotStore> =
             Arc::clone(&harness.nodes[0].assignment_snapshot_store);
@@ -930,7 +1236,10 @@ mod rebalance {
             a_map.insert(v, leader);
             b_map.insert(v, follower);
         }
-        let (a, b) = (seed.next(a_map).unwrap(), seed.next(b_map).unwrap());
+        let (a, b) = (
+            canonical_successor(&seed, a_map),
+            canonical_successor(&seed, b_map),
+        );
 
         let (ra, rb) = tokio::join!(
             store.save_if_version(&a, seed.version),
@@ -953,24 +1262,12 @@ mod rebalance {
             }
         }
 
-        wait_for(
-            || {
-                harness
-                    .nodes
-                    .iter()
-                    .all(|n| n.vnode_registry.assignment_version() >= stored.version)
-            },
-            "nodes to adopt the CAS winner",
-        )
-        .await;
-
         harness.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn stale_rotation_attempt_rejected_by_cas() {
-        let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
-        harness.start_all().await;
+        let harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
 
         let store: Arc<AssignmentSnapshotStore> =
             Arc::clone(&harness.nodes[0].assignment_snapshot_store);
@@ -993,7 +1290,7 @@ mod rebalance {
         for v in 0..VNODE_COUNT {
             m.insert(v, winner);
         }
-        let next = seed.next(m).unwrap();
+        let next = canonical_successor(&seed, m);
         assert!(matches!(
             store.save_if_version(&next, seed.version).await.unwrap(),
             RotateOutcome::Rotated,
@@ -1003,29 +1300,12 @@ mod rebalance {
         for v in 0..VNODE_COUNT {
             stale_map.insert(v, stale_owner);
         }
-        let stale = seed.next(stale_map).unwrap();
+        let stale = canonical_successor(&seed, stale_map);
         match store.save_if_version(&stale, seed.version).await.unwrap() {
             RotateOutcome::Conflict(current) => assert_eq!(current, next),
             RotateOutcome::Rotated => panic!("stale rotation must not succeed"),
         }
         assert_eq!(store.load().await.unwrap().unwrap(), next);
-
-        wait_for(
-            || {
-                harness.nodes.iter().all(|node| {
-                    node.vnode_registry.assignment_version() == next.version
-                        && (0..VNODE_COUNT).all(|vnode| node.vnode_registry.owner(vnode) == winner)
-                })
-            },
-            "nodes to adopt only the legitimate rotation",
-        )
-        .await;
-        for node in &harness.nodes {
-            assert_eq!(
-                node.vnode_registry.snapshot().as_ref(),
-                vec![winner; VNODE_COUNT as usize]
-            );
-        }
 
         harness.shutdown().await;
     }
@@ -1052,14 +1332,21 @@ mod rebalance {
         let follower_vnodes = harness.nodes[follower_idx].owned_vnodes();
         assert!(!follower_vnodes.is_empty(), "follower must own some vnodes");
 
+        let leader = NodeId(harness.nodes[leader_idx].instance_id.0);
+        let mut target = BTreeMap::new();
+        for vnode in 0..VNODE_COUNT {
+            target.insert(vnode, leader);
+        }
+        let (draining, leader_proof) = begin_planned_rotation(&mut harness, target).await;
+
         let checkpoint = harness.nodes[leader_idx]
             .db
             .checkpoint()
             .await
-            .expect("decision-bound seed checkpoint");
+            .expect("decision-bound handoff checkpoint");
         assert!(
             checkpoint.success,
-            "seed checkpoint failed: {:?}",
+            "handoff checkpoint failed: {:?}",
             checkpoint.error
         );
         let outcome = harness.cluster.nodes[leader_idx]
@@ -1068,8 +1355,8 @@ mod rebalance {
             .expect("cluster checkpoint authority")
             .cluster_outcome(checkpoint.epoch)
             .await
-            .expect("read seed outcome")
-            .expect("seed checkpoint must have a durable outcome");
+            .expect("read handoff outcome")
+            .expect("handoff checkpoint must have a durable outcome");
         assert_eq!(outcome.checkpoint_id, checkpoint.checkpoint_id);
 
         let seed_attempt = CheckpointAttempt::new(checkpoint.epoch, checkpoint.checkpoint_id);
@@ -1077,22 +1364,21 @@ mod rebalance {
             .state_backend
             .checkpoint_seal_inventory(seed_attempt)
             .await
-            .expect("read seed seal")
+            .expect("read handoff seal")
             .expect("decided checkpoint must have an exact seal");
         let all_vnodes: Vec<u32> = (0..VNODE_COUNT).collect();
         assert_eq!(inventory.attempt, seed_attempt);
         assert_eq!(inventory.required_vnodes, all_vnodes);
         assert_eq!(inventory.assignment_fence, outcome.assignment_fence);
 
-        let store: Arc<AssignmentSnapshotStore> =
-            Arc::clone(&harness.nodes[0].assignment_snapshot_store);
-        let seed = store.load().await.unwrap().unwrap();
-        let leader = NodeId(harness.nodes[leader_idx].instance_id.0);
-        let mut m = BTreeMap::new();
-        for v in 0..VNODE_COUNT {
-            m.insert(v, leader);
+        for node in &mut harness.nodes {
+            for watcher in std::mem::take(&mut node.rebalance_tasks) {
+                watcher.abort();
+                let _ = watcher.await;
+            }
         }
-        let rotated = seed.next(m).unwrap();
+        let rotated = authorize_planned_rotation(&harness, &draining, &leader_proof).await;
+        finalize_planned_rotation(&harness, &draining, &rotated).await;
         let adoption = harness.nodes[leader_idx]
             .db
             .adopt_assignment_snapshot(
@@ -1130,20 +1416,24 @@ mod rebalance {
             .expect("bootstrap cluster catalog");
         harness.start_all().await;
 
-        let store: Arc<AssignmentSnapshotStore> =
-            Arc::clone(&harness.nodes[0].assignment_snapshot_store);
-        let seed = store.load().await.unwrap().unwrap();
-
         let leader = NodeId(harness.nodes[harness.leader_idx()].instance_id.0);
         let mut m = BTreeMap::new();
         for v in 0..VNODE_COUNT {
             m.insert(v, leader);
         }
-        let rotated = seed.next(m).unwrap();
-        assert!(matches!(
-            store.save_if_version(&rotated, seed.version).await.unwrap(),
-            RotateOutcome::Rotated,
-        ));
+        let (draining, leader_proof) = begin_planned_rotation(&mut harness, m).await;
+        let handoff = harness.nodes[harness.leader_idx()]
+            .db
+            .checkpoint()
+            .await
+            .expect("checkpoint the acknowledged predecessor cut");
+        assert!(
+            handoff.success,
+            "handoff checkpoint failed: {:?}",
+            handoff.error
+        );
+        let rotated = authorize_planned_rotation(&harness, &draining, &leader_proof).await;
+        finalize_planned_rotation(&harness, &draining, &rotated).await;
 
         wait_for(
             || {
@@ -1168,14 +1458,23 @@ mod rebalance {
         );
 
         let leader_idx = harness.leader_idx();
-        assert!(harness.cluster.nodes[leader_idx]
+        let outcome = harness.cluster.nodes[leader_idx]
             .controller
             .checkpoint_authority()
             .expect("cluster checkpoint authority")
             .cluster_outcome(result.epoch)
             .await
             .expect("cluster outcome read")
-            .is_some_and(|outcome| outcome.is_commit()));
+            .expect("post-rotation checkpoint outcome");
+        assert!(outcome.is_commit());
+        assert_eq!(
+            outcome
+                .assignment_fence
+                .as_ref()
+                .map(|fence| fence.assignment_version),
+            Some(rotated.version),
+            "post-rotation checkpoint must certify the adopted assignment generation",
+        );
 
         harness.shutdown().await;
     }
@@ -1676,7 +1975,15 @@ mod two_pc {
 
         let backend = Arc::new(InProcessBackend::new(4));
         let registry = VnodeRegistry::new(4);
-        registry.set_assignment(vec![NodeId(follower_node.instance_id.0); 4].into());
+        registry.set_assignment(
+            vec![
+                NodeId(leader_node.instance_id.0),
+                NodeId(follower_node.instance_id.0),
+                NodeId(follower_node.instance_id.0),
+                NodeId(follower_node.instance_id.0),
+            ]
+            .into(),
+        );
 
         let decision_store = make_decision_store(harness.shared_state_dir.path());
         let fence = super::test_assignment_fence(&harness.cluster, &registry);
@@ -1742,7 +2049,15 @@ mod two_pc {
 
         let backend = Arc::new(InProcessBackend::new(4));
         let registry = VnodeRegistry::new(4);
-        registry.set_assignment(vec![NodeId(follower_node.instance_id.0); 4].into());
+        registry.set_assignment(
+            vec![
+                NodeId(leader_node.instance_id.0),
+                NodeId(follower_node.instance_id.0),
+                NodeId(follower_node.instance_id.0),
+                NodeId(follower_node.instance_id.0),
+            ]
+            .into(),
+        );
 
         let decision_store = make_decision_store(harness.shared_state_dir.path());
         let fence = super::test_assignment_fence(&harness.cluster, &registry);

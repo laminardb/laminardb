@@ -2,7 +2,7 @@
 
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use std::{future::Future as _, future::IntoFuture as _, task::Poll};
@@ -32,9 +32,9 @@ use crate::server::ServerError;
 #[derive(Clone)]
 pub struct ClusterComponents {
     /// Leader-election / membership controller.
-    pub controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
+    pub controller: Arc<laminar_core::cluster::control::ClusterController>,
     /// Durable vnode-assignment snapshot store.
-    pub snapshot_store: Option<Arc<laminar_core::cluster::control::AssignmentSnapshotStore>>,
+    pub snapshot_store: Arc<laminar_core::cluster::control::AssignmentSnapshotStore>,
     /// Live cluster membership feed.
     pub membership_rx:
         tokio::sync::watch::Receiver<Vec<laminar_core::cluster::discovery::NodeInfo>>,
@@ -48,21 +48,152 @@ pub struct AppState {
     pub registry: Arc<Registry>,
     pub server_metrics: ServerMetrics,
     pub(crate) ws_slots: Arc<tokio::sync::Semaphore>,
-    pub(crate) startup_ready: AtomicBool,
+    pub(crate) serving_gate: Arc<ServingGate>,
     /// Cluster control-plane handles (cluster mode only). `None` in
     /// single-node mode; the cluster endpoints 404 when absent.
     #[cfg(feature = "cluster")]
     pub cluster: Option<ClusterComponents>,
 }
 
-impl AppState {
-    /// Open the one-way startup gate after the runtime has established serving authority.
-    pub(crate) fn open_startup_gate(&self) {
-        self.startup_ready.store(true, Ordering::Release);
+const SERVING_STARTING: u8 = 0;
+const SERVING_READY: u8 = 1;
+const SERVING_FENCED: u8 = 2;
+
+/// One-way serving authority shared by startup and the terminal cluster lease fence.
+pub(crate) struct ServingGate {
+    state: AtomicU8,
+    fenced: tokio::sync::Notify,
+    #[cfg(feature = "cluster")]
+    process_deadline: std::sync::OnceLock<Arc<laminar_core::cluster::control::LeaseDeadline>>,
+    #[cfg(feature = "cluster")]
+    deadline_watcher: parking_lot::Mutex<Option<tokio::task::AbortHandle>>,
+}
+
+impl ServingGate {
+    pub(crate) fn starting() -> Self {
+        Self {
+            state: AtomicU8::new(SERVING_STARTING),
+            fenced: tokio::sync::Notify::new(),
+            #[cfg(feature = "cluster")]
+            process_deadline: std::sync::OnceLock::new(),
+            #[cfg(feature = "cluster")]
+            deadline_watcher: parking_lot::Mutex::new(None),
+        }
     }
 
-    fn startup_gate_is_open(&self) -> bool {
-        self.startup_ready.load(Ordering::Acquire)
+    /// Open serving after startup. A terminal fence can never be reopened.
+    pub(crate) fn open(&self) -> bool {
+        match self.state.compare_exchange(
+            SERVING_STARTING,
+            SERVING_READY,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(SERVING_READY) => true,
+            Err(SERVING_FENCED) => false,
+            Err(_) => unreachable!("serving gate contains an invalid state"),
+        }
+    }
+
+    /// Permanently revoke serving authority.
+    pub(crate) fn fence(&self) {
+        self.state.store(SERVING_FENCED, Ordering::Release);
+        self.fenced.notify_waiters();
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) fn install_process_lease_deadline(
+        self: &Arc<Self>,
+        deadline: Arc<laminar_core::cluster::control::LeaseDeadline>,
+    ) -> Result<(), &'static str> {
+        if !deadline.is_live() {
+            self.fence();
+            return Err("HTTP process lease is already expired");
+        }
+        let mut watcher_slot = self.deadline_watcher.lock();
+        if let Some(current) = self.process_deadline.get() {
+            return if Arc::ptr_eq(current, &deadline) {
+                Ok(())
+            } else {
+                Err("HTTP process lease deadline is already installed")
+            };
+        }
+        self.process_deadline
+            .set(Arc::clone(&deadline))
+            .map_err(|_| "HTTP process lease deadline is already installed")?;
+        let gate = Arc::downgrade(self);
+        let watcher = tokio::spawn(async move {
+            deadline.wait_until_expired().await;
+            if let Some(gate) = gate.upgrade() {
+                gate.fence();
+            }
+        });
+        *watcher_slot = Some(watcher.abort_handle());
+        Ok(())
+    }
+
+    async fn wait_fenced(&self) {
+        loop {
+            let fenced = self.fenced.notified();
+            tokio::pin!(fenced);
+            fenced.as_mut().enable();
+            if self.state.load(Ordering::Acquire) == SERVING_FENCED {
+                return;
+            }
+            fenced.await;
+        }
+    }
+
+    pub(crate) fn rejection_message(&self) -> Option<&'static str> {
+        match self.state.load(Ordering::Acquire) {
+            SERVING_STARTING => Some("server startup is not complete"),
+            SERVING_READY => None,
+            SERVING_FENCED => Some("server serving authority is fenced"),
+            _ => unreachable!("serving gate contains an invalid state"),
+        }
+    }
+}
+
+impl AppState {
+    /// Open the startup gate after the runtime has established serving authority.
+    pub(crate) fn open_startup_gate(&self) -> bool {
+        self.serving_gate.open()
+    }
+
+    fn serving_rejection(&self) -> Option<&'static str> {
+        if let Some(reason) = self.serving_gate.rejection_message() {
+            return Some(reason);
+        }
+        #[cfg(feature = "cluster")]
+        if self
+            .cluster
+            .as_ref()
+            .is_some_and(|cluster| !cluster.controller.process_lease_is_live())
+        {
+            return Some("server process lease is no longer live");
+        }
+        None
+    }
+
+    async fn wait_for_serving_fence(&self) {
+        #[cfg(feature = "cluster")]
+        if let Some(cluster) = self.cluster.as_ref() {
+            tokio::select! {
+                biased;
+                () = cluster.controller.wait_for_process_lease_loss() => return,
+                () = self.serving_gate.wait_fenced() => return,
+            }
+        }
+        self.serving_gate.wait_fenced().await;
+    }
+}
+
+impl Drop for ServingGate {
+    fn drop(&mut self) {
+        #[cfg(feature = "cluster")]
+        if let Some(watcher) = self.deadline_watcher.get_mut().take() {
+            watcher.abort();
+        }
     }
 }
 
@@ -126,12 +257,10 @@ async fn startup_gate_middleware(
 ) -> axum::response::Response {
     let path = req.uri().path();
     let startup_probe = matches!(path, "/health" | "/ready" | "/metrics");
-    if !startup_probe && !state.startup_gate_is_open() {
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "server startup is not complete",
-        )
-        .into_response();
+    if !startup_probe {
+        if let Some(reason) = state.serving_rejection() {
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, reason).into_response();
+        }
     }
     next.run(req).await
 }
@@ -398,12 +527,8 @@ async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 async fn readiness_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    if !state.startup_gate_is_open() {
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "server startup is not complete",
-        )
-        .into_response();
+    if let Some(reason) = state.serving_rejection() {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, reason).into_response();
     }
     let pipeline_state = state.db.pipeline_state();
     if pipeline_state == "Running" {
@@ -763,12 +888,12 @@ async fn fan_out_pipeline_control(state: &AppState, local: bool, path: &str) {
         let Some(cluster) = state.cluster.as_ref() else {
             return;
         };
-        let self_id = cluster.controller.as_ref().map(|c| c.instance_id());
+        let self_id = cluster.controller.instance_id();
         let peers: Vec<String> = cluster
             .membership_rx
             .borrow()
             .iter()
-            .filter(|m| self_id != Some(m.id))
+            .filter(|m| self_id != m.id)
             .map(|m| m.rpc_address.clone())
             .collect();
         let token = state.current_config.read().server.console_token.clone();
@@ -926,29 +1051,29 @@ async fn cluster_nodes(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     }
 }
 
-/// `GET /api/v1/cluster/vnodes` — the latest vnode→instance assignment
-/// snapshot (or an empty snapshot when none has been written yet).
+/// `GET /api/v1/cluster/vnodes` — the latest vnode-to-instance assignment snapshot.
 async fn cluster_vnodes(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     #[cfg(feature = "cluster")]
     {
-        use laminar_core::cluster::control::AssignmentSnapshot;
-
         let Some(cluster) = state.cluster.as_ref() else {
             return error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response();
         };
-        let snapshot = match &cluster.snapshot_store {
-            Some(store) => match store.load().await {
-                Ok(Some(snap)) => snap,
-                Ok(None) => AssignmentSnapshot::empty(),
-                Err(e) => {
-                    return error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("failed to load assignment snapshot: {e}"),
-                    )
-                    .into_response();
-                }
-            },
-            None => AssignmentSnapshot::empty(),
+        let snapshot = match cluster.snapshot_store.load().await {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "durable assignment snapshot is missing",
+                )
+                .into_response();
+            }
+            Err(error) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to load assignment snapshot: {error}"),
+                )
+                .into_response();
+            }
         };
         Json(snapshot).into_response()
     }
@@ -973,10 +1098,8 @@ async fn cluster_leader(State(state): State<Arc<AppState>>) -> impl IntoResponse
         let Some(cluster) = state.cluster.as_ref() else {
             return error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response();
         };
-        let (leader_id, is_leader) = match &cluster.controller {
-            Some(controller) => (controller.current_leader(), controller.is_leader()),
-            None => (None, false),
-        };
+        let leader_id = cluster.controller.current_leader();
+        let is_leader = cluster.controller.is_leader();
         let leader = leader_id.and_then(|id| {
             cluster
                 .membership_rx
@@ -1238,11 +1361,17 @@ fn next_ws_data_frame(
     Ok(Some(frame))
 }
 
-async fn ws_send(socket: &mut WebSocket, message: Message) -> bool {
-    matches!(
-        tokio::time::timeout(WS_WRITE_TIMEOUT, socket.send(message)).await,
-        Ok(Ok(()))
-    )
+async fn ws_send(socket: &mut WebSocket, message: Message, state: &AppState) -> bool {
+    if state.serving_rejection().is_some() {
+        return false;
+    }
+    tokio::select! {
+        biased;
+        () = state.wait_for_serving_fence() => false,
+        result = tokio::time::timeout(WS_WRITE_TIMEOUT, socket.send(message)) => {
+            matches!(result, Ok(Ok(())))
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1298,6 +1427,9 @@ async fn ws_upgrade(
             .into_response();
         }
     };
+    if let Some(reason) = state.serving_rejection() {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, reason).into_response();
+    }
 
     let st = Arc::clone(&state);
     ws.max_message_size(MAX_WS_INBOUND_BYTES)
@@ -1305,7 +1437,7 @@ async fn ws_upgrade(
         .on_upgrade(move |socket| async move {
             let _slot = slot;
             st.server_metrics.ws_connections.inc();
-            ws_client(socket, portal, name).await;
+            ws_client(socket, portal, name, Arc::clone(&st)).await;
             st.server_metrics.ws_connections.dec();
         })
         .into_response()
@@ -1315,6 +1447,7 @@ async fn ws_client(
     mut socket: WebSocket,
     mut portal: laminar_db::subscription::SubscriptionPortal,
     name: String,
+    state: Arc<AppState>,
 ) {
     let mut heartbeat = tokio::time::interval(WS_HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1323,6 +1456,8 @@ async fn ws_client(
 
     'subscription: loop {
         tokio::select! {
+            biased;
+            () = state.wait_for_serving_fence() => break,
             frame = portal.next_frame() => {
                 match frame {
                     Some(laminar_db::subscription::PortalFrame::Batch {
@@ -1351,7 +1486,11 @@ async fn ws_client(
                                         "one subscription row exceeds the WebSocket frame limit",
                                         seq,
                                     );
-                                    let _ = ws_send(&mut socket, Message::Text(out.into())).await;
+                                    let _ = ws_send(
+                                        &mut socket,
+                                        Message::Text(out.into()),
+                                        &state,
+                                    ).await;
                                     break 'subscription;
                                 }
                                 Err(WsFrameBuildError::Serialization(error)) => {
@@ -1363,11 +1502,19 @@ async fn ws_client(
                                         &message,
                                         seq,
                                     );
-                                    let _ = ws_send(&mut socket, Message::Text(out.into())).await;
+                                    let _ = ws_send(
+                                        &mut socket,
+                                        Message::Text(out.into()),
+                                        &state,
+                                    ).await;
                                     break 'subscription;
                                 }
                             };
-                            if !ws_send(&mut socket, Message::Text(out.into())).await {
+                            if !ws_send(
+                                &mut socket,
+                                Message::Text(out.into()),
+                                &state,
+                            ).await {
                                 break 'subscription;
                             }
                             let Some(next) = seq.checked_add(1) else {
@@ -1390,7 +1537,11 @@ async fn ws_client(
                             through_sequence,
                             seq,
                         );
-                        if !ws_send(&mut socket, Message::Text(out.into())).await {
+                        if !ws_send(
+                            &mut socket,
+                            Message::Text(out.into()),
+                            &state,
+                        ).await {
                             break;
                         }
                         let Some(next) = seq.checked_add(1) else {
@@ -1401,13 +1552,21 @@ async fn ws_client(
                     Some(laminar_db::subscription::PortalFrame::Lagged(n)) => {
                         warn!(stream = %name, skipped = n, "WS client fell behind, disconnecting");
                         let out = ws_gap_json(&name, n, seq);
-                        let _ = ws_send(&mut socket, Message::Text(out.into())).await;
+                        let _ = ws_send(
+                            &mut socket,
+                            Message::Text(out.into()),
+                            &state,
+                        ).await;
                         break;
                     }
                     Some(laminar_db::subscription::PortalFrame::Error { message }) => {
                         warn!(stream = %name, error = %message, "WS subscription failed, disconnecting");
                         let out = ws_error_json(&name, "subscription_failed", &message, seq);
-                        let _ = ws_send(&mut socket, Message::Text(out.into())).await;
+                        let _ = ws_send(
+                            &mut socket,
+                            Message::Text(out.into()),
+                            &state,
+                        ).await;
                         break;
                     }
                     None => break, // disconnected
@@ -1417,7 +1576,11 @@ async fn ws_client(
                 if !pong_deadline.before_ping() {
                     break;
                 }
-                if !ws_send(&mut socket, Message::Ping(bytes::Bytes::new())).await {
+                if !ws_send(
+                    &mut socket,
+                    Message::Ping(bytes::Bytes::new()),
+                    &state,
+                ).await {
                     break;
                 }
             }
@@ -1427,7 +1590,9 @@ async fn ws_client(
                 match msg {
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(Message::Ping(data))) => {
-                        if !ws_send(&mut socket, Message::Pong(data)).await { break; }
+                        if !ws_send(&mut socket, Message::Pong(data), &state).await {
+                            break;
+                        }
                     }
                     Some(Ok(Message::Pong(_))) => pong_deadline.on_pong(),
                     Some(Ok(Message::Text(_) | Message::Binary(_))) => {
@@ -1437,7 +1602,11 @@ async fn ws_client(
                             "subscription WebSocket accepts control frames only",
                             seq,
                         );
-                        let _ = ws_send(&mut socket, Message::Text(out.into())).await;
+                        let _ = ws_send(
+                            &mut socket,
+                            Message::Text(out.into()),
+                            &state,
+                        ).await;
                         break;
                     }
                     Some(Err(error)) => {
@@ -1448,7 +1617,9 @@ async fn ws_client(
             }
         }
     }
-    let _ = ws_send(&mut socket, Message::Close(None)).await;
+    if state.serving_rejection().is_none() {
+        let _ = ws_send(&mut socket, Message::Close(None), &state).await;
+    }
 }
 
 const EXACT_DISPLAY_OPTIONS: arrow_cast::display::FormatOptions<'static> =
@@ -1623,7 +1794,16 @@ mod tests {
         assert_eq!((rows(&b), t), (5, true));
     }
 
-    fn test_state_with_db(db: Arc<LaminarDB>) -> Arc<AppState> {
+    fn ready_serving_gate() -> Arc<ServingGate> {
+        let gate = Arc::new(ServingGate::starting());
+        assert!(gate.open());
+        gate
+    }
+
+    fn test_state_with_db_and_gate(
+        db: Arc<LaminarDB>,
+        serving_gate: Arc<ServingGate>,
+    ) -> Arc<AppState> {
         let registry = Arc::new(crate::metrics::build_registry([
             ("instance".into(), "test".into()),
             ("pipeline".into(), "test".into()),
@@ -1654,10 +1834,18 @@ mod tests {
             registry,
             server_metrics,
             ws_slots: ws_connection_slots(),
-            startup_ready: AtomicBool::new(true),
+            serving_gate,
             #[cfg(feature = "cluster")]
             cluster: None,
         })
+    }
+
+    fn test_state_with_db(db: Arc<LaminarDB>) -> Arc<AppState> {
+        test_state_with_db_and_gate(db, ready_serving_gate())
+    }
+
+    fn test_state_with_gate(serving_gate: Arc<ServingGate>) -> Arc<AppState> {
+        test_state_with_db_and_gate(LaminarDB::open().unwrap(), serving_gate)
     }
 
     fn test_state() -> Arc<AppState> {
@@ -1666,7 +1854,10 @@ mod tests {
 
     /// Like [`test_state`] but with a console bearer token configured, so the
     /// auth middleware is active on protected routes.
-    fn test_state_with_token(token: &str) -> Arc<AppState> {
+    fn test_state_with_token_and_gate(
+        token: &str,
+        serving_gate: Arc<ServingGate>,
+    ) -> Arc<AppState> {
         let registry = Arc::new(crate::metrics::build_registry([
             ("instance".into(), "test".into()),
             ("pipeline".into(), "test".into()),
@@ -1701,10 +1892,43 @@ mod tests {
             registry,
             server_metrics,
             ws_slots: ws_connection_slots(),
-            startup_ready: AtomicBool::new(true),
+            serving_gate,
             #[cfg(feature = "cluster")]
             cluster: None,
         })
+    }
+
+    fn test_state_with_token(token: &str) -> Arc<AppState> {
+        test_state_with_token_and_gate(token, ready_serving_gate())
+    }
+
+    #[test]
+    fn terminal_serving_fence_wins_a_concurrent_startup_open() {
+        for _ in 0..64 {
+            let gate = Arc::new(ServingGate::starting());
+            let barrier = Arc::new(std::sync::Barrier::new(3));
+            std::thread::scope(|scope| {
+                let opener_gate = Arc::clone(&gate);
+                let opener_barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    opener_barrier.wait();
+                    opener_gate.open();
+                });
+                let fencer_gate = Arc::clone(&gate);
+                let fencer_barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    fencer_barrier.wait();
+                    fencer_gate.fence();
+                });
+                barrier.wait();
+            });
+
+            assert_eq!(
+                gate.rejection_message(),
+                Some("server serving authority is fenced")
+            );
+            assert!(!gate.open(), "a terminal fence must be irreversible");
+        }
     }
 
     #[tokio::test]
@@ -1798,13 +2022,12 @@ mod tests {
 
     #[tokio::test]
     async fn startup_gate_preserves_probes_and_rejects_every_other_route() {
-        let state = test_state();
+        let state = test_state_with_gate(Arc::new(ServingGate::starting()));
         state
             .current_config
             .write()
             .server
             .console_cors_allowed_origins = Some(vec!["https://console.example".into()]);
-        state.startup_ready.store(false, Ordering::Release);
         let app = build_router(state);
 
         for path in ["/health", "/metrics"] {
@@ -1862,8 +2085,8 @@ mod tests {
 
     #[tokio::test]
     async fn startup_gate_completes_closed_requests_instead_of_replaying_them() {
-        let state = test_state_with_token("supersecret-token");
-        state.startup_ready.store(false, Ordering::Release);
+        let state =
+            test_state_with_token_and_gate("supersecret-token", Arc::new(ServingGate::starting()));
         let app = build_router(Arc::clone(&state));
         let request = || {
             Request::builder()
@@ -1881,10 +2104,127 @@ mod tests {
         .unwrap();
         assert_eq!(closed.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-        state.open_startup_gate();
+        assert!(state.open_startup_gate());
         assert_eq!(closed.status(), StatusCode::SERVICE_UNAVAILABLE);
         let after_open = app.oneshot(request()).await.unwrap();
         assert_eq!(after_open.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn terminal_serving_fence_keeps_liveness_public_and_rejects_serving() {
+        let gate = ready_serving_gate();
+        let state = test_state_with_gate(Arc::clone(&gate));
+        gate.fence();
+        assert!(!state.open_startup_gate());
+        let app = build_router(state);
+
+        for path in ["/health", "/metrics"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "public path {path}");
+        }
+
+        for path in ["/ready", "/api/v1/sources"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&body).contains("server serving authority is fenced"),
+                "terminal rejection for {path}: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn expired_process_deadline_rejects_serving_before_async_gate_fence() {
+        use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+
+        let node = laminar_core::cluster::discovery::NodeId(41);
+        let control: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
+        let assignment_store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let snapshot_store = Arc::new(
+            laminar_core::cluster::control::AssignmentSnapshotStore::new(assignment_store),
+        );
+        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(
+            node,
+            control,
+            Some(Arc::clone(&snapshot_store)),
+            members_rx.clone(),
+        ));
+        controller
+            .set_process_lease_deadline(Arc::new(
+                laminar_core::cluster::control::LeaseDeadline::fenced(),
+            ))
+            .unwrap();
+
+        let mut state = test_state_with_gate(ready_serving_gate());
+        Arc::get_mut(&mut state).unwrap().cluster = Some(ClusterComponents {
+            controller,
+            snapshot_store,
+            membership_rx: members_rx,
+        });
+        let app = build_router(state);
+
+        for path in ["/ready", "/api/v1/sources"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&body).contains("server process lease is no longer live"),
+                "deadline rejection for {path}: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn process_deadline_loss_wakes_the_serving_gate() {
+        use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+
+        let gate = Arc::new(ServingGate::starting());
+        assert!(gate.open());
+        let deadline = Arc::new(laminar_core::cluster::control::LeaseDeadline::live_for(
+            std::time::Duration::from_secs(60),
+        ));
+        let node = laminar_core::cluster::discovery::NodeId(42);
+        let control: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
+        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
+        let controller = ClusterController::new(node, control, None, members_rx);
+        controller
+            .set_process_lease_deadline(Arc::clone(&deadline))
+            .unwrap();
+        gate.install_process_lease_deadline(Arc::clone(&deadline))
+            .unwrap();
+
+        controller.fence_process_lease();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), gate.wait_fenced())
+            .await
+            .expect("process lease loss did not wake HTTP/WS serving authority");
+        assert_eq!(
+            gate.rejection_message(),
+            Some("server serving authority is fenced")
+        );
     }
 
     async fn tcp_get(addr: std::net::SocketAddr, path: &str) -> String {
@@ -1905,8 +2245,7 @@ mod tests {
 
     #[tokio::test]
     async fn live_listener_rejects_closed_gate_then_serves_after_open() {
-        let state = test_state();
-        state.startup_ready.store(false, Ordering::Release);
+        let state = test_state_with_gate(Arc::new(ServingGate::starting()));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (server, started) = serve_listener(build_router(Arc::clone(&state)), listener);
@@ -1927,7 +2266,7 @@ mod tests {
         );
         assert!(closed.contains("server startup is not complete"));
 
-        state.open_startup_gate();
+        assert!(state.open_startup_gate());
         let open = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             tcp_get(addr, "/api/v1/sources"),
@@ -2215,7 +2554,7 @@ mod tests {
             registry,
             server_metrics,
             ws_slots: ws_connection_slots(),
-            startup_ready: AtomicBool::new(true),
+            serving_gate: ready_serving_gate(),
             #[cfg(feature = "cluster")]
             cluster: None,
         });
@@ -2846,6 +3185,50 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn test_cluster_vnodes_fails_when_durable_snapshot_is_missing() {
+        use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+
+        let node = laminar_core::cluster::discovery::NodeId(51);
+        let control: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
+        let assignment_store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let snapshot_store = Arc::new(
+            laminar_core::cluster::control::AssignmentSnapshotStore::new(assignment_store),
+        );
+        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(
+            node,
+            control,
+            Some(Arc::clone(&snapshot_store)),
+            members_rx.clone(),
+        ));
+        let mut state = test_state();
+        Arc::get_mut(&mut state).unwrap().cluster = Some(ClusterComponents {
+            controller,
+            snapshot_store,
+            membership_rx: members_rx,
+        });
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/cluster/vnodes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("durable assignment snapshot is missing"));
     }
 
     #[tokio::test]

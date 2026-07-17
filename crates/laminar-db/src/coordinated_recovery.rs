@@ -2170,6 +2170,12 @@ mod tests {
         }
     }
 
+    fn install_test_process_deadline(controller: &ClusterController) {
+        controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+            .unwrap();
+    }
+
     async fn controller(
         peers: Vec<NodeInfo>,
     ) -> (
@@ -2190,12 +2196,12 @@ mod tests {
             boot: controller.recovery_incarnation(),
             process_term: 1,
         };
-        let LeaseOutcome::Acquired(lease) = authority.try_acquire(&owner, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap()
+        else {
             panic!("empty recovery test authority must grant leadership");
         };
         let (_lease_tx, lease_rx) = watch::channel(Some(lease));
-        controller
-            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))));
+        install_test_process_deadline(&controller);
         controller
             .set_leader_lease_watch(
                 lease_rx,
@@ -2300,6 +2306,7 @@ mod tests {
             None,
             members_rx,
         ));
+        install_test_process_deadline(&controller);
         assert!(!controller.is_leader());
 
         let db = LaminarDB::builder()
@@ -2489,6 +2496,7 @@ mod tests {
             None,
             members_rx,
         ));
+        install_test_process_deadline(&controller);
         let fence = CheckpointAssignmentFence::from_owner_map(
             7,
             &[1],
@@ -2510,7 +2518,7 @@ mod tests {
             process_term: 1,
         };
         let LeaseOutcome::Acquired(driver_lease) =
-            authority.try_acquire(&driver_owner, 0).await.unwrap()
+            authority.begin_new_term(&driver_owner, 0).await.unwrap()
         else {
             panic!("empty recovery test authority must grant the remote leader");
         };
@@ -2527,8 +2535,7 @@ mod tests {
         ));
         driver.publish_recovery_incarnation().await.unwrap();
         let (_driver_lease_tx, driver_lease_rx) = watch::channel(Some(driver_lease.clone()));
-        driver
-            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))));
+        install_test_process_deadline(&driver);
         driver
             .set_leader_lease_watch(
                 driver_lease_rx,
@@ -2656,6 +2663,7 @@ mod tests {
         let controller = Arc::new(ClusterController::new_with_recovery_kv(
             self_id, fast, durable, None, members_rx,
         ));
+        install_test_process_deadline(&controller);
         let db = LaminarDB::builder()
             .cluster_controller(Arc::clone(&controller))
             .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
@@ -2887,7 +2895,7 @@ mod tests {
 
     #[tokio::test]
     async fn shuffle_cutoff_failure_never_publishes_release_readiness() {
-        use laminar_core::shuffle::ShuffleReceiver;
+        use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
         use laminar_core::state::{InProcessBackend, NodeId as StateNodeId, VnodeRegistry};
 
         let (controller, _members_tx, kv) = controller(Vec::new()).await;
@@ -2921,6 +2929,10 @@ mod tests {
             .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
             .state_backend(Arc::new(InProcessBackend::new(1)))
             .vnode_registry(registry)
+            .shuffle_sender(Arc::new(ShuffleSender::new(
+                controller.instance_id().0,
+                controller.recovery_incarnation(),
+            )))
             .shuffle_receiver(receiver)
             .build()
             .await

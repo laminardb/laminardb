@@ -2358,54 +2358,13 @@ impl IncrementalAggState {
         self.delta_chain_len.clear();
     }
 
-    /// Force the groups of a rebalance-ACQUIRED vnode to re-emit once. `merge_groups` restored their
-    /// `last_emitted`, so a changelog gainer's first emit would be suppressed (`current == restored`)
-    /// and the group would be absent from every node's MV until it received new input — the loser
-    /// already retracted it (CL-4). Dropping `last_emitted` for this vnode's groups and re-marking
-    /// them dirty makes the next emit take the insert path (the loser's retract + gainer's insert net
-    /// to the group present once). No-op for full-snapshot (non-changelog) MVs, which re-emit their
-    /// whole state each cycle. Call ONLY for a genuine acquire, not a same-cycle reacquire.
+    /// Drop in-memory state for revoked (lost) vnodes. Ownership movement is a physical state
+    /// transition, not a logical relation change, so it must not emit changelog rows. Purging
+    /// prevents stale keys absent from a later FULL image from surviving a re-acquire.
     #[cfg(feature = "cluster")]
-    pub(crate) fn force_reemit_acquired_vnode(&mut self, vnode: u32, vnode_count: u32) {
-        if !self.emit_changelog {
-            return;
-        }
-        let global = self.num_group_cols == 0;
-        let vnode_of = |k: &arrow::row::OwnedRow| -> u32 {
-            if global {
-                0
-            } else {
-                #[allow(clippy::cast_possible_truncation)]
-                {
-                    (laminar_core::state::key_hash(k.as_ref()) % u64::from(vnode_count)) as u32
-                }
-            }
-        };
-        let keys: Vec<arrow::row::OwnedRow> = self
-            .last_emitted
-            .keys()
-            .filter(|k| vnode_of(k) == vnode)
-            .cloned()
-            .collect();
-        for k in keys {
-            self.remove_last_emitted(&k);
-            self.mark_emit_dirty(k);
-        }
-    }
-
-    /// Drop in-memory state for revoked (lost) vnodes and return per-vnode `-1`-weight retraction
-    /// batches (from `last_emitted` before the purge) so the losing node's MV snapshot drops the
-    /// moved groups (empty unless changelog). Purging also prevents stale keys absent from a later
-    /// FULL image from surviving a re-acquire. Runs on the compute thread; revoked and acquired
-    /// sets are disjoint per rotation, so it never races an acquire-apply.
-    #[cfg(feature = "cluster")]
-    pub(crate) fn drop_vnodes(
-        &mut self,
-        revoked: &rustc_hash::FxHashSet<u32>,
-        vnode_count: u32,
-    ) -> Result<ahash::AHashMap<u32, RecordBatch>, DbError> {
+    pub(crate) fn drop_vnodes(&mut self, revoked: &rustc_hash::FxHashSet<u32>, vnode_count: u32) {
         if revoked.is_empty() {
-            return Ok(ahash::AHashMap::new());
+            return;
         }
         let global = self.num_group_cols == 0;
         let vnode_of = |k: &arrow::row::OwnedRow| -> u32 {
@@ -2420,37 +2379,6 @@ impl IncrementalAggState {
         };
         let in_revoked = |k: &arrow::row::OwnedRow| -> bool { revoked.contains(&vnode_of(k)) };
 
-        // Build the retractions BEFORE purging, one batch per revoked vnode (keyed so a same-cycle
-        // reacquire can cancel its own vnode's retraction — see `apply_vnode_chain`).
-        let mut retractions: ahash::AHashMap<u32, RecordBatch> = ahash::AHashMap::new();
-        if self.emit_changelog {
-            let mut by_vnode: ahash::AHashMap<
-                u32,
-                (Vec<arrow::row::OwnedRow>, Vec<Vec<ScalarValue>>),
-            > = ahash::AHashMap::new();
-            for (k, vals) in &self.last_emitted {
-                let v = vnode_of(k);
-                if revoked.contains(&v) {
-                    let e = by_vnode.entry(v).or_default();
-                    e.0.push(k.clone());
-                    e.1.push(vals.clone());
-                }
-            }
-            for (v, (keys, vals)) in by_vnode {
-                let weights = vec![-1i64; keys.len()];
-                let batch = build_weighted_batch(
-                    &keys,
-                    &vals,
-                    &weights,
-                    &self.row_converter,
-                    self.num_group_cols,
-                    &self.agg_specs,
-                    &self.output_schema,
-                )?;
-                retractions.insert(v, batch);
-            }
-        }
-
         self.groups.retain(|k, _| !in_revoked(k));
         self.last_emitted.retain(|k, _| !in_revoked(k));
         self.dirty_keys.retain(|k| !in_revoked(k));
@@ -2459,7 +2387,6 @@ impl IncrementalAggState {
             self.last_emitted_dirty_by_vnode.remove(v);
             self.delta_chain_len.remove(v);
         }
-        Ok(retractions)
     }
 }
 
@@ -3603,81 +3530,6 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[tokio::test]
-    async fn force_reemit_acquired_vnode_materializes_gained_group() {
-        // A rebalance gainer rehydrates a group whose value equals its restored last_emitted, so the
-        // changelog emit gate suppresses it — the group would be absent from every node's MV until it
-        // received new input. force_reemit_acquired_vnode must make the gainer emit it once (CL-4).
-        async fn changelog_sum_state() -> IncrementalAggState {
-            let ctx = laminar_sql::create_session_context();
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("name", DataType::Utf8, false),
-                Field::new("value", DataType::Float64, false),
-            ]));
-            let dummy = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(arrow::array::StringArray::from(vec!["x"])),
-                    Arc::new(arrow::array::Float64Array::from(vec![0.0])),
-                ],
-            )
-            .unwrap();
-            let mem =
-                datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
-                    .unwrap();
-            ctx.register_table("events", Arc::new(mem)).unwrap();
-            IncrementalAggState::try_from_sql(
-                &ctx,
-                "SELECT name, SUM(value) as total FROM events GROUP BY name",
-                true,
-            )
-            .await
-            .unwrap()
-            .unwrap()
-        }
-        let pre_agg = Arc::new(Schema::new(vec![
-            Field::new("name", DataType::Utf8, true),
-            Field::new("__agg_input_1", DataType::Float64, true),
-        ]));
-        let batch = RecordBatch::try_new(
-            pre_agg,
-            vec![
-                Arc::new(arrow::array::StringArray::from(vec!["a"])),
-                Arc::new(arrow::array::Float64Array::from(vec![10.0])),
-            ],
-        )
-        .unwrap();
-
-        // Source node computes group "a" = 10 and checkpoints it.
-        let mut source = changelog_sum_state().await;
-        source.process_batch(&batch, 1000).unwrap();
-        let _ = source.emit().unwrap();
-        let cp = source.checkpoint_groups().unwrap();
-
-        // Fresh gainer rehydrates a's state; its restored last_emitted == current, so the emit gate
-        // suppresses it.
-        let mut gainer = changelog_sum_state().await;
-        gainer.merge_groups(&cp).unwrap();
-        let suppressed = gainer.emit().unwrap();
-        assert_eq!(
-            suppressed.iter().map(RecordBatch::num_rows).sum::<usize>(),
-            0,
-            "restored last_emitted suppresses the gained group"
-        );
-
-        // force_reemit drops last_emitted for the vnode's groups so the gainer emits them once.
-        for v in 0..16 {
-            gainer.force_reemit_acquired_vnode(v, 16);
-        }
-        let reemit = gainer.emit().unwrap();
-        assert_eq!(
-            reemit.iter().map(RecordBatch::num_rows).sum::<usize>(),
-            1,
-            "force_reemit_acquired_vnode must materialize the gained group"
-        );
-    }
-
-    #[cfg(feature = "cluster")]
-    #[tokio::test]
     async fn delta_tracking_records_dirty_keys_per_vnode_and_resets_on_capture() {
         const VNODES: u32 = 4;
         let (_, mut state) =
@@ -4260,17 +4112,7 @@ mod tests {
 
         // Revoke vy.
         let revoked: rustc_hash::FxHashSet<u32> = [vy].into_iter().collect();
-        let retractions = state.drop_vnodes(&revoked, VC).unwrap();
-        // The revoked vnode's still-materialized groups are retracted (-1) from the MV snapshot;
-        // the sibling vnode is untouched.
-        assert!(
-            retractions.contains_key(&vy),
-            "revoked vnode yields a retraction batch"
-        );
-        assert!(
-            !retractions.contains_key(&vx),
-            "sibling vnode is not retracted"
-        );
+        state.drop_vnodes(&revoked, VC);
 
         // Every vy entry is gone.
         assert!(

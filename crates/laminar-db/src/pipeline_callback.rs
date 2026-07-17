@@ -55,6 +55,62 @@ fn warn_late_drops(source: &str, column: &str, watermark_ms: i64, dropped: usize
     );
 }
 
+async fn await_sink_publication_until<T>(
+    deadline: Option<tokio::time::Instant>,
+    boundary: &str,
+    future: impl std::future::Future<Output = T>,
+) -> Result<T, String> {
+    let Some(deadline) = deadline else {
+        return Ok(future.await);
+    };
+    if tokio::time::Instant::now() >= deadline {
+        return Err(format!("{boundary} exhausted the checkpoint deadline"));
+    }
+    tokio::time::timeout_at(deadline, future)
+        .await
+        .map_err(|_| format!("{boundary} exhausted the checkpoint deadline"))
+}
+
+#[cfg(feature = "cluster")]
+async fn await_sink_publication<T>(
+    controller: Option<&laminar_core::cluster::control::ClusterController>,
+    deadline: Option<tokio::time::Instant>,
+    boundary: &str,
+    future: impl std::future::Future<Output = T>,
+) -> Result<T, String> {
+    let Some(controller) = controller else {
+        return await_sink_publication_until(deadline, boundary, future).await;
+    };
+    if !controller.process_lease_is_live() {
+        return Err(format!("cluster process lease expired before {boundary}"));
+    }
+    let operation = await_sink_publication_until(deadline, boundary, future);
+    tokio::pin!(operation);
+    tokio::select! {
+        biased;
+        () = controller.wait_for_process_lease_loss() => {
+            Err(format!("cluster process lease expired before {boundary}"))
+        }
+        result = &mut operation => {
+            let value = result?;
+            if controller.process_lease_is_live() {
+                Ok(value)
+            } else {
+                Err(format!("cluster process lease expired before {boundary}"))
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "cluster"))]
+async fn await_sink_publication<T>(
+    deadline: Option<tokio::time::Instant>,
+    boundary: &str,
+    future: impl std::future::Future<Output = T>,
+) -> Result<T, String> {
+    await_sink_publication_until(deadline, boundary, future).await
+}
+
 /// Terminal failure reporting is cleanup, not part of the durable attempt. A failure discovered
 /// at the attempt deadline must still release its manual caller and exact-attempt bookkeeping.
 const CHECKPOINT_FAILURE_REPORT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -1052,6 +1108,20 @@ fn observe_unrecovered_delivery_loss_incidents(
 }
 
 impl ConnectorPipelineCallback {
+    #[cfg(feature = "cluster")]
+    fn require_process_authority(&self, boundary: &str) -> Result<(), crate::pipeline::CycleError> {
+        if self
+            .cluster_controller
+            .as_ref()
+            .is_none_or(|controller| controller.process_lease_is_live())
+        {
+            return Ok(());
+        }
+        let error = format!("cluster process lease expired before {boundary}");
+        set_checkpoint_fault(&self.checkpoint_fault, error.clone());
+        Err(crate::pipeline::CycleError::Recovery(error))
+    }
+
     #[cfg(feature = "cluster")]
     fn reconcile_source_handoff_watermarks(&mut self) -> Result<(), String> {
         let Some(registry) = self.vnode_registry.as_ref() else {
@@ -2438,9 +2508,23 @@ impl ConnectorPipelineCallback {
     ) -> crate::pipeline::CheckpointControlOutcome {
         use crate::pipeline::CheckpointControlOutcome;
 
+        if self
+            .require_process_authority("follower checkpoint admission")
+            .is_err()
+        {
+            return CheckpointControlOutcome::Idle;
+        }
+
         let ann = match self.admit_follower_prepare(&controller).await {
             FollowerPrepareAdmission::Idle => return CheckpointControlOutcome::Idle,
             FollowerPrepareAdmission::Started(attempt) => {
+                if let Err(error) =
+                    self.require_process_authority("follower source-barrier admission")
+                {
+                    return self
+                        .fail_pending_follower_control(attempt, error.to_string())
+                        .await;
+                }
                 return CheckpointControlOutcome::Started {
                     attempt,
                     captured: false,
@@ -2452,6 +2536,11 @@ impl ConnectorPipelineCallback {
             FollowerPrepareAdmission::CaptureNow(announcement) => announcement,
         };
         let attempt = CheckpointAttempt::new(ann.epoch, ann.checkpoint_id);
+        if let Err(error) = self.require_process_authority("follower checkpoint capture") {
+            return self
+                .fail_pending_follower_control(attempt, error.to_string())
+                .await;
+        }
         let Some(identity) = Self::certified_announcement(&ann) else {
             return self
                 .fail_pending_follower_control(
@@ -2490,6 +2579,11 @@ impl ConnectorPipelineCallback {
         if let Err(error) = self.fence_follower_sinks_until(attempt_deadline).await {
             return self.fail_pending_follower_control(attempt, error).await;
         }
+        if let Err(error) = self.require_process_authority("follower shuffle alignment") {
+            return self
+                .fail_pending_follower_control(attempt, error.to_string())
+                .await;
+        }
 
         if let Err(error) = self
             .align_follower_shuffle_until(&controller, attempt, assignment_fence, attempt_deadline)
@@ -2499,6 +2593,11 @@ impl ConnectorPipelineCallback {
             let error = error.to_string();
             set_checkpoint_fault(&self.checkpoint_fault, error.clone());
             return self.fail_pending_follower_control(attempt, error).await;
+        }
+        if let Err(error) = self.require_process_authority("follower state capture") {
+            return self
+                .fail_pending_follower_control(attempt, error.to_string())
+                .await;
         }
 
         // Alignment above is where a peer's barrier reveals trailing loss; capturing now would
@@ -2524,6 +2623,11 @@ impl ConnectorPipelineCallback {
                 return self.fail_pending_follower_control(attempt, error).await;
             }
         };
+        if let Err(error) = self.require_process_authority("follower durable-tail handoff") {
+            return self
+                .fail_pending_follower_control(attempt, error.to_string())
+                .await;
+        }
 
         let has_shuffle = self.graph.cluster_shuffle_config().is_some();
         let tail = match self.follower_tail_future(
@@ -2581,6 +2685,12 @@ impl ConnectorPipelineCallback {
         let Some(controller) = self.cluster_controller.clone() else {
             return BarrierOutcome::Failed;
         };
+        if self
+            .require_process_authority("deferred follower checkpoint")
+            .is_err()
+        {
+            return BarrierOutcome::Failed;
+        }
         let attempt_started = controller
             .checkpoint_prepare_received_at(&ann)
             .map_or(attempt_started, |received_at| {
@@ -2600,6 +2710,12 @@ impl ConnectorPipelineCallback {
             tracing::warn!(%error, "follower deferred checkpoint sink fence failed");
             return BarrierOutcome::Failed;
         }
+        if self
+            .require_process_authority("deferred follower shuffle alignment")
+            .is_err()
+        {
+            return BarrierOutcome::Failed;
+        }
         if !self
             .deferred_follower_capture_is_aligned(
                 &controller,
@@ -2608,6 +2724,12 @@ impl ConnectorPipelineCallback {
                 attempt_deadline,
             )
             .await
+        {
+            return BarrierOutcome::Failed;
+        }
+        if self
+            .require_process_authority("deferred follower state capture")
+            .is_err()
         {
             return BarrierOutcome::Failed;
         }
@@ -2622,6 +2744,12 @@ impl ConnectorPipelineCallback {
                 return BarrierOutcome::Failed;
             }
         };
+        if self
+            .require_process_authority("deferred follower durable-tail handoff")
+            .is_err()
+        {
+            return BarrierOutcome::Failed;
+        }
 
         let has_shuffle = self.graph.cluster_shuffle_config().is_some();
         let tail = match self.follower_tail_future(
@@ -3184,12 +3312,15 @@ impl ConnectorPipelineCallback {
     #[allow(clippy::unused_self)]
     fn check_shuffle_delivery_loss(&mut self) {}
 
-    fn record_dropped_sink_write(&mut self, reason: String) {
-        let requires_replay = self.checkpoint_committable_sinks
+    fn sink_publication_requires_replay(&self) -> bool {
+        self.checkpoint_committable_sinks
             || self.delivery_guarantee
                 != laminar_connectors::connector::DeliveryGuarantee::BestEffort
-            || self.in_cluster();
-        if requires_replay {
+            || self.in_cluster()
+    }
+
+    fn record_dropped_sink_write(&mut self, reason: String) {
+        if self.sink_publication_requires_replay() {
             self.sink_fault.get_or_insert(reason);
         } else {
             self.sink_timed_out = true;
@@ -3258,10 +3389,12 @@ impl ConnectorPipelineCallback {
     async fn compile_pending_sink_filters(
         &mut self,
         results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
-    ) {
+    ) -> Result<(), String> {
         if self.pending_sink_filter_compiles == 0 {
-            return;
+            return Ok(());
         }
+
+        let requires_replay = self.sink_publication_requires_replay();
 
         while self.compiled_sink_filters.len() < self.sinks.len() {
             self.compiled_sink_filters.push(SinkFilter::Pending);
@@ -3285,6 +3418,7 @@ impl ConnectorPipelineCallback {
                     self.compiled_sink_filters[i] = SinkFilter::Compiled(compiled);
                 }
                 Err(e) => {
+                    let reason = format!("sink '{sink_name}' filter compilation failed: {e}");
                     tracing::error!(
                         sink = %sink_name,
                         filter = %sql,
@@ -3294,10 +3428,17 @@ impl ConnectorPipelineCallback {
                          Track via sink_filter_rejected_rows_total."
                     );
                     self.compiled_sink_filters[i] = SinkFilter::Rejected;
+                    self.pending_sink_filter_compiles =
+                        self.pending_sink_filter_compiles.saturating_sub(1);
+                    if requires_replay {
+                        return Err(reason);
+                    }
+                    continue;
                 }
             }
             self.pending_sink_filter_compiles = self.pending_sink_filter_compiles.saturating_sub(1);
         }
+        Ok(())
     }
 
     fn refresh_source_watermarks(&mut self) {
@@ -3323,9 +3464,13 @@ impl ConnectorPipelineCallback {
         &mut self,
         deadline: tokio::time::Instant,
     ) -> Result<(), crate::pipeline::CycleError> {
+        #[cfg(feature = "cluster")]
+        self.require_process_authority("checkpoint graph drain")?;
         self.refresh_source_watermarks();
         let watermark = self.effective_pipeline_watermark();
         while !self.graph.checkpoint_is_quiescent() {
+            #[cfg(feature = "cluster")]
+            self.require_process_authority("checkpoint graph execution")?;
             if tokio::time::Instant::now() >= deadline {
                 let error = format!(
                     "checkpoint graph drain exhausted its end-to-end deadline with {} buffered bytes",
@@ -3370,6 +3515,8 @@ impl ConnectorPipelineCallback {
                 return Err(crate::pipeline::CycleError::Recovery(error));
             }
 
+            #[cfg(feature = "cluster")]
+            self.require_process_authority("checkpoint materialized-view publication")?;
             if let Err(error) =
                 <Self as crate::pipeline::PipelineCallback>::update_mv_stores(self, &results)
             {
@@ -3379,6 +3526,8 @@ impl ConnectorPipelineCallback {
                 set_checkpoint_fault(&self.checkpoint_fault, error.clone());
                 return Err(crate::pipeline::CycleError::Recovery(error));
             }
+            #[cfg(feature = "cluster")]
+            self.require_process_authority("checkpoint stream publication")?;
             if let Err(error) =
                 <Self as crate::pipeline::PipelineCallback>::push_to_streams(self, &results)
             {
@@ -3387,7 +3536,22 @@ impl ConnectorPipelineCallback {
                 set_checkpoint_fault(&self.checkpoint_fault, error.clone());
                 return Err(crate::pipeline::CycleError::Recovery(error));
             }
-            <Self as crate::pipeline::PipelineCallback>::write_to_sinks(self, &results).await;
+            #[cfg(feature = "cluster")]
+            self.require_process_authority("checkpoint sink publication")?;
+            if let Err(error) = <Self as crate::pipeline::PipelineCallback>::write_to_sinks(
+                self,
+                &results,
+                Some(deadline),
+            )
+            .await
+            {
+                if let crate::pipeline::CycleError::Recovery(reason) = &error {
+                    set_checkpoint_fault(&self.checkpoint_fault, reason.clone());
+                }
+                return Err(error);
+            }
+            #[cfg(feature = "cluster")]
+            self.require_process_authority("checkpoint graph drain continuation")?;
             #[allow(clippy::cast_possible_truncation)]
             <Self as crate::pipeline::PipelineCallback>::record_cycle(
                 self,
@@ -3396,7 +3560,7 @@ impl ConnectorPipelineCallback {
                 pass_started.elapsed().as_nanos() as u64,
             );
 
-            if tokio::time::Instant::now() >= deadline && !self.graph.checkpoint_is_quiescent() {
+            if tokio::time::Instant::now() >= deadline {
                 let error = format!(
                     "checkpoint graph drain exhausted its end-to-end deadline with {} buffered bytes",
                     self.graph.checkpoint_pending_input_bytes()
@@ -3406,6 +3570,16 @@ impl ConnectorPipelineCallback {
             }
             tokio::task::yield_now().await;
         }
+        if tokio::time::Instant::now() >= deadline {
+            let error = format!(
+                "checkpoint graph drain exhausted its end-to-end deadline with {} buffered bytes",
+                self.graph.checkpoint_pending_input_bytes()
+            );
+            set_checkpoint_fault(&self.checkpoint_fault, error.clone());
+            return Err(crate::pipeline::CycleError::Recovery(error));
+        }
+        #[cfg(feature = "cluster")]
+        self.require_process_authority("checkpoint graph drain completion")?;
         Ok(())
     }
 }
@@ -3823,11 +3997,34 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
     }
 
-    async fn write_to_sinks(&mut self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
-        self.compile_pending_sink_filters(results).await;
+    async fn write_to_sinks(
+        &mut self,
+        results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<(), crate::pipeline::CycleError> {
+        #[cfg(feature = "cluster")]
+        let controller = self.cluster_controller.clone();
+        let compile = self.compile_pending_sink_filters(results);
+        let compile_result = await_sink_publication(
+            #[cfg(feature = "cluster")]
+            controller.as_deref(),
+            deadline,
+            "sink filter compilation",
+            compile,
+        )
+        .await;
+        let compile_error = match compile_result {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) | Err(error) => Some(error),
+        };
+        if let Some(error) = compile_error {
+            self.record_dropped_sink_write(error.clone());
+            return Err(crate::pipeline::CycleError::Recovery(error));
+        }
 
         // Shared Arc per stream so multiple sinks don't each clone the Vec.
         let mut shared_inputs: FxHashMap<&str, Arc<[RecordBatch]>> = FxHashMap::default();
+        let requires_replay = self.sink_publication_requires_replay();
 
         let sink_futures: Vec<_> = self
             .sinks
@@ -3852,6 +4049,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                     };
                     let accepts_full_changelog = contract.accepts_full_changelog();
                     let prom = Arc::clone(&self.prom);
+                    #[cfg(feature = "cluster")]
+                    let controller = controller.clone();
                     Some(async move {
                         for batch in shared.iter() {
                             let filtered: Cow<RecordBatch> = match &filter_state {
@@ -3860,11 +4059,21 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                                         Ok(Some(fb)) => Cow::Owned(fb),
                                         Ok(None) => continue,
                                         Err(e) => {
+                                            #[allow(clippy::cast_possible_truncation)]
+                                            let dropped = batch.num_rows() as u64;
+                                            prom.sink_filter_rejected_rows
+                                                .with_label_values(&[sink_name.as_str()])
+                                                .inc_by(dropped);
                                             tracing::warn!(
                                                 sink = %sink_name,
                                                 error = %e,
                                                 "Compiled sink filter error"
                                             );
+                                            if requires_replay {
+                                                return Some(format!(
+                                                    "sink '{sink_name}' filter application failed: {e}"
+                                                ));
+                                            }
                                             continue;
                                         }
                                     }
@@ -3875,6 +4084,11 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                                     prom.sink_filter_rejected_rows
                                         .with_label_values(&[sink_name.as_str()])
                                         .inc_by(dropped);
+                                    if requires_replay {
+                                        return Some(format!(
+                                            "sink '{sink_name}' filter is rejected for a replay-guaranteed publication"
+                                        ));
+                                    }
                                     continue;
                                 }
                                 SinkFilterDispatch::None => Cow::Borrowed(batch),
@@ -3887,15 +4101,37 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                             if prepared.num_rows() == 0 {
                                 continue;
                             }
-                            if let Err(e) = handle.write_batch(prepared.into_owned()).await {
-                                tracing::warn!(
-                                    sink = %sink_name,
-                                    error = %e,
-                                    "Sink write could not be enqueued"
-                                );
-                                return Some(format!(
-                                    "sink '{sink_name}' write enqueue failed: {e}"
-                                ));
+                            let boundary = format!("sink '{sink_name}' write enqueue");
+                            let batch = prepared.into_owned();
+                            let write = async {
+                                match deadline {
+                                    Some(deadline) => {
+                                        handle.write_batch_until(batch, deadline).await
+                                    }
+                                    None => handle.write_batch(batch).await,
+                                }
+                            };
+                            let enqueue = await_sink_publication(
+                                #[cfg(feature = "cluster")]
+                                controller.as_deref(),
+                                deadline,
+                                &boundary,
+                                write,
+                            )
+                            .await;
+                            match enqueue {
+                                Ok(Ok(())) => {}
+                                Ok(Err(error)) => {
+                                    tracing::warn!(
+                                        sink = %sink_name,
+                                        %error,
+                                        "Sink write could not be enqueued"
+                                    );
+                                    return Some(format!(
+                                        "sink '{sink_name}' write enqueue failed: {error}"
+                                    ));
+                                }
+                                Err(error) => return Some(error),
                             }
                         }
                         None
@@ -3903,15 +4139,28 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 },
             )
             .collect();
-        let direct_failures = futures::future::join_all(sink_futures).await;
-        for reason in direct_failures.into_iter().flatten() {
+        let direct_failures = futures::future::join_all(sink_futures)
+            .await
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        for reason in &direct_failures {
             // Do not depend on the bounded event channel for correctness. In particular, a full
             // event channel must not turn an enqueue timeout into a checkpointable lost write.
-            self.record_dropped_sink_write(reason);
+            self.record_dropped_sink_write(reason.clone());
         }
 
         // Opportunistic; the strict barrier runs in the checkpoint path.
         self.drain_sink_events();
+        if requires_replay {
+            if let Some(error) = direct_failures.first() {
+                return Err(crate::pipeline::CycleError::Recovery(error.clone()));
+            }
+            if let Some(error) = self.sink_fault.clone() {
+                return Err(crate::pipeline::CycleError::Recovery(error));
+            }
+        }
+        Ok(())
     }
 
     fn extract_watermark(&mut self, source_name: &str, batch: &RecordBatch) {
@@ -4313,6 +4562,12 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         // control to the streaming coordinator, which is the sole admission owner.
         #[cfg(feature = "cluster")]
         if let Some(cc) = self.cluster_controller.clone() {
+            if self
+                .require_process_authority("follower checkpoint control")
+                .is_err()
+            {
+                return crate::pipeline::CheckpointControlOutcome::Idle;
+            }
             if let Err(error) = self.reconcile_source_handoff_watermarks() {
                 set_checkpoint_fault(
                     &self.checkpoint_fault,
@@ -4376,6 +4631,14 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
 
         #[cfg(feature = "cluster")]
+        if self
+            .require_process_authority("checkpoint sink fencing")
+            .is_err()
+        {
+            return BarrierOutcome::Failed;
+        }
+
+        #[cfg(feature = "cluster")]
         let assignment_fence =
             match self.validate_checkpoint_assignment(admitted_assignment_fence.as_ref()) {
                 Ok(fence) => fence,
@@ -4416,6 +4679,14 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             }
         }
 
+        #[cfg(feature = "cluster")]
+        if self
+            .require_process_authority("checkpoint shuffle alignment")
+            .is_err()
+        {
+            return BarrierOutcome::Failed;
+        }
+
         // A pending exactly-once sink fault means the coordinator is about to fault for recovery;
         // don't seal this epoch past the dropped rows (CP-4). Leave the flag for `take_pipeline_fault`.
         if self.sink_fault.is_some() {
@@ -4440,6 +4711,14 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 set_checkpoint_fault(&self.checkpoint_fault, error.to_string());
                 return BarrierOutcome::Failed;
             }
+        }
+
+        #[cfg(feature = "cluster")]
+        if self
+            .require_process_authority("checkpoint state capture")
+            .is_err()
+        {
+            return BarrierOutcome::Failed;
         }
 
         // Trailing loss — a peer's last frames of the epoch, which no data-gap check can see —
@@ -4473,6 +4752,14 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 return BarrierOutcome::Failed;
             }
         };
+
+        #[cfg(feature = "cluster")]
+        if self
+            .require_process_authority("checkpoint durable-tail handoff")
+            .is_err()
+        {
+            return BarrierOutcome::Failed;
+        }
 
         let vnode_states = match self.capture_vnode_states(attempt.epoch) {
             Ok(states) => states,
@@ -5097,6 +5384,181 @@ mod tests {
         Arc::new(laminar_core::cluster::control::ClusterController::new(
             node_id, kv, None, members_rx,
         ))
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn expired_process_lease_rejects_checkpoint_graph_drain() {
+        let controller = local_controller();
+        controller
+            .set_process_lease_deadline(Arc::new(
+                laminar_core::cluster::control::LeaseDeadline::fenced(),
+            ))
+            .unwrap();
+        let mut callback = empty_callback_fixture();
+        callback.cluster_controller = Some(controller);
+
+        let error = callback
+            .drain_checkpoint_edges_until_inner(
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .expect_err("a fenced process must not drain checkpoint graph work");
+
+        assert!(
+            error.to_string().contains("process lease expired"),
+            "{error}"
+        );
+        assert!(callback
+            .checkpoint_fault
+            .lock()
+            .as_deref()
+            .is_some_and(|reason| reason.contains("process lease expired")));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn expired_process_lease_rejects_sink_work_before_polling_it() {
+        let controller = local_controller();
+        controller
+            .set_process_lease_deadline(Arc::new(
+                laminar_core::cluster::control::LeaseDeadline::fenced(),
+            ))
+            .unwrap();
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let future_polled = Arc::clone(&polled);
+
+        let error = await_sink_publication(
+            Some(controller.as_ref()),
+            None,
+            "sink enqueue",
+            async move {
+                future_polled.store(true, std::sync::atomic::Ordering::Release);
+            },
+        )
+        .await
+        .expect_err("a fenced process must not poll sink work");
+
+        assert!(error.contains("process lease expired"), "{error}");
+        assert!(!polled.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn process_lease_loss_interrupts_blocked_sink_admission() {
+        let controller = local_controller();
+        controller
+            .set_process_lease_deadline(Arc::new(
+                laminar_core::cluster::control::LeaseDeadline::live_for(Duration::from_secs(60)),
+            ))
+            .unwrap();
+        let fencing_controller = Arc::clone(&controller);
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            fencing_controller.fence_process_lease();
+        });
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            await_sink_publication(
+                Some(controller.as_ref()),
+                None,
+                "sink enqueue",
+                std::future::pending::<()>(),
+            ),
+        )
+        .await
+        .expect("lease loss did not wake blocked sink admission")
+        .expect_err("lease loss must reject blocked sink admission");
+
+        assert!(error.contains("process lease expired"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn expired_checkpoint_deadline_rejects_an_already_quiescent_graph() {
+        let mut callback = empty_callback_fixture();
+
+        let error = callback
+            .drain_checkpoint_edges_until_inner(tokio::time::Instant::now())
+            .await
+            .expect_err("the final quiescent pass must not overrun the attempt deadline");
+
+        assert!(error.to_string().contains("end-to-end deadline"), "{error}");
+        assert!(callback
+            .checkpoint_fault
+            .lock()
+            .as_deref()
+            .is_some_and(|reason| reason.contains("end-to-end deadline")));
+    }
+
+    #[tokio::test]
+    async fn rejected_sink_filter_faults_replay_guaranteed_publication() {
+        use laminar_connectors::connector::{SinkConsistency, SinkInputMode, SinkTopology};
+
+        let mut callback = empty_callback_fixture();
+        let (event_tx, event_rx) = laminar_core::streaming::channel::channel::<
+            crate::sink_task::SinkEvent,
+        >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+        callback.sink_event_rx = event_rx;
+        let contract = SinkContract::new(
+            SinkConsistency::DurableAtLeastOnce,
+            SinkTopology::MultiWriter,
+            SinkInputMode::AppendOnly,
+        );
+        let handle = crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+            name: "filtered".into(),
+            sink_id: Arc::from("filtered"),
+            connector: Box::new(laminar_connectors::testing::MockSinkConnector::new()),
+            contract,
+            requires_recovery_on_error: true,
+            channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+            flush_interval: Duration::from_secs(5),
+            write_timeout: Duration::from_secs(1),
+            event_tx,
+            #[cfg(feature = "cluster")]
+            process_authority: None,
+        });
+        callback.sinks.push((
+            "filtered".into(),
+            handle.clone(),
+            Some("(".into()),
+            "input".into(),
+            contract,
+        ));
+        callback.pending_sink_filter_compiles = 1;
+        let mut results = FxHashMap::default();
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "value",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        results.insert(
+            Arc::from("input"),
+            vec![RecordBatch::try_new(
+                schema,
+                vec![Arc::new(arrow_array::Int64Array::from(vec![1]))],
+            )
+            .unwrap()],
+        );
+
+        let error =
+            crate::pipeline::PipelineCallback::write_to_sinks(&mut callback, &results, None)
+                .await
+                .expect_err("at-least-once publication must reject an invalid sink filter");
+
+        assert!(
+            error.to_string().contains("filter compilation failed"),
+            "{error}"
+        );
+        assert!(matches!(
+            callback.compiled_sink_filters.as_slice(),
+            [SinkFilter::Rejected]
+        ));
+        assert!(callback
+            .sink_fault
+            .as_deref()
+            .is_some_and(|reason| reason.contains("filter compilation failed")));
+        handle.close().await.unwrap();
     }
 
     #[cfg(feature = "cluster")]
@@ -5871,11 +6333,11 @@ mod tests {
         files.set_metadata("connector", "file");
         files.set_metadata("schema_sha256", "abc123");
 
-        let mut kafka = SourceCheckpoint::new();
-        kafka.set_offset("orders:0", "42");
+        let mut partitioned = SourceCheckpoint::new();
+        partitioned.set_offset("orders:0", "42");
         let mut snapshots = FxHashMap::default();
         snapshots.insert("files".to_string(), files.clone());
-        snapshots.insert("orders".to_string(), kafka);
+        snapshots.insert("orders".to_string(), partitioned);
 
         let materialized = materialize_source_checkpoint_map(snapshots);
         let files_durable = materialized.get("files").expect("files checkpoint");
@@ -6061,7 +6523,7 @@ mod tests {
         drop(lock);
     }
 
-    /// Rejected must drop, not passthrough.
+    /// Rejected must never pass rows through.
     #[test]
     fn rejected_filter_dispatches_to_drop_not_passthrough() {
         let filters = [SinkFilter::Rejected];
@@ -6417,7 +6879,7 @@ mod tests {
             1_000,
         ));
         lease_store
-            .try_acquire(
+            .begin_new_term(
                 &laminar_core::cluster::control::LeaderLeaseOwner {
                     node: leader_id,
                     boot: "00000000-0000-0000-0000-000000000001".parse().unwrap(),

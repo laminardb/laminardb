@@ -1294,7 +1294,7 @@ impl ProcessLeaseManager {
                 "process lease acquisition response arrived after its local deadline".into(),
             ));
         }
-        let deadline = Arc::new(LeaseDeadline::fenced());
+        let deadline = Arc::new(LeaseDeadline::uninitialized());
         deadline.extend_until(initial_valid_until);
         if !deadline.is_live() {
             return Err(ProcessLeaseError::Invalid(

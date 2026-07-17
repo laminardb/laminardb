@@ -1746,7 +1746,8 @@ mod tests {
                 .expect("test leader belongs to the assignment certificate"),
             process_term: 1,
         };
-        let LeaseOutcome::Acquired(lease) = authority.try_acquire(&owner, 0).await.unwrap() else {
+        let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap()
+        else {
             unreachable!("fresh cluster authority must grant its first lease")
         };
         ClusterDecisions {

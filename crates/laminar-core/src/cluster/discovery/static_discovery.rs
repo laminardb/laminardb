@@ -29,6 +29,42 @@ const MAX_MESSAGE_SIZE: usize = 1_048_576;
 /// Grace period after which `Left` peers disappear from published membership.
 const LEFT_REAP_THRESHOLD: u32 = 30;
 
+const DISCOVERY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct AbortTaskOnDrop(tokio::task::AbortHandle);
+
+impl AbortTaskOnDrop {
+    fn abort(&self) {
+        self.0.abort();
+    }
+}
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
+async fn join_task_bounded<T>(
+    mut task: tokio::task::JoinHandle<T>,
+    timeout: Duration,
+    task_name: &'static str,
+) -> Option<Result<T, tokio::task::JoinError>> {
+    let abort_on_drop = AbortTaskOnDrop(task.abort_handle());
+    if let Ok(result) = tokio::time::timeout(timeout, &mut task).await {
+        Some(result)
+    } else {
+        tracing::warn!(
+            task = task_name,
+            ?timeout,
+            "Discovery task did not stop in time"
+        );
+        abort_on_drop.abort();
+        let _ = tokio::time::timeout(timeout.min(Duration::from_secs(1)), &mut task).await;
+        None
+    }
+}
+
 /// Configuration for static discovery.
 #[derive(Debug, Clone)]
 pub struct StaticDiscoveryConfig {
@@ -404,19 +440,33 @@ impl StaticDiscovery {
 
         // Bound concurrent handler tasks (W3 fix)
         let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_HANDLER_TASKS));
+        let mut handlers = tokio::task::JoinSet::new();
 
         loop {
             tokio::select! {
-                () = cancel.cancelled() => break,
+                () = cancel.cancelled() => {
+                    handlers.shutdown().await;
+                    break;
+                },
+                result = handlers.join_next(), if !handlers.is_empty() => {
+                    if let Some(Err(error)) = result {
+                        tracing::debug!(%error, "Static discovery heartbeat handler stopped");
+                    }
+                },
                 accept = listener.accept() => {
-                    let (mut stream, _) = accept?;
+                    let (mut stream, _) = match accept {
+                        Ok(accepted) => accepted,
+                        Err(error) => {
+                            handlers.shutdown().await;
+                            return Err(error.into());
+                        }
+                    };
                     let local_info = Arc::clone(&local_info);
-                    let local_identity = local_identity;
                     let state = Arc::clone(&state);
                     let membership_tx = membership_tx.clone();
                     let permit = Arc::clone(&semaphore);
 
-                    tokio::spawn(async move {
+                    handlers.spawn(async move {
                         // Acquire semaphore permit — drop-guard releases on exit
                         let Ok(_permit) = permit.try_acquire() else {
                             return; // at capacity, drop connection
@@ -520,19 +570,27 @@ impl StaticDiscovery {
                     let data = Arc::new(data);
 
                     // Send heartbeats to all seeds concurrently (W5 fix)
-                    let mut tasks = Vec::with_capacity(config.seeds.len());
+                    let mut tasks = tokio::task::JoinSet::new();
                     for seed in &config.seeds {
                         let seed = seed.clone();
                         let data = Arc::clone(&data);
-                        tasks.push(tokio::spawn(async move {
+                        tasks.spawn(async move {
                             let result = Self::send_heartbeat(&seed, &data).await;
                             (seed, result)
-                        }));
+                        });
                     }
 
                     // Collect results and update peer state
-                    for task in tasks {
-                        let Ok((seed, result)) = task.await else {
+                    while !tasks.is_empty() {
+                        let task = tokio::select! {
+                            biased;
+                            () = ctx.cancel.cancelled() => {
+                                tasks.shutdown().await;
+                                return;
+                            }
+                            task = tasks.join_next() => task,
+                        };
+                        let Some(Ok((seed, result))) = task else {
                             continue; // task panicked
                         };
 
@@ -662,6 +720,37 @@ impl StaticDiscovery {
         self.started = true;
         Ok(())
     }
+
+    async fn stop_with_timeout(&mut self, timeout: Duration) {
+        self.cancel.cancel();
+        self.started = false;
+
+        let listener_handle = self.listener_handle.take();
+        let heartbeater_handle = self.heartbeater_handle.take();
+        let stop_listener = async move {
+            if let Some(handle) = listener_handle {
+                match join_task_bounded(handle, timeout, "static-listener").await {
+                    Some(Ok(Ok(()))) | None => {}
+                    Some(Ok(Err(error))) => {
+                        tracing::warn!(%error, "Static discovery listener stopped with an error");
+                    }
+                    Some(Err(error)) => {
+                        tracing::debug!(%error, "Static discovery listener task stopped unexpectedly");
+                    }
+                }
+            }
+        };
+        let stop_heartbeater = async move {
+            if let Some(handle) = heartbeater_handle {
+                if let Some(Err(error)) =
+                    join_task_bounded(handle, timeout, "static-heartbeater").await
+                {
+                    tracing::debug!(%error, "Static discovery heartbeater task stopped unexpectedly");
+                }
+            }
+        };
+        tokio::join!(stop_listener, stop_heartbeater);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -716,18 +805,21 @@ impl Discovery for StaticDiscovery {
     }
 
     async fn stop(&mut self) -> Result<(), DiscoveryError> {
+        self.stop_with_timeout(DISCOVERY_SHUTDOWN_TIMEOUT).await;
+        Ok(())
+    }
+}
+
+impl Drop for StaticDiscovery {
+    fn drop(&mut self) {
         self.cancel.cancel();
         self.started = false;
-
-        // Wait for spawned tasks to exit (W4 fix)
-        if let Some(h) = self.listener_handle.take() {
-            let _ = h.await;
+        if let Some(handle) = self.listener_handle.take() {
+            handle.abort();
         }
-        if let Some(h) = self.heartbeater_handle.take() {
-            let _ = h.await;
+        if let Some(handle) = self.heartbeater_handle.take() {
+            handle.abort();
         }
-
-        Ok(())
     }
 }
 
@@ -1196,5 +1288,79 @@ mod tests {
         disc.start().await.unwrap();
         assert!(disc.started);
         disc.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drop_cancels_background_tasks_and_releases_listener() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let config = StaticDiscoveryConfig {
+            listen_address: address.to_string(),
+            ..StaticDiscoveryConfig::default()
+        };
+        let mut discovery = StaticDiscovery::new(config);
+        discovery.start_with_bound_listener(listener).unwrap();
+
+        let cancelled = discovery.cancel.clone();
+        let listener_task = discovery.listener_handle.as_ref().unwrap().abort_handle();
+        let heartbeater_task = discovery
+            .heartbeater_handle
+            .as_ref()
+            .unwrap()
+            .abort_handle();
+
+        drop(discovery);
+        assert!(cancelled.is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !listener_task.is_finished() || !heartbeater_task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped static discovery tasks must terminate");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match TcpListener::bind(address).await {
+                    Ok(listener) => break listener,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(5)).await,
+                }
+            }
+        })
+        .await
+        .expect("dropped static discovery must release its listener");
+    }
+
+    #[tokio::test]
+    async fn stop_aborts_background_tasks_that_exceed_the_shutdown_bound() {
+        let mut discovery = StaticDiscovery::new(StaticDiscoveryConfig::default());
+        discovery.started = true;
+        let cancelled = discovery.cancel.clone();
+
+        let listener = tokio::spawn(std::future::pending::<Result<(), DiscoveryError>>());
+        let listener_task = listener.abort_handle();
+        discovery.listener_handle = Some(listener);
+        let heartbeater = tokio::spawn(std::future::pending::<()>());
+        let heartbeater_task = heartbeater.abort_handle();
+        discovery.heartbeater_handle = Some(heartbeater);
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            discovery.stop_with_timeout(Duration::from_millis(10)),
+        )
+        .await
+        .expect("bounded static discovery shutdown did not return");
+
+        assert!(cancelled.is_cancelled());
+        assert!(!discovery.started);
+        assert!(discovery.listener_handle.is_none());
+        assert!(discovery.heartbeater_handle.is_none());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !listener_task.is_finished() || !heartbeater_task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bounded static discovery shutdown left an owned task running");
     }
 }

@@ -376,7 +376,7 @@ async fn install_test_durable_lease_on(
     use laminar_core::cluster::control::{LeaderLeaseStore, LeaseOutcome};
 
     let store = Arc::new(LeaderLeaseStore::new(object_store, 60_000));
-    let LeaseOutcome::Acquired(lease) = store.try_acquire(owner, 0).await.unwrap() else {
+    let LeaseOutcome::Acquired(lease) = store.begin_new_term(owner, 0).await.unwrap() else {
         unreachable!("fresh test authority must grant its first lease")
     };
     controller.set_leader_lease_store(store);
@@ -432,7 +432,8 @@ async fn install_test_leader_lease_on_store(
     };
     let lease = install_test_durable_lease_on(controller, &owner, object_store).await;
     controller
-        .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))));
+        .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+        .unwrap();
     let (sender, receiver) = tokio::sync::watch::channel(Some(lease));
     controller
         .set_leader_lease_watch(
@@ -1711,13 +1712,17 @@ async fn follower_commit_prunes_its_local_manifests_without_advancing_shared_gc(
     let decision_store = in_memory_decision_store_on(Arc::clone(&authority_store));
     let deployment_id = decision_store.load_or_create_deployment_id().await.unwrap();
     let pipeline_identity = PipelineIdentity::empty();
-    let writer = FileSystemCheckpointStore::new(dir.path()).with_participant_id(PARTICIPANT_ID);
+    let key_group_count = laminar_core::state::KeyGroupCount::try_from(2_u32).unwrap();
+    let writer = FileSystemCheckpointStore::new(dir.path())
+        .with_key_group_count(key_group_count)
+        .with_participant_id(PARTICIPANT_ID);
     let mut retained_manifest = None;
     for epoch in 1..=4 {
         let mut manifest = CheckpointManifest::new(epoch, epoch);
         manifest.participant_id = PARTICIPANT_ID;
         manifest.deployment_id.clone_from(&deployment_id);
         manifest.pipeline_identity.clone_from(&pipeline_identity);
+        manifest.vnode_count = key_group_count.get();
         writer.save(&manifest).await.unwrap();
         if epoch == 4 {
             retained_manifest = Some(manifest);
@@ -1729,8 +1734,11 @@ async fn follower_commit_prunes_its_local_manifests_without_advancing_shared_gc(
         max_retained: 1,
         ..CheckpointConfig::default()
     };
-    let store =
-        Box::new(FileSystemCheckpointStore::new(dir.path()).with_participant_id(PARTICIPANT_ID));
+    let store = Box::new(
+        FileSystemCheckpointStore::new(dir.path())
+            .with_key_group_count(key_group_count)
+            .with_participant_id(PARTICIPANT_ID),
+    );
     let mut coord = CheckpointCoordinator::new(config, store).await.unwrap();
     coord
         .set_decision_store(Arc::clone(&decision_store))
@@ -1745,7 +1753,7 @@ async fn follower_commit_prunes_its_local_manifests_without_advancing_shared_gc(
     coord.set_cluster_controller(Arc::clone(&controller));
 
     let attempt = CheckpointAttempt::new(4, 4);
-    let backend = Arc::new(InProcessBackend::new(1));
+    let backend = Arc::new(InProcessBackend::new(2));
     let partial = crate::vnode_partial::VnodePartial {
         operators: vec![("agg".into(), b"state".to_vec())],
         base: None,
@@ -1753,16 +1761,18 @@ async fn follower_commit_prunes_its_local_manifests_without_advancing_shared_gc(
     }
     .encode()
     .unwrap();
-    backend
-        .write_certified_partial(
-            attempt,
-            0,
-            &assignment_fence,
-            leader_id.0,
-            Bytes::from(partial),
-        )
-        .await
-        .unwrap();
+    for (vnode, owner) in [(0, leader_id.0), (1, PARTICIPANT_ID)] {
+        backend
+            .write_certified_partial(
+                attempt,
+                vnode,
+                &assignment_fence,
+                owner,
+                Bytes::from(partial.clone()),
+            )
+            .await
+            .unwrap();
+    }
 
     let (manifest_sha256, portable_state_sha256) =
         crate::cluster_recovery_capsule::manifest_digests(&retained_manifest).unwrap();
@@ -1777,9 +1787,11 @@ async fn follower_commit_prunes_its_local_manifests_without_advancing_shared_gc(
                 assignment_fence: assignment_fence.clone(),
                 deployment_id: deployment_id.clone(),
                 pipeline_identity: pipeline_identity.clone(),
-                owned_vnodes: (participant_id == leader_id.0)
-                    .then_some(vec![0])
-                    .unwrap_or_default(),
+                owned_vnodes: if participant_id == leader_id.0 {
+                    vec![0]
+                } else {
+                    vec![1]
+                },
                 source_offsets: Default::default(),
                 source_metadata: Default::default(),
                 source_assignment_versions: Default::default(),
@@ -1812,7 +1824,7 @@ async fn follower_commit_prunes_its_local_manifests_without_advancing_shared_gc(
         .seal_checkpoint(
             attempt,
             Some(&assignment_fence),
-            &[0],
+            &[0, 1],
             &required_descriptors,
         )
         .await
@@ -1879,7 +1891,9 @@ async fn follower_commit_prunes_its_local_manifests_without_advancing_shared_gc(
         "follower retention must only read, never advance, the shared floor"
     );
 
-    let reader = FileSystemCheckpointStore::new(dir.path()).with_participant_id(PARTICIPANT_ID);
+    let reader = FileSystemCheckpointStore::new(dir.path())
+        .with_key_group_count(key_group_count)
+        .with_participant_id(PARTICIPANT_ID);
     let ids = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let ids = match reader.list_ids().await {
@@ -3260,14 +3274,14 @@ async fn source_offset_handoff_round_trip() {
     coord.set_vnode_set(vec![0, 1, 2, 3]);
     let _leader_lease = attach_cluster_controller(&mut coord, 1, &[]).await;
 
-    let mut kafka_checkpoint = ConnectorCheckpoint::with_offsets(HashMap::from([(
+    let mut partitioned_checkpoint = ConnectorCheckpoint::with_offsets(HashMap::from([(
         "events:0".to_string(),
         "100".to_string(),
     )]));
-    kafka_checkpoint
+    partitioned_checkpoint
         .metadata
-        .insert("connector".into(), "kafka".into());
-    kafka_checkpoint.source_assignment_version = std::num::NonZeroU64::new(1);
+        .insert("connector".into(), "partitioned-source".into());
+    partitioned_checkpoint.source_assignment_version = std::num::NonZeroU64::new(1);
     let attempt = CheckpointAttempt::new(5, 5);
     let mut manifest = CheckpointManifest::new(attempt.checkpoint_id, attempt.epoch);
     manifest.participant_id = 1;
@@ -3275,8 +3289,8 @@ async fn source_offset_handoff_round_trip() {
     manifest.pipeline_identity = coord.expected_pipeline_identity();
     manifest
         .source_offsets
-        .insert("kafka".into(), kafka_checkpoint);
-    manifest.source_watermarks.insert("kafka".into(), 1_000);
+        .insert("orders".into(), partitioned_checkpoint);
+    manifest.source_watermarks.insert("orders".into(), 1_000);
     coord.set_local_watermark(CheckpointWatermark::Active(900));
     coord
         .persist_participant_ready_until(
@@ -3326,27 +3340,30 @@ async fn source_offset_handoff_round_trip() {
         acquired.sources.cluster_watermark(),
         CheckpointWatermark::Active(900)
     );
-    let kafka = acquired.sources.source("kafka").expect("Kafka handoff");
+    let partitioned = acquired
+        .sources
+        .source("orders")
+        .expect("partitioned source handoff");
     assert_eq!(
-        kafka.checkpoint().offsets.get("events:0"),
+        partitioned.checkpoint().offsets.get("events:0"),
         Some(&"100".to_string())
     );
     assert_eq!(
-        kafka
+        partitioned
             .checkpoint()
             .metadata
             .get("connector")
             .map(String::as_str),
-        Some("kafka")
+        Some("partitioned-source")
     );
     assert_eq!(
-        kafka
+        partitioned
             .checkpoint()
             .source_assignment_version
             .map(|version| version.get()),
         Some(1)
     );
-    assert_eq!(kafka.watermark(), Some(1_000));
+    assert_eq!(partitioned.watermark(), Some(1_000));
 }
 
 #[cfg(feature = "cluster")]
@@ -3390,7 +3407,7 @@ async fn source_handoff_ignores_a_newer_undecided_seal() {
         manifest.deployment_id = coord.expected_deployment_id().unwrap().to_string();
         manifest.pipeline_identity = coord.expected_pipeline_identity();
         manifest.source_offsets.insert(
-            "kafka".into(),
+            "orders".into(),
             ConnectorCheckpoint::with_offsets(HashMap::from([("events:0".into(), offset.into())])),
         );
         coord
@@ -3434,7 +3451,7 @@ async fn source_handoff_ignores_a_newer_undecided_seal() {
     assert_eq!(
         acquired
             .sources
-            .source("kafka")
+            .source("orders")
             .and_then(|source| source.checkpoint().offsets.get("events:0")),
         Some(&"100".to_string())
     );
@@ -3513,7 +3530,7 @@ async fn recovery_capsules_preserve_each_decided_source_cut() {
 
     let handoff = |off: &str| {
         HashMap::from([(
-            "kafka".to_string(),
+            "orders".to_string(),
             ConnectorCheckpoint::with_offsets(HashMap::from([(
                 "events:0".to_string(),
                 off.to_string(),
@@ -3574,7 +3591,7 @@ async fn recovery_capsules_preserve_each_decided_source_cut() {
     assert_eq!(
         latest
             .sources
-            .source("kafka")
+            .source("orders")
             .and_then(|source| source.checkpoint().offsets.get("events:0")),
         Some(&"200".to_string())
     );
@@ -3604,7 +3621,7 @@ async fn recovery_capsules_preserve_each_decided_source_cut() {
         assert_eq!(
             capsule
                 .source_offsets
-                .get("kafka")
+                .get("orders")
                 .and_then(|offsets| offsets.get("events:0"))
                 .map(String::as_str),
             Some(expected)
@@ -3619,7 +3636,7 @@ async fn readiness_rejects_overlapping_vnode_ownership() {
     use laminar_core::state::{InProcessBackend, StateBackend};
 
     let dir = tempfile::tempdir().unwrap();
-    let mut coord = make_cluster_coordinator(dir.path(), 2).await;
+    let mut coord = make_cluster_coordinator_with_key_groups(dir.path(), 2, 2).await;
     let backend = Arc::new(InProcessBackend::new(2));
     coord.set_state_backend(backend.clone()).unwrap();
     coord.set_assignment_version(9);
@@ -3654,7 +3671,8 @@ async fn readiness_rejects_overlapping_vnode_ownership() {
         assignment_fence: coord.active_assignment_fence.clone().unwrap(),
         deployment_id: manifest.deployment_id,
         pipeline_identity: manifest.pipeline_identity,
-        owned_vnodes: vec![0],
+        // The peer covers its certified vnode 1 but also forges ownership of vnode 0.
+        owned_vnodes: vec![0, 1],
         source_offsets: std::collections::BTreeMap::new(),
         source_metadata: std::collections::BTreeMap::new(),
         source_assignment_versions: std::collections::BTreeMap::new(),
@@ -3684,11 +3702,21 @@ async fn readiness_rejects_overlapping_vnode_ownership() {
         )
         .await
         .unwrap();
+    backend
+        .write_certified_partial(
+            attempt,
+            1,
+            coord.active_assignment_fence.as_ref().unwrap(),
+            2,
+            Bytes::from_static(b"peer-state"),
+        )
+        .await
+        .unwrap();
     assert!(backend
         .seal_checkpoint(
             attempt,
             coord.active_assignment_fence.as_ref(),
-            &[0],
+            &[0, 1],
             &[participant_ready_key(1), participant_ready_key(2)],
         )
         .await
@@ -3741,14 +3769,14 @@ async fn readiness_encoding_is_canonical_for_idempotent_reconstruction() {
         pipeline_identity: PipelineIdentity::empty(),
         owned_vnodes: vec![0],
         source_offsets: std::collections::BTreeMap::from([(
-            "kafka".into(),
+            "orders".into(),
             offsets
                 .into_iter()
                 .map(|(key, value)| (key.to_owned(), value.to_owned()))
                 .collect(),
         )]),
         source_metadata: std::collections::BTreeMap::from([(
-            "kafka".into(),
+            "orders".into(),
             std::collections::BTreeMap::new(),
         )]),
         source_assignment_versions: std::collections::BTreeMap::new(),
@@ -5454,6 +5482,8 @@ fn spawn_begin_rollback_probe(
         flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
         write_timeout: Duration::from_secs(1),
         event_tx,
+        #[cfg(feature = "cluster")]
+        process_authority: None,
     })
 }
 
@@ -5919,6 +5949,8 @@ fn spawn_phase_one_probe(
         flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
         write_timeout: Duration::from_secs(1),
         event_tx,
+        #[cfg(feature = "cluster")]
+        process_authority: None,
     })
 }
 
@@ -5949,6 +5981,8 @@ async fn pre_commit_failure_rolls_back_coordinated_prepare() {
         flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
         write_timeout: Duration::from_secs(5),
         event_tx,
+        #[cfg(feature = "cluster")]
+        process_authority: None,
     });
     coord.register_sink("failing-sink", handle);
 
@@ -6123,6 +6157,8 @@ fn spawn_recording_sink(
         flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
         write_timeout: Duration::from_secs(5),
         event_tx,
+        #[cfg(feature = "cluster")]
+        process_authority: None,
     });
     // The tests below drive no writes, so no SinkEvents are emitted; dropping the receiver is
     // harmless (event sends are best-effort).
@@ -6214,6 +6250,8 @@ async fn leader_loss_during_phase_one_prevents_sink_commit_and_decision() {
         flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
         write_timeout: Duration::from_secs(5),
         event_tx,
+        #[cfg(feature = "cluster")]
+        process_authority: None,
     });
     coord.register_sink("lease-drop-alo", handle);
 
@@ -6352,6 +6390,8 @@ async fn checkpoint_deadline_cancels_actor_flush_before_sink_write_timeout() {
         // Deliberately much longer than the whole checkpoint attempt.
         write_timeout: Duration::from_secs(5),
         event_tx,
+        #[cfg(feature = "cluster")]
+        process_authority: None,
     });
     coord.register_sink("slow-attempt-flush", handle.clone());
 
@@ -6459,6 +6499,8 @@ async fn attempt_timeout_during_failure_cleanup_requires_recovery() {
         flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
         write_timeout: Duration::from_secs(5),
         event_tx,
+        #[cfg(feature = "cluster")]
+        process_authority: None,
     });
     coord.register_sink("stuck-sink", handle.clone());
     coord.begin_initial_epoch().await.unwrap();
@@ -6579,6 +6621,8 @@ async fn coordinated_sink_idle_epoch_still_seals() {
         flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
         write_timeout: Duration::from_secs(5),
         event_tx,
+        #[cfg(feature = "cluster")]
+        process_authority: None,
     });
     coord.register_sink("ice", handle);
     coord.begin_initial_epoch().await.unwrap();
@@ -6660,6 +6704,8 @@ async fn coordinated_sink_descriptor_persisted_and_gated() {
         flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
         write_timeout: Duration::from_secs(5),
         event_tx,
+        #[cfg(feature = "cluster")]
+        process_authority: None,
     });
     coord.register_sink("ice", handle);
     coord.begin_initial_epoch().await.unwrap();
