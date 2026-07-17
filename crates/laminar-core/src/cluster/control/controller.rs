@@ -589,9 +589,10 @@ impl std::fmt::Debug for RecoveryReleaseGuard<'_> {
 }
 
 fn sha256_hex(encoded: &[u8]) -> String {
+    use std::fmt::Write as _;
+
     let digest = Sha256::digest(encoded);
     let mut hex = String::with_capacity(64);
-    use std::fmt::Write as _;
     for byte in digest {
         write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
     }

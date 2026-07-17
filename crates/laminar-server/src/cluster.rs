@@ -834,11 +834,11 @@ impl Drop for ClusterHandle {
             self.db.close();
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                 let db = Arc::clone(&self.db);
-                let _ = runtime.spawn(async move {
+                std::mem::drop(runtime.spawn(async move {
                     if let Err(error) = db.shutdown().await {
                         warn!(%error, "Database cleanup after cluster handle drop failed");
                     }
-                });
+                }));
             }
         }
         self.leader_lease.cancel();
@@ -1825,15 +1825,13 @@ pub async fn start_cluster(
         biased;
         () = process_lease_terminal.cancelled() => None,
         result = install_cluster_controller(
-            node_id,
             controller_kv,
             recovery_kv,
             Arc::clone(&snapshot_store),
             discovery.membership_watch(),
             bind_host,
             &advertise_host,
-            process_incarnation,
-            Arc::clone(&process_lease.deadline),
+            &process_lease,
         ) => Some(result),
     };
     let Some(controller) = controller else {
@@ -3287,28 +3285,26 @@ fn build_control_store(
 /// Build a `ClusterController` from a ready KV handle and start its barrier sync
 /// server. Shared by the gossip and static discovery paths.
 async fn install_cluster_controller(
-    node_id: NodeId,
     kv: Arc<dyn laminar_core::cluster::control::ClusterKv>,
     recovery_kv: Arc<dyn laminar_core::cluster::control::ClusterKv>,
     snapshot_store: Arc<laminar_core::cluster::control::AssignmentSnapshotStore>,
     members_rx: watch::Receiver<Vec<NodeInfo>>,
     bind_host: &str,
     advertise_host: &str,
-    recovery_incarnation: uuid::Uuid,
-    process_deadline: Arc<laminar_core::cluster::control::LeaseDeadline>,
+    process_lease: &ProcessLeaseRuntime,
 ) -> Result<Arc<laminar_core::cluster::control::ClusterController>, ClusterStartupError> {
     use laminar_core::cluster::control::ClusterController;
 
     let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
-        node_id,
+        process_lease.acquired.node,
         kv,
         recovery_kv,
         Some(snapshot_store),
         members_rx,
-        recovery_incarnation,
+        process_lease.acquired.owner,
     ));
     controller
-        .set_process_lease_deadline(process_deadline)
+        .set_process_lease_deadline(Arc::clone(&process_lease.deadline))
         .map_err(ClusterStartupError::EngineConstruction)?;
     controller.set_active(false);
     controller.install_local_leader_proof_provider();
@@ -4980,8 +4976,10 @@ mod tests {
         ));
         controller.set_active(false);
 
-        let mut server_config = crate::config::ServerSection::default();
-        server_config.bind = bind;
+        let server_config = crate::config::ServerSection {
+            bind,
+            ..Default::default()
+        };
         let config = ServerConfig {
             server: server_config,
             state: laminar_core::state::StateBackendConfig::default(),

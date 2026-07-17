@@ -908,7 +908,7 @@ impl RecoveryMonitor {
         reported
             .iter()
             .filter(|fault| self.handled_faults.get(&fault.reporter) != Some(&fault.sequence))
-            .cloned()
+            .copied()
             .collect()
     }
 
@@ -983,7 +983,7 @@ impl RecoveryMonitor {
             // source gate and public lifecycle closed; a round may still need its checkpoint
             // evidence even though it remains outside the restore quorum.
             db.fence_coordinated_recovery_lifecycle();
-            controller.set_recovering(true);
+            controller.set_recovering(false);
             self.fault_fenced = false;
             return;
         }
@@ -2387,7 +2387,7 @@ fn frozen_pending<T>(
         .map(|(node, _)| node)
         .collect();
     required
-        .into_iter()
+        .iter()
         .copied()
         .filter(|node| !acked.contains(node))
         .collect()
@@ -3117,7 +3117,7 @@ mod tests {
 
     #[tokio::test]
     async fn idle_worker_consumes_only_a_committed_release_fault_set() {
-        use laminar_core::state::{InProcessBackend, NodeId as StateNodeId, VnodeRegistry};
+        use laminar_core::state::{NodeId as StateNodeId, ObjectStoreBackend, VnodeRegistry};
 
         let self_id = NodeId(2);
         let kv = Arc::new(InMemoryKv::new(self_id));
@@ -3197,11 +3197,36 @@ mod tests {
         let db = LaminarDB::builder()
             .cluster_controller(Arc::clone(&controller))
             .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
-            .state_backend(Arc::new(InProcessBackend::new(1)))
+            .state_backend(Arc::new(ObjectStoreBackend::cluster_shared(
+                Arc::new(object_store::memory::InMemory::new()),
+                "idle-worker",
+                1,
+            )))
             .vnode_registry(registry)
             .build()
             .await
             .unwrap();
+        let assignments = Arc::new(AssignmentSnapshotStore::new(Arc::new(
+            object_store::memory::InMemory::new(),
+        )));
+        db.set_assignment_snapshot_store(Arc::clone(&assignments));
+        let vnodes = AssignmentSnapshot::vnodes_from_vec(&[NodeId(1)]);
+        let participants = round.assignment_fence.participants.clone();
+        let mut snapshot = AssignmentSnapshot::empty()
+            .next_for_participants(vnodes.clone(), participants.clone())
+            .unwrap();
+        assignments.save_if_absent(&snapshot).await.unwrap();
+        while snapshot.version < round.assignment_fence.assignment_version {
+            let next = snapshot
+                .next_for_participants(vnodes.clone(), participants.clone())
+                .unwrap();
+            assignments
+                .save_if_version(&next, snapshot.version)
+                .await
+                .unwrap();
+            snapshot = next;
+        }
+        assert!(coordinated_restart_assignment_ready(&db).await);
         db.set_source_gate(false);
         kv.seed(self_id, "control:fault-report", "17".into());
 

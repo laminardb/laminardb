@@ -5372,22 +5372,20 @@ impl CheckpointCoordinator {
     ) -> Result<FollowerOutcomeMatch, DbError> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(DbError::Checkpoint(format!(
-                "[LDB-6046] follower decision deadline expired before the durable read for epoch \
-                 {epoch}, checkpoint {checkpoint_id}"
-            )));
+            return Err(Self::follower_decision_timeout(epoch, checkpoint_id));
         }
         let outcome = tokio::time::timeout(remaining, authority.cluster_outcome(epoch))
             .await
             .map_err(|_| {
                 DbError::Checkpoint(format!(
                     "[LDB-6046] durable outcome read timed out for epoch {epoch}, checkpoint \
-                     {checkpoint_id}"
+                     {checkpoint_id}; participant remains prepared"
                 ))
             })?
             .map_err(|e| {
                 DbError::Checkpoint(format!(
-                    "[LDB-6045] failed to read durable outcome for epoch {epoch}: {e}"
+                    "[LDB-6045] failed to read durable outcome for epoch {epoch}; participant \
+                     remains prepared: {e}"
                 ))
             })?;
         Self::match_follower_outcome(

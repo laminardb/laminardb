@@ -81,6 +81,7 @@ impl PreparedCheckpointWitness {
         self.validate().is_ok()
     }
 
+    #[cfg(feature = "cluster")]
     pub(crate) const fn ordering_key(&self) -> (u64, u64, u64) {
         (
             self.attempt.epoch,

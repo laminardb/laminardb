@@ -4413,7 +4413,7 @@ impl LaminarDB {
                             tokio::select! {
                                 biased;
                                 () = watcher_runtime_shutdown.cancelled() => {}
-                                _ = report_cluster_compute_fault(
+                                () = report_cluster_compute_fault(
                                     watcher_controller,
                                     watcher_pending_compute_fault,
                                 ) => {}
