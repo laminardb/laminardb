@@ -123,8 +123,8 @@ impl DbControlRuntime {
     }
 
     pub(crate) fn handle(&self) -> Result<tokio::runtime::Handle, DbError> {
-        let mut owned = self.inner.lock();
-        if let Some(runtime) = owned.as_ref() {
+        let mut runtime_slot = self.inner.lock();
+        if let Some(runtime) = runtime_slot.as_ref() {
             return Ok(runtime.handle.clone());
         }
 
@@ -169,7 +169,7 @@ impl DbControlRuntime {
                     "failed to initialize LaminarDB I/O runtime: {error}"
                 ))
             })?;
-        *owned = Some(DbControlRuntimeInner {
+        *runtime_slot = Some(DbControlRuntimeInner {
             handle: handle.clone(),
             shutdown: shutdown_tx,
         });
@@ -272,6 +272,8 @@ pub struct LaminarDB {
     /// Every source task in the active or draining generation. A replacement cannot start until
     /// the stable supervisor has observed actual task exit, including after Tokio cancellation.
     pub(crate) owned_source_tasks: crate::pipeline::streaming_coordinator::OwnedSourceTasks,
+    /// Connector children admitted before an actor existed remain fenced across startup failure.
+    pub(crate) owned_connector_task_fences: crate::connector_task_fence::OwnedConnectorTaskFences,
     pub(crate) shutdown_signal: Arc<tokio::sync::Notify>,
     /// Persistent terminal cancellation for the currently installed compute runtime. Unlike a
     /// notification permit, cancellation cannot be lost while the coordinator is between awaits.
@@ -461,12 +463,12 @@ impl Drop for CatalogBootstrapGuard<'_> {
 
 #[cfg(feature = "cluster")]
 pub(crate) fn catalog_manifest_replay_active() -> bool {
-    CATALOG_MANIFEST_REPLAY.try_with(|_| ()).is_ok()
+    CATALOG_MANIFEST_REPLAY.try_with(|()| ()).is_ok()
 }
 
 #[cfg(feature = "cluster")]
 fn catalog_bootstrap_active() -> bool {
-    CATALOG_BOOTSTRAP.try_with(|_| ()).is_ok()
+    CATALOG_BOOTSTRAP.try_with(|()| ()).is_ok()
 }
 
 #[cfg(not(feature = "cluster"))]
@@ -638,8 +640,8 @@ fn uri_contains_unsupported_secret(value: &str, allow_reference: bool) -> bool {
                 .or_else(|| part.strip_prefix("pwd="))
                 .is_some_and(|password| {
                     let password = password.trim_matches(|ch| ch == '\'' || ch == '"');
-                    !password.is_empty()
-                        && !(allow_reference
+                    !(password.is_empty()
+                        || allow_reference
                             && laminar_connectors::security::is_env_reference(password))
                 })
         })
@@ -1017,6 +1019,7 @@ impl LaminarDB {
             exact_deployment_lock: parking_lot::Mutex::new(None),
             owned_sink_handles: Arc::new(parking_lot::Mutex::new(Vec::new())),
             owned_source_tasks: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            owned_connector_task_fences: Arc::new(parking_lot::Mutex::new(Vec::new())),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
             runtime_shutdown: parking_lot::RwLock::new(tokio_util::sync::CancellationToken::new()),
             engine_metrics: parking_lot::Mutex::new(None),
@@ -1149,6 +1152,7 @@ impl LaminarDB {
     }
 
     #[cfg(feature = "cluster")]
+    #[allow(clippy::too_many_lines)] // One fail-closed shuffle authority installation transaction.
     pub(crate) fn install_shuffle_assignment_fence(
         &self,
         fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
@@ -1293,6 +1297,7 @@ impl LaminarDB {
     /// force. The controller certificate is deliberately published only after both endpoints are
     /// installed.
     #[cfg(feature = "cluster")]
+    #[allow(clippy::too_many_lines)] // One serialized assignment-authority activation transaction.
     pub(crate) async fn activate_assignment_authority(
         &self,
         fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
@@ -1717,6 +1722,7 @@ impl LaminarDB {
     /// Fails closed when the manifest cannot be loaded, a local definition conflicts with it, or
     /// any entry cannot be recreated. A node must never start with a partial cluster topology.
     #[cfg(feature = "cluster")]
+    #[allow(clippy::too_many_lines)] // Replay, validation, rollback, and sealing form one transaction.
     pub(crate) async fn restore_catalog_from_manifest(
         &self,
     ) -> Result<Option<laminar_core::cluster::control::CatalogManifest>, DbError> {
@@ -2431,6 +2437,9 @@ impl LaminarDB {
     ///
     /// This is intended for cluster diagnostics and placement validation. It deliberately returns
     /// immutable batches rather than exposing the mutable `DataFusion` catalog.
+    ///
+    /// # Errors
+    /// Returns an error when the local table cannot be resolved, planned, or collected.
     #[cfg(feature = "cluster")]
     pub async fn collect_local_table(&self, name: &str) -> Result<Vec<RecordBatch>, DbError> {
         const LOCAL_SCAN_NAME: &str = "__laminar_local_table_scan";
@@ -2779,6 +2788,7 @@ impl LaminarDB {
     /// Returns an error for a partial or divergent bootstrap, unsafe catalog mutation, lost leader
     /// authority, or manifest sealing failure. Local creates are rolled back on every error.
     #[cfg(feature = "cluster")]
+    #[allow(clippy::too_many_lines)] // Parse, validate, apply, rollback, and seal one catalog batch.
     pub async fn execute_cluster_bootstrap_batch(
         &self,
         sql: &[String],
@@ -2935,6 +2945,9 @@ impl LaminarDB {
 
     /// Apply one startup catalog definition and seal it as the complete inventory.
     /// Prefer [`Self::execute_cluster_bootstrap_batch`] for server configuration.
+    ///
+    /// # Errors
+    /// Returns an error when the definition is invalid or the catalog batch cannot be sealed.
     #[cfg(feature = "cluster")]
     pub async fn execute_cluster_bootstrap(&self, sql: &str) -> Result<ExecuteResult, DbError> {
         let entries = vec![sql.to_owned()];
@@ -3153,7 +3166,7 @@ impl LaminarDB {
                 table_name,
                 columns,
                 values,
-            } => self.handle_insert_into(table_name, columns, values).await,
+            } => self.handle_insert_into(table_name, columns, values),
             StreamingStatement::DropSource {
                 name,
                 if_exists,
@@ -3264,7 +3277,7 @@ impl LaminarDB {
         result
     }
 
-    async fn handle_insert_into(
+    fn handle_insert_into(
         &self,
         table_name: &sqlparser::ast::ObjectName,
         columns: &[sqlparser::ast::Ident],

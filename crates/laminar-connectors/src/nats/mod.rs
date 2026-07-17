@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod metrics;
+mod setup;
 pub mod sink;
 pub mod source;
 
@@ -19,6 +20,10 @@ use crate::config::{ConfigKeySpec, ConnectorInfo};
 use crate::registry::ConnectorRegistry;
 
 /// Registers the NATS source connector.
+///
+/// # Errors
+///
+/// Returns an error if the source is already registered or the registry is frozen.
 pub fn register_nats_source(
     registry: &ConnectorRegistry,
 ) -> Result<(), crate::error::ConnectorError> {
@@ -43,6 +48,10 @@ pub fn register_nats_source(
 }
 
 /// Registers the NATS sink connector.
+///
+/// # Errors
+///
+/// Returns an error if the sink is already registered or the registry is frozen.
 pub fn register_nats_sink(
     registry: &ConnectorRegistry,
 ) -> Result<(), crate::error::ConnectorError> {
@@ -144,11 +153,6 @@ fn source_config_keys() -> Vec<ConfigKeySpec> {
         ),
         K::optional("fetch.batch", "Messages per pull fetch", "500"),
         K::optional("fetch.max.wait.ms", "Max wait per fetch", "500"),
-        K::optional(
-            "fetch.error.threshold",
-            "Consecutive fetch errors before the source reports Unhealthy",
-            "10",
-        ),
         K::optional(
             "lag.poll.interval.ms",
             "Interval between consumer.info() polls for the lag gauge (0 disables)",

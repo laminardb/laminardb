@@ -8,6 +8,7 @@
 
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -19,12 +20,54 @@ use tracing::{debug, info};
 
 use crate::config::ConnectorConfig;
 use crate::connector::{
-    SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology, WriteResult,
+    ConnectorTaskOwner, ConnectorTaskTracker, SinkConnector, SinkConsistency, SinkContract,
+    SinkInputMode, SinkTopology, WriteResult,
 };
 use crate::error::ConnectorError;
 use crate::schema::traits::FormatEncoder;
 
 use super::config::{FileFormat, FileSinkConfig};
+
+enum FileBlockingTaskError {
+    Retired,
+    Worker(tokio::task::JoinError),
+}
+
+fn blocking_task_error(operation: &'static str, error: FileBlockingTaskError) -> ConnectorError {
+    match error {
+        FileBlockingTaskError::Retired => ConnectorError::InvalidState {
+            expected: "active file connector generation".into(),
+            actual: "retired".into(),
+        },
+        FileBlockingTaskError::Worker(error) => {
+            ConnectorError::Internal(format!("{operation}: {error}"))
+        }
+    }
+}
+
+fn ambiguous_blocking_task_error(
+    operation: &'static str,
+    error: FileBlockingTaskError,
+) -> ConnectorError {
+    match error {
+        FileBlockingTaskError::Retired => ConnectorError::InvalidState {
+            expected: "active file connector generation".into(),
+            actual: "retired".into(),
+        },
+        FileBlockingTaskError::Worker(error) => ConnectorError::outcome_unknown(
+            format!("{operation}: the worker ended after filesystem dispatch: {error}"),
+            error.is_cancelled(),
+        ),
+    }
+}
+
+enum FilePublicationError {
+    BeforeDispatch(ConnectorError),
+    AfterDispatch {
+        published: usize,
+        error: ConnectorError,
+    },
+}
 
 /// File sink connector that publishes immutable rolling files.
 pub struct FileSink {
@@ -36,9 +79,6 @@ pub struct FileSink {
     encoder: Option<Box<dyn FormatEncoder>>,
     /// Generation reserved for the next publication.
     next_generation: u64,
-    /// Whether this generation has published at least one final file. This is
-    /// retained across a partial multi-file failure so retries cannot reuse it.
-    generation_has_published_files: bool,
     /// Buffered batches awaiting a bulk-format file flush.
     buffered_batches: Vec<RecordBatch>,
     /// Current segment index within the publication generation.
@@ -51,6 +91,12 @@ pub struct FileSink {
     active_tmp_files: Vec<PathBuf>,
     /// Whether the sink is open.
     is_open: bool,
+    /// Prevents admitted but not-yet-running blocking work from starting after retirement.
+    retired: Arc<AtomicBool>,
+    /// Admission authority for blocking work owned by this generation.
+    task_owner: ConnectorTaskOwner,
+    /// Terminal observer handed to the runtime before this generation is dropped.
+    task_tracker: ConnectorTaskTracker,
 }
 
 impl FileSink {
@@ -63,19 +109,47 @@ impl FileSink {
     /// Creates a new file sink with an optional Prometheus registry.
     #[must_use]
     pub fn with_registry(_registry: Option<&prometheus::Registry>) -> Self {
+        let (task_owner, task_tracker) = ConnectorTaskOwner::new();
         Self {
             config: None,
             schema: Arc::new(arrow_schema::Schema::empty()),
             encoder: None,
             next_generation: 1,
-            generation_has_published_files: false,
             buffered_batches: Vec::new(),
             current_segment: 0,
             segment_bytes: 0,
             writer: None,
             active_tmp_files: Vec::new(),
             is_open: false,
+            retired: Arc::new(AtomicBool::new(false)),
+            task_owner,
+            task_tracker,
         }
+    }
+
+    async fn run_blocking<T, F>(&self, operation: F) -> Result<T, FileBlockingTaskError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        if self.retired.load(Ordering::Acquire) {
+            return Err(FileBlockingTaskError::Retired);
+        }
+        let guard = self
+            .task_owner
+            .track()
+            .expect("live file sink cannot have a retired task owner");
+        let retired = Arc::clone(&self.retired);
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            if retired.load(Ordering::Acquire) {
+                Err(FileBlockingTaskError::Retired)
+            } else {
+                Ok(operation())
+            }
+        })
+        .await
+        .map_err(FileBlockingTaskError::Worker)?
     }
 
     fn ensure_open(&self) -> Result<(), ConnectorError> {
@@ -112,20 +186,21 @@ impl FileSink {
         // Register the path before awaiting. If the caller cancels while the
         // blocking open completes, a later retry still owns the file.
         self.active_tmp_files.push(path.clone());
-        let file = match tokio::task::spawn_blocking(move || {
-            std::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&open_path)
-                .map_err(|e| {
-                    ConnectorError::WriteError(format!(
-                        "cannot create temporary output '{}': {e}",
-                        open_path.display()
-                    ))
-                })
-        })
-        .await
-        .map_err(|e| ConnectorError::WriteError(format!("spawn_blocking failed: {e}")))?
+        let file = match self
+            .run_blocking(move || {
+                std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&open_path)
+                    .map_err(|e| {
+                        ConnectorError::WriteError(format!(
+                            "cannot create temporary output '{}': {e}",
+                            open_path.display()
+                        ))
+                    })
+            })
+            .await
+            .map_err(|error| blocking_task_error("temporary-file open failed", error))?
         {
             Ok(file) => file,
             Err(error) => {
@@ -152,7 +227,7 @@ impl FileSink {
         let Some(writer) = self.writer.clone() else {
             return Ok(());
         };
-        tokio::task::spawn_blocking(move || -> Result<(), ConnectorError> {
+        self.run_blocking(move || -> Result<(), ConnectorError> {
             let mut w = writer
                 .lock()
                 .map_err(|_| ConnectorError::WriteError("file writer lock was poisoned".into()))?;
@@ -163,28 +238,38 @@ impl FileSink {
                 .map_err(|e| ConnectorError::WriteError(format!("file sync error: {e}")))
         })
         .await
-        .map_err(|e| ConnectorError::WriteError(format!("spawn_blocking failed: {e}")))??;
+        .map_err(|error| ambiguous_blocking_task_error("writer flush failed", error))?
+        .map_err(|error| {
+            let retryable = error.is_transient();
+            ConnectorError::outcome_unknown(
+                format!("temporary-file flush or sync may have partially completed: {error}"),
+                retryable,
+            )
+        })?;
         self.writer = None;
         Ok(())
     }
 
     fn advance_segment(&mut self) -> Result<(), ConnectorError> {
         self.current_segment = self.current_segment.checked_add(1).ok_or_else(|| {
-            ConnectorError::WriteError("file sink segment counter overflow".into())
+            ConnectorError::outcome_unknown(
+                "file data was staged but the segment counter is exhausted",
+                false,
+            )
         })?;
         self.segment_bytes = 0;
         Ok(())
     }
 
-    fn finish_resolved_generation(&mut self) -> Result<(), ConnectorError> {
-        if self.generation_has_published_files && self.active_tmp_files.is_empty() {
-            self.next_generation = self.next_generation.checked_add(1).ok_or_else(|| {
-                ConnectorError::WriteError("file sink generation counter overflow".into())
-            })?;
-            self.generation_has_published_files = false;
-            self.current_segment = 0;
-            self.segment_bytes = 0;
-        }
+    fn finish_published_generation(&mut self) -> Result<(), ConnectorError> {
+        self.next_generation = self.next_generation.checked_add(1).ok_or_else(|| {
+            ConnectorError::outcome_unknown(
+                "files were published but the generation counter is exhausted",
+                false,
+            )
+        })?;
+        self.current_segment = 0;
+        self.segment_bytes = 0;
         Ok(())
     }
 
@@ -200,13 +285,6 @@ impl FileSink {
             return Ok(());
         }
 
-        let combined = if self.buffered_batches.len() == 1 {
-            self.buffered_batches[0].clone()
-        } else {
-            arrow_select::concat::concat_batches(&self.schema, &self.buffered_batches)
-                .map_err(|e| ConnectorError::WriteError(format!("batch concat error: {e}")))?
-        };
-
         let encoder = self
             .encoder
             .take()
@@ -214,14 +292,25 @@ impl FileSink {
                 expected: "encoder ready".into(),
                 actual: "no encoder".into(),
             })?;
-        let (encoder, encoded) = tokio::task::spawn_blocking(move || {
-            let encoded = encoder
-                .encode_batch(&combined)
-                .map_err(|e| ConnectorError::WriteError(format!("bulk encode error: {e}")));
-            (encoder, encoded)
-        })
-        .await
-        .map_err(|e| ConnectorError::WriteError(format!("spawn_blocking failed: {e}")))?;
+        let batches = self.buffered_batches.clone();
+        let schema = self.schema.clone();
+        let (encoder, encoded) = self
+            .run_blocking(move || {
+                let combined = if batches.len() == 1 {
+                    Ok(batches[0].clone())
+                } else {
+                    arrow_select::concat::concat_batches(&schema, &batches)
+                        .map_err(|e| ConnectorError::WriteError(format!("batch concat error: {e}")))
+                };
+                let encoded = combined.and_then(|combined| {
+                    encoder
+                        .encode_batch(&combined)
+                        .map_err(|e| ConnectorError::WriteError(format!("bulk encode error: {e}")))
+                });
+                (encoder, encoded)
+            })
+            .await
+            .map_err(|error| blocking_task_error("bulk encoder worker failed", error))?;
         self.encoder = Some(encoder);
         let mut encoded = encoded?;
         if encoded.len() != 1 {
@@ -238,7 +327,7 @@ impl FileSink {
             .as_ref()
             .expect("open_segment_async just ran")
             .clone();
-        tokio::task::spawn_blocking(move || -> Result<(), ConnectorError> {
+        self.run_blocking(move || -> Result<(), ConnectorError> {
             let mut writer = writer
                 .lock()
                 .map_err(|_| ConnectorError::WriteError("file writer lock was poisoned".into()))?;
@@ -248,7 +337,14 @@ impl FileSink {
             Ok(())
         })
         .await
-        .map_err(|e| ConnectorError::WriteError(format!("spawn_blocking failed: {e}")))??;
+        .map_err(|error| ambiguous_blocking_task_error("bulk file write failed", error))?
+        .map_err(|error| {
+            let retryable = error.is_transient();
+            ConnectorError::outcome_unknown(
+                format!("bulk temporary-file write may have partially completed: {error}"),
+                retryable,
+            )
+        })?;
         self.buffered_batches.clear();
         Ok(())
     }
@@ -259,7 +355,7 @@ impl FileSink {
         self.close_writer_async().await?;
 
         let paths = self.active_tmp_files.clone();
-        tokio::task::spawn_blocking(move || {
+        self.run_blocking(move || {
             for path in paths {
                 let file = std::fs::OpenOptions::new()
                     // Windows requires write access for FlushFileBuffers.
@@ -281,7 +377,7 @@ impl FileSink {
             Ok::<(), ConnectorError>(())
         })
         .await
-        .map_err(|e| ConnectorError::WriteError(format!("spawn_blocking failed: {e}")))??;
+        .map_err(|error| blocking_task_error("temporary-file sync failed", error))??;
         Ok(())
     }
 
@@ -299,8 +395,8 @@ impl FileSink {
         }
 
         let paths = self.active_tmp_files.clone();
-        let outcome =
-            tokio::task::spawn_blocking(move || -> Result<usize, (usize, ConnectorError)> {
+        let outcome = self
+            .run_blocking(move || -> Result<usize, FilePublicationError> {
                 let finals = paths
                     .iter()
                     .map(|path| {
@@ -318,21 +414,21 @@ impl FileSink {
                         }
                     })
                     .collect::<Result<Vec<_>, ConnectorError>>()
-                    .map_err(|error| (0, error))?;
+                    .map_err(FilePublicationError::BeforeDispatch)?;
 
                 let mut published = 0;
                 for (tmp_path, final_path) in paths.iter().zip(&finals) {
                     if let Err(e) =
                         durable_rename(tmp_path, final_path, DurableRenameMode::NoReplace)
                     {
-                        return Err((
+                        return Err(FilePublicationError::AfterDispatch {
                             published,
-                            ConnectorError::WriteError(format!(
+                            error: ConnectorError::WriteError(format!(
                                 "cannot publish '{}' as '{}': {e}",
                                 tmp_path.display(),
                                 final_path.display()
                             )),
-                        ));
+                        });
                     }
                     published += 1;
                     debug!(path = %final_path.display(), "file sink published immutable file");
@@ -340,20 +436,32 @@ impl FileSink {
                 Ok(published)
             })
             .await
-            .map_err(|e| ConnectorError::WriteError(format!("spawn_blocking failed: {e}")))?;
+            .map_err(|error| ambiguous_blocking_task_error("file publication failed", error))?;
 
-        let (published, error) = match outcome {
-            Ok(published) => (published, None),
-            Err((published, error)) => (published, Some(error)),
+        let published = match outcome {
+            Ok(published) => published,
+            Err(FilePublicationError::BeforeDispatch(error)) => return Err(error),
+            Err(FilePublicationError::AfterDispatch { published, error }) => {
+                let retryable = error.is_transient();
+                return Err(ConnectorError::outcome_unknown(
+                    format!(
+                        "file publication failed after dispatch; {published} file(s) were confirmed published: {error}"
+                    ),
+                    retryable,
+                ));
+            }
         };
-        if published > 0 {
-            self.active_tmp_files.drain(..published);
-            self.generation_has_published_files = true;
+        if published != self.active_tmp_files.len() {
+            return Err(ConnectorError::outcome_unknown(
+                format!(
+                    "file publication reported {published} completed file(s) for {} pending path(s)",
+                    self.active_tmp_files.len()
+                ),
+                false,
+            ));
         }
-        self.finish_resolved_generation()?;
-        if let Some(error) = error {
-            return Err(error);
-        }
+        self.active_tmp_files.clear();
+        self.finish_published_generation()?;
         Ok(())
     }
 
@@ -370,15 +478,17 @@ impl Default for FileSink {
     }
 }
 
+impl Drop for FileSink {
+    fn drop(&mut self) {
+        self.retired.store(true, Ordering::Release);
+    }
+}
+
 impl std::fmt::Debug for FileSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FileSink")
             .field("is_open", &self.is_open)
             .field("next_generation", &self.next_generation)
-            .field(
-                "generation_has_published_files",
-                &self.generation_has_published_files,
-            )
             .field("buffered_batches", &self.buffered_batches.len())
             .field("active_tmp_files", &self.active_tmp_files.len())
             .finish()
@@ -387,6 +497,10 @@ impl std::fmt::Debug for FileSink {
 
 #[async_trait]
 impl SinkConnector for FileSink {
+    fn terminal_task_tracker(&self) -> Option<ConnectorTaskTracker> {
+        Some(self.task_tracker.clone())
+    }
+
     fn contract(&self, config: &ConnectorConfig) -> Result<SinkContract, ConnectorError> {
         FileSinkConfig::from_connector_config(config)?;
         if !cfg!(any(unix, windows)) {
@@ -422,17 +536,17 @@ impl SinkConnector for FileSink {
         let out_dir = PathBuf::from(&sink_config.path);
         let prefix = sink_config.prefix.clone();
         let extension = sink_config.format.extension().to_string();
-        let next_generation = tokio::task::spawn_blocking(move || {
-            initialise_output_directory(&out_dir, &prefix, &extension)
-        })
-        .await
-        .map_err(|e| ConnectorError::WriteError(format!("spawn_blocking failed: {e}")))??;
+        let next_generation = self
+            .run_blocking(move || initialise_output_directory(&out_dir, &prefix, &extension))
+            .await
+            .map_err(|error| {
+                blocking_task_error("output-directory initialisation failed", error)
+            })??;
 
         self.config = Some(sink_config);
         self.schema = schema;
         self.encoder = Some(encoder);
         self.next_generation = next_generation;
-        self.generation_has_published_files = false;
         self.current_segment = 0;
         self.segment_bytes = 0;
         self.buffered_batches.clear();
@@ -480,22 +594,28 @@ impl SinkConnector for FileSink {
             return Ok(WriteResult::new(rows, 0));
         }
 
-        // Row format: encode in-memory, then run the blocking write
-        // loop on the blocking pool so it can't stall the runtime.
-        let encoded = self
+        // Row encoding and file writes can both be CPU- or filesystem-bound.
+        // Keep them off the Tokio worker pool and owned by this generation.
+        let encoder = self
             .encoder
-            .as_ref()
+            .take()
             .ok_or_else(|| ConnectorError::InvalidState {
                 expected: "encoder ready".into(),
                 actual: "no encoder".into(),
-            })?
-            .encode_batch(batch)
-            .map_err(|e| ConnectorError::WriteError(format!("encode error: {e}")))?;
-        if encoded.is_empty() {
-            return Err(ConnectorError::WriteError(
-                "file encoder produced no records for a non-empty batch".into(),
-            ));
-        }
+            })?;
+        let batch = batch.clone();
+        let (encoder, encoded) = self
+            .run_blocking(move || {
+                let encoded = encoder
+                    .encode_batch(&batch)
+                    .map_err(|e| ConnectorError::WriteError(format!("encode error: {e}")));
+                (encoder, encoded)
+            })
+            .await
+            .map_err(|error| blocking_task_error("row encoder worker failed", error))?;
+        self.encoder = Some(encoder);
+        let encoded = encoded?;
+        validate_encoded_row_count(rows, encoded.len())?;
 
         self.ensure_writer_async().await?;
         let writer = self
@@ -503,28 +623,41 @@ impl SinkConnector for FileSink {
             .as_ref()
             .expect("ensure_writer_async just ran")
             .clone();
-        let bytes_written = tokio::task::spawn_blocking(move || -> Result<_, ConnectorError> {
-            let mut writer = writer
-                .lock()
-                .map_err(|_| ConnectorError::WriteError("file writer lock was poisoned".into()))?;
-            let mut total: u64 = 0;
-            for record_bytes in &encoded {
-                writer
-                    .write_all(record_bytes)
-                    .map_err(|e| ConnectorError::WriteError(format!("write error: {e}")))?;
-                writer
-                    .write_all(b"\n")
-                    .map_err(|e| ConnectorError::WriteError(format!("write error: {e}")))?;
-                total += record_bytes.len() as u64 + 1;
-            }
-            Ok(total)
-        })
-        .await
-        .map_err(|e| ConnectorError::WriteError(format!("spawn_blocking failed: {e}")))??;
+        let bytes_written = self
+            .run_blocking(move || -> Result<_, ConnectorError> {
+                let mut writer = writer.lock().map_err(|_| {
+                    ConnectorError::WriteError("file writer lock was poisoned".into())
+                })?;
+                let mut total: u64 = 0;
+                for record_bytes in &encoded {
+                    writer
+                        .write_all(record_bytes)
+                        .map_err(|e| ConnectorError::WriteError(format!("write error: {e}")))?;
+                    writer
+                        .write_all(b"\n")
+                        .map_err(|e| ConnectorError::WriteError(format!("write error: {e}")))?;
+                    total += record_bytes.len() as u64 + 1;
+                }
+                Ok(total)
+            })
+            .await
+            .map_err(|error| ambiguous_blocking_task_error("row file write failed", error))?
+            .map_err(|error| {
+                let retryable = error.is_transient();
+                ConnectorError::outcome_unknown(
+                    format!("row temporary-file write may have partially completed: {error}"),
+                    retryable,
+                )
+            })?;
         self.segment_bytes = self
             .segment_bytes
             .checked_add(bytes_written)
-            .ok_or_else(|| ConnectorError::WriteError("file sink byte counter overflow".into()))?;
+            .ok_or_else(|| {
+                ConnectorError::outcome_unknown(
+                    "file data was staged but the byte counter is exhausted",
+                    false,
+                )
+            })?;
 
         // Size-based rotation within the current publication generation.
         if let Some(max_size) = max_file_size {
@@ -564,6 +697,17 @@ impl SinkConnector for FileSink {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
+
+fn validate_encoded_row_count(expected: usize, actual: usize) -> Result<(), ConnectorError> {
+    if actual == expected {
+        return Ok(());
+    }
+    Err(crate::error::SerdeError::RecordCountMismatch {
+        expected,
+        got: actual,
+    }
+    .into())
+}
 
 fn build_encoder(
     format: FileFormat,
@@ -723,6 +867,27 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn row_encoder_cardinality_must_match_the_input() {
+        validate_encoded_row_count(3, 3).unwrap();
+        let short = validate_encoded_row_count(3, 2).unwrap_err();
+        let long = validate_encoded_row_count(3, 4).unwrap_err();
+        assert!(matches!(
+            short,
+            ConnectorError::Serde(crate::error::SerdeError::RecordCountMismatch {
+                expected: 3,
+                got: 2
+            })
+        ));
+        assert!(matches!(
+            long,
+            ConnectorError::Serde(crate::error::SerdeError::RecordCountMismatch {
+                expected: 3,
+                got: 4
+            })
+        ));
+    }
+
     fn test_config(out_path: &Path, format: &str) -> ConnectorConfig {
         let mut config = ConnectorConfig::new("files");
         config.set("path", out_path.to_str().unwrap());
@@ -749,6 +914,42 @@ mod tests {
     fn test_sink_default() {
         let sink = FileSink::new();
         assert!(!sink.is_open);
+    }
+
+    #[tokio::test]
+    async fn retired_generation_owns_uncooperative_blocking_child_until_exit() {
+        let sink = Arc::new(FileSink::new());
+        let tracker = sink
+            .terminal_task_tracker()
+            .expect("file sink owns blocking tasks");
+        let child_sink = Arc::clone(&sink);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let caller = tokio::spawn(async move {
+            child_sink
+                .run_blocking(move || {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.recv();
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+        assert!(!tracker.is_terminated());
+
+        caller.abort();
+        let _ = caller.await;
+        drop(sink);
+        tokio::task::yield_now().await;
+        assert!(
+            !tracker.is_terminated(),
+            "retirement must retain a started blocking child"
+        );
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), tracker.wait_terminated())
+            .await
+            .expect("blocking generation did not reach terminal completion");
     }
 
     #[tokio::test]
@@ -903,7 +1104,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_publication_retry_finishes_generation_without_reuse() {
+    async fn partial_publication_is_outcome_unknown_and_recovery_uses_new_generation() {
         let dir = tempfile::tempdir().unwrap();
         let out_path = dir.path().join("output");
         let mut config = test_config(&out_path, "json");
@@ -922,17 +1123,18 @@ mod tests {
         std::fs::remove_file(&sink.active_tmp_files[1]).unwrap();
         let error = sink.publish_pending_files().await.unwrap_err();
         assert!(error.to_string().contains("cannot publish"));
+        assert!(error.is_outcome_unknown());
         assert_eq!(final_files(&out_path).len(), 1);
-        assert!(sink.generation_has_published_files);
+        drop(sink);
 
-        // Restore the missing temporary segment and retry. The already-published
-        // segment is retained, and the generation advances only after all files
-        // have resolved.
-        std::fs::write(&sink.active_tmp_files[0], b"recovered").unwrap();
-        sink.publish_pending_files().await.unwrap();
-        assert_eq!(sink.next_generation, 2);
-        assert!(!sink.generation_has_published_files);
+        // Outcome-unknown retires the old connector. Recovery scans the partial
+        // final output and replays into a strictly newer immutable generation.
+        let mut recovered = FileSink::new();
+        recovered.open(&config).await.unwrap();
+        assert_eq!(recovered.next_generation, 2);
+        recovered.write_batch(&test_batch(&schema)).await.unwrap();
+        recovered.flush().await.unwrap();
         assert_eq!(final_files(&out_path).len(), 2);
-        sink.close().await.unwrap();
+        recovered.close().await.unwrap();
     }
 }

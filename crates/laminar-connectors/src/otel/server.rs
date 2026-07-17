@@ -27,7 +27,11 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTraceServiceRequest, ExportTraceServiceResponse,
 };
 
+use crate::connector::ConnectorTaskGuard;
+
 use super::convert::{logs_request_to_batch, metrics_request_to_batch, trace_request_to_batch};
+
+const DOWNSTREAM_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ── Shared helpers ──
 
@@ -101,6 +105,10 @@ pub struct OtelReceiver {
     requests_received: Arc<AtomicU64>,
     send_timeout: Duration,
     batch_size: usize,
+    // Generated tonic services retain the receiver in an Arc for every
+    // accepted connection and RPC future. This guard therefore outlives all
+    // tonic work, including early failure of the parent serve future.
+    _terminal_guard: ConnectorTaskGuard,
 }
 
 impl OtelReceiver {
@@ -111,8 +119,8 @@ impl OtelReceiver {
         data_ready: Arc<Notify>,
         records_received: Arc<AtomicU64>,
         requests_received: Arc<AtomicU64>,
-        send_timeout: Duration,
         batch_size: usize,
+        terminal_guard: ConnectorTaskGuard,
     ) -> Self {
         Self {
             batch_tx,
@@ -120,8 +128,9 @@ impl OtelReceiver {
             data_ready,
             records_received,
             requests_received,
-            send_timeout,
+            send_timeout: DOWNSTREAM_SEND_TIMEOUT,
             batch_size,
+            _terminal_guard: terminal_guard,
         }
     }
 

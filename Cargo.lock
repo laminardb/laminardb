@@ -4905,6 +4905,7 @@ dependencies = [
  "libc",
  "mongodb",
  "notify",
+ "object_store 0.12.5",
  "object_store 0.13.2",
  "opentelemetry-proto",
  "parking_lot 0.12.5",

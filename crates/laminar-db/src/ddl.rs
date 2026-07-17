@@ -284,6 +284,7 @@ struct CreateTableWith {
 /// implement. Keep this destructuring exhaustive: a parser upgrade that adds a
 /// field must make this function fail to compile until its semantics are
 /// reviewed.
+#[allow(clippy::too_many_lines)] // exhaustive parser-envelope rejection is one invariant
 fn validate_create_table_envelope(create: &sqlparser::ast::CreateTable) -> Result<(), DbError> {
     let sqlparser::ast::CreateTable {
         or_replace: _,
@@ -435,6 +436,7 @@ fn validate_create_table_envelope(create: &sqlparser::ast::CreateTable) -> Resul
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // column and table constraints must be validated together
 fn build_table_fields_and_primary_key(
     create: &sqlparser::ast::CreateTable,
 ) -> Result<(Vec<Field>, String), DbError> {
@@ -1041,7 +1043,7 @@ impl LaminarDB {
         context: &str,
         name: &str,
         kind: CatalogObjectKind,
-        error: DbError,
+        error: &DbError,
     ) -> DbError {
         let reason = format!(
             "[LDB-6044] {context} left {kind} '{name}' incompletely cleaned; this LaminarDB instance is permanently fenced: {error}"
@@ -1071,7 +1073,7 @@ impl LaminarDB {
         context: &str,
     ) -> Result<(), DbError> {
         self.cleanup_catalog_object(name, kind)
-            .map_err(|error| self.terminal_catalog_cleanup_error(context, name, kind, error))
+            .map_err(|error| self.terminal_catalog_cleanup_error(context, name, kind, &error))
     }
 
     pub(crate) fn rollback_catalog_create_or_fence(
@@ -1273,9 +1275,7 @@ impl LaminarDB {
         {
             let mut planner = self.planner.lock();
             let stmt = StreamingStatement::CreateSource(Box::new(create.clone()));
-            planner
-                .plan(&stmt)
-                .map_err(|error| laminar_sql::Error::from(error))?;
+            planner.plan(&stmt).map_err(laminar_sql::Error::from)?;
         }
 
         let entry = self.register_source_entry(create, &source_def)?;
@@ -1501,9 +1501,7 @@ impl LaminarDB {
         {
             let mut planner = self.planner.lock();
             let stmt = StreamingStatement::CreateSink(Box::new(create.clone()));
-            planner
-                .plan(&stmt)
-                .map_err(|error| laminar_sql::Error::from(error))?;
+            planner.plan(&stmt).map_err(laminar_sql::Error::from)?;
         }
 
         self.catalog.register_sink(&name, &input)?;
@@ -1684,6 +1682,8 @@ impl LaminarDB {
         }))
     }
 
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    // Parsing, admission, catalog mutation, and live-control acknowledgement form one transaction.
     pub(crate) async fn handle_create_stream(
         &self,
         sql: &str,
@@ -1708,7 +1708,8 @@ impl LaminarDB {
         };
 
         self.validate_cluster_query_shape_before_plan("stream", &name_str, query_sql, emit_clause)?;
-        let planned = self.plan_streaming_query(name, query, emit_clause.cloned(), query_sql)?;
+        let planned =
+            self.plan_streaming_query(name, query, emit_clause.cloned(), query_sql, false)?;
         self.validate_cluster_query_shape("stream", &name_str, query_sql, &planned)
             .await?;
         let PlannedStreamingQuery {
@@ -1820,9 +1821,7 @@ impl LaminarDB {
             }
             Err(error) => Err(error),
         };
-        if let Err(error) = admission_result {
-            return Err(error);
-        }
+        admission_result?;
 
         reservation.commit();
 
@@ -1968,19 +1967,6 @@ impl LaminarDB {
         expected: CatalogObjectKind,
         cascade: bool,
     ) -> Result<Vec<CatalogDropTarget>, DbError> {
-        self.require_catalog_kind(name, expected, false)?;
-        let direct = self.direct_dependents(name)?;
-        if !cascade && !direct.is_empty() {
-            let names = direct
-                .iter()
-                .map(|target| target.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(DbError::InvalidOperation(format!(
-                "cannot drop {expected} '{name}': depended on by {names}; use CASCADE"
-            )));
-        }
-
         fn visit(
             db: &LaminarDB,
             target: CatalogDropTarget,
@@ -1995,6 +1981,19 @@ impl LaminarDB {
             }
             result.push(target);
             Ok(())
+        }
+
+        self.require_catalog_kind(name, expected, false)?;
+        let direct = self.direct_dependents(name)?;
+        if !cascade && !direct.is_empty() {
+            let names = direct
+                .iter()
+                .map(|target| target.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(DbError::InvalidOperation(format!(
+                "cannot drop {expected} '{name}': depended on by {names}; use CASCADE"
+            )));
         }
 
         let mut result = Vec::new();
@@ -2111,7 +2110,52 @@ impl LaminarDB {
         query: &StreamingStatement,
         emit_clause: Option<laminar_sql::parser::EmitClause>,
         query_sql: &str,
+        certify_state_backed_join: bool,
     ) -> Result<PlannedStreamingQuery, DbError> {
+        let admission = if certify_state_backed_join {
+            let incremental_mvs = self.incremental_mv_names();
+            if let Some(join) =
+                crate::sql_analysis::detect_changelog_incremental_join(query_sql, &incremental_mvs)
+            {
+                Some(
+                    laminar_sql::planner::StateBackedJoinAdmission::try_new(
+                        join.left_table,
+                        join.right_table,
+                        join.left_keys,
+                        join.right_keys,
+                        join.left_outer,
+                    )
+                    .map_err(|error| {
+                        DbError::InvalidOperation(format!(
+                            "invalid incremental-join admission certificate: {error}"
+                        ))
+                    })?,
+                )
+            } else if let Some(join) = crate::sql_analysis::detect_changelog_enrich_query(
+                query_sql,
+                &incremental_mvs,
+                &self.static_table_names(),
+            ) {
+                Some(
+                    laminar_sql::planner::StateBackedJoinAdmission::try_new(
+                        join.changelog_table,
+                        join.static_table,
+                        join.left_keys,
+                        join.right_keys,
+                        join.left_outer,
+                    )
+                    .map_err(|error| {
+                        DbError::InvalidOperation(format!(
+                            "invalid dimension-join admission certificate: {error}"
+                        ))
+                    })?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let mut planner = self.planner.lock();
         let statement = StreamingStatement::CreateStream {
             name: name.clone(),
@@ -2122,8 +2166,13 @@ impl LaminarDB {
             query_sql: query_sql.to_string(),
             retention_bytes: None,
         };
+        let plan_result = if let Some(admission) = admission.as_ref() {
+            planner.plan_state_backed_join(&statement, admission)
+        } else {
+            planner.plan(&statement)
+        };
         let laminar_sql::planner::StreamingPlan::Query(plan) =
-            planner.plan(&statement).map_err(laminar_sql::Error::from)?
+            plan_result.map_err(laminar_sql::Error::from)?
         else {
             return Err(DbError::InvalidOperation(format!(
                 "planner did not produce a streaming query for '{name}'"
@@ -2235,6 +2284,7 @@ impl LaminarDB {
     /// Cluster admission is based on configured runtime mode, never the current owner count.
     /// Every stateful route admitted here must implement key shuffle plus vnode capture, restore,
     /// and revoke. Joins fail closed until their operator and output state have that lifecycle.
+    #[allow(clippy::too_many_lines)] // fail-closed operator lifecycle admission matrix
     pub(crate) async fn validate_cluster_query_shape(
         &self,
         object_kind: &str,
@@ -2426,7 +2476,7 @@ impl LaminarDB {
                  atomic batch topology admission"
             )));
         }
-        let planned = self.plan_streaming_query(name, query, emit_clause, query_sql)?;
+        let planned = self.plan_streaming_query(name, query, emit_clause, query_sql, true)?;
         let PlannedStreamingQuery {
             emit_clause: plan_emit,
             window_config: plan_window,
@@ -2485,15 +2535,13 @@ impl LaminarDB {
             mgr.store_ddl(&name_str, sql);
         }
 
-        if let Err(error) = self.register_mv_provider(
+        self.register_mv_provider(
             &name_str,
             &schema,
             plan_window.is_some(),
             inc,
             has_aggregate,
-        ) {
-            return Err(error);
-        }
+        )?;
 
         let admission = {
             let guard = self.control_tx.lock();
@@ -2534,9 +2582,7 @@ impl LaminarDB {
             ),
             Err(error) => Err(error),
         };
-        if let Err(error) = admission_result {
-            return Err(error);
-        }
+        admission_result?;
 
         reservation.commit();
 

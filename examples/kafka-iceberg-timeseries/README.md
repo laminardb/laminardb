@@ -42,11 +42,12 @@ field and runs before `pipeline.start()`. Streaming-DDL is rejected on
 pgwire and on the HTTP `/api/v1/sql` endpoint after pipeline start, so
 the config TOML is the only working bootstrap channel.
 
-The demo selects <code>delivery = "exactly_once"</code> once under
-<code>[server]</code>. Its Kafka source is replayable, Iceberg is a
-checkpoint-committable sink, and <code>[state]</code> uses a node-durable local
-backend. This is the supported embedded/single-node exact topology; connector
-properties do not carry separate delivery flags or writer IDs.
+The demo selects <code>delivery = "at_least_once"</code> once under
+<code>[server]</code>. Kafka can replay from committed offsets and Iceberg
+durably acknowledges appends, but Iceberg publication is not coupled to a
+LaminarDB checkpoint decision. A process failure can therefore replay an
+already-published append. Connector properties do not carry separate delivery
+flags or writer IDs.
 
 PowerShell:
 
@@ -124,8 +125,8 @@ checkpoint state and deployment identity before a clean rerun.
 | Stage | Behavior |
 |---|---|
 | `crypto_ticks` source | Reads `crypto.ticks` with `WATERMARK FOR ts AS ts - INTERVAL '5' SECOND` as the single event-time policy (allows 5s of out-of-orderness before a window closes). |
-| `ohlc_1m` MV | `GROUP BY TUMBLE(ts, INTERVAL '1' MINUTE), symbol` produces non-overlapping per-symbol 1-minute buckets. `EMIT ON WINDOW CLOSE` makes the MV append-only, as required by Iceberg's coordinated exact contract. |
-| `ohlc_iceberg_sink` | Stages checkpoint committables and publishes them after the durable checkpoint decision. The global server delivery setting activates the protocol; `auto.create='true'` authors the unpartitioned table on first commit. |
+| `ohlc_1m` MV | `GROUP BY TUMBLE(ts, INTERVAL '1' MINUTE), symbol` produces non-overlapping per-symbol 1-minute buckets. `EMIT ON WINDOW CLOSE` makes the MV append-only for the Iceberg append sink. |
+| `ohlc_iceberg_sink` | Durably appends each emitted batch with at-least-once delivery; `auto.create='true'` authors the unpartitioned table on first write. |
 | `query.sql` | Reads the Iceberg table through the iceberg-REST catalog; computes tick-weighted hourly VWAP from per-bar `notional` and `volume` so per-tick weighting is preserved across bars of different volume. |
 
 ## Gotchas

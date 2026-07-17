@@ -328,18 +328,6 @@
             { "expr": "rate(laminardb_lakehouse_sink_errors_total{instance=~\"$instance\",pipeline=~\"$pipeline\"}[1m])", "legendFormat": "errors/s" }
           ],
           "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } }
-        },
-        {
-          "title": "Compaction",
-          "type": "timeseries",
-          "datasource": "${DS_PROMETHEUS}",
-          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 44 },
-          "targets": [
-            { "expr": "laminardb_delta_sink_compaction_runs_total{instance=~\"$instance\",pipeline=~\"$pipeline\"}", "legendFormat": "runs" },
-            { "expr": "laminardb_delta_sink_compaction_files_added_total{instance=~\"$instance\",pipeline=~\"$pipeline\"}", "legendFormat": "files added" },
-            { "expr": "laminardb_delta_sink_compaction_files_removed_total{instance=~\"$instance\",pipeline=~\"$pipeline\"}", "legendFormat": "files removed" }
-          ],
-          "fieldConfig": { "defaults": { "unit": "short" } }
         }
       ]
     },

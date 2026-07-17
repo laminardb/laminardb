@@ -1,6 +1,6 @@
 //! Checkpoint coordinator — Ring 2 control-plane orchestrator.
 //!
-//! Checkpoint manifest is the source of truth for source offsets; broker commits are advisory.
+//! Checkpoint manifest is the source of truth; external source progress commits are advisory.
 #![allow(clippy::disallowed_types)] // cold path
 
 use std::collections::{HashMap, HashSet};
@@ -127,7 +127,7 @@ enum PendingDecisionWait {
         epoch: u64,
         checkpoint_id: u64,
         outcome: Result<
-            Result<laminar_core::checkpoint_decision::RecordOutcomeResult, String>,
+            Result<Box<laminar_core::checkpoint_decision::RecordOutcomeResult>, String>,
             tokio::task::JoinError,
         >,
     },
@@ -839,6 +839,7 @@ async fn preflight_cluster_retention_cut(
     .await
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // One fail-closed retention authorization protocol keeps its authority inputs explicit.
 async fn authorize_retention_horizon(
     requested: u64,
     trigger_epoch: u64,
@@ -996,6 +997,7 @@ async fn run_capsule_gc_step(
     }
 }
 
+#[allow(clippy::too_many_lines)] // One ownership loop serializes every retention transition.
 async fn run_retention_maintenance(
     store: Arc<dyn CheckpointStore>,
     mut requests: tokio::sync::watch::Receiver<Option<RetentionRequest>>,
@@ -1064,7 +1066,7 @@ async fn run_retention_maintenance(
         // Publish/verify the authoritative tombstone before deleting any manifest/state artifact.
         // If the floor cannot reach a safe prefix, an old decision could remain or reappear after
         // its exact recovery data is gone, so the destructive phases are skipped.
-        let Some(artifact_horizon) = authorize_retention_horizon(
+        let Some(artifact_horizon) = Box::pin(authorize_retention_horizon(
             horizon,
             trigger_epoch,
             Arc::clone(&store),
@@ -1079,7 +1081,7 @@ async fn run_retention_maintenance(
             leader_proof,
             advance_decision_floor,
             operation_timeout,
-        )
+        ))
         .await
         else {
             continue;
@@ -1437,7 +1439,7 @@ impl CheckpointCoordinator {
                 Some(PendingDecisionWait::Completed {
                     epoch,
                     checkpoint_id,
-                    outcome,
+                    outcome: outcome.map(|result| result.map(Box::new)),
                 })
             }
             Err(_) => Some(PendingDecisionWait::TimedOut {
@@ -1460,6 +1462,7 @@ impl CheckpointCoordinator {
             && outcome.leader_proof == self.active_leader_proof
     }
 
+    #[allow(clippy::too_many_lines)] // One create-once decision transition owns ambiguity handling.
     async fn record_terminal_outcome_until(
         &mut self,
         attempt: CheckpointAttempt,
@@ -1557,7 +1560,7 @@ impl CheckpointCoordinator {
                 ..
             }) => {
                 self.decision_write_started = false;
-                Ok(result)
+                Ok(*result)
             }
             Some(PendingDecisionWait::Completed {
                 outcome: Ok(Err(error)),
@@ -1591,7 +1594,7 @@ impl CheckpointCoordinator {
                 checkpoint_id,
                 outcome: Ok(Ok(result)),
             }) => {
-                let outcome = match result {
+                let outcome = match *result {
                     laminar_core::checkpoint_decision::RecordOutcomeResult::Created(outcome)
                     | laminar_core::checkpoint_decision::RecordOutcomeResult::Unchanged(outcome) => {
                         outcome
@@ -2106,6 +2109,7 @@ impl CheckpointCoordinator {
     /// proves both manifest completion and a complete vnode-owner offset inventory, including
     /// owners whose connectors have empty offsets.
     #[cfg(feature = "cluster")]
+    #[allow(clippy::too_many_lines)] // Readiness persistence is one fail-closed attestation state machine.
     async fn persist_participant_ready_until(
         &mut self,
         attempt: CheckpointAttempt,
@@ -2397,24 +2401,24 @@ impl CheckpointCoordinator {
         .buffer_unordered(MAX_PARTICIPANT_READY_READ_CONCURRENCY);
         tokio::pin!(reads);
         let mut retained_bytes = 0;
-        let mut readiness = Vec::new();
+        let mut records = Vec::new();
         while let Some(result) = reads.next().await {
             let (key, key_participant, bytes) = result?;
             retained_bytes = checked_participant_ready_total(retained_bytes, bytes.len())?;
-            let ready = serde_json::from_slice::<ParticipantReady>(&bytes).map_err(|error| {
+            let marker = serde_json::from_slice::<ParticipantReady>(&bytes).map_err(|error| {
                 DbError::Checkpoint(format!(
                     "[LDB-6041] participant readiness marker '{key}' is corrupt: {error}"
                 ))
             })?;
-            if ready.participant_id != key_participant {
+            if marker.participant_id != key_participant {
                 return Err(DbError::Checkpoint(format!(
                     "[LDB-6041] participant readiness marker '{key}' names participant {}",
-                    ready.participant_id
+                    marker.participant_id
                 )));
             }
-            readiness.push((key, ready));
+            records.push((key, marker));
         }
-        Ok(readiness)
+        Ok(records)
     }
 
     #[cfg(feature = "cluster")]
@@ -2642,6 +2646,7 @@ impl CheckpointCoordinator {
 
     /// Apply one absolute deadline to the whole durable attempt. A decision write is treated as
     /// irrevocable from the instant it is issued because a timed-out create may still be visible.
+    #[allow(clippy::too_many_lines)] // One durable-attempt state machine owns its absolute deadline.
     async fn run_checkpoint_attempt(
         &mut self,
         request: CheckpointRequest,
@@ -3175,8 +3180,7 @@ impl CheckpointCoordinator {
         if self.last_sealed_partial_attempt.get(&vnode) != Some(&parent) {
             return Err(DbError::Checkpoint(format!(
                 "[LDB-6025] delta partial for vnode {vnode} would reference unsealed attempt \
-                 {:?} from epoch {epoch}; the next capture must re-base FULL",
-                parent
+                 {parent:?} from epoch {epoch}; the next capture must re-base FULL"
             )));
         }
         if parent.epoch.checked_add(1) != Some(epoch) {
@@ -3272,6 +3276,7 @@ impl CheckpointCoordinator {
         })?
     }
 
+    #[allow(clippy::too_many_lines)] // One fenced persistence transaction seals descriptors and state.
     async fn write_vnode_partials_inner(
         &mut self,
         epoch: u64,
@@ -4447,7 +4452,7 @@ impl CheckpointCoordinator {
         let mut sidecar_chunks: Vec<bytes::Bytes> = Vec::new();
         let mut offset: u64 = 0;
         let mut states: Vec<_> = operator_states.iter().collect();
-        states.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        states.sort_unstable_by_key(|(name, _)| *name);
         for (name, data) in states {
             let (op_ckpt, maybe_blob) =
                 laminar_core::storage::checkpoint_manifest::OperatorCheckpoint::from_bytes_shared(

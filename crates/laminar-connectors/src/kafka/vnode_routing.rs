@@ -66,7 +66,7 @@ fn vnode_from_prefix(
     let hash = key_hash(prefix);
     prefix.truncate(prefix.len() - 4);
     let vnode = hash % u64::from(vnode_count);
-    Ok(vnode as u32)
+    u32::try_from(vnode).map_err(|_| invalid_assignment("computed Kafka vnode does not fit in u32"))
 }
 
 /// Map one Kafka input partition to an engine vnode.

@@ -11,18 +11,23 @@ use async_nats::jetstream::{self, consumer::pull};
 use async_trait::async_trait;
 use bytes::Bytes;
 use crossfire::{mpsc, AsyncRx, MAsyncTx, TryRecvError};
+use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
 use tokio::sync::{mpsc as tokio_mpsc, watch, Notify};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use super::config::{build_connect_options, AckPolicy, DeliverPolicy, Mode, NatsSourceConfig};
 use super::metrics::NatsSourceMetrics;
+use super::setup::{
+    classify_connect_error, classify_create_consumer_error, classify_get_stream_error,
+    classify_subscribe_error, track_connection_tasks,
+};
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::ConnectorConfig;
 use crate::connector::{
-    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourcePosition, SourceStart,
-    SourceTopology,
+    ConnectorTaskGuard, ConnectorTaskOwner, ConnectorTaskTracker, SourceBatch, SourceConnector,
+    SourceConsistency, SourceContract, SourcePosition, SourceStart, SourceTopology,
 };
 use crate::error::ConnectorError;
 use crate::serde::{self, RecordDeserializer};
@@ -40,21 +45,92 @@ struct Incoming {
 
 struct AckRuntime {
     tx: Option<tokio_mpsc::Sender<jetstream::Message>>,
-    handle: JoinHandle<()>,
+    shutdown: watch::Sender<bool>,
+    task: TrackedTask,
 }
 
 struct Running {
     deserializer: Box<dyn RecordDeserializer>,
     rx: Option<AsyncRx<mpsc::Array<Incoming>>>,
     shutdown: watch::Sender<bool>,
-    handle: JoinHandle<()>,
+    reader: TrackedTask,
     ack_runtime: Option<AckRuntime>,
 }
 
-impl Drop for AckRuntime {
+struct TrackedTask {
+    handle: Option<JoinHandle<()>>,
+    reaper_guard: Option<ConnectorTaskGuard>,
+    name: &'static str,
+}
+
+enum TaskWait {
+    Completed(Result<(), tokio::task::JoinError>),
+    TimedOut,
+}
+
+impl TrackedTask {
+    fn spawn(
+        owner: &ConnectorTaskOwner,
+        name: &'static str,
+        future: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<Self, ConnectorError> {
+        let task_guard = owner.track().ok_or_else(|| {
+            ConnectorError::Internal("NATS source task generation is already retired".into())
+        })?;
+        let reaper_guard = owner.track().ok_or_else(|| {
+            ConnectorError::Internal("NATS source task generation is already retired".into())
+        })?;
+        let handle = tokio::spawn(async move {
+            let _task_guard = task_guard;
+            future.await;
+        });
+        Ok(Self {
+            handle: Some(handle),
+            reaper_guard: Some(reaper_guard),
+            name,
+        })
+    }
+
+    async fn wait_until(&mut self, deadline: tokio::time::Instant) -> TaskWait {
+        let Some(handle) = self.handle.as_mut() else {
+            return TaskWait::Completed(Ok(()));
+        };
+        match tokio::time::timeout_at(deadline, handle).await {
+            Ok(result) => {
+                self.handle.take();
+                self.reaper_guard.take();
+                TaskWait::Completed(result)
+            }
+            Err(_) => TaskWait::TimedOut,
+        }
+    }
+
+    fn retire(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            self.reaper_guard.take();
+            return;
+        };
+        let reaper_guard = self.reaper_guard.take();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            // Runtime destruction drops the task future and its task guard. That guard is the
+            // completion proof; a join task is useful for cleanup but is not itself the proof.
+            drop(handle);
+            drop(reaper_guard);
+            return;
+        };
+        let name = self.name;
+        drop(runtime.spawn(async move {
+            let _reaper_guard = reaper_guard;
+            if let Err(error) = handle.await {
+                debug!(task = name, %error, "retired NATS source task reaped");
+            }
+        }));
+    }
+}
+
+impl Drop for TrackedTask {
     fn drop(&mut self) {
-        self.tx.take();
-        self.handle.abort();
+        self.retire();
     }
 }
 
@@ -66,23 +142,48 @@ impl Running {
 
 impl Drop for Running {
     fn drop(&mut self) {
-        // Drop is the final backstop for a cancelled startup/close future. The watch update is
-        // observable even if the reader has not entered `changed()` yet; abort guarantees that a
-        // misbehaving transport future cannot become a detached loop.
+        // Drop is the final backstop for a cancelled startup/close future. Tasks retain their
+        // generation guards until they actually exit; the reapers retain the join handles.
         self.request_shutdown();
-        self.handle.abort();
+        self.rx.take();
+        if let Some(ack_runtime) = self.ack_runtime.as_mut() {
+            ack_runtime.request_shutdown();
+            ack_runtime.task.retire();
+        }
+        self.reader.retire();
     }
 }
 
 impl AckRuntime {
-    fn spawn(cfg: &NatsSourceConfig, metrics: NatsSourceMetrics) -> Self {
+    fn spawn(
+        cfg: &NatsSourceConfig,
+        metrics: NatsSourceMetrics,
+        owner: &ConnectorTaskOwner,
+    ) -> Result<Self, ConnectorError> {
         let (backlog, concurrency) = ack_runtime_limits(cfg);
         let (tx, rx) = tokio_mpsc::channel(backlog);
-        let handle = tokio::spawn(run_ack_worker(rx, concurrency, metrics));
-        Self {
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let task = TrackedTask::spawn(
+            owner,
+            "ack-worker",
+            run_ack_worker(rx, shutdown_rx, concurrency, metrics),
+        )?;
+        Ok(Self {
             tx: Some(tx),
-            handle,
-        }
+            shutdown,
+            task,
+        })
+    }
+
+    fn request_shutdown(&mut self) {
+        self.shutdown.send_replace(true);
+        self.tx.take();
+    }
+}
+
+impl Drop for AckRuntime {
+    fn drop(&mut self) {
+        self.request_shutdown();
     }
 }
 
@@ -93,18 +194,23 @@ pub struct NatsSource {
     data_ready: Arc<Notify>,
     metrics: NatsSourceMetrics,
     running: Option<Running>,
+    task_owner: ConnectorTaskOwner,
+    task_tracker: ConnectorTaskTracker,
 }
 
 impl NatsSource {
     /// Metrics register on `registry` if provided.
     #[must_use]
     pub fn new(schema: SchemaRef, registry: Option<&prometheus::Registry>) -> Self {
+        let (task_owner, task_tracker) = ConnectorTaskOwner::new();
         Self {
             schema,
             config: None,
             data_ready: Arc::new(Notify::new()),
             metrics: NatsSourceMetrics::new(registry),
             running: None,
+            task_owner,
+            task_tracker,
         }
     }
 
@@ -125,7 +231,7 @@ impl NatsSource {
         cfg: &NatsSourceConfig,
         deserializer: Box<dyn RecordDeserializer>,
     ) -> Result<(), ConnectorError> {
-        let client = connect(cfg).await?;
+        let client = connect(cfg, &self.task_owner).await?;
         let js = jetstream::new(client);
 
         let stream_name = cfg
@@ -141,16 +247,24 @@ impl NatsSource {
         let stream = js
             .get_stream(stream_name)
             .await
-            .map_err(|e| err(&format!("get_stream('{stream_name}') failed: {e}")))?;
+            .map_err(|error| classify_get_stream_error(&error, stream_name))?;
         let consumer = stream
             .create_consumer(pull_cfg)
             .await
-            .map_err(|e| classify_create_consumer_error(&e, consumer_name))?;
+            .map_err(|error| classify_create_consumer_error(&error, consumer_name))?;
 
         let (tx, rx) = mpsc::bounded_async::<Incoming>(cfg.fetch_batch * 2);
         let (shutdown, shutdown_rx) = watch::channel(false);
         let requires_ack = cfg.ack_policy == AckPolicy::Explicit;
-        let ack_runtime = requires_ack.then(|| AckRuntime::spawn(cfg, self.metrics.clone()));
+        let ack_runtime = if requires_ack {
+            Some(AckRuntime::spawn(
+                cfg,
+                self.metrics.clone(),
+                &self.task_owner,
+            )?)
+        } else {
+            None
+        };
 
         let reader = JsReader {
             consumer,
@@ -164,13 +278,13 @@ impl NatsSource {
             lag_poll_interval: cfg.lag_poll_interval,
             requires_ack,
         };
-        let handle = tokio::spawn(reader.run());
+        let reader = TrackedTask::spawn(&self.task_owner, "jetstream-reader", reader.run())?;
 
         self.running = Some(Running {
             deserializer,
             rx: Some(rx),
             shutdown,
-            handle,
+            reader,
             ack_runtime,
         });
         Ok(())
@@ -181,7 +295,7 @@ impl NatsSource {
         cfg: &NatsSourceConfig,
         deserializer: Box<dyn RecordDeserializer>,
     ) -> Result<(), ConnectorError> {
-        let client = connect(cfg).await?;
+        let client = connect(cfg, &self.task_owner).await?;
         let subject = cfg
             .subject
             .clone()
@@ -190,12 +304,12 @@ impl NatsSource {
             client
                 .queue_subscribe(subject, group.to_string())
                 .await
-                .map_err(|e| err(&format!("queue_subscribe: {e}")))?
+                .map_err(|error| classify_subscribe_error(&error, "NATS queue subscribe"))?
         } else {
             client
                 .subscribe(subject)
                 .await
-                .map_err(|e| err(&format!("subscribe: {e}")))?
+                .map_err(|error| classify_subscribe_error(&error, "NATS subscribe"))?
         };
 
         let (tx, rx) = mpsc::bounded_async::<Incoming>(cfg.fetch_batch * 2);
@@ -207,13 +321,13 @@ impl NatsSource {
             shutdown: shutdown_rx,
             data_ready: Arc::clone(&self.data_ready),
         };
-        let handle = tokio::spawn(reader.run());
+        let reader = TrackedTask::spawn(&self.task_owner, "core-reader", reader.run())?;
 
         self.running = Some(Running {
             deserializer,
             rx: Some(rx),
             shutdown,
-            handle,
+            reader,
             ack_runtime: None,
         });
         Ok(())
@@ -222,6 +336,10 @@ impl NatsSource {
 
 #[async_trait]
 impl SourceConnector for NatsSource {
+    fn terminal_task_tracker(&self) -> Option<ConnectorTaskTracker> {
+        Some(self.task_tracker.clone())
+    }
+
     fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
         // Neither Core NATS nor the current JetStream implementation can
         // rewind an abandoned checkpoint attempt deterministically. Durable
@@ -244,15 +362,17 @@ impl SourceConnector for NatsSource {
         let config = &config;
 
         let cfg = NatsSourceConfig::from_config(config)?;
-        // SQL DDL schema overrides the registry placeholder.
-        if let Some(schema) = config.arrow_schema() {
-            self.schema = schema;
-        }
+        // Keep the candidate schema local until network admission succeeds so
+        // cancelling start leaves the existing instance unchanged.
+        let candidate_schema = config.arrow_schema();
         let deserializer = serde::create_deserializer(cfg.format)
             .map_err(|e| err(&format!("deserializer for format {:?}: {e}", cfg.format)))?;
         match cfg.mode {
             Mode::JetStream => self.open_jetstream(&cfg, deserializer).await?,
             Mode::Core => self.open_core(&cfg, deserializer).await?,
+        }
+        if let Some(schema) = candidate_schema {
+            self.schema = schema;
         }
         self.config = Some(cfg);
         Ok(())
@@ -332,32 +452,31 @@ impl SourceConnector for NatsSource {
         };
         let close_deadline = tokio::time::Instant::now() + CLOSE_DRAIN_TIMEOUT;
         running.request_shutdown();
-        match tokio::time::timeout_at(close_deadline, &mut running.handle).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => warn!(%error, "NATS reader task failed while closing"),
-            Err(_) => {
-                warn!("NATS reader did not stop before close deadline; aborting task");
-                running.handle.abort();
-                let _ = (&mut running.handle).await;
+        match running.reader.wait_until(close_deadline).await {
+            TaskWait::Completed(Ok(())) => {}
+            TaskWait::Completed(Err(error)) => {
+                warn!(%error, "NATS reader task failed while closing");
             }
+            TaskWait::TimedOut => warn!(
+                "NATS reader exceeded its close deadline; its tracked reaper retains shutdown ownership"
+            ),
         }
         // Drop unread messages only after the reader has stopped. Their unacked JetStream
         // handles remain eligible for broker redelivery.
         running.rx.take();
 
         if let Some(mut ack_runtime) = running.ack_runtime.take() {
-            ack_runtime.tx.take();
-            match tokio::time::timeout_at(close_deadline, &mut ack_runtime.handle).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
+            ack_runtime.request_shutdown();
+            match ack_runtime.task.wait_until(close_deadline).await {
+                TaskWait::Completed(Ok(())) => {}
+                TaskWait::Completed(Err(error)) => {
                     warn!(%error, "NATS ack worker failed while closing");
                     self.metrics.record_abandoned_acks();
                 }
-                Err(_) => {
-                    warn!("NATS ack worker did not drain before close deadline; aborting task");
-                    ack_runtime.handle.abort();
-                    let _ = (&mut ack_runtime.handle).await;
-                    self.metrics.record_abandoned_acks();
+                TaskWait::TimedOut => {
+                    warn!(
+                        "NATS ack worker exceeded its close deadline; its tracked reaper retains shutdown ownership"
+                    );
                 }
             }
         }
@@ -424,51 +543,84 @@ fn enqueue_acks(
 }
 
 async fn run_ack_worker(
-    mut rx: tokio_mpsc::Receiver<jetstream::Message>,
+    rx: tokio_mpsc::Receiver<jetstream::Message>,
+    shutdown: watch::Receiver<bool>,
     concurrency: usize,
     metrics: NatsSourceMetrics,
 ) {
-    let mut in_flight = JoinSet::new();
-    loop {
+    // Ack calls stay scoped under the worker. Its single generation guard therefore proves that
+    // the receiver and every in-flight acknowledgement have all been dropped or completed.
+    let task_metrics = metrics.clone();
+    let abandoned = run_bounded_queue(rx, shutdown, concurrency, move |message| {
+        let metrics = task_metrics.clone();
+        async move {
+            acknowledge_message(message, &metrics).await;
+        }
+    })
+    .await;
+    if abandoned > 0 {
+        metrics.record_ack_abandoned(abandoned);
+        warn!(
+            abandoned,
+            "discarded queued JetStream acknowledgements during shutdown; broker will redeliver"
+        );
+    }
+}
+
+async fn run_bounded_queue<T, F, Fut>(
+    mut rx: tokio_mpsc::Receiver<T>,
+    mut shutdown: watch::Receiver<bool>,
+    concurrency: usize,
+    process: F,
+) -> usize
+where
+    T: Send + 'static,
+    F: Fn(T) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    debug_assert!(concurrency > 0);
+    let mut in_flight = FuturesUnordered::new();
+    'input: loop {
+        if shutdown_requested(&shutdown) || rx.is_closed() {
+            break;
+        }
         while in_flight.len() >= concurrency {
-            if let Some(result) = in_flight.join_next().await {
-                observe_ack_task(result, &metrics);
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => break 'input,
+                _ = in_flight.next() => {}
+            }
+            if rx.is_closed() {
+                break 'input;
             }
         }
 
         tokio::select! {
             biased;
-            result = in_flight.join_next(), if !in_flight.is_empty() => {
-                if let Some(result) = result {
-                    observe_ack_task(result, &metrics);
-                }
-            }
+            _ = shutdown.changed() => break,
+            _ = in_flight.next(), if !in_flight.is_empty() => {}
             message = rx.recv() => {
                 let Some(message) = message else {
                     break;
                 };
-                let task_metrics = metrics.clone();
-                in_flight.spawn(async move {
-                    acknowledge_message(message, &task_metrics).await;
-                });
+                in_flight.push(process(message));
             }
         }
     }
 
-    while let Some(result) = in_flight.join_next().await {
-        observe_ack_task(result, &metrics);
+    // Closing the receiver makes queued-but-unstarted messages immediately eligible for broker
+    // redelivery. Only work already admitted to `in_flight` is allowed to consume the close budget.
+    rx.close();
+    let mut abandoned = 0usize;
+    while rx.try_recv().is_ok() {
+        abandoned = abandoned.saturating_add(1);
     }
-}
-
-fn observe_ack_task(result: Result<(), tokio::task::JoinError>, metrics: &NatsSourceMetrics) {
-    if let Err(error) = result {
-        metrics.record_ack_error();
-        warn!(%error, "JetStream ack task failed; broker will redeliver");
-    }
+    while in_flight.next().await.is_some() {}
+    abandoned
 }
 
 async fn acknowledge_message(message: jetstream::Message, metrics: &NatsSourceMetrics) {
-    match tokio::time::timeout(ACK_IO_TIMEOUT, message.ack()).await {
+    match tokio::time::timeout(ACK_IO_TIMEOUT, message.double_ack()).await {
         Ok(Ok(())) => metrics.record_ack(),
         Ok(Err(error)) => {
             metrics.record_ack_error();
@@ -484,11 +636,14 @@ async fn acknowledge_message(message: jetstream::Message, metrics: &NatsSourceMe
     }
 }
 
-async fn connect(cfg: &NatsSourceConfig) -> Result<async_nats::Client, ConnectorError> {
-    build_connect_options(&cfg.auth, &cfg.tls)?
+async fn connect(
+    cfg: &NatsSourceConfig,
+    owner: &ConnectorTaskOwner,
+) -> Result<async_nats::Client, ConnectorError> {
+    track_connection_tasks(build_connect_options(&cfg.auth, &cfg.tls)?, owner, "source")?
         .connect(&cfg.servers)
         .await
-        .map_err(|e| err(&format!("nats connect({:?}): {e}", cfg.servers)))
+        .map_err(|error| classify_connect_error(&error))
 }
 
 fn build_pull_config(
@@ -563,33 +718,6 @@ fn with_jitter(base: Duration, entropy: u64) -> Duration {
 
 fn fetch_backoff(consecutive_errors: u32, entropy: u64) -> Duration {
     with_jitter(fetch_backoff_base(consecutive_errors), entropy)
-}
-
-/// Server 10148 / 10013 → consumer exists with a conflicting config;
-/// raise LDB-5070 with an operator fix-up.
-fn classify_create_consumer_error(
-    e: &async_nats::jetstream::stream::ConsumerError,
-    consumer_name: &str,
-) -> ConnectorError {
-    use async_nats::jetstream::stream::ConsumerErrorKind;
-    use async_nats::jetstream::ErrorCode;
-
-    let drift_code = match e.kind() {
-        ConsumerErrorKind::JetStream(server_err) => matches!(
-            server_err.error_code(),
-            ErrorCode::CONSUMER_ALREADY_EXISTS | ErrorCode::CONSUMER_NAME_EXIST
-        ),
-        _ => false,
-    };
-    if drift_code {
-        err(&format!(
-            "[LDB-5070] consumer '{consumer_name}' exists with incompatible config; \
-             rotate the durable name or delete the consumer out-of-band. \
-             Server said: {e}"
-        ))
-    } else {
-        err(&format!("create_consumer('{consumer_name}') failed: {e}"))
-    }
 }
 
 /// Wall-clock nanos for `with_jitter`. `Instant::now().elapsed()` is ~0
@@ -794,15 +922,14 @@ mod tests {
         }
     }
 
-    fn pending_task(
+    async fn pending_task(
         started: tokio::sync::oneshot::Sender<()>,
         dropped: tokio::sync::oneshot::Sender<()>,
-    ) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            let _drop_signal = DropSignal(Some(dropped));
-            let _ = started.send(());
-            std::future::pending::<()>().await;
-        })
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let _drop_signal = DropSignal(Some(dropped));
+        let _ = started.send(());
+        let _ = release.await;
     }
 
     #[test]
@@ -819,6 +946,61 @@ mod tests {
     fn ephemeral_source_checkpoint_has_no_protocol_state() {
         let src = NatsSource::new(Arc::new(Schema::empty()), None);
         assert!(src.checkpoint().is_empty());
+        assert_eq!(
+            src.cancellation_policy(),
+            crate::connector::ConnectorCancellationPolicy::RetireConnector
+        );
+    }
+
+    #[test]
+    fn task_tracker_notifies_waiters_on_another_runtime() {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (tracker_tx, tracker_rx) = std::sync::mpsc::sync_channel(1);
+        let owner_thread = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let mut source = NatsSource::new(Arc::new(Schema::empty()), None);
+                    let terminal = source.terminal_task_tracker().unwrap();
+                    let owner_waiter = terminal.clone();
+                    let (_, rx) = mpsc::bounded_async::<Incoming>(1);
+                    let (shutdown, _) = watch::channel(false);
+                    let reader = TrackedTask::spawn(
+                        &source.task_owner,
+                        "cross-runtime-reader",
+                        async move {
+                            let _ = release_rx.await;
+                        },
+                    )
+                    .unwrap();
+                    source.running = Some(Running {
+                        deserializer: serde::create_deserializer(serde::Format::Raw).unwrap(),
+                        rx: Some(rx),
+                        shutdown,
+                        reader,
+                        ack_runtime: None,
+                    });
+                    tracker_tx.send(terminal).unwrap();
+                    drop(source);
+                    owner_waiter.wait_terminated().await;
+                });
+        });
+
+        let terminal = tracker_rx.recv().unwrap();
+        assert!(!terminal.is_terminated());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                release_tx.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(1), terminal.wait_terminated())
+                    .await
+                    .expect("cross-runtime tracker waiter was not notified");
+            });
+        owner_thread.join().unwrap();
     }
 
     #[tokio::test]
@@ -833,11 +1015,12 @@ mod tests {
             .is_ok());
         drop(tx);
         let (shutdown, _) = watch::channel(false);
+        let reader = TrackedTask::spawn(&src.task_owner, "test-reader", async {}).unwrap();
         src.running = Some(Running {
             deserializer: serde::create_deserializer(serde::Format::Raw).unwrap(),
             rx: Some(rx),
             shutdown,
-            handle: tokio::spawn(async {}),
+            reader,
             ack_runtime: None,
         });
 
@@ -850,56 +1033,129 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_source_signals_and_aborts_the_owned_reader() {
+    async fn dropping_source_signals_and_reaps_the_owned_reader() {
         let mut source = NatsSource::new(Arc::new(Schema::empty()), None);
+        let terminal = source.terminal_task_tracker().unwrap();
         let (_, rx) = mpsc::bounded_async::<Incoming>(1);
-        let (shutdown, shutdown_rx) = watch::channel(false);
+        let (shutdown, mut task_shutdown) = watch::channel(false);
+        let shutdown_observer = task_shutdown.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let reader = TrackedTask::spawn(&source.task_owner, "test-reader", async move {
+            let _drop_signal = DropSignal(Some(dropped_tx));
+            let _ = started_tx.send(());
+            let _ = task_shutdown.changed().await;
+        })
+        .unwrap();
         source.running = Some(Running {
             deserializer: serde::create_deserializer(serde::Format::Raw).unwrap(),
             rx: Some(rx),
             shutdown,
-            handle: pending_task(started_tx, dropped_tx),
+            reader,
             ack_runtime: None,
         });
         started_rx.await.expect("reader task started");
 
         drop(source);
 
-        assert!(*shutdown_rx.borrow(), "drop must publish shutdown");
+        assert!(*shutdown_observer.borrow(), "drop must publish shutdown");
         tokio::time::timeout(Duration::from_secs(1), dropped_rx)
             .await
-            .expect("reader must be aborted on drop")
+            .expect("reader must observe shutdown on drop")
             .expect("reader drop signal");
+        tokio::time::timeout(Duration::from_secs(1), terminal.wait_terminated())
+            .await
+            .expect("reader and its tracked reaper must terminate");
+    }
+
+    #[tokio::test]
+    async fn normal_close_joins_reader_and_ack_tasks() {
+        let mut source = NatsSource::new(Arc::new(Schema::empty()), None);
+        let (_, rx) = mpsc::bounded_async::<Incoming>(1);
+        let (shutdown, mut shutdown_rx) = watch::channel(false);
+        let (reader_started_tx, reader_started_rx) = tokio::sync::oneshot::channel();
+        let (reader_dropped_tx, reader_dropped_rx) = tokio::sync::oneshot::channel();
+        let reader = TrackedTask::spawn(&source.task_owner, "test-reader", async move {
+            let _drop_signal = DropSignal(Some(reader_dropped_tx));
+            let _ = reader_started_tx.send(());
+            let _ = shutdown_rx.changed().await;
+        })
+        .unwrap();
+
+        let (ack_tx, mut ack_rx) = tokio_mpsc::channel::<jetstream::Message>(1);
+        let (ack_shutdown, _) = watch::channel(false);
+        let (ack_started_tx, ack_started_rx) = tokio::sync::oneshot::channel();
+        let (ack_dropped_tx, ack_dropped_rx) = tokio::sync::oneshot::channel();
+        let ack_task = TrackedTask::spawn(&source.task_owner, "test-ack", async move {
+            let _drop_signal = DropSignal(Some(ack_dropped_tx));
+            let _ = ack_started_tx.send(());
+            while ack_rx.recv().await.is_some() {}
+        })
+        .unwrap();
+
+        source.running = Some(Running {
+            deserializer: serde::create_deserializer(serde::Format::Raw).unwrap(),
+            rx: Some(rx),
+            shutdown,
+            reader,
+            ack_runtime: Some(AckRuntime {
+                tx: Some(ack_tx),
+                shutdown: ack_shutdown,
+                task: ack_task,
+            }),
+        });
+        reader_started_rx.await.expect("reader task started");
+        ack_started_rx.await.expect("ack task started");
+
+        tokio::time::timeout(Duration::from_secs(1), source.close())
+            .await
+            .expect("normal close must join owned tasks")
+            .unwrap();
+
+        for (name, dropped) in [("reader", reader_dropped_rx), ("ack", ack_dropped_rx)] {
+            tokio::time::timeout(Duration::from_secs(1), dropped)
+                .await
+                .unwrap_or_else(|_| panic!("{name} task was not joined"))
+                .unwrap_or_else(|_| panic!("{name} drop signal closed"));
+        }
+        assert!(source.running.is_none());
     }
 
     #[tokio::test]
     async fn cancelling_close_does_not_detach_reader_or_ack_tasks() {
         let mut source = NatsSource::new(Arc::new(Schema::empty()), None);
+        let terminal = source.terminal_task_tracker().unwrap();
         let (_, rx) = mpsc::bounded_async::<Incoming>(1);
-        let (shutdown, _) = watch::channel(false);
+        let (shutdown, shutdown_rx) = watch::channel(false);
         let (reader_started_tx, reader_started_rx) = tokio::sync::oneshot::channel();
         let (reader_dropped_tx, reader_dropped_rx) = tokio::sync::oneshot::channel();
-        let reader_handle = pending_task(reader_started_tx, reader_dropped_tx);
+        let (reader_release_tx, reader_release_rx) = tokio::sync::oneshot::channel();
+        let reader = TrackedTask::spawn(
+            &source.task_owner,
+            "test-reader",
+            pending_task(reader_started_tx, reader_dropped_tx, reader_release_rx),
+        )
+        .unwrap();
 
         let (ack_tx, ack_rx) = tokio_mpsc::channel::<jetstream::Message>(1);
+        let (ack_shutdown, _) = watch::channel(false);
         let (ack_started_tx, ack_started_rx) = tokio::sync::oneshot::channel();
         let (ack_dropped_tx, ack_dropped_rx) = tokio::sync::oneshot::channel();
-        let ack_handle = tokio::spawn(async move {
-            let _drop_signal = DropSignal(Some(ack_dropped_tx));
+        let (ack_release_tx, ack_release_rx) = tokio::sync::oneshot::channel();
+        let ack_task = TrackedTask::spawn(&source.task_owner, "test-ack", async move {
             let _ack_rx = ack_rx;
-            let _ = ack_started_tx.send(());
-            std::future::pending::<()>().await;
-        });
+            pending_task(ack_started_tx, ack_dropped_tx, ack_release_rx).await;
+        })
+        .unwrap();
         source.running = Some(Running {
             deserializer: serde::create_deserializer(serde::Format::Raw).unwrap(),
             rx: Some(rx),
             shutdown,
-            handle: reader_handle,
+            reader,
             ack_runtime: Some(AckRuntime {
                 tx: Some(ack_tx),
-                handle: ack_handle,
+                shutdown: ack_shutdown,
+                task: ack_task,
             }),
         });
         reader_started_rx.await.expect("reader task started");
@@ -914,12 +1170,60 @@ mod tests {
             .expect_err("close waiter cancelled")
             .is_cancelled());
 
+        assert!(
+            *shutdown_rx.borrow(),
+            "cancelling close must publish shutdown"
+        );
+        assert!(
+            !terminal.is_terminated(),
+            "task guards must keep a cancelled generation non-terminal"
+        );
+        reader_release_tx.send(()).expect("release reader");
+        ack_release_tx.send(()).expect("release ack worker");
+
         for (name, dropped) in [("reader", reader_dropped_rx), ("ack", ack_dropped_rx)] {
             tokio::time::timeout(Duration::from_secs(1), dropped)
                 .await
                 .unwrap_or_else(|_| panic!("{name} task remained detached"))
                 .unwrap_or_else(|_| panic!("{name} drop signal closed"));
         }
+        tokio::time::timeout(Duration::from_secs(1), terminal.wait_terminated())
+            .await
+            .expect("generation must become terminal after every owned task exits");
+    }
+
+    #[tokio::test]
+    async fn ack_shutdown_discards_queued_but_unstarted_work() {
+        let (tx, rx) = tokio_mpsc::channel(8);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (admitted_tx, mut admitted_rx) = tokio_mpsc::unbounded_channel();
+        let release = Arc::new(Notify::new());
+        let worker_release = Arc::clone(&release);
+        let worker = tokio::spawn(run_bounded_queue(rx, shutdown_rx, 1, move |message| {
+            let admitted_tx = admitted_tx.clone();
+            let release = Arc::clone(&worker_release);
+            async move {
+                admitted_tx.send(message).unwrap();
+                release.notified().await;
+            }
+        }));
+
+        for message in 1..=3 {
+            tx.send(message).await.unwrap();
+        }
+        assert_eq!(admitted_rx.recv().await, Some(1));
+
+        shutdown_tx.send_replace(true);
+        drop(tx);
+        tokio::task::yield_now().await;
+        release.notify_one();
+
+        let abandoned = tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("worker shutdown must be bounded by admitted work")
+            .unwrap();
+        assert_eq!(abandoned, 2);
+        assert!(admitted_rx.try_recv().is_err());
     }
 
     #[test]

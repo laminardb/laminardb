@@ -1490,7 +1490,7 @@ mod tests {
             data: Bytes::from_static(b"data"),
             wire_bytes: guard,
         };
-        let (tx, mut rx) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::channel::<Result<ReplicationEvent>>(1);
 
         tx.send(Ok(event)).await.unwrap();
         assert_eq!(budget.available_permits(), 0, "queued event owns bytes");

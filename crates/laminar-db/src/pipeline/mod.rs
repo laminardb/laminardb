@@ -14,7 +14,7 @@ pub use callback::{
     SkipReason, SourceRegistration,
 };
 pub use config::PipelineConfig;
-pub use streaming_coordinator::{ExitReason, StreamingCoordinator};
+pub use streaming_coordinator::{ExitReason, StreamingCoordinator, StreamingCoordinatorRuntime};
 
 use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::{JoinOperatorConfig, OrderOperatorConfig, WindowOperatorConfig};

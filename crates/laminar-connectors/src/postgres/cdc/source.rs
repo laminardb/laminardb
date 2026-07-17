@@ -15,8 +15,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{
-    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourcePosition, SourceStart,
-    SourceTopology,
+    ConnectorTaskOwner, ConnectorTaskTracker, SourceBatch, SourceConnector, SourceConsistency,
+    SourceContract, SourcePosition, SourceStart, SourceTopology,
 };
 use crate::error::ConnectorError;
 
@@ -136,6 +136,40 @@ pub struct PostgresCdcSource {
 
     /// Fatal reader error delivered out of band so a full WAL queue cannot hide it.
     wal_terminal_error: Option<WalTerminalError>,
+
+    /// Admission authority and terminal observer for this connector generation.
+    task_owner: ConnectorTaskOwner,
+    task_tracker: ConnectorTaskTracker,
+}
+
+impl Drop for PostgresCdcSource {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.reader_shutdown.take() {
+            shutdown.send_replace(true);
+        }
+        if let Some(handle) = self.reader_handle.take() {
+            reap_postgres_reader(handle, &self.task_owner);
+        }
+    }
+}
+
+fn reap_postgres_reader(handle: tokio::task::JoinHandle<()>, task_owner: &ConnectorTaskOwner) {
+    let Some(reaper_guard) = task_owner.track() else {
+        tracing::warn!("PostgreSQL CDC task generation was sealed before reader reaping");
+        return;
+    };
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        // The reader's own guard remains authoritative. Dropping its runtime
+        // destroys the future and therefore resolves the generation tracker.
+        drop(reaper_guard);
+        return;
+    };
+    drop(runtime.spawn(async move {
+        let _reaper_guard = reaper_guard;
+        if let Err(error) = handle.await {
+            tracing::debug!(%error, "PostgreSQL CDC retired reader task reaped");
+        }
+    }));
 }
 
 /// In-progress transaction state.
@@ -494,6 +528,7 @@ impl PostgresCdcSource {
     #[must_use]
     pub fn new(mut config: PostgresCdcConfig, registry: Option<&prometheus::Registry>) -> Self {
         config.normalize_table_filters();
+        let (task_owner, task_tracker) = ConnectorTaskOwner::new();
         Self {
             config,
             state: ConnectorState::Created,
@@ -518,6 +553,8 @@ impl PostgresCdcSource {
             pending_payloads: VecDeque::new(),
             wal_byte_budget: None,
             wal_terminal_error: None,
+            task_owner,
+            task_tracker,
         }
     }
 
@@ -1455,6 +1492,10 @@ impl PostgresCdcSource {
 #[async_trait]
 #[allow(clippy::too_many_lines)]
 impl SourceConnector for PostgresCdcSource {
+    fn terminal_task_tracker(&self) -> Option<ConnectorTaskTracker> {
+        Some(self.task_tracker.clone())
+    }
+
     fn recovery_identity_options(
         &self,
         config: &ConnectorConfig,
@@ -1530,7 +1571,12 @@ impl SourceConnector for PostgresCdcSource {
             use super::postgres_io;
 
             // 1. Connect control-plane for slot management
-            let control = postgres_io::connect(&parsed_config).await?;
+            let control_driver_guard = self.task_owner.track().ok_or_else(|| {
+                ConnectorError::Internal(
+                    "PostgreSQL CDC connector generation is already retired".into(),
+                )
+            })?;
+            let control = postgres_io::connect(&parsed_config, control_driver_guard).await?;
 
             // 2. Inspect the exact durable slot. Resume is deliberately
             // read-only: a replacement slot starts at a different history and
@@ -1580,9 +1626,17 @@ impl SourceConnector for PostgresCdcSource {
                     timeline_id: expected_binding.timeline_id,
                 });
 
+            let replication_worker_guard = self.task_owner.track().ok_or_else(|| {
+                ConnectorError::Internal(
+                    "PostgreSQL CDC connector generation is already retired".into(),
+                )
+            })?;
             let repl_client = match tokio::time::timeout(
                 postgres_io::CONNECT_TIMEOUT,
-                pgwire_replication::ReplicationClient::connect(repl_config),
+                pgwire_replication::ReplicationClient::connect_with_worker_lifetime(
+                    repl_config,
+                    replication_worker_guard,
+                ),
             )
             .await
             {
@@ -1615,7 +1669,14 @@ impl SourceConnector for PostgresCdcSource {
                 tokio::sync::watch::channel(start_lsn.as_u64());
             let data_ready = Arc::clone(&self.data_ready);
 
+            let reader_guard = self.task_owner.track().ok_or_else(|| {
+                ConnectorError::Internal(
+                    "PostgreSQL CDC connector generation is already retired".into(),
+                )
+            })?;
+
             let reader_handle = tokio::spawn(async move {
+                let _reader_guard = reader_guard;
                 let mut repl_client = repl_client;
                 'read: loop {
                     tokio::select! {
@@ -1986,20 +2047,30 @@ impl SourceConnector for PostgresCdcSource {
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
-        // Signal the reader, then abort and join it if cooperative shutdown stalls.
-        if let Some(tx) = self.reader_shutdown.take() {
-            let _ = tx.send(true);
+        // Keep both fields installed while awaiting. If this close future is
+        // cancelled, the same instance still owns the reader and can retry.
+        if let Some(tx) = self.reader_shutdown.as_ref() {
+            tx.send_replace(true);
         }
-        if let Some(mut handle) = self.reader_handle.take() {
-            if tokio::time::timeout(std::time::Duration::from_secs(5), &mut handle)
+        let detach_reader = if let Some(handle) = self.reader_handle.as_mut() {
+            tokio::time::timeout(std::time::Duration::from_secs(5), &mut *handle)
                 .await
                 .is_err()
-            {
-                tracing::warn!("PostgreSQL CDC reader did not stop before the deadline");
-                handle.abort();
-                let _ = handle.await;
-            }
+        } else {
+            false
+        };
+        if detach_reader {
+            tracing::warn!(
+                "PostgreSQL CDC reader did not stop before the close deadline; its tracked reaper retains shutdown ownership"
+            );
+            let handle = self
+                .reader_handle
+                .take()
+                .expect("reader handle was present while awaiting it");
+            reap_postgres_reader(handle, &self.task_owner);
         }
+        self.reader_handle = None;
+        self.reader_shutdown = None;
         self.wal_rx = None;
         self.confirmed_lsn_tx = None;
         self.pending_payloads.clear();
@@ -2174,6 +2245,16 @@ mod tests {
     use crate::postgres::cdc::types::{INT4_OID, INT8_OID, TEXT_OID};
     use arrow_array::cast::AsArray;
 
+    struct ReaderDropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for ReaderDropSignal {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
     fn default_source() -> PostgresCdcSource {
         let mut config = PostgresCdcConfig::default();
         config.ssl_mode = crate::postgres::SslMode::Disable;
@@ -2233,6 +2314,14 @@ mod tests {
             .unwrap();
         assert_eq!(contract.consistency, SourceConsistency::CommitCoupled);
         assert_eq!(contract.topology, SourceTopology::Singleton);
+    }
+
+    #[test]
+    fn source_lifecycle_cancellation_retires_the_generation() {
+        assert_eq!(
+            default_source().cancellation_policy(),
+            crate::connector::ConnectorCancellationPolicy::RetireConnector
+        );
     }
 
     #[test]
@@ -2369,6 +2458,168 @@ mod tests {
         src.close().await.unwrap();
         assert_eq!(src.state, ConnectorState::Closed);
         assert_eq!(src.buffered_events(), 0);
+    }
+
+    #[tokio::test]
+    async fn normal_close_joins_the_owned_reader() {
+        let mut src = running_source();
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        src.reader_shutdown = Some(shutdown_tx);
+        src.reader_handle = Some(tokio::spawn(async move {
+            let _drop_signal = ReaderDropSignal(Some(dropped_tx));
+            let _ = started_tx.send(());
+            let _ = shutdown_rx.changed().await;
+        }));
+        started_rx.await.expect("reader task started");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), src.close())
+            .await
+            .expect("normal close must join the reader")
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("reader was not joined")
+            .expect("reader drop signal closed");
+        assert!(src.reader_handle.is_none());
+        assert!(src.reader_shutdown.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelling_close_preserves_reader_ownership_for_retry() {
+        let mut src = running_source();
+        let terminal = src.terminal_task_tracker().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let release = Arc::new(Notify::new());
+        let task_release = Arc::clone(&release);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let reader_guard = src
+            .task_owner
+            .track()
+            .expect("live test source must admit its reader");
+        src.reader_shutdown = Some(shutdown_tx);
+        src.reader_handle = Some(tokio::spawn(async move {
+            let _reader_guard = reader_guard;
+            let _drop_signal = ReaderDropSignal(Some(dropped_tx));
+            let _ = started_tx.send(());
+            task_release.notified().await;
+        }));
+        started_rx.await.expect("reader task started");
+
+        let mut close = Box::pin(src.close());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut close)
+                .await
+                .is_err(),
+            "reader should keep the first close pending"
+        );
+        drop(close);
+
+        assert!(src.reader_handle.is_some());
+        assert!(src.reader_shutdown.is_some());
+        assert!(*shutdown_rx.borrow());
+
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), src.close())
+            .await
+            .expect("retry close must join the retained reader")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("retained reader was not joined")
+            .expect("reader drop signal closed");
+        drop(src);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            terminal.wait_terminated(),
+        )
+        .await
+        .expect("source tracker must resolve after retry close joins the reader");
+    }
+
+    #[tokio::test]
+    async fn dropping_source_signals_and_tracks_the_reader_to_completion() {
+        let mut src = running_source();
+        let terminal = src.terminal_task_tracker().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut task_shutdown = shutdown_rx.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let reader_guard = src
+            .task_owner
+            .track()
+            .expect("live test source must admit its reader");
+        src.reader_shutdown = Some(shutdown_tx);
+        src.reader_handle = Some(tokio::spawn(async move {
+            let _reader_guard = reader_guard;
+            let _drop_signal = ReaderDropSignal(Some(dropped_tx));
+            let _ = started_tx.send(());
+            let _ = task_shutdown.changed().await;
+        }));
+        started_rx.await.expect("reader task started");
+
+        drop(src);
+
+        assert!(*shutdown_rx.borrow());
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("reader must stop when the source is dropped")
+            .expect("reader drop signal closed");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            terminal.wait_terminated(),
+        )
+        .await
+        .expect("source tracker outlived the completed WAL reader");
+    }
+
+    #[test]
+    fn tracker_covers_a_reader_destroyed_before_first_poll_on_another_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut source = running_source();
+        let terminal = source.terminal_task_tracker().unwrap();
+        let reader_guard = source
+            .task_owner
+            .track()
+            .expect("live test source must admit its reader");
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let drop_signal = ReaderDropSignal(Some(dropped_tx));
+        source.reader_shutdown = Some(shutdown_tx);
+        source.reader_handle = Some(runtime.spawn(async move {
+            let _reader_guard = reader_guard;
+            let _drop_signal = drop_signal;
+            std::future::pending::<()>().await;
+        }));
+
+        // The source is retired outside the reader's executor, before that
+        // executor has polled the task even once.
+        drop(source);
+        assert!(!terminal.is_terminated());
+        drop(runtime);
+
+        let observer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        observer.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+                .await
+                .expect("runtime destruction must drop the unpolled reader promptly")
+                .expect("unpolled reader drop signal was lost");
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                terminal.wait_terminated(),
+            )
+            .await
+            .expect("tracker must resolve across runtimes after actual task destruction");
+        });
     }
 
     #[tokio::test]

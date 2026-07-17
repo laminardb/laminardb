@@ -291,6 +291,45 @@ async fn chained_dim_enrich_join_is_correct_under_updates() {
     db.shutdown().await.unwrap();
 }
 
+/// A certified state-backed LEFT enrich join preserves unmatched changelog rows and retracts their
+/// previous values when the upstream aggregate changes.
+#[tokio::test]
+async fn state_backed_left_dim_enrich_preserves_unmatched_rows_under_updates() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = LaminarDB::open_with_config(config(dir.path(), true)).unwrap();
+    db.execute(SRC).await.unwrap();
+    db.execute(MV).await.unwrap();
+    db.execute("CREATE TABLE dim (k BIGINT PRIMARY KEY, label BIGINT)")
+        .await
+        .unwrap();
+    db.execute("INSERT INTO dim VALUES (1, 100)").await.unwrap();
+    db.execute(
+        "CREATE MATERIALIZED VIEW enriched_left AS \
+         SELECT agg.k, agg.total, dim.label FROM agg LEFT JOIN dim ON agg.k = dim.k",
+    )
+    .await
+    .expect("the exact state-backed LEFT dimension join must be admitted");
+    db.start().await.unwrap();
+
+    let source = db.source_untyped("events").unwrap();
+    source.push_arrow(batch(&[1, 2], &[10, 20])).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    source.push_arrow(batch(&[1, 2], &[5, 7])).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    assert_eq!(
+        read_query(
+            &db,
+            "SELECT k, total, COALESCE(label, -1) FROM enriched_left",
+            3,
+        )
+        .await,
+        vec![vec![1, 15, 100], vec![2, 27, -1]],
+        "the unmatched key must remain NULL-padded and both keys must retract stale totals"
+    );
+    db.shutdown().await.unwrap();
+}
+
 /// A chained *aggregate* over an incremental MV nets the retraction changelog correctly under
 /// UPDATES (the value-correctness gate). `SUM(total)` over `{k1:10→15, k2:20}` = 35.
 #[tokio::test]
@@ -689,6 +728,14 @@ async fn incremental_join_guard_allows_inner_left_rejects_right_and_source() {
         )
         .await;
     assert!(src.is_err(), "changelog ⋈ source join is rejected");
+
+    let raw = db
+        .execute(
+            "CREATE MATERIALIZED VIEW raw_join AS \
+             SELECT ev_a.k FROM ev_a JOIN ev_b ON ev_a.k = ev_b.k",
+        )
+        .await;
+    assert!(raw.is_err(), "raw source ⋈ source join is rejected");
 }
 
 /// Multi-way A⋈B⋈C as chained pairwise IVM joins: an intermediate join MV is itself a

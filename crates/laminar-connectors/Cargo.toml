@@ -73,8 +73,9 @@ arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
 
 # Parquet lookup source (optional)
-parquet = { version = "57.2", optional = true, default-features = false, features = ["arrow"] }
+parquet = { version = "57.2", optional = true, default-features = false, features = ["arrow", "snap", "flate2-zlib-rs", "lz4", "zstd"] }
 object_store = { version = "0.13", optional = true }
+delta-object-store = { package = "object_store", version = "0.12.5", optional = true, default-features = false, features = ["cloud"] }
 
 # Timestamp parsing for JSON/CSV decoders
 chrono = { workspace = true }
@@ -136,7 +137,7 @@ mongodb-cdc = ["dep:mongodb", "dep:tokio-stream", "dep:futures-util", "dep:arrow
 # tests without the deltalake stack, and so Iceberg MOR can opt in independently.
 changelog-collapse = ["dep:arrow-row"]
 # Delta Lake
-delta-lake = ["dep:deltalake", "dep:url", "dep:datafusion", "deltalake/datafusion", "dep:tokio-util", "dep:tokio-stream", "changelog-collapse"]
+delta-lake = ["dep:deltalake", "dep:delta-object-store", "dep:url", "dep:datafusion", "deltalake/datafusion", "dep:tokio-util", "dep:tokio-stream", "changelog-collapse"]
 delta-lake-s3 = ["delta-lake", "deltalake/s3"]
 delta-lake-azure = ["delta-lake", "deltalake/azure"]
 delta-lake-gcs = ["delta-lake", "deltalake/gcs"]

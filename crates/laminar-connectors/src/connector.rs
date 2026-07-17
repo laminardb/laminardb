@@ -1,7 +1,8 @@
 //! Connector traits — async `SourceConnector` / `SinkConnector`.
 
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -283,17 +284,177 @@ impl WriteResult {
     }
 }
 
-/// How the runtime may enforce a deadline around a started connector operation.
+/// What the runtime must do when a started connector operation is cancelled.
 ///
 /// This is an internal connector/driver capability, not a deployment option.
-/// Drivers that can become inconsistent when their futures are dropped must
-/// finish the exact started future before the actor processes later work.
+/// Cancellation always respects the runtime-owned deadline. A connector may be
+/// reused only when dropping the exact future is known to preserve its state;
+/// otherwise the runtime retires the complete connector generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectorCancellationPolicy {
     /// Dropping an in-flight future leaves the connector valid for recovery or reuse.
     CancelSafe,
-    /// Once polled, the future must be polled to completion even after its deadline.
-    CompleteStarted,
+    /// Dropping an in-flight future may leave its external outcome unknown, so
+    /// the connector instance must not process another operation.
+    RetireConnector,
+}
+
+const CONNECTOR_TASK_OWNER_DROPPED: usize = 1usize << (usize::BITS - 1);
+
+struct ConnectorTaskState {
+    state: AtomicUsize,
+    terminated: Notify,
+}
+
+/// Sole admission authority for detached tasks owned by one connector generation.
+///
+/// The owner must live inside the connector. Dropping it seals the generation so
+/// terminal completion can be observed after every admitted task guard is gone.
+pub struct ConnectorTaskOwner {
+    inner: Arc<ConnectorTaskState>,
+}
+
+/// Cloneable, non-owning admission handle for dynamically spawned connector tasks.
+///
+/// The handle does not keep the task generation open. Admission fails after
+/// the sole [`ConnectorTaskOwner`] is dropped, including when existing task
+/// guards still keep the generation observable.
+#[derive(Clone)]
+pub struct ConnectorTaskAdmission {
+    inner: Weak<ConnectorTaskState>,
+}
+
+/// Cloneable observer for terminal completion of one connector generation.
+#[derive(Clone)]
+pub struct ConnectorTaskTracker {
+    inner: Arc<ConnectorTaskState>,
+}
+
+/// RAII proof that one connector-owned task is still active.
+///
+/// Move the guard into the task before spawning it and retain it for the task's
+/// full lifetime.
+#[must_use = "dropping the guard marks its connector task complete"]
+pub struct ConnectorTaskGuard {
+    inner: Arc<ConnectorTaskState>,
+}
+
+impl ConnectorTaskOwner {
+    /// Create the sole task owner and its cloneable terminal observer.
+    #[must_use]
+    pub fn new() -> (Self, ConnectorTaskTracker) {
+        let inner = Arc::new(ConnectorTaskState {
+            state: AtomicUsize::new(0),
+            terminated: Notify::new(),
+        });
+        (
+            Self {
+                inner: Arc::clone(&inner),
+            },
+            ConnectorTaskTracker { inner },
+        )
+    }
+
+    /// Create a non-owning admission handle for tasks discovered by owned work.
+    ///
+    /// This is intended for accept loops and similar dynamic task producers.
+    /// Cloning the handle never extends the connector generation's admission
+    /// lifetime.
+    #[must_use]
+    pub fn admission(&self) -> ConnectorTaskAdmission {
+        ConnectorTaskAdmission {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
+    /// Admit one task into this live connector generation.
+    ///
+    /// The returned guard must be created before the task is spawned and moved
+    /// into that task. `None` means the generation can no longer admit work.
+    #[must_use]
+    pub fn track(&self) -> Option<ConnectorTaskGuard> {
+        track_connector_task(&self.inner)
+    }
+}
+
+impl ConnectorTaskAdmission {
+    /// Admit one dynamic task while the connector generation remains open.
+    ///
+    /// Returns `None` once the sole owner has been dropped. A successful
+    /// admission remains tracked until its returned guard is dropped.
+    #[must_use]
+    pub fn track(&self) -> Option<ConnectorTaskGuard> {
+        let inner = self.inner.upgrade()?;
+        track_connector_task(&inner)
+    }
+}
+
+fn track_connector_task(inner: &Arc<ConnectorTaskState>) -> Option<ConnectorTaskGuard> {
+    let mut observed = inner.state.load(Ordering::Acquire);
+    loop {
+        if observed & CONNECTOR_TASK_OWNER_DROPPED != 0 {
+            return None;
+        }
+        let next = observed.checked_add(1)?;
+        if next & CONNECTOR_TASK_OWNER_DROPPED != 0 {
+            return None;
+        }
+        match inner
+            .state
+            .compare_exchange_weak(observed, next, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => {
+                return Some(ConnectorTaskGuard {
+                    inner: Arc::clone(inner),
+                });
+            }
+            Err(actual) => observed = actual,
+        }
+    }
+}
+
+impl Drop for ConnectorTaskOwner {
+    fn drop(&mut self) {
+        let previous = self
+            .inner
+            .state
+            .fetch_or(CONNECTOR_TASK_OWNER_DROPPED, Ordering::AcqRel);
+        debug_assert_eq!(previous & CONNECTOR_TASK_OWNER_DROPPED, 0);
+        if previous == 0 {
+            self.inner.terminated.notify_waiters();
+        }
+    }
+}
+
+impl ConnectorTaskTracker {
+    /// Whether the owner and all task guards have been dropped.
+    #[must_use]
+    pub fn is_terminated(&self) -> bool {
+        self.inner.state.load(Ordering::Acquire) == CONNECTOR_TASK_OWNER_DROPPED
+    }
+
+    /// Wait until the owner and all task guards have been dropped.
+    pub async fn wait_terminated(&self) {
+        loop {
+            let notified = self.inner.terminated.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_terminated() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Drop for ConnectorTaskGuard {
+    fn drop(&mut self) {
+        let previous = self.inner.state.fetch_sub(1, Ordering::AcqRel);
+        debug_assert_ne!(previous & !CONNECTOR_TASK_OWNER_DROPPED, 0);
+        if previous == CONNECTOR_TASK_OWNER_DROPPED | 1 {
+            self.inner.terminated.notify_waiters();
+        }
+    }
 }
 
 /// Atomic startup position for a source connector.
@@ -383,10 +544,19 @@ pub struct SourceDrainResolution {
 pub trait SourceConnector: Send {
     /// Deadline behavior required by the underlying client implementation.
     ///
-    /// Completion is the conservative default: a new connector must not be
-    /// cancellation-enabled until every lifecycle future has been audited.
+    /// Retirement is the conservative default: a new connector must not be
+    /// reused after cancellation until every lifecycle future has been audited.
     fn cancellation_policy(&self) -> ConnectorCancellationPolicy {
-        ConnectorCancellationPolicy::CompleteStarted
+        ConnectorCancellationPolicy::RetireConnector
+    }
+
+    /// Observe detached tasks whose lifetime may outlast this connector value.
+    ///
+    /// A connector that spawns detached work must retain the matching
+    /// [`ConnectorTaskOwner`] and move a guard into every task. The runtime can
+    /// then wait for true terminal completion after dropping the connector.
+    fn terminal_task_tracker(&self) -> Option<ConnectorTaskTracker> {
+        None
     }
 
     /// Opens the source and establishes its initial or resumed position as one
@@ -402,12 +572,14 @@ pub trait SourceConnector: Send {
     /// checkpoint cursor invalid. Such sources must enforce independent hard
     /// record and byte limits and fail before retained data can grow unbounded.
     ///
-    /// The runtime cancels this future only when the connector explicitly
-    /// declares [`ConnectorCancellationPolicy::CancelSafe`]. Such
-    /// implementations must not advance external or checkpoint-visible
-    /// position across an `.await` unless dropping the future at that point
-    /// preserves replay of every not-yet-returned record. Stage work privately,
-    /// then advance the cursor and return without another cancellation point.
+    /// The runtime may cancel this future at a shutdown or authority deadline.
+    /// [`ConnectorCancellationPolicy::CancelSafe`] implementations must not
+    /// advance external or checkpoint-visible position across an `.await`
+    /// unless dropping the future there preserves replay of every
+    /// not-yet-returned record. Stage work privately, then advance the cursor
+    /// and return without another cancellation point. The conservative
+    /// [`ConnectorCancellationPolicy::RetireConnector`] policy instead makes
+    /// the complete connector generation terminal after cancellation.
     async fn poll_batch(
         &mut self,
         max_records: usize,
@@ -468,6 +640,9 @@ pub trait SourceConnector: Send {
     /// this drain attempt; provider retries must not continue beyond it. Actor-only sources are
     /// fenced by the engine and never call this hook; assignment-scoped sources must implement it
     /// explicitly.
+    ///
+    /// # Errors
+    /// Returns an error when the provider cannot start this exact drain round.
     fn begin_drain(
         &mut self,
         _request: &SourceDrainRequest,
@@ -481,6 +656,9 @@ pub trait SourceConnector: Send {
     /// Whether the exact provider FIFO boundary has been consumed.
     ///
     /// Returns `false` while the reader is still pausing or while pre-boundary payloads remain.
+    ///
+    /// # Errors
+    /// Returns an error when drain progress cannot be observed safely.
     fn poll_drain_ready(
         &mut self,
         _round: laminar_core::checkpoint::AssignmentDrainId,
@@ -622,10 +800,19 @@ pub trait SourceConnector: Send {
 pub trait SinkConnector: Send {
     /// Deadline behavior required by the underlying client implementation.
     ///
-    /// Completion is the conservative default: a new connector must not be
-    /// cancellation-enabled until every lifecycle future has been audited.
+    /// Retirement is the conservative default: a new connector must not be
+    /// reused after cancellation until every lifecycle future has been audited.
     fn cancellation_policy(&self) -> ConnectorCancellationPolicy {
-        ConnectorCancellationPolicy::CompleteStarted
+        ConnectorCancellationPolicy::RetireConnector
+    }
+
+    /// Observe detached tasks whose lifetime may outlast this connector value.
+    ///
+    /// A connector that spawns detached work must retain the matching
+    /// [`ConnectorTaskOwner`] and move a guard into every task. The runtime can
+    /// then wait for true terminal completion after dropping the connector.
+    fn terminal_task_tracker(&self) -> Option<ConnectorTaskTracker> {
+        None
     }
 
     /// Declare durability, placement, and input semantics for this exact
@@ -647,8 +834,8 @@ pub trait SinkConnector: Send {
 
     /// Implementations using [`ConnectorCancellationPolicy::CancelSafe`] must
     /// remain valid when this future is dropped at a deadline. For
-    /// [`ConnectorCancellationPolicy::CompleteStarted`], the runtime keeps
-    /// polling the exact future to completion before processing later work.
+    /// [`ConnectorCancellationPolicy::RetireConnector`], cancellation makes the
+    /// complete connector instance terminal before later work can be processed.
     async fn write_batch(&mut self, batch: &RecordBatch) -> Result<WriteResult, ConnectorError>;
 
     /// Expected Arrow schema of input batches.
@@ -731,8 +918,8 @@ pub const MAX_COORDINATED_COMMIT_BATCH_ENTRIES: usize = 4_096;
 
 /// Stable external commit namespace for one deployment incarnation of a logical pipeline sink.
 ///
-/// The configured target (Delta table or Iceberg table) already scopes the
-/// external metadata. The create-once deployment id prevents checkpoint-store resets or two
+/// The configured external target already scopes its metadata. The create-once deployment id
+/// prevents checkpoint-store resets or two
 /// identically configured deployments from sharing a cursor. Pipeline identity plus sink id then
 /// binds that deployment to one recovery-compatible logical writer.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -1128,6 +1315,75 @@ mod tests {
         #[allow(clippy::cast_possible_wrap)]
         let ids: Vec<i64> = (0..n as i64).collect();
         RecordBatch::try_new(test_schema(), vec![Arc::new(Int64Array::from(ids))]).unwrap()
+    }
+
+    #[test]
+    fn connector_task_generation_terminates_after_owner_and_every_guard() {
+        let (owner, tracker) = ConnectorTaskOwner::new();
+        let first = owner.track().expect("live generation");
+        let second = owner.track().expect("live generation");
+
+        assert!(!tracker.is_terminated());
+        drop(owner);
+        assert!(!tracker.is_terminated());
+        drop(first);
+        assert!(!tracker.is_terminated());
+        drop(second);
+        assert!(tracker.is_terminated());
+    }
+
+    #[test]
+    fn connector_task_admission_is_sealed_by_owner_drop() {
+        let (owner, tracker) = ConnectorTaskOwner::new();
+        let admission = owner.admission();
+        let admission_clone = admission.clone();
+        let admitted = admission.track().expect("live generation");
+
+        drop(owner);
+
+        assert!(admission.track().is_none());
+        assert!(admission_clone.track().is_none());
+        assert!(!tracker.is_terminated());
+        drop(admitted);
+        assert!(tracker.is_terminated());
+    }
+
+    #[test]
+    fn connector_task_admission_does_not_retain_generation_state() {
+        let (owner, tracker) = ConnectorTaskOwner::new();
+        let admission = owner.admission();
+
+        drop(owner);
+        drop(tracker);
+
+        assert!(admission.inner.upgrade().is_none());
+        assert!(admission.track().is_none());
+    }
+
+    #[tokio::test]
+    async fn connector_task_wait_wakes_every_tracker_clone() {
+        let (owner, tracker) = ConnectorTaskOwner::new();
+        let guard = owner.track().expect("live generation");
+        let first = tokio::spawn({
+            let tracker = tracker.clone();
+            async move { tracker.wait_terminated().await }
+        });
+        let second = tokio::spawn({
+            let tracker = tracker.clone();
+            async move { tracker.wait_terminated().await }
+        });
+
+        drop(owner);
+        assert!(!tracker.is_terminated());
+        drop(guard);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            first.await.expect("first waiter task");
+            second.await.expect("second waiter task");
+        })
+        .await
+        .expect("tracker waiters must wake");
+        tracker.wait_terminated().await;
     }
 
     #[test]

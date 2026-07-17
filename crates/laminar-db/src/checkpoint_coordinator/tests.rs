@@ -5382,6 +5382,7 @@ struct FailingPreCommitSink {
 }
 
 struct BeginRollbackProbeSink {
+    cancellation_policy: laminar_connectors::connector::ConnectorCancellationPolicy,
     fail_begin_on_call: Option<u64>,
     begin_calls: u64,
     begin_delay: Duration,
@@ -5393,6 +5394,10 @@ struct BeginRollbackProbeSink {
 
 #[async_trait::async_trait]
 impl laminar_connectors::connector::SinkConnector for BeginRollbackProbeSink {
+    fn cancellation_policy(&self) -> laminar_connectors::connector::ConnectorCancellationPolicy {
+        self.cancellation_policy
+    }
+
     async fn open(
         &mut self,
         _config: &laminar_connectors::config::ConnectorConfig,
@@ -5482,6 +5487,7 @@ fn spawn_begin_rollback_probe(
         flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
         write_timeout: Duration::from_secs(1),
         event_tx,
+        terminal_tasks: None,
         #[cfg(feature = "cluster")]
         process_authority: None,
     })
@@ -5504,6 +5510,8 @@ async fn begin_epoch_reports_in_doubt_rollback_failure() {
         spawn_begin_rollback_probe(
             "started",
             BeginRollbackProbeSink {
+                cancellation_policy:
+                    laminar_connectors::connector::ConnectorCancellationPolicy::RetireConnector,
                 fail_begin_on_call: None,
                 begin_calls: 0,
                 begin_delay: Duration::ZERO,
@@ -5520,6 +5528,8 @@ async fn begin_epoch_reports_in_doubt_rollback_failure() {
         spawn_begin_rollback_probe(
             "begin-failure",
             BeginRollbackProbeSink {
+                cancellation_policy:
+                    laminar_connectors::connector::ConnectorCancellationPolicy::RetireConnector,
                 fail_begin_on_call: Some(1),
                 begin_calls: 0,
                 begin_delay: Duration::ZERO,
@@ -5565,6 +5575,8 @@ async fn timed_out_begin_uses_a_fresh_rollback_deadline() {
         spawn_begin_rollback_probe(
             "lost-begin-ack",
             BeginRollbackProbeSink {
+                cancellation_policy:
+                    laminar_connectors::connector::ConnectorCancellationPolicy::CancelSafe,
                 fail_begin_on_call: None,
                 begin_calls: 0,
                 begin_delay: Duration::from_secs(1),
@@ -5592,6 +5604,54 @@ async fn timed_out_begin_uses_a_fresh_rollback_deadline() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn timed_out_begin_retires_unsafe_generation_without_cleanup_delay() {
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut coord = make_coordinator(dir.path()).await;
+    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+    let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    let rollbacks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    coord.register_sink(
+        "retired-begin",
+        spawn_begin_rollback_probe(
+            "retired-begin",
+            BeginRollbackProbeSink {
+                cancellation_policy:
+                    laminar_connectors::connector::ConnectorCancellationPolicy::RetireConnector,
+                fail_begin_on_call: None,
+                begin_calls: 0,
+                begin_delay: Duration::from_secs(1),
+                fail_pre_commit: false,
+                fail_rollback: false,
+                rollback_count: Some(Arc::clone(&rollbacks)),
+                schema,
+            },
+            event_tx,
+        ),
+    );
+
+    let started = tokio::time::Instant::now();
+    let attempt_deadline = started + Duration::from_millis(10);
+    let error = coord
+        .begin_epoch_for_sinks_until(7, attempt_deadline)
+        .await
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("failed to begin epoch 7"), "{message}");
+    assert!(message.contains("state in-doubt"), "{message}");
+    assert!(!message.contains("rollback exceeded"), "{message}");
+    assert!(error.requires_pipeline_recovery());
+    assert_eq!(rollbacks.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(
+        tokio::time::Instant::now().duration_since(started) < Duration::from_millis(100),
+        "retired actor admission must fail before the cleanup deadline"
+    );
+}
+
 #[cfg(feature = "cluster")]
 #[tokio::test]
 async fn follower_prepare_rollback_failure_retains_in_doubt_phase() {
@@ -5615,6 +5675,8 @@ async fn follower_prepare_rollback_failure_retains_in_doubt_phase() {
         spawn_begin_rollback_probe(
             "in-doubt",
             BeginRollbackProbeSink {
+                cancellation_policy:
+                    laminar_connectors::connector::ConnectorCancellationPolicy::RetireConnector,
                 fail_begin_on_call: None,
                 begin_calls: 0,
                 begin_delay: Duration::ZERO,
@@ -5682,6 +5744,8 @@ async fn landed_follower_readiness_with_lost_ack_never_rolls_back() {
         spawn_begin_rollback_probe(
             "prepared",
             BeginRollbackProbeSink {
+                cancellation_policy:
+                    laminar_connectors::connector::ConnectorCancellationPolicy::RetireConnector,
                 fail_begin_on_call: None,
                 begin_calls: 0,
                 begin_delay: Duration::ZERO,
@@ -5709,7 +5773,7 @@ async fn landed_follower_readiness_with_lost_ack_never_rolls_back() {
             leader_proof,
             attempt.epoch,
             attempt.checkpoint_id,
-            tokio::time::Instant::now() + Duration::from_secs(1),
+            tokio::time::Instant::now() + Duration::from_secs(10),
         )
         .await
         .unwrap_err();
@@ -5744,6 +5808,8 @@ async fn follower_abort_rollback_failure_does_not_open_successor() {
         spawn_begin_rollback_probe(
             "in-doubt",
             BeginRollbackProbeSink {
+                cancellation_policy:
+                    laminar_connectors::connector::ConnectorCancellationPolicy::RetireConnector,
                 fail_begin_on_call: None,
                 begin_calls: 0,
                 begin_delay: Duration::ZERO,
@@ -5788,6 +5854,8 @@ async fn follower_successor_begin_failure_faults_instead_of_returning_idle() {
         spawn_begin_rollback_probe(
             "second-begin-fails",
             BeginRollbackProbeSink {
+                cancellation_policy:
+                    laminar_connectors::connector::ConnectorCancellationPolicy::RetireConnector,
                 fail_begin_on_call: Some(2),
                 begin_calls: 0,
                 begin_delay: Duration::ZERO,
@@ -5949,6 +6017,7 @@ fn spawn_phase_one_probe(
         flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
         write_timeout: Duration::from_secs(1),
         event_tx,
+        terminal_tasks: None,
         #[cfg(feature = "cluster")]
         process_authority: None,
     })
@@ -5981,6 +6050,7 @@ async fn pre_commit_failure_rolls_back_coordinated_prepare() {
         flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
         write_timeout: Duration::from_secs(5),
         event_tx,
+        terminal_tasks: None,
         #[cfg(feature = "cluster")]
         process_authority: None,
     });
@@ -6157,6 +6227,7 @@ fn spawn_recording_sink(
         flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
         write_timeout: Duration::from_secs(5),
         event_tx,
+        terminal_tasks: None,
         #[cfg(feature = "cluster")]
         process_authority: None,
     });
@@ -6250,6 +6321,7 @@ async fn leader_loss_during_phase_one_prevents_sink_commit_and_decision() {
         flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
         write_timeout: Duration::from_secs(5),
         event_tx,
+        terminal_tasks: None,
         #[cfg(feature = "cluster")]
         process_authority: None,
     });
@@ -6390,6 +6462,7 @@ async fn checkpoint_deadline_cancels_actor_flush_before_sink_write_timeout() {
         // Deliberately much longer than the whole checkpoint attempt.
         write_timeout: Duration::from_secs(5),
         event_tx,
+        terminal_tasks: None,
         #[cfg(feature = "cluster")]
         process_authority: None,
     });
@@ -6499,6 +6572,7 @@ async fn attempt_timeout_during_failure_cleanup_requires_recovery() {
         flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
         write_timeout: Duration::from_secs(5),
         event_tx,
+        terminal_tasks: None,
         #[cfg(feature = "cluster")]
         process_authority: None,
     });
@@ -6621,6 +6695,7 @@ async fn coordinated_sink_idle_epoch_still_seals() {
         flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
         write_timeout: Duration::from_secs(5),
         event_tx,
+        terminal_tasks: None,
         #[cfg(feature = "cluster")]
         process_authority: None,
     });
@@ -6704,6 +6779,7 @@ async fn coordinated_sink_descriptor_persisted_and_gated() {
         flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
         write_timeout: Duration::from_secs(5),
         event_tx,
+        terminal_tasks: None,
         #[cfg(feature = "cluster")]
         process_authority: None,
     });

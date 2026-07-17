@@ -288,6 +288,9 @@ impl SinkConnector for MockSinkConnector {
 }
 
 /// Registers a mock source connector with the registry.
+///
+/// # Errors
+/// Returns an error when the mock source name is already registered.
 pub fn register_mock_source(registry: &ConnectorRegistry) -> Result<(), ConnectorError> {
     registry.register_source(
         "mock",
@@ -304,6 +307,9 @@ pub fn register_mock_source(registry: &ConnectorRegistry) -> Result<(), Connecto
 }
 
 /// Registers a mock sink connector with the registry.
+///
+/// # Errors
+/// Returns an error when the mock sink name is already registered.
 pub fn register_mock_sink(registry: &ConnectorRegistry) -> Result<(), ConnectorError> {
     registry.register_sink(
         "mock",

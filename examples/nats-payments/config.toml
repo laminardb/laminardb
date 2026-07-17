@@ -1,13 +1,10 @@
-# ARCHIVED CONTRACT FIXTURE — not a runnable server configuration.
-#
-# NATS Core sources are non-replayable and require global best_effort, while
-# the Iceberg sinks require global exactly_once. LaminarDB deliberately rejects
-# that mixed contract before external I/O. Retain this file only as a pipeline
-# design fixture until the sources move to a certified replayable protocol.
-#
+# Both NATS source modes are currently ephemeral: JetStream acknowledgement is
+# delivery progress, not a LaminarDB checkpoint cursor. The durable Iceberg
+# sink does not upgrade that source contract, so this demo is best-effort.
 [server]
 mode = "single"
 bind = "127.0.0.1:8080"
+delivery = "best_effort"
 
 [state]
 backend = "in_process"

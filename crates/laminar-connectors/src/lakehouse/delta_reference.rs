@@ -288,13 +288,10 @@ mod tests {
             delta_io::write_batches(
                 table,
                 vec![batch],
-                "reference-test",
-                1,
                 SaveMode::Append,
                 None,
                 false,
                 None,
-                false,
                 None,
             )
             .await

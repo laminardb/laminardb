@@ -2445,7 +2445,7 @@ mod tests {
         for (from, value) in source_values {
             for (to, expected) in &target_values {
                 assert_eq!(
-                    checked_epoch_to_unit(value, from, to.clone()).unwrap(),
+                    checked_epoch_to_unit(value, from, *to).unwrap(),
                     *expected,
                     "from={from:?}, to={to:?}"
                 );

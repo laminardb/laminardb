@@ -23,7 +23,8 @@ use tracing::{debug, info, warn};
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{
-    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceTopology,
+    ConnectorTaskGuard, ConnectorTaskOwner, ConnectorTaskTracker, SourceBatch, SourceConnector,
+    SourceConsistency, SourceContract, SourceTopology,
 };
 use crate::connector::{SourcePosition, SourceStart};
 use crate::error::ConnectorError;
@@ -78,6 +79,10 @@ pub struct WebSocketSource {
     data_ready: Arc<Notify>,
     /// Terminal reader failure published outside the bounded data channel.
     terminal_error: Arc<Mutex<Option<String>>>,
+    /// Admission authority for tasks owned by this connector generation.
+    task_owner: ConnectorTaskOwner,
+    /// Terminal observer retained by the database before the connector starts.
+    task_tracker: ConnectorTaskTracker,
 }
 
 impl WebSocketSource {
@@ -93,6 +98,7 @@ impl WebSocketSource {
             config.format.clone(),
             JsonDecoderConfig::default(),
         );
+        let (task_owner, task_tracker) = ConnectorTaskOwner::new();
 
         Self {
             config,
@@ -107,7 +113,17 @@ impl WebSocketSource {
             max_batch_size: 1000,
             data_ready: Arc::new(Notify::new()),
             terminal_error: Arc::new(Mutex::new(None)),
+            task_owner,
+            task_tracker,
         }
+    }
+
+    fn track_reader_task(&self) -> Result<ConnectorTaskGuard, ConnectorError> {
+        self.task_owner.track().ok_or_else(|| {
+            ConnectorError::Internal(
+                "WebSocket source task generation is no longer accepting readers".into(),
+            )
+        })
     }
 
     /// Spawns the WebSocket reader task that connects to the server and
@@ -125,8 +141,10 @@ impl WebSocketSource {
         metrics: WebSocketSourceMetrics,
         byte_budget: Arc<Semaphore>,
         terminal_error: Arc<Mutex<Option<String>>>,
+        task_guard: ConnectorTaskGuard,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
+            let _task_guard = task_guard;
             let mut conn_mgr = ConnectionManager::new(urls, reconnect);
 
             'outer: loop {
@@ -390,6 +408,10 @@ fn publish_terminal(error: &Mutex<Option<String>>, data_ready: &Notify, reason: 
 
 #[async_trait]
 impl SourceConnector for WebSocketSource {
+    fn terminal_task_tracker(&self) -> Option<ConnectorTaskTracker> {
+        Some(self.task_tracker.clone())
+    }
+
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
         let SourceStart {
             config, position, ..
@@ -476,6 +498,7 @@ impl SourceConnector for WebSocketSource {
         // Create shutdown signal.
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let byte_budget = Arc::new(Semaphore::new(INGRESS_BUFFER_BYTES));
+        let task_guard = self.track_reader_task()?;
 
         // Spawn the reader task.
         let handle = Self::spawn_reader(
@@ -490,6 +513,7 @@ impl SourceConnector for WebSocketSource {
             self.metrics.clone(),
             byte_budget,
             Arc::clone(&self.terminal_error),
+            task_guard,
         );
 
         self.rx = Some(rx);
@@ -605,8 +629,8 @@ impl SourceConnector for WebSocketSource {
         }
 
         // Wait for the reader task to finish.
-        if let Some(mut handle) = self.reader_handle.take() {
-            if tokio::time::timeout(std::time::Duration::from_secs(5), &mut handle)
+        if let Some(handle) = self.reader_handle.as_mut() {
+            if tokio::time::timeout(std::time::Duration::from_secs(5), &mut *handle)
                 .await
                 .is_err()
             {
@@ -614,6 +638,7 @@ impl SourceConnector for WebSocketSource {
                 let _ = handle.await;
             }
         }
+        self.reader_handle = None;
 
         self.rx = None;
         self.message_buffer.clear();
@@ -702,6 +727,33 @@ mod tests {
         );
         let cp = source.checkpoint();
         assert!(cp.is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_tracker_waits_for_reader_exit_after_source_drop() {
+        let mut source = WebSocketSource::new(
+            test_schema(),
+            test_config(),
+            WebSocketSourceMetrics::local(),
+        );
+        let tracker = source.terminal_task_tracker().unwrap();
+        let task_guard = source.task_owner.track().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        source.reader_handle = Some(tokio::task::spawn_blocking(move || {
+            let _task_guard = task_guard;
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+        }));
+        started_rx.await.unwrap();
+
+        drop(source);
+
+        assert!(!tracker.is_terminated());
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), tracker.wait_terminated())
+            .await
+            .expect("source reader guard did not resolve after task exit");
     }
 
     #[test]

@@ -141,13 +141,10 @@ mod tests {
         let (_table, version) = delta_io::write_batches(
             table,
             vec![batch],
-            "test-writer",
-            1,
             SaveMode::Append,
             None,
             false,
             None,
-            false,
             None,
         )
         .await

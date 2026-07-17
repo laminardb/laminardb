@@ -3,6 +3,7 @@
 // Source modules
 pub mod avro;
 pub mod config;
+mod metadata_error;
 pub mod metrics;
 mod offsets;
 pub mod rebalance;
@@ -35,7 +36,7 @@ pub use partitioner::{
     KafkaPartitioner, KeyHashPartitioner, RoundRobinPartitioner, StickyPartitioner,
 };
 pub use sink::KafkaSink;
-pub use sink_config::{Acks, CompressionType, KafkaSinkConfig, PartitionStrategy};
+pub use sink_config::{CompressionType, KafkaSinkConfig, PartitionStrategy};
 pub use sink_metrics::KafkaSinkMetrics;
 
 /// Test-only access to Kafka-specific routing probes.
@@ -72,6 +73,11 @@ use crate::config::{ConfigKeySpec, ConnectorInfo};
 use crate::registry::ConnectorRegistry;
 
 /// Registers the Kafka source connector with the given registry.
+///
+/// # Errors
+///
+/// Returns an error if a Kafka source factory is already registered or the
+/// registry has been frozen.
 pub fn register_kafka_source(
     registry: &ConnectorRegistry,
 ) -> Result<(), crate::error::ConnectorError> {
@@ -100,6 +106,11 @@ pub fn register_kafka_source(
 }
 
 /// Registers the Kafka sink connector with the given registry.
+///
+/// # Errors
+///
+/// Returns an error if a Kafka sink factory is already registered or the
+/// registry has been frozen.
 pub fn register_kafka_sink(
     registry: &ConnectorRegistry,
 ) -> Result<(), crate::error::ConnectorError> {
@@ -352,10 +363,9 @@ fn kafka_sink_config_keys() -> Vec<ConfigKeySpec> {
         ),
         ConfigKeySpec::optional("ssl.key.location", "Client SSL private key file path", ""),
         ConfigKeySpec::optional("ssl.key.password", "Password for encrypted SSL key", ""),
-        ConfigKeySpec::optional("acks", "Acknowledgment level (0/1/all)", "all"),
         ConfigKeySpec::optional(
             "max.in.flight.requests",
-            "Maximum in-flight producer requests per connection",
+            "Maximum in-flight producer requests per connection (1-5)",
             "5",
         ),
         ConfigKeySpec::optional(
@@ -385,11 +395,6 @@ fn kafka_sink_config_keys() -> Vec<ConfigKeySpec> {
             "dlq.topic",
             "Dead letter queue topic for failed records",
             "",
-        ),
-        ConfigKeySpec::optional(
-            "flush.batch.size",
-            "Max records to buffer before flushing",
-            "1000",
         ),
         // Schema Registry
         ConfigKeySpec::optional(

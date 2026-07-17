@@ -26,8 +26,8 @@ use uuid::Uuid;
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{
-    ConnectorCancellationPolicy, SourceBatch, SourceConnector, SourceConsistency, SourceContract,
-    SourcePosition, SourceStart, SourceTopology,
+    ConnectorTaskOwner, ConnectorTaskTracker, SourceBatch, SourceConnector, SourceConsistency,
+    SourceContract, SourcePosition, SourceStart, SourceTopology,
 };
 use crate::error::ConnectorError;
 
@@ -494,19 +494,43 @@ pub struct MongoDbCdcSource {
     /// Terminal reader failure, independent of the bounded event queue.
     #[cfg(feature = "mongodb-cdc")]
     reader_error: Option<tokio::sync::watch::Receiver<Option<MongoReaderFailure>>>,
+
+    /// Admission authority and terminal observer for this connector generation.
+    task_owner: ConnectorTaskOwner,
+    task_tracker: ConnectorTaskTracker,
 }
 
 impl Drop for MongoDbCdcSource {
     fn drop(&mut self) {
         #[cfg(feature = "mongodb-cdc")]
-        if let Some(shutdown) = self.reader_shutdown.as_ref() {
+        if let Some(shutdown) = self.reader_shutdown.take() {
             shutdown.send_replace(true);
         }
         #[cfg(feature = "mongodb-cdc")]
         if let Some(handle) = self.reader_handle.take() {
-            handle.abort();
+            reap_mongo_reader(handle, &self.task_owner);
         }
     }
+}
+
+#[cfg(feature = "mongodb-cdc")]
+fn reap_mongo_reader(handle: tokio::task::JoinHandle<()>, task_owner: &ConnectorTaskOwner) {
+    let Some(reaper_guard) = task_owner.track() else {
+        tracing::warn!("MongoDB CDC task generation was sealed before reader reaping");
+        return;
+    };
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        // The reader owns a separate task guard. Runtime destruction drops the
+        // reader future and resolves that proof without a timer or join guess.
+        drop(reaper_guard);
+        return;
+    };
+    drop(runtime.spawn(async move {
+        let _reaper_guard = reaper_guard;
+        if let Err(error) = handle.await {
+            tracing::debug!(%error, "MongoDB CDC retired reader task reaped");
+        }
+    }));
 }
 
 /// Cloneable async sender for the change stream reader → `poll_batch` queue.
@@ -570,24 +594,18 @@ struct MongoAdmissionObservation {
 #[cfg(feature = "mongodb-cdc")]
 struct MongoReaderAdmissionGuard {
     shutdown: Option<tokio::sync::watch::Sender<bool>>,
-    abort_handle: Option<tokio::task::AbortHandle>,
 }
 
 #[cfg(feature = "mongodb-cdc")]
 impl MongoReaderAdmissionGuard {
-    fn new(
-        shutdown: tokio::sync::watch::Sender<bool>,
-        abort_handle: tokio::task::AbortHandle,
-    ) -> Self {
+    fn new(shutdown: tokio::sync::watch::Sender<bool>) -> Self {
         Self {
             shutdown: Some(shutdown),
-            abort_handle: Some(abort_handle),
         }
     }
 
     fn disarm(&mut self) {
         self.shutdown = None;
-        self.abort_handle = None;
     }
 }
 
@@ -596,9 +614,6 @@ impl Drop for MongoReaderAdmissionGuard {
     fn drop(&mut self) {
         if let Some(shutdown) = self.shutdown.as_ref() {
             shutdown.send_replace(true);
-        }
-        if let Some(abort_handle) = self.abort_handle.as_ref() {
-            abort_handle.abort();
         }
     }
 }
@@ -615,6 +630,7 @@ impl MongoDbCdcSource {
     #[must_use]
     pub fn new(config: MongoDbSourceConfig, registry: Option<&prometheus::Registry>) -> Self {
         let byte_budget = Arc::new(Semaphore::new(config.max_buffered_bytes));
+        let (task_owner, task_tracker) = ConnectorTaskOwner::new();
         Self {
             byte_budget,
             config,
@@ -635,6 +651,8 @@ impl MongoDbCdcSource {
             reader_shutdown: None,
             #[cfg(feature = "mongodb-cdc")]
             reader_error: None,
+            task_owner,
+            task_tracker,
         }
     }
 
@@ -855,6 +873,10 @@ fn events_to_record_batch_refs(
 
 #[async_trait]
 impl SourceConnector for MongoDbCdcSource {
+    fn terminal_task_tracker(&self) -> Option<ConnectorTaskTracker> {
+        Some(self.task_tracker.clone())
+    }
+
     fn recovery_identity_options(
         &self,
         config: &ConnectorConfig,
@@ -878,12 +900,6 @@ impl SourceConnector for MongoDbCdcSource {
             ("pipeline".into(), pipeline),
             ("wire.protocol".into(), "change-stream-expanded-v1".into()),
         ])))
-    }
-
-    fn cancellation_policy(&self) -> ConnectorCancellationPolicy {
-        // poll_batch only drains connector-owned memory. Admission cancellation aborts the
-        // candidate reader through its ownership guard.
-        ConnectorCancellationPolicy::CancelSafe
     }
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
@@ -1041,23 +1057,33 @@ impl SourceConnector for MongoDbCdcSource {
         let mut reader_join_error = None;
         #[cfg(feature = "mongodb-cdc")]
         {
-            if let Some(tx) = self.reader_shutdown.take() {
+            if let Some(tx) = self.reader_shutdown.as_ref() {
                 tx.send_replace(true);
             }
-            if let Some(mut handle) = self.reader_handle.take() {
-                match tokio::time::timeout(READER_SHUTDOWN_TIMEOUT, &mut handle).await {
+            let mut detach_reader = false;
+            if let Some(handle) = self.reader_handle.as_mut() {
+                match tokio::time::timeout(READER_SHUTDOWN_TIMEOUT, &mut *handle).await {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) if error.is_cancelled() => {}
                     Ok(Err(error)) => reader_join_error = Some(error.to_string()),
                     Err(_) => {
                         tracing::warn!(
-                            "MongoDB CDC reader exceeded its shutdown deadline; aborting the owned task"
+                            "MongoDB CDC reader exceeded its close deadline; its tracked reaper retains shutdown ownership"
                         );
-                        handle.abort();
-                        let _ = handle.await;
+                        detach_reader = true;
                     }
                 }
             }
+            if detach_reader {
+                let handle = self
+                    .reader_handle
+                    .take()
+                    .expect("reader handle was present while awaiting it");
+                reap_mongo_reader(handle, &self.task_owner);
+            } else {
+                self.reader_handle = None;
+            }
+            self.reader_shutdown = None;
             self.event_rx = None;
             self.reader_error = None;
         }
@@ -1167,10 +1193,9 @@ async fn await_mongo_reader_ready(
         Ok(result) => result,
         Err(_) => {
             tracing::warn!(
-                "MongoDB CDC admission reader exceeded its shutdown deadline; aborting the owned task"
+                "MongoDB CDC admission reader exceeded its shutdown deadline; the retired generation remains tracked until it exits"
             );
-            handle.abort();
-            (&mut *handle).await
+            return Err(error);
         }
     };
     let error = if include_join_error {
@@ -1222,7 +1247,12 @@ impl MongoDbCdcSource {
         let metrics = Arc::clone(&self.metrics);
         let task_byte_budget = Arc::clone(&byte_budget);
 
+        let reader_guard = self.task_owner.track().ok_or_else(|| {
+            ConnectorError::Internal("MongoDB CDC connector generation is already retired".into())
+        })?;
+
         let mut handle = tokio::spawn(async move {
+            let _reader_guard = reader_guard;
             let result = async {
                 let db =
                     match source_database(&reader_config.connection_uri, &reader_config.database)
@@ -1258,8 +1288,7 @@ impl MongoDbCdcSource {
                 terminal_ready.notify_one();
             }
         });
-        let mut admission_guard =
-            MongoReaderAdmissionGuard::new(shutdown_tx.clone(), handle.abort_handle());
+        let mut admission_guard = MongoReaderAdmissionGuard::new(shutdown_tx.clone());
 
         let ready = await_mongo_reader_ready(ready_rx, &shutdown_tx, &mut handle).await?;
 
@@ -1956,6 +1985,45 @@ async fn run_change_stream_reader(
     db: mongodb::Database,
     config: MongoDbSourceConfig,
     tx: ChangeStreamTx,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    data_ready: Arc<Notify>,
+    metrics: Arc<MongoDbCdcMetrics>,
+    byte_budget: Arc<Semaphore>,
+    max_buffered_bytes: usize,
+    initial_resume_position: Option<MongoResumePosition>,
+    expected_collection_uuid: Option<Uuid>,
+    expected_deployment_identity: Option<MongoDeploymentIdentity>,
+    ready_tx: tokio::sync::oneshot::Sender<Result<MongoReaderReady, MongoReaderFailure>>,
+) -> Result<(), ConnectorError> {
+    let client = db.client().clone();
+    let result = run_change_stream_reader_loop(
+        db,
+        config,
+        tx,
+        shutdown_rx,
+        data_ready,
+        metrics,
+        byte_budget,
+        max_buffered_bytes,
+        initial_resume_position,
+        expected_collection_uuid,
+        expected_deployment_identity,
+        ready_tx,
+    )
+    .await;
+
+    // The loop owns every database, collection, and cursor handle. Once it
+    // returns, shutdown can drain the driver's own async cleanup tasks.
+    client.shutdown().await;
+    result
+}
+
+#[cfg(feature = "mongodb-cdc")]
+#[allow(clippy::too_many_arguments)]
+async fn run_change_stream_reader_loop(
+    db: mongodb::Database,
+    config: MongoDbSourceConfig,
+    tx: ChangeStreamTx,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     data_ready: Arc<Notify>,
     metrics: Arc<MongoDbCdcMetrics>,
@@ -1978,7 +2046,7 @@ async fn run_change_stream_reader(
         }
     };
 
-    let mut current_db = db;
+    let current_db = db;
     let mut consecutive_failures: u32 = 0;
     let initial_observation = loop {
         match observe_mongodb_admission(&current_db, &config.database, &config.collection).await {
@@ -2003,11 +2071,6 @@ async fn run_change_stream_reader(
                 metrics.record_reconnect();
                 if retry_interrupted(&mut shutdown_rx, backoff).await {
                     return Ok(());
-                }
-                if let Ok(database) =
-                    source_database(&config.connection_uri, &config.database).await
-                {
-                    current_db = database;
                 }
             }
         }
@@ -2067,11 +2130,6 @@ async fn run_change_stream_reader(
                     metrics.record_reconnect();
                     if retry_interrupted(&mut shutdown_rx, backoff).await {
                         break 'reconnect;
-                    }
-                    if let Ok(database) =
-                        source_database(&config.connection_uri, &config.database).await
-                    {
-                        current_db = database;
                     }
                     continue 'reconnect;
                 }
@@ -2154,11 +2212,6 @@ async fn run_change_stream_reader(
                 if retry_interrupted(&mut shutdown_rx, backoff).await {
                     break 'reconnect;
                 }
-                if let Ok(database) =
-                    source_database(&config.connection_uri, &config.database).await
-                {
-                    current_db = database;
-                }
                 verify_before_open = true;
                 continue 'reconnect;
             }
@@ -2234,11 +2287,8 @@ async fn run_change_stream_reader(
             break 'reconnect;
         }
 
-        // Re-create client and database for reconnection.
-        match source_database(&config.connection_uri, &config.database).await {
-            Ok(database) => current_db = database,
-            Err(error) => tracing::warn!(%error, "failed to recreate client on reconnect"),
-        }
+        // The MongoDB client owns topology monitoring and reconnects its pool.
+        // Reusing it avoids spawning untracked driver generations on each retry.
         verify_before_open = true;
     }
 
@@ -2505,7 +2555,7 @@ mod tests {
         assert_eq!(source.buffered_events(), 0);
         assert_eq!(
             source.cancellation_policy(),
-            ConnectorCancellationPolicy::CancelSafe
+            crate::connector::ConnectorCancellationPolicy::RetireConnector
         );
     }
 
@@ -3143,6 +3193,7 @@ mod tests {
             .unwrap();
         assert_eq!(contract.consistency, SourceConsistency::Replayable);
         assert_eq!(contract.topology, SourceTopology::Singleton);
+        assert!(!contract.is_exact_delivery_certified());
     }
 
     #[cfg(feature = "mongodb-cdc")]
@@ -3358,34 +3409,99 @@ mod tests {
     }
 
     #[cfg(feature = "mongodb-cdc")]
-    #[tokio::test(start_paused = true)]
-    async fn close_aborts_and_joins_a_reader_after_its_deadline() {
+    #[tokio::test]
+    async fn cancelling_close_preserves_the_tracked_reader_for_retry() {
         let config = MongoDbSourceConfig::new("mongodb://localhost:27017", "db", "coll");
         let mut source = MongoDbCdcSource::new(config, None);
-        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let terminal = source.terminal_task_tracker().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let release = Arc::new(Notify::new());
+        let task_release = Arc::clone(&release);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let reader_guard = source
+            .task_owner
+            .track()
+            .expect("live test source must admit its reader");
+        source.reader_shutdown = Some(shutdown_tx);
         source.reader_handle = Some(tokio::spawn(async move {
+            let _reader_guard = reader_guard;
+            let _ = started_tx.send(());
+            task_release.notified().await;
+        }));
+        started_rx.await.expect("reader task did not start");
+
+        let mut close = Box::pin(source.close());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut close)
+                .await
+                .is_err(),
+            "reader should keep the first close pending"
+        );
+        drop(close);
+        assert!(source.reader_handle.is_some());
+        assert!(source.reader_shutdown.is_some());
+        assert!(*shutdown_rx.borrow());
+
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), source.close())
+            .await
+            .expect("retry close must join the retained reader")
+            .unwrap();
+        drop(source);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            terminal.wait_terminated(),
+        )
+        .await
+        .expect("tracker must resolve after retry close joins the reader");
+    }
+
+    #[cfg(feature = "mongodb-cdc")]
+    #[tokio::test(start_paused = true)]
+    async fn close_deadline_leaves_a_tracked_reaper_until_reader_exit() {
+        let config = MongoDbSourceConfig::new("mongodb://localhost:27017", "db", "coll");
+        let mut source = MongoDbCdcSource::new(config, None);
+        let terminal = source.terminal_task_tracker().unwrap();
+        let release = Arc::new(Notify::new());
+        let task_release = Arc::clone(&release);
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let reader_guard = source
+            .task_owner
+            .track()
+            .expect("live test source must admit its reader");
+        source.reader_handle = Some(tokio::spawn(async move {
+            let _reader_guard = reader_guard;
             let _drop_signal = TaskDropSignal(Some(dropped_tx));
-            std::future::pending::<()>().await;
+            task_release.notified().await;
         }));
 
         source.close().await.unwrap();
+        drop(source);
+        assert!(!terminal.is_terminated());
+        release.notify_one();
         dropped_rx
             .await
-            .expect("close must await destruction of the aborted reader future");
-        assert!(source.reader_handle.is_none());
+            .expect("tracked reader must exit after its release");
+        terminal.wait_terminated().await;
     }
 
     #[cfg(feature = "mongodb-cdc")]
     #[tokio::test]
-    async fn drop_aborts_the_owned_reader() {
+    async fn drop_signals_and_tracks_the_owned_reader() {
         let config = MongoDbSourceConfig::new("mongodb://localhost:27017", "db", "coll");
         let mut source = MongoDbCdcSource::new(config, None);
-        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let terminal = source.terminal_task_tracker().unwrap();
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let reader_guard = source
+            .task_owner
+            .track()
+            .expect("live test source must admit its reader");
         source.reader_shutdown = Some(shutdown_tx);
         source.reader_handle = Some(tokio::spawn(async move {
+            let _reader_guard = reader_guard;
             let _drop_signal = TaskDropSignal(Some(dropped_tx));
-            std::future::pending::<()>().await;
+            let _ = shutdown_rx.changed().await;
         }));
         tokio::task::yield_now().await;
 
@@ -3393,8 +3509,60 @@ mod tests {
 
         tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
             .await
-            .expect("drop must abort the reader")
+            .expect("drop must stop the reader")
             .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            terminal.wait_terminated(),
+        )
+        .await
+        .expect("MongoDB source tracker outlived its completed reader");
+    }
+
+    #[cfg(feature = "mongodb-cdc")]
+    #[test]
+    fn tracker_covers_a_reader_destroyed_before_first_poll_on_another_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let config = MongoDbSourceConfig::new("mongodb://localhost:27017", "db", "coll");
+        let mut source = MongoDbCdcSource::new(config, None);
+        let terminal = source.terminal_task_tracker().unwrap();
+        let reader_guard = source
+            .task_owner
+            .track()
+            .expect("live test source must admit its reader");
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let drop_signal = TaskDropSignal(Some(dropped_tx));
+        source.reader_shutdown = Some(shutdown_tx);
+        source.reader_handle = Some(runtime.spawn(async move {
+            let _reader_guard = reader_guard;
+            let _drop_signal = drop_signal;
+            std::future::pending::<()>().await;
+        }));
+
+        drop(source);
+        assert!(!terminal.is_terminated());
+        drop(runtime);
+
+        let observer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        observer.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+                .await
+                .expect("runtime destruction must drop the unpolled reader promptly")
+                .expect("unpolled reader drop signal was lost");
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                terminal.wait_terminated(),
+            )
+            .await
+            .expect("tracker must resolve across runtimes after actual task destruction");
+        });
     }
 
     #[cfg(feature = "mongodb-cdc")]
@@ -3469,7 +3637,7 @@ mod tests {
 
     #[cfg(feature = "mongodb-cdc")]
     #[tokio::test(start_paused = true)]
-    async fn reader_admission_timeout_aborts_and_joins_a_stuck_candidate() {
+    async fn reader_admission_timeout_does_not_claim_a_stuck_candidate_finished() {
         let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
@@ -3483,32 +3651,33 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("startup deadline"), "{error}");
+        assert!(!handle.is_finished());
+        handle.abort();
+        let _ = handle.await;
         dropped_rx
             .await
-            .expect("admission timeout must destroy the aborted reader future");
-        assert!(handle.is_finished());
+            .expect("test cleanup must destroy the candidate reader future");
     }
 
     #[cfg(feature = "mongodb-cdc")]
     #[tokio::test]
-    async fn cancelling_admission_aborts_its_candidate() {
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    async fn cancelling_admission_signals_its_candidate() {
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
-            let _shutdown_rx = shutdown_rx;
             let _drop_signal = TaskDropSignal(Some(dropped_tx));
-            std::future::pending::<()>().await;
+            let _ = shutdown_rx.changed().await;
         });
         tokio::task::yield_now().await;
 
-        let guard = MongoReaderAdmissionGuard::new(shutdown_tx.clone(), handle.abort_handle());
+        let guard = MongoReaderAdmissionGuard::new(shutdown_tx.clone());
         drop(guard);
 
         dropped_rx
             .await
-            .expect("admission guard must abort the candidate reader");
+            .expect("admission guard must stop the candidate reader");
         assert!(*shutdown_tx.borrow());
-        assert!(handle.await.unwrap_err().is_cancelled());
+        handle.await.unwrap();
     }
 
     #[cfg(feature = "mongodb-cdc")]

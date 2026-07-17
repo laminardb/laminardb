@@ -20,6 +20,8 @@
 //! - **Ring 1**: Batch buffering, Parquet writes, Delta log commits.
 //! - **Ring 2**: Schema management, configuration, health checks.
 
+#[cfg(feature = "delta-lake")]
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -36,9 +38,10 @@ use deltalake::protocol::SaveMode;
 
 use crate::config::{ConnectorConfig, ConnectorState};
 #[cfg(feature = "delta-lake")]
-use crate::connector::MAX_COORDINATED_COMMIT_PAYLOAD_BYTES;
+use crate::connector::{ConnectorTaskGuard, MAX_COORDINATED_COMMIT_PAYLOAD_BYTES};
 use crate::connector::{
-    SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology, WriteResult,
+    ConnectorTaskOwner, ConnectorTaskTracker, SinkConnector, SinkConsistency, SinkContract,
+    SinkInputMode, SinkTopology, WriteResult,
 };
 use crate::error::ConnectorError;
 
@@ -47,15 +50,46 @@ use super::delta_metrics::DeltaLakeSinkMetrics;
 use crate::connector::DeliveryGuarantee;
 
 #[cfg(feature = "delta-lake")]
-async fn await_delta_write<T, F>(write_timeout: Duration, write: F) -> Result<T, ConnectorError>
+async fn run_tracked_delta_task<F>(guard: ConnectorTaskGuard, task: F) -> F::Output
 where
-    F: std::future::Future<Output = Result<T, ConnectorError>>,
+    F: Future,
 {
-    tokio::time::timeout(write_timeout, write)
-        .await
-        .map_err(|_| {
-            ConnectorError::WriteError(format!("Delta write timed out after {write_timeout:?}"))
-        })?
+    let _guard = guard;
+    task.await
+}
+
+#[cfg(feature = "delta-lake")]
+fn classify_delta_attempt_error(error: super::delta_io::DeltaWriteAttemptError) -> ConnectorError {
+    use super::delta_io::DeltaWriteAttemptError;
+
+    if error.is_definite_optimistic_conflict() {
+        return ConnectorError::WriteError(format!(
+            "Delta optimistic commit collision did not publish: {error}"
+        ));
+    }
+
+    match error {
+        DeltaWriteAttemptError::Local(error) => error,
+        DeltaWriteAttemptError::Delta(error) => {
+            // A storage failure may make progress in a fresh generation, but
+            // it still cannot prove whether the catalog accepted the commit.
+            // Structural/protocol errors are terminal and must not be turned
+            // into retries merely because their message says "conflict".
+            let retryable = super::delta_io::delta_error_has_retryable_transport(&error);
+            ConnectorError::outcome_unknown(
+                format!(
+                    "Delta write was dispatched but its catalog commit outcome is not known: {error}"
+                ),
+                retryable,
+            )
+        }
+    }
+}
+
+#[cfg(feature = "delta-lake")]
+struct DeltaWriteTaskSuccess {
+    table: DeltaTable,
+    merge_result: Option<super::delta_io::MergeResult>,
 }
 
 /// Counts `(upserts, deletes)` in a collapsed changelog batch's `_op` column.
@@ -90,19 +124,70 @@ struct UnresolvedDeltaPublication {
 
 #[cfg(feature = "delta-lake")]
 impl UnresolvedDeltaPublication {
-    fn reconciled_by(
-        self: &Self,
-        observed: Option<crate::connector::CoordinatedCommitCursor>,
-    ) -> bool {
+    fn reconciled_by(&self, observed: Option<crate::connector::CoordinatedCommitCursor>) -> bool {
         observed == Some(self.target)
     }
+}
+
+#[cfg(feature = "delta-lake")]
+async fn publish_coordinated_delta_batch(
+    table_path: String,
+    storage_options: std::collections::HashMap<String, String>,
+    unresolved: Arc<parking_lot::Mutex<Option<UnresolvedDeltaPublication>>>,
+    pending: UnresolvedDeltaPublication,
+    batch: crate::connector::CoordinatedCommitBatch,
+    deadline: tokio::time::Instant,
+    publication_budget: Duration,
+) -> Result<(), ConnectorError> {
+    super::delta_io::validate_coordinated_storage_preflight(&table_path, &storage_options)?;
+    let storage_options = super::delta_io::bound_coordinated_storage_options(storage_options);
+    let result = async {
+        let table = tokio::time::timeout_at(
+            deadline,
+            super::delta_io::open_or_create_table(&table_path, storage_options, None),
+        )
+        .await
+        .map_err(|_| {
+            ConnectorError::TransactionError(
+                "Delta coordinated table open exceeded the publication deadline".into(),
+            )
+        })??;
+        let descriptor_count =
+            super::delta_io::commit_batch_coordinated(&table, &batch, deadline).await?;
+        info!(
+            epoch = batch.target.epoch,
+            checkpoint_id = batch.target.checkpoint_id,
+            descriptors = descriptor_count,
+            "delta coordinated commit"
+        );
+        Ok(())
+    }
+    .await;
+
+    if result.is_ok() && tokio::time::Instant::now() < deadline {
+        let mut unresolved = unresolved.lock();
+        if unresolved.as_ref() == Some(&pending) {
+            *unresolved = None;
+        }
+        return Ok(());
+    }
+    if result.is_ok() {
+        return Err(ConnectorError::outcome_unknown(
+            format!(
+                "Delta coordinated publication exceeded its {publication_budget:?} remaining \
+                 budget; reconcile the exact cursor before replay"
+            ),
+            true,
+        ));
+    }
+    result
 }
 
 /// Delta Lake sink connector.
 ///
 /// Writes Arrow `RecordBatch` to Delta Lake tables with ACID transactions,
 /// at-least-once delivery (exactly-once opt-in), partitioning, and
-/// background compaction.
+/// externally managed table maintenance.
 ///
 /// # Exactly-Once Semantics
 ///
@@ -112,6 +197,11 @@ impl UnresolvedDeltaPublication {
 /// descriptor. `rollback_epoch()` discards in-memory state; unreferenced files
 /// are reclaimed later by retention-safe vacuum.
 pub struct DeltaLakeSink {
+    /// Sole admission authority for Delta tasks that may outlive a cancelled caller.
+    #[cfg_attr(not(feature = "delta-lake"), allow(dead_code))]
+    task_owner: ConnectorTaskOwner,
+    /// Stable terminal observer retained by the runtime after this sink is retired.
+    task_tracker: ConnectorTaskTracker,
     /// Sink configuration.
     config: DeltaLakeSinkConfig,
     /// Arrow schema for input batches (set on first write or from existing table).
@@ -159,7 +249,7 @@ pub struct DeltaLakeSink {
     /// this instance stages a later cut. Absence cannot resolve a timed-out
     /// remote catalog mutation because the server may still complete it.
     #[cfg(feature = "delta-lake")]
-    coordinated_unresolved_publication: parking_lot::Mutex<Option<UnresolvedDeltaPublication>>,
+    coordinated_unresolved_publication: Arc<parking_lot::Mutex<Option<UnresolvedDeltaPublication>>>,
     /// Resolved table path after catalog lookup (may differ from `config.table_path`
     /// when using Unity/Glue catalogs). Used by `reopen_table()` so retries
     /// target the same resolved path that `open()` connected to.
@@ -168,21 +258,11 @@ pub struct DeltaLakeSink {
     /// Resolved storage options after catalog lookup.
     #[cfg(feature = "delta-lake")]
     resolved_storage_options: std::collections::HashMap<String, String>,
-    /// Cancellation token for the background compaction task.
-    #[cfg(feature = "delta-lake")]
-    compaction_cancel: Option<tokio_util::sync::CancellationToken>,
-    /// Handle for the background compaction task.
-    #[cfg(feature = "delta-lake")]
-    compaction_handle: Option<tokio::task::JoinHandle<()>>,
     /// When true, Delta table init is deferred until the first `write_batch()`
     /// provides a schema. This happens when Unity Catalog auto-create is
     /// configured but the pipeline schema is not yet available at `open()` time.
     #[cfg(feature = "delta-lake")]
     needs_deferred_delta_init: bool,
-    /// Background reopen kicked off after a checkpoint-boundary drop, so
-    /// the next flush doesn't pay the table-load cost on the commit path.
-    #[cfg(feature = "delta-lake")]
-    pending_reopen: Option<tokio::task::JoinHandle<Result<DeltaTable, ConnectorError>>>,
     /// Pre-built Parquet writer properties for hot-path writes. Built once
     /// in `init_delta_table()` from `config.parquet`; cloning this is far
     /// cheaper than rebuilding (string parsing, bloom-filter column setup)
@@ -195,6 +275,10 @@ pub struct DeltaLakeSink {
     /// allocator churn under steady-state upsert load.
     #[cfg(feature = "delta-lake")]
     merge_session: Option<datafusion::prelude::SessionContext>,
+    /// A dispatched Delta operation lost its result, so this generation cannot
+    /// safely admit another write even after its detached task terminates.
+    #[cfg(feature = "delta-lake")]
+    unresolved_delta_write: bool,
     /// Test hook that makes coordinated descriptor preparation remain pending.
     /// This is compiled out of production builds.
     #[cfg(all(test, feature = "delta-lake"))]
@@ -205,7 +289,10 @@ impl DeltaLakeSink {
     /// Creates a new Delta Lake sink with the given configuration.
     #[must_use]
     pub fn new(config: DeltaLakeSinkConfig, registry: Option<&prometheus::Registry>) -> Self {
+        let (task_owner, task_tracker) = ConnectorTaskOwner::new();
         Self {
+            task_owner,
+            task_tracker,
             config,
             schema: None,
             state: ConnectorState::Created,
@@ -226,7 +313,7 @@ impl DeltaLakeSink {
             #[cfg(feature = "delta-lake")]
             coordinated_descriptor_bytes: 0,
             #[cfg(feature = "delta-lake")]
-            coordinated_unresolved_publication: parking_lot::Mutex::new(None),
+            coordinated_unresolved_publication: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "delta-lake")]
             table: None,
             #[cfg(feature = "delta-lake")]
@@ -234,17 +321,13 @@ impl DeltaLakeSink {
             #[cfg(feature = "delta-lake")]
             resolved_storage_options: std::collections::HashMap::new(),
             #[cfg(feature = "delta-lake")]
-            compaction_cancel: None,
-            #[cfg(feature = "delta-lake")]
-            compaction_handle: None,
-            #[cfg(feature = "delta-lake")]
             needs_deferred_delta_init: false,
-            #[cfg(feature = "delta-lake")]
-            pending_reopen: None,
             #[cfg(feature = "delta-lake")]
             cached_writer_properties: None,
             #[cfg(feature = "delta-lake")]
             merge_session: None,
+            #[cfg(feature = "delta-lake")]
+            unresolved_delta_write: false,
             #[cfg(all(test, feature = "delta-lake"))]
             stall_descriptor_write: false,
         }
@@ -268,29 +351,53 @@ impl DeltaLakeSink {
     }
 
     /// Initializes the Delta table: auto-creates in Unity Catalog if needed,
-    /// resolves the catalog path, opens or creates the Delta table, and spawns
-    /// the compaction loop. Called from `open()` or deferred to the first
+    /// resolves the catalog path, and opens or creates the Delta table. Called
+    /// from `open()` or deferred to the first
     /// `write_batch()` when the schema is not yet available at open time.
     #[cfg(feature = "delta-lake")]
-    async fn init_delta_table(&mut self) -> Result<(), ConnectorError> {
+    async fn init_delta_table(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ConnectorError> {
         use super::delta_io;
 
         // For uc:// tables, pre-create in Unity Catalog if needed.
         // Must run before resolve_catalog_options which calls GET on the table.
         #[cfg(feature = "delta-lake-unity")]
-        ensure_uc_table_exists(&self.config, self.schema.as_ref()).await?;
+        tokio::time::timeout_at(
+            deadline,
+            ensure_uc_table_exists(&self.config, self.schema.as_ref()),
+        )
+        .await
+        .map_err(|_| {
+            ConnectorError::ConnectionFailed(
+                "Delta Unity table initialization exceeded the write deadline".into(),
+            )
+        })??;
 
         // Resolve catalog path: for Unity this calls GET to get the
         // storage_location, bypassing delta-rs credential vending.
-        let (resolved_path, mut merged_options) = delta_io::resolve_catalog_options(
-            &self.config.catalog_type,
-            self.config.catalog_database.as_deref(),
-            self.config.catalog_name.as_deref(),
-            self.config.catalog_schema.as_deref(),
-            &self.config.table_path,
-            &self.config.storage_options,
+        let (resolved_path, mut merged_options) = tokio::time::timeout_at(
+            deadline,
+            delta_io::resolve_catalog_options(
+                &self.config.catalog_type,
+                self.config.catalog_database.as_deref(),
+                self.config.catalog_name.as_deref(),
+                self.config.catalog_schema.as_deref(),
+                &self.config.table_path,
+                &self.config.storage_options,
+            ),
         )
-        .await?;
+        .await
+        .map_err(|_| {
+            ConnectorError::ConnectionFailed(
+                "Delta catalog resolution exceeded the write deadline".into(),
+            )
+        })??;
+
+        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
+            delta_io::validate_coordinated_storage_preflight(&resolved_path, &merged_options)?;
+        }
 
         // Inject default connection timeouts if not explicitly set.
         // Azure load balancers close idle connections after ~4 minutes.
@@ -309,12 +416,8 @@ impl DeltaLakeSink {
         self.resolved_table_path.clone_from(&resolved_path);
         self.resolved_storage_options.clone_from(&merged_options);
 
-        let init_timeout = self
-            .config
-            .write_timeout
-            .max(std::time::Duration::from_secs(120));
-        let table = tokio::time::timeout(
-            init_timeout,
+        let table = tokio::time::timeout_at(
+            deadline,
             delta_io::open_or_create_table(
                 &resolved_path,
                 merged_options.clone(),
@@ -324,8 +427,8 @@ impl DeltaLakeSink {
         .await
         .map_err(|_| {
             ConnectorError::ConnectionFailed(format!(
-                "Delta table init timed out after {}s",
-                init_timeout.as_secs()
+                "Delta table initialization exceeded the {:?} write deadline",
+                self.config.write_timeout
             ))
         })??;
 
@@ -353,24 +456,6 @@ impl DeltaLakeSink {
         self.cached_writer_properties = self.config.parquet.to_writer_properties().ok();
         if self.config.write_mode == DeltaWriteMode::Upsert {
             self.merge_session = Some(datafusion::prelude::SessionContext::new());
-        }
-
-        // Spawn background compaction task if enabled. Pre-build the
-        // compaction writer properties once; the loop clones per tick
-        // instead of re-parsing config strings.
-        if self.config.compaction.enabled {
-            let cancel = tokio_util::sync::CancellationToken::new();
-            let compaction_props = self.config.parquet.compaction_writer_properties().ok();
-            let handle = tokio::spawn(compaction_loop(
-                resolved_path.clone(),
-                Arc::new(merged_options),
-                self.config.compaction.clone(),
-                self.config.vacuum_retention,
-                compaction_props,
-                cancel.clone(),
-            ));
-            self.compaction_cancel = Some(cancel);
-            self.compaction_handle = Some(handle);
         }
 
         Ok(())
@@ -466,19 +551,36 @@ impl DeltaLakeSink {
             .sum()
     }
 
-    /// Returns `true` if the error is a Delta Lake optimistic concurrency
-    /// conflict (retryable). Matches specific delta-rs conflict indicators
-    /// only — not generic "transaction" mentions.
     #[cfg(feature = "delta-lake")]
-    fn is_conflict_error(err: &ConnectorError) -> bool {
-        let msg = err.to_string().to_lowercase();
-        msg.contains("conflicting commit")
-            || msg.contains("version already exists")
-            || msg.contains("concurrent")
-            || (msg.contains("conflict") && !msg.contains("log") && !msg.contains("corrupt"))
+    fn operation_deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now() + self.config.write_timeout
     }
 
-    /// Re-opens the Delta Lake table after a conflict error destroys the handle.
+    #[cfg(feature = "delta-lake")]
+    fn ensure_write_generation_usable(&self) -> Result<(), ConnectorError> {
+        if self.unresolved_delta_write {
+            return Err(ConnectorError::InvalidState {
+                expected: "a fresh Delta sink generation after reconciliation".into(),
+                actual: "a prior dispatched Delta operation lost its result".into(),
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "delta-lake")]
+    fn spawn_tracked_delta_task<F>(
+        &self,
+        task: F,
+    ) -> Result<tokio::task::JoinHandle<F::Output>, ConnectorError>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let guard = self.task_owner.track().ok_or(ConnectorError::Closed)?;
+        Ok(tokio::spawn(run_tracked_delta_task(guard, task)))
+    }
+
+    /// Re-opens the Delta Lake table after a failed write consumes the handle.
     /// Uses the resolved path/options from `open()`, not `config.*`, so that
     /// catalog-resolved paths (Unity/Glue) are used correctly.
     #[cfg(feature = "delta-lake")]
@@ -500,68 +602,21 @@ impl DeltaLakeSink {
         Ok(())
     }
 
-    /// Spawn a background reopen of the Delta table so the next flush
-    /// doesn't pay the load cost on its hot path. An already-in-flight
-    /// reopen is aborted — the fresher one supersedes it.
-    #[cfg(feature = "delta-lake")]
-    fn schedule_background_reopen(&mut self) {
-        if let Some(prev) = self.pending_reopen.take() {
-            prev.abort();
-        }
-        let path = self.resolved_table_path.clone();
-        let opts = self.resolved_storage_options.clone();
-        let schema = self.schema.clone();
-        self.pending_reopen = Some(tokio::spawn(async move {
-            super::delta_io::open_or_create_table(&path, opts, schema.as_ref()).await
-        }));
-    }
-
-    /// Install a previously-scheduled background reopen. Returns `false`
-    /// on miss — no pending reopen, task failure, or timeout — so callers
-    /// fall through to the synchronous `reopen_table()` path.
-    #[cfg(feature = "delta-lake")]
-    async fn try_install_pending_reopen(&mut self, timeout: std::time::Duration) -> bool {
-        let Some(mut pending) = self.pending_reopen.take() else {
-            return false;
-        };
-        let table = match tokio::time::timeout(timeout, &mut pending).await {
-            Ok(Ok(Ok(t))) => t,
-            Ok(Ok(Err(e))) => {
-                warn!(error = %e, "Delta background reopen failed");
-                return false;
-            }
-            Ok(Err(e)) => {
-                warn!(error = %e, "Delta background reopen task ended unexpectedly");
-                return false;
-            }
-            Err(_) => {
-                warn!(
-                    timeout_secs = timeout.as_secs(),
-                    "Delta background reopen timed out"
-                );
-                pending.abort();
-                return false;
-            }
-        };
-        #[allow(clippy::cast_sign_loss)]
-        {
-            self.delta_version = table.version().unwrap_or(0) as u64;
-        }
-        self.table = Some(table);
-        true
-    }
-
     /// Attempts a single Delta write/merge and returns the updated table on success.
     #[cfg(feature = "delta-lake")]
+    #[allow(clippy::too_many_arguments)]
     async fn attempt_delta_write(
-        &mut self,
         table: DeltaTable,
-    ) -> Result<DeltaTable, ConnectorError> {
-        // Clone batches for the write — staged_batches is only cleared on
-        // success. RecordBatch::clone is Arc-bump only (~16-48ns per batch).
-        let batches: Vec<RecordBatch> = self.staged_batches.clone();
-
-        if self.config.write_mode == DeltaWriteMode::Upsert {
+        batches: Vec<RecordBatch>,
+        write_mode: DeltaWriteMode,
+        merge_key_columns: Vec<String>,
+        partition_columns: Vec<String>,
+        schema_evolution: bool,
+        target_file_size: usize,
+        writer_properties: Option<deltalake::parquet::file::properties::WriterProperties>,
+        merge_session: Option<datafusion::prelude::SessionContext>,
+    ) -> Result<DeltaWriteTaskSuccess, super::delta_io::DeltaWriteAttemptError> {
+        if write_mode == DeltaWriteMode::Upsert {
             // ── Upsert/Merge path ──
             // flush_staged_to_delta pre-concats for upsert so retries don't
             // pay a full O(rows × cols) copy each attempt. Handle len > 1
@@ -572,75 +627,59 @@ impl DeltaLakeSink {
                 match arrow_select::concat::concat_batches(&batches[0].schema(), &batches) {
                     Ok(c) => c,
                     Err(e) => {
-                        // Concat is a local op — restore table and propagate.
-                        self.table = Some(table);
                         return Err(ConnectorError::Internal(format!(
                             "failed to concat batches: {e}"
-                        )));
+                        ))
+                        .into());
                     }
                 }
             };
 
-            // Cached in init_delta_table — cloning is a small HashMap copy
-            // plus a handful of Arc bumps, far cheaper than rebuilding from
-            // config strings each attempt.
-            let writer_props = self.cached_writer_properties.clone();
-            let merge_session = self
-                .merge_session
+            let merge_session = merge_session
                 .as_ref()
                 .expect("merge_session built in init_delta_table for Upsert mode");
 
             super::delta_io::merge_changelog(
                 table,
                 combined,
-                &self.config.merge_key_columns,
-                &self.config.writer_id,
-                self.current_epoch,
-                self.config.schema_evolution,
-                writer_props,
+                &merge_key_columns,
+                schema_evolution,
+                writer_properties,
                 merge_session,
             )
             .await
-            .map(|(t, result)| {
-                self.metrics.record_merge();
-                if result.rows_deleted > 0 {
-                    self.metrics.record_deletes(result.rows_deleted as u64);
-                }
-                t
+            .map(|(table, merge_result)| DeltaWriteTaskSuccess {
+                table,
+                merge_result: Some(merge_result),
             })
         } else {
             // ── Append/Overwrite path ──
-            let save_mode = match self.config.write_mode {
+            let save_mode = match write_mode {
                 DeltaWriteMode::Append => SaveMode::Append,
                 DeltaWriteMode::Overwrite => SaveMode::Overwrite,
                 DeltaWriteMode::Upsert => unreachable!("handled by the upsert branch above"),
             };
 
-            let partition_cols = if self.config.partition_columns.is_empty() {
+            let partition_cols = if partition_columns.is_empty() {
                 None
             } else {
-                Some(self.config.partition_columns.as_slice())
+                Some(partition_columns.as_slice())
             };
-
-            // Create a Delta Lake checkpoint every N commits for read performance.
-            let should_checkpoint = self.config.checkpoint_interval > 0
-                && self.delta_version > 0
-                && (self.delta_version + 1).is_multiple_of(self.config.checkpoint_interval);
 
             super::delta_io::write_batches(
                 table,
                 batches,
-                &self.config.writer_id,
-                self.current_epoch,
                 save_mode,
                 partition_cols,
-                self.config.schema_evolution,
-                Some(self.config.target_file_size),
-                should_checkpoint,
-                self.cached_writer_properties.clone(),
+                schema_evolution,
+                Some(target_file_size),
+                writer_properties,
             )
             .await
-            .map(|(t, _version)| t)
+            .map(|(table, _version)| DeltaWriteTaskSuccess {
+                table,
+                merge_result: None,
+            })
         }
     }
 
@@ -666,32 +705,30 @@ impl DeltaLakeSink {
     /// Write staged batches to uniquely named Parquet files without making
     /// them visible in the Delta log.
     #[cfg(feature = "delta-lake")]
-    async fn materialize_staged_adds(&self) -> Result<Vec<deltalake::kernel::Add>, ConnectorError> {
+    async fn materialize_staged_adds(
+        table: DeltaTable,
+        batches: Vec<RecordBatch>,
+        writer_properties: Option<deltalake::parquet::file::properties::WriterProperties>,
+        #[cfg(test)] stall: bool,
+    ) -> Result<Vec<deltalake::kernel::Add>, ConnectorError> {
         use deltalake::writer::{DeltaWriter, RecordBatchWriter};
 
         #[cfg(test)]
-        if self.stall_descriptor_write {
+        if stall {
             std::future::pending::<()>().await;
         }
 
-        let table = self
-            .table
-            .as_ref()
-            .ok_or_else(|| ConnectorError::InvalidState {
-                expected: "open".into(),
-                actual: "delta table not loaded".into(),
-            })?;
-        let mut writer = RecordBatchWriter::for_table(table)
+        let mut writer = RecordBatchWriter::for_table(&table)
             .map_err(|e| ConnectorError::WriteError(format!("delta writer: {e}")))?;
         // Mirror the non-coordinated path: honor configured Parquet properties
         // (compression, row-group size, bloom filters) instead of the writer's
         // hard-coded Snappy default.
-        if let Some(props) = self.cached_writer_properties.clone() {
+        if let Some(props) = writer_properties {
             writer = writer.with_writer_properties(props);
         }
-        for batch in &self.staged_batches {
+        for batch in batches {
             writer
-                .write(batch.clone())
+                .write(batch)
                 .await
                 .map_err(|e| ConnectorError::WriteError(format!("delta write: {e}")))?;
         }
@@ -706,10 +743,15 @@ impl DeltaLakeSink {
     /// bounded Delta metadata. The Parquet objects remain invisible until
     /// `commit_aggregated` publishes these Adds with the checkpoint cursor.
     #[cfg(feature = "delta-lake")]
-    async fn materialize_coordinated_staged(&mut self) -> Result<(), ConnectorError> {
+    #[allow(clippy::too_many_lines)] // One atomic staging-state transition is easier to audit whole.
+    async fn materialize_coordinated_staged(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ConnectorError> {
         if self.staged_batches.is_empty() {
             return Ok(());
         }
+        self.ensure_write_generation_usable()?;
 
         let binding =
             super::delta_io::coordinated_table_binding(self.table.as_ref().ok_or_else(|| {
@@ -729,8 +771,44 @@ impl DeltaLakeSink {
             ));
         }
 
-        let write_timeout = self.config.write_timeout;
-        let adds = await_delta_write(write_timeout, self.materialize_staged_adds()).await?;
+        let table = self
+            .table
+            .clone()
+            .ok_or_else(|| ConnectorError::InvalidState {
+                expected: "open".into(),
+                actual: "delta table not loaded".into(),
+            })?;
+        let batches = self.staged_batches.clone();
+        let writer_properties = self.cached_writer_properties.clone();
+        #[cfg(test)]
+        let stall = self.stall_descriptor_write;
+        let task = self.spawn_tracked_delta_task(Self::materialize_staged_adds(
+            table,
+            batches,
+            writer_properties,
+            #[cfg(test)]
+            stall,
+        ))?;
+        let adds = match tokio::time::timeout_at(deadline, task).await {
+            Ok(Ok(result)) => result?,
+            Ok(Err(error)) => {
+                self.unresolved_delta_write = true;
+                return Err(ConnectorError::outcome_unknown(
+                    format!("Delta descriptor writer task terminated unexpectedly: {error}"),
+                    true,
+                ));
+            }
+            Err(_) => {
+                self.unresolved_delta_write = true;
+                return Err(ConnectorError::outcome_unknown(
+                    format!(
+                        "Delta descriptor materialization timed out at its {:?} end-to-end deadline",
+                        self.config.write_timeout
+                    ),
+                    true,
+                ));
+            }
+        };
         if adds.is_empty() {
             self.staged_batches.clear();
             self.staged_rows = 0;
@@ -768,9 +846,8 @@ impl DeltaLakeSink {
         };
         if projected_descriptor_bytes > MAX_COORDINATED_COMMIT_PAYLOAD_BYTES {
             return Err(ConnectorError::WriteError(format!(
-                "Delta coordinated descriptor would exceed the fixed {} byte control-plane \
+                "Delta coordinated descriptor would exceed the fixed {MAX_COORDINATED_COMMIT_PAYLOAD_BYTES} byte control-plane \
                  limit; the checkpoint cut produced too many files or partition values",
-                MAX_COORDINATED_COMMIT_PAYLOAD_BYTES
             )));
         }
 
@@ -786,8 +863,11 @@ impl DeltaLakeSink {
     /// Flush any prior retry buffer first, then move the current in-memory
     /// exact-mode buffer into invisible Parquet staging.
     #[cfg(feature = "delta-lake")]
-    async fn stage_coordinated_buffer(&mut self) -> Result<(), ConnectorError> {
-        self.materialize_coordinated_staged().await?;
+    async fn stage_coordinated_buffer(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ConnectorError> {
+        self.materialize_coordinated_staged(deadline).await?;
         if self.buffer.is_empty() {
             return Ok(());
         }
@@ -798,17 +878,22 @@ impl DeltaLakeSink {
         self.buffered_rows = 0;
         self.buffered_bytes = 0;
         self.buffer_start_time = None;
-        self.materialize_coordinated_staged().await
+        self.materialize_coordinated_staged(deadline).await
     }
 
-    /// Retries on optimistic concurrency conflicts with exponential backoff.
-    /// On non-conflict errors or exhausted retries, propagates the error.
+    /// Writes staged data under one end-to-end deadline. delta-rs owns the
+    /// optimistic commit retry loop; this layer must not amplify that budget.
     #[cfg(feature = "delta-lake")]
     #[allow(clippy::too_many_lines)]
-    async fn flush_staged_to_delta(&mut self) -> Result<WriteResult, ConnectorError> {
+    async fn flush_staged_to_delta(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<WriteResult, ConnectorError> {
         if self.staged_batches.is_empty() {
             return Ok(WriteResult::new(0, 0));
         }
+        self.ensure_write_generation_usable()?;
+        let write_timeout = self.config.write_timeout;
 
         // For upsert, concat the whole epoch and collapse the changelog to one
         // row per merge key BEFORE the MERGE. This (a) makes the MERGE
@@ -846,122 +931,99 @@ impl DeltaLakeSink {
         let estimated_bytes = self.staged_bytes;
         let flush_start = Instant::now();
 
-        // Retry loop with exponential backoff for optimistic concurrency conflicts.
-        let backoff_ms = [100u64, 500, 2000];
-        let max_attempts = (self.config.max_commit_retries as usize).saturating_add(1);
-        let mut last_error: Option<ConnectorError> = None;
+        // A failed/expired delta-rs write consumes the table handle. A later
+        // flush reopens it, but reopening and the new commit share this one
+        // operation deadline.
+        if self.table.is_none() {
+            tokio::time::timeout_at(deadline, self.reopen_table())
+                .await
+                .map_err(|_| {
+                    ConnectorError::ConnectionFailed(format!(
+                        "Delta table reopen exceeded the {write_timeout:?} write deadline"
+                    ))
+                })??;
+        }
 
-        for attempt in 0..max_attempts {
-            // delta-rs consumes DeltaTable by value. If self.table is None
-            // (prior failure or checkpoint-boundary drop) reinstall it —
-            // prefer a scheduled background reopen, fall back to sync.
-            if self.table.is_none() {
-                let reopen_timeout = self.config.write_timeout;
-                if !self.try_install_pending_reopen(reopen_timeout).await {
-                    tokio::time::timeout(reopen_timeout, self.reopen_table())
-                        .await
-                        .map_err(|_| {
-                            ConnectorError::ConnectionFailed(format!(
-                                "Delta table reopen timed out after {}s",
-                                reopen_timeout.as_secs()
-                            ))
-                        })??;
+        let table = self
+            .table
+            .take()
+            .ok_or_else(|| ConnectorError::InvalidState {
+                expected: "table initialized".into(),
+                actual: "table not initialized".into(),
+            })?;
+
+        let write_task = self.spawn_tracked_delta_task(Self::attempt_delta_write(
+            table,
+            self.staged_batches.clone(),
+            self.config.write_mode,
+            self.config.merge_key_columns.clone(),
+            self.config.partition_columns.clone(),
+            self.config.schema_evolution,
+            self.config.target_file_size,
+            self.cached_writer_properties.clone(),
+            self.merge_session.clone(),
+        ))?;
+        let write = match tokio::time::timeout_at(deadline, write_task).await {
+            Ok(Ok(Ok(write))) => write,
+            Ok(Ok(Err(error))) => {
+                self.metrics
+                    .observe_flush_duration(flush_start.elapsed().as_secs_f64());
+                let error = classify_delta_attempt_error(error);
+                if error.is_outcome_unknown() {
+                    self.unresolved_delta_write = true;
                 }
+                return Err(error);
             }
-
-            let table = self
-                .table
-                .take()
-                .ok_or_else(|| ConnectorError::InvalidState {
-                    expected: "table initialized".into(),
-                    actual: "table not initialized".into(),
-                })?;
-
-            // Timeout the write to prevent hanging on stale connections.
-            // Azure LB drops idle connections after ~4 min; without this,
-            // a dead connection blocks the sink task forever.
-            let write_timeout = self.config.write_timeout;
-            // The table handle is consumed by attempt_delta_write; after either a timeout or
-            // write error the retry loop reopens it through reopen_table().
-            let write_result =
-                await_delta_write(write_timeout, self.attempt_delta_write(table)).await;
-
-            match write_result {
-                Ok(table) => {
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        self.delta_version = table.version().unwrap_or(0) as u64;
-                    }
-
-                    // delta-rs' in-memory Snapshot grows per commit and is not
-                    // compacted in place; drop on checkpoint boundaries so the
-                    // next flush re-opens from the checkpoint file. Pre-open
-                    // in the background so the next commit doesn't block.
-                    let crossed_checkpoint = self.config.checkpoint_interval > 0
-                        && self.delta_version > 0
-                        && self
-                            .delta_version
-                            .is_multiple_of(self.config.checkpoint_interval);
-                    if crossed_checkpoint {
-                        self.table = None;
-                        self.schedule_background_reopen();
-                    } else {
-                        self.table = Some(table);
-                    }
-
-                    self.staged_batches.clear();
-                    self.staged_rows = 0;
-                    self.staged_bytes = 0;
-
-                    self.metrics
-                        .record_flush(total_rows as u64, estimated_bytes);
-                    self.metrics.record_commit(self.delta_version);
-                    self.metrics
-                        .observe_flush_duration(flush_start.elapsed().as_secs_f64());
-
-                    debug!(
-                        rows = total_rows,
-                        bytes = estimated_bytes,
-                        delta_version = self.delta_version,
-                        attempt = attempt + 1,
-                        reopened = crossed_checkpoint,
-                        "Delta Lake: committed staged data to Delta"
-                    );
-
-                    return Ok(WriteResult::new(total_rows, estimated_bytes));
-                }
-                Err(e) => {
-                    if Self::is_conflict_error(&e) && attempt + 1 < max_attempts {
-                        self.metrics.record_conflict();
-                        self.metrics.record_retry();
-                        // ±25% jitter breaks up lockstep retries from
-                        // concurrent writers colliding on the same version.
-                        let base = backoff_ms.get(attempt).copied().unwrap_or(2000);
-                        let delay_ms = jittered_backoff_ms(base);
-                        warn!(
-                            attempt = attempt + 1,
-                            max_attempts,
-                            delay_ms,
-                            error = %e,
-                            "Delta Lake: conflict error, retrying after backoff"
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        last_error = Some(e);
-                        // self.table is already None; loop will re-open.
-                        continue;
-                    }
-                    // Non-conflict error or exhausted retries — propagate.
-                    self.metrics
-                        .observe_flush_duration(flush_start.elapsed().as_secs_f64());
-                    return Err(e);
-                }
+            Ok(Err(error)) => {
+                self.unresolved_delta_write = true;
+                self.metrics
+                    .observe_flush_duration(flush_start.elapsed().as_secs_f64());
+                return Err(ConnectorError::outcome_unknown(
+                    format!("Delta writer task terminated unexpectedly: {error}"),
+                    true,
+                ));
+            }
+            Err(_) => {
+                self.unresolved_delta_write = true;
+                self.metrics
+                    .observe_flush_duration(flush_start.elapsed().as_secs_f64());
+                return Err(ConnectorError::outcome_unknown(
+                    format!("Delta write exceeded its {write_timeout:?} end-to-end deadline"),
+                    true,
+                ));
+            }
+        };
+        let table = write.table;
+        if let Some(result) = write.merge_result {
+            self.metrics.record_merge();
+            if result.rows_deleted > 0 {
+                self.metrics.record_deletes(result.rows_deleted as u64);
             }
         }
 
-        // Should not reach here, but if it does, return the last error.
-        Err(last_error.unwrap_or_else(|| {
-            ConnectorError::Internal("flush_staged_to_delta: no attempts made".into())
-        }))
+        #[allow(clippy::cast_sign_loss)]
+        {
+            self.delta_version = table.version().unwrap_or(0) as u64;
+        }
+        self.table = Some(table);
+        self.staged_batches.clear();
+        self.staged_rows = 0;
+        self.staged_bytes = 0;
+
+        self.metrics
+            .record_flush(total_rows as u64, estimated_bytes);
+        self.metrics.record_commit(self.delta_version);
+        self.metrics
+            .observe_flush_duration(flush_start.elapsed().as_secs_f64());
+
+        debug!(
+            rows = total_rows,
+            bytes = estimated_bytes,
+            delta_version = self.delta_version,
+            "Delta Lake: committed staged data to Delta"
+        );
+
+        Ok(WriteResult::new(total_rows, estimated_bytes))
     }
 
     /// Splits a changelog `RecordBatch` into insert and delete batches.
@@ -1037,141 +1099,6 @@ impl DeltaLakeSink {
     }
 }
 
-/// Background compaction loop: OPTIMIZE + VACUUM with adaptive intervals.
-///
-/// Opens its own `DeltaTable` handle (no shared state with the sink).
-#[cfg(feature = "delta-lake")]
-#[allow(clippy::too_many_lines)]
-async fn compaction_loop(
-    table_path: String,
-    storage_options: Arc<std::collections::HashMap<String, String>>,
-    config: super::delta_config::CompactionConfig,
-    vacuum_retention: std::time::Duration,
-    compaction_props: Option<deltalake::parquet::file::properties::WriterProperties>,
-    cancel: tokio_util::sync::CancellationToken,
-) {
-    use super::delta_io;
-
-    /// Minimum adaptive compaction interval (floor).
-    const MIN_COMPACTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-
-    let base_interval = config.check_interval;
-    let mut current_interval = base_interval;
-    let mut consecutive_skips: u32 = 0;
-
-    info!(
-        table_path = %table_path,
-        check_interval_secs = base_interval.as_secs(),
-        "compaction background task started (adaptive interval)"
-    );
-
-    // Initial delay before the first check.
-    tokio::select! {
-        () = cancel.cancelled() => {
-            info!("compaction background task cancelled");
-            return;
-        }
-        () = tokio::time::sleep(current_interval) => {}
-    }
-
-    loop {
-        // Open a fresh table handle for compaction (no shared state).
-        let table =
-            match delta_io::open_or_create_table(&table_path, (*storage_options).clone(), None)
-                .await
-            {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!(error = %e, "compaction: failed to open table, will retry");
-                    tokio::select! {
-                        () = cancel.cancelled() => {
-                            info!("compaction background task cancelled");
-                            return;
-                        }
-                        () = tokio::time::sleep(current_interval) => {}
-                    }
-                    continue;
-                }
-            };
-
-        // Check if compaction is needed.
-        let should_compact = match table.snapshot() {
-            Ok(snapshot) => {
-                let file_count = snapshot.log_data().num_files();
-                if file_count < config.min_files_for_compaction {
-                    debug!(
-                        file_count,
-                        min = config.min_files_for_compaction,
-                        "compaction: skipping, not enough files"
-                    );
-                    false
-                } else {
-                    true
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "compaction: snapshot failed, skipping tick");
-                false
-            }
-        };
-
-        if should_compact {
-            consecutive_skips = 0;
-            // Speed up: halve the interval (floor at MIN_COMPACTION_INTERVAL).
-            current_interval = (current_interval / 2).max(MIN_COMPACTION_INTERVAL);
-
-            let target_size = config.target_file_size as u64;
-            // Clone the pre-built properties (cheap) instead of re-parsing
-            // from config strings each tick.
-            match delta_io::run_compaction(
-                table,
-                target_size,
-                &config.z_order_columns,
-                compaction_props.clone(),
-            )
-            .await
-            {
-                Ok((table, result)) => {
-                    debug!(
-                        files_added = result.files_added,
-                        files_removed = result.files_removed,
-                        interval_secs = current_interval.as_secs(),
-                        "compaction: OPTIMIZE complete"
-                    );
-
-                    // Run VACUUM after compaction.
-                    match delta_io::run_vacuum(table, vacuum_retention).await {
-                        Ok((_table, files_deleted)) => {
-                            debug!(files_deleted, "compaction: VACUUM complete");
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "compaction: VACUUM failed");
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, "compaction: OPTIMIZE failed");
-                }
-            }
-        } else {
-            consecutive_skips = consecutive_skips.saturating_add(1);
-            // Slow down: double the interval after 2 consecutive idle ticks.
-            if consecutive_skips >= 2 {
-                current_interval = (current_interval * 2).min(base_interval);
-            }
-        }
-
-        // Adaptive sleep: wait current_interval or cancel.
-        tokio::select! {
-            () = cancel.cancelled() => {
-                info!("compaction background task cancelled");
-                return;
-            }
-            () = tokio::time::sleep(current_interval) => {}
-        }
-    }
-}
-
 /// Pre-creates a Unity Catalog external Delta table via the REST API if
 /// `catalog.storage.location` is configured and a schema is available.
 /// Idempotent: treats "already exists" (HTTP 409 / `ALREADY_EXISTS`) as success.
@@ -1223,12 +1150,23 @@ async fn ensure_uc_table_exists(
 
 #[async_trait]
 impl SinkConnector for DeltaLakeSink {
+    fn terminal_task_tracker(&self) -> Option<ConnectorTaskTracker> {
+        Some(self.task_tracker.clone())
+    }
+
     fn contract(&self, config: &ConnectorConfig) -> Result<SinkContract, ConnectorError> {
         let cfg = if config.properties().is_empty() {
             self.config.clone()
         } else {
             DeltaLakeSinkConfig::from_config(config)?
         };
+        #[cfg(feature = "delta-lake")]
+        if cfg.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
+            super::delta_io::validate_coordinated_storage_preflight(
+                &cfg.table_path,
+                &cfg.storage_options,
+            )?;
+        }
         if cfg.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
             && cfg.write_mode != DeltaWriteMode::Append
         {
@@ -1273,6 +1211,13 @@ impl SinkConnector for DeltaLakeSink {
         if !config.properties().is_empty() {
             self.config = DeltaLakeSinkConfig::from_config(config)?;
         }
+        #[cfg(feature = "delta-lake")]
+        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
+            super::delta_io::validate_coordinated_storage_preflight(
+                &self.config.table_path,
+                &self.config.storage_options,
+            )?;
+        }
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
             && !self.is_coordinated()
         {
@@ -1310,7 +1255,8 @@ impl SinkConnector for DeltaLakeSink {
                 return Ok(());
             }
 
-            self.init_delta_table().await?;
+            let deadline = self.operation_deadline();
+            self.init_delta_table(deadline).await?;
 
             // If table still has no version after init (new table, no schema yet),
             // defer full creation to the first write_batch() when schema is available.
@@ -1349,7 +1295,12 @@ impl SinkConnector for DeltaLakeSink {
         }
 
         #[cfg(feature = "delta-lake")]
-        self.ensure_coordinated_reconciled()?;
+        {
+            self.ensure_coordinated_reconciled()?;
+            self.ensure_write_generation_usable()?;
+        }
+        #[cfg(feature = "delta-lake")]
+        let deadline = self.operation_deadline();
 
         if batch.num_rows() == 0 {
             return Ok(WriteResult::new(0, 0));
@@ -1367,7 +1318,7 @@ impl SinkConnector for DeltaLakeSink {
         #[cfg(feature = "delta-lake")]
         if self.needs_deferred_delta_init {
             info!("schema now available from first batch — completing deferred Delta table init");
-            match self.init_delta_table().await {
+            match self.init_delta_table(deadline).await {
                 Ok(()) => {
                     self.needs_deferred_delta_init = false;
                     self.state = ConnectorState::Running;
@@ -1416,12 +1367,12 @@ impl SinkConnector for DeltaLakeSink {
 
         #[cfg(feature = "delta-lake")]
         if self.is_coordinated() && self.should_flush() {
-            self.stage_coordinated_buffer().await?;
+            self.stage_coordinated_buffer(deadline).await?;
         } else if self.config.delivery_guarantee != DeliveryGuarantee::ExactlyOnce
             && self.should_flush()
         {
             if !self.staged_batches.is_empty() {
-                self.flush_staged_to_delta().await?;
+                self.flush_staged_to_delta(deadline).await?;
             }
             self.staged_batches = std::mem::take(&mut self.buffer);
             self.staged_rows = self.buffered_rows;
@@ -1429,7 +1380,7 @@ impl SinkConnector for DeltaLakeSink {
             self.buffered_rows = 0;
             self.buffered_bytes = 0;
             self.buffer_start_time = None;
-            self.flush_staged_to_delta().await?;
+            self.flush_staged_to_delta(deadline).await?;
         }
 
         Ok(WriteResult::new(0, 0))
@@ -1443,7 +1394,12 @@ impl SinkConnector for DeltaLakeSink {
 
     async fn begin_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
         #[cfg(feature = "delta-lake")]
-        self.ensure_coordinated_reconciled()?;
+        {
+            self.ensure_coordinated_reconciled()?;
+            self.ensure_write_generation_usable()?;
+        }
+        #[cfg(feature = "delta-lake")]
+        let deadline = self.operation_deadline();
 
         // Complete deferred Delta table init on the first epoch.
         #[cfg(feature = "delta-lake")]
@@ -1454,7 +1410,7 @@ impl SinkConnector for DeltaLakeSink {
             // previous epoch's write_batch set it, complete init now.
             if self.schema.is_some() {
                 info!("schema available — completing deferred Delta table init");
-                match self.init_delta_table().await {
+                match self.init_delta_table(deadline).await {
                     Ok(()) => {
                         self.needs_deferred_delta_init = false;
                         self.state = ConnectorState::Running;
@@ -1497,7 +1453,9 @@ impl SinkConnector for DeltaLakeSink {
         #[cfg(feature = "delta-lake")]
         if self.is_coordinated() {
             self.ensure_coordinated_reconciled()?;
-            self.stage_coordinated_buffer().await?;
+            self.ensure_write_generation_usable()?;
+            let deadline = self.operation_deadline();
+            self.stage_coordinated_buffer(deadline).await?;
             if self.coordinated_adds.is_empty() {
                 if self.coordinated_binding.is_some() {
                     return Err(ConnectorError::Internal(
@@ -1569,13 +1527,17 @@ impl SinkConnector for DeltaLakeSink {
     }
 
     fn suggested_write_timeout(&self) -> Duration {
-        // Delta commits can run long under compaction or contention.
-        Duration::from_secs(180)
+        self.config.write_timeout
     }
 
     async fn flush(&mut self) -> Result<(), ConnectorError> {
         #[cfg(feature = "delta-lake")]
-        self.ensure_coordinated_reconciled()?;
+        {
+            self.ensure_coordinated_reconciled()?;
+            self.ensure_write_generation_usable()?;
+        }
+        #[cfg(feature = "delta-lake")]
+        let deadline = self.operation_deadline();
 
         // For at-least-once delivery, flush() is the commit trigger. Write
         // directly to Delta without entering the coordinated protocol.
@@ -1585,7 +1547,7 @@ impl SinkConnector for DeltaLakeSink {
             // before moving new data in, to prevent silent data loss.
             // flush_staged_to_delta handles table == None via reopen_table().
             if !self.staged_batches.is_empty() {
-                self.flush_staged_to_delta().await?;
+                self.flush_staged_to_delta(deadline).await?;
             }
 
             // Stage new buffered data and flush to Delta.
@@ -1597,13 +1559,13 @@ impl SinkConnector for DeltaLakeSink {
                 self.buffered_bytes = 0;
                 self.buffer_start_time = None;
 
-                self.flush_staged_to_delta().await?;
+                self.flush_staged_to_delta(deadline).await?;
             }
             return Ok(());
         }
 
         #[cfg(feature = "delta-lake")]
-        return self.stage_coordinated_buffer().await;
+        return self.stage_coordinated_buffer(deadline).await;
 
         #[cfg(not(feature = "delta-lake"))]
         Ok(())
@@ -1615,7 +1577,9 @@ impl SinkConnector for DeltaLakeSink {
         // Only at-least-once may land buffered data during close. Exactly-once output without a
         // matching durable checkpoint must be discarded and replayed after recovery.
         #[cfg(feature = "delta-lake")]
-        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
+        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
+            || self.unresolved_delta_write
+        {
             self.buffer.clear();
             self.staged_batches.clear();
             self.buffered_rows = 0;
@@ -1627,23 +1591,6 @@ impl SinkConnector for DeltaLakeSink {
             self.coordinated_descriptor_bytes = 0;
         } else {
             self.flush().await?;
-        }
-
-        // Cancel and join the background compaction task.
-        #[cfg(feature = "delta-lake")]
-        {
-            if let Some(cancel) = self.compaction_cancel.take() {
-                cancel.cancel();
-            }
-            if let Some(handle) = self.compaction_handle.take() {
-                // Wait up to 5 seconds for the compaction task to finish.
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
-            }
-        }
-
-        #[cfg(feature = "delta-lake")]
-        if let Some(pending) = self.pending_reopen.take() {
-            pending.abort();
         }
 
         // Drop the table handle when closing.
@@ -1713,56 +1660,60 @@ impl crate::connector::CoordinatedCommitter for DeltaLakeSink {
                         .into(),
                 ));
             }
-            *unresolved = Some(pending);
+            *unresolved = Some(pending.clone());
         }
 
-        let result = async {
-            let table = tokio::time::timeout_at(
-                deadline,
-                super::delta_io::open_or_create_table(
-                    &self.resolved_table_path,
-                    self.resolved_storage_options.clone(),
-                    None,
-                ),
-            )
-            .await
-            .map_err(|_| {
-                ConnectorError::TransactionError(
-                    "Delta coordinated table open exceeded the publication deadline".into(),
-                )
-            })??;
-            // Refresh, cursor validation, overlap filtering, object validation,
-            // and commit are one operation over one optimistic snapshot.
-            let descriptor_count =
-                super::delta_io::commit_batch_coordinated(&table, &batch, deadline).await?;
-            info!(
-                epoch = batch.target.epoch,
-                checkpoint_id = batch.target.checkpoint_id,
-                descriptors = descriptor_count,
-                "delta coordinated commit"
-            );
-            Ok(())
-        }
-        .await;
-
-        if result.is_ok() && tokio::time::Instant::now() < deadline {
-            let mut unresolved = self.coordinated_unresolved_publication.lock();
-            if unresolved.as_ref().is_some_and(|pending| {
-                pending.external_key == batch.namespace.external_key()
-                    && pending.target == target_cursor
-                    && pending.exact_batch_fingerprint == exact_batch_fingerprint
-            }) {
-                *unresolved = None;
+        let operation = publish_coordinated_delta_batch(
+            self.resolved_table_path.clone(),
+            self.resolved_storage_options.clone(),
+            Arc::clone(&self.coordinated_unresolved_publication),
+            pending.clone(),
+            batch,
+            deadline,
+            publication_budget,
+        );
+        // Tokio task-local state is intentionally propagated only for the
+        // deterministic delayed-catalog test hook.
+        #[cfg(test)]
+        let operation = {
+            let delay = super::delta_io::DELAY_COORDINATED_CATALOG_COMMIT
+                .try_with(Clone::clone)
+                .ok();
+            async move {
+                if let Some(delay) = delay {
+                    super::delta_io::DELAY_COORDINATED_CATALOG_COMMIT
+                        .scope(delay, operation)
+                        .await
+                } else {
+                    operation.await
+                }
             }
-            return Ok(());
+        };
+        let task = match self.spawn_tracked_delta_task(operation) {
+            Ok(task) => task,
+            Err(error) => {
+                let mut unresolved = self.coordinated_unresolved_publication.lock();
+                if unresolved.as_ref() == Some(&pending) {
+                    *unresolved = None;
+                }
+                return Err(error);
+            }
+        };
+
+        match tokio::time::timeout_at(deadline, task).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(ConnectorError::outcome_unknown(
+                format!("Delta coordinated publication task terminated unexpectedly: {error}"),
+                true,
+            )),
+            Err(_) => Err(ConnectorError::outcome_unknown(
+                format!(
+                    "Delta coordinated publication exceeded its {publication_budget:?} remaining \
+                     budget; reconcile the exact cursor before replay"
+                ),
+                true,
+            )),
         }
-        if result.is_ok() {
-            return Err(ConnectorError::TransactionError(format!(
-                "Delta coordinated publication exceeded its {publication_budget:?} remaining \
-                 budget; the external outcome must be reconciled from its cursor"
-            )));
-        }
-        result
     }
 
     async fn committed_cursor(
@@ -1787,24 +1738,6 @@ impl crate::connector::CoordinatedCommitter for DeltaLakeSink {
     }
 }
 
-/// Safety-net: if the sink is dropped mid-lifecycle (panic, config error,
-/// shutdown without calling `close()`), cancel any background work so we
-/// don't leak a compaction loop or a stray table-reopen task.
-#[cfg(feature = "delta-lake")]
-impl Drop for DeltaLakeSink {
-    fn drop(&mut self) {
-        if let Some(cancel) = self.compaction_cancel.take() {
-            cancel.cancel();
-        }
-        if let Some(handle) = self.compaction_handle.take() {
-            handle.abort();
-        }
-        if let Some(handle) = self.pending_reopen.take() {
-            handle.abort();
-        }
-    }
-}
-
 impl std::fmt::Debug for DeltaLakeSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeltaLakeSink")
@@ -1820,24 +1753,6 @@ impl std::fmt::Debug for DeltaLakeSink {
 }
 
 // ── Helper functions ────────────────────────────────────────────────
-
-/// Applies ±25% jitter to a backoff delay in milliseconds.
-///
-/// Without jitter, multiple writers colliding on the same Delta version
-/// retry in lockstep and keep colliding — a thundering herd. The 0.75–1.25
-/// range spreads retries across a 500ms window for the default 2s max.
-#[cfg(feature = "delta-lake")]
-fn jittered_backoff_ms(base_ms: u64) -> u64 {
-    use rand::RngExt as _;
-    let factor: f64 = rand::rng().random_range(0.75_f64..=1.25_f64);
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::cast_precision_loss
-    )]
-    let jittered = (base_ms as f64 * factor) as u64;
-    jittered.max(1)
-}
 
 /// Filters a `RecordBatch` using a boolean mask and projects to the given column indices.
 ///

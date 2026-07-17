@@ -281,9 +281,10 @@ fn fail_after_mutable_capture(
     guard: &mut Option<MutableCheckpointCaptureGuard>,
     error: String,
 ) -> String {
-    guard
-        .as_mut()
-        .map_or(error.clone(), |guard| guard.fail(&error))
+    match guard.as_mut() {
+        Some(guard) => guard.fail(&error),
+        None => error,
+    }
 }
 
 async fn deliver_checkpoint_completion(
@@ -1123,6 +1124,10 @@ impl ConnectorPipelineCallback {
     }
 
     #[cfg(feature = "cluster")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "source handoff validation and watermark installation form one atomic reconciliation"
+    )]
     fn reconcile_source_handoff_watermarks(&mut self) -> Result<(), String> {
         let Some(registry) = self.vnode_registry.as_ref() else {
             return Ok(());
@@ -2501,6 +2506,10 @@ impl ConnectorPipelineCallback {
     }
 
     #[cfg(feature = "cluster")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "follower checkpoint admission is one fail-closed control-state transition"
+    )]
     async fn maybe_follower_checkpoint(
         &mut self,
         controller: Arc<laminar_core::cluster::control::ClusterController>,
@@ -2670,6 +2679,10 @@ impl ConnectorPipelineCallback {
     }
 
     #[cfg(feature = "cluster")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the deferred follower checkpoint keeps alignment, capture, and publication fences contiguous"
+    )]
     async fn run_follower_checkpoint_deferred(
         &mut self,
         ann: laminar_core::cluster::control::BarrierAnnouncement,
@@ -3460,6 +3473,10 @@ impl ConnectorPipelineCallback {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "checkpoint graph drain is one deadline-fenced quiescence protocol"
+    )]
     async fn drain_checkpoint_edges_until_inner(
         &mut self,
         deadline: tokio::time::Instant,
@@ -3595,8 +3612,9 @@ pub(crate) fn admit_control_stream(
     join_config: Option<Vec<laminar_sql::translator::JoinOperatorConfig>>,
     incremental: bool,
 ) -> Result<(), DbError> {
+    let rollback_name = name.clone();
     graph.add_query(
-        name.clone(),
+        name,
         sql,
         emit_clause,
         window_config,
@@ -3606,7 +3624,7 @@ pub(crate) fn admit_control_stream(
     );
     let admitted = graph.take_build_errors();
     if admitted.is_err() {
-        graph.remove_query(&name);
+        graph.remove_query(&rollback_name);
     }
     admitted
 }
@@ -4600,7 +4618,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         #[cfg(feature = "cluster")]
         if let Some(cc) = self.cluster_controller.clone() {
             if !cc.is_leader() {
-                if let Some(ann) = self.pending_follower_checkpoint.as_ref().cloned() {
+                if let Some(ann) = self.pending_follower_checkpoint.clone() {
                     // A slow round can finish after its epoch was abandoned; never attribute
                     // captured offsets to a newer announcement.
                     if ann.checkpoint_id != attempt.checkpoint_id || ann.epoch != attempt.epoch {
@@ -5515,6 +5533,7 @@ mod tests {
             flush_interval: Duration::from_secs(5),
             write_timeout: Duration::from_secs(1),
             event_tx,
+            terminal_tasks: None,
             #[cfg(feature = "cluster")]
             process_authority: None,
         });

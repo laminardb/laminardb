@@ -54,6 +54,153 @@ fn test_batch(n: usize) -> RecordBatch {
 
 // ── Constructor tests ──
 
+#[cfg(feature = "delta-lake")]
+#[test]
+fn typed_delta_failures_are_classified_without_message_heuristics() {
+    use deltalake::kernel::transaction::{CommitConflictError, TransactionError};
+
+    let conflict =
+        classify_delta_attempt_error(super::super::delta_io::DeltaWriteAttemptError::Delta(
+            deltalake::DeltaTableError::Transaction {
+                source: TransactionError::CommitConflict(CommitConflictError::ConcurrentDeleteRead),
+            },
+        ));
+    assert!(matches!(conflict, ConnectorError::WriteError(_)));
+    assert!(conflict.is_transient());
+
+    let false_positive =
+        classify_delta_attempt_error(super::super::delta_io::DeltaWriteAttemptError::Delta(
+            deltalake::DeltaTableError::InvalidData {
+                message: "concurrent conflict while decoding user data".into(),
+            },
+        ));
+    assert!(matches!(
+        false_positive,
+        ConnectorError::OutcomeUnknown {
+            retryable: false,
+            ..
+        }
+    ));
+
+    let protocol_change =
+        classify_delta_attempt_error(super::super::delta_io::DeltaWriteAttemptError::Delta(
+            deltalake::DeltaTableError::Transaction {
+                source: TransactionError::CommitConflict(CommitConflictError::ProtocolChanged(
+                    "concurrent conflict".into(),
+                )),
+            },
+        ));
+    assert!(!protocol_change.is_transient());
+
+    let local =
+        classify_delta_attempt_error(super::super::delta_io::DeltaWriteAttemptError::Local(
+            ConnectorError::ConfigurationError("invalid merge".into()),
+        ));
+    assert!(matches!(local, ConnectorError::ConfigurationError(_)));
+}
+
+#[cfg(feature = "delta-lake")]
+#[test]
+fn object_store_retryability_uses_typed_positive_allowlist() {
+    use delta_object_store::client::{HttpError, HttpErrorKind};
+
+    let transient =
+        classify_delta_attempt_error(super::super::delta_io::DeltaWriteAttemptError::Delta(
+            deltalake::DeltaTableError::ObjectStore {
+                source: deltalake::ObjectStoreError::Generic {
+                    store: "test",
+                    source: Box::new(HttpError::new(
+                        HttpErrorKind::Timeout,
+                        std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"),
+                    )),
+                },
+            },
+        ));
+    assert!(matches!(
+        transient,
+        ConnectorError::OutcomeUnknown {
+            retryable: true,
+            ..
+        }
+    ));
+
+    let permanent =
+        classify_delta_attempt_error(super::super::delta_io::DeltaWriteAttemptError::Delta(
+            deltalake::DeltaTableError::ObjectStore {
+                source: deltalake::ObjectStoreError::PermissionDenied {
+                    path: "table".into(),
+                    source: Box::new(HttpError::new(
+                        HttpErrorKind::Timeout,
+                        std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"),
+                    )),
+                },
+            },
+        ));
+    assert!(matches!(
+        permanent,
+        ConnectorError::OutcomeUnknown {
+            retryable: false,
+            ..
+        }
+    ));
+
+    let unknown =
+        classify_delta_attempt_error(super::super::delta_io::DeltaWriteAttemptError::Delta(
+            deltalake::DeltaTableError::ObjectStore {
+                source: deltalake::ObjectStoreError::Generic {
+                    store: "test",
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "untyped timeout",
+                    )),
+                },
+            },
+        ));
+    assert!(matches!(
+        unknown,
+        ConnectorError::OutcomeUnknown {
+            retryable: false,
+            ..
+        }
+    ));
+}
+
+#[cfg(feature = "delta-lake")]
+#[test]
+fn tracked_delta_future_owns_guard_before_first_poll() {
+    let sink = DeltaLakeSink::new(test_config(), None);
+    let terminal = sink.terminal_task_tracker().unwrap();
+    let guard = sink.task_owner.track().unwrap();
+    let task = run_tracked_delta_task(guard, std::future::pending::<()>());
+
+    drop(sink);
+    assert!(!terminal.is_terminated());
+    drop(task);
+    assert!(terminal.is_terminated());
+}
+
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
+async fn dropped_join_handle_does_not_publish_false_terminal_proof() {
+    let sink = DeltaLakeSink::new(test_config(), None);
+    let terminal = sink.terminal_task_tracker().unwrap();
+    let guard = sink.task_owner.track().unwrap();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let join = tokio::spawn(run_tracked_delta_task(guard, async move {
+        let _ = started_tx.send(());
+        let _ = release_rx.await;
+    }));
+    started_rx.await.unwrap();
+    drop(join);
+    drop(sink);
+    assert!(!terminal.is_terminated());
+
+    let _ = release_tx.send(());
+    terminal.wait_terminated().await;
+    assert!(terminal.is_terminated());
+}
+
 #[test]
 fn test_new_defaults() {
     let sink = DeltaLakeSink::new(test_config(), None);
@@ -416,7 +563,17 @@ fn test_contract_append_exactly_once() {
     let contract = sink.contract(&ConnectorConfig::new("delta-lake")).unwrap();
     assert_eq!(contract.consistency, SinkConsistency::CheckpointCommittable);
     assert_eq!(contract.input_mode, SinkInputMode::AppendOnly);
-    assert_eq!(sink.suggested_write_timeout(), Duration::from_secs(180));
+    assert_eq!(sink.suggested_write_timeout(), Duration::from_secs(30));
+}
+
+#[cfg(feature = "delta-lake")]
+#[test]
+fn write_timeout_is_one_operation_budget_not_per_retry() {
+    let mut config = test_config();
+    config.write_timeout = Duration::from_secs(7);
+    let sink = DeltaLakeSink::new(config, None);
+
+    assert_eq!(sink.suggested_write_timeout(), Duration::from_secs(7));
 }
 
 #[test]
@@ -743,7 +900,6 @@ fn coordinated_config(path: &str) -> DeltaLakeSinkConfig {
     let mut cfg = DeltaLakeSinkConfig::new(path);
     cfg.write_mode = DeltaWriteMode::Append;
     cfg.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
-    cfg.writer_id = "writer-A".to_string();
     cfg
 }
 
@@ -818,7 +974,6 @@ async fn coordinated_epoch_over_four_times_buffer_cap_commits_once() {
 
     let mut config = coordinated_config(&path);
     config.max_buffer_records = 2;
-    config.compaction.enabled = false;
     let mut sink = DeltaLakeSink::with_schema(config, test_schema());
     sink.open(&ConnectorConfig::new("delta-lake"))
         .await
@@ -848,7 +1003,7 @@ async fn coordinated_epoch_over_four_times_buffer_cap_commits_once() {
     assert!(sink.coordinated_adds.is_empty());
     assert_eq!(sink.coordinated_descriptor_bytes, 0);
 
-    let adds = super::super::delta_io::decode_commit_descriptors(&[descriptor.clone()])
+    let adds = super::super::delta_io::decode_commit_descriptors(std::slice::from_ref(&descriptor))
         .unwrap()
         .unwrap()
         .adds;
@@ -902,7 +1057,7 @@ async fn coordinated_epoch_over_four_times_buffer_cap_commits_once() {
 }
 
 /// The designated cursor is scoped by pipeline + sink and stores the globally
-/// unique checkpoint id, independently of the writer-local epoch field.
+/// unique checkpoint id, independently of the local staging epoch.
 #[cfg(feature = "delta-lake")]
 #[tokio::test]
 async fn coordinated_recovery_reads_namespaced_checkpoint_id() {
@@ -948,7 +1103,7 @@ async fn coordinated_recovery_reads_namespaced_checkpoint_id() {
                     namespace: namespace.clone(),
                     expected_predecessor: CoordinatedCommitCursor {
                         checkpoint_id: if epoch == 1 { 0 } else { 100 + epoch - 1 },
-                        fencing_token: if epoch == 1 { 0 } else { 1 },
+                        fencing_token: u64::from(epoch != 1),
                     },
                     fencing_token: 1,
                     target: attempt,
@@ -966,7 +1121,7 @@ async fn coordinated_recovery_reads_namespaced_checkpoint_id() {
     writer.close().await.unwrap();
 
     // A fresh connector reads the exact external cursor independently of its
-    // writer-local preparation lifecycle.
+    // local descriptor-preparation lifecycle.
     let mut recovered = DeltaLakeSink::with_schema(coordinated_config(&path), test_schema());
     recovered
         .open(&ConnectorConfig::new("delta-lake"))
@@ -988,6 +1143,7 @@ async fn coordinated_recovery_reads_namespaced_checkpoint_id() {
 /// advancing the cursor to the batch target.
 #[cfg(feature = "delta-lake")]
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn coordinated_failover_overlap_does_not_duplicate_committed_attempt() {
     use crate::connector::{
         CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
@@ -1143,6 +1299,7 @@ async fn coordinated_open_caches_configured_writer_properties() {
 
 #[cfg(feature = "delta-lake")]
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn coordinated_unresolved_publication_allows_only_the_exact_batch_retry() {
     use crate::connector::{
         CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
@@ -1338,7 +1495,10 @@ async fn coordinated_catalog_commit_timeout_fences_later_work_until_cursor_read(
         .await
         .unwrap_err()
         .to_string();
-    assert!(error.contains("catalog commit exceeded"), "got: {error}");
+    assert!(
+        error.contains("coordinated publication exceeded"),
+        "got: {error}"
+    );
     delayed_commit.started.notified().await;
     assert!(sink.coordinated_unresolved_publication.lock().is_some());
     assert!(sink.begin_epoch(2).await.is_err());
@@ -1373,13 +1533,13 @@ async fn coordinated_pre_commit_timeout_preserves_staged_data_until_rollback() {
     let dir = tempfile::tempdir().unwrap();
     let table_dir = dir.path().join("coord_prepare_timeout");
     std::fs::create_dir_all(&table_dir).unwrap();
-    let mut config = coordinated_config(&table_dir.to_string_lossy());
-    config.write_timeout = Duration::from_millis(10);
+    let config = coordinated_config(&table_dir.to_string_lossy());
 
     let mut sink = DeltaLakeSink::with_schema(config, test_schema());
     sink.open(&ConnectorConfig::new("delta-lake"))
         .await
         .unwrap();
+    sink.config.write_timeout = Duration::from_millis(10);
     sink.stall_descriptor_write = true;
     sink.begin_epoch(7).await.unwrap();
     sink.write_batch(&test_batch(3)).await.unwrap();

@@ -110,6 +110,13 @@ impl NatsSourceMetrics {
             .inc_by(u64::try_from(n).unwrap_or(u64::MAX));
     }
 
+    #[allow(missing_docs, clippy::cast_possible_wrap)]
+    pub fn record_ack_abandoned(&self, n: usize) {
+        self.ack_errors_total
+            .inc_by(u64::try_from(n).unwrap_or(u64::MAX));
+        self.pending_acks.sub(n as i64);
+    }
+
     #[allow(missing_docs)]
     pub fn record_abandoned_acks(&self) {
         let pending = self.pending_acks.get();
@@ -218,6 +225,9 @@ mod tests {
         m.record_ack();
         m.record_ack_enqueued();
         m.record_ack_error();
+        m.record_ack_enqueued();
+        m.record_ack_enqueued();
+        m.record_ack_abandoned(2);
         m.record_fetch_error();
 
         m.set_consumer_lag(42);
@@ -227,7 +237,7 @@ mod tests {
         assert_eq!(m.fetch_errors_total.get(), 1);
         assert_eq!(m.consumer_lag.get(), 42);
         assert_eq!(m.acks_total.get(), 1);
-        assert_eq!(m.ack_errors_total.get(), 1);
+        assert_eq!(m.ack_errors_total.get(), 3);
         assert_eq!(m.pending_acks.get(), 0);
     }
 

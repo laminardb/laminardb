@@ -42,6 +42,7 @@ pub mod checkpoint_coordinator;
 mod cluster_recovery_capsule;
 mod config;
 mod connector_manager;
+mod connector_task_fence;
 mod coordinated_committer;
 #[cfg(feature = "cluster")]
 mod coordinated_recovery;

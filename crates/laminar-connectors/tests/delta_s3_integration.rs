@@ -132,7 +132,6 @@ async fn upsert_against_minio_s3_object_store() {
     cfg.write_mode = DeltaWriteMode::Upsert;
     cfg.merge_key_columns = vec!["region".to_string()];
     cfg.delivery_guarantee = DeliveryGuarantee::AtLeastOnce;
-    cfg.writer_id = "minio-writer".to_string();
     cfg.storage_options = storage.clone();
 
     let mut sink = DeltaLakeSink::new(cfg, None);

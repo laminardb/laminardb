@@ -2,6 +2,8 @@
 
 #[cfg(not(test))]
 use super::lsn::Lsn;
+#[cfg(not(test))]
+use crate::connector::ConnectorTaskGuard;
 use crate::error::ConnectorError;
 use sha2::{Digest, Sha256};
 
@@ -101,6 +103,7 @@ impl Drop for ControlConnection {
 #[cfg(not(test))]
 pub(super) async fn connect(
     config: &super::config::PostgresCdcConfig,
+    driver_guard: ConnectorTaskGuard,
 ) -> Result<ControlConnection, ConnectorError> {
     use crate::postgres::SslMode;
 
@@ -119,6 +122,7 @@ pub(super) async fn connect(
                         ConnectorError::ConnectionFailed(format!("PostgreSQL connect: {error}"))
                     })?;
             let handle = tokio::spawn(async move {
+                let _driver_guard = driver_guard;
                 if let Err(error) = connection.await {
                     tracing::error!(%error, "PostgreSQL control-plane connection error");
                 }
@@ -142,6 +146,7 @@ pub(super) async fn connect(
                         ConnectorError::ConnectionFailed(format!("PostgreSQL TLS connect: {error}"))
                     })?;
             let handle = tokio::spawn(async move {
+                let _driver_guard = driver_guard;
                 if let Err(error) = connection.await {
                     tracing::error!(%error, "PostgreSQL control-plane TLS connection error");
                 }

@@ -30,7 +30,7 @@ scrape_configs:
 - **Kafka Source** (collapsed) — consumer lag, poll rate, commits, rebalances
 - **Kafka Sink** (collapsed) — write rate, produce latency
 - **PostgreSQL CDC** (collapsed) — replication lag, insert/update/delete rates
-- **Delta Lake Sink** (collapsed) — commits, table version, rows flushed, compaction
+- **Delta Lake Sink** (collapsed) — commits, table version, rows flushed
 - **MongoDB** (collapsed) — CDC event rates, sink write rates
 
 Connector sections are collapsed by default — expand the ones relevant to your pipeline.

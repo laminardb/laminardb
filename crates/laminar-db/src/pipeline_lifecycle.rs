@@ -14,10 +14,12 @@ use laminar_connectors::connector::{
 use laminar_core::state::StateBackendDurability;
 use rustc_hash::FxHashMap;
 
+use crate::connector_task_fence::ConnectorTaskFenceRegistration;
 #[cfg(feature = "cluster")]
 use crate::db::ClusterStartupDisposition;
 use crate::db::{exact_table_reference, DbState, LaminarDB, RuntimeMode, SourceWatermarkState};
 use crate::error::DbError;
+use crate::pipeline::streaming_coordinator::TrackedSourceRegistration;
 
 /// Bound recovery amplification while keeping every delta parent strictly inside the retained
 /// predecessor window. A single retained predecessor cannot support a delta chain, so it stays on
@@ -43,6 +45,9 @@ const fn required_recovery_scope(runtime: RuntimeMode) -> StateBackendDurability
 const EXACT_SINK_PROTOCOL: &str =
     "exactly-once external sinks require checkpoint-committable consistency, coordinated phase \
      1, participant-complete sealed markers, and a namespaced exact external cursor";
+const CLUSTER_BEST_EFFORT: &str =
+    "cluster mode requires at_least_once delivery; best_effort has no defined \
+     rebalance/state-loss contract";
 
 #[derive(Clone, Copy)]
 enum StartupFailureKind {
@@ -169,6 +174,9 @@ fn admit_source_contract(
     checkpointing_enabled: bool,
     runtime: RuntimeMode,
 ) -> Result<(), &'static str> {
+    if runtime == RuntimeMode::Cluster && delivery == DeliveryGuarantee::BestEffort {
+        return Err(CLUSTER_BEST_EFFORT);
+    }
     if runtime == RuntimeMode::Cluster && delivery == DeliveryGuarantee::ExactlyOnce {
         return Err(
             "[LDB-0013] cluster exactly-once is not admitted until supported connectors have \
@@ -207,17 +215,9 @@ fn admit_source_contract(
     if runtime == RuntimeMode::Cluster {
         match contract.topology {
             SourceTopology::Splittable => {}
-            SourceTopology::NodeLocalIngress
-                if delivery == DeliveryGuarantee::BestEffort
-                    && contract.consistency == SourceConsistency::Ephemeral => {}
-            SourceTopology::NodeLocalIngress if delivery == DeliveryGuarantee::BestEffort => {
-                return Err(
-                    "cluster node-local ingress must be ephemeral because node-local recovery cursors cannot form one global replay cut",
-                );
-            }
             SourceTopology::NodeLocalIngress => {
                 return Err(
-                    "cluster node-local ingress is supported only with best-effort delivery",
+                    "cluster node-local ingress has no defined rebalance/state-loss contract",
                 );
             }
             SourceTopology::Singleton => {
@@ -264,6 +264,9 @@ fn admit_sink_contract(
     runtime: RuntimeMode,
     carries_changelog: bool,
 ) -> Result<(), &'static str> {
+    if runtime == RuntimeMode::Cluster && delivery == DeliveryGuarantee::BestEffort {
+        return Err(CLUSTER_BEST_EFFORT);
+    }
     if runtime == RuntimeMode::Cluster && delivery == DeliveryGuarantee::ExactlyOnce {
         return Err(
             "[LDB-0013] cluster exactly-once is not admitted until supported connectors have \
@@ -291,10 +294,9 @@ fn admit_sink_contract(
     if runtime == RuntimeMode::Cluster {
         match contract.topology {
             SinkTopology::MultiWriter => {}
-            SinkTopology::NodeLocalEgress if delivery == DeliveryGuarantee::BestEffort => {}
             SinkTopology::NodeLocalEgress => {
                 return Err(
-                    "cluster node-local egress is supported only with best-effort delivery",
+                    "cluster node-local egress has no defined rebalance/state-loss contract",
                 );
             }
             SinkTopology::Singleton => {
@@ -338,6 +340,7 @@ struct PreparedSink {
     write_timeout: std::time::Duration,
     flush_interval: std::time::Duration,
     requires_recovery_on_error: bool,
+    task_fence: ConnectorTaskFenceRegistration,
 }
 
 type ReferenceTableRuntimeSource = (
@@ -542,104 +545,119 @@ fn admit_sink(
     Ok((contract, configured_timeout))
 }
 
-async fn close_opened_sinks(sinks: &mut [PreparedSink], cleanup_timeout: std::time::Duration) {
-    for prepared in sinks.iter_mut().rev() {
-        let cleanup_deadline = tokio::time::Instant::now() + cleanup_timeout;
-        let cancellation_policy = prepared.connector.cancellation_policy();
-        let mut close = std::pin::pin!(prepared.connector.close());
-        match tokio::time::timeout_at(cleanup_deadline, close.as_mut()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(
-                    sink = %prepared.name,
-                    %error,
-                    "sink close failed while rolling back pipeline startup"
-                );
-            }
-            Err(_) => {
-                tracing::warn!(
-                    sink = %prepared.name,
-                    "sink close exceeded its pipeline-startup cleanup deadline"
-                );
-                if cancellation_policy == ConnectorCancellationPolicy::CompleteStarted {
-                    if let Err(error) = close.await {
-                        tracing::warn!(
-                            sink = %prepared.name,
-                            %error,
-                            "cancellation-unsafe sink close failed after the cleanup deadline"
-                        );
-                    }
-                }
-            }
+async fn close_opened_sinks(
+    sinks: &mut [PreparedSink],
+    cleanup_timeout: std::time::Duration,
+    #[cfg(feature = "cluster")] process_authority: Option<
+        &laminar_core::cluster::control::ClusterController,
+    >,
+) {
+    let cleanup_deadline = tokio::time::Instant::now() + cleanup_timeout;
+    futures::future::join_all(sinks.iter_mut().rev().map(|prepared| {
+        close_opened_sink(
+            prepared,
+            cleanup_deadline,
+            #[cfg(feature = "cluster")]
+            process_authority,
+        )
+    }))
+    .await;
+}
+
+async fn close_opened_sink(
+    prepared: &mut PreparedSink,
+    cleanup_deadline: tokio::time::Instant,
+    #[cfg(feature = "cluster")] process_authority: Option<
+        &laminar_core::cluster::control::ClusterController,
+    >,
+) {
+    #[cfg(feature = "cluster")]
+    if process_authority.is_some_and(|controller| !controller.process_lease_is_live()) {
+        return;
+    }
+    if tokio::time::Instant::now() >= cleanup_deadline {
+        tracing::warn!(
+            sink = %prepared.name,
+            "sink close skipped after the pipeline-startup cleanup deadline"
+        );
+        return;
+    }
+
+    let mut close = std::pin::pin!(prepared.connector.close());
+    #[cfg(feature = "cluster")]
+    let close_result = if let Some(controller) = process_authority {
+        tokio::select! {
+            biased;
+            () = controller.wait_for_process_lease_loss() => return,
+            result = tokio::time::timeout_at(cleanup_deadline, close.as_mut()) => result,
+        }
+    } else {
+        tokio::time::timeout_at(cleanup_deadline, close.as_mut()).await
+    };
+    #[cfg(not(feature = "cluster"))]
+    let close_result = tokio::time::timeout_at(cleanup_deadline, close.as_mut()).await;
+    match close_result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(
+                sink = %prepared.name,
+                %error,
+                "sink close failed while rolling back pipeline startup"
+            );
+        }
+        Err(_) => {
+            tracing::warn!(
+                sink = %prepared.name,
+                "sink close exceeded the shared pipeline-startup cleanup deadline"
+            );
         }
     }
 }
 
 enum SinkOpenOutcome<T> {
     Completed(T),
-    Deadline(Option<T>),
+    Deadline,
     #[cfg(feature = "cluster")]
-    ProcessAuthorityLost(Option<T>),
+    ProcessAuthorityLost,
 }
 
 enum SinkOpenFailure {
     Connector(String),
+    Retired(String),
     #[cfg(feature = "cluster")]
     ProcessAuthorityLost,
 }
 
 async fn await_sink_open<T>(
     deadline: tokio::time::Instant,
-    cancellation_policy: ConnectorCancellationPolicy,
     #[cfg(feature = "cluster")] process_authority: Option<
         &laminar_core::cluster::control::ClusterController,
     >,
     future: impl std::future::Future<Output = T>,
 ) -> SinkOpenOutcome<T> {
     if tokio::time::Instant::now() >= deadline {
-        return SinkOpenOutcome::Deadline(None);
+        return SinkOpenOutcome::Deadline;
     }
-    let started = std::sync::atomic::AtomicBool::new(false);
-    let operation = async {
-        started.store(true, std::sync::atomic::Ordering::Release);
-        future.await
-    };
-    let mut operation = std::pin::pin!(operation);
+    let mut operation = std::pin::pin!(future);
 
     #[cfg(feature = "cluster")]
     if let Some(controller) = process_authority {
         if !controller.process_lease_is_live() {
-            return SinkOpenOutcome::ProcessAuthorityLost(None);
+            return SinkOpenOutcome::ProcessAuthorityLost;
         }
         return tokio::select! {
             biased;
             () = controller.wait_for_process_lease_loss() => {
-                let completion = if cancellation_policy
-                    == ConnectorCancellationPolicy::CompleteStarted
-                    && started.load(std::sync::atomic::Ordering::Acquire)
-                {
-                    Some(operation.await)
-                } else {
-                    None
-                };
-                SinkOpenOutcome::ProcessAuthorityLost(completion)
+                SinkOpenOutcome::ProcessAuthorityLost
             }
             () = tokio::time::sleep_until(deadline) => {
-                let completion = if cancellation_policy
-                    == ConnectorCancellationPolicy::CompleteStarted
-                    && started.load(std::sync::atomic::Ordering::Acquire)
-                {
-                    Some(operation.await)
-                } else {
-                    None
-                };
-                SinkOpenOutcome::Deadline(completion)
+                SinkOpenOutcome::Deadline
             }
             result = &mut operation => {
                 if controller.process_lease_is_live() {
                     SinkOpenOutcome::Completed(result)
                 } else {
-                    SinkOpenOutcome::ProcessAuthorityLost(Some(result))
+                    SinkOpenOutcome::ProcessAuthorityLost
                 }
             }
         };
@@ -647,16 +665,14 @@ async fn await_sink_open<T>(
 
     match tokio::time::timeout_at(deadline, operation.as_mut()).await {
         Ok(result) => SinkOpenOutcome::Completed(result),
-        Err(_)
-            if cancellation_policy == ConnectorCancellationPolicy::CompleteStarted
-                && started.load(std::sync::atomic::Ordering::Acquire) =>
-        {
-            SinkOpenOutcome::Deadline(Some(operation.await))
-        }
-        Err(_) => SinkOpenOutcome::Deadline(None),
+        Err(_) => SinkOpenOutcome::Deadline,
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "sink startup and rollback are one shared-deadline protocol"
+)]
 async fn open_prepared_sinks(
     sinks: &mut [PreparedSink],
     open_timeout: std::time::Duration,
@@ -682,6 +698,8 @@ async fn open_prepared_sinks(
             close_opened_sinks(
                 &mut sinks[..index],
                 crate::pipeline::PipelineConfig::CONNECTOR_STARTUP_CLEANUP_TIMEOUT,
+                #[cfg(feature = "cluster")]
+                process_authority,
             )
             .await;
             return Err(DbError::Connector(format!(
@@ -696,7 +714,6 @@ async fn open_prepared_sinks(
             let open = prepared.connector.open(&prepared.config);
             match await_sink_open(
                 open_deadline,
-                cancellation_policy,
                 #[cfg(feature = "cluster")]
                 process_authority,
                 open,
@@ -705,41 +722,25 @@ async fn open_prepared_sinks(
             {
                 SinkOpenOutcome::Completed(Ok(())) => None,
                 SinkOpenOutcome::Completed(Err(error)) => {
-                    Some(SinkOpenFailure::Connector(error.to_string()))
-                }
-                SinkOpenOutcome::Deadline(completion) => {
-                    if let Some(completion) = completion {
-                        match completion {
-                            Ok(()) => tracing::warn!(
-                                sink = %name,
-                                "cancellation-unsafe sink open completed after its deadline"
-                            ),
-                            Err(error) => tracing::warn!(
-                                sink = %name,
-                                %error,
-                                "cancellation-unsafe sink open failed after its deadline"
-                            ),
-                        }
+                    if error.is_outcome_unknown() {
+                        Some(SinkOpenFailure::Retired(error.to_string()))
+                    } else {
+                        Some(SinkOpenFailure::Connector(error.to_string()))
                     }
-                    Some(SinkOpenFailure::Connector(format!(
-                        "exceeded the shared {open_timeout:?} sink-open stage deadline"
-                    )))
                 }
+                SinkOpenOutcome::Deadline => Some(
+                    if cancellation_policy == ConnectorCancellationPolicy::RetireConnector {
+                        SinkOpenFailure::Retired(format!(
+                            "exceeded the shared {open_timeout:?} sink-open stage deadline"
+                        ))
+                    } else {
+                        SinkOpenFailure::Connector(format!(
+                            "exceeded the shared {open_timeout:?} sink-open stage deadline"
+                        ))
+                    },
+                ),
                 #[cfg(feature = "cluster")]
-                SinkOpenOutcome::ProcessAuthorityLost(completion) => {
-                    if let Some(completion) = completion {
-                        match completion {
-                            Ok(()) => tracing::warn!(
-                                sink = %name,
-                                "cancellation-unsafe sink open completed after process lease loss"
-                            ),
-                            Err(error) => tracing::warn!(
-                                sink = %name,
-                                %error,
-                                "cancellation-unsafe sink open failed after process lease loss"
-                            ),
-                        }
-                    }
+                SinkOpenOutcome::ProcessAuthorityLost => {
                     Some(SinkOpenFailure::ProcessAuthorityLost)
                 }
             }
@@ -756,6 +757,29 @@ async fn open_prepared_sinks(
                 close_opened_sinks(
                     &mut sinks[..=index],
                     crate::pipeline::PipelineConfig::CONNECTOR_STARTUP_CLEANUP_TIMEOUT,
+                    #[cfg(feature = "cluster")]
+                    process_authority,
+                )
+                .await;
+                return Err(DbError::Connector(format!(
+                    "Failed to open sink '{name}': {error}"
+                )));
+            }
+            Some(SinkOpenFailure::Retired(error)) => {
+                #[cfg(feature = "cluster")]
+                if process_authority.is_some_and(|controller| !controller.process_lease_is_live()) {
+                    return Err(DbError::Connector(format!(
+                        "Failed to open sink '{name}': cluster process lease expired during sink open"
+                    )));
+                }
+                // Dropping a timed-out open makes this generation terminal. Clean up only
+                // connectors whose opens completed; never invoke another method on the retired
+                // candidate.
+                close_opened_sinks(
+                    &mut sinks[..index],
+                    crate::pipeline::PipelineConfig::CONNECTOR_STARTUP_CLEANUP_TIMEOUT,
+                    #[cfg(feature = "cluster")]
+                    process_authority,
                 )
                 .await;
                 return Err(DbError::Connector(format!(
@@ -1204,6 +1228,10 @@ impl LaminarDB {
     /// closed when recovery authority is unavailable so the monitor can retry without admitting
     /// records.
     #[cfg(feature = "cluster")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "cluster startup is one assignment-certified intake admission transaction"
+    )]
     pub async fn finish_cluster_startup(
         &self,
         deadline: tokio::time::Instant,
@@ -1280,13 +1308,11 @@ impl LaminarDB {
                 }
                 Ok(Ok(reports)) => reports.iter().any(|(_, sequence)| *sequence != 0),
             };
-        let active = match tokio::time::timeout_at(deadline, controller.observe_recover()).await {
-            Err(_) => {
-                return Err(DbError::Checkpoint(
-                    "cluster startup recovery authority read timed out".into(),
-                ));
-            }
-            Ok(active) => active,
+        let Ok(active) = tokio::time::timeout_at(deadline, controller.observe_recover()).await
+        else {
+            return Err(DbError::Checkpoint(
+                "cluster startup recovery authority read timed out".into(),
+            ));
         };
         let active = match active {
             Ok(active) => active,
@@ -1517,16 +1543,60 @@ impl LaminarDB {
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<(), DbError> {
-        let (sources, sinks) = tokio::join!(
+        let (sources, sinks, startup) = tokio::join!(
             self.quiesce_owned_source_tasks_until(deadline),
             self.quiesce_owned_sink_handles_until(deadline),
+            self.quiesce_owned_connector_task_fences_until(deadline),
         );
-        match (sources, sinks) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-            (Err(source_error), Err(sink_error)) => Err(DbError::Connector(format!(
-                "connector generation remains fenced: sources: {source_error}; sinks: {sink_error}"
-            ))),
+        let mut failures = Vec::new();
+        if let Err(error) = sources {
+            failures.push(format!("sources: {error}"));
+        }
+        if let Err(error) = sinks {
+            failures.push(format!("sinks: {error}"));
+        }
+        if let Err(error) = startup {
+            failures.push(format!("startup: {error}"));
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(DbError::Connector(format!(
+                "connector generation remains fenced: {}",
+                failures.join("; ")
+            )))
+        }
+    }
+
+    async fn quiesce_owned_connector_task_fences_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), DbError> {
+        let fences = {
+            let mut owned = self.owned_connector_task_fences.lock();
+            owned.retain(|fence| !fence.is_finished());
+            owned.clone()
+        };
+        if fences.is_empty() {
+            return Ok(());
+        }
+
+        futures::future::join_all(fences.iter().map(|fence| fence.wait_until(deadline))).await;
+        let unresolved_names = {
+            let mut owned = self.owned_connector_task_fences.lock();
+            owned.retain(|fence| !fence.is_finished());
+            owned
+                .iter()
+                .map(|fence| fence.name().to_owned())
+                .collect::<Vec<_>>()
+        };
+        if unresolved_names.is_empty() {
+            Ok(())
+        } else {
+            Err(DbError::Connector(format!(
+                "cannot replace a pipeline while pre-actor connector tasks remain unresolved: {}",
+                unresolved_names.join(", ")
+            )))
         }
     }
 
@@ -1539,11 +1609,11 @@ impl LaminarDB {
             return Ok(());
         }
 
-        // Signal every task before awaiting any one task. Cancel-safe tasks may be aborted, but
-        // their lease remains fenced until the stable supervisor observes the JoinHandle exit.
+        // Signal every task before awaiting any one task. Aborting retires the owned connector
+        // generation; its lease remains fenced until the stable supervisor observes task exit.
         for task in &tasks {
             task.request_shutdown();
-            task.abort_if_cancel_safe();
+            task.abort();
         }
         let completions =
             futures::future::join_all(tasks.iter().map(|task| task.wait_until(deadline))).await;
@@ -1574,7 +1644,11 @@ impl LaminarDB {
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<(), DbError> {
-        let handles = self.owned_sink_handles.lock().clone();
+        let handles = {
+            let mut owned = self.owned_sink_handles.lock();
+            owned.retain(crate::sink_task::SinkTaskHandle::has_unresolved_task);
+            owned.clone()
+        };
         if handles.is_empty() {
             return Ok(());
         }
@@ -1586,26 +1660,42 @@ impl LaminarDB {
             ));
         }
 
-        // Poll every close in the same turn so independent actors share one restart budget. The
-        // DB-owned registry is never moved across this await; cancellation leaves every fence in
-        // place and each close that started continues in its terminal driver.
-        let closes = futures::future::join_all(handles.iter().cloned().map(|handle| async move {
-            let name = handle.name().to_owned();
-            let result = handle.close().await;
-            (name, result)
-        }));
-        let results = tokio::time::timeout_at(deadline, closes).await;
-        let mut failures = match results {
-            Ok(results) => results
-                .into_iter()
-                .filter_map(|(name, result)| result.err().map(|error| format!("{name}: {error}")))
-                .collect::<Vec<_>>(),
-            Err(_) => vec!["shared sink-generation quiescence deadline expired".to_string()],
-        };
+        // Poll every close in the same turn so independent actors share one restart budget. Each
+        // close has its own wrapper at the shared deadline: one slow actor cannot discard an
+        // already-published sticky failure from another actor. Cancellation leaves the DB-owned
+        // handles in place and any close that crossed admission continues in its stable driver.
+        let close_results =
+            futures::future::join_all(handles.iter().cloned().map(|handle| async move {
+                let name = handle.name().to_owned();
+                let result = tokio::time::timeout_at(deadline, handle.close()).await;
+                (name, result)
+            }))
+            .await;
+        let mut failures = close_results
+            .into_iter()
+            .filter_map(|(name, result)| match result {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(format!("{name}: {error}")),
+                Err(_) => Some(format!(
+                    "{name}: shared sink-generation close deadline expired"
+                )),
+            })
+            .collect::<Vec<_>>();
+
+        // A close result is not a terminal proof: timeout, disconnection, or a panicked close
+        // driver can publish immediately while the actor or a connector child remains live.
+        // Spend the remainder of the same generation deadline observing both proofs before the
+        // registry decides whether replacement is safe.
+        futures::future::join_all(
+            handles
+                .iter()
+                .map(|handle| handle.wait_terminal_until(deadline)),
+        )
+        .await;
 
         let unresolved_names = {
             let mut owned = self.owned_sink_handles.lock();
-            owned.retain(|handle| handle.has_unresolved_task());
+            owned.retain(crate::sink_task::SinkTaskHandle::has_unresolved_task);
             owned
                 .iter()
                 .map(|handle| handle.name().to_owned())
@@ -1716,7 +1806,7 @@ impl LaminarDB {
                         let driver_attempt = Arc::clone(&attempt);
                         let emergency_attempt = Arc::clone(&attempt);
                         let driver_runtime = runtime.clone();
-                        let owner = match std::thread::Builder::new()
+                        let startup_thread = match std::thread::Builder::new()
                             .name("laminar-start".into())
                             .spawn(move || {
                                 if !matches!(start_rx.recv(), Ok(true)) {
@@ -1738,7 +1828,7 @@ impl LaminarDB {
                                         .complete(Err(DbError::Pipeline(message.into())));
                                 }
                             }) {
-                            Ok(owner) => owner,
+                            Ok(thread) => thread,
                             Err(error) => {
                                 *owned = None;
                                 return Err(DbError::Pipeline(format!(
@@ -1747,7 +1837,7 @@ impl LaminarDB {
                             }
                         };
                         // The attempt is the durable owner; the short-lived OS thread is detached.
-                        drop(owner);
+                        drop(startup_thread);
                         if DbState::compare_exchange(claimed, DbState::Starting, &self.state)
                             .is_err()
                         {
@@ -1775,9 +1865,10 @@ impl LaminarDB {
         starting_from_fault: bool,
     ) {
         let terminal = StartupDriverGuard::new(&self, Arc::clone(&attempt));
-        let result = std::panic::AssertUnwindSafe(self.run_claimed_start(starting_from_fault))
-            .catch_unwind()
-            .await;
+        let result =
+            std::panic::AssertUnwindSafe(Box::pin(self.run_claimed_start(starting_from_fault)))
+                .catch_unwind()
+                .await;
         let result = match result {
             Ok(result) => result,
             Err(panic) => {
@@ -1802,6 +1893,10 @@ impl LaminarDB {
         terminal.finish(result);
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "pipeline startup is one generation-fenced lifecycle transaction"
+    )]
     async fn run_claimed_start(&self, starting_from_fault: bool) -> Result<(), DbError> {
         const FAULT_RESTART_QUIESCE_TIMEOUT: std::time::Duration =
             std::time::Duration::from_secs(10);
@@ -2266,10 +2361,9 @@ impl LaminarDB {
             coord.set_decision_store(ds)?;
             coord.bind_deployment_id(deployment_id.clone())?;
 
-            if let (Some(backend), Some(registry)) = (
-                self.state_backend.lock().clone(),
-                self.vnode_registry.lock().clone(),
-            ) {
+            let state_backend = self.state_backend.lock().clone();
+            let vnode_registry = self.vnode_registry.lock().clone();
+            if let (Some(backend), Some(registry)) = (state_backend, vnode_registry) {
                 backend
                     .bind_state_namespace(&deployment_id, &pipeline_identity)
                     .await
@@ -2658,7 +2752,7 @@ impl LaminarDB {
 
         let prom_registry = self.prometheus_registry.lock().clone();
 
-        let mut sources: Vec<SourceRegistration> = Vec::new();
+        let mut sources: Vec<TrackedSourceRegistration> = Vec::new();
         for (name, reg) in &source_regs {
             if reg.connector_type.is_none() {
                 continue;
@@ -2681,6 +2775,11 @@ impl LaminarDB {
                         config.connector_type()
                     ))
                 })?;
+            let task_fence = ConnectorTaskFenceRegistration::capture_registered(
+                Arc::<str>::from(format!("source:{name}")),
+                source.terminal_task_tracker(),
+                &self.owned_connector_task_fences,
+            );
             let contract = source.contract(&config).map_err(|e| {
                 DbError::Config(format!(
                     "source '{name}' (type '{}') has an invalid contract: {e}",
@@ -2726,14 +2825,17 @@ impl LaminarDB {
                         ))
                     })?;
             }
-            sources.push(SourceRegistration {
-                name: name.clone(),
-                connector: source,
-                config,
-                contract,
-                assignment_scoped,
-                position: laminar_connectors::connector::SourcePosition::Initial,
-            });
+            sources.push(TrackedSourceRegistration::from_captured(
+                SourceRegistration {
+                    name: name.clone(),
+                    connector: source,
+                    config,
+                    contract,
+                    assignment_scoped,
+                    position: laminar_connectors::connector::SourcePosition::Initial,
+                },
+                task_fence,
+            ));
         }
 
         let bridged_names: rustc_hash::FxHashSet<String> =
@@ -2749,44 +2851,10 @@ impl LaminarDB {
                     entry.schema.clone(),
                     entry.data_notify(),
                 );
-                let config = laminar_connectors::config::ConnectorConfig::new("catalog-bridge");
-                let contract = connector.contract(&config).map_err(|e| {
-                    DbError::Config(format!("source '{name}' has an invalid contract: {e}"))
-                })?;
-                admit_source_contract(
-                    contract,
-                    self.config.delivery_guarantee,
-                    checkpointing_enabled,
-                    runtime_mode,
-                )
-                .map_err(|reason| {
-                    DbError::Config(format!(
-                        "source '{name}' is not admissible in {runtime_mode:?} mode with {} \
-                         delivery: {reason} (contract: {contract:?})",
-                        self.config.delivery_guarantee
-                    ))
-                })?;
-                sources.push(SourceRegistration {
-                    name: name.clone(),
-                    connector: Box::new(connector),
-                    config,
-                    contract,
-                    assignment_scoped: false,
-                    position: laminar_connectors::connector::SourcePosition::Initial,
-                });
-            }
-        }
-        for name in self.catalog.list_sources() {
-            if bridged_names.contains(&name) || source_regs.contains_key(&name) {
-                continue;
-            }
-            if let Some(entry) = self.catalog.get_source(&name) {
-                graph.register_source_schema(name.clone(), entry.schema.clone());
-                let subscription = entry.sink.subscribe();
-                let connector = crate::catalog_connector::CatalogSourceConnector::new(
-                    subscription,
-                    entry.schema.clone(),
-                    entry.data_notify(),
+                let task_fence = ConnectorTaskFenceRegistration::capture_registered(
+                    Arc::<str>::from(format!("source:{name}")),
+                    connector.terminal_task_tracker(),
+                    &self.owned_connector_task_fences,
                 );
                 let config = laminar_connectors::config::ConnectorConfig::new("catalog-bridge");
                 let contract = connector.contract(&config).map_err(|e| {
@@ -2805,14 +2873,64 @@ impl LaminarDB {
                         self.config.delivery_guarantee
                     ))
                 })?;
-                sources.push(SourceRegistration {
-                    name: name.clone(),
-                    connector: Box::new(connector),
-                    config,
+                sources.push(TrackedSourceRegistration::from_captured(
+                    SourceRegistration {
+                        name: name.clone(),
+                        connector: Box::new(connector),
+                        config,
+                        contract,
+                        assignment_scoped: false,
+                        position: laminar_connectors::connector::SourcePosition::Initial,
+                    },
+                    task_fence,
+                ));
+            }
+        }
+        for name in self.catalog.list_sources() {
+            if bridged_names.contains(&name) || source_regs.contains_key(&name) {
+                continue;
+            }
+            if let Some(entry) = self.catalog.get_source(&name) {
+                graph.register_source_schema(name.clone(), entry.schema.clone());
+                let subscription = entry.sink.subscribe();
+                let connector = crate::catalog_connector::CatalogSourceConnector::new(
+                    subscription,
+                    entry.schema.clone(),
+                    entry.data_notify(),
+                );
+                let task_fence = ConnectorTaskFenceRegistration::capture_registered(
+                    Arc::<str>::from(format!("source:{name}")),
+                    connector.terminal_task_tracker(),
+                    &self.owned_connector_task_fences,
+                );
+                let config = laminar_connectors::config::ConnectorConfig::new("catalog-bridge");
+                let contract = connector.contract(&config).map_err(|e| {
+                    DbError::Config(format!("source '{name}' has an invalid contract: {e}"))
+                })?;
+                admit_source_contract(
                     contract,
-                    assignment_scoped: false,
-                    position: laminar_connectors::connector::SourcePosition::Initial,
-                });
+                    self.config.delivery_guarantee,
+                    checkpointing_enabled,
+                    runtime_mode,
+                )
+                .map_err(|reason| {
+                    DbError::Config(format!(
+                        "source '{name}' is not admissible in {runtime_mode:?} mode with {} \
+                         delivery: {reason} (contract: {contract:?})",
+                        self.config.delivery_guarantee
+                    ))
+                })?;
+                sources.push(TrackedSourceRegistration::from_captured(
+                    SourceRegistration {
+                        name: name.clone(),
+                        connector: Box::new(connector),
+                        config,
+                        contract,
+                        assignment_scoped: false,
+                        position: laminar_connectors::connector::SourcePosition::Initial,
+                    },
+                    task_fence,
+                ));
             }
         }
 
@@ -2884,6 +3002,11 @@ impl LaminarDB {
                         config.connector_type()
                     ))
                 })?;
+            let task_fence = ConnectorTaskFenceRegistration::capture_registered(
+                Arc::<str>::from(format!("sink:{name}")),
+                sink.terminal_task_tracker(),
+                &self.owned_connector_task_fences,
+            );
 
             let carries_changelog = changelog_carrying.contains(&reg.input);
             let state_backend_scope = self
@@ -2935,6 +3058,7 @@ impl LaminarDB {
                 requires_recovery_on_error: contract.is_checkpoint_committable()
                     || self.config.delivery_guarantee != DeliveryGuarantee::BestEffort
                     || runtime_mode == RuntimeMode::Cluster,
+                task_fence,
             });
         }
 
@@ -2988,8 +3112,10 @@ impl LaminarDB {
                 write_timeout,
                 flush_interval,
                 requires_recovery_on_error,
+                task_fence,
                 config: _,
             } = prepared;
+            let terminal_tasks = task_fence.tracker();
             let sink_id: std::sync::Arc<str> = std::sync::Arc::from(name.as_str());
             let handle =
                 crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
@@ -3002,6 +3128,7 @@ impl LaminarDB {
                     flush_interval,
                     write_timeout,
                     event_tx: sink_event_tx.clone(),
+                    terminal_tasks,
                     #[cfg(feature = "cluster")]
                     process_authority: sink_process_authority.clone(),
                 });
@@ -3011,6 +3138,7 @@ impl LaminarDB {
                 owned.push(handle.clone());
             }
             sinks.push((name, handle, filter_expr, input, contract));
+            task_fence.handoff();
         }
         drop(sink_event_tx);
 
@@ -3948,23 +4076,24 @@ impl LaminarDB {
             let source_gate = Arc::clone(&self.source_gate);
             #[cfg(not(feature = "cluster"))]
             let source_gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let coordinator = crate::pipeline::StreamingCoordinator::new_with_source_registry(
-                sources,
-                pipeline_config,
-                Arc::clone(&shutdown),
-                control_rx,
-                source_gate,
-                #[cfg(feature = "cluster")]
-                source_process_authority,
-                Arc::clone(&self.owned_source_tasks),
-                runtime_mode,
-            )
-            .await?
-            .with_terminal_shutdown(runtime_shutdown.clone())
-            .with_force_checkpoint_rx(force_ckpt_rx)
-            .with_checkpoint_complete_rx(checkpoint_complete_rx)
-            .with_checkpoint_admission(checkpoint_in_flight, staged_bytes, max_staged_bytes)
-            .with_coordinated_commit_admission(coordinated_commit_admission);
+            let coordinator =
+                crate::pipeline::StreamingCoordinator::new_with_tracked_source_registry(
+                    sources,
+                    pipeline_config,
+                    Arc::clone(&shutdown),
+                    control_rx,
+                    source_gate,
+                    #[cfg(feature = "cluster")]
+                    source_process_authority,
+                    Arc::clone(&self.owned_source_tasks),
+                    runtime_mode,
+                )
+                .await?
+                .with_terminal_shutdown(runtime_shutdown.clone())
+                .with_force_checkpoint_rx(force_ckpt_rx)
+                .with_checkpoint_complete_rx(checkpoint_complete_rx)
+                .with_checkpoint_admission(checkpoint_in_flight, staged_bytes, max_staged_bytes)
+                .with_coordinated_commit_admission(coordinated_commit_admission);
 
             let (done_tx, done_rx) = crossfire::oneshot::oneshot::<crate::pipeline::ExitReason>();
             let (startup_tx, startup_rx) = crossfire::oneshot::oneshot::<Result<(), String>>();
@@ -4176,6 +4305,10 @@ impl LaminarDB {
     /// # Errors
     ///
     /// Returns `Err` if the watcher task panicked.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "shutdown owns the complete terminal lifecycle and fence release sequence"
+    )]
     pub async fn shutdown(&self) -> Result<(), DbError> {
         const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
         // Terminal intent takes precedence over a concurrent restartable stop. Publishing it
@@ -4296,6 +4429,10 @@ impl LaminarDB {
     /// # Errors
     /// Returns [`DbError::InvalidOperation`] if the pipeline is still starting
     /// or the coordinator does not exit within the stop timeout.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "restartable stop owns one bounded lifecycle and fence transition"
+    )]
     pub async fn stop_pipeline(&self) -> Result<(), DbError> {
         const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
         let deadline = tokio::time::Instant::now() + STOP_TIMEOUT;
@@ -4413,7 +4550,7 @@ impl LaminarDB {
             return Ok(());
         }
         match DbState::compare_exchange(DbState::ShuttingDown, DbState::Created, &self.state) {
-            Ok(_) | Err(DbState::Created) | Err(DbState::Stopped) => Ok(()),
+            Ok(_) | Err(DbState::Created | DbState::Stopped) => Ok(()),
             Err(observed) => Err(DbError::InvalidOperation(format!(
                 "pipeline stop completed from unexpected lifecycle state {observed:?}; restart remains fenced"
             ))),
@@ -4428,23 +4565,28 @@ mod connector_admission_tests {
     use super::LaminarDB;
     use super::{
         admit_sink, admit_sink_contract, admit_source_contract, close_opened_sinks,
-        open_prepared_sinks, validate_source_recovery_assignment, PreparedSink, RuntimeMode,
-        SinkAdmissionContext, EXACT_SINK_PROTOCOL,
+        open_prepared_sinks, resolve_stream_output_schemas, validate_source_recovery_assignment,
+        ConnectorTaskFenceRegistration, DbError, PreparedSink, RuntimeMode, SinkAdmissionContext,
+        TrackedSourceRegistration, CLUSTER_BEST_EFFORT, EXACT_SINK_PROTOCOL,
     };
     use crate::db::DbState;
     use crate::pipeline::PipelineConfig;
+    use crate::sink_task::{SinkTaskConfig, DEFAULT_CHANNEL_CAPACITY, SINK_EVENT_CHANNEL_CAPACITY};
     use arrow_array::RecordBatch;
     use arrow_schema::{Schema, SchemaRef};
     use async_trait::async_trait;
+    use laminar_connectors::checkpoint::SourceCheckpoint;
     use laminar_connectors::config::ConnectorConfig;
     use laminar_connectors::connector::{
-        ConnectorCancellationPolicy, DeliveryGuarantee, SinkConnector, SinkConsistency,
-        SinkContract, SinkInputMode, SinkTopology, SourceConnector, SourceConsistency,
-        SourceContract, SourceTopology, WriteResult,
+        ConnectorCancellationPolicy, ConnectorTaskOwner, ConnectorTaskTracker, DeliveryGuarantee,
+        SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology, SourceBatch,
+        SourceConnector, SourceConsistency, SourceContract, SourceStart, SourceTopology,
+        WriteResult,
     };
     use laminar_connectors::error::ConnectorError;
     use laminar_core::state::StateBackendDurability;
     use laminar_core::storage::checkpoint_manifest::ConnectorCheckpoint;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -4459,6 +4601,148 @@ mod connector_admission_tests {
         assert_eq!(cluster_delta_chain_bound(4), Some(3));
         assert_eq!(cluster_delta_chain_bound(5), Some(4));
         assert_eq!(cluster_delta_chain_bound(usize::MAX), Some(4));
+    }
+
+    struct RetiringQuiesceSink {
+        schema: SchemaRef,
+    }
+
+    #[async_trait]
+    impl SinkConnector for RetiringQuiesceSink {
+        async fn open(&mut self, _config: &ConnectorConfig) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
+        async fn write_batch(
+            &mut self,
+            _batch: &RecordBatch,
+        ) -> Result<WriteResult, ConnectorError> {
+            Err(ConnectorError::outcome_unknown(
+                "injected unknown write outcome",
+                true,
+            ))
+        }
+
+        async fn close(&mut self) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn suggested_write_timeout(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+    }
+
+    #[tokio::test]
+    async fn sink_quiesce_waits_for_terminal_proof_after_sticky_close_error() {
+        let db = LaminarDB::open().unwrap();
+        let (owner, tracker) = ConnectorTaskOwner::new();
+        let guard = owner.track().expect("live connector child");
+        drop(owner);
+        let schema = Arc::new(Schema::empty());
+        let (event_tx, mut events) =
+            laminar_core::streaming::channel::channel(SINK_EVENT_CHANNEL_CAPACITY);
+        let handle = crate::sink_task::SinkTaskHandle::spawn(SinkTaskConfig {
+            name: "retired-quiesce".into(),
+            sink_id: Arc::from("retired-quiesce"),
+            connector: Box::new(RetiringQuiesceSink {
+                schema: Arc::clone(&schema),
+            }),
+            contract: SinkContract::new(
+                SinkConsistency::DurableAtLeastOnce,
+                SinkTopology::MultiWriter,
+                laminar_connectors::connector::SinkInputMode::AppendOnly,
+            ),
+            requires_recovery_on_error: true,
+            channel_capacity: DEFAULT_CHANNEL_CAPACITY,
+            flush_interval: Duration::from_secs(60),
+            write_timeout: Duration::from_secs(1),
+            event_tx,
+            terminal_tasks: Some(tracker),
+            #[cfg(feature = "cluster")]
+            process_authority: None,
+        });
+        handle
+            .write_batch(RecordBatch::new_empty(schema))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("retiring write did not report its error")
+            .expect("sink event channel closed unexpectedly");
+        handle
+            .sync()
+            .await
+            .expect_err("retired actor must reject later commands");
+        db.owned_sink_handles.lock().push(handle.clone());
+
+        let quiesce_db = Arc::clone(&db);
+        let quiesce = tokio::spawn(async move {
+            quiesce_db
+                .quiesce_owned_sink_handles_until(
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !handle.close_outcome_published() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retired sink did not publish its sticky close error");
+        assert!(
+            !quiesce.is_finished(),
+            "a sticky close error must not bypass the terminal connector proof"
+        );
+
+        drop(guard);
+        quiesce
+            .await
+            .expect("sink quiesce task panicked")
+            .expect("terminal sink generation should permit replacement");
+        assert!(db.owned_sink_handles.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn expired_sink_quiesce_budget_prunes_an_already_terminal_actor() {
+        let db = LaminarDB::open().unwrap();
+        let schema = Arc::new(Schema::empty());
+        let (event_tx, _events) =
+            laminar_core::streaming::channel::channel(SINK_EVENT_CHANNEL_CAPACITY);
+        let handle = crate::sink_task::SinkTaskHandle::spawn(SinkTaskConfig {
+            name: "terminal-before-quiesce".into(),
+            sink_id: Arc::from("terminal-before-quiesce"),
+            connector: Box::new(RetiringQuiesceSink { schema }),
+            contract: SinkContract::new(
+                SinkConsistency::DurableAtLeastOnce,
+                SinkTopology::MultiWriter,
+                SinkInputMode::AppendOnly,
+            ),
+            requires_recovery_on_error: true,
+            channel_capacity: DEFAULT_CHANNEL_CAPACITY,
+            flush_interval: Duration::from_secs(60),
+            write_timeout: Duration::from_secs(1),
+            event_tx,
+            terminal_tasks: None,
+            #[cfg(feature = "cluster")]
+            process_authority: None,
+        });
+        handle.close().await.unwrap();
+        assert!(
+            handle
+                .wait_terminal_until(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await
+        );
+        db.owned_sink_handles.lock().push(handle);
+
+        db.quiesce_owned_sink_handles_until(tokio::time::Instant::now())
+            .await
+            .expect("terminal actors need no remaining cleanup budget");
+        assert!(db.owned_sink_handles.lock().is_empty());
     }
 
     #[test]
@@ -4683,45 +4967,6 @@ mod connector_admission_tests {
         assert!(db.recovery_monitor.lock().is_none());
     }
 
-    #[tokio::test]
-    async fn cancelled_source_quiescence_retains_generation_fence() {
-        let db = LaminarDB::open().unwrap();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-        let join = tokio::spawn(async move {
-            let _ = release_rx.await;
-        });
-        let lease = crate::pipeline::streaming_coordinator::SourceTaskLease::supervise(
-            Arc::from("draining-source"),
-            ConnectorCancellationPolicy::CompleteStarted,
-            Arc::new(tokio::sync::Notify::new()),
-            Arc::new(AtomicBool::new(false)),
-            join,
-            &tokio::runtime::Handle::current(),
-        );
-        db.owned_source_tasks.lock().push(lease.clone());
-
-        let waiting_db = Arc::clone(&db);
-        let quiesce = tokio::spawn(async move {
-            waiting_db
-                .quiesce_owned_source_tasks_until(
-                    tokio::time::Instant::now() + Duration::from_secs(60),
-                )
-                .await
-        });
-        tokio::task::yield_now().await;
-        quiesce.abort();
-        let _ = quiesce.await;
-
-        assert_eq!(db.owned_source_tasks.lock().len(), 1);
-        assert!(!lease.is_finished());
-
-        release_tx.send(()).unwrap();
-        db.quiesce_owned_source_tasks_until(tokio::time::Instant::now() + Duration::from_secs(1))
-            .await
-            .expect("a retry must observe terminal completion and release the source fence");
-        assert!(db.owned_source_tasks.lock().is_empty());
-    }
-
     #[test]
     fn source_contract_admission_matrix_is_fail_closed() {
         let consistencies = [
@@ -4770,12 +5015,9 @@ mod connector_admission_tests {
                                 let expected = expected
                                     && (delivery != DeliveryGuarantee::ExactlyOnce || certified)
                                     && !(runtime == RuntimeMode::Cluster
-                                        && delivery == DeliveryGuarantee::ExactlyOnce)
+                                        && delivery != DeliveryGuarantee::AtLeastOnce)
                                     && (runtime != RuntimeMode::Cluster
-                                        || topology == SourceTopology::Splittable
-                                        || (topology == SourceTopology::NodeLocalIngress
-                                            && delivery == DeliveryGuarantee::BestEffort
-                                            && consistency == SourceConsistency::Ephemeral));
+                                        || topology == SourceTopology::Splittable);
 
                                 assert_eq!(
                                     admit_source_contract(
@@ -4799,7 +5041,7 @@ mod connector_admission_tests {
     }
 
     #[test]
-    fn cluster_singleton_is_rejected_even_for_best_effort() {
+    fn cluster_best_effort_is_rejected_before_source_topology() {
         let contract =
             SourceContract::new(SourceConsistency::Replayable, SourceTopology::Singleton);
         let error = admit_source_contract(
@@ -4809,23 +5051,7 @@ mod connector_admission_tests {
             RuntimeMode::Cluster,
         )
         .unwrap_err();
-        assert!(error.contains("fenced singleton placement"));
-    }
-
-    #[test]
-    fn cluster_node_local_replay_cursor_is_rejected() {
-        let contract = SourceContract::new(
-            SourceConsistency::Replayable,
-            SourceTopology::NodeLocalIngress,
-        );
-        let error = admit_source_contract(
-            contract,
-            DeliveryGuarantee::BestEffort,
-            true,
-            RuntimeMode::Cluster,
-        )
-        .unwrap_err();
-        assert!(error.contains("must be ephemeral"), "{error}");
+        assert_eq!(error, CLUSTER_BEST_EFFORT);
     }
 
     #[test]
@@ -4862,21 +5088,10 @@ mod connector_admission_tests {
         .expect("the certified deterministic generator must remain locally admissible");
     }
 
-    #[cfg(feature = "mongodb-cdc")]
     #[test]
-    fn mongodb_contract_is_rejected_for_exact_delivery() {
-        let source = laminar_connectors::mongodb::MongoDbCdcSource::new(
-            laminar_connectors::mongodb::MongoDbSourceConfig::new(
-                "mongodb://localhost:27017",
-                "production",
-                "events",
-            ),
-            None,
-        );
-        let contract = source
-            .contract(&ConnectorConfig::new("mongodb-cdc"))
-            .expect("valid MongoDB contract");
-
+    fn uncertified_replayable_source_is_rejected_for_exact_delivery() {
+        let contract =
+            SourceContract::new(SourceConsistency::Replayable, SourceTopology::Splittable);
         assert!(!contract.is_exact_delivery_certified());
         let error = admit_source_contract(
             contract,
@@ -4884,30 +5099,7 @@ mod connector_admission_tests {
             true,
             RuntimeMode::Local,
         )
-        .expect_err("MongoDB event replay is not production-certified for exact delivery");
-        assert!(error.contains(laminar_core::error_codes::EXACTLY_ONCE_SOURCE_UNCERTIFIED));
-    }
-
-    #[cfg(feature = "kafka")]
-    #[test]
-    fn kafka_contract_is_rejected_for_exact_delivery() {
-        let source = laminar_connectors::kafka::KafkaSource::new(
-            Arc::new(Schema::empty()),
-            laminar_connectors::kafka::KafkaSourceConfig::default(),
-            None,
-        );
-        let contract = source
-            .contract(&ConnectorConfig::new("kafka"))
-            .expect("static Kafka contract");
-
-        assert!(!contract.is_exact_delivery_certified());
-        let error = admit_source_contract(
-            contract,
-            DeliveryGuarantee::ExactlyOnce,
-            true,
-            RuntimeMode::Local,
-        )
-        .expect_err("Kafka source recovery is not production-certified for exact delivery");
+        .expect_err("uncertified source recovery must fail closed for exact delivery");
         assert!(error.contains(laminar_core::error_codes::EXACTLY_ONCE_SOURCE_UNCERTIFIED));
     }
 
@@ -4945,9 +5137,7 @@ mod connector_admission_tests {
                                 let durable = delivery != DeliveryGuarantee::AtLeastOnce
                                     || consistency != SinkConsistency::Ephemeral;
                                 let placed = runtime != RuntimeMode::Cluster
-                                    || topology == SinkTopology::MultiWriter
-                                    || (topology == SinkTopology::NodeLocalEgress
-                                        && delivery == DeliveryGuarantee::BestEffort);
+                                    || topology == SinkTopology::MultiWriter;
                                 let input_compatible =
                                     !carries_changelog || input_mode.accepts_full_changelog();
                                 let protocol_compatible =
@@ -4961,7 +5151,7 @@ mod connector_admission_tests {
                                     && placed
                                     && input_compatible
                                     && !(runtime == RuntimeMode::Cluster
-                                        && delivery == DeliveryGuarantee::ExactlyOnce);
+                                        && delivery != DeliveryGuarantee::AtLeastOnce);
 
                                 assert_eq!(
                                     admit_sink_contract(
@@ -4992,11 +5182,92 @@ mod connector_admission_tests {
 
     struct StartupProbeSink {
         open_delay: Duration,
+        open_error: Option<ConnectorError>,
         close_delay: Duration,
         open_calls: Arc<AtomicU64>,
         close_calls: Arc<AtomicU64>,
         schema: SchemaRef,
         cancellation_policy: ConnectorCancellationPolicy,
+    }
+
+    struct TrackedAdmissionSink {
+        _owner: ConnectorTaskOwner,
+        tracker: ConnectorTaskTracker,
+        schema: SchemaRef,
+    }
+
+    struct TrackedPlanningSource {
+        _owner: ConnectorTaskOwner,
+        tracker: ConnectorTaskTracker,
+        schema: SchemaRef,
+    }
+
+    #[async_trait]
+    impl SinkConnector for TrackedAdmissionSink {
+        fn terminal_task_tracker(&self) -> Option<ConnectorTaskTracker> {
+            Some(self.tracker.clone())
+        }
+
+        fn contract(&self, _config: &ConnectorConfig) -> Result<SinkContract, ConnectorError> {
+            Ok(SinkContract::new(
+                SinkConsistency::DurableAtLeastOnce,
+                SinkTopology::MultiWriter,
+                SinkInputMode::AppendOnly,
+            ))
+        }
+
+        async fn open(&mut self, _config: &ConnectorConfig) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
+        async fn write_batch(
+            &mut self,
+            _batch: &RecordBatch,
+        ) -> Result<WriteResult, ConnectorError> {
+            Ok(WriteResult::new(0, 0))
+        }
+
+        fn suggested_write_timeout(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        async fn close(&mut self) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl SourceConnector for TrackedPlanningSource {
+        fn terminal_task_tracker(&self) -> Option<ConnectorTaskTracker> {
+            Some(self.tracker.clone())
+        }
+
+        async fn start(&mut self, _request: SourceStart) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
+        async fn poll_batch(
+            &mut self,
+            _max_records: usize,
+        ) -> Result<Option<SourceBatch>, ConnectorError> {
+            Ok(None)
+        }
+
+        fn schema(&self) -> SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn checkpoint(&self) -> SourceCheckpoint {
+            SourceCheckpoint::new()
+        }
+
+        async fn close(&mut self) -> Result<(), ConnectorError> {
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -5016,7 +5287,7 @@ mod connector_admission_tests {
         async fn open(&mut self, _config: &ConnectorConfig) -> Result<(), ConnectorError> {
             self.open_calls.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(self.open_delay).await;
-            Ok(())
+            self.open_error.take().map_or(Ok(()), Err)
         }
 
         async fn write_batch(
@@ -5075,10 +5346,31 @@ mod connector_admission_tests {
         close_calls: Arc<AtomicU64>,
         cancellation_policy: ConnectorCancellationPolicy,
     ) -> PreparedSink {
+        prepared_lifecycle_probe_with_error(
+            name,
+            open_delay,
+            close_delay,
+            open_calls,
+            close_calls,
+            cancellation_policy,
+            None,
+        )
+    }
+
+    fn prepared_lifecycle_probe_with_error(
+        name: &str,
+        open_delay: Duration,
+        close_delay: Duration,
+        open_calls: Arc<AtomicU64>,
+        close_calls: Arc<AtomicU64>,
+        cancellation_policy: ConnectorCancellationPolicy,
+        open_error: Option<ConnectorError>,
+    ) -> PreparedSink {
         PreparedSink {
             name: name.into(),
             connector: Box::new(StartupProbeSink {
                 open_delay,
+                open_error,
                 close_delay,
                 open_calls,
                 close_calls,
@@ -5096,7 +5388,111 @@ mod connector_admission_tests {
             write_timeout: Duration::from_secs(1),
             flush_interval: Duration::from_secs(5),
             requires_recovery_on_error: true,
+            task_fence: ConnectorTaskFenceRegistration::capture(
+                Arc::<str>::from(format!("sink:{name}")),
+                None,
+            ),
         }
+    }
+
+    #[tokio::test]
+    async fn source_preplanning_failure_retains_captured_generation_fence() {
+        let (owner, tracker) = ConnectorTaskOwner::new();
+        let guard = owner.track().expect("live source child");
+        let owned = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let source: Box<dyn SourceConnector> = Box::new(TrackedPlanningSource {
+            _owner: owner,
+            tracker,
+            schema: Arc::new(Schema::empty()),
+        });
+        let task_fence = ConnectorTaskFenceRegistration::capture_registered(
+            "source:planning-failure",
+            source.terminal_task_tracker(),
+            &owned,
+        );
+        let source = TrackedSourceRegistration::from_captured(
+            crate::pipeline::SourceRegistration {
+                name: "planning-failure".into(),
+                connector: source,
+                config: ConnectorConfig::new("planning-probe"),
+                contract: SourceContract::new(
+                    SourceConsistency::Replayable,
+                    SourceTopology::Singleton,
+                ),
+                assignment_scoped: false,
+                position: laminar_connectors::connector::SourcePosition::Initial,
+            },
+            task_fence,
+        );
+
+        let result: Result<(), DbError> = async move {
+            let _source = source;
+            let context = datafusion::prelude::SessionContext::new();
+            let mut streams = HashMap::new();
+            streams.insert(
+                "unresolved".into(),
+                crate::connector_manager::StreamRegistration {
+                    name: "unresolved".into(),
+                    query_sql: "SELECT * FROM missing_source".into(),
+                    emit_clause: None,
+                    window_config: None,
+                    order_config: None,
+                    join_config: None,
+                    has_analytic: false,
+                    has_frame: false,
+                    incremental: false,
+                },
+            );
+            resolve_stream_output_schemas(&context, &streams).await?;
+            Ok(())
+        }
+        .await;
+
+        assert!(matches!(result, Err(DbError::Pipeline(_))));
+        assert_eq!(owned.lock().len(), 1);
+        assert!(!owned.lock()[0].is_finished());
+        drop(guard);
+        assert!(owned.lock()[0].is_finished());
+    }
+
+    #[test]
+    fn sink_admission_failure_retains_captured_generation_fence() {
+        let (owner, tracker) = ConnectorTaskOwner::new();
+        let guard = owner.track().expect("live sink child");
+        let owned = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let result: Result<(), DbError> = (|| {
+            let sink: Box<dyn SinkConnector> = Box::new(TrackedAdmissionSink {
+                _owner: owner,
+                tracker,
+                schema: Arc::new(Schema::empty()),
+            });
+            let _task_fence = ConnectorTaskFenceRegistration::capture_registered(
+                "sink:admission-failure",
+                sink.terminal_task_tracker(),
+                &owned,
+            );
+            let config = ConnectorConfig::new("admission-probe");
+            admit_sink(
+                sink.as_ref(),
+                SinkAdmissionContext {
+                    config: &config,
+                    name: "admission-failure",
+                    input: "input",
+                    delivery: DeliveryGuarantee::ExactlyOnce,
+                    runtime: RuntimeMode::Local,
+                    carries_changelog: false,
+                    checkpointing_enabled: true,
+                    state_backend_scope: StateBackendDurability::NodeDurable,
+                },
+            )?;
+            Ok(())
+        })();
+
+        assert!(matches!(result, Err(DbError::Config(_))));
+        assert_eq!(owned.lock().len(), 1);
+        assert!(!owned.lock()[0].is_finished());
+        drop(guard);
+        assert!(owned.lock()[0].is_finished());
     }
 
     #[tokio::test(start_paused = true)]
@@ -5216,16 +5612,16 @@ mod connector_admission_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cancellation_unsafe_sink_open_finishes_before_startup_rollback() {
+    async fn timed_out_sink_open_retires_candidate_at_the_shared_deadline() {
         let open_calls = Arc::new(AtomicU64::new(0));
         let close_calls = Arc::new(AtomicU64::new(0));
         let mut sinks = vec![prepared_lifecycle_probe_with_policy(
-            "complete-started",
+            "retired-open",
             Duration::from_secs(12),
             Duration::ZERO,
             Arc::clone(&open_calls),
             Arc::clone(&close_calls),
-            ConnectorCancellationPolicy::CompleteStarted,
+            ConnectorCancellationPolicy::RetireConnector,
         )];
         let started = tokio::time::Instant::now();
 
@@ -5243,10 +5639,14 @@ mod connector_admission_tests {
             .contains("shared 10s sink-open stage deadline"));
         assert_eq!(
             tokio::time::Instant::now() - started,
-            Duration::from_secs(12)
+            Duration::from_secs(10)
         );
         assert_eq!(open_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            close_calls.load(Ordering::SeqCst),
+            0,
+            "a retired startup candidate must not receive a later connector call"
+        );
     }
 
     #[cfg(feature = "cluster")]
@@ -5308,16 +5708,16 @@ mod connector_admission_tests {
 
     #[cfg(feature = "cluster")]
     #[tokio::test(start_paused = true)]
-    async fn cluster_process_lease_loss_finishes_complete_started_sink_open_before_cleanup() {
+    async fn cluster_process_lease_loss_retires_sink_open_without_cleanup() {
         let open_calls = Arc::new(AtomicU64::new(0));
         let close_calls = Arc::new(AtomicU64::new(0));
         let mut sinks = vec![prepared_lifecycle_probe_with_policy(
-            "complete-started-authority",
+            "retired-authority-open",
             Duration::from_secs(12),
             Duration::ZERO,
             Arc::clone(&open_calls),
             Arc::clone(&close_calls),
-            ConnectorCancellationPolicy::CompleteStarted,
+            ConnectorCancellationPolicy::RetireConnector,
         )];
         let controller = sink_open_authority(42);
         let fencer = Arc::clone(&controller);
@@ -5333,18 +5733,50 @@ mod connector_admission_tests {
             Some(controller.as_ref()),
         )
         .await
-        .expect_err("lease loss must reject even a completed cancellation-unsafe open");
+        .expect_err("lease loss must retire the in-flight open");
 
         assert!(
             error.to_string().contains("process lease expired"),
             "{error}"
         );
-        assert_eq!(
-            tokio::time::Instant::now() - started,
-            Duration::from_secs(12)
-        );
+        assert!(tokio::time::Instant::now() - started < Duration::from_secs(12));
         assert_eq!(open_calls.load(Ordering::SeqCst), 1);
         assert_eq!(close_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn outcome_unknown_sink_open_retires_candidate_without_close() {
+        let open_calls = Arc::new(AtomicU64::new(0));
+        let close_calls = Arc::new(AtomicU64::new(0));
+        let mut sinks = vec![prepared_lifecycle_probe_with_error(
+            "unknown-open",
+            Duration::ZERO,
+            Duration::ZERO,
+            Arc::clone(&open_calls),
+            Arc::clone(&close_calls),
+            ConnectorCancellationPolicy::CancelSafe,
+            Some(ConnectorError::outcome_unknown(
+                "remote admission acknowledgement was lost",
+                true,
+            )),
+        )];
+
+        let error = open_prepared_sinks(
+            &mut sinks,
+            Duration::from_secs(1),
+            #[cfg(feature = "cluster")]
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("outcome unknown"), "{error}");
+        assert_eq!(open_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            close_calls.load(Ordering::SeqCst),
+            0,
+            "a generation with unknown startup outcome must not receive another connector call"
+        );
     }
 
     #[cfg(feature = "cluster")]
@@ -5378,7 +5810,7 @@ mod connector_admission_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn sink_startup_cleanup_gives_every_connector_a_terminal_attempt() {
+    async fn sink_startup_cleanup_attempts_every_connector_with_one_shared_deadline() {
         let first_close = Arc::new(AtomicU64::new(0));
         let second_close = Arc::new(AtomicU64::new(0));
         let mut sinks = vec![
@@ -5401,13 +5833,15 @@ mod connector_admission_tests {
         close_opened_sinks(
             &mut sinks,
             PipelineConfig::CONNECTOR_STARTUP_CLEANUP_TIMEOUT,
+            #[cfg(feature = "cluster")]
+            None,
         )
         .await;
 
         assert_eq!(
             tokio::time::Instant::now().duration_since(started),
-            PipelineConfig::CONNECTOR_STARTUP_CLEANUP_TIMEOUT * 2,
-            "each started connector must receive its own terminal cleanup budget"
+            PipelineConfig::CONNECTOR_STARTUP_CLEANUP_TIMEOUT,
+            "startup rollback must not multiply latency by the connector count"
         );
         assert_eq!(first_close.load(Ordering::SeqCst), 1);
         assert_eq!(second_close.load(Ordering::SeqCst), 1);
@@ -5426,13 +5860,13 @@ mod connector_admission_tests {
             schema: Arc::new(Schema::empty()),
             exact_protocol: true,
         };
-        let config = ConnectorConfig::new("iceberg");
+        let config = ConnectorConfig::new("checkpoint-committable-probe");
 
         let error = admit_sink(
             &sink,
             SinkAdmissionContext {
                 config: &config,
-                name: "iceberg_out",
+                name: "exact_out",
                 input: "input",
                 delivery: DeliveryGuarantee::AtLeastOnce,
                 runtime: RuntimeMode::Local,
@@ -5628,64 +6062,36 @@ mod connector_admission_tests {
     }
 
     #[test]
-    fn exact_rejection_precedes_open_for_network_and_file_sink_contracts() {
-        let candidates = [
-            (
-                "kafka",
-                SinkContract::new(
-                    SinkConsistency::DurableAtLeastOnce,
-                    SinkTopology::Singleton,
-                    SinkInputMode::AppendOnly,
-                ),
+    fn exact_rejection_precedes_open_for_non_committable_contract() {
+        let opened = Arc::new(AtomicBool::new(false));
+        let sink = OpenProbeSink {
+            contract: SinkContract::new(
+                SinkConsistency::DurableAtLeastOnce,
+                SinkTopology::Singleton,
+                SinkInputMode::AppendOnly,
             ),
-            (
-                "postgres",
-                SinkContract::new(
-                    SinkConsistency::DurableAtLeastOnce,
-                    SinkTopology::Singleton,
-                    SinkInputMode::AppendOnly,
-                ),
-            ),
-            (
-                "file",
-                SinkContract::new(
-                    SinkConsistency::DurableAtLeastOnce,
-                    SinkTopology::Singleton,
-                    SinkInputMode::AppendOnly,
-                ),
-            ),
-        ];
+            opened: Arc::clone(&opened),
+            schema: Arc::new(Schema::empty()),
+            exact_protocol: false,
+        };
+        let config = ConnectorConfig::new("durable-probe");
+        let error = admit_sink(
+            &sink,
+            SinkAdmissionContext {
+                config: &config,
+                name: "durable_out",
+                input: "input",
+                delivery: DeliveryGuarantee::ExactlyOnce,
+                runtime: RuntimeMode::Local,
+                carries_changelog: false,
+                checkpointing_enabled: true,
+                state_backend_scope: StateBackendDurability::NodeDurable,
+            },
+        )
+        .unwrap_err();
 
-        for (name, contract) in candidates {
-            let opened = Arc::new(AtomicBool::new(false));
-            let sink = OpenProbeSink {
-                contract,
-                opened: Arc::clone(&opened),
-                schema: Arc::new(Schema::empty()),
-                exact_protocol: false,
-            };
-            let config = ConnectorConfig::new(name);
-            let error = admit_sink(
-                &sink,
-                SinkAdmissionContext {
-                    config: &config,
-                    name,
-                    input: "input",
-                    delivery: DeliveryGuarantee::ExactlyOnce,
-                    runtime: RuntimeMode::Local,
-                    carries_changelog: false,
-                    checkpointing_enabled: true,
-                    state_backend_scope: StateBackendDurability::NodeDurable,
-                },
-            )
-            .unwrap_err();
-
-            assert!(error.to_string().contains(EXACT_SINK_PROTOCOL));
-            assert!(
-                !opened.load(Ordering::SeqCst),
-                "{name} was opened before admission"
-            );
-        }
+        assert!(error.to_string().contains(EXACT_SINK_PROTOCOL));
+        assert!(!opened.load(Ordering::SeqCst));
     }
 }
 

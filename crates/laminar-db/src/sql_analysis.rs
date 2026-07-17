@@ -751,12 +751,21 @@ pub(crate) const CHANGELOG_ENRICH_TMP: &str = "__changelog_enrich_tmp";
 pub(crate) struct ChangelogEnrichConfig {
     /// The left (incremental MV / changelog) table the operator consumes from `input_bufs`.
     pub changelog_table: String,
+    /// Static dimension relation on the right side.
+    pub static_table: String,
+    /// Ordered left equi-join keys certified by detection.
+    pub left_keys: Vec<String>,
+    /// Ordered right equi-join keys certified by detection.
+    pub right_keys: Vec<String>,
+    /// Whether this is a LEFT rather than INNER join.
+    pub left_outer: bool,
     /// Temp-rewritten join SQL (over [`CHANGELOG_ENRICH_TMP`]) that preserves `__weight`.
     pub projection_sql: String,
 }
 
 /// Detect a single equi-join of an incremental MV (changelog) left and a static table right; returns
 /// the changelog table and a `__weight`-preserving temp-rewritten join SQL, else `None`.
+#[allow(clippy::too_many_lines)] // detection and certificate extraction must share one parsed AST
 pub(crate) fn detect_changelog_enrich_query(
     sql: &str,
     incremental_mvs: &FxHashSet<String>,
@@ -862,8 +871,24 @@ pub(crate) fn detect_changelog_enrich_query(
         "SELECT {} FROM {CHANGELOG_ENRICH_TMP} AS {lalias} {join_kw} {right_from} ON {on}{where_clause}",
         items.join(", ")
     );
+    let mut left_keys = vec![j.left_key_column.clone()];
+    let mut right_keys = vec![j.right_key_column.clone()];
+    left_keys.extend(
+        j.additional_key_columns
+            .iter()
+            .map(|(left, _)| left.clone()),
+    );
+    right_keys.extend(
+        j.additional_key_columns
+            .iter()
+            .map(|(_, right)| right.clone()),
+    );
     Some(ChangelogEnrichConfig {
         changelog_table: j.left_table.clone(),
+        static_table: j.right_table.clone(),
+        left_keys,
+        right_keys,
+        left_outer: j.join_type == JoinType::Left,
         projection_sql,
     })
 }

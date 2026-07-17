@@ -493,6 +493,7 @@ impl CoordinatedCommitter {
         first_err.map_or(Ok(()), Err)
     }
 
+    #[allow(clippy::too_many_lines)] // One snapshot audit establishes a single commit frontier.
     async fn load_commit_inventory(&self) -> Result<CommitInventory, DbError> {
         let decision_store = self.decision_store.as_ref().ok_or_else(|| {
             DbError::Checkpoint(
@@ -893,6 +894,7 @@ impl CoordinatedCommitter {
     }
 
     #[cfg(feature = "cluster")]
+    #[allow(clippy::too_many_lines)] // Capsule validation is one cohesive fail-closed recovery protocol.
     async fn validate_cluster_recovery_capsules(
         &self,
         committed_attempts: &[CheckpointAttempt],
@@ -1042,6 +1044,7 @@ impl CoordinatedCommitter {
         .await
     }
 
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // One bounded commit transaction keeps its frontier and batching limits explicit.
     async fn commit_sealed_with_limits(
         &self,
         handle: &SinkTaskHandle,
@@ -1326,17 +1329,17 @@ impl CoordinatedCommitter {
         .buffer_unordered(MAX_PARTICIPANT_READY_READ_CONCURRENCY);
         tokio::pin!(reads);
         let mut retained_bytes = 0;
-        let mut readiness = Vec::new();
+        let mut records = Vec::new();
         while let Some(record) = reads.try_next().await? {
             let (key, participant_id, bytes) = record;
             retained_bytes = checked_participant_ready_total(retained_bytes, bytes.len())?;
-            let ready = serde_json::from_slice::<ParticipantReady>(&bytes).map_err(|error| {
+            let marker = serde_json::from_slice::<ParticipantReady>(&bytes).map_err(|error| {
                 DbError::Checkpoint(format!(
                     "committer: participant {participant_id} readiness for checkpoint {} is corrupt: {error}",
                     attempt.checkpoint_id,
                 ))
             })?;
-            let canonical = canonical_json_bytes(&ready).map_err(|error| {
+            let canonical = canonical_json_bytes(&marker).map_err(|error| {
                 DbError::Checkpoint(format!(
                     "committer: canonicalize participant {participant_id} readiness for checkpoint {}: {error}",
                     attempt.checkpoint_id
@@ -1348,9 +1351,9 @@ impl CoordinatedCommitter {
                     attempt.checkpoint_id
                 )));
             }
-            readiness.push((key, ready));
+            records.push((key, marker));
         }
-        Ok(readiness)
+        Ok(records)
     }
 
     async fn load_attempt_entries(
@@ -1616,6 +1619,7 @@ mod tests {
             flush_interval: Duration::from_secs(5),
             write_timeout: Duration::from_secs(5),
             event_tx,
+            terminal_tasks: None,
             #[cfg(feature = "cluster")]
             process_authority: None,
         })

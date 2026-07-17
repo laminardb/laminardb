@@ -11,12 +11,9 @@
 //! - Clean separation of concerns (buffering/epoch management vs. actual writes)
 //! - Easy mocking for unit tests
 //!
-//! # Transaction identity
-//!
-//! Delta's `txn` action provides an idempotence primitive. Production global exactly-once uses
-//! the runtime-owned deployment/pipeline/sink namespace with globally unique checkpoint IDs and
-//! one designated catalog commit. Writer-local IDs below support ordinary direct transactions;
-//! they are not a distributed checkpoint protocol by themselves.
+//! Coordinated exactly-once publication uses runtime-owned, stable transaction
+//! namespaces. Ordinary direct writes do not emit writer-local transaction
+//! actions because a process-random identity cannot deduplicate recovery.
 
 #[cfg(feature = "delta-lake")]
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -77,6 +74,388 @@ const SET_TRANSACTION_RETENTION: &str = "delta.setTransactionRetentionDuration";
 
 #[cfg(feature = "delta-lake")]
 const COORDINATED_HEAD_CONCURRENCY: usize = 16;
+
+// Coordinated publication uses a separate metadata-client budget. The caller
+// deadline owns preparation; after preparation, one conditional catalog
+// attempt is allowed to finish without cancellation. Bounding both the HTTP
+// and optimistic retry layers makes that terminal fence finite.
+#[cfg(feature = "delta-lake")]
+const COORDINATED_REQUEST_TIMEOUT: &str = "30s";
+#[cfg(feature = "delta-lake")]
+const COORDINATED_CONNECT_TIMEOUT: &str = "10s";
+#[cfg(feature = "delta-lake")]
+const COORDINATED_RETRY_TIMEOUT: &str = "30s";
+#[cfg(feature = "delta-lake")]
+const COORDINATED_HTTP_MAX_RETRIES: &str = "0";
+#[cfg(feature = "delta-lake")]
+const COORDINATED_MAX_BACKOFF: &str = "1s";
+#[cfg(feature = "delta-lake")]
+const COORDINATED_TERMINAL_IO_HORIZON: Duration = Duration::from_secs(24 * 60 * 60);
+#[cfg(feature = "delta-lake")]
+const COORDINATED_CLOCK_SKEW_MARGIN: Duration = Duration::from_secs(5 * 60);
+#[cfg(feature = "delta-lake")]
+const MIN_COORDINATED_DELETED_FILE_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+#[cfg(feature = "delta-lake")]
+pub(super) fn bound_coordinated_storage_options(
+    mut options: HashMap<String, String>,
+) -> HashMap<String, String> {
+    options.retain(|key, _| {
+        !matches!(
+            key.to_ascii_lowercase().as_str(),
+            "timeout"
+                | "aws_timeout"
+                | "azure_timeout"
+                | "google_timeout"
+                | "connect_timeout"
+                | "aws_connect_timeout"
+                | "azure_connect_timeout"
+                | "google_connect_timeout"
+                | "max_retries"
+                | "retry_timeout"
+                | "max_backoff"
+                | "backoff.max_backoff"
+                | "backoff_config.max_backoff"
+        )
+    });
+    options.insert("timeout".into(), COORDINATED_REQUEST_TIMEOUT.into());
+    options.insert("connect_timeout".into(), COORDINATED_CONNECT_TIMEOUT.into());
+    options.insert("retry_timeout".into(), COORDINATED_RETRY_TIMEOUT.into());
+    options.insert("max_retries".into(), COORDINATED_HTTP_MAX_RETRIES.into());
+    options.insert("max_backoff".into(), COORDINATED_MAX_BACKOFF.into());
+    options
+}
+
+#[cfg(feature = "delta-lake")]
+fn effective_values<F>(
+    options: &HashMap<String, String>,
+    aliases: &[&str],
+    environment_keys: &[&str],
+    environment: &F,
+) -> Vec<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let explicit: Vec<String> = options
+        .iter()
+        .filter(|(key, _)| aliases.iter().any(|alias| key.eq_ignore_ascii_case(alias)))
+        .map(|(_, value)| value.clone())
+        .collect();
+    if !explicit.is_empty() {
+        return explicit;
+    }
+    environment_keys
+        .iter()
+        .filter_map(|key| environment(key))
+        .collect()
+}
+
+#[cfg(feature = "delta-lake")]
+fn has_effective_value<F>(
+    options: &HashMap<String, String>,
+    aliases: &[&str],
+    environment_keys: &[&str],
+    environment: &F,
+) -> bool
+where
+    F: Fn(&str) -> Option<String>,
+{
+    effective_values(options, aliases, environment_keys, environment)
+        .iter()
+        .any(|value| !value.trim().is_empty())
+}
+
+#[cfg(feature = "delta-lake")]
+fn is_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "y" | "on"
+    )
+}
+
+#[cfg(feature = "delta-lake")]
+fn validate_coordinated_s3_options<F>(
+    options: &HashMap<String, String>,
+    environment: &F,
+) -> Result<(), ConnectorError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if has_effective_value(
+        options,
+        &[
+            "endpoint",
+            "endpoint_url",
+            "aws_endpoint",
+            "aws_endpoint_url",
+        ],
+        &["AWS_ENDPOINT", "AWS_ENDPOINT_URL"],
+        environment,
+    ) {
+        return Err(ConnectorError::ConfigurationError(
+            "Delta exactly-once does not admit custom S3 endpoints until their atomic-create behavior passes the release fault suite"
+                .into(),
+        ));
+    }
+    let conditional_put = effective_values(
+        options,
+        &["conditional_put", "aws_conditional_put"],
+        &["AWS_CONDITIONAL_PUT"],
+        environment,
+    );
+    if conditional_put
+        .iter()
+        .any(|value| !value.trim().eq_ignore_ascii_case("etag"))
+    {
+        return Err(ConnectorError::ConfigurationError(
+            "Delta exactly-once requires native S3 ETag conditional put; Dynamo and disabled conditional-put modes are not certified"
+                .into(),
+        ));
+    }
+    if has_effective_value(
+        options,
+        &["s3_locking_provider", "aws_s3_locking_provider"],
+        &["AWS_S3_LOCKING_PROVIDER"],
+        environment,
+    ) || effective_values(
+        options,
+        &["allow_unsafe_rename", "aws_s3_allow_unsafe_rename"],
+        &["AWS_S3_ALLOW_UNSAFE_RENAME"],
+        environment,
+    )
+    .iter()
+    .any(|value| is_truthy(value))
+    {
+        return Err(ConnectorError::ConfigurationError(
+            "Delta exactly-once requires the native conditional-put log store; locking-provider and unsafe-rename modes are not certified"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "delta-lake")]
+fn validate_coordinated_azure_options<F>(
+    options: &HashMap<String, String>,
+    environment: &F,
+) -> Result<(), ConnectorError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if has_effective_value(
+        options,
+        &["endpoint", "azure_endpoint", "azure_storage_endpoint"],
+        &["AZURE_ENDPOINT", "AZURE_STORAGE_ENDPOINT"],
+        environment,
+    ) || effective_values(
+        options,
+        &[
+            "use_emulator",
+            "azure_use_emulator",
+            "azure_storage_use_emulator",
+        ],
+        &["AZURE_USE_EMULATOR", "AZURE_STORAGE_USE_EMULATOR"],
+        environment,
+    )
+    .iter()
+    .any(|value| is_truthy(value))
+    {
+        return Err(ConnectorError::ConfigurationError(
+            "Delta exactly-once does not admit custom Azure endpoints or emulators until their atomic-create behavior passes the release fault suite"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "delta-lake")]
+fn validate_coordinated_gcs_options<F>(
+    options: &HashMap<String, String>,
+    environment: &F,
+) -> Result<(), ConnectorError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if has_effective_value(
+        options,
+        &[
+            "google_service_account",
+            "google_service_account_path",
+            "service_account",
+            "service_account_path",
+        ],
+        &["GOOGLE_SERVICE_ACCOUNT", "GOOGLE_SERVICE_ACCOUNT_PATH"],
+        environment,
+    ) {
+        return Err(ConnectorError::ConfigurationError(
+            "Delta exactly-once does not admit GCS service-account path files because they can override the storage endpoint; use workload identity, application-default credentials, or an inline key"
+                .into(),
+        ));
+    }
+    for key in effective_values(
+        options,
+        &["google_service_account_key", "service_account_key"],
+        &["GOOGLE_SERVICE_ACCOUNT_KEY"],
+        environment,
+    ) {
+        let document: serde_json::Value = serde_json::from_str(&key).map_err(|error| {
+            ConnectorError::ConfigurationError(format!(
+                "invalid GCS service-account key for Delta exactly-once: {error}"
+            ))
+        })?;
+        if document.get("gcs_base_url").is_some() {
+            return Err(ConnectorError::ConfigurationError(
+                "Delta exactly-once does not admit a custom gcs_base_url until its atomic-create behavior passes the release fault suite"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "delta-lake")]
+fn validate_coordinated_storage_preflight_with_env<F>(
+    table_path: &str,
+    options: &HashMap<String, String>,
+    environment: &F,
+) -> Result<(), ConnectorError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let scheme = table_path
+        .split_once("://")
+        .map_or("file", |(scheme, _)| scheme)
+        .to_ascii_lowercase();
+    match scheme.as_str() {
+        "s3" | "s3a" => validate_coordinated_s3_options(options, environment),
+        "az" | "azure" | "abfs" | "abfss" => {
+            validate_coordinated_azure_options(options, environment)
+        }
+        "gs" | "gcs" => validate_coordinated_gcs_options(options, environment),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(feature = "delta-lake")]
+pub(super) fn validate_coordinated_storage_preflight(
+    table_path: &str,
+    options: &HashMap<String, String>,
+) -> Result<(), ConnectorError> {
+    validate_coordinated_storage_preflight_with_env(table_path, options, &|key| {
+        std::env::var(key).ok()
+    })
+}
+
+#[cfg(feature = "delta-lake")]
+fn is_certified_coordinated_log_store(name: &str) -> bool {
+    name == "DefaultLogStore"
+}
+
+#[cfg(feature = "delta-lake")]
+fn validate_coordinated_log_store(table: &DeltaTable) -> Result<(), ConnectorError> {
+    let log_store = table.log_store();
+    if !is_certified_coordinated_log_store(&log_store.name()) {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "Delta exactly-once requires the single-step atomic-create DefaultLogStore; '{}' is not certified",
+            log_store.name()
+        )));
+    }
+    validate_coordinated_storage_preflight(
+        log_store.config().location().as_str(),
+        &log_store.config().options().raw,
+    )
+}
+
+/// Preserves the typed delta-rs commit failure until the sink can classify
+/// publication certainty. Local planning failures have not dispatched a
+/// catalog commit.
+#[cfg(feature = "delta-lake")]
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum DeltaWriteAttemptError {
+    /// Local validation or query construction failed before commit dispatch.
+    #[error(transparent)]
+    Local(#[from] ConnectorError),
+    /// delta-rs entered the write operation and returned its typed failure.
+    #[error(transparent)]
+    Delta(#[from] deltalake::DeltaTableError),
+}
+
+#[cfg(feature = "delta-lake")]
+impl DeltaWriteAttemptError {
+    /// True only when delta-rs proves this attempt lost an optimistic race and
+    /// did not publish a commit.
+    pub(crate) fn is_definite_optimistic_conflict(&self) -> bool {
+        matches!(self, Self::Delta(error) if is_definite_prewrite_conflict(error))
+    }
+}
+
+#[cfg(feature = "delta-lake")]
+fn is_definite_prewrite_conflict(error: &deltalake::DeltaTableError) -> bool {
+    use deltalake::kernel::transaction::{CommitConflictError, TransactionError};
+
+    matches!(
+        error,
+        deltalake::DeltaTableError::Transaction {
+            source: TransactionError::CommitConflict(
+                CommitConflictError::ConcurrentAppend
+                    | CommitConflictError::ConcurrentDeleteRead
+                    | CommitConflictError::ConcurrentDeleteDelete
+                    | CommitConflictError::ConcurrentTransaction
+            )
+        }
+    )
+}
+
+#[cfg(feature = "delta-lake")]
+fn object_store_error_has_retryable_transport(error: &deltalake::ObjectStoreError) -> bool {
+    use delta_object_store::client::{HttpError, HttpErrorKind};
+
+    // Typed permanent/conditional variants fail closed. A Generic wrapper is
+    // retryable only when its source chain contains a typed transport failure.
+    let deltalake::ObjectStoreError::Generic { source, .. } = error else {
+        return false;
+    };
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(source.as_ref());
+    while let Some(current) = cause {
+        if let Some(http) = current.downcast_ref::<HttpError>() {
+            return matches!(
+                http.kind(),
+                HttpErrorKind::Connect
+                    | HttpErrorKind::Request
+                    | HttpErrorKind::Timeout
+                    | HttpErrorKind::Interrupted
+            );
+        }
+        cause = current.source();
+    }
+    false
+}
+
+#[cfg(feature = "delta-lake")]
+pub(crate) fn delta_error_has_retryable_transport(error: &deltalake::DeltaTableError) -> bool {
+    match error {
+        deltalake::DeltaTableError::ObjectStore { source }
+        | deltalake::DeltaTableError::Transaction {
+            source: deltalake::kernel::transaction::TransactionError::ObjectStore { source },
+        } => object_store_error_has_retryable_transport(source),
+        _ => false,
+    }
+}
+
+#[cfg(feature = "delta-lake")]
+pub(crate) fn is_definite_coordinated_nonpublication(error: &deltalake::DeltaTableError) -> bool {
+    use deltalake::kernel::transaction::TransactionError;
+
+    is_definite_prewrite_conflict(error)
+        || matches!(
+            error,
+            deltalake::DeltaTableError::VersionAlreadyExists(_)
+                | deltalake::DeltaTableError::Transaction {
+                    source: TransactionError::VersionAlreadyExists(_)
+                        | TransactionError::MaxCommitAttempts(_)
+                }
+        )
+}
 
 #[cfg(all(feature = "delta-lake", test))]
 #[derive(Clone)]
@@ -172,8 +551,8 @@ pub async fn open_or_create_table(
     let url = path_to_url(table_path)?;
 
     // Try to open or initialize the table. `url` and `storage_options` are
-    // not referenced after this call, so move rather than clone — a cloned
-    // HashMap per compaction tick / table reopen was pure overhead.
+    // not referenced after this call, so move rather than clone; repeated
+    // conflict-recovery opens otherwise copy the complete option map.
     let table = DeltaTable::try_from_url_with_storage_options(url, storage_options)
         .await
         .map_err(|e| ConnectorError::ConnectionFailed(format!("failed to open table: {e}")))?;
@@ -221,14 +600,12 @@ pub async fn open_or_create_table(
     Ok(table)
 }
 
-/// Writes batches to a Delta Lake table with exactly-once semantics.
+/// Writes batches to a Delta Lake table.
 ///
 /// # Arguments
 ///
 /// * `table` - The Delta Lake table handle (consumed and returned)
 /// * `batches` - Record batches to write
-/// * `writer_id` - Unique writer identifier for exactly-once deduplication
-/// * `epoch` - The epoch number for this write (stored in txn metadata)
 /// * `save_mode` - Delta Lake save mode (Append, Overwrite, etc.)
 /// * `partition_columns` - Optional partition column name slice
 /// * `schema_evolution` - If true, auto-merge new columns into the table schema
@@ -239,21 +616,18 @@ pub async fn open_or_create_table(
 ///
 /// # Errors
 ///
-/// Returns `ConnectorError::WriteError` if the write fails.
+/// Preserves a typed delta-rs failure when the write operation fails.
 #[cfg(feature = "delta-lake")]
 #[allow(clippy::too_many_arguments)]
-pub async fn write_batches(
+pub(crate) async fn write_batches(
     table: DeltaTable,
     batches: Vec<RecordBatch>,
-    writer_id: &str,
-    epoch: u64,
     save_mode: SaveMode,
     partition_columns: Option<&[String]>,
     schema_evolution: bool,
     target_file_size: Option<usize>,
-    create_checkpoint: bool,
     writer_properties: Option<deltalake::parquet::file::properties::WriterProperties>,
-) -> Result<(DeltaTable, i64), ConnectorError> {
+) -> Result<(DeltaTable, i64), DeltaWriteAttemptError> {
     if batches.is_empty() {
         debug!("no batches to write, skipping");
         let version = table.version().unwrap_or(0);
@@ -263,29 +637,15 @@ pub async fn write_batches(
     let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
 
     debug!(
-        writer_id,
-        epoch,
         total_rows,
         num_batches = batches.len(),
         "writing batches to Delta Lake"
     );
 
-    // Delta encodes application transaction versions as signed integers. Overflow must fail
-    // closed; wrapping a new epoch onto an old version would suppress or duplicate output.
-    let epoch_i64 = i64::try_from(epoch).map_err(|_| {
-        ConnectorError::TransactionError(format!(
-            "Delta transaction epoch {epoch} exceeds i64::MAX"
-        ))
-    })?;
-
     let mut write_builder = table
         .write(batches)
         .with_save_mode(save_mode)
-        .with_commit_properties(
-            CommitProperties::default()
-                .with_application_transaction(Transaction::new(writer_id, epoch_i64))
-                .with_create_checkpoint(create_checkpoint),
-        );
+        .with_commit_properties(CommitProperties::default());
 
     // Forward target file size to delta-rs so Parquet files match the
     // user's configured size, not just the internal default.
@@ -310,73 +670,13 @@ pub async fn write_batches(
     }
 
     // Execute the write.
-    let table = write_builder
-        .await
-        .map_err(|e| ConnectorError::WriteError(format!("Delta Lake write failed: {e}")))?;
+    let table = write_builder.await.map_err(DeltaWriteAttemptError::Delta)?;
 
     let version = table.version().unwrap_or(0);
 
-    info!(
-        writer_id,
-        epoch, version, total_rows, "committed Delta Lake transaction"
-    );
+    info!(version, total_rows, "committed Delta Lake transaction");
 
     Ok((table, version))
-}
-
-/// Retrieves the last committed application transaction version.
-///
-/// This is used for exactly-once recovery: on startup, we check what epoch was
-/// last committed and skip any epochs <= that value.
-///
-/// # Arguments
-///
-/// * `table` - The Delta Lake table handle
-/// * `writer_id` - The writer identifier to look up
-///
-/// # Returns
-///
-/// The last committed non-negative version, or `None` when the namespace has
-/// never committed. Metadata read/decoding failures are propagated so exact
-/// recovery never mistakes an unreadable cursor for an empty one.
-///
-/// # Errors
-///
-/// Returns `ConnectorError::TransactionError` when the table snapshot or
-/// transaction metadata cannot be read, or when the stored cursor is negative.
-#[cfg(feature = "delta-lake")]
-pub async fn get_last_committed_version(
-    table: &DeltaTable,
-    writer_id: &str,
-) -> Result<Option<u64>, ConnectorError> {
-    let snapshot = table.snapshot().map_err(|error| {
-        ConnectorError::TransactionError(format!("read Delta snapshot: {error}"))
-    })?;
-
-    match snapshot
-        .transaction_version(&table.log_store(), writer_id)
-        .await
-    {
-        Ok(Some(version)) => {
-            let version = u64::try_from(version).map_err(|_| {
-                ConnectorError::TransactionError(format!(
-                    "Delta transaction cursor for '{writer_id}' is negative"
-                ))
-            })?;
-            debug!(
-                writer_id,
-                version, "found last committed version from txn metadata"
-            );
-            Ok(Some(version))
-        }
-        Ok(None) => {
-            debug!(writer_id, "no transaction metadata found for namespace");
-            Ok(None)
-        }
-        Err(error) => Err(ConnectorError::TransactionError(format!(
-            "read Delta transaction cursor for '{writer_id}': {error}"
-        ))),
-    }
 }
 
 #[cfg(feature = "delta-lake")]
@@ -411,6 +711,10 @@ fn reject_transaction_retention(table: &DeltaTable) -> Result<(), ConnectorError
 /// corruption, never a fresh target. Delta transaction versions are treated as
 /// opaque persisted values and checked explicitly rather than assumed to be
 /// monotonic.
+///
+/// # Errors
+/// Returns an error when the table cursor is unreadable, partial, or outside
+/// Laminar's checkpoint/fencing ranges.
 #[cfg(feature = "delta-lake")]
 pub async fn get_coordinated_cursor(
     table: &DeltaTable,
@@ -789,6 +1093,7 @@ fn bounded_map_bytes<'a>(
 }
 
 #[cfg(feature = "delta-lake")]
+#[allow(clippy::too_many_lines)] // A descriptor is validated in one fail-closed pass.
 fn validate_coordinated_descriptors(
     adds: &[deltalake::kernel::Add],
     partition_columns: &[String],
@@ -945,6 +1250,16 @@ fn validate_coordinated_descriptors(
 }
 
 #[cfg(feature = "delta-lake")]
+fn validate_coordinated_retention(retention: Duration) -> Result<(), ConnectorError> {
+    if retention < MIN_COORDINATED_DELETED_FILE_RETENTION {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "Delta exactly-once requires deleted-file retention of at least {MIN_COORDINATED_DELETED_FILE_RETENTION:?}; table config is {retention:?}",
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "delta-lake")]
 async fn validate_coordinated_objects(
     table: &DeltaTable,
     objects: Vec<CoordinatedObject>,
@@ -955,6 +1270,7 @@ async fn validate_coordinated_objects(
     if objects.is_empty() {
         return Ok(());
     }
+    validate_coordinated_retention(deleted_file_retention)?;
 
     let retention = chrono::Duration::from_std(deleted_file_retention).map_err(|_| {
         ConnectorError::TransactionError(
@@ -1053,6 +1369,7 @@ struct CoordinatedPublicationOutcome {
 }
 
 #[cfg(feature = "delta-lake")]
+#[allow(clippy::too_many_lines)] // Keep the ordered prepare/admit/reconcile protocol contiguous.
 async fn publish_coordinated<F>(
     table: &DeltaTable,
     external_key: &str,
@@ -1060,7 +1377,7 @@ async fn publish_coordinated<F>(
     prepare: F,
 ) -> Result<CoordinatedPublicationOutcome, ConnectorError>
 where
-    F: FnOnce(
+    F: Fn(
             Option<CoordinatedCommitCursor>,
         ) -> Result<PreparedCoordinatedPublication, ConnectorError>
         + Send,
@@ -1077,8 +1394,22 @@ where
             "Delta coordinated publication budget exceeds the supported clock range".into(),
         )
     })?;
+    let terminal_horizon =
+        chrono::Duration::from_std(COORDINATED_TERMINAL_IO_HORIZON).map_err(|_| {
+            ConnectorError::TransactionError(
+                "Delta coordinated terminal I/O horizon exceeds the supported clock range".into(),
+            )
+        })?;
+    let clock_skew_margin =
+        chrono::Duration::from_std(COORDINATED_CLOCK_SKEW_MARGIN).map_err(|_| {
+            ConnectorError::TransactionError(
+                "Delta coordinated clock-skew margin exceeds the supported clock range".into(),
+            )
+        })?;
     let required_alive_until = chrono::Utc::now()
         .checked_add_signed(budget_on_clock)
+        .and_then(|deadline| deadline.checked_add_signed(terminal_horizon))
+        .and_then(|horizon| horizon.checked_add_signed(clock_skew_margin))
         .ok_or_else(|| {
             ConnectorError::TransactionError(
                 "Delta coordinated recovery horizon exceeds the supported clock range".into(),
@@ -1087,27 +1418,29 @@ where
 
     // Cursor filtering and the commit base share one freshly updated snapshot.
     let mut current = table.clone();
+    validate_coordinated_log_store(&current)?;
     tokio::time::timeout_at(deadline, current.update_state())
         .await
         .map_err(|_| {
-            ConnectorError::TransactionError(
-                "Delta coordinated snapshot refresh exceeded the publication deadline".into(),
+            ConnectorError::WriteError(
+                "Delta coordinated snapshot refresh exceeded the publication deadline without dispatching a commit"
+                    .into(),
             )
         })?
         .map_err(|error| {
-            ConnectorError::TransactionError(format!(
-                "refresh Delta coordinated publication snapshot: {error}"
+            ConnectorError::WriteError(format!(
+                "refresh Delta coordinated publication snapshot before commit dispatch: {error}"
             ))
         })?;
     ensure_publication_deadline(deadline, "snapshot refresh")?;
-    let observed =
-        tokio::time::timeout_at(deadline, get_coordinated_cursor(&current, external_key))
-            .await
-            .map_err(|_| {
-                ConnectorError::TransactionError(
-                    "Delta coordinated cursor read exceeded the publication deadline".into(),
-                )
-            })??;
+    let observed = tokio::time::timeout_at(deadline, get_coordinated_cursor(&current, external_key))
+        .await
+        .map_err(|_| {
+            ConnectorError::WriteError(
+                "Delta coordinated cursor read exceeded the publication deadline without dispatching a commit"
+                    .into(),
+            )
+        })??;
     ensure_publication_deadline(deadline, "cursor read")?;
     let PreparedCoordinatedPublication::Commit {
         adds,
@@ -1185,92 +1518,90 @@ where
     let actions: Vec<Action> = adds.into_iter().map(Action::Add).collect();
     let (checkpoint_transaction_id, fence_transaction_id) =
         coordinated_transaction_ids(external_key);
-    let props = CommitProperties::default().with_application_transactions(vec![
-        Transaction::new(checkpoint_transaction_id, checkpoint_id),
-        Transaction::new(fence_transaction_id, fencing_token),
-    ]);
-    ensure_publication_deadline(deadline, "catalog commit admission")?;
-    let catalog_commit = async {
-        #[cfg(test)]
-        if let Ok(delay) = DELAY_COORDINATED_CATALOG_COMMIT.try_with(Clone::clone) {
-            let snapshot = (*snapshot).clone();
-            let log_store = current.log_store();
-            return tokio::spawn(async move {
-                delay.started.notify_one();
-                delay.release.notified().await;
-                CommitBuilder::from(props)
-                    .with_actions(actions)
-                    .build(Some(&snapshot), log_store, operation)
-                    .await
-            })
-            .await
-            .map_err(|error| {
-                deltalake::DeltaTableError::Generic(format!(
-                    "delayed coordinated catalog commit task failed: {error}"
-                ))
-            })?;
+    // Checkpoint recovery owns optimistic retries. delta-rs receives one
+    // conditional catalog attempt so a timed-out terminal fence has a bounded
+    // amount of provider work and cannot amplify descriptor HEAD traffic.
+    let props = CommitProperties::default()
+        .with_max_retries(0)
+        .with_application_transactions(vec![
+            Transaction::new(checkpoint_transaction_id, checkpoint_id),
+            Transaction::new(fence_transaction_id, fencing_token),
+        ]);
+    ensure_publication_deadline(deadline, "catalog commit preparation")?;
+    let pre_commit = CommitBuilder::from(props).with_actions(actions).build(
+        Some(snapshot),
+        current.log_store(),
+        operation,
+    );
+    let prepared_commit = tokio::time::timeout_at(
+        deadline,
+        pre_commit.into_prepared_commit_future(),
+    )
+    .await
+    .map_err(|_| {
+        ConnectorError::WriteError(
+            "Delta coordinated commit preparation exceeded the publication deadline without dispatching a catalog write"
+                .into(),
+        )
+    })?
+    .map_err(|error| {
+        if delta_error_has_retryable_transport(&error) {
+            ConnectorError::WriteError(format!(
+                "prepare Delta coordinated commit before catalog dispatch: {error}"
+            ))
+        } else {
+            ConnectorError::TransactionError(format!(
+                "prepare Delta coordinated commit before catalog dispatch: {error}"
+            ))
         }
-        CommitBuilder::from(props)
-            .with_actions(actions)
-            .build(Some(snapshot), current.log_store(), operation)
-            .await
-    };
-    let commit_result = tokio::time::timeout_at(deadline, catalog_commit)
-        .await
-        .map_err(|_| {
-            ConnectorError::TransactionError(
-                "Delta coordinated catalog commit exceeded the publication deadline; the external outcome must be reconciled from its cursor"
-                    .into(),
-            )
-        })?;
-    match commit_result {
-        Ok(_) => {}
-        Err(deltalake::DeltaTableError::Transaction {
-            source:
-                deltalake::kernel::transaction::TransactionError::CommitConflict(
-                    deltalake::kernel::transaction::CommitConflictError::ConcurrentTransaction,
-                ),
-        }) => {
-            ensure_publication_deadline(deadline, "concurrent transaction reconciliation")?;
-            let mut reconciled = table.clone();
-            tokio::time::timeout_at(deadline, reconciled.update_state())
-                .await
-                .map_err(|_| {
-                    ConnectorError::TransactionError(
-                        "Delta coordinated conflict reconciliation exceeded the publication deadline"
-                            .into(),
-                    )
-                })?
-                .map_err(|error| {
-                    ConnectorError::TransactionError(format!(
-                        "refresh Delta coordinated conflict snapshot: {error}"
-                    ))
+    })?;
+    ensure_publication_deadline(deadline, "catalog commit admission")?;
+
+    #[cfg(test)]
+    if let Ok(delay) = DELAY_COORDINATED_CATALOG_COMMIT.try_with(Clone::clone) {
+        delay.started.notify_one();
+        delay.release.notified().await;
+    }
+
+    // Only PreparedCommit may outlive the caller: it performs conflict checks
+    // and the atomic log write. Dropping the returned PostCommit deliberately
+    // keeps snapshot refresh, checkpoints, and log cleanup off this path.
+    match prepared_commit.await {
+        Ok(_post_commit) => Ok(CoordinatedPublicationOutcome { descriptor_count }),
+        Err(error) => {
+            let reconciliation = async {
+                let mut reconciled = current.clone();
+                reconciled.update_state().await.map_err(|refresh_error| {
+                    format!("refresh after prepared-commit failure: {refresh_error}")
                 })?;
-            let observed = tokio::time::timeout_at(
-                deadline,
-                get_coordinated_cursor(&reconciled, external_key),
-            )
-            .await
-            .map_err(|_| {
-                ConnectorError::TransactionError(
-                    "Delta coordinated conflict cursor read exceeded the publication deadline"
-                        .into(),
-                )
-            })??;
-            if observed != Some(cursor) {
-                return Err(ConnectorError::TransactionError(format!(
-                    "Delta coordinated transaction conflict did not prove exact target cursor {} with fencing token {}",
-                    cursor.checkpoint_id, cursor.fencing_token
+                get_coordinated_cursor(&reconciled, external_key)
+                    .await
+                    .map_err(|cursor_error| {
+                        format!("read cursor after prepared-commit failure: {cursor_error}")
+                    })
+            }
+            .await;
+            if reconciliation.as_ref() == Ok(&Some(cursor)) {
+                return Ok(CoordinatedPublicationOutcome { descriptor_count });
+            }
+            if is_definite_coordinated_nonpublication(&error) {
+                return Err(ConnectorError::WriteError(format!(
+                    "Delta coordinated optimistic collision did not publish: {error}"
                 )));
             }
-        }
-        Err(error) => {
-            return Err(ConnectorError::TransactionError(format!(
-                "coordinated commit: {error}"
-            )));
+            let retryable = delta_error_has_retryable_transport(&error);
+            let reconciliation = match reconciliation {
+                Ok(observed) => format!("reconciliation observed cursor {observed:?}"),
+                Err(reconciliation_error) => reconciliation_error,
+            };
+            Err(ConnectorError::outcome_unknown(
+                format!(
+                    "Delta coordinated catalog write was dispatched but its outcome is not known: {error}; {reconciliation}"
+                ),
+                retryable,
+            ))
         }
     }
-    Ok(CoordinatedPublicationOutcome { descriptor_count })
 }
 
 /// Filter a validated checkpoint batch against one freshly observed cursor,
@@ -1321,8 +1652,8 @@ pub(super) async fn commit_batch_coordinated(
             (Some(descriptor.binding), descriptor.adds)
         });
         Ok(PreparedCoordinatedPublication::Commit {
-            adds,
-            binding,
+            adds: adds.clone(),
+            binding: binding.clone(),
             cursor: CoordinatedCommitCursor {
                 checkpoint_id: batch.target.checkpoint_id,
                 fencing_token: batch.fencing_token,
@@ -1373,8 +1704,8 @@ pub(super) async fn commit_adds_coordinated(
             }
         }
         Ok(PreparedCoordinatedPublication::Commit {
-            adds,
-            binding,
+            adds: adds.clone(),
+            binding: binding.clone(),
             cursor,
             descriptor_count: 1,
         })
@@ -2016,20 +2347,16 @@ pub struct MergeResult {
 /// Returns `ConnectorError::WriteError` if the merge fails.
 #[cfg(feature = "delta-lake")]
 #[allow(clippy::too_many_lines)]
-#[allow(clippy::too_many_arguments)]
-pub async fn merge_changelog(
+pub(crate) async fn merge_changelog(
     table: DeltaTable,
     source_batch: RecordBatch,
     key_columns: &[String],
-    writer_id: &str,
-    epoch: u64,
     schema_evolution: bool,
     writer_properties: Option<deltalake::parquet::file::properties::WriterProperties>,
     ctx: &datafusion::prelude::SessionContext,
-) -> Result<(DeltaTable, MergeResult), ConnectorError> {
+) -> Result<(DeltaTable, MergeResult), DeltaWriteAttemptError> {
     use datafusion::prelude::*;
     use deltalake::kernel::transaction::CommitProperties;
-    use deltalake::kernel::Transaction;
 
     const CDC_COLUMNS: &[&str] = &["_op", "_ts_ms"];
 
@@ -2084,12 +2411,6 @@ pub async fn merge_changelog(
     let upsert_pred = col("source._op").in_list(vec![lit("I"), lit("U"), lit("r")], false);
     let delete_pred = col("source._op").eq(lit("D"));
 
-    let epoch_i64 = i64::try_from(epoch).map_err(|_| {
-        ConnectorError::TransactionError(format!(
-            "Delta MERGE transaction epoch {epoch} exceeds i64::MAX"
-        ))
-    })?;
-
     let non_key_for_update = non_key_user_columns;
     let all_for_insert = all_user_columns;
 
@@ -2097,10 +2418,7 @@ pub async fn merge_changelog(
         .merge(source_df, predicate)
         .with_source_alias("source")
         .with_target_alias("target")
-        .with_commit_properties(
-            CommitProperties::default()
-                .with_application_transaction(Transaction::new(writer_id, epoch_i64)),
-        )
+        .with_commit_properties(CommitProperties::default())
         .when_matched_update(|update| {
             let mut u = update.predicate(upsert_pred.clone());
             for col_name in &non_key_for_update {
@@ -2128,9 +2446,7 @@ pub async fn merge_changelog(
         merge_builder = merge_builder.with_writer_properties(props);
     }
 
-    let (table, metrics) = merge_builder.await.map_err(|e| {
-        ConnectorError::WriteError(format!("Delta Lake changelog MERGE failed: {e}"))
-    })?;
+    let (table, metrics) = merge_builder.await.map_err(DeltaWriteAttemptError::Delta)?;
 
     let result = MergeResult {
         rows_inserted: metrics.num_target_rows_inserted,
@@ -2139,8 +2455,6 @@ pub async fn merge_changelog(
     };
 
     info!(
-        writer_id,
-        epoch,
         rows_inserted = result.rows_inserted,
         rows_updated = result.rows_updated,
         rows_deleted = result.rows_deleted,
@@ -2148,101 +2462,6 @@ pub async fn merge_changelog(
     );
 
     Ok((table, result))
-}
-
-/// Result of a compaction (OPTIMIZE) operation.
-#[cfg(feature = "delta-lake")]
-#[derive(Debug)]
-pub struct CompactionResult {
-    /// Number of new optimized files written.
-    pub files_added: u64,
-    /// Number of small files removed.
-    pub files_removed: u64,
-    /// Number of partitions that were optimized.
-    pub partitions_optimized: u64,
-}
-
-/// Runs an OPTIMIZE compaction on a Delta Lake table.
-///
-/// Compacts small Parquet files into larger ones (target size), optionally
-/// applying Z-ORDER clustering.
-///
-/// # Errors
-///
-/// Returns `ConnectorError::Internal` if the operation fails.
-#[cfg(feature = "delta-lake")]
-pub async fn run_compaction(
-    table: DeltaTable,
-    target_file_size: u64,
-    z_order_columns: &[String],
-    writer_properties: Option<deltalake::parquet::file::properties::WriterProperties>,
-) -> Result<(DeltaTable, CompactionResult), ConnectorError> {
-    use deltalake::operations::optimize::OptimizeType;
-
-    info!(target_file_size, "running Delta Lake compaction (OPTIMIZE)");
-
-    let optimize_type = if z_order_columns.is_empty() {
-        OptimizeType::Compact
-    } else {
-        OptimizeType::ZOrder(z_order_columns.to_vec())
-    };
-
-    let mut optimize_builder = table
-        .optimize()
-        .with_type(optimize_type)
-        .with_target_size(target_file_size);
-
-    if let Some(props) = writer_properties {
-        optimize_builder = optimize_builder.with_writer_properties(props);
-    }
-
-    let (table, metrics) = optimize_builder
-        .await
-        .map_err(|e| ConnectorError::Internal(format!("compaction failed: {e}")))?;
-
-    let result = CompactionResult {
-        files_added: metrics.num_files_added,
-        files_removed: metrics.num_files_removed,
-        partitions_optimized: metrics.partitions_optimized,
-    };
-
-    info!(
-        files_added = result.files_added,
-        files_removed = result.files_removed,
-        partitions_optimized = result.partitions_optimized,
-        "Delta Lake compaction complete"
-    );
-
-    Ok((table, result))
-}
-
-/// Runs VACUUM on a Delta Lake table, deleting old unreferenced files.
-///
-/// # Errors
-///
-/// Returns `ConnectorError::Internal` if the operation fails.
-#[cfg(feature = "delta-lake")]
-pub async fn run_vacuum(
-    table: DeltaTable,
-    retention: std::time::Duration,
-) -> Result<(DeltaTable, usize), ConnectorError> {
-    let retention_hours = retention.as_secs() / 3600;
-    info!(retention_hours, "running Delta Lake VACUUM");
-
-    let chrono_duration =
-        chrono::Duration::from_std(retention).unwrap_or_else(|_| chrono::Duration::hours(168)); // fallback: 7 days
-
-    let (table, metrics) = table
-        .vacuum()
-        .with_retention_period(chrono_duration)
-        .await
-        .map_err(|e| ConnectorError::Internal(format!("vacuum failed: {e}")))?;
-
-    let files_deleted = metrics.files_deleted.len();
-
-    info!(files_deleted, "Delta Lake VACUUM complete");
-
-    Ok((table, files_deleted))
 }
 
 /// Resolves catalog-aware table URI and merges catalog-specific storage options.

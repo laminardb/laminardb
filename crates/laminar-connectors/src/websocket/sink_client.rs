@@ -15,7 +15,8 @@ use tracing::{debug, info, warn};
 
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{
-    SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology, WriteResult,
+    ConnectorTaskGuard, ConnectorTaskOwner, ConnectorTaskTracker, SinkConnector, SinkConsistency,
+    SinkContract, SinkInputMode, SinkTopology, WriteResult,
 };
 use crate::error::ConnectorError;
 
@@ -49,8 +50,10 @@ fn spawn_control_reader(
     mut read: WsRead,
     alive: Arc<AtomicBool>,
     connection_guard: ConnectionGuard,
+    task_guard: ConnectorTaskGuard,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let _task_guard = task_guard;
         let _connection_guard = connection_guard;
         while let Some(message) = read.next().await {
             match message {
@@ -102,6 +105,10 @@ pub struct WebSocketSinkClient {
     next_reconnect_at: Option<tokio::time::Instant>,
     /// Whether the configured retry budget is exhausted or disabled.
     reconnect_exhausted: bool,
+    /// Admission authority for reader tasks owned by this connector generation.
+    task_owner: ConnectorTaskOwner,
+    /// Terminal observer retained by the database before the connector opens.
+    task_tracker: ConnectorTaskTracker,
 }
 
 impl WebSocketSinkClient {
@@ -113,6 +120,7 @@ impl WebSocketSinkClient {
         metrics: WebSocketSinkMetrics,
     ) -> Self {
         let serializer = BatchSerializer::new(schema.clone());
+        let (task_owner, task_tracker) = ConnectorTaskOwner::new();
 
         Self {
             config,
@@ -126,6 +134,8 @@ impl WebSocketSinkClient {
             metrics,
             next_reconnect_at: None,
             reconnect_exhausted: false,
+            task_owner,
+            task_tracker,
         }
     }
 
@@ -143,8 +153,13 @@ impl WebSocketSinkClient {
         stream: tokio_tungstenite::WebSocketStream<
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
-    ) {
+    ) -> Result<(), ConnectorError> {
         self.mark_disconnected();
+        let task_guard = self.task_owner.track().ok_or_else(|| {
+            ConnectorError::Internal(
+                "WebSocket sink task generation is no longer accepting readers".into(),
+            )
+        })?;
         let (sink, read) = stream.split();
         let alive = Arc::new(AtomicBool::new(true));
         let connection_guard = self.metrics.connection_guard();
@@ -152,9 +167,11 @@ impl WebSocketSinkClient {
             read,
             Arc::clone(&alive),
             connection_guard,
+            task_guard,
         ));
         self.connection_alive = alive;
         self.ws_sink = Some(sink);
+        Ok(())
     }
 
     fn mark_disconnected(&mut self) {
@@ -220,7 +237,7 @@ impl WebSocketSinkClient {
             Ok(Ok((stream, _))) => {
                 self.next_reconnect_at = None;
                 self.reconnect_exhausted = false;
-                self.install_connection(stream);
+                self.install_connection(stream)?;
                 info!(url = %safe_url, "WebSocket reconnected");
 
                 Ok(true)
@@ -236,6 +253,10 @@ impl WebSocketSinkClient {
 
 #[async_trait]
 impl SinkConnector for WebSocketSinkClient {
+    fn terminal_task_tracker(&self) -> Option<ConnectorTaskTracker> {
+        Some(self.task_tracker.clone())
+    }
+
     fn contract(&self, config: &ConnectorConfig) -> Result<SinkContract, ConnectorError> {
         let cfg = if config.properties().is_empty() {
             self.config.clone()
@@ -305,7 +326,7 @@ impl SinkConnector for WebSocketSinkClient {
             }
         };
 
-        self.install_connection(stream);
+        self.install_connection(stream)?;
         self.config = effective_config;
         self.conn_mgr = Some(ConnectionManager::new(vec![url.clone()], reconnect));
         self.next_reconnect_at = None;
@@ -469,8 +490,8 @@ impl SinkConnector for WebSocketSinkClient {
                 .await;
         }
         self.ws_sink = None;
-        if let Some(mut handle) = self.reader_handle.take() {
-            if tokio::time::timeout(Duration::from_secs(1), &mut handle)
+        if let Some(handle) = self.reader_handle.as_mut() {
+            if tokio::time::timeout(Duration::from_secs(1), &mut *handle)
                 .await
                 .is_err()
             {
@@ -479,6 +500,7 @@ impl SinkConnector for WebSocketSinkClient {
                 debug!("timed out waiting for WebSocket close handshake");
             }
         }
+        self.reader_handle = None;
         self.connection_alive.store(false, Ordering::Release);
         self.next_reconnect_at = None;
         self.state = ConnectorState::Closed;
@@ -563,6 +585,30 @@ mod tests {
         let sink =
             WebSocketSinkClient::new(schema.clone(), test_config(), WebSocketSinkMetrics::local());
         assert_eq!(sink.schema(), schema);
+    }
+
+    #[tokio::test]
+    async fn terminal_tracker_waits_for_client_reader_exit_after_sink_drop() {
+        let mut sink =
+            WebSocketSinkClient::new(test_schema(), test_config(), WebSocketSinkMetrics::local());
+        let tracker = sink.terminal_task_tracker().unwrap();
+        let task_guard = sink.task_owner.track().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        sink.reader_handle = Some(tokio::task::spawn_blocking(move || {
+            let _task_guard = task_guard;
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+        }));
+        started_rx.await.unwrap();
+
+        drop(sink);
+
+        assert!(!tracker.is_terminated());
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), tracker.wait_terminated())
+            .await
+            .expect("client reader guard did not resolve after task exit");
     }
 
     #[tokio::test]

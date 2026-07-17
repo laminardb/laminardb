@@ -1,6 +1,6 @@
 //! File source connector implementing [`SourceConnector`].
 //!
-//! Watches a directory or cloud path for new files, decodes them using the
+//! Watches a local directory for new files, decodes them using the
 //! configured format (CSV, JSON, text, Parquet), and produces `RecordBatch`es.
 
 use std::collections::VecDeque;
@@ -14,8 +14,8 @@ use tracing::{debug, info};
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::ConnectorConfig;
 use crate::connector::{
-    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourcePosition, SourceStart,
-    SourceTopology,
+    ConnectorTaskGuard, ConnectorTaskOwner, ConnectorTaskTracker, SourceBatch, SourceConnector,
+    SourceConsistency, SourceContract, SourcePosition, SourceStart, SourceTopology,
 };
 use crate::error::ConnectorError;
 use crate::schema::traits::FormatDecoder;
@@ -26,17 +26,27 @@ use super::discovery::{DiscoveredFile, DiscoveryConfig, FileDiscoveryEngine};
 use super::manifest::FileIngestionManifest;
 use super::text_decoder::TextLineDecoder;
 
+const DISCOVERY_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[async_trait]
 trait FileReader: Send + Sync {
-    async fn read(&self, path: &str) -> Result<Vec<u8>, ConnectorError>;
+    async fn read(
+        &self,
+        path: &str,
+        task_guard: ConnectorTaskGuard,
+    ) -> Result<Vec<u8>, ConnectorError>;
 }
 
 struct LocalFileReader;
 
 #[async_trait]
 impl FileReader for LocalFileReader {
-    async fn read(&self, path: &str) -> Result<Vec<u8>, ConnectorError> {
-        read_file_bytes(path).await
+    async fn read(
+        &self,
+        path: &str,
+        task_guard: ConnectorTaskGuard,
+    ) -> Result<Vec<u8>, ConnectorError> {
+        read_file_bytes(path, task_guard).await
     }
 }
 
@@ -65,7 +75,7 @@ struct DecodedFile {
 
 /// AutoLoader-style file source connector.
 ///
-/// Watches a directory (local or cloud) for new files, infers schema if
+/// Watches a local directory for new files, infers schema if
 /// needed, and produces `RecordBatch`es via `poll_batch()`.
 pub struct FileSource {
     /// Parsed configuration.
@@ -87,6 +97,12 @@ pub struct FileSource {
     reader: Arc<dyn FileReader>,
     /// Whether the connector has started.
     is_open: bool,
+    /// A failed, timed-out, or cancelled shutdown permanently retires this instance.
+    restart_forbidden: bool,
+    /// Admission authority for background and blocking work owned by this generation.
+    task_owner: ConnectorTaskOwner,
+    /// Terminal observer handed to the runtime before this generation is dropped.
+    task_tracker: ConnectorTaskTracker,
 }
 
 impl FileSource {
@@ -100,6 +116,7 @@ impl FileSource {
     #[must_use]
     pub fn with_registry(_registry: Option<&prometheus::Registry>) -> Self {
         let empty_schema = Arc::new(Schema::empty());
+        let (task_owner, task_tracker) = ConnectorTaskOwner::new();
         Self {
             config: None,
             schema: empty_schema,
@@ -110,7 +127,38 @@ impl FileSource {
             current_file: None,
             reader: Arc::new(LocalFileReader),
             is_open: false,
+            restart_forbidden: false,
+            task_owner,
+            task_tracker,
         }
+    }
+
+    async fn close_until(&mut self, deadline: tokio::time::Instant) -> Result<(), ConnectorError> {
+        let Some(discovery) = self.discovery.as_mut() else {
+            if self.is_open {
+                self.restart_forbidden = true;
+                return Err(ConnectorError::InvalidState {
+                    expected: "running discovery task".into(),
+                    actual: "open source without discovery task".into(),
+                });
+            }
+            return Ok(());
+        };
+
+        // This latch deliberately flips before the await: cancellation of the
+        // close future must not make the partially closed instance reusable.
+        let was_restart_forbidden = self.restart_forbidden;
+        self.restart_forbidden = true;
+        discovery.abort_and_join_until(deadline).await?;
+
+        self.discovery = None;
+        self.decoder = None;
+        self.pending_files.clear();
+        self.current_file = None;
+        self.is_open = false;
+        self.restart_forbidden = was_restart_forbidden;
+        info!("file source closed");
+        Ok(())
     }
 }
 
@@ -124,6 +172,7 @@ impl std::fmt::Debug for FileSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FileSource")
             .field("is_open", &self.is_open)
+            .field("restart_forbidden", &self.restart_forbidden)
             .field("schema_fields", &self.schema.fields().len())
             .field("manifest_count", &self.manifest.processed_count())
             .field("pending_files", &self.pending_files.len())
@@ -134,6 +183,10 @@ impl std::fmt::Debug for FileSource {
 
 #[async_trait]
 impl SourceConnector for FileSource {
+    fn terminal_task_tracker(&self) -> Option<ConnectorTaskTracker> {
+        Some(self.task_tracker.clone())
+    }
+
     fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
         // Replayability is backed by an exact processed-path inventory plus an
         // exact file/row cursor for a partially emitted file.
@@ -144,6 +197,17 @@ impl SourceConnector for FileSource {
     }
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
+        if self.is_open || self.discovery.is_some() || self.restart_forbidden {
+            return Err(ConnectorError::InvalidState {
+                expected: "new or cleanly closed file source".into(),
+                actual: if self.restart_forbidden {
+                    "retired file source generation".into()
+                } else {
+                    "file source already open".into()
+                },
+            });
+        }
+
         let SourceStart {
             config, position, ..
         } = request;
@@ -190,13 +254,11 @@ impl SourceConnector for FileSource {
             }
         };
 
-        // Cloud read isn't implemented in `read_file_bytes`; rejecting at
-        // start() is the only honest answer. Silently accepting and then
-        // erroring on first poll leaves the connector "registered but
-        // dead" — far worse than a clear configuration error up front.
+        // The file source is local-only; reject unsupported paths before
+        // discovery or reads can start.
         if is_cloud_url(&src_config.path) {
             return Err(ConnectorError::ConfigurationError(format!(
-                "cloud paths are not supported by the 'files' source yet: {}",
+                "cloud paths are not supported by the 'files' source: {}",
                 src_config.path
             )));
         }
@@ -248,7 +310,20 @@ impl SourceConnector for FileSource {
             glob_pattern: src_config.glob_pattern.clone(),
         };
         let known = Arc::new(manifest.snapshot_for_dedup());
-        let discovery = FileDiscoveryEngine::start(discovery_config, known);
+        let discovery_guard = self
+            .task_owner
+            .track()
+            .expect("live file source cannot have a retired task owner");
+        let initial_scan_guard = self
+            .task_owner
+            .track()
+            .expect("live file source cannot have a retired task owner");
+        let discovery = FileDiscoveryEngine::start(
+            discovery_config,
+            known,
+            discovery_guard,
+            initial_scan_guard,
+        );
 
         self.config = Some(src_config);
         self.schema = final_schema;
@@ -327,15 +402,18 @@ impl SourceConnector for FileSource {
                             expected: "discovery running".into(),
                             actual: "no discovery".into(),
                         })?;
-                self.pending_files.extend(
-                    discovery
-                        .drain(config.max_files_per_poll)
-                        .into_iter()
-                        .map(|discovered| PendingFile {
-                            discovered,
-                            resume: None,
-                        }),
-                );
+                let discovered = match discovery.drain(config.max_files_per_poll).await {
+                    Ok(discovered) => discovered,
+                    Err(error) => {
+                        self.restart_forbidden = true;
+                        return Err(error);
+                    }
+                };
+                self.pending_files
+                    .extend(discovered.into_iter().map(|discovered| PendingFile {
+                        discovered,
+                        resume: None,
+                    }));
             }
 
             let Some(pending) = self.pending_files.front().cloned() else {
@@ -354,8 +432,12 @@ impl SourceConnector for FileSource {
                 )));
             }
 
+            let read_guard = self
+                .task_owner
+                .track()
+                .expect("live file source cannot have a retired task owner");
             let bytes = Arc::clone(&self.reader)
-                .read(&pending.discovered.path)
+                .read(&pending.discovered.path, read_guard)
                 .await?;
             if bytes.len() > config.max_file_bytes {
                 return Err(ConnectorError::ConfigurationError(format!(
@@ -460,13 +542,8 @@ impl SourceConnector for FileSource {
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
-        self.discovery = None;
-        self.decoder = None;
-        self.pending_files.clear();
-        self.current_file = None;
-        self.is_open = false;
-        info!("file source closed");
-        Ok(())
+        self.close_until(tokio::time::Instant::now() + DISCOVERY_CLOSE_TIMEOUT)
+            .await
     }
 }
 
@@ -539,15 +616,24 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-async fn read_file_bytes(path: &str) -> Result<Vec<u8>, ConnectorError> {
+async fn read_file_bytes(
+    path: &str,
+    task_guard: ConnectorTaskGuard,
+) -> Result<Vec<u8>, ConnectorError> {
     // Cloud paths are rejected at `start()`; this path is local-only.
     debug_assert!(
         !is_cloud_url(path),
         "cloud paths must be rejected at start()"
     );
-    tokio::fs::read(path)
-        .await
-        .map_err(|e| ConnectorError::ReadError(format!("cannot read file '{path}': {e}")))
+    let read_path = path.to_owned();
+    let error_path = read_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let _task_guard = task_guard;
+        std::fs::read(read_path)
+    })
+    .await
+    .map_err(|e| ConnectorError::ReadError(format!("file read worker failed: {e}")))?
+    .map_err(|e| ConnectorError::ReadError(format!("cannot read file '{error_path}': {e}")))
 }
 
 fn append_metadata_column(
@@ -637,9 +723,19 @@ mod tests {
         release_read: Notify,
     }
 
+    struct BlockingChildFileReader {
+        bytes: Vec<u8>,
+        started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
     #[async_trait]
     impl FileReader for TestFileReader {
-        async fn read(&self, path: &str) -> Result<Vec<u8>, ConnectorError> {
+        async fn read(
+            &self,
+            path: &str,
+            _task_guard: ConnectorTaskGuard,
+        ) -> Result<Vec<u8>, ConnectorError> {
             if self.blocked_path.as_deref() == Some(path) {
                 self.read_started.notify_one();
                 self.release_read.notified().await;
@@ -648,6 +744,27 @@ mod tests {
                 .get(path)
                 .cloned()
                 .ok_or_else(|| ConnectorError::ReadError(format!("missing test file '{path}'")))
+        }
+    }
+
+    #[async_trait]
+    impl FileReader for BlockingChildFileReader {
+        async fn read(
+            &self,
+            _path: &str,
+            task_guard: ConnectorTaskGuard,
+        ) -> Result<Vec<u8>, ConnectorError> {
+            let started = self.started.lock().unwrap().take().unwrap();
+            let release = self.release.lock().unwrap().take().unwrap();
+            let bytes = self.bytes.clone();
+            tokio::task::spawn_blocking(move || {
+                let _task_guard = task_guard;
+                let _ = started.send(());
+                let _ = release.recv();
+                bytes
+            })
+            .await
+            .map_err(|e| ConnectorError::ReadError(format!("test file worker failed: {e}")))
         }
     }
 
@@ -663,13 +780,42 @@ mod tests {
         directory: &std::path::Path,
         position: SourcePosition,
     ) -> FileSource {
+        let config = text_source_config(directory);
+        let mut source = FileSource::new();
+        source.start(start_request(config, position)).await.unwrap();
+        source
+    }
+
+    fn text_source_config(directory: &std::path::Path) -> ConnectorConfig {
         let mut config = ConnectorConfig::new("files");
         config.set("path", directory.to_string_lossy().to_string());
         config.set("format", "text");
         config.set("stabilisation_delay", "60s");
-        let mut source = FileSource::new();
-        source.start(start_request(config, position)).await.unwrap();
+        config
+    }
+
+    async fn install_blocked_discovery(source: &mut FileSource, blocked_for: std::time::Duration) {
         source
+            .discovery
+            .as_mut()
+            .unwrap()
+            .abort_and_join_until(tokio::time::Instant::now() + std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        let guard = source.task_owner.track().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _guard = guard;
+            let _ = started_tx.send(());
+            std::thread::sleep(blocked_for);
+            Ok(())
+        });
+        source
+            .discovery
+            .as_mut()
+            .unwrap()
+            .install_task_for_test(handle);
+        started_rx.await.unwrap();
     }
 
     fn staged(path: &str, bytes: &[u8]) -> PendingFile {
@@ -702,9 +848,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_open_with_text_format() {
+        let directory = tempfile::tempdir().unwrap();
         let mut source = FileSource::new();
         let mut config = ConnectorConfig::new("files");
-        config.set("path", "/tmp");
+        config.set("path", directory.path().to_string_lossy().to_string());
         config.set("format", "text");
         let result = source
             .start(start_request(config, SourcePosition::Initial))
@@ -713,6 +860,161 @@ mod tests {
         assert!(source.is_open);
         assert_eq!(source.schema().field(0).name(), "line");
         source.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn start_while_open_is_rejected_before_request_validation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut source = started_text_source(directory.path(), SourcePosition::Initial).await;
+        let original_path = source.config.as_ref().unwrap().path.clone();
+
+        let error = source
+            .start(start_request(
+                ConnectorConfig::new("files"),
+                SourcePosition::Initial,
+            ))
+            .await
+            .expect_err("an open source must reject a second start");
+        assert!(matches!(error, ConnectorError::InvalidState { .. }));
+        assert_eq!(source.config.as_ref().unwrap().path, original_path);
+        assert!(source.is_open);
+        source.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn discovery_failure_reaches_poll_and_retires_the_instance() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing");
+        let mut source = FileSource::new();
+        source
+            .start(start_request(
+                text_source_config(&missing),
+                SourcePosition::Initial,
+            ))
+            .await
+            .unwrap();
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match source.poll_batch(10).await {
+                    Ok(None) => tokio::task::yield_now().await,
+                    Ok(Some(batch)) => panic!("unexpected batch with {} rows", batch.num_rows()),
+                    Err(error) => break error,
+                }
+            }
+        })
+        .await
+        .expect("discovery failure remained silent");
+        assert!(matches!(error, ConnectorError::InvalidState { .. }));
+        assert!(!error.is_transient());
+        assert!(error.to_string().contains("is not a directory"));
+        assert!(source.restart_forbidden);
+
+        let retry_directory = tempfile::tempdir().unwrap();
+        let retry_error = source
+            .start(start_request(
+                text_source_config(retry_directory.path()),
+                SourcePosition::Initial,
+            ))
+            .await
+            .expect_err("failed source instance must not restart");
+        assert!(matches!(retry_error, ConnectorError::InvalidState { .. }));
+    }
+
+    #[tokio::test]
+    async fn clean_close_allows_same_instance_restart() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let mut source = started_text_source(first.path(), SourcePosition::Initial).await;
+        source.close().await.unwrap();
+
+        source
+            .start(start_request(
+                text_source_config(second.path()),
+                SourcePosition::Initial,
+            ))
+            .await
+            .unwrap();
+        assert!(source.is_open);
+        assert_eq!(
+            source.config.as_ref().unwrap().path.as_str(),
+            second.path().to_string_lossy().as_ref()
+        );
+        source.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timed_out_close_retains_task_and_forbids_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut source = started_text_source(directory.path(), SourcePosition::Initial).await;
+        install_blocked_discovery(&mut source, std::time::Duration::from_millis(250)).await;
+        let terminal = source.terminal_task_tracker().unwrap();
+
+        let error = source
+            .close_until(tokio::time::Instant::now() + std::time::Duration::from_millis(5))
+            .await
+            .expect_err("blocked discovery must exceed the close deadline");
+        assert!(matches!(error, ConnectorError::Timeout(_)));
+        assert!(source.discovery.is_some());
+        assert!(source.restart_forbidden);
+
+        let restart = source
+            .start(start_request(
+                text_source_config(directory.path()),
+                SourcePosition::Initial,
+            ))
+            .await;
+        assert!(matches!(restart, Err(ConnectorError::InvalidState { .. })));
+        drop(source);
+        assert!(
+            !terminal.is_terminated(),
+            "timed-out close detached an active discovery task"
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            terminal.wait_terminated(),
+        )
+        .await
+        .expect("discovery task did not release its generation guard");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_close_retains_task_and_forbids_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut source = started_text_source(directory.path(), SourcePosition::Initial).await;
+        install_blocked_discovery(&mut source, std::time::Duration::from_millis(250)).await;
+        let terminal = source.terminal_task_tracker().unwrap();
+
+        {
+            let close =
+                source.close_until(tokio::time::Instant::now() + std::time::Duration::from_secs(1));
+            tokio::pin!(close);
+            tokio::select! {
+                result = &mut close => panic!("blocked close unexpectedly completed: {result:?}"),
+                () = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+            }
+        }
+
+        assert!(source.discovery.is_some());
+        assert!(source.restart_forbidden);
+        let restart = source
+            .start(start_request(
+                text_source_config(directory.path()),
+                SourcePosition::Initial,
+            ))
+            .await;
+        assert!(matches!(restart, Err(ConnectorError::InvalidState { .. })));
+        drop(source);
+        assert!(
+            !terminal.is_terminated(),
+            "cancelled close detached an active discovery task"
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            terminal.wait_terminated(),
+        )
+        .await
+        .expect("discovery task did not release its generation guard");
     }
 
     #[tokio::test]
@@ -732,6 +1034,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resume_from_checkpoint() {
+        let directory = tempfile::tempdir().unwrap();
         let mut source = FileSource::new();
 
         // Build a checkpoint with manifest data.
@@ -739,7 +1042,7 @@ mod tests {
         cp.set_offset("manifest", r#"["a.csv"]"#);
 
         let mut config = ConnectorConfig::new("files");
-        config.set("path", "/tmp");
+        config.set("path", directory.path().to_string_lossy().to_string());
         config.set("format", "text");
         source
             .start(start_request(
@@ -828,6 +1131,44 @@ mod tests {
             Some(second_path)
         );
         source.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retired_source_waits_for_inflight_file_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = "blocked.txt";
+        let bytes = b"blocked\n".to_vec();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let reader = Arc::new(BlockingChildFileReader {
+            bytes: bytes.clone(),
+            started: std::sync::Mutex::new(Some(started_tx)),
+            release: std::sync::Mutex::new(Some(release_rx)),
+        });
+
+        let mut source = started_text_source(directory.path(), SourcePosition::Initial).await;
+        let terminal = source
+            .terminal_task_tracker()
+            .expect("file source owns discovery and read tasks");
+        source.reader = reader;
+        source.pending_files.push_back(staged(path, &bytes));
+
+        let caller = tokio::spawn(async move { source.poll_batch(10).await });
+        started_rx.await.unwrap();
+        caller.abort();
+        let _ = caller.await;
+        assert!(
+            !terminal.is_terminated(),
+            "retirement must retain the started filesystem child"
+        );
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            terminal.wait_terminated(),
+        )
+        .await
+        .expect("file source generation did not reach terminal completion");
     }
 
     #[tokio::test]

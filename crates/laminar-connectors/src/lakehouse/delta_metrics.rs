@@ -17,24 +17,6 @@ pub struct DeltaLakeSinkMetrics {
     /// Last Delta Lake table version committed.
     pub last_delta_version: IntGauge,
 
-    /// Total compaction runs completed.
-    pub compaction_runs: IntCounter,
-
-    /// Total files added by compaction.
-    pub compaction_files_added: IntCounter,
-
-    /// Total files removed by compaction.
-    pub compaction_files_removed: IntCounter,
-
-    /// Total files deleted by vacuum.
-    pub vacuum_files_deleted: IntCounter,
-
-    /// Total optimistic-concurrency conflicts encountered (per retry).
-    pub conflicts: IntCounter,
-
-    /// Total retry attempts kicked off (both conflict and timeout).
-    pub retries: IntCounter,
-
     /// End-to-end flush duration histogram (concat → write → checkpoint).
     /// Buckets cover 5ms up to ~160s (0.005 * 2^15).
     pub flush_duration: Histogram,
@@ -109,28 +91,6 @@ impl DeltaLakeSinkMetrics {
                 "delta_sink_last_version",
                 "Last committed Delta table version",
             ),
-            compaction_runs: handle
-                .counter("delta_sink_compaction_runs_total", "Total compaction runs"),
-            compaction_files_added: handle.counter(
-                "delta_sink_compaction_files_added_total",
-                "Total files added by compaction",
-            ),
-            compaction_files_removed: handle.counter(
-                "delta_sink_compaction_files_removed_total",
-                "Total files removed by compaction",
-            ),
-            vacuum_files_deleted: handle.counter(
-                "delta_sink_vacuum_files_deleted_total",
-                "Total files deleted by vacuum",
-            ),
-            conflicts: handle.counter(
-                "delta_sink_conflicts_total",
-                "Delta Lake optimistic-concurrency conflicts observed",
-            ),
-            retries: handle.counter(
-                "delta_sink_retries_total",
-                "Retry attempts kicked off (conflict + timeout)",
-            ),
             flush_duration,
             collapse_rows_in: handle.counter(
                 "delta_sink_collapse_rows_in_total",
@@ -178,28 +138,6 @@ impl DeltaLakeSinkMetrics {
     /// Records changelog DELETE operations.
     pub fn record_deletes(&self, count: u64) {
         self.common.record_deletes(count);
-    }
-
-    /// Records a completed compaction run.
-    pub fn record_compaction(&self, files_added: u64, files_removed: u64) {
-        self.compaction_runs.inc();
-        self.compaction_files_added.inc_by(files_added);
-        self.compaction_files_removed.inc_by(files_removed);
-    }
-
-    /// Records files deleted by vacuum.
-    pub fn record_vacuum(&self, files_deleted: u64) {
-        self.vacuum_files_deleted.inc_by(files_deleted);
-    }
-
-    /// Records an optimistic-concurrency conflict (one per retry-triggering conflict).
-    pub fn record_conflict(&self) {
-        self.conflicts.inc();
-    }
-
-    /// Records a retry attempt.
-    pub fn record_retry(&self) {
-        self.retries.inc();
     }
 
     /// Records a completed flush duration (seconds).

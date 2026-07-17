@@ -15,7 +15,8 @@ use crossfire::{mpsc, AsyncRx, MAsyncTx};
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::connector::SourceBatch;
 use laminar_connectors::connector::{
-    ConnectorCancellationPolicy, DeliveryGuarantee, SourceConnector, SourcePosition, SourceStart,
+    ConnectorCancellationPolicy, ConnectorTaskTracker, DeliveryGuarantee, SourceConnector,
+    SourcePosition, SourceStart,
 };
 #[cfg(feature = "cluster")]
 use laminar_connectors::connector::{
@@ -37,6 +38,7 @@ use super::callback::{
     PipelineCallback, SourceBarrierControl, SourceBarrierSignal, SourceRegistration,
 };
 use super::config::PipelineConfig;
+use crate::connector_task_fence::{ConnectorTaskFenceRegistration, OwnedConnectorTaskFences};
 use crate::error::DbError;
 
 type SourceMsgRx = AsyncRx<mpsc::Array<SourceMsg>>;
@@ -197,6 +199,114 @@ impl Drop for SourceTaskExitGuard {
     }
 }
 
+struct SourceActorTerminalState {
+    finished: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl SourceActorTerminalState {
+    fn new() -> Self {
+        Self {
+            finished: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn finish(&self) {
+        if !self.finished.swap(true, Ordering::AcqRel) {
+            self.notify.notify_waiters();
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
+
+    async fn wait_finished(&self) {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_finished() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+#[cfg(test)]
+struct SourceActorLifetime(Arc<SourceActorTerminalState>);
+
+#[cfg(test)]
+impl Drop for SourceActorLifetime {
+    fn drop(&mut self) {
+        self.0.finish();
+    }
+}
+
+#[cfg(test)]
+fn source_actor_terminal_guard() -> (SourceActorLifetime, Arc<SourceActorTerminalState>) {
+    let terminal = Arc::new(SourceActorTerminalState::new());
+    (SourceActorLifetime(Arc::clone(&terminal)), terminal)
+}
+
+struct SourceActorFuture<F> {
+    actor: Option<std::pin::Pin<Box<F>>>,
+    terminal: Arc<SourceActorTerminalState>,
+}
+
+// Moving this wrapper never moves the separately pinned actor allocation.
+impl<F> Unpin for SourceActorFuture<F> {}
+
+impl<F> std::future::Future for SourceActorFuture<F>
+where
+    F: std::future::Future<Output = ()>,
+{
+    type Output = ();
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let actor = self
+            .actor
+            .as_mut()
+            .expect("source actor polled after terminal completion");
+        if actor.as_mut().poll(context).is_pending() {
+            return std::task::Poll::Pending;
+        }
+        // Drop the complete actor future, including its connector, before publishing exit.
+        self.actor.take();
+        self.terminal.finish();
+        std::task::Poll::Ready(())
+    }
+}
+
+impl<F> Drop for SourceActorFuture<F> {
+    fn drop(&mut self) {
+        // Cancellation must drop the actor and its connector before another generation can observe
+        // terminal completion.
+        self.actor.take();
+        self.terminal.finish();
+    }
+}
+
+fn spawn_source_actor<F>(
+    runtime: &tokio::runtime::Handle,
+    actor: F,
+) -> (tokio::task::JoinHandle<()>, Arc<SourceActorTerminalState>)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let terminal = Arc::new(SourceActorTerminalState::new());
+    let join = runtime.spawn(SourceActorFuture {
+        actor: Some(Box::pin(actor)),
+        terminal: Arc::clone(&terminal),
+    });
+    (join, terminal)
+}
+
 #[derive(Clone)]
 enum SourceTaskOutcome {
     Success,
@@ -206,13 +316,12 @@ enum SourceTaskOutcome {
 
 struct SourceTaskState {
     name: Arc<str>,
-    cancellation_policy: ConnectorCancellationPolicy,
     shutdown: Arc<tokio::sync::Notify>,
     expected_shutdown: Arc<AtomicBool>,
     abort: tokio::task::AbortHandle,
-    finished: AtomicBool,
+    actor_terminal: Arc<SourceActorTerminalState>,
+    terminal_tasks: Option<ConnectorTaskTracker>,
     outcome: parking_lot::Mutex<Option<SourceTaskOutcome>>,
-    notify: tokio::sync::Notify,
     #[cfg(feature = "cluster")]
     drain: parking_lot::Mutex<Option<SourceDrainLeaseControl>>,
 }
@@ -311,8 +420,9 @@ struct PendingSourceDrainResolution {
 
 /// DB-owned proof that one source generation has reached terminal completion.
 ///
-/// The stable control runtime owns the actual [`tokio::task::JoinHandle`] in a supervisor task.
-/// Coordinator cancellation therefore drops only this cloneable lease, never the sole task owner.
+/// Actor exit is published by a wrapper that owns the connector future before spawn, and connector
+/// children are observed through the exact tracker captured at construction. Neither proof depends
+/// on the detached outcome supervisor continuing to run.
 #[derive(Clone)]
 pub(crate) struct SourceTaskLease {
     state: Arc<SourceTaskState>,
@@ -321,23 +431,23 @@ pub(crate) struct SourceTaskLease {
 pub(crate) type OwnedSourceTasks = Arc<parking_lot::Mutex<Vec<SourceTaskLease>>>;
 
 impl SourceTaskLease {
-    pub(crate) fn supervise(
+    fn supervise(
         name: Arc<str>,
-        cancellation_policy: ConnectorCancellationPolicy,
         shutdown: Arc<tokio::sync::Notify>,
         expected_shutdown: Arc<AtomicBool>,
         join: tokio::task::JoinHandle<()>,
+        actor_terminal: Arc<SourceActorTerminalState>,
+        terminal_tasks: Option<ConnectorTaskTracker>,
         runtime: &tokio::runtime::Handle,
     ) -> Self {
         let state = Arc::new(SourceTaskState {
             name,
-            cancellation_policy,
             shutdown,
             expected_shutdown,
             abort: join.abort_handle(),
-            finished: AtomicBool::new(false),
+            actor_terminal,
+            terminal_tasks,
             outcome: parking_lot::Mutex::new(None),
-            notify: tokio::sync::Notify::new(),
             #[cfg(feature = "cluster")]
             drain: parking_lot::Mutex::new(None),
         });
@@ -349,11 +459,9 @@ impl SourceTaskLease {
                 Err(error) => SourceTaskOutcome::Failed(Arc::from(error.to_string())),
             };
             *supervisor_state.outcome.lock() = Some(outcome);
-            supervisor_state.finished.store(true, Ordering::Release);
-            supervisor_state.notify.notify_waiters();
         });
-        // Tokio owns the scheduled supervisor; detaching its handle prevents caller cancellation
-        // from ever dropping the sole source JoinHandle held inside the supervisor future.
+        // Tokio owns the scheduled outcome observer. Terminal replacement fencing is independent
+        // of this detached task and comes from the actor wrapper plus connector tracker above.
         drop(supervisor);
         Self { state }
     }
@@ -372,12 +480,13 @@ impl SourceTaskLease {
         self.state.drain.lock().clone()
     }
 
-    pub(crate) fn cancellation_policy(&self) -> ConnectorCancellationPolicy {
-        self.state.cancellation_policy
-    }
-
     pub(crate) fn is_finished(&self) -> bool {
-        self.state.finished.load(Ordering::Acquire)
+        self.state.actor_terminal.is_finished()
+            && self
+                .state
+                .terminal_tasks
+                .as_ref()
+                .is_none_or(ConnectorTaskTracker::is_terminated)
     }
 
     pub(crate) fn request_shutdown(&self) {
@@ -393,39 +502,28 @@ impl SourceTaskLease {
         self.state.shutdown.notify_one();
     }
 
-    pub(crate) fn abort_if_cancel_safe(&self) {
-        if self.cancellation_policy() == ConnectorCancellationPolicy::CancelSafe {
-            self.state.abort.abort();
-        }
+    pub(crate) fn abort(&self) {
+        self.state.abort.abort();
+    }
+
+    async fn wait_finished(&self) {
+        let actor = self.state.actor_terminal.wait_finished();
+        let connector_tasks = async {
+            if let Some(tasks) = self.state.terminal_tasks.as_ref() {
+                tasks.wait_terminated().await;
+            }
+        };
+        tokio::join!(actor, connector_tasks);
     }
 
     pub(crate) async fn wait_until(&self, deadline: tokio::time::Instant) -> bool {
-        loop {
-            let notified = self.state.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.is_finished() {
-                return true;
-            }
-            if tokio::time::timeout_at(deadline, notified.as_mut())
-                .await
-                .is_err()
-            {
-                return self.is_finished();
-            }
+        if self.is_finished() {
+            return true;
         }
-    }
-
-    async fn wait(&self) {
-        loop {
-            let notified = self.state.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.is_finished() {
-                return;
-            }
-            notified.await;
-        }
+        tokio::time::timeout_at(deadline, self.wait_finished())
+            .await
+            .is_ok()
+            || self.is_finished()
     }
 
     pub(crate) fn log_terminal_outcome(&self) {
@@ -435,6 +533,89 @@ impl SourceTaskLease {
             }
             Some(SourceTaskOutcome::Success | SourceTaskOutcome::Cancelled) | None => {}
         }
+    }
+}
+
+/// Stable owner for source generations constructed through [`StreamingCoordinator::new`].
+#[derive(Clone)]
+pub struct StreamingCoordinatorRuntime {
+    owned_source_tasks: OwnedSourceTasks,
+    owned_connector_task_fences: OwnedConnectorTaskFences,
+    construction: Arc<tokio::sync::Mutex<()>>,
+    active_coordinator: Arc<AtomicBool>,
+}
+
+struct StreamingCoordinatorGeneration {
+    runtime: StreamingCoordinatorRuntime,
+}
+
+impl Drop for StreamingCoordinatorGeneration {
+    fn drop(&mut self) {
+        self.runtime
+            .active_coordinator
+            .store(false, Ordering::Release);
+    }
+}
+
+impl StreamingCoordinatorRuntime {
+    /// Creates an empty runtime owner with no active source generation.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            owned_source_tasks: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            owned_connector_task_fences: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            construction: Arc::new(tokio::sync::Mutex::new(())),
+            active_coordinator: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn claim_generation(&self) -> Result<StreamingCoordinatorGeneration, DbError> {
+        self.active_coordinator
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                DbError::Pipeline(
+                    "cannot construct a replacement streaming coordinator while the prior \
+                     coordinator generation is still active"
+                        .into(),
+                )
+            })?;
+        Ok(StreamingCoordinatorGeneration {
+            runtime: self.clone(),
+        })
+    }
+
+    fn prune_and_require_idle(&self) -> Result<(), DbError> {
+        let source_names = {
+            let mut sources = self.owned_source_tasks.lock();
+            sources.retain(|source| !source.is_finished());
+            sources
+                .iter()
+                .map(|source| source.name().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let connector_names = {
+            let mut connectors = self.owned_connector_task_fences.lock();
+            connectors.retain(|connector| !connector.is_finished());
+            connectors
+                .iter()
+                .map(|connector| connector.name().to_owned())
+                .collect::<Vec<_>>()
+        };
+        if source_names.is_empty() && connector_names.is_empty() {
+            return Ok(());
+        }
+        Err(DbError::Pipeline(format!(
+            "cannot construct a replacement streaming coordinator while prior connector \
+             generations remain unresolved: sources=[{}], connector_tasks=[{}]",
+            source_names.join(", "),
+            connector_names.join(", ")
+        )))
+    }
+}
+
+impl Default for StreamingCoordinatorRuntime {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -480,9 +661,8 @@ async fn await_source_drain_receipt(
                 task.name()
             ));
         }
-        let task_finished = task.state.notify.notified();
+        let task_finished = task.wait_finished();
         tokio::pin!(task_finished);
-        task_finished.as_mut().enable();
         if task.is_finished() {
             continue;
         }
@@ -682,9 +862,8 @@ pub(crate) async fn resolve_owned_source_drain(
                     resolution.round
                 ));
             }
-            let task_finished = task.state.notify.notified();
+            let task_finished = task.wait_finished();
             tokio::pin!(task_finished);
-            task_finished.as_mut().enable();
             if task.is_finished() {
                 continue;
             }
@@ -728,6 +907,47 @@ struct SourceHandle {
     /// The checkpoint is what was written to the manifest (may lag). Empty only when the epoch
     /// captured no state for this source; an empty one is a no-op for upstream advancement.
     epoch_committed_tx: tokio::sync::watch::Sender<Option<(u64, SourceCheckpoint)>>,
+}
+
+pub(crate) struct TrackedSourceRegistration {
+    source: SourceRegistration,
+    task_fence: ConnectorTaskFenceRegistration,
+}
+
+impl TrackedSourceRegistration {
+    pub(crate) fn capture(source: SourceRegistration, owned: &OwnedConnectorTaskFences) -> Self {
+        let task_fence = ConnectorTaskFenceRegistration::capture_registered(
+            Arc::<str>::from(format!("source:{}", source.name)),
+            source.connector.terminal_task_tracker(),
+            owned,
+        );
+        Self { source, task_fence }
+    }
+
+    pub(crate) fn from_captured(
+        source: SourceRegistration,
+        task_fence: ConnectorTaskFenceRegistration,
+    ) -> Self {
+        Self { source, task_fence }
+    }
+}
+
+impl std::ops::Deref for TrackedSourceRegistration {
+    type Target = SourceRegistration;
+
+    fn deref(&self) -> &Self::Target {
+        &self.source
+    }
+}
+
+impl std::ops::DerefMut for TrackedSourceRegistration {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.source
+    }
+}
+
+struct PreparedSourceGeneration {
+    registration: TrackedSourceRegistration,
 }
 
 impl SourceHandle {
@@ -795,6 +1015,20 @@ pub struct StreamingCoordinator {
     coordinated_commit_admission: Option<crate::checkpoint_coordinator::CoordinatedCommitAdmission>,
     #[cfg(feature = "cluster")]
     process_authority: Option<Arc<SourceProcessAuthority>>,
+    public_generation: Option<StreamingCoordinatorGeneration>,
+}
+
+impl Drop for StreamingCoordinator {
+    fn drop(&mut self) {
+        // `run` owns the coordinator by value, so cancellation or unwind would otherwise discard
+        // the only per-source shutdown controls. The DB-owned leases remain registered until the
+        // actor-exit wrapper and exact connector tracker both prove terminal completion.
+        for handle in &self.source_handles {
+            handle.task.request_shutdown();
+        }
+        // Release public construction ownership only after every source has observed shutdown.
+        drop(self.public_generation.take());
+    }
 }
 
 /// Public checkpoint callers attached to one exact attempt at admission time.
@@ -880,9 +1114,7 @@ const IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 /// Cap on a source task's post-shutdown flush so a hot source can't stall shutdown.
 const SHUTDOWN_DRAIN_BUDGET: Duration = Duration::from_secs(2);
 
-/// Cap on awaiting a source task at shutdown before aborting it. This covers the drain budget plus
-/// cancellation-unsafe drivers' bounded close path, so the outer task does not pre-empt the
-/// connector's own hard-stop/error boundary.
+/// Cap on awaiting a source task at shutdown before retiring its connector generation.
 const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Shutdown-only poll cadence. It closes the atomic/channel race when a tail drops its in-flight
@@ -947,22 +1179,47 @@ fn try_source_checkpoint(
 /// Apply the newest durable commit notification while no source poll borrows
 /// the connector. Non-best-effort pipelines fault if upstream acknowledgement
 /// fails because silently continuing can exhaust upstream retention or acknowledgement headroom.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "source commit acknowledgement is one fenced connector protocol boundary"
+)]
 async fn acknowledge_latest_source_commit(
     connector: &mut dyn SourceConnector,
     epoch_committed_rx: &mut tokio::sync::watch::Receiver<Option<(u64, SourceCheckpoint)>>,
     delivery_guarantee: DeliveryGuarantee,
     src_name: &str,
     fault_tx: &tokio::sync::mpsc::UnboundedSender<SourceFault>,
+    deadline: tokio::time::Instant,
+    cancellation_policy: ConnectorCancellationPolicy,
+    lifecycle: &mut SourceConnectorLifecycle,
     #[cfg(feature = "cluster")] process_authority: Option<&SourceProcessAuthority>,
 ) -> bool {
-    #[cfg(feature = "cluster")]
-    if !source_process_authority_is_live(process_authority) {
-        return false;
-    }
     let Some((epoch, checkpoint)) = epoch_committed_rx.borrow_and_update().clone() else {
         return true;
     };
-    if let Err(error) = connector.notify_epoch_committed(epoch, &checkpoint).await {
+    let result = match run_source_operation(
+        deadline,
+        #[cfg(feature = "cluster")]
+        process_authority,
+        || connector.notify_epoch_committed(epoch, &checkpoint),
+    )
+    .await
+    {
+        SourceOperationOutcome::Completed(result) => result,
+        SourceOperationOutcome::Deadline => {
+            lifecycle.cancelled(cancellation_policy);
+            Err(source_operation_deadline_error(
+                src_name,
+                "commit notification",
+            ))
+        }
+        #[cfg(feature = "cluster")]
+        SourceOperationOutcome::ProcessAuthorityLost => {
+            lifecycle.authority_lost();
+            return false;
+        }
+    };
+    if let Err(error) = result {
         if delivery_guarantee == DeliveryGuarantee::BestEffort {
             tracing::warn!(
                 source = src_name,
@@ -970,28 +1227,34 @@ async fn acknowledge_latest_source_commit(
                 epoch,
                 "notify_epoch_committed failed",
             );
-            return true;
+            return lifecycle.may_invoke_connector();
         }
+        lifecycle.fault_data_plane();
         let _ = fault_tx.send(SourceFault {
             source: Arc::from(src_name),
             error: format!("commit notification failed at epoch {epoch}: {error}"),
         });
         return false;
     }
-    #[cfg(feature = "cluster")]
-    if !source_process_authority_is_live(process_authority) {
-        return false;
-    }
     true
 }
 
 #[cfg(feature = "cluster")]
-async fn apply_latest_source_drain_command(
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "a source drain command is one fenced provider state-machine transition"
+)]
+async fn apply_latest_source_drain_command_fenced(
     connector: &mut dyn SourceConnector,
     command_rx: &mut tokio::sync::watch::Receiver<Option<SourceDrainCommand>>,
     status_tx: &tokio::sync::watch::Sender<SourceDrainTaskStatus>,
     active: &mut Option<ActiveSourceDrain>,
     provider_drain: bool,
+    source_name: &str,
+    cancellation_policy: ConnectorCancellationPolicy,
+    lifecycle: &mut SourceConnectorLifecycle,
+    process_authority: Option<&SourceProcessAuthority>,
 ) -> Result<(), ConnectorError> {
     match command_rx.has_changed() {
         Ok(false) => return Ok(()),
@@ -1029,9 +1292,36 @@ async fn apply_latest_source_drain_command(
                 )));
             }
             if provider_drain {
-                connector.begin_drain(&request, deadline)?;
+                lifecycle.run_sync_hook(
+                    source_name,
+                    "drain preparation",
+                    deadline,
+                    cancellation_policy,
+                    process_authority,
+                    || connector.begin_drain(&request, deadline),
+                )?;
+            } else {
+                check_source_sync_fence(
+                    source_name,
+                    "drain preparation",
+                    deadline,
+                    false,
+                    cancellation_policy,
+                    lifecycle,
+                    process_authority,
+                )?;
             }
-            let _ = status_tx.send_replace(SourceDrainTaskStatus::Pausing(request.round));
+            lifecycle.run_sync_hook(
+                source_name,
+                "drain preparation publication",
+                deadline,
+                cancellation_policy,
+                process_authority,
+                || {
+                    let _ = status_tx.send_replace(SourceDrainTaskStatus::Pausing(request.round));
+                    Ok(())
+                },
+            )?;
             *active = Some(ActiveSourceDrain {
                 request,
                 participant,
@@ -1075,10 +1365,20 @@ async fn apply_latest_source_drain_command(
                 // exited. It has no provider cut to finish; accept that commit only after its
                 // target assignment and recovery cursor are reconciled.
                 if resolution.outcome == SourceDrainOutcome::Abort {
-                    let _ = status_tx.send_replace(SourceDrainTaskStatus::Resolved {
-                        round: resolution.round,
-                        outcome: resolution.outcome,
-                    });
+                    lifecycle.run_sync_hook(
+                        source_name,
+                        "replacement drain abort publication",
+                        deadline,
+                        cancellation_policy,
+                        process_authority,
+                        || {
+                            let _ = status_tx.send_replace(SourceDrainTaskStatus::Resolved {
+                                round: resolution.round,
+                                outcome: resolution.outcome,
+                            });
+                            Ok(())
+                        },
+                    )?;
                     return Ok(());
                 }
                 if tokio::time::Instant::now() >= deadline {
@@ -1088,11 +1388,27 @@ async fn apply_latest_source_drain_command(
                     )));
                 }
                 if provider_drain {
-                    if !connector.checkpoint_ready()? {
+                    let checkpoint_ready = lifecycle.run_sync_hook(
+                        source_name,
+                        "replacement checkpoint readiness",
+                        deadline,
+                        cancellation_policy,
+                        process_authority,
+                        || connector.checkpoint_ready(),
+                    )?;
+                    if !checkpoint_ready {
                         command_rx.mark_changed();
                         return Ok(());
                     }
-                    let Some(checkpoint) = try_source_checkpoint(connector, true)? else {
+                    let checkpoint = lifecycle.run_sync_hook(
+                        source_name,
+                        "replacement checkpoint capture",
+                        deadline,
+                        cancellation_policy,
+                        process_authority,
+                        || try_source_checkpoint(connector, true),
+                    )?;
+                    let Some(checkpoint) = checkpoint else {
                         command_rx.mark_changed();
                         return Ok(());
                     };
@@ -1115,10 +1431,20 @@ async fn apply_latest_source_drain_command(
                         });
                     }
                 }
-                let _ = status_tx.send_replace(SourceDrainTaskStatus::Resolved {
-                    round: resolution.round,
-                    outcome: resolution.outcome,
-                });
+                lifecycle.run_sync_hook(
+                    source_name,
+                    "replacement drain resolution publication",
+                    deadline,
+                    cancellation_policy,
+                    process_authority,
+                    || {
+                        let _ = status_tx.send_replace(SourceDrainTaskStatus::Resolved {
+                            round: resolution.round,
+                            outcome: resolution.outcome,
+                        });
+                        Ok(())
+                    },
+                )?;
                 return Ok(());
             };
             if current.request.round != resolution.round {
@@ -1163,25 +1489,57 @@ async fn apply_latest_source_drain_command(
                 return Ok(());
             }
             if current.provider_drain {
-                connector
-                    .finish_drain(resolution, resolution_deadline)
-                    .await?;
+                match run_source_operation(resolution_deadline, process_authority, || {
+                    connector.finish_drain(resolution, resolution_deadline)
+                })
+                .await
+                {
+                    SourceOperationOutcome::Completed(result) => result?,
+                    SourceOperationOutcome::Deadline => {
+                        lifecycle.cancelled(cancellation_policy);
+                        return Err(source_operation_deadline_error(
+                            source_name,
+                            "drain resolution",
+                        ));
+                    }
+                    SourceOperationOutcome::ProcessAuthorityLost => {
+                        lifecycle.authority_lost();
+                        return Err(source_operation_authority_error(
+                            source_name,
+                            "drain resolution",
+                        ));
+                    }
+                }
             }
+            lifecycle.run_sync_hook(
+                source_name,
+                "drain resolution publication",
+                resolution_deadline,
+                cancellation_policy,
+                process_authority,
+                || {
+                    let _ = status_tx.send_replace(SourceDrainTaskStatus::Resolved {
+                        round: resolution.round,
+                        outcome: resolution.outcome,
+                    });
+                    Ok(())
+                },
+            )?;
             *active = None;
-            let _ = status_tx.send_replace(SourceDrainTaskStatus::Resolved {
-                round: resolution.round,
-                outcome: resolution.outcome,
-            });
         }
     }
     Ok(())
 }
 
 #[cfg(feature = "cluster")]
-async fn resolve_pending_source_drain(
+async fn resolve_pending_source_drain_fenced(
     connector: &mut dyn SourceConnector,
     status_tx: &tokio::sync::watch::Sender<SourceDrainTaskStatus>,
     active: &mut Option<ActiveSourceDrain>,
+    source_name: &str,
+    cancellation_policy: ConnectorCancellationPolicy,
+    lifecycle: &mut SourceConnectorLifecycle,
+    process_authority: Option<&SourceProcessAuthority>,
 ) -> Result<(), ConnectorError> {
     let Some(pending) = active.as_ref().and_then(|current| {
         current
@@ -1201,23 +1559,97 @@ async fn resolve_pending_source_drain(
         .as_ref()
         .is_some_and(|current| current.provider_drain)
     {
-        connector
-            .finish_drain(pending.resolution, pending.deadline)
-            .await?;
+        match run_source_operation(pending.deadline, process_authority, || {
+            connector.finish_drain(pending.resolution, pending.deadline)
+        })
+        .await
+        {
+            SourceOperationOutcome::Completed(result) => result?,
+            SourceOperationOutcome::Deadline => {
+                lifecycle.cancelled(cancellation_policy);
+                return Err(source_operation_deadline_error(
+                    source_name,
+                    "pending drain resolution",
+                ));
+            }
+            SourceOperationOutcome::ProcessAuthorityLost => {
+                lifecycle.authority_lost();
+                return Err(source_operation_authority_error(
+                    source_name,
+                    "pending drain resolution",
+                ));
+            }
+        }
     }
+    lifecycle.run_sync_hook(
+        source_name,
+        "pending drain resolution publication",
+        pending.deadline,
+        cancellation_policy,
+        process_authority,
+        || {
+            let _ = status_tx.send_replace(SourceDrainTaskStatus::Resolved {
+                round: pending.resolution.round,
+                outcome: pending.resolution.outcome,
+            });
+            Ok(())
+        },
+    )?;
     *active = None;
-    let _ = status_tx.send_replace(SourceDrainTaskStatus::Resolved {
-        round: pending.resolution.round,
-        outcome: pending.resolution.outcome,
-    });
     Ok(())
 }
 
+#[cfg(all(test, feature = "cluster"))]
+async fn apply_latest_source_drain_command(
+    connector: &mut dyn SourceConnector,
+    command_rx: &mut tokio::sync::watch::Receiver<Option<SourceDrainCommand>>,
+    status_tx: &tokio::sync::watch::Sender<SourceDrainTaskStatus>,
+    active: &mut Option<ActiveSourceDrain>,
+    provider_drain: bool,
+) -> Result<(), ConnectorError> {
+    let mut lifecycle = SourceConnectorLifecycle::default();
+    apply_latest_source_drain_command_fenced(
+        connector,
+        command_rx,
+        status_tx,
+        active,
+        provider_drain,
+        "test-source",
+        ConnectorCancellationPolicy::RetireConnector,
+        &mut lifecycle,
+        None,
+    )
+    .await
+}
+
+#[cfg(all(test, feature = "cluster"))]
+async fn resolve_pending_source_drain(
+    connector: &mut dyn SourceConnector,
+    status_tx: &tokio::sync::watch::Sender<SourceDrainTaskStatus>,
+    active: &mut Option<ActiveSourceDrain>,
+) -> Result<(), ConnectorError> {
+    let mut lifecycle = SourceConnectorLifecycle::default();
+    resolve_pending_source_drain_fenced(
+        connector,
+        status_tx,
+        active,
+        "test-source",
+        ConnectorCancellationPolicy::RetireConnector,
+        &mut lifecycle,
+        None,
+    )
+    .await
+}
+
 #[cfg(feature = "cluster")]
-fn publish_source_drain_ready(
+fn publish_source_drain_ready_fenced(
     connector: &mut dyn SourceConnector,
     control: &SourceDrainLeaseControl,
     active: &mut Option<ActiveSourceDrain>,
+    source_name: &str,
+    cancellation_policy: ConnectorCancellationPolicy,
+    lifecycle: &mut SourceConnectorLifecycle,
+    process_authority: Option<&SourceProcessAuthority>,
 ) -> Result<(), ConnectorError> {
     let Some(current) = active.as_mut() else {
         return Ok(());
@@ -1232,8 +1664,24 @@ fn publish_source_drain_ready(
         )));
     }
     let ready = if current.provider_drain {
-        connector.poll_drain_ready(current.request.round)?
+        lifecycle.run_sync_hook(
+            source_name,
+            "drain readiness",
+            current.prepare_deadline,
+            cancellation_policy,
+            process_authority,
+            || connector.poll_drain_ready(current.request.round),
+        )?
     } else {
+        check_source_sync_fence(
+            source_name,
+            "drain readiness",
+            current.prepare_deadline,
+            false,
+            cancellation_policy,
+            lifecycle,
+            process_authority,
+        )?;
         true
     };
     if !ready {
@@ -1249,35 +1697,249 @@ fn publish_source_drain_ready(
             "source task produced a non-canonical drain receipt".into(),
         ));
     }
+    lifecycle.run_sync_hook(
+        source_name,
+        "drain readiness publication",
+        current.prepare_deadline,
+        cancellation_policy,
+        process_authority,
+        || {
+            let _ = control
+                .status_tx
+                .send_replace(SourceDrainTaskStatus::Ready(receipt));
+            Ok(())
+        },
+    )?;
     current.ready = true;
-    let _ = control
-        .status_tx
-        .send_replace(SourceDrainTaskStatus::Ready(receipt));
     Ok(())
 }
 
-#[cfg(feature = "cluster")]
-fn source_drain_flushing(active: &Option<ActiveSourceDrain>) -> bool {
-    active.as_ref().is_some_and(|drain| !drain.ready)
+#[cfg(all(test, feature = "cluster"))]
+fn publish_source_drain_ready(
+    connector: &mut dyn SourceConnector,
+    control: &SourceDrainLeaseControl,
+    active: &mut Option<ActiveSourceDrain>,
+) -> Result<(), ConnectorError> {
+    let mut lifecycle = SourceConnectorLifecycle::default();
+    publish_source_drain_ready_fenced(
+        connector,
+        control,
+        active,
+        "test-source",
+        ConnectorCancellationPolicy::RetireConnector,
+        &mut lifecycle,
+        None,
+    )
 }
 
 #[cfg(feature = "cluster")]
-fn source_drain_held(active: &Option<ActiveSourceDrain>) -> bool {
-    active.as_ref().is_some_and(|drain| drain.ready)
+fn source_drain_flushing(active: Option<&ActiveSourceDrain>) -> bool {
+    active.is_some_and(|drain| !drain.ready)
+}
+
+#[cfg(feature = "cluster")]
+fn source_drain_held(active: Option<&ActiveSourceDrain>) -> bool {
+    active.is_some_and(|drain| drain.ready)
 }
 
 enum SourcePollOutcome {
     Completed(Result<Option<SourceBatch>, ConnectorError>),
-    Shutdown(Option<Result<Option<SourceBatch>, ConnectorError>>),
+    Deadline,
+    Shutdown,
     #[cfg(feature = "cluster")]
     ProcessAuthorityLost,
 }
 
+enum SourceOperationOutcome<T> {
+    Completed(T),
+    Deadline,
+    #[cfg(feature = "cluster")]
+    ProcessAuthorityLost,
+}
+
+#[derive(Default)]
+struct SourceConnectorLifecycle {
+    retired: bool,
+    data_plane_faulted: bool,
+    #[cfg(feature = "cluster")]
+    process_authority_lost: bool,
+}
+
+impl SourceConnectorLifecycle {
+    fn cancelled(&mut self, cancellation_policy: ConnectorCancellationPolicy) {
+        if cancellation_policy == ConnectorCancellationPolicy::RetireConnector {
+            self.retired = true;
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    fn authority_lost(&mut self) {
+        self.process_authority_lost = true;
+    }
+
+    #[cfg(feature = "cluster")]
+    fn process_authority_lost(&self) -> bool {
+        self.process_authority_lost
+    }
+
+    fn may_invoke_connector(&self) -> bool {
+        !self.retired && {
+            #[cfg(feature = "cluster")]
+            {
+                !self.process_authority_lost
+            }
+            #[cfg(not(feature = "cluster"))]
+            {
+                true
+            }
+        }
+    }
+
+    fn fault_data_plane(&mut self) {
+        self.data_plane_faulted = true;
+    }
+
+    fn may_poll_or_ack(&self) -> bool {
+        self.may_invoke_connector() && !self.data_plane_faulted
+    }
+
+    fn run_sync_hook<T>(
+        &mut self,
+        source: &str,
+        operation: &str,
+        deadline: tokio::time::Instant,
+        cancellation_policy: ConnectorCancellationPolicy,
+        #[cfg(feature = "cluster")] process_authority: Option<&SourceProcessAuthority>,
+        hook: impl FnOnce() -> Result<T, ConnectorError>,
+    ) -> Result<T, ConnectorError> {
+        check_source_sync_fence(
+            source,
+            operation,
+            deadline,
+            false,
+            cancellation_policy,
+            self,
+            #[cfg(feature = "cluster")]
+            process_authority,
+        )?;
+        let result = hook();
+        check_source_sync_fence(
+            source,
+            operation,
+            deadline,
+            true,
+            cancellation_policy,
+            self,
+            #[cfg(feature = "cluster")]
+            process_authority,
+        )?;
+        result
+    }
+}
+
+/// Run one connector lifecycle operation behind the process-authority and absolute-deadline
+/// fences. The future is not constructed after either fence has crossed. Authority and deadline
+/// also win a ready tie, and a completed branch is revalidated before its result is admitted.
+async fn run_source_operation<T, F, Fut>(
+    deadline: tokio::time::Instant,
+    #[cfg(feature = "cluster")] process_authority: Option<&SourceProcessAuthority>,
+    make_future: F,
+) -> SourceOperationOutcome<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    #[cfg(feature = "cluster")]
+    if !source_process_authority_is_live(process_authority) {
+        return SourceOperationOutcome::ProcessAuthorityLost;
+    }
+    if tokio::time::Instant::now() >= deadline {
+        return SourceOperationOutcome::Deadline;
+    }
+
+    let future = make_future();
+    tokio::pin!(future);
+
+    #[cfg(feature = "cluster")]
+    if let Some(authority) = process_authority {
+        return tokio::select! {
+            biased;
+            () = authority.cancelled() => SourceOperationOutcome::ProcessAuthorityLost,
+            () = tokio::time::sleep_until(deadline) => SourceOperationOutcome::Deadline,
+            result = &mut future => {
+                if !authority.is_live() {
+                    SourceOperationOutcome::ProcessAuthorityLost
+                } else if tokio::time::Instant::now() >= deadline {
+                    SourceOperationOutcome::Deadline
+                } else {
+                    SourceOperationOutcome::Completed(result)
+                }
+            }
+        };
+    }
+
+    tokio::select! {
+        biased;
+        () = tokio::time::sleep_until(deadline) => SourceOperationOutcome::Deadline,
+        result = &mut future => {
+            if tokio::time::Instant::now() >= deadline {
+                SourceOperationOutcome::Deadline
+            } else {
+                SourceOperationOutcome::Completed(result)
+            }
+        }
+    }
+}
+
+fn source_operation_deadline_error(source: &str, operation: &str) -> ConnectorError {
+    ConnectorError::Internal(format!(
+        "source '{source}' {operation} exceeded its end-to-end deadline"
+    ))
+}
+
+fn check_source_sync_fence(
+    source: &str,
+    operation: &str,
+    deadline: tokio::time::Instant,
+    operation_started: bool,
+    cancellation_policy: ConnectorCancellationPolicy,
+    lifecycle: &mut SourceConnectorLifecycle,
+    #[cfg(feature = "cluster")] process_authority: Option<&SourceProcessAuthority>,
+) -> Result<(), ConnectorError> {
+    #[cfg(feature = "cluster")]
+    if !source_process_authority_is_live(process_authority) {
+        lifecycle.authority_lost();
+        return Err(source_operation_authority_error(source, operation));
+    }
+    if tokio::time::Instant::now() >= deadline {
+        if operation_started {
+            lifecycle.cancelled(cancellation_policy);
+        }
+        return Err(source_operation_deadline_error(source, operation));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cluster")]
+fn source_operation_authority_error(source: &str, operation: &str) -> ConnectorError {
+    ConnectorError::InvalidState {
+        expected: "live cluster process lease".into(),
+        actual: format!("source '{source}' lost process authority during {operation}"),
+    }
+}
+
 enum SourceStartOutcome {
     Completed(Result<(), ConnectorError>),
-    TimedOut(Option<Result<(), ConnectorError>>),
+    TimedOut,
     #[cfg(feature = "cluster")]
-    ProcessAuthorityLost(Option<Result<(), ConnectorError>>),
+    ProcessAuthorityLost,
+}
+
+enum SourceStartFailure {
+    Connector(String),
+    Retired(String),
+    #[cfg(feature = "cluster")]
+    ProcessAuthorityLost(String),
 }
 
 async fn start_source_once(
@@ -1286,76 +1948,36 @@ async fn start_source_once(
     deadline: tokio::time::Instant,
     #[cfg(feature = "cluster")] process_authority: Option<&SourceProcessAuthority>,
 ) -> SourceStartOutcome {
-    let complete_started =
-        connector.cancellation_policy() == ConnectorCancellationPolicy::CompleteStarted;
-    let mut start = std::pin::pin!(connector.start(request));
-
-    #[cfg(feature = "cluster")]
-    if let Some(authority) = process_authority {
-        return tokio::select! {
-            biased;
-            () = authority.cancelled() => {
-                let completion = if complete_started {
-                    Some(start.as_mut().await)
-                } else {
-                    None
-                };
-                SourceStartOutcome::ProcessAuthorityLost(completion)
-            }
-            result = start.as_mut() => SourceStartOutcome::Completed(result),
-            () = tokio::time::sleep_until(deadline) => {
-                let completion = if complete_started {
-                    Some(start.as_mut().await)
-                } else {
-                    None
-                };
-                SourceStartOutcome::TimedOut(completion)
-            }
-        };
-    }
-
-    tokio::select! {
-        biased;
-        result = start.as_mut() => SourceStartOutcome::Completed(result),
-        () = tokio::time::sleep_until(deadline) => {
-            let completion = if complete_started {
-                Some(start.as_mut().await)
-            } else {
-                None
-            };
-            SourceStartOutcome::TimedOut(completion)
-        }
+    match run_source_operation(
+        deadline,
+        #[cfg(feature = "cluster")]
+        process_authority,
+        || connector.start(request),
+    )
+    .await
+    {
+        SourceOperationOutcome::Completed(result) => SourceStartOutcome::Completed(result),
+        SourceOperationOutcome::Deadline => SourceStartOutcome::TimedOut,
+        #[cfg(feature = "cluster")]
+        SourceOperationOutcome::ProcessAuthorityLost => SourceStartOutcome::ProcessAuthorityLost,
     }
 }
 
 async fn poll_source_once(
     connector: &mut dyn SourceConnector,
     max_records: usize,
+    deadline: tokio::time::Instant,
     shutdown: &tokio::sync::Notify,
     #[cfg(feature = "cluster")] process_authority: Option<&SourceProcessAuthority>,
 ) -> SourcePollOutcome {
-    let cancellation_policy = connector.cancellation_policy();
-    let mut poll = std::pin::pin!(connector.poll_batch(max_records));
-    if cancellation_policy == ConnectorCancellationPolicy::CompleteStarted {
-        #[cfg(feature = "cluster")]
-        if let Some(authority) = process_authority {
-            return tokio::select! {
-                biased;
-                () = authority.cancelled() => {
-                    let _ = poll.await;
-                    SourcePollOutcome::ProcessAuthorityLost
-                }
-                () = shutdown.notified() => SourcePollOutcome::Shutdown(Some(poll.await)),
-                result = poll.as_mut() => SourcePollOutcome::Completed(result),
-            };
-        }
-        return tokio::select! {
-            biased;
-            () = shutdown.notified() => SourcePollOutcome::Shutdown(Some(poll.await)),
-            result = poll.as_mut() => SourcePollOutcome::Completed(result),
-        };
+    #[cfg(feature = "cluster")]
+    if !source_process_authority_is_live(process_authority) {
+        return SourcePollOutcome::ProcessAuthorityLost;
     }
-
+    if tokio::time::Instant::now() >= deadline {
+        return SourcePollOutcome::Deadline;
+    }
+    let mut poll = std::pin::pin!(connector.poll_batch(max_records));
     #[cfg(feature = "cluster")]
     if let Some(authority) = process_authority {
         return tokio::select! {
@@ -1363,19 +1985,39 @@ async fn poll_source_once(
             () = authority.cancelled() => {
                 SourcePollOutcome::ProcessAuthorityLost
             }
-            () = shutdown.notified() => SourcePollOutcome::Shutdown(None),
-            result = poll.as_mut() => SourcePollOutcome::Completed(result),
+            () = shutdown.notified() => SourcePollOutcome::Shutdown,
+            () = tokio::time::sleep_until(deadline) => SourcePollOutcome::Deadline,
+            result = poll.as_mut() => {
+                if !authority.is_live() {
+                    SourcePollOutcome::ProcessAuthorityLost
+                } else if tokio::time::Instant::now() >= deadline {
+                    SourcePollOutcome::Deadline
+                } else {
+                    SourcePollOutcome::Completed(result)
+                }
+            },
         };
     }
     tokio::select! {
         biased;
-        () = shutdown.notified() => SourcePollOutcome::Shutdown(None),
-        result = poll.as_mut() => SourcePollOutcome::Completed(result),
+        () = shutdown.notified() => SourcePollOutcome::Shutdown,
+        () = tokio::time::sleep_until(deadline) => SourcePollOutcome::Deadline,
+        result = poll.as_mut() => {
+            if tokio::time::Instant::now() >= deadline {
+                SourcePollOutcome::Deadline
+            } else {
+                SourcePollOutcome::Completed(result)
+            }
+        },
     }
 }
 
 /// Backoff between completed polls while still servicing durable commit
 /// notifications immediately. This never races a live `poll_batch` future.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "idle waiting multiplexes the complete source actor protocol boundary"
+)]
 async fn wait_source_idle(
     connector: &mut dyn SourceConnector,
     epoch_committed_rx: &mut tokio::sync::watch::Receiver<Option<(u64, SourceCheckpoint)>>,
@@ -1384,6 +2026,9 @@ async fn wait_source_idle(
     fault_tx: &tokio::sync::mpsc::UnboundedSender<SourceFault>,
     shutdown: &tokio::sync::Notify,
     control_wake: Option<&tokio::sync::Notify>,
+    operation_timeout: Duration,
+    cancellation_policy: ConnectorCancellationPolicy,
+    lifecycle: &mut SourceConnectorLifecycle,
     #[cfg(feature = "cluster")] process_authority: Option<&SourceProcessAuthority>,
     poll_interval: Duration,
 ) -> bool {
@@ -1392,18 +2037,26 @@ async fn wait_source_idle(
     if let Some(authority) = process_authority {
         return tokio::select! {
             biased;
-            () = authority.cancelled() => false,
+            () = authority.cancelled() => {
+                lifecycle.authority_lost();
+                false
+            },
             () = shutdown.notified() => false,
-            changed = epoch_committed_rx.changed() => match changed {
-                Ok(()) => acknowledge_latest_source_commit(
+            changed = epoch_committed_rx.changed() => if changed.is_ok() {
+                acknowledge_latest_source_commit(
                     connector,
                     epoch_committed_rx,
                     delivery_guarantee,
                     src_name,
                     fault_tx,
+                    tokio::time::Instant::now() + operation_timeout,
+                    cancellation_policy,
+                    lifecycle,
                     Some(authority),
-                ).await,
-                Err(_) => false,
+                ).await
+            } else {
+                lifecycle.fault_data_plane();
+                false
             },
             () = async move {
                 match data_ready {
@@ -1424,17 +2077,22 @@ async fn wait_source_idle(
     tokio::select! {
         biased;
         () = shutdown.notified() => false,
-        changed = epoch_committed_rx.changed() => match changed {
-            Ok(()) => acknowledge_latest_source_commit(
+        changed = epoch_committed_rx.changed() => if changed.is_ok() {
+            acknowledge_latest_source_commit(
                 connector,
                 epoch_committed_rx,
                 delivery_guarantee,
                 src_name,
                 fault_tx,
+                tokio::time::Instant::now() + operation_timeout,
+                cancellation_policy,
+                lifecycle,
                 #[cfg(feature = "cluster")]
                 None,
-            ).await,
-            Err(_) => false,
+            ).await
+        } else {
+            lifecycle.fault_data_plane();
+            false
         },
         () = async move {
             match data_ready {
@@ -1453,6 +2111,10 @@ async fn wait_source_idle(
 }
 
 #[cfg(feature = "cluster")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the drain hold must select over explicit connector, lease, commit, and shutdown fences"
+)]
 async fn wait_source_drain_hold(
     connector: &mut dyn SourceConnector,
     epoch_committed_rx: &mut tokio::sync::watch::Receiver<Option<(u64, SourceCheckpoint)>>,
@@ -1461,24 +2123,35 @@ async fn wait_source_drain_hold(
     fault_tx: &tokio::sync::mpsc::UnboundedSender<SourceFault>,
     shutdown: &tokio::sync::Notify,
     control_wake: &tokio::sync::Notify,
+    operation_timeout: Duration,
+    cancellation_policy: ConnectorCancellationPolicy,
+    lifecycle: &mut SourceConnectorLifecycle,
     process_authority: Option<&SourceProcessAuthority>,
     poll_interval: Duration,
 ) -> bool {
     if let Some(authority) = process_authority {
         return tokio::select! {
             biased;
-            () = authority.cancelled() => false,
+            () = authority.cancelled() => {
+                lifecycle.authority_lost();
+                false
+            },
             () = shutdown.notified() => false,
-            changed = epoch_committed_rx.changed() => match changed {
-                Ok(()) => acknowledge_latest_source_commit(
+            changed = epoch_committed_rx.changed() => if changed.is_ok() {
+                acknowledge_latest_source_commit(
                     connector,
                     epoch_committed_rx,
                     delivery_guarantee,
                     src_name,
                     fault_tx,
+                    tokio::time::Instant::now() + operation_timeout,
+                    cancellation_policy,
+                    lifecycle,
                     Some(authority),
-                ).await,
-                Err(_) => false,
+                ).await
+            } else {
+                lifecycle.fault_data_plane();
+                false
             },
             () = control_wake.notified() => true,
             () = tokio::time::sleep(poll_interval) => true,
@@ -1488,16 +2161,21 @@ async fn wait_source_drain_hold(
     tokio::select! {
         biased;
         () = shutdown.notified() => false,
-        changed = epoch_committed_rx.changed() => match changed {
-            Ok(()) => acknowledge_latest_source_commit(
+        changed = epoch_committed_rx.changed() => if changed.is_ok() {
+            acknowledge_latest_source_commit(
                 connector,
                 epoch_committed_rx,
                 delivery_guarantee,
                 src_name,
                 fault_tx,
+                tokio::time::Instant::now() + operation_timeout,
+                cancellation_policy,
+                lifecycle,
                 None,
-            ).await,
-            Err(_) => false,
+            ).await
+        } else {
+            lifecycle.fault_data_plane();
+            false
         },
         () = control_wake.notified() => true,
         () = tokio::time::sleep(poll_interval) => true,
@@ -1515,6 +2193,11 @@ fn source_barrier_release_covers(released: CheckpointAttempt, held: CheckpointAt
 ///
 /// The retained watch value closes the release-before-wait race. While held, the source keeps its
 /// connector control plane and durable upstream acknowledgements live, but never polls data.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "barrier hold is one source control-plane state machine"
+)]
 async fn wait_source_barrier_release(
     connector: &mut dyn SourceConnector,
     epoch_committed_rx: &mut tokio::sync::watch::Receiver<Option<(u64, SourceCheckpoint)>>,
@@ -1523,6 +2206,9 @@ async fn wait_source_barrier_release(
     src_name: &str,
     fault_tx: &tokio::sync::mpsc::UnboundedSender<SourceFault>,
     shutdown: &tokio::sync::Notify,
+    operation_timeout: Duration,
+    cancellation_policy: ConnectorCancellationPolicy,
+    lifecycle: &mut SourceConnectorLifecycle,
     #[cfg(feature = "cluster")] process_authority: Option<&SourceProcessAuthority>,
     poll_interval: Duration,
     barrier: CheckpointBarrier,
@@ -1531,6 +2217,7 @@ async fn wait_source_barrier_release(
     loop {
         #[cfg(feature = "cluster")]
         if !source_process_authority_is_live(process_authority) {
+            lifecycle.authority_lost();
             return false;
         }
         let signal = *barrier_release_rx.borrow_and_update();
@@ -1540,36 +2227,69 @@ async fn wait_source_barrier_release(
             {
                 return true;
             }
-            Some(SourceBarrierSignal::Stop) => return false,
+            Some(SourceBarrierSignal::Stop) => {
+                lifecycle.fault_data_plane();
+                return false;
+            }
             _ => {}
         }
 
-        connector.drive_control_plane();
+        let control_deadline = tokio::time::Instant::now() + operation_timeout;
+        if let Err(error) = lifecycle.run_sync_hook(
+            src_name,
+            "barrier-hold control-plane drive",
+            control_deadline,
+            cancellation_policy,
+            #[cfg(feature = "cluster")]
+            process_authority,
+            || {
+                connector.drive_control_plane();
+                Ok(())
+            },
+        ) {
+            lifecycle.fault_data_plane();
+            let _ = fault_tx.send(SourceFault {
+                source: Arc::from(src_name),
+                error: error.to_string(),
+            });
+            return false;
+        }
         #[cfg(feature = "cluster")]
         if let Some(authority) = process_authority {
             tokio::select! {
                 biased;
-                () = authority.cancelled() => return false,
-                () = shutdown.notified() => return false,
+                () = authority.cancelled() => {
+                    lifecycle.authority_lost();
+                    return false;
+                },
+                () = shutdown.notified() => {
+                    lifecycle.fault_data_plane();
+                    return false;
+                },
                 changed = barrier_release_rx.changed() => {
                     if changed.is_err() {
+                        lifecycle.fault_data_plane();
                         return false;
                     }
                 }
-                changed = epoch_committed_rx.changed() => match changed {
-                    Ok(()) => {
-                        if !acknowledge_latest_source_commit(
-                            connector,
-                            epoch_committed_rx,
-                            delivery_guarantee,
-                            src_name,
-                            fault_tx,
-                            Some(authority),
-                        ).await {
-                            return false;
-                        }
+                changed = epoch_committed_rx.changed() => {
+                    if changed.is_err() {
+                        lifecycle.fault_data_plane();
+                        return false;
                     }
-                    Err(_) => return false,
+                    if !acknowledge_latest_source_commit(
+                        connector,
+                        epoch_committed_rx,
+                        delivery_guarantee,
+                        src_name,
+                        fault_tx,
+                        tokio::time::Instant::now() + operation_timeout,
+                        cancellation_policy,
+                        lifecycle,
+                        Some(authority),
+                    ).await {
+                        return false;
+                    }
                 },
                 () = tokio::time::sleep(poll_interval) => {}
             }
@@ -1578,27 +2298,35 @@ async fn wait_source_barrier_release(
 
         tokio::select! {
             biased;
-            () = shutdown.notified() => return false,
+            () = shutdown.notified() => {
+                lifecycle.fault_data_plane();
+                return false;
+            },
             changed = barrier_release_rx.changed() => {
                 if changed.is_err() {
+                    lifecycle.fault_data_plane();
                     return false;
                 }
             }
-            changed = epoch_committed_rx.changed() => match changed {
-                Ok(()) => {
-                    if !acknowledge_latest_source_commit(
-                        connector,
-                        epoch_committed_rx,
-                        delivery_guarantee,
-                        src_name,
-                        fault_tx,
-                        #[cfg(feature = "cluster")]
-                        None,
-                    ).await {
-                        return false;
-                    }
+            changed = epoch_committed_rx.changed() => {
+                if changed.is_err() {
+                    lifecycle.fault_data_plane();
+                    return false;
                 }
-                Err(_) => return false,
+                if !acknowledge_latest_source_commit(
+                    connector,
+                    epoch_committed_rx,
+                    delivery_guarantee,
+                    src_name,
+                    fault_tx,
+                    tokio::time::Instant::now() + operation_timeout,
+                    cancellation_policy,
+                    lifecycle,
+                    #[cfg(feature = "cluster")]
+                    None,
+                ).await {
+                    return false;
+                }
             },
             () = tokio::time::sleep(poll_interval) => {}
         }
@@ -1622,69 +2350,72 @@ impl StreamingCoordinator {
         }
     }
 
-    async fn close_startup_source(source: &mut SourceRegistration, cleanup_timeout: Duration) {
-        let cleanup_deadline = tokio::time::Instant::now() + cleanup_timeout;
-        let cancellation_policy = source.connector.cancellation_policy();
-        let mut close = std::pin::pin!(source.connector.close());
-        match tokio::time::timeout_at(cleanup_deadline, close.as_mut()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
+    async fn close_startup_source(
+        source: &mut SourceRegistration,
+        cleanup_deadline: tokio::time::Instant,
+        #[cfg(feature = "cluster")] process_authority: Option<&SourceProcessAuthority>,
+    ) {
+        match run_source_operation(
+            cleanup_deadline,
+            #[cfg(feature = "cluster")]
+            process_authority,
+            || source.connector.close(),
+        )
+        .await
+        {
+            SourceOperationOutcome::Completed(Ok(())) => {}
+            SourceOperationOutcome::Completed(Err(error)) => {
                 tracing::warn!(
                     source = %source.name,
                     %error,
                     "source close failed while rolling back pipeline startup"
                 );
             }
-            Err(_) => {
+            SourceOperationOutcome::Deadline => {
                 tracing::warn!(
                     source = %source.name,
                     "source close exceeded its pipeline-startup cleanup deadline"
                 );
-                if cancellation_policy == ConnectorCancellationPolicy::CompleteStarted {
-                    if let Err(error) = close.await {
-                        tracing::warn!(
-                            source = %source.name,
-                            %error,
-                            "cancellation-unsafe source close failed after the cleanup deadline"
-                        );
-                    }
-                }
             }
+            #[cfg(feature = "cluster")]
+            SourceOperationOutcome::ProcessAuthorityLost => {}
         }
     }
 
     async fn close_prepared_sources(
-        sources: &mut Vec<SourceRegistration>,
+        sources: &mut Vec<PreparedSourceGeneration>,
         cleanup_timeout: Duration,
+        #[cfg(feature = "cluster")] process_authority: Option<&SourceProcessAuthority>,
     ) {
-        while let Some(mut source) = sources.pop() {
-            Self::close_startup_source(&mut source, cleanup_timeout).await;
-        }
+        let cleanup_deadline = tokio::time::Instant::now() + cleanup_timeout;
+        futures::future::join_all(sources.iter_mut().map(|source| {
+            Self::close_startup_source(
+                &mut source.registration,
+                cleanup_deadline,
+                #[cfg(feature = "cluster")]
+                process_authority,
+            )
+        }))
+        .await;
+        sources.clear();
     }
 
-    /// Reap a source task without allowing a replacement generation to overlap a
-    /// cancellation-unsafe operation.
-    async fn reap_source_task(task: SourceTaskLease) {
+    /// Reap a source task while preserving its generation fence until actual termination.
+    fn reap_source_task(task: SourceTaskLease) {
         if !task.is_finished() {
-            if task.cancellation_policy() == ConnectorCancellationPolicy::CompleteStarted {
-                tracing::warn!(
-                    source = %task.name(),
-                    "source task exceeded shutdown budget; replacement remains fenced until it terminates"
-                );
-                task.wait().await;
-            } else {
-                tracing::warn!(
-                    source = %task.name(),
-                    "source task did not exit within shutdown budget; requesting cancellation"
-                );
-                task.abort_if_cancel_safe();
-                // The DB-owned lease remains registered until the stable supervisor observes
-                // actual termination. Coordinator shutdown stays bounded without admitting an
-                // overlapping replacement generation.
-                return;
-            }
+            tracing::warn!(
+                source = %task.name(),
+                "source task did not exit within shutdown budget; retiring its connector generation"
+            );
+            task.abort();
+            // The DB-owned lease remains registered until the actor wrapper and connector tracker
+            // prove actual termination. Coordinator shutdown stays bounded without admitting an
+            // overlapping replacement generation.
+            drop(task);
+            return;
         }
         task.log_terminal_outcome();
+        drop(task);
     }
 
     /// Notify every source of a committed epoch so it can release retained upstream data.
@@ -1733,19 +2464,29 @@ impl StreamingCoordinator {
     /// Returns an error if delivery guarantee constraints are violated or a source fails to start
     /// at its requested initial/recovered position.
     pub async fn new(
+        runtime: &StreamingCoordinatorRuntime,
         sources: Vec<SourceRegistration>,
         config: PipelineConfig,
         shutdown: Arc<tokio::sync::Notify>,
         control_rx: ControlMsgRx,
         source_gate: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, DbError> {
+        let _construction = runtime.construction.lock().await;
+        runtime.prune_and_require_idle()?;
+        let generation = runtime.claim_generation()?;
+        let sources = sources
+            .into_iter()
+            .map(|source| {
+                TrackedSourceRegistration::capture(source, &runtime.owned_connector_task_fences)
+            })
+            .collect::<Vec<_>>();
         if let Some(source) = sources.iter().find(|source| source.assignment_scoped) {
             return Err(DbError::Config(format!(
                 "assignment-scoped source '{}' requires the database-owned cluster runtime",
                 source.name
             )));
         }
-        Self::new_with_source_registry(
+        let mut coordinator = Self::new_with_tracked_source_registry(
             sources,
             config,
             shutdown,
@@ -1753,13 +2494,16 @@ impl StreamingCoordinator {
             source_gate,
             #[cfg(feature = "cluster")]
             None,
-            Arc::new(parking_lot::Mutex::new(Vec::new())),
+            Arc::clone(&runtime.owned_source_tasks),
             crate::db::RuntimeMode::Local,
         )
-        .await
+        .await?;
+        coordinator.public_generation = Some(generation);
+        Ok(coordinator)
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[cfg(all(test, feature = "cluster"))]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new_with_source_registry(
         sources: Vec<SourceRegistration>,
         config: PipelineConfig,
@@ -1768,7 +2512,38 @@ impl StreamingCoordinator {
         source_gate: Arc<std::sync::atomic::AtomicBool>,
         #[cfg(feature = "cluster")] source_process_authority: Option<Arc<ClusterController>>,
         owned_source_tasks: OwnedSourceTasks,
-        _runtime_mode: crate::db::RuntimeMode,
+        owned_connector_task_fences: OwnedConnectorTaskFences,
+        runtime_mode: crate::db::RuntimeMode,
+    ) -> Result<Self, DbError> {
+        let sources = sources
+            .into_iter()
+            .map(|source| TrackedSourceRegistration::capture(source, &owned_connector_task_fences))
+            .collect();
+        Self::new_with_tracked_source_registry(
+            sources,
+            config,
+            shutdown,
+            control_rx,
+            source_gate,
+            #[cfg(feature = "cluster")]
+            source_process_authority,
+            owned_source_tasks,
+            runtime_mode,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    pub(crate) async fn new_with_tracked_source_registry(
+        sources: Vec<TrackedSourceRegistration>,
+        config: PipelineConfig,
+        shutdown: Arc<tokio::sync::Notify>,
+        control_rx: ControlMsgRx,
+        source_gate: Arc<std::sync::atomic::AtomicBool>,
+        #[cfg(feature = "cluster")] source_process_authority: Option<Arc<ClusterController>>,
+        owned_source_tasks: OwnedSourceTasks,
+        #[cfg_attr(not(feature = "cluster"), allow(unused_variables))]
+        runtime_mode: crate::db::RuntimeMode,
     ) -> Result<Self, DbError> {
         if config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
             for src in &sources {
@@ -1823,7 +2598,7 @@ impl StreamingCoordinator {
         }
 
         #[cfg(feature = "cluster")]
-        if _runtime_mode.is_cluster() {
+        if runtime_mode.is_cluster() {
             let controller = source_process_authority.as_ref().ok_or_else(|| {
                 DbError::Config(
                     "cluster source runtime requires a cluster controller with process lease authority"
@@ -1858,12 +2633,20 @@ impl StreamingCoordinator {
             let src_name = src.name.clone();
             let start_position = src.position.clone();
             if tokio::time::Instant::now() >= source_start_deadline {
+                #[cfg(feature = "cluster")]
+                if !source_process_authority_is_live(source_process_authority.as_deref()) {
+                    return Err(DbError::Connector(format!(
+                        "source '{src_name}' start was not attempted: cluster process lease expired"
+                    )));
+                }
                 // `timeout_at` polls its inner future once even when already expired. Starting a
                 // source can acquire a lease/slot, so never construct or poll it after the shared
                 // stage budget has been consumed by earlier sources.
                 Self::close_prepared_sources(
                     &mut prepared_sources,
                     PipelineConfig::CONNECTOR_STARTUP_CLEANUP_TIMEOUT,
+                    #[cfg(feature = "cluster")]
+                    source_process_authority.as_deref(),
                 )
                 .await;
                 let error = format!(
@@ -1891,6 +2674,7 @@ impl StreamingCoordinator {
                 position: start_position.clone(),
                 delivery: config.delivery_guarantee,
             };
+            let cancellation_policy = src.connector.cancellation_policy();
             let source_start_authorized = {
                 #[cfg(feature = "cluster")]
                 {
@@ -1901,9 +2685,7 @@ impl StreamingCoordinator {
                     true
                 }
             };
-            let start_error = if !source_start_authorized {
-                Some("process lease expired before source start began".to_owned())
-            } else {
+            let start_error = if source_start_authorized {
                 match start_source_once(
                     src.connector.as_mut(),
                     start,
@@ -1915,59 +2697,87 @@ impl StreamingCoordinator {
                 {
                     SourceStartOutcome::Completed(Ok(())) => {
                         #[cfg(feature = "cluster")]
-                        if !source_process_authority_is_live(source_process_authority.as_deref()) {
-                            Some("process lease expired as source start completed".to_owned())
-                        } else {
+                        if source_process_authority_is_live(source_process_authority.as_deref()) {
                             None
+                        } else {
+                            Some(SourceStartFailure::ProcessAuthorityLost(
+                                "process lease expired as source start completed".to_owned(),
+                            ))
                         }
                         #[cfg(not(feature = "cluster"))]
                         None
                     }
-                    SourceStartOutcome::Completed(Err(error)) => Some(error.to_string()),
-                    SourceStartOutcome::TimedOut(completion) => {
-                        match completion {
-                            Some(Ok(())) => tracing::warn!(
-                                source = %src_name,
-                                "cancellation-unsafe source start completed after its deadline"
-                            ),
-                            Some(Err(error)) => tracing::warn!(
-                                source = %src_name,
-                                %error,
-                                "cancellation-unsafe source start failed after its deadline"
-                            ),
-                            None => {}
-                        }
-                        Some(format!(
-                            "exceeded the shared {source_start_timeout:?} source-start stage deadline"
+                    SourceStartOutcome::Completed(Err(error)) => {
+                        Some(if error.is_outcome_unknown() {
+                            SourceStartFailure::Retired(error.to_string())
+                        } else {
+                            SourceStartFailure::Connector(error.to_string())
+                        })
+                    }
+                    SourceStartOutcome::TimedOut => Some(
+                        if cancellation_policy == ConnectorCancellationPolicy::RetireConnector {
+                            SourceStartFailure::Retired(format!(
+                                "exceeded the shared {source_start_timeout:?} source-start stage deadline"
+                            ))
+                        } else {
+                            SourceStartFailure::Connector(format!(
+                                "exceeded the shared {source_start_timeout:?} source-start stage deadline"
+                            ))
+                        },
+                    ),
+                    #[cfg(feature = "cluster")]
+                    SourceStartOutcome::ProcessAuthorityLost => {
+                        Some(SourceStartFailure::ProcessAuthorityLost(
+                            "process lease expired while source start was in flight".to_owned(),
                         ))
                     }
-                    #[cfg(feature = "cluster")]
-                    SourceStartOutcome::ProcessAuthorityLost(completion) => {
-                        match completion {
-                            Some(Ok(())) => tracing::warn!(
-                                source = %src_name,
-                                "cancellation-unsafe source start completed after process lease loss"
-                            ),
-                            Some(Err(error)) => tracing::warn!(
-                                source = %src_name,
-                                %error,
-                                "cancellation-unsafe source start failed after process lease loss"
-                            ),
-                            None => {}
-                        }
-                        Some("process lease expired while source start was in flight".to_owned())
-                    }
+                }
+            } else {
+                #[cfg(feature = "cluster")]
+                {
+                    Some(SourceStartFailure::ProcessAuthorityLost(
+                        "process lease expired before source start began".to_owned(),
+                    ))
+                }
+                #[cfg(not(feature = "cluster"))]
+                {
+                    unreachable!("local source startup is always authorized")
                 }
             };
-            if let Some(error) = start_error {
-                // Include the current connector: a cancelled/failed start may already have acquired
-                // external resources. Every started source receives a terminal cleanup attempt.
-                prepared_sources.push(src);
-                Self::close_prepared_sources(
-                    &mut prepared_sources,
-                    PipelineConfig::CONNECTOR_STARTUP_CLEANUP_TIMEOUT,
-                )
-                .await;
+            if let Some(failure) = start_error {
+                let error = match failure {
+                    SourceStartFailure::Connector(error) => {
+                        // A completed failure may have acquired resources, but the connector is
+                        // still valid for its bounded terminal cleanup.
+                        prepared_sources.push(PreparedSourceGeneration { registration: src });
+                        Self::close_prepared_sources(
+                            &mut prepared_sources,
+                            PipelineConfig::CONNECTOR_STARTUP_CLEANUP_TIMEOUT,
+                            #[cfg(feature = "cluster")]
+                            source_process_authority.as_deref(),
+                        )
+                        .await;
+                        error
+                    }
+                    SourceStartFailure::Retired(error) => {
+                        // The cancelled current generation is terminal. Drop it without invoking
+                        // close and clean up only sources whose starts completed.
+                        Self::close_prepared_sources(
+                            &mut prepared_sources,
+                            PipelineConfig::CONNECTOR_STARTUP_CLEANUP_TIMEOUT,
+                            #[cfg(feature = "cluster")]
+                            source_process_authority.as_deref(),
+                        )
+                        .await;
+                        error
+                    }
+                    #[cfg(feature = "cluster")]
+                    SourceStartFailure::ProcessAuthorityLost(error) => {
+                        // Generic close may publish externally. Drop every generation without
+                        // another connector call after the process authority fence.
+                        error
+                    }
+                };
                 return match start_position {
                     SourcePosition::Initial => Err(DbError::Config(format!(
                         "source '{src_name}' start failed at initial position: {error}"
@@ -1981,7 +2791,7 @@ impl StreamingCoordinator {
             }
 
             committed_offsets.push(committed_offset);
-            prepared_sources.push(src);
+            prepared_sources.push(PreparedSourceGeneration { registration: src });
         }
 
         let (tx, rx) = mpsc::bounded_async::<SourceMsg>(config.channel_capacity);
@@ -1990,7 +2800,13 @@ impl StreamingCoordinator {
         let mut source_names = Vec::with_capacity(source_count);
         let source_runtime = tokio::runtime::Handle::current();
 
-        for (idx, src) in prepared_sources.into_iter().enumerate() {
+        for (idx, prepared) in prepared_sources.into_iter().enumerate() {
+            let PreparedSourceGeneration { registration } = prepared;
+            let TrackedSourceRegistration {
+                source: src,
+                task_fence,
+            } = registration;
+            let terminal_tasks = task_fence.tracker();
             let task_shutdown = Arc::new(tokio::sync::Notify::new());
             let task_shutdown_clone = Arc::clone(&task_shutdown);
             let task_tx = tx.clone();
@@ -2000,6 +2816,7 @@ impl StreamingCoordinator {
             let task_process_authority = source_process_authority.clone();
             let max_poll = config.max_poll_records;
             let poll_interval = config.fallback_poll_interval;
+            let source_operation_timeout = config.checkpoint_timeout;
             let delivery_guarantee = config.delivery_guarantee;
             let src_name = src.name.clone();
             let recovery_cursor = src.contract.supports_replay();
@@ -2008,7 +2825,7 @@ impl StreamingCoordinator {
             let mut connector = src.connector;
 
             #[cfg(feature = "cluster")]
-            let drain_control = _runtime_mode.is_cluster().then(|| {
+            let drain_control = runtime_mode.is_cluster().then(|| {
                 let (command_tx, _) =
                     tokio::sync::watch::channel::<Option<SourceDrainCommand>>(None);
                 let (status_tx, _) = tokio::sync::watch::channel(SourceDrainTaskStatus::Idle);
@@ -2044,12 +2861,13 @@ impl StreamingCoordinator {
             let expected_shutdown = Arc::new(AtomicBool::new(false));
             let task_expected_shutdown = Arc::clone(&expected_shutdown);
 
-            let join = source_runtime.spawn(async move {
-                let _exit_guard = SourceTaskExitGuard {
-                    source: Arc::from(src_name.as_str()),
-                    expected_shutdown: task_expected_shutdown,
-                    fault_tx: task_fault_tx.clone(),
-                };
+            let task_exit_guard = SourceTaskExitGuard {
+                source: Arc::from(src_name.as_str()),
+                expected_shutdown: task_expected_shutdown,
+                fault_tx: task_fault_tx.clone(),
+            };
+            let (join, actor_terminal) = spawn_source_actor(&source_runtime, async move {
+                let _exit_guard = task_exit_guard;
                 // Starting connectors and starting their I/O are separate phases. Keeping every
                 // task behind this one-shot fence prevents a fast poll/commit failure from being
                 // queued before the dedicated compute loop can publish its readiness boundary.
@@ -2077,25 +2895,43 @@ impl StreamingCoordinator {
                 };
 
                 if !activated {
-                    if let Err(e) = connector.close().await {
-                        tracing::warn!(source = %src_name, error = %e, "source close error");
+                    let deadline = tokio::time::Instant::now() + SHUTDOWN_DRAIN_BUDGET;
+                    match run_source_operation(
+                        deadline,
+                        #[cfg(feature = "cluster")]
+                        task_process_authority.as_deref(),
+                        || connector.close(),
+                    )
+                    .await
+                    {
+                        SourceOperationOutcome::Completed(Ok(())) => {}
+                        SourceOperationOutcome::Completed(Err(error)) => {
+                            tracing::warn!(source = %src_name, %error, "source close error");
+                        }
+                        SourceOperationOutcome::Deadline => {
+                            tracing::warn!(
+                                source = %src_name,
+                                "source close exceeded its shutdown deadline"
+                            );
+                        }
+                        #[cfg(feature = "cluster")]
+                        SourceOperationOutcome::ProcessAuthorityLost => {}
                     }
                     return;
                 }
 
+                let mut lifecycle = SourceConnectorLifecycle::default();
                 let mut pending_barrier = None;
                 let mut pending_batch: Option<SourceBatch> = None;
                 #[cfg(feature = "cluster")]
                 let mut active_source_drain: Option<ActiveSourceDrain> = None;
-                #[cfg(feature = "cluster")]
-                let mut process_authority_lost = false;
 
                 // Acknowledge a fresh commit before polling more to preserve upstream retention
                 // and acknowledgement headroom.
                 loop {
                     #[cfg(feature = "cluster")]
                     if !source_process_authority_is_live(task_process_authority.as_deref()) {
-                        process_authority_lost = true;
+                        lifecycle.authority_lost();
                         break;
                     }
 
@@ -2103,57 +2939,75 @@ impl StreamingCoordinator {
                     if let (Some(control), Some(command_rx)) =
                         (task_drain_control.as_ref(), task_drain_command_rx.as_mut())
                     {
-                        if let Err(error) = apply_latest_source_drain_command(
+                        if let Err(error) = apply_latest_source_drain_command_fenced(
                             connector.as_mut(),
                             command_rx,
                             &control.status_tx,
                             &mut active_source_drain,
                             assignment_scoped,
+                            &src_name,
+                            cancellation_policy,
+                            &mut lifecycle,
+                            task_process_authority.as_deref(),
                         )
                         .await
                         {
-                            let _ = task_fault_tx.send(SourceFault {
-                                source: Arc::from(src_name.as_str()),
-                                error: error.to_string(),
-                            });
-                            break;
-                        }
-                        // At loop entry every earlier source-channel send has completed. A cut
-                        // observed in the preceding poll can therefore become externally Ready.
-                        if pending_batch.is_none()
-                            && publish_source_drain_ready(
-                                connector.as_mut(),
-                                control,
-                                &mut active_source_drain,
-                            )
-                            .is_err_and(|error| {
+                            if !lifecycle.process_authority_lost() {
+                                lifecycle.fault_data_plane();
                                 let _ = task_fault_tx.send(SourceFault {
                                     source: Arc::from(src_name.as_str()),
                                     error: error.to_string(),
                                 });
-                                true
-                            })
-                        {
+                            }
                             break;
                         }
-                        if let Err(error) = resolve_pending_source_drain(
+                        // At loop entry every earlier source-channel send has completed. A cut
+                        // observed in the preceding poll can therefore become externally Ready.
+                        if pending_batch.is_none() {
+                            if let Err(error) = publish_source_drain_ready_fenced(
+                                connector.as_mut(),
+                                control,
+                                &mut active_source_drain,
+                                &src_name,
+                                cancellation_policy,
+                                &mut lifecycle,
+                                task_process_authority.as_deref(),
+                            ) {
+                                if !lifecycle.process_authority_lost() {
+                                    lifecycle.fault_data_plane();
+                                    let _ = task_fault_tx.send(SourceFault {
+                                        source: Arc::from(src_name.as_str()),
+                                        error: error.to_string(),
+                                    });
+                                }
+                                break;
+                            }
+                        }
+                        if let Err(error) = resolve_pending_source_drain_fenced(
                             connector.as_mut(),
                             &control.status_tx,
                             &mut active_source_drain,
+                            &src_name,
+                            cancellation_policy,
+                            &mut lifecycle,
+                            task_process_authority.as_deref(),
                         )
                         .await
                         {
-                            let _ = task_fault_tx.send(SourceFault {
-                                source: Arc::from(src_name.as_str()),
-                                error: error.to_string(),
-                            });
+                            if !lifecycle.process_authority_lost() {
+                                lifecycle.fault_data_plane();
+                                let _ = task_fault_tx.send(SourceFault {
+                                    source: Arc::from(src_name.as_str()),
+                                    error: error.to_string(),
+                                });
+                            }
                             break;
                         }
                     }
 
                     #[cfg(feature = "cluster")]
                     if !source_process_authority_is_live(task_process_authority.as_deref()) {
-                        process_authority_lost = true;
+                        lifecycle.authority_lost();
                         break;
                     }
 
@@ -2165,6 +3019,9 @@ impl StreamingCoordinator {
                                 delivery_guarantee,
                                 &src_name,
                                 &task_fault_tx,
+                                tokio::time::Instant::now() + source_operation_timeout,
+                                cancellation_policy,
+                                &mut lifecycle,
                                 #[cfg(feature = "cluster")]
                                 task_process_authority.as_deref(),
                             )
@@ -2175,23 +3032,54 @@ impl StreamingCoordinator {
                             #[cfg(feature = "cluster")]
                             if !source_process_authority_is_live(task_process_authority.as_deref())
                             {
-                                process_authority_lost = true;
+                                lifecycle.authority_lost();
                                 break;
                             }
                             continue;
                         }
                         Ok(false) => {}
-                        Err(_) => break,
+                        Err(_) => {
+                            lifecycle.fault_data_plane();
+                            break;
+                        }
                     }
 
-                    connector.drive_control_plane();
+                    let control_deadline = tokio::time::Instant::now() + source_operation_timeout;
+                    if let Err(error) = lifecycle.run_sync_hook(
+                        &src_name,
+                        "control-plane drive",
+                        control_deadline,
+                        cancellation_policy,
+                        #[cfg(feature = "cluster")]
+                        task_process_authority.as_deref(),
+                        || {
+                            connector.drive_control_plane();
+                            Ok(())
+                        },
+                    ) {
+                        lifecycle.fault_data_plane();
+                        let _ = task_fault_tx.send(SourceFault {
+                            source: Arc::from(src_name.as_str()),
+                            error: error.to_string(),
+                        });
+                        break;
+                    }
 
                     // A cluster-aware source may observe a new ownership publication before its
                     // external consumer has rebound and validated the version-bound handoff
                     // cursor. Do not poll data or consume a barrier during that window.
-                    let checkpoint_ready = match connector.checkpoint_ready() {
+                    let checkpoint_ready = match lifecycle.run_sync_hook(
+                        &src_name,
+                        "checkpoint readiness",
+                        control_deadline,
+                        cancellation_policy,
+                        #[cfg(feature = "cluster")]
+                        task_process_authority.as_deref(),
+                        || connector.checkpoint_ready(),
+                    ) {
                         Ok(ready) => ready,
                         Err(error) => {
+                            lifecycle.fault_data_plane();
                             tracing::error!(
                                 source = %src_name,
                                 %error,
@@ -2213,6 +3101,9 @@ impl StreamingCoordinator {
                             &task_fault_tx,
                             &task_shutdown_clone,
                             task_control_wake.as_deref(),
+                            source_operation_timeout,
+                            cancellation_policy,
+                            &mut lifecycle,
                             #[cfg(feature = "cluster")]
                             task_process_authority.as_deref(),
                             poll_interval,
@@ -2229,7 +3120,15 @@ impl StreamingCoordinator {
                     // retry its cursor once reconciliation completes; faulting or dropping here
                     // would turn a normal rotation into either downtime or data loss.
                     if let Some(batch) = pending_batch.take() {
-                        match try_source_checkpoint(connector.as_ref(), assignment_scoped) {
+                        match lifecycle.run_sync_hook(
+                            &src_name,
+                            "pending batch checkpoint capture",
+                            control_deadline,
+                            cancellation_policy,
+                            #[cfg(feature = "cluster")]
+                            task_process_authority.as_deref(),
+                            || try_source_checkpoint(connector.as_ref(), assignment_scoped),
+                        ) {
                             Ok(Some(checkpoint)) => {
                                 let msg = SourceMsg::Batch {
                                     source_idx: idx,
@@ -2245,6 +3144,7 @@ impl StreamingCoordinator {
                                 )
                                 .await
                                 {
+                                    lifecycle.fault_data_plane();
                                     break;
                                 }
                             }
@@ -2258,6 +3158,9 @@ impl StreamingCoordinator {
                                     &task_fault_tx,
                                     &task_shutdown_clone,
                                     task_control_wake.as_deref(),
+                                    source_operation_timeout,
+                                    cancellation_policy,
+                                    &mut lifecycle,
                                     #[cfg(feature = "cluster")]
                                     task_process_authority.as_deref(),
                                     poll_interval,
@@ -2268,6 +3171,7 @@ impl StreamingCoordinator {
                                 }
                             }
                             Err(error) => {
+                                lifecycle.fault_data_plane();
                                 let _ = task_fault_tx.send(SourceFault {
                                     source: Arc::from(src_name.as_str()),
                                     error: error.to_string(),
@@ -2281,7 +3185,7 @@ impl StreamingCoordinator {
                     let drain_flushing = {
                         #[cfg(feature = "cluster")]
                         {
-                            source_drain_flushing(&active_source_drain)
+                            source_drain_flushing(active_source_drain.as_ref())
                         }
                         #[cfg(not(feature = "cluster"))]
                         {
@@ -2291,7 +3195,7 @@ impl StreamingCoordinator {
                     let drain_held = {
                         #[cfg(feature = "cluster")]
                         {
-                            source_drain_held(&active_source_drain)
+                            source_drain_held(active_source_drain.as_ref())
                         }
                         #[cfg(not(feature = "cluster"))]
                         {
@@ -2311,7 +3215,15 @@ impl StreamingCoordinator {
                             }
                         });
                         if let Some(barrier) = barrier {
-                            match try_source_checkpoint(connector.as_ref(), assignment_scoped) {
+                            match lifecycle.run_sync_hook(
+                                &src_name,
+                                "barrier checkpoint capture",
+                                control_deadline,
+                                cancellation_policy,
+                                #[cfg(feature = "cluster")]
+                                task_process_authority.as_deref(),
+                                || try_source_checkpoint(connector.as_ref(), assignment_scoped),
+                            ) {
                                 Ok(Some(checkpoint)) => {
                                     let msg = SourceMsg::Barrier {
                                         source_idx: idx,
@@ -2327,6 +3239,7 @@ impl StreamingCoordinator {
                                     )
                                     .await
                                     {
+                                        lifecycle.fault_data_plane();
                                         break;
                                     }
                                     if !wait_source_barrier_release(
@@ -2337,6 +3250,9 @@ impl StreamingCoordinator {
                                         &src_name,
                                         &task_fault_tx,
                                         &task_shutdown_clone,
+                                        source_operation_timeout,
+                                        cancellation_policy,
+                                        &mut lifecycle,
                                         #[cfg(feature = "cluster")]
                                         task_process_authority.as_deref(),
                                         poll_interval,
@@ -2357,6 +3273,9 @@ impl StreamingCoordinator {
                                         &task_fault_tx,
                                         &task_shutdown_clone,
                                         task_control_wake.as_deref(),
+                                        source_operation_timeout,
+                                        cancellation_policy,
+                                        &mut lifecycle,
                                         #[cfg(feature = "cluster")]
                                         task_process_authority.as_deref(),
                                         poll_interval,
@@ -2367,6 +3286,7 @@ impl StreamingCoordinator {
                                     }
                                 }
                                 Err(error) => {
+                                    lifecycle.fault_data_plane();
                                     let _ = task_fault_tx.send(SourceFault {
                                         source: Arc::from(src_name.as_str()),
                                         error: error.to_string(),
@@ -2391,6 +3311,9 @@ impl StreamingCoordinator {
                             &task_fault_tx,
                             &task_shutdown_clone,
                             &control.wake,
+                            source_operation_timeout,
+                            cancellation_policy,
+                            &mut lifecycle,
                             task_process_authority.as_deref(),
                             poll_interval,
                         )
@@ -2413,7 +3336,15 @@ impl StreamingCoordinator {
                         if let Some(barrier) =
                             pending_barrier.take().or_else(|| barrier_handle.poll())
                         {
-                            match try_source_checkpoint(connector.as_ref(), assignment_scoped) {
+                            match lifecycle.run_sync_hook(
+                                &src_name,
+                                "gated barrier checkpoint capture",
+                                control_deadline,
+                                cancellation_policy,
+                                #[cfg(feature = "cluster")]
+                                task_process_authority.as_deref(),
+                                || try_source_checkpoint(connector.as_ref(), assignment_scoped),
+                            ) {
                                 Ok(Some(checkpoint)) => {
                                     let msg = SourceMsg::Barrier {
                                         source_idx: idx,
@@ -2429,6 +3360,7 @@ impl StreamingCoordinator {
                                     )
                                     .await
                                     {
+                                        lifecycle.fault_data_plane();
                                         break;
                                     }
                                     if !wait_source_barrier_release(
@@ -2439,6 +3371,9 @@ impl StreamingCoordinator {
                                         &src_name,
                                         &task_fault_tx,
                                         &task_shutdown_clone,
+                                        source_operation_timeout,
+                                        cancellation_policy,
+                                        &mut lifecycle,
                                         #[cfg(feature = "cluster")]
                                         task_process_authority.as_deref(),
                                         poll_interval,
@@ -2452,6 +3387,7 @@ impl StreamingCoordinator {
                                 }
                                 Ok(None) => pending_barrier = Some(barrier),
                                 Err(error) => {
+                                    lifecycle.fault_data_plane();
                                     let _ = task_fault_tx.send(SourceFault {
                                         source: Arc::from(src_name.as_str()),
                                         error: error.to_string(),
@@ -2468,6 +3404,9 @@ impl StreamingCoordinator {
                             &task_fault_tx,
                             &task_shutdown_clone,
                             task_control_wake.as_deref(),
+                            source_operation_timeout,
+                            cancellation_policy,
+                            &mut lifecycle,
                             #[cfg(feature = "cluster")]
                             task_process_authority.as_deref(),
                             poll_interval,
@@ -2480,12 +3419,14 @@ impl StreamingCoordinator {
                     }
                     #[cfg(feature = "cluster")]
                     if !source_process_authority_is_live(task_process_authority.as_deref()) {
-                        process_authority_lost = true;
+                        lifecycle.authority_lost();
                         break;
                     }
+                    let poll_deadline = tokio::time::Instant::now() + source_operation_timeout;
                     let poll_result = match poll_source_once(
                         connector.as_mut(),
                         max_poll,
+                        poll_deadline,
                         &task_shutdown_clone,
                         #[cfg(feature = "cluster")]
                         task_process_authority.as_deref(),
@@ -2493,37 +3434,43 @@ impl StreamingCoordinator {
                     .await
                     {
                         SourcePollOutcome::Completed(result) => result,
-                        SourcePollOutcome::Shutdown(Some(Ok(Some(batch)))) => {
-                            pending_batch = Some(batch);
+                        SourcePollOutcome::Deadline => {
+                            lifecycle.cancelled(cancellation_policy);
+                            lifecycle.fault_data_plane();
+                            let error = source_operation_deadline_error(&src_name, "poll");
+                            let _ = task_fault_tx.send(SourceFault {
+                                source: Arc::from(src_name.as_str()),
+                                error: error.to_string(),
+                            });
                             break;
                         }
-                        SourcePollOutcome::Shutdown(Some(Err(error))) => {
-                            tracing::warn!(
-                                source = %src_name,
-                                %error,
-                                "source poll failed while completing for shutdown"
-                            );
+                        SourcePollOutcome::Shutdown => {
+                            lifecycle.cancelled(cancellation_policy);
                             break;
                         }
-                        SourcePollOutcome::Shutdown(Some(Ok(None)) | None) => break,
                         #[cfg(feature = "cluster")]
                         SourcePollOutcome::ProcessAuthorityLost => {
-                            process_authority_lost = true;
+                            lifecycle.authority_lost();
                             break;
                         }
                     };
 
                     #[cfg(feature = "cluster")]
                     if !source_process_authority_is_live(task_process_authority.as_deref()) {
-                        process_authority_lost = true;
+                        lifecycle.authority_lost();
                         break;
                     }
 
                     match poll_result {
                         Ok(Some(batch)) => {
-                            let checkpoint = match try_source_checkpoint(
-                                connector.as_ref(),
-                                assignment_scoped,
+                            let checkpoint = match lifecycle.run_sync_hook(
+                                &src_name,
+                                "polled batch checkpoint capture",
+                                poll_deadline,
+                                cancellation_policy,
+                                #[cfg(feature = "cluster")]
+                                task_process_authority.as_deref(),
+                                || try_source_checkpoint(connector.as_ref(), assignment_scoped),
                             ) {
                                 Ok(Some(checkpoint)) => checkpoint,
                                 Ok(None) => {
@@ -2531,6 +3478,7 @@ impl StreamingCoordinator {
                                     continue;
                                 }
                                 Err(error) => {
+                                    lifecycle.fault_data_plane();
                                     let _ = task_fault_tx.send(SourceFault {
                                         source: Arc::from(src_name.as_str()),
                                         error: error.to_string(),
@@ -2552,29 +3500,37 @@ impl StreamingCoordinator {
                             )
                             .await
                             {
+                                lifecycle.fault_data_plane();
                                 break; // Coordinator dropped
                             }
                         }
                         Ok(None) => {
                             #[cfg(feature = "cluster")]
-                            let drain_became_ready =
-                                if let Some(control) = task_drain_control.as_ref() {
-                                    let was_flushing = source_drain_flushing(&active_source_drain);
-                                    if let Err(error) = publish_source_drain_ready(
-                                        connector.as_mut(),
-                                        control,
-                                        &mut active_source_drain,
-                                    ) {
-                                        let _ = task_fault_tx.send(SourceFault {
-                                            source: Arc::from(src_name.as_str()),
-                                            error: error.to_string(),
-                                        });
-                                        break;
-                                    }
-                                    was_flushing && !source_drain_flushing(&active_source_drain)
-                                } else {
-                                    false
-                                };
+                            let drain_became_ready = if let Some(control) =
+                                task_drain_control.as_ref()
+                            {
+                                let was_flushing =
+                                    source_drain_flushing(active_source_drain.as_ref());
+                                if let Err(error) = publish_source_drain_ready_fenced(
+                                    connector.as_mut(),
+                                    control,
+                                    &mut active_source_drain,
+                                    &src_name,
+                                    cancellation_policy,
+                                    &mut lifecycle,
+                                    task_process_authority.as_deref(),
+                                ) {
+                                    lifecycle.fault_data_plane();
+                                    let _ = task_fault_tx.send(SourceFault {
+                                        source: Arc::from(src_name.as_str()),
+                                        error: error.to_string(),
+                                    });
+                                    break;
+                                }
+                                was_flushing && !source_drain_flushing(active_source_drain.as_ref())
+                            } else {
+                                false
+                            };
                             #[cfg(not(feature = "cluster"))]
                             let drain_became_ready = false;
                             if drain_became_ready {
@@ -2588,6 +3544,9 @@ impl StreamingCoordinator {
                                 &task_fault_tx,
                                 &task_shutdown_clone,
                                 task_control_wake.as_deref(),
+                                source_operation_timeout,
+                                cancellation_policy,
+                                &mut lifecycle,
                                 #[cfg(feature = "cluster")]
                                 task_process_authority.as_deref(),
                                 poll_interval,
@@ -2598,6 +3557,7 @@ impl StreamingCoordinator {
                             }
                         }
                         Err(e) if !e.is_transient() => {
+                            lifecycle.fault_data_plane();
                             tracing::error!(source = %src_name, error = %e, "terminal poll error");
                             // Delivery semantics may permit dropping individual records, never a
                             // configured producer. Surface terminal source loss in every mode so
@@ -2618,6 +3578,9 @@ impl StreamingCoordinator {
                                 &task_fault_tx,
                                 &task_shutdown_clone,
                                 task_control_wake.as_deref(),
+                                source_operation_timeout,
+                                cancellation_policy,
+                                &mut lifecycle,
                                 #[cfg(feature = "cluster")]
                                 task_process_authority.as_deref(),
                                 poll_interval,
@@ -2632,7 +3595,7 @@ impl StreamingCoordinator {
                     let drain_flushing = {
                         #[cfg(feature = "cluster")]
                         {
-                            source_drain_flushing(&active_source_drain)
+                            source_drain_flushing(active_source_drain.as_ref())
                         }
                         #[cfg(not(feature = "cluster"))]
                         {
@@ -2643,7 +3606,17 @@ impl StreamingCoordinator {
                         if let Some(barrier) =
                             pending_barrier.take().or_else(|| barrier_handle.poll())
                         {
-                            match try_source_checkpoint(connector.as_ref(), assignment_scoped) {
+                            let barrier_deadline =
+                                tokio::time::Instant::now() + source_operation_timeout;
+                            match lifecycle.run_sync_hook(
+                                &src_name,
+                                "post-poll barrier checkpoint capture",
+                                barrier_deadline,
+                                cancellation_policy,
+                                #[cfg(feature = "cluster")]
+                                task_process_authority.as_deref(),
+                                || try_source_checkpoint(connector.as_ref(), assignment_scoped),
+                            ) {
                                 Ok(Some(checkpoint)) => {
                                     let msg = SourceMsg::Barrier {
                                         source_idx: idx,
@@ -2659,6 +3632,7 @@ impl StreamingCoordinator {
                                     )
                                     .await
                                     {
+                                        lifecycle.fault_data_plane();
                                         break;
                                     }
                                     if !wait_source_barrier_release(
@@ -2669,6 +3643,9 @@ impl StreamingCoordinator {
                                         &src_name,
                                         &task_fault_tx,
                                         &task_shutdown_clone,
+                                        source_operation_timeout,
+                                        cancellation_policy,
+                                        &mut lifecycle,
                                         #[cfg(feature = "cluster")]
                                         task_process_authority.as_deref(),
                                         poll_interval,
@@ -2681,6 +3658,7 @@ impl StreamingCoordinator {
                                 }
                                 Ok(None) => pending_barrier = Some(barrier),
                                 Err(error) => {
+                                    lifecycle.fault_data_plane();
                                     let _ = task_fault_tx.send(SourceFault {
                                         source: Arc::from(src_name.as_str()),
                                         error: error.to_string(),
@@ -2694,62 +3672,100 @@ impl StreamingCoordinator {
 
                 #[cfg(feature = "cluster")]
                 if !source_process_authority_is_live(task_process_authority.as_deref()) {
-                    process_authority_lost = true;
+                    lifecycle.authority_lost();
                 }
                 #[cfg(feature = "cluster")]
                 let may_flush_on_shutdown =
-                    !process_authority_lost && active_source_drain.is_none();
+                    lifecycle.may_poll_or_ack() && active_source_drain.is_none();
                 #[cfg(not(feature = "cluster"))]
-                let may_flush_on_shutdown = true;
+                let may_flush_on_shutdown = lifecycle.may_poll_or_ack();
 
+                let shutdown_deadline = tokio::time::Instant::now() + SHUTDOWN_DRAIN_BUDGET;
                 if may_flush_on_shutdown {
-                    // Bounded best-effort flush before close(): the `while` deadline bounds an
-                    // always-ready poll (timeout() polls the future first). Unflushed rows resume
-                    // from the committed offset.
+                    // Tail polling, durable acknowledgement, and close share one absolute
+                    // shutdown budget. Unflushed rows resume from the committed offset.
+                    let mut tail_poll_allowed = true;
                     if let Some(batch) = pending_batch.take() {
-                        if let Ok(Some(checkpoint)) =
-                            try_source_checkpoint(connector.as_ref(), assignment_scoped)
-                        {
-                            let _ = task_tx.try_send(SourceMsg::Batch {
-                                source_idx: idx,
-                                batch: batch.records,
-                                checkpoint,
-                            });
+                        match lifecycle.run_sync_hook(
+                            &src_name,
+                            "shutdown pending batch checkpoint capture",
+                            shutdown_deadline,
+                            cancellation_policy,
+                            #[cfg(feature = "cluster")]
+                            task_process_authority.as_deref(),
+                            || try_source_checkpoint(connector.as_ref(), assignment_scoped),
+                        ) {
+                            Ok(Some(checkpoint)) => {
+                                if task_tx
+                                    .try_send(SourceMsg::Batch {
+                                        source_idx: idx,
+                                        batch: batch.records,
+                                        checkpoint,
+                                    })
+                                    .is_err()
+                                {
+                                    lifecycle.fault_data_plane();
+                                    tail_poll_allowed = false;
+                                }
+                            }
+                            Ok(None) => tail_poll_allowed = false,
+                            Err(error) => {
+                                lifecycle.fault_data_plane();
+                                tail_poll_allowed = false;
+                                let _ = task_fault_tx.send(SourceFault {
+                                    source: Arc::from(src_name.as_str()),
+                                    error: error.to_string(),
+                                });
+                            }
                         }
                     }
-                    let deadline = Instant::now() + SHUTDOWN_DRAIN_BUDGET;
-                    while Instant::now() < deadline {
-                        #[cfg(feature = "cluster")]
-                        if !source_process_authority_is_live(task_process_authority.as_deref()) {
-                            process_authority_lost = true;
-                            break;
-                        }
-                        let remaining = deadline.saturating_duration_since(Instant::now());
-                        let poll_result = {
-                            let cancellation_policy = connector.cancellation_policy();
-                            let mut poll = std::pin::pin!(connector.poll_batch(max_poll));
-                            match tokio::time::timeout(remaining, poll.as_mut()).await {
-                                Ok(result) => Some(result),
-                                Err(_)
-                                    if cancellation_policy
-                                        == ConnectorCancellationPolicy::CompleteStarted =>
-                                {
-                                    Some(poll.await)
-                                }
-                                Err(_) => None,
+                    while tail_poll_allowed
+                        && lifecycle.may_poll_or_ack()
+                        && tokio::time::Instant::now() < shutdown_deadline
+                    {
+                        let poll_result = match run_source_operation(
+                            shutdown_deadline,
+                            #[cfg(feature = "cluster")]
+                            task_process_authority.as_deref(),
+                            || connector.poll_batch(max_poll),
+                        )
+                        .await
+                        {
+                            SourceOperationOutcome::Completed(result) => Some(result),
+                            SourceOperationOutcome::Deadline => {
+                                lifecycle.cancelled(cancellation_policy);
+                                None
+                            }
+                            #[cfg(feature = "cluster")]
+                            SourceOperationOutcome::ProcessAuthorityLost => {
+                                lifecycle.authority_lost();
+                                None
                             }
                         };
-                        #[cfg(feature = "cluster")]
-                        if !source_process_authority_is_live(task_process_authority.as_deref()) {
-                            process_authority_lost = true;
+                        if !lifecycle.may_invoke_connector() {
                             break;
                         }
                         match poll_result {
                             Some(Ok(Some(batch))) => {
-                                let Ok(Some(checkpoint)) =
-                                    try_source_checkpoint(connector.as_ref(), assignment_scoped)
-                                else {
-                                    break;
+                                let checkpoint = match lifecycle.run_sync_hook(
+                                    &src_name,
+                                    "shutdown tail checkpoint capture",
+                                    shutdown_deadline,
+                                    cancellation_policy,
+                                    #[cfg(feature = "cluster")]
+                                    task_process_authority.as_deref(),
+                                    || try_source_checkpoint(connector.as_ref(), assignment_scoped),
+                                ) {
+                                    Ok(Some(checkpoint)) => checkpoint,
+                                    Ok(None) => break,
+                                    Err(error) => {
+                                        lifecycle.fault_data_plane();
+                                        let _ = task_fault_tx.send(SourceFault {
+                                            source: Arc::from(src_name.as_str()),
+                                            error: error.to_string(),
+                                        });
+                                        break;
+                                    }
                                 };
                                 let msg = SourceMsg::Batch {
                                     source_idx: idx,
@@ -2757,55 +3773,83 @@ impl StreamingCoordinator {
                                     checkpoint,
                                 };
                                 if task_tx.try_send(msg).is_err() {
+                                    lifecycle.fault_data_plane();
                                     break;
                                 }
-                                if Instant::now() >= deadline {
+                                if tokio::time::Instant::now() >= shutdown_deadline {
                                     break;
                                 }
                             }
-                            _ => break,
+                            Some(Err(error)) if !error.is_transient() => {
+                                lifecycle.fault_data_plane();
+                                let _ = task_fault_tx.send(SourceFault {
+                                    source: Arc::from(src_name.as_str()),
+                                    error: error.to_string(),
+                                });
+                                break;
+                            }
+                            Some(Ok(None) | Err(_)) | None => break,
                         }
                     }
                 }
 
-                #[cfg(feature = "cluster")]
-                let may_ack_on_shutdown = !process_authority_lost;
-                #[cfg(not(feature = "cluster"))]
-                let may_ack_on_shutdown = true;
-                if may_ack_on_shutdown {
+                if lifecycle.may_poll_or_ack() {
                     // Drain EpochCommitted broadcasts before close so a durable tail settled
-                    // during shutdown is acknowledged upstream.
-                    while let Ok(()) = epoch_committed_rx.changed().await {
-                        #[cfg(feature = "cluster")]
-                        if !source_process_authority_is_live(task_process_authority.as_deref()) {
+                    // during shutdown is acknowledged upstream. The watch retains the newest
+                    // value; waiting for another change here would consume the close budget.
+                    while matches!(epoch_committed_rx.has_changed(), Ok(true)) {
+                        if !acknowledge_latest_source_commit(
+                            connector.as_mut(),
+                            &mut epoch_committed_rx,
+                            delivery_guarantee,
+                            &src_name,
+                            &task_fault_tx,
+                            shutdown_deadline,
+                            cancellation_policy,
+                            &mut lifecycle,
+                            #[cfg(feature = "cluster")]
+                            task_process_authority.as_deref(),
+                        )
+                        .await
+                        {
                             break;
                         }
-                        let snapshot = epoch_committed_rx.borrow_and_update().clone();
-                        if let Some((e, cp)) = snapshot {
-                            if let Err(err) = connector.notify_epoch_committed(e, &cp).await {
-                                tracing::warn!(
-                                    source = %src_name,
-                                    error = %err,
-                                    epoch = e,
-                                    "notify_epoch_committed failed",
-                                );
-                            }
-                        }
                     }
                 }
 
-                if let Err(e) = connector.close().await {
-                    tracing::warn!(source = %src_name, error = %e, "source close error");
+                if lifecycle.may_invoke_connector() {
+                    match run_source_operation(
+                        shutdown_deadline,
+                        #[cfg(feature = "cluster")]
+                        task_process_authority.as_deref(),
+                        || connector.close(),
+                    )
+                    .await
+                    {
+                        SourceOperationOutcome::Completed(Ok(())) => {}
+                        SourceOperationOutcome::Completed(Err(error)) => {
+                            tracing::warn!(source = %src_name, %error, "source close error");
+                        }
+                        SourceOperationOutcome::Deadline => {
+                            tracing::warn!(
+                                source = %src_name,
+                                "source close exceeded its shutdown deadline"
+                            );
+                        }
+                        #[cfg(feature = "cluster")]
+                        SourceOperationOutcome::ProcessAuthorityLost => {}
+                    }
                 }
             });
 
             let arc_name: Arc<str> = Arc::from(src.name.as_str());
             let task = SourceTaskLease::supervise(
                 Arc::clone(&arc_name),
-                cancellation_policy,
                 Arc::clone(&task_shutdown),
                 Arc::clone(&expected_shutdown),
                 join,
+                actor_terminal,
+                terminal_tasks,
                 &source_runtime,
             );
             #[cfg(feature = "cluster")]
@@ -2822,6 +3866,7 @@ impl StreamingCoordinator {
                 epoch_committed_tx,
             });
             source_names.push(arc_name);
+            task_fence.handoff();
         }
 
         Ok(Self {
@@ -2851,6 +3896,7 @@ impl StreamingCoordinator {
             staged_bytes: Arc::new(AtomicU64::new(0)),
             max_staged_bytes: u64::MAX,
             coordinated_commit_admission: None,
+            public_generation: None,
             #[cfg(feature = "cluster")]
             process_authority: source_process_authority,
         })
@@ -3779,7 +4825,8 @@ impl StreamingCoordinator {
                 .min(source_deadline.saturating_duration_since(tokio::time::Instant::now()));
             if source_channel_closed {
                 // A disconnected receive is immediately ready. Keep yielding so the stable task
-                // supervisors can publish terminal completion on a current-thread runtime.
+                // actor and tracker proofs can publish terminal completion on a current-thread
+                // runtime.
                 tokio::time::sleep(tick).await;
                 continue;
             }
@@ -3799,7 +4846,9 @@ impl StreamingCoordinator {
             }
         }
 
-        futures::future::join_all(stopping_sources.into_iter().map(Self::reap_source_task)).await;
+        for source in stopping_sources {
+            Self::reap_source_task(source);
+        }
 
         // Capture messages enqueued immediately before the last source task exited.
         while let Ok(msg) = self.rx.try_recv() {
@@ -4166,9 +5215,9 @@ impl StreamingCoordinator {
             return Err(error);
         }
 
-        // A sink command admitted under authority may still be queued, and a CompleteStarted
-        // connector may finish after lease loss. Recheck before advancing the in-memory source
-        // cursor; the checkpoint path separately FIFO-fences every sink before persisting it.
+        // A sink command admitted under authority may still be queued when the lease is fenced.
+        // Recheck before advancing the in-memory source cursor; the checkpoint path separately
+        // FIFO-fences every sink before persisting it.
         #[cfg(feature = "cluster")]
         if let Err(error) = self.require_process_authority("source cursor advancement") {
             self.discard_pending_offsets();
@@ -4187,11 +5236,9 @@ impl StreamingCoordinator {
         failed: &FxHashSet<Arc<str>>,
         deferred: &FxHashSet<Arc<str>>,
     ) {
-        if failed.is_empty() {
-            if deferred.is_empty() {
-                self.commit_pending_offsets();
-                return;
-            }
+        if failed.is_empty() && deferred.is_empty() {
+            self.commit_pending_offsets();
+            return;
         }
         for (i, pending) in self.pending_offsets.iter_mut().enumerate() {
             let in_failed_domain = self
@@ -4350,6 +5397,10 @@ impl StreamingCoordinator {
     }
 
     /// Handle a barrier from a source.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "barrier alignment and durable cleanup form one checkpoint state transition"
+    )]
     async fn handle_barrier(
         &mut self,
         source_idx: usize,
@@ -4739,6 +5790,10 @@ impl StreamingCoordinator {
         .await;
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "source-less completion owns the full durable checkpoint transition"
+    )]
     async fn complete_prepared_source_less_checkpoint(
         &mut self,
         callback: &mut impl PipelineCallback,
@@ -4965,7 +6020,7 @@ impl StreamingCoordinator {
         self.drain_manual_requests();
         #[cfg(feature = "cluster")]
         if let Err(error) = self.require_process_authority("checkpoint admission") {
-            self.fail_waiting_manual(&error.to_string());
+            self.fail_waiting_manual(error.to_string());
             return;
         }
 
@@ -5012,7 +6067,7 @@ impl StreamingCoordinator {
         };
         #[cfg(feature = "cluster")]
         if let Err(error) = self.require_process_authority("checkpoint attempt creation") {
-            self.fail_waiting_manual(&error.to_string());
+            self.fail_waiting_manual(error.to_string());
             return;
         }
         if self.source_handles.is_empty() {
@@ -5634,6 +6689,11 @@ mod tests {
         tokio::sync::mpsc::unbounded_channel().1
     }
 
+    #[cfg(feature = "cluster")]
+    fn empty_connector_task_fences() -> OwnedConnectorTaskFences {
+        Arc::new(parking_lot::Mutex::new(Vec::new()))
+    }
+
     #[tokio::test]
     async fn coordinator_exit_invalidates_provisional_subscription_delivery() {
         let shutdown = Arc::new(tokio::sync::Notify::new());
@@ -5709,6 +6769,7 @@ mod tests {
             staged_bytes: Arc::new(AtomicU64::new(0)),
             max_staged_bytes: u64::MAX,
             coordinated_commit_admission: None,
+            public_generation: None,
             #[cfg(feature = "cluster")]
             process_authority: None,
         }
@@ -5773,6 +6834,7 @@ mod tests {
         let shutdown = Arc::new(tokio::sync::Notify::new());
         let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
         let coordinator = StreamingCoordinator::new(
+            &StreamingCoordinatorRuntime::new(),
             Vec::new(),
             PipelineConfig::default(),
             Arc::clone(&shutdown),
@@ -6079,13 +7141,16 @@ mod tests {
         let (barrier_release_tx, _barrier_release_rx) = tokio::sync::watch::channel(None);
         let shutdown = Arc::new(tokio::sync::Notify::new());
         let expected_shutdown = Arc::new(AtomicBool::new(false));
+        let runtime = tokio::runtime::Handle::current();
+        let (join, actor_terminal) = spawn_source_actor(&runtime, async {});
         let task = SourceTaskLease::supervise(
             Arc::from(name),
-            ConnectorCancellationPolicy::CancelSafe,
             shutdown,
             expected_shutdown,
-            tokio::spawn(async {}),
-            &tokio::runtime::Handle::current(),
+            join,
+            actor_terminal,
+            None,
+            &runtime,
         );
         (
             SourceHandle {
@@ -7135,9 +8200,18 @@ mod tests {
         state: Arc<StartupSourceState>,
         schema: Arc<Schema>,
         start_delay: Duration,
+        close_delay: Duration,
         fail_open: bool,
         fail_restore: bool,
         cancellation_policy: ConnectorCancellationPolicy,
+    }
+
+    struct TrackedStartupSource {
+        _task_owner: laminar_connectors::connector::ConnectorTaskOwner,
+        task_tracker: ConnectorTaskTracker,
+        tracker_calls: Arc<AtomicU64>,
+        start_error: Option<ConnectorError>,
+        close_calls: Arc<AtomicU64>,
     }
 
     #[derive(Default)]
@@ -7166,11 +8240,38 @@ mod tests {
         #[cfg(feature = "cluster")]
         drain_begins: AtomicU64,
         #[cfg(feature = "cluster")]
+        drain_finish_starts: AtomicU64,
+        #[cfg(feature = "cluster")]
         drain_finishes: AtomicU64,
+        #[cfg(feature = "cluster")]
+        cancelled_drain_finishes: AtomicU64,
+        #[cfg(feature = "cluster")]
+        block_drain_finish: AtomicBool,
+        #[cfg(feature = "cluster")]
+        drain_finish_started: tokio::sync::Notify,
+        #[cfg(feature = "cluster")]
+        release_drain_finish: tokio::sync::Notify,
     }
 
     struct BarrierHoldProbeSource {
         state: Arc<BarrierHoldProbeState>,
+    }
+
+    #[cfg(feature = "cluster")]
+    struct DrainFinishGuard {
+        state: Arc<BarrierHoldProbeState>,
+        completed: bool,
+    }
+
+    #[cfg(feature = "cluster")]
+    impl Drop for DrainFinishGuard {
+        fn drop(&mut self) {
+            if !self.completed {
+                self.state
+                    .cancelled_drain_finishes
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+        }
     }
 
     #[cfg(feature = "cluster")]
@@ -7258,6 +8359,18 @@ mod tests {
             _resolution: SourceDrainResolution,
             _deadline: tokio::time::Instant,
         ) -> Result<(), ConnectorError> {
+            self.state
+                .drain_finish_starts
+                .fetch_add(1, Ordering::SeqCst);
+            if self.state.block_drain_finish.load(Ordering::Acquire) {
+                let mut guard = DrainFinishGuard {
+                    state: Arc::clone(&self.state),
+                    completed: false,
+                };
+                self.state.drain_finish_started.notify_one();
+                self.state.release_drain_finish.notified().await;
+                guard.completed = true;
+            }
             self.state.drain_finishes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -7416,6 +8529,155 @@ mod tests {
         assert!(matches!(error, ConnectorError::Internal(_)));
         assert_eq!(state.drain_finishes.load(Ordering::SeqCst), 0);
         assert!(active.is_some());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(start_paused = true)]
+    async fn blocking_finish_drain_retires_at_its_absolute_deadline() {
+        let state = Arc::new(BarrierHoldProbeState::default());
+        state.block_drain_finish.store(true, Ordering::Release);
+        let mut connector = BarrierHoldProbeSource {
+            state: Arc::clone(&state),
+        };
+        let round = AssignmentDrainId {
+            predecessor_version: 7,
+            target_version: 8,
+            digest: [10; 32],
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut active = Some(ActiveSourceDrain {
+            request: SourceDrainRequest::new(round).unwrap(),
+            participant: CheckpointParticipant {
+                node_id: 1,
+                boot_incarnation: uuid::Uuid::from_u128(11),
+            },
+            provider_drain: true,
+            prepare_deadline: deadline,
+            ready: true,
+            pending_resolution: Some(PendingSourceDrainResolution {
+                resolution: SourceDrainResolution {
+                    round,
+                    outcome: SourceDrainOutcome::Abort,
+                },
+                deadline,
+            }),
+        });
+        let (status_tx, _status_rx) = tokio::sync::watch::channel(SourceDrainTaskStatus::Idle);
+        let mut lifecycle = SourceConnectorLifecycle::default();
+        let started = tokio::time::Instant::now();
+
+        let error = resolve_pending_source_drain_fenced(
+            &mut connector,
+            &status_tx,
+            &mut active,
+            "blocking-deadline-source",
+            ConnectorCancellationPolicy::RetireConnector,
+            &mut lifecycle,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, ConnectorError::Internal(_)));
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_secs(2)
+        );
+        assert!(lifecycle.retired);
+        assert_eq!(state.drain_finish_starts.load(Ordering::SeqCst), 1);
+        assert_eq!(state.cancelled_drain_finishes.load(Ordering::SeqCst), 1);
+        assert_eq!(state.drain_finishes.load(Ordering::SeqCst), 0);
+        if lifecycle.may_invoke_connector() {
+            connector.close().await.unwrap();
+        }
+        assert_eq!(
+            state.closes.load(Ordering::SeqCst),
+            0,
+            "a retired generation must not receive close after finish_drain cancellation"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn process_lease_loss_cancels_blocking_finish_drain_without_later_hooks() {
+        use laminar_core::cluster::control::{ClusterKv, InMemoryKv, LeaseDeadline};
+
+        let node_id = laminar_core::state::NodeId(41);
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node_id));
+        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(node_id, kv, None, members_rx));
+        controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+            .unwrap();
+        let authority = SourceProcessAuthority::new(Arc::clone(&controller));
+
+        let state = Arc::new(BarrierHoldProbeState::default());
+        state.block_drain_finish.store(true, Ordering::Release);
+        let task_state = Arc::clone(&state);
+        let task_authority = Arc::clone(&authority);
+        let task = tokio::spawn(async move {
+            let mut connector = BarrierHoldProbeSource { state: task_state };
+            let round = AssignmentDrainId {
+                predecessor_version: 8,
+                target_version: 9,
+                digest: [11; 32],
+            };
+            let mut active = Some(ActiveSourceDrain {
+                request: SourceDrainRequest::new(round).unwrap(),
+                participant: CheckpointParticipant {
+                    node_id: 1,
+                    boot_incarnation: uuid::Uuid::from_u128(12),
+                },
+                provider_drain: true,
+                prepare_deadline: tokio::time::Instant::now() + Duration::from_secs(60),
+                ready: true,
+                pending_resolution: Some(PendingSourceDrainResolution {
+                    resolution: SourceDrainResolution {
+                        round,
+                        outcome: SourceDrainOutcome::Commit,
+                    },
+                    deadline: tokio::time::Instant::now() + Duration::from_secs(60),
+                }),
+            });
+            let (status_tx, _status_rx) = tokio::sync::watch::channel(SourceDrainTaskStatus::Idle);
+            let mut lifecycle = SourceConnectorLifecycle::default();
+            let result = resolve_pending_source_drain_fenced(
+                &mut connector,
+                &status_tx,
+                &mut active,
+                "blocking-lease-source",
+                ConnectorCancellationPolicy::RetireConnector,
+                &mut lifecycle,
+                Some(task_authority.as_ref()),
+            )
+            .await;
+            if lifecycle.may_invoke_connector() {
+                connector.close().await.unwrap();
+            }
+            (result, lifecycle)
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            state.drain_finish_started.notified(),
+        )
+        .await
+        .expect("source never entered finish_drain");
+        controller.fence_process_lease();
+        let (result, lifecycle) = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("lease loss did not cancel finish_drain")
+            .unwrap();
+
+        assert!(matches!(result, Err(ConnectorError::InvalidState { .. })));
+        assert!(lifecycle.process_authority_lost);
+        assert_eq!(state.cancelled_drain_finishes.load(Ordering::SeqCst), 1);
+        assert_eq!(state.drain_finishes.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            state.closes.load(Ordering::SeqCst),
+            0,
+            "authority loss must fence every later connector hook"
+        );
     }
 
     #[cfg(feature = "cluster")]
@@ -7657,6 +8919,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             None,
             Arc::new(parking_lot::Mutex::new(Vec::new())),
+            empty_connector_task_fences(),
             crate::db::RuntimeMode::Cluster,
         )
         .await;
@@ -7681,6 +8944,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Some(Arc::clone(&controller)),
             Arc::new(parking_lot::Mutex::new(Vec::new())),
+            empty_connector_task_fences(),
             crate::db::RuntimeMode::Cluster,
         )
         .await;
@@ -7704,6 +8968,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Some(controller),
             Arc::new(parking_lot::Mutex::new(Vec::new())),
+            empty_connector_task_fences(),
             crate::db::RuntimeMode::Local,
         )
         .await;
@@ -7718,7 +8983,7 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[tokio::test]
-    async fn expired_process_lease_rejects_source_start_and_closes_connector() {
+    async fn expired_process_lease_rejects_source_start_without_connector_calls() {
         use laminar_core::cluster::control::{ClusterKv, InMemoryKv, LeaseDeadline};
 
         let state = Arc::new(BarrierHoldProbeState::default());
@@ -7744,6 +9009,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Some(controller),
             Arc::new(parking_lot::Mutex::new(Vec::new())),
+            empty_connector_task_fences(),
             crate::db::RuntimeMode::Cluster,
         )
         .await;
@@ -7756,12 +9022,12 @@ mod tests {
         assert_eq!(state.polls.load(Ordering::SeqCst), 0);
         assert_eq!(state.control_drives.load(Ordering::SeqCst), 0);
         assert_eq!(state.commit_notifications.load(Ordering::SeqCst), 0);
-        assert_eq!(state.closes.load(Ordering::SeqCst), 1);
+        assert_eq!(state.closes.load(Ordering::SeqCst), 0);
     }
 
     #[cfg(feature = "cluster")]
     #[tokio::test]
-    async fn lease_loss_before_activation_closes_without_polling_or_acknowledging() {
+    async fn lease_loss_before_activation_stops_without_later_connector_hooks() {
         use laminar_core::cluster::control::{ClusterKv, InMemoryKv, LeaseDeadline};
 
         let state = Arc::new(BarrierHoldProbeState::default());
@@ -7787,6 +9053,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Some(Arc::clone(&controller)),
             Arc::new(parking_lot::Mutex::new(Vec::new())),
+            empty_connector_task_fences(),
             crate::db::RuntimeMode::Cluster,
         )
         .await
@@ -7803,15 +9070,17 @@ mod tests {
             .take()
             .unwrap()
             .send(());
-        tokio::time::timeout(Duration::from_secs(2), task.wait())
-            .await
-            .expect("fenced process authority did not terminate the source task");
+        assert!(
+            task.wait_until(tokio::time::Instant::now() + Duration::from_secs(2))
+                .await,
+            "fenced process authority did not terminate the source task"
+        );
 
         assert_eq!(state.starts.load(Ordering::SeqCst), 1);
         assert_eq!(state.polls.load(Ordering::SeqCst), 0);
         assert_eq!(state.control_drives.load(Ordering::SeqCst), 0);
         assert_eq!(state.commit_notifications.load(Ordering::SeqCst), 0);
-        assert_eq!(state.closes.load(Ordering::SeqCst), 1);
+        assert_eq!(state.closes.load(Ordering::SeqCst), 0);
     }
 
     #[cfg(feature = "cluster")]
@@ -7972,6 +9241,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Some(controller),
             Arc::new(parking_lot::Mutex::new(Vec::new())),
+            empty_connector_task_fences(),
             crate::db::RuntimeMode::Cluster,
         )
         .await
@@ -8124,6 +9394,7 @@ mod tests {
         };
         let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
         let result = StreamingCoordinator::new(
+            &StreamingCoordinatorRuntime::new(),
             vec![source],
             PipelineConfig {
                 fallback_poll_interval: Duration::from_millis(1),
@@ -8504,7 +9775,42 @@ mod tests {
 
         async fn close(&mut self) -> Result<(), ConnectorError> {
             self.state.close_calls.fetch_add(1, Ordering::SeqCst);
+            if !self.close_delay.is_zero() {
+                tokio::time::sleep(self.close_delay).await;
+            }
             self.state.open.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SourceConnector for TrackedStartupSource {
+        fn terminal_task_tracker(&self) -> Option<ConnectorTaskTracker> {
+            self.tracker_calls.fetch_add(1, Ordering::SeqCst);
+            Some(self.task_tracker.clone())
+        }
+
+        async fn start(&mut self, _request: SourceStart) -> Result<(), ConnectorError> {
+            self.start_error.take().map_or(Ok(()), Err)
+        }
+
+        async fn poll_batch(
+            &mut self,
+            _max_records: usize,
+        ) -> Result<Option<SourceBatch>, ConnectorError> {
+            unreachable!("a source whose start failed must never be polled")
+        }
+
+        fn schema(&self) -> Arc<Schema> {
+            Arc::new(Schema::empty())
+        }
+
+        fn checkpoint(&self) -> SourceCheckpoint {
+            SourceCheckpoint::new()
+        }
+
+        async fn close(&mut self) -> Result<(), ConnectorError> {
+            self.close_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -8526,6 +9832,85 @@ mod tests {
     struct RuntimeFailureSource {
         state: Arc<RuntimeSourceState>,
         failure: RuntimeSourceFailure,
+    }
+
+    #[derive(Default)]
+    struct PendingCheckpointFailureState {
+        polls: AtomicU64,
+        checkpoint_captures: AtomicU64,
+        commit_notifications: AtomicU64,
+        closes: AtomicU64,
+    }
+
+    struct PendingCheckpointFailureSource {
+        state: Arc<PendingCheckpointFailureState>,
+    }
+
+    #[async_trait::async_trait]
+    impl laminar_connectors::connector::SourceConnector for PendingCheckpointFailureSource {
+        async fn start(&mut self, _request: SourceStart) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
+        async fn poll_batch(
+            &mut self,
+            _max_records: usize,
+        ) -> Result<Option<SourceBatch>, ConnectorError> {
+            let poll = self.state.polls.fetch_add(1, Ordering::SeqCst);
+            if poll != 0 {
+                return Ok(None);
+            }
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                false,
+            )]));
+            let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64]))])
+                .unwrap();
+            Ok(Some(SourceBatch::new(batch)))
+        }
+
+        fn schema(&self) -> Arc<Schema> {
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                false,
+            )]))
+        }
+
+        fn checkpoint(&self) -> SourceCheckpoint {
+            SourceCheckpoint::new()
+        }
+
+        fn try_checkpoint(&self) -> Result<Option<SourceCheckpoint>, ConnectorError> {
+            let capture = self
+                .state
+                .checkpoint_captures
+                .fetch_add(1, Ordering::SeqCst);
+            if capture == 0 {
+                Ok(None)
+            } else {
+                Err(ConnectorError::Internal(
+                    "injected pending checkpoint failure".into(),
+                ))
+            }
+        }
+
+        async fn notify_epoch_committed(
+            &mut self,
+            _epoch: u64,
+            _checkpoint: &SourceCheckpoint,
+        ) -> Result<(), ConnectorError> {
+            self.state
+                .commit_notifications
+                .fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn close(&mut self) -> Result<(), ConnectorError> {
+            self.state.closes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
     }
 
     #[derive(Default)]
@@ -8684,6 +10069,7 @@ mod tests {
         };
 
         StreamingCoordinator::new(
+            &StreamingCoordinatorRuntime::new(),
             vec![source],
             config,
             shutdown,
@@ -8750,12 +10136,35 @@ mod tests {
         position: SourcePosition,
         cancellation_policy: ConnectorCancellationPolicy,
     ) -> SourceRegistration {
+        startup_source_with_close_delay(
+            name,
+            state,
+            fail_open,
+            fail_restore,
+            start_delay,
+            Duration::ZERO,
+            position,
+            cancellation_policy,
+        )
+    }
+
+    fn startup_source_with_close_delay(
+        name: &str,
+        state: Arc<StartupSourceState>,
+        fail_open: bool,
+        fail_restore: bool,
+        start_delay: Duration,
+        close_delay: Duration,
+        position: SourcePosition,
+        cancellation_policy: ConnectorCancellationPolicy,
+    ) -> SourceRegistration {
         SourceRegistration {
             name: name.into(),
             connector: Box::new(StartupSource {
                 state,
                 schema: Arc::new(Schema::empty()),
                 start_delay,
+                close_delay,
                 fail_open,
                 fail_restore,
                 cancellation_policy,
@@ -8782,6 +10191,7 @@ mod tests {
     ) -> Result<StreamingCoordinator, DbError> {
         let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
         StreamingCoordinator::new(
+            &StreamingCoordinatorRuntime::new(),
             sources,
             config,
             Arc::new(tokio::sync::Notify::new()),
@@ -8839,6 +10249,7 @@ mod tests {
         );
         let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
         let coordinator = StreamingCoordinator::new(
+            &StreamingCoordinatorRuntime::new(),
             vec![source],
             PipelineConfig::default(),
             Arc::clone(&shutdown),
@@ -8938,6 +10349,7 @@ mod tests {
             ..PipelineConfig::default()
         };
         let coordinator = StreamingCoordinator::new(
+            &StreamingCoordinatorRuntime::new(),
             vec![source],
             config,
             Arc::clone(&shutdown),
@@ -9027,6 +10439,7 @@ mod tests {
         };
         let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
         let mut coordinator = StreamingCoordinator::new(
+            &StreamingCoordinatorRuntime::new(),
             vec![source],
             PipelineConfig {
                 fallback_poll_interval: Duration::from_secs(60),
@@ -9122,6 +10535,7 @@ mod tests {
             ..PipelineConfig::default()
         };
         let coordinator = StreamingCoordinator::new(
+            &StreamingCoordinatorRuntime::new(),
             vec![source],
             config,
             Arc::clone(&shutdown),
@@ -9177,6 +10591,7 @@ mod tests {
         );
         let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
         let coordinator = StreamingCoordinator::new(
+            &StreamingCoordinatorRuntime::new(),
             vec![source],
             PipelineConfig::default(),
             Arc::new(tokio::sync::Notify::new()),
@@ -9196,6 +10611,326 @@ mod tests {
         .expect("source was not closed when startup ownership disappeared");
         assert_eq!(state.poll_calls.load(Ordering::SeqCst), 0);
         assert!(!state.open.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cancelling_run_fences_replacement_until_source_exit() {
+        let runtime = StreamingCoordinatorRuntime::new();
+        let state = Arc::new(StartupSourceState::default());
+        let source = startup_source_with_close_delay(
+            "cancelled-run",
+            Arc::clone(&state),
+            false,
+            false,
+            Duration::ZERO,
+            Duration::from_millis(250),
+            SourcePosition::Initial,
+            ConnectorCancellationPolicy::CancelSafe,
+        );
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
+        let coordinator = StreamingCoordinator::new(
+            &runtime,
+            vec![source],
+            PipelineConfig {
+                fallback_poll_interval: Duration::from_millis(1),
+                ..PipelineConfig::default()
+            },
+            Arc::new(tokio::sync::Notify::new()),
+            control_rx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("the source generation must start");
+        let run = tokio::spawn(coordinator.run(MockCallback::new()));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.poll_calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the source actor never entered its polling loop");
+
+        run.abort();
+        assert!(run
+            .await
+            .expect_err("the run task must be cancelled")
+            .is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.close_calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelling run did not request source shutdown");
+
+        let (_overlap_control_tx, overlap_control_rx) =
+            mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
+        let overlap = StreamingCoordinator::new(
+            &runtime,
+            Vec::new(),
+            PipelineConfig::default(),
+            Arc::new(tokio::sync::Notify::new()),
+            overlap_control_rx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        assert!(matches!(overlap, Err(DbError::Pipeline(ref message))
+            if message.contains("cancelled-run")
+                && message.contains("prior connector generations remain unresolved")));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let terminal = runtime
+                    .owned_source_tasks
+                    .lock()
+                    .iter()
+                    .all(SourceTaskLease::is_finished);
+                if terminal && state.close_calls.load(Ordering::SeqCst) == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelling run orphaned its source generation");
+        assert!(!state.open.load(Ordering::SeqCst));
+
+        let (_replacement_control_tx, replacement_control_rx) =
+            mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
+        StreamingCoordinator::new(
+            &runtime,
+            Vec::new(),
+            PipelineConfig::default(),
+            Arc::new(tokio::sync::Notify::new()),
+            replacement_control_rx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("a cancelled terminal generation must not block replacement construction");
+    }
+
+    #[tokio::test]
+    async fn public_runtime_rejects_overlapping_source_generations() {
+        let runtime = StreamingCoordinatorRuntime::new();
+        let (task_owner, task_tracker) = laminar_connectors::connector::ConnectorTaskOwner::new();
+        let child = task_owner.track().expect("live source child");
+        let tracker_calls = Arc::new(AtomicU64::new(0));
+        let close_calls = Arc::new(AtomicU64::new(0));
+        let source = SourceRegistration {
+            name: "runtime-owned-source".into(),
+            connector: Box::new(TrackedStartupSource {
+                _task_owner: task_owner,
+                task_tracker,
+                tracker_calls: Arc::clone(&tracker_calls),
+                start_error: None,
+                close_calls: Arc::clone(&close_calls),
+            }),
+            config: laminar_connectors::config::ConnectorConfig::new("runtime-owned-source"),
+            contract: laminar_connectors::connector::SourceContract::new(
+                laminar_connectors::connector::SourceConsistency::Replayable,
+                laminar_connectors::connector::SourceTopology::Singleton,
+            ),
+            assignment_scoped: false,
+            position: SourcePosition::Initial,
+        };
+        let (_first_control_tx, first_control_rx) =
+            mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
+        let first = StreamingCoordinator::new(
+            &runtime,
+            vec![source],
+            PipelineConfig::default(),
+            Arc::new(tokio::sync::Notify::new()),
+            first_control_rx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("the first source generation must start");
+        assert_eq!(tracker_calls.load(Ordering::SeqCst), 1);
+
+        let (_overlap_control_tx, overlap_control_rx) =
+            mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
+        let overlap = StreamingCoordinator::new(
+            &runtime,
+            Vec::new(),
+            PipelineConfig::default(),
+            Arc::new(tokio::sync::Notify::new()),
+            overlap_control_rx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        assert!(matches!(overlap, Err(DbError::Pipeline(ref message))
+            if message.contains("runtime-owned-source")
+                && message.contains("prior connector generations remain unresolved")));
+
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while close_calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first source actor did not close");
+        assert!(runtime
+            .owned_source_tasks
+            .lock()
+            .iter()
+            .any(|task| !task.is_finished()));
+
+        drop(child);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if runtime
+                    .owned_source_tasks
+                    .lock()
+                    .iter()
+                    .all(SourceTaskLease::is_finished)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first source generation did not terminate");
+        assert_eq!(tracker_calls.load(Ordering::SeqCst), 1);
+
+        let (_replacement_control_tx, replacement_control_rx) =
+            mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
+        StreamingCoordinator::new(
+            &runtime,
+            Vec::new(),
+            PipelineConfig::default(),
+            Arc::new(tokio::sync::Notify::new()),
+            replacement_control_rx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("a terminated generation must not block replacement construction");
+    }
+
+    #[tokio::test]
+    async fn public_runtime_fences_a_live_source_less_coordinator() {
+        let runtime = StreamingCoordinatorRuntime::new();
+        let (_first_control_tx, first_control_rx) =
+            mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
+        let first = StreamingCoordinator::new(
+            &runtime,
+            Vec::new(),
+            PipelineConfig::default(),
+            Arc::new(tokio::sync::Notify::new()),
+            first_control_rx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("the first coordinator generation must be admitted");
+
+        let (_overlap_control_tx, overlap_control_rx) =
+            mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
+        let overlap = StreamingCoordinator::new(
+            &runtime,
+            Vec::new(),
+            PipelineConfig::default(),
+            Arc::new(tokio::sync::Notify::new()),
+            overlap_control_rx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        assert!(matches!(overlap, Err(DbError::Pipeline(ref message))
+            if message.contains("prior coordinator generation is still active")));
+
+        drop(first);
+        let (_replacement_control_tx, replacement_control_rx) =
+            mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
+        StreamingCoordinator::new(
+            &runtime,
+            Vec::new(),
+            PipelineConfig::default(),
+            Arc::new(tokio::sync::Notify::new()),
+            replacement_control_rx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("dropping the prior coordinator must release its generation");
+    }
+
+    #[test]
+    fn public_runtime_terminal_proof_survives_executor_shutdown() {
+        let runtime = StreamingCoordinatorRuntime::new();
+        let (task_owner, task_tracker) = laminar_connectors::connector::ConnectorTaskOwner::new();
+        let child = task_owner.track().expect("live source child");
+        let tracker_calls = Arc::new(AtomicU64::new(0));
+        let source = SourceRegistration {
+            name: "executor-shutdown-source".into(),
+            connector: Box::new(TrackedStartupSource {
+                _task_owner: task_owner,
+                task_tracker,
+                tracker_calls: Arc::clone(&tracker_calls),
+                start_error: None,
+                close_calls: Arc::new(AtomicU64::new(0)),
+            }),
+            config: laminar_connectors::config::ConnectorConfig::new("executor-shutdown-source"),
+            contract: laminar_connectors::connector::SourceContract::new(
+                laminar_connectors::connector::SourceConsistency::Replayable,
+                laminar_connectors::connector::SourceTopology::Singleton,
+            ),
+            assignment_scoped: false,
+            position: SourcePosition::Initial,
+        };
+        let first_executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (_first_control_tx, first_control_rx) =
+            mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
+        let first = first_executor
+            .block_on(StreamingCoordinator::new(
+                &runtime,
+                vec![source],
+                PipelineConfig::default(),
+                Arc::new(tokio::sync::Notify::new()),
+                first_control_rx,
+                Arc::new(AtomicBool::new(false)),
+            ))
+            .expect("the first source generation must start");
+        assert_eq!(tracker_calls.load(Ordering::SeqCst), 1);
+
+        // The actor and its detached outcome supervisor are both cancelled without another poll.
+        // The actor wrapper must still publish exit, while the exact connector child remains fenced.
+        drop(first_executor);
+        drop(first);
+
+        let second_executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (_overlap_control_tx, overlap_control_rx) =
+            mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
+        let overlap = second_executor.block_on(StreamingCoordinator::new(
+            &runtime,
+            Vec::new(),
+            PipelineConfig::default(),
+            Arc::new(tokio::sync::Notify::new()),
+            overlap_control_rx,
+            Arc::new(AtomicBool::new(false)),
+        ));
+        assert!(matches!(overlap, Err(DbError::Pipeline(ref message))
+            if message.contains("executor-shutdown-source")
+                && message.contains("prior connector generations remain unresolved")));
+
+        drop(child);
+        let (_replacement_control_tx, replacement_control_rx) =
+            mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
+        second_executor
+            .block_on(StreamingCoordinator::new(
+                &runtime,
+                Vec::new(),
+                PipelineConfig::default(),
+                Arc::new(tokio::sync::Notify::new()),
+                replacement_control_rx,
+                Arc::new(AtomicBool::new(false)),
+            ))
+            .expect("tracker termination must release the executor-independent source fence");
+        assert_eq!(tracker_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -9246,6 +10981,55 @@ mod tests {
         assert!(!current.open.load(Ordering::SeqCst));
         assert_eq!(prior.poll_calls.load(Ordering::SeqCst), 0);
         assert_eq!(current.poll_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_rollback_closes_stalled_sources_with_one_shared_deadline() {
+        let first = Arc::new(StartupSourceState::default());
+        let second = Arc::new(StartupSourceState::default());
+        let failing = Arc::new(StartupSourceState::default());
+        let started = tokio::time::Instant::now();
+
+        let result = startup_result(vec![
+            startup_source_with_close_delay(
+                "stalled-cleanup-a",
+                Arc::clone(&first),
+                false,
+                false,
+                Duration::ZERO,
+                Duration::from_secs(60),
+                SourcePosition::Initial,
+                ConnectorCancellationPolicy::CancelSafe,
+            ),
+            startup_source_with_close_delay(
+                "stalled-cleanup-b",
+                Arc::clone(&second),
+                false,
+                false,
+                Duration::ZERO,
+                Duration::from_secs(60),
+                SourcePosition::Initial,
+                ConnectorCancellationPolicy::CancelSafe,
+            ),
+            startup_source(
+                "failing-cleanup-trigger",
+                Arc::clone(&failing),
+                true,
+                false,
+                SourcePosition::Initial,
+            ),
+        ])
+        .await;
+
+        assert!(matches!(result, Err(DbError::Config(_))));
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            PipelineConfig::CONNECTOR_STARTUP_CLEANUP_TIMEOUT,
+            "independent cleanup attempts must not multiply the rollback budget"
+        );
+        assert_eq!(first.close_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second.close_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(failing.close_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -9312,7 +11096,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cancellation_unsafe_source_start_finishes_before_startup_rollback() {
+    async fn timed_out_source_start_retires_candidate_at_the_shared_deadline() {
         let state = Arc::new(StartupSourceState::default());
         let config = PipelineConfig {
             checkpoint_timeout: Duration::from_secs(10),
@@ -9321,13 +11105,13 @@ mod tests {
         let started = tokio::time::Instant::now();
         let result = startup_result_with_config(
             vec![startup_source_with_policy(
-                "complete-started",
+                "retired-start",
                 Arc::clone(&state),
                 false,
                 false,
                 Duration::from_secs(12),
                 SourcePosition::Initial,
-                ConnectorCancellationPolicy::CompleteStarted,
+                ConnectorCancellationPolicy::RetireConnector,
             )],
             config,
         )
@@ -9340,11 +11124,46 @@ mod tests {
         ));
         assert_eq!(
             tokio::time::Instant::now() - started,
-            Duration::from_secs(12)
+            Duration::from_secs(10)
         );
-        assert_eq!(state.start_completions.load(Ordering::SeqCst), 1);
-        assert_eq!(state.close_calls.load(Ordering::SeqCst), 1);
-        assert!(!state.open.load(Ordering::SeqCst));
+        assert_eq!(state.start_completions.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            state.close_calls.load(Ordering::SeqCst),
+            0,
+            "a retired startup candidate must not receive a later connector call"
+        );
+        assert!(state.open.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_start_completion_tied_with_deadline_is_rejected() {
+        let state = Arc::new(StartupSourceState::default());
+        let mut connector = StartupSource {
+            state: Arc::clone(&state),
+            schema: Arc::new(Schema::empty()),
+            start_delay: Duration::from_secs(2),
+            close_delay: Duration::ZERO,
+            fail_open: false,
+            fail_restore: false,
+            cancellation_policy: ConnectorCancellationPolicy::RetireConnector,
+        };
+        let request = SourceStart {
+            config: laminar_connectors::config::ConnectorConfig::new("deadline-tie"),
+            position: SourcePosition::Initial,
+            delivery: DeliveryGuarantee::AtLeastOnce,
+        };
+
+        let outcome = start_source_once(
+            &mut connector,
+            request,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            #[cfg(feature = "cluster")]
+            None,
+        )
+        .await;
+
+        assert!(matches!(outcome, SourceStartOutcome::TimedOut));
+        assert_eq!(state.start_completions.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -9435,6 +11254,136 @@ mod tests {
         assert_eq!(failing.poll_calls.load(Ordering::SeqCst), 0);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn failed_source_start_retains_connector_child_fence() {
+        let (task_owner, task_tracker) = laminar_connectors::connector::ConnectorTaskOwner::new();
+        let child = task_owner
+            .track()
+            .expect("the startup generation must still admit child tasks");
+        let close_calls = Arc::new(AtomicU64::new(0));
+        let tracker_calls = Arc::new(AtomicU64::new(0));
+        let source = SourceRegistration {
+            name: "tracked-start-failure".into(),
+            connector: Box::new(TrackedStartupSource {
+                _task_owner: task_owner,
+                task_tracker,
+                tracker_calls: Arc::clone(&tracker_calls),
+                start_error: Some(ConnectorError::Internal(
+                    "injected tracked startup failure".into(),
+                )),
+                close_calls: Arc::clone(&close_calls),
+            }),
+            config: laminar_connectors::config::ConnectorConfig::new("tracked-start-failure"),
+            contract: laminar_connectors::connector::SourceContract::new(
+                laminar_connectors::connector::SourceConsistency::Replayable,
+                laminar_connectors::connector::SourceTopology::Singleton,
+            ),
+            assignment_scoped: false,
+            position: SourcePosition::Initial,
+        };
+        let runtime = StreamingCoordinatorRuntime::new();
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
+
+        let result = StreamingCoordinator::new(
+            &runtime,
+            vec![source],
+            PipelineConfig::default(),
+            Arc::new(tokio::sync::Notify::new()),
+            control_rx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+
+        assert!(matches!(result, Err(DbError::Config(ref message))
+            if message.contains("injected tracked startup failure")));
+        assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(tracker_calls.load(Ordering::SeqCst), 1);
+        let fence = {
+            let fences = runtime.owned_connector_task_fences.lock();
+            assert_eq!(fences.len(), 1);
+            assert_eq!(fences[0].name(), "source:tracked-start-failure");
+            fences[0].clone()
+        };
+        assert!(
+            !fence
+                .wait_until(tokio::time::Instant::now() + Duration::from_millis(1))
+                .await,
+            "startup returned without retaining the still-running connector child"
+        );
+
+        drop(child);
+        assert!(
+            fence
+                .wait_until(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await,
+            "startup fence remained live after the final connector child exited"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn outcome_unknown_source_start_retires_without_close() {
+        let (task_owner, task_tracker) = laminar_connectors::connector::ConnectorTaskOwner::new();
+        let child = task_owner
+            .track()
+            .expect("the startup generation must still admit child tasks");
+        let close_calls = Arc::new(AtomicU64::new(0));
+        let tracker_calls = Arc::new(AtomicU64::new(0));
+        let source = SourceRegistration {
+            name: "ambiguous-start".into(),
+            connector: Box::new(TrackedStartupSource {
+                _task_owner: task_owner,
+                task_tracker,
+                tracker_calls: Arc::clone(&tracker_calls),
+                start_error: Some(ConnectorError::outcome_unknown(
+                    "injected ambiguous start result",
+                    true,
+                )),
+                close_calls: Arc::clone(&close_calls),
+            }),
+            config: laminar_connectors::config::ConnectorConfig::new("ambiguous-start"),
+            contract: laminar_connectors::connector::SourceContract::new(
+                laminar_connectors::connector::SourceConsistency::Replayable,
+                laminar_connectors::connector::SourceTopology::Singleton,
+            ),
+            assignment_scoped: false,
+            position: SourcePosition::Initial,
+        };
+        let runtime = StreamingCoordinatorRuntime::new();
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
+
+        let result = StreamingCoordinator::new(
+            &runtime,
+            vec![source],
+            PipelineConfig::default(),
+            Arc::new(tokio::sync::Notify::new()),
+            control_rx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+
+        assert!(matches!(result, Err(DbError::Config(ref message))
+            if message.contains("injected ambiguous start result")));
+        assert_eq!(
+            close_calls.load(Ordering::SeqCst),
+            0,
+            "an ambiguous start result must retire the connector without another hook"
+        );
+        assert_eq!(tracker_calls.load(Ordering::SeqCst), 1);
+        let fence = {
+            let fences = runtime.owned_connector_task_fences.lock();
+            assert_eq!(fences.len(), 1);
+            assert_eq!(fences[0].name(), "source:ambiguous-start");
+            fences[0].clone()
+        };
+        assert!(!fence.is_finished());
+        drop(child);
+        assert!(
+            fence
+                .wait_until(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await
+        );
+    }
+
     #[tokio::test]
     async fn immediate_source_fault_is_ordered_after_runtime_ready() {
         let state = Arc::new(RuntimeSourceState::default());
@@ -9499,6 +11448,50 @@ mod tests {
             assert!(state.polls.load(Ordering::SeqCst) > 0);
             assert_eq!(state.closes.load(Ordering::SeqCst), 1);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_checkpoint_failure_does_not_tail_poll_or_ack() {
+        let state = Arc::new(PendingCheckpointFailureState::default());
+        let source = SourceRegistration {
+            name: "pending-checkpoint-failure-source".into(),
+            connector: Box::new(PendingCheckpointFailureSource {
+                state: Arc::clone(&state),
+            }),
+            config: laminar_connectors::config::ConnectorConfig::new(
+                "pending-checkpoint-failure-source",
+            ),
+            contract: laminar_connectors::connector::SourceContract::default(),
+            assignment_scoped: false,
+            position: SourcePosition::Initial,
+        };
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
+        let coordinator = StreamingCoordinator::new(
+            &StreamingCoordinatorRuntime::new(),
+            vec![source],
+            PipelineConfig {
+                delivery_guarantee: DeliveryGuarantee::BestEffort,
+                checkpoint_interval: Some(Duration::from_secs(60)),
+                fallback_poll_interval: Duration::from_millis(1),
+                ..PipelineConfig::default()
+            },
+            Arc::new(tokio::sync::Notify::new()),
+            control_rx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("source must start");
+
+        let exit =
+            tokio::time::timeout(Duration::from_secs(5), coordinator.run(MockCallback::new()))
+                .await
+                .expect("checkpoint failure must stop the pipeline");
+        assert!(matches!(exit, ExitReason::Fault(ref error)
+            if error.contains("injected pending checkpoint failure")));
+        assert_eq!(state.polls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.checkpoint_captures.load(Ordering::SeqCst), 2);
+        assert_eq!(state.commit_notifications.load(Ordering::SeqCst), 0);
+        assert_eq!(state.closes.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -9574,6 +11567,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Some(Arc::clone(&controller)),
             Arc::new(parking_lot::Mutex::new(Vec::new())),
+            empty_connector_task_fences(),
             crate::db::RuntimeMode::Cluster,
         )
         .await
@@ -9589,14 +11583,16 @@ mod tests {
             .await
             .expect("source never entered its first poll");
         controller.fence_process_lease();
-        tokio::time::timeout(Duration::from_secs(2), task.wait())
-            .await
-            .expect("lease loss did not stop the in-flight poll");
+        assert!(
+            task.wait_until(tokio::time::Instant::now() + Duration::from_secs(2))
+                .await,
+            "lease loss did not stop the in-flight poll"
+        );
 
         assert_eq!(state.poll_calls.load(Ordering::SeqCst), 1);
         assert_eq!(state.cancelled_polls.load(Ordering::SeqCst), 1);
         assert_eq!(state.commit_notification_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(state.closes.load(Ordering::SeqCst), 1);
+        assert_eq!(state.closes.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -9624,6 +11620,7 @@ mod tests {
             ..PipelineConfig::default()
         };
         let coordinator = StreamingCoordinator::new(
+            &StreamingCoordinatorRuntime::new(),
             vec![source],
             config,
             Arc::clone(&shutdown),
@@ -10059,6 +12056,7 @@ mod tests {
             staged_bytes: Arc::new(AtomicU64::new(0)),
             max_staged_bytes: u64::MAX,
             coordinated_commit_admission: None,
+            public_generation: None,
             #[cfg(feature = "cluster")]
             process_authority: None,
         };
@@ -10091,6 +12089,99 @@ mod tests {
         // But the test proves: no panics, no deadlocks, clean shutdown.
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn source_lease_waits_for_connector_child_guard() {
+        let (owner, tracker) = laminar_connectors::connector::ConnectorTaskOwner::new();
+        let guard = owner.track().expect("live connector task generation");
+        drop(owner);
+        let runtime = tokio::runtime::Handle::current();
+        let (join, actor_terminal) = spawn_source_actor(&runtime, async {});
+        let lease = SourceTaskLease::supervise(
+            Arc::from("child-task-source"),
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+            join,
+            actor_terminal,
+            Some(tracker),
+            &runtime,
+        );
+
+        assert!(
+            !lease
+                .wait_until(tokio::time::Instant::now() + Duration::from_millis(1))
+                .await,
+            "the source lease finished while a connector child guard remained live"
+        );
+        drop(guard);
+        assert!(
+            lease
+                .wait_until(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await,
+            "the source lease did not finish after its last child guard dropped"
+        );
+    }
+
+    #[test]
+    fn abort_before_first_poll_drops_source_actor_before_publishing_terminal() {
+        struct DropProbe {
+            terminal: Arc<Mutex<Option<Arc<SourceActorTerminalState>>>>,
+            dropped: Arc<AtomicBool>,
+            terminal_was_finished: Arc<AtomicBool>,
+        }
+
+        impl std::future::Future for DropProbe {
+            type Output = ();
+
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _context: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Self::Output> {
+                panic!("source actor was polled before its immediate abort");
+            }
+        }
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                let terminal = self
+                    .terminal
+                    .lock()
+                    .clone()
+                    .expect("terminal state must be installed before abort");
+                self.terminal_was_finished
+                    .store(terminal.is_finished(), Ordering::Release);
+                self.dropped.store(true, Ordering::Release);
+            }
+        }
+
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            let terminal_slot = Arc::new(Mutex::new(None));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let terminal_was_finished = Arc::new(AtomicBool::new(false));
+            let (join, terminal) = spawn_source_actor(
+                &tokio::runtime::Handle::current(),
+                DropProbe {
+                    terminal: Arc::clone(&terminal_slot),
+                    dropped: Arc::clone(&dropped),
+                    terminal_was_finished: Arc::clone(&terminal_was_finished),
+                },
+            );
+            *terminal_slot.lock() = Some(Arc::clone(&terminal));
+
+            join.abort();
+            assert!(join
+                .await
+                .expect_err("the unpolled source actor must be cancelled")
+                .is_cancelled());
+            assert!(dropped.load(Ordering::Acquire));
+            assert!(!terminal_was_finished.load(Ordering::Acquire));
+            assert!(terminal.is_finished());
+        });
+    }
+
     /// An already-running blocking task ignores Tokio abort. The coordinator reaper stays bounded,
     /// but the lease must not report terminal completion until the blocking work actually exits.
     #[tokio::test]
@@ -10099,7 +12190,9 @@ mod tests {
         let task_release = Arc::clone(&release);
         let task_started = Arc::new(AtomicBool::new(false));
         let task_started_flag = Arc::clone(&task_started);
+        let (actor_lifetime, actor_terminal) = source_actor_terminal_guard();
         let wedged = tokio::task::spawn_blocking(move || {
+            let _actor_lifetime = actor_lifetime;
             task_started_flag.store(true, Ordering::Release);
             let (released, wake) = &*task_release;
             let mut released = released.lock();
@@ -10112,25 +12205,21 @@ mod tests {
         }
         let lease = SourceTaskLease::supervise(
             Arc::from("wedged"),
-            ConnectorCancellationPolicy::CancelSafe,
             Arc::new(tokio::sync::Notify::new()),
             Arc::new(AtomicBool::new(false)),
             wedged,
+            actor_terminal,
+            None,
             &tokio::runtime::Handle::current(),
         );
 
         // Always release the blocking worker before asserting so the test runtime can tear down.
-        let result = tokio::time::timeout(
-            Duration::from_millis(100),
-            StreamingCoordinator::reap_source_task(lease.clone()),
-        )
-        .await;
+        StreamingCoordinator::reap_source_task(lease.clone());
         assert!(!lease.is_finished());
         let (released, wake) = &*release;
         *released.lock() = true;
         wake.notify_all();
 
-        result.expect("shutdown reaper awaited a task that ignores Tokio abort");
         assert!(
             lease
                 .wait_until(tokio::time::Instant::now() + Duration::from_secs(1))
@@ -10140,33 +12229,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_does_not_abort_complete_started_source_task() {
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    async fn shutdown_retires_a_source_task_that_misses_its_budget() {
+        let (_release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
         let completed = Arc::new(AtomicBool::new(false));
         let task_completed = Arc::clone(&completed);
-        let task = tokio::spawn(async move {
+        let runtime = tokio::runtime::Handle::current();
+        let (task, actor_terminal) = spawn_source_actor(&runtime, async move {
             let _ = release_rx.await;
             task_completed.store(true, Ordering::Release);
         });
         let lease = SourceTaskLease::supervise(
-            Arc::from("complete-started"),
-            ConnectorCancellationPolicy::CompleteStarted,
+            Arc::from("retired"),
             Arc::new(tokio::sync::Notify::new()),
             Arc::new(AtomicBool::new(false)),
             task,
-            &tokio::runtime::Handle::current(),
+            actor_terminal,
+            None,
+            &runtime,
         );
 
-        let reaper = tokio::spawn(StreamingCoordinator::reap_source_task(lease));
-        tokio::task::yield_now().await;
+        StreamingCoordinator::reap_source_task(lease.clone());
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            lease.wait_until(tokio::time::Instant::now() + Duration::from_secs(1)),
+        )
+        .await
+        .expect("retired source task did not terminate");
+        assert!(lease.is_finished());
         assert!(!completed.load(Ordering::Acquire));
-
-        release_tx.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(1), reaper)
-            .await
-            .expect("cancellation-unsafe source reaper did not observe terminal completion")
-            .unwrap();
-        assert!(completed.load(Ordering::Acquire));
     }
 
     #[test]
@@ -10267,6 +12357,7 @@ mod tests {
         );
         let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
         let coordinator = StreamingCoordinator::new(
+            &StreamingCoordinatorRuntime::new(),
             vec![panic_source, peer],
             PipelineConfig::default(),
             Arc::new(tokio::sync::Notify::new()),
@@ -10426,6 +12517,7 @@ mod tests {
             staged_bytes: Arc::new(AtomicU64::new(0)),
             max_staged_bytes: u64::MAX,
             coordinated_commit_admission: None,
+            public_generation: None,
             #[cfg(feature = "cluster")]
             process_authority: None,
         };
@@ -10687,6 +12779,7 @@ mod tests {
             staged_bytes: Arc::new(AtomicU64::new(0)),
             max_staged_bytes: u64::MAX,
             coordinated_commit_admission: None,
+            public_generation: None,
             #[cfg(feature = "cluster")]
             process_authority: None,
         };
@@ -10877,6 +12970,7 @@ mod tests {
             staged_bytes: Arc::new(AtomicU64::new(0)),
             max_staged_bytes: u64::MAX,
             coordinated_commit_admission: None,
+            public_generation: None,
             #[cfg(feature = "cluster")]
             process_authority: None,
         };
@@ -11158,6 +13252,7 @@ mod tests {
             staged_bytes: Arc::new(AtomicU64::new(0)),
             max_staged_bytes: u64::MAX,
             coordinated_commit_admission: None,
+            public_generation: None,
             #[cfg(feature = "cluster")]
             process_authority: None,
         };

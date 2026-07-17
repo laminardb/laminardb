@@ -119,6 +119,22 @@ impl ReplicationClient {
     /// - Unix socket does not exist (when host starts with `/`)
     /// - TLS requested with Unix socket connection
     pub async fn connect(cfg: ReplicationConfig) -> Result<Self> {
+        Self::connect_with_worker_lifetime(cfg, ()).await
+    }
+
+    /// Connect while retaining `worker_lifetime` for the exact lifetime of the
+    /// spawned replication worker.
+    ///
+    /// This lets callers fence replacement work until a cancelled startup
+    /// worker has actually been destroyed, rather than merely requested to
+    /// abort.
+    pub async fn connect_with_worker_lifetime<G>(
+        cfg: ReplicationConfig,
+        worker_lifetime: G,
+    ) -> Result<Self>
+    where
+        G: Send + 'static,
+    {
         validate_buffer_limits(&cfg)?;
         let (tx, rx) = mpsc::channel(cfg.buffer_events);
         let wire_byte_budget = Arc::new(Semaphore::new(cfg.max_in_flight_bytes));
@@ -133,6 +149,7 @@ impl ReplicationClient {
         let cfg_for_worker = cfg.clone();
 
         let join = tokio::spawn(async move {
+            let _worker_lifetime = worker_lifetime;
             let mut worker = WorkerState::new(
                 cfg_for_worker,
                 progress_for_worker,
@@ -399,6 +416,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use tokio::net::TcpListener;
     use tokio::sync::{mpsc, oneshot, watch};
 
     use super::{validate_buffer_limits, ReplicationClient, DROP_SHUTDOWN_GRACE};
@@ -485,5 +503,43 @@ mod tests {
             .expect("stalled worker must be aborted and reaped within the cleanup bound")
             .unwrap();
         assert!(!active.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn cancelled_connect_retains_lifetime_until_startup_worker_is_destroyed() {
+        struct WorkerLifetime(Option<oneshot::Sender<()>>);
+
+        impl Drop for WorkerLifetime {
+            fn drop(&mut self) {
+                if let Some(terminated) = self.0.take() {
+                    let _ = terminated.send(());
+                }
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = ReplicationConfig::default();
+        config.port = listener.local_addr().unwrap().port();
+        let (terminated_tx, terminated_rx) = oneshot::channel();
+
+        let connect = tokio::spawn(ReplicationClient::connect_with_worker_lifetime(
+            config,
+            WorkerLifetime(Some(terminated_tx)),
+        ));
+        let (_socket, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .expect("startup worker must connect")
+            .unwrap();
+
+        connect.abort();
+        let error = match connect.await {
+            Err(error) => error,
+            Ok(_) => panic!("connect task must be cancelled"),
+        };
+        assert!(error.is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), terminated_rx)
+            .await
+            .expect("worker lifetime must end after startup cancellation")
+            .unwrap();
     }
 }

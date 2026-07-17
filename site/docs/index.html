@@ -1126,13 +1126,13 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
             <td class="field-name">connector</td>
             <td class="field-type">String</td>
             <td><span class="field-required">required</span></td>
-            <td>"kafka", "postgres_cdc", "mongodb-cdc", "nats", "websocket", "files", "delta-lake", "iceberg", "otel"</td>
+            <td>"kafka", "postgres-cdc", "mongodb-cdc", "nats", "websocket", "files", "delta-lake", "iceberg", "otel"</td>
           </tr>
           <tr>
             <td class="field-name">format</td>
             <td class="field-type">String</td>
             <td class="field-default">"json"</td>
-            <td>"json", "avro", "protobuf", "csv"</td>
+            <td>Connector-specific; see the source connector tables below</td>
           </tr>
           <tr>
             <td class="field-name">properties</td>
@@ -1178,7 +1178,7 @@ type = "DOUBLE"
 
 [[source.schema]]
 name = "ts"
-type = "BIGINT"
+type = "TIMESTAMP"
 
 [source.watermark]
 column = "ts"
@@ -1234,7 +1234,7 @@ max_out_of_orderness = "5s"</code></pre>
             <td class="field-name">connector</td>
             <td class="field-type">String</td>
             <td><span class="field-required">required</span></td>
-            <td>"kafka", "postgres", "mongodb", "nats", "delta-lake", "iceberg", "websocket", "files", "stdout"</td>
+            <td>"kafka", "postgres-sink", "mongodb-sink", "nats", "delta-lake", "iceberg", "websocket", "files", "stdout"</td>
           </tr>
           <tr>
             <td class="field-name">properties</td>
@@ -1337,7 +1337,7 @@ max_out_of_orderness = "5s"</code></pre>
       <table class="config-table">
         <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
         <tbody>
-          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, avro, protobuf</td></tr>
+          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, csv, avro, raw, debezium</td></tr>
           <tr><td class="field-name">schema.registry.url</td><td></td><td>Confluent Schema Registry URL</td></tr>
           <tr><td class="field-name">schema.registry.username</td><td></td><td>Schema Registry auth</td></tr>
           <tr><td class="field-name">schema.registry.password</td><td></td><td>Schema Registry auth</td></tr>
@@ -1360,12 +1360,11 @@ max_out_of_orderness = "5s"</code></pre>
       <table class="config-table">
         <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
         <tbody>
-          <tr><td class="field-name">startup.mode</td><td class="field-default">earliest</td><td>earliest, latest, none</td></tr>
+          <tr><td class="field-name">startup.mode</td><td class="field-default">group-offsets</td><td>group-offsets, earliest, latest</td></tr>
+          <tr><td class="field-name">auto.offset.reset</td><td class="field-default">earliest</td><td>earliest, latest, none (used when group offsets do not exist)</td></tr>
           <tr><td class="field-name">max.poll.records</td><td class="field-default">1000</td><td>Records per poll batch</td></tr>
           <tr><td class="field-name">isolation.level</td><td class="field-default">read_committed</td><td>read_uncommitted, read_committed</td></tr>
-          <tr><td class="field-name">partition.assignment.strategy</td><td class="field-default">range</td><td>range, roundrobin, sticky, cooperative-sticky</td></tr>
-          <tr><td class="field-name">max.out.of.orderness.ms</td><td class="field-default">5000</td><td>Watermark out-of-order tolerance</td></tr>
-          <tr><td class="field-name">idle.timeout.ms</td><td class="field-default">30000</td><td>Idle watermark advancement timeout</td></tr>
+          <tr><td class="field-name">partition.assignment.strategy</td><td class="field-default">range</td><td>range, roundrobin, cooperative-sticky</td></tr>
         </tbody>
       </table>
 
@@ -1380,11 +1379,10 @@ max_out_of_orderness = "5s"</code></pre>
         <tbody>
           <tr><td class="field-name">bootstrap.servers</td><td><span class="field-required">required</span></td><td>Kafka broker addresses</td></tr>
           <tr><td class="field-name">topic</td><td><span class="field-required">required</span></td><td>Target topic</td></tr>
-          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, avro, protobuf</td></tr>
+          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, csv, avro, raw</td></tr>
           <tr><td class="field-name">key.column</td><td></td><td>Column for partition key</td></tr>
           <tr><td class="field-name">partitioner</td><td class="field-default">key-hash</td><td>key-hash, round-robin, sticky</td></tr>
           <tr><td class="field-name">compression.type</td><td class="field-default">none</td><td>none, gzip, snappy, lz4, zstd</td></tr>
-          <tr><td class="field-name">acks</td><td class="field-default">all</td><td>all, 1, 0</td></tr>
           <tr><td class="field-name">linger.ms</td><td class="field-default">5</td><td>Batch linger time</td></tr>
           <tr><td class="field-name">batch.size</td><td class="field-default">16384</td><td>Max batch bytes</td></tr>
         </tbody>
@@ -1399,7 +1397,7 @@ max_out_of_orderness = "5s"</code></pre>
         <tbody>
           <tr><td class="field-name">servers</td><td><span class="field-required">required</span></td><td>NATS server URLs (comma-separated)</td></tr>
           <tr><td class="field-name">mode</td><td class="field-default">jetstream</td><td>jetstream, core</td></tr>
-          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, avro, protobuf</td></tr>
+          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, csv, raw</td></tr>
           <tr><td class="field-name">auth.mode</td><td class="field-default">none</td><td>none, user_pass, token, creds_file</td></tr>
           <tr><td class="field-name">user</td><td></td><td>Auth username (required for user_pass)</td></tr>
           <tr><td class="field-name">password</td><td></td><td>Auth password (required for user_pass)</td></tr>
@@ -1425,7 +1423,7 @@ max_out_of_orderness = "5s"</code></pre>
           <tr><td class="field-name">queue.group</td><td></td><td>Queue group (core mode only)</td></tr>
         </tbody>
       </table>
-      <p>JetStream messages are acknowledged asynchronously after successful deserialization;
+      <p>JetStream messages receive confirmed acknowledgements asynchronously after successful deserialization;
          acknowledgement failures and timeouts leave them eligible for broker redelivery. NATS
          source progress is not checkpoint-coupled, and both JetStream and Core modes are admitted
          only as ephemeral/best-effort sources.</p>
@@ -1439,7 +1437,7 @@ max_out_of_orderness = "5s"</code></pre>
         <tbody>
           <tr><td class="field-name">servers</td><td><span class="field-required">required</span></td><td>NATS server URLs (comma-separated)</td></tr>
           <tr><td class="field-name">mode</td><td class="field-default">jetstream</td><td>jetstream, core</td></tr>
-          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, avro, protobuf</td></tr>
+          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, csv, raw</td></tr>
           <tr><td class="field-name">auth.mode</td><td class="field-default">none</td><td>none, user_pass, token, creds_file</td></tr>
           <tr><td class="field-name">user</td><td></td><td>Auth username (required for user_pass)</td></tr>
           <tr><td class="field-name">password</td><td></td><td>Auth password (required for user_pass)</td></tr>
@@ -1449,7 +1447,7 @@ max_out_of_orderness = "5s"</code></pre>
           <tr><td class="field-name">tls.ca.location</td><td></td><td>CA cert path</td></tr>
           <tr><td class="field-name">tls.cert.location</td><td></td><td>Client certificate path</td></tr>
           <tr><td class="field-name">tls.key.location</td><td></td><td>Client key path</td></tr>
-          <tr><td class="field-name">stream</td><td><span class="field-required">required</span></td><td>JetStream target; file storage, three replicas, and publish acknowledgements are validated at startup</td></tr>
+          <tr><td class="field-name">stream</td><td></td><td>JetStream target, required in JetStream mode and forbidden in Core mode; file storage, three replicas, and publish acknowledgements are validated at startup</td></tr>
           <tr><td class="field-name">subject</td><td></td><td>Literal publishing subject. Mutually exclusive with subject.column.</td></tr>
           <tr><td class="field-name">subject.column</td><td></td><td>Per-row subject column name. Mutually exclusive with subject.</td></tr>
           <tr><td class="field-name">dedup.id.column</td><td></td><td>Column to use for JetStream message deduplication IDs</td></tr>
@@ -1500,8 +1498,9 @@ max_out_of_orderness = "5s"</code></pre>
           <tr><td class="field-name">schema.name</td><td class="field-default">public</td><td>PostgreSQL schema</td></tr>
           <tr><td class="field-name">write.mode</td><td class="field-default">append</td><td>append (COPY BINARY) or upsert (INSERT ON CONFLICT)</td></tr>
           <tr><td class="field-name">primary.key</td><td></td><td>PK columns for upsert (comma-separated). Required if write.mode=upsert.</td></tr>
-          <tr><td class="field-name">batch.size</td><td class="field-default">4096</td><td>Records per flush</td></tr>
-          <tr><td class="field-name">pool.size</td><td class="field-default">4</td><td>Connection pool size</td></tr>
+          <tr><td class="field-name">flush.interval.ms</td><td class="field-default">250</td><td>Maximum time to buffer before flushing</td></tr>
+          <tr><td class="field-name">connect.timeout.ms</td><td class="field-default">10000</td><td>Connection deadline</td></tr>
+          <tr><td class="field-name">statement.timeout.ms</td><td class="field-default">30000</td><td>Per-query deadline</td></tr>
           <tr><td class="field-name">auto.create.table</td><td class="field-default">false</td><td>Create table if missing</td></tr>
         </tbody>
       </table>
@@ -1546,25 +1545,22 @@ max_out_of_orderness = "5s"</code></pre>
       <table class="config-table">
         <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
         <tbody>
-          <tr><td class="field-name">connection.uri</td><td class="field-default">mongodb://localhost:27017</td><td>MongoDB connection string</td></tr>
+          <tr><td class="field-name">connection.uri</td><td><span class="field-required">required</span></td><td>MongoDB connection string</td></tr>
           <tr><td class="field-name">database</td><td><span class="field-required">required</span></td><td>Target database name</td></tr>
           <tr><td class="field-name">collection</td><td><span class="field-required">required</span></td><td>Target collection name</td></tr>
-          <tr><td class="field-name">write.mode</td><td class="field-default">insert</td><td>insert, upsert, replace, cdc_replay</td></tr>
-          <tr><td class="field-name">batch.size</td><td class="field-default">500</td><td>Max documents per bulk write</td></tr>
-          <tr><td class="field-name">flush.interval.ms</td><td class="field-default">1000</td><td>Max time between flushes (ms)</td></tr>
-          <tr><td class="field-name">ordered</td><td class="field-default">true</td><td>true = fail-fast ordered writes; false = unordered (higher throughput)</td></tr>
-          <tr><td class="field-name">write.concern.w</td><td class="field-default">majority</td><td>majority or integer node count</td></tr>
-          <tr><td class="field-name">write.concern.journal</td><td class="field-default">true</td><td>Wait for journal commit</td></tr>
+          <tr><td class="field-name">write.mode</td><td class="field-default">insert</td><td>insert, upsert, cdc_replay</td></tr>
+          <tr><td class="field-name">write.mode.key_fields</td><td></td><td>Comma-separated top-level keys; required for upsert</td></tr>
+          <tr><td class="field-name">flush.interval.ms</td><td class="field-default">250</td><td>Max time between flushes (ms)</td></tr>
+          <tr><td class="field-name">sink.write.timeout.ms</td><td class="field-default">30000</td><td>End-to-end write deadline</td></tr>
         </tbody>
       </table>
 
       <p style="font-size: 0.8rem; color: var(--text-dim);">
         <strong>Write modes:</strong>
         <code>insert</code> is append-only.
-        <code>upsert</code> replaces documents by the fields listed in <code>upsert.key.fields</code>.
-        <code>replace</code> rewrites the full document.
+        <code>upsert</code> replaces documents by the fields listed in <code>write.mode.key_fields</code>.
         <code>cdc_replay</code> routes by the <code>_op</code> column (I→insert, U→update, R→replace, D→delete).
-        Time series collections only support <code>insert</code>.
+        Writes are ordered and majority-journaled; these correctness settings are not user-tunable. Time series collections only support <code>insert</code>.
       </p>
 
       <!-- DELTA LAKE SOURCE -->
@@ -1598,13 +1594,11 @@ max_out_of_orderness = "5s"</code></pre>
           <tr><td class="field-name">max.buffer.records</td><td class="field-default">100000</td><td>Records before flush</td></tr>
           <tr><td class="field-name">max.buffer.duration.ms</td><td class="field-default">60000</td><td>Time before flush</td></tr>
           <tr><td class="field-name">schema.evolution</td><td class="field-default">false</td><td>Auto-merge new columns</td></tr>
-          <tr><td class="field-name">compaction.enabled</td><td class="field-default">false</td><td>Enable automatic compaction</td></tr>
-          <tr><td class="field-name">vacuum.retention.hours</td><td class="field-default">168</td><td>Retention hours (7 days)</td></tr>
           <tr><td class="field-name">catalog.type</td><td class="field-default">none</td><td>none, glue, unity</td></tr>
         </tbody>
       </table>
 
-      <p style="font-size: 0.8rem; color: var(--text-dim);">Cloud storage credentials: use <code>storage.aws_access_key_id</code>, <code>storage.aws_secret_access_key</code>, <code>storage.aws_region</code>, etc. Delivery comes from the pipeline-wide setting. Delta exactly-once is certified only for append mode in embedded/single-node runtime; the coordinated namespace and writer identity are internal.</p>
+      <p style="font-size: 0.8rem; color: var(--text-dim);">Cloud storage credentials: use <code>storage.aws_access_key_id</code>, <code>storage.aws_secret_access_key</code>, <code>storage.aws_region</code>, etc. Delivery comes from the pipeline-wide setting. Delta's checkpoint-committable protocol is limited to append mode in embedded/single-node runtime; production exactly-once certification remains a release fault/soak gate. Alternate log stores and custom object-store endpoints fail closed. Its coordinated transaction namespace is internal.</p>
 
       <!-- WEBSOCKET SOURCE -->
       <h3 id="websocket-source">WebSocket Source</h3>
@@ -1974,7 +1968,7 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
           <tr>
             <td class="field-name" style="color: var(--text);">exactly_once</td>
             <td>Barrier-aligned state and source positions are sealed before checkpoint-committable sink output becomes externally visible.</td>
-            <td>Embedded/single-node only, node-durable state, a local checkpoint directory protected by an exclusive OS deployment lock, a certified <code>Replayable</code> source cut, and a coordinated sink. In the standalone server, a <code>file://</code> checkpoint URL selects that locked local store. The currently reachable external matrix is local file/generator input to append-mode Delta Lake or Apache Iceberg. Local Kafka source ownership and recoverable Kafka sink transactions are not yet certified. Shared-object-store local exact deployments and library-injected object or decision stores fail with <code>[LDB-0014]</code> until a term-fenced lease exists. Commit-coupled CDC sources are currently at-least-once only.</td>
+            <td>Embedded/single-node only, node-durable state, a local checkpoint directory protected by an exclusive OS deployment lock, a certified <code>Replayable</code> source cut, and a coordinated sink. In the standalone server, a <code>file://</code> checkpoint URL selects that locked local store. Append-mode Delta Lake is the only implemented checkpoint-committable external sink and remains release-gated by its integration and fault/soak suite; Apache Iceberg is durable at-least-once. Local Kafka source ownership and recoverable Kafka sink transactions are not yet certified. Shared-object-store local exact deployments and library-injected object or decision stores fail with <code>[LDB-0014]</code> until a term-fenced lease exists. Commit-coupled CDC sources are currently at-least-once only.</td>
           </tr>
         </tbody>
       </table>
@@ -2040,7 +2034,7 @@ type = "BIGINT"
 
 [[source.schema]]
 name = "ts"
-type = "BIGINT"
+type = "TIMESTAMP"
 
 [source.watermark]
 column = "ts"
@@ -2055,10 +2049,10 @@ strategy = "poll"
 pushdown = true
 
 [lookup.properties]
-hostname = "db.internal"
+host = "db.internal"
 database = "reference_data"
 username = "reader"
-table.name = "instruments"
+table = "instruments"
 
 [lookup.cache]
 size_bytes = 104857600

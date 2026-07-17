@@ -53,11 +53,11 @@ INTO ICEBERG (
 [server]
 bind         = "127.0.0.1:7777"
 pgwire_bind  = "127.0.0.1:5432"
-delivery     = "exactly_once"
+delivery     = "at_least_once"
 
-# Exactly-once is a pipeline-wide setting. In embedded/single-node mode it
-# requires state that survives a process restart; connector-local delivery and
-# writer-ID options are intentionally not exposed.
+# Kafka can replay from committed offsets and Iceberg durably acknowledges each
+# append, but Iceberg publication is not checkpoint-committable. A failure may
+# therefore replay an already-published append; this demo is at-least-once.
 [state]
 backend      = "local"
 path         = "./.laminardb/state"

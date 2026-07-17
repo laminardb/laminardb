@@ -35,6 +35,49 @@ use super::sink_config::{
     quote_sql_identifier, validate_sql_identifier, PostgresSinkConfig, WriteMode,
 };
 use super::sink_metrics::PostgresSinkMetrics;
+
+#[cfg(feature = "postgres-sink")]
+fn postgres_dispatched_write_error(
+    operation: &str,
+    error: tokio_postgres::Error,
+) -> ConnectorError {
+    classify_postgres_write_failure(operation, &error, error.as_db_error().is_some())
+}
+
+#[cfg(any(feature = "postgres-sink", test))]
+fn classify_postgres_write_failure(
+    operation: &str,
+    error: &dyn std::fmt::Display,
+    server_rejected: bool,
+) -> ConnectorError {
+    if server_rejected {
+        ConnectorError::WriteError(format!("{operation}: {error}"))
+    } else {
+        ConnectorError::outcome_unknown(
+            format!(
+                "PostgreSQL {operation} failed without a server response and may have committed: {error}"
+            ),
+            true,
+        )
+    }
+}
+
+#[cfg(any(feature = "postgres-sink", test))]
+fn resolve_uncommitted_transaction_error(error: ConnectorError) -> ConnectorError {
+    match error {
+        ConnectorError::OutcomeUnknown { message, retryable } if retryable => {
+            ConnectorError::ConnectionFailed(format!(
+                "PostgreSQL transaction mutation failed before COMMIT; no commit was dispatched: {message}"
+            ))
+        }
+        ConnectorError::OutcomeUnknown { message, .. } => ConnectorError::TransactionError(
+            format!(
+                "PostgreSQL transaction mutation failed before COMMIT; no commit was dispatched: {message}"
+            ),
+        ),
+        error => error,
+    }
+}
 use super::types::{
     arrow_to_pg_ddl_type, arrow_type_to_pg_array_cast, arrow_type_to_pg_sql, postgres_type,
 };
@@ -589,17 +632,17 @@ impl PostgresSink {
         let sink = client
             .copy_in(copy_sql)
             .await
-            .map_err(|e| ConnectorError::WriteError(format!("COPY start: {e}")))?;
+            .map_err(|error| postgres_dispatched_write_error("COPY start", error))?;
 
         {
             use futures_util::SinkExt;
             futures_util::pin_mut!(sink);
             sink.send(bytes_to_send)
                 .await
-                .map_err(|e| ConnectorError::WriteError(format!("COPY send: {e}")))?;
+                .map_err(|error| postgres_dispatched_write_error("COPY send", error))?;
             sink.close()
                 .await
-                .map_err(|e| ConnectorError::WriteError(format!("COPY finish: {e}")))?;
+                .map_err(|error| postgres_dispatched_write_error("COPY finish", error))?;
         }
 
         let rows = user_batch.num_rows();
@@ -615,7 +658,7 @@ impl PostgresSink {
     #[allow(clippy::cast_possible_truncation)]
     async fn flush_upsert(
         &mut self,
-        client: &tokio_postgres::Client,
+        client: &mut tokio_postgres::Client,
         buffer: &[RecordBatch],
     ) -> Result<WriteResult, ConnectorError> {
         if self.config.changelog_mode {
@@ -649,12 +692,9 @@ impl PostgresSink {
     #[allow(clippy::cast_possible_truncation)]
     async fn flush_changelog(
         &mut self,
-        client: &tokio_postgres::Client,
+        client: &mut tokio_postgres::Client,
         buffer: &[RecordBatch],
     ) -> Result<WriteResult, ConnectorError> {
-        let mut total_rows: u64 = 0;
-        let mut total_bytes: u64 = 0;
-
         if buffer.is_empty() {
             return Ok(WriteResult::new(0, 0));
         }
@@ -696,35 +736,68 @@ impl PostgresSink {
             }
         }
 
-        // Inserts/updates before deletes: a key inserted then deleted in the same flush window
-        // ends deleted; deleted then re-inserted ends at the upserted state.
-        if !all_inserts.is_empty() {
-            let insert_batch =
-                arrow_select::concat::concat_batches(&self.user_schema, &all_inserts)
-                    .map_err(|e| ConnectorError::Internal(format!("concat inserts: {e}")))?;
+        let transaction = client.transaction().await.map_err(|error| {
+            ConnectorError::ConnectionFailed(format!(
+                "begin PostgreSQL changelog transaction: {error}"
+            ))
+        })?;
+        let mutation = async {
+            let mut upserted = 0_u64;
+            let mut deleted = 0_usize;
+            let mut bytes = 0_u64;
 
-            let upsert_sql = self
-                .upsert_sql
-                .as_deref()
-                .ok_or_else(|| ConnectorError::Internal("upsert SQL not prepared".into()))?;
+            if !all_inserts.is_empty() {
+                let insert_batch =
+                    arrow_select::concat::concat_batches(&self.user_schema, &all_inserts)
+                        .map_err(|e| ConnectorError::Internal(format!("concat inserts: {e}")))?;
+                let upsert_sql = self
+                    .upsert_sql
+                    .as_deref()
+                    .ok_or_else(|| ConnectorError::Internal("upsert SQL not prepared".into()))?;
+                upserted = execute_unnest(&transaction, upsert_sql, &insert_batch).await?;
+                bytes = retained_batch_bytes_u64(&insert_batch);
+            }
 
-            let rows = execute_unnest(client, upsert_sql, &insert_batch).await?;
-            let bytes = retained_batch_bytes_u64(&insert_batch);
-            self.metrics.record_write(rows, bytes);
+            if !all_deletes.is_empty() {
+                let delete_batch =
+                    arrow_select::concat::concat_batches(&self.user_schema, &all_deletes)
+                        .map_err(|e| ConnectorError::Internal(format!("concat deletes: {e}")))?;
+                bytes = bytes.saturating_add(retained_batch_bytes_u64(&delete_batch));
+                deleted = self.execute_deletes(&transaction, &delete_batch).await?;
+            }
+
+            Ok::<_, ConnectorError>((upserted, deleted, bytes))
+        }
+        .await;
+
+        let (upserted, deleted, total_bytes) = match mutation {
+            Ok(result) => {
+                transaction.commit().await.map_err(|error| {
+                    postgres_dispatched_write_error("transaction COMMIT", error)
+                })?;
+                result
+            }
+            Err(error) => {
+                if let Err(rollback_error) = transaction.rollback().await {
+                    tracing::warn!(
+                        %rollback_error,
+                        "PostgreSQL changelog rollback failed after a mutation error; no COMMIT was dispatched"
+                    );
+                }
+                return Err(resolve_uncommitted_transaction_error(error));
+            }
+        };
+
+        let total_rows = upserted.saturating_add(deleted as u64);
+        if total_rows != 0 {
+            self.metrics.record_write(total_rows, total_bytes);
+        }
+        if upserted != 0 {
             self.metrics.record_upsert();
-            total_rows += rows;
-            total_bytes += bytes;
         }
-
-        if !all_deletes.is_empty() {
-            let delete_batch =
-                arrow_select::concat::concat_batches(&self.user_schema, &all_deletes)
-                    .map_err(|e| ConnectorError::Internal(format!("concat deletes: {e}")))?;
-            let deleted = self.execute_deletes(client, &delete_batch).await?;
+        if deleted != 0 {
             self.metrics.record_deletes(deleted as u64);
-            total_rows += deleted as u64;
         }
-
         self.metrics.record_flush();
         Ok(WriteResult::new(total_rows as usize, total_bytes))
     }
@@ -732,11 +805,14 @@ impl PostgresSink {
     /// Executes batched DELETE for changelog delete records.
     #[cfg(feature = "postgres-sink")]
     #[allow(clippy::cast_possible_truncation)]
-    async fn execute_deletes(
+    async fn execute_deletes<C>(
         &self,
-        client: &tokio_postgres::Client,
+        client: &C,
         delete_batch: &RecordBatch,
-    ) -> Result<usize, ConnectorError> {
+    ) -> Result<usize, ConnectorError>
+    where
+        C: tokio_postgres::GenericClient + Sync,
+    {
         if delete_batch.num_rows() == 0 {
             return Ok(0);
         }
@@ -768,7 +844,7 @@ impl PostgresSink {
         let rows = client
             .execute(delete_sql, &pk_refs)
             .await
-            .map_err(|e| ConnectorError::WriteError(format!("DELETE: {e}")))?;
+            .map_err(|error| postgres_dispatched_write_error("DELETE", error))?;
 
         Ok(rows as usize)
     }
@@ -777,7 +853,7 @@ impl PostgresSink {
     #[cfg(feature = "postgres-sink")]
     async fn flush_to_client(
         &mut self,
-        client: &tokio_postgres::Client,
+        client: &mut tokio_postgres::Client,
         buffer: &[RecordBatch],
     ) -> Result<WriteResult, ConnectorError> {
         match self.config.write_mode {
@@ -797,12 +873,12 @@ impl PostgresSink {
         }
 
         let result = async {
-            let client = self
+            let mut client = self
                 .pool()?
                 .get()
                 .await
                 .map_err(|e| ConnectorError::ConnectionFailed(format!("pool checkout: {e}")))?;
-            self.flush_to_client(&client, &pending).await
+            self.flush_to_client(&mut client, &pending).await
         }
         .await;
 
@@ -938,8 +1014,12 @@ impl SinkConnector for PostgresSink {
     }
 
     fn suggested_write_timeout(&self) -> Duration {
-        // statement_timeout + small margin for pool checkout / setup.
-        self.config.statement_timeout + Duration::from_secs(5)
+        let statement_budget = if self.config.changelog_mode {
+            self.config.statement_timeout.saturating_mul(2)
+        } else {
+            self.config.statement_timeout
+        };
+        statement_budget + Duration::from_secs(5)
     }
 
     fn flush_interval(&self) -> Duration {
@@ -1316,11 +1396,14 @@ fn collapse_upsert_batch(
 
 /// Executes an UNNEST-based INSERT/UPSERT using Arrow column arrays as parameters.
 #[cfg(feature = "postgres-sink")]
-async fn execute_unnest(
-    client: &tokio_postgres::Client,
+async fn execute_unnest<C>(
+    client: &C,
     sql: &str,
     batch: &RecordBatch,
-) -> Result<u64, ConnectorError> {
+) -> Result<u64, ConnectorError>
+where
+    C: tokio_postgres::GenericClient + Sync,
+{
     let params: Vec<Box<dyn postgres_types::ToSql + Sync + Send>> = (0..batch.num_columns())
         .map(|i| arrow_column_to_pg_array(batch.column(i)))
         .collect::<Result<_, _>>()?;
@@ -1333,7 +1416,7 @@ async fn execute_unnest(
     client
         .execute(sql, &param_refs)
         .await
-        .map_err(|e| ConnectorError::WriteError(format!("UNNEST execute: {e}")))
+        .map_err(|error| postgres_dispatched_write_error("UNNEST execute", error))
 }
 
 #[cfg(any(feature = "postgres-sink", test))]
@@ -1381,6 +1464,36 @@ mod tests {
     use super::*;
     use arrow_array::{Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
+
+    #[test]
+    fn dispatched_write_without_server_response_has_unknown_outcome() {
+        let unknown = classify_postgres_write_failure("UNNEST execute", &"connection lost", false);
+        assert!(unknown.is_outcome_unknown());
+        assert!(unknown.to_string().contains("may have committed"));
+
+        let rejected = classify_postgres_write_failure("UNNEST execute", &"unique violation", true);
+        assert!(matches!(rejected, ConnectorError::WriteError(_)));
+        assert!(!rejected.is_outcome_unknown());
+    }
+
+    #[test]
+    fn uncommitted_transaction_resolves_an_ambiguous_statement_outcome() {
+        let retryable = resolve_uncommitted_transaction_error(ConnectorError::outcome_unknown(
+            "connection lost after UNNEST",
+            true,
+        ));
+        assert!(matches!(retryable, ConnectorError::ConnectionFailed(_)));
+        assert!(retryable.is_transient());
+        assert!(!retryable.is_outcome_unknown());
+
+        let terminal = resolve_uncommitted_transaction_error(ConnectorError::outcome_unknown(
+            "protocol state invalid",
+            false,
+        ));
+        assert!(matches!(terminal, ConnectorError::TransactionError(_)));
+        assert!(!terminal.is_transient());
+        assert!(!terminal.is_outcome_unknown());
+    }
 
     fn test_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -2097,6 +2210,10 @@ mod tests {
         assert_eq!(contract.input_mode, SinkInputMode::FullChangelog);
         assert_eq!(contract.topology, SinkTopology::Singleton);
         assert!(contract.accepts_full_changelog());
+        assert_eq!(
+            sink.suggested_write_timeout(),
+            sink.config.statement_timeout.saturating_mul(2) + Duration::from_secs(5)
+        );
     }
 
     #[cfg(feature = "postgres-sink")]

@@ -385,10 +385,9 @@ The only admitted local exact candidate is the certified deterministic generator
 Delta Lake, and it is not yet production-certified end to end. Iceberg is
 `DurableAtLeastOnce` and never `CheckpointCommittable`. Local Kafka sources use engine-owned assignment in supported guaranteed modes;
 dynamic consumer-group ownership is `BestEffort` and its revoke callback does not claim a later
-asynchronous checkpoint can retain the partition. The default/`acks=all` Kafka sink is
-`DurableAtLeastOnce`, never
-`CheckpointCommittable`; weaker acknowledgement modes are `Ephemeral` and fail at-least-once
-admission. This Kafka sink does not implement transactional checkpoint commit.
+asynchronous checkpoint can retain the partition. The Kafka sink forces `acks=all` and is
+`DurableAtLeastOnce`, never `CheckpointCommittable`; weaker acknowledgement modes are rejected.
+This Kafka sink does not implement transactional checkpoint commit.
 
 PostgreSQL CDC is resume-only: fresh `Initial` startup is rejected before I/O. Kafka and MongoDB
 CDC remain at-least-once-only pending exact-delivery certification; MongoDB has event-level resume

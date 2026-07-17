@@ -16,7 +16,8 @@ use tracing::{debug, info, warn};
 
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{
-    SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology, WriteResult,
+    ConnectorTaskOwner, ConnectorTaskTracker, SinkConnector, SinkConsistency, SinkContract,
+    SinkInputMode, SinkTopology, WriteResult,
 };
 use crate::error::ConnectorError;
 
@@ -29,6 +30,23 @@ use super::sink_metrics::WebSocketSinkMetrics;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONTROL_MESSAGE_BYTES: usize = 16 * 1024;
+const SERVER_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+enum AcceptorWait {
+    Completed(Result<(), tokio::task::JoinError>),
+    TimedOut,
+}
+
+async fn wait_acceptor_until(
+    handle: &mut tokio::task::JoinHandle<()>,
+    deadline: tokio::time::Instant,
+) -> AcceptorWait {
+    match tokio::time::timeout_at(deadline, handle).await {
+        Ok(_) if tokio::time::Instant::now() >= deadline => AcceptorWait::TimedOut,
+        Ok(result) => AcceptorWait::Completed(result),
+        Err(_) => AcceptorWait::TimedOut,
+    }
+}
 
 /// WebSocket sink connector in server mode.
 ///
@@ -51,6 +69,10 @@ pub struct WebSocketSinkServer {
     shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
     /// Acceptor task handle.
     acceptor_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Sole admission authority for this connector generation.
+    task_owner: Option<ConnectorTaskOwner>,
+    /// Terminal observer retained by the database before the connector opens.
+    task_tracker: ConnectorTaskTracker,
 }
 
 impl WebSocketSinkServer {
@@ -62,6 +84,7 @@ impl WebSocketSinkServer {
         metrics: WebSocketSinkMetrics,
     ) -> Self {
         let serializer = BatchSerializer::new(schema.clone());
+        let (task_owner, task_tracker) = ConnectorTaskOwner::new();
         Self {
             config,
             schema,
@@ -71,6 +94,8 @@ impl WebSocketSinkServer {
             metrics: Arc::new(metrics),
             shutdown_tx: None,
             acceptor_handle: None,
+            task_owner: Some(task_owner),
+            task_tracker,
         }
     }
 
@@ -84,6 +109,10 @@ impl WebSocketSinkServer {
 #[async_trait]
 #[allow(clippy::too_many_lines)]
 impl SinkConnector for WebSocketSinkServer {
+    fn terminal_task_tracker(&self) -> Option<ConnectorTaskTracker> {
+        Some(self.task_tracker.clone())
+    }
+
     fn contract(&self, config: &ConnectorConfig) -> Result<SinkContract, ConnectorError> {
         let cfg = if config.properties().is_empty() {
             self.config.clone()
@@ -161,8 +190,18 @@ impl SinkConnector for WebSocketSinkServer {
         let fanout = Arc::clone(&self.fanout);
         let metrics = Arc::clone(&self.metrics);
         let connection_slots = Arc::new(tokio::sync::Semaphore::new(max_connections));
+        let task_owner = self.task_owner.as_ref().ok_or_else(|| {
+            ConnectorError::Internal("WebSocket sink task generation is retired".into())
+        })?;
+        let acceptor_guard = task_owner.track().ok_or_else(|| {
+            ConnectorError::Internal(
+                "WebSocket sink task generation is no longer accepting an acceptor".into(),
+            )
+        })?;
+        let task_admission = task_owner.admission();
 
         let handle = tokio::spawn(async move {
+            let _acceptor_guard = acceptor_guard;
             let mut shutdown_rx = shutdown_rx;
             let mut clients = tokio::task::JoinSet::new();
 
@@ -183,8 +222,13 @@ impl SinkConnector for WebSocketSinkServer {
                                 let mut client_shutdown = shutdown_rx.clone();
                                 let client_ping_interval = ping_interval;
                                 let client_ping_timeout = ping_timeout;
+                                let Some(client_guard) = task_admission.track() else {
+                                    warn!(addr = %addr, "rejecting client after sink task generation closed");
+                                    break;
+                                };
 
                                 clients.spawn(async move {
+                                    let _client_guard = client_guard;
                                     let _permit = permit;
                                     // Clients only send small subscription and heartbeat controls.
                                     let mut ws_config = tungstenite::protocol::WebSocketConfig::default();
@@ -456,27 +500,53 @@ impl SinkConnector for WebSocketSinkServer {
     async fn close(&mut self) -> Result<(), ConnectorError> {
         info!("closing WebSocket sink server");
 
+        let acceptor_was_finished = self
+            .acceptor_handle
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished);
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(true);
         }
 
-        if let Some(mut handle) = self.acceptor_handle.take() {
-            if tokio::time::timeout(Duration::from_secs(5), &mut handle)
-                .await
-                .is_err()
-            {
-                handle.abort();
-                let _ = handle.await;
+        let mut close_error =
+            (self.state == ConnectorState::Failed || acceptor_was_finished).then(|| {
+                ConnectorError::Internal(
+                    "WebSocket sink acceptor stopped before an orderly close".into(),
+                )
+            });
+        if let Some(handle) = self.acceptor_handle.as_mut() {
+            let deadline = tokio::time::Instant::now() + SERVER_CLOSE_TIMEOUT;
+            match wait_acceptor_until(handle, deadline).await {
+                AcceptorWait::Completed(Ok(())) => {}
+                AcceptorWait::Completed(Err(error)) => {
+                    close_error = Some(ConnectorError::Internal(format!(
+                        "WebSocket sink acceptor failed while closing: {error}"
+                    )));
+                }
+                AcceptorWait::TimedOut => {
+                    handle.abort();
+                    close_error = Some(ConnectorError::Internal(
+                        "WebSocket sink acceptor exceeded its close deadline; connector generation retired"
+                            .into(),
+                    ));
+                }
             }
         }
-        self.state = ConnectorState::Closed;
-        info!("WebSocket sink server closed");
-        Ok(())
+        self.acceptor_handle = None;
+        if let Some(error) = close_error {
+            self.state = ConnectorState::Failed;
+            Err(error)
+        } else {
+            self.state = ConnectorState::Closed;
+            info!("WebSocket sink server closed");
+            Ok(())
+        }
     }
 }
 
 impl Drop for WebSocketSinkServer {
     fn drop(&mut self) {
+        self.task_owner.take();
         if let Some(shutdown) = self.shutdown_tx.take() {
             let _ = shutdown.send(true);
         }
@@ -550,6 +620,92 @@ mod tests {
         let sink =
             WebSocketSinkServer::new(schema.clone(), test_config(), WebSocketSinkMetrics::local());
         assert_eq!(sink.schema(), schema);
+    }
+
+    #[tokio::test]
+    async fn sink_drop_seals_client_admission_before_terminal_tasks_exit() {
+        let mut sink =
+            WebSocketSinkServer::new(test_schema(), test_config(), WebSocketSinkMetrics::local());
+        let tracker = sink.terminal_task_tracker().unwrap();
+        let task_owner = sink.task_owner.as_ref().unwrap();
+        let task_admission = task_owner.admission();
+        let acceptor_guard = task_owner.track().unwrap();
+        let client_guard = task_admission.track().unwrap();
+        let (acceptor_started_tx, acceptor_started_rx) = tokio::sync::oneshot::channel();
+        let (acceptor_done_tx, acceptor_done_rx) = tokio::sync::oneshot::channel();
+        let (admission_sealed_tx, admission_sealed_rx) = tokio::sync::oneshot::channel();
+        let (acceptor_release_tx, acceptor_release_rx) = std::sync::mpsc::channel();
+        sink.acceptor_handle = Some(tokio::task::spawn_blocking(move || {
+            let _ = acceptor_started_tx.send(());
+            let _ = acceptor_release_rx.recv();
+            let _ = admission_sealed_tx.send(task_admission.track().is_none());
+            drop(acceptor_guard);
+            let _ = acceptor_done_tx.send(());
+        }));
+        let (client_started_tx, client_started_rx) = tokio::sync::oneshot::channel();
+        let (client_release_tx, client_release_rx) = std::sync::mpsc::channel();
+        let client = tokio::task::spawn_blocking(move || {
+            let _ = client_started_tx.send(());
+            let _ = client_release_rx.recv();
+            drop(client_guard);
+        });
+        acceptor_started_rx.await.unwrap();
+        client_started_rx.await.unwrap();
+
+        drop(sink);
+
+        assert!(!tracker.is_terminated());
+        acceptor_release_tx.send(()).unwrap();
+        assert!(admission_sealed_rx.await.unwrap());
+        acceptor_done_rx.await.unwrap();
+        assert!(!tracker.is_terminated());
+        client_release_tx.send(()).unwrap();
+        client.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), tracker.wait_terminated())
+            .await
+            .expect("server task guards did not resolve after acceptor and client exit");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_timeout_retires_the_server_generation() {
+        let mut sink =
+            WebSocketSinkServer::new(test_schema(), test_config(), WebSocketSinkMetrics::local());
+        let tracker = sink.terminal_task_tracker().unwrap();
+        let guard = sink.task_owner.as_ref().unwrap().track().unwrap();
+        sink.acceptor_handle = Some(tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        }));
+        sink.state = ConnectorState::Running;
+
+        let error = sink.close().await.unwrap_err();
+
+        assert!(error.to_string().contains("close deadline"), "{error}");
+        assert_eq!(sink.state, ConnectorState::Failed);
+        assert!(sink.acceptor_handle.is_none());
+        assert!(matches!(
+            sink.open(&ConnectorConfig::new("websocket")).await,
+            Err(ConnectorError::InvalidState { .. })
+        ));
+        drop(sink);
+        tokio::time::timeout(Duration::from_secs(1), tracker.wait_terminated())
+            .await
+            .expect("aborted WebSocket server generation did not terminate");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_acceptor_completion_is_a_close_timeout() {
+        let mut handle = tokio::spawn(async {
+            std::thread::sleep(Duration::from_millis(25));
+        });
+
+        let outcome = wait_acceptor_until(
+            &mut handle,
+            tokio::time::Instant::now() + Duration::from_millis(5),
+        )
+        .await;
+
+        assert!(matches!(outcome, AcceptorWait::TimedOut));
     }
 
     #[tokio::test]
@@ -689,6 +845,8 @@ mod tests {
             client.next().await,
             Some(Ok(tungstenite::Message::Text(_)))
         ));
+        let received = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let reader_progress = Arc::clone(&received);
         let reader = tokio::spawn(async move {
             for expected_sequence in 1..=300 {
                 let message = tokio::time::timeout(Duration::from_secs(2), client.next())
@@ -701,11 +859,21 @@ mod tests {
                 };
                 let value: serde_json::Value = serde_json::from_str(text.as_ref()).unwrap();
                 assert_eq!(value["sequence"], expected_sequence);
+                reader_progress.store(expected_sequence, std::sync::atomic::Ordering::Release);
             }
         });
 
-        for _ in 0..300 {
+        for sequence in 1..=300 {
             sink.write_batch(&test_batch()).await.unwrap();
+            if sequence % 16 == 0 {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while received.load(std::sync::atomic::Ordering::Acquire) < sequence {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("fast WebSocket client did not keep pace with the bounded ring");
+            }
         }
 
         reader.await.unwrap();

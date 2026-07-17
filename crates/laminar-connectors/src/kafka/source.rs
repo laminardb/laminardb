@@ -13,15 +13,15 @@ use std::collections::BTreeSet;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::Notify;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tracing::{debug, info, warn};
 
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{
-    DeliveryGuarantee, SourceBatch, SourceConnector, SourceConsistency, SourceContract,
-    SourceDrainOutcome, SourceDrainRequest, SourceDrainResolution, SourcePosition, SourceStart,
-    SourceTopology,
+    ConnectorTaskGuard, ConnectorTaskOwner, ConnectorTaskTracker, DeliveryGuarantee, SourceBatch,
+    SourceConnector, SourceConsistency, SourceContract, SourceDrainOutcome, SourceDrainRequest,
+    SourceDrainResolution, SourcePosition, SourceStart, SourceTopology,
 };
 use crate::error::ConnectorError;
 use crate::serde::{self, Format, RecordDeserializer};
@@ -31,6 +31,7 @@ use super::config::{
     resolve_value_subject, KafkaSourceConfig, OffsetReset, SchemaEvolutionStrategy, StartupMode,
     TopicSubscription,
 };
+use super::metadata_error::{fetch_error, invalid_response, topic_error};
 use super::metrics::KafkaSourceMetrics;
 use super::offsets::{OffsetTracker, KAFKA_PARTITION_BASELINE_PREFIX};
 use super::rebalance::RebalanceState;
@@ -150,6 +151,196 @@ const KAFKA_PARTITION_INVENTORY_METADATA: &str = "kafka.partition.inventory.v1";
 const KAFKA_POSITION_LOOKUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 const KAFKA_POSITION_LOOKUP_CONCURRENCY: usize = 32;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KafkaBlockingTaskError {
+    Retired,
+    WorkerDropped,
+}
+
+impl std::fmt::Display for KafkaBlockingTaskError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Retired => f.write_str("Kafka connector generation retired"),
+            Self::WorkerDropped => f.write_str("Kafka blocking worker ended without a result"),
+        }
+    }
+}
+
+/// Retains every synchronous librdkafka call started by one source generation.
+///
+/// Tokio cannot cancel a `spawn_blocking` closure after it starts. Keeping its
+/// handle here lets close abort queued work and reap completed joins. The
+/// connector's generic terminal tracker, retained by `terminal_guard`, is the
+/// replacement fence when a native call outlives its calling future.
+#[derive(Clone)]
+struct KafkaBlockingTasks {
+    retired: Arc<AtomicBool>,
+    handles: Arc<AsyncMutex<Vec<tokio::task::JoinHandle<()>>>>,
+    reaper_started: Arc<AtomicBool>,
+    terminal_guard: Arc<ConnectorTaskGuard>,
+}
+
+impl KafkaBlockingTasks {
+    fn new(terminal_guard: ConnectorTaskGuard) -> Self {
+        Self {
+            retired: Arc::new(AtomicBool::new(false)),
+            handles: Arc::new(AsyncMutex::new(Vec::new())),
+            reaper_started: Arc::new(AtomicBool::new(false)),
+            terminal_guard: Arc::new(terminal_guard),
+        }
+    }
+
+    async fn run<T, F>(&self, operation: F) -> Result<T, KafkaBlockingTaskError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        if self.retired.load(Ordering::Acquire) {
+            return Err(KafkaBlockingTaskError::Retired);
+        }
+
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let mut handles = self.handles.lock().await;
+        if self.retired.load(Ordering::Acquire) {
+            return Err(KafkaBlockingTaskError::Retired);
+        }
+        // This under-lock check is the admission seal: after retirement no
+        // code path may clone the grouped terminal guard for provider work.
+        let retired = Arc::clone(&self.retired);
+        let terminal_guard = Arc::clone(&self.terminal_guard);
+        handles.push(tokio::task::spawn_blocking(move || {
+            let _terminal_guard = terminal_guard;
+            if retired.load(Ordering::Acquire) {
+                let _ = result_tx.send(Err(KafkaBlockingTaskError::Retired));
+                return;
+            }
+            let result = operation();
+            if retired.load(Ordering::Acquire) {
+                let _ = result_tx.send(Err(KafkaBlockingTaskError::Retired));
+            } else {
+                let _ = result_tx.send(Ok(result));
+            }
+        }));
+        drop(handles);
+
+        let result = result_rx
+            .await
+            .map_err(|_| KafkaBlockingTaskError::WorkerDropped)?;
+        self.reap_finished().await;
+        result
+    }
+
+    async fn reap_finished(&self) {
+        let completed = {
+            let mut handles = self.handles.lock().await;
+            let mut completed = Vec::new();
+            let mut index = 0;
+            while index < handles.len() {
+                if handles[index].is_finished() {
+                    completed.push(handles.swap_remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            completed
+        };
+        for handle in completed {
+            if let Err(error) = handle.await {
+                warn!(%error, "Kafka blocking worker failed");
+            }
+        }
+    }
+
+    fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
+    }
+
+    async fn join_until(&self, deadline: tokio::time::Instant) -> bool {
+        self.retire();
+        let mut handles = self.handles.lock().await;
+        for handle in handles.iter() {
+            handle.abort();
+        }
+        while let Some(handle) = handles.first_mut() {
+            match tokio::time::timeout_at(deadline, handle).await {
+                Ok(result) => {
+                    if let Err(error) = result {
+                        debug!(%error, "Kafka blocking worker cancelled during retirement");
+                    }
+                    handles.swap_remove(0);
+                }
+                Err(_) => return false,
+            }
+        }
+        self.reaper_started.store(true, Ordering::Release);
+        true
+    }
+
+    fn ensure_reaper(&self) {
+        self.retire();
+        if self.reaper_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // Retirement is published before this lock. If the list is empty while
+        // holding it, no racing `run` can pass its under-lock retirement check
+        // and install a later handle.
+        if self
+            .handles
+            .try_lock()
+            .is_ok_and(|handles| handles.is_empty())
+        {
+            return;
+        }
+        let generation = self.clone();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.reaper_started.store(false, Ordering::Release);
+            warn!("Kafka blocking generation retired outside a Tokio runtime");
+            return;
+        };
+        drop(runtime.spawn(async move {
+            let mut handles = generation.handles.lock().await;
+            for handle in handles.iter() {
+                handle.abort();
+            }
+            while let Some(handle) = handles.first_mut() {
+                if let Err(error) = handle.await {
+                    debug!(%error, "Kafka blocking worker cancelled during reaping");
+                }
+                handles.swap_remove(0);
+            }
+        }));
+    }
+
+    /// Admit only terminal destruction after retirement. This does not run a
+    /// provider operation or expose a result to the retired connector.
+    fn spawn_final_drop<T: Send + Sync + 'static>(&self, owner: Arc<T>, resource: &'static str) {
+        let terminal_guard = Arc::clone(&self.terminal_guard);
+        let reap = move || {
+            let _terminal_guard = terminal_guard;
+            while Arc::strong_count(&owner) > 1 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            drop(owner);
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            drop(runtime.spawn_blocking(reap));
+        } else {
+            warn!(resource, "Kafka resource retired outside a Tokio runtime");
+            if let Err(error) = std::thread::Builder::new()
+                .name("laminardb-kafka-resource-drop".into())
+                .spawn(reap)
+            {
+                tracing::error!(resource, %error, "failed to start Kafka resource teardown thread");
+            }
+        }
+    }
+
+    #[cfg(test)]
+    async fn tracked_count(&self) -> usize {
+        self.handles.lock().await.len()
+    }
+}
+
 struct KafkaDrainWaitGuard {
     execution: Arc<AtomicU8>,
     armed: bool,
@@ -256,8 +447,7 @@ fn kafka_partition_routes(
     for (topic, count) in topic_meta {
         if *count < 0 {
             return Err(ConnectorError::ConfigurationError(format!(
-                "Kafka topic '{}' reported a negative partition count {count}",
-                topic
+                "Kafka topic '{topic}' reported a negative partition count {count}"
             )));
         }
         let topic_routes =
@@ -267,8 +457,7 @@ fn kafka_partition_routes(
             .is_some()
         {
             return Err(ConnectorError::ConfigurationError(format!(
-                "Kafka vnode assignment contains duplicate topic '{}'",
-                topic
+                "Kafka vnode assignment contains duplicate topic '{topic}'"
             )));
         }
     }
@@ -478,8 +667,10 @@ fn kafka_drain_target_ready(
     Ok(registry_version == target_version && reconciled_version == target_version)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn resolve_kafka_reader_drain(
     consumer: &Arc<StreamConsumer<LaminarConsumerContext>>,
+    blocking_tasks: &KafkaBlockingTasks,
     vnode_reassign: Option<&(
         Arc<laminar_core::state::VnodeRegistry>,
         laminar_core::state::NodeId,
@@ -530,19 +721,23 @@ async fn resolve_kafka_reader_drain(
         if seek.count() > 0 {
             let seek_consumer = Arc::clone(consumer);
             let seek_execution = Arc::clone(execution);
-            let positioned = tokio::task::spawn_blocking(move || -> Result<_, String> {
-                claim_kafka_drain_execution(&seek_execution, deadline)?;
-                let timeout = deadline
-                    .saturating_duration_since(tokio::time::Instant::now())
-                    .min(std::time::Duration::from_secs(5));
-                if timeout.is_zero() {
-                    return Err("Kafka drain deadline expired before abort seek".into());
-                }
-                seek_consumer
-                    .seek_partitions(seek, timeout)
-                    .map_err(|error| format!("Kafka drain abort seek failed: {error}"))
-            })
+            let positioned = tokio::time::timeout_at(
+                deadline,
+                blocking_tasks.run(move || -> Result<_, String> {
+                    claim_kafka_drain_execution(&seek_execution, deadline)?;
+                    let timeout = deadline
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        .min(std::time::Duration::from_secs(5));
+                    if timeout.is_zero() {
+                        return Err("Kafka drain deadline expired before abort seek".into());
+                    }
+                    seek_consumer
+                        .seek_partitions(seek, timeout)
+                        .map_err(|error| format!("Kafka drain abort seek failed: {error}"))
+                }),
+            )
             .await
+            .map_err(|_| "Kafka drain deadline expired during abort seek".to_string())?
             .map_err(|error| format!("Kafka drain abort seek task failed: {error}"))??;
             validate_kafka_partition_results("drain abort seek", &positioned)?;
         } else {
@@ -618,45 +813,82 @@ impl KafkaAssignmentPublication {
 }
 
 async fn join_background_task(
-    mut handle: tokio::task::JoinHandle<()>,
+    handle: &mut Option<tokio::task::JoinHandle<()>>,
     deadline: tokio::time::Instant,
     task: &'static str,
 ) {
-    match tokio::time::timeout_at(deadline, &mut handle).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => warn!(task, %error, "Kafka background task failed during shutdown"),
+    let Some(owned) = handle.as_mut() else {
+        return;
+    };
+    let completed = match tokio::time::timeout_at(deadline, &mut *owned).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            warn!(task, %error, "Kafka background task failed during shutdown");
+            true
+        }
         Err(_) => {
             warn!(
                 task,
                 "Kafka background task shutdown timed out; aborting it"
             );
-            handle.abort();
-            // The task may be inside a synchronous librdkafka call and cannot observe
-            // cancellation yet. Dropping the handle keeps close() within its deadline.
+            owned.abort();
+            false
         }
+    };
+    if completed {
+        *handle = None;
     }
 }
 
+fn ensure_background_task_reaper(
+    handle: tokio::task::JoinHandle<()>,
+    task_owner: &ConnectorTaskOwner,
+    task: &'static str,
+) {
+    handle.abort();
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        warn!(
+            task,
+            "Kafka background task retired outside a Tokio runtime"
+        );
+        return;
+    };
+    let Some(terminal_guard) = task_owner.track() else {
+        warn!(
+            task,
+            "Kafka task generation was sealed before reader reaping"
+        );
+        return;
+    };
+    drop(runtime.spawn(async move {
+        let _terminal_guard = terminal_guard;
+        if let Err(error) = handle.await {
+            debug!(task, %error, "Kafka retired background task reaped");
+        }
+    }));
+}
+
 /// Keep one owner on Tokio's blocking pool until all async task owners drain, then perform the
-/// potentially blocking final drop there. Timing out detaches the reaper; it must not be aborted,
-/// or a later async task could become the last owner and block a runtime worker in librdkafka.
+/// potentially blocking final drop there. The generation tracker retains the blocking handle if
+/// the caller's close deadline expires.
 async fn reap_last_arc_off_runtime<T: Send + Sync + 'static>(
+    blocking_tasks: &KafkaBlockingTasks,
     owner: Arc<T>,
     deadline: tokio::time::Instant,
     resource: &'static str,
 ) {
-    let mut reaper = tokio::task::spawn_blocking(move || {
+    let reaper = blocking_tasks.run(move || {
         while Arc::strong_count(&owner) > 1 {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         drop(owner);
     });
-    match tokio::time::timeout_at(deadline, &mut reaper).await {
+    match tokio::time::timeout_at(deadline, reaper).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => warn!(resource, %error, "Kafka blocking reaper failed"),
         Err(_) => warn!(
             resource,
-            "Kafka resource cleanup exceeded close deadline; detached blocking reaper"
+            "Kafka resource cleanup exceeded close deadline; generation reaper retained it"
         ),
     }
 }
@@ -705,6 +937,12 @@ pub struct KafkaSource {
     msg_rx: Option<KafkaReaderRx>,
     reader_handle: Option<tokio::task::JoinHandle<()>>,
     reader_shutdown: Option<tokio::sync::watch::Sender<bool>>,
+    /// Sole admission authority for detached work in this connector generation.
+    task_owner: ConnectorTaskOwner,
+    /// Cloneable terminal observer returned to the connector runtime.
+    task_tracker: ConnectorTaskTracker,
+    /// Blocking native calls owned and fenced by this connector generation.
+    blocking_tasks: KafkaBlockingTasks,
     /// First terminal reader reason, published before an assignment wait can hide its exit.
     reader_fault: Arc<Mutex<Option<Arc<str>>>>,
     /// Allocated only for a cluster-assigned instance; local readers have no rotation path.
@@ -816,7 +1054,7 @@ impl KafkaSource {
                 config.schema_registry_ssl_key_location.as_deref(),
             )?
         } else {
-            SchemaRegistryClient::new(sr_url.clone(), config.schema_registry_auth.clone())
+            SchemaRegistryClient::new(sr_url.clone(), config.schema_registry_auth.clone())?
         };
         Ok(Some(client))
     }
@@ -830,6 +1068,10 @@ impl KafkaSource {
     ) -> Self {
         let deserializer = deser_factory(config.format);
         let channel_len = Arc::new(AtomicUsize::new(0));
+        let (task_owner, task_tracker) = ConnectorTaskOwner::new();
+        let blocking_guard = task_owner
+            .track()
+            .expect("new Kafka source task generation must be live");
 
         Self {
             consumer: None,
@@ -850,6 +1092,9 @@ impl KafkaSource {
             msg_rx: None,
             reader_handle: None,
             reader_shutdown: None,
+            task_owner,
+            task_tracker,
+            blocking_tasks: KafkaBlockingTasks::new(blocking_guard),
             reader_fault: Arc::new(Mutex::new(None)),
             reader_drain_tx: None,
             source_drain: None,
@@ -900,6 +1145,17 @@ impl KafkaSource {
     #[must_use]
     pub fn has_schema_registry(&self) -> bool {
         self.schema_registry.is_some()
+    }
+
+    fn fail_startup(&mut self) {
+        self.state = ConnectorState::Failed;
+        self.blocking_tasks.retire();
+        self.blocking_tasks.ensure_reaper();
+        if let Some(consumer) = self.consumer.take() {
+            consumer.unsubscribe();
+            self.blocking_tasks
+                .spawn_final_drop(consumer, "consumer after failed startup");
+        }
     }
 
     fn capture_drain_positions(
@@ -1051,10 +1307,16 @@ impl KafkaSource {
         let reassign_default_offset = startup_default_offset(&self.config.startup_mode);
         let deterministic_unrecorded = Arc::clone(&self.deterministic_unrecorded_position);
         let source_name = Arc::clone(&self.source_name);
+        let blocking_tasks = self.blocking_tasks.clone();
         let deterministic_default =
             deterministic_initial_offset(&self.config.startup_mode, self.config.auto_offset_reset);
         let mut reader_shutdown = shutdown_rx;
+        let reader_guard = self
+            .task_owner
+            .track()
+            .expect("live Kafka source must admit its reader task");
         let reader_handle = tokio::spawn(async move {
+            let _reader_guard = reader_guard;
             let mut cached_topic: Arc<str> = Arc::from("");
             let mut cached_topic_routes: Option<Arc<[u32]>> = None;
             let mut is_paused = false;
@@ -1284,6 +1546,7 @@ impl KafkaSource {
                             let acquired: KafkaPartitionSet =
                                 acquired_positions.keys().cloned().collect();
                             let low_watermarks = match fetch_partition_low_watermarks(
+                                blocking_tasks.clone(),
                                 Arc::clone(&consumer),
                                 &acquired,
                             )
@@ -1587,6 +1850,7 @@ impl KafkaSource {
                             } else {
                                 let result = resolve_kafka_reader_drain(
                                     &consumer,
+                                    &blocking_tasks,
                                     vnode_reassign.as_ref(),
                                     active_drain.as_ref().expect("validated above"),
                                     resolution,
@@ -1770,11 +2034,12 @@ impl KafkaSource {
                         true // fresh start: nothing checkpointed to seek to
                     } else {
                         let seek_consumer = Arc::clone(&consumer);
-                        match tokio::task::spawn_blocking(move || {
-                            seek_consumer
-                                .seek_partitions(seek_tpl, std::time::Duration::from_secs(5))
-                        })
-                        .await
+                        match blocking_tasks
+                            .run(move || {
+                                seek_consumer
+                                    .seek_partitions(seek_tpl, std::time::Duration::from_secs(5))
+                            })
+                            .await
                         {
                             Ok(Ok(result))
                                 if assign_generation.load(Ordering::Acquire) == cur_assign_gen =>
@@ -1803,6 +2068,9 @@ impl KafkaSource {
                             }
                             Err(error) => {
                                 warn!(%error, "Kafka assign-seek worker failed");
+                                if error == KafkaBlockingTaskError::Retired {
+                                    return;
+                                }
                                 false
                             }
                         }
@@ -2075,7 +2343,7 @@ impl KafkaSource {
                             data_ready.notify_one();
                         }
                     }
-                    Err(e) if !kafka_reader_error_is_terminal(&e) => {
+                    Err(e) if kafka_reader_error_is_transient(&e) => {
                         debug!(error = %e, "Kafka consumer poll event");
                     }
                     Err(e) => {
@@ -2629,27 +2897,82 @@ fn validate_positions_not_expired(
     Ok(())
 }
 
-fn kafka_reader_error_is_terminal(error: &KafkaError) -> bool {
+fn kafka_reader_error_is_transient(error: &KafkaError) -> bool {
     use rdkafka::types::RDKafkaErrorCode;
 
+    let code = match error {
+        KafkaError::PartitionEOF(_) | KafkaError::NoMessageReceived => return true,
+        KafkaError::MessageConsumption(code) | KafkaError::Global(code) => *code,
+        _ => return false,
+    };
+
     matches!(
-        error,
-        KafkaError::MessageConsumptionFatal(_)
-            | KafkaError::MessageConsumption(
-                RDKafkaErrorCode::OffsetOutOfRange
-                    | RDKafkaErrorCode::AutoOffsetReset
-                    | RDKafkaErrorCode::LogTruncation
-            )
+        code,
+        RDKafkaErrorCode::BrokerDestroy
+            | RDKafkaErrorCode::BrokerTransportFailure
+            | RDKafkaErrorCode::Resolve
+            | RDKafkaErrorCode::AllBrokersDown
+            | RDKafkaErrorCode::OperationTimedOut
+            | RDKafkaErrorCode::QueueFull
+            | RDKafkaErrorCode::NodeUpdate
+            | RDKafkaErrorCode::WaitingForCoordinator
+            | RDKafkaErrorCode::UnknownGroup
+            | RDKafkaErrorCode::InProgress
+            | RDKafkaErrorCode::PreviousInProgress
+            | RDKafkaErrorCode::TimedOutQueue
+            | RDKafkaErrorCode::WaitCache
+            | RDKafkaErrorCode::Interrupted
+            | RDKafkaErrorCode::Partial
+            | RDKafkaErrorCode::Retry
+            | RDKafkaErrorCode::PollExceeded
+            | RDKafkaErrorCode::UnknownBroker
+            | RDKafkaErrorCode::AssignmentLost
+            | RDKafkaErrorCode::DestroyBroker
+            | RDKafkaErrorCode::UnknownTopicOrPartition
+            | RDKafkaErrorCode::LeaderNotAvailable
+            | RDKafkaErrorCode::NotLeaderForPartition
+            | RDKafkaErrorCode::RequestTimedOut
+            | RDKafkaErrorCode::BrokerNotAvailable
+            | RDKafkaErrorCode::ReplicaNotAvailable
+            | RDKafkaErrorCode::NetworkException
+            | RDKafkaErrorCode::CoordinatorLoadInProgress
+            | RDKafkaErrorCode::CoordinatorNotAvailable
+            | RDKafkaErrorCode::NotCoordinator
+            | RDKafkaErrorCode::IllegalGeneration
+            | RDKafkaErrorCode::UnknownMemberId
+            | RDKafkaErrorCode::RebalanceInProgress
+            | RDKafkaErrorCode::NotController
+            | RDKafkaErrorCode::KafkaStorageError
+            | RDKafkaErrorCode::ReassignmentInProgress
+            | RDKafkaErrorCode::FetchSessionIdNotFound
+            | RDKafkaErrorCode::InvalidFetchSessionEpoch
+            | RDKafkaErrorCode::FencedLeaderEpoch
+            | RDKafkaErrorCode::UnknownLeaderEpoch
+            | RDKafkaErrorCode::StaleBrokerEpoch
+            | RDKafkaErrorCode::OffsetNotAvailable
+            | RDKafkaErrorCode::MemberIdRequired
+            | RDKafkaErrorCode::PreferredLeaderNotAvailable
+            | RDKafkaErrorCode::EligibleLeadersNotAvailable
+            | RDKafkaErrorCode::UnstableOffsetCommit
+            | RDKafkaErrorCode::ThrottlingQuotaExceeded
+            | RDKafkaErrorCode::UnknownTopicId
     )
 }
 
+fn consumer_creation_error(error: &KafkaError) -> ConnectorError {
+    ConnectorError::ConfigurationError(format!(
+        "failed to create Kafka consumer from local configuration: {error}"
+    ))
+}
+
 async fn fetch_explicit_topic_metadata(
+    blocking_tasks: KafkaBlockingTasks,
     consumer: Arc<StreamConsumer<LaminarConsumerContext>>,
     topics: Vec<String>,
 ) -> Result<Vec<(Arc<str>, i32)>, ConnectorError> {
     const METADATA_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
     let deadline = tokio::time::Instant::now() + METADATA_BUDGET;
-    let mut task = tokio::task::spawn_blocking(move || {
+    let task = blocking_tasks.run(move || {
         let blocking_deadline = std::time::Instant::now() + METADATA_BUDGET;
         let mut topic_meta = Vec::with_capacity(topics.len());
         for topic in topics {
@@ -2661,30 +2984,18 @@ async fn fetch_explicit_topic_metadata(
             }
             let metadata = consumer
                 .fetch_metadata(Some(topic.as_str()), remaining)
-                .map_err(|error| {
-                    ConnectorError::ConnectionFailed(format!(
-                        "metadata fetch for Kafka topic '{topic}': {error}"
-                    ))
-                })?;
+                .map_err(|error| fetch_error(&topic, &error))?;
             let topic_metadata = metadata
                 .topics()
                 .iter()
                 .find(|candidate| candidate.name() == topic.as_str())
-                .ok_or_else(|| {
-                    ConnectorError::ConnectionFailed(format!(
-                        "metadata response omitted Kafka topic '{topic}'"
-                    ))
-                })?;
+                .ok_or_else(|| invalid_response(&topic, "metadata response omitted the topic"))?;
             if let Some(error) = topic_metadata.error() {
-                return Err(ConnectorError::ConnectionFailed(format!(
-                    "metadata error for Kafka topic '{topic}': {error:?}"
-                )));
+                return Err(topic_error(&topic, error.into()));
             }
             let partition_count = topic_metadata.partitions().len();
             if partition_count == 0 {
-                return Err(ConnectorError::ConnectionFailed(format!(
-                    "Kafka topic '{topic}' has no partitions"
-                )));
+                return Err(invalid_response(&topic, "broker returned no partitions"));
             }
             topic_meta.push((
                 Arc::from(topic.as_str()),
@@ -2693,7 +3004,7 @@ async fn fetch_explicit_topic_metadata(
         }
         Ok(topic_meta)
     });
-    match tokio::time::timeout_at(deadline, &mut task).await {
+    match tokio::time::timeout_at(deadline, task).await {
         Ok(Ok(result)) => result,
         Ok(Err(error)) => Err(ConnectorError::Internal(format!(
             "Kafka metadata worker failed: {error}"
@@ -2705,6 +3016,7 @@ async fn fetch_explicit_topic_metadata(
 }
 
 async fn fetch_partition_low_watermarks(
+    blocking_tasks: KafkaBlockingTasks,
     consumer: Arc<StreamConsumer<LaminarConsumerContext>>,
     partitions: &KafkaPartitionSet,
 ) -> Result<KafkaPartitionBaselines, ConnectorError> {
@@ -2719,6 +3031,7 @@ async fn fetch_partition_low_watermarks(
                 break;
             };
             jobs.spawn(fetch_partition_low_watermark(
+                blocking_tasks.clone(),
                 Arc::clone(&consumer),
                 topic,
                 partition,
@@ -2738,6 +3051,7 @@ async fn fetch_partition_low_watermarks(
 }
 
 async fn fetch_partition_low_watermark(
+    blocking_tasks: KafkaBlockingTasks,
     consumer: Arc<StreamConsumer<LaminarConsumerContext>>,
     topic: String,
     partition: i32,
@@ -2750,7 +3064,7 @@ async fn fetch_partition_low_watermark(
         ));
     }
     let task_topic = topic.clone();
-    let mut task = tokio::task::spawn_blocking(move || {
+    let task = blocking_tasks.run(move || {
         consumer
             .fetch_watermarks(&task_topic, partition, remaining)
             .map_err(|error| {
@@ -2759,7 +3073,7 @@ async fn fetch_partition_low_watermark(
                 ))
             })
     });
-    match tokio::time::timeout_at(deadline, &mut task).await {
+    match tokio::time::timeout_at(deadline, task).await {
         Ok(Ok(Ok((low, _high)))) if (0..i64::MAX).contains(&low) => Ok(((topic, partition), low)),
         Ok(Ok(Ok((low, _)))) => Err(ConnectorError::ConnectionFailed(format!(
             "Kafka returned invalid low watermark {low} for '{topic}-{partition}'"
@@ -2775,12 +3089,13 @@ async fn fetch_partition_low_watermark(
 }
 
 async fn resolve_timestamp_offsets(
+    blocking_tasks: KafkaBlockingTasks,
     consumer: Arc<StreamConsumer<LaminarConsumerContext>>,
     requested: TopicPartitionList,
 ) -> Result<TopicPartitionList, ConnectorError> {
     const LOOKUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
     let deadline = tokio::time::Instant::now() + LOOKUP_BUDGET;
-    let mut task = tokio::task::spawn_blocking(move || {
+    let task = blocking_tasks.run(move || {
         consumer
             .offsets_for_times(requested, LOOKUP_BUDGET)
             .map_err(|error| {
@@ -2789,7 +3104,7 @@ async fn resolve_timestamp_offsets(
                 ))
             })
     });
-    match tokio::time::timeout_at(deadline, &mut task).await {
+    match tokio::time::timeout_at(deadline, task).await {
         Ok(Ok(result)) => result,
         Ok(Err(error)) => Err(ConnectorError::Internal(format!(
             "Kafka timestamp worker failed: {error}"
@@ -2803,6 +3118,10 @@ async fn resolve_timestamp_offsets(
 #[async_trait]
 #[allow(clippy::too_many_lines)] // poll_batch has legitimate complexity (backpressure + deser + poison pill fallback)
 impl SourceConnector for KafkaSource {
+    fn terminal_task_tracker(&self) -> Option<ConnectorTaskTracker> {
+        Some(self.task_tracker.clone())
+    }
+
     fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
         Ok(SourceContract::new(
             SourceConsistency::Replayable,
@@ -3281,10 +3600,9 @@ impl SourceConnector for KafkaSource {
             self.metrics.commits.clone(),
             self.metrics.commit_failures.clone(),
         );
-        let consumer: StreamConsumer<LaminarConsumerContext> =
-            rdkafka_config.create_with_context(context).map_err(|e| {
-                ConnectorError::ConnectionFailed(format!("failed to create consumer: {e}"))
-            })?;
+        let consumer: StreamConsumer<LaminarConsumerContext> = rdkafka_config
+            .create_with_context(context)
+            .map_err(|error| consumer_creation_error(&error))?;
         // Install ownership before any fallible activation work. If metadata, assignment, or
         // subscription fails, the source task's cleanup path can move the final consumer drop to
         // the bounded blocking reaper instead of running librdkafka Drop on a Tokio worker.
@@ -3306,8 +3624,12 @@ impl SourceConnector for KafkaSource {
             .map(|(r, s)| (Arc::clone(r), *s));
         let vnode_assigned = if let Some((registry, self_id)) = vnode {
             if let TopicSubscription::Topics(topics) = &kafka_config.subscription {
-                let topic_meta =
-                    fetch_explicit_topic_metadata(Arc::clone(&consumer), topics.clone()).await?;
+                let topic_meta = fetch_explicit_topic_metadata(
+                    self.blocking_tasks.clone(),
+                    Arc::clone(&consumer),
+                    topics.clone(),
+                )
+                .await?;
                 let partition_routes = kafka_partition_routes(
                     self.source_name.as_ref(),
                     registry.vnode_count(),
@@ -3336,9 +3658,12 @@ impl SourceConnector for KafkaSource {
                 }
                 let requires_numeric_cut = delivery != DeliveryGuarantee::BestEffort;
                 if requires_numeric_cut {
-                    let low_watermarks =
-                        fetch_partition_low_watermarks(Arc::clone(&consumer), &all_partitions)
-                            .await?;
+                    let low_watermarks = fetch_partition_low_watermarks(
+                        self.blocking_tasks.clone(),
+                        Arc::clone(&consumer),
+                        &all_partitions,
+                    )
+                    .await?;
                     let baselines = if is_resume {
                         validate_partition_baselines(&resume_baselines, &all_partitions)?;
                         resume_baselines.clone()
@@ -3443,8 +3768,12 @@ impl SourceConnector for KafkaSource {
                     "Kafka guaranteed delivery requires an explicit topic inventory".into(),
                 ));
             };
-            let topic_meta =
-                fetch_explicit_topic_metadata(Arc::clone(&consumer), topics.clone()).await?;
+            let topic_meta = fetch_explicit_topic_metadata(
+                self.blocking_tasks.clone(),
+                Arc::clone(&consumer),
+                topics.clone(),
+            )
+            .await?;
             let assigned: Vec<(String, i32)> = topic_meta
                 .iter()
                 .flat_map(|(topic, count)| {
@@ -3467,8 +3796,12 @@ impl SourceConnector for KafkaSource {
                     unexpected.partition()
                 )));
             }
-            let low_watermarks =
-                fetch_partition_low_watermarks(Arc::clone(&consumer), &assigned_set).await?;
+            let low_watermarks = fetch_partition_low_watermarks(
+                self.blocking_tasks.clone(),
+                Arc::clone(&consumer),
+                &assigned_set,
+            )
+            .await?;
             let baselines = if is_resume {
                 validate_resume_inventory(resume_inventory.as_ref(), &assigned_set)?;
                 validate_partition_baselines(&resume_baselines, &assigned_set)?;
@@ -3570,9 +3903,12 @@ impl SourceConnector for KafkaSource {
                     } else {
                         configured_baselines
                     };
-                    let low_watermarks =
-                        fetch_partition_low_watermarks(Arc::clone(&consumer), &assigned_set)
-                            .await?;
+                    let low_watermarks = fetch_partition_low_watermarks(
+                        self.blocking_tasks.clone(),
+                        Arc::clone(&consumer),
+                        &assigned_set,
+                    )
+                    .await?;
                     validate_positions_not_expired(
                         &self.offsets,
                         &baselines,
@@ -3604,9 +3940,12 @@ impl SourceConnector for KafkaSource {
                             "Kafka timestamp startup requires an explicit topic inventory".into(),
                         ));
                     };
-                    let topic_meta =
-                        fetch_explicit_topic_metadata(Arc::clone(&consumer), topics.clone())
-                            .await?;
+                    let topic_meta = fetch_explicit_topic_metadata(
+                        self.blocking_tasks.clone(),
+                        Arc::clone(&consumer),
+                        topics.clone(),
+                    )
+                    .await?;
                     let mut tpl = rdkafka::TopicPartitionList::new();
                     for (topic, partition_count) in &topic_meta {
                         for partition in 0..*partition_count {
@@ -3627,7 +3966,12 @@ impl SourceConnector for KafkaSource {
                             "Kafka timestamp startup discovered no partitions".into(),
                         ));
                     }
-                    let resolved = resolve_timestamp_offsets(Arc::clone(&consumer), tpl).await?;
+                    let resolved = resolve_timestamp_offsets(
+                        self.blocking_tasks.clone(),
+                        Arc::clone(&consumer),
+                        tpl,
+                    )
+                    .await?;
                     let mut positioned = TopicPartitionList::new();
                     let mut restored = 0usize;
                     for elem in resolved.elements() {
@@ -3694,8 +4038,6 @@ impl SourceConnector for KafkaSource {
             }
         } // end `if !vnode_assigned && !local_guaranteed_assignment`
 
-        self.state = ConnectorState::Running;
-
         // Reader startup stays deferred until the first poll. Group
         // assignments are paused by the callback and explicitly seeked from
         // the position installed above before any record can enter the channel.
@@ -3725,22 +4067,27 @@ impl SourceConnector for KafkaSource {
                                 .as_any_mut()
                                 .and_then(|any| any.downcast_mut::<AvroDeserializer>())
                             {
-                                if let Err(e) =
+                                if let Err(error) =
                                     avro_deser.register_schema(cached.id, &cached.schema_str)
                                 {
-                                    warn!(%subject, error = %e, "SR schema register failed");
-                                } else {
-                                    // Keep the catalog schema pinned — planner
-                                    // plans are already built against it.
-                                    log_schema_drift(&self.schema, &cached.arrow_schema, &subject);
-                                    info!(%subject, schema_id = cached.id,
-                                        "SR schema fetched at start()");
-                                    self.last_avro_schema = Some(cached.arrow_schema);
+                                    let error = ConnectorError::Serde(error);
+                                    self.fail_startup();
+                                    return Err(error);
                                 }
+                                // Keep the catalog schema pinned — planner
+                                // plans are already built against it.
+                                log_schema_drift(&self.schema, &cached.arrow_schema, &subject);
+                                info!(%subject, schema_id = cached.id,
+                                    "SR schema fetched at start()");
+                                self.last_avro_schema = Some(cached.arrow_schema);
                             }
                         }
-                        Ok(Err(e)) => {
+                        Ok(Err(e)) if e.is_transient() => {
                             warn!(%subject, error = %e, "SR unavailable at start(), will resolve lazily");
+                        }
+                        Ok(Err(e)) => {
+                            self.fail_startup();
+                            return Err(e);
                         }
                         Err(_elapsed) => {
                             warn!(%subject, "SR prefetch timed out at start(), will resolve lazily");
@@ -3750,6 +4097,7 @@ impl SourceConnector for KafkaSource {
             }
         }
 
+        self.state = ConnectorState::Running;
         info!("Kafka source connector started successfully");
         Ok(())
     }
@@ -3805,9 +4153,7 @@ impl SourceConnector for KafkaSource {
             }
             Ok(Err(e)) => {
                 self.metrics.record_sr_discovery_failure();
-                Err(ConnectorError::ConnectionFailed(format!(
-                    "Schema Registry lookup failed for subject '{subject}': {e}"
-                )))
+                Err(e)
             }
             Err(_) => {
                 self.metrics.record_sr_discovery_timeout();
@@ -4048,10 +4394,7 @@ impl SourceConnector for KafkaSource {
                 if let Some(schema_id) = AvroDeserializer::extract_confluent_id(
                     &self.poll_payload_buf[start..start + len],
                 ) {
-                    let is_new = avro_deser
-                        .ensure_schema_registered(schema_id)
-                        .await
-                        .map_err(ConnectorError::Serde)?;
+                    let is_new = avro_deser.ensure_schema_registered(schema_id).await?;
                     if is_new {
                         new_schema_ids.push(schema_id);
                     }
@@ -4070,11 +4413,7 @@ impl SourceConnector for KafkaSource {
                     let evolver = SchemaEvolution::new(compat);
 
                     for id in new_schema_ids {
-                        let cached = sr.resolve_confluent_id(id).await.map_err(|e| {
-                            ConnectorError::SchemaMismatch(format!(
-                                "failed to resolve schema {id}: {e}"
-                            ))
-                        })?;
+                        let cached = sr.resolve_confluent_id(id).await?;
 
                         let Some(ref prev) = self.last_avro_schema else {
                             // First schema — establish baseline, nothing to diff.
@@ -4369,19 +4708,39 @@ impl SourceConnector for KafkaSource {
             consumer.unsubscribe();
         }
         let deadline = tokio::time::Instant::now() + KAFKA_BACKGROUND_CLOSE_BUDGET;
-        if let Some(handle) = self.reader_handle.take() {
-            join_background_task(handle, deadline, "reader").await;
-        }
+        join_background_task(&mut self.reader_handle, deadline, "reader").await;
         self.msg_rx = None;
         self.reader_drain_tx = None;
         self.source_drain = None;
         self.channel_len.store(0, Ordering::Release);
         if let Some(consumer) = self.consumer.take() {
-            reap_last_arc_off_runtime(consumer, deadline, "consumer").await;
+            reap_last_arc_off_runtime(&self.blocking_tasks, consumer, deadline, "consumer").await;
+        }
+        if !self.blocking_tasks.join_until(deadline).await {
+            self.blocking_tasks.ensure_reaper();
         }
         self.state = ConnectorState::Closed;
         info!("Kafka source connector closed");
         Ok(())
+    }
+}
+
+impl Drop for KafkaSource {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.reader_shutdown.take() {
+            let _ = shutdown.send(true);
+        }
+        if let Some(consumer) = self.consumer.as_ref() {
+            consumer.unsubscribe();
+        }
+        self.blocking_tasks.retire();
+        if let Some(handle) = self.reader_handle.take() {
+            ensure_background_task_reaper(handle, &self.task_owner, "reader");
+        }
+        self.blocking_tasks.ensure_reaper();
+        if let Some(consumer) = self.consumer.take() {
+            self.blocking_tasks.spawn_final_drop(consumer, "consumer");
+        }
     }
 }
 
@@ -4438,7 +4797,7 @@ mod tests {
     };
     use laminar_core::state::CheckpointAttempt;
     use rdkafka::mocking::MockCluster;
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, time::Duration};
 
     fn test_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -4748,6 +5107,54 @@ mod tests {
         assert_eq!(source.offsets.partition_count(), 0);
     }
 
+    #[tokio::test]
+    async fn retired_generation_reaps_uncooperative_blocking_worker() {
+        let (task_owner, task_tracker) = ConnectorTaskOwner::new();
+        let tasks = KafkaBlockingTasks::new(task_owner.track().unwrap());
+        let worker_tasks = tasks.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let caller = tokio::spawn(async move {
+            worker_tasks
+                .run(move || {
+                    let _ = started_tx.send(());
+                    release_rx.recv().expect("release blocking worker");
+                    7usize
+                })
+                .await
+        });
+        started_rx.await.expect("blocking worker did not start");
+        caller.abort();
+        let _ = caller.await;
+
+        assert_eq!(tasks.tracked_count().await, 1);
+        assert!(
+            !tasks
+                .join_until(tokio::time::Instant::now() + Duration::from_millis(10))
+                .await,
+            "a started spawn_blocking worker cannot be aborted"
+        );
+        tasks.ensure_reaper();
+        release_tx.send(()).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while tasks.tracked_count().await != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("generation reaper did not join the blocking worker");
+
+        let result = tasks.run(|| 9usize).await;
+        assert_eq!(result, Err(KafkaBlockingTaskError::Retired));
+        drop(tasks);
+        drop(task_owner);
+        tokio::time::timeout(Duration::from_secs(1), task_tracker.wait_terminated())
+            .await
+            .expect("terminal tracker retained a completed blocking generation");
+    }
+
     #[test]
     fn source_contract_is_replayable_and_splittable() {
         let source = KafkaSource::new(test_schema(), test_config(), None);
@@ -4756,6 +5163,7 @@ mod tests {
             .expect("static Kafka contract");
         assert_eq!(contract.consistency, SourceConsistency::Replayable);
         assert_eq!(contract.topology, SourceTopology::Splittable);
+        assert!(!contract.is_exact_delivery_certified());
     }
 
     #[tokio::test]
@@ -4797,15 +5205,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn aborting_a_blocked_background_task_respects_the_close_deadline() {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let handle = tokio::spawn(async move {
+        let mut handle = Some(tokio::spawn(async move {
             let _ = started_tx.send(());
             std::thread::sleep(std::time::Duration::from_millis(250));
-        });
+        }));
         started_rx.await.unwrap();
 
         let started = tokio::time::Instant::now();
         join_background_task(
-            handle,
+            &mut handle,
             started + std::time::Duration::from_millis(10),
             "blocked-test-task",
         )
@@ -4814,6 +5222,44 @@ mod tests {
             started.elapsed() < std::time::Duration::from_millis(100),
             "aborting a task in synchronous library code must not extend close()"
         );
+    }
+
+    #[tokio::test]
+    async fn dropping_source_signals_and_destroys_retained_reader() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+
+        let mut source = KafkaSource::new(test_schema(), test_config(), None);
+        let terminal = source.terminal_task_tracker().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let reader = tokio::spawn(async move {
+            let _drop_signal = DropSignal(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.expect("test reader did not start");
+
+        source.reader_shutdown = Some(shutdown_tx);
+        source.reader_handle = Some(reader);
+        drop(source);
+
+        assert!(*shutdown_rx.borrow());
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("retained Kafka reader was not aborted on source drop")
+            .expect("reader drop signal was lost");
+        tokio::time::timeout(Duration::from_secs(1), terminal.wait_terminated())
+            .await
+            .expect("Kafka source tracker outlived its reaped reader");
     }
 
     #[tokio::test]
@@ -5869,7 +6315,7 @@ mod tests {
             source.manual_partition_baselines
         );
 
-        let mut expanded = source.manual_topic_partitions;
+        let mut expanded = source.manual_topic_partitions.clone();
         expanded.insert(("events".to_string(), 2));
         let expanded_inventory = decode_partition_inventory(&checkpoint).unwrap();
         let error = validate_resume_inventory(expanded_inventory.as_ref(), &expanded).unwrap_err();
@@ -6017,27 +6463,57 @@ mod tests {
     }
 
     #[test]
-    fn reader_error_classification_faults_fatal_errors() {
+    fn reader_error_classification_uses_a_positive_transient_allowlist() {
         use rdkafka::types::RDKafkaErrorCode;
 
-        assert!(!kafka_reader_error_is_terminal(&KafkaError::PartitionEOF(
-            0
+        for error in [
+            KafkaError::PartitionEOF(0),
+            KafkaError::NoMessageReceived,
+            KafkaError::MessageConsumption(RDKafkaErrorCode::BrokerTransportFailure),
+            KafkaError::MessageConsumption(RDKafkaErrorCode::CoordinatorNotAvailable),
+            KafkaError::MessageConsumption(RDKafkaErrorCode::RebalanceInProgress),
+            KafkaError::Global(RDKafkaErrorCode::AllBrokersDown),
+        ] {
+            assert!(kafka_reader_error_is_transient(&error), "{error:?}");
+        }
+
+        for code in [
+            RDKafkaErrorCode::Authentication,
+            RDKafkaErrorCode::SaslAuthenticationFailed,
+            RDKafkaErrorCode::TopicAuthorizationFailed,
+            RDKafkaErrorCode::GroupAuthorizationFailed,
+            RDKafkaErrorCode::ClusterAuthorizationFailed,
+            RDKafkaErrorCode::InvalidTopic,
+            RDKafkaErrorCode::InvalidGroupId,
+            RDKafkaErrorCode::InvalidConfig,
+            RDKafkaErrorCode::UnsupportedSASLMechanism,
+            RDKafkaErrorCode::OffsetOutOfRange,
+            RDKafkaErrorCode::AutoOffsetReset,
+            RDKafkaErrorCode::LogTruncation,
+            RDKafkaErrorCode::Unknown,
+        ] {
+            let error = KafkaError::MessageConsumption(code);
+            assert!(!kafka_reader_error_is_transient(&error), "{error:?}");
+        }
+
+        assert!(!kafka_reader_error_is_transient(
+            &KafkaError::MessageConsumptionFatal(RDKafkaErrorCode::BrokerTransportFailure)
+        ));
+        assert!(!kafka_reader_error_is_transient(
+            &KafkaError::ClientCreation("invalid local configuration".into())
+        ));
+        assert!(!kafka_reader_error_is_transient(&KafkaError::Subscription(
+            "invalid topic subscription".into()
         )));
-        assert!(!kafka_reader_error_is_terminal(
-            &KafkaError::NoMessageReceived
+    }
+
+    #[test]
+    fn local_consumer_creation_failure_is_terminal_configuration() {
+        let error = consumer_creation_error(&KafkaError::ClientCreation(
+            "invalid local configuration".into(),
         ));
-        assert!(!kafka_reader_error_is_terminal(
-            &KafkaError::MessageConsumption(RDKafkaErrorCode::BrokerTransportFailure)
-        ));
-        assert!(kafka_reader_error_is_terminal(
-            &KafkaError::MessageConsumption(RDKafkaErrorCode::AutoOffsetReset)
-        ));
-        assert!(kafka_reader_error_is_terminal(
-            &KafkaError::MessageConsumption(RDKafkaErrorCode::LogTruncation)
-        ));
-        assert!(kafka_reader_error_is_terminal(
-            &KafkaError::MessageConsumptionFatal(RDKafkaErrorCode::OffsetOutOfRange)
-        ));
+        assert!(matches!(error, ConnectorError::ConfigurationError(_)));
+        assert!(!error.is_transient());
     }
 
     #[test]
@@ -6056,7 +6532,7 @@ mod tests {
 
     #[test]
     fn test_with_schema_registry() {
-        let sr = SchemaRegistryClient::new("http://localhost:8081", None);
+        let sr = SchemaRegistryClient::new("http://localhost:8081", None).unwrap();
         let mut cfg = test_config();
         cfg.format = Format::Avro;
         cfg.schema_registry_url = Some("http://localhost:8081".into());
@@ -6068,7 +6544,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_start_preserves_injected_schema_registry() {
-        let sr = SchemaRegistryClient::new("http://localhost:8081", None);
+        let sr = SchemaRegistryClient::new("http://localhost:8081", None).unwrap();
         let mut cfg = test_config();
         cfg.format = Format::Avro;
         cfg.schema_registry_url = Some("http://localhost:8081".into());
@@ -6229,6 +6705,71 @@ mod tests {
             "expected ConnectionFailed or Timeout, got: {err:?}"
         );
         assert_eq!(source.schema().fields().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn discover_schema_preserves_terminal_registry_classification() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let sr = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/subjects/orders-value/versions/latest"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("invalid credentials"))
+            .mount(&sr)
+            .await;
+
+        let mut source = KafkaSource::new(empty_schema(), KafkaSourceConfig::default(), None);
+        let error = source
+            .discover_schema(&props(&[
+                ("bootstrap.servers", "localhost:9092"),
+                ("group.id", "g"),
+                ("topic", "orders"),
+                ("format", "avro"),
+                ("schema.registry.url", &sr.uri()),
+            ]))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ConnectorError::ConfigurationError(_)));
+        assert!(!error.is_transient());
+        assert!(error.to_string().contains("orders-value"));
+    }
+
+    #[tokio::test]
+    async fn source_start_fails_closed_on_terminal_registry_prefetch_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let sr = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/subjects/orders-value/versions/latest"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
+            .mount(&sr)
+            .await;
+
+        let mut config = test_config();
+        config.format = Format::Avro;
+        config.subscription = TopicSubscription::Topics(vec!["orders".into()]);
+        config.schema_registry_url = Some(sr.uri());
+        let registry = SchemaRegistryClient::new(sr.uri(), None).unwrap();
+        let mut source = KafkaSource::with_schema_registry(test_schema(), config, registry);
+
+        let error = source
+            .start(SourceStart {
+                config: ConnectorConfig::new("kafka"),
+                position: SourcePosition::Initial,
+                delivery: DeliveryGuarantee::BestEffort,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ConnectorError::ConfigurationError(_)));
+        assert!(!error.is_transient());
+        assert!(error.to_string().contains("orders-value"));
+        assert_eq!(source.state(), ConnectorState::Failed);
+        assert!(source.consumer.is_none());
+        assert!(source.blocking_tasks.retired.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -6418,7 +6959,7 @@ mod tests {
         cfg.subscription = TopicSubscription::Topics(vec!["ion_tw".into()]);
         cfg.format = Format::Avro;
         cfg.schema_registry_url = Some(sr.uri());
-        let sr_client = SchemaRegistryClient::new(sr.uri(), None);
+        let sr_client = SchemaRegistryClient::new(sr.uri(), None).unwrap();
         let mut source = KafkaSource::with_schema_registry(stale_catalog, cfg, sr_client);
 
         let empty_cfg = crate::config::ConnectorConfig::new("kafka");

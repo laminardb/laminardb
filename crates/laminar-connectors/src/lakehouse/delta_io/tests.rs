@@ -33,6 +33,204 @@ fn test_batch(n: usize) -> RecordBatch {
     .unwrap()
 }
 
+#[test]
+fn only_proven_optimistic_collisions_are_retryable_conflicts() {
+    use deltalake::kernel::transaction::{CommitConflictError, TransactionError};
+
+    let proven = vec![
+        deltalake::DeltaTableError::Transaction {
+            source: TransactionError::CommitConflict(CommitConflictError::ConcurrentAppend),
+        },
+        deltalake::DeltaTableError::Transaction {
+            source: TransactionError::CommitConflict(CommitConflictError::ConcurrentDeleteRead),
+        },
+        deltalake::DeltaTableError::Transaction {
+            source: TransactionError::CommitConflict(CommitConflictError::ConcurrentDeleteDelete),
+        },
+        deltalake::DeltaTableError::Transaction {
+            source: TransactionError::CommitConflict(CommitConflictError::ConcurrentTransaction),
+        },
+    ];
+    for error in proven {
+        assert!(DeltaWriteAttemptError::Delta(error).is_definite_optimistic_conflict());
+    }
+
+    for error in [
+        deltalake::DeltaTableError::VersionAlreadyExists(4),
+        deltalake::DeltaTableError::Transaction {
+            source: TransactionError::VersionAlreadyExists(4),
+        },
+        deltalake::DeltaTableError::Transaction {
+            source: TransactionError::MaxCommitAttempts(3),
+        },
+    ] {
+        assert!(
+            !DeltaWriteAttemptError::Delta(error).is_definite_optimistic_conflict(),
+            "HTTP retries can turn a published conditional write into an AlreadyExists result"
+        );
+    }
+
+    let excluded = [
+        CommitConflictError::MetadataChanged,
+        CommitConflictError::ProtocolChanged("concurrent conflict".into()),
+        CommitConflictError::UnsupportedWriterVersion(99),
+        CommitConflictError::UnsupportedReaderVersion(99),
+        CommitConflictError::CorruptedState {
+            source: Box::new(std::io::Error::other("concurrent conflict")),
+        },
+        CommitConflictError::Predicate {
+            source: Box::new(std::io::Error::other("concurrent conflict")),
+        },
+        CommitConflictError::NoMetadata,
+    ];
+    for conflict in excluded {
+        let error = DeltaWriteAttemptError::Delta(deltalake::DeltaTableError::Transaction {
+            source: TransactionError::CommitConflict(conflict),
+        });
+        assert!(!error.is_definite_optimistic_conflict(), "{error}");
+    }
+}
+
+#[test]
+fn coordinated_typed_collisions_prove_nonpublication() {
+    use deltalake::kernel::transaction::TransactionError;
+
+    let exhausted = deltalake::DeltaTableError::Transaction {
+        source: TransactionError::MaxCommitAttempts(15),
+    };
+    assert!(is_definite_coordinated_nonpublication(&exhausted));
+    assert!(!is_definite_coordinated_nonpublication(
+        &deltalake::DeltaTableError::Transaction {
+            source: TransactionError::LogStoreError {
+                msg: "unknown".into(),
+                source: Box::new(std::io::Error::other("unknown")),
+            },
+        }
+    ));
+}
+
+#[test]
+fn coordinated_storage_budget_replaces_provider_aliases() {
+    let options = HashMap::from([
+        ("AWS_TIMEOUT".into(), "10m".into()),
+        ("azure_connect_timeout".into(), "5m".into()),
+        ("retry_timeout".into(), "1h".into()),
+        ("max_retries".into(), "100".into()),
+        ("backoff.max_backoff".into(), "2m".into()),
+        ("aws_region".into(), "us-east-1".into()),
+    ]);
+
+    let bounded = bound_coordinated_storage_options(options);
+    assert_eq!(bounded["timeout"], COORDINATED_REQUEST_TIMEOUT);
+    assert_eq!(bounded["connect_timeout"], COORDINATED_CONNECT_TIMEOUT);
+    assert_eq!(bounded["retry_timeout"], COORDINATED_RETRY_TIMEOUT);
+    assert_eq!(bounded["max_retries"], COORDINATED_HTTP_MAX_RETRIES);
+    assert_eq!(bounded["max_backoff"], COORDINATED_MAX_BACKOFF);
+    assert_eq!(bounded["aws_region"], "us-east-1");
+    assert!(!bounded.contains_key("AWS_TIMEOUT"));
+    assert!(!bounded.contains_key("azure_connect_timeout"));
+    assert!(!bounded.contains_key("backoff.max_backoff"));
+}
+
+#[test]
+fn coordinated_provider_and_retention_scope_fail_closed() {
+    assert!(is_certified_coordinated_log_store("DefaultLogStore"));
+    assert!(!is_certified_coordinated_log_store("S3DynamoDbLogStore"));
+    assert!(!is_certified_coordinated_log_store("LakeFSLogStore"));
+
+    let no_environment = |_: &str| None;
+    let custom = HashMap::from([("aws_endpoint_url".into(), "http://minio:9000".into())]);
+    assert!(validate_coordinated_storage_preflight_with_env(
+        "s3://bucket/table",
+        &custom,
+        &no_environment,
+    )
+    .is_err());
+    for conditional_put in ["disabled", "dynamo:commits"] {
+        let options = HashMap::from([("aws_conditional_put".into(), conditional_put.into())]);
+        assert!(validate_coordinated_storage_preflight_with_env(
+            "s3://bucket/table",
+            &options,
+            &no_environment,
+        )
+        .is_err());
+    }
+    validate_coordinated_storage_preflight_with_env(
+        "s3://bucket/table",
+        &HashMap::from([("aws_conditional_put".into(), "etag".into())]),
+        &no_environment,
+    )
+    .unwrap();
+
+    let s3_environment = HashMap::from([("AWS_ENDPOINT_URL", "http://minio:9000")]);
+    let s3_environment = |key: &str| s3_environment.get(key).map(ToString::to_string);
+    assert!(validate_coordinated_storage_preflight_with_env(
+        "s3://bucket/table",
+        &HashMap::new(),
+        &s3_environment,
+    )
+    .is_err());
+    validate_coordinated_storage_preflight_with_env(
+        "file:///tmp/table",
+        &HashMap::new(),
+        &s3_environment,
+    )
+    .unwrap();
+    let conditional_environment = HashMap::from([("AWS_CONDITIONAL_PUT", "dynamo:commits")]);
+    let conditional_environment =
+        |key: &str| conditional_environment.get(key).map(ToString::to_string);
+    assert!(validate_coordinated_storage_preflight_with_env(
+        "s3://bucket/table",
+        &HashMap::new(),
+        &conditional_environment,
+    )
+    .is_err());
+
+    let azure_environment = HashMap::from([("AZURE_STORAGE_USE_EMULATOR", "true")]);
+    let azure_environment = |key: &str| azure_environment.get(key).map(ToString::to_string);
+    assert!(validate_coordinated_storage_preflight_with_env(
+        "abfss://container@account/table",
+        &HashMap::new(),
+        &azure_environment,
+    )
+    .is_err());
+
+    for options in [
+        HashMap::from([(
+            "google_service_account_key".into(),
+            r#"{"gcs_base_url":"http://gcs-emulator"}"#.into(),
+        )]),
+        HashMap::from([(
+            "google_service_account_path".into(),
+            "service-account.json".into(),
+        )]),
+    ] {
+        assert!(validate_coordinated_storage_preflight_with_env(
+            "gs://bucket/table",
+            &options,
+            &no_environment,
+        )
+        .is_err());
+    }
+    validate_coordinated_storage_preflight_with_env(
+        "gs://bucket/table",
+        &HashMap::from([(
+            "google_service_account_key".into(),
+            r#"{"client_email":"service@example.com"}"#.into(),
+        )]),
+        &no_environment,
+    )
+    .unwrap();
+
+    validate_coordinated_retention(MIN_COORDINATED_DELETED_FILE_RETENTION).unwrap();
+    assert!(validate_coordinated_retention(
+        MIN_COORDINATED_DELETED_FILE_RETENTION
+            .checked_sub(Duration::from_secs(1))
+            .unwrap()
+    )
+    .is_err());
+}
+
 async fn staged_adds(table: &DeltaTable, batch: RecordBatch) -> Vec<deltalake::kernel::Add> {
     use deltalake::writer::{DeltaWriter, RecordBatchWriter};
 
@@ -123,13 +321,10 @@ async fn test_write_batch_creates_parquet() {
     let (table, version) = write_batches(
         table,
         vec![batch],
-        "test-writer",
-        1,
         SaveMode::Append,
         None,
         false,
         None,
-        false,
         None,
     )
     .await
@@ -152,93 +347,33 @@ async fn test_write_batch_creates_parquet() {
 }
 
 #[tokio::test]
-async fn test_application_transaction_cursor_survives_reopen() {
+async fn test_multiple_appends_sequential() {
     let temp_dir = TempDir::new().unwrap();
     let table_path = temp_dir.path().to_str().unwrap();
-    let writer_id = "cursor-writer";
-
-    // Create the table and write application transaction version 1.
-    let schema = test_schema();
-    let table = open_or_create_table(table_path, HashMap::new(), Some(&schema))
-        .await
-        .unwrap();
-
-    let batch = test_batch(10);
-    let (table, _) = write_batches(
-        table,
-        vec![batch.clone()],
-        writer_id,
-        1,
-        SaveMode::Append,
-        None,
-        false,
-        None,
-        false,
-        None,
-    )
-    .await
-    .unwrap();
-
-    let last_version = get_last_committed_version(&table, writer_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(last_version, 1);
-
-    // Simulate recovery: reopen table.
-    let reopened_table = open_or_create_table(table_path, HashMap::new(), None)
-        .await
-        .unwrap();
-
-    // The low-level Delta transaction cursor remains available after reopen.
-    let recovered_version = get_last_committed_version(&reopened_table, writer_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(recovered_version, 1);
-}
-
-#[tokio::test]
-async fn test_multiple_epochs_sequential() {
-    let temp_dir = TempDir::new().unwrap();
-    let table_path = temp_dir.path().to_str().unwrap();
-    let writer_id = "sequential-writer";
 
     let schema = test_schema();
     let mut table = open_or_create_table(table_path, HashMap::new(), Some(&schema))
         .await
         .unwrap();
 
-    // Write application transaction versions 1, 2, 3.
     for version in 1..=3 {
         let batch = test_batch(10);
         let result = write_batches(
             table,
             vec![batch],
-            writer_id,
-            version,
             SaveMode::Append,
             None,
             false,
             None,
-            false,
             None,
         )
         .await
         .unwrap();
         table = result.0;
-        assert_eq!(result.1, version as i64);
+        assert_eq!(result.1, i64::from(version));
     }
 
-    // Final version should be 3.
     assert_eq!(table.version(), Some(3));
-
-    // The writer-local application transaction cursor should be 3.
-    let last_version = get_last_committed_version(&table, writer_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(last_version, 3);
 }
 
 #[tokio::test]
@@ -271,20 +406,9 @@ async fn test_write_empty_batches() {
         .unwrap();
 
     // Write empty batch list - should be no-op.
-    let (table, version) = write_batches(
-        table,
-        vec![],
-        "test-writer",
-        1,
-        SaveMode::Append,
-        None,
-        false,
-        None,
-        false,
-        None,
-    )
-    .await
-    .unwrap();
+    let (table, version) = write_batches(table, vec![], SaveMode::Append, None, false, None, None)
+        .await
+        .unwrap();
 
     // Version should still be 0 (no write happened).
     assert_eq!(version, 0);
@@ -308,13 +432,10 @@ async fn test_write_multiple_batches() {
     let (table, version) = write_batches(
         table,
         vec![batch1, batch2],
-        "multi-batch-writer",
-        1,
         SaveMode::Append,
         None,
         false,
         None,
-        false,
         None,
     )
     .await
@@ -379,13 +500,10 @@ async fn test_get_latest_version() {
     let (returned_table, version) = write_batches(
         table,
         vec![batch],
-        "writer",
-        1,
         SaveMode::Append,
         None,
         false,
         None,
-        false,
         None,
     )
     .await
@@ -412,13 +530,10 @@ async fn test_read_batches_at_version() {
     let (table, _) = write_batches(
         table,
         vec![batch],
-        "writer",
-        1,
         SaveMode::Append,
         None,
         false,
         None,
-        false,
         None,
     )
     .await
@@ -429,13 +544,10 @@ async fn test_read_batches_at_version() {
     let (_table, _) = write_batches(
         table,
         vec![batch],
-        "writer",
-        2,
         SaveMode::Append,
         None,
         false,
         None,
-        false,
         None,
     )
     .await
@@ -533,13 +645,10 @@ async fn test_source_checkpoint_resume_is_rejected_until_delta_replay_is_certifi
     let (table, _) = write_batches(
         table,
         vec![test_batch(10)],
-        "writer",
-        1,
         SaveMode::Append,
         None,
         false,
         None,
-        false,
         None,
     )
     .await
@@ -547,13 +656,10 @@ async fn test_source_checkpoint_resume_is_rejected_until_delta_replay_is_certifi
     let (_table, _) = write_batches(
         table,
         vec![test_batch(20)],
-        "writer",
-        2,
         SaveMode::Append,
         None,
         false,
         None,
-        false,
         None,
     )
     .await
@@ -729,6 +835,7 @@ async fn coordinated_cursor_rejects_token_change_stale_fence_and_checkpoint_roll
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn coordinated_race_serializes_cursor_and_permanently_fences_stale_writer() {
     use crate::connector::CoordinatedCommitCursor;
 
@@ -992,6 +1099,7 @@ async fn coordinated_descriptor_batch_rejects_mixed_table_bindings() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn coordinated_late_exact_commit_and_higher_batch_cannot_both_win() {
     use crate::connector::{
         CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
@@ -1771,13 +1879,10 @@ async fn test_schema_evolution_adds_column() {
     let (table, _) = write_batches(
         table,
         vec![batch_v1],
-        "evo-writer",
-        1,
         SaveMode::Append,
         None,
         true, // schema_evolution enabled
         None,
-        false,
         None,
     )
     .await
@@ -1801,13 +1906,10 @@ async fn test_schema_evolution_adds_column() {
     let (table, _) = write_batches(
         table,
         vec![batch_v2],
-        "evo-writer",
-        2,
         SaveMode::Append,
         None,
         true,
         None,
-        false,
         None,
     )
     .await
@@ -1829,61 +1931,4 @@ async fn test_schema_evolution_adds_column() {
         .unwrap();
     let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
     assert_eq!(total_rows, 3);
-}
-
-#[tokio::test]
-async fn test_compaction_reduces_files() {
-    let temp_dir = TempDir::new().unwrap();
-    let table_path = temp_dir.path().to_str().unwrap();
-
-    let schema = test_schema();
-    let mut table = open_or_create_table(table_path, HashMap::new(), Some(&schema))
-        .await
-        .unwrap();
-
-    // Write 10 small batches (1 file each = 10 versions).
-    for epoch in 1..=10u64 {
-        let batch = test_batch(5);
-        let (t, _) = write_batches(
-            table,
-            vec![batch],
-            "compaction-writer",
-            epoch,
-            SaveMode::Append,
-            None,
-            false,
-            None,
-            false,
-            None,
-        )
-        .await
-        .unwrap();
-        table = t;
-    }
-
-    // Count Parquet files before compaction.
-    let parquet_before: Vec<_> = std::fs::read_dir(temp_dir.path())
-        .unwrap()
-        .filter_map(Result::ok)
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "parquet"))
-        .collect();
-    assert!(
-        parquet_before.len() >= 10,
-        "should have at least 10 Parquet files before compaction, got {}",
-        parquet_before.len()
-    );
-
-    // Run compaction.
-    let (table, result) = run_compaction(table, 128 * 1024 * 1024, &[], None)
-        .await
-        .unwrap();
-    assert!(
-        result.files_removed > 0,
-        "compaction should have removed files"
-    );
-
-    // Compaction itself proves file reduction via metrics.
-    // Vacuum is not tested here — delta-rs enforces a 168h minimum
-    // retention, and test files are too fresh to be vacuumed.
-    drop(table);
 }

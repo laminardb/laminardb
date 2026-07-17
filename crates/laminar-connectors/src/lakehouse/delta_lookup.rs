@@ -337,20 +337,9 @@ mod tests {
         let table = delta_io::open_or_create_table(path, HashMap::new(), Some(&test_schema()))
             .await
             .unwrap();
-        delta_io::write_batches(
-            table,
-            batches,
-            "test-writer",
-            1,
-            SaveMode::Append,
-            None,
-            false,
-            None,
-            false,
-            None,
-        )
-        .await
-        .unwrap();
+        delta_io::write_batches(table, batches, SaveMode::Append, None, false, None, None)
+            .await
+            .unwrap();
     }
 
     async fn open_source(path: &str, table_name: &str) -> DeltaLookupSource {
@@ -415,13 +404,10 @@ mod tests {
                     &[0, 1, 2, 3, 4, 5, 6, 7],
                     &["a", "b", "c", "d", "e", "f", "g", "h"],
                 )],
-                "w",
-                1,
                 SaveMode::Append,
                 Some(&["id".to_string()]),
                 false,
                 None,
-                false,
                 None,
             )
             .await

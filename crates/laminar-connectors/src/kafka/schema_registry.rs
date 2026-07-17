@@ -15,6 +15,63 @@ use serde::{Deserialize, Serialize};
 use crate::error::{ConnectorError, SerdeError};
 use crate::kafka::config::{CompatibilityLevel, SrAuth};
 
+const SCHEMA_REGISTRY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const SCHEMA_REGISTRY_READ_TIMEOUT: Duration = Duration::from_secs(2);
+const SCHEMA_REGISTRY_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Clone, Copy)]
+struct SchemaRegistryHttpTimeouts {
+    connect: Duration,
+    read: Duration,
+    request: Duration,
+}
+
+const SCHEMA_REGISTRY_HTTP_TIMEOUTS: SchemaRegistryHttpTimeouts = SchemaRegistryHttpTimeouts {
+    connect: SCHEMA_REGISTRY_CONNECT_TIMEOUT,
+    read: SCHEMA_REGISTRY_READ_TIMEOUT,
+    request: SCHEMA_REGISTRY_REQUEST_TIMEOUT,
+};
+
+fn http_client_builder(timeouts: SchemaRegistryHttpTimeouts) -> reqwest::ClientBuilder {
+    Client::builder()
+        .connect_timeout(timeouts.connect)
+        .read_timeout(timeouts.read)
+        .timeout(timeouts.request)
+}
+
+fn build_http_client(timeouts: SchemaRegistryHttpTimeouts) -> Result<Client, ConnectorError> {
+    http_client_builder(timeouts).build().map_err(|e| {
+        ConnectorError::ConfigurationError(format!(
+            "failed to build Schema Registry HTTP client: {e}"
+        ))
+    })
+}
+
+fn schema_registry_http_error(
+    operation: &str,
+    status: reqwest::StatusCode,
+    detail: &str,
+) -> ConnectorError {
+    let message = format!("schema registry {operation} failed: {status} {detail}");
+    if status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+    {
+        ConnectorError::ConnectionFailed(message)
+    } else {
+        ConnectorError::ConfigurationError(message)
+    }
+}
+
+fn schema_registry_request_error(operation: &str, error: &reqwest::Error) -> ConnectorError {
+    let message = format!("schema registry {operation} failed: {error}");
+    if error.is_builder() {
+        ConnectorError::ConfigurationError(message)
+    } else {
+        ConnectorError::ConnectionFailed(message)
+    }
+}
+
 /// Schema type as reported by the Schema Registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaType {
@@ -48,6 +105,16 @@ impl std::fmt::Display for SchemaType {
             SchemaType::Protobuf => write!(f, "PROTOBUF"),
             SchemaType::Json => write!(f, "JSON"),
         }
+    }
+}
+
+fn require_avro_mutation(schema_type: SchemaType) -> Result<(), ConnectorError> {
+    if schema_type == SchemaType::Avro {
+        Ok(())
+    } else {
+        Err(ConnectorError::ConfigurationError(format!(
+            "Kafka Schema Registry registration supports AVRO only, got {schema_type}"
+        )))
     }
 }
 
@@ -174,8 +241,11 @@ fn default_schema_type() -> String {
 
 impl SchemaRegistryClient {
     /// Creates a new Schema Registry client with default cache config.
-    #[must_use]
-    pub fn new(base_url: impl Into<String>, auth: Option<SrAuth>) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectorError::ConfigurationError` if the HTTP client cannot be built.
+    pub fn new(base_url: impl Into<String>, auth: Option<SrAuth>) -> Result<Self, ConnectorError> {
         Self::with_cache_config(base_url, auth, SchemaRegistryCacheConfig::default())
     }
 
@@ -216,7 +286,8 @@ impl SchemaRegistryClient {
             ))
         })?;
 
-        let mut builder = Client::builder().add_root_certificate(cert);
+        let mut builder =
+            http_client_builder(SCHEMA_REGISTRY_HTTP_TIMEOUTS).add_root_certificate(cert);
 
         if client_cert_path.is_some() != client_key_path.is_some() {
             return Err(ConnectorError::ConfigurationError(
@@ -246,31 +317,53 @@ impl SchemaRegistryClient {
             ConnectorError::ConfigurationError(format!("failed to build TLS client: {e}"))
         })?;
 
-        let cache_config = SchemaRegistryCacheConfig::default();
-        let cache = Cache::new(cache_config.max_entries);
-        let subject_cache = Cache::new(256);
-        Ok(Self {
-            client,
-            base_url: base_url.into().trim_end_matches('/').to_string(),
+        Ok(Self::from_http_client(
+            base_url,
             auth,
-            cache,
-            subject_cache,
-            cache_config,
-        })
+            SchemaRegistryCacheConfig::default(),
+            client,
+        ))
     }
 
     /// Creates a new Schema Registry client with custom cache config.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectorError::ConfigurationError` if the HTTP client cannot be built.
     pub fn with_cache_config(
         base_url: impl Into<String>,
         auth: Option<SrAuth>,
         cache_config: SchemaRegistryCacheConfig,
+    ) -> Result<Self, ConnectorError> {
+        Self::with_cache_config_and_timeouts(
+            base_url,
+            auth,
+            cache_config,
+            SCHEMA_REGISTRY_HTTP_TIMEOUTS,
+        )
+    }
+
+    fn with_cache_config_and_timeouts(
+        base_url: impl Into<String>,
+        auth: Option<SrAuth>,
+        cache_config: SchemaRegistryCacheConfig,
+        timeouts: SchemaRegistryHttpTimeouts,
+    ) -> Result<Self, ConnectorError> {
+        let client = build_http_client(timeouts)?;
+        Ok(Self::from_http_client(base_url, auth, cache_config, client))
+    }
+
+    fn from_http_client(
+        base_url: impl Into<String>,
+        auth: Option<SrAuth>,
+        cache_config: SchemaRegistryCacheConfig,
+        client: Client,
     ) -> Self {
         let cache = Cache::new(cache_config.max_entries);
         // Subject cache is small — one entry per subject
         let subject_cache = Cache::new(256);
         Self {
-            client: Client::new(),
+            client,
             base_url: base_url.into().trim_end_matches('/').to_string(),
             auth,
             cache,
@@ -335,7 +428,8 @@ impl SchemaRegistryClient {
         }
 
         let url = format!("{}/schemas/ids/{}", self.base_url, id);
-        let resp: SchemaByIdResponse = self.get_json(&url).await?;
+        let operation = format!("fetch schema ID {id}");
+        let resp: SchemaByIdResponse = self.get_json(&url, &operation).await?;
 
         let schema_type: SchemaType = resp.schema_type.parse()?;
         let arrow_schema = schema_to_arrow(schema_type, &resp.schema)?;
@@ -359,7 +453,8 @@ impl SchemaRegistryClient {
     /// Returns `ConnectorError` if the HTTP request fails.
     pub async fn get_latest_schema(&self, subject: &str) -> Result<CachedSchema, ConnectorError> {
         let url = format!("{}/subjects/{}/versions/latest", self.base_url, subject);
-        let resp: SchemaVersionResponse = self.get_json(&url).await?;
+        let operation = format!("fetch latest schema for subject '{subject}'");
+        let resp: SchemaVersionResponse = self.get_json(&url, &operation).await?;
 
         let schema_type: SchemaType = resp.schema_type.parse()?;
         let arrow_schema = schema_to_arrow(schema_type, &resp.schema)?;
@@ -393,7 +488,8 @@ impl SchemaRegistryClient {
             "{}/subjects/{}/versions/{}",
             self.base_url, subject, version
         );
-        let resp: SchemaVersionResponse = self.get_json(&url).await?;
+        let operation = format!("fetch version {version} for subject '{subject}'");
+        let resp: SchemaVersionResponse = self.get_json(&url, &operation).await?;
 
         let schema_type: SchemaType = resp.schema_type.parse()?;
         let arrow_schema = schema_to_arrow(schema_type, &resp.schema)?;
@@ -410,7 +506,7 @@ impl SchemaRegistryClient {
         Ok(cached)
     }
 
-    /// Checks compatibility of a schema against the latest version.
+    /// Checks compatibility of an Avro schema against the latest version.
     ///
     /// # Errors
     ///
@@ -427,7 +523,7 @@ impl SchemaRegistryClient {
 
         let body = CompatibilityRequest {
             schema: schema_str.to_string(),
-            schema_type: "AVRO".to_string(),
+            schema_type: SchemaType::Avro.to_string(),
         };
 
         let mut req = self.client.post(&url).json(&body);
@@ -435,21 +531,28 @@ impl SchemaRegistryClient {
             req = req.basic_auth(&auth.username, Some(&auth.password));
         }
 
+        let operation = format!("compatibility check for subject '{subject}'");
         let resp = req
             .send()
             .await
-            .map_err(|e| ConnectorError::ConnectionFailed(format!("schema registry: {e}")))?;
+            .map_err(|error| schema_registry_request_error(&operation, &error))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(ConnectorError::ConnectionFailed(format!(
-                "schema registry compatibility check failed: {status} {text}"
-            )));
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Ok(CompatibilityResult {
+                    is_compatible: true,
+                    messages: Vec::new(),
+                });
+            }
+            return Err(schema_registry_http_error(&operation, status, &text));
         }
 
         let result: CompatibilityResponse = resp.json().await.map_err(|e| {
-            ConnectorError::Internal(format!("failed to parse compatibility response: {e}"))
+            ConnectorError::Internal(format!(
+                "schema registry {operation} returned an invalid response: {e}"
+            ))
         })?;
 
         Ok(CompatibilityResult {
@@ -468,7 +571,8 @@ impl SchemaRegistryClient {
         subject: &str,
     ) -> Result<CompatibilityLevel, ConnectorError> {
         let url = format!("{}/config/{}", self.base_url, subject);
-        let resp: ConfigResponse = self.get_json(&url).await?;
+        let operation = format!("fetch compatibility config for subject '{subject}'");
+        let resp: ConfigResponse = self.get_json(&url, &operation).await?;
         resp.compatibility_level.parse()
     }
 
@@ -492,17 +596,16 @@ impl SchemaRegistryClient {
             req = req.basic_auth(&auth.username, Some(&auth.password));
         }
 
+        let operation = format!("update compatibility config for subject '{subject}'");
         let resp = req
             .send()
             .await
-            .map_err(|e| ConnectorError::ConnectionFailed(format!("schema registry: {e}")))?;
+            .map_err(|error| schema_registry_request_error(&operation, &error))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(ConnectorError::ConnectionFailed(format!(
-                "schema registry config update failed: {status} {text}"
-            )));
+            return Err(schema_registry_http_error(&operation, status, &text));
         }
 
         Ok(())
@@ -520,21 +623,23 @@ impl SchemaRegistryClient {
         self.get_schema_by_id(id).await
     }
 
-    /// Registers a schema with the Schema Registry under the given subject.
+    /// Registers an Avro schema with the Schema Registry under the given subject.
     ///
     /// Returns the schema ID assigned by the registry. Caches the result
     /// so subsequent calls with the same subject return immediately.
     ///
     /// # Errors
     ///
-    /// Returns `ConnectorError` if the HTTP request fails or the response
-    /// is malformed.
+    /// Returns `ConnectorError` if `schema_type` is not Avro, the HTTP request
+    /// fails, or the response is malformed.
     pub async fn register_schema(
         &self,
         subject: &str,
         schema_str: &str,
         schema_type: SchemaType,
     ) -> Result<i32, ConnectorError> {
+        require_avro_mutation(schema_type)?;
+
         // Check subject cache — only return cached ID if schema hasn't changed.
         if let Some(cached) = self.subject_cache.get(subject) {
             if cached.schema_str == schema_str {
@@ -553,21 +658,22 @@ impl SchemaRegistryClient {
             req = req.basic_auth(&auth.username, Some(&auth.password));
         }
 
+        let operation = format!("register schema for subject '{subject}'");
         let resp = req
             .send()
             .await
-            .map_err(|e| ConnectorError::ConnectionFailed(format!("schema registry: {e}")))?;
+            .map_err(|error| schema_registry_request_error(&operation, &error))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(ConnectorError::ConnectionFailed(format!(
-                "schema registry register failed: {status} {text}"
-            )));
+            return Err(schema_registry_http_error(&operation, status, &text));
         }
 
         let result: RegisterSchemaResponse = resp.json().await.map_err(|e| {
-            ConnectorError::Internal(format!("failed to parse register schema response: {e}"))
+            ConnectorError::Internal(format!(
+                "schema registry {operation} returned an invalid response: {e}"
+            ))
         })?;
 
         let arrow_schema = avro_to_arrow_schema(schema_str)?;
@@ -601,25 +707,21 @@ impl SchemaRegistryClient {
         schema_str: &str,
         schema_type: SchemaType,
     ) -> Result<i32, ConnectorError> {
-        // Check compatibility first (404 means no existing schema — OK to proceed).
-        match self.check_compatibility(subject, schema_str).await {
-            Ok(result) => {
-                if !result.is_compatible {
-                    let message = if result.messages.is_empty() {
-                        "new schema is not compatible with existing version".to_string()
-                    } else {
-                        result.messages.join("; ")
-                    };
-                    return Err(ConnectorError::Serde(SerdeError::SchemaIncompatible {
-                        subject: subject.to_string(),
-                        message,
-                    }));
-                }
-            }
-            Err(ConnectorError::ConnectionFailed(msg)) if msg.contains("404") => {
-                // No existing schema — first registration, skip compatibility.
-            }
-            Err(e) => return Err(e),
+        // Reject unsupported mutation types before the compatibility request.
+        // `register_schema` repeats this guard because it is also public.
+        require_avro_mutation(schema_type)?;
+
+        let result = self.check_compatibility(subject, schema_str).await?;
+        if !result.is_compatible {
+            let message = if result.messages.is_empty() {
+                "new schema is not compatible with existing version".to_string()
+            } else {
+                result.messages.join("; ")
+            };
+            return Err(ConnectorError::Serde(SerdeError::SchemaIncompatible {
+                subject: subject.to_string(),
+                message,
+            }));
         }
 
         self.register_schema(subject, schema_str, schema_type).await
@@ -639,11 +741,12 @@ impl SchemaRegistryClient {
 
     /// Helper to perform a GET request and deserialize JSON.
     ///
-    /// Retries transient failures (5xx, timeouts) up to 3 attempts with
-    /// exponential backoff (100ms, 500ms). 4xx client errors fail immediately.
+    /// Retries transient failures (408, 429, 5xx, and transport errors) up to
+    /// 3 attempts with exponential backoff (100ms, 500ms).
     async fn get_json<T: serde::de::DeserializeOwned>(
         &self,
         url: &str,
+        operation: &str,
     ) -> Result<T, ConnectorError> {
         let backoffs = [
             std::time::Duration::from_millis(100),
@@ -667,14 +770,16 @@ impl SchemaRegistryClient {
             let resp = match req.send().await {
                 Ok(r) => r,
                 Err(e) => {
+                    let error = schema_registry_request_error(operation, &e);
+                    if !error.is_transient() {
+                        return Err(error);
+                    }
                     tracing::warn!(
                         attempt = attempt + 1,
-                        error = %e,
+                        error = %error,
                         "schema registry request failed, retrying"
                     );
-                    last_err = Some(ConnectorError::ConnectionFailed(format!(
-                        "schema registry: {e}"
-                    )));
+                    last_err = Some(error);
                     continue;
                 }
             };
@@ -683,33 +788,32 @@ impl SchemaRegistryClient {
             if status.is_success() {
                 return resp.json::<T>().await.map_err(|e| {
                     ConnectorError::Internal(format!(
-                        "failed to parse schema registry response: {e}"
+                        "schema registry {operation} returned an invalid response: {e}"
                     ))
                 });
             }
 
-            // Client errors (4xx) are not retryable.
-            if status.is_client_error() {
+            let transient = status == reqwest::StatusCode::REQUEST_TIMEOUT
+                || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || status.is_server_error();
+            if !transient {
                 let text = resp.text().await.unwrap_or_default();
-                return Err(ConnectorError::ConnectionFailed(format!(
-                    "schema registry client error: {status} {text}"
-                )));
+                return Err(schema_registry_http_error(operation, status, &text));
             }
 
-            // Server errors (5xx) are retryable.
             let text = resp.text().await.unwrap_or_default();
             tracing::warn!(
                 attempt = attempt + 1,
                 status = %status,
                 "schema registry server error, retrying"
             );
-            last_err = Some(ConnectorError::ConnectionFailed(format!(
-                "schema registry request failed: {status} {text}"
-            )));
+            last_err = Some(schema_registry_http_error(operation, status, &text));
         }
 
         Err(last_err.unwrap_or_else(|| {
-            ConnectorError::ConnectionFailed("schema registry: all retries exhausted".into())
+            ConnectorError::ConnectionFailed(format!(
+                "schema registry {operation} exhausted all retries"
+            ))
         }))
     }
 }
@@ -1026,9 +1130,45 @@ mod tests {
         assert_eq!(SchemaType::Json.to_string(), "JSON");
     }
 
+    #[tokio::test]
+    async fn non_avro_mutations_are_rejected_without_network_access() {
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let client = SchemaRegistryClient::new(server.uri(), None).unwrap();
+
+        for schema_type in [SchemaType::Protobuf, SchemaType::Json] {
+            let schema_name = schema_type.to_string();
+            let registration = client
+                .register_schema("orders-value", "unused", schema_type)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                &registration,
+                ConnectorError::ConfigurationError(_)
+            ));
+            assert!(!registration.is_transient());
+            assert!(registration.to_string().contains(schema_name.as_str()));
+
+            let validation = client
+                .validate_and_register_schema("orders-value", "unused", schema_type)
+                .await
+                .unwrap_err();
+            assert!(matches!(&validation, ConnectorError::ConfigurationError(_)));
+            assert!(!validation.is_transient());
+            assert!(validation.to_string().contains(schema_name.as_str()));
+        }
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests.is_empty(),
+            "unsupported schema mutations must fail before HTTP"
+        );
+    }
+
     #[test]
     fn test_client_creation() {
-        let client = SchemaRegistryClient::new("http://localhost:8081", None);
+        let client = SchemaRegistryClient::new("http://localhost:8081", None).unwrap();
         assert_eq!(client.base_url(), "http://localhost:8081");
         assert!(!client.has_auth());
         assert_eq!(client.cache_size(), 0);
@@ -1040,14 +1180,98 @@ mod tests {
             username: "user".into(),
             password: "pass".into(),
         };
-        let client = SchemaRegistryClient::new("http://localhost:8081", Some(auth));
+        let client = SchemaRegistryClient::new("http://localhost:8081", Some(auth)).unwrap();
         assert!(client.has_auth());
     }
 
     #[test]
     fn test_client_trailing_slash_stripped() {
-        let client = SchemaRegistryClient::new("http://localhost:8081/", None);
+        let client = SchemaRegistryClient::new("http://localhost:8081/", None).unwrap();
         assert_eq!(client.base_url(), "http://localhost:8081");
+    }
+
+    #[test]
+    fn schema_registry_http_budget_fits_default_discovery_deadline() {
+        assert!(SCHEMA_REGISTRY_CONNECT_TIMEOUT <= SCHEMA_REGISTRY_REQUEST_TIMEOUT);
+        assert!(SCHEMA_REGISTRY_READ_TIMEOUT <= SCHEMA_REGISTRY_REQUEST_TIMEOUT);
+
+        let three_attempt_get_budget =
+            SCHEMA_REGISTRY_REQUEST_TIMEOUT.saturating_mul(3) + Duration::from_millis(600);
+        assert!(three_attempt_get_budget <= Duration::from_secs(10));
+    }
+
+    #[test]
+    fn schema_registry_http_status_classification_is_fail_closed() {
+        for status in [
+            reqwest::StatusCode::REQUEST_TIMEOUT,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert!(schema_registry_http_error("test", status, "failure").is_transient());
+        }
+        for status in [
+            reqwest::StatusCode::BAD_REQUEST,
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::NOT_FOUND,
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ] {
+            assert!(!schema_registry_http_error("test", status, "failure").is_transient());
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_subject_is_compatible_for_first_registration() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/compatibility/subjects/orders/versions/latest"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let client = SchemaRegistryClient::new(server.uri(), None).unwrap();
+
+        let result = client.check_compatibility("orders", "{}").await.unwrap();
+        assert!(result.is_compatible);
+        assert!(result.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn schema_registry_http_client_times_out_a_stalled_response() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/compatibility/subjects/orders/versions/latest"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(250))
+                    .set_body_json(serde_json::json!({ "is_compatible": true })),
+            )
+            .mount(&server)
+            .await;
+
+        let test_timeouts = SchemaRegistryHttpTimeouts {
+            connect: Duration::from_millis(50),
+            read: Duration::from_millis(50),
+            request: Duration::from_millis(50),
+        };
+        let client = SchemaRegistryClient::with_cache_config_and_timeouts(
+            server.uri(),
+            None,
+            SchemaRegistryCacheConfig::default(),
+            test_timeouts,
+        )
+        .unwrap();
+
+        let err = client
+            .check_compatibility("orders", "{}")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConnectorError::ConnectionFailed(_)));
     }
 
     #[test]
@@ -1422,7 +1646,8 @@ mod tests {
             max_entries: 3,
             ttl: None,
         };
-        let client = SchemaRegistryClient::with_cache_config("http://localhost:8081", None, config);
+        let client =
+            SchemaRegistryClient::with_cache_config("http://localhost:8081", None, config).unwrap();
 
         // Insert 3 schemas.
         client.cache_insert(1, make_cached_schema(1));
@@ -1446,7 +1671,8 @@ mod tests {
             max_entries: 100,
             ttl: Some(Duration::from_millis(1000)),
         };
-        let client = SchemaRegistryClient::with_cache_config("http://localhost:8081", None, config);
+        let client =
+            SchemaRegistryClient::with_cache_config("http://localhost:8081", None, config).unwrap();
 
         client.cache_insert(1, make_cached_schema(1));
         assert!(client.cache_get(1).is_some());
@@ -1463,7 +1689,8 @@ mod tests {
             max_entries: 100,
             ttl: None,
         };
-        let client = SchemaRegistryClient::with_cache_config("http://localhost:8081", None, config);
+        let client =
+            SchemaRegistryClient::with_cache_config("http://localhost:8081", None, config).unwrap();
 
         client.cache_insert(1, make_cached_schema(1));
         // No TTL — entry should stay.
@@ -1476,7 +1703,8 @@ mod tests {
             max_entries: 10,
             ttl: None,
         };
-        let client = SchemaRegistryClient::with_cache_config("http://localhost:8081", None, config);
+        let client =
+            SchemaRegistryClient::with_cache_config("http://localhost:8081", None, config).unwrap();
 
         client.cache_insert(1, make_cached_schema(1));
         client.cache_insert(2, make_cached_schema(2));
@@ -1504,7 +1732,7 @@ mod tests {
     #[test]
     fn test_validate_and_register_method_exists() {
         // Verify the method exists and has the correct signature by referencing it.
-        let client = SchemaRegistryClient::new("http://localhost:8081", None);
+        let client = SchemaRegistryClient::new("http://localhost:8081", None).unwrap();
         // Just check the method is callable (we can't actually test without a registry).
         let _ = &client;
     }

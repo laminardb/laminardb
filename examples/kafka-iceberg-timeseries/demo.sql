@@ -37,8 +37,8 @@ CREATE SOURCE crypto_ticks (
 --      window.
 --    - SUM(price * qty) drives the tick-weighted hourly VWAP rollup
 --      computed in query.sql.                         (prompt requirement)
---    - EMIT ON WINDOW CLOSE: append-only, exactly the Iceberg sink
---      contract (statements.rs:425-427, EmitClause::OnWindowClose).
+--    - EMIT ON WINDOW CLOSE makes the result append-only for the Iceberg
+--      append sink (statements.rs:425-427, EmitClause::OnWindowClose).
 -- ──────────────────────────────────────────────────────────────────────
 CREATE MATERIALIZED VIEW ohlc_1m AS
 SELECT

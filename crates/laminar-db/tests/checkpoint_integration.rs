@@ -153,7 +153,7 @@ mod exactly_once {
     };
     use laminar_db::pipeline::{
         CycleError, CycleOutcome, PipelineCallback, PipelineConfig, SourceRegistration,
-        StreamingCoordinator,
+        StreamingCoordinator, StreamingCoordinatorRuntime,
     };
 
     /// A callback that tracks barrier checkpoint calls and records state.
@@ -328,10 +328,17 @@ mod exactly_once {
 
         // Start with the gate CLOSED.
         let gate = Arc::new(AtomicBool::new(true));
-        let coordinator =
-            StreamingCoordinator::new(sources, config, shutdown, control_rx, Arc::clone(&gate))
-                .await
-                .unwrap();
+        let runtime = StreamingCoordinatorRuntime::new();
+        let coordinator = StreamingCoordinator::new(
+            &runtime,
+            sources,
+            config,
+            shutdown,
+            control_rx,
+            Arc::clone(&gate),
+        )
+        .await
+        .unwrap();
         let record_counter = Arc::new(AtomicU64::new(0));
         let callback = BarrierTrackingCallback::new(
             Arc::new(AtomicBool::new(false)),
@@ -403,7 +410,9 @@ mod exactly_once {
 
         let (_control_tx, control_rx) =
             crossfire::mpsc::bounded_async::<laminar_db::pipeline::ControlMsg>(64);
+        let runtime = StreamingCoordinatorRuntime::new();
         let coordinator = StreamingCoordinator::new(
+            &runtime,
             sources,
             config,
             shutdown,
@@ -487,7 +496,9 @@ mod exactly_once {
 
         let (_control_tx, control_rx) =
             crossfire::mpsc::bounded_async::<laminar_db::pipeline::ControlMsg>(64);
+        let runtime = StreamingCoordinatorRuntime::new();
         let coordinator = StreamingCoordinator::new(
+            &runtime,
             sources,
             config,
             shutdown,
@@ -640,7 +651,9 @@ mod exactly_once {
 
         let (_control_tx, control_rx) =
             crossfire::mpsc::bounded_async::<laminar_db::pipeline::ControlMsg>(64);
+        let runtime = StreamingCoordinatorRuntime::new();
         let coordinator = StreamingCoordinator::new(
+            &runtime,
             sources,
             config,
             shutdown,
@@ -712,7 +725,9 @@ mod exactly_once {
 
         let (_control_tx, control_rx) =
             crossfire::mpsc::bounded_async::<laminar_db::pipeline::ControlMsg>(64);
+        let runtime = StreamingCoordinatorRuntime::new();
         let coordinator = StreamingCoordinator::new(
+            &runtime,
             sources,
             config,
             shutdown,

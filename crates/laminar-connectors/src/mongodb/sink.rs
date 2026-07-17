@@ -9,6 +9,7 @@
 //! Keyed and CDC flushes use one ordered MongoDB 8+ bulk operation, preserving
 //! input order without a network round trip per row.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,8 +21,8 @@ use tracing::{debug, info};
 use crate::changelog::collapse_changelog;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{
-    ConnectorCancellationPolicy, SinkConnector, SinkConsistency, SinkContract, SinkInputMode,
-    SinkTopology, WriteResult,
+    ConnectorTaskOwner, ConnectorTaskTracker, SinkConnector, SinkConsistency, SinkContract,
+    SinkInputMode, SinkTopology, WriteResult,
 };
 use crate::error::ConnectorError;
 use laminar_core::changelog::WEIGHT_COLUMN;
@@ -189,6 +190,10 @@ pub struct MongoDbSink {
     write_timeout: Duration,
     metrics: MongoDbSinkMetrics,
 
+    /// Admission authority and terminal observer for bulk operations owned by this generation.
+    task_owner: ConnectorTaskOwner,
+    task_tracker: ConnectorTaskTracker,
+
     client: Option<mongodb::Client>,
     collection: Option<mongodb::Collection<mongodb::bson::Document>>,
 }
@@ -201,6 +206,7 @@ impl MongoDbSink {
         config: MongoDbSinkConfig,
         registry: Option<&prometheus::Registry>,
     ) -> Self {
+        let (task_owner, task_tracker) = ConnectorTaskOwner::new();
         Self {
             config,
             schema,
@@ -210,6 +216,8 @@ impl MongoDbSink {
             buffered_retained_bytes: 0,
             write_timeout: DEFAULT_WRITE_TIMEOUT,
             metrics: MongoDbSinkMetrics::new(registry),
+            task_owner,
+            task_tracker,
             client: None,
             collection: None,
         }
@@ -531,8 +539,8 @@ impl MongoDbSink {
             return Ok(WriteResult::new(0, 0));
         }
 
-        // Drain before any await. The runtime's CompleteStarted policy continues a timed-out
-        // MongoDB future to completion before it can process or recover past this write.
+        // Drain before any await. A timeout makes the bulk-write outcome unknown, retires this
+        // connector generation, and replays from the last durable engine checkpoint.
         let (mut pending, retained_bytes) = self.take_buffer();
         let write_result: Result<(usize, u64), ConnectorError> =
             if matches!(self.config.write_mode, WriteMode::CdcReplay) {
@@ -658,14 +666,20 @@ impl MongoDbSink {
                 chunk_retained_bytes,
                 retained_limit,
             )? {
-                let flushed = self.flush_inner().await?;
+                let flushed = self
+                    .flush_inner()
+                    .await
+                    .map_err(|error| mongo_partial_batch_error(&result, error))?;
                 accumulate_write_result(&mut result, flushed);
             }
 
             self.retain_batch(chunk, chunk_retained_bytes);
             offset += chunk_rows;
             if self.buffered_rows == MAX_DOCUMENTS_PER_FLUSH {
-                let flushed = self.flush_inner().await?;
+                let flushed = self
+                    .flush_inner()
+                    .await
+                    .map_err(|error| mongo_partial_batch_error(&result, error))?;
                 accumulate_write_result(&mut result, flushed);
             }
         }
@@ -868,6 +882,20 @@ fn accumulate_write_result(total: &mut WriteResult, flushed: WriteResult) {
     total.bytes_written = total.bytes_written.saturating_add(flushed.bytes_written);
 }
 
+fn mongo_partial_batch_error(completed: &WriteResult, error: ConnectorError) -> ConnectorError {
+    if completed.records_written == 0 {
+        return error;
+    }
+    let retryable = error.is_transient();
+    ConnectorError::outcome_unknown(
+        format!(
+            "MongoDB batch failed after {} records and {} bytes were already written: {error}",
+            completed.records_written, completed.bytes_written
+        ),
+        retryable,
+    )
+}
+
 fn checked_converted_total(
     current: u64,
     incoming: usize,
@@ -1037,8 +1065,8 @@ fn validate_cdc_replacement_key(
 
 #[async_trait]
 impl SinkConnector for MongoDbSink {
-    fn cancellation_policy(&self) -> ConnectorCancellationPolicy {
-        ConnectorCancellationPolicy::CompleteStarted
+    fn terminal_task_tracker(&self) -> Option<ConnectorTaskTracker> {
+        Some(self.task_tracker.clone())
     }
 
     fn contract(&self, config: &ConnectorConfig) -> Result<SinkContract, ConnectorError> {
@@ -1163,6 +1191,50 @@ struct BulkCounts {
     inserts: u64,
     upserts: u64,
     deletes: u64,
+}
+
+enum MongoOperationOutcome<T> {
+    Completed(T),
+    Deadline,
+    TaskFailed(tokio::task::JoinError),
+}
+
+fn spawn_mongo_sink_operation<F, T>(
+    task_owner: &ConnectorTaskOwner,
+    operation: F,
+) -> Result<tokio::task::JoinHandle<T>, ConnectorError>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let guard = task_owner.track().ok_or_else(|| {
+        ConnectorError::Internal(
+            "MongoDB sink task generation was sealed before bulk operation admission".into(),
+        )
+    })?;
+    // The driver has no supported socket/operation timeout. Dropping this handle therefore
+    // detaches the operation; its guard remains live until the driver future actually exits.
+    Ok(tokio::spawn(async move {
+        let _guard = guard;
+        operation.await
+    }))
+}
+
+async fn await_mongo_sink_operation<F, T>(
+    task_owner: &ConnectorTaskOwner,
+    deadline: tokio::time::Instant,
+    operation: F,
+) -> Result<MongoOperationOutcome<T>, ConnectorError>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let mut task = spawn_mongo_sink_operation(task_owner, operation)?;
+    match tokio::time::timeout_at(deadline, &mut task).await {
+        Ok(Ok(result)) => Ok(MongoOperationOutcome::Completed(result)),
+        Ok(Err(error)) => Ok(MongoOperationOutcome::TaskFailed(error)),
+        Err(_) => Ok(MongoOperationOutcome::Deadline),
+    }
 }
 
 fn cdc_bulk_models(
@@ -1607,14 +1679,39 @@ impl MongoDbSink {
             .client
             .as_ref()
             .ok_or_else(|| ConnectorError::Internal("client not initialized".to_string()))?;
-        client
-            .bulk_write(models)
-            .ordered(true)
-            .await
-            .map_err(|error| {
+        let driver_timeout = self.driver_timeout();
+        let deadline = tokio::time::Instant::now() + driver_timeout;
+        let operation_client = client.clone();
+        match await_mongo_sink_operation(&self.task_owner, deadline, async move {
+            operation_client.bulk_write(models).ordered(true).await
+        })
+        .await?
+        {
+            MongoOperationOutcome::Completed(Ok(_)) => {}
+            MongoOperationOutcome::Completed(Err(error)) => {
                 self.metrics.record_error();
-                ConnectorError::WriteError(format!("{context}: {error}"))
-            })?;
+                return Err(classify_mongo_bulk_failure(
+                    context,
+                    MongoBulkFailure::Driver(&error),
+                ));
+            }
+            MongoOperationOutcome::Deadline => {
+                self.metrics.record_error();
+                return Err(classify_mongo_bulk_failure(
+                    context,
+                    MongoBulkFailure::Deadline(driver_timeout),
+                ));
+            }
+            MongoOperationOutcome::TaskFailed(error) => {
+                self.metrics.record_error();
+                return Err(ConnectorError::outcome_unknown(
+                    format!(
+                        "{context} task terminated before its MongoDB outcome was observed: {error}"
+                    ),
+                    false,
+                ));
+            }
+        }
         self.metrics.record_bulk_write();
         self.metrics.record_inserts(counts.inserts);
         self.metrics.record_upserts(counts.upserts);
@@ -1869,11 +1966,195 @@ impl MongoDbSink {
     }
 }
 
+enum MongoBulkFailure<'a> {
+    Driver(&'a mongodb::error::Error),
+    Deadline(Duration),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MongoBulkFailureShape {
+    PreCommandTransient,
+    PreCommandTerminal,
+    Transport,
+    Command,
+    WriteRejected,
+    WriteConcern,
+    Bulk {
+        partial: bool,
+        write_errors: bool,
+        write_concern_errors: bool,
+    },
+    Deadline,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MongoBulkFailureFacts {
+    no_writes: bool,
+    retryable_signal: bool,
+    shape: MongoBulkFailureShape,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MongoBulkDisposition {
+    DefinitelyNotApplied { retryable: bool },
+    OutcomeUnknown { retryable: bool },
+}
+
+fn mongo_bulk_failure_facts(error: &mongodb::error::Error) -> MongoBulkFailureFacts {
+    use mongodb::error::{
+        ErrorKind, WriteFailure, NO_WRITES_PERFORMED, RETRYABLE_ERROR, RETRYABLE_WRITE_ERROR,
+        SYSTEM_OVERLOADED_ERROR,
+    };
+
+    let retryable_label = error.contains_label(RETRYABLE_WRITE_ERROR)
+        || (error.contains_label(SYSTEM_OVERLOADED_ERROR) && error.contains_label(RETRYABLE_ERROR));
+    let transient_cause = mongo_error_chain_has_transient_cause(error);
+    let shape = match error.kind.as_ref() {
+        ErrorKind::ServerSelection { .. } | ErrorKind::DnsResolve { .. } => {
+            MongoBulkFailureShape::PreCommandTransient
+        }
+        ErrorKind::InvalidArgument { .. }
+        | ErrorKind::Authentication { .. }
+        | ErrorKind::BsonSerialization(_)
+        | ErrorKind::SessionsNotSupported
+        | ErrorKind::InvalidTlsConfig { .. }
+        | ErrorKind::IncompatibleServer { .. }
+        | ErrorKind::Shutdown => MongoBulkFailureShape::PreCommandTerminal,
+        ErrorKind::Io(_) | ErrorKind::ConnectionPoolCleared { .. } => {
+            MongoBulkFailureShape::Transport
+        }
+        ErrorKind::Command(_) => MongoBulkFailureShape::Command,
+        ErrorKind::Write(WriteFailure::WriteError(_)) => MongoBulkFailureShape::WriteRejected,
+        ErrorKind::Write(WriteFailure::WriteConcernError(_)) => MongoBulkFailureShape::WriteConcern,
+        ErrorKind::BulkWrite(bulk) => MongoBulkFailureShape::Bulk {
+            partial: bulk.partial_result.is_some(),
+            write_errors: !bulk.write_errors.is_empty(),
+            write_concern_errors: !bulk.write_concern_errors.is_empty(),
+        },
+        _ => MongoBulkFailureShape::Unknown,
+    };
+
+    MongoBulkFailureFacts {
+        no_writes: error.contains_label(NO_WRITES_PERFORMED),
+        retryable_signal: retryable_label || transient_cause,
+        shape,
+    }
+}
+
+fn mongo_error_chain_has_transient_cause(error: &mongodb::error::Error) -> bool {
+    use std::error::Error as _;
+
+    use mongodb::error::ErrorKind;
+
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if matches!(
+            error.kind.as_ref(),
+            ErrorKind::Io(_)
+                | ErrorKind::ConnectionPoolCleared { .. }
+                | ErrorKind::ServerSelection { .. }
+                | ErrorKind::DnsResolve { .. }
+        ) {
+            return true;
+        }
+        current = error
+            .source()
+            .and_then(|source| source.downcast_ref::<mongodb::error::Error>());
+    }
+    false
+}
+
+fn classify_mongo_bulk_facts(facts: MongoBulkFailureFacts) -> MongoBulkDisposition {
+    use MongoBulkDisposition::{DefinitelyNotApplied, OutcomeUnknown};
+    use MongoBulkFailureShape::{
+        Bulk, Command, Deadline, PreCommandTerminal, PreCommandTransient, Transport, Unknown,
+        WriteConcern, WriteRejected,
+    };
+
+    let partial_result = matches!(facts.shape, Bulk { partial: true, .. });
+    // A nested NoWritesPerformed label only describes the failed wire batch. Earlier wire
+    // batches are still applied when the driver reports a partial result on the wrapper error.
+    if facts.no_writes && !partial_result {
+        let retryable = match facts.shape {
+            PreCommandTerminal => false,
+            Bulk {
+                write_errors: true, ..
+            } => false,
+            Command | WriteRejected => facts.retryable_signal,
+            PreCommandTransient | Transport => true,
+            _ => facts.retryable_signal,
+        };
+        return DefinitelyNotApplied { retryable };
+    }
+
+    match facts.shape {
+        PreCommandTransient => DefinitelyNotApplied { retryable: true },
+        PreCommandTerminal => DefinitelyNotApplied { retryable: false },
+        Command => OutcomeUnknown {
+            retryable: facts.retryable_signal,
+        },
+        WriteRejected => DefinitelyNotApplied {
+            retryable: facts.retryable_signal,
+        },
+        Bulk {
+            partial,
+            write_errors: true,
+            write_concern_errors,
+        } => {
+            if partial || write_concern_errors {
+                OutcomeUnknown { retryable: false }
+            } else {
+                DefinitelyNotApplied { retryable: false }
+            }
+        }
+        Transport | Deadline => OutcomeUnknown { retryable: true },
+        Bulk { .. } | WriteConcern | Unknown => OutcomeUnknown {
+            retryable: facts.retryable_signal,
+        },
+    }
+}
+
+fn classify_mongo_bulk_failure(context: &str, failure: MongoBulkFailure<'_>) -> ConnectorError {
+    let (facts, detail) = match failure {
+        MongoBulkFailure::Driver(error) => (mongo_bulk_failure_facts(error), error.to_string()),
+        MongoBulkFailure::Deadline(timeout) => (
+            MongoBulkFailureFacts {
+                no_writes: false,
+                retryable_signal: true,
+                shape: MongoBulkFailureShape::Deadline,
+            },
+            format!("timed out after {timeout:?}"),
+        ),
+    };
+
+    match classify_mongo_bulk_facts(facts) {
+        MongoBulkDisposition::DefinitelyNotApplied { retryable: true } => {
+            ConnectorError::WriteError(format!(
+                "{context} failed without applying any ordered bulk write: {detail}"
+            ))
+        }
+        MongoBulkDisposition::DefinitelyNotApplied { retryable: false } => {
+            ConnectorError::ConfigurationError(format!(
+                "{context} was rejected without applying any ordered bulk write: {detail}"
+            ))
+        }
+        MongoBulkDisposition::OutcomeUnknown { retryable } => ConnectorError::outcome_unknown(
+            format!(
+                "{context} failed after dispatch; MongoDB may have applied part or all of the \
+                 ordered bulk: {detail}"
+            ),
+            retryable,
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow_array::{Int64Array, StringArray};
     use arrow_schema::{Field, Schema};
+    use futures_util::FutureExt as _;
 
     fn test_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -1906,6 +2187,193 @@ mod tests {
         let config = MongoDbSinkConfig::new("mongodb://localhost:27017", "db", "coll");
         let sink = MongoDbSink::new(test_schema(), config, None);
         assert_eq!(sink.buffered_rows(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_wait_before_bulk_task_first_poll_keeps_operation_tracked() {
+        let sink = MongoDbSink::new(test_schema(), test_config(), None);
+        let terminal = sink.terminal_task_tracker().unwrap();
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_polled = Arc::clone(&polled);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let task_release = Arc::clone(&release);
+
+        let wait = await_mongo_sink_operation(
+            &sink.task_owner,
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            async move {
+                task_polled.store(true, std::sync::atomic::Ordering::Release);
+                task_release.notified().await;
+            },
+        );
+        assert!(
+            wait.now_or_never().is_none(),
+            "operation wait must still be pending"
+        );
+        assert!(
+            !polled.load(std::sync::atomic::Ordering::Acquire),
+            "the spawned bulk task must not have reached its first poll"
+        );
+
+        drop(sink);
+        assert!(!terminal.is_terminated());
+        tokio::task::yield_now().await;
+        assert!(polled.load(std::sync::atomic::Ordering::Acquire));
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), terminal.wait_terminated())
+            .await
+            .expect("tracker must resolve only after the detached operation exits");
+    }
+
+    #[tokio::test]
+    async fn bulk_deadline_keeps_generation_non_terminal_until_operation_exit() {
+        let sink = MongoDbSink::new(test_schema(), test_config(), None);
+        let terminal = sink.terminal_task_tracker().unwrap();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let task_release = Arc::clone(&release);
+
+        let outcome =
+            await_mongo_sink_operation(&sink.task_owner, tokio::time::Instant::now(), async move {
+                task_release.notified().await;
+            })
+            .await
+            .unwrap();
+        assert!(matches!(outcome, MongoOperationOutcome::Deadline));
+
+        drop(sink);
+        assert!(!terminal.is_terminated());
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), terminal.wait_terminated())
+            .await
+            .expect("deadline must not publish terminal state before the operation exits");
+    }
+
+    #[test]
+    fn mongo_bulk_failure_classification_table() {
+        use MongoBulkDisposition::{DefinitelyNotApplied, OutcomeUnknown};
+        use MongoBulkFailureShape::{
+            Bulk, Command, Deadline, Transport, Unknown, WriteConcern, WriteRejected,
+        };
+
+        let facts = |shape, no_writes, retryable_signal| MongoBulkFailureFacts {
+            no_writes,
+            retryable_signal,
+            shape,
+        };
+        let bulk = |partial, write_errors, write_concern_errors| Bulk {
+            partial,
+            write_errors,
+            write_concern_errors,
+        };
+
+        let cases = [
+            (
+                "no writes performed",
+                facts(Transport, true, true),
+                DefinitelyNotApplied { retryable: true },
+            ),
+            (
+                "partial permanent rejection",
+                facts(bulk(true, true, false), false, false),
+                OutcomeUnknown { retryable: false },
+            ),
+            (
+                "partial transport failure",
+                // The nested retry wrote nothing, but an earlier wire batch still succeeded.
+                facts(bulk(true, false, false), true, true),
+                OutcomeUnknown { retryable: true },
+            ),
+            (
+                "deadline",
+                facts(Deadline, false, true),
+                OutcomeUnknown { retryable: true },
+            ),
+            (
+                "first ordered write rejected",
+                facts(bulk(false, true, false), false, false),
+                DefinitelyNotApplied { retryable: false },
+            ),
+            (
+                "unknown terminal failure",
+                facts(Unknown, false, false),
+                OutcomeUnknown { retryable: false },
+            ),
+            (
+                "retryable write concern failure",
+                facts(WriteConcern, false, true),
+                OutcomeUnknown { retryable: true },
+            ),
+            (
+                "retryable server rejection",
+                facts(Command, false, true),
+                OutcomeUnknown { retryable: true },
+            ),
+            (
+                "per-item write rejection",
+                facts(WriteRejected, false, false),
+                DefinitelyNotApplied { retryable: false },
+            ),
+        ];
+
+        for (name, facts, expected) in cases {
+            assert_eq!(classify_mongo_bulk_facts(facts), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn later_chunk_failure_preserves_partial_application() {
+        let completed = WriteResult::new(7, 256);
+        let error = mongo_partial_batch_error(
+            &completed,
+            ConnectorError::ConfigurationError("later chunk rejected".into()),
+        );
+        assert!(error.is_outcome_unknown());
+        assert!(!error.is_transient());
+        assert!(error.to_string().contains("7 records and 256 bytes"));
+
+        let before_output = mongo_partial_batch_error(
+            &WriteResult::new(0, 0),
+            ConnectorError::ConfigurationError("rejected before output".into()),
+        );
+        assert!(matches!(
+            before_output,
+            ConnectorError::ConfigurationError(_)
+        ));
+    }
+
+    #[test]
+    fn mongo_transport_and_deadline_errors_require_retirement() {
+        let driver_error: mongodb::error::Error =
+            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset").into();
+        let transport = classify_mongo_bulk_failure(
+            "MongoDB sink bulk_write",
+            MongoBulkFailure::Driver(&driver_error),
+        );
+        assert!(transport.is_outcome_unknown());
+        assert!(transport.is_transient());
+
+        let deadline = classify_mongo_bulk_failure(
+            "MongoDB sink bulk_write",
+            MongoBulkFailure::Deadline(Duration::from_secs(1)),
+        );
+        assert!(deadline.is_outcome_unknown());
+        assert!(deadline.is_transient());
+        assert!(deadline.to_string().contains("timed out after 1s"));
+    }
+
+    #[test]
+    fn mongo_driver_partial_result_is_classified_as_applied() {
+        let mut bulk = mongodb::error::BulkWriteError::default();
+        bulk.partial_result = Some(mongodb::error::PartialBulkWriteResult::Summary(
+            mongodb::results::SummaryBulkWriteResult::default(),
+        ));
+        let driver_error: mongodb::error::Error = mongodb::error::ErrorKind::BulkWrite(bulk).into();
+
+        assert_eq!(
+            classify_mongo_bulk_facts(mongo_bulk_failure_facts(&driver_error)),
+            MongoBulkDisposition::OutcomeUnknown { retryable: false }
+        );
     }
 
     #[test]

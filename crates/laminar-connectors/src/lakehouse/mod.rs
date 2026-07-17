@@ -41,7 +41,7 @@ mod snapshot_schema;
 
 // Re-export Delta Lake types at module level.
 pub use delta::DeltaLakeSink;
-pub use delta_config::{CompactionConfig, DeltaCatalogType, DeltaLakeSinkConfig, DeltaWriteMode};
+pub use delta_config::{DeltaCatalogType, DeltaLakeSinkConfig, DeltaWriteMode};
 #[cfg(feature = "delta-lake")]
 pub use delta_lookup::{DeltaLookupSource, DeltaLookupSourceConfig};
 pub use delta_metrics::DeltaLakeSinkMetrics;
@@ -376,11 +376,6 @@ fn delta_lake_config_keys() -> Vec<ConfigKeySpec> {
             "60000",
         ),
         ConfigKeySpec::optional(
-            "checkpoint.interval",
-            "Create Delta checkpoint every N commits",
-            "10",
-        ),
-        ConfigKeySpec::optional(
             "schema.evolution",
             "Enable automatic schema evolution (additive columns)",
             "false",
@@ -394,36 +389,6 @@ fn delta_lake_config_keys() -> Vec<ConfigKeySpec> {
             "merge.key.columns",
             "Key columns for upsert MERGE (required for upsert mode)",
             "",
-        ),
-        ConfigKeySpec::optional(
-            "compaction.enabled",
-            "Enable background OPTIMIZE compaction",
-            "true",
-        ),
-        ConfigKeySpec::optional(
-            "compaction.z-order.columns",
-            "Columns for Z-ORDER clustering",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "compaction.target-file-size",
-            "Target file size after compaction (bytes, defaults to target.file.size)",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "compaction.min-files",
-            "Minimum files before triggering compaction",
-            "10",
-        ),
-        ConfigKeySpec::optional(
-            "compaction.check-interval.ms",
-            "How often to check if compaction is needed (milliseconds)",
-            "3600000",
-        ),
-        ConfigKeySpec::optional(
-            "vacuum.retention.hours",
-            "Hours to retain old files during VACUUM",
-            "168",
         ),
         // ── Catalog configuration ──
         ConfigKeySpec::optional("catalog.type", "Catalog type: none, glue, unity", "none"),
@@ -452,11 +417,6 @@ fn delta_lake_config_keys() -> Vec<ConfigKeySpec> {
             "catalog.storage.location",
             "Storage location for auto-created UC external tables (e.g. s3://bucket/path)",
             "",
-        ),
-        ConfigKeySpec::optional(
-            "max.commit.retries",
-            "Maximum retries on optimistic concurrency conflicts",
-            "3",
         ),
         // ── LogStore configuration ──
         ConfigKeySpec::optional(
@@ -735,9 +695,10 @@ mod tests {
         assert!(!optional.contains(&"delivery.guarantee"));
         assert!(optional.contains(&"merge.key.columns"));
         assert!(optional.contains(&"schema.evolution"));
-        assert!(optional.contains(&"compaction.enabled"));
-        assert!(optional.contains(&"compaction.z-order.columns"));
-        assert!(optional.contains(&"vacuum.retention.hours"));
+        assert!(!optional.contains(&"checkpoint.interval"));
+        assert!(!optional.contains(&"max.commit.retries"));
+        assert!(!optional.iter().any(|key| key.starts_with("compaction.")));
+        assert!(!optional.contains(&"vacuum.retention.hours"));
         assert!(!optional.contains(&"writer.id"));
         // Catalog keys
         assert!(optional.contains(&"catalog.type"));

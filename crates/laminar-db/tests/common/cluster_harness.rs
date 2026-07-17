@@ -1113,33 +1113,33 @@ impl ClusterEngineHarness {
                 .expect("cluster startup authority activation");
             recovery_fenced |= disposition == ClusterStartupDisposition::RecoveryFenced;
         }
-        if recovery_fenced {
-            tokio::time::timeout(Duration::from_secs(60), async {
-                loop {
-                    if self
-                        .nodes
-                        .iter()
-                        .zip(&self.cluster.nodes)
-                        .all(|(runtime, cluster_node)| {
-                            let fence = cluster_node
-                                .controller
-                                .checkpoint_assignment_fence(
-                                    runtime.vnode_registry.assignment_version(),
-                                )
-                                .expect("recovery assignment fence");
-                            !fence.contains(runtime.instance_id.0)
-                                || (!runtime.db.cluster_intake_fenced()
-                                    && !cluster_node.controller.is_recovering())
-                        })
-                    {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if self
+                    .nodes
+                    .iter()
+                    .zip(&self.cluster.nodes)
+                    .all(|(runtime, cluster_node)| {
+                        let fence = cluster_node
+                            .controller
+                            .checkpoint_assignment_fence(
+                                runtime.vnode_registry.assignment_version(),
+                            )
+                            .expect("startup assignment fence");
+                        let owns_vnodes = fence.contains(runtime.instance_id.0);
+                        runtime.db.cluster_intake_fenced() == !owns_vnodes
+                            && (!recovery_fenced
+                                || !owns_vnodes
+                                || !cluster_node.controller.is_recovering())
+                    })
+                {
+                    break;
                 }
-            })
-            .await
-            .expect("coordinated startup recovery must release every node");
-        }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("cluster startup must align source intake with assignment ownership");
         for (node, cluster_node) in self.nodes.iter().zip(&self.cluster.nodes) {
             let fence = cluster_node
                 .controller

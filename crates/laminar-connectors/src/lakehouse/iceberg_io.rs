@@ -169,7 +169,7 @@ pub fn current_snapshot_id(table: &Table) -> Option<i64> {
 /// Append `data_files` in one Iceberg transaction.
 ///
 /// # Errors
-/// Returns `ConnectorError::TransactionError` on commit failure.
+/// Returns [`ConnectorError::OutcomeUnknown`] when the catalog does not acknowledge the commit.
 pub async fn commit_data_files_append(
     table: &Table,
     catalog: &dyn Catalog,
@@ -184,9 +184,36 @@ pub async fn commit_data_files_append(
             .apply(tx)
             .map_err(|e| ConnectorError::TransactionError(format!("apply fast_append: {e}")))?
     };
-    tx.commit(catalog)
-        .await
-        .map_err(|e| ConnectorError::TransactionError(format!("commit: {e}")))
+    tx.commit(catalog).await.map_err(iceberg_commit_error)
+}
+
+fn iceberg_commit_error(error: iceberg::Error) -> ConnectorError {
+    use iceberg::ErrorKind;
+
+    let kind = error.kind();
+    let retryable = error.retryable();
+    match kind {
+        ErrorKind::CatalogCommitConflicts => {
+            ConnectorError::WriteError(format!("Iceberg catalog commit conflict: {error}"))
+        }
+        ErrorKind::PreconditionFailed
+        | ErrorKind::DataInvalid
+        | ErrorKind::NamespaceAlreadyExists
+        | ErrorKind::TableAlreadyExists
+        | ErrorKind::NamespaceNotFound
+        | ErrorKind::TableNotFound
+        | ErrorKind::FeatureUnsupported => ConnectorError::TransactionError(format!(
+            "Iceberg catalog rejected commit ({kind}): {error}"
+        )),
+        ErrorKind::Unexpected => ConnectorError::outcome_unknown(
+            format!("Iceberg catalog commit failed after dispatch and may have applied: {error}"),
+            retryable,
+        ),
+        _ => ConnectorError::outcome_unknown(
+            format!("Iceberg catalog returned an unclassified commit failure: {error}"),
+            retryable,
+        ),
+    }
 }
 
 /// Creates an Iceberg table (and namespace) if it does not already exist.
@@ -254,6 +281,27 @@ pub async fn ensure_table_exists(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_commit_failure_has_unknown_outcome() {
+        let error = iceberg_commit_error(
+            iceberg::Error::new(iceberg::ErrorKind::Unexpected, "response lost")
+                .with_retryable(true),
+        );
+        assert!(error.is_outcome_unknown());
+        assert!(error.is_transient());
+        assert!(error.to_string().contains("may have applied"));
+    }
+
+    #[test]
+    fn catalog_commit_conflict_is_a_definite_retryable_rejection() {
+        let error = iceberg_commit_error(iceberg::Error::new(
+            iceberg::ErrorKind::CatalogCommitConflicts,
+            "base metadata changed",
+        ));
+        assert!(!error.is_outcome_unknown());
+        assert!(error.is_transient());
+    }
 
     #[test]
     fn test_storage_factory_infers_s3_from_warehouse_url() {

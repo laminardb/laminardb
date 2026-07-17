@@ -10,9 +10,9 @@ use arrow::array::RecordBatch;
 use crossfire::{mpsc, oneshot, AsyncRx, MAsyncTx, SendTimeoutError};
 use futures::FutureExt;
 use laminar_connectors::connector::{
-    ConnectorCancellationPolicy, CoordinatedCommitBatch, CoordinatedCommitContext,
-    CoordinatedCommitCursor, CoordinatedCommitNamespace, CoordinatedCommitter, SinkConnector,
-    SinkContract,
+    ConnectorCancellationPolicy, ConnectorTaskTracker, CoordinatedCommitBatch,
+    CoordinatedCommitContext, CoordinatedCommitCursor, CoordinatedCommitNamespace,
+    CoordinatedCommitter, SinkConnector, SinkContract,
 };
 use laminar_connectors::error::ConnectorError;
 #[cfg(feature = "cluster")]
@@ -36,26 +36,22 @@ const SINK_CLOSE_TIMEOUT: Duration = Duration::from_secs(15);
 
 enum ConnectorOperationOutcome<T> {
     Completed(T),
-    Deadline(Option<T>),
+    Deadline,
     #[cfg(feature = "cluster")]
-    ProcessAuthorityLost(Option<T>),
+    ProcessAuthorityLost,
 }
 
 async fn await_connector_operation_local<T>(
     deadline: Instant,
-    cancellation_policy: ConnectorCancellationPolicy,
     future: impl std::future::Future<Output = T>,
 ) -> ConnectorOperationOutcome<T> {
     if Instant::now() >= deadline {
-        return ConnectorOperationOutcome::Deadline(None);
+        return ConnectorOperationOutcome::Deadline;
     }
-    let mut future = std::pin::pin!(future);
-    match tokio::time::timeout_at(deadline, future.as_mut()).await {
+    match tokio::time::timeout_at(deadline, future).await {
+        Ok(_) if Instant::now() >= deadline => ConnectorOperationOutcome::Deadline,
         Ok(result) => ConnectorOperationOutcome::Completed(result),
-        Err(_) if cancellation_policy == ConnectorCancellationPolicy::CompleteStarted => {
-            ConnectorOperationOutcome::Deadline(Some(future.await))
-        }
-        Err(_) => ConnectorOperationOutcome::Deadline(None),
+        Err(_) => ConnectorOperationOutcome::Deadline,
     }
 }
 
@@ -63,43 +59,25 @@ async fn await_connector_operation_local<T>(
 async fn await_connector_operation_fenced<T>(
     controller: &ClusterController,
     deadline: Instant,
-    cancellation_policy: ConnectorCancellationPolicy,
     future: impl std::future::Future<Output = T>,
 ) -> ConnectorOperationOutcome<T> {
-    let started = AtomicBool::new(false);
-    let operation = async {
-        started.store(true, Ordering::Release);
-        future.await
-    };
-    tokio::pin!(operation);
+    tokio::pin!(future);
 
     tokio::select! {
         biased;
         () = controller.wait_for_process_lease_loss() => {
-            let completion = if cancellation_policy == ConnectorCancellationPolicy::CompleteStarted
-                && started.load(Ordering::Acquire)
-            {
-                Some(operation.await)
-            } else {
-                None
-            };
-            ConnectorOperationOutcome::ProcessAuthorityLost(completion)
+            ConnectorOperationOutcome::ProcessAuthorityLost
         }
         () = tokio::time::sleep_until(deadline) => {
-            let completion = if cancellation_policy == ConnectorCancellationPolicy::CompleteStarted
-                && started.load(Ordering::Acquire)
-            {
-                Some(operation.await)
-            } else {
-                None
-            };
-            ConnectorOperationOutcome::Deadline(completion)
+            ConnectorOperationOutcome::Deadline
         }
-        result = &mut operation => {
-            if controller.process_lease_is_live() {
-                ConnectorOperationOutcome::Completed(result)
+        result = &mut future => {
+            if !controller.process_lease_is_live() {
+                ConnectorOperationOutcome::ProcessAuthorityLost
+            } else if Instant::now() >= deadline {
+                ConnectorOperationOutcome::Deadline
             } else {
-                ConnectorOperationOutcome::ProcessAuthorityLost(Some(result))
+                ConnectorOperationOutcome::Completed(result)
             }
         }
     }
@@ -108,7 +86,6 @@ async fn await_connector_operation_fenced<T>(
 #[cfg(feature = "cluster")]
 async fn await_connector_operation<T, F, Fut>(
     deadline: Instant,
-    cancellation_policy: ConnectorCancellationPolicy,
     process_authority: Option<Arc<ClusterController>>,
     make_future: F,
 ) -> ConnectorOperationOutcome<T>
@@ -117,31 +94,24 @@ where
     Fut: std::future::Future<Output = T>,
 {
     let Some(controller) = process_authority else {
-        return await_connector_operation_local(deadline, cancellation_policy, make_future()).await;
+        return await_connector_operation_local(deadline, make_future()).await;
     };
     if !controller.process_lease_is_live() {
-        return ConnectorOperationOutcome::ProcessAuthorityLost(None);
+        return ConnectorOperationOutcome::ProcessAuthorityLost;
     }
-    await_connector_operation_fenced(
-        controller.as_ref(),
-        deadline,
-        cancellation_policy,
-        make_future(),
-    )
-    .await
+    await_connector_operation_fenced(controller.as_ref(), deadline, make_future()).await
 }
 
 #[cfg(not(feature = "cluster"))]
 async fn await_connector_operation<T, F, Fut>(
     deadline: Instant,
-    cancellation_policy: ConnectorCancellationPolicy,
     make_future: F,
 ) -> ConnectorOperationOutcome<T>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = T>,
 {
-    await_connector_operation_local(deadline, cancellation_policy, make_future()).await
+    await_connector_operation_local(deadline, make_future()).await
 }
 
 async fn bounded_connector_operation<T, F, Fut>(
@@ -151,57 +121,33 @@ async fn bounded_connector_operation<T, F, Fut>(
     cancellation_policy: ConnectorCancellationPolicy,
     #[cfg(feature = "cluster")] process_authority: Option<Arc<ClusterController>>,
     make_future: F,
-) -> Result<T, ConnectorError>
+) -> (Result<T, ConnectorError>, bool)
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<T, ConnectorError>>,
 {
     match await_connector_operation(
         deadline,
-        cancellation_policy,
         #[cfg(feature = "cluster")]
         process_authority,
         make_future,
     )
     .await
     {
-        ConnectorOperationOutcome::Completed(result) => result,
-        ConnectorOperationOutcome::Deadline(completion) => {
-            if let Some(completion) = completion {
-                match completion {
-                    Ok(_) => tracing::warn!(
-                        sink = sink_name,
-                        operation,
-                        "connector operation completed after its deadline"
-                    ),
-                    Err(error) => tracing::warn!(
-                        sink = sink_name,
-                        operation,
-                        %error,
-                        "connector operation failed after its deadline"
-                    ),
-                }
-            }
-            Err(protocol_deadline_error(sink_name, operation))
+        ConnectorOperationOutcome::Completed(result) => {
+            let retire = result
+                .as_ref()
+                .err()
+                .is_some_and(ConnectorError::is_outcome_unknown);
+            (result, retire)
         }
+        ConnectorOperationOutcome::Deadline => (
+            Err(protocol_deadline_error(sink_name, operation)),
+            cancellation_policy == ConnectorCancellationPolicy::RetireConnector,
+        ),
         #[cfg(feature = "cluster")]
-        ConnectorOperationOutcome::ProcessAuthorityLost(completion) => {
-            if let Some(completion) = completion {
-                match completion {
-                    Ok(_) => tracing::warn!(
-                        sink = sink_name,
-                        operation,
-                        "connector operation completed after process lease loss"
-                    ),
-                    Err(error) => tracing::warn!(
-                        sink = sink_name,
-                        operation,
-                        %error,
-                        "connector operation failed after process lease loss"
-                    ),
-                }
-            }
-            Err(process_authority_error(sink_name, operation))
+        ConnectorOperationOutcome::ProcessAuthorityLost => {
+            (Err(process_authority_error(sink_name, operation)), true)
         }
     }
 }
@@ -281,6 +227,8 @@ pub(crate) struct SinkTaskConfig {
     pub flush_interval: Duration,
     pub write_timeout: Duration,
     pub event_tx: Producer<SinkEvent>,
+    /// Exact generation proof captured when the connector was created.
+    pub terminal_tasks: Option<ConnectorTaskTracker>,
     #[cfg(feature = "cluster")]
     pub process_authority: Option<Arc<ClusterController>>,
 }
@@ -350,16 +298,128 @@ impl SinkCloseOutcome {
 }
 
 struct SinkCloseState {
-    finished: AtomicBool,
     phase: parking_lot::Mutex<&'static str>,
     outcome: parking_lot::Mutex<Option<SinkCloseOutcome>>,
     notify: tokio::sync::Notify,
 }
 
+struct SinkTerminalState {
+    actor: Arc<SinkActorState>,
+    connector_tasks: Option<ConnectorTaskTracker>,
+}
+
+struct SinkActorState {
+    accepting: AtomicBool,
+    finished: AtomicBool,
+    finished_notify: tokio::sync::Notify,
+}
+
+impl SinkActorState {
+    fn new() -> Self {
+        Self {
+            accepting: AtomicBool::new(true),
+            finished: AtomicBool::new(false),
+            finished_notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn stop_admission(&self) {
+        self.accepting.store(false, Ordering::Release);
+    }
+
+    fn finish(&self) {
+        self.stop_admission();
+        if !self.finished.swap(true, Ordering::AcqRel) {
+            self.finished_notify.notify_waiters();
+        }
+    }
+
+    async fn wait_finished_until(&self, deadline: Instant) -> bool {
+        loop {
+            let notified = self.finished_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.finished.load(Ordering::Acquire) {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified.as_mut())
+                .await
+                .is_err()
+            {
+                return self.finished.load(Ordering::Acquire);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+struct SinkActorLifetime(Arc<SinkActorState>);
+
+#[cfg(test)]
+impl Drop for SinkActorLifetime {
+    fn drop(&mut self) {
+        self.0.finish();
+    }
+}
+
+struct SinkActorFuture<F> {
+    actor: Option<std::pin::Pin<Box<F>>>,
+    terminal: Arc<SinkActorState>,
+}
+
+// Moving this wrapper never moves the separately pinned actor allocation.
+impl<F> Unpin for SinkActorFuture<F> {}
+
+impl<F> std::future::Future for SinkActorFuture<F>
+where
+    F: std::future::Future<Output = ()>,
+{
+    type Output = ();
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let actor = self
+            .actor
+            .as_mut()
+            .expect("sink actor polled after terminal completion");
+        if actor.as_mut().poll(context).is_pending() {
+            return std::task::Poll::Pending;
+        }
+        // Drop the complete actor future, including its connector, before publishing exit.
+        self.actor.take();
+        self.terminal.finish();
+        std::task::Poll::Ready(())
+    }
+}
+
+impl<F> Drop for SinkActorFuture<F> {
+    fn drop(&mut self) {
+        // Cancellation must drop the actor and its connector before another generation can observe
+        // terminal completion.
+        self.actor.take();
+        self.terminal.finish();
+    }
+}
+
+fn spawn_sink_actor<F>(
+    runtime: &tokio::runtime::Handle,
+    actor: F,
+    terminal: Arc<SinkActorState>,
+) -> tokio::task::JoinHandle<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    runtime.spawn(SinkActorFuture {
+        actor: Some(Box::pin(actor)),
+        terminal,
+    })
+}
+
 impl SinkCloseState {
     fn new() -> Self {
         Self {
-            finished: AtomicBool::new(false),
             phase: parking_lot::Mutex::new("admission"),
             outcome: parking_lot::Mutex::new(None),
             notify: tokio::sync::Notify::new(),
@@ -374,14 +434,91 @@ impl SinkCloseState {
         *self.phase.lock()
     }
 
-    fn finish(&self, outcome: SinkCloseOutcome) {
-        *self.outcome.lock() = Some(outcome);
-        self.finished.store(true, Ordering::Release);
+    fn publish_outcome(&self, outcome: SinkCloseOutcome) {
+        let mut current = self.outcome.lock();
+        if current.is_none() {
+            *current = Some(outcome);
+        }
+        drop(current);
         self.notify.notify_waiters();
+    }
+
+    fn finish(&self, outcome: SinkCloseOutcome) {
+        self.publish_outcome(outcome);
     }
 
     fn outcome(&self) -> Option<SinkCloseOutcome> {
         self.outcome.lock().clone()
+    }
+}
+
+impl SinkTerminalState {
+    fn new(actor: Arc<SinkActorState>, connector_tasks: Option<ConnectorTaskTracker>) -> Self {
+        Self {
+            actor,
+            connector_tasks,
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.actor.finished.load(Ordering::Acquire)
+            && self
+                .connector_tasks
+                .as_ref()
+                .is_none_or(ConnectorTaskTracker::is_terminated)
+    }
+
+    async fn wait_until(&self, deadline: Instant) -> bool {
+        if !self.actor.wait_finished_until(deadline).await {
+            return false;
+        }
+        let Some(tasks) = self.connector_tasks.as_ref() else {
+            return true;
+        };
+        if tasks.is_terminated() {
+            return true;
+        }
+        if tokio::time::timeout_at(deadline, tasks.wait_terminated())
+            .await
+            .is_err()
+        {
+            return tasks.is_terminated();
+        }
+        true
+    }
+}
+
+struct OwnedSinkTask {
+    actor_abort: tokio::task::AbortHandle,
+    terminal_join: JoinHandle<Result<(), Arc<str>>>,
+    terminal_state: Arc<SinkTerminalState>,
+}
+
+impl OwnedSinkTask {
+    fn abort_actor(&self) {
+        self.actor_abort.abort();
+    }
+}
+
+fn supervise_sink_task(
+    actor: JoinHandle<()>,
+    terminal_tasks: Option<ConnectorTaskTracker>,
+    actor_state: Arc<SinkActorState>,
+    runtime: &tokio::runtime::Handle,
+) -> OwnedSinkTask {
+    let actor_abort = actor.abort_handle();
+    let terminal_state = Arc::new(SinkTerminalState::new(actor_state, terminal_tasks.clone()));
+    let terminal_join = runtime.spawn(async move {
+        let actor_result = actor.await.map_err(|error| Arc::from(error.to_string()));
+        if let Some(tasks) = terminal_tasks {
+            tasks.wait_terminated().await;
+        }
+        actor_result
+    });
+    OwnedSinkTask {
+        actor_abort,
+        terminal_join,
+        terminal_state,
     }
 }
 
@@ -395,13 +532,15 @@ pub(crate) struct SinkTaskHandle {
     requires_recovery_on_error: bool,
     /// End-to-end budget for enqueue, connector execution and acknowledgement.
     write_timeout: Duration,
-    cancellation_policy: ConnectorCancellationPolicy,
     closing: Arc<AtomicBool>,
     /// Linearizes command admission with Close so no producer can enqueue behind it.
     admission: Arc<tokio::sync::Mutex<()>>,
-    // The terminal driver takes this exactly once. Public close futures never own the actor.
-    task: Arc<parking_lot::Mutex<Option<JoinHandle<()>>>>,
+    // The terminal driver takes this exactly once. Public close futures never own the actor or
+    // its connector-child termination proof.
+    task: Arc<parking_lot::Mutex<Option<OwnedSinkTask>>>,
     close_state: Arc<SinkCloseState>,
+    terminal_state: Arc<SinkTerminalState>,
+    actor_state: Arc<SinkActorState>,
     /// Runtime that owns the actor. Terminal cleanup must not be spawned on the short-lived
     /// compute callback runtime that happened to call `close()`.
     runtime: tokio::runtime::Handle,
@@ -442,18 +581,19 @@ impl SinkTaskHandle {
             flush_interval,
             write_timeout,
             event_tx,
+            terminal_tasks,
             #[cfg(feature = "cluster")]
             process_authority,
         } = config;
         let (tx, rx) = mpsc::bounded_async::<SinkCommand>(channel_capacity);
-        let cancellation_policy = connector.cancellation_policy();
         let task_sink_id = Arc::clone(&sink_id);
         let task_event_tx = event_tx.clone();
         let task_name = name.clone();
         let epoch_poisoned = Arc::new(AtomicBool::new(false));
         let admission = Arc::new(tokio::sync::Mutex::new(()));
+        let actor_state = Arc::new(SinkActorState::new());
         let runtime = tokio::runtime::Handle::current();
-        let handle = runtime.spawn(run_sink_task(
+        let actor_future = run_sink_task(
             SinkTaskInner {
                 name: task_name,
                 sink_id: task_sink_id,
@@ -470,7 +610,11 @@ impl SinkTaskHandle {
                 admission: Arc::clone(&admission),
             },
             Arc::clone(&epoch_poisoned),
-        ));
+            Arc::clone(&actor_state),
+        );
+        let actor = spawn_sink_actor(&runtime, actor_future, Arc::clone(&actor_state));
+        let task = supervise_sink_task(actor, terminal_tasks, Arc::clone(&actor_state), &runtime);
+        let terminal_state = Arc::clone(&task.terminal_state);
 
         Self {
             name: Arc::from(name),
@@ -479,11 +623,12 @@ impl SinkTaskHandle {
             contract,
             requires_recovery_on_error,
             write_timeout,
-            cancellation_policy,
             closing: Arc::new(AtomicBool::new(false)),
             admission,
-            task: Arc::new(parking_lot::Mutex::new(Some(handle))),
+            task: Arc::new(parking_lot::Mutex::new(Some(task))),
             close_state: Arc::new(SinkCloseState::new()),
+            terminal_state,
+            actor_state,
             runtime,
             event_tx,
             epoch_poisoned,
@@ -511,6 +656,9 @@ impl SinkTaskHandle {
 
     fn ensure_open(&self) -> Result<(), ConnectorError> {
         if self.closing.load(Ordering::Acquire) {
+            return Err(self.closed_err());
+        }
+        if !self.actor_state.accepting.load(Ordering::Acquire) {
             return Err(self.closed_err());
         }
         #[cfg(feature = "cluster")]
@@ -564,7 +712,7 @@ impl SinkTaskHandle {
             .await
             .map_err(|_| command_deadline_error(&self.name, operation, effective_timeout))?;
         self.ensure_open()?;
-        let (ack_tx, ack_rx) = oneshot::oneshot();
+        let (ack_tx, mut ack_rx) = oneshot::oneshot();
         let command = SinkCommand {
             deadline,
             operation: make_operation(ack_tx),
@@ -585,10 +733,27 @@ impl SinkTaskHandle {
             }
         }
         drop(admission);
-        match tokio::time::timeout_at(deadline, ack_rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(self.ack_dropped_err(operation)),
-            Err(_) => Err(command_deadline_error(
+        let actor_finished = self.actor_state.finished_notify.notified();
+        tokio::pin!(actor_finished);
+        actor_finished.as_mut().enable();
+        if self.actor_state.finished.load(Ordering::Acquire) {
+            return tokio::select! {
+                biased;
+                result = &mut ack_rx => match result {
+                    Ok(result) => result,
+                    Err(_) => Err(self.ack_dropped_err(operation)),
+                },
+                () = std::future::ready(()) => Err(self.closed_err()),
+            };
+        }
+        tokio::select! {
+            biased;
+            result = &mut ack_rx => match result {
+                Ok(result) => result,
+                Err(_) => Err(self.ack_dropped_err(operation)),
+            },
+            () = actor_finished.as_mut() => Err(self.closed_err()),
+            () = tokio::time::sleep_until(deadline) => Err(command_deadline_error(
                 &self.name,
                 operation,
                 effective_timeout,
@@ -811,9 +976,10 @@ impl SinkTaskHandle {
                 spawn_sink_close_driver(
                     Arc::clone(&self.name),
                     self.tx.clone(),
-                    self.cancellation_policy,
                     handle,
                     Arc::clone(&self.close_state),
+                    Arc::clone(&self.actor_state),
+                    deadline,
                     &self.runtime,
                 );
             } else {
@@ -833,16 +999,19 @@ impl SinkTaskHandle {
         self.name.as_ref()
     }
 
-    /// True while a connector operation or terminal close still owns the sink actor.
+    /// True until the actor and all connector-owned child tasks are terminal.
     pub(crate) fn has_unresolved_task(&self) -> bool {
-        if self.closing.load(Ordering::Acquire) {
-            !self.close_state.finished.load(Ordering::Acquire)
-        } else {
-            self.task
-                .lock()
-                .as_ref()
-                .is_some_and(|handle| !handle.is_finished())
-        }
+        !self.terminal_state.is_finished()
+    }
+
+    /// Wait for the actor and its exact connector-task generation under a caller-owned deadline.
+    pub(crate) async fn wait_terminal_until(&self, deadline: Instant) -> bool {
+        self.terminal_state.wait_until(deadline).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close_outcome_published(&self) -> bool {
+        self.close_state.outcome().is_some()
     }
 
     pub(crate) fn same_actor(&self, other: &Self) -> bool {
@@ -853,27 +1022,40 @@ impl SinkTaskHandle {
 fn spawn_sink_close_driver(
     name: Arc<str>,
     tx: SinkCommandTx,
-    cancellation_policy: ConnectorCancellationPolicy,
-    handle: JoinHandle<()>,
+    task: OwnedSinkTask,
     state: Arc<SinkCloseState>,
+    actor_state: Arc<SinkActorState>,
+    deadline: Instant,
     runtime: &tokio::runtime::Handle,
 ) {
+    let close = drive_sink_close(
+        Arc::clone(&name),
+        tx,
+        task,
+        Arc::clone(&state),
+        actor_state,
+        deadline,
+    );
+    spawn_sink_close_driver_future(name, state, close, runtime);
+}
+
+fn spawn_sink_close_driver_future<F>(
+    name: Arc<str>,
+    state: Arc<SinkCloseState>,
+    close: F,
+    runtime: &tokio::runtime::Handle,
+) where
+    F: std::future::Future<Output = SinkCloseOutcome> + Send + 'static,
+{
     let supervisor = runtime.spawn(async move {
-        let close = drive_sink_close(
-            Arc::clone(&name),
-            tx,
-            cancellation_policy,
-            handle,
-            Arc::clone(&state),
-        );
         if let Ok(outcome) = std::panic::AssertUnwindSafe(close).catch_unwind().await {
             state.finish(outcome);
         } else {
-            // The actor JoinHandle was inside the unwound future, so terminal completion is
-            // no longer provable. Fail closed: keep the generation fence permanently set.
             state.set_phase("terminal driver panic");
-            state.notify.notify_waiters();
-            tracing::error!(sink = %name, "sink terminal close driver panicked; replacement remains fenced");
+            state.finish(SinkCloseOutcome::Failure(Arc::from(format!(
+                "sink task '{name}' terminal close driver panicked"
+            ))));
+            tracing::error!(sink = %name, "sink terminal close driver panicked");
         }
     });
     drop(supervisor); // detached by design; shared state and the DB registry retain ownership
@@ -909,96 +1091,73 @@ async fn wait_for_sink_close(
 async fn drive_sink_close(
     name: Arc<str>,
     tx: SinkCommandTx,
-    cancellation_policy: ConnectorCancellationPolicy,
-    mut handle: JoinHandle<()>,
+    mut task: OwnedSinkTask,
     state: Arc<SinkCloseState>,
+    actor_state: Arc<SinkActorState>,
+    deadline: Instant,
 ) -> SinkCloseOutcome {
-    let first_deadline = operation_deadline(SINK_CLOSE_TIMEOUT);
+    if !actor_state.accepting.load(Ordering::Acquire) {
+        task.abort_actor();
+        let outcome = SinkCloseOutcome::Failure(Arc::from(format!(
+            "sink task '{name}' retired before close"
+        )));
+        state.publish_outcome(outcome.clone());
+        let _ = wait_for_sink_terminal(&name, &mut task).await;
+        return outcome;
+    }
     let (ack_tx, mut ack_rx) = oneshot::oneshot();
-    let mut command = SinkCommand {
-        deadline: first_deadline,
+    let command = SinkCommand {
+        deadline,
         operation: SinkOperation::Close { ack: ack_tx },
     };
 
-    loop {
-        state.set_phase("enqueue");
-        let deadline = if cancellation_policy == ConnectorCancellationPolicy::CompleteStarted {
-            operation_deadline(SINK_CLOSE_TIMEOUT)
-        } else {
-            first_deadline
-        };
-        command.deadline = deadline;
-        match tx
-            .send_with_timer(command, tokio::time::sleep_until(deadline))
-            .await
-        {
-            Ok(()) => break,
-            Err(SendTimeoutError::Disconnected(_)) => {
-                return finish_disconnected_sink_close(&name, cancellation_policy, handle).await;
-            }
-            Err(SendTimeoutError::Timeout(returned)) => {
-                if cancellation_policy == ConnectorCancellationPolicy::CancelSafe {
-                    handle.abort();
-                    let _ = handle.await;
-                    return SinkCloseOutcome::Failure(Arc::from(
-                        close_deadline_error(&name, "enqueue").to_string(),
-                    ));
-                }
-                tracing::warn!(
-                    sink = %name,
-                    "sink close enqueue is still blocked; retaining terminal ownership"
-                );
-                command = returned;
-            }
+    state.set_phase("enqueue");
+    match tx
+        .send_with_timer(command, tokio::time::sleep_until(deadline))
+        .await
+    {
+        Ok(()) => {}
+        Err(SendTimeoutError::Disconnected(_)) => {
+            return finish_disconnected_sink_close(&name, task, &state).await;
+        }
+        Err(SendTimeoutError::Timeout(_)) => {
+            task.abort_actor();
+            let outcome = SinkCloseOutcome::Failure(Arc::from(
+                close_deadline_error(&name, "enqueue").to_string(),
+            ));
+            state.publish_outcome(outcome.clone());
+            let _ = wait_for_sink_terminal(&name, &mut task).await;
+            return outcome;
         }
     }
 
     state.set_phase("acknowledgement");
-    let connector_result = if cancellation_policy == ConnectorCancellationPolicy::CompleteStarted {
-        match (&mut ack_rx).await {
-            Ok(result) => result,
-            Err(_) => Err(ConnectorError::ConnectionFailed(format!(
-                "sink task '{name}' dropped close acknowledgment"
-            ))),
-        }
-    } else {
-        match tokio::time::timeout_at(first_deadline, &mut ack_rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(ConnectorError::ConnectionFailed(format!(
-                "sink task '{name}' dropped close acknowledgment"
-            ))),
-            Err(_) => {
-                handle.abort();
-                let _ = handle.await;
-                return SinkCloseOutcome::Failure(Arc::from(
-                    close_deadline_error(&name, "acknowledgement").to_string(),
-                ));
-            }
+    let connector_result = match tokio::time::timeout_at(deadline, &mut ack_rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(ConnectorError::ConnectionFailed(format!(
+            "sink task '{name}' dropped close acknowledgment"
+        ))),
+        Err(_) => {
+            task.abort_actor();
+            let outcome = SinkCloseOutcome::Failure(Arc::from(
+                close_deadline_error(&name, "acknowledgement").to_string(),
+            ));
+            state.publish_outcome(outcome.clone());
+            let _ = wait_for_sink_terminal(&name, &mut task).await;
+            return outcome;
         }
     };
 
     state.set_phase("join");
-    let join_result = if cancellation_policy == ConnectorCancellationPolicy::CompleteStarted {
-        handle.await.map_err(|error| {
-            ConnectorError::Internal(format!(
-                "sink task '{name}' failed while joining after close: {error}"
-            ))
-        })
-    } else {
-        if let Ok(result) = tokio::time::timeout_at(first_deadline, &mut handle).await {
-            result.map_err(|error| {
-                ConnectorError::Internal(format!(
-                    "sink task '{name}' failed while joining after close: {error}"
-                ))
-            })
-        } else {
-            // CancelSafe is an audited promise that dropping the connector future cannot
-            // leave an external mutation in flight. The stable driver, rather than the
-            // public caller, owns the unbounded terminal observation after abort.
-            handle.abort();
-            let _ = handle.await;
-            Err(close_deadline_error(&name, "join"))
-        }
+    let Ok(join_result) =
+        tokio::time::timeout_at(deadline, wait_for_sink_terminal(&name, &mut task)).await
+    else {
+        task.abort_actor();
+        let outcome =
+            SinkCloseOutcome::Failure(Arc::from(close_deadline_error(&name, "join").to_string()));
+        state.publish_outcome(outcome.clone());
+        let _ = wait_for_sink_terminal(&name, &mut task).await;
+        return outcome;
     };
 
     match (connector_result, join_result) {
@@ -1012,18 +1171,33 @@ async fn drive_sink_close(
     }
 }
 
+async fn wait_for_sink_terminal(
+    name: &str,
+    task: &mut OwnedSinkTask,
+) -> Result<(), ConnectorError> {
+    match (&mut task.terminal_join).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(ConnectorError::Internal(format!(
+            "sink task '{name}' failed while joining after close: {error}"
+        ))),
+        Err(error) => Err(ConnectorError::Internal(format!(
+            "sink task '{name}' terminal supervisor failed: {error}"
+        ))),
+    }
+}
+
 async fn finish_disconnected_sink_close(
     name: &str,
-    cancellation_policy: ConnectorCancellationPolicy,
-    handle: JoinHandle<()>,
+    mut task: OwnedSinkTask,
+    state: &SinkCloseState,
 ) -> SinkCloseOutcome {
-    if cancellation_policy == ConnectorCancellationPolicy::CancelSafe {
-        handle.abort();
-    }
-    let _ = handle.await;
-    SinkCloseOutcome::Failure(Arc::from(format!(
+    task.abort_actor();
+    let outcome = SinkCloseOutcome::Failure(Arc::from(format!(
         "sink task '{name}' rejected close command: channel closed"
-    )))
+    )));
+    state.publish_outcome(outcome.clone());
+    let _ = wait_for_sink_terminal(name, &mut task).await;
+    outcome
 }
 
 struct SinkTaskInner {
@@ -1045,17 +1219,25 @@ struct SinkTaskInner {
 
 // In replay-required modes, `epoch_poisoned` rejects checkpoint Flush/PreCommit so no durable cut
 // can pass a dropped write. Local best-effort mode reports loss without permanently fencing state.
-async fn run_sink_task(inner: SinkTaskInner, epoch_poisoned: Arc<AtomicBool>) {
+async fn run_sink_task(
+    inner: SinkTaskInner,
+    epoch_poisoned: Arc<AtomicBool>,
+    actor_state: Arc<SinkActorState>,
+) {
     #[cfg(feature = "cluster")]
     if let Some(controller) = inner.process_authority.clone() {
-        run_process_fenced_sink_task(inner, epoch_poisoned, controller).await;
+        run_process_fenced_sink_task(inner, epoch_poisoned, controller, actor_state.as_ref()).await;
         return;
     }
 
-    run_local_sink_task(inner, epoch_poisoned).await;
+    run_local_sink_task(inner, epoch_poisoned, actor_state.as_ref()).await;
 }
 
-async fn run_local_sink_task(mut inner: SinkTaskInner, epoch_poisoned: Arc<AtomicBool>) {
+async fn run_local_sink_task(
+    mut inner: SinkTaskInner,
+    epoch_poisoned: Arc<AtomicBool>,
+    actor_state: &SinkActorState,
+) {
     let mut flush_timer = tokio::time::interval(inner.flush_interval);
     flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     flush_timer.tick().await; // skip the first immediate tick
@@ -1074,6 +1256,7 @@ async fn run_local_sink_task(mut inner: SinkTaskInner, epoch_poisoned: Arc<Atomi
                     cmd.deadline,
                     &mut current_epoch,
                     epoch_poisoned.as_ref(),
+                    actor_state,
                 )
                 .await;
                 if stop {
@@ -1081,7 +1264,10 @@ async fn run_local_sink_task(mut inner: SinkTaskInner, epoch_poisoned: Arc<Atomi
                 }
             }
             _ = flush_timer.tick() => {
-                flush_sink_periodically(&mut inner, current_epoch, epoch_poisoned.as_ref()).await;
+                if flush_sink_periodically(&mut inner, current_epoch, epoch_poisoned.as_ref()).await {
+                    actor_state.stop_admission();
+                    break;
+                }
             }
         }
     }
@@ -1092,6 +1278,7 @@ async fn run_process_fenced_sink_task(
     mut inner: SinkTaskInner,
     epoch_poisoned: Arc<AtomicBool>,
     controller: Arc<ClusterController>,
+    actor_state: &SinkActorState,
 ) {
     let mut flush_timer = tokio::time::interval(inner.flush_interval);
     flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1141,6 +1328,7 @@ async fn run_process_fenced_sink_task(
                     command.deadline,
                     &mut current_epoch,
                     epoch_poisoned.as_ref(),
+                    actor_state,
                 ).await;
                 if !controller.process_lease_is_live() {
                     terminate_after_process_authority_loss(
@@ -1156,11 +1344,15 @@ async fn run_process_fenced_sink_task(
                 }
             }
             _ = flush_timer.tick() => {
-                flush_sink_periodically(
+                let retire = flush_sink_periodically(
                     &mut inner,
                     current_epoch,
                     epoch_poisoned.as_ref(),
                 ).await;
+                if retire {
+                    actor_state.stop_admission();
+                    return;
+                }
                 if !controller.process_lease_is_live() {
                     terminate_after_process_authority_loss(
                         &mut inner,
@@ -1179,11 +1371,11 @@ async fn flush_sink_periodically(
     inner: &mut SinkTaskInner,
     current_epoch: u64,
     epoch_poisoned: &AtomicBool,
-) {
+) -> bool {
     if inner.contract.is_checkpoint_committable() {
-        return;
+        return false;
     }
-    if let Err(error) = bounded_connector_operation(
+    let (result, retire) = bounded_connector_operation(
         &inner.name,
         "periodic flush",
         operation_deadline(inner.write_timeout),
@@ -1192,8 +1384,8 @@ async fn flush_sink_periodically(
         inner.process_authority.clone(),
         || inner.sink.flush(),
     )
-    .await
-    {
+    .await;
+    if let Err(error) = result {
         record_flush_error(
             inner,
             current_epoch,
@@ -1202,12 +1394,13 @@ async fn flush_sink_periodically(
             epoch_poisoned,
         );
     }
+    retire
 }
 
 async fn close_disconnected_sink(inner: &mut SinkTaskInner) {
     tracing::debug!(sink = %inner.name, "Sink command channel closed");
     if !inner.contract.is_checkpoint_committable() {
-        if let Err(error) = bounded_connector_operation(
+        let (result, retire) = bounded_connector_operation(
             &inner.name,
             "flush on channel close",
             operation_deadline(inner.write_timeout),
@@ -1216,9 +1409,12 @@ async fn close_disconnected_sink(inner: &mut SinkTaskInner) {
             inner.process_authority.clone(),
             || inner.sink.flush(),
         )
-        .await
-        {
+        .await;
+        if let Err(error) = result {
             tracing::warn!(sink = %inner.name, %error, "Sink flush failed on channel close");
+        }
+        if retire {
+            return;
         }
     }
     #[cfg(feature = "cluster")]
@@ -1229,7 +1425,7 @@ async fn close_disconnected_sink(inner: &mut SinkTaskInner) {
     {
         return;
     }
-    if let Err(error) = bounded_connector_operation(
+    let (result, _) = bounded_connector_operation(
         &inner.name,
         "connector close",
         operation_deadline(SINK_CLOSE_TIMEOUT),
@@ -1238,8 +1434,8 @@ async fn close_disconnected_sink(inner: &mut SinkTaskInner) {
         inner.process_authority.clone(),
         || inner.sink.close(),
     )
-    .await
-    {
+    .await;
+    if let Err(error) = result {
         tracing::warn!(sink = %inner.name, %error, "Sink close failed on channel close");
     }
 }
@@ -1330,70 +1526,102 @@ async fn handle_sink_command(
     deadline: Instant,
     current_epoch: &mut u64,
     epoch_poisoned: &AtomicBool,
+    actor_state: &SinkActorState,
 ) -> bool {
+    let mut retire = false;
     match operation {
         SinkOperation::WriteBatch { batch } => {
-            handle_write_batch(inner, batch, deadline, *current_epoch, epoch_poisoned).await;
+            retire =
+                handle_write_batch(inner, batch, deadline, *current_epoch, epoch_poisoned).await;
         }
         SinkOperation::BeginEpoch { epoch, ack } => {
-            ack.send(begin_sink_epoch(inner, epoch, deadline, current_epoch, epoch_poisoned).await);
+            let (result, operation_retired) =
+                begin_sink_epoch(inner, epoch, deadline, current_epoch, epoch_poisoned).await;
+            if operation_retired {
+                actor_state.stop_admission();
+            }
+            ack.send(result);
+            retire = operation_retired;
         }
         SinkOperation::Flush { ack } => {
-            ack.send(flush_checkpoint_sink(inner, deadline, *current_epoch, epoch_poisoned).await);
+            let (result, operation_retired) =
+                flush_checkpoint_sink(inner, deadline, *current_epoch, epoch_poisoned).await;
+            if operation_retired {
+                actor_state.stop_admission();
+            }
+            ack.send(result);
+            retire = operation_retired;
         }
         SinkOperation::PreCommit { epoch, ack } => {
-            ack.send(pre_commit_sink(inner, epoch, deadline, epoch_poisoned).await);
+            let (result, operation_retired) =
+                pre_commit_sink(inner, epoch, deadline, epoch_poisoned).await;
+            if operation_retired {
+                actor_state.stop_admission();
+            }
+            ack.send(result);
+            retire = operation_retired;
         }
         SinkOperation::CommitAggregated { batch, ack } => {
             let cancellation_policy = inner.sink.cancellation_policy();
             let committer = inner.sink.as_coordinated_committer();
-            ack.send(
-                commit_aggregated_sink(
-                    &inner.name,
-                    committer,
-                    batch,
-                    deadline,
-                    cancellation_policy,
-                    #[cfg(feature = "cluster")]
-                    inner.process_authority.clone(),
-                )
-                .await,
-            );
+            let (result, operation_retired) = commit_aggregated_sink(
+                &inner.name,
+                committer,
+                batch,
+                deadline,
+                cancellation_policy,
+                #[cfg(feature = "cluster")]
+                inner.process_authority.clone(),
+            )
+            .await;
+            if operation_retired {
+                actor_state.stop_admission();
+            }
+            ack.send(result);
+            retire = operation_retired;
         }
         SinkOperation::CommittedCursor { namespace, ack } => {
             let cancellation_policy = inner.sink.cancellation_policy();
             let committer = inner.sink.as_coordinated_committer();
-            ack.send(
-                committed_cursor(
-                    &inner.name,
-                    committer,
-                    &namespace,
-                    deadline,
-                    cancellation_policy,
-                    #[cfg(feature = "cluster")]
-                    inner.process_authority.clone(),
-                )
-                .await,
-            );
+            let (result, operation_retired) = committed_cursor(
+                &inner.name,
+                committer,
+                &namespace,
+                deadline,
+                cancellation_policy,
+                #[cfg(feature = "cluster")]
+                inner.process_authority.clone(),
+            )
+            .await;
+            if operation_retired {
+                actor_state.stop_admission();
+            }
+            ack.send(result);
+            retire = operation_retired;
         }
         SinkOperation::RollbackEpoch { epoch, ack } => {
-            let result = handle_rollback_epoch(inner, epoch, deadline).await;
+            let (result, operation_retired) = handle_rollback_epoch(inner, epoch, deadline).await;
+            if operation_retired {
+                actor_state.stop_admission();
+            }
             ack.send(result);
+            retire = operation_retired;
         }
         SinkOperation::Sync { ack } => {
             ack.send(validate_sync_deadline(&inner.name, deadline));
         }
         SinkOperation::Close { ack } => {
-            // Queue residence is covered by the public close budget, but terminal cleanup owns
-            // its own budget once it reaches the actor. Reusing an expired enqueue timestamp
-            // would skip the final at-least-once flush after a CompleteStarted write drains.
-            let result = close_sink_connector(inner, operation_deadline(SINK_CLOSE_TIMEOUT)).await;
+            actor_state.stop_admission();
+            let result = close_sink_connector(inner, deadline).await;
             ack.send(result);
             tracing::debug!(sink = %inner.name, "Sink task closed");
             return true;
         }
     }
-    false
+    if retire {
+        actor_state.stop_admission();
+    }
+    retire
 }
 
 async fn begin_sink_epoch(
@@ -1402,8 +1630,8 @@ async fn begin_sink_epoch(
     deadline: Instant,
     current_epoch: &mut u64,
     epoch_poisoned: &AtomicBool,
-) -> Result<(), ConnectorError> {
-    let result = bounded_connector_operation(
+) -> (Result<(), ConnectorError>, bool) {
+    let (result, retire) = bounded_connector_operation(
         &inner.name,
         "begin_epoch",
         deadline,
@@ -1417,7 +1645,7 @@ async fn begin_sink_epoch(
         *current_epoch = epoch;
         epoch_poisoned.store(false, Ordering::Release);
     }
-    result
+    (result, retire)
 }
 
 async fn flush_checkpoint_sink(
@@ -1425,12 +1653,12 @@ async fn flush_checkpoint_sink(
     deadline: Instant,
     current_epoch: u64,
     epoch_poisoned: &AtomicBool,
-) -> Result<(), ConnectorError> {
+) -> (Result<(), ConnectorError>, bool) {
     // A write rejected before enqueue never reaches this actor. The shared poison bit is therefore
     // the durable-cut fence for at-least-once sinks and a race-safe actor-side recheck.
     let already_poisoned = epoch_poisoned.load(Ordering::Acquire);
-    let result = if already_poisoned {
-        Err(poisoned_epoch_error(&inner.name))
+    let (result, retire) = if already_poisoned {
+        (Err(poisoned_epoch_error(&inner.name)), false)
     } else {
         bounded_connector_operation(
             &inner.name,
@@ -1452,7 +1680,7 @@ async fn flush_checkpoint_sink(
             epoch_poisoned,
         );
     }
-    result
+    (result, retire)
 }
 
 async fn pre_commit_sink(
@@ -1460,9 +1688,9 @@ async fn pre_commit_sink(
     epoch: u64,
     deadline: Instant,
     epoch_poisoned: &AtomicBool,
-) -> Result<Option<Vec<u8>>, ConnectorError> {
+) -> (Result<Option<Vec<u8>>, ConnectorError>, bool) {
     if epoch_poisoned.load(Ordering::Acquire) {
-        Err(poisoned_epoch_error(&inner.name))
+        (Err(poisoned_epoch_error(&inner.name)), false)
     } else {
         bounded_connector_operation(
             &inner.name,
@@ -1484,7 +1712,7 @@ async fn commit_aggregated_sink(
     deadline: Instant,
     cancellation_policy: ConnectorCancellationPolicy,
     #[cfg(feature = "cluster")] process_authority: Option<Arc<ClusterController>>,
-) -> Result<(), ConnectorError> {
+) -> (Result<(), ConnectorError>, bool) {
     match committer {
         Some(committer) => {
             let context = CoordinatedCommitContext::new(deadline);
@@ -1499,10 +1727,13 @@ async fn commit_aggregated_sink(
             )
             .await
         }
-        None => Err(ConnectorError::InvalidState {
-            expected: "coordinated committer".into(),
-            actual: format!("sink '{sink_name}' is not coordinated"),
-        }),
+        None => (
+            Err(ConnectorError::InvalidState {
+                expected: "coordinated committer".into(),
+                actual: format!("sink '{sink_name}' is not coordinated"),
+            }),
+            false,
+        ),
     }
 }
 
@@ -1513,7 +1744,10 @@ async fn committed_cursor(
     deadline: Instant,
     cancellation_policy: ConnectorCancellationPolicy,
     #[cfg(feature = "cluster")] process_authority: Option<Arc<ClusterController>>,
-) -> Result<Option<CoordinatedCommitCursor>, ConnectorError> {
+) -> (
+    Result<Option<CoordinatedCommitCursor>, ConnectorError>,
+    bool,
+) {
     match committer {
         Some(committer) => {
             bounded_connector_operation(
@@ -1527,7 +1761,7 @@ async fn committed_cursor(
             )
             .await
         }
-        None => Ok(None),
+        None => (Ok(None), false),
     }
 }
 
@@ -1547,8 +1781,8 @@ async fn close_sink_connector(
     // open transaction. Weaker sinks must first land every queued write. While process authority
     // remains live, always call close even when flush fails so resources are not leaked.
     let cancellation_policy = inner.sink.cancellation_policy();
-    let flush_result = if inner.contract.is_checkpoint_committable() {
-        Ok(())
+    let (flush_result, flush_retired) = if inner.contract.is_checkpoint_committable() {
+        (Ok(()), false)
     } else {
         bounded_connector_operation(
             &inner.name,
@@ -1572,19 +1806,24 @@ async fn close_sink_connector(
             Err(error) => Err(error),
         };
     }
-    // A cancellation-unsafe flush may legitimately finish after the command's
-    // protocol deadline. Connector teardown is still mandatory and receives a
-    // fresh terminal budget rather than inheriting an already-expired instant.
-    let close_result = bounded_connector_operation(
-        &inner.name,
-        "connector close",
-        operation_deadline(SINK_CLOSE_TIMEOUT),
-        cancellation_policy,
-        #[cfg(feature = "cluster")]
-        inner.process_authority.clone(),
-        || inner.sink.close(),
-    )
-    .await;
+    if flush_retired {
+        return flush_result;
+    }
+    let close_result = if Instant::now() >= deadline {
+        Err(protocol_deadline_error(&inner.name, "connector close"))
+    } else {
+        bounded_connector_operation(
+            &inner.name,
+            "connector close",
+            deadline,
+            cancellation_policy,
+            #[cfg(feature = "cluster")]
+            inner.process_authority.clone(),
+            || inner.sink.close(),
+        )
+        .await
+        .0
+    };
     let result = match (flush_result, close_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
@@ -1637,6 +1876,7 @@ fn record_flush_error(
     });
 }
 
+#[allow(clippy::too_many_arguments)] // Copied fields avoid borrowing the actor across sink I/O.
 fn record_write_error(
     sink_name: &str,
     sink_id: &Arc<str>,
@@ -1673,90 +1913,21 @@ async fn handle_write_batch(
     deadline: Instant,
     current_epoch: u64,
     epoch_poisoned: &AtomicBool,
-) {
-    #[cfg(feature = "cluster")]
-    if let Some(controller) = inner.process_authority.clone() {
-        handle_process_fenced_write_batch(
-            inner,
-            batch,
-            deadline,
-            current_epoch,
-            epoch_poisoned,
-            controller,
-        )
-        .await;
-        return;
-    }
-
+) -> bool {
     let rows = batch.num_rows();
-    if deadline <= Instant::now() {
-        record_write_timeout(
-            &inner.name,
-            &inner.sink_id,
-            inner.write_timeout,
-            inner.requires_recovery_on_error,
-            &inner.event_tx,
-            current_epoch,
-            rows,
-            epoch_poisoned,
-        );
-        return;
-    }
     let cancellation_policy = inner.sink.cancellation_policy();
-    let write_result = {
-        let mut write = std::pin::pin!(inner.sink.write_batch(&batch));
-        match tokio::time::timeout_at(deadline, write.as_mut()).await {
-            Ok(result) => Some((result, false)),
-            Err(_elapsed)
-                if cancellation_policy == ConnectorCancellationPolicy::CompleteStarted =>
-            {
-                record_write_timeout(
-                    &inner.name,
-                    &inner.sink_id,
-                    inner.write_timeout,
-                    inner.requires_recovery_on_error,
-                    &inner.event_tx,
-                    current_epoch,
-                    rows,
-                    epoch_poisoned,
-                );
-                Some((write.await, true))
-            }
-            Err(_elapsed) => None,
-        }
-    };
-    let Some((write_result, timed_out)) = write_result else {
-        record_write_timeout(
-            &inner.name,
-            &inner.sink_id,
-            inner.write_timeout,
-            inner.requires_recovery_on_error,
-            &inner.event_tx,
-            current_epoch,
-            rows,
-            epoch_poisoned,
-        );
-        return;
-    };
-    if timed_out {
-        match write_result {
-            Ok(_) => tracing::warn!(
-                sink = %inner.name,
-                rows,
-                "sink write completed after its deadline"
-            ),
-            Err(error) => tracing::warn!(
-                sink = %inner.name,
-                rows,
-                %error,
-                "sink write failed after its deadline"
-            ),
-        }
-        return;
-    }
-    match write_result {
-        Ok(_) => {}
-        Err(e) => {
+    let outcome = await_connector_operation(
+        deadline,
+        #[cfg(feature = "cluster")]
+        inner.process_authority.clone(),
+        || inner.sink.write_batch(&batch),
+    )
+    .await;
+
+    match outcome {
+        ConnectorOperationOutcome::Completed(Ok(_)) => false,
+        ConnectorOperationOutcome::Completed(Err(error)) => {
+            let retire = error.is_outcome_unknown();
             record_write_error(
                 &inner.name,
                 &inner.sink_id,
@@ -1764,133 +1935,43 @@ async fn handle_write_batch(
                 &inner.event_tx,
                 current_epoch,
                 rows,
-                &e,
+                &error,
                 epoch_poisoned,
             );
+            retire
         }
-    }
-}
-
-#[cfg(feature = "cluster")]
-async fn handle_process_fenced_write_batch(
-    inner: &mut SinkTaskInner,
-    batch: RecordBatch,
-    deadline: Instant,
-    current_epoch: u64,
-    epoch_poisoned: &AtomicBool,
-    controller: Arc<ClusterController>,
-) {
-    let rows = batch.num_rows();
-    if !controller.process_lease_is_live() {
-        let error = process_authority_error(&inner.name, "write");
-        record_write_error(
-            &inner.name,
-            &inner.sink_id,
-            inner.requires_recovery_on_error,
-            &inner.event_tx,
-            current_epoch,
-            rows,
-            &error,
-            epoch_poisoned,
-        );
-        return;
-    }
-    if deadline <= Instant::now() {
-        record_write_timeout(
-            &inner.name,
-            &inner.sink_id,
-            inner.write_timeout,
-            inner.requires_recovery_on_error,
-            &inner.event_tx,
-            current_epoch,
-            rows,
-            epoch_poisoned,
-        );
-        return;
-    }
-
-    let cancellation_policy = inner.sink.cancellation_policy();
-    let sink_name = inner.name.clone();
-    let sink_id = Arc::clone(&inner.sink_id);
-    let requires_recovery = inner.requires_recovery_on_error;
-    let event_tx = inner.event_tx.clone();
-    let write_timeout = inner.write_timeout;
-    let started = AtomicBool::new(false);
-    let operation = async {
-        started.store(true, Ordering::Release);
-        inner.sink.write_batch(&batch).await
-    };
-    tokio::pin!(operation);
-
-    tokio::select! {
-        biased;
-        () = controller.wait_for_process_lease_loss() => {
-            let error = process_authority_error(&sink_name, "write");
+        ConnectorOperationOutcome::Deadline => {
+            record_write_timeout(
+                &inner.name,
+                &inner.sink_id,
+                inner.write_timeout,
+                inner.requires_recovery_on_error,
+                &inner.event_tx,
+                current_epoch,
+                rows,
+                epoch_poisoned,
+            );
+            cancellation_policy == ConnectorCancellationPolicy::RetireConnector
+        }
+        #[cfg(feature = "cluster")]
+        ConnectorOperationOutcome::ProcessAuthorityLost => {
+            let error = process_authority_error(&inner.name, "write");
             record_write_error(
-                &sink_name,
-                &sink_id,
-                requires_recovery,
-                &event_tx,
+                &inner.name,
+                &inner.sink_id,
+                inner.requires_recovery_on_error,
+                &inner.event_tx,
                 current_epoch,
                 rows,
                 &error,
                 epoch_poisoned,
             );
-            if cancellation_policy == ConnectorCancellationPolicy::CompleteStarted
-                && started.load(Ordering::Acquire)
-            {
-                let _ = operation.await;
-            }
-        }
-        () = tokio::time::sleep_until(deadline) => {
-            record_write_timeout(
-                &sink_name,
-                &sink_id,
-                write_timeout,
-                requires_recovery,
-                &event_tx,
-                current_epoch,
-                rows,
-                epoch_poisoned,
-            );
-            if cancellation_policy == ConnectorCancellationPolicy::CompleteStarted
-                && started.load(Ordering::Acquire)
-            {
-                match operation.await {
-                    Ok(_) => tracing::warn!(sink = %sink_name, rows, "sink write completed after its deadline"),
-                    Err(error) => tracing::warn!(sink = %sink_name, rows, %error, "sink write failed after its deadline"),
-                }
-            }
-        }
-        result = &mut operation => {
-            if !controller.process_lease_is_live() {
-                let error = process_authority_error(&sink_name, "write");
-                record_write_error(
-                    &sink_name,
-                    &sink_id,
-                    requires_recovery,
-                    &event_tx,
-                    current_epoch,
-                    rows,
-                    &error,
-                    epoch_poisoned,
-                );
-            } else if let Err(error) = result {
-                record_write_error(
-                    &sink_name,
-                    &sink_id,
-                    requires_recovery,
-                    &event_tx,
-                    current_epoch,
-                    rows,
-                    &error,
-                    epoch_poisoned,
-                );
-            }
+            true
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Copied fields avoid borrowing the actor across sink I/O.
 fn record_write_timeout(
     sink_name: &str,
     sink_id: &Arc<str>,
@@ -1924,8 +2005,8 @@ async fn handle_rollback_epoch(
     inner: &mut SinkTaskInner,
     epoch: u64,
     deadline: Instant,
-) -> Result<(), ConnectorError> {
-    let result = bounded_connector_operation(
+) -> (Result<(), ConnectorError>, bool) {
+    let (result, retire) = bounded_connector_operation(
         &inner.name,
         "rollback_epoch",
         deadline,
@@ -1941,7 +2022,7 @@ async fn handle_rollback_epoch(
             "[LDB-6004] Sink rollback failed"
         );
     }
-    result
+    (result, retire)
 }
 
 #[cfg(test)]
@@ -1950,7 +2031,7 @@ mod tests {
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use laminar_connectors::connector::{
-        SinkConsistency, SinkInputMode, SinkTopology, WriteResult,
+        ConnectorTaskOwner, SinkConsistency, SinkInputMode, SinkTopology, WriteResult,
     };
     use laminar_core::streaming::AsyncConsumer;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1958,11 +2039,118 @@ mod tests {
     #[cfg(feature = "cluster")]
     use crossfire::AsyncTxTrait as _;
 
+    fn supervise_test_actor<F>(
+        actor: F,
+        terminal_tasks: Option<ConnectorTaskTracker>,
+    ) -> (OwnedSinkTask, Arc<SinkActorState>)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let runtime = tokio::runtime::Handle::current();
+        let actor_state = Arc::new(SinkActorState::new());
+        let actor = spawn_sink_actor(&runtime, actor, Arc::clone(&actor_state));
+        let task = supervise_sink_task(actor, terminal_tasks, Arc::clone(&actor_state), &runtime);
+        (task, actor_state)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_blocking_completion_is_a_deadline_and_retires_the_generation() {
+        let deadline = Instant::now() + Duration::from_millis(5);
+        let (result, retire) = bounded_connector_operation(
+            "late-completion",
+            "flush",
+            deadline,
+            ConnectorCancellationPolicy::RetireConnector,
+            #[cfg(feature = "cluster")]
+            None,
+            || async {
+                std::thread::sleep(Duration::from_millis(25));
+                Ok::<_, ConnectorError>(())
+            },
+        )
+        .await;
+
+        assert!(result.unwrap_err().to_string().contains("deadline"));
+        assert!(retire);
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_blocking_completion_cannot_cross_the_process_fence() {
+        use laminar_core::cluster::control::{ClusterKv, InMemoryKv, LeaseDeadline};
+
+        let node = laminar_core::state::NodeId(91);
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
+        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
+        let controller = ClusterController::new(node, kv, None, members_rx);
+        controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+            .unwrap();
+
+        let outcome = await_connector_operation_fenced(
+            &controller,
+            Instant::now() + Duration::from_millis(5),
+            async {
+                std::thread::sleep(Duration::from_millis(25));
+                7_u64
+            },
+        )
+        .await;
+        assert!(matches!(outcome, ConnectorOperationOutcome::Deadline));
+    }
+
     /// Minimal mock sink for testing the task infrastructure.
     struct CountingSink {
         writes: Arc<AtomicU64>,
         flushes: Arc<AtomicU64>,
         schema: arrow::datatypes::SchemaRef,
+    }
+
+    struct AlternatingTrackerSink {
+        _first_owner: ConnectorTaskOwner,
+        _second_owner: ConnectorTaskOwner,
+        first_tracker: ConnectorTaskTracker,
+        second_tracker: ConnectorTaskTracker,
+        tracker_calls: Arc<AtomicU64>,
+        schema: arrow::datatypes::SchemaRef,
+    }
+
+    #[async_trait::async_trait]
+    impl SinkConnector for AlternatingTrackerSink {
+        fn terminal_task_tracker(&self) -> Option<ConnectorTaskTracker> {
+            let call = self.tracker_calls.fetch_add(1, Ordering::SeqCst);
+            Some(if call == 0 {
+                self.first_tracker.clone()
+            } else {
+                self.second_tracker.clone()
+            })
+        }
+
+        async fn open(
+            &mut self,
+            _config: &laminar_connectors::config::ConnectorConfig,
+        ) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
+        async fn write_batch(
+            &mut self,
+            _batch: &RecordBatch,
+        ) -> Result<WriteResult, ConnectorError> {
+            Ok(WriteResult::new(0, 0))
+        }
+
+        fn suggested_write_timeout(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        async fn close(&mut self) -> Result<(), ConnectorError> {
+            Ok(())
+        }
     }
 
     impl CountingSink {
@@ -2103,7 +2291,6 @@ mod tests {
         flushes: Arc<AtomicU64>,
         completions: Arc<AtomicU64>,
         cancellations: Arc<AtomicU64>,
-        gate: Arc<tokio::sync::Semaphore>,
     }
 
     #[cfg(feature = "cluster")]
@@ -2143,6 +2330,7 @@ mod tests {
             flush_interval: Duration::from_secs(60),
             write_timeout: Duration::from_secs(60),
             event_tx,
+            terminal_tasks: None,
             process_authority: Some(Arc::clone(&controller)),
         });
         AuthoritySinkProbe {
@@ -2153,7 +2341,6 @@ mod tests {
             flushes,
             completions,
             cancellations,
-            gate,
         }
     }
 
@@ -2171,15 +2358,7 @@ mod tests {
     #[cfg(feature = "cluster")]
     async fn wait_for_actor_exit(handle: &SinkTaskHandle) {
         tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let finished = handle
-                    .task
-                    .lock()
-                    .as_ref()
-                    .is_none_or(tokio::task::JoinHandle::is_finished);
-                if finished {
-                    break;
-                }
+            while !handle.actor_state.finished.load(Ordering::Acquire) {
                 tokio::task::yield_now().await;
             }
         })
@@ -2257,8 +2436,8 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[tokio::test]
-    async fn process_lease_loss_finishes_started_write_then_rejects_queued_commands() {
-        let mut probe = authority_sink_probe(33, ConnectorCancellationPolicy::CompleteStarted);
+    async fn process_lease_loss_retires_started_write_and_rejects_queued_commands() {
+        let mut probe = authority_sink_probe(33, ConnectorCancellationPolicy::RetireConnector);
         probe.handle.write_batch(test_batch()).await.unwrap();
         wait_for_connector_write(&probe.writes).await;
 
@@ -2268,20 +2447,6 @@ mod tests {
         wait_for_actor_queue(&probe.handle, 2).await;
 
         probe.controller.fence_process_lease();
-        tokio::task::yield_now().await;
-        assert!(
-            !probe
-                .handle
-                .task
-                .lock()
-                .as_ref()
-                .is_none_or(tokio::task::JoinHandle::is_finished),
-            "complete-started write was dropped on process lease loss"
-        );
-        assert_eq!(probe.completions.load(Ordering::SeqCst), 0);
-        assert_eq!(probe.cancellations.load(Ordering::SeqCst), 0);
-
-        probe.gate.add_permits(1);
         wait_for_actor_exit(&probe.handle).await;
 
         let error = queued_flush.await.unwrap().unwrap_err().to_string();
@@ -2290,8 +2455,8 @@ mod tests {
         receive_authority_write_error(&mut probe.events).await;
         assert_eq!(probe.writes.load(Ordering::SeqCst), 1);
         assert_eq!(probe.flushes.load(Ordering::SeqCst), 0);
-        assert_eq!(probe.completions.load(Ordering::SeqCst), 1);
-        assert_eq!(probe.cancellations.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.completions.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.cancellations.load(Ordering::SeqCst), 1);
         assert!(probe.handle.epoch_poisoned.load(Ordering::Acquire));
     }
 
@@ -2449,6 +2614,7 @@ mod tests {
             flush_interval: Duration::from_secs(5),
             write_timeout: Duration::from_secs(5),
             event_tx,
+            terminal_tasks: None,
             #[cfg(feature = "cluster")]
             process_authority: None,
         });
@@ -2472,6 +2638,7 @@ mod tests {
             flush_interval: DEFAULT_FLUSH_INTERVAL,
             write_timeout,
             event_tx,
+            terminal_tasks: None,
             #[cfg(feature = "cluster")]
             process_authority: None,
         });
@@ -2488,6 +2655,64 @@ mod tests {
         handle.close().await.unwrap();
 
         assert_eq!(writes.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn spawn_uses_the_exact_captured_connector_tracker() {
+        let (first_owner, first_tracker) = ConnectorTaskOwner::new();
+        let first_guard = first_owner.track().expect("first tracker generation");
+        let (second_owner, second_tracker) = ConnectorTaskOwner::new();
+        let second_guard = second_owner.track().expect("second tracker generation");
+        let tracker_calls = Arc::new(AtomicU64::new(0));
+        let connector: Box<dyn SinkConnector> = Box::new(AlternatingTrackerSink {
+            _first_owner: first_owner,
+            _second_owner: second_owner,
+            first_tracker,
+            second_tracker,
+            tracker_calls: Arc::clone(&tracker_calls),
+            schema: Arc::new(Schema::empty()),
+        });
+        let terminal_tasks = connector.terminal_task_tracker();
+        let (event_tx, _events) =
+            laminar_core::streaming::channel::channel::<SinkEvent>(SINK_EVENT_CHANNEL_CAPACITY);
+
+        let handle = SinkTaskHandle::spawn(SinkTaskConfig {
+            name: "exact-tracker".into(),
+            sink_id: Arc::from("exact-tracker"),
+            connector,
+            contract: at_least_once_contract(),
+            requires_recovery_on_error: true,
+            channel_capacity: DEFAULT_CHANNEL_CAPACITY,
+            flush_interval: DEFAULT_FLUSH_INTERVAL,
+            write_timeout: Duration::from_secs(5),
+            event_tx,
+            terminal_tasks,
+            #[cfg(feature = "cluster")]
+            process_authority: None,
+        });
+        assert_eq!(tracker_calls.load(Ordering::SeqCst), 1);
+
+        let close = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.close().await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !handle.actor_state.finished.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("sink actor did not finish close");
+        assert!(!close.is_finished());
+
+        drop(first_guard);
+        tokio::time::timeout(Duration::from_secs(1), close)
+            .await
+            .expect("captured tracker did not release terminal supervision")
+            .expect("close task panicked")
+            .expect("sink close failed");
+        assert_eq!(tracker_calls.load(Ordering::SeqCst), 1);
+        drop(second_guard);
     }
 
     #[tokio::test]
@@ -2533,10 +2758,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SinkConnector for GatedCloseSink {
-        fn cancellation_policy(&self) -> ConnectorCancellationPolicy {
-            ConnectorCancellationPolicy::CompleteStarted
-        }
-
         async fn open(
             &mut self,
             _config: &laminar_connectors::config::ConnectorConfig,
@@ -2626,10 +2847,6 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SinkConnector for GatedWriteSink {
-        fn cancellation_policy(&self) -> ConnectorCancellationPolicy {
-            ConnectorCancellationPolicy::CompleteStarted
-        }
-
         async fn open(
             &mut self,
             _config: &laminar_connectors::config::ConnectorConfig,
@@ -2683,6 +2900,7 @@ mod tests {
             flush_interval: DEFAULT_FLUSH_INTERVAL,
             write_timeout: Duration::from_secs(5),
             event_tx,
+            terminal_tasks: None,
             #[cfg(feature = "cluster")]
             process_authority: None,
         });
@@ -2732,6 +2950,7 @@ mod tests {
             flush_interval: Duration::from_millis(250),
             write_timeout: Duration::from_secs(5),
             event_tx,
+            terminal_tasks: None,
             #[cfg(feature = "cluster")]
             process_authority: None,
         });
@@ -2846,6 +3065,7 @@ mod tests {
             flush_interval: Duration::from_millis(5),
             write_timeout: Duration::from_secs(5),
             event_tx,
+            terminal_tasks: None,
             #[cfg(feature = "cluster")]
             process_authority: None,
         });
@@ -3065,7 +3285,117 @@ mod tests {
         }
     }
 
-    struct CompleteStartedSink {
+    struct LateBlockingWriteSink {
+        schema: arrow::datatypes::SchemaRef,
+    }
+
+    #[async_trait::async_trait]
+    impl SinkConnector for LateBlockingWriteSink {
+        async fn open(
+            &mut self,
+            _config: &laminar_connectors::config::ConnectorConfig,
+        ) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
+        async fn write_batch(
+            &mut self,
+            _batch: &RecordBatch,
+        ) -> Result<WriteResult, ConnectorError> {
+            std::thread::sleep(Duration::from_millis(25));
+            Ok(WriteResult::new(1, 0))
+        }
+
+        async fn close(&mut self) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn suggested_write_timeout(&self) -> Duration {
+            Duration::from_millis(5)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_blocking_write_is_a_timeout_and_retires_the_actor() {
+        let sink = LateBlockingWriteSink {
+            schema: Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)])),
+        };
+        let (handle, mut events) =
+            spawn_with_defaults("late-write", Box::new(sink), Duration::from_millis(5));
+
+        handle.write_batch(test_batch()).await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("late write did not report its deadline")
+            .expect("sink event channel closed unexpectedly");
+
+        assert!(matches!(
+            event,
+            SinkEvent::WriteTimeout { sink_id, rows: 3, .. } if &*sink_id == "late-write"
+        ));
+        assert!(
+            handle
+                .wait_terminal_until(Instant::now() + Duration::from_secs(1))
+                .await,
+            "late write did not retire its connector generation"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_late_blocking_write_cannot_cross_its_deadline() {
+        use laminar_core::cluster::control::{ClusterKv, InMemoryKv, LeaseDeadline};
+
+        let node = laminar_core::state::NodeId(92);
+        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
+        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(node, kv, None, members_rx));
+        controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+            .unwrap();
+        let sink = LateBlockingWriteSink {
+            schema: Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)])),
+        };
+        let (event_tx, mut events) =
+            laminar_core::streaming::channel::channel::<SinkEvent>(SINK_EVENT_CHANNEL_CAPACITY);
+        let handle = SinkTaskHandle::spawn(SinkTaskConfig {
+            name: "cluster-late-write".into(),
+            sink_id: Arc::from("cluster-late-write"),
+            connector: Box::new(sink),
+            contract: at_least_once_contract(),
+            requires_recovery_on_error: true,
+            channel_capacity: DEFAULT_CHANNEL_CAPACITY,
+            flush_interval: DEFAULT_FLUSH_INTERVAL,
+            write_timeout: Duration::from_millis(5),
+            event_tx,
+            terminal_tasks: None,
+            process_authority: Some(controller),
+        });
+
+        handle.write_batch(test_batch()).await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("cluster late write did not report its deadline")
+            .expect("sink event channel closed unexpectedly");
+
+        assert!(matches!(
+            event,
+            SinkEvent::WriteTimeout { sink_id, rows: 3, .. }
+                if &*sink_id == "cluster-late-write"
+        ));
+        assert!(
+            handle
+                .wait_terminal_until(Instant::now() + Duration::from_secs(1))
+                .await,
+            "cluster late write did not retire its connector generation"
+        );
+    }
+
+    struct RetiredWriteSink {
         schema: arrow::datatypes::SchemaRef,
         completed: Arc<AtomicBool>,
         flushes: Arc<AtomicU64>,
@@ -3073,9 +3403,9 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl SinkConnector for CompleteStartedSink {
+    impl SinkConnector for RetiredWriteSink {
         fn cancellation_policy(&self) -> ConnectorCancellationPolicy {
-            ConnectorCancellationPolicy::CompleteStarted
+            ConnectorCancellationPolicy::RetireConnector
         }
 
         async fn open(
@@ -3114,87 +3444,194 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cancellation_unsafe_write_is_finished_after_timeout_before_actor_reuse() {
+    async fn timed_out_write_retires_actor_without_late_completion_or_cleanup() {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
         let completed = Arc::new(AtomicBool::new(false));
         let flushes = Arc::new(AtomicU64::new(0));
         let closed = Arc::new(AtomicBool::new(false));
-        let sink = CompleteStartedSink {
+        let sink = RetiredWriteSink {
             schema,
             completed: Arc::clone(&completed),
             flushes: Arc::clone(&flushes),
             closed: Arc::clone(&closed),
         };
-        let (handle, events) = spawn_with_defaults(
-            "complete-started",
-            Box::new(sink),
-            Duration::from_millis(50),
-        );
+        let (handle, events) =
+            spawn_with_defaults("retired-write", Box::new(sink), Duration::from_millis(50));
 
         handle.write_batch(test_batch()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(matches!(
             events.try_recv(),
-            Ok(SinkEvent::WriteTimeout { sink_id, .. }) if &*sink_id == "complete-started"
+            Ok(SinkEvent::WriteTimeout { sink_id, .. }) if &*sink_id == "retired-write"
         ));
         assert!(!completed.load(Ordering::Acquire));
+        assert!(
+            !handle.has_unresolved_task(),
+            "the retired actor must terminate after dropping the overdue write"
+        );
 
         tokio::time::advance(Duration::from_secs(60)).await;
         tokio::task::yield_now().await;
-        assert!(completed.load(Ordering::Acquire));
-        handle.close().await.unwrap();
-        assert_eq!(
-            flushes.load(Ordering::Acquire),
-            2,
-            "the overdue periodic flush and terminal close flush must both complete"
-        );
-        assert!(closed.load(Ordering::Acquire));
+        assert!(!completed.load(Ordering::Acquire));
+        assert_eq!(flushes.load(Ordering::Acquire), 0);
+        assert!(!closed.load(Ordering::Acquire));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn close_timeout_retains_complete_started_write_until_a_terminal_retry() {
-        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
-        let completed = Arc::new(AtomicBool::new(false));
+    struct UnknownOutcomeSink {
+        schema: arrow::datatypes::SchemaRef,
+        flushes: Arc<AtomicU64>,
+        closes: Arc<AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl SinkConnector for UnknownOutcomeSink {
+        fn cancellation_policy(&self) -> ConnectorCancellationPolicy {
+            ConnectorCancellationPolicy::CancelSafe
+        }
+
+        async fn open(
+            &mut self,
+            _config: &laminar_connectors::config::ConnectorConfig,
+        ) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
+        async fn write_batch(
+            &mut self,
+            _batch: &RecordBatch,
+        ) -> Result<WriteResult, ConnectorError> {
+            Err(ConnectorError::outcome_unknown(
+                "remote acknowledgement was lost",
+                true,
+            ))
+        }
+
+        async fn flush(&mut self) -> Result<(), ConnectorError> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn close(&mut self) -> Result<(), ConnectorError> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn suggested_write_timeout(&self) -> Duration {
+            Duration::from_secs(5)
+        }
+    }
+
+    #[tokio::test]
+    async fn connector_reported_unknown_outcome_retires_even_cancel_safe_generation() {
         let flushes = Arc::new(AtomicU64::new(0));
-        let closed = Arc::new(AtomicBool::new(false));
-        let sink = CompleteStartedSink {
-            schema,
-            completed: Arc::clone(&completed),
+        let closes = Arc::new(AtomicU64::new(0));
+        let sink = UnknownOutcomeSink {
+            schema: Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)])),
             flushes: Arc::clone(&flushes),
-            closed: Arc::clone(&closed),
+            closes: Arc::clone(&closes),
         };
-        let (handle, _events) = spawn_with_defaults(
-            "complete-started-close",
-            Box::new(sink),
-            Duration::from_millis(50),
-        );
+        let (handle, events) =
+            spawn_with_defaults("unknown-outcome", Box::new(sink), Duration::from_secs(5));
 
         handle.write_batch(test_batch()).await.unwrap();
-        tokio::task::yield_now().await;
-        let error = handle
-            .close()
-            .await
-            .expect_err("outer close budget must expire while the write completes");
-        assert!(error.to_string().contains("acknowledgement"), "{error}");
-        assert!(!completed.load(Ordering::Acquire));
-        assert!(!closed.load(Ordering::Acquire));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.has_unresolved_task() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retired sink terminal proof did not settle");
+        assert!(!handle.has_unresolved_task());
+        assert!(matches!(
+            events.try_recv(),
+            Ok(SinkEvent::WriteError { sink_id, error, .. })
+                if &*sink_id == "unknown-outcome" && error.contains("outcome unknown")
+        ));
+        let close_error = handle.close().await.unwrap_err().to_string();
+        assert!(
+            close_error.contains("retired before close"),
+            "{close_error}"
+        );
+        assert_eq!(flushes.load(Ordering::SeqCst), 0);
+        assert_eq!(closes.load(Ordering::SeqCst), 0);
+    }
 
-        tokio::time::advance(Duration::from_secs(60)).await;
-        tokio::task::yield_now().await;
-        assert!(completed.load(Ordering::Acquire));
+    struct UnknownProtocolSink {
+        schema: arrow::datatypes::SchemaRef,
+        closes: Arc<AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl SinkConnector for UnknownProtocolSink {
+        fn cancellation_policy(&self) -> ConnectorCancellationPolicy {
+            ConnectorCancellationPolicy::CancelSafe
+        }
+
+        async fn open(
+            &mut self,
+            _config: &laminar_connectors::config::ConnectorConfig,
+        ) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
+        async fn write_batch(
+            &mut self,
+            _batch: &RecordBatch,
+        ) -> Result<WriteResult, ConnectorError> {
+            Ok(WriteResult::new(1, 0))
+        }
+
+        async fn flush(&mut self) -> Result<(), ConnectorError> {
+            Err(ConnectorError::outcome_unknown(
+                "flush acknowledgement was lost",
+                true,
+            ))
+        }
+
+        async fn close(&mut self) -> Result<(), ConnectorError> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn suggested_write_timeout(&self) -> Duration {
+            Duration::from_secs(5)
+        }
+    }
+
+    #[tokio::test]
+    async fn acked_unknown_protocol_outcome_is_reported_before_actor_retirement() {
+        let closes = Arc::new(AtomicU64::new(0));
+        let sink = UnknownProtocolSink {
+            schema: Arc::new(Schema::empty()),
+            closes: Arc::clone(&closes),
+        };
+        let (handle, _events) =
+            spawn_with_defaults("unknown-flush", Box::new(sink), Duration::from_secs(5));
+
+        let error = handle.flush().await.unwrap_err();
+        assert!(error.is_outcome_unknown(), "{error}");
+        assert!(error.to_string().contains("flush acknowledgement was lost"));
+        for _ in 0..100 {
+            if !handle.has_unresolved_task() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(!handle.has_unresolved_task());
+        let close_error = handle.close().await.unwrap_err().to_string();
         assert!(
-            closed.load(Ordering::Acquire),
-            "connector close was skipped after the original command deadline expired"
+            close_error.contains("retired before close"),
+            "{close_error}"
         );
-        let flush_count = flushes.load(Ordering::Acquire);
-        assert!(
-            (1..=2).contains(&flush_count),
-            "late buffered writes require a terminal flush and may first observe one overdue periodic flush; got {flush_count}"
-        );
-        handle
-            .close()
-            .await
-            .expect("terminal retry must join the retained task");
+        assert_eq!(closes.load(Ordering::SeqCst), 0);
     }
 
     /// A slow write holds the actor while a following protocol command waits in the queue.
@@ -3358,6 +3795,7 @@ mod tests {
             flush_interval: DEFAULT_FLUSH_INTERVAL,
             write_timeout: Duration::from_millis(100),
             event_tx,
+            terminal_tasks: None,
             #[cfg(feature = "cluster")]
             process_authority: None,
         });
@@ -3450,6 +3888,76 @@ mod tests {
         }
     }
 
+    struct CloseDeadlineSink {
+        schema: arrow::datatypes::SchemaRef,
+        close_calls: Arc<AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl SinkConnector for CloseDeadlineSink {
+        fn cancellation_policy(&self) -> ConnectorCancellationPolicy {
+            ConnectorCancellationPolicy::CancelSafe
+        }
+
+        async fn open(
+            &mut self,
+            _config: &laminar_connectors::config::ConnectorConfig,
+        ) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
+        async fn write_batch(
+            &mut self,
+            _batch: &RecordBatch,
+        ) -> Result<WriteResult, ConnectorError> {
+            Ok(WriteResult::new(1, 0))
+        }
+
+        async fn flush(&mut self) -> Result<(), ConnectorError> {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(())
+        }
+
+        async fn close(&mut self) -> Result<(), ConnectorError> {
+            self.close_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn suggested_write_timeout(&self) -> Duration {
+            Duration::from_secs(5)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_uses_one_deadline_and_never_starts_late_connector_close() {
+        let close_calls = Arc::new(AtomicU64::new(0));
+        let sink = CloseDeadlineSink {
+            schema: Arc::new(Schema::empty()),
+            close_calls: Arc::clone(&close_calls),
+        };
+        let (handle, _events) =
+            spawn_with_defaults("close-deadline", Box::new(sink), Duration::from_secs(5));
+        let started = Instant::now();
+        let admission = handle.admission.lock().await;
+        let close_handle = handle.clone();
+        let close = tokio::spawn(async move { close_handle.close().await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        drop(admission);
+
+        close
+            .await
+            .unwrap()
+            .expect_err("shutdown flush must consume the one close deadline");
+
+        assert_eq!(Instant::now() - started, SINK_CLOSE_TIMEOUT);
+        assert_eq!(close_calls.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn protocol_connector_operation_uses_configured_budget() {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
@@ -3466,6 +3974,7 @@ mod tests {
             flush_interval: DEFAULT_FLUSH_INTERVAL,
             write_timeout: Duration::from_millis(25),
             event_tx,
+            terminal_tasks: None,
             #[cfg(feature = "cluster")]
             process_authority: None,
         });
@@ -3492,6 +4001,7 @@ mod tests {
             flush_interval: DEFAULT_FLUSH_INTERVAL,
             write_timeout: Duration::from_secs(5),
             event_tx,
+            terminal_tasks: None,
             #[cfg(feature = "cluster")]
             process_authority: None,
         });
@@ -3561,6 +4071,8 @@ mod tests {
         .await
         .unwrap();
         let epoch_poisoned = Arc::new(AtomicBool::new(false));
+        let (task, actor_state) = supervise_test_actor(async {}, None);
+        let terminal_state = Arc::clone(&task.terminal_state);
         let handle = SinkTaskHandle {
             name: Arc::from("saturated"),
             sink_id: Arc::from("saturated"),
@@ -3568,11 +4080,12 @@ mod tests {
             contract: at_least_once_contract(),
             requires_recovery_on_error: true,
             write_timeout,
-            cancellation_policy: ConnectorCancellationPolicy::CancelSafe,
             closing: Arc::new(AtomicBool::new(false)),
             admission: Arc::new(tokio::sync::Mutex::new(())),
-            task: Arc::new(parking_lot::Mutex::new(Some(tokio::spawn(async {})))),
+            task: Arc::new(parking_lot::Mutex::new(Some(task))),
             close_state: Arc::new(SinkCloseState::new()),
+            terminal_state,
+            actor_state,
             runtime: tokio::runtime::Handle::current(),
             event_tx,
             epoch_poisoned: Arc::clone(&epoch_poisoned),
@@ -3618,7 +4131,10 @@ mod tests {
         let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let task_started = Arc::clone(&started);
         let task_gate = Arc::clone(&gate);
+        let actor_state = Arc::new(SinkActorState::new());
+        let actor_lifetime = SinkActorLifetime(Arc::clone(&actor_state));
         let task = tokio::task::spawn_blocking(move || {
+            let _lifetime = actor_lifetime;
             task_started.store(true, Ordering::Release);
             let (lock, released) = &*task_gate;
             let mut ready = lock.lock().unwrap();
@@ -3630,6 +4146,13 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
+        let task = supervise_sink_task(
+            task,
+            None,
+            Arc::clone(&actor_state),
+            &tokio::runtime::Handle::current(),
+        );
+        let terminal_state = Arc::clone(&task.terminal_state);
         let handle = SinkTaskHandle {
             name: Arc::from("uncooperative-cancel-safe"),
             sink_id: Arc::from("uncooperative-cancel-safe"),
@@ -3637,11 +4160,12 @@ mod tests {
             contract: at_least_once_contract(),
             requires_recovery_on_error: true,
             write_timeout: Duration::from_secs(1),
-            cancellation_policy: ConnectorCancellationPolicy::CancelSafe,
             closing: Arc::new(AtomicBool::new(false)),
             admission: Arc::new(tokio::sync::Mutex::new(())),
             task: Arc::new(parking_lot::Mutex::new(Some(task))),
             close_state: Arc::new(SinkCloseState::new()),
+            terminal_state,
+            actor_state,
             runtime: tokio::runtime::Handle::current(),
             event_tx,
             epoch_poisoned: Arc::new(AtomicBool::new(false)),
@@ -3674,8 +4198,282 @@ mod tests {
             .await
             .expect_err("terminal timeout result must persist after the actor exits");
         assert!(repeated.to_string().contains("enqueue"), "{repeated}");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.has_unresolved_task() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal supervisor did not observe the released blocking actor");
         assert!(!handle.has_unresolved_task());
         drop(rx);
+    }
+
+    #[tokio::test]
+    async fn connector_child_task_holds_replacement_fence_after_actor_exit() {
+        let (owner, tracker) = ConnectorTaskOwner::new();
+        let guard = owner.track().expect("terminal task owner must be live");
+        drop(owner);
+
+        let (event_tx, _events) =
+            laminar_core::streaming::channel::channel::<SinkEvent>(SINK_EVENT_CHANNEL_CAPACITY);
+        let (tx, rx) = mpsc::bounded_async::<SinkCommand>(1);
+        drop(rx);
+        let runtime = tokio::runtime::Handle::current();
+        let (task, actor_state) = supervise_test_actor(async {}, Some(tracker));
+        let terminal_state = Arc::clone(&task.terminal_state);
+        let handle = SinkTaskHandle {
+            name: Arc::from("terminal-child"),
+            sink_id: Arc::from("terminal-child"),
+            tx,
+            contract: at_least_once_contract(),
+            requires_recovery_on_error: true,
+            write_timeout: Duration::from_secs(1),
+            closing: Arc::new(AtomicBool::new(false)),
+            admission: Arc::new(tokio::sync::Mutex::new(())),
+            task: Arc::new(parking_lot::Mutex::new(Some(task))),
+            close_state: Arc::new(SinkCloseState::new()),
+            terminal_state,
+            actor_state,
+            runtime,
+            event_tx,
+            epoch_poisoned: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "cluster")]
+            process_authority: None,
+        };
+
+        while !handle.actor_state.finished.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+
+        let error = handle
+            .close()
+            .await
+            .expect_err("retired actor must fail close");
+        assert!(
+            error.to_string().contains("retired before close"),
+            "{error}"
+        );
+        assert!(handle.has_unresolved_task());
+
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.has_unresolved_task() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal child did not release replacement fence");
+    }
+
+    #[test]
+    fn abort_before_first_poll_drops_sink_actor_before_publishing_terminal() {
+        struct DropProbe {
+            terminal: Arc<parking_lot::Mutex<Option<Arc<SinkActorState>>>>,
+            dropped: Arc<AtomicBool>,
+            terminal_was_finished: Arc<AtomicBool>,
+        }
+
+        impl std::future::Future for DropProbe {
+            type Output = ();
+
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _context: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Self::Output> {
+                panic!("sink actor was polled before its immediate abort");
+            }
+        }
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                let terminal = self
+                    .terminal
+                    .lock()
+                    .clone()
+                    .expect("terminal state must be installed before abort");
+                self.terminal_was_finished
+                    .store(terminal.finished.load(Ordering::Acquire), Ordering::Release);
+                self.dropped.store(true, Ordering::Release);
+            }
+        }
+
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            let terminal_slot = Arc::new(parking_lot::Mutex::new(None));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let terminal_was_finished = Arc::new(AtomicBool::new(false));
+            let terminal = Arc::new(SinkActorState::new());
+            let join = spawn_sink_actor(
+                &tokio::runtime::Handle::current(),
+                DropProbe {
+                    terminal: Arc::clone(&terminal_slot),
+                    dropped: Arc::clone(&dropped),
+                    terminal_was_finished: Arc::clone(&terminal_was_finished),
+                },
+                Arc::clone(&terminal),
+            );
+            *terminal_slot.lock() = Some(Arc::clone(&terminal));
+
+            join.abort();
+            assert!(join
+                .await
+                .expect_err("the unpolled sink actor must be cancelled")
+                .is_cancelled());
+            assert!(dropped.load(Ordering::Acquire));
+            assert!(!terminal_was_finished.load(Ordering::Acquire));
+            assert!(terminal.finished.load(Ordering::Acquire));
+        });
+    }
+
+    #[tokio::test]
+    async fn cancelled_terminal_supervisor_cannot_publish_false_terminal() {
+        let (owner, tracker) = ConnectorTaskOwner::new();
+        let guard = owner.track().expect("live connector child");
+        drop(owner);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (task, actor_state) = supervise_test_actor(
+            async move {
+                let _ = release_rx.await;
+            },
+            Some(tracker),
+        );
+        task.terminal_join.abort();
+        let terminal_state = Arc::clone(&task.terminal_state);
+        let (event_tx, _events) =
+            laminar_core::streaming::channel::channel::<SinkEvent>(SINK_EVENT_CHANNEL_CAPACITY);
+        let (tx, _rx) = mpsc::bounded_async::<SinkCommand>(1);
+        let handle = SinkTaskHandle {
+            name: Arc::from("cancelled-terminal-supervisor"),
+            sink_id: Arc::from("cancelled-terminal-supervisor"),
+            tx,
+            contract: at_least_once_contract(),
+            requires_recovery_on_error: true,
+            write_timeout: Duration::from_secs(1),
+            closing: Arc::new(AtomicBool::new(false)),
+            admission: Arc::new(tokio::sync::Mutex::new(())),
+            task: Arc::new(parking_lot::Mutex::new(Some(task))),
+            close_state: Arc::new(SinkCloseState::new()),
+            terminal_state,
+            actor_state,
+            runtime: tokio::runtime::Handle::current(),
+            event_tx,
+            epoch_poisoned: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "cluster")]
+            process_authority: None,
+        };
+
+        assert!(handle.has_unresolved_task());
+        assert!(
+            !handle
+                .wait_terminal_until(Instant::now() + Duration::from_millis(20))
+                .await,
+            "supervisor cancellation must not substitute for actor exit"
+        );
+
+        let _ = release_tx.send(());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !handle.actor_state.finished.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actor did not exit after release");
+        assert!(handle.has_unresolved_task());
+        assert!(
+            !handle
+                .wait_terminal_until(Instant::now() + Duration::from_millis(20))
+                .await,
+            "actor exit must not substitute for connector-child termination"
+        );
+
+        drop(guard);
+        assert!(
+            handle
+                .wait_terminal_until(Instant::now() + Duration::from_secs(1))
+                .await
+        );
+        assert!(!handle.has_unresolved_task());
+    }
+
+    #[tokio::test]
+    async fn close_driver_panic_is_sticky_but_terminal_proof_remains_observable() {
+        let (owner, tracker) = ConnectorTaskOwner::new();
+        let guard = owner.track().expect("live connector child");
+        drop(owner);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let runtime = tokio::runtime::Handle::current();
+        let (task, actor_state) = supervise_test_actor(
+            async move {
+                let _ = release_rx.await;
+            },
+            Some(tracker),
+        );
+        let terminal_state = Arc::clone(&task.terminal_state);
+        let (event_tx, _events) =
+            laminar_core::streaming::channel::channel::<SinkEvent>(SINK_EVENT_CHANNEL_CAPACITY);
+        let (tx, _rx) = mpsc::bounded_async::<SinkCommand>(1);
+        let handle = SinkTaskHandle {
+            name: Arc::from("panicked-close-driver"),
+            sink_id: Arc::from("panicked-close-driver"),
+            tx,
+            contract: at_least_once_contract(),
+            requires_recovery_on_error: true,
+            write_timeout: Duration::from_secs(1),
+            closing: Arc::new(AtomicBool::new(true)),
+            admission: Arc::new(tokio::sync::Mutex::new(())),
+            task: Arc::new(parking_lot::Mutex::new(None)),
+            close_state: Arc::new(SinkCloseState::new()),
+            terminal_state,
+            actor_state,
+            runtime: runtime.clone(),
+            event_tx,
+            epoch_poisoned: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "cluster")]
+            process_authority: None,
+        };
+        let state = Arc::clone(&handle.close_state);
+        spawn_sink_close_driver_future(
+            Arc::clone(&handle.name),
+            Arc::clone(&state),
+            async move {
+                let _task = task;
+                panic!("injected terminal driver panic");
+                #[allow(unreachable_code)]
+                SinkCloseOutcome::Success
+            },
+            &runtime,
+        );
+
+        let error = wait_for_sink_close(
+            handle.name(),
+            Arc::clone(&state),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .expect_err("driver panic must publish an immediate close failure");
+        assert!(error.to_string().contains("terminal close driver panicked"));
+        assert!(handle.has_unresolved_task());
+
+        let _ = release_tx.send(());
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.has_unresolved_task() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached terminal proof did not observe actor and child termination");
+        let repeated = handle
+            .close()
+            .await
+            .expect_err("driver panic result must remain sticky");
+        assert!(repeated
+            .to_string()
+            .contains("terminal close driver panicked"));
     }
 
     #[tokio::test]
@@ -3709,6 +4507,8 @@ mod tests {
             laminar_core::streaming::channel::channel::<SinkEvent>(SINK_EVENT_CHANNEL_CAPACITY);
         let (tx, rx) = mpsc::bounded_async::<SinkCommand>(1);
         drop(rx);
+        let (task, actor_state) = supervise_test_actor(async {}, None);
+        let terminal_state = Arc::clone(&task.terminal_state);
         let handle = SinkTaskHandle {
             name: Arc::from("dead"),
             sink_id: Arc::from("dead"),
@@ -3716,11 +4516,12 @@ mod tests {
             contract: at_least_once_contract(),
             requires_recovery_on_error: true,
             write_timeout: Duration::from_secs(5),
-            cancellation_policy: ConnectorCancellationPolicy::CancelSafe,
             closing: Arc::new(AtomicBool::new(false)),
             admission: Arc::new(tokio::sync::Mutex::new(())),
-            task: Arc::new(parking_lot::Mutex::new(Some(tokio::spawn(async {})))),
+            task: Arc::new(parking_lot::Mutex::new(Some(task))),
             close_state: Arc::new(SinkCloseState::new()),
+            terminal_state,
+            actor_state,
             runtime: tokio::runtime::Handle::current(),
             event_tx,
             epoch_poisoned: Arc::new(AtomicBool::new(false)),
