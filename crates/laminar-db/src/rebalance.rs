@@ -3886,23 +3886,29 @@ mod tests {
             .await
             .expect("shuffle send did not reach the peer handshake");
 
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            close_local_assignment_authority(
-                &db,
-                None,
-                tokio::time::Instant::now() + Duration::from_millis(500),
-            ),
-        )
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let closing = {
+            let db = Arc::clone(&db);
+            tokio::spawn(async move { close_local_assignment_authority(&db, None, deadline).await })
+        };
+        tokio::time::timeout_at(deadline, async {
+            while sender.assignment_version() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
         .await
-        .expect("authority closure deadlocked behind a shuffle-held read fence")
-        .expect("authority closure exceeded its deadline");
-        let error = tokio::time::timeout(Duration::from_secs(1), blocked_cycle)
+        .expect("authority closure did not cancel shuffle admission");
+        let error = tokio::time::timeout_at(deadline, blocked_cycle)
             .await
             .expect("cancelled shuffle cycle did not exit")
             .unwrap()
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+        tokio::time::timeout_at(deadline, closing)
+            .await
+            .expect("authority closure deadlocked behind a shuffle-held read fence")
+            .unwrap()
+            .expect("authority closure exceeded its deadline");
         assert!(db.cluster_intake_fenced());
         peer.abort();
     }
@@ -4719,6 +4725,30 @@ mod tests {
         controller.publish_checkpoint_drain_transition(Some(transition.clone()));
         controller.set_recovering(true);
         db.set_source_gate(true);
+        let resolution = SourceDrainResolution {
+            round: transition.id(),
+            outcome: SourceDrainOutcome::Commit,
+        };
+        let error = settle_source_drain_before_recovery_release(
+            &db,
+            &controller,
+            &committed.assignment_fence().unwrap(),
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .expect_err("a predecessor assignment must not authorize terminal source resolution");
+        assert!(error.contains("assignment 2 changed"), "{error}");
+        assert_eq!(
+            controller.checkpoint_drain_transition(),
+            Some(transition.clone())
+        );
+        assert!(
+            !crate::pipeline::streaming_coordinator::owned_source_drain_resolved(
+                &db.owned_source_tasks,
+                resolution,
+            )
+            .unwrap()
+        );
         assert_eq!(
             settle_source_drain_before_recovery_release(
                 &db,
@@ -4730,12 +4760,30 @@ mod tests {
             .unwrap(),
             Some(terminal.version)
         );
-        let resolution = SourceDrainResolution {
-            round: transition.id(),
-            outcome: SourceDrainOutcome::Commit,
-        };
         assert!(
             crate::pipeline::streaming_coordinator::owned_source_drain_resolved(
+                &db.owned_source_tasks,
+                resolution,
+            )
+            .unwrap()
+        );
+        assert!(controller.checkpoint_drain_transition().is_none());
+
+        task.request_shutdown();
+        assert!(
+            task.wait_until(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await
+        );
+        db.owned_source_tasks
+            .lock()
+            .retain(|source| !source.is_finished());
+        let replacement =
+            crate::pipeline::streaming_coordinator::install_replacement_source_drain_task_for_test(
+                &db.owned_source_tasks,
+                "next-replacement-source",
+            );
+        assert!(
+            !crate::pipeline::streaming_coordinator::owned_source_drain_resolved(
                 &db.owned_source_tasks,
                 resolution,
             )
@@ -4754,10 +4802,18 @@ mod tests {
             Some(terminal.version),
             "a replacement generation must reconcile retained terminal authority even after the process-local marker was cleared"
         );
-
-        task.request_shutdown();
         assert!(
-            task.wait_until(tokio::time::Instant::now() + Duration::from_secs(1))
+            crate::pipeline::streaming_coordinator::owned_source_drain_resolved(
+                &db.owned_source_tasks,
+                resolution,
+            )
+            .unwrap()
+        );
+
+        replacement.request_shutdown();
+        assert!(
+            replacement
+                .wait_until(tokio::time::Instant::now() + Duration::from_secs(1))
                 .await
         );
         controller.publish_checkpoint_drain_transition(Some(transition.clone()));

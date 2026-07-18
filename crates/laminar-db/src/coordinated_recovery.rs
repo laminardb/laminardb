@@ -429,6 +429,7 @@ impl RecoveryMonitor {
         controller: &ClusterController,
         local_fault: Option<RecoveryFault>,
     ) {
+        let mut rejected_committed_gen = None;
         if let Some(start) = self.restored_for.as_ref().map(|(start, _)| start.clone()) {
             if let RecoverPhase::Start { epoch } = start.phase {
                 let terminal = tokio::time::timeout(
@@ -443,14 +444,14 @@ impl RecoveryMonitor {
                         return;
                     }
                     Ok(result) => match result {
-                        Ok(Some(terminal))
-                            if round_assignment_is_current(db, controller, &terminal.round) =>
-                        {
+                        Ok(Some(terminal)) => {
                             self.last_protocol_error = None;
-                            self.observe_release(db, controller, terminal, epoch).await;
-                            return;
+                            if self.observe_release(db, controller, terminal, epoch).await {
+                                return;
+                            }
+                            rejected_committed_gen = Some(start.round.id.generation);
                         }
-                        Ok(Some(_)) | Ok(None) | Err(RecoveryControlError::Superseded(_)) => {}
+                        Ok(None) | Err(RecoveryControlError::Superseded(_)) => {}
                         Err(RecoveryControlError::Uncertain(error)) => {
                             controller.set_recovering(true);
                             db.set_source_gate(true);
@@ -511,7 +512,6 @@ impl RecoveryMonitor {
                     if terminal.round.id.generation > self.applied_gen
                         && covers_local_settlement
                         && !terminal.round.contains_owner(controller.instance_id())
-                        && round_assignment_is_current(db, controller, &terminal.round)
                     {
                         if !controller.recovery_round_requires_current_process_stop(&terminal.round)
                         {
@@ -528,9 +528,13 @@ impl RecoveryMonitor {
                             return;
                         }
                         self.last_protocol_error = None;
-                        self.observe_nonparticipant_release(db, controller, &terminal)
-                            .await;
-                        return;
+                        if self
+                            .observe_nonparticipant_release(db, controller, &terminal)
+                            .await
+                        {
+                            return;
+                        }
+                        rejected_committed_gen = Some(terminal.round.id.generation);
                     }
                 }
             }
@@ -568,10 +572,62 @@ impl RecoveryMonitor {
                 }
             },
         };
-        let current = observed.filter(|announcement| {
-            controller.recovery_driver_is_current(&announcement.round)
-                && round_assignment_is_current(db, controller, &announcement.round)
-        });
+        let current = match observed
+            .filter(|announcement| controller.recovery_driver_is_current(&announcement.round))
+        {
+            Some(announcement)
+                if round_assignment_is_current(db, controller, &announcement.round) =>
+            {
+                Some(announcement)
+            }
+            Some(announcement)
+                if matches!(announcement.phase, RecoverPhase::ReleaseCommitted { .. }) =>
+            {
+                Some(announcement)
+            }
+            Some(announcement) => {
+                match recovery_round_assignment_is_restorable(
+                    db,
+                    controller,
+                    &announcement.round,
+                    tokio::time::Instant::now() + DECISION_IO_TIMEOUT,
+                )
+                .await
+                {
+                    Ok(true) => Some(announcement),
+                    Ok(false) => None,
+                    Err(error) => {
+                        tracing::warn!(
+                            gen = announcement.round.id.generation,
+                            %error,
+                            "could not audit suspended assignment authority for recovery control"
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        if let Some(rejected_gen) = rejected_committed_gen {
+            let successor_is_current = current.as_ref().is_some_and(|announcement| {
+                announcement.round.id.generation > rejected_gen
+                    && controller.recovery_round_requires_current_process_stop(&announcement.round)
+            });
+            if !successor_is_current {
+                self.applied_gen = self.applied_gen.max(rejected_gen);
+                self.restored_for = None;
+                self.stopped_for = None;
+                self.hold_fault_fence(db, controller);
+                tracing::error!(
+                    gen = rejected_gen,
+                    "committed recovery Release cannot settle locally; requesting a successor round"
+                );
+                if !self.request_fresh_fault(db, controller).await {
+                    self.fault_audit_unknown = true;
+                }
+                return;
+            }
+        }
         match current {
             Some(RecoveryAnnouncement {
                 round,
@@ -598,7 +654,7 @@ impl RecoveryMonitor {
                     ..
                 },
             ) if controller.recovery_round_contains_current_process(&release.round) => {
-                self.observe_release(db, controller, release, epoch).await;
+                let _ = self.observe_release(db, controller, release, epoch).await;
             }
             Some(RecoveryAnnouncement {
                 phase: RecoverPhase::ReleaseCommitted { .. },
@@ -682,6 +738,7 @@ impl RecoveryMonitor {
             tracing::error!(gen, %error, "could not acknowledge recovery Prepare");
             return;
         }
+        self.restored_for = None;
         self.stopped_for = Some((round, tokio::time::Instant::now()));
         tracing::warn!(gen, "stopped for recovery round; awaiting target");
     }
@@ -735,7 +792,7 @@ impl RecoveryMonitor {
         controller: &ClusterController,
         release: RecoveryAnnouncement,
         epoch: u64,
-    ) {
+    ) -> bool {
         let exact_start = self.restored_for.as_ref().is_some_and(|(start, _)| {
             start.round == release.round && start.phase == (RecoverPhase::Start { epoch })
         });
@@ -749,19 +806,20 @@ impl RecoveryMonitor {
                 controller.retire_committed_recover_release_hint(&release.round, epoch),
             )
             .await;
-            return;
+            return true;
         }
         if exact_start {
-            if self
+            let consumed = self
                 .release_after_readiness_quorum(db, controller, &release, epoch)
-                .await
-            {
+                .await;
+            if consumed {
                 tracing::warn!(
                     target_epoch = epoch,
                     gen = release.round.id.generation,
                     "recovery Release consumed; source gate opened"
                 );
             }
+            return consumed;
         } else if release.round.id.generation > self.applied_gen {
             // A process that missed Start must never interpret a persisted Release as an
             // instruction to rewind alone. Fence it and request a fresh complete round.
@@ -775,28 +833,47 @@ impl RecoveryMonitor {
             if !self.request_fresh_fault(db, controller).await {
                 self.fault_audit_unknown = true;
             }
+            return true;
         }
+        false
     }
 
     /// An ownerless worker consumes only a leader-fenced terminal that names this exact boot in
     /// its stopped roster and was committed after every data owner prepared while fenced. The
     /// terminal retains stable-node fault evidence after authority tombstones the covered slot.
-    /// It never joins the frozen data quorum, restarts state, acknowledges recovery, or opens its
-    /// assignment-closed source gate.
+    /// It never joins the frozen restore quorum, acknowledges recovery, or opens its
+    /// assignment-closed source gate. It may rebuild a gated local runtime to settle connector
+    /// evidence before consuming the terminal.
     async fn observe_nonparticipant_release(
         &mut self,
         db: &Arc<LaminarDB>,
         controller: &ClusterController,
         release: &RecoveryAnnouncement,
-    ) {
+    ) -> bool {
         let RecoverPhase::ReleaseCommitted { epoch } = release.phase else {
-            return;
+            return false;
         };
+        controller.set_recovering(true);
+        db.set_source_gate(true);
         let deadline = tokio::time::Instant::now() + RELEASE_PROTOCOL_TIMEOUT;
+        let assignment_restorable =
+            match recovery_round_assignment_is_restorable(db, controller, &release.round, deadline)
+                .await
+            {
+                Ok(restorable) => restorable,
+                Err(error) => {
+                    tracing::warn!(
+                        gen = release.round.id.generation,
+                        %error,
+                        "could not audit ownerless recovery assignment"
+                    );
+                    false
+                }
+            };
         if release.round.contains_owner(controller.instance_id())
             || !controller.recovery_round_requires_current_process_stop(&release.round)
             || !controller.process_lease_is_live()
-            || !round_assignment_is_current(db, controller, &release.round)
+            || !assignment_restorable
             || !matches!(
                 tokio::time::timeout_at(
                     deadline,
@@ -806,7 +883,7 @@ impl RecoveryMonitor {
                 Ok(Ok(Some(active))) if active == *release
             )
         {
-            return;
+            return false;
         }
 
         // A non-owner is outside the restore quorum, but it can still hold participant-local
@@ -816,7 +893,7 @@ impl RecoveryMonitor {
         // round and must request another evidence-bearing round instead of silently accepting the
         // Release.
         let Some(prepared_witnesses) = stop_and_collect_prepared(db).await else {
-            return;
+            return false;
         };
         if !prepared_witnesses.is_empty() {
             tracing::error!(
@@ -827,20 +904,51 @@ impl RecoveryMonitor {
             if !self.request_fresh_fault(db, controller).await {
                 self.fault_audit_unknown = true;
             }
-            return;
+            return false;
         }
 
         db.set_shuffle_recovery_gen(release.round.id.generation);
         db.purge_shuffle_receiver_buffers();
+        let assignment_deadline = tokio::time::Instant::now() + DECISION_IO_TIMEOUT;
+        let authority_revision = match install_recovery_start_assignment(
+            db,
+            controller,
+            &release.round,
+            assignment_deadline,
+        )
+        .await
+        {
+            Ok(revision) => revision,
+            Err(error) => {
+                tracing::error!(
+                    gen = release.round.id.generation,
+                    %error,
+                    "ownerless recovery assignment repair failed"
+                );
+                return false;
+            }
+        };
         if !start_pipeline(db, Some(epoch)).await {
             tracing::error!(
                 gen = release.round.id.generation,
                 target_epoch = epoch,
                 "ownerless process could not rebuild its assignment-closed connector runtime"
             );
-            return;
+            return false;
         }
-        if !controller.process_lease_is_live()
+        let assignment_still_exact = matches!(
+            recovery_round_assignment_is_restorable(
+                db,
+                controller,
+                &release.round,
+                tokio::time::Instant::now() + DECISION_IO_TIMEOUT,
+            )
+            .await,
+            Ok(true)
+        );
+        if !assignment_still_exact
+            || !controller.process_lease_is_live()
+            || db.assignment_authority_revision.load(Ordering::Acquire) != authority_revision
             || !round_assignment_is_current(db, controller, &release.round)
             || !matches!(
                 controller
@@ -849,7 +957,7 @@ impl RecoveryMonitor {
                 Ok(Some(active)) if active == *release
             )
         {
-            return;
+            return false;
         }
 
         let deadline = tokio::time::Instant::now() + RELEASE_PROTOCOL_TIMEOUT;
@@ -866,9 +974,9 @@ impl RecoveryMonitor {
                     if !self.ensure_fault_request(db, controller).await {
                         self.fault_audit_unknown = true;
                     }
-                    return;
+                    return false;
                 }
-                Ok(Ok(None)) | Ok(Err(RecoveryControlError::Superseded(_))) => return,
+                Ok(Ok(None)) | Ok(Err(RecoveryControlError::Superseded(_))) => return false,
                 Ok(Err(RecoveryControlError::Uncertain(_)))
                     if tokio::time::Instant::now() < deadline =>
                 {
@@ -883,9 +991,9 @@ impl RecoveryMonitor {
                     if !self.request_fresh_fault(db, controller).await {
                         self.fault_audit_unknown = true;
                     }
-                    return;
+                    return false;
                 }
-                Ok(Err(RecoveryControlError::Uncertain(_))) | Err(_) => return,
+                Ok(Err(RecoveryControlError::Uncertain(_))) | Err(_) => return false,
             }
         };
         if !self.clear_authorized_pending_request(db) {
@@ -894,7 +1002,7 @@ impl RecoveryMonitor {
                 "a replacement recovery request prevented ownerless Release consumption"
             );
             drop(release_guard);
-            return;
+            return false;
         }
         self.record_released_faults(&release.round);
         self.applied_gen = release.round.id.generation;
@@ -903,6 +1011,7 @@ impl RecoveryMonitor {
         db.set_source_gate(true);
         drop(release_guard);
         db.release_coordinated_recovery_lifecycle();
+        true
     }
 
     async fn observe_orphans(&mut self, db: &Arc<LaminarDB>, controller: &ClusterController) {
@@ -1229,7 +1338,7 @@ impl RecoveryMonitor {
                 }
             };
 
-        if !driver_owns_prepare(controller, &round).await {
+        if !driver_owns_prepare(db, controller, &round).await {
             tracing::warn!(
                 gen = gen_id,
                 "recovery driver lost ownership before target selection; yielding"
@@ -1262,7 +1371,7 @@ impl RecoveryMonitor {
                 return;
             }
         };
-        if !driver_owns_prepare(controller, &round).await {
+        if !driver_owns_prepare(db, controller, &round).await {
             tracing::warn!(
                 gen = gen_id,
                 "recovery driver was superseded during target selection; yielding"
@@ -1318,7 +1427,7 @@ impl RecoveryMonitor {
             hold_intake_and_request_retry(db, controller, gen_id, false).await;
             return;
         }
-        if !round_is_current(db, controller, &round).await {
+        if !round_is_releasable(db, controller, &round).await {
             tracing::error!(
                 gen = gen_id,
                 "recovery certificate changed after restore quorum; refusing Release"
@@ -1403,12 +1512,47 @@ impl RecoveryMonitor {
         // Advancing this after `start_pipeline` leaves a window in which old data can be folded
         // onto restored state. The monotonic generation remains safe if startup fails and retries.
         db.set_shuffle_recovery_gen(gen_id);
+        let assignment_deadline = tokio::time::Instant::now() + DECISION_IO_TIMEOUT;
+        let authority_revision = match install_recovery_start_assignment(
+            db,
+            controller,
+            &start.round,
+            assignment_deadline,
+        )
+        .await
+        {
+            Ok(revision) => revision,
+            Err(error) => {
+                tracing::error!(gen = gen_id, %error, "recovery Start assignment repair failed");
+                return false;
+            }
+        };
         if !start_pipeline(db, Some(target)).await {
             // Starting from the selected cut failed. Keep intake fenced while `Start` remains
             // visible so the next monitor tick can retry without exposing pre-recovery state.
             // The lifecycle deadline may have expired while the owned start thread continued;
             // forget the old stop marker so the retry first quiesces any late successful start.
             self.stopped_for = None;
+            return false;
+        }
+        let assignment_still_exact = matches!(
+            recovery_round_assignment_is_restorable(
+                db,
+                controller,
+                &start.round,
+                tokio::time::Instant::now() + DECISION_IO_TIMEOUT,
+            )
+            .await,
+            Ok(true)
+        );
+        if !assignment_still_exact
+            || db.assignment_authority_revision.load(Ordering::Acquire) != authority_revision
+            || !local_release_round_is_current(db, controller, &start.round)
+        {
+            tracing::error!(
+                gen = gen_id,
+                "recovery assignment changed while rebuilding the data plane; withholding restore acknowledgement"
+            );
             return false;
         }
         match controller.announce_recovered(start).await {
@@ -1493,7 +1637,27 @@ impl RecoveryMonitor {
         db.set_source_gate(true);
         let release_deadline = tokio::time::Instant::now() + RELEASE_PROTOCOL_TIMEOUT;
         let authority_revision = db.assignment_authority_revision.load(Ordering::Acquire);
-        if !local_release_round_is_current(db, controller, &release.round) {
+        let assignment_restorable = match recovery_round_assignment_is_restorable(
+            db,
+            controller,
+            &release.round,
+            release_deadline,
+        )
+        .await
+        {
+            Ok(restorable) => restorable,
+            Err(error) => {
+                tracing::error!(
+                    gen = release.round.id.generation,
+                    %error,
+                    "could not audit recovery Release assignment"
+                );
+                false
+            }
+        };
+        if !assignment_restorable
+            || db.assignment_authority_revision.load(Ordering::Acquire) != authority_revision
+        {
             return false;
         }
         if !db.complete_shuffle_recovery(release.round.id.generation) {
@@ -1528,9 +1692,7 @@ impl RecoveryMonitor {
                 return false;
             }
         }
-        if db.assignment_authority_revision.load(Ordering::Acquire) != authority_revision
-            || !local_release_round_is_current(db, controller, &release.round)
-        {
+        if db.assignment_authority_revision.load(Ordering::Acquire) != authority_revision {
             self.defer_release_retry(db, controller, release.round.id.generation, false);
             return false;
         }
@@ -1551,7 +1713,10 @@ impl RecoveryMonitor {
             )
             .await;
         match activation {
-            Ok(activation) if activation.installed && !activation.intake_open => {}
+            Ok(activation)
+                if activation.installed
+                    && !activation.intake_open
+                    && local_release_round_is_current(db, controller, &release.round) => {}
             Ok(_) => return false,
             Err(error) => {
                 tracing::error!(
@@ -1944,6 +2109,35 @@ async fn stop_and_collect_prepared(db: &Arc<LaminarDB>) -> Option<Vec<PreparedCh
     }
 }
 
+async fn install_recovery_start_assignment(
+    db: &Arc<LaminarDB>,
+    controller: &ClusterController,
+    round: &RecoveryRound,
+    deadline: tokio::time::Instant,
+) -> Result<u64, String> {
+    if !controller.is_recovering() || !db.cluster_intake_fenced() {
+        return Err("recovery Start assignment repair requires closed intake".into());
+    }
+    let revision = db.assignment_authority_revision.load(Ordering::Acquire);
+    if !recovery_round_assignment_is_restorable(db, controller, round, deadline).await?
+        || db.assignment_authority_revision.load(Ordering::Acquire) != revision
+    {
+        return Err("recovery Start assignment authority changed during audit".into());
+    }
+    let activation = db
+        .activate_assignment_authority(&round.assignment_fence, None, revision, deadline)
+        .await
+        .map_err(|error| error.to_string())?;
+    if !activation.installed
+        || activation.intake_open
+        || db.assignment_authority_revision.load(Ordering::Acquire) != revision
+        || !round_assignment_is_current(db, controller, round)
+    {
+        return Err("recovery Start could not install its exact assignment authority".into());
+    }
+    Ok(revision)
+}
+
 /// Start the pipeline, rewinding to `target` when given. `true` on a clean start.
 async fn start_pipeline(db: &Arc<LaminarDB>, target: Option<u64>) -> bool {
     if !coordinated_restart_assignment_ready(db).await {
@@ -2094,17 +2288,139 @@ fn round_assignment_is_current(
     current_assignment_fence(db, controller).as_ref() == Some(&round.assignment_fence)
 }
 
-/// Both the assignment cut and every assignment-owner process must still match the frozen round.
-async fn round_is_current(
+fn local_assignment_matches_recovery_round(
+    db: &LaminarDB,
+    controller: &ClusterController,
+    round: &RecoveryRound,
+) -> bool {
+    if !controller.process_lease_is_live() {
+        return false;
+    }
+    let Some(registry) = db.vnode_registry.lock().clone() else {
+        return false;
+    };
+    let assignment = registry.versioned_snapshot();
+    let owners: Vec<u64> = assignment.owners().iter().map(|owner| owner.0).collect();
+    let fence = &round.assignment_fence;
+    let local_id = controller.instance_id().0;
+    if !fence.is_canonical()
+        || fence.assignment_version != assignment.version()
+        || fence.vnode_count != registry.vnode_count()
+        || !fence.matches_owner_map(&owners)
+        || fence
+            .participant_incarnation(local_id)
+            .is_some_and(|incarnation| incarnation != controller.recovery_incarnation())
+        || (fence.participant_incarnation(local_id).is_none() && owners.contains(&local_id))
+    {
+        return false;
+    }
+    let published = controller.checkpoint_assignment_watch();
+    if published
+        .borrow()
+        .as_ref()
+        .is_some_and(|published| published != fence)
+    {
+        return false;
+    }
+    controller
+        .checkpoint_drain_transition()
+        .is_none_or(|transition| transition.predecessor == *fence || transition.target == *fence)
+}
+
+/// Admit a recovery control phase from durable assignment authority when a local safety fence is
+/// intentionally suspended. This may stop or rebuild a gated data plane; it never authorizes
+/// Release without reinstalling the exact local certificate.
+async fn recovery_round_assignment_is_restorable(
+    db: &Arc<LaminarDB>,
+    controller: &ClusterController,
+    round: &RecoveryRound,
+    deadline: tokio::time::Instant,
+) -> Result<bool, String> {
+    if !db.cluster_intake_fenced()
+        || !local_assignment_matches_recovery_round(db, controller, round)
+    {
+        return Ok(false);
+    }
+    let authority_revision = db.assignment_authority_revision.load(Ordering::Acquire);
+    let store = db
+        .assignment_snapshot_store
+        .lock()
+        .clone()
+        .ok_or_else(|| "recovery assignment admission has no assignment store".to_string())?;
+    let snapshot = tokio::time::timeout_at(deadline, store.load())
+        .await
+        .map_err(|_| "recovery assignment admission head read timed out".to_string())?
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "recovery assignment admission has no durable head".to_string())?;
+    if snapshot.draining
+        || snapshot
+            .assignment_fence()
+            .map_err(|error| error.to_string())?
+            != round.assignment_fence
+    {
+        return Ok(false);
+    }
+    tokio::time::timeout_at(
+        deadline,
+        crate::rebalance::audit_assignment_snapshot_authority(&store, Some(controller), &snapshot),
+    )
+    .await
+    .map_err(|_| "recovery assignment authority audit timed out".to_string())??;
+    let durable_transition =
+        tokio::time::timeout_at(deadline, store.load_drain_transition(snapshot.version))
+            .await
+            .map_err(|_| "recovery assignment transition read timed out".to_string())?
+            .map_err(|error| error.to_string())?;
+    let confirmed = tokio::time::timeout_at(deadline, store.load())
+        .await
+        .map_err(|_| "recovery assignment admission head recheck timed out".to_string())?
+        .map_err(|error| error.to_string())?;
+    if confirmed.as_ref() != Some(&snapshot) {
+        return Ok(false);
+    }
+    tokio::time::timeout_at(
+        deadline,
+        crate::rebalance::audit_assignment_snapshot_authority(&store, Some(controller), &snapshot),
+    )
+    .await
+    .map_err(|_| "recovery assignment authority recheck timed out".to_string())??;
+    let confirmed_transition =
+        tokio::time::timeout_at(deadline, store.load_drain_transition(snapshot.version))
+            .await
+            .map_err(|_| "recovery assignment transition recheck timed out".to_string())?
+            .map_err(|error| error.to_string())?;
+    if confirmed_transition != durable_transition {
+        return Ok(false);
+    }
+    let local_transition = controller.checkpoint_drain_transition();
+    Ok(local_transition
+        .as_ref()
+        .is_none_or(|local| durable_transition.as_ref() == Some(local))
+        && db.assignment_authority_revision.load(Ordering::Acquire) == authority_revision
+        && db.cluster_intake_fenced()
+        && local_assignment_matches_recovery_round(db, controller, round))
+}
+
+/// Both the restorable assignment cut and every assignment-owner process must still match the
+/// frozen round.
+async fn round_is_releasable(
     db: &Arc<LaminarDB>,
     controller: &ClusterController,
     round: &RecoveryRound,
 ) -> bool {
-    round_assignment_is_current(db, controller, round)
-        && matches!(
-            controller.recovery_incarnations_match(round).await,
-            Ok(true)
+    matches!(
+        recovery_round_assignment_is_restorable(
+            db,
+            controller,
+            round,
+            tokio::time::Instant::now() + DECISION_IO_TIMEOUT,
         )
+        .await,
+        Ok(true)
+    ) && matches!(
+        controller.recovery_incarnations_match(round).await,
+        Ok(true)
+    )
 }
 
 fn local_release_round_is_current(
@@ -2263,41 +2579,63 @@ async fn replicate_recovery_gen(controller: &ClusterController, gen_id: u64) -> 
 }
 
 async fn driver_owns_prepare_until(
+    db: &Arc<LaminarDB>,
     controller: &ClusterController,
     round: &RecoveryRound,
     deadline: tokio::time::Instant,
 ) -> bool {
     let audit = async {
-        if !controller.is_leader()
-            || controller
-                .checkpoint_assignment_fence(round.assignment_fence.assignment_version)
-                .as_ref()
-                != Some(&round.assignment_fence)
-            || !matches!(
-                controller.recovery_incarnations_match(round).await,
+        let local_certificate_is_exact = controller
+            .checkpoint_assignment_fence(round.assignment_fence.assignment_version)
+            .as_ref()
+            == Some(&round.assignment_fence);
+        if !local_certificate_is_exact
+            && !matches!(
+                recovery_round_assignment_is_restorable(db, controller, round, deadline).await,
                 Ok(true)
             )
         {
             return false;
         }
-        matches!(
-            controller.observe_recover_control().await,
-            Ok(Some(RecoveryAnnouncement {
-                round: active,
-                phase: RecoverPhase::Prepare,
-            })) if active == *round
-        )
+        driver_controls_prepare(controller, round).await
     };
     matches!(tokio::time::timeout_at(deadline, audit).await, Ok(true))
 }
 
-async fn driver_owns_prepare(controller: &ClusterController, round: &RecoveryRound) -> bool {
-    driver_owns_prepare_until(
-        controller,
-        round,
-        tokio::time::Instant::now() + DECISION_IO_TIMEOUT,
+async fn driver_controls_prepare(controller: &ClusterController, round: &RecoveryRound) -> bool {
+    if !controller.is_leader()
+        || !matches!(
+            controller.recovery_incarnations_match(round).await,
+            Ok(true)
+        )
+    {
+        return false;
+    }
+    matches!(
+        controller.observe_recover_control().await,
+        Ok(Some(RecoveryAnnouncement {
+            round: active,
+            phase: RecoverPhase::Prepare,
+        })) if active == *round
     )
-    .await
+}
+
+async fn driver_owns_prepare(
+    db: &Arc<LaminarDB>,
+    controller: &ClusterController,
+    round: &RecoveryRound,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + DECISION_IO_TIMEOUT;
+    let audit = async {
+        if !matches!(
+            recovery_round_assignment_is_restorable(db, controller, round, deadline).await,
+            Ok(true)
+        ) {
+            return false;
+        }
+        driver_controls_prepare(controller, round).await
+    };
+    matches!(tokio::time::timeout_at(deadline, audit).await, Ok(true))
 }
 
 async fn audit_cluster_outcome_until(
@@ -2398,7 +2736,7 @@ async fn settle_stopped_prepared_witnesses(
             "stopped Prepared witnesses contain conflicting epoch/checkpoint dimensions".into(),
         );
     }
-    if !driver_owns_prepare_until(controller, round, write_deadline).await {
+    if !driver_owns_prepare_until(db, controller, round, write_deadline).await {
         return Err("recovery driver lost Prepare authority before checkpoint settlement".into());
     }
 
@@ -2526,7 +2864,7 @@ async fn settle_stopped_prepared_witnesses(
         outcomes.sort_unstable_by_key(|outcome| (outcome.epoch, outcome.checkpoint_id));
     }
 
-    if !driver_owns_prepare_until(controller, round, deadline).await {
+    if !driver_owns_prepare_until(db, controller, round, deadline).await {
         return Err("recovery driver lost Prepare authority during checkpoint settlement".into());
     }
     Ok(())
@@ -2579,11 +2917,14 @@ async fn wait_stopped_quorum_until(
         if !controller.is_leader() {
             return StoppedQuorum::Superseded;
         }
-        if controller
+        let local_assignment_is_exact = controller
             .checkpoint_assignment_fence(round.assignment_fence.assignment_version)
             .as_ref()
-            != Some(&round.assignment_fence)
-        {
+            == Some(&round.assignment_fence);
+        let published_assignment = controller.checkpoint_assignment_watch();
+        // Absence is a deliberate safety suspension repaired by the post-quorum durable audit.
+        // A present certificate that is no longer admissible means its roster changed.
+        if !local_assignment_is_exact && published_assignment.borrow().is_some() {
             return StoppedQuorum::ParticipantsChanged;
         }
         if tokio::time::Instant::now() >= next_roster_audit {
@@ -2764,9 +3105,9 @@ mod tests {
     use super::*;
     use laminar_core::checkpoint::{CheckpointAssignmentFence, LeaderProof, LeaderProofOwner};
     use laminar_core::cluster::control::{
-        AssignmentSnapshot, AssignmentSnapshotStore, CheckpointParticipant, ClusterKv, InMemoryKv,
-        LeaderLeaseOwner, LeaderLeaseStore, LeaseDeadline, LeaseOutcome, ProcessLeaseAuthority,
-        ProcessLeaseOutcome,
+        AssignmentDrainDecision, AssignmentDrainVerdict, AssignmentSnapshot,
+        AssignmentSnapshotStore, CheckpointParticipant, ClusterKv, InMemoryKv, LeaderLeaseOwner,
+        LeaderLeaseStore, LeaseDeadline, LeaseOutcome, ProcessLeaseAuthority, ProcessLeaseOutcome,
     };
     use laminar_core::cluster::discovery::{NodeInfo, NodeMetadata, NodeState};
     use tokio::sync::watch;
@@ -3433,7 +3774,7 @@ mod tests {
         ));
         install_test_process_deadline(&controller);
         let fence = CheckpointAssignmentFence::from_owner_map(
-            7,
+            1,
             &[1],
             vec![CheckpointParticipant {
                 node_id: 1,
@@ -3483,7 +3824,6 @@ mod tests {
         driver.set_active(true);
 
         let registry = Arc::new(VnodeRegistry::single_owner(1, StateNodeId(1)));
-        registry.set_assignment_and_version(Arc::from([StateNodeId(1)]), 7);
         let db = LaminarDB::builder()
             .cluster_controller(Arc::clone(&controller))
             .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
@@ -3528,20 +3868,10 @@ mod tests {
         db.set_assignment_snapshot_store(Arc::clone(&assignments));
         let vnodes = AssignmentSnapshot::vnodes_from_vec(&[NodeId(1)]);
         let participants = round.assignment_fence.participants.clone();
-        let mut snapshot = AssignmentSnapshot::empty()
-            .next_for_participants(vnodes.clone(), participants.clone())
+        let snapshot = AssignmentSnapshot::empty()
+            .next_for_participants(vnodes, participants)
             .unwrap();
         assignments.save_if_absent(&snapshot).await.unwrap();
-        while snapshot.version < round.assignment_fence.assignment_version {
-            let next = snapshot
-                .next_for_participants(vnodes.clone(), participants.clone())
-                .unwrap();
-            assignments
-                .save_if_version(&next, snapshot.version)
-                .await
-                .unwrap();
-            snapshot = next;
-        }
         assert!(coordinated_restart_assignment_ready(&db).await);
 
         driver_kv.seed(
@@ -3640,6 +3970,10 @@ mod tests {
         assert!(monitor.restored_for.is_none());
         assert_eq!(db.pending_recovery_fault.load(Ordering::Acquire), 0);
         assert_eq!(monitor.applied_gen, round.id.generation);
+        assert_eq!(
+            controller.checkpoint_assignment_fence(1),
+            Some(round.assignment_fence.clone())
+        );
         assert_eq!(
             monitor.handled_faults.get(&self_id),
             Some(&idle_fault.sequence)
@@ -3755,6 +4089,425 @@ mod tests {
             .await
             .unwrap();
         assert!(!coordinated_restart_assignment_ready(&db).await);
+    }
+
+    #[tokio::test]
+    async fn recovery_assignment_admission_requires_the_exact_committed_head() {
+        use laminar_core::state::{InProcessBackend, NodeId as StateNodeId, VnodeRegistry};
+
+        let (controller, _members_tx, kv) = controller(vec![info(2)]).await;
+        let controller = Arc::new(controller);
+        report_test_fault(&controller).await;
+        let round = round_for_current_faults_at_assignment(&controller, 7, 1, &[1, 2]).await;
+        let owners = [NodeId(1), NodeId(2)];
+        let (assignments, committed) =
+            initial_assignment_store(&round.assignment_fence, &owners).await;
+        let registry = Arc::new(VnodeRegistry::new_unassigned(2));
+        registry.set_assignment_and_version(
+            Arc::from([StateNodeId(1), StateNodeId(2)]),
+            round.assignment_fence.assignment_version,
+        );
+        let db = LaminarDB::builder()
+            .cluster_controller(Arc::clone(&controller))
+            .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
+            .state_backend(Arc::new(InProcessBackend::new(2)))
+            .vnode_registry(registry)
+            .assignment_snapshot_store(Arc::clone(&assignments))
+            .build()
+            .await
+            .unwrap();
+        publish_round_roster(&controller, &kv, &round).await;
+        controller.set_recovering(true);
+        db.set_source_gate(true);
+        controller.publish_checkpoint_assignment_fence(None);
+        db.suspend_shuffle_assignment_fence();
+
+        assert!(!round_assignment_is_current(&db, &controller, &round));
+        assert!(recovery_round_assignment_is_restorable(
+            &db,
+            &controller,
+            &round,
+            tokio::time::Instant::now() + DECISION_IO_TIMEOUT,
+        )
+        .await
+        .unwrap());
+
+        let mut wrong_participants = round.assignment_fence.participants.clone();
+        let original_remote_boot = wrong_participants[1].boot_incarnation;
+        while wrong_participants[1].boot_incarnation == original_remote_boot {
+            wrong_participants[1].boot_incarnation = uuid::Uuid::new_v4();
+        }
+        let wrong_fence = CheckpointAssignmentFence::from_owner_map(
+            round.assignment_fence.assignment_version,
+            &[1, 2],
+            wrong_participants,
+        )
+        .unwrap();
+        let wrong_round = RecoveryRound::new(
+            round.id.generation,
+            round.leader_proof.clone(),
+            wrong_fence,
+            round.evidence_participants.clone(),
+            round.fault_revision(),
+            round.faults.clone(),
+        )
+        .unwrap();
+        assert!(local_assignment_matches_recovery_round(
+            &db,
+            &controller,
+            &wrong_round
+        ));
+        assert!(!recovery_round_assignment_is_restorable(
+            &db,
+            &controller,
+            &wrong_round,
+            tokio::time::Instant::now() + DECISION_IO_TIMEOUT,
+        )
+        .await
+        .unwrap());
+
+        let mut replacement_remote_boot = uuid::Uuid::new_v4();
+        while replacement_remote_boot == original_remote_boot {
+            replacement_remote_boot = uuid::Uuid::new_v4();
+        }
+        kv.seed(
+            NodeId(2),
+            "control:recovery-incarnation",
+            replacement_remote_boot.to_string(),
+        );
+        assert!(recovery_round_assignment_is_restorable(
+            &db,
+            &controller,
+            &round,
+            tokio::time::Instant::now() + DECISION_IO_TIMEOUT,
+        )
+        .await
+        .unwrap());
+        assert!(!round_is_releasable(&db, &controller, &round).await);
+
+        let draining = committed
+            .next_draining(
+                AssignmentSnapshot::vnodes_from_vec(&owners),
+                round.assignment_fence.participants.clone(),
+                controller.capture_leader_proof().unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            assignments
+                .save_if_version(&draining, committed.version)
+                .await
+                .unwrap(),
+            laminar_core::cluster::control::RotateOutcome::Rotated
+        ));
+        assert!(!recovery_round_assignment_is_restorable(
+            &db,
+            &controller,
+            &round,
+            tokio::time::Instant::now() + DECISION_IO_TIMEOUT,
+        )
+        .await
+        .unwrap());
+
+        let newer = draining.committed_target().unwrap();
+        let transition = draining.drain_transition.as_ref().unwrap();
+        let decision = AssignmentDrainDecision::new(
+            transition,
+            transition.leader.clone(),
+            AssignmentDrainVerdict::Commit,
+        )
+        .unwrap();
+        controller
+            .checkpoint_authority()
+            .unwrap()
+            .record_assignment_drain_decision(&transition.leader, decision)
+            .await
+            .unwrap();
+        assert!(matches!(
+            assignments.finalize_drain(&draining, &newer).await.unwrap(),
+            laminar_core::cluster::control::RotateOutcome::Rotated
+        ));
+        kv.seed(
+            NodeId(2),
+            "control:recovery-incarnation",
+            original_remote_boot.to_string(),
+        );
+        controller.publish_checkpoint_assignment_fence(Some(round.assignment_fence.clone()));
+        controller.announce_recover_prepare(&round).await.unwrap();
+        assert!(round_assignment_is_current(&db, &controller, &round));
+        assert!(!driver_owns_prepare(&db, &controller, &round).await);
+    }
+
+    #[tokio::test]
+    async fn recovery_start_repairs_suspended_shuffle_authority_without_opening_intake() {
+        use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
+        use laminar_core::state::{InProcessBackend, NodeId as StateNodeId, VnodeRegistry};
+
+        let (controller, _members_tx, kv) = controller(Vec::new()).await;
+        let controller = Arc::new(controller);
+        report_test_fault(&controller).await;
+        let round = round_for_current_faults_at_assignment(&controller, 7, 1, &[1]).await;
+        let (assignments, committed) =
+            initial_assignment_store(&round.assignment_fence, &[NodeId(1)]).await;
+        let registry = Arc::new(VnodeRegistry::single_owner(1, StateNodeId(1)));
+        let boot = controller.recovery_incarnation();
+        let receiver = Arc::new(
+            ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap(), boot)
+                .await
+                .unwrap(),
+        );
+        let sender = Arc::new(ShuffleSender::new(1, boot));
+        let db = LaminarDB::builder()
+            .cluster_controller(Arc::clone(&controller))
+            .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
+            .state_backend(Arc::new(InProcessBackend::new(1)))
+            .vnode_registry(registry)
+            .assignment_snapshot_store(Arc::clone(&assignments))
+            .shuffle_sender(Arc::clone(&sender))
+            .shuffle_receiver(Arc::clone(&receiver))
+            .build()
+            .await
+            .unwrap();
+        publish_round_roster(&controller, &kv, &round).await;
+        db.install_shuffle_assignment_fence(&round.assignment_fence)
+            .unwrap();
+        assert_eq!(
+            sender.active_assignment_digest(),
+            Some(round.assignment_fence.digest())
+        );
+        assert_eq!(
+            receiver.active_assignment_digest(),
+            Some(round.assignment_fence.digest())
+        );
+
+        db.set_source_gate(true);
+        controller.set_recovering(true);
+        controller.publish_checkpoint_assignment_fence(None);
+        db.suspend_shuffle_assignment_fence();
+        assert!(!round_assignment_is_current(&db, &controller, &round));
+        assert_eq!(sender.assignment_version(), 0);
+        assert_eq!(receiver.assignment_version(), 0);
+        assert_eq!(sender.active_assignment_digest(), None);
+        assert_eq!(receiver.active_assignment_digest(), None);
+
+        let expected_revision = db.assignment_authority_revision.load(Ordering::Acquire);
+        let installed_revision = install_recovery_start_assignment(
+            &db,
+            &controller,
+            &round,
+            tokio::time::Instant::now() + DECISION_IO_TIMEOUT,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(installed_revision, expected_revision);
+        assert_eq!(
+            db.assignment_authority_revision.load(Ordering::Acquire),
+            expected_revision
+        );
+        assert!(round_assignment_is_current(&db, &controller, &round));
+        assert_eq!(
+            controller.checkpoint_assignment_fence(1),
+            Some(round.assignment_fence.clone())
+        );
+        assert_eq!(sender.assignment_version(), 1);
+        assert_eq!(receiver.assignment_version(), 1);
+        assert_eq!(
+            sender.active_assignment_digest(),
+            Some(round.assignment_fence.digest())
+        );
+        assert_eq!(
+            receiver.active_assignment_digest(),
+            Some(round.assignment_fence.digest())
+        );
+        assert!(controller.is_recovering());
+        assert!(db.cluster_intake_fenced());
+
+        let newer = committed
+            .next_for_participants(
+                AssignmentSnapshot::vnodes_from_vec(&[NodeId(1)]),
+                round.assignment_fence.participants.clone(),
+            )
+            .unwrap();
+        assert!(matches!(
+            assignments
+                .save_if_version(&newer, committed.version)
+                .await
+                .unwrap(),
+            laminar_core::cluster::control::RotateOutcome::Rotated
+        ));
+        assert!(round_assignment_is_current(&db, &controller, &round));
+        assert!(!recovery_round_assignment_is_restorable(
+            &db,
+            &controller,
+            &round,
+            tokio::time::Instant::now() + DECISION_IO_TIMEOUT,
+        )
+        .await
+        .unwrap());
+        assert!(install_recovery_start_assignment(
+            &db,
+            &controller,
+            &round,
+            tokio::time::Instant::now() + DECISION_IO_TIMEOUT,
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn suspended_leader_retains_prepare_from_the_exact_durable_head() {
+        use laminar_core::state::{InProcessBackend, NodeId as StateNodeId, VnodeRegistry};
+
+        let (controller, _members_tx, kv) = controller(Vec::new()).await;
+        let controller = Arc::new(controller);
+        report_test_fault(&controller).await;
+        let round = round_for_current_faults_at_assignment(&controller, 7, 1, &[1]).await;
+        let (assignments, _committed) =
+            initial_assignment_store(&round.assignment_fence, &[NodeId(1)]).await;
+        let db = LaminarDB::builder()
+            .cluster_controller(Arc::clone(&controller))
+            .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
+            .state_backend(Arc::new(InProcessBackend::new(1)))
+            .vnode_registry(Arc::new(VnodeRegistry::single_owner(1, StateNodeId(1))))
+            .assignment_snapshot_store(assignments)
+            .build()
+            .await
+            .unwrap();
+        publish_round_roster(&controller, &kv, &round).await;
+        controller.announce_recover_prepare(&round).await.unwrap();
+        controller.set_recovering(true);
+        db.set_source_gate(true);
+        controller.publish_checkpoint_assignment_fence(None);
+        db.suspend_shuffle_assignment_fence();
+
+        assert!(!round_assignment_is_current(&db, &controller, &round));
+        assert!(driver_owns_prepare(&db, &controller, &round).await);
+        assert!(round_is_releasable(&db, &controller, &round).await);
+    }
+
+    #[tokio::test]
+    async fn rejected_committed_release_does_not_starve_a_successor_prepare() {
+        use laminar_core::state::{InProcessBackend, NodeId as StateNodeId, VnodeRegistry};
+
+        let backing: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let (controller, _members_tx, kv) = controller_on(Vec::new(), Arc::clone(&backing)).await;
+        let controller = Arc::new(controller);
+        report_test_fault(&controller).await;
+        let old_round = round_for_current_faults_at_assignment(&controller, 7, 1, &[1]).await;
+        let terminal = commit_release(&controller, &kv, &old_round, 4).await;
+        let old_start = start(old_round.clone(), 4);
+
+        let successor_fault = report_test_fault(&controller).await;
+        let successor = round_for_current_faults_at_assignment(&controller, 8, 2, &[1]).await;
+        let assignments = Arc::new(AssignmentSnapshotStore::new(Arc::clone(&backing)));
+        let committed = AssignmentSnapshot::empty()
+            .next_for_participants(
+                AssignmentSnapshot::vnodes_from_vec(&[NodeId(1)]),
+                old_round.assignment_fence.participants.clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            committed.assignment_fence().unwrap(),
+            old_round.assignment_fence
+        );
+        assignments.save_if_absent(&committed).await.unwrap();
+        let draining = committed
+            .next_draining(
+                AssignmentSnapshot::vnodes_from_vec(&[NodeId(1)]),
+                successor.assignment_fence.participants.clone(),
+                controller.capture_leader_proof().unwrap(),
+            )
+            .unwrap();
+        let newer = draining.committed_target().unwrap();
+        assert_eq!(
+            newer.assignment_fence().unwrap(),
+            successor.assignment_fence
+        );
+        assert!(matches!(
+            assignments
+                .save_if_version(&draining, committed.version)
+                .await
+                .unwrap(),
+            laminar_core::cluster::control::RotateOutcome::Rotated
+        ));
+        let transition = draining.drain_transition.as_ref().unwrap();
+        let decision = AssignmentDrainDecision::new(
+            transition,
+            transition.leader.clone(),
+            AssignmentDrainVerdict::Commit,
+        )
+        .unwrap();
+        controller
+            .checkpoint_authority()
+            .unwrap()
+            .record_assignment_drain_decision(&transition.leader, decision)
+            .await
+            .unwrap();
+        assert!(matches!(
+            assignments.finalize_drain(&draining, &newer).await.unwrap(),
+            laminar_core::cluster::control::RotateOutcome::Rotated
+        ));
+        assert_eq!(assignments.load().await.unwrap(), Some(newer));
+        let registry = Arc::new(VnodeRegistry::single_owner(1, StateNodeId(1)));
+        registry.set_assignment_and_version(Arc::from([StateNodeId(1)]), 2);
+        let db = LaminarDB::builder()
+            .cluster_controller(Arc::clone(&controller))
+            .cluster_checkpoint_object_store(Arc::clone(&backing))
+            .state_backend(Arc::new(InProcessBackend::new(1)))
+            .vnode_registry(registry)
+            .assignment_snapshot_store(assignments)
+            .build()
+            .await
+            .unwrap();
+        publish_round_roster(&controller, &kv, &successor).await;
+        controller
+            .announce_recover_prepare(&successor)
+            .await
+            .unwrap();
+        controller.set_recovering(true);
+        db.set_source_gate(true);
+        controller.publish_checkpoint_assignment_fence(None);
+        db.suspend_shuffle_assignment_fence();
+        assert!(controller.checkpoint_assignment_watch().borrow().is_none());
+        let mut monitor = RecoveryMonitor {
+            applied_gen: old_round.id.generation,
+            restored_for: Some((old_start, tokio::time::Instant::now())),
+            ..RecoveryMonitor::default()
+        };
+
+        assert_eq!(
+            controller
+                .observe_committed_recover_release(&old_round, 4)
+                .await
+                .unwrap(),
+            Some(terminal)
+        );
+        assert!(!round_assignment_is_current(&db, &controller, &successor));
+        assert!(recovery_round_assignment_is_restorable(
+            &db,
+            &controller,
+            &successor,
+            tokio::time::Instant::now() + DECISION_IO_TIMEOUT,
+        )
+        .await
+        .unwrap());
+        monitor
+            .observe(&db, &controller, Some(successor_fault))
+            .await;
+
+        assert!(monitor.restored_for.is_none());
+        assert_eq!(
+            monitor.stopped_for.as_ref().map(|(round, _)| round),
+            Some(&successor)
+        );
+        assert!(matches!(
+            wait_stopped_quorum(&controller, &successor, Duration::from_secs(1)).await,
+            StoppedQuorum::Reached(_)
+        ));
+        assert_eq!(db.pending_recovery_fault.load(Ordering::Acquire), 0);
+        assert!(!monitor.fault_audit_unknown);
+        assert!(db.cluster_intake_fenced());
     }
 
     #[tokio::test]
@@ -3889,6 +4642,30 @@ mod tests {
             .await
             .unwrap();
         members_tx.send(Vec::new()).unwrap();
+
+        let outcome = wait_stopped_quorum(&controller, &round, Duration::from_secs(1)).await;
+
+        assert_eq!(outcome, StoppedQuorum::ParticipantsChanged);
+    }
+
+    #[tokio::test]
+    async fn prepare_quorum_rejects_a_divergent_published_assignment() {
+        let (controller, _members_tx, kv) = controller(Vec::new()).await;
+        report_test_fault(&controller).await;
+        let round = round_for_current_faults(&controller, 7, &[1]).await;
+        publish_round_roster(&controller, &kv, &round).await;
+        controller.announce_recover_prepare(&round).await.unwrap();
+        controller
+            .announce_stopped(&round, Vec::new())
+            .await
+            .unwrap();
+        let divergent = CheckpointAssignmentFence::from_owner_map(
+            round.assignment_fence.assignment_version + 1,
+            &[1],
+            round.assignment_fence.participants.clone(),
+        )
+        .unwrap();
+        controller.publish_checkpoint_assignment_fence(Some(divergent));
 
         let outcome = wait_stopped_quorum(&controller, &round, Duration::from_secs(1)).await;
 
@@ -4475,7 +5252,7 @@ mod tests {
         let (controller, _members_tx, kv) = controller(Vec::new()).await;
         let controller = Arc::new(controller);
         report_test_fault(&controller).await;
-        let round = round_for_current_faults(&controller, 7, &[1]).await;
+        let round = round_for_current_faults_at_assignment(&controller, 7, 1, &[1]).await;
         activate_start(&controller, &kv, &round, 4).await;
         let start = start(round.clone(), 4);
         controller.announce_recovered(&start).await.unwrap();
@@ -4487,8 +5264,9 @@ mod tests {
             round: round.clone(),
             phase: RecoverPhase::Release { epoch: 4 },
         };
+        let (assignments, _committed) =
+            initial_assignment_store(&round.assignment_fence, &[NodeId(1)]).await;
         let registry = Arc::new(VnodeRegistry::single_owner(1, StateNodeId(1)));
-        registry.set_assignment_and_version(Arc::from([StateNodeId(1)]), 7);
         let receiver = Arc::new(
             ShuffleReceiver::bind(
                 1,
@@ -4508,6 +5286,7 @@ mod tests {
                 controller.recovery_incarnation(),
             )))
             .shuffle_receiver(receiver)
+            .assignment_snapshot_store(assignments)
             .build()
             .await
             .unwrap();
@@ -4518,6 +5297,14 @@ mod tests {
             ..RecoveryMonitor::default()
         };
 
+        assert!(recovery_round_assignment_is_restorable(
+            &db,
+            &controller,
+            &round,
+            tokio::time::Instant::now() + DECISION_IO_TIMEOUT,
+        )
+        .await
+        .unwrap());
         assert!(
             !monitor
                 .release_after_readiness_quorum(&db, &controller, &release, 4)
@@ -4679,5 +5466,28 @@ mod tests {
         assert!(db.cluster_intake_fenced());
         assert!(controller.is_recovering());
         assert_eq!(controller.checkpoint_assignment_fence(1), None);
+
+        let mut retry = RecoveryMonitor {
+            restored_for,
+            ..RecoveryMonitor::default()
+        };
+        assert!(
+            retry
+                .release_after_readiness_quorum(&db, &controller, &release, 4)
+                .await
+        );
+        assert!(retry.restored_for.is_none());
+        assert!(!db.cluster_intake_fenced());
+        assert!(!controller.is_recovering());
+        assert_eq!(
+            controller
+                .observe_committed_recover_release(&round, 4)
+                .await
+                .unwrap(),
+            Some(RecoveryAnnouncement {
+                round,
+                phase: RecoverPhase::ReleaseCommitted { epoch: 4 },
+            })
+        );
     }
 }
