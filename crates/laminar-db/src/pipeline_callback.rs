@@ -2734,6 +2734,7 @@ impl ConnectorPipelineCallback {
         let attempt_deadline =
             tokio::time::Instant::from_std(attempt_started) + self.checkpoint_timeout;
         let _stall_timer = self.prom.checkpoint_pipeline_stall_duration.start_timer();
+        let local_barrier_timer = self.prom.checkpoint_barrier_local_duration.start_timer();
         let Some(assignment_fence) = ann.assignment_fence.as_ref() else {
             let error = "admitted follower checkpoint lost its assignment certificate";
             tracing::error!(error);
@@ -2822,10 +2823,13 @@ impl ConnectorPipelineCallback {
             set_checkpoint_fault(&self.checkpoint_fault, error.clone());
             return CheckpointControlOutcome::Failed { attempt, error };
         }
+        drop(local_barrier_timer);
         if self.checkpoint_committable_sinks {
             tail.await;
         } else {
             self.spawn_checkpoint_tail(tail);
+            let _resume_timer =
+                has_shuffle.then(|| self.prom.checkpoint_aligned_resume_wait.start_timer());
             if let Err(error) = Self::wait_for_aligned_resume_until(
                 has_shuffle,
                 &controller,
@@ -2882,6 +2886,7 @@ impl ConnectorPipelineCallback {
         let attempt_deadline =
             tokio::time::Instant::from_std(attempt_started) + self.checkpoint_timeout;
         let _stall_timer = self.prom.checkpoint_pipeline_stall_duration.start_timer();
+        let local_barrier_timer = self.prom.checkpoint_barrier_local_duration.start_timer();
         let Some(assignment_fence) = ann.assignment_fence.as_ref() else {
             tracing::warn!("follower deferred checkpoint lost its assignment certificate");
             return BarrierOutcome::Failed;
@@ -2945,10 +2950,13 @@ impl ConnectorPipelineCallback {
                 return BarrierOutcome::Failed;
             }
         };
+        drop(local_barrier_timer);
         if self.checkpoint_committable_sinks {
             tail.await;
         } else {
             self.spawn_checkpoint_tail(tail);
+            let _resume_timer =
+                has_shuffle.then(|| self.prom.checkpoint_aligned_resume_wait.start_timer());
             if let Err(error) = Self::wait_for_aligned_resume_until(
                 has_shuffle,
                 &controller,
@@ -4870,6 +4878,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         // Sink fencing, shuffle alignment, and state capture all pause the pipeline. A
         // drop-observing timer also records early failures rather than hiding their latency.
         let _stall_timer = self.prom.checkpoint_pipeline_stall_duration.start_timer();
+        let local_barrier_timer = self.prom.checkpoint_barrier_local_duration.start_timer();
 
         match tokio::time::timeout_at(
             attempt_deadline,
@@ -5069,6 +5078,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             #[cfg(feature = "cluster")]
             delta_rebase_needed: Arc::clone(&self.delta_rebase_needed),
         };
+        drop(local_barrier_timer);
         if self.checkpoint_committable_sinks {
             Self::run_leader_tail(tail).await;
         } else {
@@ -5079,6 +5089,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 (self.cluster_controller.clone(), resume_certificate)
             {
                 let has_shuffle = self.graph.cluster_shuffle_config().is_some();
+                let _resume_timer =
+                    has_shuffle.then(|| self.prom.checkpoint_aligned_resume_wait.start_timer());
                 if let Err(error) = Self::wait_for_aligned_resume_until(
                     has_shuffle,
                     &cc,

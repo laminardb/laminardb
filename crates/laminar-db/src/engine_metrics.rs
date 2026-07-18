@@ -81,6 +81,12 @@ pub struct EngineMetrics {
     /// Aligned resume gate. Exactly-once mode also includes its inline durable tail; other modes
     /// resume at Aligned while that tail remains supervised in the background.
     pub checkpoint_pipeline_stall_duration: Histogram,
+    /// Local barrier work while the pipeline is paused: sink fencing, shuffle alignment, state
+    /// capture, and construction of the immutable durable-tail handoff.
+    pub checkpoint_barrier_local_duration: Histogram,
+    /// Cluster-shuffle pause after local capture while waiting for the global Aligned release.
+    /// Embedded and single-node runtimes do not observe this metric.
+    pub checkpoint_aligned_resume_wait: Histogram,
     /// Time the leader's restorable gate spends polling for vnode
     /// partials (failed gates that burn the timeout are observed too).
     /// When this dominates restorable latency at production cadence,
@@ -299,6 +305,22 @@ impl EngineMetrics {
                 HistogramOpts::new(
                     "checkpoint_pipeline_stall_duration_seconds",
                     "Pipeline stall per checkpoint barrier (align + capture + resume gate)",
+                )
+                .buckets(prometheus::exponential_buckets(0.001, 2.0, 16).unwrap()),
+            )
+            .unwrap()),
+            checkpoint_barrier_local_duration: reg!(Histogram::with_opts(
+                HistogramOpts::new(
+                    "checkpoint_barrier_local_duration_seconds",
+                    "Local paused barrier work (sink fence + shuffle align + state capture + tail handoff)",
+                )
+                .buckets(prometheus::exponential_buckets(0.001, 2.0, 16).unwrap()),
+            )
+            .unwrap()),
+            checkpoint_aligned_resume_wait: reg!(Histogram::with_opts(
+                HistogramOpts::new(
+                    "checkpoint_aligned_resume_wait_seconds",
+                    "Cluster-shuffle pause waiting for the global Aligned release",
                 )
                 .buckets(prometheus::exponential_buckets(0.001, 2.0, 16).unwrap()),
             )

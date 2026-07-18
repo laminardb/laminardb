@@ -156,10 +156,6 @@ fn validate_checkpoint_liveness(interval_ms: u64, recovery: Duration) {
     );
 }
 
-fn steady_progress_budget(interval_ms: u64) -> Duration {
-    Duration::from_millis(interval_ms.saturating_mul(4).saturating_add(1000))
-}
-
 fn validate_local_source_liveness(
     rows: u64,
     rows_per_second: u64,
@@ -617,7 +613,7 @@ impl Node {
     }
 
     #[cfg(feature = "kafka")]
-    fn checkpoint_latency_metrics(&self) -> Option<(f64, f64, f64, f64, f64, f64)> {
+    fn checkpoint_latency_metrics(&self) -> Option<CheckpointLatencySnapshot> {
         let body = self.http_get("/metrics")?;
         let value = |name: &str| {
             let values = body
@@ -630,18 +626,42 @@ impl Node {
                 .collect::<Option<Vec<_>>>()?;
             (!values.is_empty()).then(|| values.into_iter().sum())
         };
-        Some((
-            value("laminardb_checkpoint_restorable_gate_wait_seconds_sum")?,
-            value("laminardb_checkpoint_restorable_gate_wait_seconds_count")?,
-            value("laminardb_checkpoint_duration_seconds_sum")?,
-            value("laminardb_checkpoint_duration_seconds_count")?,
-            value("laminardb_checkpoint_pipeline_stall_duration_seconds_count")?,
-            prometheus_histogram_bucket_value(
+        Some(CheckpointLatencySnapshot {
+            gate_wait_seconds: value("laminardb_checkpoint_restorable_gate_wait_seconds_sum")?,
+            gate_wait_observations: value(
+                "laminardb_checkpoint_restorable_gate_wait_seconds_count",
+            )?,
+            checkpoint_seconds: value("laminardb_checkpoint_duration_seconds_sum")?,
+            checkpoint_observations: value("laminardb_checkpoint_duration_seconds_count")?,
+            pipeline_stall_observations: value(
+                "laminardb_checkpoint_pipeline_stall_duration_seconds_count",
+            )?,
+            pipeline_stall_within_slo: prometheus_histogram_bucket_value(
                 &body,
                 "laminardb_checkpoint_pipeline_stall_duration_seconds_bucket",
                 CHECKPOINT_PIPELINE_STALL_SLO_SECONDS,
             )?,
-        ))
+            barrier_local_seconds: value(
+                "laminardb_checkpoint_barrier_local_duration_seconds_sum",
+            )?,
+            barrier_local_observations: value(
+                "laminardb_checkpoint_barrier_local_duration_seconds_count",
+            )?,
+            barrier_local_within_slo: prometheus_histogram_bucket_value(
+                &body,
+                "laminardb_checkpoint_barrier_local_duration_seconds_bucket",
+                CHECKPOINT_PIPELINE_STALL_SLO_SECONDS,
+            )?,
+            aligned_resume_seconds: value("laminardb_checkpoint_aligned_resume_wait_seconds_sum")?,
+            aligned_resume_observations: value(
+                "laminardb_checkpoint_aligned_resume_wait_seconds_count",
+            )?,
+            aligned_resume_within_slo: prometheus_histogram_bucket_value(
+                &body,
+                "laminardb_checkpoint_aligned_resume_wait_seconds_bucket",
+                CHECKPOINT_PIPELINE_STALL_SLO_SECONDS,
+            )?,
+        })
     }
 
     #[cfg(feature = "kafka")]
@@ -841,6 +861,12 @@ struct CheckpointLatencySnapshot {
     checkpoint_observations: f64,
     pipeline_stall_observations: f64,
     pipeline_stall_within_slo: f64,
+    barrier_local_seconds: f64,
+    barrier_local_observations: f64,
+    barrier_local_within_slo: f64,
+    aligned_resume_seconds: f64,
+    aligned_resume_observations: f64,
+    aligned_resume_within_slo: f64,
 }
 
 #[cfg(feature = "kafka")]
@@ -859,6 +885,24 @@ impl CheckpointLatencySnapshot {
                 "checkpoint pipeline-stall SLO bucket",
                 self.pipeline_stall_within_slo,
             ),
+            ("checkpoint local-barrier sum", self.barrier_local_seconds),
+            (
+                "checkpoint local-barrier count",
+                self.barrier_local_observations,
+            ),
+            (
+                "checkpoint local-barrier SLO bucket",
+                self.barrier_local_within_slo,
+            ),
+            ("checkpoint aligned-resume sum", self.aligned_resume_seconds),
+            (
+                "checkpoint aligned-resume count",
+                self.aligned_resume_observations,
+            ),
+            (
+                "checkpoint aligned-resume SLO bucket",
+                self.aligned_resume_within_slo,
+            ),
         ] {
             if !value.is_finite() || value < 0.0 {
                 return Err(format!(
@@ -872,6 +916,18 @@ impl CheckpointLatencySnapshot {
                 self.pipeline_stall_within_slo, self.pipeline_stall_observations
             ));
         }
+        if self.barrier_local_within_slo > self.barrier_local_observations {
+            return Err(format!(
+                "checkpoint local-barrier SLO bucket {} exceeds histogram count {}",
+                self.barrier_local_within_slo, self.barrier_local_observations
+            ));
+        }
+        if self.aligned_resume_within_slo > self.aligned_resume_observations {
+            return Err(format!(
+                "checkpoint aligned-resume SLO bucket {} exceeds histogram count {}",
+                self.aligned_resume_within_slo, self.aligned_resume_observations
+            ));
+        }
         Ok(self)
     }
 
@@ -882,6 +938,12 @@ impl CheckpointLatencySnapshot {
         self.checkpoint_observations += other.checkpoint_observations;
         self.pipeline_stall_observations += other.pipeline_stall_observations;
         self.pipeline_stall_within_slo += other.pipeline_stall_within_slo;
+        self.barrier_local_seconds += other.barrier_local_seconds;
+        self.barrier_local_observations += other.barrier_local_observations;
+        self.barrier_local_within_slo += other.barrier_local_within_slo;
+        self.aligned_resume_seconds += other.aligned_resume_seconds;
+        self.aligned_resume_observations += other.aligned_resume_observations;
+        self.aligned_resume_within_slo += other.aligned_resume_within_slo;
     }
 
     fn pipeline_stall_within_slo_percent(self) -> Option<f64> {
@@ -895,12 +957,25 @@ impl CheckpointLatencySnapshot {
             .ok_or_else(|| format!("{label} captured no checkpoint pipeline-stall observations"))?;
         if within_slo_percent < 99.0 {
             return Err(format!(
-                "{label} checkpoint pipeline-stall p99 exceeded {:.0}ms: only {within_slo_percent:.2}% of {} observations met the latency SLO",
+                "{label} checkpoint pipeline-stall SLO requires 99.00% of observations at or below {:.0}ms; only {within_slo_percent:.2}% of {} observations complied",
                 CHECKPOINT_PIPELINE_STALL_SLO_SECONDS * 1_000.0,
                 self.pipeline_stall_observations as u64,
             ));
         }
         Ok(())
+    }
+
+    fn phase_profile(sum_seconds: f64, observations: f64, within_slo: f64) -> String {
+        if observations == 0.0 {
+            return "no observations".into();
+        }
+        format!(
+            "avg={:.0}ms, <= {:.0}ms={:.2}% of {} obs",
+            sum_seconds / observations * 1_000.0,
+            CHECKPOINT_PIPELINE_STALL_SLO_SECONDS * 1_000.0,
+            within_slo / observations * 100.0,
+            observations as u64,
+        )
     }
 }
 
@@ -931,14 +1006,7 @@ impl CheckpointLatencyEvidence {
     }
 
     fn capture_node(&mut self, node: &Node) {
-        let (
-            gate_wait_seconds,
-            gate_wait_observations,
-            checkpoint_seconds,
-            checkpoint_observations,
-            pipeline_stall_observations,
-            pipeline_stall_within_slo,
-        ) = node
+        let snapshot = node
             .checkpoint_latency_metrics()
             .expect("node did not expose checkpoint latency metrics");
         self.record_generation(
@@ -946,14 +1014,7 @@ impl CheckpointLatencyEvidence {
                 node_id: node.id,
                 generation: node.process_generation,
             },
-            CheckpointLatencySnapshot {
-                gate_wait_seconds,
-                gate_wait_observations,
-                checkpoint_seconds,
-                checkpoint_observations,
-                pipeline_stall_observations,
-                pipeline_stall_within_slo,
-            },
+            snapshot,
         )
         .unwrap_or_else(|error| {
             panic!("invalid node{} checkpoint latency scrape: {error}", node.id)
@@ -984,12 +1045,25 @@ impl CheckpointLatencyEvidence {
     }
 
     fn report(&self) {
-        let aggregate = self
-            .validate_slos()
-            .unwrap_or_else(|error| panic!("{error}"));
-        let within_slo_percent = aggregate
-            .pipeline_stall_within_slo_percent()
-            .expect("pipeline-stall observations were validated above");
+        let aggregate = self.aggregate().unwrap_or_else(|error| panic!("{error}"));
+        for (generation, snapshot) in &self.generations {
+            eprintln!(
+                "soak: PROFILE node{} process generation {}: local barrier {}; aligned resume {}",
+                generation.node_id,
+                generation.generation,
+                CheckpointLatencySnapshot::phase_profile(
+                    snapshot.barrier_local_seconds,
+                    snapshot.barrier_local_observations,
+                    snapshot.barrier_local_within_slo,
+                ),
+                CheckpointLatencySnapshot::phase_profile(
+                    snapshot.aligned_resume_seconds,
+                    snapshot.aligned_resume_observations,
+                    snapshot.aligned_resume_within_slo,
+                ),
+            );
+        }
+        let within_slo_percent = aggregate.pipeline_stall_within_slo_percent().unwrap_or(0.0);
         let checkpoint_average_ms =
             aggregate.checkpoint_seconds / aggregate.checkpoint_observations * 1_000.0;
         if aggregate.gate_wait_observations > 0.0 {
@@ -1009,6 +1083,8 @@ impl CheckpointLatencyEvidence {
                 aggregate.checkpoint_observations as u64,
             );
         }
+        self.validate_slos()
+            .unwrap_or_else(|error| panic!("{error}"));
     }
 }
 
@@ -2464,14 +2540,10 @@ fn local_exact_source_state_kill9_soak() {
     }
 
     let steady_deadline = Instant::now() + Duration::from_secs(steady_seconds);
-    while let Some(remaining) = remaining_at(steady_deadline, Instant::now()) {
-        if remaining < steady_progress_budget(interval_ms) {
-            std::thread::sleep(remaining);
-            break;
-        }
+    while remaining_at(steady_deadline, Instant::now()).is_some() {
         latest_epoch = assert_checkpoint_progress(
             std::slice::from_mut(&mut node),
-            remaining.min(recovery_ceiling),
+            recovery_ceiling,
             "local exact steady progress",
             latest_epoch,
         );
@@ -2838,17 +2910,16 @@ fn three_node_kill9_soak() {
     }
 
     let steady_deadline = Instant::now() + Duration::from_secs(soak_secs);
-    while let Some(remaining) = remaining_at(steady_deadline, Instant::now()) {
-        if remaining < steady_progress_budget(interval_ms) {
-            std::thread::sleep(remaining);
-            break;
-        }
+    while remaining_at(steady_deadline, Instant::now()).is_some() {
         round += 1;
         latest_checkpoint = assert_progress(
             &mut nodes,
             Some(&mut producer),
             Some(&commit_oracle),
-            remaining.min(RECOVERY_LIVENESS_WINDOW),
+            // The soak deadline decides whether to start another proof round. Once started, the
+            // round gets the full configured liveness SLO instead of an artificial truncated
+            // timeout at the end of the requested observation period.
+            recovery_ceiling,
             "steady progress",
             Some(latest_checkpoint),
         );
@@ -3357,6 +3428,12 @@ fn test_checkpoint_latency_snapshot(
         checkpoint_observations,
         pipeline_stall_observations,
         pipeline_stall_within_slo,
+        barrier_local_seconds: pipeline_stall_observations * 0.025,
+        barrier_local_observations: pipeline_stall_observations,
+        barrier_local_within_slo: pipeline_stall_observations,
+        aligned_resume_seconds: pipeline_stall_observations * 0.05,
+        aligned_resume_observations: pipeline_stall_observations,
+        aligned_resume_within_slo: pipeline_stall_observations,
     }
 }
 
@@ -3376,6 +3453,20 @@ fn checkpoint_latency_snapshot_rejects_malformed_histograms() {
         .validate()
         .unwrap_err()
         .contains("exceeds histogram count"));
+
+    let mut impossible_local_bucket = test_checkpoint_latency_snapshot(1.0, 10.0, 10.0);
+    impossible_local_bucket.barrier_local_within_slo = 11.0;
+    assert!(impossible_local_bucket
+        .validate()
+        .unwrap_err()
+        .contains("local-barrier SLO bucket"));
+
+    let mut impossible_resume_bucket = test_checkpoint_latency_snapshot(1.0, 10.0, 10.0);
+    impossible_resume_bucket.aligned_resume_within_slo = 11.0;
+    assert!(impossible_resume_bucket
+        .validate()
+        .unwrap_err()
+        .contains("aligned-resume SLO bucket"));
 }
 
 #[cfg(feature = "kafka")]
