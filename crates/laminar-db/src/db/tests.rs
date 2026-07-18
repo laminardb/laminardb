@@ -975,6 +975,137 @@ async fn assignment_activation_installs_transport_before_controller_publication(
 }
 
 #[cfg(feature = "cluster")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn assignment_activation_keeps_intake_fenced_until_peer_transport_is_ready() {
+    use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+    use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+    use laminar_core::cluster::discovery::{NodeId, NodeInfo, NodeMetadata, NodeState};
+    use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
+    use laminar_core::state::{InProcessBackend, NodeId as StateNodeId, VnodeRegistry};
+    use uuid::Uuid;
+
+    let local_id = NodeId(1);
+    let peer_id = NodeId(2);
+    let local_boot = Uuid::from_u128(2);
+    let peer_boot = Uuid::from_u128(3);
+    let peer = NodeInfo {
+        id: peer_id,
+        name: "peer".into(),
+        rpc_address: String::new(),
+        raft_address: String::new(),
+        state: NodeState::Active,
+        metadata: NodeMetadata::default(),
+        last_heartbeat_ms: 0,
+    };
+    let kv = Arc::new(InMemoryKv::new(local_id));
+    let control: Arc<dyn ClusterKv> = kv.clone();
+    let recovery: Arc<dyn ClusterKv> = kv;
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(vec![peer]);
+    let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
+        local_id, control, recovery, None, members_rx, local_boot,
+    ));
+    controller.set_active(true);
+    let authority_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    install_test_process_and_leader_authority(&controller, Arc::clone(&authority_store)).await;
+
+    let registry = Arc::new(VnodeRegistry::new_unassigned(2));
+    registry.set_assignment_and_version(
+        vec![StateNodeId(local_id.0), StateNodeId(peer_id.0)].into(),
+        1,
+    );
+    let fence = CheckpointAssignmentFence::from_owner_map(
+        1,
+        &[local_id.0, peer_id.0],
+        vec![
+            CheckpointParticipant {
+                node_id: local_id.0,
+                boot_incarnation: local_boot,
+            },
+            CheckpointParticipant {
+                node_id: peer_id.0,
+                boot_incarnation: peer_boot,
+            },
+        ],
+    )
+    .unwrap();
+    let peer_receiver = Arc::new(
+        ShuffleReceiver::bind(peer_id.0, "127.0.0.1:0".parse().unwrap(), peer_boot)
+            .await
+            .unwrap(),
+    );
+    peer_receiver
+        .install_process_lease_deadline(Arc::new(
+            laminar_core::cluster::control::LeaseDeadline::live_for(
+                std::time::Duration::from_secs(60),
+            ),
+        ))
+        .unwrap();
+    let local_receiver = Arc::new(
+        ShuffleReceiver::bind(local_id.0, "127.0.0.1:0".parse().unwrap(), local_boot)
+            .await
+            .unwrap(),
+    );
+    let local_sender = Arc::new(ShuffleSender::new(local_id.0, local_boot));
+    local_sender
+        .register_peer(peer_id.0, peer_receiver.local_addr())
+        .await;
+    let db = LaminarDB::builder()
+        .cluster_controller(Arc::clone(&controller))
+        .cluster_checkpoint_object_store(authority_store)
+        .state_backend(Arc::new(InProcessBackend::new(2)))
+        .vnode_registry(registry)
+        .shuffle_sender(Arc::clone(&local_sender))
+        .shuffle_receiver(Arc::clone(&local_receiver))
+        .build()
+        .await
+        .unwrap();
+    db.set_source_gate(true);
+    let revision = db
+        .assignment_authority_revision
+        .load(std::sync::atomic::Ordering::Acquire);
+    let activation = {
+        let db = Arc::clone(&db);
+        let fence = fence.clone();
+        tokio::spawn(async move {
+            db.activate_assignment_authority(
+                &fence,
+                None,
+                revision,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+            )
+            .await
+        })
+    };
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while local_sender.assignment_version() == 0
+            || controller.checkpoint_assignment_fence(1).as_ref() != Some(&fence)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("local transport authority was not published");
+    assert!(!activation.is_finished());
+    assert!(db.cluster_intake_fenced());
+    assert_eq!(local_sender.assignment_version(), 1);
+    assert_eq!(local_receiver.assignment_version(), 1);
+    assert_eq!(
+        controller.checkpoint_assignment_fence(1),
+        Some(fence.clone())
+    );
+
+    peer_receiver
+        .install_assignment_fence(&fence, &[local_id.0, peer_id.0])
+        .unwrap();
+    let activated = activation.await.unwrap().unwrap();
+    assert!(activated.installed);
+    assert!(activated.intake_open);
+    assert!(!db.cluster_intake_fenced());
+}
+
+#[cfg(feature = "cluster")]
 #[tokio::test]
 async fn assignment_activation_withdraws_partial_authority_when_fault_audit_fails() {
     let fixture = fault_audit_activation_fixture().await;

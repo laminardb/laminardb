@@ -1513,6 +1513,76 @@ impl LaminarDB {
                 });
             }
 
+            let shuffle_sender = { self.shuffle_sender.lock().clone() };
+            if let Some(sender) = shuffle_sender {
+                let mut retry_delay = std::time::Duration::from_millis(25);
+                let mut last_error = None;
+                loop {
+                    if !controller.process_lease_is_live() {
+                        self.revoke_cluster_authority();
+                        return Ok(AssignmentAuthorityActivation {
+                            installed: false,
+                            intake_open: false,
+                            revision: self
+                                .assignment_authority_revision
+                                .load(std::sync::atomic::Ordering::Acquire),
+                        });
+                    }
+                    if self
+                        .assignment_authority_revision
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        != expected_revision
+                        || controller
+                            .checkpoint_assignment_fence(fence.assignment_version)
+                            .as_ref()
+                            != Some(fence)
+                        || controller.checkpoint_drain_transition() != expected_drain_transition
+                    {
+                        return Ok(AssignmentAuthorityActivation {
+                            installed: false,
+                            intake_open: false,
+                            revision: self
+                                .assignment_authority_revision
+                                .load(std::sync::atomic::Ordering::Acquire),
+                        });
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        self.withdraw_assignment_authority(&controller);
+                        return Err(DbError::Checkpoint(format!(
+                            "assignment shuffle mesh did not become ready before the activation deadline{}",
+                            last_error
+                                .as_ref()
+                                .map(|error| format!("; last error: {error}"))
+                                .unwrap_or_default()
+                        )));
+                    }
+                    match tokio::time::timeout_at(deadline, sender.establish_assignment_mesh(fence))
+                        .await
+                    {
+                        Ok(Ok(())) => break,
+                        Ok(Err(error)) => last_error = Some(error.to_string()),
+                        Err(_) => {
+                            self.withdraw_assignment_authority(&controller);
+                            return Err(DbError::Checkpoint(format!(
+                                "assignment shuffle mesh readiness timed out{}",
+                                last_error
+                                    .as_ref()
+                                    .map(|error| format!("; last error: {error}"))
+                                    .unwrap_or_default()
+                            )));
+                        }
+                    }
+                    let wake = tokio::time::Instant::now()
+                        .checked_add(retry_delay)
+                        .map_or(deadline, |wake| wake.min(deadline));
+                    tokio::time::sleep_until(wake).await;
+                    retry_delay = retry_delay
+                        .checked_mul(2)
+                        .unwrap_or(std::time::Duration::from_millis(250))
+                        .min(std::time::Duration::from_millis(250));
+                }
+            }
+
             let expected_leader = expected_drain_transition
                 .as_ref()
                 .filter(|_| preserve_predecessor_execution)

@@ -2250,6 +2250,57 @@ mod grpc {
             self.validate_expected_assignment(expected)
         }
 
+        /// Establish an exact-scope stream to every remote assignment participant without sending
+        /// a frame or consuming a delivery sequence.
+        ///
+        /// # Errors
+        /// Returns the first peer connection or handshake error after attempting the full roster.
+        pub async fn establish_assignment_mesh(
+            &self,
+            assignment_fence: &CheckpointAssignmentFence,
+        ) -> io::Result<()> {
+            let installed = self.current_assignment()?;
+            if *assignment_fence != installed.fence
+                || assignment_fence.digest() != installed.digest
+                || !assignment_fence.is_canonical()
+                || assignment_fence.participant_incarnation(self.local_id)
+                    != Some(self.sender_incarnation)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "shuffle mesh does not match the installed assignment certificate",
+                ));
+            }
+            let scope = self.current_scope(Some(assignment_fence.assignment_version))?;
+            let results = futures::future::join_all(
+                assignment_fence
+                    .participants
+                    .iter()
+                    .map(|participant| participant.node_id)
+                    .filter(|peer| *peer != self.local_id)
+                    .map(|peer| {
+                        let peer_scope = scope.clone();
+                        async move { (peer, self.connection_for(peer, &peer_scope).await) }
+                    }),
+            )
+            .await;
+            let mut first_error = None;
+            for (peer, result) in results {
+                if let Err(error) = result {
+                    first_error.get_or_insert_with(|| {
+                        io::Error::new(
+                            error.kind(),
+                            format!("shuffle assignment mesh peer {peer}: {error}"),
+                        )
+                    });
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+            self.validate_scope(&scope, Some(assignment_fence.assignment_version))
+        }
+
         /// Ship `barrier` to every required peer. All peers are attempted, but
         /// any failure rejects the cut so the coordinator can abort promptly.
         ///
@@ -6042,6 +6093,29 @@ mod shim {
             ))
         }
 
+        /// No cluster fabric exists, so only a local-only assignment has a complete mesh.
+        ///
+        /// # Errors
+        /// Returns an unsupported error when the assignment names a remote participant.
+        #[allow(clippy::unused_async)]
+        pub async fn establish_assignment_mesh(
+            &self,
+            assignment_fence: &CheckpointAssignmentFence,
+        ) -> io::Result<()> {
+            if assignment_fence
+                .participants
+                .iter()
+                .all(|participant| participant.node_id == self.local_id)
+            {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "cluster shuffle mesh is disabled",
+                ))
+            }
+        }
+
         /// Fan out to every required peer, reporting any missing peer after all
         /// sends have been attempted.
         ///
@@ -6674,6 +6748,55 @@ mod tests {
             .install_assignment_fence(&fence, &owners)
             .expect_err("unwired inbound shuffle must fail closed");
         assert_eq!(receiver_error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn assignment_mesh_waits_for_exact_peer_certificate_without_consuming_sequence() {
+        let fence = assignment_fence(1, &[1, 2]);
+        let owners = assignment_owners(&[1, 2]);
+        let receiver = ShuffleReceiver::bind(2, "127.0.0.1:0".parse().unwrap(), Uuid::from_u128(3))
+            .await
+            .unwrap();
+        receiver
+            .install_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
+                std::time::Duration::from_secs(60),
+            )))
+            .unwrap();
+        let sender = sender(1);
+        sender.register_peer(2, receiver.local_addr()).await;
+
+        let error = sender
+            .establish_assignment_mesh(&fence)
+            .await
+            .expect_err("an uncertified receiver must keep the assignment mesh fenced");
+        assert!(error.to_string().contains("peer 2"), "{error}");
+        assert_eq!(sender.tracked_resources_for_test().3, 0);
+
+        receiver.install_assignment_fence(&fence, &owners).unwrap();
+        sender.establish_assignment_mesh(&fence).await.unwrap();
+        let resources = sender.tracked_resources_for_test();
+        assert_eq!(resources.1, 1);
+        assert_eq!(
+            resources.3, 0,
+            "a handshake must not allocate a data sequence"
+        );
+
+        let mut conflicting_owners = owners;
+        conflicting_owners.swap(0, 1);
+        let conflicting = CheckpointAssignmentFence::from_owner_map(
+            fence.assignment_version,
+            &conflicting_owners,
+            fence.participants.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            sender
+                .establish_assignment_mesh(&conflicting)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     async fn wait_until(mut ready: impl FnMut() -> bool) {
