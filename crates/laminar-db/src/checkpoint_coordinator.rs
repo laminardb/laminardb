@@ -2760,12 +2760,19 @@ impl CheckpointCoordinator {
         self.prom = Some(prom);
     }
 
-    fn emit_checkpoint_metrics(&self, success: bool, epoch: u64, duration: Duration) {
+    fn emit_checkpoint_metrics(
+        &self,
+        success: bool,
+        checkpoint_id: u64,
+        epoch: u64,
+        duration: Duration,
+    ) {
         if let Some(ref m) = self.prom {
             if success {
                 m.checkpoints_completed.inc();
             } else {
                 m.checkpoints_failed.inc();
+                warn!(checkpoint_id, epoch, "checkpoint failure metric recorded");
             }
             #[allow(clippy::cast_possible_wrap)]
             m.checkpoint_epoch.set(epoch as i64);
@@ -4026,7 +4033,7 @@ impl CheckpointCoordinator {
         self.phase = CheckpointPhase::Idle;
         self.decision_write_started = false;
         let duration = started.elapsed();
-        self.emit_checkpoint_metrics(false, epoch, duration);
+        self.emit_checkpoint_metrics(false, checkpoint_id, epoch, duration);
         // Once the attempt is terminal, staged data must not survive cancellation of the bounded
         // connector cleanup below.
         self.pending_vnode_states.clear();
@@ -4066,7 +4073,7 @@ impl CheckpointCoordinator {
         self.phase = CheckpointPhase::Idle;
         self.decision_write_started = false;
         let duration = started.elapsed();
-        self.emit_checkpoint_metrics(false, epoch, duration);
+        self.emit_checkpoint_metrics(false, checkpoint_id, epoch, duration);
         self.pending_vnode_states.clear();
         self.pending_sink_descriptors.clear();
         CheckpointResult {
@@ -6128,7 +6135,7 @@ impl CheckpointCoordinator {
         let duration = committed_duration;
         self.last_checkpoint_duration = Some(duration);
         self.duration_histogram.record(duration);
-        self.emit_checkpoint_metrics(true, epoch, duration);
+        self.emit_checkpoint_metrics(true, checkpoint_id, epoch, duration);
 
         // The state seal and exact durable decision are now both visible. Wake the one
         // designated external committer immediately; it re-validates both before committing.

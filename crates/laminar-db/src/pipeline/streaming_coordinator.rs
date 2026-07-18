@@ -5488,6 +5488,7 @@ impl StreamingCoordinator {
             started_at,
             assignment_fence,
         } = context;
+        let authoritative_abort = matches!(&outcome, BarrierOutcome::Aborted);
         let (cleanup_reason, manual_reason, record_failure) = match outcome {
             BarrierOutcome::Committed(epoch) if epoch == attempt.epoch => {
                 #[cfg(feature = "cluster")]
@@ -5561,14 +5562,18 @@ impl StreamingCoordinator {
             }
         };
         callback.abort_subscription_cut(attempt);
-        Self::cleanup_checkpoint_attempt(
-            callback,
-            cleanup_owner,
-            attempt,
-            &cleanup_reason,
-            assignment_fence,
-        )
-        .await?;
+        if authoritative_abort && cleanup_owner == CheckpointCleanupOwner::Follower {
+            callback.resolve_authoritative_follower_abort(attempt)?;
+        } else {
+            Self::cleanup_checkpoint_attempt(
+                callback,
+                cleanup_owner,
+                attempt,
+                &cleanup_reason,
+                assignment_fence,
+            )
+            .await?;
+        }
         if record_failure {
             callback.record_checkpoint_failure(attempt.checkpoint_id, &cleanup_reason);
         }
@@ -6530,6 +6535,8 @@ mod tests {
         abandon_error: Option<String>,
         abandoned_attempts: Arc<Mutex<Vec<(CheckpointAttempt, String)>>>,
         cancelled_source_barrier_attempts: Arc<Mutex<Vec<(CheckpointAttempt, String)>>>,
+        resolved_follower_aborts: Arc<Mutex<Vec<CheckpointAttempt>>>,
+        resolve_follower_abort_error: Option<String>,
         abandoned_fences:
             Arc<Mutex<Vec<Option<laminar_core::cluster::control::CheckpointAssignmentFence>>>>,
         checkpoint_failures: Vec<(u64, String)>,
@@ -6604,6 +6611,8 @@ mod tests {
                 abandon_error: None,
                 abandoned_attempts: Arc::new(Mutex::new(Vec::new())),
                 cancelled_source_barrier_attempts: Arc::new(Mutex::new(Vec::new())),
+                resolved_follower_aborts: Arc::new(Mutex::new(Vec::new())),
+                resolve_follower_abort_error: None,
                 abandoned_fences: Arc::new(Mutex::new(Vec::new())),
                 checkpoint_failures: Vec::new(),
                 checkpoint_continuation_failures: Vec::new(),
@@ -6832,6 +6841,15 @@ mod tests {
                 .lock()
                 .push((attempt, reason.to_owned()));
             Ok(())
+        }
+
+        fn resolve_authoritative_follower_abort(
+            &mut self,
+            attempt: CheckpointAttempt,
+        ) -> Result<(), String> {
+            self.checkpoint_order.lock().push("cleanup");
+            self.resolved_follower_aborts.lock().push(attempt);
+            self.resolve_follower_abort_error.take().map_or(Ok(()), Err)
         }
 
         fn record_checkpoint_failure(&mut self, checkpoint_id: u64, reason: &str) {
@@ -8025,6 +8043,8 @@ mod tests {
         assert_eq!(callback.control_checkpoint_calls, 1);
         assert!(callback.checkpoint_failures.is_empty());
         assert!(callback.checkpoint_admission_failures.is_empty());
+        assert!(callback.resolved_follower_aborts.lock().is_empty());
+        assert!(callback.cancelled_source_barrier_attempts.lock().is_empty());
         assert!(!coordinator.pending_barrier.active);
     }
 
@@ -8863,7 +8883,7 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[tokio::test]
-    async fn follower_aligned_abort_cancels_after_role_change_without_failure() {
+    async fn follower_aligned_abort_resolves_after_role_change_without_failure() {
         let (source, _poll) = checkpoint_source_handle("source");
         let mut release = source.barrier_release_tx.subscribe();
         let mut coordinator = admission_coordinator(vec![source]);
@@ -8874,6 +8894,7 @@ mod tests {
         callback.runtime.leader = true;
         callback.barrier_outcome = Some(BarrierOutcome::Aborted);
         let cancelled = Arc::clone(&callback.cancelled_source_barrier_attempts);
+        let resolved = Arc::clone(&callback.resolved_follower_aborts);
 
         coordinator
             .handle_barrier(
@@ -8886,14 +8907,45 @@ mod tests {
             .unwrap();
 
         assert!(callback.checkpoint_failures.is_empty());
-        let cancelled = cancelled.lock();
-        assert_eq!(cancelled.len(), 1);
-        assert_eq!(cancelled[0].0, attempt);
-        assert!(cancelled[0].1.contains("authoritative cluster control"));
+        assert!(cancelled.lock().is_empty());
+        assert_eq!(resolved.lock().as_slice(), &[attempt]);
         assert_eq!(
             *release.borrow_and_update(),
             Some(SourceBarrierSignal::Release(attempt))
         );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn follower_aligned_abort_cleanup_failure_keeps_sources_fenced() {
+        let (source, _poll) = checkpoint_source_handle("source");
+        let mut release = source.barrier_release_tx.subscribe();
+        let mut coordinator = admission_coordinator(vec![source]);
+        install_test_process_authority(&mut coordinator, 57);
+        let attempt = CheckpointAttempt::new(57, 90_057);
+        coordinator.pending_barrier.reset_follower(attempt, 1);
+        let mut callback = MockCallback::new();
+        callback.barrier_outcome = Some(BarrierOutcome::Aborted);
+        callback.resolve_follower_abort_error = Some("injected local cleanup failure".into());
+
+        let error = coordinator
+            .handle_barrier(
+                0,
+                &CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch),
+                &checkpoint_at(attempt.epoch),
+                &mut callback,
+            )
+            .await
+            .expect_err("failed follower Abort cleanup must require recovery");
+
+        assert!(matches!(error, CycleError::Recovery(_)), "{error:?}");
+        assert!(callback.cancelled_source_barrier_attempts.lock().is_empty());
+        assert_eq!(
+            callback.resolved_follower_aborts.lock().as_slice(),
+            &[attempt]
+        );
+        assert!(callback.checkpoint_failures.is_empty());
+        assert_eq!(*release.borrow_and_update(), None);
     }
 
     #[tokio::test]
@@ -13972,6 +14024,12 @@ mod tests {
             self.inner
                 .cancel_source_barrier_attempt(attempt, reason)
                 .await
+        }
+        fn resolve_authoritative_follower_abort(
+            &mut self,
+            attempt: CheckpointAttempt,
+        ) -> Result<(), String> {
+            self.inner.resolve_authoritative_follower_abort(attempt)
         }
         fn record_cycle(&self, e: u64, b: u64, ns: u64) {
             self.inner.record_cycle(e, b, ns);

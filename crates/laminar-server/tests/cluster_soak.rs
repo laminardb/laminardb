@@ -79,6 +79,10 @@ const CHECKPOINT_ATTEMPT_FAILED_LOG: &str = "checkpoint attempt failed";
 const CHECKPOINT_ADMISSION_FAILED_LOG: &str = "checkpoint admission failed";
 #[cfg(feature = "kafka")]
 const CHECKPOINT_CONTINUATION_FAILED_LOG: &str = "checkpoint continuation failed";
+#[cfg(feature = "kafka")]
+const CHECKPOINT_FAILURE_METRIC_LOG: &str = "checkpoint failure metric recorded";
+#[cfg(feature = "kafka")]
+const RECOVERY_PREPARE_LOG: &str = "leader announced recovery prepare";
 const RECOVERY_LIVENESS_WINDOW: Duration = Duration::from_secs(90);
 const DEFAULT_MAX_RECOVERY_MS: u64 = 90_000;
 const LOCAL_EXACT_PREFIX_CYCLES: u64 = 4;
@@ -276,6 +280,28 @@ fn checkpoint_reservation_from_log_line(
     if checkpoint_id == 0 || epoch == 0 {
         return Err(format!(
             "checkpoint reservation log carried a non-canonical identity: checkpoint_id={checkpoint_id}, epoch={epoch}"
+        ));
+    }
+    Ok(Some(DurableCheckpointStatus {
+        checkpoint_id,
+        epoch,
+    }))
+}
+
+#[cfg(feature = "kafka")]
+fn checkpoint_failure_metric_from_log_line(
+    line: &str,
+) -> Result<Option<DurableCheckpointStatus>, String> {
+    if !line.contains(CHECKPOINT_FAILURE_METRIC_LOG) {
+        return Ok(None);
+    }
+    let checkpoint_id = log_line_u64_field(line, "checkpoint_id")
+        .ok_or_else(|| "checkpoint failure metric log omitted checkpoint_id".to_string())?;
+    let epoch = log_line_u64_field(line, "epoch")
+        .ok_or_else(|| "checkpoint failure metric log omitted epoch".to_string())?;
+    if checkpoint_id == 0 || epoch == 0 {
+        return Err(format!(
+            "checkpoint failure metric log carried a non-canonical identity: checkpoint_id={checkpoint_id}, epoch={epoch}"
         ));
     }
     Ok(Some(DurableCheckpointStatus {
@@ -839,12 +865,82 @@ struct ProducedPrefix {
 #[cfg(feature = "kafka")]
 struct ExplicitFaultEvidence {
     victim: usize,
+    recovery_leader: usize,
     log_offsets: Vec<u64>,
     pipeline_fault_baselines: Vec<f64>,
     recovery_baselines: Vec<f64>,
     recovery_failure_baselines: Vec<f64>,
+    checkpoint_failure_baselines: Vec<f64>,
     checkpoint_failure_totals: Vec<f64>,
+    interrupted_checkpoint: Option<DurableCheckpointStatus>,
     resumed_checkpoint: DurableCheckpointStatus,
+}
+
+#[cfg(feature = "kafka")]
+struct CheckpointFailureSnapshot {
+    totals: Vec<f64>,
+    log_offsets: Vec<u64>,
+    log_prefixes: Vec<Vec<u8>>,
+}
+
+#[cfg(feature = "kafka")]
+fn capture_checkpoint_failure_snapshot(
+    nodes: &[Node],
+    timeout: Duration,
+) -> CheckpointFailureSnapshot {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let before = nodes
+            .iter()
+            .map(|node| node.metric("laminardb_checkpoints_failed_total"))
+            .collect::<Option<Vec<_>>>();
+        let log_offsets = nodes.iter().map(Node::log_len).collect::<Vec<_>>();
+        let log_prefixes = nodes
+            .iter()
+            .zip(&log_offsets)
+            .map(|(node, end)| {
+                let mut bytes = std::fs::read(&node.log_path).unwrap_or_else(|error| {
+                    panic!("read node{} checkpoint evidence log: {error}", node.id)
+                });
+                let end = usize::try_from(*end)
+                    .unwrap_or_else(|_| panic!("node{} log offset exceeds usize", node.id));
+                assert!(
+                    end <= bytes.len(),
+                    "node{} checkpoint evidence log shrank from {end} to {} bytes",
+                    node.id,
+                    bytes.len()
+                );
+                bytes.truncate(end);
+                bytes
+            })
+            .collect::<Vec<_>>();
+        let after = nodes
+            .iter()
+            .map(|node| node.metric("laminardb_checkpoints_failed_total"))
+            .collect::<Option<Vec<_>>>();
+
+        if let (Some(before), Some(after)) = (before, after) {
+            let logs_match_metrics = log_prefixes.iter().zip(&after).all(|(log, total)| {
+                String::from_utf8_lossy(log)
+                    .matches(CHECKPOINT_FAILURE_METRIC_LOG)
+                    .count() as f64
+                    == *total
+            });
+            if before == after && logs_match_metrics {
+                return CheckpointFailureSnapshot {
+                    totals: after,
+                    log_offsets,
+                    log_prefixes,
+                };
+            }
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "checkpoint failure metrics and exact log markers did not reach a coherent snapshot"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[cfg(feature = "kafka")]
@@ -1588,8 +1684,6 @@ fn assert_final_outputs(
 
 #[cfg(feature = "kafka")]
 fn assert_no_unsolicited_cold_start_recovery(nodes: &[Node]) {
-    const PREPARE: &str = "leader announced recovery prepare";
-
     for node in nodes {
         assert_eq!(
             node.metric("laminardb_coordinated_recoveries_total")
@@ -1607,7 +1701,7 @@ fn assert_no_unsolicited_cold_start_recovery(nodes: &[Node]) {
         );
         let log = node.log_since(0);
         assert!(
-            !log.contains(PREPARE) && !log.contains(RECOVERY_RELEASE_LOG),
+            !log.contains(RECOVERY_PREPARE_LOG) && !log.contains(RECOVERY_RELEASE_LOG),
             "node{} log contains unsolicited cold-start recovery activity",
             node.id
         );
@@ -1680,24 +1774,184 @@ fn validate_recovery_checkpoint_failure_totals(
 }
 
 #[cfg(feature = "kafka")]
-fn assert_explicit_fault_recovery_evidence(nodes: &[Node], evidence: &ExplicitFaultEvidence) {
-    const PREPARE: &str = "leader announced recovery prepare";
+fn validate_recovery_checkpoint_failure_evidence(
+    baselines: &[f64],
+    totals: &[f64],
+    leader: usize,
+    fault_logs: &[String],
+    leader_log: &str,
+    resumed_checkpoint: DurableCheckpointStatus,
+) -> Result<Option<DurableCheckpointStatus>, String> {
+    validate_recovery_checkpoint_failure_totals(baselines, totals, leader)?;
+    if fault_logs.len() != totals.len() {
+        return Err(format!(
+            "checkpoint failure log cardinality {} does not match {} metric samples",
+            fault_logs.len(),
+            totals.len()
+        ));
+    }
 
+    let mut leader_failure = None;
+    for (node_id, log) in fault_logs.iter().enumerate() {
+        let mut failures = Vec::new();
+        for line in log.lines() {
+            if let Some(failure) = checkpoint_failure_metric_from_log_line(line)? {
+                failures.push(failure);
+            }
+        }
+        let delta = totals[node_id] - baselines[node_id];
+        let expected = if delta == 1.0 { 1 } else { 0 };
+        if failures.len() != expected {
+            return Err(format!(
+                "node{node_id} checkpoint failure metric changed by {delta} but its fault log contains {} exact metric records",
+                failures.len()
+            ));
+        }
+        if node_id == leader {
+            leader_failure = failures.first().copied();
+        }
+    }
+    let Some(failed) = leader_failure else {
+        return Ok(None);
+    };
+    let prepare_count = fault_logs
+        .iter()
+        .map(|log| log.matches(RECOVERY_PREPARE_LOG).count())
+        .sum::<usize>();
+    if prepare_count != 1 {
+        return Err(format!(
+            "checkpoint failure metric was recorded with {prepare_count} recovery Prepare records"
+        ));
+    }
+    let leader_fault_lines = fault_logs[leader].lines().collect::<Vec<_>>();
+    let prepare = leader_fault_lines
+        .iter()
+        .position(|line| line.contains(RECOVERY_PREPARE_LOG))
+        .ok_or_else(|| {
+            "checkpoint failure was not preceded by the recovery leader's Prepare".to_string()
+        })?;
+    let mut fault_failure = None;
+    for (index, line) in leader_fault_lines.iter().enumerate() {
+        if checkpoint_failure_metric_from_log_line(line)? == Some(failed) {
+            fault_failure = Some(index);
+            break;
+        }
+    }
+    let fault_failure = fault_failure.ok_or_else(|| {
+        format!(
+            "checkpoint {} epoch {} failure is absent from the recovery leader fault log",
+            failed.checkpoint_id, failed.epoch
+        )
+    })?;
+    if prepare >= fault_failure {
+        return Err(format!(
+            "checkpoint {} epoch {} failure was not caused by the injected recovery Prepare",
+            failed.checkpoint_id, failed.epoch
+        ));
+    }
+    if !leader_fault_lines[fault_failure + 1..]
+        .iter()
+        .any(|line| line.contains(RECOVERY_RELEASE_LOG))
+    {
+        return Err(format!(
+            "checkpoint {} epoch {} failure was not followed by recovery Release",
+            failed.checkpoint_id, failed.epoch
+        ));
+    }
+
+    let lines = leader_log.lines().collect::<Vec<_>>();
+    let mut reservations = Vec::new();
+    let mut failures = Vec::new();
+    let mut completions = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if checkpoint_reservation_from_log_line(line)? == Some(failed) {
+            reservations.push(index);
+        }
+        if checkpoint_failure_metric_from_log_line(line)? == Some(failed) {
+            failures.push(index);
+        }
+        if log_line_reports_checkpoint_completion(line, failed) {
+            completions.push(index);
+        }
+    }
+    if reservations.len() != 1 {
+        return Err(format!(
+            "checkpoint failure metric for checkpoint {} epoch {} has {} matching leader reservations",
+            failed.checkpoint_id,
+            failed.epoch,
+            reservations.len()
+        ));
+    }
+    if failures.len() != 1 {
+        return Err(format!(
+            "checkpoint failure metric for checkpoint {} epoch {} appears {} times in the leader log",
+            failed.checkpoint_id,
+            failed.epoch,
+            failures.len()
+        ));
+    }
+    let reservation = reservations[0];
+    let failure = failures[0];
+    if reservation >= failure {
+        return Err(format!(
+            "checkpoint {} epoch {} failed before its exact reservation",
+            failed.checkpoint_id, failed.epoch
+        ));
+    }
+    if !completions.is_empty() {
+        return Err(format!(
+            "checkpoint {} epoch {} both completed and recorded a failure metric",
+            failed.checkpoint_id, failed.epoch
+        ));
+    }
+    let failed_attempt = CheckpointAttempt::new(failed.epoch, failed.checkpoint_id);
+    let resumed_attempt =
+        CheckpointAttempt::new(resumed_checkpoint.epoch, resumed_checkpoint.checkpoint_id);
+    if failed_attempt.relation_to(resumed_attempt) != CheckpointAttemptRelation::Older {
+        return Err(format!(
+            "resumed checkpoint {} epoch {} is not strictly newer than interrupted checkpoint {} epoch {}",
+            resumed_checkpoint.checkpoint_id,
+            resumed_checkpoint.epoch,
+            failed.checkpoint_id,
+            failed.epoch
+        ));
+    }
+    Ok(Some(failed))
+}
+
+#[cfg(feature = "kafka")]
+fn assert_explicit_fault_recovery_evidence(nodes: &[Node], evidence: &ExplicitFaultEvidence) {
     assert_eq!(nodes.len(), evidence.log_offsets.len());
     assert_eq!(nodes.len(), evidence.pipeline_fault_baselines.len());
     assert_eq!(nodes.len(), evidence.recovery_baselines.len());
     assert_eq!(nodes.len(), evidence.recovery_failure_baselines.len());
+    assert_eq!(nodes.len(), evidence.checkpoint_failure_baselines.len());
     assert_eq!(nodes.len(), evidence.checkpoint_failure_totals.len());
     let logs = nodes
         .iter()
         .zip(&evidence.log_offsets)
         .map(|(node, offset)| node.log_since(*offset))
         .collect::<Vec<_>>();
-    let prepare_count: usize = logs.iter().map(|log| log.matches(PREPARE).count()).sum();
+    let prepare_count: usize = logs
+        .iter()
+        .map(|log| log.matches(RECOVERY_PREPARE_LOG).count())
+        .sum();
     assert_eq!(
         prepare_count, 1,
         "explicit fault created {prepare_count} recovery Prepare generations instead of exactly one"
     );
+    let leader_log = std::fs::read_to_string(&nodes[evidence.recovery_leader].log_path)
+        .expect("read recovery leader log for checkpoint failure evidence");
+    let interrupted = validate_recovery_checkpoint_failure_evidence(
+        &evidence.checkpoint_failure_baselines,
+        &evidence.checkpoint_failure_totals,
+        evidence.recovery_leader,
+        &logs,
+        &leader_log,
+        evidence.resumed_checkpoint,
+    )
+    .unwrap_or_else(|error| panic!("explicit recovery checkpoint failure invalid: {error}"));
+    assert_eq!(interrupted, evidence.interrupted_checkpoint);
     validate_post_release_checkpoint_lifecycle(&logs, evidence.resumed_checkpoint)
         .unwrap_or_else(|error| panic!("explicit recovery checkpoint lifecycle invalid: {error}"));
 
@@ -2785,7 +3039,6 @@ fn three_node_kill9_soak() {
     let mut explicit_fault_evidence = None;
     if let Some(role) = fault_role.as_deref() {
         assert_no_unsolicited_cold_start_recovery(&nodes);
-        let fault_log_offsets = nodes.iter().map(Node::log_len).collect::<Vec<_>>();
         let leader = wait_for_stable_leader(&mut nodes, &mut producer);
         let victim = match role {
             "leader" => leader,
@@ -2815,13 +3068,11 @@ fn three_node_kill9_soak() {
                     .expect("node did not expose coordinated_recovery_failures_total")
             })
             .collect();
-        let checkpoint_failure_baselines: Vec<f64> = nodes
-            .iter()
-            .map(|node| {
-                node.metric("laminardb_checkpoints_failed_total")
-                    .expect("node did not expose checkpoint failure count")
-            })
-            .collect();
+        let CheckpointFailureSnapshot {
+            totals: checkpoint_failure_baselines,
+            log_offsets: fault_log_offsets,
+            ..
+        } = capture_checkpoint_failure_snapshot(&nodes, Duration::from_secs(5));
         eprintln!("soak: trigger fatal cycle fault on observed {role} node {victim}");
         let recovery_started = Instant::now();
         let recovery_deadline = recovery_started + recovery_ceiling;
@@ -2861,26 +3112,44 @@ fn three_node_kill9_soak() {
             "progress after coordinated recovery",
             Some(latest_checkpoint),
         );
-        let checkpoint_failure_totals = nodes
+        let failure_snapshot = capture_checkpoint_failure_snapshot(&nodes, Duration::from_secs(5));
+        let checkpoint_failure_totals = failure_snapshot.totals.clone();
+        let fault_logs = failure_snapshot
+            .log_prefixes
             .iter()
-            .map(|node| {
-                node.metric("laminardb_checkpoints_failed_total")
-                    .expect("node stopped exposing checkpoint failure count")
+            .zip(&fault_log_offsets)
+            .enumerate()
+            .map(|(node_id, (log, offset))| {
+                let offset = usize::try_from(*offset)
+                    .unwrap_or_else(|_| panic!("node{node_id} log offset exceeds usize"));
+                assert!(
+                    offset <= log.len(),
+                    "node{node_id} checkpoint evidence log shrank below its fault boundary"
+                );
+                String::from_utf8_lossy(&log[offset..]).into_owned()
             })
             .collect::<Vec<_>>();
-        validate_recovery_checkpoint_failure_totals(
+        let leader_log =
+            String::from_utf8_lossy(&failure_snapshot.log_prefixes[leader]).into_owned();
+        let interrupted_checkpoint = validate_recovery_checkpoint_failure_evidence(
             &checkpoint_failure_baselines,
             &checkpoint_failure_totals,
             leader,
+            &fault_logs,
+            &leader_log,
+            latest_checkpoint,
         )
         .unwrap_or_else(|error| panic!("invalid explicit recovery checkpoint failures: {error}"));
         let evidence = ExplicitFaultEvidence {
             victim,
+            recovery_leader: leader,
             log_offsets: fault_log_offsets,
             pipeline_fault_baselines,
             recovery_baselines,
             recovery_failure_baselines: failure_baselines,
+            checkpoint_failure_baselines,
             checkpoint_failure_totals,
+            interrupted_checkpoint,
             resumed_checkpoint: latest_checkpoint,
         };
         assert_explicit_fault_recovery_evidence(&nodes, &evidence);
@@ -2917,6 +3186,14 @@ fn three_node_kill9_soak() {
             (victim, "follower")
         };
         nodes[victim].assert_running();
+        let pre_arm_latency = nodes[victim]
+            .checkpoint_latency_metrics()
+            .expect("kill victim did not expose checkpoint latency metrics");
+        assert!(
+            pre_arm_latency.pipeline_stall_observations > 0.0,
+            "node{victim} process generation {} had no completed checkpoint stall observation before arming kill-{round}",
+            nodes[victim].process_generation
+        );
         nodes[victim].arm_checkpoint_kill(victim_role);
         wait_for(
             "selected node to enter its armed checkpoint phase",
@@ -3311,6 +3588,132 @@ fn recovery_checkpoint_failure_oracle_allows_only_one_leader_abort() {
             .unwrap_err()
             .contains("node1")
     );
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn recovery_checkpoint_failure_evidence_binds_the_interrupted_attempt() {
+    let baselines = [3.0, 7.0, 2.0];
+    let totals = [4.0, 7.0, 2.0];
+    let failed = DurableCheckpointStatus {
+        checkpoint_id: 4,
+        epoch: 4,
+    };
+    let resumed = DurableCheckpointStatus {
+        checkpoint_id: 5,
+        epoch: 5,
+    };
+    let metric = format!("checkpoint_id=4 epoch=4 {CHECKPOINT_FAILURE_METRIC_LOG}");
+    let leader_log = format!(
+        "checkpoint_id=4 epoch=4 {CHECKPOINT_ATTEMPT_RESERVED_LOG}\n{RECOVERY_PREPARE_LOG}\n{metric}\n{RECOVERY_RELEASE_LOG}\ncheckpoint_id=5 epoch=5 checkpoint completed"
+    );
+    let fault_logs = vec![
+        format!("{RECOVERY_PREPARE_LOG}\n{metric}\n{RECOVERY_RELEASE_LOG}"),
+        RECOVERY_RELEASE_LOG.into(),
+        RECOVERY_RELEASE_LOG.into(),
+    ];
+
+    assert_eq!(
+        validate_recovery_checkpoint_failure_evidence(
+            &baselines,
+            &totals,
+            0,
+            &fault_logs,
+            &leader_log,
+            resumed,
+        )
+        .unwrap(),
+        Some(failed)
+    );
+
+    let pre_prepare_failure_logs = vec![
+        format!("{metric}\n{RECOVERY_PREPARE_LOG}\n{RECOVERY_RELEASE_LOG}"),
+        RECOVERY_RELEASE_LOG.into(),
+        RECOVERY_RELEASE_LOG.into(),
+    ];
+    let error = validate_recovery_checkpoint_failure_evidence(
+        &baselines,
+        &totals,
+        0,
+        &pre_prepare_failure_logs,
+        &leader_log,
+        resumed,
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("not caused by the injected recovery"),
+        "{error}"
+    );
+
+    let no_failure_logs = vec![
+        format!("{RECOVERY_PREPARE_LOG}\n{RECOVERY_RELEASE_LOG}"),
+        RECOVERY_RELEASE_LOG.into(),
+        RECOVERY_RELEASE_LOG.into(),
+    ];
+    assert_eq!(
+        validate_recovery_checkpoint_failure_evidence(
+            &baselines,
+            &baselines,
+            0,
+            &no_failure_logs,
+            RECOVERY_RELEASE_LOG,
+            resumed,
+        )
+        .unwrap(),
+        None
+    );
+
+    let error = validate_recovery_checkpoint_failure_evidence(
+        &baselines,
+        &baselines,
+        0,
+        &fault_logs,
+        &leader_log,
+        resumed,
+    )
+    .unwrap_err();
+    assert!(error.contains("exact metric records"), "{error}");
+
+    let duplicate_logs = vec![
+        format!("{RECOVERY_PREPARE_LOG}\n{metric}\n{metric}\n{RECOVERY_RELEASE_LOG}"),
+        RECOVERY_RELEASE_LOG.into(),
+        RECOVERY_RELEASE_LOG.into(),
+    ];
+    let error = validate_recovery_checkpoint_failure_evidence(
+        &baselines,
+        &totals,
+        0,
+        &duplicate_logs,
+        &leader_log,
+        resumed,
+    )
+    .unwrap_err();
+    assert!(error.contains("exact metric records"), "{error}");
+
+    let completed_log = format!(
+        "checkpoint_id=4 epoch=4 {CHECKPOINT_ATTEMPT_RESERVED_LOG}\ncheckpoint_id=4 epoch=4 checkpoint completed\n{RECOVERY_PREPARE_LOG}\n{metric}\n{RECOVERY_RELEASE_LOG}"
+    );
+    let error = validate_recovery_checkpoint_failure_evidence(
+        &baselines,
+        &totals,
+        0,
+        &fault_logs,
+        &completed_log,
+        resumed,
+    )
+    .unwrap_err();
+    assert!(error.contains("both completed"), "{error}");
+
+    let error = validate_recovery_checkpoint_failure_evidence(
+        &baselines,
+        &totals,
+        0,
+        &fault_logs,
+        &leader_log,
+        failed,
+    )
+    .unwrap_err();
+    assert!(error.contains("not strictly newer"), "{error}");
 }
 
 #[test]

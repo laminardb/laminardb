@@ -524,13 +524,24 @@ pub trait PipelineCallback: Send + 'static {
 
     /// Cancel an exact follower source-barrier attempt before capture.
     ///
-    /// Local and leader runtimes use `abandon_checkpoint_attempt`; a follower instead releases
-    /// its exact local reservation and publishes a negative barrier acknowledgement.
+    /// An attempt admitted with follower ownership releases its exact local reservation and
+    /// publishes a negative barrier acknowledgement, even if this process changes role while the
+    /// attempt is active. Originator-owned attempts use `abandon_checkpoint_attempt`.
     fn cancel_source_barrier_attempt(
         &mut self,
         _attempt: CheckpointAttempt,
         _reason: &str,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send;
+
+    /// Resolve exact local follower state after an authoritative pre-capture
+    /// [`BarrierOutcome::Aborted`]. This operation must not publish control traffic or wait on the
+    /// network because cluster authority has already terminated the attempt.
+    fn resolve_authoritative_follower_abort(
+        &mut self,
+        _attempt: CheckpointAttempt,
+    ) -> Result<(), String> {
+        Err("authoritative follower Abort cleanup is not implemented by this callback".into())
+    }
 
     /// Capture the exact assignment certificate for a new attempt. `Ok(None)` is a local runtime,
     /// `Ok(Some(_))` is a certified clustered cut, and `Err` closes admission with a reason.

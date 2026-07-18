@@ -2580,6 +2580,26 @@ impl OperatorGraph {
     }
 
     #[cfg(feature = "cluster")]
+    fn stage_received_shuffle_data(
+        &mut self,
+        received: laminar_core::shuffle::ReceivedShuffle,
+        watermark: i64,
+    ) -> Result<(), DbError> {
+        let assignment_version = received.assignment_version();
+        let (message, admission) = received.into_parts();
+        let laminar_core::shuffle::ShuffleMessage::Data { stage, batch, .. } = message else {
+            return Err(DbError::Pipeline(
+                "non-data frame entered shuffle data staging".into(),
+            ));
+        };
+        self.stage_checkpointed_shuffle(
+            &stage,
+            RetainedBatch::admitted(batch, admission, assignment_version),
+            watermark,
+        )
+    }
+
+    #[cfg(feature = "cluster")]
     fn validate_shuffle_attempt_scope(
         cfg: &crate::operator::sql_query::ClusterShuffleConfig,
         assignment_fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
@@ -2723,6 +2743,79 @@ impl OperatorGraph {
         }
     }
 
+    #[cfg(feature = "cluster")]
+    async fn observe_shuffle_alignment_control(
+        controller: Option<&laminar_core::cluster::control::ClusterController>,
+        attempt: laminar_core::state::CheckpointAttempt,
+    ) -> Result<Option<ShuffleAlignmentOutcome>, DbError> {
+        use laminar_core::cluster::control::Phase;
+
+        let Some(controller) = controller else {
+            return Ok(None);
+        };
+        let announcement = controller
+            .observe_barrier_matching(|announcement| {
+                let announced = laminar_core::state::CheckpointAttempt::new(
+                    announcement.epoch,
+                    announcement.checkpoint_id,
+                );
+                match announced.relation_to(attempt) {
+                    laminar_core::state::CheckpointAttemptRelation::Newer
+                    | laminar_core::state::CheckpointAttemptRelation::Conflict => true,
+                    laminar_core::state::CheckpointAttemptRelation::Exact => {
+                        announcement.phase == Phase::Abort
+                    }
+                    laminar_core::state::CheckpointAttemptRelation::Older => false,
+                }
+            })
+            .await
+            .map_err(|error| {
+                DbError::Pipeline(format!(
+                    "shuffle barrier control observation failed: {error}"
+                ))
+            })?;
+        let Some(announcement) = announcement.as_ref() else {
+            return Ok(None);
+        };
+        let Some(outcome) = Self::classify_shuffle_alignment_control(attempt, announcement)? else {
+            return Ok(None);
+        };
+
+        // Abort gossip is only a wake-up hint. The immutable cluster outcome is the terminal
+        // authority; accepting the hint itself would let an unauthorised or stale announcement
+        // release a partially aligned channel cut.
+        let authority = controller.checkpoint_authority().map_err(|error| {
+            DbError::Pipeline(format!(
+                "shuffle barrier Abort authority is unavailable: {error}"
+            ))
+        })?;
+        let durable = authority
+            .cluster_outcome(attempt.epoch)
+            .await
+            .map_err(|error| {
+                DbError::Pipeline(format!(
+                    "shuffle barrier Abort outcome read failed: {error}"
+                ))
+            })?;
+        let Some(durable) = durable else {
+            return Ok(None);
+        };
+        if durable.scope != laminar_core::checkpoint_decision::CheckpointScope::Cluster
+            || durable.checkpoint_id != attempt.checkpoint_id
+            || durable.verdict != laminar_core::checkpoint_decision::CheckpointVerdict::Abort
+        {
+            return Err(DbError::Pipeline(format!(
+                "shuffle barrier Abort hint for checkpoint {} epoch {} conflicts with durable outcome scope={:?} checkpoint={} verdict={:?}",
+                attempt.checkpoint_id,
+                attempt.epoch,
+                durable.scope,
+                durable.checkpoint_id,
+                durable.verdict
+            )));
+        }
+        Ok(Some(outcome))
+    }
+
     /// Aligned shuffle checkpointing: fan out an in-band barrier, retain each peer's pre-barrier
     /// rows as channel state, and wait until every peer's barrier is observed before snapshotting.
     /// A barrier closes that peer's current-attempt channel: data from an already aligned peer while
@@ -2746,7 +2839,6 @@ impl OperatorGraph {
         controller: Option<&laminar_core::cluster::control::ClusterController>,
     ) -> Result<ShuffleAlignmentOutcome, DbError> {
         use laminar_core::checkpoint::barrier::CheckpointBarrier;
-        use laminar_core::cluster::control::Phase;
         use laminar_core::shuffle::ShuffleMessage;
         use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -2850,6 +2942,8 @@ impl OperatorGraph {
             // separate holdovers. The transport sequence reconstructs their per-peer order: data
             // below the barrier's exclusive high-water belongs to this cut; data at/above it does
             // not and cannot be sealed into the current snapshot.
+            let mut post_cut_batches = Vec::new();
+            let mut post_cut_error = None;
             for (stage, received) in staged_batches {
                 Self::validate_received_batch_scope(
                     &received,
@@ -2861,9 +2955,13 @@ impl OperatorGraph {
                 let sequence = received.checkpoint_sequence();
                 if let Some(cut) = barrier_cuts.get(&peer) {
                     if sequence >= *cut {
-                        return Err(DbError::Pipeline(format!(
-                            "shuffle data sequence {sequence} from peer {peer} is at or after its checkpoint barrier high-water {cut}"
-                        )));
+                        post_cut_error.get_or_insert_with(|| {
+                            format!(
+                                "shuffle data sequence {sequence} from peer {peer} is at or after its checkpoint barrier high-water {cut}"
+                            )
+                        });
+                        post_cut_batches.push((stage, received));
+                        continue;
                     }
                 }
                 self.stage_checkpointed_shuffle(
@@ -2873,6 +2971,21 @@ impl OperatorGraph {
                 )?;
             }
             ensure_no_delivery_loss()?;
+            if let Some(error) = post_cut_error {
+                if let Some(outcome) =
+                    Self::observe_shuffle_alignment_control(controller, attempt).await?
+                {
+                    for (stage, received) in post_cut_batches {
+                        self.stage_checkpointed_shuffle(
+                            &stage,
+                            RetainedBatch::from_received(received),
+                            watermark,
+                        )?;
+                    }
+                    return Ok(outcome);
+                }
+                return Err(DbError::Pipeline(error));
+            }
             if remaining.is_empty() {
                 Self::validate_shuffle_attempt_scope(
                     &cfg,
@@ -2881,6 +2994,11 @@ impl OperatorGraph {
                     controller,
                 )?;
                 ensure_no_delivery_loss()?;
+                if let Some(outcome) =
+                    Self::observe_shuffle_alignment_control(controller, attempt).await?
+                {
+                    return Ok(outcome);
+                }
                 return Ok(ShuffleAlignmentOutcome::Aligned);
             }
 
@@ -2905,25 +3023,20 @@ impl OperatorGraph {
                             let peer = received.peer();
                             let sequence = received.checkpoint_sequence();
                             if let Some(cut) = barrier_cuts.get(&peer) {
+                                if let Some(outcome) = Self::observe_shuffle_alignment_control(
+                                    controller,
+                                    attempt,
+                                )
+                                .await?
+                                {
+                                    self.stage_received_shuffle_data(received, watermark)?;
+                                    return Ok(outcome);
+                                }
                                 return Err(DbError::Pipeline(format!(
                                     "shuffle data sequence {sequence} from peer {peer} arrived after its checkpoint barrier high-water {cut} while peers {remaining:?} were still outstanding"
                                 )));
                             }
-                            let assignment_version = received.assignment_version();
-                            let (message, admission) = received.into_parts();
-                            let ShuffleMessage::Data {
-                                stage,
-                                batch,
-                                ..
-                            } = message
-                            else {
-                                unreachable!("matched data above");
-                            };
-                            self.stage_checkpointed_shuffle(
-                                &stage,
-                                RetainedBatch::admitted(batch, admission, assignment_version),
-                                watermark,
-                            )?;
+                            self.stage_received_shuffle_data(received, watermark)?;
                             continue;
                         }
 
@@ -2970,36 +3083,10 @@ impl OperatorGraph {
                             controller,
                         )?;
                         ensure_no_delivery_loss()?;
-                        if let Some(ctrl) = controller {
-                            let announcement = ctrl
-                                .observe_barrier_matching(|announcement| {
-                                    let announced = laminar_core::state::CheckpointAttempt::new(
-                                        announcement.epoch,
-                                        announcement.checkpoint_id,
-                                    );
-                                    match announced.relation_to(attempt) {
-                                        laminar_core::state::CheckpointAttemptRelation::Newer
-                                        | laminar_core::state::CheckpointAttemptRelation::Conflict => true,
-                                        laminar_core::state::CheckpointAttemptRelation::Exact => {
-                                            announcement.phase == Phase::Abort
-                                        }
-                                        laminar_core::state::CheckpointAttemptRelation::Older => false,
-                                    }
-                                })
-                                .await
-                                .map_err(|error| {
-                                    DbError::Pipeline(format!(
-                                        "shuffle barrier control observation failed: {error}"
-                                    ))
-                                })?;
-                            if let Some(announcement) = announcement {
-                                if let Some(outcome) = Self::classify_shuffle_alignment_control(
-                                    attempt,
-                                    &announcement,
-                                )? {
-                                    return Ok(outcome);
-                                }
-                            }
+                        if let Some(outcome) =
+                            Self::observe_shuffle_alignment_control(controller, attempt).await?
+                        {
+                            return Ok(outcome);
                         }
                     }
                 }
@@ -3011,6 +3098,11 @@ impl OperatorGraph {
                 controller,
             )?;
             ensure_no_delivery_loss()?;
+            if let Some(outcome) =
+                Self::observe_shuffle_alignment_control(controller, attempt).await?
+            {
+                return Ok(outcome);
+            }
             tracing::debug!(
                 checkpoint_id = attempt.checkpoint_id,
                 epoch = attempt.epoch,
@@ -3819,76 +3911,22 @@ mod tests {
         }
     }
 
-    /// A peer ships a row + its exact-attempt barrier; alignment retains the row as channel state
-    /// before completing the certified distributed cut.
     #[cfg(feature = "cluster")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn align_shuffle_barriers_retains_peer_rows_then_aligns_exact_attempt() {
-        use laminar_core::checkpoint::CheckpointBarrier;
-        use laminar_core::shuffle::ShuffleMessage;
-        use laminar_core::state::CheckpointAttempt;
-
-        let mut harness = alignment_harness().await;
-        let attempt = CheckpointAttempt::new(7, 70);
-
-        let batch = test_batch();
-        harness
-            .remote_sender
-            .send_to(
-                1,
-                &ShuffleMessage::checkpointed("out".into(), 0, batch.clone()),
-            )
-            .await
-            .unwrap();
-        harness
-            .remote_sender
-            .fan_out_barrier(
-                &[1],
-                CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch),
-                &harness.fence,
-            )
-            .await
-            .unwrap();
-
-        harness
-            .graph
-            .align_shuffle_barriers(
-                attempt,
-                0,
-                &harness.fence,
-                tokio::time::Instant::now() + std::time::Duration::from_secs(2),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let received = harness.remote_receiver.recv().await.unwrap();
-        assert_eq!(received.peer(), 1);
-        assert_eq!(received.assignment_digest(), Some(harness.fence.digest()));
-        assert!(matches!(
-            received.message(),
-            ShuffleMessage::Barrier(barrier)
-                if barrier.epoch == attempt.epoch
-                    && barrier.checkpoint_id == attempt.checkpoint_id
-        ));
-
-        let got = harness.recorded.lock();
-        assert_eq!(
-            got.len(),
-            1,
-            "peer's pre-barrier row retained by the operator"
-        );
-        assert_eq!(got[0].num_rows(), batch.num_rows());
+    struct ThreeNodeAlignmentHarness {
+        graph: OperatorGraph,
+        local_receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
+        _peer_two_receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
+        _waiting_peer_receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
+        peer_two_sender: laminar_core::shuffle::ShuffleSender,
+        fence: laminar_core::checkpoint::CheckpointAssignmentFence,
+        recorded: Arc<parking_lot::Mutex<Vec<RetainedBatch>>>,
     }
 
     #[cfg(feature = "cluster")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn shuffle_alignment_rejects_staged_data_barrier_data_sequence() {
-        use laminar_core::checkpoint::{
-            CheckpointAssignmentFence, CheckpointBarrier, CheckpointParticipant,
-        };
-        use laminar_core::shuffle::{ShuffleMessage, ShuffleReceiver, ShuffleSender};
-        use laminar_core::state::{CheckpointAttempt, NodeId, VnodeRegistry};
+    async fn three_node_alignment_harness() -> ThreeNodeAlignmentHarness {
+        use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+        use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
+        use laminar_core::state::{NodeId, VnodeRegistry};
 
         let registry = Arc::new(VnodeRegistry::new(3));
         registry.set_assignment(vec![NodeId(1), NodeId(2), NodeId(3)].into());
@@ -3990,41 +4028,72 @@ mod tests {
             self_id: NodeId(1),
         });
 
-        let attempt = CheckpointAttempt::new(7, 70);
+        ThreeNodeAlignmentHarness {
+            graph,
+            local_receiver,
+            _peer_two_receiver: peer_two_receiver,
+            _waiting_peer_receiver: waiting_peer_receiver,
+            peer_two_sender,
+            fence,
+            recorded,
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn stage_peer_two_data_barrier_data(
+        harness: &ThreeNodeAlignmentHarness,
+        attempt: laminar_core::state::CheckpointAttempt,
+    ) -> (RecordBatch, RecordBatch) {
+        use laminar_core::checkpoint::CheckpointBarrier;
+        use laminar_core::shuffle::ShuffleMessage;
+
         let before_barrier = test_batch();
-        peer_two_sender
+        let after_barrier = RecordBatch::try_new(
+            test_schema(),
+            vec![
+                Arc::new(StringArray::from(vec!["MSFT", "NVDA"])),
+                Arc::new(Float64Array::from(vec![420.0, 125.0])),
+                Arc::new(Int64Array::from(vec![3000, 4000])),
+            ],
+        )
+        .unwrap();
+        harness
+            .peer_two_sender
             .send_to(
                 1,
                 &ShuffleMessage::checkpointed("out".into(), 0, before_barrier.clone()),
             )
             .await
             .unwrap();
-        peer_two_sender
+        harness
+            .peer_two_sender
             .fan_out_barrier(
                 &[1, 3],
                 CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch),
-                &fence,
+                &harness.fence,
             )
             .await
             .unwrap();
-        peer_two_sender
+        harness
+            .peer_two_sender
             .send_to(
                 1,
-                &ShuffleMessage::checkpointed("out".into(), 0, test_batch()),
+                &ShuffleMessage::checkpointed("out".into(), 0, after_barrier.clone()),
             )
             .await
             .unwrap();
 
-        // Force the normal per-stage drainer to split the queued data/barrier stream into its two
-        // holdovers before alignment starts. The sequence metadata must still distinguish the
-        // pre-barrier batch from the post-barrier batch.
+        // Reproduce the normal drainer splitting a queued data/barrier/data sequence: the first
+        // batch and barrier enter holdovers, while the post-barrier batch remains on the live queue.
         let stage_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            let _ = local_receiver.drain_checkpointed_data_for("__alignment_probe");
-            let barriers = local_receiver.drain_staged_barriers();
+            let _ = harness
+                .local_receiver
+                .drain_checkpointed_data_for("__alignment_probe");
+            let barriers = harness.local_receiver.drain_staged_barriers();
             if !barriers.is_empty() {
                 for barrier in barriers {
-                    local_receiver.stash_barrier(barrier);
+                    harness.local_receiver.stash_barrier(barrier);
                 }
                 break;
             }
@@ -4034,12 +4103,174 @@ mod tests {
             );
             tokio::task::yield_now().await;
         }
+        (before_barrier, after_barrier)
+    }
 
-        let error = graph
+    #[cfg(feature = "cluster")]
+    async fn alignment_abort_controller(
+        fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
+        attempt: laminar_core::state::CheckpointAttempt,
+        durable: bool,
+    ) -> Arc<laminar_core::cluster::control::ClusterController> {
+        use laminar_core::checkpoint_decision::CheckpointVerdict;
+        use laminar_core::cluster::control::{
+            BarrierAnnouncement, ClusterController, ClusterKv, InMemoryKv, LeaderLeaseOwner,
+            LeaderLeaseStore, LeaseDeadline, LeaseOutcome, Phase, ANNOUNCEMENT_KEY,
+        };
+        use laminar_core::cluster::discovery::{NodeId, NodeInfo, NodeMetadata, NodeState};
+
+        let node_id = NodeId(1);
+        let kv = Arc::new(InMemoryKv::new(node_id));
+        let kv_trait: Arc<dyn ClusterKv> = kv.clone();
+        let info = |id| NodeInfo {
+            id: NodeId(id),
+            name: format!("node-{id}"),
+            rpc_address: String::new(),
+            raft_address: String::new(),
+            state: NodeState::Active,
+            metadata: NodeMetadata::default(),
+            last_heartbeat_ms: 0,
+        };
+        let (_members_tx, members_rx) =
+            tokio::sync::watch::channel(vec![info(1), info(2), info(3)]);
+        let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
+            node_id,
+            Arc::clone(&kv_trait),
+            kv_trait,
+            None,
+            members_rx,
+            uuid::Uuid::from_u128(1),
+        ));
+        controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
+                std::time::Duration::from_secs(60),
+            )))
+            .unwrap();
+        controller.set_active(true);
+        controller.publish_checkpoint_assignment_fence(Some(fence.clone()));
+
+        let backing: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let authority = Arc::new(LeaderLeaseStore::new(backing, 1_000));
+        let owner = LeaderLeaseOwner {
+            node: node_id,
+            boot: uuid::Uuid::from_u128(1),
+            process_term: 1,
+        };
+        let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap()
+        else {
+            panic!("empty alignment authority must grant leadership");
+        };
+        let proof = lease.proof();
+        if durable {
+            authority
+                .record_cluster_outcome(
+                    &proof,
+                    attempt.epoch,
+                    attempt.checkpoint_id,
+                    fence.clone(),
+                    CheckpointVerdict::Abort,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        controller.set_leader_lease_store(authority);
+        kv.seed(
+            node_id,
+            ANNOUNCEMENT_KEY,
+            serde_json::to_string(&BarrierAnnouncement {
+                epoch: attempt.epoch,
+                checkpoint_id: attempt.checkpoint_id,
+                assignment_fence: Some(fence.clone()),
+                leader_proof: Some(proof),
+                phase: Phase::Abort,
+                flags: 0,
+                min_watermark_ms: None,
+            })
+            .unwrap(),
+        );
+        controller
+    }
+
+    /// A peer ships a row + its exact-attempt barrier; alignment retains the row as channel state
+    /// before completing the certified distributed cut.
+    #[cfg(feature = "cluster")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn align_shuffle_barriers_retains_peer_rows_then_aligns_exact_attempt() {
+        use laminar_core::checkpoint::CheckpointBarrier;
+        use laminar_core::shuffle::ShuffleMessage;
+        use laminar_core::state::CheckpointAttempt;
+
+        let mut harness = alignment_harness().await;
+        let attempt = CheckpointAttempt::new(7, 70);
+
+        let batch = test_batch();
+        harness
+            .remote_sender
+            .send_to(
+                1,
+                &ShuffleMessage::checkpointed("out".into(), 0, batch.clone()),
+            )
+            .await
+            .unwrap();
+        harness
+            .remote_sender
+            .fan_out_barrier(
+                &[1],
+                CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch),
+                &harness.fence,
+            )
+            .await
+            .unwrap();
+
+        harness
+            .graph
             .align_shuffle_barriers(
                 attempt,
                 0,
-                &fence,
+                &harness.fence,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let received = harness.remote_receiver.recv().await.unwrap();
+        assert_eq!(received.peer(), 1);
+        assert_eq!(received.assignment_digest(), Some(harness.fence.digest()));
+        assert!(matches!(
+            received.message(),
+            ShuffleMessage::Barrier(barrier)
+                if barrier.epoch == attempt.epoch
+                    && barrier.checkpoint_id == attempt.checkpoint_id
+        ));
+
+        let got = harness.recorded.lock();
+        assert_eq!(
+            got.len(),
+            1,
+            "peer's pre-barrier row retained by the operator"
+        );
+        assert_eq!(got[0].num_rows(), batch.num_rows());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shuffle_alignment_rejects_staged_data_barrier_data_sequence() {
+        use laminar_core::state::CheckpointAttempt;
+
+        let mut harness = three_node_alignment_harness().await;
+        let attempt = CheckpointAttempt::new(7, 70);
+        let (before_barrier, _after_barrier) =
+            stage_peer_two_data_barrier_data(&harness, attempt).await;
+
+        let error = harness
+            .graph
+            .align_shuffle_barriers(
+                attempt,
+                0,
+                &harness.fence,
                 tokio::time::Instant::now() + std::time::Duration::from_secs(2),
                 None,
             )
@@ -4050,9 +4281,60 @@ mod tests {
             error.requires_pipeline_recovery(),
             "destructive alignment failure must rewind the pipeline"
         );
-        let retained = recorded.lock();
+        let retained = harness.recorded.lock();
         assert_eq!(retained.len(), 1);
         assert_eq!(retained[0].num_rows(), before_barrier.num_rows());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shuffle_alignment_retains_resumed_peer_data_on_durable_abort() {
+        use laminar_core::state::CheckpointAttempt;
+
+        let mut harness = three_node_alignment_harness().await;
+        let attempt = CheckpointAttempt::new(8, 80);
+        let (before_barrier, after_barrier) =
+            stage_peer_two_data_barrier_data(&harness, attempt).await;
+        let controller = alignment_abort_controller(&harness.fence, attempt, true).await;
+
+        let outcome = harness
+            .graph
+            .align_shuffle_barriers(
+                attempt,
+                0,
+                &harness.fence,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                Some(controller.as_ref()),
+            )
+            .await
+            .expect("an exact durable Abort must end pre-capture alignment cleanly");
+
+        assert_eq!(outcome, ShuffleAlignmentOutcome::Aborted);
+        let retained = harness.recorded.lock();
+        assert_eq!(
+            retained.len(),
+            2,
+            "both owned batches must survive the Abort"
+        );
+        assert_eq!(retained[0].batch(), &before_barrier);
+        assert_eq!(retained[1].batch(), &after_barrier);
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn shuffle_alignment_does_not_trust_abort_hint_without_durable_outcome() {
+        use laminar_core::state::CheckpointAttempt;
+
+        let harness = three_node_alignment_harness().await;
+        let attempt = CheckpointAttempt::new(9, 90);
+        let controller = alignment_abort_controller(&harness.fence, attempt, false).await;
+
+        assert_eq!(
+            OperatorGraph::observe_shuffle_alignment_control(Some(controller.as_ref()), attempt)
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[cfg(feature = "cluster")]
