@@ -5655,8 +5655,7 @@ impl CheckpointCoordinator {
             return Ok(self.fail_after_irrevocable_work(checkpoint_id, epoch, start, error));
         }
 
-        info!(checkpoint_id, epoch, "starting checkpoint");
-
+        debug!(checkpoint_id, epoch, "starting checkpoint durable tail");
         self.phase = CheckpointPhase::Snapshotting;
         #[cfg(all(debug_assertions, feature = "cluster"))]
         checkpoint_kill_gate("leader").await;

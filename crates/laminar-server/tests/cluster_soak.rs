@@ -49,6 +49,9 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "kafka")]
+use laminar_core::state::{CheckpointAttempt, CheckpointAttemptRelation};
+
 const NODES: usize = 3;
 /// Per-node ports: http = BASE + i, gossip = BASE + 100 + i.
 const BASE_PORT: u16 = 19310;
@@ -66,6 +69,16 @@ const ACTIVE_LOAD_SAMPLE_WINDOW: Duration = Duration::from_secs(15);
 const ACTIVE_LOAD_MINIMUM_RATIO: f64 = 0.9;
 #[cfg(feature = "kafka")]
 const CHECKPOINT_PIPELINE_STALL_SLO_SECONDS: f64 = 1.024;
+#[cfg(feature = "kafka")]
+const RECOVERY_RELEASE_LOG: &str = "coordinated recovery: releasing source gate";
+#[cfg(feature = "kafka")]
+const CHECKPOINT_ATTEMPT_RESERVED_LOG: &str = "checkpoint attempt reserved";
+#[cfg(feature = "kafka")]
+const CHECKPOINT_ATTEMPT_FAILED_LOG: &str = "checkpoint attempt failed";
+#[cfg(feature = "kafka")]
+const CHECKPOINT_ADMISSION_FAILED_LOG: &str = "checkpoint admission failed";
+#[cfg(feature = "kafka")]
+const CHECKPOINT_CONTINUATION_FAILED_LOG: &str = "checkpoint continuation failed";
 const RECOVERY_LIVENESS_WINDOW: Duration = Duration::from_secs(90);
 const DEFAULT_MAX_RECOVERY_MS: u64 = 90_000;
 const LOCAL_EXACT_PREFIX_CYCLES: u64 = 4;
@@ -83,6 +96,14 @@ fn env_u64(name: &str, default: u64) -> u64 {
             panic!("{name} is not valid Unicode: {value:?}")
         }
     }
+}
+
+fn soak_run_id() -> String {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is before the Unix epoch")
+        .as_nanos();
+    format!("{}-{nonce}", std::process::id())
 }
 
 #[cfg(feature = "kafka")]
@@ -163,6 +184,8 @@ struct Node {
     config_path: PathBuf,
     log_path: PathBuf,
     child: Option<Child>,
+    #[cfg(feature = "kafka")]
+    process_generation: u64,
     http_port: u16,
     /// Per-process one-shot fault trigger used only by the coordinated-recovery soak.
     fault_trigger_path: Option<PathBuf>,
@@ -205,6 +228,31 @@ fn log_line_has_u64_field(line: &str, name: &str, value: u64) -> bool {
         })
 }
 
+#[cfg(feature = "kafka")]
+fn log_line_u64_field(line: &str, name: &str) -> Option<u64> {
+    [format!("{name}="), format!("{name}: ")]
+        .iter()
+        .find_map(|needle| {
+            line.match_indices(needle).find_map(|(offset, _)| {
+                let bytes = line.as_bytes();
+                let starts_at_field_boundary = offset == 0
+                    || bytes.get(offset - 1).is_some_and(|previous| {
+                        !previous.is_ascii_alphanumeric() && *previous != b'_'
+                    });
+                if !starts_at_field_boundary {
+                    return None;
+                }
+                let digits = line[offset + needle.len()..]
+                    .bytes()
+                    .take_while(u8::is_ascii_digit)
+                    .count();
+                (digits > 0)
+                    .then(|| line[offset + needle.len()..offset + needle.len() + digits].parse())?
+                    .ok()
+            })
+        })
+}
+
 fn log_line_reports_recovery(line: &str, checkpoint: DurableCheckpointStatus) -> bool {
     line.contains("Recovered from unified checkpoint")
         && log_line_has_u64_field(line, "checkpoint_id", checkpoint.checkpoint_id)
@@ -216,6 +264,145 @@ fn log_line_reports_checkpoint_completion(line: &str, checkpoint: DurableCheckpo
     line.contains("checkpoint completed")
         && log_line_has_u64_field(line, "checkpoint_id", checkpoint.checkpoint_id)
         && log_line_has_u64_field(line, "epoch", checkpoint.epoch)
+}
+
+#[cfg(feature = "kafka")]
+fn checkpoint_reservation_from_log_line(
+    line: &str,
+) -> Result<Option<DurableCheckpointStatus>, String> {
+    if !line.contains(CHECKPOINT_ATTEMPT_RESERVED_LOG) {
+        return Ok(None);
+    }
+    let checkpoint_id = log_line_u64_field(line, "checkpoint_id")
+        .ok_or_else(|| "checkpoint reservation log omitted checkpoint_id".to_string())?;
+    let epoch = log_line_u64_field(line, "epoch")
+        .ok_or_else(|| "checkpoint reservation log omitted epoch".to_string())?;
+    if checkpoint_id == 0 || epoch == 0 {
+        return Err(format!(
+            "checkpoint reservation log carried a non-canonical identity: checkpoint_id={checkpoint_id}, epoch={epoch}"
+        ));
+    }
+    Ok(Some(DurableCheckpointStatus {
+        checkpoint_id,
+        epoch,
+    }))
+}
+
+#[cfg(feature = "kafka")]
+fn validate_post_release_checkpoint_lifecycle(
+    logs: &[String],
+    resumed_checkpoint: DurableCheckpointStatus,
+) -> Result<DurableCheckpointStatus, String> {
+    let mut post_release = Vec::with_capacity(logs.len());
+    for (node_id, log) in logs.iter().enumerate() {
+        let releases = log.matches(RECOVERY_RELEASE_LOG).count();
+        if releases != 1 {
+            return Err(format!(
+                "node{node_id} consumed {releases} recovery Releases instead of exactly one"
+            ));
+        }
+        let release_offset = log
+            .find(RECOVERY_RELEASE_LOG)
+            .expect("one Release was counted above");
+        let after_release = &log[release_offset + RECOVERY_RELEASE_LOG.len()..];
+        if let Some(failure) = after_release.lines().find(|line| {
+            line.contains(CHECKPOINT_ATTEMPT_FAILED_LOG)
+                || line.contains(CHECKPOINT_ADMISSION_FAILED_LOG)
+                || line.contains(CHECKPOINT_CONTINUATION_FAILED_LOG)
+        }) {
+            return Err(format!(
+                "node{node_id} reported a checkpoint lifecycle failure after recovery Release: {failure}"
+            ));
+        }
+        post_release.push(after_release);
+    }
+
+    let mut reservations = Vec::new();
+    for (node_id, log) in post_release.iter().enumerate() {
+        for (line_index, line) in log.lines().enumerate() {
+            if let Some(attempt) = checkpoint_reservation_from_log_line(line)? {
+                reservations.push((attempt, node_id, line_index));
+            }
+        }
+    }
+    let Some(mut first_reservation) = reservations.first().copied() else {
+        return Err("no checkpoint attempt was reserved after recovery Release".into());
+    };
+    for (index, left) in reservations.iter().enumerate() {
+        let left_attempt = CheckpointAttempt::new(left.0.epoch, left.0.checkpoint_id);
+        for right in &reservations[index + 1..] {
+            let right_attempt = CheckpointAttempt::new(right.0.epoch, right.0.checkpoint_id);
+            match left_attempt.relation_to(right_attempt) {
+                CheckpointAttemptRelation::Older | CheckpointAttemptRelation::Newer => {}
+                CheckpointAttemptRelation::Exact => {
+                    return Err(format!(
+                        "duplicate checkpoint reservation after recovery Release: checkpoint {} epoch {}",
+                        left.0.checkpoint_id, left.0.epoch
+                    ));
+                }
+                CheckpointAttemptRelation::Conflict => {
+                    return Err(format!(
+                        "conflicting checkpoint reservations after recovery Release: checkpoint {} epoch {} versus checkpoint {} epoch {}",
+                        left.0.checkpoint_id,
+                        left.0.epoch,
+                        right.0.checkpoint_id,
+                        right.0.epoch
+                    ));
+                }
+            }
+        }
+        if left_attempt.relation_to(CheckpointAttempt::new(
+            first_reservation.0.epoch,
+            first_reservation.0.checkpoint_id,
+        )) == CheckpointAttemptRelation::Older
+        {
+            first_reservation = *left;
+        }
+    }
+    let first_attempt = first_reservation.0;
+    match CheckpointAttempt::new(first_attempt.epoch, first_attempt.checkpoint_id).relation_to(
+        CheckpointAttempt::new(resumed_checkpoint.epoch, resumed_checkpoint.checkpoint_id),
+    ) {
+        CheckpointAttemptRelation::Exact | CheckpointAttemptRelation::Older => {}
+        CheckpointAttemptRelation::Newer | CheckpointAttemptRelation::Conflict => {
+            return Err(format!(
+                "resumed checkpoint {} epoch {} does not follow first post-Release checkpoint {} epoch {}",
+                resumed_checkpoint.checkpoint_id,
+                resumed_checkpoint.epoch,
+                first_attempt.checkpoint_id,
+                first_attempt.epoch
+            ));
+        }
+    }
+    let completion_follows = |reservation: (DurableCheckpointStatus, usize, usize)| {
+        post_release[reservation.1]
+            .lines()
+            .skip(reservation.2 + 1)
+            .any(|line| log_line_reports_checkpoint_completion(line, reservation.0))
+    };
+    if !completion_follows(first_reservation) {
+        return Err(format!(
+            "first checkpoint reserved after recovery Release did not complete after its reservation: checkpoint {} epoch {}",
+            first_attempt.checkpoint_id, first_attempt.epoch
+        ));
+    }
+    let Some(resumed_reservation) = reservations
+        .iter()
+        .copied()
+        .find(|reservation| reservation.0 == resumed_checkpoint)
+    else {
+        return Err(format!(
+            "exact resumed checkpoint {} epoch {} was not reserved after recovery Release",
+            resumed_checkpoint.checkpoint_id, resumed_checkpoint.epoch
+        ));
+    };
+    if !completion_follows(resumed_reservation) {
+        return Err(format!(
+            "exact resumed checkpoint {} epoch {} did not complete after its reservation",
+            resumed_checkpoint.checkpoint_id, resumed_checkpoint.epoch
+        ));
+    }
+    Ok(first_attempt)
 }
 
 fn remove_marker(path: &Path) {
@@ -283,7 +470,15 @@ impl Node {
                 cmd.env_remove("LAMINAR_CHECKPOINT_KILL_GATE_FILE");
             }
         }
-        self.child = Some(cmd.spawn().expect("spawn laminardb"));
+        let child = cmd.spawn().expect("spawn laminardb");
+        #[cfg(feature = "kafka")]
+        {
+            self.process_generation = self
+                .process_generation
+                .checked_add(1)
+                .expect("soak process generation overflow");
+        }
+        self.child = Some(child);
     }
 
     /// `kill -9` equivalent: no shutdown hooks, no final checkpoint.
@@ -631,8 +826,15 @@ struct ExplicitFaultEvidence {
 }
 
 #[cfg(feature = "kafka")]
-#[derive(Default)]
-struct CheckpointLatencyEvidence {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ProcessGeneration {
+    node_id: usize,
+    generation: u64,
+}
+
+#[cfg(feature = "kafka")]
+#[derive(Debug, Clone, Copy, Default)]
+struct CheckpointLatencySnapshot {
     gate_wait_seconds: f64,
     gate_wait_observations: f64,
     checkpoint_seconds: f64,
@@ -642,60 +844,169 @@ struct CheckpointLatencyEvidence {
 }
 
 #[cfg(feature = "kafka")]
+impl CheckpointLatencySnapshot {
+    fn validate(self) -> Result<Self, String> {
+        for (name, value) in [
+            ("restorable-gate wait sum", self.gate_wait_seconds),
+            ("restorable-gate wait count", self.gate_wait_observations),
+            ("checkpoint duration sum", self.checkpoint_seconds),
+            ("checkpoint duration count", self.checkpoint_observations),
+            (
+                "checkpoint pipeline-stall count",
+                self.pipeline_stall_observations,
+            ),
+            (
+                "checkpoint pipeline-stall SLO bucket",
+                self.pipeline_stall_within_slo,
+            ),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(format!(
+                    "{name} must be finite and non-negative, got {value}"
+                ));
+            }
+        }
+        if self.pipeline_stall_within_slo > self.pipeline_stall_observations {
+            return Err(format!(
+                "checkpoint pipeline-stall SLO bucket {} exceeds histogram count {}",
+                self.pipeline_stall_within_slo, self.pipeline_stall_observations
+            ));
+        }
+        Ok(self)
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.gate_wait_seconds += other.gate_wait_seconds;
+        self.gate_wait_observations += other.gate_wait_observations;
+        self.checkpoint_seconds += other.checkpoint_seconds;
+        self.checkpoint_observations += other.checkpoint_observations;
+        self.pipeline_stall_observations += other.pipeline_stall_observations;
+        self.pipeline_stall_within_slo += other.pipeline_stall_within_slo;
+    }
+
+    fn pipeline_stall_within_slo_percent(self) -> Option<f64> {
+        (self.pipeline_stall_observations > 0.0)
+            .then(|| self.pipeline_stall_within_slo / self.pipeline_stall_observations * 100.0)
+    }
+
+    fn validate_pipeline_stall_slo(self, label: &str) -> Result<(), String> {
+        let within_slo_percent = self
+            .pipeline_stall_within_slo_percent()
+            .ok_or_else(|| format!("{label} captured no checkpoint pipeline-stall observations"))?;
+        if within_slo_percent < 99.0 {
+            return Err(format!(
+                "{label} checkpoint pipeline-stall p99 exceeded {:.0}ms: only {within_slo_percent:.2}% of {} observations met the latency SLO",
+                CHECKPOINT_PIPELINE_STALL_SLO_SECONDS * 1_000.0,
+                self.pipeline_stall_observations as u64,
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "kafka")]
+#[derive(Default)]
+struct CheckpointLatencyEvidence {
+    generations: BTreeMap<ProcessGeneration, CheckpointLatencySnapshot>,
+}
+
+#[cfg(feature = "kafka")]
 impl CheckpointLatencyEvidence {
+    fn record_generation(
+        &mut self,
+        generation: ProcessGeneration,
+        snapshot: CheckpointLatencySnapshot,
+    ) -> Result<(), String> {
+        let snapshot = snapshot.validate()?;
+        match self.generations.entry(generation) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(snapshot);
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(_) => Err(format!(
+                "checkpoint latency for node{} process generation {} was captured more than once",
+                generation.node_id, generation.generation
+            )),
+        }
+    }
+
     fn capture_node(&mut self, node: &Node) {
         let (
-            gate_seconds,
-            gate_count,
+            gate_wait_seconds,
+            gate_wait_observations,
             checkpoint_seconds,
-            checkpoint_count,
-            pipeline_stall_count,
+            checkpoint_observations,
+            pipeline_stall_observations,
             pipeline_stall_within_slo,
         ) = node
             .checkpoint_latency_metrics()
             .expect("node did not expose checkpoint latency metrics");
-        self.gate_wait_seconds += gate_seconds;
-        self.gate_wait_observations += gate_count;
-        self.checkpoint_seconds += checkpoint_seconds;
-        self.checkpoint_observations += checkpoint_count;
-        self.pipeline_stall_observations += pipeline_stall_count;
-        self.pipeline_stall_within_slo += pipeline_stall_within_slo;
+        self.record_generation(
+            ProcessGeneration {
+                node_id: node.id,
+                generation: node.process_generation,
+            },
+            CheckpointLatencySnapshot {
+                gate_wait_seconds,
+                gate_wait_observations,
+                checkpoint_seconds,
+                checkpoint_observations,
+                pipeline_stall_observations,
+                pipeline_stall_within_slo,
+            },
+        )
+        .unwrap_or_else(|error| {
+            panic!("invalid node{} checkpoint latency scrape: {error}", node.id)
+        });
+    }
+
+    fn aggregate(&self) -> Result<CheckpointLatencySnapshot, String> {
+        let mut aggregate = CheckpointLatencySnapshot::default();
+        for snapshot in self.generations.values() {
+            aggregate.merge(*snapshot);
+        }
+        aggregate.validate()
+    }
+
+    fn validate_slos(&self) -> Result<CheckpointLatencySnapshot, String> {
+        let aggregate = self.aggregate()?;
+        if aggregate.checkpoint_observations <= 0.0 {
+            return Err("aggregate captured no checkpoint latency observations".into());
+        }
+        for (generation, snapshot) in &self.generations {
+            snapshot.validate_pipeline_stall_slo(&format!(
+                "node{} process generation {}",
+                generation.node_id, generation.generation
+            ))?;
+        }
+        aggregate.validate_pipeline_stall_slo("aggregate")?;
+        Ok(aggregate)
     }
 
     fn report(&self) {
-        assert!(
-            self.checkpoint_observations > 0.0,
-            "soak captured no checkpoint latency observations"
-        );
-        assert!(
-            self.pipeline_stall_observations > 0.0,
-            "soak captured no checkpoint pipeline-stall observations"
-        );
-        let within_slo_percent =
-            self.pipeline_stall_within_slo / self.pipeline_stall_observations * 100.0;
-        assert!(
-            within_slo_percent >= 99.0,
-            "checkpoint pipeline-stall p99 exceeded {:.0}ms: only {within_slo_percent:.2}% of {} observations met the latency SLO",
-            CHECKPOINT_PIPELINE_STALL_SLO_SECONDS * 1_000.0,
-            self.pipeline_stall_observations as u64,
-        );
+        let aggregate = self
+            .validate_slos()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let within_slo_percent = aggregate
+            .pipeline_stall_within_slo_percent()
+            .expect("pipeline-stall observations were validated above");
         let checkpoint_average_ms =
-            self.checkpoint_seconds / self.checkpoint_observations * 1_000.0;
-        if self.gate_wait_observations > 0.0 {
+            aggregate.checkpoint_seconds / aggregate.checkpoint_observations * 1_000.0;
+        if aggregate.gate_wait_observations > 0.0 {
             eprintln!(
                 "soak: PROFILE pipeline-stall <= {:.0}ms for {within_slo_percent:.2}% of {} obs; gate-wait avg={:.0}ms over {} obs; checkpoint_duration avg={checkpoint_average_ms:.0}ms over {} obs (including pre-restart process lifetimes)",
                 CHECKPOINT_PIPELINE_STALL_SLO_SECONDS * 1_000.0,
-                self.pipeline_stall_observations as u64,
-                self.gate_wait_seconds / self.gate_wait_observations * 1_000.0,
-                self.gate_wait_observations as u64,
-                self.checkpoint_observations as u64,
+                aggregate.pipeline_stall_observations as u64,
+                aggregate.gate_wait_seconds / aggregate.gate_wait_observations * 1_000.0,
+                aggregate.gate_wait_observations as u64,
+                aggregate.checkpoint_observations as u64,
             );
         } else {
             eprintln!(
                 "soak: PROFILE pipeline-stall <= {:.0}ms for {within_slo_percent:.2}% of {} obs; checkpoint_duration avg={checkpoint_average_ms:.0}ms over {} obs (including pre-restart process lifetimes); no restorable-gate waits were observed",
                 CHECKPOINT_PIPELINE_STALL_SLO_SECONDS * 1_000.0,
-                self.pipeline_stall_observations as u64,
-                self.checkpoint_observations as u64,
+                aggregate.pipeline_stall_observations as u64,
+                aggregate.checkpoint_observations as u64,
             );
         }
     }
@@ -1200,7 +1511,6 @@ fn assert_final_outputs(
 #[cfg(feature = "kafka")]
 fn assert_no_unsolicited_cold_start_recovery(nodes: &[Node]) {
     const PREPARE: &str = "leader announced recovery prepare";
-    const RELEASE: &str = "coordinated recovery: releasing source gate";
 
     for node in nodes {
         assert_eq!(
@@ -1219,7 +1529,7 @@ fn assert_no_unsolicited_cold_start_recovery(nodes: &[Node]) {
         );
         let log = node.log_since(0);
         assert!(
-            !log.contains(PREPARE) && !log.contains(RELEASE),
+            !log.contains(PREPARE) && !log.contains(RECOVERY_RELEASE_LOG),
             "node{} log contains unsolicited cold-start recovery activity",
             node.id
         );
@@ -1229,7 +1539,6 @@ fn assert_no_unsolicited_cold_start_recovery(nodes: &[Node]) {
 #[cfg(feature = "kafka")]
 fn assert_explicit_fault_recovery_evidence(nodes: &[Node], evidence: &ExplicitFaultEvidence) {
     const PREPARE: &str = "leader announced recovery prepare";
-    const RELEASE: &str = "coordinated recovery: releasing source gate";
 
     assert_eq!(nodes.len(), evidence.log_offsets.len());
     assert_eq!(nodes.len(), evidence.recovery_baselines.len());
@@ -1245,10 +1554,10 @@ fn assert_explicit_fault_recovery_evidence(nodes: &[Node], evidence: &ExplicitFa
         prepare_count, 1,
         "explicit fault created {prepare_count} recovery Prepare generations instead of exactly one"
     );
+    validate_post_release_checkpoint_lifecycle(&logs, evidence.resumed_checkpoint)
+        .unwrap_or_else(|error| panic!("explicit recovery checkpoint lifecycle invalid: {error}"));
 
-    let mut resumed_completion_count = 0usize;
     for (index, node) in nodes.iter().enumerate() {
-        let log = &logs[index];
         let recovery_baseline = evidence.recovery_baselines[index];
         let recoveries = node
             .metric("laminardb_coordinated_recoveries_total")
@@ -1276,31 +1585,7 @@ fn assert_explicit_fault_recovery_evidence(nodes: &[Node], evidence: &ExplicitFa
             "node{} recorded a failed checkpoint during explicit recovery",
             node.id
         );
-        assert_eq!(
-            log.matches(RELEASE).count(),
-            1,
-            "node{} did not consume exactly one recovery Release",
-            node.id
-        );
-
-        let lines = log.lines().collect::<Vec<_>>();
-        let release_index = lines
-            .iter()
-            .position(|line| line.contains(RELEASE))
-            .expect("release occurrence was counted above");
-        resumed_completion_count += lines[release_index + 1..]
-            .iter()
-            .filter(|line| {
-                log_line_reports_checkpoint_completion(line, evidence.resumed_checkpoint)
-            })
-            .count();
     }
-    assert!(
-        resumed_completion_count > 0,
-        "no node logged exact checkpoint {} epoch {} completing after recovery Release",
-        evidence.resumed_checkpoint.checkpoint_id,
-        evidence.resumed_checkpoint.epoch,
-    );
 }
 
 fn json_u64(value: &serde_json::Value) -> Option<u64> {
@@ -1979,9 +2264,9 @@ fn local_exact_source_state_kill9_soak() {
     validate_local_source_liveness(prefix_rows, rows_per_second, interval_ms, recovery_ceiling);
 
     let dir = tempfile::tempdir().expect("local exact soak tempdir");
-    let log_dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("soak-local-exact-{}", std::process::id()));
-    std::fs::create_dir_all(&log_dir).unwrap();
+    let log_dir =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("soak-local-exact-{}", soak_run_id()));
+    std::fs::create_dir(&log_dir).expect("create exclusive local exact soak log directory");
     eprintln!("soak: local exact node logs in {}", log_dir.display());
 
     let mut node = Node {
@@ -1996,6 +2281,8 @@ fn local_exact_source_state_kill9_soak() {
         ),
         log_path: log_dir.join("node0.log"),
         child: None,
+        #[cfg(feature = "kafka")]
+        process_generation: 0,
         http_port: BASE_PORT,
         fault_trigger_path: None,
         // The runtime remains single-node. Building this ignored test with the `cluster` feature
@@ -2213,11 +2500,7 @@ fn three_node_kill9_soak() {
     );
     let brokers = std::env::var("LAMINAR_SOAK_KAFKA_SOURCE_BROKERS")
         .expect("three_node_kill9_soak requires LAMINAR_SOAK_KAFKA_SOURCE_BROKERS");
-    let run_nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock is before the Unix epoch")
-        .as_nanos();
-    let run_id = format!("{}-{run_nonce}", std::process::id());
+    let run_id = soak_run_id();
     let input_topic = format!("soak-cluster-in-{run_id}");
     let output_topic = format!("soak-cluster-out-{run_id}");
     let consumer_group = format!("soak-cluster-{run_id}");
@@ -2241,7 +2524,7 @@ fn three_node_kill9_soak() {
 
     // Node logs under target/ (not the tempdir) so they survive a failed run for post-mortem.
     let log_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("soak-{run_id}"));
-    std::fs::create_dir_all(&log_dir).unwrap();
+    std::fs::create_dir(&log_dir).expect("create exclusive cluster soak log directory");
     eprintln!("soak: node logs in {}", log_dir.display());
 
     let fault_role = std::env::var("LAMINAR_SOAK_FAULT_INJECT_ROLE").ok();
@@ -2273,6 +2556,7 @@ fn three_node_kill9_soak() {
             ),
             log_path: log_dir.join(format!("node{id}.log")),
             child: None,
+            process_generation: 0,
             http_port: BASE_PORT + id as u16,
             fault_trigger_path: fault_role
                 .as_ref()
@@ -2872,6 +3156,178 @@ fn checkpoint_completion_log_match_binds_checkpoint_and_epoch() {
 
 #[cfg(feature = "kafka")]
 #[test]
+fn post_release_lifecycle_requires_first_reserved_attempt_to_complete() {
+    let logs = vec![
+        format!(
+            "{RECOVERY_RELEASE_LOG}\ncheckpoint_id=41 epoch=43 {CHECKPOINT_ATTEMPT_RESERVED_LOG}\ncheckpoint_id=41 epoch=43 checkpoint completed\ncheckpoint_id=42 epoch=44 {CHECKPOINT_ATTEMPT_RESERVED_LOG}\ncheckpoint_id=42 epoch=44 checkpoint completed"
+        ),
+        RECOVERY_RELEASE_LOG.to_string(),
+        RECOVERY_RELEASE_LOG.to_string(),
+    ];
+    assert_eq!(
+        validate_post_release_checkpoint_lifecycle(
+            &logs,
+            DurableCheckpointStatus {
+                checkpoint_id: 42,
+                epoch: 44,
+            },
+        )
+        .unwrap(),
+        DurableCheckpointStatus {
+            checkpoint_id: 41,
+            epoch: 43,
+        }
+    );
+
+    let skipped = vec![
+        format!(
+            "{RECOVERY_RELEASE_LOG}\ncheckpoint_id=41 epoch=43 {CHECKPOINT_ATTEMPT_RESERVED_LOG}\nunrecognized failure text\ncheckpoint_id=42 epoch=44 {CHECKPOINT_ATTEMPT_RESERVED_LOG}\ncheckpoint_id=42 epoch=44 checkpoint completed"
+        ),
+        RECOVERY_RELEASE_LOG.to_string(),
+        RECOVERY_RELEASE_LOG.to_string(),
+    ];
+    let error = validate_post_release_checkpoint_lifecycle(
+        &skipped,
+        DurableCheckpointStatus {
+            checkpoint_id: 42,
+            epoch: 44,
+        },
+    )
+    .unwrap_err();
+    assert!(error.contains("checkpoint 41 epoch 43"), "{error}");
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn post_release_lifecycle_rejects_missing_or_pre_release_evidence() {
+    let resumed = DurableCheckpointStatus {
+        checkpoint_id: 41,
+        epoch: 43,
+    };
+    let no_reservation = vec![
+        format!("{RECOVERY_RELEASE_LOG}\ncheckpoint_id=41 epoch=43 checkpoint completed"),
+        RECOVERY_RELEASE_LOG.to_string(),
+        RECOVERY_RELEASE_LOG.to_string(),
+    ];
+    assert!(
+        validate_post_release_checkpoint_lifecycle(&no_reservation, resumed)
+            .unwrap_err()
+            .contains("no checkpoint attempt was reserved")
+    );
+
+    let completion_before_release = vec![
+        format!(
+            "checkpoint_id=41 epoch=43 checkpoint completed\n{RECOVERY_RELEASE_LOG}\ncheckpoint_id=41 epoch=43 {CHECKPOINT_ATTEMPT_RESERVED_LOG}"
+        ),
+        RECOVERY_RELEASE_LOG.to_string(),
+        RECOVERY_RELEASE_LOG.to_string(),
+    ];
+    assert!(
+        validate_post_release_checkpoint_lifecycle(&completion_before_release, resumed)
+            .unwrap_err()
+            .contains("did not complete")
+    );
+
+    let completion_before_reservation = vec![
+        format!(
+            "{RECOVERY_RELEASE_LOG}\ncheckpoint_id=41 epoch=43 checkpoint completed\ncheckpoint_id=41 epoch=43 {CHECKPOINT_ATTEMPT_RESERVED_LOG}"
+        ),
+        RECOVERY_RELEASE_LOG.to_string(),
+        RECOVERY_RELEASE_LOG.to_string(),
+    ];
+    assert!(
+        validate_post_release_checkpoint_lifecycle(&completion_before_reservation, resumed)
+            .unwrap_err()
+            .contains("did not complete after its reservation")
+    );
+
+    let completion_on_another_node = vec![
+        format!(
+            "{RECOVERY_RELEASE_LOG}\ncheckpoint_id=41 epoch=43 {CHECKPOINT_ATTEMPT_RESERVED_LOG}"
+        ),
+        format!("{RECOVERY_RELEASE_LOG}\ncheckpoint_id=41 epoch=43 checkpoint completed"),
+        RECOVERY_RELEASE_LOG.to_string(),
+    ];
+    assert!(
+        validate_post_release_checkpoint_lifecycle(&completion_on_another_node, resumed)
+            .unwrap_err()
+            .contains("did not complete after its reservation")
+    );
+
+    let resumed_without_reservation = vec![
+        format!(
+            "{RECOVERY_RELEASE_LOG}\ncheckpoint_id=41 epoch=43 {CHECKPOINT_ATTEMPT_RESERVED_LOG}\ncheckpoint_id=41 epoch=43 checkpoint completed\ncheckpoint_id=42 epoch=44 checkpoint completed"
+        ),
+        RECOVERY_RELEASE_LOG.to_string(),
+        RECOVERY_RELEASE_LOG.to_string(),
+    ];
+    assert!(validate_post_release_checkpoint_lifecycle(
+        &resumed_without_reservation,
+        DurableCheckpointStatus {
+            checkpoint_id: 42,
+            epoch: 44,
+        },
+    )
+    .unwrap_err()
+    .contains("was not reserved"));
+
+    let admission_failure = vec![
+        format!("{RECOVERY_RELEASE_LOG}\n{CHECKPOINT_ADMISSION_FAILED_LOG}"),
+        RECOVERY_RELEASE_LOG.to_string(),
+        RECOVERY_RELEASE_LOG.to_string(),
+    ];
+    assert!(
+        validate_post_release_checkpoint_lifecycle(&admission_failure, resumed)
+            .unwrap_err()
+            .contains("lifecycle failure")
+    );
+
+    let continuation_failure = vec![
+        format!("{RECOVERY_RELEASE_LOG}\n{CHECKPOINT_CONTINUATION_FAILED_LOG}"),
+        RECOVERY_RELEASE_LOG.to_string(),
+        RECOVERY_RELEASE_LOG.to_string(),
+    ];
+    assert!(
+        validate_post_release_checkpoint_lifecycle(&continuation_failure, resumed)
+            .unwrap_err()
+            .contains("lifecycle failure")
+    );
+
+    let conflicting = vec![
+        format!(
+            "{RECOVERY_RELEASE_LOG}\ncheckpoint_id=42 epoch=42 {CHECKPOINT_ATTEMPT_RESERVED_LOG}\ncheckpoint_id=42 epoch=42 checkpoint completed"
+        ),
+        format!(
+            "{RECOVERY_RELEASE_LOG}\ncheckpoint_id=41 epoch=43 {CHECKPOINT_ATTEMPT_RESERVED_LOG}\ncheckpoint_id=41 epoch=43 checkpoint completed"
+        ),
+        RECOVERY_RELEASE_LOG.to_string(),
+    ];
+    assert!(validate_post_release_checkpoint_lifecycle(
+        &conflicting,
+        DurableCheckpointStatus {
+            checkpoint_id: 41,
+            epoch: 43,
+        },
+    )
+    .unwrap_err()
+    .contains("conflicting checkpoint reservations"));
+
+    let duplicate = vec![
+        format!(
+            "{RECOVERY_RELEASE_LOG}\ncheckpoint_id=41 epoch=43 {CHECKPOINT_ATTEMPT_RESERVED_LOG}\ncheckpoint_id=41 epoch=43 {CHECKPOINT_ATTEMPT_RESERVED_LOG}\ncheckpoint_id=41 epoch=43 checkpoint completed"
+        ),
+        RECOVERY_RELEASE_LOG.to_string(),
+        RECOVERY_RELEASE_LOG.to_string(),
+    ];
+    assert!(
+        validate_post_release_checkpoint_lifecycle(&duplicate, resumed)
+            .unwrap_err()
+            .contains("duplicate checkpoint reservation")
+    );
+}
+
+#[cfg(feature = "kafka")]
+#[test]
 fn prometheus_bucket_parser_accepts_registry_labels() {
     let body = concat!(
         "laminardb_checkpoint_pipeline_stall_duration_seconds_bucket{instance=\"node0\",pipeline=\"soak\",le=\"0.512\"} 38\n",
@@ -2886,6 +3342,148 @@ fn prometheus_bucket_parser_accepts_registry_labels() {
         ),
         Some(41.0)
     );
+}
+
+#[cfg(feature = "kafka")]
+fn test_checkpoint_latency_snapshot(
+    checkpoint_observations: f64,
+    pipeline_stall_observations: f64,
+    pipeline_stall_within_slo: f64,
+) -> CheckpointLatencySnapshot {
+    CheckpointLatencySnapshot {
+        gate_wait_seconds: 0.25,
+        gate_wait_observations: 1.0,
+        checkpoint_seconds: checkpoint_observations * 0.1,
+        checkpoint_observations,
+        pipeline_stall_observations,
+        pipeline_stall_within_slo,
+    }
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn checkpoint_latency_snapshot_rejects_malformed_histograms() {
+    let mut non_finite = test_checkpoint_latency_snapshot(1.0, 1.0, 1.0);
+    non_finite.pipeline_stall_observations = f64::NAN;
+    assert!(non_finite.validate().unwrap_err().contains("finite"));
+
+    let mut negative = test_checkpoint_latency_snapshot(1.0, 1.0, 1.0);
+    negative.pipeline_stall_within_slo = -1.0;
+    assert!(negative.validate().unwrap_err().contains("non-negative"));
+
+    let impossible_bucket = test_checkpoint_latency_snapshot(1.0, 10.0, 11.0);
+    assert!(impossible_bucket
+        .validate()
+        .unwrap_err()
+        .contains("exceeds histogram count"));
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn checkpoint_latency_generation_gate_prevents_follower_dilution() {
+    let mut evidence = CheckpointLatencyEvidence::default();
+    evidence
+        .record_generation(
+            ProcessGeneration {
+                node_id: 0,
+                generation: 1,
+            },
+            test_checkpoint_latency_snapshot(100.0, 100.0, 98.0),
+        )
+        .unwrap();
+    evidence
+        .record_generation(
+            ProcessGeneration {
+                node_id: 1,
+                generation: 1,
+            },
+            test_checkpoint_latency_snapshot(200.0, 200.0, 200.0),
+        )
+        .unwrap();
+
+    let aggregate = evidence.aggregate().unwrap();
+    assert!(aggregate.pipeline_stall_within_slo_percent().unwrap() > 99.0);
+    let error = evidence.validate_slos().unwrap_err();
+    assert!(error.contains("node0 process generation 1"));
+    assert!(error.contains("98.00%"));
+
+    let mut missing_generation = CheckpointLatencyEvidence::default();
+    missing_generation
+        .record_generation(
+            ProcessGeneration {
+                node_id: 0,
+                generation: 1,
+            },
+            test_checkpoint_latency_snapshot(100.0, 100.0, 100.0),
+        )
+        .unwrap();
+    missing_generation
+        .record_generation(
+            ProcessGeneration {
+                node_id: 1,
+                generation: 1,
+            },
+            test_checkpoint_latency_snapshot(0.0, 0.0, 0.0),
+        )
+        .unwrap();
+    let error = missing_generation.validate_slos().unwrap_err();
+    assert!(error.contains("node1 process generation 1"), "{error}");
+    assert!(
+        error.contains("no checkpoint pipeline-stall observations"),
+        "{error}"
+    );
+
+    let mut healthy_follower = CheckpointLatencyEvidence::default();
+    healthy_follower
+        .record_generation(
+            ProcessGeneration {
+                node_id: 0,
+                generation: 1,
+            },
+            test_checkpoint_latency_snapshot(10.0, 10.0, 10.0),
+        )
+        .unwrap();
+    healthy_follower
+        .record_generation(
+            ProcessGeneration {
+                node_id: 1,
+                generation: 1,
+            },
+            test_checkpoint_latency_snapshot(0.0, 10.0, 10.0),
+        )
+        .unwrap();
+    assert!(healthy_follower.validate_slos().is_ok());
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn checkpoint_latency_aggregation_preserves_restart_generations_once() {
+    let mut evidence = CheckpointLatencyEvidence::default();
+    let first = ProcessGeneration {
+        node_id: 0,
+        generation: 1,
+    };
+    evidence
+        .record_generation(first, test_checkpoint_latency_snapshot(10.0, 10.0, 10.0))
+        .unwrap();
+    evidence
+        .record_generation(
+            ProcessGeneration {
+                node_id: 0,
+                generation: 2,
+            },
+            test_checkpoint_latency_snapshot(20.0, 20.0, 20.0),
+        )
+        .unwrap();
+
+    let duplicate = evidence
+        .record_generation(first, test_checkpoint_latency_snapshot(99.0, 99.0, 99.0))
+        .unwrap_err();
+    assert!(duplicate.contains("captured more than once"));
+    let aggregate = evidence.aggregate().unwrap();
+    assert_eq!(aggregate.checkpoint_observations, 30.0);
+    assert_eq!(aggregate.pipeline_stall_observations, 30.0);
+    assert_eq!(aggregate.pipeline_stall_within_slo, 30.0);
 }
 
 #[test]

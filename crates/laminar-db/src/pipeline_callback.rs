@@ -1031,6 +1031,9 @@ pub(crate) struct ConnectorPipelineCallback {
     /// Fault raised by capture or a spawned checkpoint tail. Kept separate from `sink_fault`
     /// because durable decision waits run outside the callback.
     pub(crate) checkpoint_fault: Arc<parking_lot::Mutex<Option<String>>>,
+    /// Last admission failure already reported; cleared by the next successful admission path.
+    pub(crate) last_checkpoint_admission_failure: Option<String>,
+    pub(crate) checkpoint_admission_recovering: bool,
     pub(crate) shutdown_signal: Arc<tokio::sync::Notify>,
     #[cfg(feature = "cluster")]
     pub(crate) cluster_controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
@@ -1109,6 +1112,36 @@ fn observe_unrecovered_delivery_loss_incidents(
 }
 
 impl ConnectorPipelineCallback {
+    fn checkpoint_recovery_active(&self) -> bool {
+        #[cfg(feature = "cluster")]
+        {
+            return self
+                .cluster_controller
+                .as_ref()
+                .is_some_and(|controller| controller.is_recovering());
+        }
+        #[cfg(not(feature = "cluster"))]
+        {
+            false
+        }
+    }
+
+    fn mark_checkpoint_admission_failure(&mut self, reason: &str) -> bool {
+        if self.last_checkpoint_admission_failure.as_deref() == Some(reason) {
+            return false;
+        }
+        self.last_checkpoint_admission_failure = Some(reason.to_owned());
+        true
+    }
+
+    fn observe_checkpoint_recovery_state(&mut self, recovering: bool) -> bool {
+        if self.checkpoint_admission_recovering != recovering {
+            self.checkpoint_admission_recovering = recovering;
+            self.last_checkpoint_admission_failure = None;
+        }
+        recovering
+    }
+
     #[cfg(feature = "cluster")]
     fn require_process_authority(&self, boundary: &str) -> Result<(), crate::pipeline::CycleError> {
         if self
@@ -4437,14 +4470,9 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         true
     }
 
-    fn is_recovering(&self) -> bool {
-        #[cfg(feature = "cluster")]
-        {
-            if let Some(ref cc) = self.cluster_controller {
-                return cc.is_recovering();
-            }
-        }
-        false
+    fn is_recovering(&mut self) -> bool {
+        let recovering = self.checkpoint_recovery_active();
+        self.observe_checkpoint_recovery_state(recovering)
     }
 
     fn fault_on_cycle_error(&self) -> bool {
@@ -4487,6 +4515,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     fn record_checkpoint_failure(&mut self, checkpoint_id: u64, reason: &str) {
+        tracing::warn!(checkpoint_id, reason = %reason, "checkpoint attempt failed");
         if self.delivery_guarantee == laminar_connectors::connector::DeliveryGuarantee::ExactlyOnce
         {
             set_checkpoint_fault(
@@ -4497,6 +4526,12 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     fn record_checkpoint_continuation_fault(&mut self, attempt: CheckpointAttempt, reason: &str) {
+        tracing::error!(
+            checkpoint_id = attempt.checkpoint_id,
+            epoch = attempt.epoch,
+            reason = %reason,
+            "checkpoint continuation failed"
+        );
         set_checkpoint_fault(
             &self.checkpoint_fault,
             format!(
@@ -4507,6 +4542,11 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     fn record_checkpoint_admission_failure(&mut self, reason: &str) {
+        let recovering = self.checkpoint_recovery_active();
+        self.observe_checkpoint_recovery_state(recovering);
+        if self.mark_checkpoint_admission_failure(reason) {
+            tracing::error!(reason = %reason, "checkpoint admission failed");
+        }
         if self.delivery_guarantee == laminar_connectors::connector::DeliveryGuarantee::ExactlyOnce
         {
             set_checkpoint_fault(
@@ -4520,9 +4560,12 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         &mut self,
         attempt_started: std::time::Instant,
     ) -> Result<CheckpointAttempt, String> {
-        self.reserve_attempt(attempt_started)
+        let attempt = self
+            .reserve_attempt(attempt_started)
             .await
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        self.last_checkpoint_admission_failure = None;
+        Ok(attempt)
     }
 
     async fn publish_checkpoint_prepare(
@@ -4729,19 +4772,21 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         // control to the streaming coordinator, which is the sole admission owner.
         #[cfg(feature = "cluster")]
         if let Some(cc) = self.cluster_controller.clone() {
-            if self
-                .require_process_authority("follower checkpoint control")
-                .is_err()
-            {
-                return crate::pipeline::CheckpointControlOutcome::Idle;
+            if let Err(error) = self.require_process_authority("follower checkpoint control") {
+                return crate::pipeline::CheckpointControlOutcome::AdmissionFailed {
+                    error: error.to_string(),
+                };
             }
             if let Err(error) = self.reconcile_source_handoff_watermarks() {
                 set_checkpoint_fault(
                     &self.checkpoint_fault,
                     format!("follower source handoff reconciliation failed: {error}"),
                 );
-                return crate::pipeline::CheckpointControlOutcome::Idle;
+                return crate::pipeline::CheckpointControlOutcome::AdmissionFailed {
+                    error: format!("follower source handoff reconciliation failed: {error}"),
+                };
             }
+            self.last_checkpoint_admission_failure = None;
             return if cc.is_leader() {
                 crate::pipeline::CheckpointControlOutcome::Idle
             } else {
@@ -5462,6 +5507,8 @@ mod tests {
             sink_timed_out: false,
             sink_fault: None,
             checkpoint_fault: Arc::new(parking_lot::Mutex::new(None)),
+            last_checkpoint_admission_failure: None,
+            checkpoint_admission_recovering: false,
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
             #[cfg(feature = "cluster")]
             cluster_controller: None,
@@ -5499,6 +5546,20 @@ mod tests {
             checkpoint_committable_sinks: false,
             intake_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    #[test]
+    fn checkpoint_admission_failure_reporting_is_edge_deduplicated() {
+        let mut callback = empty_callback_fixture();
+        assert!(callback.mark_checkpoint_admission_failure("authority unavailable"));
+        assert!(!callback.mark_checkpoint_admission_failure("authority unavailable"));
+        assert!(callback.mark_checkpoint_admission_failure("assignment unavailable"));
+        assert!(callback.observe_checkpoint_recovery_state(true));
+        assert!(callback.mark_checkpoint_admission_failure("assignment unavailable"));
+        assert!(callback.observe_checkpoint_recovery_state(true));
+        assert!(!callback.mark_checkpoint_admission_failure("assignment unavailable"));
+        assert!(!callback.observe_checkpoint_recovery_state(false));
+        assert!(callback.mark_checkpoint_admission_failure("assignment unavailable"));
     }
 
     #[tokio::test]
@@ -6109,6 +6170,8 @@ mod tests {
                 sink_timed_out: false,
                 sink_fault: None,
                 checkpoint_fault: Arc::new(parking_lot::Mutex::new(None)),
+                last_checkpoint_admission_failure: None,
+                checkpoint_admission_recovering: false,
                 shutdown_signal: Arc::new(tokio::sync::Notify::new()),
                 cluster_controller: Some(controller),
                 shuffle_delivery_loss_incidents: None,
@@ -6135,6 +6198,71 @@ mod tests {
             },
             source,
         }
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn follower_checkpoint_control_exposes_expired_process_authority() {
+        use laminar_core::cluster::control::LeaseDeadline;
+
+        let controller = local_controller();
+        controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::fenced()))
+            .unwrap();
+        let mut callback = empty_callback_fixture();
+        callback.cluster_controller = Some(controller);
+
+        let outcome = crate::pipeline::PipelineCallback::service_checkpoint_control(
+            &mut callback,
+            FxHashMap::default(),
+        )
+        .await;
+
+        let crate::pipeline::CheckpointControlOutcome::AdmissionFailed { error } = outcome else {
+            panic!("expired follower authority must be an explicit admission failure");
+        };
+        assert!(error.contains("cluster process lease expired"), "{error}");
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn follower_checkpoint_control_exposes_handoff_reconciliation_failure() {
+        use laminar_core::cluster::control::LeaseDeadline;
+        use laminar_core::state::{NodeId, VnodeRegistry};
+
+        let controller = local_controller();
+        controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+            .unwrap();
+        let registry = Arc::new(VnodeRegistry::new_unassigned(1));
+        let fence = local_assignment_fence(&controller, 1);
+        registry.set_assignment_and_version_with_source_handoff(
+            vec![NodeId(1)].into(),
+            1,
+            committed_source_handoff(
+                fence.clone(),
+                Some(1_000),
+                CheckpointWatermark::Active(1_000),
+                Some(1_000),
+            ),
+        );
+        controller.publish_checkpoint_assignment_fence(Some(fence));
+        let mut fixture = cluster_callback_fixture(registry, controller, None, Some(1_000));
+        fixture
+            .callback
+            .source_name_arcs
+            .insert(0, Arc::from("missing"));
+
+        let outcome = crate::pipeline::PipelineCallback::service_checkpoint_control(
+            &mut fixture.callback,
+            FxHashMap::default(),
+        )
+        .await;
+
+        let crate::pipeline::CheckpointControlOutcome::AdmissionFailed { error } = outcome else {
+            panic!("handoff reconciliation failure must not be reported as idle");
+        };
+        assert!(error.contains("no watermark state"), "{error}");
     }
 
     #[cfg(feature = "cluster")]

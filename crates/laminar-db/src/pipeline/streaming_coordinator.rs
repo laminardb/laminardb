@@ -4284,6 +4284,7 @@ impl StreamingCoordinator {
                         let reason = error.to_string();
                         callback.abort_subscription_cut(attempt);
                         self.fail_manual_attempt(attempt, &reason);
+                        callback.record_checkpoint_continuation_fault(attempt, &reason);
                         return Some(reason);
                     }
                     let continuation_error = result.continuation_error().map(str::to_owned);
@@ -4293,7 +4294,11 @@ impl StreamingCoordinator {
                     let publication_error = callback.publish_barrier(attempt).err();
                     self.broadcast_epoch_committed(attempt.epoch, &source_checkpoints);
                     self.finish_manual_success(attempt, &result);
-                    return publication_error.or(continuation_error);
+                    let continuation_error = publication_error.or(continuation_error);
+                    if let Some(reason) = continuation_error.as_deref() {
+                        callback.record_checkpoint_continuation_fault(attempt, reason);
+                    }
+                    return continuation_error;
                 }
             }
             CheckpointCompletion::Failed { error, .. } => {
@@ -4389,6 +4394,11 @@ impl StreamingCoordinator {
                 break;
             }
             let intake_paused = callback.intake_paused();
+            if intake_paused || self.replay_pending {
+                // Observe recovery while data processing is gated. Failure reporting observes the
+                // current state again before deduplication, including Release's falling edge.
+                let _ = callback.is_recovering();
+            }
             // At the coordinated external hard bound, stop consuming source data entirely.
             // The bounded source channel then propagates backpressure to connector polling. A
             // one-batch-per-idle-tick trickle would still let the open epoch grow without bound
@@ -5700,6 +5710,7 @@ impl StreamingCoordinator {
         let assignment_fence = match callback.checkpoint_assignment_for_admission().await {
             Ok(fence) => fence,
             Err(reason) => {
+                callback.record_checkpoint_admission_failure(&reason);
                 if manual {
                     self.fail_waiting_manual(format!(
                         "[LDB-6056] manual checkpoint rejected: {reason}"
@@ -5731,6 +5742,11 @@ impl StreamingCoordinator {
         attempt_started: Instant,
     ) -> Result<CheckpointAttempt, String> {
         let attempt = callback.reserve_checkpoint_attempt(attempt_started).await?;
+        tracing::info!(
+            checkpoint_id = attempt.checkpoint_id,
+            epoch = attempt.epoch,
+            "checkpoint attempt reserved"
+        );
         #[cfg(feature = "cluster")]
         if let Err(error) = self.require_process_authority("checkpoint prepare publication") {
             let reason = error.to_string();
@@ -5860,11 +5876,6 @@ impl StreamingCoordinator {
                     attempt,
                     "manual source-less checkpoint failed before the durable tail",
                 );
-                tracing::warn!(
-                    checkpoint_id = attempt.checkpoint_id,
-                    epoch = attempt.epoch,
-                    "source-less checkpoint failed"
-                );
             }
         }
         Ok(())
@@ -5882,10 +5893,6 @@ impl StreamingCoordinator {
         {
             Ok(attempt) => attempt,
             Err(error) => {
-                tracing::error!(
-                    error = %error,
-                    "durable source-less checkpoint attempt reservation failed"
-                );
                 callback.record_checkpoint_admission_failure(&error);
                 if admission.manual {
                     self.fail_waiting_manual(format!(
@@ -6044,7 +6051,6 @@ impl StreamingCoordinator {
         {
             Ok(attempt) => attempt,
             Err(error) => {
-                tracing::error!(error = %error, "durable checkpoint attempt reservation failed");
                 callback.record_checkpoint_admission_failure(&error);
                 if admission.manual {
                     self.fail_waiting_manual(format!(
@@ -6134,7 +6140,9 @@ impl StreamingCoordinator {
         self.drain_manual_requests();
         #[cfg(feature = "cluster")]
         if let Err(error) = self.require_process_authority("checkpoint admission") {
-            self.fail_waiting_manual(error.to_string());
+            let reason = error.to_string();
+            callback.record_checkpoint_admission_failure(&reason);
+            self.fail_waiting_manual(reason);
             return true;
         }
 
@@ -6147,6 +6155,11 @@ impl StreamingCoordinator {
             if !self.checkpoint_capacity_available() {
                 return false;
             }
+            #[cfg(feature = "cluster")]
+            if let Err(error) = self.require_process_authority("checkpoint control admission") {
+                callback.record_checkpoint_admission_failure(&error.to_string());
+                return true;
+            }
             let outcome = callback
                 .service_checkpoint_control(self.current_source_offsets())
                 .await;
@@ -6154,16 +6167,29 @@ impl StreamingCoordinator {
             if let Err(error) =
                 self.require_process_authority("follower checkpoint control application")
             {
-                let reason = error.to_string();
+                let authority_reason = error.to_string();
                 if let CheckpointControlOutcome::Started { attempt, .. }
                 | CheckpointControlOutcome::Failed { attempt, .. } = &outcome
                 {
-                    callback.record_checkpoint_failure(attempt.checkpoint_id, &reason);
+                    callback.record_checkpoint_failure(attempt.checkpoint_id, &authority_reason);
+                } else {
+                    let reason = match &outcome {
+                        CheckpointControlOutcome::AdmissionFailed { error } => {
+                            format!("{error}; {authority_reason}")
+                        }
+                        CheckpointControlOutcome::Idle
+                        | CheckpointControlOutcome::Started { .. }
+                        | CheckpointControlOutcome::Failed { .. } => authority_reason,
+                    };
+                    callback.record_checkpoint_admission_failure(&reason);
                 }
                 return true;
             }
             match outcome {
                 CheckpointControlOutcome::Idle => {}
+                CheckpointControlOutcome::AdmissionFailed { error } => {
+                    callback.record_checkpoint_admission_failure(&error);
+                }
                 CheckpointControlOutcome::Started { attempt, captured } => {
                     if !captured {
                         self.pending_barrier
@@ -6181,7 +6207,9 @@ impl StreamingCoordinator {
         };
         #[cfg(feature = "cluster")]
         if let Err(error) = self.require_process_authority("checkpoint attempt creation") {
-            self.fail_waiting_manual(error.to_string());
+            let reason = error.to_string();
+            callback.record_checkpoint_admission_failure(&reason);
+            self.fail_waiting_manual(reason);
             return true;
         }
         if self.source_handles.is_empty() {
@@ -6385,6 +6413,7 @@ mod tests {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum ProcessAuthorityFencePoint {
         Watermark,
+        AssignmentAdmission,
         CheckpointDrain,
         PreparePublication,
         SubscriptionCut,
@@ -6397,6 +6426,7 @@ mod tests {
         attempt_to_reserve: CheckpointAttempt,
         reserve_error: Option<String>,
         reserve_calls: u64,
+        checkpoint_assignment_calls: u64,
         control_checkpoint_calls: u64,
         control_checkpoint_call_audit: Arc<AtomicU64>,
         control_checkpoint_fault: Option<String>,
@@ -6425,6 +6455,8 @@ mod tests {
         abandoned_fences:
             Arc<Mutex<Vec<Option<laminar_core::cluster::control::CheckpointAssignmentFence>>>>,
         checkpoint_failures: Vec<(u64, String)>,
+        checkpoint_continuation_failures: Vec<(CheckpointAttempt, String)>,
+        checkpoint_admission_failures: Vec<String>,
         barrier_outcome: Option<BarrierOutcome>,
         results: Vec<FxHashMap<Arc<str>, Vec<RecordBatch>>>,
         watermark: i64,
@@ -6470,6 +6502,7 @@ mod tests {
                 attempt_to_reserve: CheckpointAttempt::new(1, 1),
                 reserve_error: None,
                 reserve_calls: 0,
+                checkpoint_assignment_calls: 0,
                 control_checkpoint_calls: 0,
                 control_checkpoint_call_audit: Arc::new(AtomicU64::new(0)),
                 control_checkpoint_fault: None,
@@ -6494,6 +6527,8 @@ mod tests {
                 abandoned_attempts: Arc::new(Mutex::new(Vec::new())),
                 abandoned_fences: Arc::new(Mutex::new(Vec::new())),
                 checkpoint_failures: Vec::new(),
+                checkpoint_continuation_failures: Vec::new(),
+                checkpoint_admission_failures: Vec::new(),
                 barrier_outcome: None,
                 results: Vec::new(),
                 watermark: 0,
@@ -6647,7 +6682,7 @@ mod tests {
             self.runtime.leader
         }
 
-        fn is_recovering(&self) -> bool {
+        fn is_recovering(&mut self) -> bool {
             self.runtime.recovering
         }
 
@@ -6655,6 +6690,9 @@ mod tests {
             &mut self,
         ) -> Result<Option<laminar_core::cluster::control::CheckpointAssignmentFence>, String>
         {
+            self.checkpoint_assignment_calls += 1;
+            #[cfg(feature = "cluster")]
+            self.fence_process_authority_at(ProcessAuthorityFencePoint::AssignmentAdmission);
             if self.runtime.assignment_ready {
                 Ok(self.assignment_fence.clone())
             } else {
@@ -6716,6 +6754,19 @@ mod tests {
         fn record_checkpoint_failure(&mut self, checkpoint_id: u64, reason: &str) {
             self.checkpoint_failures
                 .push((checkpoint_id, reason.to_owned()));
+        }
+
+        fn record_checkpoint_continuation_fault(
+            &mut self,
+            attempt: CheckpointAttempt,
+            reason: &str,
+        ) {
+            self.checkpoint_continuation_failures
+                .push((attempt, reason.to_owned()));
+        }
+
+        fn record_checkpoint_admission_failure(&mut self, reason: &str) {
+            self.checkpoint_admission_failures.push(reason.to_owned());
         }
 
         fn push_to_streams(
@@ -7644,6 +7695,39 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[tokio::test]
+    async fn process_lease_loss_before_reservation_reports_admission_failure() {
+        let mut coordinator = admission_coordinator(Vec::new());
+        let controller = install_test_process_authority(&mut coordinator, 48);
+        controller.fence_process_lease();
+        let mut callback = MockCallback::new();
+
+        coordinator.maybe_checkpoint(&mut callback).await;
+
+        assert_eq!(callback.reserve_calls, 0);
+        assert_eq!(callback.checkpoint_assignment_calls, 0);
+        assert_eq!(callback.checkpoint_admission_failures.len(), 1);
+        assert!(callback.checkpoint_admission_failures[0].contains("checkpoint admission"));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn process_lease_loss_during_assignment_admission_stops_before_reservation() {
+        let mut coordinator = admission_coordinator(Vec::new());
+        let controller = install_test_process_authority(&mut coordinator, 49);
+        let mut callback = MockCallback::new();
+        *callback.process_authority_fence.lock() =
+            Some((ProcessAuthorityFencePoint::AssignmentAdmission, controller));
+
+        coordinator.maybe_checkpoint(&mut callback).await;
+
+        assert_eq!(callback.checkpoint_assignment_calls, 1);
+        assert_eq!(callback.reserve_calls, 0);
+        assert_eq!(callback.checkpoint_admission_failures.len(), 1);
+        assert!(callback.checkpoint_admission_failures[0].contains("checkpoint attempt creation"));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
     async fn process_lease_loss_after_prepare_abandons_the_exact_attempt() {
         let mut coordinator = admission_coordinator(Vec::new());
         let controller = install_test_process_authority(&mut coordinator, 41);
@@ -7807,6 +7891,44 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[tokio::test]
+    async fn follower_idle_control_reports_process_lease_loss_as_admission_failure() {
+        let mut coordinator = admission_coordinator(Vec::new());
+        let controller = install_test_process_authority(&mut coordinator, 50);
+        let mut callback = MockCallback::new();
+        callback.runtime.leader = false;
+        *callback.process_authority_fence.lock() =
+            Some((ProcessAuthorityFencePoint::CheckpointControl, controller));
+
+        coordinator.maybe_checkpoint(&mut callback).await;
+
+        assert_eq!(callback.control_checkpoint_calls, 1);
+        assert_eq!(callback.checkpoint_admission_failures.len(), 1);
+        assert!(callback.checkpoint_admission_failures[0]
+            .contains("follower checkpoint control application"));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn follower_control_admission_failure_is_not_silently_idle() {
+        let mut coordinator = admission_coordinator(Vec::new());
+        install_test_process_authority(&mut coordinator, 51);
+        let mut callback = MockCallback::new();
+        callback.runtime.leader = false;
+        callback.control_checkpoint_outcome = Some(CheckpointControlOutcome::AdmissionFailed {
+            error: "follower source handoff reconciliation failed".into(),
+        });
+
+        coordinator.maybe_checkpoint(&mut callback).await;
+
+        assert_eq!(callback.control_checkpoint_calls, 1);
+        assert_eq!(
+            callback.checkpoint_admission_failures,
+            ["follower source handoff reconciliation failed"]
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
     async fn source_barrier_state_is_not_installed_after_process_lease_loss() {
         let (source, poll) = checkpoint_source_handle("source");
         let mut coordinator = admission_coordinator(vec![source]);
@@ -7911,6 +8033,36 @@ mod tests {
             Some((attempt.epoch, checkpoint))
         );
         assert!(callback.checkpoint_failures.is_empty());
+        assert_eq!(
+            callback.checkpoint_continuation_failures,
+            [(attempt, "injected publication failure".to_string())]
+        );
+        assert_eq!(coordinator.last_published_checkpoint, Some(attempt));
+    }
+
+    #[test]
+    fn durable_completion_reports_successor_epoch_continuation_failure() {
+        let mut coordinator = admission_coordinator(Vec::new());
+        let mut callback = MockCallback::new();
+        let attempt = CheckpointAttempt::new(131, 1_301);
+        let mut result = successful_checkpoint_result(attempt);
+        result.error = Some("injected successor epoch failure".into());
+        let completion =
+            CheckpointCompletion::validated(attempt, result, FxHashMap::default()).unwrap();
+
+        let error = coordinator
+            .handle_checkpoint_completion(completion, &mut callback)
+            .expect("successor epoch failure must fault continuation");
+
+        assert_eq!(error, "injected successor epoch failure");
+        assert_eq!(
+            callback.checkpoint_continuation_failures,
+            [(attempt, "injected successor epoch failure".to_string())]
+        );
+        assert_eq!(
+            *callback.published_barriers.lock(),
+            vec![(attempt.epoch, attempt.checkpoint_id)]
+        );
         assert_eq!(coordinator.last_published_checkpoint, Some(attempt));
     }
 
@@ -7951,6 +8103,11 @@ mod tests {
         assert!(published.lock().is_empty());
         assert!(committed_rx.borrow().is_none());
         assert_eq!(aborted.lock().as_slice(), &[attempt]);
+        assert_eq!(callback.checkpoint_continuation_failures.len(), 1);
+        assert_eq!(callback.checkpoint_continuation_failures[0].0, attempt);
+        assert!(callback.checkpoint_continuation_failures[0]
+            .1
+            .contains("cluster process lease expired"));
         assert_eq!(coordinator.last_published_checkpoint, None);
     }
 
@@ -8040,6 +8197,10 @@ mod tests {
         callback.runtime.assignment_ready = false;
         coordinator.maybe_checkpoint(&mut callback).await;
         assert_eq!(callback.reserve_calls, 0);
+        assert_eq!(
+            callback.checkpoint_admission_failures,
+            ["assignment is not checkpoint-ready"]
+        );
 
         callback.runtime.assignment_ready = true;
         coordinator.maybe_checkpoint(&mut callback).await;

@@ -239,6 +239,8 @@ pub(crate) enum CheckpointCompletion {
 pub enum CheckpointControlOutcome {
     /// No new authoritative checkpoint command was observed.
     Idle,
+    /// Follower admission failed before an exact leader-prepared attempt could be identified.
+    AdmissionFailed { error: String },
     /// The exact leader-prepared attempt was admitted locally.
     Started {
         attempt: CheckpointAttempt,
@@ -446,7 +448,7 @@ pub trait PipelineCallback: Send + 'static {
 
     /// `true` while a coordinated restart is in flight; the checkpoint admission gate holds.
     /// Default `false`.
-    fn is_recovering(&self) -> bool {
+    fn is_recovering(&mut self) -> bool {
         false
     }
 

@@ -4211,6 +4211,8 @@ impl LaminarDB {
             sink_timed_out: false,
             sink_fault: None,
             checkpoint_fault: Arc::new(parking_lot::Mutex::new(None)),
+            last_checkpoint_admission_failure: None,
+            checkpoint_admission_recovering: false,
             shutdown_signal: Arc::clone(&self.shutdown_signal),
             #[cfg(feature = "cluster")]
             vnode_registry: callback_vnode_registry,
