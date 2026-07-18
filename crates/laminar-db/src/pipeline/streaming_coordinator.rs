@@ -891,6 +891,55 @@ pub(crate) async fn resolve_owned_source_drain(
     Ok(())
 }
 
+#[cfg(all(test, feature = "cluster"))]
+pub(crate) fn install_replacement_source_drain_task_for_test(
+    tasks: &OwnedSourceTasks,
+    name: &str,
+) -> SourceTaskLease {
+    let (command_tx, mut command_rx) =
+        tokio::sync::watch::channel::<Option<SourceDrainCommand>>(None);
+    let (status_tx, _status_rx) = tokio::sync::watch::channel(SourceDrainTaskStatus::Idle);
+    let wake = Arc::new(tokio::sync::Notify::new());
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let actor_wake = Arc::clone(&wake);
+    let actor_shutdown = Arc::clone(&shutdown);
+    let actor_status = status_tx.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let (join, actor_terminal) = spawn_source_actor(&runtime, async move {
+        loop {
+            tokio::select! {
+                () = actor_shutdown.notified() => return,
+                () = actor_wake.notified() => {
+                    let command = command_rx.borrow_and_update().clone();
+                    if let Some(SourceDrainCommand::Resolve { resolution, .. }) = command {
+                        actor_status.send_replace(SourceDrainTaskStatus::Resolved {
+                            round: resolution.round,
+                            outcome: resolution.outcome,
+                        });
+                    }
+                }
+            }
+        }
+    });
+    let task = SourceTaskLease::supervise(
+        Arc::from(name),
+        shutdown,
+        Arc::new(AtomicBool::new(false)),
+        join,
+        actor_terminal,
+        None,
+        &runtime,
+    );
+    task.install_drain_control(SourceDrainLeaseControl {
+        task_incarnation: uuid::Uuid::new_v4(),
+        command_tx,
+        status_tx,
+        wake,
+    });
+    tasks.lock().push(task.clone());
+    task
+}
+
 /// Handle to a running source I/O task.
 struct SourceHandle {
     /// Whether this source's checkpoint is a durable recovery cursor. Ephemeral source

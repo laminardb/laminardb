@@ -356,7 +356,7 @@ pub fn spawn_snapshot_watcher(
                                 snapshot,
                                 audited_for_transition,
                                 head_deadline,
-                                config.drain_ack_timeout,
+                                SourceDrainResolutionDeadline::Fresh(config.drain_ack_timeout),
                             )
                             .await
                             {
@@ -1167,6 +1167,21 @@ async fn audit_materialized_drain_transition(
 /// Apply a durable drain outcome before adopting any later assignment. The exact terminal
 /// generation must be installed before connector resolution; skipping it would make the source
 /// cut unverifiable.
+#[derive(Clone, Copy)]
+enum SourceDrainResolutionDeadline {
+    Fresh(Duration),
+    Absolute(tokio::time::Instant),
+}
+
+impl SourceDrainResolutionDeadline {
+    fn resolve(self) -> tokio::time::Instant {
+        match self {
+            Self::Fresh(timeout) => tokio::time::Instant::now() + timeout,
+            Self::Absolute(deadline) => deadline,
+        }
+    }
+}
+
 async fn settle_observed_local_drain(
     db: &Arc<LaminarDB>,
     store: &AssignmentSnapshotStore,
@@ -1176,7 +1191,7 @@ async fn settle_observed_local_drain(
     observed: &AssignmentSnapshot,
     audited_observed: Option<&AuditedDrainOutcome>,
     adoption_deadline: tokio::time::Instant,
-    drain_timeout: Duration,
+    drain_deadline: SourceDrainResolutionDeadline,
 ) -> Result<bool, String> {
     if observed.draining {
         if observed.drain_transition.as_ref() == Some(transition) {
@@ -1274,14 +1289,123 @@ async fn settle_observed_local_drain(
             target_version
         ));
     }
-    db.resolve_local_source_drain(
-        transition.id(),
-        outcome,
-        tokio::time::Instant::now() + drain_timeout,
+    db.resolve_local_source_drain(transition.id(), outcome, drain_deadline.resolve())
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+fn clear_settled_source_drain(
+    controller: &ClusterController,
+    transition: &AssignmentDrainTransition,
+) -> Result<(), String> {
+    match controller.checkpoint_drain_transition() {
+        Some(active) if active == *transition => controller
+            .clear_checkpoint_drain_transition_if_matches(transition)
+            .then_some(())
+            .ok_or_else(|| "process-local source drain changed during settlement".into()),
+        Some(_) => Err("process-local source drain changed during settlement".into()),
+        None => Ok(()),
+    }
+}
+
+/// Reapply a materialized drain terminal to a source generation created by coordinated recovery.
+/// The caller keeps recovery and intake fenced until this returns.
+pub(crate) async fn settle_source_drain_before_recovery_release(
+    db: &Arc<LaminarDB>,
+    controller: &ClusterController,
+    expected_fence: &CheckpointAssignmentFence,
+    deadline: tokio::time::Instant,
+) -> Result<Option<u64>, String> {
+    if !controller.is_recovering() || !db.cluster_intake_fenced() {
+        return Err("recovery source-drain settlement requires closed intake".into());
+    }
+    let published_transition = controller.checkpoint_drain_transition();
+    let store =
+        db.assignment_snapshot_store.lock().clone().ok_or_else(|| {
+            "recovery source-drain settlement has no assignment store".to_string()
+        })?;
+    let snapshot = tokio::time::timeout_at(deadline, store.load())
+        .await
+        .map_err(|_| "recovery source-drain head read timed out".to_string())?
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "recovery source-drain settlement has no assignment head".to_string())?;
+    if snapshot.draining {
+        return Err(format!(
+            "recovery Release reached unresolved draining assignment {}",
+            snapshot.version
+        ));
+    }
+    let fence = snapshot
+        .assignment_fence()
+        .map_err(|error| error.to_string())?;
+    if &fence != expected_fence {
+        return Err(format!(
+            "recovery assignment {} changed before source-drain settlement",
+            snapshot.version
+        ));
+    }
+    let audited = tokio::time::timeout_at(
+        deadline,
+        audit_assignment_snapshot_authority_outcome(&store, Some(controller), &snapshot),
     )
     .await
-    .map_err(|error| error.to_string())?;
-    Ok(true)
+    .map_err(|_| "recovery source-drain terminal audit timed out".to_string())??;
+    let Some(audited) = audited else {
+        if published_transition.is_some() {
+            return Err("process-local source drain has no durable terminal".into());
+        }
+        return Ok(None);
+    };
+    if published_transition.is_some_and(|active| active != audited.transition) {
+        return Err("process-local source drain conflicts with the durable terminal".into());
+    }
+    if local_drain_participant(controller, &audited.transition).is_none() {
+        clear_settled_source_drain(controller, &audited.transition)?;
+        return Ok(None);
+    }
+    if tokio::time::Instant::now() >= deadline {
+        return Err("recovery source-drain settlement deadline expired".into());
+    }
+    let registry = db
+        .vnode_registry
+        .lock()
+        .clone()
+        .ok_or_else(|| "recovery source-drain settlement has no vnode registry".to_string())?;
+    if !settle_observed_local_drain(
+        db,
+        &store,
+        &registry,
+        Some(controller),
+        &audited.transition,
+        &snapshot,
+        Some(&audited),
+        deadline,
+        SourceDrainResolutionDeadline::Absolute(deadline),
+    )
+    .await?
+    {
+        return Err("materialized source drain was not ready for recovery Release".into());
+    }
+    let confirmed = tokio::time::timeout_at(deadline, store.load())
+        .await
+        .map_err(|_| "recovery source-drain head recheck timed out".to_string())?
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "recovery source-drain assignment disappeared".to_string())?;
+    if confirmed != snapshot {
+        return Err("recovery source-drain assignment changed during settlement".into());
+    }
+    let confirmed_terminal = tokio::time::timeout_at(
+        deadline,
+        audit_assignment_snapshot_authority_outcome(&store, Some(controller), &confirmed),
+    )
+    .await
+    .map_err(|_| "recovery source-drain terminal recheck timed out".to_string())??;
+    if confirmed_terminal.as_ref() != Some(&audited) {
+        return Err("recovery source-drain terminal changed during settlement".into());
+    }
+    clear_settled_source_drain(controller, &audited.transition)?;
+    Ok(Some(snapshot.version))
 }
 
 async fn audit_drain_predecessor(
@@ -4509,6 +4633,144 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(decision.verdict, AssignmentDrainVerdict::Abort);
+    }
+
+    #[tokio::test]
+    async fn recovery_release_reapplies_a_committed_drain_to_replacement_sources() {
+        use laminar_core::cluster::control::{ClusterKv, InMemoryKv};
+        use laminar_core::cluster::discovery::NodeInfo;
+        use uuid::Uuid;
+
+        let self_id = NodeId(1);
+        let boot = Uuid::from_u128(11);
+        let participant = CheckpointParticipant {
+            node_id: self_id.0,
+            boot_incarnation: boot,
+        };
+        let owners = BTreeMap::from([(0, self_id)]);
+        let durable = Arc::new(store());
+        let committed = AssignmentSnapshot::empty()
+            .next_for_participants(owners.clone(), vec![participant])
+            .unwrap();
+        durable.save_if_absent(&committed).await.unwrap();
+
+        let kv = Arc::new(InMemoryKv::new(self_id));
+        let control: Arc<dyn ClusterKv> = kv.clone();
+        let recovery: Arc<dyn ClusterKv> = kv;
+        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
+        let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
+            self_id,
+            control,
+            recovery,
+            Some(Arc::clone(&durable)),
+            members_rx,
+            boot,
+        ));
+        controller.publish_recovery_incarnation().await.unwrap();
+        let _leader_lease = grant_test_leadership(&controller).await;
+        let draining = committed
+            .next_draining(
+                owners,
+                vec![participant],
+                controller.capture_leader_proof().unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            durable
+                .save_if_version(&draining, committed.version)
+                .await
+                .unwrap(),
+            RotateOutcome::Rotated
+        ));
+
+        let registry = Arc::new(VnodeRegistry::single_owner(1, self_id));
+        let db = LaminarDB::builder()
+            .cluster_controller(Arc::clone(&controller))
+            .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
+            .state_backend(Arc::new(InProcessBackend::new(1)))
+            .vnode_registry(Arc::clone(&registry))
+            .assignment_snapshot_store(Arc::clone(&durable))
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            finalize_drain_snapshot(
+                &db,
+                &durable,
+                &controller,
+                &draining,
+                &committed,
+                AssignmentDrainVerdict::Commit,
+                RebalanceConfig::test_defaults(),
+            )
+            .await
+            .unwrap(),
+            Some(draining.version)
+        );
+        let terminal = durable.load().await.unwrap().unwrap();
+        let terminal_fence = terminal.assignment_fence().unwrap();
+        let transition = draining.drain_transition.clone().unwrap();
+        let task =
+            crate::pipeline::streaming_coordinator::install_replacement_source_drain_task_for_test(
+                &db.owned_source_tasks,
+                "replacement-source",
+            );
+
+        controller.publish_checkpoint_drain_transition(Some(transition.clone()));
+        controller.set_recovering(true);
+        db.set_source_gate(true);
+        assert_eq!(
+            settle_source_drain_before_recovery_release(
+                &db,
+                &controller,
+                &terminal_fence,
+                tokio::time::Instant::now() + Duration::from_secs(2),
+            )
+            .await
+            .unwrap(),
+            Some(terminal.version)
+        );
+        let resolution = SourceDrainResolution {
+            round: transition.id(),
+            outcome: SourceDrainOutcome::Commit,
+        };
+        assert!(
+            crate::pipeline::streaming_coordinator::owned_source_drain_resolved(
+                &db.owned_source_tasks,
+                resolution,
+            )
+            .unwrap()
+        );
+        assert!(controller.checkpoint_drain_transition().is_none());
+        assert_eq!(
+            settle_source_drain_before_recovery_release(
+                &db,
+                &controller,
+                &terminal_fence,
+                tokio::time::Instant::now() + Duration::from_secs(2),
+            )
+            .await
+            .unwrap(),
+            Some(terminal.version),
+            "a replacement generation must reconcile retained terminal authority even after the process-local marker was cleared"
+        );
+
+        task.request_shutdown();
+        assert!(
+            task.wait_until(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await
+        );
+        controller.publish_checkpoint_drain_transition(Some(transition.clone()));
+        let error = settle_source_drain_before_recovery_release(
+            &db,
+            &controller,
+            &terminal_fence,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .expect_err("a finished replacement source must block recovery Release");
+        assert!(error.contains("exited before committing drain"), "{error}");
+        assert_eq!(controller.checkpoint_drain_transition(), Some(transition));
     }
 
     #[tokio::test]

@@ -1503,6 +1503,37 @@ impl RecoveryMonitor {
             );
             return false;
         }
+        match crate::rebalance::settle_source_drain_before_recovery_release(
+            db,
+            controller,
+            &release.round.assignment_fence,
+            release_deadline,
+        )
+        .await
+        {
+            Ok(Some(version)) => {
+                tracing::info!(
+                    version,
+                    gen = release.round.id.generation,
+                    "reapplied assignment drain terminal before recovery Release"
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(
+                    gen = release.round.id.generation,
+                    %error,
+                    "recovery Release could not settle assignment drain terminal"
+                );
+                return false;
+            }
+        }
+        if db.assignment_authority_revision.load(Ordering::Acquire) != authority_revision
+            || !local_release_round_is_current(db, controller, &release.round)
+        {
+            self.defer_release_retry(db, controller, release.round.id.generation, false);
+            return false;
+        }
         if let Some(transition) = controller.checkpoint_drain_transition() {
             tracing::error!(
                 gen = release.round.id.generation,
@@ -2896,6 +2927,15 @@ mod tests {
         generation: u64,
         participants: &[u64],
     ) -> RecoveryRound {
+        round_for_current_faults_at_assignment(controller, generation, 7, participants).await
+    }
+
+    async fn round_for_current_faults_at_assignment(
+        controller: &ClusterController,
+        generation: u64,
+        assignment_version: u64,
+        participants: &[u64],
+    ) -> RecoveryRound {
         let inventory = controller.read_recovery_fault_inventory().await.unwrap();
         let checkpoint_participants = participants
             .iter()
@@ -2910,12 +2950,35 @@ mod tests {
             controller
                 .capture_leader_proof()
                 .expect("recovery test controller must hold durable leadership"),
-            CheckpointAssignmentFence::from_owner_map(7, &owners, checkpoint_participants).unwrap(),
+            CheckpointAssignmentFence::from_owner_map(
+                assignment_version,
+                &owners,
+                checkpoint_participants,
+            )
+            .unwrap(),
             Vec::new(),
             inventory.revision(),
             inventory.faults().to_vec(),
         )
         .unwrap()
+    }
+
+    async fn initial_assignment_store(
+        fence: &CheckpointAssignmentFence,
+        owners: &[NodeId],
+    ) -> (Arc<AssignmentSnapshotStore>, AssignmentSnapshot) {
+        let assignments = Arc::new(AssignmentSnapshotStore::new(Arc::new(
+            object_store::memory::InMemory::new(),
+        )));
+        let committed = AssignmentSnapshot::empty()
+            .next_for_participants(
+                AssignmentSnapshot::vnodes_from_vec(owners),
+                fence.participants.clone(),
+            )
+            .unwrap();
+        assert_eq!(committed.assignment_fence().unwrap(), fence.clone());
+        assignments.save_if_absent(&committed).await.unwrap();
+        (assignments, committed)
     }
 
     async fn publish_round_roster(
@@ -4468,13 +4531,12 @@ mod tests {
 
     #[tokio::test]
     async fn active_assignment_drain_blocks_recovery_release_readiness() {
-        use laminar_core::checkpoint::AssignmentDrainTransition;
         use laminar_core::state::{InProcessBackend, NodeId as StateNodeId, VnodeRegistry};
 
         let (controller, _members_tx, kv) = controller(Vec::new()).await;
         let controller = Arc::new(controller);
         report_test_fault(&controller).await;
-        let round = round_for_current_faults(&controller, 7, &[1]).await;
+        let round = round_for_current_faults_at_assignment(&controller, 7, 1, &[1]).await;
         activate_start(&controller, &kv, &round, 4).await;
         let start = start(round.clone(), 4);
         controller.announce_recovered(&start).await.unwrap();
@@ -4486,27 +4548,32 @@ mod tests {
             round: round.clone(),
             phase: RecoverPhase::Release { epoch: 4 },
         };
-        let target = CheckpointAssignmentFence::from_owner_map(
-            8,
-            &[1],
-            round.assignment_fence.participants.clone(),
-        )
-        .unwrap();
-        let transition = AssignmentDrainTransition::new(
-            round.assignment_fence.clone(),
-            target,
-            controller.capture_leader_proof().unwrap(),
-        )
-        .unwrap();
+        let (assignments, committed) =
+            initial_assignment_store(&round.assignment_fence, &[NodeId(1)]).await;
+        let draining = committed
+            .next_draining(
+                AssignmentSnapshot::vnodes_from_vec(&[NodeId(1)]),
+                round.assignment_fence.participants.clone(),
+                controller.capture_leader_proof().unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            assignments
+                .save_if_version(&draining, committed.version)
+                .await
+                .unwrap(),
+            laminar_core::cluster::control::RotateOutcome::Rotated
+        ));
+        let transition = draining.drain_transition.clone().unwrap();
         controller.publish_checkpoint_drain_transition(Some(transition.clone()));
 
         let registry = Arc::new(VnodeRegistry::single_owner(1, StateNodeId(1)));
-        registry.set_assignment_and_version(Arc::from([StateNodeId(1)]), 7);
         let db = LaminarDB::builder()
             .cluster_controller(Arc::clone(&controller))
             .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
             .state_backend(Arc::new(InProcessBackend::new(1)))
             .vnode_registry(registry)
+            .assignment_snapshot_store(assignments)
             .build()
             .await
             .unwrap();
@@ -4537,7 +4604,7 @@ mod tests {
         let (controller, _members_tx, kv) = controller(Vec::new()).await;
         let controller = Arc::new(controller);
         report_test_fault(&controller).await;
-        let round = round_for_current_faults(&controller, 7, &[1]).await;
+        let round = round_for_current_faults_at_assignment(&controller, 7, 1, &[1]).await;
         activate_start(&controller, &kv, &round, 4).await;
         let start = start(round.clone(), 4);
         controller.announce_recovered(&start).await.unwrap();
@@ -4550,8 +4617,9 @@ mod tests {
             phase: RecoverPhase::Release { epoch: 4 },
         };
 
+        let (assignments, _committed) =
+            initial_assignment_store(&round.assignment_fence, &[NodeId(1)]).await;
         let registry = Arc::new(VnodeRegistry::single_owner(1, StateNodeId(1)));
-        registry.set_assignment_and_version(Arc::from([StateNodeId(1)]), 7);
         let boot = controller.recovery_incarnation();
         let receiver = Arc::new(
             ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap(), boot)
@@ -4564,6 +4632,7 @@ mod tests {
             .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
             .state_backend(Arc::new(InProcessBackend::new(1)))
             .vnode_registry(registry)
+            .assignment_snapshot_store(assignments)
             .shuffle_sender(sender)
             .shuffle_receiver(receiver)
             .build()
@@ -4609,6 +4678,6 @@ mod tests {
         assert!(restored_for.is_some());
         assert!(db.cluster_intake_fenced());
         assert!(controller.is_recovering());
-        assert_eq!(controller.checkpoint_assignment_fence(7), None);
+        assert_eq!(controller.checkpoint_assignment_fence(1), None);
     }
 }

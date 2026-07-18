@@ -2925,6 +2925,23 @@ impl ClusterController {
         self.checkpoint_drain_transition.send_replace(transition);
     }
 
+    /// Clear the locally audited drain transition only when it still equals `expected`.
+    ///
+    /// The comparison and clear share the process-authority transition lock with publication and
+    /// terminal process fencing, so a newer transition cannot be erased by stale reconciliation.
+    #[must_use]
+    pub fn clear_checkpoint_drain_transition_if_matches(
+        &self,
+        expected: &AssignmentDrainTransition,
+    ) -> bool {
+        let _transition = self.process_authority_transition.lock();
+        let matches = self.checkpoint_drain_transition.borrow().as_ref() == Some(expected);
+        if matches {
+            self.checkpoint_drain_transition.send_replace(None);
+        }
+        matches
+    }
+
     /// Current locally audited drain transition.
     #[must_use]
     pub fn checkpoint_drain_transition(&self) -> Option<AssignmentDrainTransition> {
@@ -4985,6 +5002,24 @@ mod tests {
             controller.checkpoint_assignment_watch().borrow().clone(),
             None
         );
+        assert_eq!(controller.checkpoint_drain_transition(), None);
+    }
+
+    #[test]
+    fn checkpoint_drain_transition_compare_and_clear_preserves_a_nonmatch() {
+        let controller = ctl(1, Vec::new());
+        let (_, installed) = checkpoint_fence_and_drain(&controller);
+        let other_controller = ctl(2, Vec::new());
+        let (_, nonmatching) = checkpoint_fence_and_drain(&other_controller);
+        controller.publish_checkpoint_drain_transition(Some(installed.clone()));
+
+        assert!(!controller.clear_checkpoint_drain_transition_if_matches(&nonmatching));
+        assert_eq!(
+            controller.checkpoint_drain_transition(),
+            Some(installed.clone())
+        );
+
+        assert!(controller.clear_checkpoint_drain_transition_if_matches(&installed));
         assert_eq!(controller.checkpoint_drain_transition(), None);
     }
 
