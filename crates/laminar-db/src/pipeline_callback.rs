@@ -2246,6 +2246,49 @@ impl ConnectorPipelineCallback {
                 resume_gate_deadline,
             )
             .await?;
+        } else if CheckpointAttempt::new(released.epoch, released.checkpoint_id)
+            .relation_to(identity.attempt)
+            == CheckpointAttemptRelation::Newer
+            && released.phase == Phase::Aligned
+        {
+            let successor_fence = released.assignment_fence.as_ref().ok_or_else(|| {
+                "newer Aligned announcement lost its assignment certificate".to_string()
+            })?;
+            let successor_proof = released
+                .leader_proof
+                .as_ref()
+                .ok_or_else(|| "newer Aligned announcement lost its leader proof".to_string())?;
+            if !successor_fence.contains(controller.instance_id().0) {
+                return Err(format!(
+                    "newer checkpoint epoch {} excludes this process from its certified \
+                     assignment; the old pipeline remains fenced",
+                    released.epoch
+                ));
+            }
+            let remaining =
+                resume_gate_deadline.saturating_duration_since(tokio::time::Instant::now());
+            let certified = tokio::time::timeout(
+                remaining,
+                controller.checkpoint_assignment_fence_for_leader(
+                    successor_fence.assignment_version,
+                    successor_proof,
+                ),
+            )
+            .await
+            .map_err(|_| {
+                format!(
+                    "newer checkpoint epoch {} exhausted its shuffle resume deadline while \
+                     certifying assignment {}",
+                    released.epoch, successor_fence.assignment_version
+                )
+            })?;
+            if certified.as_ref() != Some(successor_fence) {
+                return Err(format!(
+                    "newer checkpoint epoch {} has no locally certified assignment {}; the old \
+                     pipeline remains fenced",
+                    released.epoch, successor_fence.assignment_version
+                ));
+            }
         }
         Ok(())
     }
@@ -7125,8 +7168,24 @@ mod tests {
             metadata: NodeMetadata::default(),
             last_heartbeat_ms: 0,
         };
-        let (tx, rx) = tokio::sync::watch::channel(vec![leader_info]);
-        let controller = ClusterController::new(follower_id, kv_trait, None, rx);
+        let follower_info = NodeInfo {
+            id: follower_id,
+            name: "follower".into(),
+            rpc_address: String::new(),
+            raft_address: String::new(),
+            state: NodeState::Active,
+            metadata: NodeMetadata::default(),
+            last_heartbeat_ms: 0,
+        };
+        let (tx, rx) = tokio::sync::watch::channel(vec![leader_info, follower_info]);
+        let controller = ClusterController::new_with_recovery_incarnation(
+            follower_id,
+            Arc::clone(&kv_trait),
+            kv_trait,
+            None,
+            rx,
+            "00000000-0000-0000-0000-000000000007".parse().unwrap(),
+        );
         let backing: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::memory::InMemory::new());
         let decision_store = Arc::new(
@@ -7554,10 +7613,12 @@ mod tests {
 
         let (kv, controller, leader_id, _members_tx, _decision_store) = gate_controller().await;
         let (fence, identity) = resume_identity(3, 3);
+        let successor_fence = assignment_fence(2, &[1, 7]);
+        controller.publish_checkpoint_assignment_fence(Some(successor_fence.clone()));
         let newer = serde_json::to_string(&BarrierAnnouncement {
             epoch: 4,
             checkpoint_id: 4,
-            assignment_fence: Some(assignment_fence(2, &[1, 7])),
+            assignment_fence: Some(successor_fence),
             leader_proof: Some(leader_proof(1)),
             phase: Phase::Aligned,
             flags: 0,
@@ -7652,6 +7713,56 @@ mod tests {
                 "newer {:?} without successor alignment authority released the gate",
                 announcement.phase
             );
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn newer_aligned_requires_the_local_successor_assignment() {
+        use laminar_core::cluster::control::{BarrierAnnouncement, Phase, ANNOUNCEMENT_KEY};
+
+        for (successor_fence, publish, expected) in [
+            (
+                assignment_fence(2, &[1, 7]),
+                false,
+                "no locally certified assignment",
+            ),
+            (assignment_fence(2, &[1, 2]), true, "excludes this process"),
+        ] {
+            let (kv, controller, leader_id, _members_tx, _decision_store) = gate_controller().await;
+            let (fence, identity) = resume_identity(3, 3);
+            if publish {
+                controller.publish_checkpoint_assignment_fence(Some(successor_fence.clone()));
+            }
+            kv.seed(
+                leader_id,
+                ANNOUNCEMENT_KEY,
+                serde_json::to_string(&BarrierAnnouncement {
+                    epoch: 4,
+                    checkpoint_id: 4,
+                    assignment_fence: Some(successor_fence),
+                    leader_proof: Some(leader_proof(1)),
+                    phase: Phase::Aligned,
+                    flags: 0,
+                    min_watermark_ms: None,
+                })
+                .unwrap(),
+            );
+
+            let error = tokio::time::timeout(
+                Duration::from_secs(2),
+                ConnectorPipelineCallback::wait_for_aligned_resume(
+                    true,
+                    &controller,
+                    identity,
+                    &fence,
+                    Duration::from_secs(1),
+                ),
+            )
+            .await
+            .expect("the successor announcement must be observed")
+            .expect_err("an uncertified successor assignment must keep the old pipeline fenced");
+            assert!(error.contains(expected), "{error}");
         }
     }
 

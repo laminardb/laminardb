@@ -3035,16 +3035,164 @@ impl LeaderLeaseStore {
         }
     }
 
+    async fn cluster_outcome_from_snapshot(
+        &self,
+        head: &LeaderAuthorityRecord,
+        epoch: u64,
+        decisions: &CheckpointDecisionStore,
+    ) -> Result<Option<CheckpointOutcome>, ClusterCheckpointAuthorityError> {
+        let floor = head.outcome_floor.as_ref();
+        let before_epoch = floor.map_or(0, |floor| floor.before_epoch);
+        if epoch < before_epoch {
+            return Ok(None);
+        }
+
+        let Some(mut current) = head.outcome_head else {
+            if floor.and_then(|floor| floor.terminal_anchor_link).is_some() {
+                return Err(DecisionError::Conflict(
+                    "cluster outcome floor anchor is disconnected from the authority head".into(),
+                )
+                .into());
+            }
+            return Ok(None);
+        };
+        if epoch > current.epoch {
+            return Ok(None);
+        }
+
+        let mut traversed = 0;
+        loop {
+            if current.epoch < before_epoch {
+                match (
+                    floor,
+                    floor.and_then(|floor| floor.terminal_anchor_link),
+                    floor.and_then(|floor| floor.terminal_anchor.as_ref()),
+                ) {
+                    (Some(_), Some(anchor_link), Some(anchor))
+                        if current == anchor_link
+                            && current.epoch == anchor.epoch
+                            && current.checkpoint_id == anchor.checkpoint_id =>
+                    {
+                        return Ok(None);
+                    }
+                    _ => {
+                        return Err(DecisionError::Conflict(format!(
+                            "cluster outcome chain does not meet durable floor {before_epoch} at its terminal anchor"
+                        ))
+                        .into());
+                    }
+                }
+            }
+            if current.epoch < epoch {
+                return Ok(None);
+            }
+            if !consume_live_authority_link(&mut traversed) {
+                return Err(DecisionError::Conflict(format!(
+                    "live outcome retention exceeds the fixed {MAX_LIVE_AUTHORITY_LINKS}-link authority bound during exact lookup"
+                ))
+                .into());
+            }
+
+            let admission;
+            let record = if current.sequence == head.lease.seq {
+                head
+            } else {
+                admission = read_authority_record(self.store.as_ref(), current.sequence)
+                    .await?
+                    .ok_or_else(|| {
+                        DecisionError::InventoryChanged(format!(
+                            "cluster outcome authority record {} disappeared during exact lookup",
+                            current.sequence
+                        ))
+                    })?;
+                &admission
+            };
+            let outcome = record.checkpoint_outcome.as_ref().ok_or_else(|| {
+                DecisionError::Conflict(format!(
+                    "cluster outcome head epoch {} points to non-outcome authority record {}",
+                    current.epoch, current.sequence
+                ))
+            })?;
+            if record.outcome_head != Some(current)
+                || outcome.epoch != current.epoch
+                || outcome.checkpoint_id != current.checkpoint_id
+            {
+                return Err(DecisionError::Conflict(format!(
+                    "cluster outcome link epoch {} sequence {} does not match its authority record",
+                    current.epoch, current.sequence
+                ))
+                .into());
+            }
+            if outcome.epoch == epoch {
+                let expected_deployment = decisions.load_or_create_deployment_id().await?;
+                if let Some(floor) = floor {
+                    if floor.deployment_id != expected_deployment {
+                        return Err(DecisionError::Conflict(format!(
+                            "cluster outcome floor belongs to deployment {}, current deployment is {}",
+                            floor.deployment_id, expected_deployment
+                        ))
+                        .into());
+                    }
+                }
+                if outcome.deployment_id != expected_deployment {
+                    return Err(DecisionError::Conflict(format!(
+                        "cluster outcome epoch {} belongs to deployment {}, current deployment is {}",
+                        outcome.epoch, outcome.deployment_id, expected_deployment
+                    ))
+                    .into());
+                }
+                return Ok(Some(outcome.clone()));
+            }
+
+            let Some(previous) = record.previous_outcome else {
+                if floor.and_then(|floor| floor.terminal_anchor_link).is_some() {
+                    return Err(DecisionError::Conflict(format!(
+                        "cluster outcome chain stopped without durable floor {before_epoch} terminal anchor"
+                    ))
+                    .into());
+                }
+                return Ok(None);
+            };
+            current = previous;
+        }
+    }
+
+    async fn cluster_outcome_with_decision_store(
+        &self,
+        epoch: u64,
+        decisions: &CheckpointDecisionStore,
+    ) -> Result<Option<CheckpointOutcome>, ClusterCheckpointAuthorityError> {
+        const LOOKUP_RETRIES: usize = 3;
+        for attempt in 0..LOOKUP_RETRIES {
+            let Some(head) = self.load_record().await? else {
+                return Ok(None);
+            };
+            match self
+                .cluster_outcome_from_snapshot(&head, epoch, decisions)
+                .await
+            {
+                Err(ClusterCheckpointAuthorityError::Decision(
+                    DecisionError::InventoryChanged(_),
+                )) if attempt + 1 < LOOKUP_RETRIES => {
+                    tokio::task::yield_now().await;
+                }
+                result => return result,
+            }
+        }
+        Err(DecisionError::InventoryChanged(
+            "cluster outcome exact lookup exhausted stability retries".into(),
+        )
+        .into())
+    }
+
     /// Read one live cluster outcome from the shared authority.
     pub async fn cluster_outcome(
         &self,
         epoch: u64,
     ) -> Result<Option<CheckpointOutcome>, ClusterCheckpointAuthorityError> {
-        Ok(self
-            .cluster_outcomes()
-            .await?
-            .into_iter()
-            .find(|outcome| outcome.epoch == epoch))
+        let decisions = CheckpointDecisionStore::new(Arc::clone(&self.store));
+        self.cluster_outcome_with_decision_store(epoch, &decisions)
+            .await
     }
 
     /// Read one live cluster outcome together with its content-addressed recovery capsule.
@@ -3056,7 +3204,11 @@ impl LeaderLeaseStore {
         Option<(CheckpointOutcome, Option<ClusterRecoveryCapsule>)>,
         ClusterCheckpointAuthorityError,
     > {
-        let Some(outcome) = self.cluster_outcome(epoch).await? else {
+        let decisions = CheckpointDecisionStore::new(Arc::clone(&self.store));
+        let Some(outcome) = self
+            .cluster_outcome_with_decision_store(epoch, &decisions)
+            .await?
+        else {
             return Ok(None);
         };
         let capsule = if outcome.is_commit() {
@@ -3066,9 +3218,7 @@ impl LeaderLeaseStore {
                     outcome.epoch, outcome.checkpoint_id
                 ))
             })?;
-            let capsule = CheckpointDecisionStore::new(Arc::clone(&self.store))
-                .load_recovery_capsule(reference)
-                .await?;
+            let capsule = decisions.load_recovery_capsule(reference).await?;
             if capsule.attempt.epoch != outcome.epoch
                 || capsule.attempt.checkpoint_id != outcome.checkpoint_id
                 || Some(&capsule.assignment_fence) != outcome.assignment_fence.as_ref()
@@ -6478,6 +6628,272 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(1, 10)]
         );
+    }
+
+    #[tokio::test]
+    async fn exact_cluster_outcome_bounds_latest_future_and_older_reads() {
+        let (raw, store) = blocking_once_at(
+            1_000,
+            OsPath::from("control/never-block-exact-outcome-reads"),
+        );
+        let incumbent = owner(1, 1, 1);
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let proof = first.proof();
+        let fence = assignment_fence(&incumbent);
+        for epoch in 1..=4 {
+            store
+                .record_cluster_outcome(
+                    &proof,
+                    epoch,
+                    epoch * 10,
+                    fence.clone(),
+                    CheckpointVerdict::Abort,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while store.prune_running.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let deployment_path = OsPath::from("checkpoint-deployment/identity.json");
+
+        raw.clear_get_counts();
+        let latest = store.cluster_outcome(4).await.unwrap().unwrap();
+        assert_eq!((latest.epoch, latest.checkpoint_id), (4, 40));
+        assert_eq!(raw.get_count(&lease_path(5)), 1);
+        assert_eq!(raw.get_count(&lease_path(4)), 0);
+        assert_eq!(raw.get_count(&deployment_path), 1);
+
+        raw.clear_get_counts();
+        assert!(store.cluster_outcome(5).await.unwrap().is_none());
+        assert_eq!(raw.get_count(&lease_path(5)), 1);
+        assert_eq!(raw.get_count(&lease_path(4)), 0);
+        assert_eq!(raw.get_count(&deployment_path), 0);
+
+        raw.clear_get_counts();
+        let older = store.cluster_outcome(2).await.unwrap().unwrap();
+        assert_eq!((older.epoch, older.checkpoint_id), (2, 20));
+        assert_eq!(raw.get_count(&lease_path(5)), 1);
+        assert_eq!(raw.get_count(&lease_path(4)), 1);
+        assert_eq!(raw.get_count(&lease_path(3)), 1);
+        assert_eq!(raw.get_count(&lease_path(2)), 0);
+        assert_eq!(raw.get_count(&deployment_path), 1);
+
+        record_commit(store.as_ref(), &proof, &fence, 5, 50).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while store.prune_running.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let recovery_reference = store
+            .load_record()
+            .await
+            .unwrap()
+            .unwrap()
+            .checkpoint_outcome
+            .unwrap()
+            .recovery_capsule
+            .unwrap();
+        raw.clear_get_counts();
+        let (committed, capsule) = store
+            .cluster_outcome_with_recovery_capsule(5)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(committed.is_commit());
+        assert_eq!(capsule.unwrap().attempt.epoch, 5);
+        assert_eq!(raw.get_count(&lease_path(6)), 1);
+        assert_eq!(raw.get_count(&deployment_path), 1);
+        assert_eq!(
+            raw.get_count(&recovery_capsule_path(&recovery_reference)),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_cluster_outcome_retries_a_disappearing_admission() {
+        let (raw, store) = blocking_once_at(
+            1_000,
+            OsPath::from("control/never-block-exact-outcome-retry"),
+        );
+        let incumbent = owner(1, 1, 1);
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let proof = first.proof();
+        let fence = assignment_fence(&incumbent);
+        for epoch in 1..=3 {
+            store
+                .record_cluster_outcome(
+                    &proof,
+                    epoch,
+                    epoch * 10,
+                    fence.clone(),
+                    CheckpointVerdict::Abort,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while store.prune_running.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        raw.inner.delete(&lease_path(3)).await.unwrap();
+        raw.clear_get_counts();
+
+        assert!(matches!(
+            store.cluster_outcome(1).await,
+            Err(ClusterCheckpointAuthorityError::Decision(
+                DecisionError::InventoryChanged(_)
+            ))
+        ));
+        assert_eq!(raw.get_count(&lease_path(4)), 3);
+        assert_eq!(raw.get_count(&lease_path(3)), 3);
+        assert_eq!(
+            raw.get_count(&OsPath::from("checkpoint-deployment/identity.json")),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_cluster_outcome_rejects_a_rewritten_immutable_link() {
+        let store = store(1_000);
+        let incumbent = owner(1, 1, 1);
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let proof = first.proof();
+        let fence = assignment_fence(&incumbent);
+        store
+            .record_cluster_outcome(&proof, 1, 10, fence.clone(), CheckpointVerdict::Abort, None)
+            .await
+            .unwrap();
+        store
+            .acquire_or_renew_current_term_for_test(&incumbent, 1)
+            .await
+            .unwrap();
+        store
+            .record_cluster_outcome(&proof, 3, 30, fence, CheckpointVerdict::Abort, None)
+            .await
+            .unwrap();
+
+        let mut corrupt = store.load_record().await.unwrap().unwrap();
+        corrupt.previous_outcome = Some(OutcomeLink {
+            sequence: 3,
+            epoch: 1,
+            checkpoint_id: 10,
+        });
+        store
+            .store
+            .put(
+                &lease_path(corrupt.lease.seq),
+                PutPayload::from(encode_authority_record(&corrupt).unwrap()),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store.cluster_outcome(1).await,
+            Err(ClusterCheckpointAuthorityError::Decision(
+                DecisionError::Conflict(_)
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn exact_cluster_outcome_obeys_and_validates_the_durable_floor_anchor() {
+        let (raw, store) = blocking_once_at(
+            1_000,
+            OsPath::from("control/never-block-exact-outcome-floor"),
+        );
+        let incumbent = owner(1, 1, 1);
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let proof = first.proof();
+        let fence = assignment_fence(&incumbent);
+        record_commit(store.as_ref(), &proof, &fence, 1, 10).await;
+        record_commit(store.as_ref(), &proof, &fence, 5, 50).await;
+        store
+            .prune_cluster_outcomes_before(&proof, 3, accept_recovery_artifacts)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while store.prune_running.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        raw.clear_get_counts();
+        assert!(store.cluster_outcome(1).await.unwrap().is_none());
+        assert_eq!(raw.get_count(&lease_path(4)), 1);
+        assert_eq!(raw.get_count(&lease_path(3)), 0);
+        assert_eq!(raw.get_count(&lease_path(2)), 0);
+        assert_eq!(
+            raw.get_count(&OsPath::from("checkpoint-deployment/identity.json")),
+            0
+        );
+
+        raw.clear_get_counts();
+        assert!(store.cluster_outcome(3).await.unwrap().is_none());
+        assert_eq!(raw.get_count(&lease_path(4)), 1);
+        assert_eq!(raw.get_count(&lease_path(3)), 1);
+        assert_eq!(raw.get_count(&lease_path(2)), 0);
+
+        let mut corrupt = store.load_record().await.unwrap().unwrap();
+        corrupt
+            .outcome_floor
+            .as_mut()
+            .unwrap()
+            .terminal_anchor_link
+            .as_mut()
+            .unwrap()
+            .sequence += 1;
+        store
+            .store
+            .put(
+                &lease_path(corrupt.lease.seq),
+                PutPayload::from(encode_authority_record(&corrupt).unwrap()),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.cluster_outcome(3).await,
+            Err(ClusterCheckpointAuthorityError::Decision(
+                DecisionError::Conflict(_)
+            ))
+        ));
     }
 
     #[tokio::test]

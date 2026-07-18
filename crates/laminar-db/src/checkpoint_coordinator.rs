@@ -170,10 +170,7 @@ const FOLLOWER_DECISION_POLL: Duration = Duration::from_millis(250);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FollowerOutcomeMatch {
     Pending,
-    Commit {
-        status: CheckpointWatermark,
-        frontier: Option<i64>,
-    },
+    Commit { frontier: Option<i64> },
     Abort,
 }
 
@@ -5237,8 +5234,8 @@ impl CheckpointCoordinator {
             )
             .await?
             {
-                FollowerOutcomeMatch::Commit { status, frontier } => {
-                    Self::install_follower_watermark(cc, status, frontier)?;
+                FollowerOutcomeMatch::Commit { frontier } => {
+                    Self::install_follower_watermark(cc, frontier);
                     return Ok(true);
                 }
                 FollowerOutcomeMatch::Abort => return Ok(false),
@@ -5280,8 +5277,8 @@ impl CheckpointCoordinator {
             )
             .await?
             {
-                FollowerOutcomeMatch::Commit { status, frontier } => {
-                    Self::install_follower_watermark(cc, status, frontier)?;
+                FollowerOutcomeMatch::Commit { frontier } => {
+                    Self::install_follower_watermark(cc, frontier);
                     return Ok(true);
                 }
                 FollowerOutcomeMatch::Abort => return Ok(false),
@@ -5442,7 +5439,6 @@ impl CheckpointCoordinator {
                     ))
                 })?;
                 Ok(FollowerOutcomeMatch::Commit {
-                    status: capsule.cluster_watermark,
                     frontier: capsule.recovery_watermark_frontier,
                 })
             }
@@ -5456,28 +5452,15 @@ impl CheckpointCoordinator {
     }
 
     #[cfg(feature = "cluster")]
-    pub(crate) fn install_follower_watermark(
+    fn install_follower_watermark(
         controller: &laminar_core::cluster::control::ClusterController,
-        status: CheckpointWatermark,
         frontier: Option<i64>,
-    ) -> Result<(), DbError> {
+    ) {
         match (controller.cluster_min_watermark(), frontier) {
-            (Some(current), Some(committed)) if current > committed => {
-                return Err(DbError::Checkpoint(format!(
-                    "[LDB-6045] local cluster watermark {current} is ahead of committed \
-                     follower frontier {committed}"
-                )));
-            }
-            (Some(current), None) => {
-                return Err(DbError::Checkpoint(format!(
-                    "[LDB-6045] local cluster watermark {current} is ahead of committed \
-                     {status:?} follower state without a numeric frontier"
-                )));
-            }
+            (Some(current), Some(committed)) if current >= committed => {}
+            (Some(_), None) | (None, None) => {}
             (_, Some(committed)) => controller.publish_cluster_min_watermark(committed),
-            (None, None) => {}
         }
-        Ok(())
     }
 
     /// Follower stage 3: act on the decision. Returns `true` on a clean commit.

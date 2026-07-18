@@ -3322,6 +3322,29 @@ async fn follower_prepare_failure_overwrites_capture_ack() {
 }
 
 #[cfg(feature = "cluster")]
+#[test]
+fn out_of_order_follower_commits_do_not_regress_the_installed_watermark() {
+    use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+    use laminar_core::cluster::discovery::NodeId;
+    use tokio::sync::watch;
+
+    let node = NodeId(2);
+    let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
+    let (_members_tx, members_rx) = watch::channel(Vec::new());
+    let controller = ClusterController::new(node, kv, None, members_rx);
+
+    controller.publish_cluster_min_watermark(200);
+    CheckpointCoordinator::install_follower_watermark(&controller, Some(100));
+    CheckpointCoordinator::install_follower_watermark(&controller, None);
+
+    assert_eq!(
+        controller.cluster_min_watermark(),
+        Some(200),
+        "a late follower completion must be a monotonic no-op"
+    );
+}
+
+#[cfg(feature = "cluster")]
 #[tokio::test]
 async fn cluster_watermark_remains_decision_bound_across_commit_and_recovery() {
     // On a solo cluster, `await_prepare_quorum` computes the
