@@ -2314,6 +2314,11 @@ fn assert_final_input_cut(
 #[test]
 #[ignore = "spawns a real laminardb process; run with --ignored"]
 fn local_exact_source_state_kill9_soak() {
+    assert!(
+        cfg!(debug_assertions),
+        "local exact-state kill injection requires `cargo test --profile soak`; the release \
+         profile excludes the test-only checkpoint gate"
+    );
     let steady_seconds = env_u64("LAMINAR_SOAK_SECONDS", 60);
     let interval_ms = env_u64("LAMINAR_SOAK_INTERVAL_MS", 300);
     assert!(
@@ -2565,6 +2570,23 @@ fn three_node_kill9_soak() {
     validate_checkpoint_liveness(interval_ms, recovery_ceiling);
     let key_group_count = cluster_key_group_count();
     let kafka_partitions = cluster_kafka_partition_count();
+    let fault_role = std::env::var("LAMINAR_SOAK_FAULT_INJECT_ROLE").ok();
+    if let Some(role) = fault_role.as_deref() {
+        assert!(
+            matches!(role, "leader" | "follower"),
+            "LAMINAR_SOAK_FAULT_INJECT_ROLE must be 'leader' or 'follower', got {role:?}"
+        );
+    }
+    let max_kills = env_u64("LAMINAR_SOAK_KILLS", 4);
+    assert!(
+        fault_role.is_none() || max_kills == 0,
+        "coordinated-recovery fault injection and process kill rounds are separate soak modes"
+    );
+    assert!(
+        cfg!(debug_assertions) || (fault_role.is_none() && max_kills == 0),
+        "cluster checkpoint fault injection requires `cargo test --profile soak`; the release \
+         profile excludes the test-only injector and checkpoint gate"
+    );
 
     let dir = tempfile::tempdir().expect("tempdir");
     let url = std::env::var("LAMINAR_SOAK_CHECKPOINT_URL").expect(
@@ -2598,19 +2620,6 @@ fn three_node_kill9_soak() {
     let log_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("soak-{run_id}"));
     std::fs::create_dir(&log_dir).expect("create exclusive cluster soak log directory");
     eprintln!("soak: node logs in {}", log_dir.display());
-
-    let fault_role = std::env::var("LAMINAR_SOAK_FAULT_INJECT_ROLE").ok();
-    if let Some(role) = fault_role.as_deref() {
-        assert!(
-            matches!(role, "leader" | "follower"),
-            "LAMINAR_SOAK_FAULT_INJECT_ROLE must be 'leader' or 'follower', got {role:?}"
-        );
-    }
-    let max_kills = env_u64("LAMINAR_SOAK_KILLS", 4);
-    assert!(
-        fault_role.is_none() || max_kills == 0,
-        "coordinated-recovery fault injection and process kill rounds are separate soak modes"
-    );
 
     let mut nodes: Vec<Node> = (0..NODES)
         .map(|id| Node {
