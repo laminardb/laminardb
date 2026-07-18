@@ -427,7 +427,13 @@ async fn terminal_process_lease_revocation_cannot_reinstall_data_plane_authority
         });
         barrier.wait();
         if let Err(error) = installer.join().unwrap() {
-            assert!(error.to_string().contains("terminally revoked"), "{error}");
+            let error = error.to_string();
+            assert!(
+                error.contains("terminally revoked")
+                    || error
+                        .contains("an invalidated shuffle assignment requires a higher version"),
+                "{error}"
+            );
         }
         revoker.join().unwrap();
     });

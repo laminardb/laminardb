@@ -222,7 +222,7 @@ pub fn spawn_snapshot_watcher(
         let mut terminal_resolution_hold: Option<(AssignmentDrainId, u64)> = None;
         let mut installed_fence: Option<(u64, [u8; 32])> = None;
         let mut installed_authority_revision = 0u64;
-        let mut assignment_invalidated = false;
+        let mut assignment_authority_dirty = false;
         loop {
             tokio::select! {
                 biased;
@@ -262,7 +262,7 @@ pub fn spawn_snapshot_watcher(
                             audited_terminal = outcome;
                         }
                         failed => {
-                            assignment_invalidated = true;
+                            assignment_authority_dirty = true;
                             let _ = suspend_local_assignment_authority(
                                 &db,
                                 controller.as_deref(),
@@ -311,7 +311,7 @@ pub fn spawn_snapshot_watcher(
                                 ) {
                                     Ok(resolved) => resolved,
                                     Err(error) => {
-                                        assignment_invalidated = true;
+                                        assignment_authority_dirty = true;
                                         let _ = hold_terminal_source_resolution(
                                             &db,
                                             controller.as_deref(),
@@ -331,7 +331,7 @@ pub fn spawn_snapshot_watcher(
                             active_local_drain = None;
                             terminal_resolution_hold = None;
                         } else {
-                            assignment_invalidated = true;
+                            assignment_authority_dirty = true;
                             match hold_terminal_source_resolution(
                                 &db,
                                 controller.as_deref(),
@@ -463,7 +463,7 @@ pub fn spawn_snapshot_watcher(
                         Ok(Err(error)) => {
                             durable_snapshot = None;
                             durable_drain_transition = None;
-                            assignment_invalidated = true;
+                            assignment_authority_dirty = true;
                             let _ = suspend_local_assignment_authority(
                                 &db,
                                 controller.as_deref(),
@@ -475,7 +475,7 @@ pub fn spawn_snapshot_watcher(
                         Err(_) => {
                             durable_snapshot = None;
                             durable_drain_transition = None;
-                            assignment_invalidated = true;
+                            assignment_authority_dirty = true;
                             let _ = suspend_local_assignment_authority(
                                 &db,
                                 controller.as_deref(),
@@ -489,7 +489,7 @@ pub fn spawn_snapshot_watcher(
                 Ok(Ok(Some(snap))) if !snap.draining && snap.version > local => {
                     if audited_recovery {
                         let Some(controller) = controller.as_deref() else {
-                            assignment_invalidated = true;
+                            assignment_authority_dirty = true;
                             let _ =
                                 suspend_local_assignment_authority(&db, None, head_deadline).await;
                             warn!(
@@ -499,22 +499,22 @@ pub fn spawn_snapshot_watcher(
                             continue;
                         };
                         if let Err(error) =
-                            close_local_assignment_authority(&db, Some(controller), head_deadline)
+                            suspend_local_assignment_authority(&db, Some(controller), head_deadline)
                                 .await
                         {
-                            assignment_invalidated = true;
-                            warn!(%error, version = snap.version, "snapshot watcher: could not fence recovery assignment");
+                            assignment_authority_dirty = true;
+                            warn!(%error, version = snap.version, "snapshot watcher: could not suspend recovery assignment");
                             continue;
                         }
                         if let Err(error) = ensure_local_recovery_fault(&db, controller).await {
-                            assignment_invalidated = true;
+                            assignment_authority_dirty = true;
                             warn!(%error, version = snap.version, "snapshot watcher: could not publish recovery fault");
                             continue;
                         }
                         authority_revision = db
                             .assignment_authority_revision
                             .load(std::sync::atomic::Ordering::Acquire);
-                        assignment_invalidated = true;
+                        assignment_authority_dirty = true;
                     }
                     durable_drain_transition = None;
                     durable_snapshot = Some(snap.clone());
@@ -547,7 +547,7 @@ pub fn spawn_snapshot_watcher(
                 Ok(Err(error)) => {
                     durable_snapshot = None;
                     durable_drain_transition = None;
-                    assignment_invalidated = true;
+                    assignment_authority_dirty = true;
                     let _ = suspend_local_assignment_authority(
                         &db,
                         controller.as_deref(),
@@ -559,7 +559,7 @@ pub fn spawn_snapshot_watcher(
                 Err(_) => {
                     durable_snapshot = None;
                     durable_drain_transition = None;
-                    assignment_invalidated = true;
+                    assignment_authority_dirty = true;
                     let _ = suspend_local_assignment_authority(
                         &db,
                         controller.as_deref(),
@@ -584,13 +584,13 @@ pub fn spawn_snapshot_watcher(
                     c.publish_checkpoint_drain_transition(None);
                     c.publish_checkpoint_assignment_fence(None);
                 }
-                assignment_invalidated = true;
+                assignment_authority_dirty = true;
                 continue;
             }
             if installed_fence.is_some()
                 && installed_authority_revision != current_authority_revision
             {
-                assignment_invalidated = true;
+                assignment_authority_dirty = true;
             }
 
             let assignment = registry.versioned_snapshot();
@@ -703,7 +703,7 @@ pub fn spawn_snapshot_watcher(
                     db.set_source_gate(true);
                     c.publish_checkpoint_drain_transition(None);
                     c.publish_checkpoint_assignment_fence(None);
-                    assignment_invalidated = true;
+                    assignment_authority_dirty = true;
                     continue;
                 }
                 let drain_transition = durable_drain_transition
@@ -717,7 +717,7 @@ pub fn spawn_snapshot_watcher(
                             == Some(c.recovery_incarnation());
                         let published_fence =
                             c.checkpoint_assignment_fence(fence.assignment_version);
-                        let needs_activation = assignment_invalidated
+                        let needs_activation = assignment_authority_dirty
                             || installed_fence != Some(identity)
                             || published_fence.as_ref() != Some(&fence)
                             || c.checkpoint_drain_transition() != drain_transition
@@ -726,13 +726,15 @@ pub fn spawn_snapshot_watcher(
                                 && drain_transition.is_none()
                                 && db.cluster_intake_fenced());
                         if needs_activation {
-                            if !assignment_invalidated && installed_fence != Some(identity) {
-                                // A different certificate supersedes the active lifetime. Cancel it
-                                // before waiting for compute cycles that may be blocked in send.
+                            if installed_fence.is_some() && installed_fence != Some(identity) {
+                                // Cancel the cached lifetime before waiting for compute cycles that
+                                // may be blocked in send. Suspension is safe if another authority
+                                // path already installed this exact successor; a genuinely higher
+                                // certificate resets the delivery domain during installation.
                                 db.set_source_gate(true);
                                 c.publish_checkpoint_drain_transition(None);
                                 c.publish_checkpoint_assignment_fence(None);
-                                db.invalidate_shuffle_assignment_fence();
+                                db.suspend_shuffle_assignment_fence();
                                 authority_revision = db
                                     .assignment_authority_revision
                                     .load(std::sync::atomic::Ordering::Acquire);
@@ -750,32 +752,41 @@ pub fn spawn_snapshot_watcher(
                                 Ok(activation) if activation.installed => {
                                     installed_fence = Some(identity);
                                     installed_authority_revision = activation.revision;
-                                    assignment_invalidated = false;
+                                    assignment_authority_dirty = false;
                                 }
-                                Ok(_) => assignment_invalidated = true,
+                                Ok(_) => assignment_authority_dirty = true,
                                 Err(error) => {
                                     c.publish_checkpoint_drain_transition(None);
                                     c.publish_checkpoint_assignment_fence(None);
                                     installed_fence = None;
-                                    assignment_invalidated = true;
+                                    assignment_authority_dirty = true;
                                     warn!(%error, version, "shuffle assignment certificate install failed");
                                 }
                             }
                         }
                     }
-                    None if !assignment_invalidated => {
-                        // A process-roster change can invalidate a certificate without changing
-                        // vnode owners. Cancel it before waiting for the old compute scope.
-                        installed_fence = None;
-                        assignment_invalidated = true;
-                        if close_local_assignment_authority(&db, Some(c.as_ref()), head_deadline)
-                            .await
-                            .is_err()
+                    None if !assignment_authority_dirty => {
+                        // An incomplete adoption or process-roster read is not proof that the
+                        // installed certificate was superseded. Close admission while retaining
+                        // its delivery sequence; installing a later concrete successor resets the
+                        // delivery domain from that certified boundary.
+                        assignment_authority_dirty = true;
+                        match suspend_local_assignment_authority(
+                            &db,
+                            Some(c.as_ref()),
+                            head_deadline,
+                        )
+                        .await
                         {
-                            warn!(
+                            Ok(()) => warn!(
                                 version,
-                                "assignment invalidation could not drain the prior execution scope"
-                            );
+                                "owner-complete assignment certificate unavailable; authority suspended"
+                            ),
+                            Err(error) => warn!(
+                                %error,
+                                version,
+                                "assignment suspension could not drain the prior execution scope"
+                            ),
                         }
                     }
                     None => {}
@@ -4182,7 +4193,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watcher_suspends_and_resumes_exact_authority_after_transient_corrupt_head() {
+    async fn watcher_resumes_exact_authority_after_transient_audit_gaps() {
         use laminar_core::cluster::control::{ClusterKv, InMemoryKv};
         use laminar_core::cluster::discovery::NodeInfo;
         use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
@@ -4203,7 +4214,7 @@ mod tests {
 
         let kv = Arc::new(InMemoryKv::new(self_id));
         let control: Arc<dyn ClusterKv> = kv.clone();
-        let recovery: Arc<dyn ClusterKv> = kv;
+        let recovery: Arc<dyn ClusterKv> = kv.clone();
         let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
         let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
             self_id,
@@ -4301,6 +4312,54 @@ mod tests {
         .expect("the exact durable head should resume after the transient read fault clears");
         assert_eq!(sender.assignment_version(), committed.version);
         assert_eq!(receiver.assignment_version(), committed.version);
+
+        let exact_adoption = controller
+            .read_adopted_assignments()
+            .await
+            .unwrap()
+            .into_iter()
+            .find_map(|(node, adoption)| (node == self_id).then_some(adoption))
+            .expect("watcher must publish its exact adoption report");
+        let expected_digest = committed.assignment_fence().unwrap().digest();
+        let mut incomplete_adoption = exact_adoption.clone();
+        incomplete_adoption.assignment_version += 1;
+        kv.seed(
+            self_id,
+            "control:adopted-assignment",
+            serde_json::to_string(&incomplete_adoption).unwrap(),
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !db.cluster_intake_fenced()
+                || sender.assignment_version() != 0
+                || receiver.assignment_version() != 0
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("an incomplete adoption cut must suspend assignment authority");
+        assert_eq!(
+            controller.checkpoint_assignment_fence(committed.version),
+            None
+        );
+
+        kv.seed(
+            self_id,
+            "control:adopted-assignment",
+            serde_json::to_string(&exact_adoption).unwrap(),
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while db.cluster_intake_fenced() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the exact adoption cut should resume its retained certificate");
+        assert_eq!(registry.assignment_version(), committed.version);
+        assert_eq!(sender.assignment_version(), committed.version);
+        assert_eq!(receiver.assignment_version(), committed.version);
+        assert_eq!(sender.active_assignment_digest(), Some(expected_digest));
+        assert_eq!(receiver.active_assignment_digest(), Some(expected_digest));
 
         object_store
             .put(

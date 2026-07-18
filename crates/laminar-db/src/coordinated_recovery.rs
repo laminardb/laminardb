@@ -4289,6 +4289,9 @@ mod tests {
         assert_eq!(sender.active_assignment_digest(), None);
         assert_eq!(receiver.active_assignment_digest(), None);
 
+        db.set_shuffle_recovery_gen(round.id.generation);
+        assert_eq!(sender.recovery_gen(), round.id.generation);
+        assert_eq!(receiver.recovery_gen(), round.id.generation);
         let expected_revision = db.assignment_authority_revision.load(Ordering::Acquire);
         let installed_revision = install_recovery_start_assignment(
             &db,
