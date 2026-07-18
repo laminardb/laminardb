@@ -2328,17 +2328,35 @@ impl ConnectorPipelineCallback {
         &mut self,
         controller: &laminar_core::cluster::control::ClusterController,
     ) -> FollowerPrepareAdmission {
-        use laminar_core::cluster::control::Phase;
-
-        let announcement = match controller.observe_barrier().await {
-            Ok(Some(announcement)) if announcement.phase == Phase::Prepare => announcement,
-            _ => return FollowerPrepareAdmission::Idle,
+        let announcement = match controller.observe_checkpoint_prepare().await {
+            Ok(Some(
+                laminar_core::cluster::control::CheckpointPrepareObservation::AssignmentReady(
+                    announcement,
+                ),
+            )) => announcement,
+            Ok(Some(
+                laminar_core::cluster::control::CheckpointPrepareObservation::AssignmentRejected {
+                    announcement,
+                    error,
+                },
+            )) => {
+                let attempt =
+                    CheckpointAttempt::new(announcement.epoch, announcement.checkpoint_id);
+                Self::reject_uncertified_follower_prepare(controller, &announcement, error.clone())
+                    .await;
+                return FollowerPrepareAdmission::Failed { attempt, error };
+            }
+            Ok(None) => return FollowerPrepareAdmission::Idle,
+            Err(error) => {
+                set_checkpoint_fault(
+                    &self.checkpoint_fault,
+                    format!("follower checkpoint control observation failed: {error}"),
+                );
+                return FollowerPrepareAdmission::Idle;
+            }
         };
         let attempt = CheckpointAttempt::new(announcement.epoch, announcement.checkpoint_id);
-        if let Some(error) = self
-            .follower_prepare_assignment_error(controller, &announcement)
-            .await
-        {
+        if let Some(error) = self.follower_prepare_assignment_error(controller, &announcement) {
             Self::reject_uncertified_follower_prepare(controller, &announcement, error.clone())
                 .await;
             return FollowerPrepareAdmission::Failed { attempt, error };
@@ -2400,8 +2418,8 @@ impl ConnectorPipelineCallback {
     }
 
     #[cfg(feature = "cluster")]
-    async fn follower_prepare_assignment_error(
-        &mut self,
+    fn follower_prepare_assignment_error(
+        &self,
         controller: &laminar_core::cluster::control::ClusterController,
         announcement: &laminar_core::cluster::control::BarrierAnnouncement,
     ) -> Option<String> {
@@ -2456,17 +2474,6 @@ impl ConnectorPipelineCallback {
             return Some(
                 "[LDB-6055] leader authority owner does not match the checkpoint roster".into(),
             );
-        }
-        if controller
-            .checkpoint_assignment_fence_for_leader(fence.assignment_version, leader_proof)
-            .await
-            .as_ref()
-            != Some(fence)
-        {
-            return Some(format!(
-                "[LDB-6055] follower cannot certify leader Prepare assignment {}",
-                fence.assignment_version
-            ));
         }
         None
     }
@@ -4650,6 +4657,21 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             return Err("assignment changed while checkpoint admission was being certified".into());
         }
         Ok(Some(fence))
+    }
+
+    fn checkpoint_control_wake(&self) -> Option<crate::pipeline::callback::CheckpointControlWake> {
+        #[cfg(feature = "cluster")]
+        {
+            return self.cluster_controller.as_ref().map(|controller| {
+                crate::pipeline::callback::CheckpointControlWake::new(
+                    controller.checkpoint_announcement_watch(),
+                )
+            });
+        }
+        #[cfg(not(feature = "cluster"))]
+        {
+            None
+        }
     }
 
     fn tick_idle_watermark(&mut self) {
@@ -7207,6 +7229,61 @@ mod tests {
             .unwrap();
         controller.set_leader_lease_store(lease_store);
         (kv, controller, leader_id, tx, decision_store)
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn mismatched_observed_assignment_sends_exact_negative_prepare_ack() {
+        use laminar_core::checkpoint::CheckpointAssignmentFence;
+        use laminar_core::cluster::control::{
+            BarrierAck, BarrierAnnouncement, ClusterKv, Phase, ACK_KEY, ANNOUNCEMENT_KEY,
+        };
+
+        let (kv, controller, leader_id, _members_tx, _decision_store) = gate_controller().await;
+        let announced_fence = assignment_fence(17, &[1, 7]);
+        let local_fence = CheckpointAssignmentFence::from_owner_map(
+            17,
+            &[7, 1],
+            announced_fence.participants.clone(),
+        )
+        .unwrap();
+        controller.publish_checkpoint_assignment_fence(Some(local_fence));
+        let announcement = BarrierAnnouncement {
+            epoch: 20,
+            checkpoint_id: 200,
+            assignment_fence: Some(announced_fence.clone()),
+            leader_proof: Some(leader_proof(1)),
+            phase: Phase::Prepare,
+            flags: 0,
+            min_watermark_ms: None,
+        };
+        kv.seed(
+            leader_id,
+            ANNOUNCEMENT_KEY,
+            serde_json::to_string(&announcement).unwrap(),
+        );
+
+        let mut callback = empty_callback_fixture();
+        let admission = callback.admit_follower_prepare(&controller).await;
+        let FollowerPrepareAdmission::Failed { attempt, error } = admission else {
+            panic!("a mismatched local assignment must reject follower admission");
+        };
+        assert_eq!(attempt, CheckpointAttempt::new(20, 200));
+        assert!(error.contains("follower assignment differs"), "{error}");
+
+        let encoded = kv
+            .read_from(controller.instance_id(), ACK_KEY)
+            .await
+            .expect("assignment rejection must publish a prompt negative acknowledgement");
+        let acknowledgement: BarrierAck = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(acknowledgement.epoch, 20);
+        assert_eq!(acknowledgement.checkpoint_id, 200);
+        assert_eq!(
+            acknowledgement.assignment_digest,
+            Some(announced_fence.digest())
+        );
+        assert!(!acknowledgement.ok);
+        assert_eq!(acknowledgement.error.as_deref(), Some(error.as_str()));
     }
 
     #[cfg(feature = "cluster")]

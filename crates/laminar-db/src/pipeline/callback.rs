@@ -5,6 +5,7 @@
 //! through a narrow interface.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow_array::RecordBatch;
 use laminar_connectors::checkpoint::SourceCheckpoint;
@@ -14,6 +15,92 @@ use laminar_core::checkpoint::{CheckpointBarrier, CheckpointBarrierInjector};
 use laminar_core::cluster::control::CheckpointAssignmentFence;
 use laminar_core::state::{CheckpointAttempt, CheckpointAttemptRelation};
 use rustc_hash::{FxHashMap, FxHashSet};
+
+#[cfg(feature = "cluster")]
+const CHECKPOINT_CONTROL_DIRECT_FALLBACK: Duration = Duration::from_millis(250);
+const CHECKPOINT_CONTROL_POLL_FALLBACK: Duration = Duration::from_millis(25);
+
+/// Push wake plus bounded KV fallback for clustered checkpoint control.
+#[cfg(feature = "cluster")]
+#[doc(hidden)]
+pub struct CheckpointControlWake {
+    announcements: Option<
+        tokio::sync::watch::Receiver<Option<laminar_core::cluster::control::BarrierAnnouncement>>,
+    >,
+    fallback: Duration,
+}
+
+#[cfg(not(feature = "cluster"))]
+#[doc(hidden)]
+pub struct CheckpointControlWake {
+    _private: (),
+}
+
+#[cfg(feature = "cluster")]
+impl CheckpointControlWake {
+    #[must_use]
+    pub(crate) fn new(
+        announcements: Option<
+            tokio::sync::watch::Receiver<
+                Option<laminar_core::cluster::control::BarrierAnnouncement>,
+            >,
+        >,
+    ) -> Self {
+        let fallback = if announcements.is_some() {
+            CHECKPOINT_CONTROL_DIRECT_FALLBACK
+        } else {
+            CHECKPOINT_CONTROL_POLL_FALLBACK
+        };
+        Self {
+            announcements,
+            fallback,
+        }
+    }
+
+    pub(crate) async fn wait_until(&mut self, fallback_at: tokio::time::Instant) {
+        let Some(announcements) = self.announcements.as_mut() else {
+            tokio::time::sleep_until(fallback_at).await;
+            return;
+        };
+        tokio::select! {
+            biased;
+            changed = announcements.changed() => {
+                if changed.is_err() {
+                    self.announcements = None;
+                    self.fallback = CHECKPOINT_CONTROL_POLL_FALLBACK;
+                }
+            }
+            () = tokio::time::sleep_until(fallback_at) => {}
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn fallback(&self) -> Duration {
+        self.fallback
+    }
+
+    #[must_use]
+    pub(crate) const fn capacity_retry(&self) -> Duration {
+        CHECKPOINT_CONTROL_POLL_FALLBACK
+    }
+}
+
+#[cfg(not(feature = "cluster"))]
+impl CheckpointControlWake {
+    pub(crate) async fn wait_until(&mut self, fallback_at: tokio::time::Instant) {
+        tokio::time::sleep_until(fallback_at).await;
+    }
+
+    #[must_use]
+    pub(crate) const fn fallback(&self) -> Duration {
+        CHECKPOINT_CONTROL_POLL_FALLBACK
+    }
+
+    #[must_use]
+    pub(crate) const fn capacity_retry(&self) -> Duration {
+        CHECKPOINT_CONTROL_POLL_FALLBACK
+    }
+}
 
 /// Retained source-task command for an exact barrier attempt.
 ///
@@ -448,6 +535,12 @@ pub trait PipelineCallback: Send + 'static {
         std::future::ready(Ok(None))
     }
 
+    /// Wake the coordinator for leader-originated checkpoint control. `None` keeps local
+    /// runtimes free of cluster polling.
+    fn checkpoint_control_wake(&self) -> Option<CheckpointControlWake> {
+        None
+    }
+
     /// Demote sources idle past their timeout so a quiet input doesn't pin the combined watermark.
     fn tick_idle_watermark(&mut self) {}
 
@@ -520,5 +613,47 @@ pub trait PipelineCallback: Send + 'static {
     /// Register the local source barrier injectors.
     fn set_barrier_injectors(&mut self, injectors: Vec<SourceBarrierControl>) {
         let _ = injectors;
+    }
+}
+
+#[cfg(all(test, feature = "cluster"))]
+mod tests {
+    use super::*;
+
+    async fn assert_quiet_wake_at(wake: &mut CheckpointControlWake, delay: Duration) {
+        let deadline = tokio::time::Instant::now() + delay;
+        assert!(tokio::time::timeout(
+            delay.saturating_sub(Duration::from_millis(1)),
+            wake.wait_until(deadline),
+        )
+        .await
+        .is_err());
+        tokio::time::timeout(Duration::from_millis(2), wake.wait_until(deadline))
+            .await
+            .expect("checkpoint control fallback exceeded its configured deadline");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn checkpoint_control_wake_uses_bounded_direct_and_poll_fallbacks() {
+        let (_direct_tx, direct_rx) = tokio::sync::watch::channel(None);
+        let mut direct = CheckpointControlWake::new(Some(direct_rx));
+        assert_eq!(direct.fallback(), Duration::from_millis(250));
+        assert_quiet_wake_at(&mut direct, Duration::from_millis(250)).await;
+
+        let mut poll = CheckpointControlWake::new(None);
+        assert_eq!(poll.fallback(), Duration::from_millis(25));
+        assert_quiet_wake_at(&mut poll, Duration::from_millis(25)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn checkpoint_control_wake_degrades_when_direct_delivery_closes() {
+        let (direct_tx, direct_rx) = tokio::sync::watch::channel(None);
+        let mut wake = CheckpointControlWake::new(Some(direct_rx));
+        drop(direct_tx);
+
+        wake.wait_until(tokio::time::Instant::now() + Duration::from_millis(250))
+            .await;
+        assert_eq!(wake.fallback(), Duration::from_millis(25));
+        assert_quiet_wake_at(&mut wake, Duration::from_millis(25)).await;
     }
 }

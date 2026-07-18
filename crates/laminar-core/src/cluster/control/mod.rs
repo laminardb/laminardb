@@ -18,6 +18,8 @@ pub use barrier::{
     BarrierAck, BarrierAnnouncement, BarrierCoordinator, ClusterKv, InMemoryKv, Phase,
     QuorumOutcome, ACK_KEY, ANNOUNCEMENT_KEY,
 };
+#[cfg(feature = "cluster")]
+pub use controller::CheckpointPrepareObservation;
 pub use controller::{
     ClusterController, RecoverPhase, RecoveryAnnouncement, RecoveryControlError, RecoveryFault,
     RecoveryFaultReportOutcome, RecoveryFaultRequest, RecoveryRound, RecoveryRoundId,

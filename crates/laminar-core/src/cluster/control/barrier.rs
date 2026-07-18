@@ -1431,6 +1431,23 @@ impl BarrierCoordinator {
                 ann.phase, ann.epoch, ann.checkpoint_id
             )
         })?;
+        self.validate_announcement_leader(ann, proof).await
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn validate_announcement_leader(
+        &self,
+        ann: &BarrierAnnouncement,
+        proof: &crate::checkpoint::LeaderProof,
+    ) -> Result<(), String> {
+        let local_proof = self
+            .local_leader_proof
+            .lock()
+            .clone()
+            .and_then(|provider| provider());
+        if local_proof.as_ref() == Some(proof) {
+            return Ok(());
+        }
         let store = self
             .leader_lease_store
             .lock()
@@ -1448,6 +1465,23 @@ impl BarrierCoordinator {
             ));
         }
         Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(super) async fn validate_checkpoint_prepare(
+        &self,
+        announcement: &BarrierAnnouncement,
+    ) -> Result<(), String> {
+        if announcement.phase != Phase::Prepare {
+            return Err("checkpoint Prepare validation received a different barrier phase".into());
+        }
+        let proof = announcement.leader_proof.as_ref().ok_or_else(|| {
+            format!(
+                "clustered Prepare for checkpoint {}/{} is missing a durable leader proof",
+                announcement.epoch, announcement.checkpoint_id
+            )
+        })?;
+        self.validate_announcement_leader(announcement, proof).await
     }
 
     /// Configure membership used to target active barrier peers.
@@ -1766,23 +1800,24 @@ impl BarrierCoordinator {
     /// Watch over gRPC-delivered announcements, for push-driven waits
     /// (the decision wait and the Aligned resume gate). `None` until
     /// the gRPC server is started — gossip-KV-only deployments fall
-    /// back to polling [`observe`](Self::observe).
+    /// back to polling the merged gossip history.
     #[cfg(feature = "cluster")]
     #[must_use]
     pub fn announcement_watch(&self) -> Option<watch::Receiver<Option<BarrierAnnouncement>>> {
         self.grpc.lock().as_ref().map(|s| s.latest_rx.clone())
     }
 
-    /// Follower-side observe — returns the *latest* announcement
-    /// (non-destructive; repeated calls return the same value until a
-    /// newer one arrives, matching the gossip-KV fallback). Callers
-    /// already dedup by exact attempt/phase. The gRPC-delivered value and gossip-KV value must be
-    /// related in both attempt dimensions. Within an exact attempt phase progress is monotonic
-    /// while gossip catches up; a terminal durable KV value is the decision authority.
+    /// Merge the latest direct and gossip announcements without consulting remote authority.
+    /// Callers may inspect the result, but must validate a matching reversible phase before use.
+    /// Observation is non-destructive, and direct plus gossip histories must remain related in
+    /// both attempt dimensions. Terminal durable KV values remain the decision authority.
     ///
     /// # Errors
     /// Returns a string on transport, decode, or conflicting-history failure.
-    pub async fn observe(&self, leader: NodeId) -> Result<Option<BarrierAnnouncement>, String> {
+    pub(super) async fn observe_hint(
+        &self,
+        leader: NodeId,
+    ) -> Result<Option<BarrierAnnouncement>, String> {
         #[cfg(feature = "cluster")]
         let grpc_latest: Option<BarrierAnnouncement> = {
             let grpc_opt = self.grpc.lock().clone();
@@ -1810,11 +1845,16 @@ impl BarrierCoordinator {
             (Some(g), None) => Some(g),
             (None, k) => k,
         };
-        #[cfg(feature = "cluster")]
-        if let Some(ann) = observed.as_ref() {
-            self.validate_reversible_announcement(ann).await?;
-        }
         Ok(observed)
+    }
+
+    #[cfg(feature = "cluster")]
+    /// Validate one merged announcement immediately before a caller uses it.
+    pub(super) async fn validate_observed(
+        &self,
+        announcement: &BarrierAnnouncement,
+    ) -> Result<(), String> {
+        self.validate_reversible_announcement(announcement).await
     }
 
     /// Highest valid attempt any node has announced across the gossiped per-node keys.
@@ -2274,6 +2314,49 @@ mod tests {
     }
 
     #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn reversible_announcement_uses_only_an_exact_live_local_proof() {
+        use object_store::memory::InMemory;
+
+        let coordinator = BarrierCoordinator::new(kv(NodeId(1)));
+        coordinator.set_leader_lease_store(Arc::new(super::super::LeaderLeaseStore::new(
+            Arc::new(InMemory::new()),
+            1_000,
+        )));
+        let proof = super::super::LeaderProof {
+            owner: crate::checkpoint::LeaderProofOwner {
+                node_id: 1,
+                boot_id: uuid::Uuid::from_u128(11),
+                process_term: 3,
+            },
+            fencing_token: 7,
+        };
+        let local = proof.clone();
+        coordinator.set_local_leader_proof_provider(Arc::new(move || Some(local.clone())));
+        let mut announcement = BarrierAnnouncement {
+            epoch: 20,
+            checkpoint_id: 200,
+            assignment_fence: Some(test_fence(9, &[1], &[(1, 11)])),
+            leader_proof: Some(proof),
+            phase: Phase::Prepare,
+            flags: 0,
+            min_watermark_ms: None,
+        };
+
+        coordinator
+            .validate_reversible_announcement(&announcement)
+            .await
+            .expect("the exact locally live proof must avoid a remote authority read");
+
+        announcement.leader_proof.as_mut().unwrap().fencing_token += 1;
+        let error = coordinator
+            .validate_reversible_announcement(&announcement)
+            .await
+            .expect_err("a different token must fall through to durable validation");
+        assert!(error.contains("no durable leader lease exists"), "{error}");
+    }
+
+    #[cfg(feature = "cluster")]
     #[test]
     fn phase_ack_rejects_same_map_from_a_restarted_process() {
         let expected = test_fence(17, &[1, 2], &[(1, 11), (2, 22)]);
@@ -2453,7 +2536,7 @@ mod tests {
             phase: Phase,
         ) -> BarrierAnnouncement {
             for _ in 0..100 {
-                if let Some(ann) = coord.observe(leader).await.unwrap() {
+                if let Some(ann) = coord.observe_hint(leader).await.unwrap() {
                     if ann.phase == phase {
                         return ann;
                     }
@@ -2470,7 +2553,7 @@ mod tests {
             phase: Phase,
         ) -> BarrierAnnouncement {
             for _ in 0..100 {
-                if let Some(announcement) = coord.observe(leader).await.unwrap() {
+                if let Some(announcement) = coord.observe_hint(leader).await.unwrap() {
                     if announcement_attempt(&announcement) == expected
                         && announcement.phase == phase
                     {
@@ -3331,7 +3414,7 @@ mod tests {
             .await
             .unwrap();
         for _ in 0..100 {
-            if let Some(ann) = follower_coord.observe(NodeId(1)).await.unwrap() {
+            if let Some(ann) = follower_coord.observe_hint(NodeId(1)).await.unwrap() {
                 if ann.phase == Phase::Abort {
                     break;
                 }
@@ -3353,7 +3436,11 @@ mod tests {
         })
         .unwrap();
         follower_kv.seed(NodeId(1), ANNOUNCEMENT_KEY, next);
-        let got = follower_coord.observe(NodeId(1)).await.unwrap().unwrap();
+        let got = follower_coord
+            .observe_hint(NodeId(1))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(got.epoch, 6);
         assert_eq!(got.phase, Phase::Prepare);
 
@@ -3370,7 +3457,11 @@ mod tests {
         })
         .unwrap();
         follower_kv.seed(NodeId(1), ANNOUNCEMENT_KEY, stale);
-        let got = follower_coord.observe(NodeId(1)).await.unwrap().unwrap();
+        let got = follower_coord
+            .observe_hint(NodeId(1))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             got.phase,
             Phase::Abort,
@@ -3394,7 +3485,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let got = coord.observe(NodeId(1)).await.unwrap().unwrap();
+        let got = coord.observe_hint(NodeId(1)).await.unwrap().unwrap();
         assert_eq!(got.epoch, 5);
         assert_eq!(got.checkpoint_id, 42);
     }
@@ -3403,7 +3494,7 @@ mod tests {
     async fn observe_returns_none_when_leader_silent() {
         let k = kv(NodeId(1));
         let coord = BarrierCoordinator::new(k);
-        assert!(coord.observe(NodeId(1)).await.unwrap().is_none());
+        assert!(coord.observe_hint(NodeId(1)).await.unwrap().is_none());
     }
 
     fn announcement_json(epoch: u64, checkpoint_id: u64) -> String {

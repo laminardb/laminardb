@@ -141,7 +141,7 @@ async fn barrier_announce_then_follower_observes_and_acks() {
         let mut observed = None;
         let start = std::time::Instant::now();
         while start.elapsed() < Duration::from_secs(4) {
-            match follower.controller.observe_barrier().await {
+            match follower.controller.observe_barrier_matching(|_| true).await {
                 Ok(Some(ann)) if ann.epoch == 7 => {
                     observed = Some(ann);
                     break;

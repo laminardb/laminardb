@@ -48,6 +48,21 @@ struct LeaderLeaseGate {
     deadline: Arc<super::LeaseDeadline>,
 }
 
+/// One authority-validated clustered `Prepare` and its local assignment disposition.
+#[cfg(feature = "cluster")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckpointPrepareObservation {
+    /// The announced assignment exactly matches the locally installed certified assignment.
+    AssignmentReady(BarrierAnnouncement),
+    /// Authority is valid, but the assignment must be rejected before barrier injection.
+    AssignmentRejected {
+        /// Leader announcement to identify the negative acknowledgement.
+        announcement: BarrierAnnouncement,
+        /// Local certification failure sent back to the leader.
+        error: String,
+    },
+}
+
 /// Immutable identity of one coordinated recovery attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RecoveryRoundId {
@@ -3006,6 +3021,15 @@ impl ClusterController {
         if !lease.matches_proof(leader) {
             return None;
         }
+        self.checkpoint_assignment_fence_after_authority_validation(fence, leader)
+    }
+
+    #[cfg(feature = "cluster")]
+    fn checkpoint_assignment_fence_after_authority_validation(
+        &self,
+        fence: CheckpointAssignmentFence,
+        leader: &crate::checkpoint::LeaderProof,
+    ) -> Option<CheckpointAssignmentFence> {
         let transition = self.checkpoint_drain_transition.borrow();
         if transition
             .as_ref()
@@ -3208,19 +3232,106 @@ impl ClusterController {
         self.barrier.max_announced().await
     }
 
-    /// Follower-side observe; `Ok(None)` if no leader is visible.
-    ///
-    /// Observation is deliberately side-effect free. Event-time progress comes from the
-    /// content-addressed recovery capsule selected by immutable checkpoint authority, never from
-    /// an announcement hint.
+    /// Observe the merged barrier history, validating durable authority only when `predicate`
+    /// selects the announcement. Malformed or conflicting histories fail before filtering.
     ///
     /// # Errors
-    /// Propagates [`BarrierCoordinator::observe`] errors.
-    pub async fn observe_barrier(&self) -> Result<Option<BarrierAnnouncement>, String> {
+    /// Propagates merge, transport, and matching reversible-authority failures.
+    pub async fn observe_barrier_matching<F>(
+        &self,
+        mut predicate: F,
+    ) -> Result<Option<BarrierAnnouncement>, String>
+    where
+        F: FnMut(&BarrierAnnouncement) -> bool,
+    {
         let Some(leader) = self.current_leader() else {
             return Ok(None);
         };
-        self.barrier.observe(leader).await
+        let Some(announcement) = self.barrier.observe_hint(leader).await? else {
+            return Ok(None);
+        };
+        if !predicate(&announcement) {
+            return Ok(None);
+        }
+        #[cfg(feature = "cluster")]
+        self.barrier.validate_observed(&announcement).await?;
+        Ok(Some(announcement))
+    }
+
+    /// Observe a clustered `Prepare`, validate its leader with one durable-authority read, and
+    /// report the local assignment disposition without consulting authority again.
+    ///
+    /// # Errors
+    /// Rejects missing, stale, or conflicting authority and assignment certificates.
+    #[cfg(feature = "cluster")]
+    pub async fn observe_checkpoint_prepare(
+        &self,
+    ) -> Result<Option<CheckpointPrepareObservation>, String> {
+        let Some(leader) = self.current_leader() else {
+            return Ok(None);
+        };
+        let Some(announcement) = self.barrier.observe_hint(leader).await? else {
+            return Ok(None);
+        };
+        if announcement.phase != super::Phase::Prepare {
+            return Ok(None);
+        }
+        self.barrier
+            .validate_checkpoint_prepare(&announcement)
+            .await?;
+        let proof = announcement
+            .leader_proof
+            .as_ref()
+            .filter(|proof| proof.is_canonical())
+            .ok_or_else(|| "leader Prepare omitted its canonical authority proof".to_string())?;
+        let assignment_error = match announcement.assignment_fence.as_ref() {
+            None => Some(
+                "[LDB-6055] leader Prepare omitted its canonical assignment certificate"
+                    .to_string(),
+            ),
+            Some(fence) if !fence.is_canonical() => Some(
+                "[LDB-6055] leader Prepare carried a non-canonical assignment certificate"
+                    .to_string(),
+            ),
+            Some(fence) => self
+                .checkpoint_assignment_fence(fence.assignment_version)
+                .and_then(|certified| {
+                    self.checkpoint_assignment_fence_after_authority_validation(certified, proof)
+                })
+                .map_or_else(
+                    || {
+                        Some(format!(
+                            "[LDB-6055] follower cannot certify leader Prepare assignment {}",
+                            fence.assignment_version
+                        ))
+                    },
+                    |certified| {
+                        (certified != *fence).then(|| {
+                            format!(
+                                "[LDB-6055] follower assignment differs from leader Prepare assignment {}",
+                                fence.assignment_version
+                            )
+                        })
+                    },
+                ),
+        };
+        Ok(Some(match assignment_error {
+            Some(error) => CheckpointPrepareObservation::AssignmentRejected {
+                announcement,
+                error,
+            },
+            None => CheckpointPrepareObservation::AssignmentReady(announcement),
+        }))
+    }
+
+    /// Subscribe to direct checkpoint announcements. Consumers must retain a bounded KV poll:
+    /// the watch is a latency path, while the merged gossip history remains the fallback.
+    #[cfg(feature = "cluster")]
+    #[must_use]
+    pub fn checkpoint_announcement_watch(
+        &self,
+    ) -> Option<watch::Receiver<Option<BarrierAnnouncement>>> {
+        self.barrier.announcement_watch()
     }
 
     /// Local monotonic receipt time for this exact direct Prepare, if gRPC delivered it.
@@ -3873,7 +3984,7 @@ impl ClusterController {
         Ok(true)
     }
 
-    /// Wait until [`Self::observe_barrier`] yields an announcement matching `pred`, or `timeout`
+    /// Wait until the merged barrier history yields an announcement matching `pred`, or `timeout`
     /// expires (→ `Ok(None)`). Observation remains side-effect free; event-time progress must come
     /// from immutable checkpoint authority. Push-driven off the gRPC announcement watch when available; gossip-KV-only
     /// deployments (and KV-only announcements) are covered by a
@@ -3903,10 +4014,8 @@ impl ClusterController {
         };
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            if let Some(ann) = self.observe_barrier().await? {
-                if pred(&ann) {
-                    return Ok(Some(ann));
-                }
+            if let Some(ann) = self.observe_barrier_matching(&mut pred).await? {
+                return Ok(Some(ann));
             }
             if tokio::time::Instant::now() >= deadline {
                 return Ok(None);
@@ -4772,6 +4881,30 @@ mod tests {
             .is_none());
     }
 
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn missing_checkpoint_assignment_avoids_durable_authority_io() {
+        let controller = ctl(1, vec![]);
+        let backing: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let gate = Arc::new(AuthorityIoGateStore::new(
+            backing,
+            AuthorityIoGateOperation::Get,
+        ));
+        let gated_backing: Arc<dyn object_store::ObjectStore> = gate.clone();
+        let (_authority, proof) =
+            install_recovery_authority_with_store(&controller, 1_000, gated_backing).await;
+
+        gate.arm();
+        let certified = tokio::time::timeout(
+            Duration::from_millis(50),
+            controller.checkpoint_assignment_fence_for_leader(4, &proof),
+        )
+        .await
+        .expect("missing local assignment must fail before durable authority I/O");
+        assert!(certified.is_none());
+    }
+
     #[test]
     fn is_leader_when_lowest_id() {
         let c = ctl(1, vec![info(5), info(7)]);
@@ -5528,7 +5661,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let got = c.observe_barrier().await.unwrap().unwrap();
+        let got = c.observe_barrier_matching(|_| true).await.unwrap().unwrap();
         assert_eq!(got.epoch, 5);
     }
 
@@ -5545,6 +5678,201 @@ mod tests {
 
         assert!(
             error.contains("malformed durable barrier announcement"),
+            "{error}"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_barrier_validates_authority_only_after_predicate_match() {
+        let follower_kv = Arc::new(InMemoryKv::new(NodeId(2)));
+        let (_members_tx, members_rx) = watch::channel(vec![info(1)]);
+        let follower = ClusterController::new(NodeId(2), follower_kv.clone(), None, members_rx);
+        follower.set_leader_lease_store(Arc::new(super::super::LeaderLeaseStore::new(
+            Arc::new(object_store::memory::InMemory::new()),
+            1_000,
+        )));
+        let proof = test_leader_proof(1, Uuid::from_u128(11), 1);
+        let fence = CheckpointAssignmentFence::from_owner_map(
+            7,
+            &[1, 2],
+            vec![
+                CheckpointParticipant {
+                    node_id: 1,
+                    boot_incarnation: proof.owner.boot_id,
+                },
+                CheckpointParticipant {
+                    node_id: 2,
+                    boot_incarnation: follower.recovery_incarnation(),
+                },
+            ],
+        )
+        .unwrap();
+        let mut announcement = BarrierAnnouncement {
+            epoch: 9,
+            checkpoint_id: 90,
+            assignment_fence: Some(fence),
+            leader_proof: Some(proof),
+            phase: Phase::Prepare,
+            flags: 0,
+            min_watermark_ms: None,
+        };
+        follower_kv.seed(
+            NodeId(1),
+            ANNOUNCEMENT_KEY,
+            serde_json::to_string(&announcement).unwrap(),
+        );
+
+        let observed = follower
+            .wait_for_barrier(
+                |candidate| candidate.phase == Phase::Aligned,
+                Duration::from_millis(30),
+            )
+            .await
+            .expect("a nonmatching reversible hint must not read authority");
+        assert!(observed.is_none());
+
+        announcement.phase = Phase::Aligned;
+        follower_kv.seed(
+            NodeId(1),
+            ANNOUNCEMENT_KEY,
+            serde_json::to_string(&announcement).unwrap(),
+        );
+        let error = follower
+            .wait_for_barrier(
+                |candidate| candidate.phase == Phase::Aligned,
+                Duration::from_millis(30),
+            )
+            .await
+            .expect_err("a matching reversible hint must validate current authority");
+        assert!(error.contains("no durable leader lease exists"), "{error}");
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn checkpoint_prepare_without_assignment_still_requires_durable_authority() {
+        let follower_kv = Arc::new(InMemoryKv::new(NodeId(2)));
+        let (_members_tx, members_rx) = watch::channel(vec![info(1)]);
+        let follower = ClusterController::new(NodeId(2), follower_kv.clone(), None, members_rx);
+        follower.set_leader_lease_store(Arc::new(super::super::LeaderLeaseStore::new(
+            Arc::new(object_store::memory::InMemory::new()),
+            1_000,
+        )));
+        follower_kv.seed(
+            NodeId(1),
+            ANNOUNCEMENT_KEY,
+            serde_json::to_string(&BarrierAnnouncement {
+                epoch: 9,
+                checkpoint_id: 90,
+                assignment_fence: None,
+                leader_proof: Some(test_leader_proof(1, Uuid::from_u128(11), 1)),
+                phase: Phase::Prepare,
+                flags: 0,
+                min_watermark_ms: None,
+            })
+            .unwrap(),
+        );
+
+        let error = follower
+            .observe_checkpoint_prepare()
+            .await
+            .expect_err("a malformed Prepare must not bypass durable leader validation");
+        assert!(error.contains("no durable leader lease exists"), "{error}");
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn checkpoint_prepare_reports_exact_local_assignment_disposition() {
+        use crate::cluster::control::{LeaderLeaseOwner, LeaseOutcome};
+
+        let follower_kv = Arc::new(InMemoryKv::new(NodeId(2)));
+        let (_members_tx, members_rx) = watch::channel(vec![info(1)]);
+        let follower = ClusterController::new(NodeId(2), follower_kv.clone(), None, members_rx);
+        let authority = Arc::new(super::super::LeaderLeaseStore::new(
+            Arc::new(object_store::memory::InMemory::new()),
+            1_000,
+        ));
+        let leader_boot = Uuid::from_u128(11);
+        let owner = LeaderLeaseOwner {
+            node: NodeId(1),
+            boot: leader_boot,
+            process_term: 3,
+        };
+        let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap()
+        else {
+            panic!("empty leader authority must be acquired");
+        };
+        follower.set_leader_lease_store(authority);
+
+        let participants = vec![
+            CheckpointParticipant {
+                node_id: 1,
+                boot_incarnation: leader_boot,
+            },
+            CheckpointParticipant {
+                node_id: 2,
+                boot_incarnation: follower.recovery_incarnation(),
+            },
+        ];
+        let announced =
+            CheckpointAssignmentFence::from_owner_map(7, &[1, 2], participants.clone()).unwrap();
+        follower.publish_checkpoint_assignment_fence(Some(announced.clone()));
+        let announcement = BarrierAnnouncement {
+            epoch: 9,
+            checkpoint_id: 90,
+            assignment_fence: Some(announced.clone()),
+            leader_proof: Some(lease.proof()),
+            phase: Phase::Prepare,
+            flags: 0,
+            min_watermark_ms: None,
+        };
+        follower_kv.seed(
+            NodeId(1),
+            ANNOUNCEMENT_KEY,
+            serde_json::to_string(&announcement).unwrap(),
+        );
+
+        let ready = follower
+            .observe_checkpoint_prepare()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ready,
+            CheckpointPrepareObservation::AssignmentReady(announcement.clone())
+        );
+
+        let different_local =
+            CheckpointAssignmentFence::from_owner_map(7, &[2, 1], participants).unwrap();
+        follower.publish_checkpoint_assignment_fence(Some(different_local));
+        let rejected = follower
+            .observe_checkpoint_prepare()
+            .await
+            .unwrap()
+            .unwrap();
+        let CheckpointPrepareObservation::AssignmentRejected {
+            announcement: rejected_announcement,
+            error,
+        } = rejected
+        else {
+            panic!("a different local owner map must be rejected");
+        };
+        assert_eq!(rejected_announcement, announcement);
+        assert!(error.contains("follower assignment differs"), "{error}");
+
+        let mut stale = announcement;
+        stale.leader_proof.as_mut().unwrap().fencing_token += 1;
+        follower_kv.seed(
+            NodeId(1),
+            ANNOUNCEMENT_KEY,
+            serde_json::to_string(&stale).unwrap(),
+        );
+        let error = follower
+            .observe_checkpoint_prepare()
+            .await
+            .expect_err("a stale leader token must fail before assignment disposition");
+        assert!(
+            error.contains("does not match the latest durable leader lease"),
             "{error}"
         );
     }
@@ -5612,7 +5940,7 @@ mod tests {
             .unwrap(),
         );
         let error = follower
-            .wait_for_barrier(|_| true, Duration::from_secs(10))
+            .wait_for_barrier(|_| false, Duration::from_secs(10))
             .await
             .expect_err("mixed attempt dimensions must fail instead of timing out");
 

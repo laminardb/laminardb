@@ -40,23 +40,6 @@ fn test_assignment_fence(
     .unwrap()
 }
 
-fn test_leader_proof(
-    fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
-    leader_id: u64,
-    fencing_token: u64,
-) -> laminar_core::checkpoint::LeaderProof {
-    laminar_core::checkpoint::LeaderProof {
-        owner: laminar_core::checkpoint::LeaderProofOwner {
-            node_id: leader_id,
-            boot_id: fence
-                .participant_incarnation(leader_id)
-                .expect("test leader must belong to the assignment"),
-            process_term: 1,
-        },
-        fencing_token,
-    }
-}
-
 mod durable_backend_gate {
     use std::sync::Arc;
 
@@ -2104,11 +2087,13 @@ mod two_pc {
 }
 
 mod minio {
+    use super::cluster_harness::ClusterEngineHarness;
     use std::sync::Arc;
     use std::time::Duration;
 
-    use laminar_core::cluster::control::{BarrierAnnouncement, CheckpointAssignmentFence, Phase};
-    use laminar_core::cluster::testing::MiniCluster;
+    use laminar_core::cluster::control::{
+        BarrierAnnouncement, CheckpointAssignmentFence, CheckpointDecisionStore, Phase,
+    };
     use laminar_core::state::{
         owned_vnodes, rendezvous_assignment, CheckpointAttempt, NodeId, ObjectStoreBackend,
         StateBackend, VnodeRegistry,
@@ -2117,11 +2102,10 @@ mod minio {
     use laminar_db::checkpoint_coordinator::{
         CheckpointConfig, CheckpointCoordinator, CheckpointRequest,
     };
-    use object_store::ObjectStoreExt;
+    use object_store::local::LocalFileSystem;
+    use object_store::{ObjectStore, ObjectStoreExt};
 
     use super::common::{minio_endpoint, minio_store};
-
-    const CONVERGENCE: Duration = Duration::from_secs(5);
 
     fn certified_request(
         controller: &laminar_core::cluster::control::ClusterController,
@@ -2140,6 +2124,7 @@ mod minio {
         gate_vnodes: Vec<u32>,
         assignment_fence: &CheckpointAssignmentFence,
         controller: Arc<laminar_core::cluster::control::ClusterController>,
+        decision_store: Arc<CheckpointDecisionStore>,
     ) -> CheckpointCoordinator {
         let key_group_count =
             laminar_core::state::KeyGroupCount::try_from(backend.key_group_capacity()).unwrap();
@@ -2158,6 +2143,10 @@ mod minio {
         controller.publish_checkpoint_assignment_fence(Some(assignment_fence.clone()));
         coord.set_cluster_controller(controller);
         coord
+            .bind_durable_decision_store(decision_store)
+            .await
+            .unwrap();
+        coord
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2166,11 +2155,8 @@ mod minio {
             eprintln!("skipping: MinIO not reachable at 127.0.0.1:19000");
             return;
         }
-        let cluster = MiniCluster::spawn(2).await;
-        cluster
-            .wait_for_convergence(CONVERGENCE)
-            .await
-            .expect("cluster converges");
+        let harness = ClusterEngineHarness::spawn(2, 4).await;
+        let cluster = &harness.cluster;
 
         let (leader_node, follower_node) = if cluster.nodes[0].controller.is_leader() {
             (&cluster.nodes[0], &cluster.nodes[1])
@@ -2186,6 +2172,11 @@ mod minio {
                 .as_millis()
         );
         let store = minio_store(&bucket).await;
+        let decision_objects: Arc<dyn ObjectStore> = Arc::new(
+            LocalFileSystem::new_with_prefix(harness.shared_state_dir.path())
+                .expect("LocalFileSystem for decision store"),
+        );
+        let decision_store = Arc::new(CheckpointDecisionStore::new(decision_objects));
 
         let leader_backend = Arc::new(ObjectStoreBackend::cluster_shared(
             Arc::clone(&store),
@@ -2220,6 +2211,7 @@ mod minio {
             full.clone(),
             &fence,
             Arc::clone(&leader_node.controller),
+            Arc::clone(&decision_store),
         )
         .await;
         let mut follower_coord = make_coord(
@@ -2229,6 +2221,7 @@ mod minio {
             full,
             &fence,
             Arc::clone(&follower_node.controller),
+            decision_store,
         )
         .await;
 
@@ -2239,11 +2232,12 @@ mod minio {
             assignment_fence: leader_node
                 .controller
                 .checkpoint_assignment_fence(assignment_version),
-            leader_proof: Some(super::test_leader_proof(
-                &fence,
-                leader_node.instance_id.0,
-                1,
-            )),
+            leader_proof: Some(
+                leader_node
+                    .controller
+                    .capture_leader_proof()
+                    .expect("durable leader proof must be live"),
+            ),
             phase: Phase::Prepare,
             flags: 0,
             min_watermark_ms: None,
@@ -2291,7 +2285,7 @@ mod minio {
             "missing exact-attempt _SEAL marker on MinIO",
         );
 
-        cluster.shutdown().await;
+        harness.shutdown().await;
     }
 
     /// Coordinated-commit descriptors written by two nodes to shared MinIO seal

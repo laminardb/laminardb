@@ -4366,6 +4366,9 @@ impl StreamingCoordinator {
             .coordinated_commit_admission
             .as_ref()
             .map(crate::checkpoint_coordinator::CoordinatedCommitAdmission::progress_notify);
+        let mut checkpoint_control_wake = callback.checkpoint_control_wake();
+        let mut checkpoint_control_poll_at = tokio::time::Instant::now();
+        let mut checkpoint_control_pending = false;
         let mut barriers_buf: Vec<(usize, CheckpointBarrier, SourceCheckpoint)> = Vec::new();
         // Set by a fatal replay-guaranteed error; gates the open-epoch shutdown drain.
         let mut fault: Option<String> = None;
@@ -4401,6 +4404,7 @@ impl StreamingCoordinator {
                 && self.parked_source_msg.is_some();
             // Wait for data, shutdown, or idle timeout.
             let mut retrying_replay = false;
+            let mut checkpoint_control_due = false;
             let msg = tokio::select! {
                 biased;
                 () = self.terminal_shutdown.cancelled() => break,
@@ -4424,7 +4428,15 @@ impl StreamingCoordinator {
                         fault = Some(error);
                         break;
                     }
-                    continue;
+                    if !checkpoint_control_pending {
+                        continue;
+                    }
+                    checkpoint_control_due = true;
+                    if let Some(wake) = checkpoint_control_wake.as_ref() {
+                        checkpoint_control_poll_at =
+                            tokio::time::Instant::now() + wake.capacity_retry();
+                    }
+                    None
                 }
                 Some(reply) = async {
                     if let Some(ref mut rx) = self.force_ckpt_rx {
@@ -4434,6 +4446,30 @@ impl StreamingCoordinator {
                     }
                 } => {
                     self.manual_waiting.push(reply);
+                    None
+                },
+                () = async {
+                    match checkpoint_control_wake.as_mut() {
+                        Some(wake) => wake.wait_until(checkpoint_control_poll_at).await,
+                        None => std::future::pending().await,
+                    }
+                }, if !checkpoint_control_pending && !callback.is_leader() => {
+                    checkpoint_control_pending = true;
+                    checkpoint_control_due = true;
+                    if let Some(wake) = checkpoint_control_wake.as_ref() {
+                        checkpoint_control_poll_at =
+                            tokio::time::Instant::now() + wake.capacity_retry();
+                    }
+                    None
+                },
+                () = tokio::time::sleep_until(checkpoint_control_poll_at),
+                    if checkpoint_control_pending && !callback.is_leader() =>
+                {
+                    checkpoint_control_due = true;
+                    if let Some(wake) = checkpoint_control_wake.as_ref() {
+                        checkpoint_control_poll_at =
+                            tokio::time::Instant::now() + wake.capacity_retry();
+                    }
                     None
                 },
                 () = std::future::ready(()), if replay_ready => {
@@ -4741,8 +4777,37 @@ impl StreamingCoordinator {
             }
 
             #[allow(clippy::cast_possible_truncation)]
-            if !self.replay_pending && (bg_start.elapsed().as_nanos() as u64) < bg_budget {
-                self.maybe_checkpoint(&mut callback).await;
+            let within_background_budget = (bg_start.elapsed().as_nanos() as u64) < bg_budget;
+            let follower_control_ready =
+                checkpoint_control_pending && checkpoint_control_due && !callback.is_leader();
+            let checkpoint_work_due =
+                callback.is_leader() || follower_control_ready || !self.manual_waiting.is_empty();
+            if !self.replay_pending
+                && checkpoint_work_due
+                && (follower_control_ready || within_background_budget)
+            {
+                let control_serviced = self.maybe_checkpoint(&mut callback).await;
+                if follower_control_ready {
+                    if let Some(wake) = checkpoint_control_wake.as_ref() {
+                        if control_serviced {
+                            checkpoint_control_pending = false;
+                            checkpoint_control_poll_at =
+                                tokio::time::Instant::now() + wake.fallback();
+                        } else {
+                            checkpoint_control_poll_at =
+                                tokio::time::Instant::now() + wake.capacity_retry();
+                        }
+                    }
+                }
+                if let Some(reason) = callback.take_pipeline_fault() {
+                    self.discard_pending_offsets();
+                    tracing::error!(
+                        reason = %reason,
+                        "[LDB-3024] checkpoint control fault; stopping for recovery"
+                    );
+                    fault = Some(reason);
+                    break;
+                }
             }
 
             // DDL after checkpoint so newly added queries don't appear in the same snapshot.
@@ -6065,12 +6130,12 @@ impl StreamingCoordinator {
     }
 
     /// Service periodic, manual, or leader-announced checkpoint admission.
-    async fn maybe_checkpoint(&mut self, callback: &mut impl PipelineCallback) {
+    async fn maybe_checkpoint(&mut self, callback: &mut impl PipelineCallback) -> bool {
         self.drain_manual_requests();
         #[cfg(feature = "cluster")]
         if let Err(error) = self.require_process_authority("checkpoint admission") {
             self.fail_waiting_manual(error.to_string());
-            return;
+            return true;
         }
 
         // Followers do not originate attempts. Preserve their resource cap while servicing the
@@ -6080,7 +6145,7 @@ impl StreamingCoordinator {
                 self.fail_waiting_manual("only the cluster leader may admit a manual checkpoint");
             }
             if !self.checkpoint_capacity_available() {
-                return;
+                return false;
             }
             let outcome = callback
                 .service_checkpoint_control(self.current_source_offsets())
@@ -6095,7 +6160,7 @@ impl StreamingCoordinator {
                 {
                     callback.record_checkpoint_failure(attempt.checkpoint_id, &reason);
                 }
-                return;
+                return true;
             }
             match outcome {
                 CheckpointControlOutcome::Idle => {}
@@ -6109,15 +6174,15 @@ impl StreamingCoordinator {
                     callback.record_checkpoint_failure(attempt.checkpoint_id, &error);
                 }
             }
-            return;
+            return true;
         }
         let Some(admission) = self.checkpoint_admission(callback).await else {
-            return;
+            return true;
         };
         #[cfg(feature = "cluster")]
         if let Err(error) = self.require_process_authority("checkpoint attempt creation") {
             self.fail_waiting_manual(error.to_string());
-            return;
+            return true;
         }
         if self.source_handles.is_empty() {
             self.admit_source_less_checkpoint(callback, &admission)
@@ -6126,6 +6191,7 @@ impl StreamingCoordinator {
             self.admit_source_barrier_checkpoint(callback, &admission)
                 .await;
         }
+        true
     }
 }
 
@@ -6333,6 +6399,17 @@ mod tests {
         reserve_calls: u64,
         control_checkpoint_calls: u64,
         control_checkpoint_call_audit: Arc<AtomicU64>,
+        control_checkpoint_fault: Option<String>,
+        control_checkpoint_fault_observed: Option<Arc<tokio::sync::Notify>>,
+        control_checkpoint_fault_release: Option<Arc<tokio::sync::Notify>>,
+        #[cfg(feature = "cluster")]
+        checkpoint_control_enabled: bool,
+        #[cfg(feature = "cluster")]
+        checkpoint_control_watch: Option<
+            tokio::sync::watch::Receiver<
+                Option<laminar_core::cluster::control::BarrierAnnouncement>,
+            >,
+        >,
         barrier_captures: Vec<(CheckpointAttempt, usize)>,
         runtime: MockRuntimeState,
         assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
@@ -6379,6 +6456,7 @@ mod tests {
         close_error: Option<String>,
         barrier_control_installed: Arc<AtomicBool>,
         intake_gate: Arc<AtomicBool>,
+        intake_pause_call_audit: Arc<AtomicU64>,
         #[cfg(feature = "cluster")]
         process_authority_fence:
             Arc<Mutex<Option<(ProcessAuthorityFencePoint, Arc<ClusterController>)>>>,
@@ -6394,6 +6472,13 @@ mod tests {
                 reserve_calls: 0,
                 control_checkpoint_calls: 0,
                 control_checkpoint_call_audit: Arc::new(AtomicU64::new(0)),
+                control_checkpoint_fault: None,
+                control_checkpoint_fault_observed: None,
+                control_checkpoint_fault_release: None,
+                #[cfg(feature = "cluster")]
+                checkpoint_control_enabled: false,
+                #[cfg(feature = "cluster")]
+                checkpoint_control_watch: None,
                 barrier_captures: Vec::new(),
                 runtime: MockRuntimeState {
                     leader: true,
@@ -6433,6 +6518,7 @@ mod tests {
                 close_error: None,
                 barrier_control_installed: Arc::new(AtomicBool::new(false)),
                 intake_gate: Arc::new(AtomicBool::new(false)),
+                intake_pause_call_audit: Arc::new(AtomicU64::new(0)),
                 #[cfg(feature = "cluster")]
                 process_authority_fence: Arc::new(Mutex::new(None)),
                 control_checkpoint_outcome: None,
@@ -6459,6 +6545,23 @@ mod tests {
     }
 
     impl PipelineCallback for MockCallback {
+        fn checkpoint_control_wake(
+            &self,
+        ) -> Option<crate::pipeline::callback::CheckpointControlWake> {
+            #[cfg(feature = "cluster")]
+            {
+                return self.checkpoint_control_enabled.then(|| {
+                    crate::pipeline::callback::CheckpointControlWake::new(
+                        self.checkpoint_control_watch.clone(),
+                    )
+                });
+            }
+            #[cfg(not(feature = "cluster"))]
+            {
+                None
+            }
+        }
+
         async fn execute_cycle(
             &mut self,
             source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
@@ -6528,6 +6631,7 @@ mod tests {
         }
 
         fn intake_paused(&self) -> bool {
+            self.intake_pause_call_audit.fetch_add(1, Ordering::Relaxed);
             self.intake_gate.load(Ordering::Acquire)
         }
 
@@ -6687,6 +6791,15 @@ mod tests {
             self.control_checkpoint_calls += 1;
             self.control_checkpoint_call_audit
                 .fetch_add(1, Ordering::SeqCst);
+            if let Some(fault) = self.control_checkpoint_fault.take() {
+                self.pipeline_fault = Some(fault);
+                if let Some(observed) = self.control_checkpoint_fault_observed.as_ref() {
+                    observed.notify_one();
+                }
+                if let Some(release) = self.control_checkpoint_fault_release.as_ref() {
+                    release.notified().await;
+                }
+            }
             #[cfg(feature = "cluster")]
             self.fence_process_authority_at(ProcessAuthorityFencePoint::CheckpointControl);
             self.control_checkpoint_outcome
@@ -6764,6 +6877,264 @@ mod tests {
         assert!(matches!(exit, ExitReason::Shutdown));
         assert_eq!(invalidated.lock().len(), 1);
         assert!(invalidated.lock()[0].contains("last committed progress frontier"));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(start_paused = true)]
+    async fn checkpoint_control_watch_wakes_a_quiet_follower_outside_background_budget() {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let (_source_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
+        let mut coordinator = test_coordinator(
+            rx,
+            control_rx,
+            Arc::clone(&shutdown),
+            DeliveryGuarantee::AtLeastOnce,
+            None,
+        );
+        coordinator.config.background_budget_ns = 0;
+
+        let (announcement_tx, announcement_rx) = tokio::sync::watch::channel(None);
+        let mut callback = MockCallback::new();
+        callback.runtime.leader = false;
+        callback.checkpoint_control_enabled = true;
+        callback.checkpoint_control_watch = Some(announcement_rx);
+        let calls = Arc::clone(&callback.control_checkpoint_call_audit);
+
+        let task = tokio::spawn(coordinator.run(callback));
+        tokio::time::timeout(Duration::from_millis(10), async {
+            while calls.load(Ordering::SeqCst) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the initial merged-history poll must wake the quiet follower");
+
+        announcement_tx
+            .send(Some(laminar_core::cluster::control::BarrierAnnouncement {
+                epoch: 7,
+                checkpoint_id: 70,
+                assignment_fence: None,
+                leader_proof: None,
+                phase: laminar_core::cluster::control::Phase::Commit,
+                flags: 0,
+                min_watermark_ms: None,
+            }))
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(10), async {
+            while calls.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a direct checkpoint announcement must wake before the 250ms fallback");
+
+        shutdown.notify_one();
+        assert!(matches!(task.await.unwrap(), ExitReason::Shutdown));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(start_paused = true)]
+    async fn pending_checkpoint_control_rechecks_when_completion_precedes_claim_drop() {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let (_source_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
+        let (completion_tx, completion_rx) = mpsc::bounded_async::<CheckpointCompletion>(1);
+        let in_flight = Arc::new(AtomicU64::new(1));
+        let mut coordinator = test_coordinator(
+            rx,
+            control_rx,
+            Arc::clone(&shutdown),
+            DeliveryGuarantee::AtLeastOnce,
+            None,
+        )
+        .with_checkpoint_complete_rx(completion_rx);
+        coordinator.config.background_budget_ns = 0;
+        coordinator.checkpoint_in_flight = Arc::clone(&in_flight);
+
+        let mut callback = MockCallback::new();
+        callback.runtime.leader = false;
+        callback.checkpoint_control_enabled = true;
+        let calls = Arc::clone(&callback.control_checkpoint_call_audit);
+        let published = Arc::clone(&callback.published_barriers);
+
+        let task = tokio::spawn(coordinator.run(callback));
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let completed = CheckpointAttempt::new(6, 60);
+        completion_tx
+            .send(CheckpointCompletion::new(completed, FxHashMap::default()))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(10), async {
+            while published.lock().as_slice() != [(6, 60)] {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the completion must be handled before its in-flight claim is dropped");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        in_flight.store(0, Ordering::Release);
+        tokio::time::advance(Duration::from_millis(24)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        tokio::time::advance(Duration::from_millis(2)).await;
+        tokio::time::timeout(Duration::from_millis(1), async {
+            while calls.load(Ordering::SeqCst) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the retained control edge must retry after the completion/claim-drop race");
+
+        shutdown.notify_one();
+        assert!(matches!(task.await.unwrap(), ExitReason::Shutdown));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(start_paused = true)]
+    async fn pending_checkpoint_control_rechecks_eventless_follower_tail_at_25ms() {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let (_source_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
+        let in_flight = Arc::new(AtomicU64::new(1));
+        let mut coordinator = test_coordinator(
+            rx,
+            control_rx,
+            Arc::clone(&shutdown),
+            DeliveryGuarantee::AtLeastOnce,
+            None,
+        );
+        coordinator.config.background_budget_ns = 0;
+        coordinator.checkpoint_in_flight = Arc::clone(&in_flight);
+
+        let mut callback = MockCallback::new();
+        callback.runtime.leader = false;
+        callback.checkpoint_control_enabled = true;
+        let calls = Arc::clone(&callback.control_checkpoint_call_audit);
+
+        let task = tokio::spawn(coordinator.run(callback));
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        in_flight.store(0, Ordering::Release);
+        tokio::time::advance(Duration::from_millis(23)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        tokio::time::advance(Duration::from_millis(2)).await;
+        tokio::time::timeout(Duration::from_millis(1), async {
+            while calls.load(Ordering::SeqCst) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("an eventless follower tail must be rechecked at the 25ms capacity bound");
+
+        shutdown.notify_one();
+        assert!(matches!(task.await.unwrap(), ExitReason::Shutdown));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(start_paused = true)]
+    async fn pending_checkpoint_control_rearms_while_intake_is_paused() {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let (_source_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
+        let mut coordinator = test_coordinator(
+            rx,
+            control_rx,
+            Arc::clone(&shutdown),
+            DeliveryGuarantee::AtLeastOnce,
+            None,
+        );
+        coordinator.config.background_budget_ns = 0;
+
+        let mut callback = MockCallback::new();
+        callback.runtime.leader = false;
+        callback.checkpoint_control_enabled = true;
+        let calls = Arc::clone(&callback.control_checkpoint_call_audit);
+        let intake_gate = Arc::clone(&callback.intake_gate);
+        let intake_calls = Arc::clone(&callback.intake_pause_call_audit);
+        intake_gate.store(true, Ordering::Release);
+
+        let task = tokio::spawn(coordinator.run(callback));
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            intake_calls.load(Ordering::Relaxed) <= 3,
+            "a past-due control timer spun while the intake gate was closed"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        intake_gate.store(false, Ordering::Release);
+        tokio::time::advance(Duration::from_millis(25)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(25)).await;
+        tokio::time::timeout(Duration::from_millis(1), async {
+            while calls.load(Ordering::SeqCst) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("checkpoint control did not resume after the intake gate opened");
+
+        shutdown.notify_one();
+        assert!(matches!(task.await.unwrap(), ExitReason::Shutdown));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(start_paused = true)]
+    async fn checkpoint_control_fault_stops_before_post_fault_batch_executes() {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let (source_tx, rx) = mpsc::bounded_async::<SourceMsg>(1);
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(1);
+        let mut coordinator = test_coordinator(
+            rx,
+            control_rx,
+            Arc::clone(&shutdown),
+            DeliveryGuarantee::AtLeastOnce,
+            None,
+        );
+        coordinator.config.background_budget_ns = 0;
+        let mut callback = MockCallback::new();
+        callback.runtime.leader = false;
+        callback.checkpoint_control_enabled = true;
+        callback.control_checkpoint_fault = Some("uncertified follower Prepare".into());
+        let fault_observed = Arc::new(tokio::sync::Notify::new());
+        let fault_release = Arc::new(tokio::sync::Notify::new());
+        callback.control_checkpoint_fault_observed = Some(Arc::clone(&fault_observed));
+        callback.control_checkpoint_fault_release = Some(Arc::clone(&fault_release));
+        let cycle_inputs = Arc::clone(&callback.cycle_input_rows);
+        let written_rows = Arc::clone(&callback.written_rows);
+
+        let task = tokio::spawn(coordinator.run(callback));
+        fault_observed.notified().await;
+        source_tx
+            .send(SourceMsg::Batch {
+                source_idx: 0,
+                batch: int_batch(42),
+                checkpoint: checkpoint_at(1),
+            })
+            .await
+            .unwrap();
+        fault_release.notify_one();
+
+        let exit = task.await.unwrap();
+        assert!(matches!(
+            exit,
+            ExitReason::Fault(ref error) if error == "uncertified follower Prepare"
+        ));
+        assert!(cycle_inputs.lock().is_empty());
+        assert_eq!(written_rows.load(Ordering::Acquire), 0);
     }
 
     /// Build a source-less coordinator over a direct channel (bypasses source spawning).

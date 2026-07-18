@@ -2850,7 +2850,11 @@ impl OperatorGraph {
                 return Ok(());
             }
 
-            let mut check_interval = tokio::time::interval(RECHECK);
+            let mut check_interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + RECHECK,
+                RECHECK,
+            );
+            check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     res = cfg.receiver.recv() => {
@@ -2933,7 +2937,28 @@ impl OperatorGraph {
                         )?;
                         ensure_no_delivery_loss()?;
                         if let Some(ctrl) = controller {
-                            if let Ok(Some(announcement)) = ctrl.observe_barrier().await {
+                            let announcement = ctrl
+                                .observe_barrier_matching(|announcement| {
+                                    let announced = laminar_core::state::CheckpointAttempt::new(
+                                        announcement.epoch,
+                                        announcement.checkpoint_id,
+                                    );
+                                    match announced.relation_to(attempt) {
+                                        laminar_core::state::CheckpointAttemptRelation::Newer
+                                        | laminar_core::state::CheckpointAttemptRelation::Conflict => true,
+                                        laminar_core::state::CheckpointAttemptRelation::Exact => {
+                                            announcement.phase == Phase::Abort
+                                        }
+                                        laminar_core::state::CheckpointAttemptRelation::Older => false,
+                                    }
+                                })
+                                .await
+                                .map_err(|error| {
+                                    DbError::Pipeline(format!(
+                                        "shuffle barrier control observation failed: {error}"
+                                    ))
+                                })?;
+                            if let Some(announcement) = announcement {
                                 let announced = laminar_core::state::CheckpointAttempt::new(
                                     announcement.epoch,
                                     announcement.checkpoint_id,

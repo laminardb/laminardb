@@ -3695,7 +3695,7 @@ async fn cluster_watermark_remains_decision_bound_across_commit_and_recovery() {
     // cluster-wide min as "leader's local watermark" (no followers
     // to fold). This must be mirrored into the controller atomic so
     // the leader's own operators consume the same value that
-    // followers pick up via `observe_barrier(Commit)` — otherwise
+    // followers pick up via matching `Commit` observation — otherwise
     // the leader would drive event-time decisions off a watermark
     // that none of its peers have acked yet.
     use laminar_core::cluster::control::{
