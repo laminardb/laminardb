@@ -36,6 +36,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write as _};
+#[cfg(feature = "kafka")]
+use std::io::{Seek as _, SeekFrom};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -58,6 +60,12 @@ const DEFAULT_KAFKA_PARTITIONS: u64 = 96;
 const OUTPUT_TOPIC_PARTITIONS: i32 = 1;
 #[cfg(feature = "kafka")]
 const SOAK_PRODUCER_MAX_IN_FLIGHT: usize = 4_096;
+#[cfg(feature = "kafka")]
+const ACTIVE_LOAD_SAMPLE_WINDOW: Duration = Duration::from_secs(15);
+#[cfg(feature = "kafka")]
+const ACTIVE_LOAD_MINIMUM_RATIO: f64 = 0.9;
+#[cfg(feature = "kafka")]
+const CHECKPOINT_PIPELINE_STALL_SLO_SECONDS: f64 = 1.024;
 const RECOVERY_LIVENESS_WINDOW: Duration = Duration::from_secs(90);
 const DEFAULT_MAX_RECOVERY_MS: u64 = 90_000;
 const LOCAL_EXACT_PREFIX_CYCLES: u64 = 4;
@@ -179,27 +187,35 @@ fn assert_checkpoint_epoch_advanced(previous: u64, current: u64, label: &str) {
     );
 }
 
-fn log_line_reports_recovery(line: &str, checkpoint: DurableCheckpointStatus) -> bool {
-    let has_field = |name: &str, value: u64| {
-        [format!("{name}={value}"), format!("{name}: {value}")]
-            .iter()
-            .any(|needle| {
-                line.match_indices(needle).any(|(offset, _)| {
-                    let bytes = line.as_bytes();
-                    let starts_at_field_boundary = offset == 0
-                        || bytes.get(offset - 1).is_some_and(|previous| {
-                            !previous.is_ascii_alphanumeric() && *previous != b'_'
-                        });
-                    starts_at_field_boundary
-                        && bytes
-                            .get(offset + needle.len())
-                            .is_none_or(|next| !next.is_ascii_digit())
-                })
+fn log_line_has_u64_field(line: &str, name: &str, value: u64) -> bool {
+    [format!("{name}={value}"), format!("{name}: {value}")]
+        .iter()
+        .any(|needle| {
+            line.match_indices(needle).any(|(offset, _)| {
+                let bytes = line.as_bytes();
+                let starts_at_field_boundary = offset == 0
+                    || bytes.get(offset - 1).is_some_and(|previous| {
+                        !previous.is_ascii_alphanumeric() && *previous != b'_'
+                    });
+                starts_at_field_boundary
+                    && bytes
+                        .get(offset + needle.len())
+                        .is_none_or(|next| !next.is_ascii_digit())
             })
-    };
+        })
+}
+
+fn log_line_reports_recovery(line: &str, checkpoint: DurableCheckpointStatus) -> bool {
     line.contains("Recovered from unified checkpoint")
-        && has_field("checkpoint_id", checkpoint.checkpoint_id)
-        && has_field("epoch", checkpoint.epoch)
+        && log_line_has_u64_field(line, "checkpoint_id", checkpoint.checkpoint_id)
+        && log_line_has_u64_field(line, "epoch", checkpoint.epoch)
+}
+
+#[cfg(feature = "kafka")]
+fn log_line_reports_checkpoint_completion(line: &str, checkpoint: DurableCheckpointStatus) -> bool {
+    line.contains("checkpoint completed")
+        && log_line_has_u64_field(line, "checkpoint_id", checkpoint.checkpoint_id)
+        && log_line_has_u64_field(line, "epoch", checkpoint.epoch)
 }
 
 fn remove_marker(path: &Path) {
@@ -382,6 +398,30 @@ impl Node {
     }
 
     #[cfg(feature = "kafka")]
+    fn checkpoint_latency_metrics(&self) -> Option<(f64, f64, f64, f64, f64, f64)> {
+        let body = self.http_get("/metrics")?;
+        let value = |name: &str| {
+            let values = body
+                .lines()
+                .filter(|line| {
+                    line.strip_prefix(name)
+                        .is_some_and(|rest| rest.starts_with(' ') || rest.starts_with('{'))
+                })
+                .map(|line| line.split_whitespace().last()?.parse::<f64>().ok())
+                .collect::<Option<Vec<_>>>()?;
+            (!values.is_empty()).then(|| values.into_iter().sum())
+        };
+        Some((
+            value("laminardb_checkpoint_restorable_gate_wait_seconds_sum")?,
+            value("laminardb_checkpoint_restorable_gate_wait_seconds_count")?,
+            value("laminardb_checkpoint_duration_seconds_sum")?,
+            value("laminardb_checkpoint_duration_seconds_count")?,
+            value("laminardb_checkpoint_pipeline_stall_duration_seconds_count")?,
+            value("laminardb_checkpoint_pipeline_stall_duration_seconds_bucket{le=\"1.024\"}")?,
+        ))
+    }
+
+    #[cfg(feature = "kafka")]
     fn is_leader(&self) -> Option<bool> {
         let body = self.http_get("/api/v1/cluster/leader")?;
         serde_json::from_str::<serde_json::Value>(&body)
@@ -466,6 +506,27 @@ impl Node {
         std::fs::metadata(&self.log_path).map_or(0, |metadata| metadata.len())
     }
 
+    #[cfg(feature = "kafka")]
+    fn log_since(&self, start_offset: u64) -> String {
+        let mut log = std::fs::File::open(&self.log_path)
+            .unwrap_or_else(|error| panic!("read node{} soak log: {error}", self.id));
+        let log_len = log
+            .metadata()
+            .unwrap_or_else(|error| panic!("inspect node{} soak log: {error}", self.id))
+            .len();
+        assert!(
+            start_offset <= log_len,
+            "node{} log shrank during the soak: {log_len} < {start_offset}",
+            self.id
+        );
+        log.seek(SeekFrom::Start(start_offset))
+            .unwrap_or_else(|error| panic!("seek node{} soak log: {error}", self.id));
+        let mut tail = Vec::new();
+        log.read_to_end(&mut tail)
+            .unwrap_or_else(|error| panic!("read node{} soak log tail: {error}", self.id));
+        String::from_utf8_lossy(&tail).into_owned()
+    }
+
     fn logged_recovery_since(
         &self,
         start_offset: u64,
@@ -521,9 +582,8 @@ impl Drop for Node {
 #[cfg(feature = "kafka")]
 struct ProducerGuard {
     stop: Arc<AtomicBool>,
-    produced: Arc<AtomicU64>,
-    handle: Option<JoinHandle<Vec<i64>>>,
-    started_at: Instant,
+    enqueued: Arc<AtomicU64>,
+    handle: Option<JoinHandle<ProducedPrefix>>,
 }
 
 #[cfg(feature = "kafka")]
@@ -534,13 +594,92 @@ struct ProducedPrefix {
 }
 
 #[cfg(feature = "kafka")]
+struct ExplicitFaultEvidence {
+    log_offsets: Vec<u64>,
+    recovery_baselines: Vec<f64>,
+    recovery_failure_baselines: Vec<f64>,
+    checkpoint_failure_baselines: Vec<f64>,
+    resumed_checkpoint: DurableCheckpointStatus,
+}
+
+#[cfg(feature = "kafka")]
+#[derive(Default)]
+struct CheckpointLatencyEvidence {
+    gate_wait_seconds: f64,
+    gate_wait_observations: f64,
+    checkpoint_seconds: f64,
+    checkpoint_observations: f64,
+    pipeline_stall_observations: f64,
+    pipeline_stall_within_slo: f64,
+}
+
+#[cfg(feature = "kafka")]
+impl CheckpointLatencyEvidence {
+    fn capture_node(&mut self, node: &Node) {
+        let (
+            gate_seconds,
+            gate_count,
+            checkpoint_seconds,
+            checkpoint_count,
+            pipeline_stall_count,
+            pipeline_stall_within_slo,
+        ) = node
+            .checkpoint_latency_metrics()
+            .expect("node did not expose checkpoint latency metrics");
+        self.gate_wait_seconds += gate_seconds;
+        self.gate_wait_observations += gate_count;
+        self.checkpoint_seconds += checkpoint_seconds;
+        self.checkpoint_observations += checkpoint_count;
+        self.pipeline_stall_observations += pipeline_stall_count;
+        self.pipeline_stall_within_slo += pipeline_stall_within_slo;
+    }
+
+    fn report(&self) {
+        assert!(
+            self.checkpoint_observations > 0.0,
+            "soak captured no checkpoint latency observations"
+        );
+        assert!(
+            self.pipeline_stall_observations > 0.0,
+            "soak captured no checkpoint pipeline-stall observations"
+        );
+        let within_slo_percent =
+            self.pipeline_stall_within_slo / self.pipeline_stall_observations * 100.0;
+        assert!(
+            within_slo_percent >= 99.0,
+            "checkpoint pipeline-stall p99 exceeded {:.0}ms: only {within_slo_percent:.2}% of {} observations met the latency SLO",
+            CHECKPOINT_PIPELINE_STALL_SLO_SECONDS * 1_000.0,
+            self.pipeline_stall_observations as u64,
+        );
+        let checkpoint_average_ms =
+            self.checkpoint_seconds / self.checkpoint_observations * 1_000.0;
+        if self.gate_wait_observations > 0.0 {
+            eprintln!(
+                "soak: PROFILE pipeline-stall <= {:.0}ms for {within_slo_percent:.2}% of {} obs; gate-wait avg={:.0}ms over {} obs; checkpoint_duration avg={checkpoint_average_ms:.0}ms over {} obs (including pre-restart process lifetimes)",
+                CHECKPOINT_PIPELINE_STALL_SLO_SECONDS * 1_000.0,
+                self.pipeline_stall_observations as u64,
+                self.gate_wait_seconds / self.gate_wait_observations * 1_000.0,
+                self.gate_wait_observations as u64,
+                self.checkpoint_observations as u64,
+            );
+        } else {
+            eprintln!(
+                "soak: PROFILE pipeline-stall <= {:.0}ms for {within_slo_percent:.2}% of {} obs; checkpoint_duration avg={checkpoint_average_ms:.0}ms over {} obs (including pre-restart process lifetimes); no restorable-gate waits were observed",
+                CHECKPOINT_PIPELINE_STALL_SLO_SECONDS * 1_000.0,
+                self.pipeline_stall_observations as u64,
+                self.checkpoint_observations as u64,
+            );
+        }
+    }
+}
+
+#[cfg(feature = "kafka")]
 impl ProducerGuard {
     fn spawn(brokers: String, topic: String, partitions: i32, rps: u64) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let produced = Arc::new(AtomicU64::new(0));
+        let enqueued = Arc::new(AtomicU64::new(0));
         let producer_stop = Arc::clone(&stop);
-        let producer_count = Arc::clone(&produced);
-        let started_at = Instant::now();
+        let producer_enqueued = Arc::clone(&enqueued);
         let handle = std::thread::spawn(move || {
             produce_seq(
                 &brokers,
@@ -548,15 +687,18 @@ impl ProducerGuard {
                 partitions,
                 rps,
                 &producer_stop,
-                &producer_count,
+                &producer_enqueued,
             )
         });
         Self {
             stop,
-            produced,
+            enqueued,
             handle: Some(handle),
-            started_at,
         }
+    }
+
+    fn enqueued(&self) -> u64 {
+        self.enqueued.load(Ordering::Acquire)
     }
 
     fn assert_running(&mut self) {
@@ -576,17 +718,11 @@ impl ProducerGuard {
 
     fn stop(&mut self) -> ProducedPrefix {
         self.stop.store(true, Ordering::Release);
-        let end_offsets = self
-            .handle
+        self.handle
             .take()
             .expect("Kafka producer was already stopped")
             .join()
-            .expect("Kafka producer thread failed");
-        ProducedPrefix {
-            count: self.produced.load(Ordering::Acquire),
-            end_offsets,
-            elapsed: self.started_at.elapsed(),
-        }
+            .expect("Kafka producer thread failed")
     }
 }
 
@@ -702,6 +838,134 @@ fn kafka_high_watermarks(
                 .map(|(_, high)| high)
         })
         .collect()
+}
+
+#[cfg(feature = "kafka")]
+fn monotonic_offset_delta(label: &str, start: &[i64], end: &[i64]) -> u64 {
+    assert_eq!(
+        start.len(),
+        end.len(),
+        "{label} partition count changed during active-load sampling"
+    );
+    start
+        .iter()
+        .zip(end)
+        .enumerate()
+        .try_fold(0_u64, |total, (partition, (start, end))| {
+            assert!(
+                *start >= 0 && end >= start,
+                "{label} partition {partition} regressed or was uninitialized: {start}->{end}"
+            );
+            let delta = u64::try_from(end - start).expect("non-negative Kafka offset delta");
+            total
+                .checked_add(delta)
+                .ok_or("Kafka offset delta sum overflow")
+        })
+        .unwrap_or_else(|error| panic!("{label}: {error}"))
+}
+
+#[cfg(feature = "kafka")]
+fn initialized_offset_sum(label: &str, offsets: &[i64]) -> u64 {
+    offsets
+        .iter()
+        .enumerate()
+        .try_fold(0_u64, |total, (partition, offset)| {
+            assert!(
+                *offset >= 0,
+                "{label} partition {partition} is uninitialized: {offset}"
+            );
+            let offset = u64::try_from(*offset).expect("non-negative Kafka offset");
+            total.checked_add(offset).ok_or("Kafka offset sum overflow")
+        })
+        .unwrap_or_else(|error| panic!("{label}: {error}"))
+}
+
+#[cfg(feature = "kafka")]
+fn timed_snapshot<T>(snapshot: impl FnOnce() -> T) -> (Instant, Instant, T) {
+    let started = Instant::now();
+    let value = snapshot();
+    (started, Instant::now(), value)
+}
+
+#[cfg(feature = "kafka")]
+fn assert_active_load_throughput(
+    nodes: &mut [Node],
+    producer: &mut ProducerGuard,
+    input: &KafkaCommitOracle,
+    output: &KafkaOutputOracle,
+    target_rps: u64,
+) {
+    assert_running_nodes(nodes);
+    producer.assert_running();
+    let (offered_start_at, _, offered_start) = timed_snapshot(|| producer.enqueued());
+    let (durable_start_at, _, committed_start) = timed_snapshot(|| {
+        initialized_offset_sum(
+            "active-load input committed offsets",
+            &input
+                .committed_offsets()
+                .expect("active-load input committed-offset snapshot"),
+        )
+    });
+    let (emitted_start_at, _, output_start) = timed_snapshot(|| {
+        output
+            .high_watermarks()
+            .expect("active-load output high-watermark snapshot")
+    });
+    let sample_started = Instant::now();
+    while sample_started.elapsed() < ACTIVE_LOAD_SAMPLE_WINDOW {
+        assert_running_nodes(nodes);
+        producer.assert_running();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let (_, offered_end_at, offered_end) = timed_snapshot(|| producer.enqueued());
+    let (_, durable_end_at, committed_end) = timed_snapshot(|| {
+        initialized_offset_sum(
+            "active-load final input committed offsets",
+            &input
+                .committed_offsets()
+                .expect("active-load final input committed-offset snapshot"),
+        )
+    });
+    let (_, emitted_end_at, output_end) = timed_snapshot(|| {
+        output
+            .high_watermarks()
+            .expect("active-load final output high-watermark snapshot")
+    });
+    let offered = offered_end
+        .checked_sub(offered_start)
+        .expect("producer enqueue count regressed");
+    let durable = committed_end
+        .checked_sub(committed_start)
+        .expect("committed input offset sum regressed");
+    let emitted = monotonic_offset_delta("sink output", &output_start, &output_end);
+    let offered_elapsed = offered_end_at
+        .duration_since(offered_start_at)
+        .as_secs_f64();
+    let durable_elapsed = durable_end_at
+        .duration_since(durable_start_at)
+        .as_secs_f64();
+    let emitted_elapsed = emitted_end_at
+        .duration_since(emitted_start_at)
+        .as_secs_f64();
+    let offered_rps = offered as f64 / offered_elapsed;
+    let durable_rps = durable as f64 / durable_elapsed;
+    let emitted_rps = emitted as f64 / emitted_elapsed;
+    let minimum_rps = target_rps as f64 * ACTIVE_LOAD_MINIMUM_RATIO;
+    assert!(
+        offered_rps >= minimum_rps,
+        "active-load producer accepted only {offered_rps:.1} rps against target {target_rps} rps"
+    );
+    assert!(
+        durable_rps >= minimum_rps,
+        "LaminarDB durably advanced source offsets at only {durable_rps:.1} rps against target {target_rps} rps"
+    );
+    assert!(
+        emitted_rps >= minimum_rps,
+        "LaminarDB sink output advanced at only {emitted_rps:.1} rps against target {target_rps} rps"
+    );
+    eprintln!(
+        "soak: ACTIVE LOAD producer_accepted={offered_rps:.1} rps/{offered_elapsed:.1}s, durable_input={durable_rps:.1} rps/{durable_elapsed:.1}s, sink_output={emitted_rps:.1} rps/{emitted_elapsed:.1}s"
+    );
 }
 
 #[cfg(feature = "kafka")]
@@ -902,6 +1166,112 @@ fn assert_final_outputs(
     }
     panic!(
         "soak: frozen Kafka output boundaries did not remain drained and stable for {OUTPUT_BOUNDARY_STABILITY:?}"
+    );
+}
+
+#[cfg(feature = "kafka")]
+fn assert_no_unsolicited_cold_start_recovery(nodes: &[Node]) {
+    const PREPARE: &str = "leader announced recovery prepare";
+    const RELEASE: &str = "coordinated recovery: releasing source gate";
+
+    for node in nodes {
+        assert_eq!(
+            node.metric("laminardb_coordinated_recoveries_total")
+                .expect("node did not expose coordinated recovery count"),
+            0.0,
+            "node{} performed an unsolicited cold-start recovery",
+            node.id
+        );
+        assert_eq!(
+            node.metric("laminardb_coordinated_recovery_failures_total")
+                .expect("node did not expose coordinated recovery failure count"),
+            0.0,
+            "node{} failed an unsolicited cold-start recovery",
+            node.id
+        );
+        let log = node.log_since(0);
+        assert!(
+            !log.contains(PREPARE) && !log.contains(RELEASE),
+            "node{} log contains unsolicited cold-start recovery activity",
+            node.id
+        );
+    }
+}
+
+#[cfg(feature = "kafka")]
+fn assert_explicit_fault_recovery_evidence(nodes: &[Node], evidence: &ExplicitFaultEvidence) {
+    const PREPARE: &str = "leader announced recovery prepare";
+    const RELEASE: &str = "coordinated recovery: releasing source gate";
+
+    assert_eq!(nodes.len(), evidence.log_offsets.len());
+    assert_eq!(nodes.len(), evidence.recovery_baselines.len());
+    assert_eq!(nodes.len(), evidence.recovery_failure_baselines.len());
+    assert_eq!(nodes.len(), evidence.checkpoint_failure_baselines.len());
+    let logs = nodes
+        .iter()
+        .zip(&evidence.log_offsets)
+        .map(|(node, offset)| node.log_since(*offset))
+        .collect::<Vec<_>>();
+    let prepare_count: usize = logs.iter().map(|log| log.matches(PREPARE).count()).sum();
+    assert_eq!(
+        prepare_count, 1,
+        "explicit fault created {prepare_count} recovery Prepare generations instead of exactly one"
+    );
+
+    let mut resumed_completion_count = 0usize;
+    for (index, node) in nodes.iter().enumerate() {
+        let log = &logs[index];
+        let recovery_baseline = evidence.recovery_baselines[index];
+        let recoveries = node
+            .metric("laminardb_coordinated_recoveries_total")
+            .expect("node stopped exposing coordinated recovery count");
+        assert_eq!(
+            recoveries,
+            recovery_baseline + 1.0,
+            "node{} applied {} recovery generations for one explicit fault",
+            node.id,
+            recoveries - recovery_baseline
+        );
+        let failures = node
+            .metric("laminardb_coordinated_recovery_failures_total")
+            .expect("node stopped exposing coordinated recovery failure count");
+        assert_eq!(
+            failures, evidence.recovery_failure_baselines[index],
+            "node{} recorded a coordinated recovery failure",
+            node.id
+        );
+        let checkpoint_failures = node
+            .metric("laminardb_checkpoints_failed_total")
+            .expect("node stopped exposing checkpoint failure count");
+        assert_eq!(
+            checkpoint_failures, evidence.checkpoint_failure_baselines[index],
+            "node{} recorded a failed checkpoint during explicit recovery",
+            node.id
+        );
+        assert_eq!(
+            log.matches(RELEASE).count(),
+            1,
+            "node{} did not consume exactly one recovery Release",
+            node.id
+        );
+
+        let lines = log.lines().collect::<Vec<_>>();
+        let release_index = lines
+            .iter()
+            .position(|line| line.contains(RELEASE))
+            .expect("release occurrence was counted above");
+        resumed_completion_count += lines[release_index + 1..]
+            .iter()
+            .filter(|line| {
+                log_line_reports_checkpoint_completion(line, evidence.resumed_checkpoint)
+            })
+            .count();
+    }
+    assert!(
+        resumed_completion_count > 0,
+        "no node logged exact checkpoint {} epoch {} completing after recovery Release",
+        evidence.resumed_checkpoint.checkpoint_id,
+        evidence.resumed_checkpoint.epoch,
     );
 }
 
@@ -1815,9 +2185,14 @@ fn three_node_kill9_soak() {
     );
     let brokers = std::env::var("LAMINAR_SOAK_KAFKA_SOURCE_BROKERS")
         .expect("three_node_kill9_soak requires LAMINAR_SOAK_KAFKA_SOURCE_BROKERS");
-    let input_topic = format!("soak-cluster-in-{}", std::process::id());
-    let output_topic = format!("soak-cluster-out-{}", std::process::id());
-    let consumer_group = format!("soak-cluster-{}", std::process::id());
+    let run_nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is before the Unix epoch")
+        .as_nanos();
+    let run_id = format!("{}-{run_nonce}", std::process::id());
+    let input_topic = format!("soak-cluster-in-{run_id}");
+    let output_topic = format!("soak-cluster-out-{run_id}");
+    let consumer_group = format!("soak-cluster-{run_id}");
     // Kafka partitioning is independent from engine key-group cardinality. The provider hashes
     // each source/topic/partition identity onto the current key-group topology; the producer below
     // assigns records round-robin so every external partition receives deterministic traffic.
@@ -1837,8 +2212,7 @@ fn three_node_kill9_soak() {
     );
 
     // Node logs under target/ (not the tempdir) so they survive a failed run for post-mortem.
-    let log_dir =
-        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("soak-{}", std::process::id()));
+    let log_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("soak-{run_id}"));
     std::fs::create_dir_all(&log_dir).unwrap();
     eprintln!("soak: node logs in {}", log_dir.display());
 
@@ -1879,6 +2253,7 @@ fn three_node_kill9_soak() {
                 .then(|| dir.path().join(format!("checkpoint-node-{id}.arm"))),
         })
         .collect();
+    let mut latency_evidence = CheckpointLatencyEvidence::default();
     for n in &mut nodes {
         n.spawn();
         // Stagger process startup to reduce formation churn; role is observed from the API below.
@@ -1932,7 +2307,10 @@ fn three_node_kill9_soak() {
     );
     assert_every_node_ingests(&mut nodes, &mut producer, Duration::from_secs(60));
 
+    let mut explicit_fault_evidence = None;
     if let Some(role) = fault_role.as_deref() {
+        assert_no_unsolicited_cold_start_recovery(&nodes);
+        let fault_log_offsets = nodes.iter().map(Node::log_len).collect::<Vec<_>>();
         let leader = wait_for_stable_leader(&mut nodes, &mut producer);
         let victim = match role {
             "leader" => leader,
@@ -1956,6 +2334,13 @@ fn three_node_kill9_soak() {
             .map(|node| {
                 node.metric("laminardb_coordinated_recovery_failures_total")
                     .expect("node did not expose coordinated_recovery_failures_total")
+            })
+            .collect();
+        let checkpoint_failure_baselines: Vec<f64> = nodes
+            .iter()
+            .map(|node| {
+                node.metric("laminardb_checkpoints_failed_total")
+                    .expect("node did not expose checkpoint failure count")
             })
             .collect();
         eprintln!("soak: trigger fatal cycle fault on observed {role} node {victim}");
@@ -1989,16 +2374,6 @@ fn three_node_kill9_soak() {
                     })
             },
         );
-        for (node, baseline) in nodes.iter().zip(&failure_baselines) {
-            let failures = node
-                .metric("laminardb_coordinated_recovery_failures_total")
-                .expect("node stopped exposing coordinated_recovery_failures_total");
-            assert_eq!(
-                failures, *baseline,
-                "node{} recorded a coordinated recovery failure",
-                node.id
-            );
-        }
         latest_checkpoint = assert_progress(
             &mut nodes,
             Some(&mut producer),
@@ -2007,6 +2382,15 @@ fn three_node_kill9_soak() {
             "progress after coordinated recovery",
             Some(latest_checkpoint),
         );
+        let evidence = ExplicitFaultEvidence {
+            log_offsets: fault_log_offsets,
+            recovery_baselines,
+            recovery_failure_baselines: failure_baselines,
+            checkpoint_failure_baselines,
+            resumed_checkpoint: latest_checkpoint,
+        };
+        assert_explicit_fault_recovery_evidence(&nodes, &evidence);
+        explicit_fault_evidence = Some(evidence);
         let recovery_elapsed = assert_recovery_within(
             recovery_started,
             recovery_ceiling,
@@ -2052,6 +2436,7 @@ fn three_node_kill9_soak() {
         eprintln!(
             "soak round {round}: kill -9 observed {victim_role} node {victim} inside checkpoint"
         );
+        latency_evidence.capture_node(&nodes[victim]);
         let failover_started = Instant::now();
         let failover_deadline = failover_started + recovery_ceiling;
         nodes[victim].kill9();
@@ -2168,6 +2553,17 @@ fn three_node_kill9_soak() {
         latest_checkpoint.checkpoint_id, latest_checkpoint.epoch
     );
 
+    assert_active_load_throughput(
+        &mut nodes,
+        &mut producer,
+        &commit_oracle,
+        &output_oracle,
+        source_rps,
+    );
+    if let Some(evidence) = &explicit_fault_evidence {
+        assert_explicit_fault_recovery_evidence(&nodes, evidence);
+    }
+
     // Freeze the exact broker-acknowledged input offsets. Require that source commits cover them
     // and two later checkpoints complete before freezing the sink broker boundaries.
     let produced_prefix = producer.stop();
@@ -2228,24 +2624,10 @@ fn three_node_kill9_soak() {
         remaining_progress_window(boundary_deadline, "frozen output validation"),
     );
 
-    // Durability-gate poll wait vs whole checkpoint (leader-only metric; sum picks it up).
-    // avg = histogram sum/count.
-    {
-        let m = |n: &str| -> f64 { nodes.iter().filter_map(|x| x.metric(n)).sum() };
-        let gw_sum = m("laminardb_checkpoint_restorable_gate_wait_seconds_sum");
-        let gw_cnt = m("laminardb_checkpoint_restorable_gate_wait_seconds_count");
-        let cd_sum = m("laminardb_checkpoint_duration_seconds_sum");
-        let cd_cnt = m("laminardb_checkpoint_duration_seconds_count");
-        if gw_cnt > 0.0 {
-            eprintln!(
-                "soak: PROFILE gate-wait avg={:.0}ms over {} obs; checkpoint_duration avg={:.0}ms over {} obs",
-                gw_sum / gw_cnt * 1000.0,
-                gw_cnt as u64,
-                cd_sum / cd_cnt.max(1.0) * 1000.0,
-                cd_cnt as u64,
-            );
-        }
+    for node in &nodes {
+        latency_evidence.capture_node(node);
     }
+    latency_evidence.report();
 }
 
 /// Create `topic` with `partitions` partitions (blocking; the admin API is async).
@@ -2287,8 +2669,8 @@ fn produce_seq(
     partitions: i32,
     rps: u64,
     stop: &AtomicBool,
-    produced: &AtomicU64,
-) -> Vec<i64> {
+    enqueued_count: &AtomicU64,
+) -> ProducedPrefix {
     use futures::stream::{FuturesUnordered, StreamExt as _};
     use rdkafka::producer::{FutureProducer, FutureRecord};
 
@@ -2299,7 +2681,6 @@ fn produce_seq(
         >,
         end_offsets: &mut [i64],
         acknowledged: &mut u64,
-        produced: &AtomicU64,
     ) {
         let delivery = result
             .expect("Kafka delivery future was cancelled before the producer stopped")
@@ -2313,7 +2694,6 @@ fn produce_seq(
         *acknowledged = acknowledged
             .checked_add(1)
             .expect("soak acknowledgement count overflow");
-        produced.store(*acknowledged, Ordering::Release);
     }
 
     let producer: FutureProducer = rdkafka::ClientConfig::new()
@@ -2341,7 +2721,7 @@ fn produce_seq(
                     .next()
                     .await
                     .expect("bounded producer has an in-flight delivery");
-                record_delivery(delivery, &mut end_offsets, &mut acknowledged, produced);
+                record_delivery(delivery, &mut end_offsets, &mut acknowledged);
                 continue;
             }
 
@@ -2356,7 +2736,6 @@ fn produce_seq(
                                 delivery.expect("producer has an in-flight delivery"),
                                 &mut end_offsets,
                                 &mut acknowledged,
-                                produced,
                             );
                             continue;
                         }
@@ -2382,15 +2761,20 @@ fn produce_seq(
                 .unwrap_or_else(|(error, _)| panic!("Kafka enqueue failed: {error}"));
             deliveries.push(delivery);
             n = n.checked_add(1).expect("soak sequence overflow");
+            enqueued_count.store(n, Ordering::Release);
         }
         while let Some(delivery) = deliveries.next().await {
-            record_delivery(delivery, &mut end_offsets, &mut acknowledged, produced);
+            record_delivery(delivery, &mut end_offsets, &mut acknowledged);
         }
         assert_eq!(
             acknowledged, n,
             "producer stopped before every enqueued record was acknowledged"
         );
-        end_offsets
+        ProducedPrefix {
+            count: acknowledged,
+            end_offsets,
+            elapsed: start.elapsed(),
+        }
     })
 }
 
@@ -2429,6 +2813,31 @@ fn recovery_log_match_binds_checkpoint_and_epoch() {
     ));
     assert!(!log_line_reports_recovery(
         "Recovered from unified checkpoint previous_checkpoint_id=41 epoch=43",
+        expected
+    ));
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn checkpoint_completion_log_match_binds_checkpoint_and_epoch() {
+    let expected = DurableCheckpointStatus {
+        checkpoint_id: 41,
+        epoch: 43,
+    };
+    assert!(log_line_reports_checkpoint_completion(
+        "checkpoint completed checkpoint_id=41 epoch=43",
+        expected
+    ));
+    assert!(!log_line_reports_checkpoint_completion(
+        "checkpoint completed checkpoint_id=40 epoch=43",
+        expected
+    ));
+    assert!(!log_line_reports_checkpoint_completion(
+        "checkpoint completed checkpoint_id=41 epoch=42",
+        expected
+    ));
+    assert!(!log_line_reports_checkpoint_completion(
+        "checkpoint failed checkpoint_id=41 epoch=43",
         expected
     ));
 }
