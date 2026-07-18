@@ -811,31 +811,18 @@ async fn preflight_cluster_retention_cut(
         .load_recovery_capsule(reference)
         .await
         .map_err(|error| DbError::Checkpoint(format!("[LDB-6041] {error}")))?;
-    let recovered = crate::recovery_manager::RecoveryManager::new(store)
+    crate::recovery_manager::RecoveryManager::new(store)
         .with_pipeline_identity(&capsule.pipeline_identity)
         .with_deployment_id(&capsule.deployment_id)
         .with_outcome_scope(laminar_core::checkpoint_decision::CheckpointScope::Cluster)
-        .preflight_cluster_committed_outcome(outcome, decision_store)
+        .preflight_cluster_committed_metadata(outcome, &capsule)
         .await?;
-    let recovered_capsule = recovered.cluster_capsule().ok_or_else(|| {
-        DbError::Checkpoint(format!(
-            "[LDB-6041] cluster checkpoint {} preflight did not resolve its recovery capsule",
-            outcome.checkpoint_id
-        ))
-    })?;
-    if recovered_capsule != &capsule {
-        return Err(DbError::Checkpoint(format!(
-            "[LDB-6041] cluster checkpoint {} capsule changed during artifact preflight",
-            outcome.checkpoint_id
-        )));
-    }
-    CheckpointCoordinator::validate_cluster_cut_state(
+    CheckpointCoordinator::validate_cluster_cut_metadata(
         state_backend,
         outcome,
         &capsule,
         &capsule.deployment_id,
         &capsule.pipeline_identity,
-        true,
     )
     .await
 }
@@ -858,38 +845,23 @@ async fn authorize_retention_horizon(
     let _ = (&store, &state_backend);
     #[cfg(feature = "cluster")]
     if let Some(authority) = checkpoint_authority {
-        let Some(capsule_store) = decision_store.clone() else {
-            warn!(
-                trigger_epoch,
-                horizon = requested,
-                "[LDB-6050] cluster retention has no recovery capsule store; skipping artifact prune"
-            );
-            return None;
-        };
-        let Some(preflight_backend) = state_backend.clone() else {
-            warn!(
-                trigger_epoch,
-                horizon = requested,
-                "[LDB-6050] cluster retention has no sealed state backend; skipping artifact prune"
-            );
-            return None;
-        };
-        let validate_artifacts = move |outcome| {
-            let store = Arc::clone(&store);
-            let state_backend = Arc::clone(&preflight_backend);
-            let decision_store = Arc::clone(&capsule_store);
-            async move {
-                preflight_cluster_retention_cut(
-                    store.as_ref(),
-                    state_backend.as_ref(),
-                    decision_store.as_ref(),
-                    &outcome,
-                )
-                .await
-                .map_err(|error| error.to_string())
-            }
-        };
         let floor = if advance_decision_floor {
+            let Some(capsule_store) = decision_store.clone() else {
+                warn!(
+                    trigger_epoch,
+                    horizon = requested,
+                    "[LDB-6050] cluster retention has no recovery capsule store; skipping artifact prune"
+                );
+                return None;
+            };
+            let Some(preflight_backend) = state_backend.clone() else {
+                warn!(
+                    trigger_epoch,
+                    horizon = requested,
+                    "[LDB-6050] cluster retention has no sealed state backend; skipping artifact prune"
+                );
+                return None;
+            };
             let Some(proof) = leader_proof else {
                 warn!(
                     trigger_epoch,
@@ -897,6 +869,21 @@ async fn authorize_retention_horizon(
                     "[LDB-6026] cluster retention has no captured leader proof; skipping artifact prune"
                 );
                 return None;
+            };
+            let validate_artifacts = move |outcome| {
+                let store = Arc::clone(&store);
+                let state_backend = Arc::clone(&preflight_backend);
+                let decision_store = Arc::clone(&capsule_store);
+                async move {
+                    preflight_cluster_retention_cut(
+                        store.as_ref(),
+                        state_backend.as_ref(),
+                        decision_store.as_ref(),
+                        &outcome,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())
+                }
             };
             tokio::time::timeout(operation_timeout, async {
                 authority
@@ -908,7 +895,7 @@ async fn authorize_retention_horizon(
         } else {
             tokio::time::timeout(operation_timeout, async {
                 authority
-                    .validated_cluster_outcome_retention_boundary(validate_artifacts)
+                    .audited_cluster_outcome_retention_boundary()
                     .await
                     .map(|boundary| boundary.before_epoch)
                     .map_err(|error| error.to_string())
@@ -1753,10 +1740,10 @@ impl CheckpointCoordinator {
         let request = RetentionRequest {
             horizon: self.local_manifest_retention_requested_horizon,
             trigger_epoch: epoch,
-            preflight_state_backend: self.state_backend.clone(),
+            preflight_state_backend: None,
             state_backend: None,
             state_ancestry_slack: 0,
-            decision_store: self.decision_store.clone(),
+            decision_store: None,
             checkpoint_authority,
             leader_proof: None,
             advance_decision_floor: false,
@@ -6281,13 +6268,12 @@ impl CheckpointCoordinator {
     }
 
     #[cfg(feature = "cluster")]
-    async fn validate_cluster_cut_state(
+    async fn validate_cluster_cut_metadata(
         backend: &dyn StateBackend,
         outcome: &laminar_core::checkpoint_decision::CheckpointOutcome,
         capsule: &ClusterRecoveryCapsule,
         expected_deployment: &str,
         expected_identity: &PipelineIdentity,
-        verify_vnode_payloads: bool,
     ) -> Result<(), DbError> {
         let attempt = CheckpointAttempt::new(outcome.epoch, outcome.checkpoint_id);
         let inventory = backend
@@ -6309,6 +6295,14 @@ impl CheckpointCoordinator {
             expected_deployment,
             expected_identity,
         )?;
+        backend
+            .verify_checkpoint_artifact_metadata(&inventory)
+            .await
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6041] sealed state artifact metadata verification failed: {error}"
+                ))
+            })?;
         let readiness = Self::read_readiness_inventory(backend, attempt, &inventory).await?;
         let reproduced = assemble_capsule(
             &inventory,
@@ -6323,11 +6317,6 @@ impl CheckpointCoordinator {
                 "[LDB-6041] participant readiness inventory no longer reproduces the committed recovery capsule for epoch {} checkpoint {}",
                 outcome.epoch, outcome.checkpoint_id
             )));
-        }
-        if verify_vnode_payloads {
-            crate::recovery_manager::VnodeRehydrator::new(backend)
-                .validate_at(&inventory.required_vnodes, attempt)
-                .await?;
         }
         Ok(())
     }
@@ -6396,13 +6385,12 @@ impl CheckpointCoordinator {
                 outcome.epoch, outcome.checkpoint_id
             ))
         })?;
-        Self::validate_cluster_cut_state(
+        Self::validate_cluster_cut_metadata(
             backend.as_ref(),
             outcome,
             capsule,
             self.expected_deployment_id()?,
             &self.expected_pipeline_identity(),
-            false,
         )
         .await
     }

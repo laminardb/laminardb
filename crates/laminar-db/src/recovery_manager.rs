@@ -247,38 +247,6 @@ impl<'a> VnodeRehydrator<'a> {
         Ok(report)
     }
 
-    /// Verify every requested vnode chain while discarding payloads as soon as each bounded task
-    /// completes. Retention uses this before deleting an older recovery window.
-    #[cfg(feature = "cluster")]
-    pub(crate) async fn validate_at(
-        &self,
-        vnodes: &[u32],
-        attempt: CheckpointAttempt,
-    ) -> Result<(), DbError> {
-        if vnodes.is_empty() {
-            let inventory = self.sealed_inventory(attempt).await?;
-            if !inventory.required_vnodes.is_empty() {
-                return Err(DbError::Checkpoint(format!(
-                    "[LDB-6050] empty vnode preflight does not cover sealed checkpoint {attempt:?}"
-                )));
-            }
-            return Ok(());
-        }
-        let inventory = self.sealed_inventory(attempt).await?;
-        if inventory.required_vnodes.as_slice() != vnodes {
-            return Err(DbError::Checkpoint(format!(
-                "[LDB-6050] vnode preflight does not exactly cover the state seal for checkpoint {} epoch {}",
-                attempt.checkpoint_id, attempt.epoch
-            )));
-        }
-        futures::stream::iter(vnodes.iter().copied().map(Ok::<_, DbError>))
-            .try_for_each_concurrent(VNODE_REHYDRATION_CONCURRENCY, |vnode| async move {
-                self.collect_chain(vnode, attempt).await.map(|_| ())
-            })
-            .await?;
-        Ok(())
-    }
-
     /// Resolve a vnode's recovery chain at an exact attempt: collapse leading reference hops,
     /// then walk exact parent attempts until each head op has its FULL base (oldest→newest).
     async fn collect_chain(
@@ -424,6 +392,73 @@ enum RecoveryOutcomeAuthority<'a> {
 struct ClusterPreparedDominance {
     highest_terminal_epoch: u64,
     highest_terminal_checkpoint_id: u64,
+}
+
+#[cfg(feature = "cluster")]
+fn validate_cluster_candidate_manifest_binding(
+    manifest: &CheckpointManifest,
+    participant: &laminar_core::checkpoint::ParticipantRecoveryRef,
+    outcome: &CheckpointOutcome,
+    expected_pipeline_identity: &PipelineIdentity,
+    expected_deployment_id: &str,
+    expected_portable_state_sha256: &str,
+) -> Result<(), String> {
+    if manifest.epoch != outcome.epoch
+        || manifest.checkpoint_id != outcome.checkpoint_id
+        || manifest.participant_id != participant.participant_id
+        || manifest.pipeline_identity != *expected_pipeline_identity
+        || manifest.deployment_id != expected_deployment_id
+    {
+        return Err("manifest does not identify the committed runtime cut".into());
+    }
+    let (manifest_sha256, portable_state_sha256) =
+        crate::cluster_recovery_capsule::manifest_digests(manifest)
+            .map_err(|error| format!("manifest is not portable: {error}"))?;
+    if manifest_sha256 != participant.manifest_sha256
+        || portable_state_sha256 != participant.portable_state_sha256
+        || portable_state_sha256 != expected_portable_state_sha256
+    {
+        return Err("manifest digest does not match the recovery capsule".into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cluster")]
+fn declared_sidecar_len(manifest: &CheckpointManifest) -> Result<Option<u64>, String> {
+    let mut ranges = manifest
+        .operator_states
+        .iter()
+        .filter(|(_, state)| state.external)
+        .map(|(name, state)| {
+            let end = state
+                .external_offset
+                .checked_add(state.external_length)
+                .ok_or_else(|| format!("operator '{name}' sidecar range overflows"))?;
+            if state.external_length == 0 {
+                return Err(format!(
+                    "operator '{name}' has an empty external sidecar range"
+                ));
+            }
+            Ok((state.external_offset, end, name.as_str()))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if ranges.is_empty() {
+        if manifest.operator_states.is_empty() && manifest.state_checksum.is_some() {
+            return Err("sidecar checksum has no external operator ranges".into());
+        }
+        return Ok(None);
+    }
+    ranges.sort_unstable();
+    let mut expected_offset = 0;
+    for (start, end, name) in ranges {
+        if start != expected_offset {
+            return Err(format!(
+                "operator '{name}' sidecar range starts at {start}, expected {expected_offset}"
+            ));
+        }
+        expected_offset = end;
+    }
+    Ok(Some(expected_offset))
 }
 
 impl ClusterPreparedDominance {
@@ -716,57 +751,23 @@ impl<'a> RecoveryManager<'a> {
             };
 
             let manifest = &artifacts.manifest;
-            if manifest.epoch != outcome.epoch
-                || manifest.checkpoint_id != outcome.checkpoint_id
-                || manifest.participant_id != storage_participant
-                || manifest.pipeline_identity != self.expected_pipeline_identity
-                || manifest.deployment_id != self.expected_deployment_id
-            {
-                reject_candidate(format!(
-                    "participant {storage_participant} manifest does not identify the committed runtime cut"
-                ));
+            if let Err(failure) = validate_cluster_candidate_manifest_binding(
+                manifest,
+                participant,
+                outcome,
+                &self.expected_pipeline_identity,
+                &self.expected_deployment_id,
+                &capsule.portable_state_sha256,
+            ) {
+                reject_candidate(format!("participant {storage_participant} {failure}"));
                 warn!(
                     storage_participant,
                     checkpoint_id = outcome.checkpoint_id,
-                    manifest_epoch = manifest.epoch,
-                    manifest_checkpoint_id = manifest.checkpoint_id,
-                    manifest_participant = manifest.participant_id,
-                    "cluster recovery candidate manifest identity mismatch"
+                    %failure,
+                    "cluster recovery candidate manifest binding is invalid"
                 );
                 continue;
             }
-
-            let digests = crate::cluster_recovery_capsule::manifest_digests(manifest);
-            let (manifest_sha256, portable_state_sha256) = match digests {
-                Ok(digests) => digests,
-                Err(error) => {
-                    reject_candidate(format!(
-                        "participant {storage_participant} manifest is not portable: {error}"
-                    ));
-                    warn!(
-                        storage_participant,
-                        checkpoint_id = outcome.checkpoint_id,
-                        %error,
-                        "cluster recovery candidate manifest is not portable"
-                    );
-                    continue;
-                }
-            };
-            if manifest_sha256 != participant.manifest_sha256
-                || portable_state_sha256 != participant.portable_state_sha256
-                || portable_state_sha256 != capsule.portable_state_sha256
-            {
-                reject_candidate(format!(
-                    "participant {storage_participant} manifest digest does not match the capsule"
-                ));
-                warn!(
-                    storage_participant,
-                    checkpoint_id = outcome.checkpoint_id,
-                    "cluster recovery candidate digest mismatch"
-                );
-                continue;
-            }
-
             let validation = artifacts.validate(
                 outcome.checkpoint_id,
                 storage_participant,
@@ -843,7 +844,6 @@ impl<'a> RecoveryManager<'a> {
             return Ok(Some(recovered));
         }
 
-        drop(reject_candidate);
         let failure_summary = match (first_failure, last_failure) {
             (Some(first), Some(last)) if first != last => {
                 format!("; first failure: {first}; last failure: {last}")
@@ -872,6 +872,116 @@ impl<'a> RecoveryManager<'a> {
                     outcome.checkpoint_id
                 ))
             })
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn preflight_cluster_candidate_metadata(
+        &self,
+        participant: &laminar_core::checkpoint::ParticipantRecoveryRef,
+        outcome: &CheckpointOutcome,
+        capsule: &ClusterRecoveryCapsule,
+    ) -> Result<(), String> {
+        let participant_id = participant.participant_id;
+        let manifest = self
+            .store
+            .load_manifest_for_participant(participant_id, outcome.checkpoint_id)
+            .await
+            .map_err(|error| {
+                format!("participant {participant_id} manifest is unreadable: {error}")
+            })?
+            .ok_or_else(|| format!("participant {participant_id} manifest is absent"))?;
+        let validation = manifest.validate(self.store.key_group_count());
+        if let Some(failure) = validation.first() {
+            return Err(format!(
+                "participant {participant_id} manifest metadata is invalid: {failure}"
+            ));
+        }
+        validate_cluster_candidate_manifest_binding(
+            &manifest,
+            participant,
+            outcome,
+            &self.expected_pipeline_identity,
+            &self.expected_deployment_id,
+            &capsule.portable_state_sha256,
+        )
+        .map_err(|failure| format!("participant {participant_id} {failure}"))?;
+
+        let Some(expected_len) = declared_sidecar_len(&manifest).map_err(|failure| {
+            format!("participant {participant_id} manifest sidecar shape is invalid: {failure}")
+        })?
+        else {
+            return Ok(());
+        };
+        match self
+            .store
+            .state_data_len_for_participant(participant_id, outcome.checkpoint_id)
+            .await
+            .map_err(|error| {
+                format!("participant {participant_id} sidecar metadata is unreadable: {error}")
+            })?
+        {
+            Some(actual_len) if actual_len == expected_len => Ok(()),
+            Some(actual_len) => Err(format!(
+                "participant {participant_id} sidecar is {actual_len} bytes; expected {expected_len}"
+            )),
+            None => Err(format!("participant {participant_id} sidecar is absent")),
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    /// Audit durable recovery metadata bound to a committed cluster capsule without reading
+    /// state-sidecar or vnode payload bodies. Recovery validates those bodies before use.
+    pub(crate) async fn preflight_cluster_committed_metadata(
+        &self,
+        outcome: &CheckpointOutcome,
+        capsule: &ClusterRecoveryCapsule,
+    ) -> Result<(), DbError> {
+        capsule
+            .validate()
+            .map_err(|error| DbError::Checkpoint(format!("[LDB-6041] {error}")))?;
+        let expected_attempt = CheckpointAttempt::new(outcome.epoch, outcome.checkpoint_id);
+        if !outcome.is_commit()
+            || outcome.scope != CheckpointScope::Cluster
+            || capsule.attempt != expected_attempt
+            || capsule.deployment_id != outcome.deployment_id
+            || capsule.deployment_id != self.expected_deployment_id
+            || capsule.pipeline_identity != self.expected_pipeline_identity
+            || outcome.assignment_fence.as_ref() != Some(&capsule.assignment_fence)
+        {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6041] cluster epoch {} checkpoint {} manifest preflight does not match the committed runtime cut",
+                outcome.epoch, outcome.checkpoint_id
+            )));
+        }
+
+        let local_participant = self.store.participant_id();
+        let mut candidates = capsule.participants.iter().collect::<Vec<_>>();
+        if let Some(local_index) = candidates
+            .iter()
+            .position(|participant| participant.participant_id == local_participant)
+        {
+            candidates[..=local_index].rotate_right(1);
+        }
+        let mut rejected = 0_usize;
+        let mut last_failure = None;
+        for participant in candidates {
+            match self
+                .preflight_cluster_candidate_metadata(participant, outcome, capsule)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(failure) => {
+                    rejected += 1;
+                    last_failure = Some(failure);
+                }
+            }
+        }
+
+        let failure = last_failure.map_or_else(String::new, |failure| format!("; {failure}"));
+        Err(DbError::Checkpoint(format!(
+            "[LDB-6041] committed cluster checkpoint {} has no usable participant manifest metadata; {rejected} candidate(s) rejected{failure}",
+            outcome.checkpoint_id
+        )))
     }
 
     #[cfg(feature = "cluster")]
@@ -1702,7 +1812,7 @@ impl<'a> RecoveryManager<'a> {
             self.validate_outcome_manifest_binding(
                 outcome,
                 storage_id,
-                &manifest,
+                manifest,
                 storage_participant,
             )?;
         }
@@ -3572,6 +3682,91 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[tokio::test]
+    async fn retention_preflight_uses_a_complete_peer_and_rejects_all_missing_sidecars() {
+        use object_store::ObjectStoreExt;
+
+        let backing: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        let peer =
+            ObjectStoreCheckpointStore::new(std::sync::Arc::clone(&backing), "nodes/1/".into())
+                .with_participant_id(1);
+        let local =
+            ObjectStoreCheckpointStore::new(std::sync::Arc::clone(&backing), "nodes/2/".into())
+                .with_participant_id(2);
+        let fence = assignment_fence(4, &[1, 2]);
+        let decisions = cluster_decisions(std::sync::Arc::clone(&backing), &fence, 1).await;
+        let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
+
+        let mut participant_1 = CheckpointManifest::new(7, 6);
+        participant_1.participant_id = 1;
+        participant_1.deployment_id.clone_from(&deployment_id);
+        participant_1
+            .operator_states
+            .insert("global".into(), OperatorCheckpoint::external(0, 5));
+        let mut participant_2 = participant_1.clone();
+        participant_2.participant_id = 2;
+        let participant_1 = peer
+            .save_with_state(&participant_1, Some(&[Bytes::from_static(b"state")]))
+            .await
+            .unwrap();
+        let participant_2 = local
+            .save_with_state(&participant_2, Some(&[Bytes::from_static(b"state")]))
+            .await
+            .unwrap();
+        record_cluster_commit_for_manifests(
+            &decisions,
+            6,
+            7,
+            &fence,
+            &[(1, &participant_1), (2, &participant_2)],
+        )
+        .await;
+        let outcome = decisions
+            .authority
+            .cluster_outcome(6)
+            .await
+            .unwrap()
+            .expect("cluster Commit outcome");
+        let capsule = decisions
+            .load_recovery_capsule(outcome.recovery_capsule.as_ref().unwrap())
+            .await
+            .unwrap();
+        let manager = RecoveryManager::new(&local)
+            .with_deployment_id(&deployment_id)
+            .with_outcome_scope(CheckpointScope::Cluster);
+
+        backing
+            .delete(&object_store::path::Path::from(
+                "nodes/2/checkpoints/state-000007.bin",
+            ))
+            .await
+            .unwrap();
+        manager
+            .preflight_cluster_committed_metadata(&outcome, &capsule)
+            .await
+            .expect("a complete peer sidecar must preserve the recovery cut");
+
+        backing
+            .delete(&object_store::path::Path::from(
+                "nodes/1/checkpoints/state-000007.bin",
+            ))
+            .await
+            .unwrap();
+        let error = manager
+            .preflight_cluster_committed_metadata(&outcome, &capsule)
+            .await
+            .expect_err("retention must fail when every participant sidecar is missing");
+        assert!(
+            error
+                .to_string()
+                .contains("no usable participant manifest metadata; 2 candidate(s) rejected"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("sidecar is absent"), "{error}");
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
     async fn cluster_recovery_never_combines_a_manifest_and_sidecar_from_different_participants() {
         use object_store::ObjectStoreExt;
 
@@ -3695,7 +3890,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("participant 1 manifest digest does not match the capsule"),
+                .contains("participant 1 manifest digest does not match the recovery capsule"),
             "{error}"
         );
     }
@@ -3859,6 +4054,15 @@ mod rehydration_tests {
             attempt: CheckpointAttempt,
         ) -> Result<Option<CheckpointSealInventory>, StateBackendError> {
             self.inner.checkpoint_seal_inventory(attempt).await
+        }
+
+        async fn verify_checkpoint_artifact_metadata(
+            &self,
+            inventory: &CheckpointSealInventory,
+        ) -> Result<(), StateBackendError> {
+            self.inner
+                .verify_checkpoint_artifact_metadata(inventory)
+                .await
         }
 
         async fn prune_before(&self, before: u64) -> Result<(), StateBackendError> {

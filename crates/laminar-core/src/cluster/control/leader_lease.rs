@@ -3598,7 +3598,7 @@ impl LeaderLeaseStore {
             .await
             .map_err(|error| {
                 DecisionError::Conflict(format!(
-                    "cluster recovery cut epoch {} checkpoint {} failed complete artifact preflight: {error}",
+                    "cluster recovery cut epoch {} checkpoint {} failed durable recovery metadata preflight: {error}",
                     recovery_cut.epoch, recovery_cut.checkpoint_id
                 ))
             })?;
@@ -3630,8 +3630,21 @@ impl LeaderLeaseStore {
         ))
     }
 
+    /// Read an existing cluster retention boundary after auditing its outcome chain and selected
+    /// recovery capsule, without invoking a caller-supplied state-artifact preflight.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the authority history or selected recovery capsule is invalid.
+    pub async fn audited_cluster_outcome_retention_boundary(
+        &self,
+    ) -> Result<ClusterOutcomeRetentionBoundary, ClusterCheckpointAuthorityError> {
+        self.validated_cluster_outcome_retention_boundary(|_| async { Ok(()) })
+            .await
+    }
+
     /// Read an existing cluster retention boundary only after its selected live Commit passes the
-    /// caller's complete artifact preflight and the outcome head remains unchanged.
+    /// caller's durable recovery metadata preflight and the outcome head remains unchanged.
     pub async fn validated_cluster_outcome_retention_boundary<V, Fut>(
         &self,
         validate_artifacts: V,
@@ -3750,56 +3763,53 @@ impl LeaderLeaseStore {
             if !current.lease.matches_proof(proof) {
                 return Err(ClusterCheckpointAuthorityError::Fenced);
             }
-            let outcomes = self.audited_cluster_outcomes_from(&current).await?;
-            let floor_is_existing = current
+            if let Some(floor) = current
                 .outcome_floor
                 .as_ref()
-                .is_some_and(|floor| floor.before_epoch >= before_epoch);
-            let floor = if floor_is_existing {
-                current
-                    .outcome_floor
-                    .clone()
-                    .expect("existing floor checked above")
-            } else {
-                if !outcomes
-                    .iter()
-                    .any(|outcome| outcome.epoch >= before_epoch && outcome.is_commit())
-                {
-                    return Err(DecisionError::Conflict(format!(
-                        "cannot advance cluster outcome floor to {before_epoch}: no live commit recovery cut would remain"
-                    ))
-                    .into());
-                }
-                let deployment_id = CheckpointDecisionStore::new(Arc::clone(&self.store))
-                    .load_or_create_deployment_id()
-                    .await?;
-                let terminal_anchor = outcomes
+                .filter(|floor| floor.before_epoch >= before_epoch)
+            {
+                self.schedule_history_prune();
+                return Ok(floor.before_epoch);
+            }
+            let outcomes = self.audited_cluster_outcomes_from(&current).await?;
+            if !outcomes
+                .iter()
+                .any(|outcome| outcome.epoch >= before_epoch && outcome.is_commit())
+            {
+                return Err(DecisionError::Conflict(format!(
+                    "cannot advance cluster outcome floor to {before_epoch}: no live commit recovery cut would remain"
+                ))
+                .into());
+            }
+            let deployment_id = CheckpointDecisionStore::new(Arc::clone(&self.store))
+                .load_or_create_deployment_id()
+                .await?;
+            let terminal_anchor = outcomes
+                .iter()
+                .rev()
+                .find(|outcome| outcome.epoch < before_epoch)
+                .cloned();
+            let terminal_anchor_link = match terminal_anchor.as_ref() {
+                Some(anchor) => Some(self.exact_outcome_link(&current, anchor).await?),
+                None => None,
+            };
+            let floor = AuthorityOutcomeFloor {
+                deployment_id,
+                before_epoch,
+                terminal_anchor,
+                terminal_anchor_link,
+                committed_anchor: outcomes
                     .iter()
                     .rev()
-                    .find(|outcome| outcome.epoch < before_epoch)
-                    .cloned();
-                let terminal_anchor_link = match terminal_anchor.as_ref() {
-                    Some(anchor) => Some(self.exact_outcome_link(&current, anchor).await?),
-                    None => None,
-                };
-                AuthorityOutcomeFloor {
-                    deployment_id,
-                    before_epoch,
-                    terminal_anchor,
-                    terminal_anchor_link,
-                    committed_anchor: outcomes
-                        .iter()
-                        .rev()
-                        .find(|outcome| outcome.epoch < before_epoch && outcome.is_commit())
-                        .cloned(),
-                }
+                    .find(|outcome| outcome.epoch < before_epoch && outcome.is_commit())
+                    .cloned(),
             };
             floor.validate()?;
             self.preflight_cluster_recovery_cut(&floor, &outcomes, &validate_artifacts)
                 .await?;
 
             // Lease renewals and catalog seals may advance the shared sequence while the complete
-            // artifact preflight performs remote reads. They are harmless only when both the
+            // recovery metadata preflight performs remote reads. They are harmless only when both the
             // outcome head and retention floor remain exactly the same.
             let rechecked = self
                 .load_record()
@@ -3814,11 +3824,6 @@ impl LeaderLeaseStore {
                 tokio::task::yield_now().await;
                 continue;
             }
-            if floor_is_existing {
-                self.schedule_history_prune();
-                return Ok(floor.before_epoch);
-            }
-
             let base_sequence = rechecked.lease.seq;
             let sequence = base_sequence
                 .checked_add(1)
@@ -4868,6 +4873,25 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    async fn retention_test_store(
+        ttl_ms: i64,
+    ) -> (Arc<LeaderLeaseStore>, LeaderLeaseOwner, LeaderProof) {
+        let store = Arc::new(store(ttl_ms));
+        let incumbent = owner(1, 1, 1);
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let proof = first.proof();
+        let fence = assignment_fence(&incumbent);
+        record_commit(store.as_ref(), &proof, &fence, 1, 10).await;
+        record_commit(store.as_ref(), &proof, &fence, 3, 30).await;
+        (store, incumbent, proof)
     }
 
     #[tokio::test]
@@ -8314,6 +8338,241 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_recovery_metadata_preflight_does_not_publish_a_new_floor() {
+        let (store, _incumbent, proof) = retention_test_store(1_000).await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&calls);
+
+        let error = store
+            .prune_cluster_outcomes_before(&proof, 3, move |_| {
+                let calls = Arc::clone(&observed_calls);
+                async move {
+                    calls.fetch_add(1, Ordering::AcqRel);
+                    Err("selected state replica is unreadable".to_owned())
+                }
+            })
+            .await
+            .expect_err("artifact failure must block a new durable floor");
+
+        assert!(error
+            .to_string()
+            .contains("durable recovery metadata preflight"));
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            store
+                .cluster_outcome_retention_boundary()
+                .await
+                .unwrap()
+                .before_epoch,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn covered_retention_horizon_does_not_repeat_artifact_preflight() {
+        let (store, _incumbent, proof) = retention_test_store(1_000).await;
+        assert_eq!(
+            store
+                .prune_cluster_outcomes_before(&proof, 3, accept_recovery_artifacts)
+                .await
+                .unwrap(),
+            3
+        );
+        let sequence = store.load().await.unwrap().unwrap().seq;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&calls);
+
+        assert_eq!(
+            store
+                .prune_cluster_outcomes_before(&proof, 2, move |_| {
+                    let calls = Arc::clone(&observed_calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::AcqRel);
+                        Err("covered horizon must not run this callback".to_owned())
+                    }
+                })
+                .await
+                .unwrap(),
+            3
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+        assert_eq!(store.load().await.unwrap().unwrap().seq, sequence);
+    }
+
+    #[tokio::test]
+    async fn renewal_during_artifact_preflight_preserves_new_floor_authorization() {
+        let (store, incumbent, proof) = retention_test_store(1_000).await;
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pruning = {
+            let store = Arc::clone(&store);
+            let proof = proof.clone();
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            let calls = Arc::clone(&calls);
+            tokio::spawn(async move {
+                store
+                    .prune_cluster_outcomes_before(&proof, 3, move |_| {
+                        let entered = Arc::clone(&entered);
+                        let release = Arc::clone(&release);
+                        let calls = Arc::clone(&calls);
+                        async move {
+                            if calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                                entered.add_permits(1);
+                                release.acquire().await.unwrap().forget();
+                            }
+                            Ok(())
+                        }
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+
+        assert!(matches!(
+            store
+                .acquire_or_renew_current_term_for_test(&incumbent, 1)
+                .await
+                .unwrap(),
+            LeaseOutcome::Acquired(_)
+        ));
+        release.add_permits(1);
+
+        assert_eq!(pruning.await.unwrap().unwrap(), 3);
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            store
+                .cluster_outcome_retention_boundary()
+                .await
+                .unwrap()
+                .before_epoch,
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_outcome_head_during_preflight_restarts_new_floor_authorization() {
+        let (store, incumbent, proof) = retention_test_store(1_000).await;
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pruning = {
+            let store = Arc::clone(&store);
+            let proof = proof.clone();
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            let calls = Arc::clone(&calls);
+            tokio::spawn(async move {
+                store
+                    .prune_cluster_outcomes_before(&proof, 3, move |_| {
+                        let entered = Arc::clone(&entered);
+                        let release = Arc::clone(&release);
+                        let calls = Arc::clone(&calls);
+                        async move {
+                            if calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                                entered.add_permits(1);
+                                release.acquire().await.unwrap().forget();
+                            }
+                            Ok(())
+                        }
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+
+        store
+            .record_cluster_outcome(
+                &proof,
+                4,
+                40,
+                assignment_fence(&incumbent),
+                CheckpointVerdict::Abort,
+                None,
+            )
+            .await
+            .unwrap();
+        release.add_permits(1);
+
+        assert_eq!(pruning.await.unwrap().unwrap(), 3);
+        assert_eq!(calls.load(Ordering::Acquire), 2);
+        assert_eq!(
+            store
+                .cluster_outcome_retention_boundary()
+                .await
+                .unwrap()
+                .before_epoch,
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn takeover_during_artifact_preflight_fences_new_floor_publication() {
+        let (store, _incumbent, proof) = retention_test_store(10).await;
+        let successor = owner(2, 2, 1);
+        let current = store.load().await.unwrap().unwrap();
+        let observation = store.observe_rival(&successor, &current).unwrap();
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let pruning = {
+            let store = Arc::clone(&store);
+            let proof = proof.clone();
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            tokio::spawn(async move {
+                store
+                    .prune_cluster_outcomes_before(&proof, 3, move |_| {
+                        let entered = Arc::clone(&entered);
+                        let release = Arc::clone(&release);
+                        async move {
+                            entered.add_permits(1);
+                            release.acquire().await.unwrap().forget();
+                            Ok(())
+                        }
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        assert!(matches!(
+            store
+                .try_takeover(&successor, &observation, 20)
+                .await
+                .unwrap(),
+            LeaseOutcome::Acquired(_)
+        ));
+        release.add_permits(1);
+
+        assert!(matches!(
+            pruning.await.unwrap(),
+            Err(ClusterCheckpointAuthorityError::Fenced)
+        ));
+        assert_eq!(
+            store
+                .cluster_outcome_retention_boundary()
+                .await
+                .unwrap()
+                .before_epoch,
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn ambiguous_floor_create_revalidates_the_winner_cut() {
         let (raw, store) = ambiguous_once_at(1_000, lease_path(4));
         let incumbent = owner(1, 1, 1);
@@ -8774,6 +9033,12 @@ mod tests {
             .unwrap();
         assert!(matches!(
             store.cluster_outcomes().await,
+            Err(ClusterCheckpointAuthorityError::Decision(
+                DecisionError::Conflict(_)
+            ))
+        ));
+        assert!(matches!(
+            store.audited_cluster_outcome_retention_boundary().await,
             Err(ClusterCheckpointAuthorityError::Decision(
                 DecisionError::Conflict(_)
             ))

@@ -874,6 +874,24 @@ pub trait StateBackend: Send + Sync + 'static {
         attempt: CheckpointAttempt,
     ) -> Result<Option<CheckpointSealInventory>, StateBackendError>;
 
+    /// Prove from storage metadata that every artifact named by an exact seal still exists with
+    /// its sealed length, without reading artifact payloads.
+    ///
+    /// Cluster retention invokes this only while advancing the shared GC floor. Durable custom
+    /// backends must override the fail-closed default with equivalent metadata evidence.
+    async fn verify_checkpoint_artifact_metadata(
+        &self,
+        inventory: &CheckpointSealInventory,
+    ) -> Result<(), StateBackendError> {
+        Err(StateBackendError::Conflict {
+            resource: format!(
+                "state-v2/epoch={}/checkpoint={}",
+                inventory.attempt.epoch, inventory.attempt.checkpoint_id
+            ),
+            message: "backend does not implement metadata-only sealed-artifact verification".into(),
+        })
+    }
+
     /// Garbage-collect every partial and state seal whose epoch is
     /// strictly less than `before`. Called by the checkpoint
     /// coordinator after a successful checkpoint commit so the backend

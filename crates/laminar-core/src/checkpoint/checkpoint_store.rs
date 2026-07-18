@@ -536,6 +536,22 @@ pub trait CheckpointStore: Send + Sync {
         self.load_state_data(id).await
     }
 
+    /// Read only the durable sidecar object's length from storage metadata.
+    ///
+    /// Cluster retention uses this to prove that a manifest's immutable sidecar still exists
+    /// without downloading its body. Custom stores fail closed until they provide an equivalent
+    /// metadata-only lookup.
+    async fn state_data_len_for_participant(
+        &self,
+        participant_id: u64,
+        id: u64,
+    ) -> Result<Option<u64>, CheckpointStoreError> {
+        Err(CheckpointStoreError::Invalid(format!(
+            "checkpoint store participant {} cannot provide metadata-only sidecar evidence for participant {participant_id} checkpoint {id}",
+            self.participant_id()
+        )))
+    }
+
     /// Load the manifest and checksum-required sidecar for a local checkpoint exactly once.
     async fn load_checkpoint_artifacts(
         &self,
@@ -1143,6 +1159,27 @@ impl CheckpointStore for FileSystemCheckpointStore {
             Err(e) => Err(e.into()),
         }
     }
+
+    async fn state_data_len_for_participant(
+        &self,
+        participant_id: u64,
+        id: u64,
+    ) -> Result<Option<u64>, CheckpointStoreError> {
+        if participant_id != self.participant_id {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "checkpoint store participant {} cannot read participant {participant_id}",
+                self.participant_id
+            )));
+        }
+        match tokio::fs::metadata(self.state_path(id)).await {
+            Ok(metadata) if metadata.is_file() => Ok(Some(metadata.len())),
+            Ok(_) => Err(CheckpointStoreError::Invalid(format!(
+                "checkpoint {id} state sidecar is not a regular file"
+            ))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1721,6 +1758,19 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
     ) -> Result<Option<Vec<u8>>, CheckpointStoreError> {
         let path = self.state_path_for_participant(participant_id, id)?;
         Ok(self.get_bytes(&path).await?.map(|data| data.to_vec()))
+    }
+
+    async fn state_data_len_for_participant(
+        &self,
+        participant_id: u64,
+        id: u64,
+    ) -> Result<Option<u64>, CheckpointStoreError> {
+        let path = self.state_path_for_participant(participant_id, id)?;
+        match self.store.head(&path).await {
+            Ok(metadata) => Ok(Some(metadata.size)),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(error) => Err(CheckpointStoreError::ObjectStore(error)),
+        }
     }
 
     async fn cleanup_orphans(&self) -> Result<usize, CheckpointStoreError> {

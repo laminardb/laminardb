@@ -368,6 +368,32 @@ impl ObjectStoreBackend {
         Ok(false)
     }
 
+    async fn verify_object_size_from_metadata(
+        &self,
+        path: &OsPath,
+        listed_size: Option<u64>,
+        expected_size: u64,
+    ) -> Result<(), StateBackendError> {
+        if listed_size == Some(expected_size) {
+            return Ok(());
+        }
+        match self.store.head(path).await {
+            Ok(metadata) if metadata.size == expected_size => Ok(()),
+            Ok(metadata) => Err(StateBackendError::Conflict {
+                resource: path.to_string(),
+                message: format!(
+                    "sealed artifact is {} bytes in storage metadata; expected {expected_size}",
+                    metadata.size
+                ),
+            }),
+            Err(object_store::Error::NotFound { .. }) => Err(StateBackendError::Conflict {
+                resource: path.to_string(),
+                message: "sealed artifact is missing from storage metadata".into(),
+            }),
+            Err(error) => Err(StateBackendError::Io(error.to_string())),
+        }
+    }
+
     /// Parse an attempt from `state-v2/epoch=N/checkpoint=M/...`.
     fn attempt_from_path(loc: &str) -> Option<CheckpointAttempt> {
         let mut parts = loc.split('/');
@@ -1423,6 +1449,81 @@ impl StateBackend for ObjectStoreBackend {
         }
     }
 
+    async fn verify_checkpoint_artifact_metadata(
+        &self,
+        inventory: &CheckpointSealInventory,
+    ) -> Result<(), StateBackendError> {
+        use futures::StreamExt as _;
+
+        let attempt = inventory.attempt;
+        if self.attempt_is_pruned(attempt).await? {
+            return Err(StateBackendError::Conflict {
+                resource: Self::attempt_prefix(attempt),
+                message: "sealed attempt is below the durable state prune floor".into(),
+            });
+        }
+
+        let prefix = OsPath::from(Self::attempt_prefix(attempt));
+        let mut objects = self.store.list(Some(&prefix));
+        let mut listed_sizes = rustc_hash::FxHashMap::default();
+        while let Some(entry) = objects.next().await {
+            let entry = entry.map_err(|error| StateBackendError::Io(error.to_string()))?;
+            listed_sizes.insert(entry.location, entry.size);
+        }
+
+        for partial in &inventory.sealed_partials {
+            let path = Self::partial_path(attempt, partial.vnode);
+            let header_len = u64::try_from(VNODE_PARTIAL_HEADER_LEN).map_err(|_| {
+                StateBackendError::Conflict {
+                    resource: path.to_string(),
+                    message: "vnode storage header length is not representable".into(),
+                }
+            })?;
+            let expected_size = header_len.checked_add(partial.payload_len).ok_or_else(|| {
+                StateBackendError::Conflict {
+                    resource: path.to_string(),
+                    message: "sealed vnode partial length overflows storage size".into(),
+                }
+            })?;
+            self.verify_object_size_from_metadata(
+                &path,
+                listed_sizes.get(&path).copied(),
+                expected_size,
+            )
+            .await?;
+        }
+        for descriptor in &inventory.sealed_descriptors {
+            let path = Self::descriptor_path(attempt, &descriptor.key);
+            let header_len = u64::try_from(COMMIT_DESCRIPTOR_HEADER_LEN).map_err(|_| {
+                StateBackendError::Conflict {
+                    resource: path.to_string(),
+                    message: "descriptor storage header length is not representable".into(),
+                }
+            })?;
+            let expected_size =
+                header_len
+                    .checked_add(descriptor.payload_len)
+                    .ok_or_else(|| StateBackendError::Conflict {
+                        resource: path.to_string(),
+                        message: "sealed commit descriptor length overflows storage size".into(),
+                    })?;
+            self.verify_object_size_from_metadata(
+                &path,
+                listed_sizes.get(&path).copied(),
+                expected_size,
+            )
+            .await?;
+        }
+
+        if self.attempt_is_pruned(attempt).await? {
+            return Err(StateBackendError::Conflict {
+                resource: Self::attempt_prefix(attempt),
+                message: "sealed attempt was pruned during metadata verification".into(),
+            });
+        }
+        Ok(())
+    }
+
     async fn prune_before(&self, before: u64) -> Result<(), StateBackendError> {
         use futures::stream::{self, StreamExt};
 
@@ -2321,6 +2422,58 @@ mod tests {
             .seal_checkpoint(attempt(1), None, &vnodes, &[])
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn sealed_artifact_metadata_rejects_a_missing_or_wrong_sized_vnode_object() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let backend = ObjectStoreBackend::new(Arc::clone(&store), "node-0", 1);
+        let checkpoint = attempt(1);
+        backend
+            .write_partial(checkpoint, 0, 0, Bytes::from_static(b"state"))
+            .await
+            .unwrap();
+        assert!(backend
+            .seal_checkpoint(checkpoint, None, &[0], &[])
+            .await
+            .unwrap());
+        let inventory = backend
+            .checkpoint_seal_inventory(checkpoint)
+            .await
+            .unwrap()
+            .unwrap();
+        backend
+            .verify_checkpoint_artifact_metadata(&inventory)
+            .await
+            .unwrap();
+
+        let path = ObjectStoreBackend::partial_path(checkpoint, 0);
+        store.delete(&path).await.unwrap();
+        let missing = backend
+            .verify_checkpoint_artifact_metadata(&inventory)
+            .await
+            .unwrap_err();
+        assert!(
+            missing
+                .to_string()
+                .contains("sealed artifact is missing from storage metadata"),
+            "{missing}"
+        );
+
+        store
+            .put(&path, PutPayload::from(Bytes::from_static(b"wrong")))
+            .await
+            .unwrap();
+        let wrong_size = backend
+            .verify_checkpoint_artifact_metadata(&inventory)
+            .await
+            .unwrap_err();
+        assert!(
+            wrong_size
+                .to_string()
+                .contains("sealed artifact is 5 bytes in storage metadata"),
+            "{wrong_size}"
+        );
     }
 
     #[tokio::test]

@@ -228,6 +228,8 @@ async fn retained_ambiguous_decision_requires_recovery_before_any_delivery_mode_
 struct ClusterTestCoordinator {
     coordinator: CheckpointCoordinator,
     checkpoint_store: Arc<dyn object_store::ObjectStore>,
+    _membership_tx:
+        Option<tokio::sync::watch::Sender<Vec<laminar_core::cluster::discovery::NodeInfo>>>,
 }
 
 #[cfg(feature = "cluster")]
@@ -284,6 +286,7 @@ async fn make_cluster_coordinator_with_key_groups(
     ClusterTestCoordinator {
         coordinator: coord,
         checkpoint_store,
+        _membership_tx: None,
     }
 }
 
@@ -510,7 +513,7 @@ async fn attach_cluster_controller(
             last_heartbeat_ms: 0,
         })
         .collect();
-    let (_tx, rx) = watch::channel(peers);
+    let (membership_tx, rx) = watch::channel(peers);
     let controller = Arc::new(ClusterController::new(self_id, kv, None, rx));
     let leader_lease = if peer_ids.iter().all(|peer_id| participant_id < *peer_id) {
         Some(
@@ -551,6 +554,7 @@ async fn attach_cluster_controller(
             .expect("test leader proof")
     });
     coord.set_cluster_controller(controller);
+    coord._membership_tx = Some(membership_tx);
     leader_lease
 }
 
@@ -865,6 +869,345 @@ async fn retention_requests_coalesce_into_one_owned_worker() {
 
     assert_eq!(coord.retention_requested_horizon, 32);
     assert_eq!(coord.maintenance_tasks.len(), 1);
+}
+
+#[cfg(feature = "cluster")]
+async fn cluster_authority_with_retention_floor() -> (
+    Arc<laminar_core::cluster::control::LeaderLeaseStore>,
+    Arc<dyn object_store::ObjectStore>,
+) {
+    use laminar_core::checkpoint_decision::CheckpointVerdict;
+    use laminar_core::cluster::control::{LeaderLeaseOwner, LeaderLeaseStore, LeaseOutcome};
+    use laminar_core::cluster::discovery::NodeId;
+
+    let backing: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let decisions = in_memory_decision_store_on(Arc::clone(&backing));
+    let authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&backing), 60_000));
+    let fence = test_assignment_fence(1, &[1]);
+    let owner = LeaderLeaseOwner {
+        node: NodeId(1),
+        boot: fence.participant_incarnation(1).unwrap(),
+        process_term: 1,
+    };
+    let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap() else {
+        unreachable!()
+    };
+    for (epoch, checkpoint_id) in [(1, 10), (3, 30)] {
+        let capsule = create_test_recovery_capsule(
+            decisions.as_ref(),
+            epoch,
+            checkpoint_id,
+            &fence,
+            None,
+            None,
+        )
+        .await;
+        authority
+            .record_cluster_outcome(
+                &lease.proof(),
+                epoch,
+                checkpoint_id,
+                fence.clone(),
+                CheckpointVerdict::Commit,
+                Some(capsule),
+            )
+            .await
+            .unwrap();
+    }
+    authority
+        .prune_cluster_outcomes_before(&lease.proof(), 3, |_| async { Ok::<(), String>(()) })
+        .await
+        .unwrap();
+    (authority, backing)
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn follower_retention_reads_durable_floor_without_preflight_dependencies() {
+    let (authority, _backing) = cluster_authority_with_retention_floor().await;
+    let sequence = authority.load().await.unwrap().unwrap().seq;
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn CheckpointStore> = Arc::new(FileSystemCheckpointStore::new(dir.path()));
+
+    assert_eq!(
+        authorize_retention_horizon(
+            3,
+            4,
+            store,
+            None,
+            None,
+            Some(Arc::clone(&authority)),
+            None,
+            false,
+            Duration::from_secs(1),
+        )
+        .await,
+        Some(3),
+        "a follower should need only the durable authority floor"
+    );
+    assert_eq!(
+        authority.load().await.unwrap().unwrap().seq,
+        sequence,
+        "a follower floor read must not append an authority record"
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn follower_retention_rejects_a_floor_with_a_missing_selected_capsule() {
+    use object_store::ObjectStoreExt;
+
+    let (authority, backing) = cluster_authority_with_retention_floor().await;
+    let outcome = authority
+        .cluster_outcome(3)
+        .await
+        .unwrap()
+        .expect("floor must retain its selected Commit");
+    let capsule = outcome
+        .recovery_capsule
+        .expect("cluster Commit must name its recovery capsule");
+    let capsule_path = object_store::path::Path::from(format!(
+        "checkpoint-recovery-capsules/epoch={:020}/checkpoint={:020}/sha256={}",
+        capsule.epoch, capsule.checkpoint_id, capsule.sha256
+    ));
+    backing.delete(&capsule_path).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn CheckpointStore> = Arc::new(FileSystemCheckpointStore::new(dir.path()));
+
+    assert_eq!(
+        authorize_retention_horizon(
+            3,
+            4,
+            store,
+            None,
+            None,
+            Some(authority),
+            None,
+            false,
+            Duration::from_secs(1),
+        )
+        .await,
+        None,
+        "a follower must not delete manifests from an unauditable durable floor"
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn follower_retention_fails_closed_for_missing_or_malformed_floor() {
+    use laminar_core::cluster::control::{LeaderLeaseOwner, LeaderLeaseStore, LeaseOutcome};
+    use laminar_core::cluster::discovery::NodeId;
+    use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+
+    let backing = Arc::new(object_store::memory::InMemory::new());
+    let authority_store: Arc<dyn ObjectStore> = backing.clone();
+    let authority = Arc::new(LeaderLeaseStore::new(authority_store, 60_000));
+    let owner = LeaderLeaseOwner {
+        node: NodeId(1),
+        boot: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+        process_term: 1,
+    };
+    let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap() else {
+        unreachable!()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn CheckpointStore> = Arc::new(FileSystemCheckpointStore::new(dir.path()));
+
+    assert_eq!(
+        authorize_retention_horizon(
+            2,
+            3,
+            Arc::clone(&store),
+            None,
+            None,
+            Some(Arc::clone(&authority)),
+            None,
+            false,
+            Duration::from_secs(1),
+        )
+        .await,
+        None,
+        "an absent durable floor cannot authorize follower deletion"
+    );
+
+    let path =
+        object_store::path::Path::from(format!("control/leader-lease/v{:016}.json", lease.seq));
+    let bytes = backing.get(&path).await.unwrap().bytes().await.unwrap();
+    let mut record: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    record["outcome_floor"] = serde_json::json!({
+        "deployment_id": "00000000-0000-0000-0000-000000000001",
+        "before_epoch": 0,
+        "terminal_anchor": null,
+        "terminal_anchor_link": null,
+        "committed_anchor": null
+    });
+    backing
+        .put(
+            &path,
+            PutPayload::from(serde_json::to_vec(&record).unwrap()),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        authorize_retention_horizon(
+            2,
+            3,
+            store,
+            None,
+            None,
+            Some(authority),
+            None,
+            false,
+            Duration::from_secs(1),
+        )
+        .await,
+        None,
+        "malformed durable floor metadata cannot authorize follower deletion"
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn retention_preflight_audits_metadata_without_reading_payloads() {
+    use laminar_core::state::StateBackend;
+    use std::sync::atomic::Ordering;
+
+    let probe = Arc::new(RetentionReadProbe::default());
+    let backend = Arc::new(FaultBackend {
+        inner: laminar_core::state::InProcessBackend::new(1),
+        fail: parking_lot::Mutex::new(std::collections::HashSet::new()),
+        write_delay: Duration::ZERO,
+        seal_delay: Duration::ZERO,
+        write_probe: None,
+        descriptor_error_after_write: false,
+        retention_read_probe: Some(Arc::clone(&probe)),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let mut coord = make_cluster_coordinator(dir.path(), 1).await;
+    coord
+        .set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>)
+        .unwrap();
+    coord.set_vnode_set(vec![0]);
+    let _leader_lease = attach_cluster_controller(&mut coord, 1, &[]).await;
+
+    let mut request = certified_cluster_request(&coord);
+    request.operator_states.insert(
+        "large".into(),
+        bytes::Bytes::from(vec![0xAB; STATE_INLINE_THRESHOLD + 1]),
+    );
+    let result = coord.checkpoint(request).await.unwrap();
+    assert!(result.success, "{:?}", result.error);
+    let checkpoint_dir = dir
+        .path()
+        .join("checkpoints")
+        .join(format!("checkpoint_{:06}", result.checkpoint_id));
+    let sidecar = checkpoint_dir.join("state.bin");
+    assert!(
+        sidecar.is_file(),
+        "test checkpoint must use a state sidecar"
+    );
+    let authority = coord
+        .cluster_controller
+        .as_ref()
+        .unwrap()
+        .checkpoint_authority()
+        .unwrap();
+    let outcome = authority
+        .cluster_outcome(result.epoch)
+        .await
+        .unwrap()
+        .expect("committed retention cut");
+    let decision_store = coord.decision_store.as_ref().unwrap();
+
+    probe.deny_vnode_payload_reads.store(true, Ordering::SeqCst);
+    probe.vnode_payload_reads.store(0, Ordering::SeqCst);
+    preflight_cluster_retention_cut(
+        coord.store(),
+        backend.as_ref(),
+        decision_store.as_ref(),
+        &outcome,
+    )
+    .await
+    .unwrap();
+    assert_eq!(probe.vnode_payload_reads.load(Ordering::SeqCst), 0);
+
+    std::fs::remove_file(&sidecar).unwrap();
+    let error = preflight_cluster_retention_cut(
+        coord.store(),
+        backend.as_ref(),
+        decision_store.as_ref(),
+        &outcome,
+    )
+    .await
+    .expect_err("a missing only-replica sidecar must block retention");
+    assert!(error.to_string().contains("sidecar is absent"), "{error}");
+    assert_eq!(probe.vnode_payload_reads.load(Ordering::SeqCst), 0);
+    std::fs::write(&sidecar, vec![0xAB; STATE_INLINE_THRESHOLD + 1]).unwrap();
+
+    probe.reject_artifact_metadata.store(true, Ordering::SeqCst);
+    let error = preflight_cluster_retention_cut(
+        coord.store(),
+        backend.as_ref(),
+        decision_store.as_ref(),
+        &outcome,
+    )
+    .await
+    .expect_err("missing sealed vnode metadata must block retention");
+    assert!(
+        error
+            .to_string()
+            .contains("injected sealed vnode metadata mismatch"),
+        "{error}"
+    );
+    assert_eq!(probe.vnode_payload_reads.load(Ordering::SeqCst), 0);
+    probe
+        .reject_artifact_metadata
+        .store(false, Ordering::SeqCst);
+
+    probe.reject_readiness.store(true, Ordering::SeqCst);
+    let error = preflight_cluster_retention_cut(
+        coord.store(),
+        backend.as_ref(),
+        decision_store.as_ref(),
+        &outcome,
+    )
+    .await
+    .expect_err("sealed readiness mismatch must block retention");
+    assert!(
+        error
+            .to_string()
+            .contains("injected sealed readiness mismatch"),
+        "{error}"
+    );
+    assert_eq!(probe.vnode_payload_reads.load(Ordering::SeqCst), 0);
+
+    probe.reject_readiness.store(false, Ordering::SeqCst);
+    probe.hide_seal.store(true, Ordering::SeqCst);
+    let error = preflight_cluster_retention_cut(
+        coord.store(),
+        backend.as_ref(),
+        decision_store.as_ref(),
+        &outcome,
+    )
+    .await
+    .expect_err("missing state seal must block retention");
+    assert!(error.to_string().contains("no exact state seal"), "{error}");
+    assert_eq!(probe.vnode_payload_reads.load(Ordering::SeqCst), 0);
+
+    probe.hide_seal.store(false, Ordering::SeqCst);
+    std::fs::remove_file(checkpoint_dir.join("manifest.json")).unwrap();
+    let error = preflight_cluster_retention_cut(
+        coord.store(),
+        backend.as_ref(),
+        decision_store.as_ref(),
+        &outcome,
+    )
+    .await
+    .expect_err("missing participant manifest must block retention");
+    assert!(error.to_string().contains("manifest is absent"), "{error}");
+    assert_eq!(probe.vnode_payload_reads.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -4366,6 +4709,8 @@ async fn restorable_gate_exits_when_assignment_fence_changes_while_waiting() {
         write_probe: None,
         #[cfg(feature = "cluster")]
         descriptor_error_after_write: false,
+        #[cfg(feature = "cluster")]
+        retention_read_probe: None,
     });
     let attempt = CheckpointAttempt::new(1, 1);
     backend
@@ -4428,6 +4773,8 @@ async fn restorable_gate_rejects_same_version_roster_replacement() {
         write_probe: None,
         #[cfg(feature = "cluster")]
         descriptor_error_after_write: false,
+        #[cfg(feature = "cluster")]
+        retention_read_probe: None,
     });
     let attempt = CheckpointAttempt::new(1, 2);
     backend
@@ -5052,6 +5399,18 @@ struct FaultBackend {
     write_probe: Option<Arc<WriteProbe>>,
     #[cfg(feature = "cluster")]
     descriptor_error_after_write: bool,
+    #[cfg(feature = "cluster")]
+    retention_read_probe: Option<Arc<RetentionReadProbe>>,
+}
+
+#[cfg(feature = "cluster")]
+#[derive(Default)]
+struct RetentionReadProbe {
+    vnode_payload_reads: std::sync::atomic::AtomicUsize,
+    deny_vnode_payload_reads: std::sync::atomic::AtomicBool,
+    hide_seal: std::sync::atomic::AtomicBool,
+    reject_artifact_metadata: std::sync::atomic::AtomicBool,
+    reject_readiness: std::sync::atomic::AtomicBool,
 }
 
 struct WriteProbe {
@@ -5149,6 +5508,17 @@ impl StateBackend for FaultBackend {
         attempt: CheckpointAttempt,
         vnode: u32,
     ) -> Result<Option<bytes::Bytes>, laminar_core::state::StateBackendError> {
+        #[cfg(feature = "cluster")]
+        if let Some(probe) = self.retention_read_probe.as_ref() {
+            use std::sync::atomic::Ordering;
+
+            probe.vnode_payload_reads.fetch_add(1, Ordering::SeqCst);
+            if probe.deny_vnode_payload_reads.load(Ordering::SeqCst) {
+                return Err(laminar_core::state::StateBackendError::Io(
+                    "injected vnode payload read".into(),
+                ));
+            }
+        }
         self.inner.read_partial(attempt, vnode).await
     }
 
@@ -5212,6 +5582,17 @@ impl StateBackend for FaultBackend {
         sealed: &laminar_core::state::SealedCommitDescriptor,
         max_bytes: u64,
     ) -> Result<Option<bytes::Bytes>, laminar_core::state::StateBackendError> {
+        #[cfg(feature = "cluster")]
+        if self.retention_read_probe.as_ref().is_some_and(|probe| {
+            probe
+                .reject_readiness
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }) {
+            return Err(laminar_core::state::StateBackendError::Conflict {
+                resource: sealed.key.clone(),
+                message: "injected sealed readiness mismatch".into(),
+            });
+        }
         self.inner
             .read_sealed_commit_descriptor_bounded(attempt, sealed, max_bytes)
             .await
@@ -5237,7 +5618,38 @@ impl StateBackend for FaultBackend {
         Option<laminar_core::state::CheckpointSealInventory>,
         laminar_core::state::StateBackendError,
     > {
+        #[cfg(feature = "cluster")]
+        if self
+            .retention_read_probe
+            .as_ref()
+            .is_some_and(|probe| probe.hide_seal.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            return Ok(None);
+        }
         self.inner.checkpoint_seal_inventory(attempt).await
+    }
+
+    async fn verify_checkpoint_artifact_metadata(
+        &self,
+        inventory: &laminar_core::state::CheckpointSealInventory,
+    ) -> Result<(), laminar_core::state::StateBackendError> {
+        #[cfg(feature = "cluster")]
+        if self.retention_read_probe.as_ref().is_some_and(|probe| {
+            probe
+                .reject_artifact_metadata
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }) {
+            return Err(laminar_core::state::StateBackendError::Conflict {
+                resource: format!(
+                    "state-v2/epoch={}/checkpoint={}/vnode=0/partial.bin",
+                    inventory.attempt.epoch, inventory.attempt.checkpoint_id
+                ),
+                message: "injected sealed vnode metadata mismatch".into(),
+            });
+        }
+        self.inner
+            .verify_checkpoint_artifact_metadata(inventory)
+            .await
     }
 
     async fn prune_before(
@@ -5278,6 +5690,8 @@ async fn vnode_partial_write_fanout_is_bounded() {
         write_probe: Some(Arc::clone(&probe)),
         #[cfg(feature = "cluster")]
         descriptor_error_after_write: false,
+        #[cfg(feature = "cluster")]
+        retention_read_probe: None,
     });
     let dir = tempfile::tempdir().unwrap();
     let mut coord = make_coordinator_with_key_groups(dir.path(), vnode_count_u32).await;
@@ -5357,6 +5771,8 @@ async fn overlapping_epoch_failure_is_isolated() {
         write_probe: None,
         #[cfg(feature = "cluster")]
         descriptor_error_after_write: false,
+        #[cfg(feature = "cluster")]
+        retention_read_probe: None,
     });
     coord
         .set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>)
@@ -6142,6 +6558,8 @@ async fn landed_follower_readiness_with_lost_ack_never_rolls_back() {
         write_probe: None,
         #[cfg(feature = "cluster")]
         descriptor_error_after_write: true,
+        #[cfg(feature = "cluster")]
+        retention_read_probe: None,
     });
     coord
         .set_state_backend(Arc::clone(&backend) as Arc<dyn StateBackend>)

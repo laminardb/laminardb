@@ -433,6 +433,83 @@ impl StateBackend for InProcessBackend {
             .map(CheckpointSeal::inventory))
     }
 
+    async fn verify_checkpoint_artifact_metadata(
+        &self,
+        inventory: &CheckpointSealInventory,
+    ) -> Result<(), StateBackendError> {
+        let attempt = inventory.attempt;
+        let resource = format!(
+            "state-v2/epoch={}/checkpoint={}",
+            attempt.epoch, attempt.checkpoint_id
+        );
+        let sealed = self.sealed.read();
+        let Some(seal) = sealed.get(&attempt) else {
+            return Err(StateBackendError::Conflict {
+                resource,
+                message: "checkpoint seal is missing during metadata verification".into(),
+            });
+        };
+        if seal.inventory() != *inventory {
+            return Err(StateBackendError::Conflict {
+                resource,
+                message: "checkpoint seal changed during metadata verification".into(),
+            });
+        }
+
+        let partials = self.partials.read();
+        for expected in &inventory.sealed_partials {
+            let path = format!(
+                "state-v2/epoch={}/checkpoint={}/vnode={}/partial.bin",
+                attempt.epoch, attempt.checkpoint_id, expected.vnode
+            );
+            let Some(stored) = partials.get(&(attempt, expected.vnode)) else {
+                return Err(StateBackendError::Conflict {
+                    resource: path,
+                    message: "sealed vnode partial is missing".into(),
+                });
+            };
+            let stored_len =
+                u64::try_from(stored.bytes.len()).map_err(|_| StateBackendError::Conflict {
+                    resource: path.clone(),
+                    message: "sealed vnode partial length is not representable".into(),
+                })?;
+            if stored.attestation != *expected || stored_len != expected.payload_len {
+                return Err(StateBackendError::Conflict {
+                    resource: path,
+                    message: "sealed vnode partial metadata does not match the seal".into(),
+                });
+            }
+        }
+
+        let descriptors = self.descriptors.read();
+        let attempt_descriptors = descriptors.get(&attempt);
+        for expected in &inventory.sealed_descriptors {
+            let path = format!(
+                "state-v2/epoch={}/checkpoint={}/commit/{}",
+                attempt.epoch, attempt.checkpoint_id, expected.key
+            );
+            let Some(stored) = attempt_descriptors.and_then(|entries| entries.get(&expected.key))
+            else {
+                return Err(StateBackendError::Conflict {
+                    resource: path,
+                    message: "sealed commit descriptor is missing".into(),
+                });
+            };
+            let stored_len =
+                u64::try_from(stored.bytes.len()).map_err(|_| StateBackendError::Conflict {
+                    resource: path.clone(),
+                    message: "sealed commit descriptor length is not representable".into(),
+                })?;
+            if stored.attestation != *expected || stored_len != expected.payload_len {
+                return Err(StateBackendError::Conflict {
+                    resource: path,
+                    message: "sealed commit descriptor metadata does not match the seal".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     async fn prune_before(&self, before: u64) -> Result<(), StateBackendError> {
         // Without this, every checkpoint leaks one Bytes per vnode
         // forever.
