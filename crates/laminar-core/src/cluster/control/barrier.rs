@@ -35,6 +35,12 @@ pub const BARRIER_ADDR_KEY: &str = "barrier:addr";
 #[cfg(feature = "cluster")]
 const PHASE_RPC_TIMEOUT: Duration = Duration::from_secs(3);
 
+#[cfg(feature = "cluster")]
+const PREPARE_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(10);
+
+#[cfg(feature = "cluster")]
+const PREPARE_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(250);
+
 /// Barrier phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
@@ -1182,6 +1188,148 @@ enum PeerFailure {
     Nack(String),
 }
 
+#[cfg(feature = "cluster")]
+fn retryable_prepare_status(status: &tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        // Tonic maps a client-service readiness failure to `Unknown`; it is
+        // transport state, not a response from the follower. The remaining
+        // codes represent a connection that cannot currently complete the
+        // request. Fence and validation failures use distinct semantic codes.
+        tonic::Code::Unknown
+            | tonic::Code::Unavailable
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::Cancelled
+            | tonic::Code::Aborted
+    )
+}
+
+#[cfg(feature = "cluster")]
+async fn wait_for_prepare_retry(deadline: tokio::time::Instant, backoff: &mut Duration) -> bool {
+    let now = tokio::time::Instant::now();
+    if now >= deadline {
+        return false;
+    }
+
+    tokio::time::sleep_until((now + *backoff).min(deadline)).await;
+    *backoff = backoff.saturating_mul(2).min(PREPARE_RETRY_MAX_BACKOFF);
+    tokio::time::Instant::now() < deadline
+}
+
+#[cfg(feature = "cluster")]
+#[allow(clippy::too_many_arguments)]
+async fn prepare_peer_until_deadline(
+    peer: NodeId,
+    clients_pool: BarrierClientPool,
+    kv: Arc<dyn ClusterKv>,
+    epoch: u64,
+    checkpoint_id: u64,
+    assignment: WireAssignmentFence,
+    assignment_digest: Option<[u8; 32]>,
+    leader_proof: Option<barrier_v1::LeaderProof>,
+    deadline: tokio::time::Instant,
+) -> Result<(NodeId, CheckpointWatermark), (NodeId, PeerFailure)> {
+    let mut backoff = PREPARE_RETRY_INITIAL_BACKOFF;
+
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err((peer, PeerFailure::Unreachable));
+        }
+
+        let client =
+            match tokio::time::timeout_at(deadline, get_barrier_client(peer, &clients_pool, &kv))
+                .await
+            {
+                Ok(client) => client,
+                Err(_) => return Err((peer, PeerFailure::Unreachable)),
+            };
+        let Some(mut client) = client else {
+            if wait_for_prepare_retry(deadline, &mut backoff).await {
+                continue;
+            }
+            return Err((peer, PeerFailure::Unreachable));
+        };
+
+        let now = tokio::time::Instant::now();
+        let remaining = deadline.saturating_duration_since(now);
+        if remaining.is_zero() {
+            clients_pool.lock().remove(&peer);
+            return Err((peer, PeerFailure::Unreachable));
+        }
+        // Leave part of the existing quorum budget available to evict and re-resolve a lazy
+        // channel whose readiness check stalls. Prepare identities are idempotent, so a live
+        // follower may safely complete an earlier attempt and serve its cached acknowledgement.
+        let attempt_budget = remaining / 2;
+        if attempt_budget.is_zero() {
+            clients_pool.lock().remove(&peer);
+            return Err((peer, PeerFailure::Unreachable));
+        }
+        let attempt_deadline = now + attempt_budget;
+
+        let mut request = tonic::Request::new(barrier_v1::PrepareRequest {
+            epoch,
+            checkpoint_id,
+            flags: 0,
+            assignment_version: assignment.version,
+            assignment_participants: assignment.participants.clone(),
+            assignment_vnode_count: assignment.vnode_count,
+            assignment_map_digest: assignment.map_digest.clone(),
+            leader_proof: leader_proof.clone(),
+        });
+        request.set_timeout(attempt_budget);
+
+        match tokio::time::timeout_at(attempt_deadline, client.prepare(request)).await {
+            Ok(Ok(response)) => {
+                let ack = response.into_inner();
+                if ack.epoch != epoch
+                    || ack.checkpoint_id != checkpoint_id
+                    || ack.assignment_digest.as_slice()
+                        != assignment_digest
+                            .as_ref()
+                            .map_or(&[][..], <[u8; 32]>::as_slice)
+                {
+                    return Err((
+                        peer,
+                        PeerFailure::Nack("Prepare acknowledgement identity mismatch".into()),
+                    ));
+                }
+                if !ack.ok {
+                    return Err((
+                        peer,
+                        PeerFailure::Nack(
+                            ack.error
+                                .unwrap_or_else(|| "Unknown prepare failure".to_string()),
+                        ),
+                    ));
+                }
+                return checkpoint_watermark_from_wire(
+                    ack.watermark_status,
+                    ack.local_watermark_ms,
+                )
+                .map(|watermark| (peer, watermark))
+                .map_err(|error| (peer, PeerFailure::Nack(error)));
+            }
+            Ok(Err(status)) => {
+                clients_pool.lock().remove(&peer);
+                if retryable_prepare_status(&status) {
+                    if wait_for_prepare_retry(deadline, &mut backoff).await {
+                        continue;
+                    }
+                    return Err((peer, PeerFailure::Unreachable));
+                }
+                return Err((peer, PeerFailure::Nack(status.to_string())));
+            }
+            Err(_) => {
+                clients_pool.lock().remove(&peer);
+                if wait_for_prepare_retry(deadline, &mut backoff).await {
+                    continue;
+                }
+                return Err((peer, PeerFailure::Unreachable));
+            }
+        }
+    }
+}
+
 /// Cross-instance barrier coordination.
 pub struct BarrierCoordinator {
     kv: Arc<dyn ClusterKv>,
@@ -1735,83 +1883,24 @@ impl BarrierCoordinator {
             if let Some(state) = grpc_opt {
                 let assignment = assignment_fence_to_wire(prepare.assignment_fence.as_ref());
                 let leader_proof = leader_proof_to_wire(prepare.leader_proof.as_ref());
+                let prepare_deadline = tokio::time::Instant::now() + deadline;
                 let mut futures = Vec::new();
                 for &peer in expected {
                     let clients_pool = Arc::clone(&state.clients);
                     let kv = Arc::clone(&self.kv);
                     let assignment = assignment.clone();
                     let leader_proof = leader_proof.clone();
-                    futures.push(async move {
-                        let client_opt = get_barrier_client(peer, &clients_pool, &kv).await;
-                        let Some(mut client) = client_opt else {
-                            return Err((peer, PeerFailure::Unreachable));
-                        };
-
-                        let mut req = tonic::Request::new(barrier_v1::PrepareRequest {
-                            epoch,
-                            checkpoint_id,
-                            flags: 0,
-                            assignment_version: assignment.version,
-                            assignment_participants: assignment.participants,
-                            assignment_vnode_count: assignment.vnode_count,
-                            assignment_map_digest: assignment.map_digest,
-                            leader_proof,
-                        });
-                        req.set_timeout(deadline);
-
-                        match tokio::time::timeout(deadline, client.prepare(req)).await {
-                            Ok(Ok(response)) => {
-                                let ack = response.into_inner();
-                                if ack.epoch != epoch
-                                    || ack.checkpoint_id != checkpoint_id
-                                    || ack.assignment_digest.as_slice()
-                                        != assignment_digest
-                                            .as_ref()
-                                            .map_or(&[][..], <[u8; 32]>::as_slice)
-                                {
-                                    Err((
-                                        peer,
-                                        PeerFailure::Nack(
-                                            "Prepare acknowledgement identity mismatch".into(),
-                                        ),
-                                    ))
-                                } else if ack.ok {
-                                    checkpoint_watermark_from_wire(
-                                        ack.watermark_status,
-                                        ack.local_watermark_ms,
-                                    )
-                                    .map(|watermark| (peer, watermark))
-                                    .map_err(|error| (peer, PeerFailure::Nack(error)))
-                                } else {
-                                    Err((
-                                        peer,
-                                        PeerFailure::Nack(ack.error.unwrap_or_else(|| {
-                                            "Unknown prepare failure".to_string()
-                                        })),
-                                    ))
-                                }
-                            }
-                            Ok(Err(status)) => {
-                                clients_pool.lock().remove(&peer);
-                                // Classify by gRPC status code, not message
-                                // text: transport-level codes mean the peer
-                                // cannot participate (same epistemic state
-                                // as a timeout); anything else is a live
-                                // server refusing the call.
-                                match status.code() {
-                                    tonic::Code::Unavailable
-                                    | tonic::Code::DeadlineExceeded
-                                    | tonic::Code::Cancelled
-                                    | tonic::Code::Aborted => Err((peer, PeerFailure::Unreachable)),
-                                    _ => Err((peer, PeerFailure::Nack(status.to_string()))),
-                                }
-                            }
-                            Err(_) => {
-                                clients_pool.lock().remove(&peer);
-                                Err((peer, PeerFailure::Unreachable))
-                            }
-                        }
-                    });
+                    futures.push(prepare_peer_until_deadline(
+                        peer,
+                        clients_pool,
+                        kv,
+                        epoch,
+                        checkpoint_id,
+                        assignment,
+                        assignment_digest,
+                        leader_proof,
+                        prepare_deadline,
+                    ));
                 }
 
                 let results = futures::future::join_all(futures).await;
@@ -2003,6 +2092,30 @@ mod tests {
                 .is_err()
         );
         assert!(checkpoint_watermark_from_wire(99, None).is_err());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn prepare_retry_classification_keeps_fence_failures_semantic() {
+        for code in [
+            tonic::Code::Unknown,
+            tonic::Code::Unavailable,
+            tonic::Code::DeadlineExceeded,
+            tonic::Code::Cancelled,
+            tonic::Code::Aborted,
+        ] {
+            assert!(retryable_prepare_status(&tonic::Status::new(code, "")));
+        }
+
+        for code in [
+            tonic::Code::PermissionDenied,
+            tonic::Code::FailedPrecondition,
+            tonic::Code::InvalidArgument,
+            tonic::Code::ResourceExhausted,
+            tonic::Code::Internal,
+        ] {
+            assert!(!retryable_prepare_status(&tonic::Status::new(code, "")));
+        }
     }
 
     #[cfg(feature = "cluster")]
@@ -2481,6 +2594,81 @@ mod tests {
             }
 
             follower_task.await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn prepare_reconnects_a_stale_client_within_the_same_quorum_deadline() {
+            let leader_kv = kv(NodeId(1));
+            let follower_kv = kv(NodeId(2));
+            let (store, proof) = lease_authority().await;
+            let leader_coord = coordinator(leader_kv.clone(), Arc::clone(&store));
+            let follower_coord = coordinator(follower_kv.clone(), store);
+            let slot = || Arc::new(parking_lot::RwLock::new(None));
+            let leader_addr = leader_coord
+                .start_server("127.0.0.1:0".parse().unwrap(), None, slot())
+                .await
+                .unwrap();
+            let follower_addr = follower_coord
+                .start_server("127.0.0.1:0".parse().unwrap(), None, slot())
+                .await
+                .unwrap();
+            leader_kv.seed(NodeId(2), BARRIER_ADDR_KEY, follower_addr.to_string());
+            follower_kv.seed(NodeId(1), BARRIER_ADDR_KEY, leader_addr.to_string());
+
+            let dead_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let dead_addr = dead_listener.local_addr().unwrap();
+            drop(dead_listener);
+            let dead_channel =
+                tonic::transport::Endpoint::from_shared(format!("http://{dead_addr}"))
+                    .unwrap()
+                    .connect_lazy();
+            let state = leader_coord.grpc.lock().clone().unwrap();
+            state.clients.lock().insert(
+                NodeId(2),
+                barrier_v1::barrier_sync_client::BarrierSyncClient::new(dead_channel),
+            );
+
+            let assignment_fence = test_fence(9, &[1, 2], &[(1, 11), (2, 22)]);
+            let follower_fence = assignment_fence.clone();
+            let prepare = BarrierAnnouncement {
+                epoch: 2,
+                checkpoint_id: 43,
+                assignment_fence: Some(assignment_fence),
+                leader_proof: Some(proof),
+                phase: Phase::Prepare,
+                flags: 0,
+                min_watermark_ms: None,
+            };
+            leader_coord.announce(&prepare).await.unwrap();
+
+            let follower = async {
+                let announcement = wait_observe(&follower_coord, NodeId(1), Phase::Prepare).await;
+                follower_coord
+                    .ack(&BarrierAck {
+                        epoch: announcement.epoch,
+                        checkpoint_id: announcement.checkpoint_id,
+                        assignment_digest: Some(follower_fence.digest()),
+                        ok: true,
+                        error: None,
+                        watermark: CheckpointWatermark::Active(101),
+                    })
+                    .await
+                    .unwrap();
+            };
+            let leader =
+                leader_coord.wait_for_quorum(&prepare, &[NodeId(2)], Duration::from_secs(2));
+            let (outcome, ()) = tokio::join!(leader, follower);
+
+            assert!(
+                matches!(
+                    &outcome,
+                    QuorumOutcome::Reached {
+                        acks,
+                        follower_watermark: CheckpointWatermark::Active(101),
+                    } if acks.as_slice() == [NodeId(2)]
+                ),
+                "the stale transport client must be evicted and re-resolved: {outcome:?}"
+            );
         }
 
         #[tokio::test]

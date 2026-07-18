@@ -178,6 +178,21 @@ async fn report_cluster_compute_fault(
     }
 }
 
+/// Queue only a fault that won lifecycle ownership before this runtime generation was cancelled.
+#[cfg(feature = "cluster")]
+fn queue_owned_cluster_compute_fault(
+    controller: &laminar_core::cluster::control::ClusterController,
+    pending: &std::sync::atomic::AtomicU64,
+    owns_fault_state: bool,
+    runtime_shutdown: &tokio_util::sync::CancellationToken,
+) -> Result<bool, String> {
+    if !owns_fault_state || runtime_shutdown.is_cancelled() {
+        return Ok(false);
+    }
+    crate::coordinated_recovery::queue_local_fault(controller, pending)?;
+    Ok(true)
+}
+
 /// Validate source durability and placement before the connector performs I/O.
 fn admit_source_contract(
     contract: SourceContract,
@@ -4283,6 +4298,8 @@ impl LaminarDB {
             let compute_fault_controller = self.cluster_controller.lock().clone();
             #[cfg(feature = "cluster")]
             let compute_fault_pending = Arc::clone(&self.pending_recovery_fault);
+            #[cfg(feature = "cluster")]
+            let compute_fault_runtime_shutdown = runtime_shutdown.clone();
             match std::thread::Builder::new()
                 .name("laminar-compute".into())
                 .spawn(move || {
@@ -4318,47 +4335,69 @@ impl LaminarDB {
                             crate::pipeline::ExitReason::Fault(msg.to_string())
                         }
                     };
-                    match &exit {
-                        crate::pipeline::ExitReason::Shutdown => {}
+                    let exit = match exit {
+                        crate::pipeline::ExitReason::Shutdown => {
+                            crate::pipeline::ExitReason::Shutdown
+                        }
                         crate::pipeline::ExitReason::Fault(reason) => {
-                            tracing::error!(
-                                reason = %reason,
-                                "pipeline faulted on a fatal cycle error; recovering from last checkpoint"
-                            );
+                            #[cfg(feature = "cluster")]
+                            if compute_fault_is_cluster {
+                                // Fence public restarts before publishing Faulted. The state CAS
+                                // then orders this fault against a concurrent coordinated stop.
+                                compute_fault_source_gate
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                                compute_fault_recovery_fence
+                                    .store(true, std::sync::atomic::Ordering::Release);
+                            }
+
                             // Publish before notifying the watcher. This closes the ready-send ->
                             // watcher-scheduled window in which start() could otherwise report
                             // Running after the compute loop had already exited.
-                            *fault_slot.lock() = Some(reason.clone());
+                            let owns_fault_state = publish_runtime_fault_state(&fault_state);
                             #[cfg(feature = "cluster")]
-                            if compute_fault_is_cluster {
-                                // The public start path rechecks this bit while holding the
-                                // startup claim. Publish it before Faulted so no local restart can
-                                // claim the failed cluster generation ahead of the monitor.
-                                compute_fault_source_gate
-                                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                                compute_fault_recovery_fence
-                                    .store(true, std::sync::atomic::Ordering::Release);
-                                if let Some(controller) = compute_fault_controller.as_deref() {
-                                    if let Err(error) = crate::coordinated_recovery::queue_local_fault(
-                                        controller,
-                                        &compute_fault_pending,
-                                    ) {
-                                        tracing::error!(%error, "could not allocate a recovery fault request");
+                            let covered_by_terminal_stop = compute_fault_is_cluster
+                                && !owns_fault_state
+                                && compute_fault_runtime_shutdown.is_cancelled()
+                                && DbState::load(&fault_state) == DbState::ShuttingDown;
+                            #[cfg(not(feature = "cluster"))]
+                            let covered_by_terminal_stop = false;
+
+                            if covered_by_terminal_stop {
+                                crate::pipeline::ExitReason::Shutdown
+                            } else {
+                                tracing::error!(
+                                    reason = %reason,
+                                    "pipeline faulted on a fatal cycle error; recovering from last checkpoint"
+                                );
+                                *fault_slot.lock() = Some(reason.clone());
+                                #[cfg(feature = "cluster")]
+                                if compute_fault_is_cluster {
+                                    if let Some(controller) = compute_fault_controller.as_deref() {
+                                        if let Err(error) = queue_owned_cluster_compute_fault(
+                                            controller,
+                                            &compute_fault_pending,
+                                            owns_fault_state,
+                                            &compute_fault_runtime_shutdown,
+                                        ) {
+                                            tracing::error!(
+                                                %error,
+                                                "could not allocate a recovery fault request"
+                                            );
+                                        }
                                     }
+                                    // A Release may have raced the close-before-queue edge.
+                                    compute_fault_source_gate
+                                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                                    compute_fault_recovery_fence
+                                        .store(true, std::sync::atomic::Ordering::Release);
                                 }
-                                // A Release may have raced the close-before-queue edge. Reassert
-                                // both local fences after the replacement request is visible.
-                                compute_fault_source_gate
-                                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                                compute_fault_recovery_fence
-                                    .store(true, std::sync::atomic::Ordering::Release);
-                            }
-                            publish_runtime_fault_state(&fault_state);
-                            if let Some(ref m) = fault_metrics {
-                                m.pipeline_faults_total.inc();
+                                if let Some(ref metrics) = fault_metrics {
+                                    metrics.pipeline_faults_total.inc();
+                                }
+                                crate::pipeline::ExitReason::Fault(reason)
                             }
                         }
-                    }
+                    };
                     done_tx.send(exit);
                 }) {
                 Ok(_) => {}
@@ -7139,7 +7178,10 @@ mod mv_recovery_lifecycle_tests {
 
 #[cfg(all(test, feature = "cluster"))]
 mod cluster_fault_watcher_tests {
-    use super::report_cluster_compute_fault;
+    use super::{
+        publish_runtime_fault_state, queue_owned_cluster_compute_fault,
+        report_cluster_compute_fault,
+    };
     use crate::db::DbState;
     use crate::{ClusterStartupDisposition, LaminarDB};
     use async_trait::async_trait;
@@ -7883,6 +7925,39 @@ mod cluster_fault_watcher_tests {
                 phase: RecoverPhase::Prepare,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_arbitration_queues_only_a_live_generation_that_won_faulted() {
+        let (_db, controller, _kv, _members, _round, _manifest_store, _proof) = startup_db().await;
+        let pending = AtomicU64::new(0);
+        let stopped_state = std::sync::atomic::AtomicU8::new(DbState::ShuttingDown as u8);
+        let stopped_generation = tokio_util::sync::CancellationToken::new();
+        stopped_generation.cancel();
+        let stopped_owned = publish_runtime_fault_state(&stopped_state);
+        assert!(!stopped_owned);
+        assert!(!queue_owned_cluster_compute_fault(
+            &controller,
+            &pending,
+            stopped_owned,
+            &stopped_generation,
+        )
+        .unwrap());
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+
+        let running_state = std::sync::atomic::AtomicU8::new(DbState::Running as u8);
+        let running_generation = tokio_util::sync::CancellationToken::new();
+        let running_owned = publish_runtime_fault_state(&running_state);
+        assert!(running_owned);
+        assert_eq!(DbState::load(&running_state), DbState::Faulted);
+        assert!(queue_owned_cluster_compute_fault(
+            &controller,
+            &pending,
+            running_owned,
+            &running_generation,
+        )
+        .unwrap());
+        assert_ne!(pending.load(Ordering::Acquire), 0);
     }
 }
 
