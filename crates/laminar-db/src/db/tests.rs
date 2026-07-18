@@ -67,6 +67,10 @@ async fn install_test_process_and_leader_authority(
     controller
         .set_process_lease_authority(process_authority)
         .unwrap();
+    controller
+        .publish_leased_recovery_incarnation(&process_lease)
+        .await
+        .unwrap();
 
     let leader_authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&store), 30_000));
     let leader_owner = LeaderLeaseOwner {
@@ -96,82 +100,127 @@ async fn install_test_process_and_leader_authority(
 
 #[cfg(feature = "cluster")]
 #[derive(Debug)]
-struct FaultAuditKv {
-    inner: laminar_core::cluster::control::InMemoryKv,
-    fault_scan_mode: std::sync::atomic::AtomicU8,
-    fault_scan_started: tokio::sync::Notify,
+struct FaultAuditStore {
+    inner: Arc<dyn object_store::ObjectStore>,
+    authority_read_mode: std::sync::atomic::AtomicU8,
+    authority_read_started: tokio::sync::Notify,
 }
 
 #[cfg(feature = "cluster")]
-impl FaultAuditKv {
+impl FaultAuditStore {
     const NORMAL: u8 = 0;
     const FAIL: u8 = 1;
     const STALL: u8 = 2;
 
-    fn new(local_id: laminar_core::cluster::discovery::NodeId) -> Self {
+    fn new(inner: Arc<dyn object_store::ObjectStore>) -> Self {
         Self {
-            inner: laminar_core::cluster::control::InMemoryKv::new(local_id),
-            fault_scan_mode: std::sync::atomic::AtomicU8::new(0),
-            fault_scan_started: tokio::sync::Notify::new(),
+            inner,
+            authority_read_mode: std::sync::atomic::AtomicU8::new(Self::NORMAL),
+            authority_read_started: tokio::sync::Notify::new(),
         }
     }
 
-    fn fail_fault_scans(&self) {
-        self.fault_scan_mode
+    fn fail_authority_reads(&self) {
+        self.authority_read_mode
             .store(Self::FAIL, std::sync::atomic::Ordering::Release);
     }
 
-    fn stall_fault_scans(&self) {
-        self.fault_scan_mode
+    fn stall_authority_reads(&self) {
+        self.authority_read_mode
             .store(Self::STALL, std::sync::atomic::Ordering::Release);
     }
 
-    fn restore_fault_scans(&self) {
-        self.fault_scan_mode
+    fn restore_authority_reads(&self) {
+        self.authority_read_mode
             .store(Self::NORMAL, std::sync::atomic::Ordering::Release);
     }
 }
 
 #[cfg(feature = "cluster")]
+impl std::fmt::Display for FaultAuditStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("FaultAuditStore")
+    }
+}
+
+#[cfg(feature = "cluster")]
 #[async_trait::async_trait]
-impl laminar_core::cluster::control::ClusterKv for FaultAuditKv {
-    async fn write(&self, key: &str, value: String) {
-        laminar_core::cluster::control::ClusterKv::write(&self.inner, key, value).await;
-    }
-
-    async fn read_from(
+impl object_store::ObjectStore for FaultAuditStore {
+    async fn put_opts(
         &self,
-        who: laminar_core::cluster::discovery::NodeId,
-        key: &str,
-    ) -> Option<String> {
-        laminar_core::cluster::control::ClusterKv::read_from(&self.inner, who, key).await
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        options: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, options).await
     }
 
-    async fn scan(&self, key: &str) -> Vec<(laminar_core::cluster::discovery::NodeId, String)> {
-        laminar_core::cluster::control::ClusterKv::scan(&self.inner, key).await
-    }
-
-    async fn scan_checked(
+    async fn put_multipart_opts(
         &self,
-        key: &str,
-    ) -> Result<Vec<(laminar_core::cluster::discovery::NodeId, String)>, String> {
-        if key == "control:fault-report" {
+        location: &object_store::path::Path,
+        options: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if location.as_ref().starts_with("control/leader-lease/") {
             match self
-                .fault_scan_mode
+                .authority_read_mode
                 .load(std::sync::atomic::Ordering::Acquire)
             {
                 Self::FAIL => {
-                    self.fault_scan_started.notify_one();
-                    return Err("injected fault audit failure".into());
+                    self.authority_read_started.notify_one();
+                    return Err(object_store::Error::Generic {
+                        store: "FaultAuditStore",
+                        source: Box::new(std::io::Error::other("injected authority audit failure")),
+                    });
                 }
                 Self::STALL => {
-                    self.fault_scan_started.notify_one();
+                    self.authority_read_started.notify_one();
                     return std::future::pending().await;
                 }
                 _ => {}
             }
         }
-        Ok(laminar_core::cluster::control::ClusterKv::scan(&self.inner, key).await)
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
     }
 }
 
@@ -179,7 +228,7 @@ impl laminar_core::cluster::control::ClusterKv for FaultAuditKv {
 struct FaultAuditActivationFixture {
     db: Arc<LaminarDB>,
     controller: Arc<laminar_core::cluster::control::ClusterController>,
-    recovery: Arc<FaultAuditKv>,
+    authority: Arc<FaultAuditStore>,
     sender: Arc<laminar_core::shuffle::ShuffleSender>,
     receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
     fence: laminar_core::checkpoint::CheckpointAssignmentFence,
@@ -188,20 +237,20 @@ struct FaultAuditActivationFixture {
 #[cfg(feature = "cluster")]
 async fn fault_audit_activation_fixture() -> FaultAuditActivationFixture {
     use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
-    use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+    use laminar_core::cluster::control::{
+        ClusterController, ClusterKv, InMemoryKv, LeaderLeaseStore,
+    };
     use laminar_core::cluster::discovery::{NodeId, NodeInfo};
     use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
     use laminar_core::state::{InProcessBackend, NodeId as StateNodeId, VnodeRegistry};
 
     let node_id = NodeId(1);
     let boot = uuid::Uuid::from_u128(11);
-    let control: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node_id));
-    let recovery = Arc::new(FaultAuditKv::new(node_id));
-    let recovery_kv: Arc<dyn ClusterKv> = recovery.clone();
+    let recovery_kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node_id));
     let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
     let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
         node_id,
-        control,
+        Arc::clone(&recovery_kv),
         recovery_kv,
         None,
         members_rx,
@@ -213,6 +262,12 @@ async fn fault_audit_activation_fixture() -> FaultAuditActivationFixture {
     let authority_store: Arc<dyn object_store::ObjectStore> =
         Arc::new(object_store::memory::InMemory::new());
     install_test_process_and_leader_authority(&controller, Arc::clone(&authority_store)).await;
+    let authority = Arc::new(FaultAuditStore::new(Arc::clone(&authority_store)));
+    let authority_object_store: Arc<dyn object_store::ObjectStore> = authority.clone();
+    controller.set_leader_lease_store(Arc::new(LeaderLeaseStore::new(
+        authority_object_store,
+        30_000,
+    )));
 
     let registry = Arc::new(VnodeRegistry::single_owner(1, StateNodeId(node_id.0)));
     let fence = CheckpointAssignmentFence::from_owner_map(
@@ -245,7 +300,7 @@ async fn fault_audit_activation_fixture() -> FaultAuditActivationFixture {
     FaultAuditActivationFixture {
         db,
         controller,
-        recovery,
+        authority,
         sender,
         receiver,
         fence,
@@ -281,7 +336,7 @@ fn assert_fault_audit_withdrew_authority(
 
 #[cfg(feature = "cluster")]
 async fn assert_fault_audit_retry_reopens(fixture: &FaultAuditActivationFixture) {
-    fixture.recovery.restore_fault_scans();
+    fixture.authority.restore_authority_reads();
     let revision = fixture
         .db
         .assignment_authority_revision
@@ -921,7 +976,7 @@ async fn assignment_activation_withdraws_partial_authority_when_fault_audit_fail
         .db
         .assignment_authority_revision
         .load(std::sync::atomic::Ordering::Acquire);
-    fixture.recovery.fail_fault_scans();
+    fixture.authority.fail_authority_reads();
 
     let error = fixture
         .db
@@ -934,7 +989,9 @@ async fn assignment_activation_withdraws_partial_authority_when_fault_audit_fail
         .await
         .unwrap_err();
 
-    assert!(error.to_string().contains("injected fault audit failure"));
+    assert!(error
+        .to_string()
+        .contains("injected authority audit failure"));
     assert_fault_audit_withdrew_authority(&fixture, initial_revision);
     assert_fault_audit_retry_reopens(&fixture).await;
 }
@@ -947,7 +1004,7 @@ async fn assignment_activation_withdraws_partial_authority_when_fault_audit_time
         .db
         .assignment_authority_revision
         .load(std::sync::atomic::Ordering::Acquire);
-    fixture.recovery.stall_fault_scans();
+    fixture.authority.stall_authority_reads();
     let db = Arc::clone(&fixture.db);
     let fence = fixture.fence.clone();
     let activation = tokio::spawn(async move {
@@ -960,7 +1017,7 @@ async fn assignment_activation_withdraws_partial_authority_when_fault_audit_time
         .await
     });
 
-    fixture.recovery.fault_scan_started.notified().await;
+    fixture.authority.authority_read_started.notified().await;
     assert_eq!(
         fixture.sender.active_assignment_digest(),
         Some(fixture.fence.digest())
@@ -6890,6 +6947,7 @@ fn catalog_authority_controller(
     };
     let (lease_tx, lease_rx) = tokio::sync::watch::channel(Some(LeaderLease {
         seq: 1,
+        renewal_sequence: 1,
         token: 1,
         owner: observed_owner,
         expires_at_ms: i64::MAX,

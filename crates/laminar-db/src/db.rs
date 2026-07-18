@@ -315,8 +315,8 @@ pub struct LaminarDB {
     /// report's quiescence claim.
     #[cfg(feature = "cluster")]
     pub(crate) coordinated_recovery_fenced: Arc<std::sync::atomic::AtomicBool>,
-    /// Stable sequence for a local fault whose durable recovery report has not yet been
-    /// acknowledged. The database-owned recovery monitor retries this exact value.
+    /// Opaque local fault request retained through durable publication and cleared only while an
+    /// authorized committed recovery Release is consumed. A newer fault atomically replaces it.
     #[cfg(feature = "cluster")]
     pub(crate) pending_recovery_fault: Arc<std::sync::atomic::AtomicU64>,
     /// Epoch the most recent start restored from (`None` = started fresh). A rejoin fault

@@ -124,12 +124,14 @@ async fn close_local_assignment_authority(
     Ok(())
 }
 
-async fn ensure_local_recovery_fault(controller: &ClusterController) -> Result<(), String> {
+async fn ensure_local_recovery_fault(
+    db: &LaminarDB,
+    controller: &ClusterController,
+) -> Result<(), String> {
     controller.set_recovering(true);
-    if controller.read_local_fault_report().await?.is_none() {
-        crate::coordinated_recovery::report_local_fault(controller).await?;
-    }
-    Ok(())
+    crate::coordinated_recovery::request_local_fault(controller, &db.pending_recovery_fault)
+        .await
+        .map(|_| ())
 }
 
 /// Fail closed for a transient durable snapshot read without forcing a new assignment version.
@@ -504,7 +506,7 @@ pub fn spawn_snapshot_watcher(
                             warn!(%error, version = snap.version, "snapshot watcher: could not fence recovery assignment");
                             continue;
                         }
-                        if let Err(error) = ensure_local_recovery_fault(controller).await {
+                        if let Err(error) = ensure_local_recovery_fault(&db, controller).await {
                             assignment_invalidated = true;
                             warn!(%error, version = snap.version, "snapshot watcher: could not publish recovery fault");
                             continue;
@@ -1595,7 +1597,7 @@ async fn materialize_recovery_decision(
 ) -> Result<Option<u64>, String> {
     let deadline = tokio::time::Instant::now() + operation_timeout;
     close_local_assignment_authority(db, Some(controller), deadline).await?;
-    ensure_local_recovery_fault(controller).await?;
+    ensure_local_recovery_fault(db, controller).await?;
     let proposal =
         tokio::time::timeout_at(deadline, store.load_recovery_proposal(&decision.proposal))
             .await
@@ -2772,16 +2774,39 @@ mod tests {
             )
             .unwrap(),
         );
+        let mut local_lease = None;
         for participant in participants {
-            authority
+            let outcome = authority
                 .store_for(NodeId(participant.node_id))
                 .try_acquire(participant.boot_incarnation, 0)
                 .await
+                .unwrap();
+            if participant.node_id == controller.instance_id().0 {
+                let laminar_core::cluster::control::ProcessLeaseOutcome::Acquired(lease) = outcome
+                else {
+                    panic!("local test process lease must be acquired");
+                };
+                local_lease = Some(lease);
+            }
+        }
+        if controller.process_lease_deadline().is_none() {
+            controller
+                .set_process_lease_deadline(Arc::new(
+                    laminar_core::cluster::control::LeaseDeadline::live_for(Duration::from_secs(
+                        60,
+                    )),
+                ))
                 .unwrap();
         }
         controller
             .set_process_lease_authority(Arc::clone(&authority))
             .unwrap();
+        if let Some(lease) = local_lease {
+            controller
+                .publish_leased_recovery_incarnation(&lease)
+                .await
+                .unwrap();
+        }
         authority
     }
 
@@ -2936,8 +2961,6 @@ mod tests {
             members_rx,
             self_process.boot_incarnation,
         ));
-        controller.publish_recovery_incarnation().await.unwrap();
-        controller.set_active(true);
         let process_authority = Arc::new(
             laminar_core::cluster::control::ProcessLeaseAuthority::new(
                 Arc::clone(&shared_store),
@@ -2955,6 +2978,12 @@ mod tests {
                 laminar_core::cluster::control::ProcessLeaseOutcome::Acquired(_)
             ));
         }
+        let local_process_lease = process_authority
+            .store_for(self_id)
+            .load()
+            .await
+            .unwrap()
+            .expect("local test process lease must be durable");
         controller
             .set_process_lease_authority(Arc::clone(&process_authority))
             .unwrap();
@@ -2973,6 +3002,10 @@ mod tests {
         };
         let _leader_lease =
             install_test_leadership(&controller, leader_authority, leader_owner, leader_lease);
+        controller
+            .publish_leased_recovery_incarnation(&local_process_lease)
+            .await
+            .unwrap();
 
         let vnode_count = u32::try_from(owners.len()).unwrap();
         let registry = Arc::new(VnodeRegistry::new_unassigned(vnode_count));
@@ -4247,6 +4280,16 @@ mod tests {
         controller
             .set_process_lease_authority(process_authority)
             .unwrap();
+        controller
+            .set_process_lease_deadline(Arc::new(
+                laminar_core::cluster::control::LeaseDeadline::live_for(Duration::from_secs(60)),
+            ))
+            .unwrap();
+        controller
+            .publish_leased_recovery_incarnation(&new_lease)
+            .await
+            .unwrap();
+        controller.set_active(true);
         let leader_authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&shared_store), 10_000));
         let leader_owner = laminar_core::cluster::control::LeaderLeaseOwner {
             node: self_id,

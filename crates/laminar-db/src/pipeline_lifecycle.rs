@@ -160,8 +160,8 @@ impl StartupAttempt {
 /// Hand a compute fault to cluster recovery without retaining pipeline lifecycle ownership.
 ///
 /// Recovery stops the pipeline by joining its watcher, so this path must never wait for an active
-/// recovery announcement to clear. A successful restore clears the report; a failed round leaves
-/// it available for retry.
+/// recovery announcement to clear. The request stays latched after publication until an authorized
+/// committed Release consumes it; a failed round leaves it available for retry.
 #[cfg(feature = "cluster")]
 async fn report_cluster_compute_fault(
     controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
@@ -1176,6 +1176,15 @@ impl LaminarDB {
             return;
         }
         let _transition = self.cluster_authority_transition.lock();
+        if self
+            .pending_recovery_fault
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+        {
+            self.source_gate
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
         let process_authority_live = !self.is_cluster_runtime()
             || self
                 .cluster_controller
@@ -1216,12 +1225,21 @@ impl LaminarDB {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    /// Release recovery lifecycle ownership only after the durable release terminal is consumed.
+    /// Release lifecycle ownership after terminal consumption unless a replacement fault won the
+    /// transition; its outstanding latch keeps public mutation fenced.
     #[cfg(feature = "cluster")]
     pub(crate) fn release_coordinated_recovery_lifecycle(&self) {
         let _lifecycle_claim = self.startup_attempt.lock();
         self.coordinated_recovery_fenced
             .store(false, std::sync::atomic::Ordering::Release);
+        if self
+            .pending_recovery_fault
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+        {
+            self.coordinated_recovery_fenced
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 
     fn ensure_pipeline_lifecycle_authorized(
@@ -1519,6 +1537,11 @@ impl LaminarDB {
     /// Returns an error if the database-owned control runtime cannot be initialized.
     #[cfg(feature = "cluster")]
     pub fn enable_coordinated_recovery(self: &Arc<Self>) -> Result<(), DbError> {
+        if !self.is_cluster_runtime() || self.cluster_controller.lock().is_none() {
+            return Err(DbError::Config(
+                "coordinated recovery requires a cluster runtime and controller".into(),
+            ));
+        }
         let runtime = self.control_runtime.handle()?;
         let mut owned = self.recovery_monitor.lock();
         if owned.as_ref().is_some_and(|monitor| !monitor.is_finished()) {
@@ -4316,11 +4339,19 @@ impl LaminarDB {
                                 compute_fault_recovery_fence
                                     .store(true, std::sync::atomic::Ordering::Release);
                                 if let Some(controller) = compute_fault_controller.as_deref() {
-                                    crate::coordinated_recovery::queue_local_fault(
+                                    if let Err(error) = crate::coordinated_recovery::queue_local_fault(
                                         controller,
                                         &compute_fault_pending,
-                                    );
+                                    ) {
+                                        tracing::error!(%error, "could not allocate a recovery fault request");
+                                    }
                                 }
+                                // A Release may have raced the close-before-queue edge. Reassert
+                                // both local fences after the replacement request is visible.
+                                compute_fault_source_gate
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                                compute_fault_recovery_fence
+                                    .store(true, std::sync::atomic::Ordering::Release);
                             }
                             publish_runtime_fault_state(&fault_state);
                             if let Some(ref m) = fault_metrics {
@@ -5320,7 +5351,13 @@ mod connector_admission_tests {
     #[cfg(feature = "cluster")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn coordinated_recovery_supervisor_is_owned_and_replaces_a_terminated_task() {
-        let db = LaminarDB::open().unwrap();
+        let controller = sink_open_authority(1);
+        let db = LaminarDB::builder()
+            .cluster_controller(controller)
+            .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
+            .build()
+            .await
+            .unwrap();
         let runtime = db.control_runtime.handle().unwrap();
         let finished = runtime.spawn(async {});
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -5341,6 +5378,20 @@ mod connector_admission_tests {
 
         db.shutdown().await.unwrap();
         assert!(db.recovery_monitor.lock().is_none());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn coordinated_recovery_supervisor_rejects_local_runtime() {
+        let db = LaminarDB::open().unwrap();
+
+        let error = db.enable_coordinated_recovery().unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("coordinated recovery requires a cluster runtime"));
+        assert!(db.recovery_monitor.lock().is_none());
+        db.shutdown().await.unwrap();
     }
 
     #[test]
@@ -7234,7 +7285,6 @@ mod cluster_fault_watcher_tests {
             None,
             members_rx,
         ));
-        controller.publish_recovery_incarnation().await.unwrap();
         let checkpoint_store: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::memory::InMemory::new());
         let process_authority = Arc::new(
@@ -7252,6 +7302,13 @@ mod cluster_fault_watcher_tests {
         controller
             .set_process_lease_authority(process_authority)
             .unwrap();
+        controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+            .unwrap();
+        controller
+            .publish_leased_recovery_incarnation(&process_lease)
+            .await
+            .unwrap();
         let authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&checkpoint_store), 10_000));
         let owner = LeaderLeaseOwner {
             node: node_id,
@@ -7263,9 +7320,6 @@ mod cluster_fault_watcher_tests {
             panic!("empty test authority must grant leadership");
         };
         let (_lease_tx, lease_rx) = tokio::sync::watch::channel(Some(lease.clone()));
-        controller
-            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
-            .unwrap();
         controller
             .set_leader_lease_watch(
                 lease_rx,
@@ -7290,6 +7344,7 @@ mod cluster_fault_watcher_tests {
             )
             .unwrap(),
             Vec::new(),
+            1,
             vec![RecoveryFault {
                 reporter: node_id,
                 sequence: 1,
@@ -7365,7 +7420,8 @@ mod cluster_fault_watcher_tests {
     #[tokio::test]
     async fn durable_fault_before_startup_audit_keeps_intake_closed() {
         let (db, controller, _kv, _members, _round, _manifest_store, _proof) = startup_db().await;
-        controller.report_fault(9).await.unwrap();
+        let request = controller.next_recovery_fault_request().unwrap();
+        controller.report_fault(request).await.unwrap();
 
         assert_eq!(
             db.finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(1))
@@ -7445,7 +7501,11 @@ mod cluster_fault_watcher_tests {
         assert!(sender.active_assignment_digest().is_none());
         assert_eq!(controller.checkpoint_assignment_fence(1), Some(fence));
         assert!(!controller.is_recovering());
-        assert!(controller.read_fault_reports().await.unwrap().is_empty());
+        assert_eq!(
+            db.pending_recovery_fault
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
     }
 
     #[tokio::test]

@@ -19,17 +19,19 @@ use laminar_core::checkpoint_decision::{
     CheckpointOutcome, CheckpointScope, CheckpointVerdict, RecordOutcomeResult,
 };
 use laminar_core::cluster::control::controller::{
-    RecoveryAnnouncement, RecoveryFault, RecoveryRound, RecoveryStoppedReport,
+    RecoveryAnnouncement, RecoveryFault, RecoveryFaultInventory, RecoveryRound,
+    RecoveryStoppedReport,
 };
 use laminar_core::cluster::control::{
-    ClusterController, RecoverPhase, RecoveryControlError, ReleaseCommitStatus,
+    ClusterController, RecoverPhase, RecoveryControlError, RecoveryFaultReportOutcome,
+    ReleaseCommitStatus,
 };
 use laminar_core::cluster::discovery::NodeId;
 
 use crate::LaminarDB;
 
-/// Healthy-state monitor cadence. Every worker point-reads only its own durable fault slot and the
-/// current recovery driver; the leader alone scans the cluster fault set.
+/// Healthy-state monitor cadence. Only the leader polls the shared fault inventory; followers use
+/// the replicated recovery intent unless they have a local settlement latch.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 // A peer may legitimately consume the full lifecycle, inventory, and durable stopped-report
 // budgets after observing Prepare. This is a failure-path ceiling; healthy quorums return at once.
@@ -52,94 +54,118 @@ const SELF_RESTORE_ATTEMPTS: u32 = 3;
 /// Recovery target meaning "no committed cut exists": start fresh.
 const GENESIS: u64 = 0;
 
-/// Boot-bound, process-local fault sequence. Wall-clock rollback cannot repeat it, and a same-id
-/// process restart changes the UUID-derived prefix.
-fn next_fault_sequence(controller: &ClusterController) -> u64 {
-    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let boot = controller.recovery_incarnation().as_u128();
-    let prefix = u64::try_from(boot & u128::from(u64::MAX)).unwrap_or_default()
-        ^ u64::try_from(boot >> 64).unwrap_or_default();
-    let sequence = SEQUENCE.fetch_add(1, Ordering::AcqRel);
-    prefix
-        .rotate_left(17)
-        .wrapping_add(sequence.wrapping_mul(0x9e37_79b9_7f4a_7c15))
-        .max(1)
+fn install_new_local_fault_request(
+    controller: &ClusterController,
+    pending: &std::sync::atomic::AtomicU64,
+) -> Result<u64, String> {
+    let request = controller.next_recovery_fault_request()?;
+    pending.fetch_max(request.sequence(), Ordering::AcqRel);
+    Ok(pending.load(Ordering::Acquire))
 }
 
-/// Retain one local-fault identity until its exact durable report is acknowledged. Reusing the
-/// sequence makes a retry idempotent when the first write succeeded but its acknowledgement was
-/// lost.
+/// Queue one new local fault event, atomically superseding an older outstanding request. The
+/// request remains latched until an authorized committed Release consumes it.
 pub(crate) fn queue_local_fault(
     controller: &ClusterController,
     pending: &std::sync::atomic::AtomicU64,
-) {
-    if pending.load(Ordering::Acquire) != 0 {
-        return;
-    }
-    let sequence = next_fault_sequence(controller);
-    let _ = pending.compare_exchange(0, sequence, Ordering::AcqRel, Ordering::Acquire);
+) -> Result<(), String> {
+    install_new_local_fault_request(controller, pending).map(|_| ())
 }
 
-async fn persist_local_fault(controller: &ClusterController, seq: u64) -> Result<(), String> {
-    match tokio::time::timeout(DECISION_IO_TIMEOUT, controller.report_fault(seq)).await {
-        Ok(Ok(())) => {
-            tracing::warn!(seq, "reported local fault for coordinated cluster recovery");
-            Ok(())
+fn retain_local_fault_request(
+    controller: &ClusterController,
+    pending: &std::sync::atomic::AtomicU64,
+) -> Result<u64, String> {
+    loop {
+        let observed = pending.load(Ordering::Acquire);
+        if observed != 0 {
+            return Ok(observed);
+        }
+        let request = controller.next_recovery_fault_request()?.sequence();
+        match pending.compare_exchange(0, request, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Ok(request),
+            Err(concurrent) if concurrent != 0 => return Ok(concurrent),
+            Err(_) => {}
+        }
+    }
+}
+
+async fn persist_local_fault(
+    controller: &ClusterController,
+    raw_request: u64,
+) -> Result<RecoveryFaultReportOutcome, String> {
+    let request = controller.recovery_fault_request(raw_request)?;
+    match tokio::time::timeout(DECISION_IO_TIMEOUT, controller.report_fault(request)).await {
+        Ok(Ok(outcome)) => {
+            if outcome == RecoveryFaultReportOutcome::Active {
+                tracing::warn!(
+                    request_ordinal = raw_request,
+                    "reported local fault for coordinated cluster recovery"
+                );
+            }
+            Ok(outcome)
         }
         Ok(Err(error)) => {
-            tracing::error!(seq, %error, "could not persist local recovery fault");
+            tracing::error!(request_ordinal = raw_request, %error, "could not persist local recovery fault");
             Err(error)
         }
         Err(_) => Err("local recovery fault publication timed out".into()),
     }
 }
 
-/// Retry a queued local fault and clear it only after the exact write and read-back succeed.
-pub(crate) async fn flush_pending_local_fault(
+/// Publish the exact queued request without clearing its terminal-discovery latch.
+async fn flush_pending_local_fault(
     controller: &ClusterController,
     pending: &std::sync::atomic::AtomicU64,
 ) -> Result<(), String> {
-    let sequence = pending.load(Ordering::Acquire);
-    if sequence == 0 {
+    let raw_request = pending.load(Ordering::Acquire);
+    if raw_request == 0 {
         return Ok(());
     }
-    persist_local_fault(controller, sequence).await?;
-    let _ = pending.compare_exchange(sequence, 0, Ordering::AcqRel, Ordering::Acquire);
-    Ok(())
+    persist_local_fault(controller, raw_request)
+        .await
+        .map(|_| ())
 }
 
-/// Queue a stable local fault and make one bounded durable publication attempt.
+/// Coalesce a duplicate notification into the outstanding request and make one bounded durable
+/// publication attempt.
 pub(crate) async fn request_local_fault(
     controller: &ClusterController,
     pending: &std::sync::atomic::AtomicU64,
-) -> Result<(), String> {
-    queue_local_fault(controller, pending);
-    flush_pending_local_fault(controller, pending).await
+) -> Result<u64, String> {
+    let raw_request = retain_local_fault_request(controller, pending)?;
+    match persist_local_fault(controller, raw_request).await? {
+        RecoveryFaultReportOutcome::Active => Ok(raw_request),
+        RecoveryFaultReportOutcome::AlreadyCleared
+        | RecoveryFaultReportOutcome::CoveredByNewerRequest => {
+            let concurrent = pending.load(Ordering::Acquire);
+            let fresh_request = if concurrent != 0 && concurrent != raw_request {
+                concurrent
+            } else {
+                install_new_local_fault_request(controller, pending)?
+            };
+            match persist_local_fault(controller, fresh_request).await? {
+                RecoveryFaultReportOutcome::Active => Ok(fresh_request),
+                RecoveryFaultReportOutcome::AlreadyCleared
+                | RecoveryFaultReportOutcome::CoveredByNewerRequest => Err(format!(
+                    "fresh recovery fault request {fresh_request} was settled before it became active"
+                )),
+            }
+        }
+    }
 }
 
-/// Publish a fault so the leader drives a global restart; this node's monitor then
-/// restores it on observing the round.
-pub(crate) async fn report_local_fault(controller: &ClusterController) -> Result<(), String> {
-    persist_local_fault(controller, next_fault_sequence(controller)).await
-}
-
-/// A fresh identity, not the boot nonce: the leader already handled that one, so only a new value
-/// drives the round an orphaned node needs.
-async fn report_fresh_fault(controller: &ClusterController) -> bool {
-    let seq = next_fault_sequence(controller);
-    match tokio::time::timeout(DECISION_IO_TIMEOUT, controller.report_fault(seq)).await {
-        Ok(Ok(())) => {
-            tracing::warn!(seq, "reported fresh fault after an orphaned recovery round");
-            true
-        }
-        Ok(Err(error)) => {
-            tracing::error!(seq, %error, "could not persist fresh recovery fault");
-            false
-        }
-        Err(_) => {
-            tracing::error!(seq, "fresh recovery fault publication timed out");
-            false
-        }
+async fn request_fresh_local_fault(
+    controller: &ClusterController,
+    pending: &std::sync::atomic::AtomicU64,
+) -> Result<u64, String> {
+    let raw_request = install_new_local_fault_request(controller, pending)?;
+    match persist_local_fault(controller, raw_request).await? {
+        RecoveryFaultReportOutcome::Active => Ok(raw_request),
+        RecoveryFaultReportOutcome::AlreadyCleared
+        | RecoveryFaultReportOutcome::CoveredByNewerRequest => Err(format!(
+            "fresh recovery fault request {raw_request} was settled before it became active"
+        )),
     }
 }
 
@@ -168,7 +194,11 @@ pub(crate) fn spawn_monitor(db: &Arc<LaminarDB>, runtime: &Handle) -> tokio::tas
             let controller = { db.cluster_controller.lock().clone() };
             if let Some(controller) = controller {
                 controller.set_recovering(true);
-                report_fresh_fault(&controller).await;
+                if let Err(error) =
+                    request_fresh_local_fault(&controller, &db.pending_recovery_fault).await
+                {
+                    tracing::error!(%error, "could not persist monitor restart fault");
+                }
             }
             tracing::error!(
                 "coordinated recovery monitor panicked; intake fenced and monitor restarting"
@@ -196,6 +226,9 @@ struct RecoveryMonitor {
     restored_for: Option<(RecoveryAnnouncement, tokio::time::Instant)>,
     /// Deduplicates a persistent malformed/conflicting control-plane report.
     last_protocol_error: Option<String>,
+    /// Exact in-process request whose authority publication succeeded. It suppresses redundant
+    /// writes while the durable outstanding-request latch remains unchanged.
+    published_local_request: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,74 +267,45 @@ impl RecoveryMonitor {
                 continue;
             };
 
-            self.publish_pending_local_fault(&db, &controller).await;
+            let pending_published = self.publish_pending_local_fault(&db, &controller).await;
+            if db.pending_recovery_fault.load(Ordering::Acquire) != 0 && !pending_published {
+                continue;
+            }
             if self.fault_audit_unknown {
                 self.hold_fault_fence(&db, &controller);
-                if report_fresh_fault(&controller).await {
+                if pending_published
+                    || (db.pending_recovery_fault.load(Ordering::Acquire) == 0
+                        && self.request_fresh_fault(&db, &controller).await)
+                {
                     self.fault_audit_unknown = false;
                 }
                 continue;
             }
-            let local_pending = match self.pending_local_fault(&controller).await {
-                Ok(pending) => pending.into_iter().collect::<Vec<_>>(),
+            let local_fault = match self.pending_local_fault_if_queued(&db, &controller).await {
+                Ok(pending) => pending,
                 Err(error) => {
                     tracing::error!(%error, "could not read the local recovery fault report");
                     self.hold_for_unknown_fault_audit(&db, &controller).await;
                     continue;
                 }
             };
+            let local_pending = local_fault.into_iter().collect::<Vec<_>>();
             self.hold_for_visible_or_queued_fault(&db, &controller, &local_pending);
-            self.observe(&db, &controller).await;
+            self.observe(&db, &controller, local_fault).await;
             if !controller.is_leader() {
                 continue;
             }
-            let reported = match self.reported_faults(&controller).await {
-                Ok(reported) => reported,
+            let inventory = match self.fault_inventory(&controller).await {
+                Ok(inventory) => inventory,
                 Err(error) => {
                     tracing::error!(%error, "could not read cluster recovery fault reports");
                     self.hold_for_unknown_fault_audit(&db, &controller).await;
                     continue;
                 }
             };
+            let reported = inventory.faults().to_vec();
             let pending = self.unhandled_faults(&reported);
             self.hold_for_visible_or_queued_fault(&db, &controller, &pending);
-            // A committed release is immutable authority state, not a mutable driver-slot phase.
-            // Do not overwrite it while any covered fault report is still waiting to consume it.
-            let terminal = if reported.is_empty() {
-                Ok(None)
-            } else {
-                match tokio::time::timeout(
-                    DECISION_IO_TIMEOUT,
-                    controller.latest_committed_recover_release(),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => Err(RecoveryControlError::Uncertain(
-                        "recovery release authority read timed out".into(),
-                    )),
-                }
-            };
-            match terminal {
-                Ok(Some(terminal))
-                    if reported
-                        .iter()
-                        .any(|fault| terminal.round.faults.contains(fault))
-                        && round_assignment_is_current(&db, &controller, &terminal.round) =>
-                {
-                    continue;
-                }
-                Err(RecoveryControlError::Uncertain(error)) => {
-                    tracing::warn!(%error, "recovery release authority is temporarily unreadable");
-                    continue;
-                }
-                Err(RecoveryControlError::Conflict(error)) => {
-                    tracing::error!(%error, "recovery release authority is invalid");
-                    self.hold_for_unknown_fault_audit(&db, &controller).await;
-                    continue;
-                }
-                Err(RecoveryControlError::Superseded(_)) | Ok(_) => {}
-            }
 
             // `drive_round` owns every nonterminal local Prepare/Start synchronously. Seeing
             // one here means that owner disappeared or returned early. Retire only the exact
@@ -315,10 +319,12 @@ impl RecoveryMonitor {
                 Ok(result) => match result {
                     Ok(Some(active)) if controller.recovery_driver_is_current(&active.round) => {
                         match active.phase {
-                            RecoverPhase::Release { .. } if active.round.faults == pending => {
-                                // `observe` owns retrying the retained prepare/commit barrier. Do not
-                                // overwrite it merely because its covered reports remain intentionally
-                                // nonzero until the terminal is consumed locally.
+                            RecoverPhase::Release { .. }
+                                if active.round.fault_revision() == inventory.revision()
+                                    && active.round.faults == reported =>
+                            {
+                                // `observe` owns retrying the retained prepare/commit barrier. Do
+                                // not overwrite the exact still-active pre-commit fault inventory.
                                 continue;
                             }
                             RecoverPhase::Release { .. }
@@ -327,7 +333,7 @@ impl RecoveryMonitor {
                                 if active.round.id.driver == controller.instance_id() =>
                             {
                                 let _ = controller.clear_recover(&active.round).await;
-                                if !report_fresh_fault(&controller).await {
+                                if !self.request_fresh_fault(&db, &controller).await {
                                     self.fault_audit_unknown = true;
                                 }
                             }
@@ -345,7 +351,8 @@ impl RecoveryMonitor {
                 },
             }
             if !pending.is_empty() {
-                self.drive_round(&db, &controller, pending).await;
+                self.drive_round(&db, &controller, inventory.revision(), reported)
+                    .await;
             }
         }
     }
@@ -354,19 +361,74 @@ impl RecoveryMonitor {
         &mut self,
         db: &LaminarDB,
         controller: &ClusterController,
-    ) {
-        if db.pending_recovery_fault.load(Ordering::Acquire) == 0 {
-            return;
+    ) -> bool {
+        let raw_request = db.pending_recovery_fault.load(Ordering::Acquire);
+        if raw_request == 0 {
+            self.published_local_request = None;
+            return false;
         }
         self.hold_fault_fence(db, controller);
+        if self.published_local_request == Some(raw_request) {
+            return true;
+        }
         if let Err(error) = flush_pending_local_fault(controller, &db.pending_recovery_fault).await
         {
             tracing::warn!(%error, "queued local fault remains pending durable publication");
+            return false;
+        }
+        self.cache_published_local_request(db, raw_request)
+    }
+
+    async fn request_fresh_fault(
+        &mut self,
+        db: &LaminarDB,
+        controller: &ClusterController,
+    ) -> bool {
+        self.published_local_request = None;
+        match request_fresh_local_fault(controller, &db.pending_recovery_fault).await {
+            Ok(raw_request) => self.cache_published_local_request(db, raw_request),
+            Err(error) => {
+                tracing::warn!(%error, "fresh recovery fault remains queued for publication retry");
+                false
+            }
+        }
+    }
+
+    async fn ensure_fault_request(
+        &mut self,
+        db: &LaminarDB,
+        controller: &ClusterController,
+    ) -> bool {
+        let pending = db.pending_recovery_fault.load(Ordering::Acquire);
+        if pending != 0 && self.published_local_request == Some(pending) {
+            return true;
+        }
+        match request_local_fault(controller, &db.pending_recovery_fault).await {
+            Ok(raw_request) => self.cache_published_local_request(db, raw_request),
+            Err(error) => {
+                tracing::warn!(%error, "recovery fault remains queued for publication retry");
+                false
+            }
+        }
+    }
+
+    fn cache_published_local_request(&mut self, db: &LaminarDB, raw_request: u64) -> bool {
+        if raw_request != 0 && db.pending_recovery_fault.load(Ordering::Acquire) == raw_request {
+            self.published_local_request = Some(raw_request);
+            true
+        } else {
+            self.published_local_request = None;
+            false
         }
     }
 
     /// Act on the leader's announcement: stop on `Prepare`, restore on `Start`.
-    async fn observe(&mut self, db: &Arc<LaminarDB>, controller: &ClusterController) {
+    async fn observe(
+        &mut self,
+        db: &Arc<LaminarDB>,
+        controller: &ClusterController,
+        local_fault: Option<RecoveryFault>,
+    ) {
         if let Some(start) = self.restored_for.as_ref().map(|(start, _)| start.clone()) {
             if let RecoverPhase::Start { epoch } = start.phase {
                 let terminal = tokio::time::timeout(
@@ -403,78 +465,74 @@ impl RecoveryMonitor {
                 }
             }
         } else {
-            let local_fault = tokio::time::timeout(
-                DECISION_IO_TIMEOUT,
-                controller.read_local_fault_report_control(),
-            )
-            .await;
-            match local_fault {
-                Err(_) => {
-                    controller.set_recovering(true);
-                    db.set_source_gate(true);
-                    return;
-                }
-                Ok(result) => match result {
-                    Ok(Some(sequence)) => {
-                        let terminal = tokio::time::timeout(
-                            DECISION_IO_TIMEOUT,
-                            controller.latest_committed_recover_release(),
-                        )
-                        .await;
-                        match terminal {
-                            Err(_) => {
-                                controller.set_recovering(true);
-                                db.set_source_gate(true);
-                                return;
-                            }
-                            Ok(result) => match result {
-                                Ok(Some(terminal))
-                                    if terminal.round.fault_sequence(controller.instance_id())
-                                        == Some(sequence)
-                                        && !controller.recovery_round_contains_current_process(
-                                            &terminal.round,
-                                        )
-                                        && round_assignment_is_current(
-                                            db,
-                                            controller,
-                                            &terminal.round,
-                                        ) =>
-                                {
-                                    self.last_protocol_error = None;
-                                    self.observe_nonparticipant_release(db, controller, &terminal)
-                                        .await;
-                                    return;
-                                }
-                                Ok(_) | Err(RecoveryControlError::Superseded(_)) => {}
-                                Err(RecoveryControlError::Uncertain(error)) => {
-                                    controller.set_recovering(true);
-                                    db.set_source_gate(true);
-                                    tracing::warn!(%error, "committed recovery release is temporarily unreadable");
-                                    return;
-                                }
-                                Err(RecoveryControlError::Conflict(error)) => {
-                                    self.hold_for_protocol_error(db, controller, error).await;
-                                    return;
-                                }
-                            },
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        match error {
-                            RecoveryControlError::Uncertain(error) => {
-                                controller.set_recovering(true);
-                                db.set_source_gate(true);
-                                tracing::warn!(%error, "local recovery fault is temporarily unreadable");
-                            }
-                            RecoveryControlError::Conflict(error)
-                            | RecoveryControlError::Superseded(error) => {
-                                self.hold_for_protocol_error(db, controller, error).await;
-                            }
-                        }
+            let pending_request = db.pending_recovery_fault.load(Ordering::Acquire);
+            let stopped_round = self.stopped_for.as_ref().map(|(round, _)| round);
+            let needs_terminal_settlement =
+                local_fault.is_some() || pending_request != 0 || stopped_round.is_some();
+            if needs_terminal_settlement {
+                let terminal = match tokio::time::timeout(
+                    DECISION_IO_TIMEOUT,
+                    controller.latest_committed_recover_release(),
+                )
+                .await
+                {
+                    Err(_) => {
+                        controller.set_recovering(true);
+                        db.set_source_gate(true);
                         return;
                     }
-                },
+                    Ok(Ok(terminal)) => terminal,
+                    Ok(Err(RecoveryControlError::Superseded(_))) => None,
+                    Ok(Err(RecoveryControlError::Uncertain(error))) => {
+                        controller.set_recovering(true);
+                        db.set_source_gate(true);
+                        tracing::warn!(%error, "committed recovery release is temporarily unreadable");
+                        return;
+                    }
+                    Ok(Err(RecoveryControlError::Conflict(error))) => {
+                        self.hold_for_protocol_error(db, controller, error).await;
+                        return;
+                    }
+                };
+
+                if let Some(terminal) = terminal {
+                    let covered_fault = terminal.round.fault_sequence(controller.instance_id());
+                    let active_fault_matches =
+                        local_fault.is_some_and(|fault| covered_fault == Some(fault.sequence));
+                    let published_tombstone_matches = local_fault.is_none()
+                        && pending_request != 0
+                        && self.published_local_request == Some(pending_request)
+                        && covered_fault.is_some();
+                    let stopped_round_matches = local_fault.is_none()
+                        && stopped_round.is_some_and(|round| *round == terminal.round);
+                    let covers_local_settlement = active_fault_matches
+                        || published_tombstone_matches
+                        || stopped_round_matches;
+                    if terminal.round.id.generation > self.applied_gen
+                        && covers_local_settlement
+                        && !terminal.round.contains_owner(controller.instance_id())
+                        && round_assignment_is_current(db, controller, &terminal.round)
+                    {
+                        if !controller.recovery_round_requires_current_process_stop(&terminal.round)
+                        {
+                            self.applied_gen = terminal.round.id.generation;
+                            self.stopped_for = None;
+                            self.hold_fault_fence(db, controller);
+                            tracing::error!(
+                                gen = terminal.round.id.generation,
+                                "committed recovery Release omitted or superseded this process; requesting a fresh round"
+                            );
+                            if !self.request_fresh_fault(db, controller).await {
+                                self.fault_audit_unknown = true;
+                            }
+                            return;
+                        }
+                        self.last_protocol_error = None;
+                        self.observe_nonparticipant_release(db, controller, &terminal)
+                            .await;
+                        return;
+                    }
+                }
             }
         }
 
@@ -585,7 +643,7 @@ impl RecoveryMonitor {
         if self.last_protocol_error.as_deref() != Some(error.as_str()) {
             tracing::error!(%error, "invalid coordinated-recovery control state");
             self.last_protocol_error = Some(error);
-            if !report_fresh_fault(controller).await {
+            if !self.request_fresh_fault(db, controller).await {
                 self.fault_audit_unknown = true;
             }
         }
@@ -714,14 +772,15 @@ impl RecoveryMonitor {
                 gen = release.round.id.generation,
                 "Release observed without restoring its exact Start; holding intake"
             );
-            if !report_fresh_fault(controller).await {
+            if !self.request_fresh_fault(db, controller).await {
                 self.fault_audit_unknown = true;
             }
         }
     }
 
-    /// An ownerless worker consumes only a leader-fenced terminal committed after every data
-    /// owner prepared while fenced.
+    /// An ownerless worker consumes only a leader-fenced terminal that names this exact boot in
+    /// its stopped roster and was committed after every data owner prepared while fenced. The
+    /// terminal retains stable-node fault evidence after authority tombstones the covered slot.
     /// It never joins the frozen data quorum, restarts state, acknowledges recovery, or opens its
     /// assignment-closed source gate.
     async fn observe_nonparticipant_release(
@@ -734,7 +793,9 @@ impl RecoveryMonitor {
             return;
         };
         let deadline = tokio::time::Instant::now() + RELEASE_PROTOCOL_TIMEOUT;
-        if !controller.process_lease_is_live()
+        if release.round.contains_owner(controller.instance_id())
+            || !controller.recovery_round_requires_current_process_stop(&release.round)
+            || !controller.process_lease_is_live()
             || !round_assignment_is_current(db, controller, &release.round)
             || !matches!(
                 tokio::time::timeout_at(
@@ -750,9 +811,10 @@ impl RecoveryMonitor {
 
         // A non-owner is outside the restore quorum, but it can still hold participant-local
         // Prepared evidence or a connector generation stopped for this round. Quiesce it before
-        // consuming the covered fault. Settlement makes a reported Prepared inventory empty; a
-        // remaining witness means this boot was omitted from the round and must request another
-        // evidence-bearing round instead of silently accepting the Release.
+        // accepting the terminal that tombstoned its covered fault. Settlement makes a reported
+        // Prepared inventory empty; a remaining witness means this boot was omitted from the
+        // round and must request another evidence-bearing round instead of silently accepting the
+        // Release.
         let Some(prepared_witnesses) = stop_and_collect_prepared(db).await else {
             return;
         };
@@ -762,7 +824,7 @@ impl RecoveryMonitor {
                 prepared_attempts = prepared_witnesses.len(),
                 "ownerless process retains unresolved Prepared evidence after recovery Release"
             );
-            if !report_fresh_fault(controller).await {
+            if !self.request_fresh_fault(db, controller).await {
                 self.fault_audit_unknown = true;
             }
             return;
@@ -793,14 +855,19 @@ impl RecoveryMonitor {
         let deadline = tokio::time::Instant::now() + RELEASE_PROTOCOL_TIMEOUT;
         let mut backoff = Duration::from_millis(25);
         let release_guard = loop {
-            match tokio::time::timeout_at(
-                deadline,
-                controller
-                    .begin_recovery_release(release.round.fault_sequence(controller.instance_id())),
-            )
-            .await
+            match tokio::time::timeout_at(deadline, controller.begin_recovery_release(release))
+                .await
             {
                 Ok(Ok(Some(guard))) => break guard,
+                Ok(Ok(None)) if controller.process_lease_is_live() => {
+                    self.hold_fault_fence(db, controller);
+                    self.applied_gen = self.applied_gen.max(release.round.id.generation);
+                    self.stopped_for = None;
+                    if !self.ensure_fault_request(db, controller).await {
+                        self.fault_audit_unknown = true;
+                    }
+                    return;
+                }
                 Ok(Ok(None)) | Ok(Err(RecoveryControlError::Superseded(_))) => return,
                 Ok(Err(RecoveryControlError::Uncertain(_)))
                     if tokio::time::Instant::now() < deadline =>
@@ -811,9 +878,9 @@ impl RecoveryMonitor {
                     tracing::error!(
                         gen = release.round.id.generation,
                         %error,
-                        "ownerless recovery fault conflicts with the committed Release"
+                        "ownerless recovery authority state conflicts with the committed Release"
                     );
-                    if !report_fresh_fault(controller).await {
+                    if !self.request_fresh_fault(db, controller).await {
                         self.fault_audit_unknown = true;
                     }
                     return;
@@ -821,6 +888,14 @@ impl RecoveryMonitor {
                 Ok(Err(RecoveryControlError::Uncertain(_))) | Err(_) => return,
             }
         };
+        if !self.clear_authorized_pending_request(db) {
+            tracing::warn!(
+                gen = release.round.id.generation,
+                "a replacement recovery request prevented ownerless Release consumption"
+            );
+            drop(release_guard);
+            return;
+        }
         self.record_released_faults(&release.round);
         self.applied_gen = release.round.id.generation;
         self.stopped_for = None;
@@ -843,7 +918,7 @@ impl RecoveryMonitor {
                     "recovery round orphaned (no Start); holding intake"
                 );
                 self.stopped_for = None;
-                if !report_fresh_fault(controller).await {
+                if !self.request_fresh_fault(db, controller).await {
                     self.fault_audit_unknown = true;
                 }
             }
@@ -867,9 +942,9 @@ impl RecoveryMonitor {
         }
     }
 
-    /// Fault reports not yet handled. `0` means no fault. Faults become handled only when an exact
-    /// terminal `Release` covers their node and boot-bound sequence; retaining that sequence also
-    /// suppresses a stale post-clear observation without hiding a distinct later report.
+    /// Fault reports not yet handled. Faults become handled only when an exact terminal `Release`
+    /// covers their node and authority-assigned sequence; retaining that sequence also suppresses
+    /// a stale post-clear observation without hiding a distinct later report.
     async fn pending_faults(
         &mut self,
         controller: &ClusterController,
@@ -882,26 +957,19 @@ impl RecoveryMonitor {
         &self,
         controller: &ClusterController,
     ) -> Result<Vec<RecoveryFault>, String> {
-        let mut reported = Vec::new();
-        let reports = tokio::time::timeout(DECISION_IO_TIMEOUT, controller.read_fault_reports())
-            .await
-            .map_err(|_| "cluster recovery fault report read timed out".to_string())??;
-        for (node, seq) in reports {
-            if seq != 0 {
-                reported.push(RecoveryFault {
-                    reporter: node,
-                    sequence: seq,
-                });
-            }
-        }
-        reported.sort_unstable_by_key(|fault| fault.reporter);
-        if reported
-            .windows(2)
-            .any(|pair| pair[0].reporter == pair[1].reporter)
-        {
-            return Err("duplicate recovery fault-report publisher".into());
-        }
-        Ok(reported)
+        Ok(self.fault_inventory(controller).await?.faults().to_vec())
+    }
+
+    async fn fault_inventory(
+        &self,
+        controller: &ClusterController,
+    ) -> Result<RecoveryFaultInventory, String> {
+        tokio::time::timeout(
+            DECISION_IO_TIMEOUT,
+            controller.read_recovery_fault_inventory(),
+        )
+        .await
+        .map_err(|_| "cluster recovery fault inventory read timed out".to_string())?
     }
 
     fn unhandled_faults(&self, reported: &[RecoveryFault]) -> Vec<RecoveryFault> {
@@ -930,6 +998,17 @@ impl RecoveryMonitor {
         )
     }
 
+    async fn pending_local_fault_if_queued(
+        &self,
+        db: &LaminarDB,
+        controller: &ClusterController,
+    ) -> Result<Option<RecoveryFault>, String> {
+        if db.pending_recovery_fault.load(Ordering::Acquire) == 0 {
+            return Ok(None);
+        }
+        self.pending_local_fault(controller).await
+    }
+
     async fn hold_for_unknown_fault_audit(
         &mut self,
         db: &LaminarDB,
@@ -937,7 +1016,7 @@ impl RecoveryMonitor {
     ) {
         self.fault_audit_unknown = true;
         self.hold_fault_fence(db, controller);
-        if report_fresh_fault(controller).await {
+        if self.request_fresh_fault(db, controller).await {
             self.fault_audit_unknown = false;
         }
     }
@@ -1004,7 +1083,8 @@ impl RecoveryMonitor {
         &mut self,
         db: &Arc<LaminarDB>,
         controller: &ClusterController,
-        pending: Vec<RecoveryFault>,
+        fault_revision: u64,
+        faults: Vec<RecoveryFault>,
     ) {
         // Precheck readability before stopping anything — a transient decision-store error
         // must defer the round (faults stay pending), not flap a stop-the-world cycle.
@@ -1059,7 +1139,7 @@ impl RecoveryMonitor {
             );
             return;
         };
-        let evidence_candidates = pending
+        let evidence_candidates = faults
             .iter()
             .filter(|fault| !assignment_fence.contains(fault.reporter.0))
             .map(|fault| fault.reporter.0)
@@ -1087,7 +1167,8 @@ impl RecoveryMonitor {
             leader_proof,
             assignment_fence,
             evidence_participants,
-            pending,
+            fault_revision,
+            faults,
         ) {
             Ok(round) => round,
             Err(error) => {
@@ -1350,6 +1431,34 @@ impl RecoveryMonitor {
     fn record_released_faults(&mut self, round: &RecoveryRound) {
         for fault in &round.faults {
             self.handled_faults.insert(fault.reporter, fault.sequence);
+        }
+    }
+
+    /// Clear only the exact request already published by this monitor. Callers hold an authorized
+    /// committed-Release guard; a concurrently installed replacement remains latched and fenced.
+    fn clear_authorized_pending_request(&mut self, db: &LaminarDB) -> bool {
+        let pending = db.pending_recovery_fault.load(Ordering::Acquire);
+        if pending == 0 {
+            self.published_local_request = None;
+            return true;
+        }
+        if self.published_local_request != Some(pending) {
+            return false;
+        }
+        match db.pending_recovery_fault.compare_exchange(
+            pending,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                self.published_local_request = None;
+                true
+            }
+            Err(_) => {
+                self.published_local_request = None;
+                false
+            }
         }
     }
 
@@ -1666,17 +1775,24 @@ impl RecoveryMonitor {
         let release_guard = loop {
             match tokio::time::timeout_at(
                 release_deadline,
-                controller
-                    .begin_recovery_release(release.round.fault_sequence(controller.instance_id())),
+                controller.begin_recovery_release(&committed),
             )
             .await
             {
                 Ok(Ok(Some(guard))) => break guard,
-                Ok(Ok(None)) | Ok(Err(RecoveryControlError::Superseded(_))) => {
+                Ok(Ok(None)) if controller.process_lease_is_live() => {
                     tracing::error!(
                         gen = release.round.id.generation,
-                        "a newer local fault replaced the released recovery fault"
+                        "committed recovery Release cannot settle this live process; requesting a successor round"
                     );
+                    self.applied_gen = self.applied_gen.max(release.round.id.generation);
+                    self.restored_for = None;
+                    if !self.ensure_fault_request(db, controller).await {
+                        self.fault_audit_unknown = true;
+                    }
+                    return false;
+                }
+                Ok(Ok(None)) | Ok(Err(RecoveryControlError::Superseded(_))) => {
                     return false;
                 }
                 Ok(Err(RecoveryControlError::Uncertain(_))) => {
@@ -1710,6 +1826,14 @@ impl RecoveryMonitor {
         if !release_still_authorized {
             drop(release_guard);
             self.defer_release_retry(db, controller, release.round.id.generation, false);
+            return false;
+        }
+        if !self.clear_authorized_pending_request(db) {
+            tracing::warn!(
+                gen = release.round.id.generation,
+                "a replacement recovery request prevented Release consumption"
+            );
+            drop(release_guard);
             return false;
         }
         controller.set_recovering(false);
@@ -2015,7 +2139,9 @@ async fn hold_intake_and_request_retry(
     quorum: bool,
 ) {
     hold_intake_for_retry(db, controller, gen_id, quorum);
-    report_fresh_fault(controller).await;
+    if let Err(error) = request_fresh_local_fault(controller, &db.pending_recovery_fault).await {
+        tracing::error!(%error, "could not persist recovery retry request");
+    }
 }
 
 fn hold_intake_for_retry(
@@ -2608,138 +2734,11 @@ mod tests {
     use laminar_core::checkpoint::{CheckpointAssignmentFence, LeaderProof, LeaderProofOwner};
     use laminar_core::cluster::control::{
         AssignmentSnapshot, AssignmentSnapshotStore, CheckpointParticipant, ClusterKv, InMemoryKv,
-        LeaderLeaseOwner, LeaderLeaseStore, LeaseDeadline, LeaseOutcome,
+        LeaderLeaseOwner, LeaderLeaseStore, LeaseDeadline, LeaseOutcome, ProcessLeaseAuthority,
+        ProcessLeaseOutcome,
     };
     use laminar_core::cluster::discovery::{NodeInfo, NodeMetadata, NodeState};
     use tokio::sync::watch;
-
-    struct FailOnceFaultScanKv {
-        inner: InMemoryKv,
-        fail: std::sync::atomic::AtomicBool,
-    }
-
-    struct FailOnceFaultWriteKv {
-        inner: InMemoryKv,
-        attempts: std::sync::atomic::AtomicUsize,
-    }
-
-    /// Exposes a newer nonzero report to the conditional clear, then models that slot becoming
-    /// absent before any accidental verification read. Once the clear observed the newer value,
-    /// the Release must remain fenced regardless of what a later read would return.
-    struct NewerThenMissingFaultKv {
-        inner: InMemoryKv,
-        newer_sequence: u64,
-        fault_reads: std::sync::atomic::AtomicUsize,
-    }
-
-    impl NewerThenMissingFaultKv {
-        fn new(local_id: NodeId, newer_sequence: u64) -> Self {
-            Self {
-                inner: InMemoryKv::new(local_id),
-                newer_sequence,
-                fault_reads: std::sync::atomic::AtomicUsize::new(0),
-            }
-        }
-
-        fn fault_reads(&self) -> usize {
-            self.fault_reads.load(std::sync::atomic::Ordering::Acquire)
-        }
-    }
-
-    impl FailOnceFaultScanKv {
-        fn new(local_id: NodeId) -> Self {
-            Self {
-                inner: InMemoryKv::new(local_id),
-                fail: std::sync::atomic::AtomicBool::new(true),
-            }
-        }
-    }
-
-    impl FailOnceFaultWriteKv {
-        fn new(local_id: NodeId) -> Self {
-            Self {
-                inner: InMemoryKv::new(local_id),
-                attempts: std::sync::atomic::AtomicUsize::new(0),
-            }
-        }
-
-        fn attempts(&self) -> usize {
-            self.attempts.load(std::sync::atomic::Ordering::Acquire)
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ClusterKv for FailOnceFaultScanKv {
-        async fn write(&self, key: &str, value: String) {
-            self.inner.write(key, value).await;
-        }
-
-        async fn read_from(&self, who: NodeId, key: &str) -> Option<String> {
-            self.inner.read_from(who, key).await
-        }
-
-        async fn scan(&self, key: &str) -> Vec<(NodeId, String)> {
-            self.inner.scan(key).await
-        }
-
-        async fn scan_checked(&self, key: &str) -> Result<Vec<(NodeId, String)>, String> {
-            if key == "control:fault-report"
-                && self.fail.swap(false, std::sync::atomic::Ordering::AcqRel)
-            {
-                return Err("injected recovery fault scan failure".into());
-            }
-            Ok(self.inner.scan(key).await)
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ClusterKv for FailOnceFaultWriteKv {
-        async fn write(&self, key: &str, value: String) {
-            self.inner.write(key, value).await;
-        }
-
-        async fn write_checked(&self, key: &str, value: String) -> Result<(), String> {
-            if key == "control:fault-report"
-                && self
-                    .attempts
-                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-                    == 0
-            {
-                return Err("injected first fault-report write failure".into());
-            }
-            self.inner.write(key, value).await;
-            Ok(())
-        }
-
-        async fn read_from(&self, who: NodeId, key: &str) -> Option<String> {
-            self.inner.read_from(who, key).await
-        }
-
-        async fn scan(&self, key: &str) -> Vec<(NodeId, String)> {
-            self.inner.scan(key).await
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ClusterKv for NewerThenMissingFaultKv {
-        async fn write(&self, key: &str, value: String) {
-            self.inner.write(key, value).await;
-        }
-
-        async fn read_from(&self, who: NodeId, key: &str) -> Option<String> {
-            if key == "control:fault-report" {
-                let read = self
-                    .fault_reads
-                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                return (read == 0).then(|| self.newer_sequence.to_string());
-            }
-            self.inner.read_from(who, key).await
-        }
-
-        async fn scan(&self, key: &str) -> Vec<(NodeId, String)> {
-            self.inner.scan(key).await
-        }
-    }
 
     fn info(id: u64) -> NodeInfo {
         NodeInfo {
@@ -2757,6 +2756,63 @@ mod tests {
         controller
             .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
             .unwrap();
+    }
+
+    async fn install_test_process_authority(
+        controller: &ClusterController,
+        authority_store: Arc<dyn object_store::ObjectStore>,
+    ) -> u64 {
+        let lease_duration = Duration::from_secs(60);
+        let authority = Arc::new(
+            ProcessLeaseAuthority::new(authority_store, lease_duration)
+                .expect("test process authority must accept its lease duration"),
+        );
+        let ProcessLeaseOutcome::Acquired(lease) = authority
+            .store_for(controller.instance_id())
+            .try_acquire(controller.recovery_incarnation(), 0)
+            .await
+            .unwrap()
+        else {
+            panic!("empty process authority must grant the test process");
+        };
+        if controller.process_lease_deadline().is_none() {
+            install_test_process_deadline(controller);
+        }
+        controller.set_process_lease_authority(authority).unwrap();
+        controller
+            .publish_leased_recovery_incarnation(&lease)
+            .await
+            .unwrap();
+        lease.term
+    }
+
+    async fn install_test_leader_authority(
+        controller: &ClusterController,
+        authority_store: Arc<dyn object_store::ObjectStore>,
+    ) -> Arc<LeaderLeaseStore> {
+        let process_term =
+            install_test_process_authority(controller, Arc::clone(&authority_store)).await;
+        let authority = Arc::new(LeaderLeaseStore::new(authority_store, 10_000));
+        let owner = LeaderLeaseOwner {
+            node: controller.instance_id(),
+            boot: controller.recovery_incarnation(),
+            process_term,
+        };
+        let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap()
+        else {
+            panic!("empty recovery test authority must grant leadership");
+        };
+        let (_lease_tx, lease_rx) = watch::channel(Some(lease));
+        controller
+            .set_leader_lease_watch(
+                lease_rx,
+                owner,
+                Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))),
+            )
+            .unwrap();
+        controller.set_leader_lease_store(Arc::clone(&authority));
+        controller.set_active(true);
+        authority
     }
 
     async fn controller(
@@ -2781,35 +2837,66 @@ mod tests {
         let kv = Arc::new(InMemoryKv::new(self_id));
         let (members_tx, members_rx) = watch::channel(peers);
         let controller = ClusterController::new(self_id, kv.clone(), None, members_rx);
-        let authority = Arc::new(LeaderLeaseStore::new(authority_store, 10_000));
-        let owner = LeaderLeaseOwner {
-            node: self_id,
-            boot: controller.recovery_incarnation(),
-            process_term: 1,
-        };
-        let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap()
-        else {
-            panic!("empty recovery test authority must grant leadership");
-        };
-        let (_lease_tx, lease_rx) = watch::channel(Some(lease));
         install_test_process_deadline(&controller);
-        controller
-            .set_leader_lease_watch(
-                lease_rx,
-                owner,
-                Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))),
-            )
-            .unwrap();
-        controller.set_leader_lease_store(authority);
-        controller.set_active(true);
+        install_test_leader_authority(&controller, authority_store).await;
         (controller, members_tx, kv)
     }
 
-    fn round(
+    async fn driver_and_follower() -> (
+        Arc<ClusterController>,
+        Arc<ClusterController>,
+        Arc<InMemoryKv>,
+    ) {
+        let driver_id = NodeId(1);
+        let driver_kv = Arc::new(InMemoryKv::new(driver_id));
+        let (_driver_members_tx, driver_members_rx) = watch::channel(vec![info(2)]);
+        let driver = Arc::new(ClusterController::new(
+            driver_id,
+            driver_kv.clone(),
+            None,
+            driver_members_rx,
+        ));
+        install_test_process_deadline(&driver);
+        let backing: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let authority = install_test_leader_authority(&driver, Arc::clone(&backing)).await;
+
+        let follower_id = NodeId(2);
+        let follower_kv = Arc::new(InMemoryKv::new(follower_id));
+        let (_follower_members_tx, follower_members_rx) = watch::channel(vec![info(1)]);
+        let follower = Arc::new(ClusterController::new(
+            follower_id,
+            follower_kv,
+            None,
+            follower_members_rx,
+        ));
+        install_test_process_deadline(&follower);
+        install_test_process_authority(&follower, backing).await;
+        follower.set_leader_lease_store(authority);
+
+        (driver, follower, driver_kv)
+    }
+
+    async fn report_test_fault(controller: &ClusterController) -> RecoveryFault {
+        let request = controller.next_recovery_fault_request().unwrap();
+        controller.report_fault(request).await.unwrap();
+        controller
+            .read_recovery_fault_inventory()
+            .await
+            .unwrap()
+            .faults()
+            .iter()
+            .find(|fault| fault.reporter == controller.instance_id())
+            .copied()
+            .expect("reported fault must appear in the shared authority inventory")
+    }
+
+    async fn round_for_current_faults(
         controller: &ClusterController,
         generation: u64,
         participants: &[u64],
     ) -> RecoveryRound {
+        let inventory = controller.read_recovery_fault_inventory().await.unwrap();
         let checkpoint_participants = participants
             .iter()
             .map(|node_id| CheckpointParticipant {
@@ -2825,10 +2912,8 @@ mod tests {
                 .expect("recovery test controller must hold durable leadership"),
             CheckpointAssignmentFence::from_owner_map(7, &owners, checkpoint_participants).unwrap(),
             Vec::new(),
-            vec![RecoveryFault {
-                reporter: NodeId(1),
-                sequence: generation,
-            }],
+            inventory.revision(),
+            inventory.faults().to_vec(),
         )
         .unwrap()
     }
@@ -2865,6 +2950,32 @@ mod tests {
             .unwrap();
     }
 
+    async fn commit_release(
+        controller: &ClusterController,
+        kv: &InMemoryKv,
+        round: &RecoveryRound,
+        epoch: u64,
+    ) -> RecoveryAnnouncement {
+        activate_start(controller, kv, round, epoch).await;
+        controller
+            .announce_recover_release(round, epoch)
+            .await
+            .unwrap();
+        let pending = RecoveryAnnouncement {
+            round: round.clone(),
+            phase: RecoverPhase::Release { epoch },
+        };
+        controller.announce_release_ready(&pending).await.unwrap();
+        let ReleaseCommitStatus::Committed { terminal } = controller
+            .try_commit_recover_release(&pending)
+            .await
+            .unwrap()
+        else {
+            panic!("single-owner recovery Release must commit");
+        };
+        terminal
+    }
+
     fn start(round: RecoveryRound, epoch: u64) -> RecoveryAnnouncement {
         RecoveryAnnouncement {
             round,
@@ -2873,9 +2984,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn monitor_retries_the_same_local_fault_after_a_durable_write_failure() {
+    async fn pending_fault_retries_and_remains_latched_until_release() {
         let self_id = NodeId(1);
-        let kv = Arc::new(FailOnceFaultWriteKv::new(self_id));
+        let kv = Arc::new(InMemoryKv::new(self_id));
         let (_members_tx, members_rx) = watch::channel(Vec::new());
         let controller = Arc::new(ClusterController::new(
             self_id,
@@ -2884,32 +2995,233 @@ mod tests {
             members_rx,
         ));
         install_test_process_deadline(&controller);
+        let authority_store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let db = LaminarDB::builder()
+            .cluster_controller(Arc::clone(&controller))
+            .cluster_checkpoint_object_store(Arc::clone(&authority_store))
+            .build()
+            .await
+            .unwrap();
+        queue_local_fault(&controller, &db.pending_recovery_fault).unwrap();
+        let raw_request = db.pending_recovery_fault.load(Ordering::Acquire);
+        let mut monitor = RecoveryMonitor::default();
+
+        assert!(!monitor.publish_pending_local_fault(&db, &controller).await);
+        assert_eq!(
+            db.pending_recovery_fault.load(Ordering::Acquire),
+            raw_request,
+            "a failed first publication must retain the retry identity"
+        );
+        assert!(controller.checkpoint_authority().is_err());
+        assert!(db.coordinated_recovery_in_progress());
+
+        install_test_leader_authority(&controller, authority_store).await;
+        assert!(monitor.publish_pending_local_fault(&db, &controller).await);
+        assert_eq!(
+            db.pending_recovery_fault.load(Ordering::Acquire),
+            raw_request,
+            "successful publication must retain terminal discovery"
+        );
+        let inventory = controller.read_recovery_fault_inventory().await.unwrap();
+        assert_ne!(inventory.revision(), 0);
+        let [fault] = inventory.faults() else {
+            panic!("one retried request must create one authority fault");
+        };
+        assert_eq!(fault.reporter, self_id);
+        assert_ne!(fault.sequence, 0);
+        assert_eq!(
+            controller.read_local_fault_report().await.unwrap(),
+            Some(fault.sequence)
+        );
+
+        let round = round_for_current_faults(&controller, 1, &[self_id.0]).await;
+        let terminal = commit_release(&controller, &kv, &round, 1).await;
+        assert_eq!(
+            db.pending_recovery_fault.load(Ordering::Acquire),
+            raw_request
+        );
+        let release_guard = controller
+            .begin_recovery_release(&terminal)
+            .await
+            .unwrap()
+            .expect("the exact committed Release must authorize latch settlement");
+        assert!(monitor.clear_authorized_pending_request(&db));
+        assert_eq!(db.pending_recovery_fault.load(Ordering::Acquire), 0);
+        drop(release_guard);
+    }
+
+    #[tokio::test]
+    async fn new_event_supersedes_a_settled_latch_while_monitor_flush_does_not() {
+        let self_id = NodeId(1);
+        let kv = Arc::new(InMemoryKv::new(self_id));
+        let (_members_tx, members_rx) = watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(
+            self_id,
+            kv.clone(),
+            None,
+            members_rx,
+        ));
+        install_test_process_deadline(&controller);
+        let authority_store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let db = LaminarDB::builder()
+            .cluster_controller(Arc::clone(&controller))
+            .cluster_checkpoint_object_store(Arc::clone(&authority_store))
+            .build()
+            .await
+            .unwrap();
+        install_test_leader_authority(&controller, authority_store).await;
+
+        let original = request_local_fault(&controller, &db.pending_recovery_fault)
+            .await
+            .unwrap();
+        assert_eq!(
+            request_local_fault(&controller, &db.pending_recovery_fault)
+                .await
+                .unwrap(),
+            original,
+            "a duplicate active notification must coalesce"
+        );
+        let round = round_for_current_faults(&controller, 1, &[self_id.0]).await;
+        let terminal = commit_release(&controller, &kv, &round, 1).await;
+        assert!(controller
+            .read_recovery_fault_inventory()
+            .await
+            .unwrap()
+            .faults()
+            .is_empty());
+
+        flush_pending_local_fault(&controller, &db.pending_recovery_fault)
+            .await
+            .unwrap();
+        assert_eq!(db.pending_recovery_fault.load(Ordering::Acquire), original);
+        assert!(controller
+            .read_recovery_fault_inventory()
+            .await
+            .unwrap()
+            .faults()
+            .is_empty());
+
+        let successor = request_local_fault(&controller, &db.pending_recovery_fault)
+            .await
+            .unwrap();
+        assert!(successor > original);
+        assert_eq!(db.pending_recovery_fault.load(Ordering::Acquire), successor);
+        let inventory = controller.read_recovery_fault_inventory().await.unwrap();
+        assert_eq!(inventory.faults().len(), 1);
+        assert_eq!(inventory.faults()[0].reporter, self_id);
+        assert!(controller
+            .begin_recovery_release(&terminal)
+            .await
+            .unwrap()
+            .is_none());
+        db.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn published_request_cache_rejects_a_concurrent_replacement() {
+        let self_id = NodeId(1);
+        let kv = Arc::new(InMemoryKv::new(self_id));
+        let (_members_tx, members_rx) = watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(self_id, kv, None, members_rx));
+        install_test_process_deadline(&controller);
         let db = LaminarDB::builder()
             .cluster_controller(Arc::clone(&controller))
             .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
             .build()
             .await
             .unwrap();
-        queue_local_fault(&controller, &db.pending_recovery_fault);
-        let sequence = db.pending_recovery_fault.load(Ordering::Acquire);
         let mut monitor = RecoveryMonitor::default();
 
-        monitor.publish_pending_local_fault(&db, &controller).await;
+        queue_local_fault(&controller, &db.pending_recovery_fault).unwrap();
+        let reported = db.pending_recovery_fault.load(Ordering::Acquire);
+        queue_local_fault(&controller, &db.pending_recovery_fault).unwrap();
+        let replacement = db.pending_recovery_fault.load(Ordering::Acquire);
+
+        assert!(replacement > reported);
+        assert!(!monitor.cache_published_local_request(&db, reported));
+        assert!(monitor.published_local_request.is_none());
         assert_eq!(
             db.pending_recovery_fault.load(Ordering::Acquire),
-            sequence,
-            "a failed first write must retain the retry identity"
+            replacement
         );
-        assert_eq!(controller.read_local_fault_report().await.unwrap(), None);
-        assert!(db.coordinated_recovery_in_progress());
+        db.shutdown().await.unwrap();
+    }
 
-        monitor.publish_pending_local_fault(&db, &controller).await;
+    #[tokio::test]
+    async fn healthy_monitor_does_not_require_terminal_authority() {
+        let self_id = NodeId(1);
+        let kv = Arc::new(InMemoryKv::new(self_id));
+        let (_members_tx, members_rx) = watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(self_id, kv, None, members_rx));
+        install_test_process_deadline(&controller);
+        let db = LaminarDB::builder()
+            .cluster_controller(Arc::clone(&controller))
+            .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
+            .build()
+            .await
+            .unwrap();
+        db.set_source_gate(false);
+        controller.set_recovering(false);
+        let mut monitor = RecoveryMonitor::default();
+
+        let local_fault = monitor
+            .pending_local_fault_if_queued(&db, &controller)
+            .await
+            .unwrap();
+        monitor.observe(&db, &controller, local_fault).await;
+
+        assert!(controller.checkpoint_authority().is_err());
+        assert!(!controller.is_recovering());
+        assert!(!db.cluster_intake_fenced());
         assert_eq!(db.pending_recovery_fault.load(Ordering::Acquire), 0);
+        assert!(monitor.last_protocol_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn replacement_fault_blocks_release_latch_clear_and_gate_open() {
+        let self_id = NodeId(1);
+        let kv = Arc::new(InMemoryKv::new(self_id));
+        let (_members_tx, members_rx) = watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(self_id, kv, None, members_rx));
+        install_test_process_deadline(&controller);
+        let db = LaminarDB::builder()
+            .cluster_controller(Arc::clone(&controller))
+            .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
+            .build()
+            .await
+            .unwrap();
+        db.set_source_gate(false);
+        assert!(!db.cluster_intake_fenced());
+        queue_local_fault(&controller, &db.pending_recovery_fault).unwrap();
+        let published = db.pending_recovery_fault.load(Ordering::Acquire);
+        assert!(request_local_fault(&controller, &db.pending_recovery_fault)
+            .await
+            .is_err());
         assert_eq!(
-            controller.read_local_fault_report().await.unwrap(),
-            Some(sequence)
+            db.pending_recovery_fault.load(Ordering::Acquire),
+            published,
+            "a duplicate reporter must retain the compute event's request"
         );
-        assert_eq!(kv.attempts(), 2);
+        let mut monitor = RecoveryMonitor {
+            published_local_request: Some(published),
+            ..RecoveryMonitor::default()
+        };
+
+        queue_local_fault(&controller, &db.pending_recovery_fault).unwrap();
+        let replacement = db.pending_recovery_fault.load(Ordering::Acquire);
+
+        assert_ne!(replacement, published);
+        assert!(!monitor.clear_authorized_pending_request(&db));
+        assert_eq!(
+            db.pending_recovery_fault.load(Ordering::Acquire),
+            replacement
+        );
+        db.release_coordinated_recovery_lifecycle();
+        assert!(db.coordinated_recovery_in_progress());
+        db.set_source_gate(false);
+        assert!(db.cluster_intake_fenced());
     }
 
     #[tokio::test]
@@ -2929,16 +3241,7 @@ mod tests {
 
     #[tokio::test]
     async fn follower_fences_each_continuous_durable_fault_once() {
-        let self_id = NodeId(2);
-        let kv = Arc::new(InMemoryKv::new(self_id));
-        let (_members_tx, members_rx) = watch::channel(vec![info(1)]);
-        let controller = Arc::new(ClusterController::new(
-            self_id,
-            kv.clone(),
-            None,
-            members_rx,
-        ));
-        install_test_process_deadline(&controller);
+        let (driver, controller, driver_kv) = driver_and_follower().await;
         assert!(!controller.is_leader());
 
         let db = LaminarDB::builder()
@@ -2952,18 +3255,12 @@ mod tests {
         let initial_revision = db.assignment_authority_revision.load(Ordering::Acquire);
         let mut monitor = RecoveryMonitor::default();
 
-        kv.seed(NodeId(1), "control:fault-report", "17".into());
+        let first_fault = report_test_fault(&driver).await;
         let pending = monitor.pending_faults(&controller).await.unwrap();
         monitor.hold_for_pending_fault(&db, &controller, &pending);
         let held_revision = db.assignment_authority_revision.load(Ordering::Acquire);
 
-        assert_eq!(
-            pending,
-            vec![RecoveryFault {
-                reporter: NodeId(1),
-                sequence: 17,
-            }]
-        );
+        assert_eq!(pending, vec![first_fault]);
         assert!(db.cluster_intake_fenced());
         assert!(controller.is_recovering());
         assert_eq!(held_revision, initial_revision + 1);
@@ -2976,7 +3273,15 @@ mod tests {
             "a level-triggered report must not churn assignment authority"
         );
 
-        kv.seed(NodeId(1), "control:fault-report", "0".into());
+        let round = round_for_current_faults(&driver, 17, &[1]).await;
+        let terminal = commit_release(&driver, &driver_kv, &round, 4).await;
+        drop(
+            driver
+                .begin_recovery_release(&terminal)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
         let pending = monitor.pending_faults(&controller).await.unwrap();
         monitor.hold_for_pending_fault(&db, &controller, &pending);
         assert!(pending.is_empty());
@@ -2984,9 +3289,11 @@ mod tests {
         assert!(db.cluster_intake_fenced());
         assert!(controller.is_recovering());
 
-        kv.seed(NodeId(1), "control:fault-report", "18".into());
+        let second_fault = report_test_fault(&driver).await;
         let pending = monitor.pending_faults(&controller).await.unwrap();
         monitor.hold_for_pending_fault(&db, &controller, &pending);
+        assert_eq!(pending, vec![second_fault]);
+        assert!(second_fault.sequence > first_fault.sequence);
         assert_eq!(
             db.assignment_authority_revision.load(Ordering::Acquire),
             held_revision + 1,
@@ -2995,71 +3302,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn released_fault_set_does_not_hide_a_newer_local_report() {
-        let (controller, _members_tx, _kv) = controller(Vec::new()).await;
-        let round = round(&controller, 7, &[1]);
-        controller.report_fault(8).await.unwrap();
-        let mut monitor = RecoveryMonitor::default();
-
-        assert!(controller
-            .begin_recovery_release(round.fault_sequence(controller.instance_id()))
-            .await
-            .unwrap()
-            .is_none());
-        assert_eq!(monitor.handled_faults.get(&NodeId(1)), None);
-        assert_eq!(
-            monitor.pending_faults(&controller).await.unwrap(),
-            vec![RecoveryFault {
-                reporter: NodeId(1),
-                sequence: 8,
-            }]
-        );
-    }
-
-    #[tokio::test]
-    async fn observed_newer_fault_cannot_be_reinterpreted_as_an_idempotent_clear() {
-        let (round_controller, _members_tx, _kv) = controller(Vec::new()).await;
-        let round = round(&round_controller, 7, &[1]);
-        let self_id = NodeId(1);
-        let fast = Arc::new(InMemoryKv::new(self_id));
-        let durable = Arc::new(NewerThenMissingFaultKv::new(self_id, 8));
-        let (_members_tx, members_rx) = watch::channel(Vec::new());
-        let controller = ClusterController::new_with_recovery_incarnation(
-            self_id,
-            fast,
-            durable.clone(),
-            None,
-            members_rx,
-            round_controller.recovery_incarnation(),
-        );
-        let monitor = RecoveryMonitor::default();
-
-        assert!(controller
-            .begin_recovery_release(round.fault_sequence(controller.instance_id()))
-            .await
-            .unwrap()
-            .is_none());
-        assert_eq!(
-            durable.fault_reads(),
-            1,
-            "a definitive newer-fault observation must not be weakened by a second read"
-        );
-        assert_eq!(monitor.handled_faults.get(&self_id), None);
-    }
-
-    #[tokio::test]
     async fn release_fault_guard_orders_a_new_report_after_local_gate_transition() {
-        let (controller, _members_tx, _kv) = controller(Vec::new()).await;
+        let (controller, _members_tx, kv) = controller(Vec::new()).await;
         let controller = Arc::new(controller);
-        controller.report_fault(7).await.unwrap();
+        report_test_fault(&controller).await;
+        let round = round_for_current_faults(&controller, 7, &[1]).await;
+        let terminal = commit_release(&controller, &kv, &round, 4).await;
         let release_guard = controller
-            .begin_recovery_release(Some(7))
+            .begin_recovery_release(&terminal)
             .await
             .unwrap()
             .unwrap();
         let report = {
             let controller = Arc::clone(&controller);
-            tokio::spawn(async move { controller.report_fault(8).await })
+            tokio::spawn(async move { report_test_fault(&controller).await })
         };
         tokio::task::yield_now().await;
         assert!(
@@ -3068,55 +3324,39 @@ mod tests {
         );
 
         drop(release_guard);
-        report.await.unwrap().unwrap();
-        assert_eq!(controller.read_local_fault_report().await.unwrap(), Some(8));
+        let next_fault = report.await.unwrap();
+        assert_eq!(
+            controller.read_local_fault_report().await.unwrap(),
+            Some(next_fault.sequence)
+        );
     }
 
     #[tokio::test]
     async fn fault_after_release_commit_is_preserved_for_the_next_round() {
         let (controller, _members_tx, kv) = controller(Vec::new()).await;
-        let round = round(&controller, 7, &[1]);
-        controller.report_fault(7).await.unwrap();
-        activate_start(&controller, &kv, &round, 4).await;
-        controller
-            .announce_recover_release(&round, 4)
-            .await
-            .unwrap();
-        let pending = RecoveryAnnouncement {
-            round: round.clone(),
-            phase: RecoverPhase::Release { epoch: 4 },
-        };
-        controller.announce_release_ready(&pending).await.unwrap();
-        assert!(matches!(
-            controller
-                .try_commit_recover_release(&pending)
-                .await
-                .unwrap(),
-            ReleaseCommitStatus::Committed { .. }
-        ));
+        report_test_fault(&controller).await;
+        let round = round_for_current_faults(&controller, 7, &[1]).await;
+        let terminal = commit_release(&controller, &kv, &round, 4).await;
 
         // The committed terminal linearizes before this new failure. It may release peers that
-        // already consumed it, but this reporting owner must stay fenced and the new sequence must
-        // remain the level-trigger for the immediately following global round.
-        controller.report_fault(8).await.unwrap();
+        // already consumed it, but this reporting owner must stay fenced and the new authority
+        // fault must remain the level-trigger for the immediately following global round.
+        let next_fault = report_test_fault(&controller).await;
         let mut monitor = RecoveryMonitor::default();
         assert!(controller
-            .begin_recovery_release(round.fault_sequence(controller.instance_id()))
+            .begin_recovery_release(&terminal)
             .await
             .unwrap()
             .is_none());
         assert_eq!(monitor.handled_faults.get(&NodeId(1)), None);
         assert_eq!(
             monitor.pending_faults(&controller).await.unwrap(),
-            vec![RecoveryFault {
-                reporter: NodeId(1),
-                sequence: 8,
-            }]
+            vec![next_fault]
         );
     }
 
     #[tokio::test]
-    async fn idle_worker_consumes_only_a_committed_release_fault_set() {
+    async fn evidence_only_worker_consumes_tombstoned_release_after_stopped_quorum() {
         use laminar_core::state::{NodeId as StateNodeId, ObjectStoreBackend, VnodeRegistry};
 
         let self_id = NodeId(2);
@@ -3140,21 +3380,9 @@ mod tests {
         .unwrap();
         let driver_id = NodeId(1);
         let driver_boot = fence.participant_incarnation(1).unwrap();
-        let authority = Arc::new(LeaderLeaseStore::new(
-            Arc::new(object_store::memory::InMemory::new()),
-            10_000,
-        ));
-        let driver_owner = LeaderLeaseOwner {
-            node: driver_id,
-            boot: driver_boot,
-            process_term: 1,
-        };
-        let LeaseOutcome::Acquired(driver_lease) =
-            authority.begin_new_term(&driver_owner, 0).await.unwrap()
-        else {
-            panic!("empty recovery test authority must grant the remote leader");
-        };
-        controller.set_leader_lease_store(Arc::clone(&authority));
+        let backing: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        install_test_process_authority(&controller, Arc::clone(&backing)).await;
         let driver_kv = Arc::new(InMemoryKv::new(driver_id));
         let (_driver_members_tx, driver_members_rx) = watch::channel(vec![info(self_id.0)]);
         let driver = Arc::new(ClusterController::new_with_recovery_incarnation(
@@ -3165,9 +3393,22 @@ mod tests {
             driver_members_rx,
             driver_boot,
         ));
-        driver.publish_recovery_incarnation().await.unwrap();
-        let (_driver_lease_tx, driver_lease_rx) = watch::channel(Some(driver_lease.clone()));
         install_test_process_deadline(&driver);
+        let driver_process_term =
+            install_test_process_authority(&driver, Arc::clone(&backing)).await;
+        let authority = Arc::new(LeaderLeaseStore::new(backing, 10_000));
+        let driver_owner = LeaderLeaseOwner {
+            node: driver_id,
+            boot: driver_boot,
+            process_term: driver_process_term,
+        };
+        let LeaseOutcome::Acquired(driver_lease) =
+            authority.begin_new_term(&driver_owner, 0).await.unwrap()
+        else {
+            panic!("empty recovery test authority must grant the remote leader");
+        };
+        controller.set_leader_lease_store(Arc::clone(&authority));
+        let (_driver_lease_tx, driver_lease_rx) = watch::channel(Some(driver_lease.clone()));
         driver
             .set_leader_lease_watch(
                 driver_lease_rx,
@@ -3177,20 +3418,6 @@ mod tests {
             .unwrap();
         driver.set_leader_lease_store(authority);
         driver.set_active(true);
-        let round = RecoveryRound::new(
-            5,
-            driver_lease.proof(),
-            fence.clone(),
-            Vec::new(),
-            vec![RecoveryFault {
-                reporter: self_id,
-                sequence: 17,
-            }],
-        )
-        .unwrap();
-        controller.publish_checkpoint_assignment_fence(Some(fence));
-        driver.publish_checkpoint_assignment_fence(Some(round.assignment_fence.clone()));
-        driver_kv.seed(self_id, "control:fault-report", "17".into());
 
         let registry = Arc::new(VnodeRegistry::single_owner(1, StateNodeId(1)));
         registry.set_assignment_and_version(Arc::from([StateNodeId(1)]), 7);
@@ -3206,6 +3433,32 @@ mod tests {
             .build()
             .await
             .unwrap();
+        db.set_source_gate(false);
+        request_local_fault(&controller, &db.pending_recovery_fault)
+            .await
+            .unwrap();
+        let raw_request = db.pending_recovery_fault.load(Ordering::Acquire);
+        let inventory = driver.read_recovery_fault_inventory().await.unwrap();
+        let [idle_fault] = inventory.faults() else {
+            panic!("one latched request must publish one evidence fault");
+        };
+        let idle_fault = *idle_fault;
+        let evidence_participant = CheckpointParticipant {
+            node_id: self_id.0,
+            boot_incarnation: controller.recovery_incarnation(),
+        };
+        let round = RecoveryRound::new(
+            5,
+            driver_lease.proof(),
+            fence.clone(),
+            vec![evidence_participant],
+            inventory.revision(),
+            inventory.faults().to_vec(),
+        )
+        .unwrap();
+        assert!(controller.recovery_round_requires_current_process_stop(&round));
+        controller.publish_checkpoint_assignment_fence(Some(fence));
+        driver.publish_checkpoint_assignment_fence(Some(round.assignment_fence.clone()));
         let assignments = Arc::new(AssignmentSnapshotStore::new(Arc::new(
             object_store::memory::InMemory::new(),
         )));
@@ -3227,33 +3480,57 @@ mod tests {
             snapshot = next;
         }
         assert!(coordinated_restart_assignment_ready(&db).await);
-        db.set_source_gate(false);
-        kv.seed(self_id, "control:fault-report", "17".into());
 
-        let start = RecoveryAnnouncement {
+        driver_kv.seed(
+            self_id,
+            "control:recovery-incarnation",
+            controller.recovery_incarnation().to_string(),
+        );
+        driver.announce_recover_prepare(&round).await.unwrap();
+        driver.announce_stopped(&round, Vec::new()).await.unwrap();
+        let prepare = RecoveryAnnouncement {
             round: round.clone(),
-            phase: RecoverPhase::Start { epoch: 3 },
+            phase: RecoverPhase::Prepare,
         };
         kv.seed(
             NodeId(1),
             "control:recover",
-            serde_json::to_string(&start).unwrap(),
+            serde_json::to_string(&prepare).unwrap(),
         );
         let mut monitor = RecoveryMonitor::default();
+        assert!(monitor.publish_pending_local_fault(&db, &controller).await);
         let pending = monitor.pending_faults(&controller).await.unwrap();
         monitor.hold_for_pending_fault(&db, &controller, &pending);
-        monitor.observe(&db, &controller).await;
+        let local_fault = monitor.pending_local_fault(&controller).await.unwrap();
+        monitor.observe(&db, &controller, local_fault).await;
 
-        assert!(!controller.is_recovering());
+        assert!(controller.is_recovering());
         assert!(db.cluster_intake_fenced());
-        assert!(monitor.stopped_for.is_none());
+        assert_eq!(
+            monitor.stopped_for.as_ref().map(|(stopped, _)| stopped),
+            Some(&round)
+        );
         assert!(monitor.restored_for.is_none());
         assert_eq!(
-            controller.read_fault_reports().await.unwrap(),
-            vec![(self_id, 17)]
+            controller
+                .read_recovery_fault_inventory()
+                .await
+                .unwrap()
+                .faults(),
+            &[idle_fault]
         );
 
-        driver.announce_recover_prepare(&round).await.unwrap();
+        let evidence_stopped =
+            RecoveryStoppedReport::new(&round, evidence_participant, Vec::new()).unwrap();
+        driver_kv.seed(
+            self_id,
+            "control:recovery-stopped",
+            serde_json::to_string(&evidence_stopped).unwrap(),
+        );
+        assert!(matches!(
+            wait_stopped_quorum(&driver, &round, Duration::from_secs(1)).await,
+            StoppedQuorum::Reached(_)
+        ));
         driver.announce_recover_start(&round, 3).await.unwrap();
         driver.announce_recover_release(&round, 3).await.unwrap();
         let pending_release = RecoveryAnnouncement {
@@ -3271,12 +3548,25 @@ mod tests {
                 .unwrap(),
             ReleaseCommitStatus::Committed { .. }
         ));
+        assert_eq!(controller.read_local_fault_report().await.unwrap(), None);
+        assert!(controller
+            .read_recovery_fault_inventory()
+            .await
+            .unwrap()
+            .faults()
+            .is_empty());
+        assert_eq!(
+            db.pending_recovery_fault.load(Ordering::Acquire),
+            raw_request,
+            "atomic tombstoning must not clear terminal discovery"
+        );
         kv.seed(
             NodeId(1),
             "control:recovery-incarnation",
             controller.recovery_incarnation().to_string(),
         );
-        monitor.observe(&db, &controller).await;
+        let local_fault = monitor.pending_local_fault(&controller).await.unwrap();
+        monitor.observe(&db, &controller, local_fault).await;
         let pending = monitor.pending_faults(&controller).await.unwrap();
         monitor.hold_for_pending_fault(&db, &controller, &pending);
 
@@ -3285,6 +3575,12 @@ mod tests {
         assert!(db.cluster_intake_fenced());
         assert!(monitor.stopped_for.is_none());
         assert!(monitor.restored_for.is_none());
+        assert_eq!(db.pending_recovery_fault.load(Ordering::Acquire), 0);
+        assert_eq!(monitor.applied_gen, round.id.generation);
+        assert_eq!(
+            monitor.handled_faults.get(&self_id),
+            Some(&idle_fault.sequence)
+        );
     }
 
     #[tokio::test]
@@ -3304,27 +3600,24 @@ mod tests {
 
         assert!(db.cluster_intake_fenced());
         assert!(controller.is_recovering());
-        assert!(controller
-            .read_fault_reports()
-            .await
-            .unwrap()
-            .iter()
-            .any(|(_, sequence)| *sequence != 0));
+        assert_ne!(db.pending_recovery_fault.load(Ordering::Acquire), 0);
+        let inventory = controller.read_recovery_fault_inventory().await.unwrap();
+        assert_ne!(inventory.revision(), 0);
+        assert!(inventory.faults().iter().any(|fault| fault.sequence != 0));
     }
 
     #[tokio::test]
-    async fn transient_fault_scan_failure_becomes_a_durable_recovery_trigger() {
+    async fn transient_fault_authority_unavailability_becomes_a_durable_recovery_trigger() {
         let self_id = NodeId(1);
-        let fast: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(self_id));
-        let durable: Arc<dyn ClusterKv> = Arc::new(FailOnceFaultScanKv::new(self_id));
+        let kv = Arc::new(InMemoryKv::new(self_id));
         let (_members_tx, members_rx) = watch::channel(Vec::new());
-        let controller = Arc::new(ClusterController::new_with_recovery_kv(
-            self_id, fast, durable, None, members_rx,
-        ));
+        let controller = Arc::new(ClusterController::new(self_id, kv, None, members_rx));
         install_test_process_deadline(&controller);
+        let authority_store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
         let db = LaminarDB::builder()
             .cluster_controller(Arc::clone(&controller))
-            .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
+            .cluster_checkpoint_object_store(Arc::clone(&authority_store))
             .build()
             .await
             .unwrap();
@@ -3332,12 +3625,16 @@ mod tests {
         let mut monitor = RecoveryMonitor::default();
 
         assert!(monitor.pending_faults(&controller).await.is_err());
+        install_test_leader_authority(&controller, authority_store).await;
         monitor.hold_for_unknown_fault_audit(&db, &controller).await;
 
         assert!(db.cluster_intake_fenced());
         assert!(controller.is_recovering());
         assert!(!monitor.fault_audit_unknown);
         let pending = monitor.pending_faults(&controller).await.unwrap();
+        let inventory = controller.read_recovery_fault_inventory().await.unwrap();
+        assert_ne!(inventory.revision(), 0);
+        assert_eq!(pending.as_slice(), inventory.faults());
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].reporter, self_id);
         assert_ne!(pending[0].sequence, 0);
@@ -3400,7 +3697,8 @@ mod tests {
     #[tokio::test]
     async fn recovery_quorum_requires_the_exact_round_and_target() {
         let (controller, _members_tx, kv) = controller(Vec::new()).await;
-        let exact_round = round(&controller, 7, &[1]);
+        report_test_fault(&controller).await;
+        let exact_round = round_for_current_faults(&controller, 7, &[1]).await;
         activate_start(&controller, &kv, &exact_round, 4).await;
         let start = start(exact_round, 4);
         controller.announce_recovered(&start).await.unwrap();
@@ -3413,10 +3711,12 @@ mod tests {
     #[tokio::test]
     async fn newer_recovery_ack_supersedes_instead_of_satisfying_old_quorum() {
         let (controller, _members_tx, kv) = controller(Vec::new()).await;
-        let expected_round = round(&controller, 7, &[1]);
+        report_test_fault(&controller).await;
+        let expected_round = round_for_current_faults(&controller, 7, &[1]).await;
         activate_start(&controller, &kv, &expected_round, 4).await;
         let expected = start(expected_round, 4);
-        let newer = start(round(&controller, 8, &[1]), 4);
+        report_test_fault(&controller).await;
+        let newer = start(round_for_current_faults(&controller, 8, &[1]).await, 4);
         controller.announce_recovered(&newer).await.unwrap();
 
         let outcome = wait_restored_quorum(&controller, &expected, Duration::from_secs(1)).await;
@@ -3427,10 +3727,11 @@ mod tests {
     #[tokio::test]
     async fn same_generation_nonce_conflict_never_satisfies_quorum() {
         let (controller, _members_tx, kv) = controller(Vec::new()).await;
-        let expected_round = round(&controller, 7, &[1]);
+        report_test_fault(&controller).await;
+        let expected_round = round_for_current_faults(&controller, 7, &[1]).await;
         activate_start(&controller, &kv, &expected_round, 4).await;
         let expected = start(expected_round, 4);
-        let conflicting = start(round(&controller, 7, &[1]), 4);
+        let conflicting = start(round_for_current_faults(&controller, 7, &[1]).await, 4);
         controller.announce_recovered(&conflicting).await.unwrap();
 
         let outcome = wait_restored_quorum(&controller, &expected, Duration::from_secs(1)).await;
@@ -3441,7 +3742,8 @@ mod tests {
     #[tokio::test]
     async fn different_start_target_never_satisfies_restore_quorum() {
         let (controller, _members_tx, kv) = controller(Vec::new()).await;
-        let exact_round = round(&controller, 7, &[1]);
+        report_test_fault(&controller).await;
+        let exact_round = round_for_current_faults(&controller, 7, &[1]).await;
         activate_start(&controller, &kv, &exact_round, 4).await;
         let expected = start(exact_round.clone(), 4);
         controller
@@ -3460,7 +3762,8 @@ mod tests {
 
         let (controller, _members_tx, kv) = controller(Vec::new()).await;
         let controller = Arc::new(controller);
-        let exact_round = round(&controller, 7, &[1]);
+        let original_fault = report_test_fault(&controller).await;
+        let exact_round = round_for_current_faults(&controller, 7, &[1]).await;
         activate_start(&controller, &kv, &exact_round, 4).await;
         let registry = Arc::new(VnodeRegistry::single_owner(1, StateNodeId(1)));
         registry.set_assignment_and_version(Arc::from([StateNodeId(1)]), 7);
@@ -3481,24 +3784,26 @@ mod tests {
             ..RecoveryMonitor::default()
         };
 
-        monitor.observe(&db, &controller).await;
+        let local_fault = monitor.pending_local_fault(&controller).await.unwrap();
+        monitor.observe(&db, &controller, local_fault).await;
 
         assert_eq!(
             monitor.stopped_for.as_ref().map(|(round, _)| round),
             Some(&exact_round)
         );
-        assert!(controller
-            .read_local_fault_report()
-            .await
-            .unwrap()
-            .is_none());
+        assert_eq!(
+            controller.read_local_fault_report().await.unwrap(),
+            Some(original_fault.sequence),
+            "the active round's original fault must remain unchanged until Release"
+        );
         db.shutdown().await.unwrap();
     }
 
     #[tokio::test]
     async fn restore_quorum_does_not_shrink_when_membership_changes() {
         let (controller, members_tx, kv) = controller(vec![info(2)]).await;
-        let exact_round = round(&controller, 7, &[1, 2]);
+        report_test_fault(&controller).await;
+        let exact_round = round_for_current_faults(&controller, 7, &[1, 2]).await;
         activate_start(&controller, &kv, &exact_round, 4).await;
         let start = start(exact_round, 4);
         controller.announce_recovered(&start).await.unwrap();
@@ -3512,7 +3817,8 @@ mod tests {
     #[tokio::test]
     async fn prepare_quorum_fails_when_its_assignment_certificate_changes() {
         let (controller, members_tx, kv) = controller(vec![info(2)]).await;
-        let round = round(&controller, 7, &[1, 2]);
+        report_test_fault(&controller).await;
+        let round = round_for_current_faults(&controller, 7, &[1, 2]).await;
         publish_round_roster(&controller, &kv, &round).await;
         controller.announce_recover_prepare(&round).await.unwrap();
         controller
@@ -3529,7 +3835,8 @@ mod tests {
     #[tokio::test]
     async fn missing_prepare_participant_obeys_the_hard_quorum_deadline() {
         let (controller, _members_tx, kv) = controller(vec![info(2)]).await;
-        let round = round(&controller, 7, &[1, 2]);
+        report_test_fault(&controller).await;
+        let round = round_for_current_faults(&controller, 7, &[1, 2]).await;
         publish_round_roster(&controller, &kv, &round).await;
         controller.announce_recover_prepare(&round).await.unwrap();
         controller
@@ -3550,31 +3857,26 @@ mod tests {
 
     #[tokio::test]
     async fn stopped_quorum_includes_non_owner_evidence_reporters() {
-        let (controller, _members_tx, kv) = controller(Vec::new()).await;
+        let (controller, evidence_controller, kv) = driver_and_follower().await;
         let owner = CheckpointParticipant {
             node_id: 1,
             boot_incarnation: controller.recovery_incarnation(),
         };
         let evidence = CheckpointParticipant {
             node_id: 2,
-            boot_incarnation: uuid::Uuid::from_u128(2),
+            boot_incarnation: evidence_controller.recovery_incarnation(),
         };
+        report_test_fault(&controller).await;
+        report_test_fault(&evidence_controller).await;
+        let inventory = controller.read_recovery_fault_inventory().await.unwrap();
         let fence = CheckpointAssignmentFence::from_owner_map(7, &[1], vec![owner]).unwrap();
         let round = RecoveryRound::new(
             8,
             controller.capture_leader_proof().unwrap(),
             fence,
             vec![evidence],
-            vec![
-                RecoveryFault {
-                    reporter: NodeId(1),
-                    sequence: 8,
-                },
-                RecoveryFault {
-                    reporter: NodeId(2),
-                    sequence: 8,
-                },
-            ],
+            inventory.revision(),
+            inventory.faults().to_vec(),
         )
         .unwrap();
         publish_round_roster(&controller, &kv, &round).await;
@@ -3611,28 +3913,23 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_rejects_an_omitted_available_evidence_reporter() {
-        let (controller, _members_tx, kv) = controller(Vec::new()).await;
+        let (controller, evidence_controller, kv) = driver_and_follower().await;
         let owner = CheckpointParticipant {
             node_id: 1,
             boot_incarnation: controller.recovery_incarnation(),
         };
-        let evidence_boot = uuid::Uuid::from_u128(2);
+        let evidence_boot = evidence_controller.recovery_incarnation();
+        report_test_fault(&controller).await;
+        report_test_fault(&evidence_controller).await;
+        let inventory = controller.read_recovery_fault_inventory().await.unwrap();
         let fence = CheckpointAssignmentFence::from_owner_map(7, &[1], vec![owner]).unwrap();
         let round = RecoveryRound::new(
             8,
             controller.capture_leader_proof().unwrap(),
             fence,
             Vec::new(),
-            vec![
-                RecoveryFault {
-                    reporter: NodeId(1),
-                    sequence: 8,
-                },
-                RecoveryFault {
-                    reporter: NodeId(2),
-                    sequence: 8,
-                },
-            ],
+            inventory.revision(),
+            inventory.faults().to_vec(),
         )
         .unwrap();
         publish_round_roster(&controller, &kv, &round).await;
@@ -3652,7 +3949,8 @@ mod tests {
     #[tokio::test]
     async fn checkpoint_disabled_empty_stopped_inventory_needs_no_coordinator() {
         let (controller, _members_tx, kv) = controller(Vec::new()).await;
-        let round = round(&controller, 8, &[1]);
+        report_test_fault(&controller).await;
+        let round = round_for_current_faults(&controller, 8, &[1]).await;
         publish_round_roster(&controller, &kv, &round).await;
         controller.announce_recover_prepare(&round).await.unwrap();
         let report = RecoveryStoppedReport::new(
@@ -3687,7 +3985,8 @@ mod tests {
         let decisions = CheckpointDecisionStore::new(Arc::clone(&backing));
         let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
         let (controller, _members_tx, kv) = controller_on(Vec::new(), backing).await;
-        let round = round(&controller, 8, &[1]);
+        report_test_fault(&controller).await;
+        let round = round_for_current_faults(&controller, 8, &[1]).await;
         publish_round_roster(&controller, &kv, &round).await;
         controller.announce_recover_prepare(&round).await.unwrap();
         let authority = controller.checkpoint_authority().unwrap();
@@ -3787,7 +4086,8 @@ mod tests {
     #[tokio::test]
     async fn ambiguity_audit_finds_an_outcome_that_becomes_visible_after_the_write_returns() {
         let (controller, _members_tx, kv) = controller(Vec::new()).await;
-        let round = round(&controller, 8, &[1]);
+        report_test_fault(&controller).await;
+        let round = round_for_current_faults(&controller, 8, &[1]).await;
         publish_round_roster(&controller, &kv, &round).await;
         let authority = controller.checkpoint_authority().unwrap();
         let writer = {
@@ -3836,7 +4136,8 @@ mod tests {
     #[tokio::test]
     async fn restarted_same_id_process_invalidates_persisted_stop_ack() {
         let (controller, _members_tx, kv) = controller(Vec::new()).await;
-        let round = round(&controller, 9, &[1]);
+        report_test_fault(&controller).await;
+        let round = round_for_current_faults(&controller, 9, &[1]).await;
         publish_round_roster(&controller, &kv, &round).await;
         controller.announce_recover_prepare(&round).await.unwrap();
         controller
@@ -3869,10 +4170,20 @@ mod tests {
         let authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&backing), 1));
 
         let predecessor_boot = uuid::Uuid::from_u128(20);
+        let process_authority =
+            ProcessLeaseAuthority::new(Arc::clone(&backing), Duration::from_secs(60)).unwrap();
+        let ProcessLeaseOutcome::Acquired(predecessor_process_lease) = process_authority
+            .store_for(NodeId(2))
+            .try_acquire(predecessor_boot, 0)
+            .await
+            .unwrap()
+        else {
+            panic!("predecessor process must acquire its stable-node term");
+        };
         let predecessor_owner = LeaderLeaseOwner {
             node: NodeId(2),
             boot: predecessor_boot,
-            process_term: 1,
+            process_term: predecessor_process_lease.term,
         };
         let LeaseOutcome::Acquired(predecessor_lease) = authority
             .begin_new_term(&predecessor_owner, 0)
@@ -3892,10 +4203,12 @@ mod tests {
             members_rx,
         ));
         install_test_process_deadline(&controller);
+        let successor_process_term =
+            install_test_process_authority(&controller, Arc::clone(&backing)).await;
         let successor_owner = LeaderLeaseOwner {
             node: self_id,
             boot: controller.recovery_incarnation(),
-            process_term: 1,
+            process_term: successor_process_term,
         };
         let observation = authority
             .observe_rival(&successor_owner, &predecessor_lease)
@@ -3934,15 +4247,15 @@ mod tests {
             },
         ];
         let fence = CheckpointAssignmentFence::from_owner_map(7, &[1, 2], participants).unwrap();
+        report_test_fault(&controller).await;
+        let inventory = controller.read_recovery_fault_inventory().await.unwrap();
         let round = RecoveryRound::new(
             9,
             successor_lease.proof(),
             fence.clone(),
             Vec::new(),
-            vec![RecoveryFault {
-                reporter: self_id,
-                sequence: 9,
-            }],
+            inventory.revision(),
+            inventory.faults().to_vec(),
         )
         .unwrap();
         controller.publish_recovery_incarnation().await.unwrap();
@@ -4054,10 +4367,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn release_commit_rejects_a_post_ready_fault_sequence() {
+    async fn release_commit_rejects_a_post_ready_fault() {
         let (controller, _members_tx, kv) = controller(Vec::new()).await;
-        let round = round(&controller, 11, &[1]);
-        controller.report_fault(11).await.unwrap();
+        report_test_fault(&controller).await;
+        let round = round_for_current_faults(&controller, 11, &[1]).await;
         activate_start(&controller, &kv, &round, 6).await;
         let start = start(round.clone(), 6);
         controller.announce_recovered(&start).await.unwrap();
@@ -4070,7 +4383,7 @@ mod tests {
             phase: RecoverPhase::Release { epoch: 6 },
         };
         controller.announce_release_ready(&release).await.unwrap();
-        controller.report_fault(12).await.unwrap();
+        let post_ready_fault = report_test_fault(&controller).await;
 
         let RecoveryControlError::Superseded(reason) = controller
             .try_commit_recover_release(&release)
@@ -4081,8 +4394,12 @@ mod tests {
         };
         assert!(reason.contains("fault set changed"));
         assert_eq!(
-            controller.read_fault_reports().await.unwrap(),
-            vec![(NodeId(1), 12)]
+            controller
+                .read_recovery_fault_inventory()
+                .await
+                .unwrap()
+                .faults(),
+            &[post_ready_fault]
         );
         assert_eq!(controller.observe_recover().await.unwrap(), Some(release));
     }
@@ -4094,8 +4411,8 @@ mod tests {
 
         let (controller, _members_tx, kv) = controller(Vec::new()).await;
         let controller = Arc::new(controller);
-        let round = round(&controller, 7, &[1]);
-        controller.report_fault(7).await.unwrap();
+        report_test_fault(&controller).await;
+        let round = round_for_current_faults(&controller, 7, &[1]).await;
         activate_start(&controller, &kv, &round, 4).await;
         let start = start(round.clone(), 4);
         controller.announce_recovered(&start).await.unwrap();
@@ -4156,8 +4473,8 @@ mod tests {
 
         let (controller, _members_tx, kv) = controller(Vec::new()).await;
         let controller = Arc::new(controller);
-        let round = round(&controller, 7, &[1]);
-        controller.report_fault(7).await.unwrap();
+        report_test_fault(&controller).await;
+        let round = round_for_current_faults(&controller, 7, &[1]).await;
         activate_start(&controller, &kv, &round, 4).await;
         let start = start(round.clone(), 4);
         controller.announce_recovered(&start).await.unwrap();
@@ -4219,8 +4536,8 @@ mod tests {
 
         let (controller, _members_tx, kv) = controller(Vec::new()).await;
         let controller = Arc::new(controller);
-        let round = round(&controller, 7, &[1]);
-        controller.report_fault(7).await.unwrap();
+        report_test_fault(&controller).await;
+        let round = round_for_current_faults(&controller, 7, &[1]).await;
         activate_start(&controller, &kv, &round, 4).await;
         let start = start(round.clone(), 4);
         controller.announce_recovered(&start).await.unwrap();

@@ -17,6 +17,7 @@ use uuid::Uuid;
 use crate::checkpoint::{
     AssignmentDrainId, AssignmentDrainTransition, CheckpointAssignmentFence,
     ClusterRecoveryCapsule, LeaderProof, LeaderProofOwner, RecoveryCapsuleRef,
+    MAX_CHECKPOINT_PARTICIPANTS,
 };
 use crate::checkpoint_decision::{
     CheckpointDecisionStore, CheckpointOutcome, CheckpointScope, CheckpointVerdict, DecisionError,
@@ -28,7 +29,8 @@ use super::catalog_manifest::{
     CatalogManifest, CatalogManifestError, CatalogManifestRef, CatalogSealOutcome,
 };
 use super::controller::{
-    RecoverPhase, RecoveryAnnouncement, RecoveryReleaseId, MAX_RECOVERY_ANNOUNCEMENT_BYTES,
+    RecoverPhase, RecoveryAnnouncement, RecoveryFault, RecoveryFaultInventory,
+    RecoveryFaultPublisher, RecoveryReleaseId, MAX_RECOVERY_ANNOUNCEMENT_BYTES,
 };
 use super::lease_deadline::LeaseDeadline;
 use super::process_lease::{ProcessLease, ProcessLeaseFence};
@@ -37,9 +39,11 @@ use super::snapshot::{
 };
 
 const LEASE_PREFIX: &str = "control/leader-lease/";
-const RECOVERY_RELEASE_TERMINAL_PREFIX: &str = "control/recovery-release-terminals/v1/";
-const AUTHORITY_RECORD_VERSION: u32 = 6;
+const RECOVERY_RELEASE_TERMINAL_PREFIX: &str = "control/recovery-release-terminals/v2/";
+const AUTHORITY_RECORD_VERSION: u32 = 7;
 const MAX_AUTHORITY_RECORD_BYTES: u64 = 256 * 1024;
+const MAX_RECOVERY_FAULT_SLOTS: usize = MAX_CHECKPOINT_PARTICIPANTS * 4;
+const RECOVERY_FAULT_AUTHORITY_HEADROOM_BYTES: u64 = 32 * 1024;
 const MAX_RECOVERY_RELEASE_TERMINAL_BYTES: u64 = MAX_RECOVERY_ANNOUNCEMENT_BYTES as u64;
 const MAX_LEASE_HEAD_READ_ATTEMPTS: usize = 4;
 const MAX_LIVE_AUTHORITY_LINKS: usize = 4096;
@@ -188,15 +192,29 @@ async fn read_authority_record(
 fn encode_authority_record(record: &LeaderAuthorityRecord) -> Result<Bytes, LeaseError> {
     record.validate()?;
     let encoded = serde_json::to_vec(record)?;
-    if encoded.is_empty()
-        || u64::try_from(encoded.len()).unwrap_or(u64::MAX) > MAX_AUTHORITY_RECORD_BYTES
-    {
+    let encoded_len = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
+    if encoded.is_empty() || encoded_len > MAX_AUTHORITY_RECORD_BYTES {
         return Err(LeaseError::Invalid(format!(
             "encoded leader authority record is {} bytes; maximum is {MAX_AUTHORITY_RECORD_BYTES}",
             encoded.len()
         )));
     }
+    if record.recovery_fault_slots.iter().any(|slot| slot.active) {
+        ensure_recovery_fault_authority_headroom(encoded_len)?;
+    }
     Ok(Bytes::from(encoded))
+}
+
+fn ensure_recovery_fault_authority_headroom(encoded_len: u64) -> Result<(), LeaseError> {
+    let limit = MAX_AUTHORITY_RECORD_BYTES
+        .checked_sub(RECOVERY_FAULT_AUTHORITY_HEADROOM_BYTES)
+        .expect("recovery fault headroom must fit the authority record");
+    if encoded_len > limit {
+        return Err(LeaseError::Invalid(format!(
+            "recovery fault inventory leaves {RECOVERY_FAULT_AUTHORITY_HEADROOM_BYTES} bytes of mandatory authority headroom only up to {limit} bytes; candidate is {encoded_len} bytes"
+        )));
+    }
+    Ok(())
 }
 
 /// Exact process incarnation eligible to hold the leader lease.
@@ -245,6 +263,8 @@ impl LeaderLeaseOwner {
 pub struct LeaderLease {
     /// Append-only compare-and-set sequence.
     pub seq: u64,
+    /// Monotonic liveness sequence, advanced only by an acquisition or renewal.
+    pub renewal_sequence: u64,
     /// Fencing token, stable across uninterrupted renewals and advanced for each authority term.
     pub token: u64,
     /// Exact process incarnation holding the lease.
@@ -268,6 +288,38 @@ struct OutcomeLink {
 struct AssignmentDecisionLink {
     sequence: u64,
     target_version: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthorityRecoveryFaultSlot {
+    publisher: RecoveryFaultPublisher,
+    request_sequence: u64,
+    fault_sequence: u64,
+    active: bool,
+}
+
+impl AuthorityRecoveryFaultSlot {
+    fn validate(&self) -> Result<(), LeaseError> {
+        self.publisher.validate().map_err(LeaseError::Invalid)?;
+        if self.request_sequence == 0 || self.fault_sequence == 0 {
+            return Err(LeaseError::Invalid(
+                "recovery fault request and authority sequence must be nonzero".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn fault(&self) -> RecoveryFault {
+        RecoveryFault {
+            reporter: NodeId(self.publisher.participant.node_id),
+            sequence: self.fault_sequence,
+        }
+    }
+
+    fn matches_request(&self, publisher: RecoveryFaultPublisher, request_sequence: u64) -> bool {
+        self.publisher == publisher && self.request_sequence == request_sequence
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -343,6 +395,15 @@ pub(crate) enum RecordRecoveryReleaseCommitResult {
     Created(RecoveryReleaseTerminalRef),
     Unchanged(RecoveryReleaseTerminalRef),
     Conflict { winner: RecoveryReleaseTerminalRef },
+    FaultsChanged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordRecoveryFaultResult {
+    Active,
+    AlreadyCleared,
+    CoveredByNewerRequest,
+    Superseded,
 }
 
 fn recovery_release_id_for_terminal(
@@ -652,6 +713,10 @@ struct LeaderAuthorityRecord {
     assignment_decision_head: Option<AssignmentDecisionLink>,
     /// Monotonic assignment-decision retention boundary and its continuity anchor.
     assignment_decision_floor: Option<AuthorityAssignmentDecisionFloor>,
+    /// Authority sequence that admitted the current recovery-fault slot state.
+    recovery_fault_revision: u64,
+    /// One active or tombstoned request identity per stable node.
+    recovery_fault_slots: Vec<AuthorityRecoveryFaultSlot>,
     /// Present only on the sequence that admitted the latest recovery release.
     recovery_release_commit: Option<AuthorityRecoveryReleaseCommit>,
     /// Latest admitted recovery release, preserved by every later authority mutation.
@@ -661,9 +726,14 @@ struct LeaderAuthorityRecord {
 impl LeaderLease {
     fn validate(&self) -> Result<(), LeaseError> {
         self.owner.validate()?;
-        if self.seq == 0 || self.token == 0 {
+        if self.seq == 0
+            || self.renewal_sequence == 0
+            || self.renewal_sequence > self.seq
+            || self.token == 0
+        {
             return Err(LeaseError::Invalid(
-                "leader lease sequence and token must be nonzero".into(),
+                "leader lease sequence and token must be nonzero and renewal sequence must be within 1..=sequence"
+                    .into(),
             ));
         }
         if let Some(reference) = &self.catalog_manifest {
@@ -689,6 +759,12 @@ impl LeaderLease {
         proof.is_canonical()
             && proof.owner == self.owner.proof_owner()
             && proof.fencing_token == self.token
+    }
+
+    fn has_same_liveness_identity(&self, other: &Self) -> bool {
+        self.owner == other.owner
+            && self.token == other.token
+            && self.renewal_sequence == other.renewal_sequence
     }
 }
 
@@ -813,6 +889,8 @@ impl LeaderAuthorityRecord {
             previous_assignment_decision: None,
             assignment_decision_head: None,
             assignment_decision_floor: None,
+            recovery_fault_revision: 0,
+            recovery_fault_slots: Vec::new(),
             recovery_release_commit: None,
             recovery_release_head: None,
         }
@@ -830,6 +908,8 @@ impl LeaderAuthorityRecord {
             previous_assignment_decision: None,
             assignment_decision_head: self.assignment_decision_head,
             assignment_decision_floor: self.assignment_decision_floor.clone(),
+            recovery_fault_revision: self.recovery_fault_revision,
+            recovery_fault_slots: self.recovery_fault_slots.clone(),
             recovery_release_commit: None,
             recovery_release_head: self.recovery_release_head.clone(),
         }
@@ -848,6 +928,35 @@ impl LeaderAuthorityRecord {
         }
         if let Some(floor) = &self.assignment_decision_floor {
             floor.validate()?;
+        }
+        if self.recovery_fault_slots.windows(2).any(|pair| {
+            pair[0].publisher.participant.node_id >= pair[1].publisher.participant.node_id
+        }) || (self.recovery_fault_revision == 0 && !self.recovery_fault_slots.is_empty())
+            || (self.recovery_fault_revision != 0
+                && self.recovery_fault_slots.is_empty()
+                && self
+                    .recovery_release_head
+                    .as_ref()
+                    .map(|head| head.sequence)
+                    != Some(self.recovery_fault_revision))
+            || self.recovery_fault_revision > self.lease.seq
+            || self.recovery_fault_slots.len() > MAX_RECOVERY_FAULT_SLOTS
+        {
+            return Err(LeaseError::Invalid(
+                "leader authority recovery-fault inventory is not canonical".into(),
+            ));
+        }
+        let mut fault_sequences = BTreeSet::new();
+        for slot in &self.recovery_fault_slots {
+            slot.validate()?;
+            if slot.fault_sequence > self.recovery_fault_revision
+                || slot.fault_sequence > self.lease.seq
+                || !fault_sequences.insert(slot.fault_sequence)
+            {
+                return Err(LeaseError::Invalid(
+                    "leader authority recovery-fault sequences are not canonical".into(),
+                ));
+            }
         }
         if [
             self.checkpoint_outcome.is_some(),
@@ -1010,9 +1119,11 @@ impl LeaderAuthorityRecord {
                 };
                 if !self.lease.matches_proof(&commit.leader_proof)
                     || self.recovery_release_head.as_ref() != Some(&expected)
+                    || self.recovery_fault_revision != self.lease.seq
+                    || self.recovery_fault_slots.iter().any(|slot| slot.active)
                 {
                     return Err(LeaseError::Invalid(
-                        "recovery release commit is not bound to its exact authority sequence and term"
+                        "recovery release commit is not bound to its exact authority sequence, term, and settled fault inventory"
                             .into(),
                     ));
                 }
@@ -1023,6 +1134,14 @@ impl LeaderAuthorityRecord {
                     if head.sequence >= self.lease.seq {
                         return Err(LeaseError::Invalid(
                             "recovery release head is outside the durable authority sequence"
+                                .into(),
+                        ));
+                    }
+                    if !self.recovery_fault_slots.iter().any(|slot| slot.active)
+                        && self.recovery_fault_revision != head.sequence
+                    {
+                        return Err(LeaseError::Invalid(
+                            "settled recovery fault inventory is not bound to its release head"
                                 .into(),
                         ));
                     }
@@ -1055,7 +1174,7 @@ enum SameOwnerToken {
     Exact(u64),
 }
 
-/// Candidate-local proof that one exact rival record remained current for a full TTL.
+/// Candidate-local proof that one rival liveness identity remained current for a full TTL.
 #[derive(Debug)]
 pub struct LeaderLeaseObservation {
     lease: LeaderLease,
@@ -1182,6 +1301,156 @@ impl LeaderLeaseStore {
             ttl_ms,
             prune_running: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn recovery_fault_inventory_from(record: &LeaderAuthorityRecord) -> RecoveryFaultInventory {
+        RecoveryFaultInventory {
+            revision: record.recovery_fault_revision,
+            faults: record
+                .recovery_fault_slots
+                .iter()
+                .filter(|slot| slot.active)
+                .map(AuthorityRecoveryFaultSlot::fault)
+                .collect(),
+        }
+    }
+
+    pub(crate) async fn recovery_fault_inventory(
+        &self,
+    ) -> Result<RecoveryFaultInventory, ClusterCheckpointAuthorityError> {
+        let record = self
+            .load_record()
+            .await?
+            .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+        Ok(Self::recovery_fault_inventory_from(&record))
+    }
+
+    pub(crate) async fn record_recovery_fault(
+        &self,
+        publisher: RecoveryFaultPublisher,
+        request_sequence: u64,
+    ) -> Result<RecordRecoveryFaultResult, ClusterCheckpointAuthorityError> {
+        publisher.validate().map_err(LeaseError::Invalid)?;
+        if request_sequence == 0 {
+            return Err(LeaseError::Invalid(
+                "recovery fault request sequence must be nonzero".into(),
+            )
+            .into());
+        }
+
+        loop {
+            let current = self
+                .load_record()
+                .await?
+                .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+            let node_id = publisher.participant.node_id;
+            let slot_index = current
+                .recovery_fault_slots
+                .binary_search_by_key(&node_id, |slot| slot.publisher.participant.node_id);
+            let (insert_at, replace) = match slot_index {
+                Ok(index) => {
+                    let slot = &current.recovery_fault_slots[index];
+                    if slot.matches_request(publisher, request_sequence) {
+                        return Ok(if slot.active {
+                            RecordRecoveryFaultResult::Active
+                        } else {
+                            RecordRecoveryFaultResult::AlreadyCleared
+                        });
+                    }
+                    if publisher.process_term < slot.publisher.process_term {
+                        return Ok(RecordRecoveryFaultResult::Superseded);
+                    }
+                    if publisher.process_term == slot.publisher.process_term
+                        && publisher.participant.boot_incarnation
+                            != slot.publisher.participant.boot_incarnation
+                    {
+                        return Err(LeaseError::Invalid(format!(
+                            "stable node {node_id} has two recovery fault publishers for process term {}",
+                            publisher.process_term
+                        ))
+                        .into());
+                    }
+                    if publisher.process_term == slot.publisher.process_term
+                        && request_sequence < slot.request_sequence
+                    {
+                        return Ok(RecordRecoveryFaultResult::CoveredByNewerRequest);
+                    }
+                    (index, true)
+                }
+                Err(index) => (index, false),
+            };
+
+            let sequence =
+                current.lease.seq.checked_add(1).ok_or_else(|| {
+                    LeaseError::Invalid("leader authority sequence exhausted".into())
+                })?;
+            let mut lease = current.lease.clone();
+            lease.seq = sequence;
+            let mut candidate = current.preserve_with_lease(lease);
+            let slot = AuthorityRecoveryFaultSlot {
+                publisher,
+                request_sequence,
+                // Authority sequence is globally monotonic even after an obsolete tombstone is
+                // compacted. A delayed retry can therefore become a conservative fresh fault,
+                // but can never alias a sequence already remembered by a recovery monitor.
+                fault_sequence: sequence,
+                active: true,
+            };
+            if replace {
+                candidate.recovery_fault_slots[insert_at] = slot;
+            } else {
+                candidate.recovery_fault_slots.insert(insert_at, slot);
+            }
+            candidate.recovery_fault_revision = sequence;
+            candidate.validate()?;
+
+            match self.create_authority_record(&candidate).await? {
+                AuthorityCreateOutcome::Created => {
+                    return Ok(RecordRecoveryFaultResult::Active);
+                }
+                AuthorityCreateOutcome::Contended(_) => tokio::task::yield_now().await,
+            }
+        }
+    }
+
+    pub(crate) async fn authorize_recovery_release(
+        &self,
+        clearer: RecoveryFaultPublisher,
+        terminal: &RecoveryAnnouncement,
+    ) -> Result<bool, ClusterCheckpointAuthorityError> {
+        clearer.validate().map_err(LeaseError::Invalid)?;
+        let (_, terminal_reference) = encode_recovery_release_terminal(terminal)?;
+        let reporter = NodeId(clearer.participant.node_id);
+        let expected = terminal.round.fault_sequence(reporter);
+        let current = self
+            .load_record()
+            .await?
+            .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+        let Some(release_head) = current.recovery_release_head.as_ref() else {
+            return Ok(false);
+        };
+        if release_head.terminal != terminal_reference
+            || current.recovery_fault_revision != release_head.sequence
+        {
+            return Ok(false);
+        }
+        if current.recovery_fault_slots.iter().any(|slot| slot.active) {
+            return Ok(false);
+        }
+        let slot_index = current
+            .recovery_fault_slots
+            .binary_search_by_key(&reporter.0, |slot| slot.publisher.participant.node_id);
+        let Some(expected_sequence) = expected else {
+            return Ok(match slot_index {
+                Ok(index) => !current.recovery_fault_slots[index].active,
+                Err(_) => true,
+            });
+        };
+        let Ok(index) = slot_index else {
+            return Ok(false);
+        };
+        let slot = &current.recovery_fault_slots[index];
+        Ok(slot.publisher == clearer && slot.fault_sequence == expected_sequence && !slot.active)
     }
 
     pub(crate) async fn stage_recovery_release_terminal(
@@ -1318,6 +1587,12 @@ impl LeaderLeaseStore {
             if !current.lease.matches_proof(proof) {
                 return Err(ClusterCheckpointAuthorityError::Fenced);
             }
+            let fault_inventory = Self::recovery_fault_inventory_from(&current);
+            if fault_inventory.revision != terminal.round.fault_revision()
+                || fault_inventory.faults != terminal.round.faults
+            {
+                return Ok(RecordRecoveryReleaseCommitResult::FaultsChanged);
+            }
 
             let base_sequence = current.lease.seq;
             let sequence = base_sequence
@@ -1325,11 +1600,25 @@ impl LeaderLeaseStore {
                 .ok_or_else(|| LeaseError::Invalid("leader authority sequence exhausted".into()))?;
             let mut candidate = current.preserve_with_lease(LeaderLease {
                 seq: sequence,
+                renewal_sequence: current.lease.renewal_sequence,
                 token: current.lease.token,
                 owner: current.lease.owner.clone(),
                 expires_at_ms: current.lease.expires_at_ms,
                 catalog_manifest: current.lease.catalog_manifest.clone(),
             });
+            // Only a process frozen into the stopped roster may consume this terminal. Covered
+            // unavailable publishers remain fenced and conservatively republish if they return.
+            candidate.recovery_fault_slots.retain(|slot| {
+                slot.active
+                    && terminal
+                        .round
+                        .stopped_participant_incarnation(NodeId(slot.publisher.participant.node_id))
+                        == Some(slot.publisher.participant.boot_incarnation)
+            });
+            for slot in &mut candidate.recovery_fault_slots {
+                slot.active = false;
+            }
+            candidate.recovery_fault_revision = sequence;
             candidate.recovery_release_commit = Some(AuthorityRecoveryReleaseCommit {
                 terminal: reference.clone(),
                 leader_proof: proof.clone(),
@@ -2023,6 +2312,7 @@ impl LeaderLeaseStore {
                         "lease sequence exhausted".into(),
                     ))
                 })?,
+                renewal_sequence: current.lease.renewal_sequence,
                 token: current.lease.token,
                 owner: current.lease.owner.clone(),
                 expires_at_ms: current.lease.expires_at_ms,
@@ -2483,6 +2773,7 @@ impl LeaderLeaseStore {
                 .ok_or_else(|| LeaseError::Invalid("leader authority sequence exhausted".into()))?;
             let mut next = current.preserve_with_lease(LeaderLease {
                 seq: sequence,
+                renewal_sequence: current.lease.renewal_sequence,
                 token: current.lease.token,
                 owner: current.lease.owner.clone(),
                 expires_at_ms: current.lease.expires_at_ms,
@@ -2653,6 +2944,7 @@ impl LeaderLeaseStore {
                 .ok_or_else(|| LeaseError::Invalid("leader authority sequence exhausted".into()))?;
             let mut candidate = current.preserve_with_lease(LeaderLease {
                 seq: sequence,
+                renewal_sequence: current.lease.renewal_sequence,
                 token: current.lease.token,
                 owner: current.lease.owner.clone(),
                 expires_at_ms: current.lease.expires_at_ms,
@@ -3002,6 +3294,7 @@ impl LeaderLeaseStore {
                 .ok_or_else(|| LeaseError::Invalid("leader authority sequence exhausted".into()))?;
             let mut next = current.preserve_with_lease(LeaderLease {
                 seq: sequence,
+                renewal_sequence: current.lease.renewal_sequence,
                 token: current.lease.token,
                 owner: current.lease.owner.clone(),
                 expires_at_ms: current.lease.expires_at_ms,
@@ -3532,6 +3825,7 @@ impl LeaderLeaseStore {
                 .ok_or_else(|| LeaseError::Invalid("leader authority sequence exhausted".into()))?;
             let mut next = rechecked.preserve_with_lease(LeaderLease {
                 seq: sequence,
+                renewal_sequence: rechecked.lease.renewal_sequence,
                 token: rechecked.lease.token,
                 owner: rechecked.lease.owner.clone(),
                 expires_at_ms: rechecked.lease.expires_at_ms,
@@ -3663,6 +3957,7 @@ impl LeaderLeaseStore {
                     }
                     LeaderAuthorityRecord::initial(LeaderLease {
                         seq: 1,
+                        renewal_sequence: 1,
                         token: 1,
                         owner: owner.clone(),
                         expires_at_ms,
@@ -3691,6 +3986,9 @@ impl LeaderLeaseStore {
                         seq: record.lease.seq.checked_add(1).ok_or_else(|| {
                             LeaseError::Invalid("lease sequence exhausted".into())
                         })?,
+                        renewal_sequence: record.lease.renewal_sequence.checked_add(1).ok_or_else(
+                            || LeaseError::Invalid("lease renewal sequence exhausted".into()),
+                        )?,
                         token,
                         owner: owner.clone(),
                         expires_at_ms,
@@ -3734,7 +4032,7 @@ impl LeaderLeaseStore {
         }
     }
 
-    /// Start a candidate-local observation of a rival durable record.
+    /// Start a candidate-local observation of a rival durable liveness identity.
     ///
     /// # Errors
     /// Rejects malformed state or an observation of the candidate itself.
@@ -3757,8 +4055,8 @@ impl LeaderLeaseStore {
         })
     }
 
-    /// Take over only after the exact rival owner and sequence remained current for a full TTL on
-    /// the candidate's monotonic clock.
+    /// Take over only after the rival's owner, fencing token, and renewal sequence remained
+    /// current for a full TTL on the candidate's monotonic clock.
     ///
     /// # Errors
     /// Fails closed on early observation, invalid state, I/O, or arithmetic exhaustion.
@@ -3779,32 +4077,47 @@ impl LeaderLeaseStore {
         if observation.started.elapsed() < ttl {
             return Ok(LeaseOutcome::Held(observation.lease.clone()));
         }
-        let current = self
-            .load_record()
-            .await?
-            .ok_or_else(|| LeaseError::Invalid("observed leader lease disappeared".into()))?;
-        if current.lease != observation.lease {
-            return Ok(LeaseOutcome::Held(current.lease));
-        }
-        let candidate_lease = LeaderLease {
-            seq: current
-                .lease
-                .seq
-                .checked_add(1)
-                .ok_or_else(|| LeaseError::Invalid("lease sequence exhausted".into()))?,
-            token: current
-                .lease
-                .token
-                .checked_add(1)
-                .ok_or_else(|| LeaseError::Invalid("fencing token exhausted".into()))?,
-            owner: owner.clone(),
-            expires_at_ms: self.diagnostic_expiry(now_ms)?,
-            catalog_manifest: current.lease.catalog_manifest.clone(),
-        };
-        let candidate = current.preserve_with_lease(candidate_lease);
-        match self.create_authority_record(&candidate).await? {
-            AuthorityCreateOutcome::Created => Ok(LeaseOutcome::Acquired(candidate.lease)),
-            AuthorityCreateOutcome::Contended(winner) => Ok(LeaseOutcome::Held(winner.lease)),
+        let expires_at_ms = self.diagnostic_expiry(now_ms)?;
+        loop {
+            let current = self
+                .load_record()
+                .await?
+                .ok_or_else(|| LeaseError::Invalid("observed leader lease disappeared".into()))?;
+            if !current.lease.has_same_liveness_identity(&observation.lease) {
+                return Ok(LeaseOutcome::Held(current.lease));
+            }
+            let candidate_lease = LeaderLease {
+                seq: current
+                    .lease
+                    .seq
+                    .checked_add(1)
+                    .ok_or_else(|| LeaseError::Invalid("lease sequence exhausted".into()))?,
+                renewal_sequence: current.lease.renewal_sequence.checked_add(1).ok_or_else(
+                    || LeaseError::Invalid("lease renewal sequence exhausted".into()),
+                )?,
+                token: current
+                    .lease
+                    .token
+                    .checked_add(1)
+                    .ok_or_else(|| LeaseError::Invalid("fencing token exhausted".into()))?,
+                owner: owner.clone(),
+                expires_at_ms,
+                catalog_manifest: current.lease.catalog_manifest.clone(),
+            };
+            let candidate = current.preserve_with_lease(candidate_lease);
+            match self.create_authority_record(&candidate).await? {
+                AuthorityCreateOutcome::Created => {
+                    return Ok(LeaseOutcome::Acquired(candidate.lease));
+                }
+                AuthorityCreateOutcome::Contended(winner)
+                    if winner.lease.has_same_liveness_identity(&observation.lease) =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                AuthorityCreateOutcome::Contended(winner) => {
+                    return Ok(LeaseOutcome::Held(winner.lease));
+                }
+            }
         }
     }
 }
@@ -4138,7 +4451,7 @@ impl LeaderLeaseManager {
                     held_token = None;
                     let unchanged = observation
                         .as_ref()
-                        .is_some_and(|observed| observed.lease == rival);
+                        .is_some_and(|observed| observed.lease.has_same_liveness_identity(&rival));
                     if !unchanged {
                         match self.store.observe_rival(&self.owner, &rival) {
                             Ok(new_observation) => observation = Some(new_observation),
@@ -4242,26 +4555,86 @@ mod tests {
         .unwrap()
     }
 
-    fn recovery_release_terminal(
+    fn recovery_fault_publisher(
+        node_id: u64,
+        boot_incarnation: u128,
+        process_term: u64,
+    ) -> RecoveryFaultPublisher {
+        RecoveryFaultPublisher {
+            participant: crate::checkpoint::CheckpointParticipant {
+                node_id,
+                boot_incarnation: Uuid::from_u128(boot_incarnation),
+            },
+            process_term,
+        }
+    }
+
+    fn owner_recovery_fault_publisher(owner: &LeaderLeaseOwner) -> RecoveryFaultPublisher {
+        RecoveryFaultPublisher {
+            participant: crate::checkpoint::CheckpointParticipant {
+                node_id: owner.node.0,
+                boot_incarnation: owner.boot,
+            },
+            process_term: owner.process_term,
+        }
+    }
+
+    async fn recovery_release_terminal(
+        store: &LeaderLeaseStore,
         lease: &LeaderLease,
         generation: u64,
         epoch: u64,
     ) -> RecoveryAnnouncement {
+        let inventory = store.recovery_fault_inventory().await.unwrap();
+        assert!(!inventory.faults().is_empty());
         let round = RecoveryRound::new(
             generation,
             lease.proof(),
             assignment_fence(&lease.owner),
             Vec::new(),
-            vec![RecoveryFault {
-                reporter: lease.owner.node,
-                sequence: generation,
-            }],
+            inventory.revision(),
+            inventory.faults().to_vec(),
         )
         .unwrap();
         RecoveryAnnouncement {
             round,
             phase: RecoverPhase::ReleaseCommitted { epoch },
         }
+    }
+
+    async fn recovery_release_terminal_after_owner_fault(
+        store: &LeaderLeaseStore,
+        lease: &LeaderLease,
+        generation: u64,
+        epoch: u64,
+    ) -> RecoveryAnnouncement {
+        assert_eq!(
+            store
+                .record_recovery_fault(owner_recovery_fault_publisher(&lease.owner), generation,)
+                .await
+                .unwrap(),
+            RecordRecoveryFaultResult::Active
+        );
+        recovery_release_terminal(store, lease, generation, epoch).await
+    }
+
+    async fn commit_recovery_release(
+        store: &LeaderLeaseStore,
+        lease: &LeaderLease,
+        terminal: &RecoveryAnnouncement,
+    ) -> RecoveryReleaseTerminalRef {
+        let reference = store
+            .stage_recovery_release_terminal(terminal)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .record_recovery_release_commit(&lease.proof(), reference.clone())
+                .await
+                .unwrap(),
+            RecordRecoveryReleaseCommitResult::Created(reference.clone())
+        );
+        reference
     }
 
     fn assignment_drain_transition(
@@ -4498,6 +4871,623 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_active_recovery_fault_retry_is_idempotent() {
+        let store = store(1_000);
+        let incumbent = owner(1, 1, 1);
+        let LeaseOutcome::Acquired(_) = store.begin_new_term(&incumbent, 0).await.unwrap() else {
+            panic!("empty authority must be acquired");
+        };
+        let publisher = owner_recovery_fault_publisher(&incumbent);
+
+        assert_eq!(
+            store.record_recovery_fault(publisher, 7).await.unwrap(),
+            RecordRecoveryFaultResult::Active
+        );
+        let admitted = store.load_record().await.unwrap().unwrap();
+        assert_eq!(
+            store.record_recovery_fault(publisher, 7).await.unwrap(),
+            RecordRecoveryFaultResult::Active
+        );
+
+        assert_eq!(store.load_record().await.unwrap().unwrap(), admitted);
+        assert_eq!(
+            store.recovery_fault_inventory().await.unwrap().faults(),
+            &[RecoveryFault {
+                reporter: incumbent.node,
+                sequence: 2,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_recovery_fault_create_reconciles_without_a_duplicate_sequence() {
+        let (raw, store) = ambiguous_once_at(1_000, lease_path(2));
+        let incumbent = owner(1, 1, 1);
+        let LeaseOutcome::Acquired(_) = store.begin_new_term(&incumbent, 0).await.unwrap() else {
+            panic!("empty authority must be acquired");
+        };
+        let publisher = owner_recovery_fault_publisher(&incumbent);
+
+        assert_eq!(
+            store.record_recovery_fault(publisher, 7).await.unwrap(),
+            RecordRecoveryFaultResult::Active
+        );
+        assert!(raw
+            .did_return_ambiguous
+            .load(std::sync::atomic::Ordering::Acquire));
+        let admitted = store.load_record().await.unwrap().unwrap();
+        assert_eq!(admitted.lease.seq, 2);
+        assert_eq!(admitted.recovery_fault_revision, 2);
+        assert_eq!(admitted.recovery_fault_slots.len(), 1);
+        assert_eq!(admitted.recovery_fault_slots[0].fault_sequence, 2);
+
+        assert_eq!(
+            store.record_recovery_fault(publisher, 7).await.unwrap(),
+            RecordRecoveryFaultResult::Active
+        );
+        assert_eq!(store.load_record().await.unwrap().unwrap(), admitted);
+    }
+
+    #[tokio::test]
+    async fn exact_recovery_fault_retry_observes_a_terminal_bound_tombstone() {
+        let store = store(1_000);
+        let incumbent = owner(1, 1, 1);
+        let LeaseOutcome::Acquired(lease) = store.begin_new_term(&incumbent, 0).await.unwrap()
+        else {
+            panic!("empty authority must be acquired");
+        };
+        let publisher = owner_recovery_fault_publisher(&incumbent);
+        assert_eq!(
+            store.record_recovery_fault(publisher, 7).await.unwrap(),
+            RecordRecoveryFaultResult::Active
+        );
+        let terminal = recovery_release_terminal(&store, &lease, 1, 0).await;
+        commit_recovery_release(&store, &lease, &terminal).await;
+        let tombstone = store.load_record().await.unwrap().unwrap();
+        assert_eq!(tombstone.recovery_fault_revision, tombstone.lease.seq);
+        assert!(!tombstone.recovery_fault_slots[0].active);
+        let mut stale_revision = tombstone.clone();
+        stale_revision.recovery_fault_revision -= 1;
+        assert!(stale_revision.validate().is_err());
+        let mut active_slot = tombstone.clone();
+        active_slot.recovery_fault_slots[0].active = true;
+        assert!(active_slot.validate().is_err());
+        let mut advanced_lease = tombstone.lease.clone();
+        advanced_lease.seq += 1;
+        let mut detached_revision = tombstone.preserve_with_lease(advanced_lease);
+        detached_revision.recovery_fault_revision = detached_revision.lease.seq;
+        assert!(detached_revision.validate().is_err());
+        assert!(store
+            .authorize_recovery_release(publisher, &terminal)
+            .await
+            .unwrap());
+        assert!(!store
+            .authorize_recovery_release(recovery_fault_publisher(1, 2, 2), &terminal)
+            .await
+            .unwrap());
+        assert_eq!(store.load_record().await.unwrap().unwrap(), tombstone);
+
+        assert_eq!(
+            store.record_recovery_fault(publisher, 7).await.unwrap(),
+            RecordRecoveryFaultResult::AlreadyCleared
+        );
+        assert_eq!(store.load_record().await.unwrap().unwrap(), tombstone);
+        assert!(store
+            .recovery_fault_inventory()
+            .await
+            .unwrap()
+            .faults()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_new_fault_blocks_authorization_from_the_previous_release() {
+        let store = store(1_000);
+        let incumbent = owner(1, 1, 1);
+        let LeaseOutcome::Acquired(lease) = store.begin_new_term(&incumbent, 0).await.unwrap()
+        else {
+            panic!("empty authority must be acquired");
+        };
+        let released = owner_recovery_fault_publisher(&incumbent);
+        assert_eq!(
+            store.record_recovery_fault(released, 1).await.unwrap(),
+            RecordRecoveryFaultResult::Active
+        );
+        let terminal = recovery_release_terminal(&store, &lease, 1, 0).await;
+        commit_recovery_release(&store, &lease, &terminal).await;
+
+        let newer = recovery_fault_publisher(2, 2, 1);
+        assert_eq!(
+            store.record_recovery_fault(newer, 1).await.unwrap(),
+            RecordRecoveryFaultResult::Active
+        );
+        assert!(!store
+            .authorize_recovery_release(released, &terminal)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn recovery_release_retains_only_exact_stopped_fault_publishers() {
+        let store = store(1_000);
+        let incumbent = owner(1, 1, 1);
+        let LeaseOutcome::Acquired(lease) = store.begin_new_term(&incumbent, 0).await.unwrap()
+        else {
+            panic!("empty authority must be acquired");
+        };
+        let evidence = recovery_fault_publisher(2, 2, 1);
+        let unavailable = recovery_fault_publisher(3, 3, 1);
+        assert_eq!(
+            store.record_recovery_fault(evidence, 1).await.unwrap(),
+            RecordRecoveryFaultResult::Active
+        );
+        assert_eq!(
+            store.record_recovery_fault(unavailable, 1).await.unwrap(),
+            RecordRecoveryFaultResult::Active
+        );
+        let inventory = store.recovery_fault_inventory().await.unwrap();
+        let round = RecoveryRound::new(
+            1,
+            lease.proof(),
+            assignment_fence(&incumbent),
+            vec![evidence.participant],
+            inventory.revision(),
+            inventory.faults().to_vec(),
+        )
+        .unwrap();
+        let terminal = RecoveryAnnouncement {
+            round,
+            phase: RecoverPhase::ReleaseCommitted { epoch: 0 },
+        };
+
+        commit_recovery_release(&store, &lease, &terminal).await;
+        let head = store.load_record().await.unwrap().unwrap();
+        assert_eq!(head.recovery_fault_slots.len(), 1);
+        assert_eq!(head.recovery_fault_slots[0].publisher, evidence);
+        assert!(!head.recovery_fault_slots[0].active);
+        assert!(store
+            .authorize_recovery_release(evidence, &terminal)
+            .await
+            .unwrap());
+        assert!(!store
+            .authorize_recovery_release(unavailable, &terminal)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn older_same_boot_recovery_fault_is_covered_by_the_newer_request() {
+        let store = store(1_000);
+        let incumbent = owner(1, 1, 1);
+        let LeaseOutcome::Acquired(_) = store.begin_new_term(&incumbent, 0).await.unwrap() else {
+            panic!("empty authority must be acquired");
+        };
+        let publisher = owner_recovery_fault_publisher(&incumbent);
+        assert_eq!(
+            store.record_recovery_fault(publisher, 2).await.unwrap(),
+            RecordRecoveryFaultResult::Active
+        );
+        let newer = store.load_record().await.unwrap().unwrap();
+
+        assert_eq!(
+            store.record_recovery_fault(publisher, 1).await.unwrap(),
+            RecordRecoveryFaultResult::CoveredByNewerRequest
+        );
+        assert_eq!(store.load_record().await.unwrap().unwrap(), newer);
+    }
+
+    #[tokio::test]
+    async fn lower_term_recovery_fault_is_superseded() {
+        let store = store(1_000);
+        let incumbent = owner(1, 1, 1);
+        let LeaseOutcome::Acquired(_) = store.begin_new_term(&incumbent, 0).await.unwrap() else {
+            panic!("empty authority must be acquired");
+        };
+        let current = recovery_fault_publisher(1, 2, 2);
+        assert_eq!(
+            store.record_recovery_fault(current, 1).await.unwrap(),
+            RecordRecoveryFaultResult::Active
+        );
+        let admitted = store.load_record().await.unwrap().unwrap();
+
+        assert_eq!(
+            store
+                .record_recovery_fault(recovery_fault_publisher(1, 1, 1), u64::MAX)
+                .await
+                .unwrap(),
+            RecordRecoveryFaultResult::Superseded
+        );
+        assert_eq!(store.load_record().await.unwrap().unwrap(), admitted);
+    }
+
+    #[tokio::test]
+    async fn higher_term_recovery_fault_replaces_the_stable_node_slot() {
+        let store = store(1_000);
+        let incumbent = owner(1, 1, 1);
+        let LeaseOutcome::Acquired(_) = store.begin_new_term(&incumbent, 0).await.unwrap() else {
+            panic!("empty authority must be acquired");
+        };
+        let first = recovery_fault_publisher(1, 1, 1);
+        let replacement = recovery_fault_publisher(1, 2, 2);
+        assert_eq!(
+            store.record_recovery_fault(first, 10).await.unwrap(),
+            RecordRecoveryFaultResult::Active
+        );
+
+        assert_eq!(
+            store.record_recovery_fault(replacement, 1).await.unwrap(),
+            RecordRecoveryFaultResult::Active
+        );
+        let head = store.load_record().await.unwrap().unwrap();
+        assert_eq!(head.recovery_fault_slots.len(), 1);
+        assert_eq!(head.recovery_fault_slots[0].publisher, replacement);
+        assert_eq!(head.recovery_fault_slots[0].request_sequence, 1);
+        assert_eq!(head.recovery_fault_slots[0].fault_sequence, 3);
+        assert!(head.recovery_fault_slots[0].active);
+        assert_eq!(
+            store.record_recovery_fault(first, u64::MAX).await.unwrap(),
+            RecordRecoveryFaultResult::Superseded
+        );
+    }
+
+    #[tokio::test]
+    async fn same_term_different_boot_recovery_fault_is_rejected() {
+        let store = store(1_000);
+        let incumbent = owner(1, 1, 1);
+        let LeaseOutcome::Acquired(_) = store.begin_new_term(&incumbent, 0).await.unwrap() else {
+            panic!("empty authority must be acquired");
+        };
+        assert_eq!(
+            store
+                .record_recovery_fault(recovery_fault_publisher(1, 1, 1), 1)
+                .await
+                .unwrap(),
+            RecordRecoveryFaultResult::Active
+        );
+        let admitted = store.load_record().await.unwrap().unwrap();
+
+        let error = store
+            .record_recovery_fault(recovery_fault_publisher(1, 2, 1), 2)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ClusterCheckpointAuthorityError::Authority(LeaseError::Invalid(message))
+                if message.contains("two recovery fault publishers")
+        ));
+        assert_eq!(store.load_record().await.unwrap().unwrap(), admitted);
+    }
+
+    #[tokio::test]
+    async fn recovery_release_authorization_rejects_uncommitted_and_stale_terminals() {
+        let store = store(1_000);
+        let incumbent = owner(1, 1, 1);
+        let LeaseOutcome::Acquired(lease) = store.begin_new_term(&incumbent, 0).await.unwrap()
+        else {
+            panic!("empty authority must be acquired");
+        };
+        let publisher = owner_recovery_fault_publisher(&incumbent);
+        assert_eq!(
+            store.record_recovery_fault(publisher, 1).await.unwrap(),
+            RecordRecoveryFaultResult::Active
+        );
+        let first = recovery_release_terminal(&store, &lease, 1, 0).await;
+        let first_reference = store.stage_recovery_release_terminal(&first).await.unwrap();
+
+        assert!(!store
+            .authorize_recovery_release(publisher, &first)
+            .await
+            .unwrap());
+        assert_eq!(
+            store
+                .record_recovery_release_commit(&lease.proof(), first_reference.clone())
+                .await
+                .unwrap(),
+            RecordRecoveryReleaseCommitResult::Created(first_reference)
+        );
+        assert!(store
+            .authorize_recovery_release(publisher, &first)
+            .await
+            .unwrap());
+
+        assert_eq!(
+            store.record_recovery_fault(publisher, 2).await.unwrap(),
+            RecordRecoveryFaultResult::Active
+        );
+        let second = recovery_release_terminal(&store, &lease, 2, 0).await;
+        commit_recovery_release(&store, &lease, &second).await;
+
+        assert!(!store
+            .authorize_recovery_release(publisher, &first)
+            .await
+            .unwrap());
+        assert!(store
+            .authorize_recovery_release(publisher, &second)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn fault_report_before_recovery_release_cas_returns_faults_changed() {
+        let store = store(1_000);
+        let incumbent = owner(1, 1, 1);
+        let LeaseOutcome::Acquired(lease) = store.begin_new_term(&incumbent, 0).await.unwrap()
+        else {
+            panic!("empty authority must be acquired");
+        };
+        let publisher = owner_recovery_fault_publisher(&incumbent);
+        assert_eq!(
+            store.record_recovery_fault(publisher, 1).await.unwrap(),
+            RecordRecoveryFaultResult::Active
+        );
+        let terminal = recovery_release_terminal(&store, &lease, 1, 0).await;
+        let reference = store
+            .stage_recovery_release_terminal(&terminal)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.record_recovery_fault(publisher, 2).await.unwrap(),
+            RecordRecoveryFaultResult::Active
+        );
+        assert_eq!(
+            store
+                .record_recovery_release_commit(&lease.proof(), reference)
+                .await
+                .unwrap(),
+            RecordRecoveryReleaseCommitResult::FaultsChanged
+        );
+        assert_eq!(
+            store.recovery_fault_inventory().await.unwrap().faults(),
+            &[RecoveryFault {
+                reporter: incumbent.node,
+                sequence: 3,
+            }]
+        );
+        assert_eq!(
+            store.latest_recovery_release_terminal().await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_release_cas_before_fault_report_preserves_both_facts() {
+        let store = store(1_000);
+        let incumbent = owner(1, 1, 1);
+        let LeaseOutcome::Acquired(lease) = store.begin_new_term(&incumbent, 0).await.unwrap()
+        else {
+            panic!("empty authority must be acquired");
+        };
+        let publisher = owner_recovery_fault_publisher(&incumbent);
+        assert_eq!(
+            store.record_recovery_fault(publisher, 1).await.unwrap(),
+            RecordRecoveryFaultResult::Active
+        );
+        let terminal = recovery_release_terminal(&store, &lease, 1, 0).await;
+        let reference = commit_recovery_release(&store, &lease, &terminal).await;
+
+        assert_eq!(
+            store.record_recovery_fault(publisher, 2).await.unwrap(),
+            RecordRecoveryFaultResult::Active
+        );
+        assert_eq!(
+            store.latest_recovery_release_terminal().await.unwrap(),
+            Some(terminal.clone())
+        );
+        assert_eq!(
+            store.recovery_fault_inventory().await.unwrap().faults(),
+            &[RecoveryFault {
+                reporter: incumbent.node,
+                sequence: 4,
+            }]
+        );
+        assert!(!store
+            .authorize_recovery_release(publisher, &terminal)
+            .await
+            .unwrap());
+        assert_eq!(
+            store
+                .record_recovery_release_commit(&lease.proof(), reference.clone())
+                .await
+                .unwrap(),
+            RecordRecoveryReleaseCommitResult::Unchanged(reference)
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_release_compacts_tombstones_without_reusing_fault_sequences() {
+        let store = store(1_000);
+        let incumbent = owner(1, 1, 1);
+        let LeaseOutcome::Acquired(lease) = store.begin_new_term(&incumbent, 0).await.unwrap()
+        else {
+            panic!("empty authority must be acquired");
+        };
+        let first = recovery_fault_publisher(2, 2, 1);
+        assert_eq!(
+            store.record_recovery_fault(first, 1).await.unwrap(),
+            RecordRecoveryFaultResult::Active
+        );
+        let first_sequence = store.recovery_fault_inventory().await.unwrap().faults()[0].sequence;
+        let terminal = recovery_release_terminal(&store, &lease, 1, 0).await;
+        commit_recovery_release(&store, &lease, &terminal).await;
+
+        for offset in 0..=MAX_RECOVERY_FAULT_SLOTS {
+            let ordinal = u64::try_from(offset).unwrap();
+            let publisher =
+                recovery_fault_publisher(10_000 + ordinal, 10_000 + u128::from(ordinal), 1);
+            assert_eq!(
+                store.record_recovery_fault(publisher, 1).await.unwrap(),
+                RecordRecoveryFaultResult::Active
+            );
+            let terminal = recovery_release_terminal(&store, &lease, 2 + ordinal, 0).await;
+            commit_recovery_release(&store, &lease, &terminal).await;
+            let head = store.load_record().await.unwrap().unwrap();
+            assert!(head.recovery_fault_slots.is_empty());
+            assert_eq!(head.recovery_fault_revision, head.lease.seq);
+        }
+
+        assert_eq!(
+            store.record_recovery_fault(first, 1).await.unwrap(),
+            RecordRecoveryFaultResult::Active
+        );
+        let retried = store.recovery_fault_inventory().await.unwrap();
+        assert_eq!(retried.faults().len(), 1);
+        assert!(retried.faults()[0].sequence > first_sequence);
+    }
+
+    #[tokio::test]
+    async fn full_unavailable_fault_inventory_is_compacted_before_new_admission() {
+        let incumbent = owner(1, 1, 1);
+        let sequence = u64::try_from(MAX_RECOVERY_FAULT_SLOTS).unwrap() + 1;
+        let lease = LeaderLease {
+            seq: sequence,
+            renewal_sequence: 1,
+            token: 1,
+            owner: incumbent.clone(),
+            expires_at_ms: i64::MAX,
+            catalog_manifest: None,
+        };
+        let mut record = LeaderAuthorityRecord::initial(lease.clone());
+        record.recovery_fault_revision = sequence;
+        record.recovery_fault_slots = (0..MAX_RECOVERY_FAULT_SLOTS)
+            .map(|index| {
+                let ordinal = u64::try_from(index).unwrap() + 2;
+                AuthorityRecoveryFaultSlot {
+                    publisher: recovery_fault_publisher(ordinal, u128::from(ordinal), 1),
+                    request_sequence: 1,
+                    fault_sequence: ordinal,
+                    active: true,
+                }
+            })
+            .collect();
+        let store = store(1_000);
+        store
+            .store
+            .put(
+                &lease_path(sequence),
+                PutPayload::from(encode_authority_record(&record).unwrap()),
+            )
+            .await
+            .unwrap();
+        let inventory = store.recovery_fault_inventory().await.unwrap();
+        let terminal = RecoveryAnnouncement {
+            round: RecoveryRound::new(
+                1,
+                lease.proof(),
+                assignment_fence(&incumbent),
+                Vec::new(),
+                inventory.revision(),
+                inventory.faults().to_vec(),
+            )
+            .unwrap(),
+            phase: RecoverPhase::ReleaseCommitted { epoch: 0 },
+        };
+
+        commit_recovery_release(&store, &lease, &terminal).await;
+        let settled = store.load_record().await.unwrap().unwrap();
+        assert!(settled.recovery_fault_slots.is_empty());
+        assert_eq!(settled.recovery_fault_revision, settled.lease.seq);
+        assert!(settled.validate().is_ok());
+
+        let unseen = recovery_fault_publisher(sequence + 1, u128::from(sequence + 1), 1);
+        assert_eq!(
+            store.record_recovery_fault(unseen, 1).await.unwrap(),
+            RecordRecoveryFaultResult::Active
+        );
+        let admitted = store.recovery_fault_inventory().await.unwrap();
+        assert_eq!(admitted.faults().len(), 1);
+        assert!(admitted.faults()[0].sequence > sequence);
+    }
+
+    #[test]
+    fn recovery_fault_slot_capacity_preserves_authority_headroom() {
+        fn authority_with_fault_slots(
+            slot_count: usize,
+            wide_values: bool,
+        ) -> LeaderAuthorityRecord {
+            let sequence = if wide_values {
+                u64::MAX
+            } else {
+                u64::try_from(slot_count.max(1)).unwrap()
+            };
+            let mut record = LeaderAuthorityRecord::initial(LeaderLease {
+                seq: sequence,
+                renewal_sequence: 1,
+                token: 1,
+                owner: owner(1, 1, 1),
+                expires_at_ms: i64::MAX,
+                catalog_manifest: None,
+            });
+            record.recovery_fault_revision = sequence;
+            record.recovery_fault_slots = (0..slot_count)
+                .map(|index| {
+                    let ordinal = u64::try_from(index).unwrap() + 1;
+                    let node_id = if wide_values {
+                        u64::MAX - u64::try_from(slot_count - 1 - index).unwrap()
+                    } else {
+                        ordinal
+                    };
+                    AuthorityRecoveryFaultSlot {
+                        publisher: RecoveryFaultPublisher {
+                            participant: crate::checkpoint::CheckpointParticipant {
+                                node_id,
+                                boot_incarnation: if wide_values {
+                                    Uuid::from_u128(
+                                        u128::MAX - u128::try_from(slot_count - 1 - index).unwrap(),
+                                    )
+                                } else {
+                                    Uuid::from_u128(u128::from(ordinal))
+                                },
+                            },
+                            process_term: sequence,
+                        },
+                        request_sequence: sequence,
+                        fault_sequence: if wide_values {
+                            sequence - u64::try_from(slot_count - 1 - index).unwrap()
+                        } else {
+                            ordinal
+                        },
+                        active: true,
+                    }
+                })
+                .collect();
+            record
+        }
+
+        let canonical_roster = authority_with_fault_slots(MAX_CHECKPOINT_PARTICIPANTS, true);
+        let slot_bound = authority_with_fault_slots(MAX_RECOVERY_FAULT_SLOTS, true);
+        for record in [&canonical_roster, &slot_bound] {
+            record.validate().unwrap();
+            let encoded = encode_authority_record(record).unwrap();
+            let encoded_len = u64::try_from(encoded.len()).unwrap();
+            assert!(
+                encoded_len + RECOVERY_FAULT_AUTHORITY_HEADROOM_BYTES <= MAX_AUTHORITY_RECORD_BYTES,
+                "{} fault slots encoded to {encoded_len} bytes",
+                record.recovery_fault_slots.len()
+            );
+        }
+
+        let overflow = authority_with_fault_slots(MAX_RECOVERY_FAULT_SLOTS + 1, true);
+        assert!(overflow.validate().is_err());
+
+        let mut future_fault = authority_with_fault_slots(1, false);
+        future_fault.lease.seq = 2;
+        future_fault.recovery_fault_slots[0].fault_sequence = 2;
+        assert!(future_fault.validate().is_err());
+
+        let mut orphaned_revision = LeaderAuthorityRecord::initial(LeaderLease {
+            seq: 2,
+            renewal_sequence: 1,
+            token: 1,
+            owner: owner(1, 1, 1),
+            expires_at_ms: 1,
+            catalog_manifest: None,
+        });
+        orphaned_revision.recovery_fault_revision = 2;
+        assert!(orphaned_revision.validate().is_err());
+    }
+
+    #[tokio::test]
     async fn exact_owner_renews_without_advancing_token() {
         let store = store(1_000);
         let owner = owner(1, 1, 4);
@@ -4509,8 +5499,76 @@ mod tests {
         else {
             panic!("exact owner must renew");
         };
-        assert_eq!((first.seq, first.token), (1, 1));
-        assert_eq!((second.seq, second.token), (2, 1));
+        assert_eq!((first.seq, first.renewal_sequence, first.token), (1, 1, 1));
+        assert_eq!(
+            (second.seq, second.renewal_sequence, second.token),
+            (2, 2, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn acquisition_new_term_and_takeover_advance_the_renewal_sequence() {
+        let store = store(10);
+        let incumbent = owner(1, 1, 4);
+        let rival = owner(2, 2, 1);
+        let LeaseOutcome::Acquired(first) = store.begin_new_term(&incumbent, 10).await.unwrap()
+        else {
+            panic!("empty authority must be acquired");
+        };
+        let LeaseOutcome::Acquired(renewed) = store
+            .renew_exact(&incumbent, first.token, 20)
+            .await
+            .unwrap()
+        else {
+            panic!("exact owner must renew");
+        };
+        let LeaseOutcome::Acquired(new_term) = store.begin_new_term(&incumbent, 30).await.unwrap()
+        else {
+            panic!("same owner must begin a new authority term");
+        };
+        let observation = store.observe_rival(&rival, &new_term).unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        let LeaseOutcome::Acquired(takeover) =
+            store.try_takeover(&rival, &observation, 40).await.unwrap()
+        else {
+            panic!("expired rival must be replaced");
+        };
+
+        assert_eq!((first.seq, first.renewal_sequence, first.token), (1, 1, 1));
+        assert_eq!(
+            (renewed.seq, renewed.renewal_sequence, renewed.token),
+            (2, 2, 1)
+        );
+        assert_eq!(
+            (new_term.seq, new_term.renewal_sequence, new_term.token),
+            (3, 3, 2)
+        );
+        assert_eq!(
+            (
+                takeover.seq,
+                takeover.renewal_sequence,
+                takeover.token,
+                takeover.owner,
+            ),
+            (4, 4, 3, rival)
+        );
+    }
+
+    #[test]
+    fn lease_validation_rejects_an_invalid_renewal_sequence() {
+        let mut lease = LeaderLease {
+            seq: 2,
+            renewal_sequence: 0,
+            token: 1,
+            owner: owner(1, 1, 1),
+            expires_at_ms: 1,
+            catalog_manifest: None,
+        };
+        assert!(lease.validate().is_err());
+        lease.renewal_sequence = 3;
+        assert!(lease.validate().is_err());
+        lease.renewal_sequence = 2;
+        assert!(lease.validate().is_ok());
     }
 
     #[tokio::test]
@@ -4589,11 +5647,99 @@ mod tests {
             panic!("renewal must invalidate the old observation");
         };
         assert_eq!(current.seq, 2);
+        assert_eq!(current.renewal_sequence, 2);
         assert_eq!(current.owner, incumbent);
     }
 
     #[tokio::test]
-    async fn full_unchanged_observation_is_required_for_takeover() {
+    async fn recovery_fault_append_does_not_reset_takeover_observation() {
+        let store = store(60);
+        let incumbent = owner(1, 1, 1);
+        let rival = owner(2, 2, 1);
+        let LeaseOutcome::Acquired(first) = store.begin_new_term(&incumbent, 0).await.unwrap()
+        else {
+            panic!("initial leader acquisition");
+        };
+        let observation = store.observe_rival(&rival, &first).unwrap();
+
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        assert_eq!(
+            store
+                .record_recovery_fault(owner_recovery_fault_publisher(&incumbent), 1)
+                .await
+                .unwrap(),
+            RecordRecoveryFaultResult::Active
+        );
+        let appended = store.load().await.unwrap().unwrap();
+        assert_eq!(appended.seq, 2);
+        assert_eq!(appended.renewal_sequence, first.renewal_sequence);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let LeaseOutcome::Acquired(takeover) =
+            store.try_takeover(&rival, &observation, 1).await.unwrap()
+        else {
+            panic!("recovery fault append reset the takeover observation");
+        };
+        assert_eq!(takeover.seq, 3);
+        assert_eq!(takeover.renewal_sequence, 2);
+        assert_eq!(takeover.owner, rival);
+    }
+
+    #[tokio::test]
+    async fn repeated_recovery_fault_contention_cannot_starve_an_expired_takeover() {
+        let (raw, store) = blocking_once_at(10, lease_path(2));
+        let incumbent = owner(1, 1, 1);
+        let rival = owner(2, 2, 1);
+        let LeaseOutcome::Acquired(first) = store.begin_new_term(&incumbent, 0).await.unwrap()
+        else {
+            panic!("initial leader acquisition");
+        };
+        let publisher = owner_recovery_fault_publisher(&incumbent);
+        let observation = store.observe_rival(&rival, &first).unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        let takeover_store = Arc::clone(&store);
+        let takeover_owner = rival.clone();
+        let takeover = tokio::spawn(async move {
+            takeover_store
+                .try_takeover(&takeover_owner, &observation, 1)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), raw.entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+
+        assert_eq!(
+            store.record_recovery_fault(publisher, 1).await.unwrap(),
+            RecordRecoveryFaultResult::Active
+        );
+        assert_eq!(
+            store.record_recovery_fault(publisher, 2).await.unwrap(),
+            RecordRecoveryFaultResult::Active
+        );
+        let contending_head = store.load().await.unwrap().unwrap();
+        assert_eq!(contending_head.seq, 3);
+        assert_eq!(contending_head.renewal_sequence, 1);
+        raw.release.add_permits(1);
+
+        let LeaseOutcome::Acquired(replacement) =
+            tokio::time::timeout(Duration::from_secs(1), takeover)
+                .await
+                .expect("takeover was starved by recovery fault appends")
+                .unwrap()
+                .unwrap()
+        else {
+            panic!("unchanged liveness identity did not retry after CAS contention");
+        };
+        assert_eq!(replacement.seq, 4);
+        assert_eq!(replacement.renewal_sequence, 2);
+        assert_eq!(replacement.owner, rival);
+    }
+
+    #[tokio::test]
+    async fn unchanged_liveness_observation_is_required_for_takeover() {
         let store = store(15);
         let incumbent = owner(1, 1, 1);
         let rival = owner(2, 2, 1);
@@ -4619,7 +5765,10 @@ mod tests {
         else {
             panic!("unchanged rival may be replaced after a full TTL");
         };
-        assert_eq!((lease.seq, lease.token, lease.owner), (2, 2, rival));
+        assert_eq!(
+            (lease.seq, lease.renewal_sequence, lease.token, lease.owner,),
+            (2, 2, 2, rival)
+        );
     }
 
     #[tokio::test]
@@ -4830,6 +5979,7 @@ mod tests {
         let owner = owner(1, 1, 1);
         let first_lease = LeaderLease {
             seq: 1,
+            renewal_sequence: 1,
             token: 1,
             owner: owner.clone(),
             expires_at_ms: 1_000,
@@ -4838,6 +5988,7 @@ mod tests {
         let first = LeaderAuthorityRecord::initial(first_lease);
         let second_lease = LeaderLease {
             seq: 2,
+            renewal_sequence: 2,
             token: 1,
             owner,
             expires_at_ms: 2_000,
@@ -5247,7 +6398,7 @@ mod tests {
             unreachable!()
         };
         let proof = first.proof();
-        let terminal = recovery_release_terminal(&first, 7, 4);
+        let terminal = recovery_release_terminal_after_owner_fault(&store, &first, 7, 4).await;
         let reference = store
             .stage_recovery_release_terminal(&terminal)
             .await
@@ -5292,7 +6443,7 @@ mod tests {
 
     #[tokio::test]
     async fn takeover_before_recovery_release_append_fences_the_old_commit() {
-        let (raw, store) = blocking_once_at(10, lease_path(2));
+        let (raw, store) = blocking_once_at(10, lease_path(3));
         let incumbent = owner(1, 11, 1);
         let successor = owner(2, 22, 1);
         let LeaseOutcome::Acquired(first) = store
@@ -5303,7 +6454,7 @@ mod tests {
             unreachable!()
         };
         let proof = first.proof();
-        let terminal = recovery_release_terminal(&first, 7, 4);
+        let terminal = recovery_release_terminal_after_owner_fault(&store, &first, 7, 4).await;
         let reference = store
             .stage_recovery_release_terminal(&terminal)
             .await
@@ -5344,7 +6495,7 @@ mod tests {
 
     #[tokio::test]
     async fn ambiguous_recovery_release_create_reconciles_the_exact_winner() {
-        let (raw, store) = ambiguous_once_at(1_000, lease_path(2));
+        let (raw, store) = ambiguous_once_at(1_000, lease_path(3));
         let incumbent = owner(1, 11, 1);
         let LeaseOutcome::Acquired(first) = store
             .acquire_or_renew_current_term_for_test(&incumbent, 0)
@@ -5353,7 +6504,7 @@ mod tests {
         else {
             unreachable!()
         };
-        let terminal = recovery_release_terminal(&first, 7, 4);
+        let terminal = recovery_release_terminal_after_owner_fault(&store, &first, 7, 4).await;
         let reference = store
             .stage_recovery_release_terminal(&terminal)
             .await
@@ -5386,7 +6537,8 @@ mod tests {
             unreachable!()
         };
         let proof = first.proof();
-        let first_terminal = recovery_release_terminal(&first, 7, 4);
+        let first_terminal =
+            recovery_release_terminal_after_owner_fault(&store, &first, 7, 4).await;
         let first_reference = store
             .stage_recovery_release_terminal(&first_terminal)
             .await
@@ -5410,7 +6562,7 @@ mod tests {
             RecordRecoveryReleaseCommitResult::Conflict { .. }
         ));
 
-        let newer = recovery_release_terminal(&first, 8, 5);
+        let newer = recovery_release_terminal_after_owner_fault(&store, &first, 8, 5).await;
         let newer_reference = store.stage_recovery_release_terminal(&newer).await.unwrap();
         assert!(matches!(
             store
@@ -5438,7 +6590,7 @@ mod tests {
         else {
             unreachable!()
         };
-        let terminal = recovery_release_terminal(&first, 7, 4);
+        let terminal = recovery_release_terminal_after_owner_fault(&store, &first, 7, 4).await;
         let (encoded, expected_reference) = encode_recovery_release_terminal(&terminal).unwrap();
         let reference = store
             .stage_recovery_release_terminal(&terminal)
@@ -5488,7 +6640,7 @@ mod tests {
         else {
             unreachable!()
         };
-        let terminal = recovery_release_terminal(&first, 7, 4);
+        let terminal = recovery_release_terminal_after_owner_fault(&store, &first, 7, 4).await;
         let (_, reference) = encode_recovery_release_terminal(&terminal).unwrap();
         raw.put(
             &recovery_release_terminal_path(&reference),
@@ -5518,7 +6670,7 @@ mod tests {
         else {
             unreachable!()
         };
-        let terminal = recovery_release_terminal(&first, 7, 4);
+        let terminal = recovery_release_terminal_after_owner_fault(&store, &first, 7, 4).await;
         let retained = store
             .stage_recovery_release_terminal(&terminal)
             .await
@@ -5547,7 +6699,7 @@ mod tests {
             .await
             .unwrap();
         let sequences = store.list_seqs().await.unwrap();
-        assert!(sequences.contains(&2), "{sequences:?}");
+        assert!(sequences.contains(&3), "{sequences:?}");
         assert!(raw
             .get(&recovery_release_terminal_path(&retained))
             .await
@@ -5567,6 +6719,7 @@ mod tests {
         let incumbent = owner(1, 1, 1);
         let incumbent_lease = LeaderLease {
             seq: 1,
+            renewal_sequence: 1,
             token: 1,
             owner: incumbent.clone(),
             expires_at_ms: 1,
@@ -5575,6 +6728,7 @@ mod tests {
         let transition = assignment_drain_transition(&incumbent, incumbent_lease.proof());
         let replacement = LeaderLease {
             seq: 2,
+            renewal_sequence: 2,
             token: 2,
             owner: owner(2, 2, 1),
             expires_at_ms: 2,
@@ -8003,6 +9157,7 @@ mod tests {
         let expected = owner(1, 1, 1);
         let lease = Some(LeaderLease {
             seq: 1,
+            renewal_sequence: 1,
             token: 1,
             owner: expected.clone(),
             expires_at_ms: i64::MIN,

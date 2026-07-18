@@ -3049,6 +3049,7 @@ impl object_store::ObjectStore for LeaseDroppingObjectStore {
             if let Some(lease_tx) = self.lease_tx.lock().clone() {
                 lease_tx.send_replace(Some(laminar_core::cluster::control::LeaderLease {
                     seq: 2,
+                    renewal_sequence: 2,
                     token: 2,
                     owner: test_leader_owner(2, 2),
                     expires_at_ms: i64::MAX,
@@ -6676,6 +6677,7 @@ impl laminar_connectors::connector::SinkConnector for LeaseDroppingAloSink {
         self.lease_tx
             .send_replace(Some(laminar_core::cluster::control::LeaderLease {
                 seq: 2,
+                renewal_sequence: 2,
                 token: 2,
                 owner: test_leader_owner(2, 2),
                 expires_at_ms: i64::MAX,

@@ -5281,7 +5281,8 @@ mod tests {
         use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
         use laminar_core::cluster::control::{
             ClusterController, ClusterKv, LeaderLeaseOwner, LeaderLeaseStore, LeaseOutcome,
-            RecoverPhase, RecoveryAnnouncement, RecoveryFault, RecoveryRound,
+            ProcessLeaseAuthority, RecoverPhase, RecoveryAnnouncement, RecoveryFault,
+            RecoveryRound,
         };
 
         let inner: Arc<dyn object_store::ObjectStore> =
@@ -5290,6 +5291,13 @@ mod tests {
         let store: Arc<dyn object_store::ObjectStore> = delayed.clone();
         let node = NodeId(7);
         let ttl_ms = 1;
+        let process_authority = Arc::new(
+            ProcessLeaseAuthority::new(
+                Arc::clone(&store),
+                std::time::Duration::from_millis(u64::try_from(ttl_ms).unwrap()),
+            )
+            .unwrap(),
+        );
         let old_boot = uuid::Uuid::from_u128(71);
         let old_process =
             acquire_test_process_lease(Arc::clone(&store), node, old_boot, ttl_ms).await;
@@ -5313,6 +5321,9 @@ mod tests {
         ));
         old_controller
             .set_process_lease_deadline(Arc::clone(&old_deadline))
+            .unwrap();
+        old_controller
+            .set_process_lease_authority(Arc::clone(&process_authority))
             .unwrap();
         old_controller
             .publish_leased_recovery_incarnation(&old_process)
@@ -5345,6 +5356,7 @@ mod tests {
             old_leader.proof(),
             CheckpointAssignmentFence::from_owner_map(7, &[node.0], vec![old_participant]).unwrap(),
             Vec::new(),
+            61,
             vec![RecoveryFault {
                 reporter: node,
                 sequence: 1,
@@ -5417,6 +5429,9 @@ mod tests {
             .set_process_lease_deadline(Arc::clone(&replacement_deadline))
             .unwrap();
         replacement_controller
+            .set_process_lease_authority(process_authority)
+            .unwrap();
+        replacement_controller
             .publish_leased_recovery_incarnation(&replacement_process)
             .await
             .unwrap();
@@ -5441,6 +5456,7 @@ mod tests {
             CheckpointAssignmentFence::from_owner_map(8, &[node.0], vec![replacement_participant])
                 .unwrap(),
             Vec::new(),
+            62,
             vec![RecoveryFault {
                 reporter: node,
                 sequence: 2,
@@ -6082,7 +6098,8 @@ mod tests {
     #[tokio::test]
     async fn failed_process_lease_candidate_cannot_overwrite_active_incarnation() {
         use laminar_core::cluster::control::{
-            ClusterController, ClusterKv, InMemoryKv, ProcessLeaseOutcome, ProcessLeaseStore,
+            ClusterController, ClusterKv, InMemoryKv, LeaseDeadline, ProcessLeaseAuthority,
+            ProcessLeaseOutcome,
         };
 
         let node = NodeId(7);
@@ -6098,13 +6115,26 @@ mod tests {
             members_rx.clone(),
             active_owner,
         );
-        let lease_store =
-            ProcessLeaseStore::new(Arc::new(object_store::memory::InMemory::new()), node, 1_000);
+        let process_store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let process_authority = Arc::new(
+            ProcessLeaseAuthority::new(process_store, std::time::Duration::from_millis(1_000))
+                .unwrap(),
+        );
+        let lease_store = process_authority.store_for(node);
         let ProcessLeaseOutcome::Acquired(active_lease) =
             lease_store.try_acquire(active_owner, 0).await.unwrap()
         else {
             panic!("first process must acquire its stable identity");
         };
+        active
+            .set_process_lease_authority(Arc::clone(&process_authority))
+            .unwrap();
+        active
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
+                std::time::Duration::from_secs(60),
+            )))
+            .unwrap();
         active
             .publish_leased_recovery_incarnation(&active_lease)
             .await
@@ -6126,6 +6156,14 @@ mod tests {
         else {
             panic!("client wall time must not let a candidate steal the lease");
         };
+        candidate
+            .set_process_lease_authority(process_authority)
+            .unwrap();
+        candidate
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
+                std::time::Duration::from_secs(60),
+            )))
+            .unwrap();
         assert!(candidate
             .publish_leased_recovery_incarnation(&incumbent)
             .await
