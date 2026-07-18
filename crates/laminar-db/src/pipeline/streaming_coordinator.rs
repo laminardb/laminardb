@@ -1091,6 +1091,21 @@ struct CheckpointAdmission {
     assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckpointCleanupOwner {
+    /// Embedded, single-node, or cluster-leader attempt originator.
+    Originator,
+    /// Cluster follower that reserved an attempt announced by the originator.
+    Follower,
+}
+
+struct AlignedCheckpointContext {
+    cleanup_owner: CheckpointCleanupOwner,
+    attempt: CheckpointAttempt,
+    started_at: Instant,
+    assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
+}
+
 /// Tracks in-flight checkpoint barrier alignment.
 struct PendingBarrier {
     attempt: Option<CheckpointAttempt>,
@@ -1100,6 +1115,7 @@ struct PendingBarrier {
     started_at: Instant,
     active: bool,
     assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
+    cleanup_owner: CheckpointCleanupOwner,
 }
 
 impl PendingBarrier {
@@ -1112,11 +1128,22 @@ impl PendingBarrier {
             started_at: Instant::now(),
             active: false,
             assignment_fence: None,
+            cleanup_owner: CheckpointCleanupOwner::Originator,
         }
     }
 
+    #[cfg(test)]
     fn reset(&mut self, attempt: CheckpointAttempt, sources_total: usize) {
         self.reset_with_assignment(attempt, sources_total, None);
+    }
+
+    fn reset_follower(&mut self, attempt: CheckpointAttempt, sources_total: usize) {
+        self.reset_inner(
+            attempt,
+            sources_total,
+            None,
+            CheckpointCleanupOwner::Follower,
+        );
     }
 
     fn reset_with_assignment(
@@ -1125,6 +1152,21 @@ impl PendingBarrier {
         sources_total: usize,
         assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
     ) {
+        self.reset_inner(
+            attempt,
+            sources_total,
+            assignment_fence,
+            CheckpointCleanupOwner::Originator,
+        );
+    }
+
+    fn reset_inner(
+        &mut self,
+        attempt: CheckpointAttempt,
+        sources_total: usize,
+        assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
+        cleanup_owner: CheckpointCleanupOwner,
+    ) {
         self.attempt = Some(attempt);
         self.sources_total = sources_total;
         self.sources_aligned.clear();
@@ -1132,19 +1174,22 @@ impl PendingBarrier {
         self.started_at = Instant::now();
         self.active = true;
         self.assignment_fence = assignment_fence;
+        self.cleanup_owner = cleanup_owner;
     }
 
-    /// Clear alignment state and return the exact active attempt, if one existed.
-    fn take_active_attempt(&mut self) -> Option<CheckpointAttempt> {
+    /// Clear alignment state and return the exact active attempt and its cleanup owner.
+    fn take_active_attempt(&mut self) -> Option<(CheckpointAttempt, CheckpointCleanupOwner)> {
         if !self.active {
             return None;
         }
+        let cleanup_owner = self.cleanup_owner;
         self.active = false;
         self.sources_total = 0;
         self.sources_aligned.clear();
         self.source_checkpoints.clear();
         self.assignment_fence = None;
-        self.attempt.take()
+        self.cleanup_owner = CheckpointCleanupOwner::Originator;
+        self.attempt.take().map(|attempt| (attempt, cleanup_owner))
     }
 
     fn clear(&mut self) {
@@ -1154,6 +1199,7 @@ impl PendingBarrier {
         self.sources_aligned.clear();
         self.source_checkpoints.clear();
         self.assignment_fence = None;
+        self.cleanup_owner = CheckpointCleanupOwner::Originator;
     }
 }
 
@@ -4078,18 +4124,22 @@ impl StreamingCoordinator {
 
     async fn cleanup_checkpoint_attempt(
         callback: &mut impl PipelineCallback,
+        cleanup_owner: CheckpointCleanupOwner,
         attempt: CheckpointAttempt,
         reason: &str,
         assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
     ) -> Result<(), String> {
-        if callback.is_leader() {
-            callback
-                .abandon_checkpoint_attempt(attempt, reason, assignment_fence)
-                .await
-        } else {
-            callback
-                .cancel_source_barrier_attempt(attempt, reason)
-                .await
+        match cleanup_owner {
+            CheckpointCleanupOwner::Originator => {
+                callback
+                    .abandon_checkpoint_attempt(attempt, reason, assignment_fence)
+                    .await
+            }
+            CheckpointCleanupOwner::Follower => {
+                callback
+                    .cancel_source_barrier_attempt(attempt, reason)
+                    .await
+            }
         }
     }
 
@@ -4105,21 +4155,27 @@ impl StreamingCoordinator {
         self.barrier_seen.clear();
 
         match attempt {
-            Some(attempt) => {
+            Some((attempt, cleanup_owner)) => {
                 tracing::info!(
                     checkpoint_id = attempt.checkpoint_id,
                     epoch = attempt.epoch,
                     reason,
                     "abandoning checkpoint interrupted before source alignment"
                 );
-                if callback.is_leader() {
+                if cleanup_owner == CheckpointCleanupOwner::Originator {
                     self.cancel_local_source_barriers(CheckpointBarrier::new(
                         attempt.checkpoint_id,
                         attempt.epoch,
                     ));
                 }
-                Self::cleanup_checkpoint_attempt(callback, attempt, reason, assignment_fence)
-                    .await?;
+                Self::cleanup_checkpoint_attempt(
+                    callback,
+                    cleanup_owner,
+                    attempt,
+                    reason,
+                    assignment_fence,
+                )
+                .await?;
                 if release_sources {
                     self.release_source_barrier_attempt(attempt);
                 }
@@ -5423,100 +5479,100 @@ impl StreamingCoordinator {
         &mut self,
         callback: &mut impl PipelineCallback,
         outcome: BarrierOutcome,
-        attempt: CheckpointAttempt,
-        attempt_started: Instant,
-        assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
+        context: AlignedCheckpointContext,
         source_checkpoints: &FxHashMap<String, SourceCheckpoint>,
     ) -> Result<(), String> {
-        match outcome {
-            BarrierOutcome::Committed(epoch) => {
-                if epoch == attempt.epoch {
-                    #[cfg(feature = "cluster")]
-                    if let Err(error) =
-                        self.require_process_authority("aligned checkpoint publication")
-                    {
-                        let reason = error.to_string();
-                        callback.abort_subscription_cut(attempt);
-                        self.fail_manual_attempt(attempt, &reason);
-                        return Err(reason);
-                    }
-                    let publication_error = callback.publish_barrier(attempt).err();
-                    self.broadcast_epoch_committed(epoch, source_checkpoints);
-                    self.finish_manual_success(
-                        attempt,
-                        &crate::checkpoint_coordinator::CheckpointResult {
-                            success: true,
-                            checkpoint_id: attempt.checkpoint_id,
-                            epoch: attempt.epoch,
-                            duration: attempt_started.elapsed(),
-                            error: None,
-                            failure_disposition: None,
-                        },
-                    );
-                    if let Some(reason) = publication_error {
-                        return Err(reason);
-                    }
-                } else {
+        let AlignedCheckpointContext {
+            cleanup_owner,
+            attempt,
+            started_at,
+            assignment_fence,
+        } = context;
+        let (cleanup_reason, manual_reason, record_failure) = match outcome {
+            BarrierOutcome::Committed(epoch) if epoch == attempt.epoch => {
+                #[cfg(feature = "cluster")]
+                if let Err(error) = self.require_process_authority("aligned checkpoint publication")
+                {
+                    let reason = error.to_string();
                     callback.abort_subscription_cut(attempt);
-                    let reason = format!(
-                        "checkpoint callback committed epoch {epoch} for reserved epoch {}",
-                        attempt.epoch
-                    );
-                    Self::cleanup_checkpoint_attempt(
-                        callback,
-                        attempt,
-                        &reason,
-                        assignment_fence.clone(),
-                    )
-                    .await?;
-                    callback.record_checkpoint_failure(attempt.checkpoint_id, &reason);
-                    self.fail_manual_attempt(attempt, reason);
+                    self.fail_manual_attempt(attempt, &reason);
+                    return Err(reason);
                 }
+                let publication_error = callback.publish_barrier(attempt).err();
+                self.broadcast_epoch_committed(epoch, source_checkpoints);
+                self.finish_manual_success(
+                    attempt,
+                    &crate::checkpoint_coordinator::CheckpointResult {
+                        success: true,
+                        checkpoint_id: attempt.checkpoint_id,
+                        epoch: attempt.epoch,
+                        duration: started_at.elapsed(),
+                        error: None,
+                        failure_disposition: None,
+                    },
+                );
+                return publication_error.map_or(Ok(()), Err);
             }
             BarrierOutcome::Async => {
                 self.last_checkpoint = Instant::now();
+                return Ok(());
+            }
+            BarrierOutcome::Committed(epoch) => {
+                let reason = format!(
+                    "checkpoint callback committed epoch {epoch} for reserved epoch {}",
+                    attempt.epoch
+                );
+                (reason.clone(), reason, true)
             }
             BarrierOutcome::Skipped(reason) => {
-                callback.abort_subscription_cut(attempt);
                 tracing::debug!(
                     checkpoint_id = attempt.checkpoint_id,
                     epoch = attempt.epoch,
                     reason = %reason,
                     "barrier checkpoint skipped"
                 );
-                Self::cleanup_checkpoint_attempt(
-                    callback,
-                    attempt,
-                    &reason.to_string(),
-                    assignment_fence.clone(),
+                (
+                    reason.to_string(),
+                    format!("manual checkpoint skipped: {reason}"),
+                    false,
                 )
-                .await?;
-                self.fail_manual_attempt(attempt, format!("manual checkpoint skipped: {reason}"));
+            }
+            BarrierOutcome::Aborted => {
+                tracing::info!(
+                    checkpoint_id = attempt.checkpoint_id,
+                    epoch = attempt.epoch,
+                    "barrier checkpoint was authoritatively aborted"
+                );
+                let reason =
+                    "checkpoint was aborted by authoritative cluster control before state capture";
+                (reason.into(), format!("manual {reason}"), false)
             }
             BarrierOutcome::Failed => {
-                callback.abort_subscription_cut(attempt);
-                Self::cleanup_checkpoint_attempt(
-                    callback,
-                    attempt,
-                    "barrier-aligned checkpoint failed before durable tail",
-                    assignment_fence,
-                )
-                .await?;
-                callback.record_checkpoint_failure(
-                    attempt.checkpoint_id,
-                    "barrier-aligned checkpoint failed",
-                );
-                self.fail_manual_attempt(
-                    attempt,
-                    "manual barrier-aligned checkpoint failed before the durable tail",
-                );
                 tracing::warn!(
                     checkpoint_id = attempt.checkpoint_id,
                     epoch = attempt.epoch,
                     "barrier checkpoint failed"
                 );
+                (
+                    "barrier-aligned checkpoint failed before durable tail".into(),
+                    "manual barrier-aligned checkpoint failed before the durable tail".into(),
+                    true,
+                )
             }
+        };
+        callback.abort_subscription_cut(attempt);
+        Self::cleanup_checkpoint_attempt(
+            callback,
+            cleanup_owner,
+            attempt,
+            &cleanup_reason,
+            assignment_fence,
+        )
+        .await?;
+        if record_failure {
+            callback.record_checkpoint_failure(attempt.checkpoint_id, &cleanup_reason);
         }
+        self.fail_manual_attempt(attempt, manual_reason);
         Ok(())
     }
 
@@ -5552,6 +5608,7 @@ impl StreamingCoordinator {
             let attempt = barrier_attempt;
             let attempt_started = self.pending_barrier.started_at;
             let assignment_fence = self.pending_barrier.assignment_fence.clone();
+            let cleanup_owner = self.pending_barrier.cleanup_owner;
             self.pending_barrier.clear();
             let attempt_deadline =
                 tokio::time::Instant::from_std(attempt_started) + self.config.checkpoint_timeout;
@@ -5569,9 +5626,12 @@ impl StreamingCoordinator {
                 self.handle_aligned_checkpoint_outcome(
                     callback,
                     BarrierOutcome::Failed,
-                    attempt,
-                    attempt_started,
-                    assignment_fence,
+                    AlignedCheckpointContext {
+                        cleanup_owner,
+                        attempt,
+                        started_at: attempt_started,
+                        assignment_fence,
+                    },
                     &fan_out,
                 )
                 .await
@@ -5585,6 +5645,7 @@ impl StreamingCoordinator {
                 let reason = error.to_string();
                 let cleanup = Self::cleanup_checkpoint_attempt(
                     callback,
+                    cleanup_owner,
                     attempt,
                     &reason,
                     assignment_fence.clone(),
@@ -5601,9 +5662,12 @@ impl StreamingCoordinator {
                 self.handle_aligned_checkpoint_outcome(
                     callback,
                     BarrierOutcome::Failed,
-                    attempt,
-                    attempt_started,
-                    assignment_fence,
+                    AlignedCheckpointContext {
+                        cleanup_owner,
+                        attempt,
+                        started_at: attempt_started,
+                        assignment_fence,
+                    },
                     &fan_out,
                 )
                 .await
@@ -5618,6 +5682,7 @@ impl StreamingCoordinator {
                 callback.abort_subscription_cut(attempt);
                 let cleanup = Self::cleanup_checkpoint_attempt(
                     callback,
+                    cleanup_owner,
                     attempt,
                     &reason,
                     assignment_fence.clone(),
@@ -5641,9 +5706,12 @@ impl StreamingCoordinator {
             self.handle_aligned_checkpoint_outcome(
                 callback,
                 outcome,
-                attempt,
-                attempt_started,
-                assignment_fence,
+                AlignedCheckpointContext {
+                    cleanup_owner,
+                    attempt,
+                    started_at: attempt_started,
+                    assignment_fence,
+                },
                 &fan_out,
             )
             .await
@@ -5797,7 +5865,7 @@ impl StreamingCoordinator {
         attempt: CheckpointAttempt,
         outcome: BarrierOutcome,
     ) -> Result<(), String> {
-        match outcome {
+        let (cleanup_reason, manual_reason, record_failure) = match outcome {
             BarrierOutcome::Committed(epoch) if epoch == attempt.epoch => {
                 #[cfg(feature = "cluster")]
                 if let Err(error) =
@@ -5821,63 +5889,58 @@ impl StreamingCoordinator {
                         failure_disposition: None,
                     },
                 );
-                if let Some(reason) = publication_error {
-                    return Err(reason);
-                }
+                return publication_error.map_or(Ok(()), Err);
             }
             BarrierOutcome::Committed(epoch) => {
-                callback.abort_subscription_cut(attempt);
                 let reason = format!(
                     "checkpoint callback committed epoch {epoch} for reserved epoch {}",
                     attempt.epoch
                 );
-                Self::cleanup_checkpoint_attempt(
-                    callback,
-                    attempt,
-                    &reason,
-                    admission.assignment_fence.clone(),
-                )
-                .await?;
-                callback.record_checkpoint_failure(attempt.checkpoint_id, &reason);
-                self.fail_manual_attempt(attempt, reason);
+                (reason.clone(), reason, true)
             }
-            BarrierOutcome::Async => {}
+            BarrierOutcome::Async => return Ok(()),
             BarrierOutcome::Skipped(reason) => {
-                callback.abort_subscription_cut(attempt);
                 tracing::debug!(
                     checkpoint_id = attempt.checkpoint_id,
                     epoch = attempt.epoch,
                     reason = %reason,
                     "source-less checkpoint skipped"
                 );
-                Self::cleanup_checkpoint_attempt(
-                    callback,
-                    attempt,
-                    &reason.to_string(),
-                    admission.assignment_fence.clone(),
+                (
+                    reason.to_string(),
+                    format!("manual checkpoint skipped: {reason}"),
+                    false,
                 )
-                .await?;
-                self.fail_manual_attempt(attempt, format!("manual checkpoint skipped: {reason}"));
             }
-            BarrierOutcome::Failed => {
-                callback.abort_subscription_cut(attempt);
-                Self::cleanup_checkpoint_attempt(
-                    callback,
-                    attempt,
-                    "source-less checkpoint failed before durable tail",
-                    admission.assignment_fence.clone(),
-                )
-                .await?;
-                callback.record_checkpoint_failure(
-                    attempt.checkpoint_id,
-                    "source-less checkpoint failed",
+            BarrierOutcome::Aborted => {
+                tracing::info!(
+                    checkpoint_id = attempt.checkpoint_id,
+                    epoch = attempt.epoch,
+                    "source-less checkpoint was authoritatively aborted"
                 );
-                self.fail_manual_attempt(
-                    attempt,
-                    "manual source-less checkpoint failed before the durable tail",
-                );
+                let reason =
+                    "checkpoint was aborted by authoritative cluster control before state capture";
+                (reason.into(), format!("manual {reason}"), false)
             }
+            BarrierOutcome::Failed => (
+                "source-less checkpoint failed before durable tail".into(),
+                "manual source-less checkpoint failed before the durable tail".into(),
+                true,
+            ),
+        };
+        callback.abort_subscription_cut(attempt);
+        Self::cleanup_checkpoint_attempt(
+            callback,
+            CheckpointCleanupOwner::Originator,
+            attempt,
+            &cleanup_reason,
+            admission.assignment_fence.clone(),
+        )
+        .await?;
+        if record_failure {
+            callback.record_checkpoint_failure(attempt.checkpoint_id, &cleanup_reason);
         }
+        self.fail_manual_attempt(attempt, manual_reason);
         Ok(())
     }
 
@@ -5954,6 +6017,7 @@ impl StreamingCoordinator {
             let reason = error.to_string();
             let cleanup = Self::cleanup_checkpoint_attempt(
                 callback,
+                CheckpointCleanupOwner::Originator,
                 attempt,
                 &reason,
                 admission.assignment_fence.clone(),
@@ -5995,6 +6059,7 @@ impl StreamingCoordinator {
             callback.abort_subscription_cut(attempt);
             let cleanup = Self::cleanup_checkpoint_attempt(
                 callback,
+                CheckpointCleanupOwner::Originator,
                 attempt,
                 &reason,
                 admission.assignment_fence.clone(),
@@ -6079,6 +6144,7 @@ impl StreamingCoordinator {
             let reason = error.to_string();
             let cleanup = Self::cleanup_checkpoint_attempt(
                 callback,
+                CheckpointCleanupOwner::Originator,
                 attempt,
                 &reason,
                 admission.assignment_fence.clone(),
@@ -6109,6 +6175,7 @@ impl StreamingCoordinator {
                 self.cancel_local_source_barriers(barrier);
                 let cleanup = Self::cleanup_checkpoint_attempt(
                     callback,
+                    CheckpointCleanupOwner::Originator,
                     attempt,
                     "source barrier injection was rejected after preflight",
                     admission.assignment_fence.clone(),
@@ -6168,20 +6235,19 @@ impl StreamingCoordinator {
                 self.require_process_authority("follower checkpoint control application")
             {
                 let authority_reason = error.to_string();
-                if let CheckpointControlOutcome::Started { attempt, .. }
-                | CheckpointControlOutcome::Failed { attempt, .. } = &outcome
-                {
-                    callback.record_checkpoint_failure(attempt.checkpoint_id, &authority_reason);
-                } else {
-                    let reason = match &outcome {
-                        CheckpointControlOutcome::AdmissionFailed { error } => {
-                            format!("{error}; {authority_reason}")
-                        }
-                        CheckpointControlOutcome::Idle
-                        | CheckpointControlOutcome::Started { .. }
-                        | CheckpointControlOutcome::Failed { .. } => authority_reason,
-                    };
-                    callback.record_checkpoint_admission_failure(&reason);
+                match &outcome {
+                    CheckpointControlOutcome::Started { attempt, .. }
+                    | CheckpointControlOutcome::Failed { attempt, .. } => {
+                        callback
+                            .record_checkpoint_failure(attempt.checkpoint_id, &authority_reason);
+                    }
+                    CheckpointControlOutcome::AdmissionFailed { error } => callback
+                        .record_checkpoint_admission_failure(&format!(
+                            "{error}; {authority_reason}"
+                        )),
+                    CheckpointControlOutcome::Idle | CheckpointControlOutcome::Aborted { .. } => {
+                        callback.record_checkpoint_admission_failure(&authority_reason);
+                    }
                 }
                 return true;
             }
@@ -6193,8 +6259,19 @@ impl StreamingCoordinator {
                 CheckpointControlOutcome::Started { attempt, captured } => {
                     if !captured {
                         self.pending_barrier
-                            .reset(attempt, self.source_handles.len());
+                            .reset_follower(attempt, self.source_handles.len());
                     }
+                }
+                CheckpointControlOutcome::Aborted { attempt } => {
+                    if self.pending_barrier.attempt == Some(attempt) {
+                        self.pending_barrier.clear();
+                        self.barrier_seen.clear();
+                    }
+                    self.release_source_barrier_attempt(attempt);
+                    self.fail_manual_attempt(
+                        attempt,
+                        "manual checkpoint was aborted by authoritative cluster control",
+                    );
                 }
                 CheckpointControlOutcome::Failed { attempt, error } => {
                     callback.record_checkpoint_failure(attempt.checkpoint_id, &error);
@@ -6452,6 +6529,7 @@ mod tests {
         checkpoint_drain_error: Option<CycleError>,
         abandon_error: Option<String>,
         abandoned_attempts: Arc<Mutex<Vec<(CheckpointAttempt, String)>>>,
+        cancelled_source_barrier_attempts: Arc<Mutex<Vec<(CheckpointAttempt, String)>>>,
         abandoned_fences:
             Arc<Mutex<Vec<Option<laminar_core::cluster::control::CheckpointAssignmentFence>>>>,
         checkpoint_failures: Vec<(u64, String)>,
@@ -6525,6 +6603,7 @@ mod tests {
                 checkpoint_drain_error: None,
                 abandon_error: None,
                 abandoned_attempts: Arc::new(Mutex::new(Vec::new())),
+                cancelled_source_barrier_attempts: Arc::new(Mutex::new(Vec::new())),
                 abandoned_fences: Arc::new(Mutex::new(Vec::new())),
                 checkpoint_failures: Vec::new(),
                 checkpoint_continuation_failures: Vec::new(),
@@ -6745,9 +6824,13 @@ mod tests {
 
         async fn cancel_source_barrier_attempt(
             &mut self,
-            _attempt: CheckpointAttempt,
-            _reason: &str,
+            attempt: CheckpointAttempt,
+            reason: &str,
         ) -> Result<(), String> {
+            self.checkpoint_order.lock().push("cleanup");
+            self.cancelled_source_barrier_attempts
+                .lock()
+                .push((attempt, reason.to_owned()));
             Ok(())
         }
 
@@ -7929,6 +8012,24 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[tokio::test]
+    async fn authoritative_follower_control_abort_is_not_recorded_as_a_failure() {
+        let mut coordinator = admission_coordinator(Vec::new());
+        install_test_process_authority(&mut coordinator, 52);
+        let attempt = CheckpointAttempt::new(52, 4_052);
+        let mut callback = MockCallback::new();
+        callback.runtime.leader = false;
+        callback.control_checkpoint_outcome = Some(CheckpointControlOutcome::Aborted { attempt });
+
+        coordinator.maybe_checkpoint(&mut callback).await;
+
+        assert_eq!(callback.control_checkpoint_calls, 1);
+        assert!(callback.checkpoint_failures.is_empty());
+        assert!(callback.checkpoint_admission_failures.is_empty());
+        assert!(!coordinator.pending_barrier.active);
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
     async fn source_barrier_state_is_not_installed_after_process_lease_loss() {
         let (source, poll) = checkpoint_source_handle("source");
         let mut coordinator = admission_coordinator(vec![source]);
@@ -8669,13 +8770,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skipped_or_failed_aligned_checkpoint_abandons_the_exact_attempt() {
+    async fn skipped_aborted_or_failed_aligned_checkpoint_abandons_the_exact_attempt() {
         use super::super::callback::SkipReason;
 
         let outcomes = [
             (
                 BarrierOutcome::Skipped(SkipReason::PreservingReplayWindowAfterSinkTimeout),
                 "preserving_replay_window_after_sink_timeout",
+                false,
+            ),
+            (
+                BarrierOutcome::Aborted,
+                "checkpoint was aborted by authoritative cluster control before state capture",
                 false,
             ),
             (
@@ -8718,6 +8824,106 @@ mod tests {
                 assert_eq!(callback.checkpoint_failures[0].0, attempt.checkpoint_id);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn originator_aligned_abort_abandons_after_role_change_without_failure() {
+        let (source, _poll) = checkpoint_source_handle("source");
+        let mut release = source.barrier_release_tx.subscribe();
+        let mut coordinator = admission_coordinator(vec![source]);
+        let attempt = CheckpointAttempt::new(54, 90_054);
+        coordinator.pending_barrier.reset(attempt, 1);
+        let mut callback = MockCallback::new();
+        callback.runtime.leader = false;
+        callback.barrier_outcome = Some(BarrierOutcome::Aborted);
+        let abandoned = Arc::clone(&callback.abandoned_attempts);
+        let aborted_cuts = Arc::clone(&callback.aborted_subscription_cuts);
+
+        coordinator
+            .handle_barrier(
+                0,
+                &CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch),
+                &checkpoint_at(attempt.epoch),
+                &mut callback,
+            )
+            .await
+            .unwrap();
+
+        assert!(callback.checkpoint_failures.is_empty());
+        assert_eq!(aborted_cuts.lock().as_slice(), &[attempt]);
+        let abandoned = abandoned.lock();
+        assert_eq!(abandoned.len(), 1);
+        assert_eq!(abandoned[0].0, attempt);
+        assert!(abandoned[0].1.contains("authoritative cluster control"));
+        assert_eq!(
+            *release.borrow_and_update(),
+            Some(SourceBarrierSignal::Release(attempt))
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn follower_aligned_abort_cancels_after_role_change_without_failure() {
+        let (source, _poll) = checkpoint_source_handle("source");
+        let mut release = source.barrier_release_tx.subscribe();
+        let mut coordinator = admission_coordinator(vec![source]);
+        install_test_process_authority(&mut coordinator, 56);
+        let attempt = CheckpointAttempt::new(56, 90_056);
+        coordinator.pending_barrier.reset_follower(attempt, 1);
+        let mut callback = MockCallback::new();
+        callback.runtime.leader = true;
+        callback.barrier_outcome = Some(BarrierOutcome::Aborted);
+        let cancelled = Arc::clone(&callback.cancelled_source_barrier_attempts);
+
+        coordinator
+            .handle_barrier(
+                0,
+                &CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch),
+                &checkpoint_at(attempt.epoch),
+                &mut callback,
+            )
+            .await
+            .unwrap();
+
+        assert!(callback.checkpoint_failures.is_empty());
+        let cancelled = cancelled.lock();
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(cancelled[0].0, attempt);
+        assert!(cancelled[0].1.contains("authoritative cluster control"));
+        assert_eq!(
+            *release.borrow_and_update(),
+            Some(SourceBarrierSignal::Release(attempt))
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_source_less_abort_abandons_without_failure() {
+        let mut coordinator = admission_coordinator(Vec::new());
+        let admission = CheckpointAdmission {
+            manual: false,
+            assignment_fence: None,
+        };
+        let attempt = CheckpointAttempt::new(55, 90_055);
+        let mut callback = MockCallback::new();
+        let abandoned = Arc::clone(&callback.abandoned_attempts);
+        let aborted_cuts = Arc::clone(&callback.aborted_subscription_cuts);
+
+        coordinator
+            .handle_source_less_checkpoint_outcome(
+                &mut callback,
+                &admission,
+                attempt,
+                BarrierOutcome::Aborted,
+            )
+            .await
+            .unwrap();
+
+        assert!(callback.checkpoint_failures.is_empty());
+        assert_eq!(aborted_cuts.lock().as_slice(), &[attempt]);
+        let abandoned = abandoned.lock();
+        assert_eq!(abandoned.len(), 1);
+        assert_eq!(abandoned[0].0, attempt);
+        assert!(abandoned[0].1.contains("authoritative cluster control"));
     }
 
     #[tokio::test]

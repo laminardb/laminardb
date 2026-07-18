@@ -838,10 +838,12 @@ struct ProducedPrefix {
 
 #[cfg(feature = "kafka")]
 struct ExplicitFaultEvidence {
+    victim: usize,
     log_offsets: Vec<u64>,
+    pipeline_fault_baselines: Vec<f64>,
     recovery_baselines: Vec<f64>,
     recovery_failure_baselines: Vec<f64>,
-    checkpoint_failure_baselines: Vec<f64>,
+    checkpoint_failure_totals: Vec<f64>,
     resumed_checkpoint: DurableCheckpointStatus,
 }
 
@@ -1613,13 +1615,79 @@ fn assert_no_unsolicited_cold_start_recovery(nodes: &[Node]) {
 }
 
 #[cfg(feature = "kafka")]
+fn validate_explicit_pipeline_fault_totals(
+    baselines: &[f64],
+    totals: &[f64],
+    victim: usize,
+) -> Result<(), String> {
+    if baselines.len() != totals.len() {
+        return Err(format!(
+            "pipeline fault metric cardinality changed from {} to {}",
+            baselines.len(),
+            totals.len()
+        ));
+    }
+    if victim >= totals.len() {
+        return Err(format!(
+            "explicit fault victim node{victim} is outside {} metric samples",
+            totals.len()
+        ));
+    }
+    for (node_id, (baseline, total)) in baselines.iter().zip(totals).enumerate() {
+        let expected = baseline + if node_id == victim { 1.0 } else { 0.0 };
+        if *total != expected {
+            return Err(format!(
+                "node{node_id} pipeline fault total is {total}, expected {expected} after explicit fault on node{victim}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "kafka")]
+fn validate_recovery_checkpoint_failure_totals(
+    baselines: &[f64],
+    totals: &[f64],
+    leader: usize,
+) -> Result<(), String> {
+    if baselines.len() != totals.len() {
+        return Err(format!(
+            "checkpoint failure metric cardinality changed from {} to {}",
+            baselines.len(),
+            totals.len()
+        ));
+    }
+    if leader >= totals.len() {
+        return Err(format!(
+            "recovery leader node{leader} is outside {} metric samples",
+            totals.len()
+        ));
+    }
+    for (node_id, (baseline, total)) in baselines.iter().zip(totals).enumerate() {
+        let delta = total - baseline;
+        let valid = if node_id == leader {
+            delta == 0.0 || delta == 1.0
+        } else {
+            delta == 0.0
+        };
+        if !valid {
+            return Err(format!(
+                "node{node_id} checkpoint failure total changed by {delta}; only recovery leader node{leader} may record one durable aborted attempt"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "kafka")]
 fn assert_explicit_fault_recovery_evidence(nodes: &[Node], evidence: &ExplicitFaultEvidence) {
     const PREPARE: &str = "leader announced recovery prepare";
 
     assert_eq!(nodes.len(), evidence.log_offsets.len());
+    assert_eq!(nodes.len(), evidence.pipeline_fault_baselines.len());
     assert_eq!(nodes.len(), evidence.recovery_baselines.len());
     assert_eq!(nodes.len(), evidence.recovery_failure_baselines.len());
-    assert_eq!(nodes.len(), evidence.checkpoint_failure_baselines.len());
+    assert_eq!(nodes.len(), evidence.checkpoint_failure_totals.len());
     let logs = nodes
         .iter()
         .zip(&evidence.log_offsets)
@@ -1632,6 +1700,20 @@ fn assert_explicit_fault_recovery_evidence(nodes: &[Node], evidence: &ExplicitFa
     );
     validate_post_release_checkpoint_lifecycle(&logs, evidence.resumed_checkpoint)
         .unwrap_or_else(|error| panic!("explicit recovery checkpoint lifecycle invalid: {error}"));
+
+    let pipeline_fault_totals = nodes
+        .iter()
+        .map(|node| {
+            node.metric("laminardb_pipeline_faults_total")
+                .expect("node stopped exposing pipeline fault count")
+        })
+        .collect::<Vec<_>>();
+    validate_explicit_pipeline_fault_totals(
+        &evidence.pipeline_fault_baselines,
+        &pipeline_fault_totals,
+        evidence.victim,
+    )
+    .unwrap_or_else(|error| panic!("explicit fault amplification detected: {error}"));
 
     for (index, node) in nodes.iter().enumerate() {
         let recovery_baseline = evidence.recovery_baselines[index];
@@ -1657,8 +1739,8 @@ fn assert_explicit_fault_recovery_evidence(nodes: &[Node], evidence: &ExplicitFa
             .metric("laminardb_checkpoints_failed_total")
             .expect("node stopped exposing checkpoint failure count");
         assert_eq!(
-            checkpoint_failures, evidence.checkpoint_failure_baselines[index],
-            "node{} recorded a failed checkpoint during explicit recovery",
+            checkpoint_failures, evidence.checkpoint_failure_totals[index],
+            "node{} checkpoint failure count changed after explicit recovery",
             node.id
         );
     }
@@ -2712,9 +2794,13 @@ fn three_node_kill9_soak() {
                 .expect("three-node cluster has no follower"),
             _ => unreachable!(),
         };
-        let fault_baseline = nodes[victim]
-            .metric("laminardb_pipeline_faults_total")
-            .expect("selected node did not expose pipeline_faults_total");
+        let pipeline_fault_baselines: Vec<f64> = nodes
+            .iter()
+            .map(|node| {
+                node.metric("laminardb_pipeline_faults_total")
+                    .expect("node did not expose pipeline_faults_total")
+            })
+            .collect();
         let recovery_baselines: Vec<f64> = nodes
             .iter()
             .map(|node| {
@@ -2749,7 +2835,7 @@ fn three_node_kill9_soak() {
                 producer.assert_running();
                 nodes[victim]
                     .metric("laminardb_pipeline_faults_total")
-                    .is_some_and(|faults| faults > fault_baseline)
+                    .is_some_and(|faults| faults > pipeline_fault_baselines[victim])
             },
         );
         wait_for(
@@ -2775,11 +2861,26 @@ fn three_node_kill9_soak() {
             "progress after coordinated recovery",
             Some(latest_checkpoint),
         );
+        let checkpoint_failure_totals = nodes
+            .iter()
+            .map(|node| {
+                node.metric("laminardb_checkpoints_failed_total")
+                    .expect("node stopped exposing checkpoint failure count")
+            })
+            .collect::<Vec<_>>();
+        validate_recovery_checkpoint_failure_totals(
+            &checkpoint_failure_baselines,
+            &checkpoint_failure_totals,
+            leader,
+        )
+        .unwrap_or_else(|error| panic!("invalid explicit recovery checkpoint failures: {error}"));
         let evidence = ExplicitFaultEvidence {
+            victim,
             log_offsets: fault_log_offsets,
+            pipeline_fault_baselines,
             recovery_baselines,
             recovery_failure_baselines: failure_baselines,
-            checkpoint_failure_baselines,
+            checkpoint_failure_totals,
             resumed_checkpoint: latest_checkpoint,
         };
         assert_explicit_fault_recovery_evidence(&nodes, &evidence);
@@ -3175,6 +3276,41 @@ fn checkpoint_epoch_progress_requires_strict_advance() {
     assert!(checkpoint_epoch_advanced(7, 8));
     assert!(!checkpoint_epoch_advanced(7, 7));
     assert!(!checkpoint_epoch_advanced(7, 6));
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn explicit_fault_oracle_requires_one_fault_on_only_the_victim() {
+    let baselines = [3.0, 7.0, 2.0];
+    assert!(validate_explicit_pipeline_fault_totals(&baselines, &[3.0, 8.0, 2.0], 1).is_ok());
+    assert!(
+        validate_explicit_pipeline_fault_totals(&baselines, &[4.0, 8.0, 2.0], 1)
+            .unwrap_err()
+            .contains("node0")
+    );
+    assert!(
+        validate_explicit_pipeline_fault_totals(&baselines, &[3.0, 9.0, 2.0], 1)
+            .unwrap_err()
+            .contains("node1")
+    );
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn recovery_checkpoint_failure_oracle_allows_only_one_leader_abort() {
+    let baselines = [3.0, 7.0, 2.0];
+    assert!(validate_recovery_checkpoint_failure_totals(&baselines, &baselines, 0).is_ok());
+    assert!(validate_recovery_checkpoint_failure_totals(&baselines, &[4.0, 7.0, 2.0], 0).is_ok());
+    assert!(
+        validate_recovery_checkpoint_failure_totals(&baselines, &[5.0, 7.0, 2.0], 0)
+            .unwrap_err()
+            .contains("node0")
+    );
+    assert!(
+        validate_recovery_checkpoint_failure_totals(&baselines, &[4.0, 8.0, 2.0], 0)
+            .unwrap_err()
+            .contains("node1")
+    );
 }
 
 #[test]

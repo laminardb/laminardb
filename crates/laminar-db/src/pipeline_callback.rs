@@ -20,6 +20,8 @@ use rustc_hash::FxHashMap;
 
 use crate::db::{filter_late_rows, SourceWatermarkState};
 use crate::error::DbError;
+#[cfg(feature = "cluster")]
+use crate::operator_graph::ShuffleAlignmentOutcome;
 use crate::pipeline::CheckpointCompletion;
 
 /// Resolution state of a sink WHERE filter.
@@ -2595,7 +2597,7 @@ impl ConnectorPipelineCallback {
         attempt: CheckpointAttempt,
         assignment_fence: &laminar_core::cluster::control::CheckpointAssignmentFence,
         deadline: tokio::time::Instant,
-    ) -> Result<(), DbError> {
+    ) -> Result<ShuffleAlignmentOutcome, DbError> {
         let watermark = self.effective_pipeline_watermark();
         self.graph
             .align_shuffle_barriers(
@@ -2648,6 +2650,25 @@ impl ConnectorPipelineCallback {
             Err(cleanup) => format!("{error}; follower cleanup failed: {cleanup}"),
         };
         crate::pipeline::CheckpointControlOutcome::Failed { attempt, error }
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn abort_pending_follower_control(
+        &mut self,
+        attempt: CheckpointAttempt,
+    ) -> crate::pipeline::CheckpointControlOutcome {
+        let reason = "checkpoint was aborted by the cluster leader during shuffle alignment";
+        match <Self as crate::pipeline::PipelineCallback>::cancel_source_barrier_attempt(
+            self, attempt, reason,
+        )
+        .await
+        {
+            Ok(()) => crate::pipeline::CheckpointControlOutcome::Aborted { attempt },
+            Err(cleanup) => crate::pipeline::CheckpointControlOutcome::Failed {
+                attempt,
+                error: format!("{reason}; follower cleanup failed: {cleanup}"),
+            },
+        }
     }
 
     #[cfg(feature = "cluster")]
@@ -2762,14 +2783,25 @@ impl ConnectorPipelineCallback {
                 .await;
         }
 
-        if let Err(error) = self
+        match self
             .align_follower_shuffle_until(&controller, attempt, assignment_fence, attempt_deadline)
             .await
         {
-            tracing::warn!(%error, "follower shuffle alignment failed — skipping");
-            let error = error.to_string();
-            set_checkpoint_fault(&self.checkpoint_fault, error.clone());
-            return self.fail_pending_follower_control(attempt, error).await;
+            Ok(ShuffleAlignmentOutcome::Aligned) => {}
+            Ok(ShuffleAlignmentOutcome::Aborted) => {
+                tracing::info!(
+                    checkpoint_id = attempt.checkpoint_id,
+                    epoch = attempt.epoch,
+                    "follower shuffle alignment observed the leader's checkpoint Abort"
+                );
+                return self.abort_pending_follower_control(attempt).await;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "follower shuffle alignment failed — skipping");
+                let error = error.to_string();
+                set_checkpoint_fault(&self.checkpoint_fault, error.clone());
+                return self.fail_pending_follower_control(attempt, error).await;
+            }
         }
         if let Err(error) = self.require_process_authority("follower state capture") {
             return self
@@ -2901,8 +2933,8 @@ impl ConnectorPipelineCallback {
         {
             return BarrierOutcome::Failed;
         }
-        if !self
-            .deferred_follower_capture_is_aligned(
+        match self
+            .align_deferred_follower_capture(
                 &controller,
                 attempt,
                 assignment_fence,
@@ -2910,7 +2942,13 @@ impl ConnectorPipelineCallback {
             )
             .await
         {
-            return BarrierOutcome::Failed;
+            Ok(ShuffleAlignmentOutcome::Aligned) => {}
+            Ok(ShuffleAlignmentOutcome::Aborted) => return BarrierOutcome::Aborted,
+            Err(error) => {
+                tracing::warn!(%error, "follower deferred shuffle alignment failed");
+                set_checkpoint_fault(&self.checkpoint_fault, error.to_string());
+                return BarrierOutcome::Failed;
+            }
         }
         if self
             .require_process_authority("deferred follower state capture")
@@ -2974,30 +3012,32 @@ impl ConnectorPipelineCallback {
     }
 
     #[cfg(feature = "cluster")]
-    async fn deferred_follower_capture_is_aligned(
+    async fn align_deferred_follower_capture(
         &mut self,
         controller: &laminar_core::cluster::control::ClusterController,
         attempt: CheckpointAttempt,
         assignment_fence: &laminar_core::cluster::control::CheckpointAssignmentFence,
         deadline: tokio::time::Instant,
-    ) -> bool {
+    ) -> Result<ShuffleAlignmentOutcome, DbError> {
         // Capture only after peers' pre-checkpoint rows have crossed the shuffle barrier.
-        if let Err(error) = self
+        let outcome = self
             .align_follower_shuffle_until(controller, attempt, assignment_fence, deadline)
-            .await
-        {
-            tracing::warn!(%error, "follower shuffle alignment failed — skipping");
-            set_checkpoint_fault(&self.checkpoint_fault, error.to_string());
-            return false;
+            .await?;
+        if outcome == ShuffleAlignmentOutcome::Aborted {
+            tracing::info!(
+                checkpoint_id = attempt.checkpoint_id,
+                epoch = attempt.epoch,
+                "follower shuffle alignment observed the leader's checkpoint Abort"
+            );
+            return Ok(outcome);
         }
 
         // A trailing shuffle gap discovered during alignment must not be sealed cluster-wide.
         self.check_shuffle_delivery_loss();
-        if self.sink_fault.is_some() {
-            tracing::warn!("follower: shuffle loss before capture; failing the epoch for replay");
-            return false;
+        if let Some(error) = self.sink_fault.clone() {
+            return Err(DbError::Checkpoint(error));
         }
-        true
+        Ok(ShuffleAlignmentOutcome::Aligned)
     }
 
     #[cfg(feature = "cluster")]
@@ -3175,11 +3215,11 @@ impl ConnectorPipelineCallback {
         attempt: CheckpointAttempt,
         assignment_fence: Option<&laminar_core::cluster::control::CheckpointAssignmentFence>,
         deadline: tokio::time::Instant,
-    ) -> Result<(), DbError> {
+    ) -> Result<ShuffleAlignmentOutcome, DbError> {
         // A binary compiled with cluster support may still run embedded or single-node without a
         // controller. Those runtimes have no cross-node shuffle to align.
         let Some(cc) = self.cluster_controller.clone() else {
-            return Ok(());
+            return Ok(ShuffleAlignmentOutcome::Aligned);
         };
         if !cc.is_leader() {
             return Err(DbError::Checkpoint(
@@ -4936,7 +4976,15 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             .align_shuffle_for_leader(attempt, assignment_fence.as_ref(), attempt_deadline)
             .await
         {
-            Ok(()) => {}
+            Ok(ShuffleAlignmentOutcome::Aligned) => {}
+            Ok(ShuffleAlignmentOutcome::Aborted) => {
+                tracing::info!(
+                    checkpoint_id = attempt.checkpoint_id,
+                    epoch = attempt.epoch,
+                    "leader shuffle alignment observed its checkpoint Abort"
+                );
+                return BarrierOutcome::Aborted;
+            }
             Err(error) => {
                 tracing::warn!(%error, "shuffle barrier alignment failed");
                 set_checkpoint_fault(&self.checkpoint_fault, error.to_string());

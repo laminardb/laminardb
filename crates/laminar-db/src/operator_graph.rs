@@ -325,6 +325,13 @@ impl GraphOperator for ChangelogEnrichOperator {
     }
 }
 
+#[cfg(feature = "cluster")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShuffleAlignmentOutcome {
+    Aligned,
+    Aborted,
+}
+
 #[allow(clippy::struct_excessive_bools)] // distinct independent flags, not a state enum
 pub(crate) struct OperatorGraph {
     nodes: Vec<GraphNode>,
@@ -2693,14 +2700,41 @@ impl OperatorGraph {
         }
     }
 
+    #[cfg(feature = "cluster")]
+    fn classify_shuffle_alignment_control(
+        attempt: laminar_core::state::CheckpointAttempt,
+        announcement: &laminar_core::cluster::control::BarrierAnnouncement,
+    ) -> Result<Option<ShuffleAlignmentOutcome>, DbError> {
+        use laminar_core::cluster::control::Phase;
+
+        let announced = laminar_core::state::CheckpointAttempt::new(
+            announcement.epoch,
+            announcement.checkpoint_id,
+        );
+        match Self::compare_shuffle_attempts(attempt, announced)? {
+            std::cmp::Ordering::Equal if announcement.phase == Phase::Abort => {
+                Ok(Some(ShuffleAlignmentOutcome::Aborted))
+            }
+            std::cmp::Ordering::Greater => Err(DbError::Pipeline(format!(
+                "checkpoint {} epoch {} was superseded by {announced:?}",
+                attempt.checkpoint_id, attempt.epoch
+            ))),
+            std::cmp::Ordering::Equal | std::cmp::Ordering::Less => Ok(None),
+        }
+    }
+
     /// Aligned shuffle checkpointing: fan out an in-band barrier, retain each peer's pre-barrier
     /// rows as channel state, and wait until every peer's barrier is observed before snapshotting.
     /// A barrier closes that peer's current-attempt channel: data from an already aligned peer while
     /// other peers are outstanding is a protocol violation and requires recovery.
     ///
+    /// An exact, authority-validated leader Abort is a normal terminal outcome: rows dequeued
+    /// before observing it remain staged in the live graph, and no snapshot was captured. Every
+    /// actual alignment failure still requires coordinated recovery because partial staging may
+    /// otherwise lose or double-apply channel data.
+    ///
     /// # Errors
-    /// Every admitted-attempt failure requires coordinated recovery: alignment may already have
-    /// dequeued channel data, so retrying only the checkpoint could lose or double-apply it.
+    /// Returns a recovery-classified error for timeout, loss, scope conflict, or supersession.
     #[cfg(feature = "cluster")]
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn align_shuffle_barriers(
@@ -2710,7 +2744,7 @@ impl OperatorGraph {
         assignment_fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
         deadline: tokio::time::Instant,
         controller: Option<&laminar_core::cluster::control::ClusterController>,
-    ) -> Result<(), DbError> {
+    ) -> Result<ShuffleAlignmentOutcome, DbError> {
         use laminar_core::checkpoint::barrier::CheckpointBarrier;
         use laminar_core::cluster::control::Phase;
         use laminar_core::shuffle::ShuffleMessage;
@@ -2719,7 +2753,7 @@ impl OperatorGraph {
         const RECHECK: std::time::Duration = std::time::Duration::from_millis(500);
 
         let Some(cfg) = self.cluster_shuffle.clone() else {
-            return Ok(());
+            return Ok(ShuffleAlignmentOutcome::Aligned);
         };
         let alignment = tokio::time::timeout_at(deadline, async {
             let recovery_gen = cfg.receiver.recovery_gen();
@@ -2746,7 +2780,7 @@ impl OperatorGraph {
                 .filter(|peer| *peer != cfg.self_id.0)
                 .collect();
             if peers.is_empty() {
-                return Ok(());
+                return Ok(ShuffleAlignmentOutcome::Aligned);
             }
 
             // Take only previously staged data. Consuming the live queue here would split its
@@ -2847,7 +2881,7 @@ impl OperatorGraph {
                     controller,
                 )?;
                 ensure_no_delivery_loss()?;
-                return Ok(());
+                return Ok(ShuffleAlignmentOutcome::Aligned);
             }
 
             let mut check_interval = tokio::time::interval_at(
@@ -2959,24 +2993,11 @@ impl OperatorGraph {
                                     ))
                                 })?;
                             if let Some(announcement) = announcement {
-                                let announced = laminar_core::state::CheckpointAttempt::new(
-                                    announcement.epoch,
-                                    announcement.checkpoint_id,
-                                );
-                                match Self::compare_shuffle_attempts(attempt, announced)? {
-                                    std::cmp::Ordering::Equal if announcement.phase == Phase::Abort => {
-                                        return Err(DbError::Pipeline(format!(
-                                            "checkpoint {} epoch {} was aborted by leader",
-                                            attempt.checkpoint_id, attempt.epoch
-                                        )));
-                                    }
-                                    std::cmp::Ordering::Greater => {
-                                        return Err(DbError::Pipeline(format!(
-                                            "checkpoint {} epoch {} was superseded by {announced:?}",
-                                            attempt.checkpoint_id, attempt.epoch
-                                        )));
-                                    }
-                                    std::cmp::Ordering::Equal | std::cmp::Ordering::Less => {}
+                                if let Some(outcome) = Self::classify_shuffle_alignment_control(
+                                    attempt,
+                                    &announcement,
+                                )? {
+                                    return Ok(outcome);
                                 }
                             }
                         }
@@ -2995,7 +3016,7 @@ impl OperatorGraph {
                 epoch = attempt.epoch,
                 "shuffle align: complete"
             );
-            Ok(())
+            Ok(ShuffleAlignmentOutcome::Aligned)
         })
         .await
         .map_err(|_| {
@@ -4080,6 +4101,49 @@ mod tests {
                 "mixed attempt order must fail: {observed:?}"
             );
         }
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn shuffle_alignment_treats_only_the_exact_abort_as_a_terminal_outcome() {
+        use laminar_core::cluster::control::{BarrierAnnouncement, Phase};
+        use laminar_core::state::CheckpointAttempt;
+
+        let attempt = CheckpointAttempt::new(7, 70);
+        let announcement = |attempt: CheckpointAttempt, phase| BarrierAnnouncement {
+            epoch: attempt.epoch,
+            checkpoint_id: attempt.checkpoint_id,
+            assignment_fence: None,
+            leader_proof: None,
+            phase,
+            flags: 0,
+            min_watermark_ms: None,
+        };
+
+        assert_eq!(
+            OperatorGraph::classify_shuffle_alignment_control(
+                attempt,
+                &announcement(attempt, Phase::Abort),
+            )
+            .unwrap(),
+            Some(ShuffleAlignmentOutcome::Aborted)
+        );
+        assert_eq!(
+            OperatorGraph::classify_shuffle_alignment_control(
+                attempt,
+                &announcement(attempt, Phase::Prepare),
+            )
+            .unwrap(),
+            None
+        );
+
+        let newer = CheckpointAttempt::new(8, 71);
+        let error = OperatorGraph::classify_shuffle_alignment_control(
+            attempt,
+            &announcement(newer, Phase::Abort),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("superseded"), "{error}");
     }
 
     #[cfg(feature = "cluster")]

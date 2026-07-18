@@ -200,6 +200,8 @@ pub enum BarrierOutcome {
     Async,
     /// Deliberately skipped (see `SkipReason`).
     Skipped(SkipReason),
+    /// The exact attempt was terminated by authoritative cluster control before capture.
+    Aborted,
     /// Attempted and failed; retry on the next interval.
     Failed,
 }
@@ -246,6 +248,8 @@ pub enum CheckpointControlOutcome {
         attempt: CheckpointAttempt,
         captured: bool,
     },
+    /// The exact leader-prepared attempt was authoritatively aborted before capture.
+    Aborted { attempt: CheckpointAttempt },
     /// The exact leader-prepared attempt was rejected before it could remain in flight.
     Failed {
         attempt: CheckpointAttempt,
