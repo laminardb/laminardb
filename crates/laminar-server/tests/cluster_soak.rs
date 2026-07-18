@@ -56,6 +56,8 @@ const DEFAULT_CLUSTER_KEY_GROUPS: u32 = 64;
 const DEFAULT_KAFKA_PARTITIONS: u64 = 96;
 #[cfg(feature = "kafka")]
 const OUTPUT_TOPIC_PARTITIONS: i32 = 1;
+#[cfg(feature = "kafka")]
+const SOAK_PRODUCER_MAX_IN_FLIGHT: usize = 4_096;
 const RECOVERY_LIVENESS_WINDOW: Duration = Duration::from_secs(90);
 const DEFAULT_MAX_RECOVERY_MS: u64 = 90_000;
 const LOCAL_EXACT_PREFIX_CYCLES: u64 = 4;
@@ -521,12 +523,14 @@ struct ProducerGuard {
     stop: Arc<AtomicBool>,
     produced: Arc<AtomicU64>,
     handle: Option<JoinHandle<Vec<i64>>>,
+    started_at: Instant,
 }
 
 #[cfg(feature = "kafka")]
 struct ProducedPrefix {
     count: u64,
     end_offsets: Vec<i64>,
+    elapsed: Duration,
 }
 
 #[cfg(feature = "kafka")]
@@ -536,6 +540,7 @@ impl ProducerGuard {
         let produced = Arc::new(AtomicU64::new(0));
         let producer_stop = Arc::clone(&stop);
         let producer_count = Arc::clone(&produced);
+        let started_at = Instant::now();
         let handle = std::thread::spawn(move || {
             produce_seq(
                 &brokers,
@@ -550,6 +555,7 @@ impl ProducerGuard {
             stop,
             produced,
             handle: Some(handle),
+            started_at,
         }
     }
 
@@ -579,6 +585,7 @@ impl ProducerGuard {
         ProducedPrefix {
             count: self.produced.load(Ordering::Acquire),
             end_offsets,
+            elapsed: self.started_at.elapsed(),
         }
     }
 }
@@ -2166,6 +2173,15 @@ fn three_node_kill9_soak() {
     let produced_prefix = producer.stop();
     let produced_count = produced_prefix.count;
     assert!(produced_count > 0, "soak producer emitted no input records");
+    let achieved_rps = produced_count as f64 / produced_prefix.elapsed.as_secs_f64();
+    eprintln!(
+        "soak: producer acknowledged {produced_count} records in {:.1}s ({achieved_rps:.1} rps; target {source_rps} rps)",
+        produced_prefix.elapsed.as_secs_f64()
+    );
+    assert!(
+        achieved_rps >= source_rps as f64 * 0.9,
+        "soak producer achieved only {achieved_rps:.1} rps against target {source_rps} rps"
+    );
     assert!(
         produced_count >= u64::try_from(kafka_partitions).expect("Kafka partition count fits u64"),
         "soak produced {produced_count} rows for {kafka_partitions} input partitions; every vnode must receive work"
@@ -2260,7 +2276,8 @@ fn kafka_create_topic(brokers: &str, topic: &str, partitions: i32) {
 }
 
 /// Produce an unbounded `{"seq": n}` stream, paced near `rps`, until the guard requests stop.
-/// Every delivery is awaited so broker-side rejection or timeout fails the soak.
+/// Deliveries are bounded and awaited concurrently so broker-side rejection or timeout fails the
+/// soak without serializing the configured input rate on round-trip latency.
 /// Explicit round-robin assignment guarantees that every source partition and vnode receives
 /// records; Kafka keys remain unique diagnostics and do not determine placement.
 #[cfg(feature = "kafka")]
@@ -2272,7 +2289,32 @@ fn produce_seq(
     stop: &AtomicBool,
     produced: &AtomicU64,
 ) -> Vec<i64> {
+    use futures::stream::{FuturesUnordered, StreamExt as _};
     use rdkafka::producer::{FutureProducer, FutureRecord};
+
+    fn record_delivery(
+        result: Result<
+            rdkafka::producer::future_producer::OwnedDeliveryResult,
+            futures::channel::oneshot::Canceled,
+        >,
+        end_offsets: &mut [i64],
+        acknowledged: &mut u64,
+        produced: &AtomicU64,
+    ) {
+        let delivery = result
+            .expect("Kafka delivery future was cancelled before the producer stopped")
+            .unwrap_or_else(|(error, _)| panic!("Kafka delivery failed: {error}"));
+        let partition = usize::try_from(delivery.partition)
+            .expect("Kafka returned a negative delivery partition");
+        let boundary = end_offsets
+            .get_mut(partition)
+            .expect("Kafka returned an out-of-range delivery partition");
+        *boundary = (*boundary).max(delivery.offset.saturating_add(1));
+        *acknowledged = acknowledged
+            .checked_add(1)
+            .expect("soak acknowledgement count overflow");
+        produced.store(*acknowledged, Ordering::Release);
+    }
 
     let producer: FutureProducer = rdkafka::ClientConfig::new()
         .set("bootstrap.servers", brokers)
@@ -2291,32 +2333,63 @@ fn produce_seq(
         assert!(partition_count > 0, "partition count must be positive");
         let mut end_offsets =
             vec![0; usize::try_from(partition_count).expect("partition count fits usize")];
+        let mut deliveries = FuturesUnordered::new();
+        let mut acknowledged = 0u64;
         while !stop.load(Ordering::Acquire) {
+            if deliveries.len() >= SOAK_PRODUCER_MAX_IN_FLIGHT {
+                let delivery = deliveries
+                    .next()
+                    .await
+                    .expect("bounded producer has an in-flight delivery");
+                record_delivery(delivery, &mut end_offsets, &mut acknowledged, produced);
+                continue;
+            }
+
+            let target = start + Duration::from_secs_f64(n as f64 / rps as f64);
+            if target > tokio::time::Instant::now() {
+                if deliveries.is_empty() {
+                    tokio::time::sleep_until(target).await;
+                } else {
+                    tokio::select! {
+                        delivery = deliveries.next() => {
+                            record_delivery(
+                                delivery.expect("producer has an in-flight delivery"),
+                                &mut end_offsets,
+                                &mut acknowledged,
+                                produced,
+                            );
+                            continue;
+                        }
+                        () = tokio::time::sleep_until(target) => {}
+                    }
+                }
+            }
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+
             let payload = format!(r#"{{"seq":{n}}}"#);
             let key = n.to_string();
             let partition =
                 i32::try_from(n % partition_count).expect("round-robin partition fits i32");
             let delivery = producer
-                .send(
+                .send_result(
                     FutureRecord::to(topic)
                         .payload(&payload)
                         .key(&key)
                         .partition(partition),
-                    Duration::from_secs(10),
                 )
-                .await
-                .unwrap_or_else(|(error, _)| panic!("Kafka delivery failed: {error}"));
-            let partition = usize::try_from(delivery.partition)
-                .expect("Kafka returned a negative delivery partition");
-            let boundary = end_offsets
-                .get_mut(partition)
-                .expect("Kafka returned an out-of-range delivery partition");
-            *boundary = (*boundary).max(delivery.offset.saturating_add(1));
+                .unwrap_or_else(|(error, _)| panic!("Kafka enqueue failed: {error}"));
+            deliveries.push(delivery);
             n = n.checked_add(1).expect("soak sequence overflow");
-            produced.store(n, Ordering::Release);
-            let target = start + Duration::from_secs_f64(n as f64 / rps as f64);
-            tokio::time::sleep_until(target).await;
         }
+        while let Some(delivery) = deliveries.next().await {
+            record_delivery(delivery, &mut end_offsets, &mut acknowledged, produced);
+        }
+        assert_eq!(
+            acknowledged, n,
+            "producer stopped before every enqueued record was acknowledged"
+        );
         end_offsets
     })
 }
