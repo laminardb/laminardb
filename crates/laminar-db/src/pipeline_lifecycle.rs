@@ -4353,7 +4353,10 @@ impl LaminarDB {
                             // Publish before notifying the watcher. This closes the ready-send ->
                             // watcher-scheduled window in which start() could otherwise report
                             // Running after the compute loop had already exited.
+                            #[cfg(feature = "cluster")]
                             let owns_fault_state = publish_runtime_fault_state(&fault_state);
+                            #[cfg(not(feature = "cluster"))]
+                            publish_runtime_fault_state(&fault_state);
                             #[cfg(feature = "cluster")]
                             let covered_by_terminal_stop = compute_fault_is_cluster
                                 && !owns_fault_state
