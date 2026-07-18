@@ -226,6 +226,30 @@ fn remove_marker(path: &Path) {
     }
 }
 
+#[cfg(feature = "kafka")]
+fn prometheus_histogram_bucket_value(body: &str, metric: &str, upper_bound: f64) -> Option<f64> {
+    let mut found = false;
+    let sum = body
+        .lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix(metric)?;
+            let (labels, _) = rest.strip_prefix('{')?.split_once('}')?;
+            let encoded_bound = labels.split(',').find_map(|label| {
+                label
+                    .strip_prefix("le=\"")?
+                    .strip_suffix('"')?
+                    .parse::<f64>()
+                    .ok()
+            })?;
+            let tolerance = f64::EPSILON * upper_bound.abs().max(1.0) * 4.0;
+            ((encoded_bound - upper_bound).abs() <= tolerance)
+                .then(|| line.split_whitespace().last()?.parse::<f64>().ok())?
+        })
+        .inspect(|_| found = true)
+        .sum();
+    found.then_some(sum)
+}
+
 impl Node {
     fn spawn(&mut self) {
         let log = std::fs::OpenOptions::new()
@@ -417,7 +441,11 @@ impl Node {
             value("laminardb_checkpoint_duration_seconds_sum")?,
             value("laminardb_checkpoint_duration_seconds_count")?,
             value("laminardb_checkpoint_pipeline_stall_duration_seconds_count")?,
-            value("laminardb_checkpoint_pipeline_stall_duration_seconds_bucket{le=\"1.024\"}")?,
+            prometheus_histogram_bucket_value(
+                &body,
+                "laminardb_checkpoint_pipeline_stall_duration_seconds_bucket",
+                CHECKPOINT_PIPELINE_STALL_SLO_SECONDS,
+            )?,
         ))
     }
 
@@ -2840,6 +2868,24 @@ fn checkpoint_completion_log_match_binds_checkpoint_and_epoch() {
         "checkpoint failed checkpoint_id=41 epoch=43",
         expected
     ));
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn prometheus_bucket_parser_accepts_registry_labels() {
+    let body = concat!(
+        "laminardb_checkpoint_pipeline_stall_duration_seconds_bucket{instance=\"node0\",pipeline=\"soak\",le=\"0.512\"} 38\n",
+        "laminardb_checkpoint_pipeline_stall_duration_seconds_bucket{instance=\"node0\",pipeline=\"soak\",le=\"1.024\"} 41\n",
+        "laminardb_checkpoint_pipeline_stall_duration_seconds_bucket{instance=\"node0\",pipeline=\"soak\",le=\"+Inf\"} 43\n",
+    );
+    assert_eq!(
+        prometheus_histogram_bucket_value(
+            body,
+            "laminardb_checkpoint_pipeline_stall_duration_seconds_bucket",
+            CHECKPOINT_PIPELINE_STALL_SLO_SECONDS,
+        ),
+        Some(41.0)
+    );
 }
 
 #[test]
