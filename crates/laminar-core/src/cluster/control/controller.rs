@@ -11,7 +11,7 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use super::barrier::{
-    BarrierAck, BarrierAnnouncement, BarrierCoordinator, ClusterKv, Phase, QuorumOutcome,
+    BarrierAck, BarrierAnnouncement, BarrierCoordinator, ClusterKv, QuorumOutcome,
 };
 use super::leader::leader_of;
 use super::snapshot::AssignmentSnapshotStore;
@@ -39,6 +39,7 @@ const RECOVERY_CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_DRAIN_ACK_BYTES: usize = 1_024;
 const MAX_RELEASE_READY_ACK_BYTES: usize = 1_024;
 const CONTROL_ROSTER_IO_CONCURRENCY: usize = 32;
+const PENDING_RELEASE_FAULT_AUDIT_INTERVAL: Duration = Duration::from_secs(1);
 
 #[cfg(feature = "cluster")]
 struct LeaderLeaseGate {
@@ -886,6 +887,10 @@ pub struct ClusterController {
     leadership_participants: parking_lot::RwLock<Option<(u64, Vec<u64>)>>,
     /// Serialises this node's recovery and fault-slot conditional writes.
     recovery_writes: tokio::sync::Mutex<()>,
+    /// Coalesces non-authorizing fault audits while a Release still lacks readiness. The complete
+    /// path never consults this cache.
+    pending_release_fault_audit:
+        tokio::sync::Mutex<Option<(RecoveryReleaseId, tokio::time::Instant)>>,
     /// Exact process incarnations that missed a capture quorum, keyed by stable node id. Entries
     /// remain quarantined until that process acknowledges or a different lease-bound boot appears;
     /// elapsed time is not evidence that a stalled owner became safe.
@@ -987,6 +992,7 @@ impl ClusterController {
             leader_candidacy: watch::channel(super::LeaderCandidacy::initial(false)).0,
             leadership_participants: parking_lot::RwLock::new(None),
             recovery_writes: tokio::sync::Mutex::new(()),
+            pending_release_fault_audit: tokio::sync::Mutex::new(None),
             unresponsive: Arc::new(parking_lot::Mutex::new(rustc_hash::FxHashMap::default())),
             self_locality: parking_lot::RwLock::new(Locality::default()),
             #[cfg(feature = "cluster")]
@@ -2221,6 +2227,56 @@ impl ClusterController {
             .collect()
     }
 
+    async fn read_nonzero_faults_control(
+        &self,
+    ) -> Result<Vec<RecoveryFault>, RecoveryControlError> {
+        let mut faults = self
+            .read_fault_reports_control()
+            .await?
+            .into_iter()
+            .filter_map(|(reporter, sequence)| {
+                (sequence != 0).then_some(RecoveryFault { reporter, sequence })
+            })
+            .collect::<Vec<_>>();
+        faults.sort_unstable_by_key(|fault| fault.reporter);
+        Ok(faults)
+    }
+
+    async fn audit_recovery_faults_control(
+        &self,
+        round: &RecoveryRound,
+    ) -> Result<(), RecoveryControlError> {
+        if self.read_nonzero_faults_control().await? == round.faults {
+            Ok(())
+        } else {
+            Err(RecoveryControlError::Superseded(
+                "recovery fault set changed before Release commit".into(),
+            ))
+        }
+    }
+
+    async fn audit_pending_release_faults_control(
+        &self,
+        release: &RecoveryAnnouncement,
+    ) -> Result<(), RecoveryControlError> {
+        let release_id =
+            RecoveryReleaseId::for_pending(release).map_err(RecoveryControlError::Conflict)?;
+        let mut cached = self.pending_release_fault_audit.lock().await;
+        let now = tokio::time::Instant::now();
+        if cached
+            .as_ref()
+            .is_some_and(|(audited, valid_until)| audited == &release_id && now < *valid_until)
+        {
+            return Ok(());
+        }
+        self.audit_recovery_faults_control(&release.round).await?;
+        *cached = Some((
+            release_id,
+            tokio::time::Instant::now() + PENDING_RELEASE_FAULT_AUDIT_INTERVAL,
+        ));
+        Ok(())
+    }
+
     /// Publish that this node restored the exact frozen recovery round.
     ///
     /// # Errors
@@ -2921,10 +2977,9 @@ impl ClusterController {
 
     /// Follower-side observe; `Ok(None)` if no leader is visible.
     ///
-    /// Observation is deliberately side-effect free. The caller must validate the exact
-    /// checkpoint identity and assignment certificate before passing an `Aligned` or `Commit`
-    /// to [`Self::accept_barrier_watermark`]. This prevents a malformed or stale announcement
-    /// from advancing event time merely because it was visible in the control plane.
+    /// Observation is deliberately side-effect free. Event-time progress comes from the
+    /// content-addressed recovery capsule selected by immutable checkpoint authority, never from
+    /// an announcement hint.
     ///
     /// # Errors
     /// Propagates [`BarrierCoordinator::observe`] errors.
@@ -2942,36 +2997,6 @@ impl ClusterController {
         prepare: &BarrierAnnouncement,
     ) -> Option<std::time::Instant> {
         self.barrier.prepare_received_at(prepare)
-    }
-
-    /// Accept an exact, assignment-certified checkpoint phase.
-    ///
-    /// Returns `true` when the announcement matches the expected attempt and is an `Aligned` or
-    /// `Commit` phase. Only an immutable `Commit` may advance the recovery-safe watermark;
-    /// `Aligned` releases the live data path but can still abort before a durable decision. A
-    /// matching phase without a watermark is accepted without changing state. All mismatches fail
-    /// closed and leave the monotonic watermark untouched.
-    pub fn accept_barrier_watermark(
-        &self,
-        announcement: &BarrierAnnouncement,
-        expected_epoch: u64,
-        expected_checkpoint_id: u64,
-        expected_fence: &CheckpointAssignmentFence,
-    ) -> bool {
-        if !expected_fence.is_canonical()
-            || announcement.epoch != expected_epoch
-            || announcement.checkpoint_id != expected_checkpoint_id
-            || announcement.assignment_fence.as_ref() != Some(expected_fence)
-            || !matches!(announcement.phase, Phase::Aligned | Phase::Commit)
-        {
-            return false;
-        }
-        if announcement.phase == Phase::Commit {
-            if let Some(watermark) = announcement.min_watermark_ms {
-                self.publish_cluster_min_watermark(watermark);
-            }
-        }
-        true
     }
 
     /// Follower-side ack.
@@ -3199,9 +3224,9 @@ impl ClusterController {
 
     /// Commit a pending release after every frozen owner published its compact readiness record.
     ///
-    /// Pending attempts point-read only the readiness roster. Once complete, the process roster
-    /// and fault set are validated under the driver's phase-transition mutex before admitting the
-    /// content-addressed terminal into durable leader authority.
+    /// A pending attempt audits the frozen fault set before returning incomplete readiness. Once
+    /// complete, the process roster and fault set are validated under the driver's phase-transition
+    /// mutex before admitting the content-addressed terminal into durable leader authority.
     ///
     /// # Errors
     /// Returns a classified uncertain, conflict, or superseded outcome. Missing readiness remains
@@ -3227,6 +3252,7 @@ impl ClusterController {
         match self.read_release_ready(release).await? {
             ReleaseReadyStatus::Complete => {}
             ReleaseReadyStatus::Pending { missing } => {
+                self.audit_pending_release_faults_control(release).await?;
                 return Ok(ReleaseCommitStatus::Pending { missing });
             }
         }
@@ -3248,20 +3274,7 @@ impl ClusterController {
                 "recovery process-incarnation roster changed before Release commit".into(),
             ));
         }
-        let mut observed_faults = self
-            .read_fault_reports_control()
-            .await?
-            .into_iter()
-            .filter_map(|(reporter, sequence)| {
-                (sequence != 0).then_some(RecoveryFault { reporter, sequence })
-            })
-            .collect::<Vec<_>>();
-        observed_faults.sort_unstable_by_key(|fault| fault.reporter);
-        if observed_faults != round.faults {
-            return Err(RecoveryControlError::Superseded(
-                "recovery fault set changed before Release commit".into(),
-            ));
-        }
+        self.audit_recovery_faults_control(round).await?;
         let Some(current) = self
             .read_recovery_value(self.instance_id, "control:recover")
             .await
@@ -3623,10 +3636,8 @@ impl ClusterController {
     }
 
     /// Wait until [`Self::observe_barrier`] yields an announcement matching `pred`, or `timeout`
-    /// expires (→ `Ok(None)`). Observation remains side-effect free; a caller consuming event-time
-    /// progress must subsequently use [`Self::accept_barrier_watermark`] after its exact identity
-    /// validation. Push-driven
-    /// off the gRPC announcement watch when available; gossip-KV-only
+    /// expires (→ `Ok(None)`). Observation remains side-effect free; event-time progress must come
+    /// from immutable checkpoint authority. Push-driven off the gRPC announcement watch when available; gossip-KV-only
     /// deployments (and KV-only announcements) are covered by a
     /// fallback poll — 250ms with the watch, 25ms without.
     ///
@@ -3707,7 +3718,7 @@ mod tests {
     use super::*;
     use crate::cluster::control::barrier::InMemoryKv;
     #[cfg(feature = "cluster")]
-    use crate::cluster::control::barrier::{ANNOUNCEMENT_KEY, BARRIER_ADDR_KEY};
+    use crate::cluster::control::barrier::{Phase, ANNOUNCEMENT_KEY, BARRIER_ADDR_KEY};
     use crate::cluster::discovery::{NodeMetadata, NodeState};
 
     struct FailedWriteKv;
@@ -3739,6 +3750,8 @@ mod tests {
     struct FaultyReadyReadKv {
         inner: InMemoryKv,
         remaining_failures: std::sync::atomic::AtomicUsize,
+        fault_scans: std::sync::atomic::AtomicUsize,
+        remaining_fault_scan_failures: std::sync::atomic::AtomicUsize,
     }
 
     impl FaultyReadyReadKv {
@@ -3746,6 +3759,8 @@ mod tests {
             Self {
                 inner: InMemoryKv::new(local_id),
                 remaining_failures: std::sync::atomic::AtomicUsize::new(0),
+                fault_scans: std::sync::atomic::AtomicUsize::new(0),
+                remaining_fault_scan_failures: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
@@ -3755,6 +3770,27 @@ mod tests {
 
         fn should_fail_ready_read(&self) -> bool {
             self.remaining_failures
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    (remaining != 0).then(|| remaining.saturating_sub(1))
+                })
+                .is_ok()
+        }
+
+        fn reset_fault_scans(&self) {
+            self.fault_scans.store(0, Ordering::Release);
+        }
+
+        fn fault_scans(&self) -> usize {
+            self.fault_scans.load(Ordering::Acquire)
+        }
+
+        fn fail_next_fault_scans(&self, failures: usize) {
+            self.remaining_fault_scan_failures
+                .store(failures, Ordering::Release);
+        }
+
+        fn should_fail_fault_scan(&self) -> bool {
+            self.remaining_fault_scan_failures
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                     (remaining != 0).then(|| remaining.saturating_sub(1))
                 })
@@ -3839,6 +3875,16 @@ mod tests {
 
         async fn scan(&self, key: &str) -> Vec<(NodeId, String)> {
             self.inner.scan(key).await
+        }
+
+        async fn scan_checked(&self, key: &str) -> Result<Vec<(NodeId, String)>, String> {
+            if key == "control:fault-report" {
+                self.fault_scans.fetch_add(1, Ordering::AcqRel);
+                if self.should_fail_fault_scan() {
+                    return Err("injected fault scan failure".into());
+                }
+            }
+            Ok(self.inner.scan(key).await)
         }
     }
 
@@ -5399,8 +5445,7 @@ mod tests {
 
     #[test]
     fn publish_cluster_min_watermark_is_monotonic() {
-        // Leader-side publish mirrors the monotonic contract the certified follower acceptance
-        // path enforces through `accept_barrier_watermark`.
+        // Both leaders and followers install only decision-bound recovery frontiers here.
         let c = ctl(1, vec![]);
         assert_eq!(c.cluster_min_watermark(), None);
 
@@ -5418,145 +5463,6 @@ mod tests {
         // Equal value is a no-op; still Some(250).
         c.publish_cluster_min_watermark(250);
         assert_eq!(c.cluster_min_watermark(), Some(250));
-    }
-
-    #[tokio::test]
-    async fn only_an_exact_accepted_barrier_publishes_cluster_min_watermark() {
-        let c = ctl(1, vec![]);
-        assert_eq!(c.cluster_min_watermark(), None, "uninitialised");
-        #[cfg(feature = "cluster")]
-        let leader_proof = {
-            use crate::cluster::control::{LeaderLeaseOwner, LeaderLeaseStore, LeaseOutcome};
-            use object_store::memory::InMemory;
-
-            let store = Arc::new(LeaderLeaseStore::new(Arc::new(InMemory::new()), 1_000));
-            let owner = LeaderLeaseOwner {
-                node: c.instance_id(),
-                boot: c.recovery_incarnation(),
-                process_term: 1,
-            };
-            let lease = match store.begin_new_term(&owner, 1).await.unwrap() {
-                LeaseOutcome::Acquired(lease) => lease,
-                LeaseOutcome::Held(_) => unreachable!(),
-            };
-            c.set_leader_lease_store(store);
-            Some(lease.proof())
-        };
-        #[cfg(not(feature = "cluster"))]
-        let leader_proof = None;
-        let fence = CheckpointAssignmentFence::from_owner_map(
-            7,
-            &[1],
-            vec![CheckpointParticipant {
-                node_id: 1,
-                boot_incarnation: c.recovery_incarnation(),
-            }],
-        )
-        .unwrap();
-
-        c.announce_barrier(&BarrierAnnouncement {
-            epoch: 8,
-            checkpoint_id: 1,
-            assignment_fence: Some(fence.clone()),
-            leader_proof,
-            phase: crate::cluster::control::Phase::Aligned,
-            flags: 0,
-            min_watermark_ms: Some(12_000),
-        })
-        .await
-        .unwrap();
-        let aligned = c.observe_barrier().await.unwrap().unwrap();
-        assert!(c.accept_barrier_watermark(&aligned, 8, 1, &fence));
-        assert_eq!(
-            c.cluster_min_watermark(),
-            None,
-            "Aligned is reversible and must not advance the recovery-safe watermark"
-        );
-
-        c.announce_barrier(&BarrierAnnouncement {
-            epoch: 9,
-            checkpoint_id: 1,
-            assignment_fence: Some(fence.clone()),
-            leader_proof: None,
-            phase: crate::cluster::control::Phase::Commit,
-            flags: 0,
-            min_watermark_ms: Some(12_345),
-        })
-        .await
-        .unwrap();
-        let observed = c.observe_barrier().await.unwrap().unwrap();
-        assert_eq!(
-            c.cluster_min_watermark(),
-            None,
-            "observation alone must not mutate event-time state"
-        );
-        assert!(c.accept_barrier_watermark(&observed, 9, 1, &fence));
-        assert_eq!(c.cluster_min_watermark(), Some(12_345));
-
-        let wrong_fence = CheckpointAssignmentFence::from_owner_map(
-            7,
-            &[2],
-            vec![CheckpointParticipant {
-                node_id: 2,
-                boot_incarnation: Uuid::new_v4(),
-            }],
-        )
-        .unwrap();
-        c.announce_barrier(&BarrierAnnouncement {
-            epoch: 9,
-            checkpoint_id: 1,
-            assignment_fence: Some(wrong_fence),
-            leader_proof: None,
-            phase: crate::cluster::control::Phase::Commit,
-            flags: 0,
-            min_watermark_ms: Some(99_999),
-        })
-        .await
-        .unwrap();
-        let observed = c.observe_barrier().await.unwrap().unwrap();
-        assert!(!c.accept_barrier_watermark(&observed, 9, 1, &fence));
-        assert_eq!(
-            c.cluster_min_watermark(),
-            Some(12_345),
-            "a different assignment certificate must not advance event time"
-        );
-
-        // A later Commit with a lower value must NOT regress the atomic —
-        // event-time can only advance.
-        c.announce_barrier(&BarrierAnnouncement {
-            epoch: 10,
-            checkpoint_id: 2,
-            assignment_fence: Some(fence.clone()),
-            leader_proof: None,
-            phase: crate::cluster::control::Phase::Commit,
-            flags: 0,
-            min_watermark_ms: Some(100), // stale re-gossip
-        })
-        .await
-        .unwrap();
-        let observed = c.observe_barrier().await.unwrap().unwrap();
-        assert!(c.accept_barrier_watermark(&observed, 10, 2, &fence));
-        assert_eq!(
-            c.cluster_min_watermark(),
-            Some(12_345),
-            "stale Commit must not lower the published watermark",
-        );
-
-        // A Prepare announcement (no min_watermark_ms carried) is a no-op.
-        c.announce_barrier(&BarrierAnnouncement {
-            epoch: 11,
-            checkpoint_id: 3,
-            assignment_fence: None,
-            leader_proof: None,
-            phase: crate::cluster::control::Phase::Prepare,
-            flags: 0,
-            min_watermark_ms: None,
-        })
-        .await
-        .unwrap();
-        let observed = c.observe_barrier().await.unwrap().unwrap();
-        assert!(!c.accept_barrier_watermark(&observed, 11, 3, &fence));
-        assert_eq!(c.cluster_min_watermark(), Some(12_345));
     }
 
     async fn install_recovery_authority(
@@ -5723,6 +5629,40 @@ mod tests {
             remote.boot_incarnation.to_string(),
         );
         controller.report_fault(41).await.unwrap();
+        controller.publish_checkpoint_assignment_fence(Some(round.assignment_fence.clone()));
+        controller.announce_recover_prepare(&round).await.unwrap();
+        controller.announce_recover_start(&round, 8).await.unwrap();
+        controller
+            .announce_recover_release(&round, 8)
+            .await
+            .unwrap();
+        let release = RecoveryAnnouncement {
+            round,
+            phase: RecoverPhase::Release { epoch: 8 },
+        };
+        (controller, kv, release, remote)
+    }
+
+    async fn instrumented_two_owner_pending_release() -> (
+        ClusterController,
+        Arc<FaultyReadyReadKv>,
+        RecoveryAnnouncement,
+        CheckpointParticipant,
+    ) {
+        let self_id = NodeId(1);
+        let kv = Arc::new(FaultyReadyReadKv::new(self_id));
+        let (_members_tx, members_rx) = watch::channel(vec![info(2)]);
+        let controller = ClusterController::new(self_id, kv.clone(), None, members_rx);
+        controller.publish_recovery_incarnation().await.unwrap();
+        let (_authority, proof) = install_recovery_authority(&controller, 10_000).await;
+        let round = recovery_round(&controller, 42, &proof, &[1, 2]);
+        let remote = round.assignment_fence.participants[1];
+        kv.inner.seed(
+            NodeId(remote.node_id),
+            RECOVERY_INCARNATION_KEY,
+            remote.boot_incarnation.to_string(),
+        );
+        controller.report_fault(42).await.unwrap();
         controller.publish_checkpoint_assignment_fence(Some(round.assignment_fence.clone()));
         controller.announce_recover_prepare(&round).await.unwrap();
         controller.announce_recover_start(&round, 8).await.unwrap();
@@ -5990,6 +5930,130 @@ mod tests {
         assert!(local_ack.len() < 512);
         assert!(!local_ack.contains("assignment_fence"));
         assert!(!local_ack.contains("faults"));
+    }
+
+    #[tokio::test]
+    async fn changed_fault_set_supersedes_release_before_missing_readiness() {
+        let (controller, kv, release, remote) = two_owner_pending_release().await;
+        controller.announce_release_ready(&release).await.unwrap();
+        kv.seed(NodeId(remote.node_id), "control:fault-report", "42".into());
+
+        let RecoveryControlError::Superseded(reason) = controller
+            .try_commit_recover_release(&release)
+            .await
+            .unwrap_err()
+        else {
+            panic!("a newer fault must supersede the pending Release");
+        };
+        assert!(reason.contains("fault set changed"), "{reason}");
+        assert_eq!(
+            controller.observe_recover().await.unwrap(),
+            Some(release.clone())
+        );
+        assert_eq!(
+            controller
+                .observe_committed_recover_release(&release.round, 8)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_release_fault_audits_are_coalesced_and_expire() {
+        let (controller, kv, release, remote) = instrumented_two_owner_pending_release().await;
+        controller.announce_release_ready(&release).await.unwrap();
+        kv.reset_fault_scans();
+
+        for _ in 0..20 {
+            assert!(matches!(
+                controller
+                    .try_commit_recover_release(&release)
+                    .await
+                    .unwrap(),
+                ReleaseCommitStatus::Pending { .. }
+            ));
+        }
+        assert_eq!(kv.fault_scans(), 1);
+
+        kv.inner
+            .seed(NodeId(remote.node_id), "control:fault-report", "43".into());
+        assert!(matches!(
+            controller
+                .try_commit_recover_release(&release)
+                .await
+                .unwrap(),
+            ReleaseCommitStatus::Pending { .. }
+        ));
+        assert_eq!(kv.fault_scans(), 1);
+
+        tokio::time::advance(PENDING_RELEASE_FAULT_AUDIT_INTERVAL - Duration::from_nanos(1)).await;
+        assert!(matches!(
+            controller
+                .try_commit_recover_release(&release)
+                .await
+                .unwrap(),
+            ReleaseCommitStatus::Pending { .. }
+        ));
+        assert_eq!(kv.fault_scans(), 1);
+
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        assert!(matches!(
+            controller.try_commit_recover_release(&release).await,
+            Err(RecoveryControlError::Superseded(_))
+        ));
+        assert_eq!(kv.fault_scans(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn complete_release_bypasses_the_pending_fault_audit_cache() {
+        let (controller, kv, release, remote) = instrumented_two_owner_pending_release().await;
+        controller.announce_release_ready(&release).await.unwrap();
+        kv.reset_fault_scans();
+        assert!(matches!(
+            controller
+                .try_commit_recover_release(&release)
+                .await
+                .unwrap(),
+            ReleaseCommitStatus::Pending { .. }
+        ));
+        assert_eq!(kv.fault_scans(), 1);
+
+        seed_release_ready(&kv.inner, remote, &release);
+        kv.inner
+            .seed(NodeId(remote.node_id), "control:fault-report", "43".into());
+        assert!(matches!(
+            controller.try_commit_recover_release(&release).await,
+            Err(RecoveryControlError::Superseded(_))
+        ));
+        assert_eq!(kv.fault_scans(), 2);
+        assert!(controller
+            .observe_committed_recover_release(&release.round, 8)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn uncertain_pending_fault_audit_is_not_cached() {
+        let (controller, kv, release, _remote) = instrumented_two_owner_pending_release().await;
+        controller.announce_release_ready(&release).await.unwrap();
+        kv.reset_fault_scans();
+        kv.fail_next_fault_scans(1);
+
+        assert!(matches!(
+            controller.try_commit_recover_release(&release).await,
+            Err(RecoveryControlError::Uncertain(_))
+        ));
+        assert_eq!(kv.fault_scans(), 1);
+        assert!(matches!(
+            controller
+                .try_commit_recover_release(&release)
+                .await
+                .unwrap(),
+            ReleaseCommitStatus::Pending { .. }
+        ));
+        assert_eq!(kv.fault_scans(), 2);
     }
 
     #[tokio::test]

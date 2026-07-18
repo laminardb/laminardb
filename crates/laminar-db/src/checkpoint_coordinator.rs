@@ -170,7 +170,10 @@ const FOLLOWER_DECISION_POLL: Duration = Duration::from_millis(250);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FollowerOutcomeMatch {
     Pending,
-    Commit,
+    Commit {
+        status: CheckpointWatermark,
+        frontier: Option<i64>,
+    },
     Abort,
 }
 
@@ -4458,7 +4461,8 @@ impl CheckpointCoordinator {
     /// Announce PREPARE and wait for follower acks.
     ///
     /// On quorum, returns the capture-time follower set and retains the exact cluster watermark
-    /// status for the recovery capsule and Commit announcement. On failure, announces Abort.
+    /// status for the recovery capsule and Commit announcement. The caller records a durable
+    /// Abort before publishing its terminal wake-up hint on failure.
     #[cfg(feature = "cluster")]
     async fn await_prepare_quorum(
         &mut self,
@@ -4467,7 +4471,6 @@ impl CheckpointCoordinator {
         assignment_fence: Option<&laminar_core::cluster::control::CheckpointAssignmentFence>,
         leader_proof: Option<&LeaderProof>,
     ) -> Result<Vec<laminar_core::cluster::discovery::NodeId>, String> {
-        use laminar_core::cluster::control::Phase;
         let Some(cc) = self.cluster_controller.clone() else {
             return Ok(Vec::new());
         };
@@ -4497,18 +4500,7 @@ impl CheckpointCoordinator {
                 self.cluster_watermark = merged;
                 Ok(participants)
             }
-            Err(msg) => {
-                self.announce_if_leader(
-                    epoch,
-                    checkpoint_id,
-                    Phase::Abort,
-                    Some(assignment_fence),
-                    Some(leader_proof),
-                    None,
-                )
-                .await;
-                Err(msg)
-            }
+            Err(msg) => Err(msg),
         }
     }
 
@@ -5245,7 +5237,10 @@ impl CheckpointCoordinator {
             )
             .await?
             {
-                FollowerOutcomeMatch::Commit => return Ok(true),
+                FollowerOutcomeMatch::Commit { status, frontier } => {
+                    Self::install_follower_watermark(cc, status, frontier)?;
+                    return Ok(true);
+                }
                 FollowerOutcomeMatch::Abort => return Ok(false),
                 FollowerOutcomeMatch::Pending => {}
             }
@@ -5265,7 +5260,7 @@ impl CheckpointCoordinator {
                 continue;
             }
             let hint_wait_started = Instant::now();
-            let Some(announcement) =
+            let Some(_announcement) =
                 Self::wait_for_follower_terminal_hint(cc, epoch, poll_wait).await?
             else {
                 continue;
@@ -5285,18 +5280,8 @@ impl CheckpointCoordinator {
             )
             .await?
             {
-                FollowerOutcomeMatch::Commit => {
-                    if announcement.phase == laminar_core::cluster::control::Phase::Commit
-                        && announcement.checkpoint_id == checkpoint_id
-                        && announcement.assignment_fence.as_ref() == Some(assignment_fence)
-                    {
-                        cc.accept_barrier_watermark(
-                            &announcement,
-                            epoch,
-                            checkpoint_id,
-                            assignment_fence,
-                        );
-                    }
+                FollowerOutcomeMatch::Commit { status, frontier } => {
+                    Self::install_follower_watermark(cc, status, frontier)?;
                     return Ok(true);
                 }
                 FollowerOutcomeMatch::Abort => return Ok(false),
@@ -5374,22 +5359,27 @@ impl CheckpointCoordinator {
         if remaining.is_zero() {
             return Err(Self::follower_decision_timeout(epoch, checkpoint_id));
         }
-        let outcome = tokio::time::timeout(remaining, authority.cluster_outcome(epoch))
-            .await
-            .map_err(|_| {
-                DbError::Checkpoint(format!(
-                    "[LDB-6046] durable outcome read timed out for epoch {epoch}, checkpoint \
+        let outcome = tokio::time::timeout(
+            remaining,
+            authority.cluster_outcome_with_recovery_capsule(epoch),
+        )
+        .await
+        .map_err(|_| {
+            DbError::Checkpoint(format!(
+                "[LDB-6046] durable outcome read timed out for epoch {epoch}, checkpoint \
                      {checkpoint_id}; participant remains prepared"
-                ))
-            })?
-            .map_err(|e| {
-                DbError::Checkpoint(format!(
-                    "[LDB-6045] failed to read durable outcome for epoch {epoch}; participant \
+            ))
+        })?
+        .map_err(|e| {
+            DbError::Checkpoint(format!(
+                "[LDB-6045] failed to read durable outcome for epoch {epoch}; participant \
                      remains prepared: {e}"
-                ))
-            })?;
+            ))
+        })?;
+        let (outcome, capsule) = outcome.unzip();
         Self::match_follower_outcome(
             outcome.as_ref(),
+            capsule.as_ref().and_then(Option::as_ref),
             participant_id,
             epoch,
             checkpoint_id,
@@ -5400,6 +5390,7 @@ impl CheckpointCoordinator {
     #[cfg(feature = "cluster")]
     fn match_follower_outcome(
         outcome: Option<&laminar_core::checkpoint_decision::CheckpointOutcome>,
+        capsule: Option<&laminar_core::checkpoint::ClusterRecoveryCapsule>,
         participant_id: u64,
         epoch: u64,
         checkpoint_id: u64,
@@ -5444,7 +5435,16 @@ impl CheckpointCoordinator {
                          {checkpoint_id} excludes follower {participant_id} or has no recovery capsule"
                     )));
                 }
-                Ok(FollowerOutcomeMatch::Commit)
+                let capsule = capsule.ok_or_else(|| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6045] durable Commit outcome for epoch {epoch}, checkpoint \
+                         {checkpoint_id} has no validated recovery capsule"
+                    ))
+                })?;
+                Ok(FollowerOutcomeMatch::Commit {
+                    status: capsule.cluster_watermark,
+                    frontier: capsule.recovery_watermark_frontier,
+                })
             }
             CheckpointVerdict::Abort => {
                 // The store validates deployment identity and the successor's canonical
@@ -5453,6 +5453,31 @@ impl CheckpointCoordinator {
                 Ok(FollowerOutcomeMatch::Abort)
             }
         }
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) fn install_follower_watermark(
+        controller: &laminar_core::cluster::control::ClusterController,
+        status: CheckpointWatermark,
+        frontier: Option<i64>,
+    ) -> Result<(), DbError> {
+        match (controller.cluster_min_watermark(), frontier) {
+            (Some(current), Some(committed)) if current > committed => {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6045] local cluster watermark {current} is ahead of committed \
+                     follower frontier {committed}"
+                )));
+            }
+            (Some(current), None) => {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6045] local cluster watermark {current} is ahead of committed \
+                     {status:?} follower state without a numeric frontier"
+                )));
+            }
+            (_, Some(committed)) => controller.publish_cluster_min_watermark(committed),
+            (None, None) => {}
+        }
+        Ok(())
     }
 
     /// Follower stage 3: act on the decision. Returns `true` on a clean commit.

@@ -15,8 +15,8 @@ use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 use crate::checkpoint::{
-    AssignmentDrainId, AssignmentDrainTransition, CheckpointAssignmentFence, LeaderProof,
-    LeaderProofOwner, RecoveryCapsuleRef,
+    AssignmentDrainId, AssignmentDrainTransition, CheckpointAssignmentFence,
+    ClusterRecoveryCapsule, LeaderProof, LeaderProofOwner, RecoveryCapsuleRef,
 };
 use crate::checkpoint_decision::{
     CheckpointDecisionStore, CheckpointOutcome, CheckpointScope, CheckpointVerdict, DecisionError,
@@ -3045,6 +3045,46 @@ impl LeaderLeaseStore {
             .await?
             .into_iter()
             .find(|outcome| outcome.epoch == epoch))
+    }
+
+    /// Read one live cluster outcome together with its content-addressed recovery capsule.
+    /// Commit always returns a validated capsule; Abort returns `None` for the capsule.
+    pub async fn cluster_outcome_with_recovery_capsule(
+        &self,
+        epoch: u64,
+    ) -> Result<
+        Option<(CheckpointOutcome, Option<ClusterRecoveryCapsule>)>,
+        ClusterCheckpointAuthorityError,
+    > {
+        let Some(outcome) = self.cluster_outcome(epoch).await? else {
+            return Ok(None);
+        };
+        let capsule = if outcome.is_commit() {
+            let reference = outcome.recovery_capsule.as_ref().ok_or_else(|| {
+                DecisionError::Conflict(format!(
+                    "cluster Commit epoch {} checkpoint {} has no recovery capsule",
+                    outcome.epoch, outcome.checkpoint_id
+                ))
+            })?;
+            let capsule = CheckpointDecisionStore::new(Arc::clone(&self.store))
+                .load_recovery_capsule(reference)
+                .await?;
+            if capsule.attempt.epoch != outcome.epoch
+                || capsule.attempt.checkpoint_id != outcome.checkpoint_id
+                || Some(&capsule.assignment_fence) != outcome.assignment_fence.as_ref()
+                || capsule.deployment_id != outcome.deployment_id
+            {
+                return Err(DecisionError::Conflict(format!(
+                    "cluster Commit epoch {} checkpoint {} does not match recovery capsule '{}'",
+                    outcome.epoch, outcome.checkpoint_id, reference.sha256
+                ))
+                .into());
+            }
+            Some(capsule)
+        } else {
+            None
+        };
+        Ok(Some((outcome, capsule)))
     }
 
     /// Audit and return every live cluster outcome in ascending epoch order.

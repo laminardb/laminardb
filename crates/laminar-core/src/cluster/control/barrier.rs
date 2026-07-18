@@ -103,8 +103,55 @@ fn same_announcement_identity(left: &BarrierAnnouncement, right: &BarrierAnnounc
         && left.flags == right.flags
 }
 
-/// Merge direct deliveries without allowing a delayed non-terminal phase to regress the same
-/// exact barrier identity. Conflicting attempts, certificates, or terminal phases fail closed.
+/// Merge one exact attempt from a single history. A successor may settle a reversible phase under
+/// a new assignment and leader proof, but reversible equivocation and opposing decisions fail
+/// closed.
+fn merge_history_exact(
+    current: BarrierAnnouncement,
+    incoming: BarrierAnnouncement,
+    history: &str,
+) -> Result<BarrierAnnouncement, String> {
+    if current.flags != incoming.flags {
+        return Err(format!(
+            "conflicting {history} barrier flags for exact attempt ({}, {})",
+            current.epoch, current.checkpoint_id
+        ));
+    }
+    if is_terminal_phase(current.phase) && is_terminal_phase(incoming.phase) {
+        if current.phase != incoming.phase {
+            return Err(format!(
+                "conflicting {history} terminal phases for exact attempt ({}, {})",
+                current.epoch, current.checkpoint_id
+            ));
+        }
+        if !same_announcement_identity(&current, &incoming) {
+            return Err(format!(
+                "conflicting {history} barrier certificates for exact attempt ({}, {})",
+                current.epoch, current.checkpoint_id
+            ));
+        }
+        return Ok(current);
+    }
+    if is_terminal_phase(current.phase) {
+        return Ok(current);
+    }
+    if is_terminal_phase(incoming.phase) {
+        return Ok(incoming);
+    }
+    if !same_announcement_identity(&current, &incoming) {
+        return Err(format!(
+            "conflicting {history} barrier certificates for exact attempt ({}, {})",
+            current.epoch, current.checkpoint_id
+        ));
+    }
+    if current.phase == Phase::Aligned && incoming.phase == Phase::Prepare {
+        Ok(current)
+    } else {
+        Ok(incoming)
+    }
+}
+
+/// Merge direct deliveries without allowing a delayed phase to regress the same exact attempt.
 #[cfg(feature = "cluster")]
 fn merge_direct_announcement(
     current: BarrierAnnouncement,
@@ -117,32 +164,7 @@ fn merge_direct_announcement(
             "conflicting direct barrier attempts: retained ({}, {}), incoming ({}, {})",
             current.epoch, current.checkpoint_id, incoming.epoch, incoming.checkpoint_id
         )),
-        CheckpointAttemptRelation::Exact => {
-            if !same_announcement_identity(&current, &incoming) {
-                return Err(format!(
-                    "conflicting direct barrier certificates for exact attempt ({}, {})",
-                    current.epoch, current.checkpoint_id
-                ));
-            }
-
-            if is_terminal_phase(current.phase) && is_terminal_phase(incoming.phase) {
-                return if current.phase == incoming.phase {
-                    Ok(current)
-                } else {
-                    Err(format!(
-                        "conflicting direct terminal phases for exact attempt ({}, {})",
-                        current.epoch, current.checkpoint_id
-                    ))
-                };
-            }
-            if is_terminal_phase(current.phase)
-                || (current.phase == Phase::Aligned && incoming.phase == Phase::Prepare)
-            {
-                Ok(current)
-            } else {
-                Ok(incoming)
-            }
-        }
+        CheckpointAttemptRelation::Exact => merge_history_exact(current, incoming, "direct"),
     }
 }
 
@@ -161,17 +183,16 @@ fn merge_observed_announcement(
             grpc.epoch, grpc.checkpoint_id, durable.epoch, durable.checkpoint_id
         )),
         CheckpointAttemptRelation::Exact => {
-            if !same_announcement_identity(&grpc, &durable) {
-                return Err(format!(
-                    "conflicting direct and durable certificates for exact attempt ({}, {})",
-                    grpc.epoch, grpc.checkpoint_id
-                ));
-            }
             if is_terminal_phase(durable.phase) {
                 Ok(durable)
-            } else if is_terminal_phase(grpc.phase)
-                || (grpc.phase == Phase::Aligned && durable.phase == Phase::Prepare)
-            {
+            } else if is_terminal_phase(grpc.phase) {
+                Ok(grpc)
+            } else if !same_announcement_identity(&grpc, &durable) {
+                Err(format!(
+                    "conflicting direct and durable certificates for exact attempt ({}, {})",
+                    grpc.epoch, grpc.checkpoint_id
+                ))
+            } else if grpc.phase == Phase::Aligned && durable.phase == Phase::Prepare {
                 Ok(grpc)
             } else {
                 Ok(durable)
@@ -180,9 +201,8 @@ fn merge_observed_announcement(
     }
 }
 
-/// Merge per-node durable histories for leader reclamation. Nodes may legitimately lag at an
-/// earlier phase of the same certified attempt, but they may not disagree about its certificate,
-/// or terminal outcome.
+/// Merge per-node durable histories for leader reclamation. A successor terminal may carry a new
+/// certificate; reversible phases must retain one certificate and terminal outcomes must agree.
 fn merge_scanned_announcement(
     current: BarrierAnnouncement,
     incoming: BarrierAnnouncement,
@@ -194,41 +214,22 @@ fn merge_scanned_announcement(
             "conflicting announced checkpoint history: ({}, {}) versus ({}, {})",
             current.epoch, current.checkpoint_id, incoming.epoch, incoming.checkpoint_id
         )),
-        CheckpointAttemptRelation::Exact => {
-            if !same_announcement_identity(&current, &incoming) {
-                return Err(format!(
-                    "conflicting durable barrier certificates for exact attempt ({}, {})",
-                    current.epoch, current.checkpoint_id
-                ));
-            }
-            if current.phase == incoming.phase {
-                // Reconciliation may re-announce the same terminal decision without the earlier
-                // diagnostic watermark. It does not change allocation or recovery authority.
-                return Ok(current);
-            }
-            if is_terminal_phase(current.phase) && is_terminal_phase(incoming.phase) {
-                return Err(format!(
-                    "conflicting durable terminal phases for exact attempt ({}, {})",
-                    current.epoch, current.checkpoint_id
-                ));
-            }
-            if is_terminal_phase(current.phase)
-                || (current.phase == Phase::Aligned && incoming.phase == Phase::Prepare)
-            {
-                Ok(current)
-            } else {
-                Ok(incoming)
-            }
-        }
+        CheckpointAttemptRelation::Exact => merge_history_exact(current, incoming, "durable"),
     }
 }
 
 fn validate_scanned_announcements(
     mut announcements: Vec<BarrierAnnouncement>,
 ) -> Result<Option<BarrierAnnouncement>, String> {
-    // This sort groups exact attempts for validation; ordering authority remains `relation_to`.
-    announcements
-        .sort_unstable_by_key(|announcement| (announcement.epoch, announcement.checkpoint_id));
+    // Group exact attempts and audit every reversible certificate before a terminal can absorb it.
+    // Ordering authority remains `relation_to`.
+    announcements.sort_unstable_by_key(|announcement| {
+        (
+            announcement.epoch,
+            announcement.checkpoint_id,
+            is_terminal_phase(announcement.phase),
+        )
+    });
     announcements
         .into_iter()
         .try_fold(None, |highest, announcement| {
@@ -2349,6 +2350,27 @@ mod tests {
             panic!("timed out waiting for {phase:?} announcement from leader {leader:?}");
         }
 
+        async fn wait_observe_exact(
+            coord: &BarrierCoordinator,
+            leader: NodeId,
+            expected: CheckpointAttempt,
+            phase: Phase,
+        ) -> BarrierAnnouncement {
+            for _ in 0..100 {
+                if let Some(announcement) = coord.observe(leader).await.unwrap() {
+                    if announcement_attempt(&announcement) == expected
+                        && announcement.phase == phase
+                    {
+                        return announcement;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!(
+                "timed out waiting for {phase:?} announcement {expected:?} from leader {leader:?}"
+            );
+        }
+
         #[tokio::test]
         async fn test_grpc_barrier_flow() {
             let leader_kv = kv(NodeId(1));
@@ -2704,6 +2726,110 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn successor_abort_does_not_poison_the_grpc_relay() {
+            let authority = Arc::new(crate::cluster::control::LeaderLeaseStore::new(
+                Arc::new(InMemory::new()),
+                1,
+            ));
+            let original_owner = crate::cluster::control::LeaderLeaseOwner {
+                node: NodeId(1),
+                boot: uuid::Uuid::from_u128(1),
+                process_term: 1,
+            };
+            let successor_owner = crate::cluster::control::LeaderLeaseOwner {
+                node: NodeId(3),
+                boot: uuid::Uuid::from_u128(3),
+                process_term: 2,
+            };
+            let original_lease = match authority.begin_new_term(&original_owner, 1).await.unwrap() {
+                crate::cluster::control::LeaseOutcome::Acquired(lease) => lease,
+                crate::cluster::control::LeaseOutcome::Held(_) => unreachable!(),
+            };
+            let takeover_observation = authority
+                .observe_rival(&successor_owner, &original_lease)
+                .unwrap();
+            let successor_proof = proof(3, 3, 2, original_lease.token + 1);
+
+            let leader_kv = kv(NodeId(1));
+            let follower_kv = kv(NodeId(2));
+            let leader = coordinator(leader_kv.clone(), Arc::clone(&authority));
+            let follower = coordinator(follower_kv.clone(), Arc::clone(&authority));
+            let slot = || Arc::new(parking_lot::RwLock::new(None));
+            let leader_addr = leader
+                .start_server("127.0.0.1:0".parse().unwrap(), None, slot())
+                .await
+                .unwrap();
+            let follower_addr = follower
+                .start_server("127.0.0.1:0".parse().unwrap(), None, slot())
+                .await
+                .unwrap();
+            leader_kv.seed(NodeId(2), BARRIER_ADDR_KEY, follower_addr.to_string());
+            follower_kv.seed(NodeId(1), BARRIER_ADDR_KEY, leader_addr.to_string());
+
+            let aligned = BarrierAnnouncement {
+                epoch: 12,
+                checkpoint_id: 12,
+                assignment_fence: Some(test_fence(1, &[1, 2], &[(1, 1), (2, 2)])),
+                leader_proof: Some(original_lease.proof()),
+                phase: Phase::Aligned,
+                flags: 0,
+                min_watermark_ms: None,
+            };
+            let abort = BarrierAnnouncement {
+                assignment_fence: Some(test_fence(2, &[2, 3], &[(2, 2), (3, 3)])),
+                leader_proof: Some(successor_proof.clone()),
+                phase: Phase::Abort,
+                ..aligned.clone()
+            };
+
+            leader.announce(&aligned).await.unwrap();
+            wait_observe_exact(
+                &follower,
+                NodeId(1),
+                CheckpointAttempt::new(12, 12),
+                Phase::Aligned,
+            )
+            .await;
+            leader.announce(&abort).await.unwrap();
+            wait_observe_exact(
+                &follower,
+                NodeId(1),
+                CheckpointAttempt::new(12, 12),
+                Phase::Abort,
+            )
+            .await;
+            leader.announce(&aligned).await.unwrap();
+
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            let successor_lease = match authority
+                .try_takeover(&successor_owner, &takeover_observation, 2)
+                .await
+                .unwrap()
+            {
+                crate::cluster::control::LeaseOutcome::Acquired(lease) => lease,
+                crate::cluster::control::LeaseOutcome::Held(_) => unreachable!(),
+            };
+            assert_eq!(successor_lease.proof(), successor_proof);
+
+            let successor_aligned = BarrierAnnouncement {
+                epoch: 13,
+                checkpoint_id: 13,
+                phase: Phase::Aligned,
+                ..abort
+            };
+            leader.announce(&successor_aligned).await.unwrap();
+            wait_observe_exact(
+                &follower,
+                NodeId(1),
+                CheckpointAttempt::new(13, 13),
+                Phase::Aligned,
+            )
+            .await;
+            let state = follower.grpc.lock().clone().unwrap();
+            assert!(state.merge_error.lock().is_none());
+        }
+
+        #[tokio::test]
         async fn phase_rpc_deadline_bounds_a_live_handler() {
             use object_store::throttle::{ThrottleConfig, ThrottledStore};
 
@@ -2848,6 +2974,37 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn successor_terminal_supersedes_a_reversible_direct_certificate() {
+        let (aligned, abort) = failover_aligned_and_abort();
+
+        assert_eq!(
+            merge_direct_announcement(aligned.clone(), abort.clone()).unwrap(),
+            abort
+        );
+        assert_eq!(
+            merge_direct_announcement(abort.clone(), aligned.clone()).unwrap(),
+            abort
+        );
+        assert!(merge_direct_announcement(
+            BarrierAnnouncement {
+                phase: Phase::Abort,
+                ..aligned.clone()
+            },
+            abort.clone(),
+        )
+        .is_err());
+        assert!(merge_direct_announcement(
+            aligned,
+            BarrierAnnouncement {
+                phase: Phase::Prepare,
+                ..abort
+            },
+        )
+        .is_err());
+    }
+
     #[test]
     fn durable_terminal_is_authoritative_during_channel_merge() {
         let base = BarrierAnnouncement {
@@ -2889,6 +3046,31 @@ mod tests {
             "lagging durable Prepare must not hide a delivered terminal phase"
         );
 
+        let (aligned, abort) = failover_aligned_and_abort();
+        assert_eq!(
+            merge_observed_announcement(aligned.clone(), abort.clone()).unwrap(),
+            abort
+        );
+        for direct in [Phase::Commit, Phase::Abort] {
+            assert_eq!(
+                merge_observed_announcement(
+                    BarrierAnnouncement {
+                        phase: direct,
+                        ..aligned.clone()
+                    },
+                    abort.clone(),
+                )
+                .unwrap(),
+                abort,
+                "the durable terminal must override every exact direct hint"
+            );
+        }
+        assert_eq!(
+            merge_observed_announcement(abort.clone(), aligned).unwrap(),
+            abort,
+            "a delivered successor terminal must beat the predecessor's durable reversible phase"
+        );
+
         for durable in [
             BarrierAnnouncement {
                 epoch: base.epoch,
@@ -2917,7 +3099,6 @@ mod tests {
         assert!(merge_observed_announcement(
             base.clone(),
             BarrierAnnouncement {
-                phase: Phase::Commit,
                 flags: crate::checkpoint::flags::FULL_SNAPSHOT,
                 ..base
             },
@@ -3103,6 +3284,30 @@ mod tests {
         }
     }
 
+    fn failover_aligned_and_abort() -> (BarrierAnnouncement, BarrierAnnouncement) {
+        let aligned = certified_announcement(
+            test_fence(9, &[1, 2], &[(1, 11), (2, 22)]),
+            crate::cluster::control::LeaderProof {
+                owner: crate::checkpoint::LeaderProofOwner {
+                    node_id: 2,
+                    boot_id: uuid::Uuid::from_u128(22),
+                    process_term: 3,
+                },
+                fencing_token: 7,
+            },
+            Phase::Aligned,
+        );
+        let abort = certified_announcement(
+            test_fence(10, &[1], &[(1, 11)]),
+            crate::cluster::control::LeaderProof {
+                fencing_token: 8,
+                ..test_leader_proof()
+            },
+            Phase::Abort,
+        );
+        (aligned, abort)
+    }
+
     fn test_leader_proof() -> crate::cluster::control::LeaderProof {
         crate::cluster::control::LeaderProof {
             owner: crate::checkpoint::LeaderProofOwner {
@@ -3156,6 +3361,14 @@ mod tests {
                 certified_announcement(fence.clone(), proof.clone(), Phase::Abort),
             ),
             (
+                certified_announcement(fence.clone(), proof.clone(), Phase::Abort),
+                certified_announcement(
+                    test_fence(10, &[1, 2], &[(1, 11), (2, 22)]),
+                    proof.clone(),
+                    Phase::Abort,
+                ),
+            ),
+            (
                 certified_announcement(fence.clone(), proof.clone(), Phase::Prepare),
                 BarrierAnnouncement {
                     flags: crate::checkpoint::flags::FULL_SNAPSHOT,
@@ -3205,6 +3418,58 @@ mod tests {
                 .unwrap(),
             Some(CheckpointAttempt::new(5, 50))
         );
+    }
+
+    #[tokio::test]
+    async fn max_announced_accepts_successor_settlement_and_later_attempt() {
+        let (aligned, abort) = failover_aligned_and_abort();
+        let history = kv(NodeId(1));
+        history.seed(
+            NodeId(1),
+            ANNOUNCEMENT_KEY,
+            serde_json::to_string(&aligned).unwrap(),
+        );
+        history.seed(
+            NodeId(2),
+            ANNOUNCEMENT_KEY,
+            serde_json::to_string(&abort).unwrap(),
+        );
+        let coordinator = BarrierCoordinator::new(history.clone());
+        assert_eq!(
+            coordinator.max_announced().await.unwrap(),
+            Some(CheckpointAttempt::new(5, 50))
+        );
+
+        history.seed(NodeId(3), ANNOUNCEMENT_KEY, announcement_json(6, 60));
+        assert_eq!(
+            coordinator.max_announced().await.unwrap(),
+            Some(CheckpointAttempt::new(6, 60))
+        );
+    }
+
+    #[test]
+    fn scanned_successor_terminal_cannot_hide_reversible_equivocation() {
+        let (aligned, abort) = failover_aligned_and_abort();
+        let conflicting = BarrierAnnouncement {
+            phase: Phase::Prepare,
+            ..abort.clone()
+        };
+        let records = [aligned, conflicting, abort];
+
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let history = order
+                .into_iter()
+                .map(|index| records[index].clone())
+                .collect();
+            assert!(validate_scanned_announcements(history).is_err());
+        }
     }
 
     #[test]

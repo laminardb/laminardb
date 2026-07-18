@@ -2276,6 +2276,31 @@ async fn create_test_recovery_capsule(
     seal_inventory_sha256: Option<String>,
     manifest: Option<&CheckpointManifest>,
 ) -> laminar_core::checkpoint::RecoveryCapsuleRef {
+    create_test_recovery_capsule_with_watermark(
+        store,
+        epoch,
+        checkpoint_id,
+        fence,
+        seal_inventory_sha256,
+        manifest,
+        CheckpointWatermark::Uninitialized,
+        None,
+    )
+    .await
+}
+
+#[cfg(feature = "cluster")]
+#[allow(clippy::too_many_arguments)]
+async fn create_test_recovery_capsule_with_watermark(
+    store: &laminar_core::checkpoint_decision::CheckpointDecisionStore,
+    epoch: u64,
+    checkpoint_id: u64,
+    fence: &laminar_core::cluster::control::CheckpointAssignmentFence,
+    seal_inventory_sha256: Option<String>,
+    manifest: Option<&CheckpointManifest>,
+    cluster_watermark: CheckpointWatermark,
+    recovery_watermark_frontier: Option<i64>,
+) -> laminar_core::checkpoint::RecoveryCapsuleRef {
     use laminar_core::checkpoint::{
         ClusterRecoveryCapsule, ParticipantRecoveryRef, PipelineIdentity,
         CLUSTER_RECOVERY_CAPSULE_VERSION,
@@ -2313,8 +2338,8 @@ async fn create_test_recovery_capsule(
         source_metadata: Default::default(),
         source_assignment_versions: Default::default(),
         source_watermarks: Default::default(),
-        cluster_watermark: CheckpointWatermark::Uninitialized,
-        recovery_watermark_frontier: None,
+        cluster_watermark,
+        recovery_watermark_frontier,
         portable_state_sha256,
     };
     store.create_recovery_capsule(&capsule).await.unwrap()
@@ -2412,13 +2437,24 @@ async fn follower_polls_exact_decision_when_commit_announcement_is_lost() {
     let decision_fence = assignment_fence.clone();
     let record = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        record_follower_outcome(
-            writer_controller.as_ref(),
+        let capsule = create_test_recovery_capsule_with_watermark(
             writer.as_ref(),
             12,
             34,
             &decision_fence,
+            None,
+            None,
+            CheckpointWatermark::Active(12_345),
+            Some(12_345),
+        )
+        .await;
+        record_follower_outcome_with_capsule(
+            writer_controller.as_ref(),
+            12,
+            34,
+            &decision_fence,
             laminar_core::checkpoint_decision::CheckpointVerdict::Commit,
+            Some(capsule),
         )
         .await;
     });
@@ -2436,6 +2472,11 @@ async fn follower_polls_exact_decision_when_commit_announcement_is_lost() {
     assert!(
         committed,
         "the exact durable marker must commit even when control remains at Prepare"
+    );
+    assert_eq!(
+        controller.cluster_min_watermark(),
+        Some(12_345),
+        "the immutable capsule must install the frontier when the Commit hint is lost"
     );
 }
 
@@ -2885,6 +2926,68 @@ impl laminar_core::cluster::control::ClusterKv for RecordingKv {
     async fn scan(&self, key: &str) -> Vec<(laminar_core::cluster::discovery::NodeId, String)> {
         self.inner.scan(key).await
     }
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn prepare_quorum_failure_never_announces_abort_before_outcome() {
+    use laminar_core::cluster::control::{
+        BarrierAnnouncement, ClusterController, ClusterKv, InMemoryKv, Phase,
+    };
+    use laminar_core::cluster::discovery::{NodeId, NodeInfo, NodeMetadata, NodeState};
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = CheckpointConfig {
+        quorum_timeout: Duration::from_millis(20),
+        ..CheckpointConfig::default()
+    };
+    let store = Box::new(FileSystemCheckpointStore::new(dir.path()).with_participant_id(1));
+    let mut coordinator = CheckpointCoordinator::new(config, store).await.unwrap();
+    coordinator.set_assignment_version(1);
+
+    let announcements = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let kv = Arc::new(RecordingKv {
+        inner: InMemoryKv::new(NodeId(1)),
+        announcements: Arc::clone(&announcements),
+    });
+    let control_kv: Arc<dyn ClusterKv> = kv;
+    let peer = NodeInfo {
+        id: NodeId(2),
+        name: "peer".into(),
+        rpc_address: String::new(),
+        raft_address: String::new(),
+        state: NodeState::Active,
+        metadata: NodeMetadata::default(),
+        last_heartbeat_ms: 0,
+    };
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(vec![peer]);
+    let controller = Arc::new(ClusterController::new(
+        NodeId(1),
+        control_kv,
+        None,
+        members_rx,
+    ));
+    let _lease = install_test_leader_lease(&controller).await;
+    publish_test_assignment_fence(&controller, 1);
+    let fence = controller.checkpoint_assignment_fence(1).unwrap();
+    let proof = controller.capture_leader_proof().unwrap();
+    coordinator.set_cluster_controller(controller);
+
+    coordinator
+        .await_prepare_quorum(1, 1, Some(&fence), Some(&proof))
+        .await
+        .expect_err("a silent peer must miss the Prepare quorum");
+
+    let phases = announcements
+        .lock()
+        .iter()
+        .map(|raw| {
+            serde_json::from_str::<BarrierAnnouncement>(raw)
+                .unwrap()
+                .phase
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(phases, vec![Phase::Prepare]);
 }
 
 /// Object-store middleware that transfers the watched lease immediately after a checkpoint

@@ -3494,6 +3494,7 @@ const OBJECT_STORE_CONTROL_MAX_LIST_RECORDS: usize = 4096;
 const OBJECT_STORE_CONTROL_MAX_WRITE_ATTEMPTS: usize = 4;
 const OBJECT_STORE_CONTROL_PRUNE_BATCH_RECORDS: usize = 256;
 const OBJECT_STORE_CONTROL_MAX_PRUNE_BATCHES: usize = 4;
+const OBJECT_STORE_CONTROL_SCAN_CONCURRENCY: usize = 32;
 const RECOVERY_GENERATION_KEY: &str = "control:recovery-gen";
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -4183,6 +4184,8 @@ impl laminar_core::cluster::control::ClusterKv for ObjectStoreClusterKv {
     }
 
     async fn scan_checked(&self, key: &str) -> Result<Vec<(NodeId, String)>, String> {
+        use futures::StreamExt;
+
         let scan = async {
             self.require_local_process_term().await?;
             if key == RECOVERY_GENERATION_KEY {
@@ -4190,21 +4193,20 @@ impl laminar_core::cluster::control::ClusterKv for ObjectStoreClusterKv {
                 self.require_local_process_term().await?;
                 return Ok(value.map_or_else(Vec::new, |value| vec![(self.local_id, value)]));
             }
-            let futures = self.visible_ids().into_iter().map(|id| {
-                let key = key.to_string();
-                async move {
-                    let value = self.read_target_value(id, &key).await?;
+            let mut reads = futures::stream::iter(self.visible_ids())
+                .map(|id| async move {
+                    let value = self.read_target_value(id, key).await?;
                     Ok::<_, String>((id, value))
-                }
-            });
-            let joined = futures::future::join_all(futures).await;
+                })
+                .buffer_unordered(OBJECT_STORE_CONTROL_SCAN_CONCURRENCY);
             let mut results = Vec::new();
-            for result in joined {
+            while let Some(result) = reads.next().await {
                 let (id, value) = result?;
                 if let Some(value) = value {
                     results.push((id, value));
                 }
             }
+            results.sort_unstable_by_key(|(id, _)| *id);
             self.require_local_process_term().await?;
             Ok(results)
         };
@@ -4230,6 +4232,9 @@ mod tests {
         blocked_get_path: parking_lot::Mutex<Option<object_store::path::Path>>,
         get_entered: tokio::sync::Semaphore,
         get_release: tokio::sync::Semaphore,
+        track_get_concurrency: std::sync::atomic::AtomicBool,
+        active_gets: std::sync::atomic::AtomicUsize,
+        max_gets: std::sync::atomic::AtomicUsize,
     }
 
     impl DelayedControlPutStore {
@@ -4243,6 +4248,9 @@ mod tests {
                 blocked_get_path: parking_lot::Mutex::new(None),
                 get_entered: tokio::sync::Semaphore::new(0),
                 get_release: tokio::sync::Semaphore::new(0),
+                track_get_concurrency: std::sync::atomic::AtomicBool::new(false),
+                active_gets: std::sync::atomic::AtomicUsize::new(0),
+                max_gets: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
@@ -4272,6 +4280,20 @@ mod tests {
 
         fn release_get(&self) {
             self.get_release.add_permits(1);
+        }
+
+        fn begin_get_concurrency_probe(&self) {
+            self.active_gets
+                .store(0, std::sync::atomic::Ordering::Release);
+            self.max_gets.store(0, std::sync::atomic::Ordering::Release);
+            self.track_get_concurrency
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+
+        fn finish_get_concurrency_probe(&self) -> usize {
+            self.track_get_concurrency
+                .store(false, std::sync::atomic::Ordering::Release);
+            self.max_gets.load(std::sync::atomic::Ordering::Acquire)
         }
     }
 
@@ -4350,6 +4372,18 @@ mod tests {
             location: &object_store::path::Path,
             options: object_store::GetOptions,
         ) -> object_store::Result<object_store::GetResult> {
+            let track_concurrency = self
+                .track_get_concurrency
+                .load(std::sync::atomic::Ordering::Acquire);
+            if track_concurrency {
+                let active = self
+                    .active_gets
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                    + 1;
+                self.max_gets
+                    .fetch_max(active, std::sync::atomic::Ordering::AcqRel);
+                tokio::task::yield_now().await;
+            }
             let should_block = {
                 let mut blocked_path = self.blocked_get_path.lock();
                 if blocked_path.as_ref() == Some(location) {
@@ -4370,7 +4404,12 @@ mod tests {
                     })?
                     .forget();
             }
-            self.inner.get_opts(location, options).await
+            let result = self.inner.get_opts(location, options).await;
+            if track_concurrency {
+                self.active_gets
+                    .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            }
+            result
         }
 
         fn delete_stream(
@@ -5584,6 +5623,77 @@ mod tests {
         assert!(read_error.contains("owner or term changed"), "{read_error}");
         let scan_error = first.scan_checked("control:recover").await.unwrap_err();
         assert!(scan_error.contains("owner or term changed"), "{scan_error}");
+    }
+
+    #[tokio::test]
+    async fn object_store_control_scan_bounds_concurrency_and_preserves_order() {
+        use laminar_core::cluster::control::ClusterKv;
+
+        let inner: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let delayed = Arc::new(DelayedControlPutStore::new(inner));
+        let store: Arc<dyn object_store::ObjectStore> = delayed.clone();
+        let (_empty_tx, empty_rx) = watch::channel(Vec::new());
+        let node_count = OBJECT_STORE_CONTROL_SCAN_CONCURRENCY + 5;
+        let mut leases = Vec::with_capacity(node_count);
+
+        for raw_id in 1..=node_count {
+            let id = NodeId(u64::try_from(raw_id).unwrap());
+            let lease = acquire_test_process_lease(
+                Arc::clone(&store),
+                id,
+                uuid::Uuid::from_u128(raw_id as u128),
+                60_000,
+            )
+            .await;
+            let writer = ObjectStoreClusterKv::new(
+                lease.clone(),
+                live_test_process_deadline(),
+                60_000,
+                Arc::clone(&store),
+                empty_rx.clone(),
+            );
+            writer
+                .write_checked("control:test-scan", format!("node-{raw_id}"))
+                .await
+                .unwrap();
+            leases.push(lease);
+        }
+
+        let members = (1..=node_count)
+            .map(|raw_id| NodeInfo {
+                id: NodeId(u64::try_from(raw_id).unwrap()),
+                name: format!("node-{raw_id}"),
+                rpc_address: String::new(),
+                raft_address: String::new(),
+                state: NodeState::Active,
+                metadata: NodeMetadata::default(),
+                last_heartbeat_ms: 0,
+            })
+            .collect();
+        let (_members_tx, members_rx) = watch::channel(members);
+        let scanner = ObjectStoreClusterKv::new(
+            leases[0].clone(),
+            live_test_process_deadline(),
+            60_000,
+            store,
+            members_rx,
+        );
+
+        delayed.begin_get_concurrency_probe();
+        let results = scanner.scan_checked("control:test-scan").await.unwrap();
+        let max_gets = delayed.finish_get_concurrency_probe();
+
+        assert_eq!(results.len(), node_count);
+        assert_eq!(
+            results.iter().map(|(id, _)| id.0).collect::<Vec<_>>(),
+            (1..=u64::try_from(node_count).unwrap()).collect::<Vec<_>>()
+        );
+        assert!(max_gets > 1, "the probe must observe concurrent reads");
+        assert!(
+            max_gets <= OBJECT_STORE_CONTROL_SCAN_CONCURRENCY,
+            "observed {max_gets} concurrent GETs"
+        );
     }
 
     #[tokio::test]

@@ -2075,6 +2075,55 @@ impl ConnectorPipelineCallback {
     /// Prevents epoch-N+1 shuffle rows from reaching a peer still snapshotting epoch-N.
     /// No-op without a cross-node shuffle; bounded — on timeout the epoch aborts via the leader.
     #[cfg(feature = "cluster")]
+    async fn wait_for_newer_terminal_outcome(
+        controller: &laminar_core::cluster::control::ClusterController,
+        attempt: CheckpointAttempt,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), String> {
+        let authority = controller.checkpoint_authority().map_err(|error| {
+            format!("newer checkpoint {attempt:?} has no durable authority: {error}")
+        })?;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(format!(
+                    "newer checkpoint {attempt:?} has no immutable terminal outcome; pipeline \
+                     remains fenced"
+                ));
+            }
+            let observed =
+                tokio::time::timeout(remaining, authority.cluster_outcome(attempt.epoch))
+                    .await
+                    .map_err(|_| {
+                        format!(
+                    "durable outcome read for newer checkpoint {attempt:?} exhausted the shuffle \
+                     resume deadline"
+                )
+                    })?
+                    .map_err(|error| {
+                        format!(
+                            "durable outcome read for newer checkpoint {attempt:?} failed: {error}"
+                        )
+                    })?;
+            if let Some(outcome) = observed {
+                if outcome.checkpoint_id != attempt.checkpoint_id {
+                    return Err(format!(
+                        "newer epoch {} is durably resolved for checkpoint {}, not announced \
+                         checkpoint {}",
+                        attempt.epoch, outcome.checkpoint_id, attempt.checkpoint_id
+                    ));
+                }
+                return Ok(());
+            }
+            tokio::time::sleep(
+                Duration::from_millis(250)
+                    .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+            )
+            .await;
+        }
+    }
+
+    #[cfg(feature = "cluster")]
     async fn wait_for_aligned_resume(
         has_cluster_shuffle: bool,
         controller: &laminar_core::cluster::control::ClusterController,
@@ -2091,6 +2140,7 @@ impl ConnectorPipelineCallback {
         // user-raised quorum_timeout can never invert the gate > quorum relation (CL-6).
         let resume_gate_timeout = std::time::Duration::from_secs(10)
             .max(quorum_timeout + std::time::Duration::from_secs(5));
+        let resume_gate_deadline = tokio::time::Instant::now() + resume_gate_timeout;
 
         if !has_cluster_shuffle {
             return Ok(());
@@ -2109,19 +2159,32 @@ impl ConnectorPipelineCallback {
                 |a| {
                     let candidate = CheckpointAttempt::new(a.epoch, a.checkpoint_id);
                     match candidate.relation_to(identity.attempt) {
-                        CheckpointAttemptRelation::Newer => true,
-                        CheckpointAttemptRelation::Exact => {
-                            a.assignment_fence.as_ref() == Some(assignment_fence)
-                                && match a.phase {
-                                    Phase::Aligned => {
-                                        a.leader_proof.as_ref() == Some(&identity.leader_proof)
-                                    }
-                                    // Terminal records are only wake-up hints; durable outcome
-                                    // validation owns their authority.
-                                    Phase::Commit | Phase::Abort => true,
-                                    Phase::Prepare => false,
-                                }
-                        }
+                        CheckpointAttemptRelation::Newer => match a.phase {
+                            Phase::Aligned => a
+                                .assignment_fence
+                                .as_ref()
+                                .zip(a.leader_proof.as_ref())
+                                .is_some_and(|(fence, proof)| {
+                                    fence.is_canonical()
+                                        && proof.is_canonical()
+                                        && fence.participant_incarnation(proof.owner.node_id)
+                                            == Some(proof.owner.boot_id)
+                                }),
+                            Phase::Commit | Phase::Abort => true,
+                            Phase::Prepare => false,
+                        },
+                        CheckpointAttemptRelation::Exact => match a.phase {
+                            // A successor may durably abort an attempt prepared by the old
+                            // leader. The terminal record is only a wake-up hint; durable outcome
+                            // validation owns its authority and performs the rollback.
+                            Phase::Abort => true,
+                            Phase::Aligned => {
+                                a.assignment_fence.as_ref() == Some(assignment_fence)
+                                    && a.leader_proof.as_ref() == Some(&identity.leader_proof)
+                            }
+                            Phase::Commit => a.assignment_fence.as_ref() == Some(assignment_fence),
+                            Phase::Prepare => false,
+                        },
                         CheckpointAttemptRelation::Older | CheckpointAttemptRelation::Conflict => {
                             false
                         }
@@ -2144,24 +2207,45 @@ impl ConnectorPipelineCallback {
             ));
         };
 
-        // Observation is side-effect free. Validate the exact attempt and certificate before the
-        // controller sees the phase; only Commit advances its recovery-safe watermark. A newer
-        // epoch may supersede this gate, but its watermark belongs to its own validation path.
         if released.epoch == identity.attempt.epoch
             && released.checkpoint_id == identity.attempt.checkpoint_id
-            && matches!(released.phase, Phase::Aligned | Phase::Commit)
-            && !controller.accept_barrier_watermark(
-                &released,
+            && matches!(released.phase, Phase::Commit | Phase::Abort)
+        {
+            let remaining =
+                resume_gate_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(format!(
+                    "checkpoint {} epoch {} exhausted its shuffle resume deadline before the \
+                     terminal outcome could be verified",
+                    identity.attempt.checkpoint_id, identity.attempt.epoch
+                ));
+            }
+            crate::checkpoint_coordinator::CheckpointCoordinator::await_follower_decision(
+                controller,
                 identity.attempt.epoch,
                 identity.attempt.checkpoint_id,
                 assignment_fence,
+                remaining,
             )
+            .await
+            .map_err(|error| {
+                format!(
+                    "shuffle resume for checkpoint {} epoch {} could not verify its immutable \
+                     terminal outcome: {error}",
+                    identity.attempt.checkpoint_id, identity.attempt.epoch
+                )
+            })?;
+        } else if CheckpointAttempt::new(released.epoch, released.checkpoint_id)
+            .relation_to(identity.attempt)
+            == CheckpointAttemptRelation::Newer
+            && matches!(released.phase, Phase::Commit | Phase::Abort)
         {
-            return Err(format!(
-                "[LDB-6055] exact shuffle resume for checkpoint {} epoch {} failed watermark \
-                 certification",
-                identity.attempt.checkpoint_id, identity.attempt.epoch
-            ));
+            Self::wait_for_newer_terminal_outcome(
+                controller,
+                CheckpointAttempt::new(released.epoch, released.checkpoint_id),
+                resume_gate_deadline,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -5392,16 +5476,165 @@ mod tests {
     }
 
     #[cfg(feature = "cluster")]
-    fn local_controller() -> Arc<laminar_core::cluster::control::ClusterController> {
+    fn local_controller_with_kv() -> (
+        Arc<laminar_core::cluster::control::ClusterController>,
+        Arc<laminar_core::cluster::control::InMemoryKv>,
+    ) {
         use laminar_core::cluster::control::{ClusterKv, InMemoryKv};
         use laminar_core::cluster::discovery::{NodeId, NodeInfo};
 
         let node_id = NodeId(1);
-        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node_id));
+        let kv = Arc::new(InMemoryKv::new(node_id));
+        let control_kv: Arc<dyn ClusterKv> = kv.clone();
         let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
-        Arc::new(laminar_core::cluster::control::ClusterController::new(
-            node_id, kv, None, members_rx,
-        ))
+        (
+            Arc::new(laminar_core::cluster::control::ClusterController::new(
+                node_id, control_kv, None, members_rx,
+            )),
+            kv,
+        )
+    }
+
+    #[cfg(feature = "cluster")]
+    fn local_controller() -> Arc<laminar_core::cluster::control::ClusterController> {
+        local_controller_with_kv().0
+    }
+
+    #[cfg(feature = "cluster")]
+    fn test_leader_proof(
+        node_id: u64,
+        boot_id: uuid::Uuid,
+        process_term: u64,
+        fencing_token: u64,
+    ) -> laminar_core::cluster::control::LeaderProof {
+        laminar_core::cluster::control::LeaderProof {
+            owner: laminar_core::checkpoint::LeaderProofOwner {
+                node_id,
+                boot_id,
+                process_term,
+            },
+            fencing_token,
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    fn certified_barrier(
+        attempt: CheckpointAttempt,
+        assignment_fence: laminar_core::checkpoint::CheckpointAssignmentFence,
+        leader_proof: laminar_core::cluster::control::LeaderProof,
+        phase: laminar_core::cluster::control::Phase,
+    ) -> laminar_core::cluster::control::BarrierAnnouncement {
+        laminar_core::cluster::control::BarrierAnnouncement {
+            epoch: attempt.epoch,
+            checkpoint_id: attempt.checkpoint_id,
+            assignment_fence: Some(assignment_fence),
+            leader_proof: Some(leader_proof),
+            phase,
+            flags: 0,
+            min_watermark_ms: None,
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn reserve_attempt_is_newer_than_successor_abort_in_both_dimensions() {
+        use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+        use laminar_core::cluster::control::{Phase, ANNOUNCEMENT_KEY};
+        use laminar_core::cluster::discovery::NodeId;
+
+        let (controller, kv) = local_controller_with_kv();
+        let local_boot = controller.recovery_incarnation();
+        let old_fence = CheckpointAssignmentFence::from_owner_map(
+            1,
+            &[1, 2],
+            vec![
+                CheckpointParticipant {
+                    node_id: 1,
+                    boot_incarnation: local_boot,
+                },
+                CheckpointParticipant {
+                    node_id: 2,
+                    boot_incarnation: uuid::Uuid::from_u128(2),
+                },
+            ],
+        )
+        .unwrap();
+        let successor_fence = CheckpointAssignmentFence::from_owner_map(
+            2,
+            &[1, 1],
+            vec![CheckpointParticipant {
+                node_id: 1,
+                boot_incarnation: local_boot,
+            }],
+        )
+        .unwrap();
+        let announced = CheckpointAttempt::new(7, 3);
+        let aligned = certified_barrier(
+            announced,
+            old_fence,
+            test_leader_proof(2, uuid::Uuid::from_u128(2), 1, 1),
+            Phase::Aligned,
+        );
+        let abort = certified_barrier(
+            announced,
+            successor_fence,
+            test_leader_proof(1, local_boot, 2, 2),
+            Phase::Abort,
+        );
+        kv.seed(
+            NodeId(2),
+            ANNOUNCEMENT_KEY,
+            serde_json::to_string(&aligned).unwrap(),
+        );
+        kv.seed(
+            NodeId(1),
+            ANNOUNCEMENT_KEY,
+            serde_json::to_string(&abort).unwrap(),
+        );
+        assert_eq!(
+            controller.max_announced_epoch().await.unwrap(),
+            Some(announced)
+        );
+
+        let object_store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let initial = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(Arc::clone(
+            &object_store,
+        ));
+        for expected in 1..=announced.checkpoint_id {
+            assert_eq!(initial.allocate_checkpoint_id().await.unwrap(), expected);
+        }
+        let restarted =
+            Arc::new(laminar_core::checkpoint_decision::CheckpointDecisionStore::new(object_store));
+        let dir = tempfile::tempdir().unwrap();
+        let store = Box::new(
+            laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(dir.path()),
+        );
+        let mut coordinator = crate::checkpoint_coordinator::CheckpointCoordinator::new(
+            crate::checkpoint_coordinator::CheckpointConfig::default(),
+            store,
+        )
+        .await
+        .unwrap();
+        coordinator
+            .bind_durable_decision_store(restarted)
+            .await
+            .unwrap();
+
+        let mut callback = empty_callback_fixture();
+        callback.cluster_controller = Some(controller);
+        callback.epoch_allocator = Some(coordinator.epoch_allocator());
+        let reserved = callback
+            .reserve_attempt(std::time::Instant::now())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reserved.relation_to(announced),
+            CheckpointAttemptRelation::Newer
+        );
+        assert!(reserved.epoch > announced.epoch);
+        assert!(reserved.checkpoint_id > announced.checkpoint_id);
     }
 
     #[cfg(feature = "cluster")]
@@ -6874,6 +7107,7 @@ mod tests {
         laminar_core::cluster::control::ClusterController,
         laminar_core::cluster::discovery::NodeId,
         tokio::sync::watch::Sender<Vec<laminar_core::cluster::discovery::NodeInfo>>,
+        Arc<laminar_core::checkpoint_decision::CheckpointDecisionStore>,
     ) {
         use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
         use laminar_core::cluster::discovery::{NodeId, NodeInfo, NodeMetadata, NodeState};
@@ -6893,9 +7127,13 @@ mod tests {
         };
         let (tx, rx) = tokio::sync::watch::channel(vec![leader_info]);
         let controller = ClusterController::new(follower_id, kv_trait, None, rx);
+        let backing: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let decision_store = Arc::new(
+            laminar_core::checkpoint_decision::CheckpointDecisionStore::new(Arc::clone(&backing)),
+        );
         let lease_store = Arc::new(laminar_core::cluster::control::LeaderLeaseStore::new(
-            Arc::new(object_store::memory::InMemory::new()),
-            1_000,
+            backing, 1_000,
         ));
         lease_store
             .begin_new_term(
@@ -6909,7 +7147,72 @@ mod tests {
             .await
             .unwrap();
         controller.set_leader_lease_store(lease_store);
-        (kv, controller, leader_id, tx)
+        (kv, controller, leader_id, tx, decision_store)
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn gate_recovery_capsule(
+        decision_store: &laminar_core::checkpoint_decision::CheckpointDecisionStore,
+        attempt: CheckpointAttempt,
+        fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
+    ) -> laminar_core::checkpoint::RecoveryCapsuleRef {
+        use laminar_core::checkpoint::{
+            ClusterRecoveryCapsule, ParticipantRecoveryRef, PipelineIdentity,
+            CLUSTER_RECOVERY_CAPSULE_VERSION,
+        };
+
+        let capsule = ClusterRecoveryCapsule {
+            version: CLUSTER_RECOVERY_CAPSULE_VERSION,
+            attempt,
+            deployment_id: decision_store.load_or_create_deployment_id().await.unwrap(),
+            pipeline_identity: PipelineIdentity::empty(),
+            assignment_fence: fence.clone(),
+            seal_inventory_sha256: digest(1),
+            participants: fence
+                .participant_ids()
+                .into_iter()
+                .map(|participant_id| ParticipantRecoveryRef {
+                    participant_id,
+                    readiness_sha256: digest(2),
+                    manifest_sha256: digest(3),
+                    portable_state_sha256: digest(4),
+                })
+                .collect(),
+            source_offsets: Default::default(),
+            source_metadata: Default::default(),
+            source_assignment_versions: Default::default(),
+            source_watermarks: Default::default(),
+            cluster_watermark: CheckpointWatermark::Active(42),
+            recovery_watermark_frontier: Some(42),
+            portable_state_sha256: digest(4),
+        };
+        decision_store
+            .create_recovery_capsule(&capsule)
+            .await
+            .unwrap()
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn record_gate_commit(
+        controller: &laminar_core::cluster::control::ClusterController,
+        decision_store: &laminar_core::checkpoint_decision::CheckpointDecisionStore,
+        attempt: CheckpointAttempt,
+        fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
+    ) {
+        let recovery_capsule = gate_recovery_capsule(decision_store, attempt, fence).await;
+        let authority = controller.checkpoint_authority().unwrap();
+        let proof = authority.load().await.unwrap().unwrap().proof();
+        authority
+            .record_cluster_outcome(
+                &proof,
+                attempt.epoch,
+                attempt.checkpoint_id,
+                fence.clone(),
+                laminar_core::checkpoint_decision::CheckpointVerdict::Commit,
+                Some(recovery_capsule),
+            )
+            .await
+            .unwrap();
     }
 
     /// The resume gate releases on the leader's `Aligned` announcement.
@@ -6918,7 +7221,7 @@ mod tests {
     async fn aligned_resume_gate_releases_on_aligned() {
         use laminar_core::cluster::control::{BarrierAnnouncement, Phase, ANNOUNCEMENT_KEY};
 
-        let (kv, controller, leader_id, _members_tx) = gate_controller().await;
+        let (kv, controller, leader_id, _members_tx, _decision_store) = gate_controller().await;
         let (fence, identity) = resume_identity(3, 3);
         let aligned = serde_json::to_string(&BarrierAnnouncement {
             epoch: 3,
@@ -6957,8 +7260,15 @@ mod tests {
     async fn exact_commit_resume_gate_publishes_the_recovery_safe_watermark() {
         use laminar_core::cluster::control::{BarrierAnnouncement, Phase, ANNOUNCEMENT_KEY};
 
-        let (kv, controller, leader_id, _members_tx) = gate_controller().await;
+        let (kv, controller, leader_id, _members_tx, decision_store) = gate_controller().await;
         let (fence, identity) = resume_identity(3, 3);
+        record_gate_commit(
+            &controller,
+            decision_store.as_ref(),
+            identity.attempt,
+            &fence,
+        )
+        .await;
         kv.seed(
             leader_id,
             ANNOUNCEMENT_KEY,
@@ -6969,7 +7279,7 @@ mod tests {
                 leader_proof: Some(identity.leader_proof.clone()),
                 phase: Phase::Commit,
                 flags: 0,
-                min_watermark_ms: Some(42),
+                min_watermark_ms: Some(99_999),
             })
             .unwrap(),
         );
@@ -6983,13 +7293,133 @@ mod tests {
         )
         .await
         .expect("exact Commit must release the resume gate");
-        assert_eq!(controller.cluster_min_watermark(), Some(42));
+        assert_eq!(
+            controller.cluster_min_watermark(),
+            Some(42),
+            "the immutable capsule, not the terminal hint, owns the watermark"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn successor_abort_releases_the_resume_gate_without_publishing_a_watermark() {
+        use laminar_core::checkpoint_decision::{CheckpointVerdict, RecordOutcomeResult};
+        use laminar_core::cluster::control::{BarrierAnnouncement, Phase, ANNOUNCEMENT_KEY};
+
+        let (kv, controller, leader_id, _members_tx, _decision_store) = gate_controller().await;
+        let (prepared_fence, identity) = resume_identity(3, 3);
+        let successor_fence = assignment_fence(2, &[1, 7]);
+        let authority = controller.checkpoint_authority().unwrap();
+        let owner = laminar_core::cluster::control::LeaderLeaseOwner {
+            node: leader_id,
+            boot: "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+            process_term: 1,
+        };
+        let laminar_core::cluster::control::LeaseOutcome::Acquired(successor) =
+            authority.begin_new_term(&owner, 1).await.unwrap()
+        else {
+            panic!("the incumbent process must rotate its leader term");
+        };
+        assert!(matches!(
+            authority
+                .record_cluster_outcome(
+                    &successor.proof(),
+                    3,
+                    3,
+                    successor_fence.clone(),
+                    CheckpointVerdict::Abort,
+                    None,
+                )
+                .await
+                .unwrap(),
+            RecordOutcomeResult::Created(_)
+        ));
+        kv.seed(
+            leader_id,
+            ANNOUNCEMENT_KEY,
+            serde_json::to_string(&BarrierAnnouncement {
+                epoch: 3,
+                checkpoint_id: 3,
+                assignment_fence: Some(successor_fence),
+                leader_proof: Some(successor.proof()),
+                phase: Phase::Abort,
+                flags: 0,
+                min_watermark_ms: None,
+            })
+            .unwrap(),
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            ConnectorPipelineCallback::wait_for_aligned_resume(
+                true,
+                &controller,
+                identity,
+                &prepared_fence,
+                Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("successor Abort must release the old leader's resume gate")
+        .expect("durable outcome validation owns successor Abort authority");
+        assert_eq!(
+            controller.cluster_min_watermark(),
+            None,
+            "Abort cannot publish a recovery-safe watermark"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn terminal_hint_without_an_outcome_does_not_release_the_resume_gate() {
+        use laminar_core::cluster::control::{BarrierAnnouncement, Phase, ANNOUNCEMENT_KEY};
+
+        for phase in [Phase::Commit, Phase::Abort] {
+            let (kv, controller, leader_id, _members_tx, _decision_store) = gate_controller().await;
+            let (prepared_fence, identity) = resume_identity(3, 3);
+            let terminal_fence = if phase == Phase::Commit {
+                prepared_fence.clone()
+            } else {
+                assignment_fence(2, &[1, 7])
+            };
+            kv.seed(
+                leader_id,
+                ANNOUNCEMENT_KEY,
+                serde_json::to_string(&BarrierAnnouncement {
+                    epoch: 3,
+                    checkpoint_id: 3,
+                    assignment_fence: Some(terminal_fence),
+                    leader_proof: Some(leader_proof(if phase == Phase::Commit { 1 } else { 2 })),
+                    phase,
+                    flags: 0,
+                    min_watermark_ms: None,
+                })
+                .unwrap(),
+            );
+
+            let outcome = tokio::time::timeout(
+                Duration::from_millis(100),
+                ConnectorPipelineCallback::wait_for_aligned_resume(
+                    true,
+                    &controller,
+                    identity,
+                    &prepared_fence,
+                    Duration::from_secs(1),
+                ),
+            )
+            .await;
+            assert!(
+                outcome.is_err(),
+                "a {phase:?} hint cannot reopen shuffle without immutable authority"
+            );
+            assert_eq!(controller.cluster_min_watermark(), None);
+        }
     }
 
     #[cfg(feature = "cluster")]
     #[tokio::test]
     async fn aligned_resume_gate_timeout_fails_closed() {
-        let (_kv, controller, _leader_id, _members_tx) = gate_controller().await;
+        let (_kv, controller, _leader_id, _members_tx, _decision_store) = gate_controller().await;
         let (fence, identity) = resume_identity(3, 3);
         let error = ConnectorPipelineCallback::wait_for_aligned_resume(
             true,
@@ -7037,7 +7467,7 @@ mod tests {
                 min_watermark_ms: Some(99),
             },
         ] {
-            let (kv, controller, leader_id, _members_tx) = gate_controller().await;
+            let (kv, controller, leader_id, _members_tx, _decision_store) = gate_controller().await;
             let (expected_fence, identity) = resume_identity(3, 3);
             kv.seed(
                 leader_id,
@@ -7068,6 +7498,53 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn resume_gate_does_not_observe_commit_from_another_assignment() {
+        use laminar_core::cluster::control::{BarrierAnnouncement, Phase, ANNOUNCEMENT_KEY};
+
+        let (kv, controller, leader_id, _members_tx, decision_store) = gate_controller().await;
+        let (prepared_fence, identity) = resume_identity(3, 3);
+        record_gate_commit(
+            &controller,
+            decision_store.as_ref(),
+            identity.attempt,
+            &prepared_fence,
+        )
+        .await;
+        kv.seed(
+            leader_id,
+            ANNOUNCEMENT_KEY,
+            serde_json::to_string(&BarrierAnnouncement {
+                epoch: 3,
+                checkpoint_id: 3,
+                assignment_fence: Some(assignment_fence(2, &[1, 7])),
+                leader_proof: Some(leader_proof(2)),
+                phase: Phase::Commit,
+                flags: 0,
+                min_watermark_ms: Some(99),
+            })
+            .unwrap(),
+        );
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(100),
+            ConnectorPipelineCallback::wait_for_aligned_resume(
+                true,
+                &controller,
+                identity,
+                &prepared_fence,
+                Duration::from_secs(3),
+            ),
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "a Commit from another assignment must remain unobserved"
+        );
+        assert_eq!(controller.cluster_min_watermark(), None);
+    }
+
     /// A newer epoch's announcement supersedes the awaited one
     /// (latest-wins observation can overwrite Aligned/Commit).
     #[cfg(feature = "cluster")]
@@ -7075,7 +7552,7 @@ mod tests {
     async fn aligned_resume_gate_releases_on_newer_epoch() {
         use laminar_core::cluster::control::{BarrierAnnouncement, Phase, ANNOUNCEMENT_KEY};
 
-        let (kv, controller, leader_id, _members_tx) = gate_controller().await;
+        let (kv, controller, leader_id, _members_tx, _decision_store) = gate_controller().await;
         let (fence, identity) = resume_identity(3, 3);
         let newer = serde_json::to_string(&BarrierAnnouncement {
             epoch: 4,
@@ -7109,12 +7586,228 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn newer_reversible_phase_requires_successor_alignment_authority() {
+        use laminar_core::cluster::control::{BarrierAnnouncement, Phase, ANNOUNCEMENT_KEY};
+
+        for announcement in [
+            BarrierAnnouncement {
+                epoch: 4,
+                checkpoint_id: 4,
+                assignment_fence: Some(assignment_fence(2, &[1, 7])),
+                leader_proof: Some(leader_proof(1)),
+                phase: Phase::Prepare,
+                flags: 0,
+                min_watermark_ms: None,
+            },
+            BarrierAnnouncement {
+                epoch: 4,
+                checkpoint_id: 4,
+                assignment_fence: None,
+                leader_proof: None,
+                phase: Phase::Aligned,
+                flags: 0,
+                min_watermark_ms: None,
+            },
+            BarrierAnnouncement {
+                epoch: 4,
+                checkpoint_id: 4,
+                assignment_fence: Some(assignment_fence(2, &[2, 7])),
+                leader_proof: Some(leader_proof(1)),
+                phase: Phase::Aligned,
+                flags: 0,
+                min_watermark_ms: None,
+            },
+            BarrierAnnouncement {
+                epoch: 4,
+                checkpoint_id: 4,
+                assignment_fence: Some(assignment_fence(2, &[1, 7])),
+                leader_proof: None,
+                phase: Phase::Aligned,
+                flags: 0,
+                min_watermark_ms: None,
+            },
+        ] {
+            let (kv, controller, leader_id, _members_tx, _decision_store) = gate_controller().await;
+            let (fence, identity) = resume_identity(3, 3);
+            kv.seed(
+                leader_id,
+                ANNOUNCEMENT_KEY,
+                serde_json::to_string(&announcement).unwrap(),
+            );
+            let outcome = tokio::time::timeout(
+                Duration::from_millis(100),
+                ConnectorPipelineCallback::wait_for_aligned_resume(
+                    true,
+                    &controller,
+                    identity,
+                    &fence,
+                    Duration::from_secs(1),
+                ),
+            )
+            .await;
+            assert!(
+                !matches!(outcome, Ok(Ok(()))),
+                "newer {:?} without successor alignment authority released the gate",
+                announcement.phase
+            );
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn newer_terminal_hint_requires_an_immutable_outcome() {
+        use laminar_core::cluster::control::{BarrierAnnouncement, Phase, ANNOUNCEMENT_KEY};
+
+        for phase in [Phase::Commit, Phase::Abort] {
+            let (kv, controller, leader_id, _members_tx, _decision_store) = gate_controller().await;
+            let (fence, identity) = resume_identity(3, 3);
+            kv.seed(
+                leader_id,
+                ANNOUNCEMENT_KEY,
+                serde_json::to_string(&BarrierAnnouncement {
+                    epoch: 4,
+                    checkpoint_id: 4,
+                    assignment_fence: Some(assignment_fence(2, &[1, 7])),
+                    leader_proof: Some(leader_proof(1)),
+                    phase,
+                    flags: 0,
+                    min_watermark_ms: Some(99_999),
+                })
+                .unwrap(),
+            );
+            let outcome = tokio::time::timeout(
+                Duration::from_millis(100),
+                ConnectorPipelineCallback::wait_for_aligned_resume(
+                    true,
+                    &controller,
+                    identity,
+                    &fence,
+                    Duration::from_secs(1),
+                ),
+            )
+            .await;
+            assert!(
+                outcome.is_err(),
+                "newer {phase:?} hint released the gate without immutable authority"
+            );
+            assert_eq!(controller.cluster_min_watermark(), None);
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn newer_durable_abort_releases_the_resume_gate() {
+        use laminar_core::checkpoint_decision::CheckpointVerdict;
+        use laminar_core::cluster::control::{BarrierAnnouncement, Phase, ANNOUNCEMENT_KEY};
+
+        let (kv, controller, leader_id, _members_tx, _decision_store) = gate_controller().await;
+        let (fence, identity) = resume_identity(3, 3);
+        let successor_fence = assignment_fence(2, &[1, 7]);
+        let authority = controller.checkpoint_authority().unwrap();
+        let proof = authority.load().await.unwrap().unwrap().proof();
+        authority
+            .record_cluster_outcome(
+                &proof,
+                4,
+                4,
+                successor_fence.clone(),
+                CheckpointVerdict::Abort,
+                None,
+            )
+            .await
+            .unwrap();
+        kv.seed(
+            leader_id,
+            ANNOUNCEMENT_KEY,
+            serde_json::to_string(&BarrierAnnouncement {
+                epoch: 4,
+                checkpoint_id: 4,
+                assignment_fence: Some(successor_fence),
+                leader_proof: Some(proof),
+                phase: Phase::Abort,
+                flags: 0,
+                min_watermark_ms: None,
+            })
+            .unwrap(),
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            ConnectorPipelineCallback::wait_for_aligned_resume(
+                true,
+                &controller,
+                identity,
+                &fence,
+                Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("durable newer Abort must release the old gate")
+        .unwrap();
+        assert_eq!(controller.cluster_min_watermark(), None);
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn newer_durable_commit_does_not_publish_an_unapplied_watermark() {
+        use laminar_core::cluster::control::{BarrierAnnouncement, Phase, ANNOUNCEMENT_KEY};
+
+        let (kv, controller, leader_id, _members_tx, decision_store) = gate_controller().await;
+        let (fence, identity) = resume_identity(3, 3);
+        let successor = CheckpointAttempt::new(4, 4);
+        let successor_fence = assignment_fence(2, &[1, 2]);
+        record_gate_commit(&controller, &decision_store, successor, &successor_fence).await;
+        let proof = controller
+            .checkpoint_authority()
+            .unwrap()
+            .load()
+            .await
+            .unwrap()
+            .unwrap()
+            .proof();
+        kv.seed(
+            leader_id,
+            ANNOUNCEMENT_KEY,
+            serde_json::to_string(&BarrierAnnouncement {
+                epoch: successor.epoch,
+                checkpoint_id: successor.checkpoint_id,
+                assignment_fence: Some(successor_fence),
+                leader_proof: Some(proof),
+                phase: Phase::Commit,
+                flags: 0,
+                min_watermark_ms: Some(99_999),
+            })
+            .unwrap(),
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            ConnectorPipelineCallback::wait_for_aligned_resume(
+                true,
+                &controller,
+                identity,
+                &fence,
+                Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("a durable newer Commit must supersede the old gate")
+        .unwrap();
+        assert_eq!(
+            controller.cluster_min_watermark(),
+            None,
+            "an old gate cannot install state from a newer cut that this process did not apply"
+        );
+    }
+
     /// Without a cross-node shuffle there is no in-flight-row invariant
     /// to protect — the gate is a no-op even with no announcement.
     #[cfg(feature = "cluster")]
     #[tokio::test]
     async fn aligned_resume_gate_skips_without_shuffle() {
-        let (_kv, controller, _leader_id, _members_tx) = gate_controller().await;
+        let (_kv, controller, _leader_id, _members_tx, _decision_store) = gate_controller().await;
         let (fence, identity) = resume_identity(3, 3);
         tokio::time::timeout(
             Duration::from_millis(100),
