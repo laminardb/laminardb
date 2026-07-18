@@ -3223,6 +3223,22 @@ impl ClusterController {
         self.barrier.announce(ann).await
     }
 
+    /// Leader-side assignment-certified Prepare publication with its configured quorum window.
+    ///
+    /// # Errors
+    /// Propagates process-lease and [`BarrierCoordinator::announce_prepare`] errors.
+    #[cfg(feature = "cluster")]
+    pub async fn announce_prepare_barrier(
+        &self,
+        ann: &BarrierAnnouncement,
+        quorum_window: Duration,
+    ) -> Result<(), String> {
+        if !self.process_lease_is_live() {
+            return Err("stable node process lease is no longer live".into());
+        }
+        self.barrier.announce_prepare(ann, quorum_window).await
+    }
+
     /// Highest valid attempt announced anywhere in the cluster — used by a node reclaiming
     /// leadership to advance its allocator past the in-flight epoch.
     ///

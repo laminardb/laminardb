@@ -4614,21 +4614,31 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             })?;
             let deadline =
                 tokio::time::Instant::from_std(attempt_started) + self.checkpoint_timeout;
+            let quorum_window = self.quorum_timeout.min(
+                self.checkpoint_timeout
+                    .saturating_sub(attempt_started.elapsed()),
+            );
+            if quorum_window.is_zero() {
+                return Err("checkpoint Prepare has no remaining quorum window".into());
+            }
             // Publication failure is ambiguous: retain the proof before issuing I/O so cleanup
             // can resolve this exact attempt instead of assuming Prepare was absent.
             self.checkpoint_leader_proofs
                 .insert(attempt, leader_proof.clone());
             tokio::time::timeout_at(
                 deadline,
-                controller.announce_barrier(&BarrierAnnouncement {
-                    epoch: attempt.epoch,
-                    checkpoint_id: attempt.checkpoint_id,
-                    assignment_fence: Some(assignment_fence),
-                    leader_proof: Some(leader_proof.clone()),
-                    phase: Phase::Prepare,
-                    flags: 0,
-                    min_watermark_ms: None,
-                }),
+                controller.announce_prepare_barrier(
+                    &BarrierAnnouncement {
+                        epoch: attempt.epoch,
+                        checkpoint_id: attempt.checkpoint_id,
+                        assignment_fence: Some(assignment_fence),
+                        leader_proof: Some(leader_proof.clone()),
+                        phase: Phase::Prepare,
+                        flags: 0,
+                        min_watermark_ms: None,
+                    },
+                    quorum_window,
+                ),
             )
             .await
             .map_err(|_| {
@@ -5967,6 +5977,149 @@ mod tests {
             }],
         )
         .unwrap()
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn callback_publishes_prepare_directly_before_checkpoint_work() {
+        use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+        use laminar_core::cluster::control::barrier::BARRIER_ADDR_KEY;
+        use laminar_core::cluster::control::{
+            ClusterController, ClusterKv, InMemoryKv, LeaderLeaseOwner, LeaderLeaseStore,
+            LeaseDeadline, LeaseOutcome, ANNOUNCEMENT_KEY,
+        };
+        use laminar_core::cluster::discovery::{NodeId, NodeInfo, NodeMetadata, NodeState};
+        use laminar_core::state::VnodeRegistry;
+
+        let member = |id| NodeInfo {
+            id,
+            name: format!("node-{}", id.0),
+            rpc_address: String::new(),
+            raft_address: String::new(),
+            state: NodeState::Active,
+            metadata: NodeMetadata::default(),
+            last_heartbeat_ms: 0,
+        };
+        let leader_id = NodeId(1);
+        let follower_id = NodeId(2);
+        let leader_kv = Arc::new(InMemoryKv::new(leader_id));
+        let follower_kv = Arc::new(InMemoryKv::new(follower_id));
+        let leader_control_kv: Arc<dyn ClusterKv> = leader_kv.clone();
+        let follower_control_kv: Arc<dyn ClusterKv> = follower_kv.clone();
+        let (_leader_members_tx, leader_members_rx) =
+            tokio::sync::watch::channel(vec![member(follower_id)]);
+        let (_follower_members_tx, follower_members_rx) =
+            tokio::sync::watch::channel(vec![member(leader_id)]);
+        let leader = Arc::new(ClusterController::new(
+            leader_id,
+            leader_control_kv,
+            None,
+            leader_members_rx,
+        ));
+        let follower = Arc::new(ClusterController::new(
+            follower_id,
+            follower_control_kv,
+            None,
+            follower_members_rx,
+        ));
+
+        let authority = Arc::new(LeaderLeaseStore::new(
+            Arc::new(object_store::memory::InMemory::new()),
+            1_000,
+        ));
+        let owner = LeaderLeaseOwner {
+            node: leader_id,
+            boot: leader.recovery_incarnation(),
+            process_term: 1,
+        };
+        let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap()
+        else {
+            panic!("test leader must acquire its first durable term");
+        };
+        let deadline = Arc::new(LeaseDeadline::live_for(Duration::from_secs(30)));
+        leader
+            .set_process_lease_deadline(Arc::clone(&deadline))
+            .unwrap();
+        let (_lease_tx, lease_rx) = tokio::sync::watch::channel(Some(lease));
+        leader
+            .set_leader_lease_watch(lease_rx, owner, deadline)
+            .unwrap();
+        leader.set_leader_lease_store(Arc::clone(&authority));
+        follower.set_leader_lease_store(authority);
+
+        let follower_addr = follower
+            .start_barrier_server("127.0.0.1:0".parse().unwrap(), None)
+            .await
+            .unwrap();
+        leader
+            .start_barrier_server("127.0.0.1:0".parse().unwrap(), None)
+            .await
+            .unwrap();
+        leader_kv.seed(follower_id, BARRIER_ADDR_KEY, follower_addr.to_string());
+
+        let fence = CheckpointAssignmentFence::from_owner_map(
+            1,
+            &[leader_id.0, follower_id.0],
+            vec![
+                CheckpointParticipant {
+                    node_id: leader_id.0,
+                    boot_incarnation: leader.recovery_incarnation(),
+                },
+                CheckpointParticipant {
+                    node_id: follower_id.0,
+                    boot_incarnation: follower.recovery_incarnation(),
+                },
+            ],
+        )
+        .unwrap();
+        let registry = Arc::new(VnodeRegistry::new_unassigned(2));
+        registry.set_assignment_and_version(vec![leader_id, follower_id].into(), 1);
+        leader.publish_checkpoint_assignment_fence(Some(fence.clone()));
+
+        let mut callback = empty_callback_fixture();
+        callback.cluster_controller = Some(Arc::clone(&leader));
+        callback.vnode_registry = Some(registry);
+        callback.checkpoint_timeout = Duration::from_secs(1);
+        callback.quorum_timeout = Duration::from_millis(200);
+
+        let expired = CheckpointAttempt::new(1, 40);
+        let error = crate::pipeline::PipelineCallback::publish_checkpoint_prepare(
+            &mut callback,
+            expired,
+            std::time::Instant::now() - Duration::from_secs(2),
+            Some(fence.clone()),
+        )
+        .await
+        .expect_err("an exhausted attempt must not publish Prepare");
+        assert!(error.contains("no remaining quorum window"), "{error}");
+        assert!(!callback.checkpoint_leader_proofs.contains_key(&expired));
+        assert!(leader_kv
+            .read_from(leader_id, ANNOUNCEMENT_KEY)
+            .await
+            .is_none());
+
+        let attempt = CheckpointAttempt::new(2, 41);
+        let expected = certified_barrier(
+            attempt,
+            fence.clone(),
+            leader.capture_leader_proof().unwrap(),
+            laminar_core::cluster::control::Phase::Prepare,
+        );
+        crate::pipeline::PipelineCallback::publish_checkpoint_prepare(
+            &mut callback,
+            attempt,
+            std::time::Instant::now(),
+            Some(fence),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while follower.checkpoint_prepare_received_at(&expected).is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the callback did not start direct Prepare delivery");
     }
 
     #[cfg(feature = "cluster")]

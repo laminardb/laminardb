@@ -3333,6 +3333,45 @@ async fn prepare_quorum_failure_never_announces_abort_before_outcome() {
     assert_eq!(phases, vec![Phase::Prepare]);
 }
 
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn solo_prepare_quorum_propagates_publication_failure() {
+    use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+    use laminar_core::cluster::discovery::NodeId;
+
+    let self_id = NodeId(1);
+    let kv = Arc::new(InMemoryKv::new(self_id));
+    let control_kv: Arc<dyn ClusterKv> = kv.clone();
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
+    let controller = Arc::new(ClusterController::new(
+        self_id, control_kv, None, members_rx,
+    ));
+    let _lease = install_test_leader_lease(&controller).await;
+    publish_test_assignment_fence(&controller, 1);
+    let fence = controller.checkpoint_assignment_fence(1).unwrap();
+    let proof = controller.capture_leader_proof().unwrap();
+
+    let error = CheckpointCoordinator::run_prepare_quorum(
+        &controller,
+        Duration::ZERO,
+        PrepareQuorum::new(
+            CheckpointAttempt::new(1, 1),
+            CheckpointWatermark::Active(10),
+            &fence,
+            &proof,
+            true,
+        ),
+    )
+    .await
+    .expect_err("a solo cluster must not bypass failed Prepare publication");
+
+    assert!(error.contains("[LDB-6031]"), "{error}");
+    assert!(kv
+        .read_from(self_id, laminar_core::cluster::control::ANNOUNCEMENT_KEY,)
+        .await
+        .is_none());
+}
+
 /// Object-store middleware that transfers the watched lease immediately after a checkpoint
 /// decision create lands. It makes the decision/lease TOCTOU deterministic for the coordinator
 /// test below.

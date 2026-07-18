@@ -4626,9 +4626,11 @@ impl CheckpointCoordinator {
             return Err("[LDB-6054] exact leader proof was stale before Prepare".into());
         }
         if announce_prepare {
-            if let Err(e) = cc.announce_barrier(&prepare).await {
-                warn!(epoch, checkpoint_id, error = %e, "[LDB-6031] prepare announcement failed");
-            }
+            cc.announce_prepare_barrier(&prepare, quorum_timeout)
+                .await
+                .map_err(|error| {
+                    format!("[LDB-6031] checkpoint Prepare publication failed: {error}")
+                })?;
         }
 
         let mut followers: Vec<laminar_core::cluster::discovery::NodeId> = assignment_fence

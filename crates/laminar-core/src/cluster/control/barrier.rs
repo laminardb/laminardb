@@ -549,6 +549,13 @@ struct GrpcState {
     latest_rx: watch::Receiver<Option<BarrierAnnouncement>>,
     merge_error: Arc<parking_lot::Mutex<Option<String>>>,
     prepare_acks: Arc<parking_lot::Mutex<PrepareAckState>>,
+    /// The one clustered Prepare batch admitted after its durable announcement. Pending tasks are
+    /// owned here; once claimed, `wait_for_quorum` owns their structured cancellation. The
+    /// orchestration must finish or drop that future before publishing a terminal or successor.
+    prepare_fanout: parking_lot::Mutex<Option<PrepareFanoutState>>,
+    /// Serializes local durable publication with the corresponding Prepare fan-out transition.
+    /// Non-Prepare network delivery runs after this lock is released.
+    announcement_lock: tokio::sync::Mutex<()>,
     clients: BarrierClientPool,
     server_handle: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     relay_handle: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
@@ -1149,8 +1156,8 @@ async fn send_phase_rpc(
                     .map_err(|e| e.to_string())
                     .and_then(|response| validate_phase_ack(&response.into_inner(), &ann))
             }
-            // Prepare RPCs are issued by wait_for_quorum, not here.
-            Phase::Prepare => Ok(()),
+            // Prepare uses its dedicated acknowledgement-bearing eager batch.
+            Phase::Prepare => Err("Prepare cannot use the phase-notification RPC path".into()),
         }
     })
     .await;
@@ -1188,6 +1195,204 @@ enum PeerFailure {
     Nack(String),
 }
 
+/// Exact announcement and participant roster bound to one eager Prepare round.
+#[cfg(feature = "cluster")]
+struct PrepareFanoutBatch {
+    announcement: BarrierAnnouncement,
+    expected: Vec<NodeId>,
+    // `JoinSet` aborts all remaining tasks when the batch or quorum future is dropped.
+    tasks: tokio::task::JoinSet<Result<(NodeId, CheckpointWatermark), (NodeId, PeerFailure)>>,
+}
+
+#[cfg(feature = "cluster")]
+#[derive(Clone, Copy)]
+struct PrepareFanoutBudget {
+    total: Duration,
+    per_attempt: Duration,
+}
+
+#[cfg(feature = "cluster")]
+fn prepare_fanout_budget(quorum_window: Duration) -> Result<PrepareFanoutBudget, String> {
+    if quorum_window.is_zero() {
+        return Err("Prepare quorum window must be greater than zero".into());
+    }
+    let per_attempt = quorum_window / 2;
+    if per_attempt.is_zero() {
+        return Err("Prepare quorum window is too small to divide into retry attempts".into());
+    }
+    Ok(PrepareFanoutBudget {
+        total: PREPARE_RPC_TIMEOUT.max(quorum_window),
+        per_attempt,
+    })
+}
+
+#[cfg(feature = "cluster")]
+enum PrepareFanoutState {
+    Pending(PrepareFanoutBatch),
+    Claimed(BarrierAnnouncement),
+}
+
+#[cfg(feature = "cluster")]
+impl PrepareFanoutState {
+    const fn announcement(&self) -> &BarrierAnnouncement {
+        match self {
+            Self::Pending(batch) => &batch.announcement,
+            Self::Claimed(announcement) => announcement,
+        }
+    }
+}
+
+#[cfg(feature = "cluster")]
+fn clustered_prepare_roster(prepare: &BarrierAnnouncement) -> Result<Option<Vec<NodeId>>, String> {
+    if prepare.phase != Phase::Prepare {
+        return Err("Prepare fan-out received a different barrier phase".into());
+    }
+    if prepare.min_watermark_ms.is_some() {
+        return Err("Prepare fan-out cannot carry a committed watermark".into());
+    }
+    let Some(fence) = prepare.assignment_fence.as_ref() else {
+        // A build with the cluster feature may still run embedded or single-node. Those modes
+        // retain the existing KV/direct-on-wait behavior and do not install a clustered batch.
+        return Ok(None);
+    };
+    if !fence.is_canonical() {
+        return Err("clustered Prepare has a non-canonical assignment certificate".into());
+    }
+    let proof = prepare
+        .leader_proof
+        .as_ref()
+        .filter(|proof| proof.is_canonical())
+        .ok_or_else(|| "clustered Prepare has no canonical leader proof".to_string())?;
+    if fence.participant_incarnation(proof.owner.node_id) != Some(proof.owner.boot_id) {
+        return Err(
+            "clustered Prepare leader proof is outside its exact assignment process roster".into(),
+        );
+    }
+
+    Ok(Some(
+        fence
+            .participants
+            .iter()
+            .filter(|participant| participant.node_id != proof.owner.node_id)
+            .map(|participant| NodeId(participant.node_id))
+            .collect(),
+    ))
+}
+
+#[cfg(feature = "cluster")]
+fn prepare_fanout_plan(
+    announcement: &BarrierAnnouncement,
+    quorum_window: Option<Duration>,
+) -> Result<(Option<Vec<NodeId>>, Option<PrepareFanoutBudget>), String> {
+    if announcement.phase != Phase::Prepare {
+        return Ok((None, None));
+    }
+    let roster = clustered_prepare_roster(announcement)?;
+    let budget = roster
+        .as_ref()
+        .map(|_| {
+            quorum_window.ok_or_else(|| {
+                "assignment-certified Prepare has no quorum retry window".to_string()
+            })
+        })
+        .transpose()?
+        .map(prepare_fanout_budget)
+        .transpose()?;
+    Ok((roster, budget))
+}
+
+#[cfg(feature = "cluster")]
+fn canonical_expected_roster(expected: &[NodeId]) -> Result<Vec<NodeId>, String> {
+    let mut canonical = expected.to_vec();
+    canonical.sort_unstable_by_key(|peer| peer.0);
+    if canonical.iter().any(NodeId::is_unassigned)
+        || canonical.windows(2).any(|pair| pair[0] == pair[1])
+    {
+        return Err("Prepare quorum participant roster is not canonical".into());
+    }
+    Ok(canonical)
+}
+
+#[cfg(feature = "cluster")]
+fn install_prepare_fanout(
+    state: &GrpcState,
+    kv: &Arc<dyn ClusterKv>,
+    prepare: &BarrierAnnouncement,
+    expected: Vec<NodeId>,
+    budget: PrepareFanoutBudget,
+) {
+    let mut pending = state.prepare_fanout.lock();
+    let rpc_deadline = tokio::time::Instant::now() + budget.total;
+    let mut tasks = tokio::task::JoinSet::new();
+    for &peer in &expected {
+        let clients_pool = Arc::clone(&state.clients);
+        let kv = Arc::clone(kv);
+        let prepare = prepare.clone();
+        tasks.spawn(async move {
+            prepare_peer_until_deadline(
+                peer,
+                clients_pool,
+                kv,
+                prepare,
+                rpc_deadline,
+                budget.per_attempt,
+            )
+            .await
+        });
+    }
+    let incoming = PrepareFanoutBatch {
+        announcement: prepare.clone(),
+        expected,
+        tasks,
+    };
+    *pending = Some(PrepareFanoutState::Pending(incoming));
+}
+
+#[cfg(feature = "cluster")]
+fn preflight_prepare_fanout(
+    state: &GrpcState,
+    prepare: &BarrierAnnouncement,
+) -> Result<bool, String> {
+    let pending = state.prepare_fanout.lock();
+    let Some(current) = pending.as_ref() else {
+        return Ok(true);
+    };
+    match announcement_attempt(prepare).relation_to(announcement_attempt(current.announcement())) {
+        CheckpointAttemptRelation::Newer => Ok(true),
+        CheckpointAttemptRelation::Exact if current.announcement() == prepare => Ok(false),
+        CheckpointAttemptRelation::Older => {
+            Err("stale Prepare cannot replace a newer in-flight fan-out".into())
+        }
+        CheckpointAttemptRelation::Conflict => {
+            Err("conflicting Prepare attempt cannot replace the in-flight fan-out".into())
+        }
+        CheckpointAttemptRelation::Exact => {
+            Err("conflicting Prepare certificate cannot replace the in-flight fan-out".into())
+        }
+    }
+}
+
+#[cfg(feature = "cluster")]
+fn retire_prepare_fanout(state: &GrpcState, announcement: &BarrierAnnouncement) {
+    let mut pending = state.prepare_fanout.lock();
+    let Some(current) = pending.as_ref() else {
+        return;
+    };
+    match announcement_attempt(announcement)
+        .relation_to(announcement_attempt(current.announcement()))
+    {
+        CheckpointAttemptRelation::Newer => {
+            pending.take();
+        }
+        CheckpointAttemptRelation::Exact if announcement.phase != Phase::Prepare => {
+            pending.take();
+        }
+        CheckpointAttemptRelation::Older
+        | CheckpointAttemptRelation::Conflict
+        | CheckpointAttemptRelation::Exact => {}
+    }
+}
+
 #[cfg(feature = "cluster")]
 fn retryable_prepare_status(status: &tonic::Status) -> bool {
     matches!(
@@ -1217,18 +1422,20 @@ async fn wait_for_prepare_retry(deadline: tokio::time::Instant, backoff: &mut Du
 }
 
 #[cfg(feature = "cluster")]
-#[allow(clippy::too_many_arguments)]
 async fn prepare_peer_until_deadline(
     peer: NodeId,
     clients_pool: BarrierClientPool,
     kv: Arc<dyn ClusterKv>,
-    epoch: u64,
-    checkpoint_id: u64,
-    assignment: WireAssignmentFence,
-    assignment_digest: Option<[u8; 32]>,
-    leader_proof: Option<barrier_v1::LeaderProof>,
+    prepare: BarrierAnnouncement,
     deadline: tokio::time::Instant,
+    max_attempt_duration: Duration,
 ) -> Result<(NodeId, CheckpointWatermark), (NodeId, PeerFailure)> {
+    let assignment = assignment_fence_to_wire(prepare.assignment_fence.as_ref());
+    let assignment_digest = prepare
+        .assignment_fence
+        .as_ref()
+        .map(super::CheckpointAssignmentFence::digest);
+    let leader_proof = leader_proof_to_wire(prepare.leader_proof.as_ref());
     let mut backoff = PREPARE_RETRY_INITIAL_BACKOFF;
 
     loop {
@@ -1236,13 +1443,11 @@ async fn prepare_peer_until_deadline(
             return Err((peer, PeerFailure::Unreachable));
         }
 
-        let client =
-            match tokio::time::timeout_at(deadline, get_barrier_client(peer, &clients_pool, &kv))
-                .await
-            {
-                Ok(client) => client,
-                Err(_) => return Err((peer, PeerFailure::Unreachable)),
-            };
+        let Ok(client) =
+            tokio::time::timeout_at(deadline, get_barrier_client(peer, &clients_pool, &kv)).await
+        else {
+            return Err((peer, PeerFailure::Unreachable));
+        };
         let Some(mut client) = client else {
             if wait_for_prepare_retry(deadline, &mut backoff).await {
                 continue;
@@ -1259,7 +1464,7 @@ async fn prepare_peer_until_deadline(
         // Leave part of the existing quorum budget available to evict and re-resolve a lazy
         // channel whose readiness check stalls. Prepare identities are idempotent, so a live
         // follower may safely complete an earlier attempt and serve its cached acknowledgement.
-        let attempt_budget = remaining / 2;
+        let attempt_budget = (remaining / 2).min(max_attempt_duration);
         if attempt_budget.is_zero() {
             clients_pool.lock().remove(&peer);
             return Err((peer, PeerFailure::Unreachable));
@@ -1267,9 +1472,9 @@ async fn prepare_peer_until_deadline(
         let attempt_deadline = now + attempt_budget;
 
         let mut request = tonic::Request::new(barrier_v1::PrepareRequest {
-            epoch,
-            checkpoint_id,
-            flags: 0,
+            epoch: prepare.epoch,
+            checkpoint_id: prepare.checkpoint_id,
+            flags: prepare.flags,
             assignment_version: assignment.version,
             assignment_participants: assignment.participants.clone(),
             assignment_vnode_count: assignment.vnode_count,
@@ -1281,8 +1486,8 @@ async fn prepare_peer_until_deadline(
         match tokio::time::timeout_at(attempt_deadline, client.prepare(request)).await {
             Ok(Ok(response)) => {
                 let ack = response.into_inner();
-                if ack.epoch != epoch
-                    || ack.checkpoint_id != checkpoint_id
+                if ack.epoch != prepare.epoch
+                    || ack.checkpoint_id != prepare.checkpoint_id
                     || ack.assignment_digest.as_slice()
                         != assignment_digest
                             .as_ref()
@@ -1616,6 +1821,8 @@ impl BarrierCoordinator {
             latest_rx,
             merge_error,
             prepare_acks,
+            prepare_fanout: parking_lot::Mutex::new(None),
+            announcement_lock: tokio::sync::Mutex::new(()),
             clients,
             server_handle: Arc::new(parking_lot::Mutex::new(Some(server_task))),
             relay_handle: Arc::new(parking_lot::Mutex::new(Some(relay_task))),
@@ -1699,16 +1906,59 @@ impl BarrierCoordinator {
         }
     }
 
-    /// Leader-side announce.
+    /// Leader-side announcement for terminal, aligned, and assignment-less local/KV phases.
     ///
     /// # Errors
-    /// Returns a string on JSON encode failure.
+    /// Assignment-certified Prepare must use [`Self::announce_prepare`] so its retry cadence is
+    /// derived from the configured quorum window. Other errors propagate validation and encoding
+    /// failures.
     pub async fn announce(&self, ann: &BarrierAnnouncement) -> Result<(), String> {
+        #[cfg(feature = "cluster")]
+        if ann.phase == Phase::Prepare && ann.assignment_fence.is_some() {
+            return Err(
+                "assignment-certified Prepare requires an explicit quorum retry window".into(),
+            );
+        }
+        self.announce_inner(ann, None).await
+    }
+
+    /// Durably publish one assignment-certified Prepare and immediately start its direct fan-out.
+    ///
+    /// # Errors
+    /// Rejects a different phase, an assignment-less announcement, a zero/indivisible quorum
+    /// window, malformed authority, or conflicting in-flight Prepare state.
+    #[cfg(feature = "cluster")]
+    pub async fn announce_prepare(
+        &self,
+        ann: &BarrierAnnouncement,
+        quorum_window: Duration,
+    ) -> Result<(), String> {
+        if ann.phase != Phase::Prepare || ann.assignment_fence.is_none() {
+            return Err("explicit Prepare fan-out requires an assignment certificate".into());
+        }
+        self.announce_inner(ann, Some(quorum_window)).await
+    }
+
+    async fn announce_inner(
+        &self,
+        ann: &BarrierAnnouncement,
+        prepare_quorum_window: Option<Duration>,
+    ) -> Result<(), String> {
         #[cfg(feature = "cluster")]
         {
             self.validate_reversible_announcement(ann).await?;
+            let (prepare_roster, prepare_budget) = prepare_fanout_plan(ann, prepare_quorum_window)?;
             let grpc_opt = self.grpc.lock().clone();
             if let Some(state) = grpc_opt {
+                let announcement_guard = state.announcement_lock.lock().await;
+                let replace_prepare_fanout = if prepare_roster.is_some() {
+                    // Reject stale/equivocating retries before they can overwrite the durable
+                    // gossip slot. The announcement lock keeps this check and publication atomic
+                    // with respect to every local phase transition.
+                    preflight_prepare_fanout(&state, ann)?
+                } else {
+                    false
+                };
                 // Record the decision in KV before delivery, so a reclaiming
                 // leader's `max_announced()` and a recovering peer's KV fallback
                 // still see this epoch even if a peer RPC below fails and returns
@@ -1716,8 +1966,25 @@ impl BarrierCoordinator {
                 let json = serde_json::to_string(ann).map_err(|e| e.to_string())?;
                 self.kv.write(ANNOUNCEMENT_KEY, json).await;
                 if ann.phase == Phase::Prepare {
-                    // Prepare RPCs come from wait_for_quorum; a redundant one here double-fires.
+                    if let Some(expected) = prepare_roster.filter(|_| replace_prepare_fanout) {
+                        // Start the exact assignment-complete batch only after Prepare is durable.
+                        // Local source fencing, shuffle alignment, and state capture can now run
+                        // concurrently with follower capture instead of delaying RPC delivery.
+                        install_prepare_fanout(
+                            &state,
+                            &self.kv,
+                            ann,
+                            expected,
+                            prepare_budget.expect("certified Prepare budget was validated"),
+                        );
+                    }
+                    drop(announcement_guard);
                 } else {
+                    // Retire a still-pending batch. A claimed batch's tasks are owned by the
+                    // quorum future; checkpoint orchestration completes or drops that future
+                    // before it publishes this terminal/successor phase.
+                    retire_prepare_fanout(&state, ann);
+                    drop(announcement_guard);
                     // A node's barrier address lingers in the KV after it dies,
                     // so announce to peers still Active in membership — a Commit
                     // RPC to a departed peer returns Err and wedges every epoch.
@@ -1792,6 +2059,8 @@ impl BarrierCoordinator {
             }
         }
 
+        #[cfg(not(feature = "cluster"))]
+        let _ = prepare_quorum_window;
         let json = serde_json::to_string(ann).map_err(|e| e.to_string())?;
         self.kv.write(ANNOUNCEMENT_KEY, json).await;
         Ok(())
@@ -1921,29 +2190,123 @@ impl BarrierCoordinator {
         {
             let grpc_opt = self.grpc.lock().clone();
             if let Some(state) = grpc_opt {
-                let assignment = assignment_fence_to_wire(prepare.assignment_fence.as_ref());
-                let leader_proof = leader_proof_to_wire(prepare.leader_proof.as_ref());
-                let prepare_deadline = tokio::time::Instant::now() + deadline;
-                let mut futures = Vec::new();
-                for &peer in expected {
-                    let clients_pool = Arc::clone(&state.clients);
-                    let kv = Arc::clone(&self.kv);
-                    let assignment = assignment.clone();
-                    let leader_proof = leader_proof.clone();
-                    futures.push(prepare_peer_until_deadline(
-                        peer,
-                        clients_pool,
-                        kv,
-                        epoch,
-                        checkpoint_id,
-                        assignment,
-                        assignment_digest,
-                        leader_proof,
-                        prepare_deadline,
-                    ));
-                }
+                let expected_roster = match canonical_expected_roster(expected) {
+                    Ok(roster) => roster,
+                    Err(error) => {
+                        return QuorumOutcome::Failed {
+                            failures: vec![(
+                                expected.first().copied().unwrap_or(NodeId::UNASSIGNED),
+                                error,
+                            )],
+                        };
+                    }
+                };
+                let eager_batch = if prepare.assignment_fence.is_some() {
+                    let mut pending = state.prepare_fanout.lock();
+                    match pending.take() {
+                        Some(PrepareFanoutState::Pending(batch))
+                            if batch.announcement == *prepare
+                                && batch.expected == expected_roster =>
+                        {
+                            *pending = Some(PrepareFanoutState::Claimed(prepare.clone()));
+                            Some(batch)
+                        }
+                        Some(state @ PrepareFanoutState::Pending(_))
+                            if state.announcement() != prepare =>
+                        {
+                            let claimed = state.announcement().clone();
+                            *pending = Some(PrepareFanoutState::Claimed(claimed));
+                            return QuorumOutcome::Failed {
+                                failures: vec![(
+                                    expected_roster
+                                        .first()
+                                        .copied()
+                                        .unwrap_or(NodeId::UNASSIGNED),
+                                    "Prepare quorum does not match the exact announced fan-out"
+                                        .into(),
+                                )],
+                            };
+                        }
+                        Some(state @ PrepareFanoutState::Pending(_)) => {
+                            let claimed = state.announcement().clone();
+                            *pending = Some(PrepareFanoutState::Claimed(claimed));
+                            return QuorumOutcome::Failed {
+                                failures: vec![(
+                                    expected_roster
+                                        .first()
+                                        .copied()
+                                        .unwrap_or(NodeId::UNASSIGNED),
+                                    "Prepare quorum roster does not match the announced assignment"
+                                        .into(),
+                                )],
+                            };
+                        }
+                        Some(state @ PrepareFanoutState::Claimed(_)) => {
+                            let exact = state.announcement() == prepare;
+                            *pending = Some(state);
+                            return QuorumOutcome::Failed {
+                                failures: vec![(
+                                    expected_roster
+                                        .first()
+                                        .copied()
+                                        .unwrap_or(NodeId::UNASSIGNED),
+                                    if exact {
+                                        "clustered Prepare fan-out was already claimed"
+                                    } else {
+                                        "Prepare quorum does not match the claimed fan-out"
+                                    }
+                                    .into(),
+                                )],
+                            };
+                        }
+                        None => {
+                            return QuorumOutcome::Failed {
+                                failures: vec![(
+                                    expected_roster
+                                        .first()
+                                        .copied()
+                                        .unwrap_or(NodeId::UNASSIGNED),
+                                    "clustered Prepare has no in-flight announced fan-out".into(),
+                                )],
+                            };
+                        }
+                    }
+                } else {
+                    None
+                };
 
-                let results = futures::future::join_all(futures).await;
+                let prepare_deadline = tokio::time::Instant::now() + deadline;
+                let results = if let Some(mut batch) = eager_batch {
+                    debug_assert_eq!(batch.tasks.len(), expected_roster.len());
+                    let mut results = Vec::with_capacity(expected_roster.len());
+                    loop {
+                        match tokio::time::timeout_at(prepare_deadline, batch.tasks.join_next())
+                            .await
+                        {
+                            Ok(Some(Ok(result))) => results.push(result),
+                            Ok(Some(Err(error))) => results.push(Err((
+                                NodeId::UNASSIGNED,
+                                PeerFailure::Nack(format!("Prepare RPC task failed: {error}")),
+                            ))),
+                            Ok(None) | Err(_) => break,
+                        }
+                    }
+                    results
+                } else {
+                    // Embedded/single-node use with the cluster feature and legacy direct tests
+                    // have no assignment certificate. Keep their on-demand direct path intact.
+                    let futures = expected.iter().map(|&peer| {
+                        prepare_peer_until_deadline(
+                            peer,
+                            Arc::clone(&state.clients),
+                            Arc::clone(&self.kv),
+                            prepare.clone(),
+                            prepare_deadline,
+                            deadline / 2,
+                        )
+                    });
+                    futures::future::join_all(futures).await
+                };
 
                 let mut successful = Vec::new();
                 let mut failures = Vec::new();
@@ -1962,6 +2325,21 @@ impl BarrierCoordinator {
                         Err((peer, PeerFailure::Nack(msg))) => failures.push((peer, msg)),
                     }
                 }
+                successful.sort_unstable_by_key(|peer| peer.0);
+                failures.sort_unstable_by_key(|(peer, _)| peer.0);
+
+                let completed: FxHashSet<NodeId> = successful
+                    .iter()
+                    .copied()
+                    .chain(timed_out.iter().copied())
+                    .chain(failures.iter().map(|(peer, _)| *peer))
+                    .collect();
+                for &peer in &expected_roster {
+                    if !completed.contains(&peer) {
+                        timed_out.push(peer);
+                    }
+                }
+                timed_out.sort_unstable_by_key(|peer| peer.0);
 
                 if !failures.is_empty() {
                     return QuorumOutcome::Failed { failures };
@@ -1975,6 +2353,7 @@ impl BarrierCoordinator {
                             missing.push(peer);
                         }
                     }
+                    missing.sort_unstable_by_key(|peer| peer.0);
                     return QuorumOutcome::TimedOut { got, missing };
                 }
 
@@ -2156,6 +2535,20 @@ mod tests {
         ] {
             assert!(!retryable_prepare_status(&tonic::Status::new(code, "")));
         }
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn eager_prepare_retry_budget_tracks_the_configured_quorum_window() {
+        let default = prepare_fanout_budget(Duration::from_secs(3)).unwrap();
+        assert_eq!(default.per_attempt, Duration::from_millis(1_500));
+        assert_eq!(default.total, PREPARE_RPC_TIMEOUT);
+
+        let extended = prepare_fanout_budget(Duration::from_secs(40)).unwrap();
+        assert_eq!(extended.per_attempt, Duration::from_secs(20));
+        assert_eq!(extended.total, Duration::from_secs(40));
+        assert!(prepare_fanout_budget(Duration::ZERO).is_err());
+        assert!(prepare_fanout_budget(Duration::from_nanos(1)).is_err());
     }
 
     #[cfg(feature = "cluster")]
@@ -2435,6 +2828,47 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn prepare_validation_precedes_transport_start_and_durable_publication() {
+            let leader_kv = kv(NodeId(1));
+            let (store, leader_proof) = lease_authority().await;
+            let leader = coordinator(leader_kv.clone(), store);
+            let valid = BarrierAnnouncement {
+                epoch: 1,
+                checkpoint_id: 40,
+                assignment_fence: Some(test_fence(9, &[1, 2], &[(1, 1), (2, 22)])),
+                leader_proof: Some(leader_proof.clone()),
+                phase: Phase::Prepare,
+                flags: 0,
+                min_watermark_ms: None,
+            };
+
+            assert!(leader
+                .announce_prepare(&valid, Duration::ZERO)
+                .await
+                .is_err());
+            assert!(leader_kv
+                .read_from(NodeId(1), ANNOUNCEMENT_KEY)
+                .await
+                .is_none());
+
+            let leader_outside_roster = BarrierAnnouncement {
+                epoch: 1,
+                checkpoint_id: 41,
+                assignment_fence: Some(test_fence(10, &[2], &[(2, 22)])),
+                leader_proof: Some(leader_proof),
+                ..valid
+            };
+            assert!(leader
+                .announce_prepare(&leader_outside_roster, Duration::from_secs(1))
+                .await
+                .is_err());
+            assert!(leader_kv
+                .read_from(NodeId(1), ANNOUNCEMENT_KEY)
+                .await
+                .is_none());
+        }
+
+        #[tokio::test]
         async fn remote_proof_confirmation_acknowledges_only_the_exact_live_provider_value() {
             let caller_kv = kv(NodeId(1));
             let remote_kv = kv(NodeId(2));
@@ -2567,6 +3001,354 @@ mod tests {
             );
         }
 
+        fn pending_prepare_waiters(
+            coordinator: &BarrierCoordinator,
+            prepare: &BarrierAnnouncement,
+        ) -> usize {
+            let identity = BarrierIdentity::from_announcement(prepare);
+            let state = coordinator.grpc.lock().clone().unwrap();
+            let waiters = state
+                .prepare_acks
+                .lock()
+                .pending
+                .get(&identity)
+                .map_or(0, Vec::len);
+            waiters
+        }
+
+        async fn wait_for_direct_prepare(
+            coordinator: &BarrierCoordinator,
+            prepare: &BarrierAnnouncement,
+        ) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if coordinator.prepare_received_at(prepare).is_some() {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("direct Prepare was not delivered");
+        }
+
+        async fn started_barrier_pair() -> (
+            BarrierCoordinator,
+            BarrierCoordinator,
+            crate::cluster::control::LeaderProof,
+        ) {
+            let leader_kv = kv(NodeId(1));
+            let follower_kv = kv(NodeId(2));
+            let (store, proof) = lease_authority().await;
+            let leader = coordinator(leader_kv.clone(), Arc::clone(&store));
+            let follower = coordinator(follower_kv, store);
+            let slot = || Arc::new(parking_lot::RwLock::new(None));
+            leader
+                .start_server("127.0.0.1:0".parse().unwrap(), None, slot())
+                .await
+                .unwrap();
+            let follower_addr = follower
+                .start_server("127.0.0.1:0".parse().unwrap(), None, slot())
+                .await
+                .unwrap();
+            leader_kv.seed(NodeId(2), BARRIER_ADDR_KEY, follower_addr.to_string());
+            (leader, follower, proof)
+        }
+
+        #[tokio::test]
+        async fn announce_starts_one_prepare_rpc_before_quorum_wait() {
+            let (leader, follower, proof) = started_barrier_pair().await;
+
+            let fence = test_fence(9, &[1, 2], &[(1, 1), (2, 22)]);
+            let prepare = BarrierAnnouncement {
+                epoch: 1,
+                checkpoint_id: 41,
+                assignment_fence: Some(fence.clone()),
+                leader_proof: Some(proof),
+                phase: Phase::Prepare,
+                flags: crate::checkpoint::flags::FULL_SNAPSHOT,
+                min_watermark_ms: None,
+            };
+
+            assert!(leader.announce(&prepare).await.is_err());
+            assert!(
+                leader
+                    .kv
+                    .read_from(NodeId(1), ANNOUNCEMENT_KEY)
+                    .await
+                    .is_none(),
+                "generic announcement must reject certified Prepare before durable publication"
+            );
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                leader.announce_prepare(&prepare, Duration::from_secs(1)),
+            )
+            .await
+            .expect("announce must not wait for the follower acknowledgement")
+            .unwrap();
+            wait_for_direct_prepare(&follower, &prepare).await;
+            let direct = wait_observe_exact(
+                &follower,
+                NodeId(1),
+                CheckpointAttempt::new(prepare.epoch, prepare.checkpoint_id),
+                Phase::Prepare,
+            )
+            .await;
+            assert_eq!(direct, prepare);
+            assert_eq!(pending_prepare_waiters(&follower, &prepare), 1);
+            let accepted_json = leader
+                .kv
+                .read_from(NodeId(1), ANNOUNCEMENT_KEY)
+                .await
+                .unwrap();
+            leader
+                .announce_prepare(&prepare, Duration::from_secs(1))
+                .await
+                .unwrap();
+            let conflicting = BarrierAnnouncement {
+                flags: 0,
+                ..prepare.clone()
+            };
+            assert!(leader
+                .announce_prepare(&conflicting, Duration::from_secs(1))
+                .await
+                .is_err());
+            assert_eq!(
+                leader.kv.read_from(NodeId(1), ANNOUNCEMENT_KEY).await,
+                Some(accepted_json),
+                "rejected equivocation must not overwrite the durable announcement"
+            );
+            assert_eq!(
+                pending_prepare_waiters(&follower, &prepare),
+                1,
+                "idempotent and conflicting publications must not issue another RPC"
+            );
+
+            let quorum = leader.wait_for_quorum(&prepare, &[NodeId(2)], Duration::from_secs(1));
+            tokio::pin!(quorum);
+            tokio::select! {
+                outcome = &mut quorum => panic!("silent follower completed quorum early: {outcome:?}"),
+                () = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+            assert_eq!(
+                pending_prepare_waiters(&follower, &prepare),
+                1,
+                "wait_for_quorum must consume the eager task instead of issuing a duplicate RPC"
+            );
+
+            follower
+                .ack(&BarrierAck {
+                    epoch: prepare.epoch,
+                    checkpoint_id: prepare.checkpoint_id,
+                    assignment_digest: Some(fence.digest()),
+                    ok: true,
+                    error: None,
+                    watermark: CheckpointWatermark::Active(91),
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                quorum.await,
+                QuorumOutcome::Reached {
+                    acks,
+                    follower_watermark: CheckpointWatermark::Active(91),
+                } if acks == vec![NodeId(2)]
+            ));
+        }
+
+        #[tokio::test]
+        async fn eager_prepare_ack_before_quorum_wait_is_retained() {
+            let (leader, follower, proof) = started_barrier_pair().await;
+            let fence = test_fence(10, &[1, 2], &[(1, 1), (2, 22)]);
+            let prepare = BarrierAnnouncement {
+                epoch: 2,
+                checkpoint_id: 42,
+                assignment_fence: Some(fence.clone()),
+                leader_proof: Some(proof),
+                phase: Phase::Prepare,
+                flags: 0,
+                min_watermark_ms: None,
+            };
+
+            leader
+                .announce_prepare(&prepare, Duration::from_secs(1))
+                .await
+                .unwrap();
+            wait_for_direct_prepare(&follower, &prepare).await;
+            follower
+                .ack(&BarrierAck {
+                    epoch: prepare.epoch,
+                    checkpoint_id: prepare.checkpoint_id,
+                    assignment_digest: Some(fence.digest()),
+                    ok: true,
+                    error: None,
+                    watermark: CheckpointWatermark::Active(92),
+                })
+                .await
+                .unwrap();
+
+            let outcome = leader
+                .wait_for_quorum(&prepare, &[NodeId(2)], Duration::from_secs(1))
+                .await;
+            assert!(matches!(
+                outcome,
+                QuorumOutcome::Reached {
+                    acks,
+                    follower_watermark: CheckpointWatermark::Active(92),
+                } if acks == vec![NodeId(2)]
+            ));
+        }
+
+        #[tokio::test]
+        async fn quorum_deadline_aborts_a_silent_eager_prepare_rpc() {
+            let (leader, follower, proof) = started_barrier_pair().await;
+
+            let fence = test_fence(10, &[1, 2], &[(1, 1), (2, 22)]);
+            let prepare = BarrierAnnouncement {
+                epoch: 2,
+                checkpoint_id: 42,
+                assignment_fence: Some(fence),
+                leader_proof: Some(proof),
+                phase: Phase::Prepare,
+                flags: 0,
+                min_watermark_ms: None,
+            };
+            leader
+                .announce_prepare(&prepare, Duration::from_millis(50))
+                .await
+                .unwrap();
+            wait_for_direct_prepare(&follower, &prepare).await;
+
+            let started = std::time::Instant::now();
+            let outcome = leader
+                .wait_for_quorum(&prepare, &[NodeId(2)], Duration::from_millis(50))
+                .await;
+            assert!(matches!(
+                outcome,
+                QuorumOutcome::TimedOut {
+                    got,
+                    missing,
+                } if got.is_empty() && missing == vec![NodeId(2)]
+            ));
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "the caller deadline must bound the eager task's longer transport deadline"
+            );
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while pending_prepare_waiters(&follower, &prepare) != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("caller timeout did not cancel the follower Prepare waiter");
+        }
+
+        #[tokio::test]
+        async fn newer_and_terminal_announcements_retire_eager_prepare_tasks() {
+            let (leader, follower, proof) = started_barrier_pair().await;
+            let fence = test_fence(11, &[1, 2], &[(1, 1), (2, 22)]);
+            let first = BarrierAnnouncement {
+                epoch: 3,
+                checkpoint_id: 43,
+                assignment_fence: Some(fence.clone()),
+                leader_proof: Some(proof.clone()),
+                phase: Phase::Prepare,
+                flags: 0,
+                min_watermark_ms: None,
+            };
+            leader
+                .announce_prepare(&first, Duration::from_secs(1))
+                .await
+                .unwrap();
+            wait_for_direct_prepare(&follower, &first).await;
+            assert_eq!(pending_prepare_waiters(&follower, &first), 1);
+
+            let successor = BarrierAnnouncement {
+                epoch: 4,
+                checkpoint_id: 44,
+                ..first.clone()
+            };
+            leader
+                .announce_prepare(&successor, Duration::from_secs(1))
+                .await
+                .unwrap();
+            wait_for_direct_prepare(&follower, &successor).await;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while pending_prepare_waiters(&follower, &first) != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the newer Prepare did not cancel its predecessor task");
+            assert_eq!(pending_prepare_waiters(&follower, &successor), 1);
+
+            leader
+                .announce(&BarrierAnnouncement {
+                    phase: Phase::Abort,
+                    ..successor.clone()
+                })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while pending_prepare_waiters(&follower, &successor) != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the terminal announcement did not cancel its Prepare task");
+            assert!(
+                leader
+                    .grpc
+                    .lock()
+                    .as_ref()
+                    .unwrap()
+                    .prepare_fanout
+                    .lock()
+                    .is_none(),
+                "the terminal announcement must retire the batch identity"
+            );
+        }
+
+        #[tokio::test]
+        async fn quorum_roster_mismatch_aborts_the_eager_batch() {
+            let (leader, follower, proof) = started_barrier_pair().await;
+            let fence = test_fence(12, &[1, 2], &[(1, 1), (2, 22)]);
+            let prepare = BarrierAnnouncement {
+                epoch: 5,
+                checkpoint_id: 45,
+                assignment_fence: Some(fence),
+                leader_proof: Some(proof),
+                phase: Phase::Prepare,
+                flags: 0,
+                min_watermark_ms: None,
+            };
+            leader
+                .announce_prepare(&prepare, Duration::from_millis(100))
+                .await
+                .unwrap();
+            wait_for_direct_prepare(&follower, &prepare).await;
+
+            let outcome = leader
+                .wait_for_quorum(&prepare, &[NodeId(3)], Duration::from_millis(100))
+                .await;
+            assert!(matches!(outcome, QuorumOutcome::Failed { .. }));
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while pending_prepare_waiters(&follower, &prepare) != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("roster mismatch did not abort the eager Prepare task");
+
+            let retry = leader
+                .wait_for_quorum(&prepare, &[NodeId(2)], Duration::from_millis(100))
+                .await;
+            assert!(
+                matches!(retry, QuorumOutcome::Failed { .. }),
+                "a rejected batch must not be silently recreated: {retry:?}"
+            );
+        }
+
         #[tokio::test]
         async fn test_grpc_barrier_flow() {
             let leader_kv = kv(NodeId(1));
@@ -2590,7 +3372,7 @@ mod tests {
             // leader must not announce Commit until the follower has
             // observed Aligned (otherwise Commit may overwrite it).
             let (aligned_seen_tx, aligned_seen_rx) = tokio::sync::oneshot::channel::<()>();
-            let assignment_fence = test_fence(9, &[1, 2, 1, 2], &[(1, 11), (2, 22)]);
+            let assignment_fence = test_fence(9, &[1, 2, 1, 2], &[(1, 1), (2, 22)]);
             let follower_fence = assignment_fence.clone();
 
             let follower_task = tokio::spawn(async move {
@@ -2631,7 +3413,10 @@ mod tests {
                 flags: 0,
                 min_watermark_ms: None,
             };
-            leader_coord.announce(&prepare).await.unwrap();
+            leader_coord
+                .announce_prepare(&prepare, Duration::from_secs(5))
+                .await
+                .unwrap();
 
             let outcome = leader_coord
                 .wait_for_quorum(&prepare, &[NodeId(2)], Duration::from_secs(5))
@@ -2711,7 +3496,7 @@ mod tests {
                 barrier_v1::barrier_sync_client::BarrierSyncClient::new(dead_channel),
             );
 
-            let assignment_fence = test_fence(9, &[1, 2], &[(1, 11), (2, 22)]);
+            let assignment_fence = test_fence(9, &[1, 2], &[(1, 1), (2, 22)]);
             let follower_fence = assignment_fence.clone();
             let prepare = BarrierAnnouncement {
                 epoch: 2,
@@ -2722,7 +3507,10 @@ mod tests {
                 flags: 0,
                 min_watermark_ms: None,
             };
-            leader_coord.announce(&prepare).await.unwrap();
+            leader_coord
+                .announce_prepare(&prepare, Duration::from_secs(2))
+                .await
+                .unwrap();
 
             let follower = async {
                 let announcement = wait_observe(&follower_coord, NodeId(1), Phase::Prepare).await;
@@ -2937,8 +3725,8 @@ mod tests {
             leader_kv.seed(NodeId(2), BARRIER_ADDR_KEY, follower_addr.to_string());
             follower_kv.seed(NodeId(1), BARRIER_ADDR_KEY, leader_addr.to_string());
 
-            let accepted_fence = test_fence(9, &[1, 2, 1, 2], &[(1, 11), (2, 22)]);
-            let conflicting_fence = test_fence(9, &[2, 1, 1, 2], &[(1, 11), (2, 22)]);
+            let accepted_fence = test_fence(9, &[1, 2, 1, 2], &[(1, 1), (2, 22)]);
+            let conflicting_fence = test_fence(9, &[2, 1, 1, 2], &[(1, 1), (2, 22)]);
             let accepted = BarrierAnnouncement {
                 epoch: 12,
                 checkpoint_id: 102,
@@ -2952,7 +3740,10 @@ mod tests {
                 assignment_fence: Some(conflicting_fence),
                 ..accepted.clone()
             };
-            leader_coord.announce(&accepted).await.unwrap();
+            leader_coord
+                .announce_prepare(&accepted, Duration::from_secs(2))
+                .await
+                .unwrap();
 
             let accepted_wait =
                 leader_coord.wait_for_quorum(&accepted, &[NodeId(2)], Duration::from_secs(2));
@@ -2980,7 +3771,7 @@ mod tests {
                 "{accepted_outcome:?}"
             );
             assert!(
-                matches!(conflicting_outcome, QuorumOutcome::TimedOut { .. }),
+                matches!(conflicting_outcome, QuorumOutcome::Failed { .. }),
                 "a different certificate must not consume the accepted ACK: {conflicting_outcome:?}"
             );
 
@@ -3377,10 +4168,9 @@ mod tests {
         .is_err());
     }
 
-    /// The gRPC-vs-gossip merge in `observe`: a newer attempt's
-    /// gossip-only announcement (the early `Prepare` is KV-only)
-    /// supersedes an older epoch in the gRPC watch, while lagging
-    /// gossip for the same exact attempt never masks terminal progress.
+    /// The gRPC-vs-gossip merge in `observe`: a manually seeded gossip-only `Prepare` for a newer
+    /// attempt supersedes an older gRPC value, while lagging gossip for the same exact attempt
+    /// never masks terminal progress.
     #[cfg(feature = "cluster")]
     #[tokio::test]
     async fn observe_merges_grpc_and_gossip_by_epoch() {
@@ -3422,9 +4212,8 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
 
-        // The next epoch's early Prepare reaches this follower via
-        // gossip KV only (its prepare RPC comes later, at quorum time)
-        // and must win the merge over the stale watch value.
+        // This uncertified local-mode Prepare is seeded in gossip KV only and must win the merge
+        // over the stale watch value.
         let next = serde_json::to_string(&BarrierAnnouncement {
             epoch: 6,
             checkpoint_id: 10,
