@@ -17,7 +17,8 @@ pub enum CheckpointSchedule {
     Disabled,
     /// Checkpoints run only when explicitly requested.
     Manual,
-    /// Checkpoints run on the configured cadence and may also be requested explicitly.
+    /// Checkpoints wait at least this long after a terminal outcome before the next automatic
+    /// admission; they may also be requested explicitly.
     Periodic(Duration),
 }
 

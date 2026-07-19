@@ -4371,6 +4371,7 @@ impl StreamingCoordinator {
                     let publication_error = callback.publish_barrier(attempt).err();
                     self.broadcast_epoch_committed(attempt.epoch, &source_checkpoints);
                     self.finish_manual_success(attempt, &result);
+                    self.advance_checkpoint_cadence();
                     let continuation_error = publication_error.or(continuation_error);
                     if let Some(reason) = continuation_error.as_deref() {
                         callback.record_checkpoint_continuation_fault(attempt, reason);
@@ -4382,6 +4383,7 @@ impl StreamingCoordinator {
                 callback.abort_subscription_cut(attempt);
                 self.fail_manual_attempt(attempt, &error);
                 callback.record_checkpoint_failure(attempt.checkpoint_id, &error);
+                self.advance_checkpoint_cadence();
             }
         }
         None
@@ -5738,6 +5740,7 @@ impl StreamingCoordinator {
                 )
                 .await;
             let topology_cancelled = matches!(&outcome, BarrierOutcome::CancelledBeforeCapture);
+            let durable_tail_pending = matches!(&outcome, BarrierOutcome::Async);
             self.handle_aligned_checkpoint_outcome(
                 callback,
                 outcome,
@@ -5762,7 +5765,8 @@ impl StreamingCoordinator {
                     self.defer_checkpoint_until_topology_ready();
                 }
                 (true, CheckpointCleanupOwner::Follower) => {}
-                (false, _) => self.advance_checkpoint_cadence(),
+                (false, _) if !durable_tail_pending => self.advance_checkpoint_cadence(),
+                (false, _) => {}
             }
         }
         Ok(())
@@ -6163,6 +6167,7 @@ impl StreamingCoordinator {
             .await;
         let retry_after_topology_change =
             matches!(&outcome, BarrierOutcome::CancelledBeforeCapture);
+        let durable_tail_pending = matches!(&outcome, BarrierOutcome::Async);
         if let Err(error) = self
             .handle_source_less_checkpoint_outcome(callback, admission, attempt, outcome)
             .await
@@ -6171,7 +6176,7 @@ impl StreamingCoordinator {
         }
         if retry_after_topology_change {
             self.defer_checkpoint_until_topology_ready();
-        } else {
+        } else if !durable_tail_pending {
             self.advance_checkpoint_cadence();
         }
     }
@@ -8214,6 +8219,7 @@ mod tests {
         assert!(coordinator
             .handle_checkpoint_completion(completion, &mut callback)
             .is_none());
+        let accepted_cadence = coordinator.last_checkpoint;
 
         for invalid in [
             CheckpointAttempt::new(13, 119),
@@ -8233,6 +8239,7 @@ mod tests {
                 .handle_checkpoint_completion(completion, &mut callback)
                 .expect("non-strict checkpoint identity progress must fault");
             assert!(error.contains("not strictly newer"), "{error}");
+            assert_eq!(coordinator.last_checkpoint, accepted_cadence);
         }
         assert_eq!(*callback.published_barriers.lock(), vec![(12, 120)]);
         assert_eq!(coordinator.last_published_checkpoint, Some(newer));
@@ -8320,6 +8327,7 @@ mod tests {
         let mut callback = MockCallback::new();
         let published = Arc::clone(&callback.published_barriers);
         let aborted = Arc::clone(&callback.aborted_subscription_cuts);
+        let previous_cadence = coordinator.last_checkpoint;
         let attempt = CheckpointAttempt::new(14, 140);
         let mut source_checkpoints = FxHashMap::default();
         source_checkpoints.insert("source".to_owned(), checkpoint_at(140));
@@ -8344,6 +8352,7 @@ mod tests {
             .1
             .contains("cluster process lease expired"));
         assert_eq!(coordinator.last_published_checkpoint, None);
+        assert_eq!(coordinator.last_checkpoint, previous_cadence);
     }
 
     #[test]
@@ -8354,6 +8363,149 @@ mod tests {
             .checkpoint_in_flight
             .store(1, std::sync::atomic::Ordering::Release);
         assert!(!coordinator.checkpoint_capacity_available());
+    }
+
+    #[tokio::test]
+    async fn sourced_async_capture_does_not_advance_checkpoint_cadence() {
+        let (source, poll) = checkpoint_source_handle("source");
+        let mut coordinator = admission_coordinator(vec![source]);
+        coordinator.config.checkpoint_schedule =
+            CheckpointSchedule::Periodic(Duration::from_secs(60));
+        coordinator.last_checkpoint = Instant::now() - Duration::from_secs(60);
+        coordinator.checkpoint_retry_not_before =
+            Some(Instant::now() - Duration::from_millis(1));
+        coordinator.checkpoint_retry_backoff = Duration::from_millis(400);
+        let previous_cadence = coordinator.last_checkpoint;
+        let previous_retry = coordinator.checkpoint_retry_not_before;
+        let attempt = CheckpointAttempt::new(15, 150);
+        let mut callback = MockCallback::new();
+        callback.attempt_to_reserve = attempt;
+        callback.barrier_outcome = Some(BarrierOutcome::Async);
+
+        coordinator.maybe_checkpoint(&mut callback).await;
+        let barrier = poll.poll().expect("periodic source barrier was not injected");
+        coordinator
+            .handle_barrier(
+                0,
+                &barrier,
+                &checkpoint_at(attempt.epoch),
+                &mut callback,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(coordinator.last_checkpoint, previous_cadence);
+        assert_eq!(coordinator.checkpoint_retry_not_before, previous_retry);
+        assert_eq!(
+            coordinator.checkpoint_retry_backoff,
+            Duration::from_millis(400)
+        );
+    }
+
+    #[tokio::test]
+    async fn source_less_async_capture_does_not_advance_checkpoint_cadence() {
+        let mut coordinator = admission_coordinator(Vec::new());
+        coordinator.config.checkpoint_schedule =
+            CheckpointSchedule::Periodic(Duration::from_secs(60));
+        coordinator.last_checkpoint = Instant::now() - Duration::from_secs(60);
+        coordinator.checkpoint_retry_not_before =
+            Some(Instant::now() - Duration::from_millis(1));
+        coordinator.checkpoint_retry_backoff = Duration::from_millis(400);
+        let previous_cadence = coordinator.last_checkpoint;
+        let previous_retry = coordinator.checkpoint_retry_not_before;
+        let attempt = CheckpointAttempt::new(16, 160);
+        let mut callback = MockCallback::new();
+        callback.attempt_to_reserve = attempt;
+        callback.barrier_outcome = Some(BarrierOutcome::Async);
+
+        coordinator.maybe_checkpoint(&mut callback).await;
+
+        assert_eq!(coordinator.last_checkpoint, previous_cadence);
+        assert_eq!(coordinator.checkpoint_retry_not_before, previous_retry);
+        assert_eq!(
+            coordinator.checkpoint_retry_backoff,
+            Duration::from_millis(400)
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_completions_start_the_next_periodic_delay() {
+        let committed = CheckpointAttempt::new(17, 170);
+        let failed = CheckpointAttempt::new(18, 180);
+        let completions = [
+            (
+                committed,
+                CheckpointCompletion::validated(
+                    committed,
+                    successful_checkpoint_result(committed),
+                    FxHashMap::default(),
+                )
+                .unwrap(),
+                false,
+            ),
+            (
+                failed,
+                CheckpointCompletion::failed(failed, "injected durable-tail failure"),
+                true,
+            ),
+        ];
+
+        for (attempt, completion, failed) in completions {
+            let mut coordinator = admission_coordinator(Vec::new());
+            let interval = Duration::from_secs(60);
+            coordinator.config.checkpoint_schedule = CheckpointSchedule::Periodic(interval);
+            coordinator.last_checkpoint = Instant::now() - interval;
+            coordinator.checkpoint_retry_not_before = Some(Instant::now() + interval);
+            coordinator.checkpoint_retry_backoff = Duration::from_millis(800);
+            let terminal_started = Instant::now();
+            let mut callback = MockCallback::new();
+            callback.runtime.leader = false;
+
+            assert!(coordinator
+                .handle_checkpoint_completion(completion, &mut callback)
+                .is_none());
+
+            assert!(coordinator.last_checkpoint >= terminal_started);
+            assert!(coordinator.checkpoint_retry_not_before.is_none());
+            assert_eq!(coordinator.checkpoint_retry_backoff, Duration::ZERO);
+            assert_eq!(callback.checkpoint_failures.len(), usize::from(failed));
+
+            callback.runtime.leader = true;
+            coordinator.maybe_checkpoint(&mut callback).await;
+            assert_eq!(callback.reserve_calls, 0);
+
+            coordinator.last_checkpoint = Instant::now() - interval;
+            let successor = CheckpointAttempt::new(
+                attempt.epoch + 100,
+                attempt.checkpoint_id + 1_000,
+            );
+            callback.attempt_to_reserve = successor;
+            callback.barrier_outcome = Some(BarrierOutcome::Committed(successor.epoch));
+            coordinator.maybe_checkpoint(&mut callback).await;
+            assert_eq!(callback.reserve_calls, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn source_less_synchronous_outcome_advances_checkpoint_cadence() {
+        let mut coordinator = admission_coordinator(Vec::new());
+        coordinator.config.checkpoint_schedule =
+            CheckpointSchedule::Periodic(Duration::from_secs(60));
+        coordinator.last_checkpoint = Instant::now() - Duration::from_secs(60);
+        coordinator.checkpoint_retry_not_before =
+            Some(Instant::now() - Duration::from_millis(1));
+        coordinator.checkpoint_retry_backoff = Duration::from_millis(400);
+        let previous_cadence = coordinator.last_checkpoint;
+        let attempt = CheckpointAttempt::new(19, 190);
+        let mut callback = MockCallback::new();
+        callback.attempt_to_reserve = attempt;
+        callback.barrier_outcome = Some(BarrierOutcome::Committed(attempt.epoch));
+
+        coordinator.maybe_checkpoint(&mut callback).await;
+
+        assert!(coordinator.last_checkpoint > previous_cadence);
+        assert!(coordinator.checkpoint_retry_not_before.is_none());
+        assert_eq!(coordinator.checkpoint_retry_backoff, Duration::ZERO);
     }
 
     #[tokio::test]
