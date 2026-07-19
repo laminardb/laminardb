@@ -21,6 +21,7 @@ async fn bind_in_memory_decision_store(
 }
 
 mod disk_persistence {
+    use laminar_connectors::connector::DeliveryGuarantee;
     use laminar_core::storage::checkpoint_store::{CheckpointStore, FileSystemCheckpointStore};
     use laminar_core::streaming::StreamCheckpointConfig;
     use laminar_db::{LaminarConfig, LaminarDB};
@@ -32,47 +33,35 @@ mod disk_persistence {
                 interval_ms: None, // manual only
                 ..StreamCheckpointConfig::default()
             }),
+            delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
             ..LaminarConfig::default()
         }
     }
 
     #[tokio::test]
-    async fn test_manual_checkpoint_writes_to_disk() {
+    async fn test_at_least_once_manual_checkpoint_writes_to_disk() {
         let dir = tempfile::tempdir().unwrap();
         let storage = dir.path().to_path_buf();
 
         let db = LaminarDB::open_with_config(config_with_storage(&storage)).unwrap();
 
-        db.execute("CREATE SOURCE sensors (ts BIGINT, device VARCHAR, value DOUBLE)")
-            .await
-            .unwrap();
         db.execute(
-            "CREATE STREAM avg_val AS SELECT device, AVG(value) AS avg_v FROM sensors GROUP BY device",
+            "CREATE SOURCE sensors (seq BIGINT, ts_ms BIGINT, value VARCHAR) WITH \
+             ('connector' = 'generator', 'rows.per.second' = '1000', 'max.rows' = '3')",
         )
         .await
         .unwrap();
-        db.execute("CREATE SINK out FROM avg_val").await.unwrap();
+        db.execute("CREATE STREAM projected AS SELECT seq FROM sensors")
+            .await
+            .unwrap();
+        db.execute("CREATE SINK out FROM projected").await.unwrap();
 
         db.start().await.unwrap();
-
-        // Insert some data
-        let source = db.source_untyped("sensors").unwrap();
-        let schema = source.schema();
-        let batch = arrow::array::RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                std::sync::Arc::new(arrow::array::Int64Array::from(vec![1, 2, 3])),
-                std::sync::Arc::new(arrow::array::StringArray::from(vec!["a", "b", "a"])),
-                std::sync::Arc::new(arrow::array::Float64Array::from(vec![1.0, 2.0, 3.0])),
-            ],
-        )
-        .unwrap();
-        source.push_arrow(batch).unwrap();
 
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 if db
-                    .stream_metrics("avg_val")
+                    .stream_metrics("projected")
                     .is_some_and(|metrics| metrics.total_events > 0)
                 {
                     break;
@@ -81,7 +70,7 @@ mod disk_persistence {
             }
         })
         .await
-        .expect("the inserted batch must complete a processing cycle");
+        .expect("the generated rows must complete a processing cycle");
 
         // Manual checkpoint — this should persist to disk
         let result = db.checkpoint().await.unwrap();
@@ -112,7 +101,75 @@ mod disk_persistence {
             laminar_core::state::PARTITIONING_ABI_VERSION
         );
 
-        db.close();
+        db.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_exactly_once_manual_checkpoint_writes_to_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().to_path_buf();
+        let state_dir = storage.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let state_store: std::sync::Arc<dyn object_store::ObjectStore> = std::sync::Arc::new(
+            object_store::local::LocalFileSystem::new_with_prefix(&state_dir).unwrap(),
+        );
+        let db = LaminarDB::builder()
+            .storage_dir(&storage)
+            .checkpoint(StreamCheckpointConfig {
+                interval_ms: None,
+                data_dir: Some(storage.clone()),
+                ..StreamCheckpointConfig::default()
+            })
+            .delivery_guarantee(DeliveryGuarantee::ExactlyOnce)
+            .state_backend(std::sync::Arc::new(
+                laminar_core::state::ObjectStoreBackend::node_durable(state_store, "node-0", 1),
+            ))
+            .vnode_registry(std::sync::Arc::new(
+                laminar_core::state::VnodeRegistry::single_owner(1, laminar_core::state::NodeId(0)),
+            ))
+            .build()
+            .await
+            .unwrap();
+
+        db.execute(
+            "CREATE SOURCE sensors (seq BIGINT, ts_ms BIGINT, value VARCHAR) WITH \
+             ('connector' = 'generator', 'rows.per.second' = '1000', 'max.rows' = '3')",
+        )
+        .await
+        .unwrap();
+        db.execute("CREATE STREAM projected AS SELECT seq FROM sensors")
+            .await
+            .unwrap();
+
+        db.start()
+            .await
+            .expect("local node-durable exactly-once must admit manual checkpointing");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if db
+                    .stream_metrics("projected")
+                    .is_some_and(|metrics| metrics.total_events > 0)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the generated rows must complete an exact processing cycle");
+
+        let result = db.checkpoint().await.unwrap();
+        assert!(result.success, "manual exact checkpoint should succeed");
+        assert_eq!(result.checkpoint_id, 1);
+
+        let manifest = FileSystemCheckpointStore::new(&storage)
+            .load_latest()
+            .await
+            .unwrap()
+            .expect("manual exact checkpoint must publish a manifest");
+        assert_eq!((manifest.epoch, manifest.checkpoint_id), (1, 1));
+
+        db.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -121,6 +178,31 @@ mod disk_persistence {
 
         let err = db.checkpoint().await;
         assert!(err.is_err(), "checkpoint should fail when not enabled");
+    }
+
+    #[tokio::test]
+    async fn test_at_least_once_rejects_disabled_checkpointing() {
+        let db = LaminarDB::open_with_config(LaminarConfig {
+            delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
+            checkpoint: None,
+            ..LaminarConfig::default()
+        })
+        .unwrap();
+        db.execute(
+            "CREATE SOURCE input (seq BIGINT, ts_ms BIGINT, value VARCHAR) WITH \
+             ('connector' = 'generator', 'max.rows' = '1')",
+        )
+        .await
+        .unwrap();
+        db.execute("CREATE STREAM output AS SELECT seq FROM input")
+            .await
+            .unwrap();
+
+        let error = db
+            .start()
+            .await
+            .expect_err("at-least-once must reject disabled checkpointing");
+        assert!(error.to_string().contains("[LDB-5032]"), "{error}");
     }
 
     #[tokio::test]
@@ -152,8 +234,8 @@ mod exactly_once {
         CheckpointConfig, CheckpointCoordinator, CheckpointRequest,
     };
     use laminar_db::pipeline::{
-        CycleError, CycleOutcome, PipelineCallback, PipelineConfig, SourceRegistration,
-        StreamingCoordinator, StreamingCoordinatorRuntime,
+        CheckpointSchedule, CycleError, CycleOutcome, PipelineCallback, PipelineConfig,
+        SourceRegistration, StreamingCoordinator, StreamingCoordinatorRuntime,
     };
 
     /// A callback that tracks barrier checkpoint calls and records state.
@@ -403,7 +485,7 @@ mod exactly_once {
         let config = PipelineConfig {
             fallback_poll_interval: Duration::from_millis(1),
             batch_window: Duration::ZERO,
-            checkpoint_interval: Some(Duration::from_millis(10)),
+            checkpoint_schedule: CheckpointSchedule::Periodic(Duration::from_millis(10)),
             checkpoint_timeout: Duration::from_secs(5),
             ..PipelineConfig::default()
         };
@@ -489,7 +571,7 @@ mod exactly_once {
         let config = PipelineConfig {
             fallback_poll_interval: Duration::from_millis(1),
             batch_window: Duration::ZERO,
-            checkpoint_interval: Some(Duration::from_millis(10)),
+            checkpoint_schedule: CheckpointSchedule::Periodic(Duration::from_millis(10)),
             checkpoint_timeout: Duration::from_secs(5),
             ..PipelineConfig::default()
         };
@@ -644,7 +726,7 @@ mod exactly_once {
         let config = PipelineConfig {
             fallback_poll_interval: Duration::from_millis(1),
             batch_window: Duration::ZERO,
-            checkpoint_interval: Some(Duration::from_millis(10)),
+            checkpoint_schedule: CheckpointSchedule::Periodic(Duration::from_millis(10)),
             checkpoint_timeout: Duration::from_secs(5),
             ..PipelineConfig::default()
         };
@@ -718,7 +800,7 @@ mod exactly_once {
         let config = PipelineConfig {
             fallback_poll_interval: Duration::from_millis(1),
             batch_window: Duration::ZERO,
-            checkpoint_interval: Some(Duration::from_millis(5)),
+            checkpoint_schedule: CheckpointSchedule::Periodic(Duration::from_millis(5)),
             checkpoint_timeout: Duration::from_secs(1),
             ..PipelineConfig::default()
         };

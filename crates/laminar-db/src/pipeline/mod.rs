@@ -13,7 +13,7 @@ pub use callback::{
     BarrierOutcome, CheckpointAssignmentAdmission, CheckpointControlOutcome, CycleError,
     CycleOutcome, PipelineCallback, SkipReason, SourceRegistration,
 };
-pub use config::PipelineConfig;
+pub use config::{CheckpointSchedule, PipelineConfig};
 pub use streaming_coordinator::{ExitReason, StreamingCoordinator, StreamingCoordinatorRuntime};
 
 use laminar_sql::parser::EmitClause;

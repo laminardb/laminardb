@@ -6,6 +6,36 @@ use laminar_connectors::connector::DeliveryGuarantee;
 
 use crate::config::BackpressurePolicy;
 
+/// Checkpoint triggering configured for the running pipeline.
+///
+/// The three states mirror [`LaminarConfig::checkpoint`](crate::config::LaminarConfig::checkpoint)
+/// without allowing an enabled flag and timer interval to contradict each other.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CheckpointSchedule {
+    /// No durable checkpoint service is configured.
+    #[default]
+    Disabled,
+    /// Checkpoints run only when explicitly requested.
+    Manual,
+    /// Checkpoints run on the configured cadence and may also be requested explicitly.
+    Periodic(Duration),
+}
+
+impl CheckpointSchedule {
+    /// Whether the durable checkpoint service is configured.
+    pub const fn is_enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    /// The periodic cadence, if automatic checkpoints are configured.
+    pub const fn periodic_interval(self) -> Option<Duration> {
+        match self {
+            Self::Periodic(interval) => Some(interval),
+            Self::Disabled | Self::Manual => None,
+        }
+    }
+}
+
 /// Configuration for the event-driven connector pipeline.
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
@@ -18,11 +48,8 @@ pub struct PipelineConfig {
     /// Fallback poll interval when a source returns no `data_ready_notify`.
     pub fallback_poll_interval: Duration,
 
-    /// Timer-based checkpoint interval (at-least-once). `None` disables auto-checkpointing.
-    ///
-    /// For exactly-once, use barrier-aligned checkpoints via
-    /// [`PipelineCallback::checkpoint_with_barrier`](super::callback::PipelineCallback::checkpoint_with_barrier).
-    pub checkpoint_interval: Option<Duration>,
+    /// Whether checkpoints are disabled, manual-only, or periodic.
+    pub checkpoint_schedule: CheckpointSchedule,
 
     /// Sleep after the first event in a cycle to let more data accumulate.
     ///
@@ -75,7 +102,7 @@ impl Default for PipelineConfig {
             max_poll_records: 1024,
             channel_capacity: 64,
             fallback_poll_interval: Duration::from_millis(10),
-            checkpoint_interval: None,
+            checkpoint_schedule: CheckpointSchedule::Disabled,
             batch_window: Duration::from_millis(5),
             checkpoint_timeout: Duration::from_secs(30),
             delivery_guarantee: DeliveryGuarantee::default(),

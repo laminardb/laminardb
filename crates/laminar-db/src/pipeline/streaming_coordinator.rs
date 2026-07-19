@@ -38,6 +38,8 @@ use super::callback::{
     CycleError, CycleOutcome, PipelineCallback, SourceBarrierControl, SourceBarrierSignal,
     SourceRegistration,
 };
+#[cfg(test)]
+use super::config::CheckpointSchedule;
 use super::config::PipelineConfig;
 use crate::connector_task_fence::{ConnectorTaskFenceRegistration, OwnedConnectorTaskFences};
 use crate::error::DbError;
@@ -2647,6 +2649,16 @@ impl StreamingCoordinator {
         #[cfg_attr(not(feature = "cluster"), allow(unused_variables))]
         runtime_mode: crate::db::RuntimeMode,
     ) -> Result<Self, DbError> {
+        if config
+            .checkpoint_schedule
+            .periodic_interval()
+            .is_some_and(|interval| interval.is_zero())
+        {
+            return Err(DbError::Config(
+                "checkpoint interval must be greater than zero; use manual checkpointing instead"
+                    .into(),
+            ));
+        }
         if config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
             for src in &sources {
                 if !src.contract.is_exact_delivery_certified() {
@@ -2670,7 +2682,7 @@ impl StreamingCoordinator {
                     )));
                 }
             }
-            if config.checkpoint_interval.is_none() {
+            if !config.checkpoint_schedule.is_enabled() {
                 return Err(DbError::Config(format!(
                     "[LDB-5032] {} requires checkpointing to be enabled",
                     config.delivery_guarantee
@@ -2681,7 +2693,7 @@ impl StreamingCoordinator {
         // A source that releases externally retained data only on durable commit needs
         // checkpointing; otherwise that data can grow without bound. Reject the combination up
         // front.
-        if config.checkpoint_interval.is_none() {
+        if !config.checkpoint_schedule.is_enabled() {
             for src in &sources {
                 if src.contract.requires_checkpointing() {
                     return Err(DbError::Config(format!(
@@ -5805,7 +5817,8 @@ impl StreamingCoordinator {
         let interval = leader
             && self
                 .config
-                .checkpoint_interval
+                .checkpoint_schedule
+                .periodic_interval()
                 .is_some_and(|value| self.last_checkpoint.elapsed() >= value);
         let retry_ready = self
             .checkpoint_retry_not_before
@@ -7376,13 +7389,15 @@ mod tests {
         delivery_guarantee: DeliveryGuarantee,
         checkpoint_interval: Option<Duration>,
     ) -> StreamingCoordinator {
+        let checkpoint_schedule =
+            checkpoint_interval.map_or(CheckpointSchedule::Disabled, CheckpointSchedule::Periodic);
         StreamingCoordinator {
             config: PipelineConfig {
                 batch_window: Duration::ZERO,
                 max_poll_records: 1000,
                 channel_capacity: 64,
                 fallback_poll_interval: Duration::from_millis(10),
-                checkpoint_interval,
+                checkpoint_schedule,
                 delivery_guarantee,
                 checkpoint_timeout: Duration::from_secs(30),
                 cycle_budget_ns: 10_000_000,
@@ -8446,7 +8461,7 @@ mod tests {
     async fn prepare_publication_failure_prevents_source_cut_and_retains_exact_abort_fence() {
         let (source, poll) = checkpoint_source_handle("prepare-failure");
         let mut coordinator = admission_coordinator(vec![source]);
-        coordinator.config.checkpoint_interval = Some(Duration::ZERO);
+        coordinator.config.checkpoint_schedule = CheckpointSchedule::Periodic(Duration::ZERO);
         let assignment_fence = assignment_fence(9, &[1, 2]);
         let attempt = CheckpointAttempt::new(107, 10_007);
         let mut callback = MockCallback::new();
@@ -8474,7 +8489,7 @@ mod tests {
     #[tokio::test]
     async fn manual_checkpoint_rejects_unready_assignment_without_burning_attempt() {
         let mut coordinator = admission_coordinator(Vec::new());
-        coordinator.config.checkpoint_interval = None;
+        coordinator.config.checkpoint_schedule = CheckpointSchedule::Manual;
         let (force_tx, force_rx) = mpsc::bounded_async::<ForceCheckpointReply>(2);
         coordinator = coordinator.with_force_checkpoint_rx(force_rx);
         let (reply_tx, reply_rx) = crossfire::oneshot::oneshot();
@@ -8489,6 +8504,28 @@ mod tests {
         assert_eq!(callback.reserve_calls, 0);
         assert!(coordinator.manual_waiting.is_empty());
         assert!(coordinator.manual_active.is_none());
+    }
+
+    #[tokio::test]
+    async fn manual_only_checkpointing_does_not_schedule_periodic_attempts() {
+        let (source, poll) = checkpoint_source_handle("manual-only-source");
+        let mut coordinator = admission_coordinator(vec![source]);
+        coordinator.config.delivery_guarantee = DeliveryGuarantee::AtLeastOnce;
+        coordinator.config.checkpoint_schedule = CheckpointSchedule::Manual;
+        let (force_tx, force_rx) = mpsc::bounded_async::<ForceCheckpointReply>(2);
+        coordinator = coordinator.with_force_checkpoint_rx(force_rx);
+        let mut callback = MockCallback::new();
+
+        coordinator.maybe_checkpoint(&mut callback).await;
+        assert_eq!(callback.reserve_calls, 0);
+        assert_eq!(poll.poll(), None);
+
+        let (reply_tx, _reply_rx) = crossfire::oneshot::oneshot();
+        force_tx.send(reply_tx).await.unwrap();
+        coordinator.maybe_checkpoint(&mut callback).await;
+
+        assert_eq!(callback.reserve_calls, 1);
+        assert!(poll.poll().is_some());
     }
 
     #[tokio::test]
@@ -8526,7 +8563,7 @@ mod tests {
     #[tokio::test]
     async fn cluster_follower_rejects_manual_checkpoint_instead_of_stranding_caller() {
         let mut coordinator = admission_coordinator(Vec::new());
-        coordinator.config.checkpoint_interval = None;
+        coordinator.config.checkpoint_schedule = CheckpointSchedule::Manual;
         let (force_tx, force_rx) = mpsc::bounded_async::<ForceCheckpointReply>(2);
         coordinator = coordinator.with_force_checkpoint_rx(force_rx);
         let (reply_tx, reply_rx) = crossfire::oneshot::oneshot();
@@ -8758,7 +8795,7 @@ mod tests {
     async fn manual_requests_coalesce_onto_one_new_exact_source_barrier() {
         let (source, poll) = checkpoint_source_handle("manual-source");
         let mut coordinator = admission_coordinator(vec![source]);
-        coordinator.config.checkpoint_interval = None;
+        coordinator.config.checkpoint_schedule = CheckpointSchedule::Manual;
         let (force_tx, force_rx) = mpsc::bounded_async::<ForceCheckpointReply>(8);
         coordinator = coordinator.with_force_checkpoint_rx(force_rx);
 
@@ -8811,7 +8848,7 @@ mod tests {
     #[tokio::test]
     async fn manual_reservation_failure_replies_instead_of_hanging() {
         let mut coordinator = admission_coordinator(Vec::new());
-        coordinator.config.checkpoint_interval = None;
+        coordinator.config.checkpoint_schedule = CheckpointSchedule::Manual;
         let (force_tx, force_rx) = mpsc::bounded_async::<ForceCheckpointReply>(2);
         coordinator = coordinator.with_force_checkpoint_rx(force_rx);
         let (reply_tx, reply_rx) = crossfire::oneshot::oneshot();
@@ -8831,7 +8868,7 @@ mod tests {
     async fn manual_request_after_admission_waits_for_the_next_attempt() {
         let (source, poll) = checkpoint_source_handle("manual-source");
         let mut coordinator = admission_coordinator(vec![source]);
-        coordinator.config.checkpoint_interval = None;
+        coordinator.config.checkpoint_schedule = CheckpointSchedule::Manual;
         let (force_tx, force_rx) = mpsc::bounded_async::<ForceCheckpointReply>(8);
         coordinator = coordinator.with_force_checkpoint_rx(force_rx);
 
@@ -8982,7 +9019,8 @@ mod tests {
     async fn topology_retry_waits_for_backoff_and_ready_assignment_without_burning_an_attempt() {
         let (source, poll) = checkpoint_source_handle("topology-retry");
         let mut coordinator = admission_coordinator(vec![source]);
-        coordinator.config.checkpoint_interval = Some(Duration::from_secs(60));
+        coordinator.config.checkpoint_schedule =
+            CheckpointSchedule::Periodic(Duration::from_secs(60));
         coordinator.last_checkpoint = Instant::now() - Duration::from_secs(60);
         let cancelled = CheckpointAttempt::new(53, 90_053);
         coordinator.pending_barrier.reset(cancelled, 1);
@@ -9028,7 +9066,8 @@ mod tests {
     #[tokio::test]
     async fn source_less_topology_cancellation_keeps_periodic_checkpoint_due() {
         let mut coordinator = admission_coordinator(Vec::new());
-        coordinator.config.checkpoint_interval = Some(Duration::from_secs(60));
+        coordinator.config.checkpoint_schedule =
+            CheckpointSchedule::Periodic(Duration::from_secs(60));
         coordinator.last_checkpoint = Instant::now() - Duration::from_secs(60);
         let previous_cadence = coordinator.last_checkpoint;
         let cancelled = CheckpointAttempt::new(55, 90_055);
@@ -10094,7 +10133,7 @@ mod tests {
             vec![source],
             PipelineConfig {
                 fallback_poll_interval: Duration::from_millis(1),
-                checkpoint_interval: None,
+                checkpoint_schedule: CheckpointSchedule::Disabled,
                 ..PipelineConfig::default()
             },
             Arc::new(tokio::sync::Notify::new()),
@@ -10138,7 +10177,7 @@ mod tests {
             vec![source],
             PipelineConfig {
                 fallback_poll_interval: Duration::from_millis(1),
-                checkpoint_interval: None,
+                checkpoint_schedule: CheckpointSchedule::Disabled,
                 ..PipelineConfig::default()
             },
             Arc::new(tokio::sync::Notify::new()),
@@ -10326,7 +10365,7 @@ mod tests {
             vec![source],
             PipelineConfig {
                 fallback_poll_interval: Duration::from_millis(1),
-                checkpoint_interval: None,
+                checkpoint_schedule: CheckpointSchedule::Disabled,
                 ..PipelineConfig::default()
             },
             Arc::new(tokio::sync::Notify::new()),
@@ -10491,7 +10530,7 @@ mod tests {
             vec![source],
             PipelineConfig {
                 fallback_poll_interval: Duration::from_millis(1),
-                checkpoint_interval: None,
+                checkpoint_schedule: CheckpointSchedule::Disabled,
                 ..PipelineConfig::default()
             },
             Arc::new(tokio::sync::Notify::new()),
@@ -11156,7 +11195,7 @@ mod tests {
         let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
         let config = PipelineConfig {
             delivery_guarantee,
-            checkpoint_interval: Some(Duration::from_secs(60)),
+            checkpoint_schedule: CheckpointSchedule::Periodic(Duration::from_secs(60)),
             fallback_poll_interval: Duration::from_millis(1),
             ..PipelineConfig::default()
         };
@@ -11308,7 +11347,7 @@ mod tests {
             vec![source],
             PipelineConfig {
                 delivery_guarantee: DeliveryGuarantee::ExactlyOnce,
-                checkpoint_interval: Some(Duration::from_secs(60)),
+                checkpoint_schedule: CheckpointSchedule::Periodic(Duration::from_secs(60)),
                 ..PipelineConfig::default()
             },
         )
@@ -11324,6 +11363,100 @@ mod tests {
                 .contains(laminar_core::error_codes::EXACTLY_ONCE_SOURCE_UNCERTIFIED),
             "unexpected error: {error}"
         );
+        assert_eq!(state.open_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.start_completions.load(Ordering::SeqCst), 0);
+        assert_eq!(state.poll_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn at_least_once_manual_only_checkpointing_is_admitted() {
+        let state = Arc::new(StartupSourceState::default());
+        let mut source = startup_source(
+            "manual-only-at-least-once",
+            Arc::clone(&state),
+            false,
+            false,
+            SourcePosition::Initial,
+        );
+        source.contract = laminar_connectors::connector::SourceContract::new(
+            laminar_connectors::connector::SourceConsistency::CommitCoupled,
+            laminar_connectors::connector::SourceTopology::Singleton,
+        );
+        let coordinator = startup_result_with_config(
+            vec![source],
+            PipelineConfig {
+                delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
+                checkpoint_schedule: CheckpointSchedule::Manual,
+                ..PipelineConfig::default()
+            },
+        )
+        .await
+        .expect("manual-only checkpointing must satisfy at-least-once admission");
+
+        assert_eq!(
+            coordinator.config.checkpoint_schedule,
+            CheckpointSchedule::Manual
+        );
+        assert_eq!(state.open_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(state.start_completions.load(Ordering::SeqCst), 1);
+        assert_eq!(state.poll_calls.load(Ordering::SeqCst), 0);
+        drop(coordinator);
+    }
+
+    #[tokio::test]
+    async fn at_least_once_without_checkpointing_is_rejected_before_start() {
+        let state = Arc::new(StartupSourceState::default());
+        let source = startup_source(
+            "disabled-at-least-once",
+            Arc::clone(&state),
+            false,
+            false,
+            SourcePosition::Initial,
+        );
+        let result = startup_result_with_config(
+            vec![source],
+            PipelineConfig {
+                delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
+                checkpoint_schedule: CheckpointSchedule::Disabled,
+                ..PipelineConfig::default()
+            },
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("at-least-once must reject disabled checkpointing"),
+        };
+
+        assert!(error.to_string().contains("[LDB-5032]"), "{error}");
+        assert_eq!(state.open_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.start_completions.load(Ordering::SeqCst), 0);
+        assert_eq!(state.poll_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn zero_periodic_checkpoint_interval_is_rejected_before_start() {
+        let state = Arc::new(StartupSourceState::default());
+        let source = startup_source(
+            "zero-checkpoint-interval",
+            Arc::clone(&state),
+            false,
+            false,
+            SourcePosition::Initial,
+        );
+        let result = startup_result_with_config(
+            vec![source],
+            PipelineConfig {
+                checkpoint_schedule: CheckpointSchedule::Periodic(Duration::ZERO),
+                ..PipelineConfig::default()
+            },
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("a zero periodic checkpoint interval must be rejected"),
+        };
+
+        assert!(error.to_string().contains("greater than zero"), "{error}");
         assert_eq!(state.open_calls.load(Ordering::SeqCst), 0);
         assert_eq!(state.start_completions.load(Ordering::SeqCst), 0);
         assert_eq!(state.poll_calls.load(Ordering::SeqCst), 0);
@@ -11438,7 +11571,7 @@ mod tests {
         let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
         let config = PipelineConfig {
             fallback_poll_interval: Duration::from_millis(1),
-            checkpoint_interval: None,
+            checkpoint_schedule: CheckpointSchedule::Disabled,
             ..PipelineConfig::default()
         };
         let coordinator = StreamingCoordinator::new(
@@ -11536,7 +11669,7 @@ mod tests {
             vec![source],
             PipelineConfig {
                 fallback_poll_interval: Duration::from_secs(60),
-                checkpoint_interval: None,
+                checkpoint_schedule: CheckpointSchedule::Disabled,
                 ..PipelineConfig::default()
             },
             Arc::new(tokio::sync::Notify::new()),
@@ -11624,7 +11757,7 @@ mod tests {
         let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
         let config = PipelineConfig {
             fallback_poll_interval: Duration::from_millis(1),
-            checkpoint_interval: None,
+            checkpoint_schedule: CheckpointSchedule::Disabled,
             ..PipelineConfig::default()
         };
         let coordinator = StreamingCoordinator::new(
@@ -12564,7 +12697,7 @@ mod tests {
             vec![source],
             PipelineConfig {
                 delivery_guarantee: DeliveryGuarantee::BestEffort,
-                checkpoint_interval: Some(Duration::from_secs(60)),
+                checkpoint_schedule: CheckpointSchedule::Periodic(Duration::from_secs(60)),
                 fallback_poll_interval: Duration::from_millis(1),
                 ..PipelineConfig::default()
             },
@@ -12651,7 +12784,7 @@ mod tests {
             vec![source],
             PipelineConfig {
                 delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
-                checkpoint_interval: Some(Duration::from_secs(60)),
+                checkpoint_schedule: CheckpointSchedule::Periodic(Duration::from_secs(60)),
                 fallback_poll_interval: Duration::from_millis(1),
                 ..PipelineConfig::default()
             },
@@ -12708,7 +12841,7 @@ mod tests {
         let shutdown = Arc::new(tokio::sync::Notify::new());
         let config = PipelineConfig {
             delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
-            checkpoint_interval: Some(Duration::from_secs(60)),
+            checkpoint_schedule: CheckpointSchedule::Periodic(Duration::from_secs(60)),
             fallback_poll_interval: Duration::from_millis(1),
             ..PipelineConfig::default()
         };
@@ -13111,7 +13244,7 @@ mod tests {
                 max_poll_records: 1000,
                 channel_capacity: 64,
                 fallback_poll_interval: Duration::from_millis(10),
-                checkpoint_interval: None,
+                checkpoint_schedule: CheckpointSchedule::Manual,
                 delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
                 checkpoint_timeout: Duration::from_secs(30),
                 cycle_budget_ns: 10_000_000,
@@ -13574,7 +13707,7 @@ mod tests {
                 max_poll_records: 1000,
                 channel_capacity: 64,
                 fallback_poll_interval: Duration::from_millis(10),
-                checkpoint_interval: Some(Duration::from_secs(60)),
+                checkpoint_schedule: CheckpointSchedule::Periodic(Duration::from_secs(60)),
                 delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
                 checkpoint_timeout: Duration::from_secs(30),
                 cycle_budget_ns: 10_000_000,
@@ -13838,7 +13971,7 @@ mod tests {
                 max_poll_records: 1000,
                 channel_capacity: 64,
                 fallback_poll_interval: Duration::from_millis(10),
-                checkpoint_interval: None,
+                checkpoint_schedule: CheckpointSchedule::Manual,
                 delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
                 checkpoint_timeout: Duration::from_secs(30),
                 cycle_budget_ns: 10_000_000,
@@ -14031,7 +14164,7 @@ mod tests {
                 max_poll_records: 1000,
                 channel_capacity: 64,
                 fallback_poll_interval: Duration::from_millis(10),
-                checkpoint_interval: None,
+                checkpoint_schedule: CheckpointSchedule::Manual,
                 delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
                 checkpoint_timeout: Duration::from_secs(30),
                 cycle_budget_ns: 10_000_000,
@@ -14321,7 +14454,7 @@ mod tests {
                 max_poll_records: 1000,
                 channel_capacity: 64,
                 fallback_poll_interval: Duration::from_millis(10),
-                checkpoint_interval: None,
+                checkpoint_schedule: CheckpointSchedule::Manual,
                 delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
                 checkpoint_timeout: Duration::from_secs(30),
                 cycle_budget_ns: 10_000_000,

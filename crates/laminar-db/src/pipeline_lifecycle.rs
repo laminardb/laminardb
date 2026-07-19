@@ -2764,7 +2764,7 @@ impl LaminarDB {
             build_sink_config, build_source_config, build_table_config,
         };
         use crate::operator_graph::OperatorGraph;
-        use crate::pipeline::{PipelineConfig, SourceRegistration};
+        use crate::pipeline::{CheckpointSchedule, PipelineConfig, SourceRegistration};
         use laminar_connectors::connector::SourceConnector as _;
 
         let runtime_mode = self.runtime_mode();
@@ -2784,7 +2784,20 @@ impl LaminarDB {
         self.revalidate_persisted_cluster_query_shapes(&stream_regs)
             .await?;
 
-        let checkpointing_enabled = self.config.checkpoint.is_some();
+        let checkpoint_schedule =
+            self.config
+                .checkpoint
+                .as_ref()
+                .map_or(CheckpointSchedule::Disabled, |config| {
+                    config
+                        .interval_ms
+                        .map_or(CheckpointSchedule::Manual, |interval_ms| {
+                            CheckpointSchedule::Periodic(std::time::Duration::from_millis(
+                                interval_ms,
+                            ))
+                        })
+                });
+        let checkpointing_enabled = checkpoint_schedule.is_enabled();
         let pipeline_checkpoint_timeout = self
             .config
             .checkpoint
@@ -4119,13 +4132,6 @@ impl LaminarDB {
         }
 
         let max_poll = self.config.default_buffer_size.min(1024);
-        let checkpoint_interval = self
-            .config
-            .checkpoint
-            .as_ref()
-            .and_then(|c| c.interval_ms)
-            .map(std::time::Duration::from_millis);
-
         tracing::info!(
             sources = sources.len(),
             sinks = sinks.len(),
@@ -4144,7 +4150,7 @@ impl LaminarDB {
             } else {
                 std::time::Duration::from_millis(1)
             },
-            checkpoint_interval,
+            checkpoint_schedule,
             batch_window: self
                 .config
                 .pipeline_batch_window
@@ -4165,16 +4171,6 @@ impl LaminarDB {
             shared_source_isolation: self.config.shared_source_isolation,
             max_replay_buffer_bytes: 256 * 1024 * 1024,
         };
-
-        if pipeline_config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
-            && pipeline_config.checkpoint_interval.is_none()
-        {
-            return Err(DbError::Config(
-                "[LDB-5032] exactly-once requires checkpointing to be enabled. \
-                     Set checkpoint.interval.ms in the pipeline configuration."
-                    .into(),
-            ));
-        }
 
         let shutdown = self.shutdown_signal.clone();
 
