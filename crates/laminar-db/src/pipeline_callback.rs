@@ -2798,16 +2798,18 @@ impl ConnectorPipelineCallback {
         &mut self,
         deadline: tokio::time::Instant,
     ) -> Result<(), String> {
-        let result =
-            match tokio::time::timeout_at(deadline, self.sync_sinks_and_drain_events(deadline))
-                .await
-            {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => Err(format!("follower sink fence failed: {error}")),
-                Err(_) => {
-                    Err("follower sink fence exhausted the end-to-end checkpoint deadline".into())
-                }
-            };
+        let result = match tokio::time::timeout_at(
+            deadline,
+            self.fence_sinks_before_capture_until(deadline),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(format!("follower sink fence failed: {error}")),
+            Err(_) => {
+                Err("follower sink fence exhausted the end-to-end checkpoint deadline".into())
+            }
+        };
         if let Err(error) = result {
             set_checkpoint_fault(&self.checkpoint_fault, error.clone());
             return Err(error);
@@ -3753,13 +3755,20 @@ impl ConnectorPipelineCallback {
         }
     }
 
-    /// Sync all sinks and drain their events; `sink_timed_out` is current after this returns.
-    /// A failed fence aborts this checkpoint: sealing offsets while queued writes are unknown
-    /// would violate both ALO and EO delivery.
-    async fn sync_sinks_and_drain_events(
+    /// Observe reported sink failures before capture. Checkpoint-committable sinks additionally
+    /// require an inline queue fence because post-capture writes cannot enter the open transaction.
+    /// At-least-once sinks enqueue their durable `Flush` in the checkpoint tail; the sink actor's
+    /// FIFO queue and poison recheck make that flush cover every pre-cut write without extending
+    /// the local capture pause by the sink's I/O latency.
+    async fn fence_sinks_before_capture_until(
         &mut self,
         attempt_deadline: tokio::time::Instant,
     ) -> Result<(), String> {
+        self.drain_sink_events();
+        if !self.checkpoint_committable_sinks {
+            return Ok(());
+        }
+
         let sync_futures = self.sinks.iter().map(|(name, handle, _, _, _)| {
             let name = name.clone();
             let handle = handle.clone();
@@ -5248,7 +5257,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
 
         match tokio::time::timeout_at(
             attempt_deadline,
-            self.sync_sinks_and_drain_events(attempt_deadline),
+            self.fence_sinks_before_capture_until(attempt_deadline),
         )
         .await
         {
@@ -5764,6 +5773,103 @@ pub(crate) fn encode_arrow_schema(schema: &arrow_schema::Schema) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use laminar_connectors::connector::{
+        ConnectorCancellationPolicy, SinkConnector, SinkConsistency, SinkInputMode, SinkTopology,
+        WriteResult,
+    };
+    use laminar_connectors::error::ConnectorError;
+
+    struct CaptureFenceBlockingSink {
+        write_started: tokio::sync::mpsc::UnboundedSender<()>,
+        write_release: Arc<tokio::sync::Semaphore>,
+        schema: arrow_schema::SchemaRef,
+    }
+
+    #[async_trait::async_trait]
+    impl SinkConnector for CaptureFenceBlockingSink {
+        fn cancellation_policy(&self) -> ConnectorCancellationPolicy {
+            ConnectorCancellationPolicy::CancelSafe
+        }
+
+        async fn open(
+            &mut self,
+            _config: &laminar_connectors::config::ConnectorConfig,
+        ) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
+        async fn write_batch(
+            &mut self,
+            _batch: &RecordBatch,
+        ) -> Result<WriteResult, ConnectorError> {
+            let _ = self.write_started.send(());
+            self.write_release
+                .acquire()
+                .await
+                .expect("test write gate must remain open")
+                .forget();
+            Ok(WriteResult::new(0, 0))
+        }
+
+        fn schema(&self) -> arrow_schema::SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn suggested_write_timeout(&self) -> Duration {
+            Duration::from_secs(5)
+        }
+
+        async fn close(&mut self) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+    }
+
+    fn attach_capture_fence_blocking_sink(
+        callback: &mut ConnectorPipelineCallback,
+    ) -> (
+        crate::sink_task::SinkTaskHandle,
+        Arc<tokio::sync::Semaphore>,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+    ) {
+        let (event_tx, event_rx) = laminar_core::streaming::channel::channel::<
+            crate::sink_task::SinkEvent,
+        >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+        callback.sink_event_rx = event_rx;
+        let (write_started, write_started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let write_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let schema = Arc::new(arrow_schema::Schema::empty());
+        let contract = SinkContract::new(
+            SinkConsistency::DurableAtLeastOnce,
+            SinkTopology::MultiWriter,
+            SinkInputMode::AppendOnly,
+        );
+        let handle = crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+            name: "capture-fence".into(),
+            sink_id: Arc::from("capture-fence"),
+            connector: Box::new(CaptureFenceBlockingSink {
+                write_started,
+                write_release: Arc::clone(&write_release),
+                schema,
+            }),
+            contract,
+            requires_recovery_on_error: true,
+            channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+            flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
+            write_timeout: Duration::from_secs(5),
+            event_tx,
+            terminal_tasks: None,
+            #[cfg(feature = "cluster")]
+            process_authority: None,
+        });
+        callback.sinks.push((
+            "capture-fence".into(),
+            handle.clone(),
+            None,
+            "input".into(),
+            contract,
+        ));
+        (handle, write_release, write_started_rx)
+    }
 
     struct DrainingCaptureFailureOperator {
         live_rows: Arc<std::sync::atomic::AtomicUsize>,
@@ -5947,6 +6053,75 @@ mod tests {
             checkpoint_committable_sinks: false,
             intake_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    #[tokio::test]
+    async fn alo_capture_does_not_wait_for_pre_cut_write_but_tail_flush_does() {
+        let mut callback = empty_callback_fixture();
+        let (handle, write_release, mut write_started) =
+            attach_capture_fence_blocking_sink(&mut callback);
+        handle
+            .write_batch(RecordBatch::new_empty(Arc::new(
+                arrow_schema::Schema::empty(),
+            )))
+            .await
+            .unwrap();
+        write_started.recv().await.unwrap();
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            callback.fence_sinks_before_capture_until(
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("ALO capture waited for a blocked sink write")
+        .unwrap();
+
+        let flush_handle = handle.clone();
+        let mut tail_flush = tokio::spawn(async move {
+            flush_handle
+                .flush_until(tokio::time::Instant::now() + Duration::from_secs(1))
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut tail_flush)
+                .await
+                .is_err(),
+            "tail flush crossed the pre-cut write"
+        );
+
+        write_release.add_permits(1);
+        tail_flush.await.unwrap().unwrap();
+        handle.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn committable_pipeline_keeps_pre_cut_sink_fence_inline() {
+        let mut callback = empty_callback_fixture();
+        callback.checkpoint_committable_sinks = true;
+        let (handle, write_release, mut write_started) =
+            attach_capture_fence_blocking_sink(&mut callback);
+        handle
+            .write_batch(RecordBatch::new_empty(Arc::new(
+                arrow_schema::Schema::empty(),
+            )))
+            .await
+            .unwrap();
+        write_started.recv().await.unwrap();
+
+        let fence = callback
+            .fence_sinks_before_capture_until(tokio::time::Instant::now() + Duration::from_secs(1));
+        tokio::pin!(fence);
+        tokio::select! {
+            biased;
+            result = &mut fence => panic!("committable sink fence returned before the pre-cut write: {result:?}"),
+            () = tokio::task::yield_now() => {}
+        }
+
+        write_release.add_permits(1);
+        fence.await.unwrap();
+        handle.close().await.unwrap();
     }
 
     #[test]
