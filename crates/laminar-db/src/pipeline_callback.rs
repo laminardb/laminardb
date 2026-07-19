@@ -2306,7 +2306,7 @@ impl ConnectorPipelineCallback {
                 ));
             }
             let observed =
-                tokio::time::timeout(remaining, authority.cluster_outcome(attempt.epoch))
+                tokio::time::timeout(remaining, authority.cluster_attempt_settlement(attempt))
                     .await
                     .map_err(|_| {
                         format!(
@@ -2320,14 +2320,18 @@ impl ConnectorPipelineCallback {
                         )
                     })?;
             if let Some(outcome) = observed {
-                if outcome.checkpoint_id != attempt.checkpoint_id {
-                    return Err(format!(
-                        "newer epoch {} is durably resolved for checkpoint {}, not announced \
-                         checkpoint {}",
-                        attempt.epoch, outcome.checkpoint_id, attempt.checkpoint_id
-                    ));
+                let settled = CheckpointAttempt::new(outcome.epoch, outcome.checkpoint_id);
+                match settled.relation_to(attempt) {
+                    CheckpointAttemptRelation::Exact | CheckpointAttemptRelation::Newer => {
+                        return Ok(());
+                    }
+                    CheckpointAttemptRelation::Older | CheckpointAttemptRelation::Conflict => {
+                        return Err(format!(
+                            "durable settlement {settled:?} does not close newer checkpoint \
+                             {attempt:?}"
+                        ));
+                    }
                 }
-                return Ok(());
             }
             tokio::time::sleep(
                 Duration::from_millis(250)
@@ -9299,6 +9303,44 @@ mod tests {
             None,
             "Abort cannot publish a recovery-safe watermark"
         );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn compacted_abort_still_settles_the_newer_terminal_wait() {
+        use laminar_core::checkpoint_decision::CheckpointVerdict;
+
+        let (_kv, controller, _leader_id, _members_tx, _decision_store) = gate_controller().await;
+        let authority = controller.checkpoint_authority().unwrap();
+        let proof = authority.load().await.unwrap().unwrap().proof();
+        let fence = assignment_fence(1, &[1, 7]);
+        for epoch in 1..=80 {
+            authority
+                .record_cluster_outcome(
+                    &proof,
+                    epoch,
+                    epoch,
+                    fence.clone(),
+                    CheckpointVerdict::Abort,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        let compacted = CheckpointAttempt::new(1, 1);
+        assert!(authority
+            .cluster_outcome(compacted.epoch)
+            .await
+            .unwrap()
+            .is_none());
+        ConnectorPipelineCallback::wait_for_newer_terminal_outcome(
+            &controller,
+            compacted,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .expect("a newer durable settlement must close a compacted Abort");
     }
 
     #[cfg(feature = "cluster")]

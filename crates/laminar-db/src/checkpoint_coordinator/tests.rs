@@ -2068,7 +2068,7 @@ async fn compacted_prepared_attempt_requires_two_dimensional_dominance() {
             .cluster_outcome_retention_boundary()
             .await
             .unwrap()
-            .before_epoch,
+            .terminal_before_epoch,
         0
     );
     assert!(
@@ -2515,7 +2515,7 @@ async fn follower_commit_prunes_its_local_manifests_without_advancing_shared_gc(
             .cluster_outcome_retention_boundary()
             .await
             .unwrap()
-            .before_epoch,
+            .artifact_before_epoch,
         3,
         "follower retention must only read, never advance, the shared floor"
     );

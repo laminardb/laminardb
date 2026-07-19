@@ -897,7 +897,7 @@ async fn authorize_retention_horizon(
                 authority
                     .audited_cluster_outcome_retention_boundary()
                     .await
-                    .map(|boundary| boundary.before_epoch)
+                    .map(|boundary| boundary.artifact_before_epoch)
                     .map_err(|error| error.to_string())
             })
             .await
@@ -4192,7 +4192,7 @@ impl CheckpointCoordinator {
                 warn!(
                     epoch,
                     checkpoint_id,
-                    retention_floor = boundary.before_epoch,
+                    retention_floor = boundary.terminal_before_epoch,
                     highest_terminal_epoch = highest_terminal.map(|outcome| outcome.epoch),
                     highest_terminal_checkpoint_id =
                         highest_terminal.map(|outcome| outcome.checkpoint_id),

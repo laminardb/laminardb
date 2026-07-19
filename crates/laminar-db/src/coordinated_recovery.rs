@@ -2788,7 +2788,7 @@ async fn settle_stopped_prepared_witnesses(
             }
             continue;
         }
-        if attempt.epoch < boundary.before_epoch {
+        if attempt.epoch < boundary.terminal_before_epoch {
             let anchor = boundary.terminal_anchor.as_ref().ok_or_else(|| {
                 "checkpoint outcome floor has no terminal continuity anchor".to_string()
             })?;

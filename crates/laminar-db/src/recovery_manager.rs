@@ -462,8 +462,8 @@ fn declared_sidecar_len(manifest: &CheckpointManifest) -> Result<Option<u64>, St
 }
 
 impl ClusterPreparedDominance {
-    fn from_outcomes(outcome_floor: Option<u64>, outcomes: &[CheckpointOutcome]) -> Option<Self> {
-        outcome_floor?;
+    #[cfg(feature = "cluster")]
+    fn from_outcomes(outcomes: &[CheckpointOutcome]) -> Option<Self> {
         let terminal = outcomes.last()?;
         Some(Self {
             highest_terminal_epoch: terminal.epoch,
@@ -989,7 +989,7 @@ impl<'a> RecoveryManager<'a> {
         &self,
         authority: &laminar_core::cluster::control::LeaderLeaseStore,
         capsule_store: &laminar_core::checkpoint_decision::CheckpointDecisionStore,
-    ) -> Result<u64, DbError> {
+    ) -> Result<(), DbError> {
         authority
             .validated_cluster_outcome_retention_boundary(|outcome| async move {
                 self.preflight_cluster_committed_outcome(&outcome, capsule_store)
@@ -998,7 +998,7 @@ impl<'a> RecoveryManager<'a> {
                     .map_err(|error| error.to_string())
             })
             .await
-            .map(|boundary| boundary.before_epoch)
+            .map(drop)
             .map_err(|error| DbError::Checkpoint(error.to_string()))
     }
 
@@ -1339,7 +1339,7 @@ impl<'a> RecoveryManager<'a> {
         // highest commit first and require an exact participant-bound manifest. Corruption or
         // storage loss for an included participant is fatal rather than a reason to rewind.
         if let Some(authority) = authority {
-            let (outcomes, cluster_outcome_floor) = match authority {
+            let (outcomes, cluster_dominance) = match authority {
                 RecoveryOutcomeAuthority::Local(decision_store) => {
                     let mut outcomes = authority.outcomes().await?;
                     // Prepared is the sole local pre-outcome durable phase: state is sealed and
@@ -1356,14 +1356,13 @@ impl<'a> RecoveryManager<'a> {
                     outcomes: cluster_authority,
                     capsules,
                 } => {
-                    let floor = self
-                        .validated_cluster_prepared_dominance(cluster_authority, capsules)
+                    self.validated_cluster_prepared_dominance(cluster_authority, capsules)
                         .await?;
-                    (authority.outcomes().await?, Some(floor))
+                    let outcomes = authority.outcomes().await?;
+                    let dominance = ClusterPreparedDominance::from_outcomes(&outcomes);
+                    (outcomes, dominance)
                 }
             };
-            let cluster_dominance =
-                ClusterPreparedDominance::from_outcomes(cluster_outcome_floor, &outcomes);
             let outcome = outcomes
                 .iter()
                 .rev()
@@ -1434,7 +1433,7 @@ impl<'a> RecoveryManager<'a> {
         if let Some(authority) = authority {
             // Audit the immutable outcome history before selecting a target. Abort closes an
             // attempt but never creates a recovery cut; the newest retained Commit is authoritative.
-            let (outcomes, cluster_outcome_floor) = match authority {
+            let (outcomes, cluster_dominance) = match authority {
                 RecoveryOutcomeAuthority::Local(decision_store) => {
                     let mut outcomes = authority.outcomes().await?;
                     self.settle_local_prepared_attempts(decision_store, &outcomes)
@@ -1447,14 +1446,13 @@ impl<'a> RecoveryManager<'a> {
                     outcomes: cluster_authority,
                     capsules,
                 } => {
-                    let floor = self
-                        .validated_cluster_prepared_dominance(cluster_authority, capsules)
+                    self.validated_cluster_prepared_dominance(cluster_authority, capsules)
                         .await?;
-                    (authority.outcomes().await?, Some(floor))
+                    let outcomes = authority.outcomes().await?;
+                    let dominance = ClusterPreparedDominance::from_outcomes(&outcomes);
+                    (outcomes, dominance)
                 }
             };
-            let cluster_dominance =
-                ClusterPreparedDominance::from_outcomes(cluster_outcome_floor, &outcomes);
             let committed = outcomes
                 .iter()
                 .rev()
@@ -2999,7 +2997,7 @@ mod tests {
                 .cluster_outcome_retention_boundary()
                 .await
                 .unwrap()
-                .before_epoch,
+                .artifact_before_epoch,
             7
         );
         assert!(decisions

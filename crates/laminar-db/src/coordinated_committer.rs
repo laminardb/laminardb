@@ -59,7 +59,7 @@ struct CommitBindings {
 }
 
 struct RetainedOutcomeContinuity {
-    before_epoch: u64,
+    artifact_before_epoch: u64,
     committed_checkpoint_id: Option<u64>,
     committed_anchor: Option<CheckpointOutcome>,
 }
@@ -531,7 +531,7 @@ impl CoordinatedCommitter {
             (
                 outcomes,
                 RetainedOutcomeContinuity {
-                    before_epoch: boundary.before_epoch,
+                    artifact_before_epoch: boundary.artifact_before_epoch,
                     committed_checkpoint_id,
                     committed_anchor: boundary.committed_anchor,
                 },
@@ -552,7 +552,7 @@ impl CoordinatedCommitter {
             (
                 outcomes,
                 RetainedOutcomeContinuity {
-                    before_epoch: boundary.before_epoch,
+                    artifact_before_epoch: boundary.before_epoch,
                     committed_checkpoint_id: boundary.committed_checkpoint_id,
                     committed_anchor: None,
                 },
@@ -575,7 +575,7 @@ impl CoordinatedCommitter {
             (
                 outcomes,
                 RetainedOutcomeContinuity {
-                    before_epoch: boundary.before_epoch,
+                    artifact_before_epoch: boundary.before_epoch,
                     committed_checkpoint_id: boundary.committed_checkpoint_id,
                     committed_anchor: None,
                 },
@@ -595,7 +595,9 @@ impl CoordinatedCommitter {
             .into_iter()
             // A floor may advance after outcomes() selected its stable view. Apply the separately
             // audited scalar boundary before any seal read or connector call.
-            .filter(|outcome| outcome.epoch >= retention.before_epoch && outcome.is_commit())
+            .filter(|outcome| {
+                outcome.epoch >= retention.artifact_before_epoch && outcome.is_commit()
+            })
             .collect();
         let committed_attempts: Vec<CheckpointAttempt> = committed
             .iter()
@@ -1524,6 +1526,7 @@ mod tests {
 
     type Recorded = Arc<Mutex<Vec<CoordinatedCommitBatch>>>;
     type ExternalCursor = Arc<Mutex<Option<CoordinatedCommitCursor>>>;
+    const TEST_SINK_ID: &str = "external";
 
     #[test]
     fn prune_floor_rejects_epoch_exhaustion() {
@@ -1602,8 +1605,8 @@ mod tests {
             crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY,
         );
         SinkTaskHandle::spawn(SinkTaskConfig {
-            name: "ice".into(),
-            sink_id: Arc::from("ice"),
+            name: TEST_SINK_ID.into(),
+            sink_id: Arc::from(TEST_SINK_ID),
             connector: Box::new(RecordingSink {
                 schema,
                 recorded,
@@ -1645,7 +1648,7 @@ mod tests {
     }
 
     fn namespace() -> CoordinatedCommitNamespace {
-        CoordinatedCommitNamespace::try_new(identity(), deployment_id(), "ice").unwrap()
+        CoordinatedCommitNamespace::try_new(identity(), deployment_id(), TEST_SINK_ID).unwrap()
     }
 
     #[cfg(feature = "cluster")]
@@ -2092,7 +2095,7 @@ mod tests {
         let floor = Arc::new(AtomicU64::new(0));
         let mut committer = CoordinatedCommitter::new(
             Arc::clone(&backend) as Arc<dyn StateBackend>,
-            vec![("ice".into(), handle)],
+            vec![(TEST_SINK_ID.into(), handle)],
             identity(),
             deployment_id(),
             Arc::clone(&floor),
@@ -2179,7 +2182,7 @@ mod tests {
         let handle = spawn_recording_sink(Arc::clone(&recorded));
         let committer = CoordinatedCommitter::new(
             Arc::clone(&backend) as Arc<dyn StateBackend>,
-            vec![("ice".into(), handle.clone())],
+            vec![(TEST_SINK_ID.into(), handle.clone())],
             identity(),
             deployment_id(),
             Arc::new(AtomicU64::new(0)),
@@ -2191,7 +2194,7 @@ mod tests {
         let cursor = committer
             .commit_sealed_with_limits(
                 &handle,
-                "ice",
+                TEST_SINK_ID,
                 CoordinatedCommitCursor {
                     checkpoint_id: 0,
                     fencing_token: 0,
@@ -2289,7 +2292,7 @@ mod tests {
         );
         let mut committer = CoordinatedCommitter::new(
             backend as Arc<dyn StateBackend>,
-            vec![("ice".into(), handle)],
+            vec![(TEST_SINK_ID.into(), handle)],
             identity(),
             deployment_id(),
             Arc::new(AtomicU64::new(0)),
@@ -2333,7 +2336,10 @@ mod tests {
         .await;
         let mut committer = CoordinatedCommitter::new(
             Arc::clone(&backend) as Arc<dyn StateBackend>,
-            vec![("ice".into(), spawn_recording_sink(Arc::clone(&recorded)))],
+            vec![(
+                TEST_SINK_ID.into(),
+                spawn_recording_sink(Arc::clone(&recorded)),
+            )],
             identity(),
             deployment_id(),
             Arc::new(AtomicU64::new(0)),
@@ -2380,7 +2386,7 @@ mod tests {
 
         let mut committer = CoordinatedCommitter::new(
             Arc::clone(&backend) as Arc<dyn StateBackend>,
-            vec![("ice".into(), handle)],
+            vec![(TEST_SINK_ID.into(), handle)],
             identity(),
             deployment_id(),
             Arc::new(AtomicU64::new(0)),
@@ -2420,7 +2426,7 @@ mod tests {
         record_local_commit(&decisions, 3, 31).await;
         let mut committer = CoordinatedCommitter::new(
             Arc::clone(&backend) as Arc<dyn StateBackend>,
-            vec![("ice".into(), handle)],
+            vec![(TEST_SINK_ID.into(), handle)],
             identity(),
             deployment_id(),
             Arc::new(AtomicU64::new(0)),
@@ -2461,7 +2467,7 @@ mod tests {
 
         let mut first = CoordinatedCommitter::new(
             Arc::clone(&backend) as Arc<dyn StateBackend>,
-            vec![("ice".into(), handle.clone())],
+            vec![(TEST_SINK_ID.into(), handle.clone())],
             identity(),
             deployment_id(),
             Arc::new(AtomicU64::new(0)),
@@ -2473,7 +2479,7 @@ mod tests {
         // Fresh committer (restart) over the same sink — seeds from committed_through.
         let mut restarted = CoordinatedCommitter::new(
             Arc::clone(&backend) as Arc<dyn StateBackend>,
-            vec![("ice".into(), handle)],
+            vec![(TEST_SINK_ID.into(), handle)],
             identity(),
             deployment_id(),
             Arc::new(AtomicU64::new(0)),
@@ -2501,7 +2507,7 @@ mod tests {
         );
         let mut committer = CoordinatedCommitter::new(
             backend as Arc<dyn StateBackend>,
-            vec![("ice".into(), handle)],
+            vec![(TEST_SINK_ID.into(), handle)],
             identity(),
             deployment_id(),
             Arc::new(AtomicU64::new(0)),
@@ -2541,7 +2547,7 @@ mod tests {
         );
         let mut committer = CoordinatedCommitter::new(
             Arc::clone(&backend) as Arc<dyn StateBackend>,
-            vec![("ice".into(), handle)],
+            vec![(TEST_SINK_ID.into(), handle)],
             identity(),
             deployment_id(),
             Arc::new(AtomicU64::new(0)),
@@ -2562,6 +2568,117 @@ mod tests {
         assert_eq!(batches[0].target, live);
         assert_eq!(batches[0].entries.len(), 1);
         assert_eq!(batches[0].entries[0].attempt, live);
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn terminal_compaction_preserves_every_lagging_commit_for_external_publication() {
+        let backend = Arc::new(InProcessBackend::new(1));
+        let fence = assignment_fence(3, &[7]);
+        let decisions = cluster_decisions(&fence, 7).await;
+        let commits = [1_u64, 3, 20, 40, 60, 80].map(|epoch| CheckpointAttempt::new(epoch, epoch));
+        let anchor = commits[0];
+        let live_commits = &commits[1..];
+
+        for epoch in 1..=80 {
+            let attempt = CheckpointAttempt::new(epoch, epoch);
+            if commits.contains(&attempt) {
+                seal_with_fence(
+                    &backend,
+                    attempt,
+                    &[(7, Some(b"live"))],
+                    &[7],
+                    Some(&fence),
+                    Some(&decisions.proof),
+                )
+                .await;
+                record_cluster_commit(&decisions, &backend, epoch, epoch, &fence).await;
+            } else {
+                decisions
+                    .authority
+                    .record_cluster_outcome(
+                        &decisions.proof,
+                        epoch,
+                        epoch,
+                        fence.clone(),
+                        CheckpointVerdict::Abort,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            if epoch == 3 {
+                assert_eq!(
+                    decisions
+                        .authority
+                        .prune_cluster_outcomes_before(&decisions.proof, 3, |_| async { Ok(()) })
+                        .await
+                        .unwrap(),
+                    3
+                );
+            }
+        }
+
+        let boundary = decisions
+            .authority
+            .cluster_outcome_retention_boundary()
+            .await
+            .unwrap();
+        assert_eq!(boundary.artifact_before_epoch, 3);
+        assert!(
+            boundary.terminal_before_epoch > boundary.artifact_before_epoch,
+            "automatic terminal compaction must not advance artifact retention"
+        );
+        assert!(decisions
+            .authority
+            .cluster_outcome(4)
+            .await
+            .unwrap()
+            .is_none());
+        let retained_commits = decisions
+            .authority
+            .cluster_outcomes()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(CheckpointOutcome::is_commit)
+            .map(|outcome| CheckpointAttempt::new(outcome.epoch, outcome.checkpoint_id))
+            .collect::<Vec<_>>();
+        assert_eq!(retained_commits.as_slice(), live_commits);
+
+        let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
+        let handle = spawn_recording_sink_with_cursor(
+            Arc::clone(&recorded),
+            external_cursor(anchor.checkpoint_id, decisions.proof.fencing_token),
+        );
+        let mut committer = CoordinatedCommitter::new(
+            backend as Arc<dyn StateBackend>,
+            vec![(TEST_SINK_ID.into(), handle)],
+            identity(),
+            deployment_id(),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .with_cluster_controller(Some(Arc::clone(&decisions.controller)))
+        .with_decision_store(Some(Arc::clone(&decisions.capsules)));
+
+        committer.commit_ready().await.unwrap();
+
+        let batches = recorded.lock();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0].expected_predecessor,
+            CoordinatedCommitCursor {
+                checkpoint_id: anchor.checkpoint_id,
+                fencing_token: decisions.proof.fencing_token,
+            }
+        );
+        assert_eq!(batches[0].target, *live_commits.last().unwrap());
+        let submitted_commits = batches[0]
+            .entries
+            .iter()
+            .map(|entry| entry.attempt)
+            .collect::<Vec<_>>();
+        assert_eq!(submitted_commits.as_slice(), live_commits);
     }
 
     #[cfg(feature = "cluster")]
@@ -2621,7 +2738,7 @@ mod tests {
         );
         let mut committer = CoordinatedCommitter::new(
             backend as Arc<dyn StateBackend>,
-            vec![("ice".into(), handle)],
+            vec![(TEST_SINK_ID.into(), handle)],
             identity(),
             deployment_id(),
             Arc::new(AtomicU64::new(0)),
@@ -2660,7 +2777,7 @@ mod tests {
         record_local_commit(&decisions, 4, 44).await;
         let mut committer = CoordinatedCommitter::new(
             backend as Arc<dyn StateBackend>,
-            vec![("ice".into(), handle)],
+            vec![(TEST_SINK_ID.into(), handle)],
             identity(),
             deployment_id(),
             Arc::new(AtomicU64::new(0)),
@@ -2693,7 +2810,7 @@ mod tests {
         record_local_commit(&decisions, 4, 45).await;
         let mut committer = CoordinatedCommitter::new(
             backend as Arc<dyn StateBackend>,
-            vec![("ice".into(), handle)],
+            vec![(TEST_SINK_ID.into(), handle)],
             identity(),
             deployment_id(),
             Arc::new(AtomicU64::new(0)),
@@ -2715,7 +2832,7 @@ mod tests {
         record_local_commit(&decisions, 4, 44).await;
         let mut committer = CoordinatedCommitter::new(
             backend as Arc<dyn StateBackend>,
-            vec![("ice".into(), handle)],
+            vec![(TEST_SINK_ID.into(), handle)],
             identity(),
             "018f0000-0000-7000-8000-000000000099".into(),
             Arc::new(AtomicU64::new(0)),
@@ -2765,7 +2882,7 @@ mod tests {
         let handle = spawn_recording_sink(Arc::clone(&recorded));
         let mut committer = CoordinatedCommitter::new(
             Arc::new(InProcessBackend::new(1)) as Arc<dyn StateBackend>,
-            vec![("ice".into(), handle)],
+            vec![(TEST_SINK_ID.into(), handle)],
             identity(),
             deployment_id(),
             Arc::new(AtomicU64::new(0)),
@@ -2873,7 +2990,10 @@ mod tests {
         let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
         let mut committer = CoordinatedCommitter::new(
             backend as Arc<dyn StateBackend>,
-            vec![("ice".into(), spawn_recording_sink(Arc::clone(&recorded)))],
+            vec![(
+                TEST_SINK_ID.into(),
+                spawn_recording_sink(Arc::clone(&recorded)),
+            )],
             identity(),
             deployment_id(),
             Arc::new(AtomicU64::new(0)),
@@ -2909,7 +3029,7 @@ mod tests {
         record_cluster_commit(&decisions, &backend, 5, 55, &fence).await;
         let mut committer = CoordinatedCommitter::new(
             backend as Arc<dyn StateBackend>,
-            vec![("ice".into(), handle)],
+            vec![(TEST_SINK_ID.into(), handle)],
             identity(),
             deployment_id(),
             Arc::new(AtomicU64::new(0)),
@@ -2951,7 +3071,7 @@ mod tests {
             .unwrap();
         let mut committer = CoordinatedCommitter::new(
             backend as Arc<dyn StateBackend>,
-            vec![("ice".into(), handle)],
+            vec![(TEST_SINK_ID.into(), handle)],
             identity(),
             deployment_id(),
             Arc::new(AtomicU64::new(0)),
@@ -3014,7 +3134,10 @@ mod tests {
 
         let mut committer = CoordinatedCommitter::new(
             backend as Arc<dyn StateBackend>,
-            vec![("ice".into(), spawn_recording_sink(Arc::clone(&recorded)))],
+            vec![(
+                TEST_SINK_ID.into(),
+                spawn_recording_sink(Arc::clone(&recorded)),
+            )],
             identity(),
             deployment_id(),
             Arc::new(AtomicU64::new(0)),
@@ -3051,7 +3174,7 @@ mod tests {
         record_cluster_commit(&decisions, &backend, 6, 66, &decision_fence).await;
         let mut committer = CoordinatedCommitter::new(
             backend as Arc<dyn StateBackend>,
-            vec![("ice".into(), handle)],
+            vec![(TEST_SINK_ID.into(), handle)],
             identity(),
             deployment_id(),
             Arc::new(AtomicU64::new(0)),
@@ -3077,7 +3200,7 @@ mod tests {
         let lag_known = Arc::new(AtomicBool::new(true));
         let mut committer = CoordinatedCommitter::new(
             backend as Arc<dyn StateBackend>,
-            vec![("ice".into(), handle)],
+            vec![(TEST_SINK_ID.into(), handle)],
             identity(),
             deployment_id(),
             Arc::new(AtomicU64::new(0)),
@@ -3108,7 +3231,7 @@ mod tests {
         record_local_commit(&decisions, 1, 11).await;
         let mut committer = CoordinatedCommitter::new(
             backend as Arc<dyn StateBackend>,
-            vec![("ice".into(), handle)],
+            vec![(TEST_SINK_ID.into(), handle)],
             identity(),
             deployment_id(),
             Arc::new(AtomicU64::new(0)),
