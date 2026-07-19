@@ -4647,14 +4647,48 @@ mod tests {
             .expect("an exact durable Abort must end pre-capture alignment cleanly");
 
         assert_eq!(outcome, ShuffleAlignmentOutcome::Aborted);
-        let retained = harness.recorded.lock();
+        let mut retained: Vec<_> = harness
+            .recorded
+            .lock()
+            .iter()
+            .map(|batch| batch.batch().clone())
+            .collect();
+        assert!(
+            matches!(retained.len(), 1 | 2),
+            "the pre-barrier batch must be staged before Abort"
+        );
+        if retained.len() == 1 {
+            let receiver_owned = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let batches = harness.local_receiver.drain_checkpointed_data_for("out");
+                    if !batches.is_empty() {
+                        break batches;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("post-barrier batch remained in flight after Abort");
+            retained.extend(
+                receiver_owned
+                    .into_iter()
+                    .map(|batch| batch.batch().clone()),
+            );
+        }
         assert_eq!(
             retained.len(),
             2,
-            "both owned batches must survive the Abort"
+            "the graph and receiver must jointly own each batch exactly once after Abort"
         );
-        assert_eq!(retained[0].batch(), &before_barrier);
-        assert_eq!(retained[1].batch(), &after_barrier);
+        assert_eq!(retained[0], before_barrier);
+        assert_eq!(retained[1], after_barrier);
+        assert!(
+            harness
+                .local_receiver
+                .drain_checkpointed_data_for("out")
+                .is_empty(),
+            "post-barrier batch was duplicated in receiver ownership"
+        );
     }
 
     #[cfg(feature = "cluster")]
