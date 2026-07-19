@@ -170,6 +170,31 @@ impl RecoveryFaultInventory {
     }
 }
 
+/// One coherent recovery-admission view from the shared leader authority.
+/// This is evidence, not authority to open intake; callers must revalidate it with the audited
+/// leader proof immediately before activation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryAdmissionSnapshot {
+    pub(crate) committed_release: Option<RecoveryAnnouncement>,
+    pub(crate) fault_inventory: RecoveryFaultInventory,
+    pub(crate) authority_sequence: u64,
+    pub(crate) release_head: Option<super::leader_lease::RecoveryReleaseLink>,
+}
+
+impl RecoveryAdmissionSnapshot {
+    /// Latest committed recovery release in this authority view.
+    #[must_use]
+    pub fn committed_release(&self) -> Option<&RecoveryAnnouncement> {
+        self.committed_release.as_ref()
+    }
+
+    /// Active recovery faults from the same authority view.
+    #[must_use]
+    pub const fn fault_inventory(&self) -> &RecoveryFaultInventory {
+        &self.fault_inventory
+    }
+}
+
 impl RecoveryRound {
     /// Construct a fresh uniquely identified recovery round.
     ///
@@ -2333,6 +2358,37 @@ impl ClusterController {
         self.read_recovery_fault_inventory_control()
             .await
             .map_err(|error| error.to_string())
+    }
+
+    /// Coherent committed-release and fault view from shared recovery authority.
+    ///
+    /// # Errors
+    /// Returns a classified error when the authority or immutable terminal cannot be validated.
+    pub async fn read_recovery_admission_snapshot(
+        &self,
+    ) -> Result<RecoveryAdmissionSnapshot, RecoveryControlError> {
+        self.checkpoint_authority()
+            .map_err(|error| RecoveryControlError::Conflict(error.to_string()))?
+            .recovery_admission_snapshot()
+            .await
+            .map_err(RecoveryControlError::from_authority)
+    }
+
+    /// Confirm this recovery view still has the same terminal, no active faults, and the exact
+    /// audited leader term.
+    ///
+    /// # Errors
+    /// Returns a classified error when the current shared authority cannot be validated.
+    pub async fn recovery_admission_is_current(
+        &self,
+        snapshot: &RecoveryAdmissionSnapshot,
+        leader_proof: &LeaderProof,
+    ) -> Result<bool, RecoveryControlError> {
+        self.checkpoint_authority()
+            .map_err(|error| RecoveryControlError::Conflict(error.to_string()))?
+            .recovery_admission_is_current(snapshot, leader_proof)
+            .await
+            .map_err(RecoveryControlError::from_authority)
     }
 
     /// Publish this process's fault request so the leader drives a recovery round.

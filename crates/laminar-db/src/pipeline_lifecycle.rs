@@ -1533,6 +1533,113 @@ impl LaminarDB {
         }
     }
 
+    /// Import the last recovery generation that reached an irrevocable cluster Release before a
+    /// fresh pipeline starts. The allocation high-watermark is deliberately not used: a driver
+    /// can reserve a generation and fail before any data plane rewinds to it.
+    ///
+    /// # Errors
+    /// Returns an error when durable recovery authority is unavailable, the process lease is
+    /// lost, or an already-active transport conflicts with the committed terminal.
+    #[cfg(feature = "cluster")]
+    pub async fn prepare_cluster_startup_recovery_generation(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), DbError> {
+        let controller = self.cluster_controller.lock().clone().ok_or_else(|| {
+            DbError::Checkpoint("cluster recovery generation bootstrap has no controller".into())
+        })?;
+        if !controller.process_lease_is_live() {
+            return Err(DbError::Checkpoint(
+                "cluster recovery generation bootstrap lost its process lease".into(),
+            ));
+        }
+        let terminal =
+            tokio::time::timeout_at(deadline, controller.latest_committed_recover_release())
+                .await
+                .map_err(|_| {
+                    DbError::Checkpoint(
+                        "committed recovery Release lookup exceeded its deadline".into(),
+                    )
+                })?
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "committed recovery Release authority is unavailable: {error}"
+                    ))
+                })?;
+        let committed = terminal
+            .as_ref()
+            .map_or(0, |release| release.round.id.generation);
+        if !controller.process_lease_is_live() {
+            return Err(DbError::Checkpoint(
+                "cluster recovery generation bootstrap lost its process lease".into(),
+            ));
+        }
+        let current = self.shuffle_recovery_generation()?.unwrap_or(0);
+        if current == committed {
+            return Ok(());
+        }
+        let assignment_active = self
+            .shuffle_receiver
+            .lock()
+            .as_ref()
+            .is_some_and(|receiver| receiver.assignment_version() != 0)
+            || self
+                .shuffle_sender
+                .lock()
+                .as_ref()
+                .is_some_and(|sender| sender.assignment_version() != 0);
+        let exact_terminal_participant = terminal.as_ref().is_some_and(|release| {
+            controller.recovery_round_requires_current_process_stop(&release.round)
+        });
+        if current != 0 || assignment_active || exact_terminal_participant {
+            return Err(DbError::Checkpoint(format!(
+                "startup shuffle recovery generation {current} conflicts with committed generation {committed}"
+            )));
+        }
+        self.set_shuffle_recovery_gen(committed);
+        let installed = self.shuffle_recovery_generation()?.unwrap_or(committed);
+        if installed != committed {
+            return Err(DbError::Checkpoint(format!(
+                "startup shuffle recovery generation {installed} does not match committed generation {committed}"
+            )));
+        }
+        if !controller.process_lease_is_live() {
+            return Err(DbError::Checkpoint(
+                "cluster recovery generation bootstrap lost its process lease".into(),
+            ));
+        }
+        if committed != 0 {
+            let epoch = terminal.as_ref().and_then(|release| match release.phase {
+                laminar_core::cluster::control::RecoverPhase::ReleaseCommitted { epoch } => {
+                    Some(epoch)
+                }
+                _ => None,
+            });
+            tracing::info!(
+                generation = committed,
+                ?epoch,
+                "restored committed shuffle recovery generation"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) fn shuffle_recovery_generation(&self) -> Result<Option<u64>, DbError> {
+        let receiver = self.shuffle_receiver.lock().clone();
+        let sender = self.shuffle_sender.lock().clone();
+        let receiver_generation = receiver.as_ref().map(|receiver| receiver.recovery_gen());
+        let sender_generation = sender.as_ref().map(|sender| sender.recovery_gen());
+        if let (Some(receiver), Some(sender)) = (receiver_generation, sender_generation) {
+            if receiver != sender {
+                return Err(DbError::Checkpoint(format!(
+                    "shuffle endpoints disagree on recovery generation: receiver {receiver}, sender {sender}"
+                )));
+            }
+        }
+        Ok(receiver_generation.or(sender_generation))
+    }
+
     /// Resolve only the cumulative shuffle-loss cutoff captured when this exact generation
     /// started. This must succeed before publishing local `Release` readiness.
     #[cfg(feature = "cluster")]

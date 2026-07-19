@@ -42,6 +42,7 @@ fn install_test_process_deadline(
 async fn install_test_process_and_leader_authority(
     controller: &laminar_core::cluster::control::ClusterController,
     store: Arc<dyn object_store::ObjectStore>,
+    process_lease_duration: std::time::Duration,
 ) -> laminar_core::checkpoint::LeaderProof {
     use laminar_core::cluster::control::{
         LeaderLeaseOwner, LeaderLeaseStore, LeaseDeadline, LeaseOutcome, ProcessLeaseAuthority,
@@ -50,9 +51,8 @@ async fn install_test_process_and_leader_authority(
 
     let node = controller.instance_id();
     let boot = controller.recovery_incarnation();
-    let lease_duration = std::time::Duration::from_secs(30);
     let process_authority =
-        Arc::new(ProcessLeaseAuthority::new(Arc::clone(&store), lease_duration).unwrap());
+        Arc::new(ProcessLeaseAuthority::new(Arc::clone(&store), process_lease_duration).unwrap());
     let ProcessLeaseOutcome::Acquired(process_lease) = process_authority
         .store_for(node)
         .try_acquire(boot, 0)
@@ -62,7 +62,9 @@ async fn install_test_process_and_leader_authority(
         panic!("empty process authority must grant the local test process");
     };
     controller
-        .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(lease_duration)))
+        .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
+            std::time::Duration::from_secs(30),
+        )))
         .unwrap();
     controller
         .set_process_lease_authority(process_authority)
@@ -91,7 +93,7 @@ async fn install_test_process_and_leader_authority(
         .set_leader_lease_watch(
             leader_rx,
             leader_owner,
-            Arc::new(LeaseDeadline::live_for(lease_duration)),
+            Arc::new(LeaseDeadline::live_for(std::time::Duration::from_secs(30))),
         )
         .unwrap();
     controller.set_leader_lease_store(leader_authority);
@@ -103,6 +105,7 @@ async fn install_test_process_and_leader_authority(
 struct FaultAuditStore {
     inner: Arc<dyn object_store::ObjectStore>,
     authority_read_mode: std::sync::atomic::AtomicU8,
+    authority_read_count: std::sync::atomic::AtomicU64,
     authority_read_started: tokio::sync::Notify,
 }
 
@@ -116,8 +119,14 @@ impl FaultAuditStore {
         Self {
             inner,
             authority_read_mode: std::sync::atomic::AtomicU8::new(Self::NORMAL),
+            authority_read_count: std::sync::atomic::AtomicU64::new(0),
             authority_read_started: tokio::sync::Notify::new(),
         }
+    }
+
+    fn authority_read_count(&self) -> u64 {
+        self.authority_read_count
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn fail_authority_reads(&self) {
@@ -169,6 +178,8 @@ impl object_store::ObjectStore for FaultAuditStore {
         options: object_store::GetOptions,
     ) -> object_store::Result<object_store::GetResult> {
         if location.as_ref().starts_with("control/leader-lease/") {
+            self.authority_read_count
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             match self
                 .authority_read_mode
                 .load(std::sync::atomic::Ordering::Acquire)
@@ -237,9 +248,7 @@ struct FaultAuditActivationFixture {
 #[cfg(feature = "cluster")]
 async fn fault_audit_activation_fixture() -> FaultAuditActivationFixture {
     use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
-    use laminar_core::cluster::control::{
-        ClusterController, ClusterKv, InMemoryKv, LeaderLeaseStore,
-    };
+    use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
     use laminar_core::cluster::discovery::{NodeId, NodeInfo};
     use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
     use laminar_core::state::{InProcessBackend, NodeId as StateNodeId, VnodeRegistry};
@@ -261,13 +270,17 @@ async fn fault_audit_activation_fixture() -> FaultAuditActivationFixture {
 
     let authority_store: Arc<dyn object_store::ObjectStore> =
         Arc::new(object_store::memory::InMemory::new());
-    install_test_process_and_leader_authority(&controller, Arc::clone(&authority_store)).await;
+    install_test_process_and_leader_authority(
+        &controller,
+        Arc::clone(&authority_store),
+        std::time::Duration::from_secs(30),
+    )
+    .await;
     let authority = Arc::new(FaultAuditStore::new(Arc::clone(&authority_store)));
     let authority_object_store: Arc<dyn object_store::ObjectStore> = authority.clone();
-    controller.set_leader_lease_store(Arc::new(LeaderLeaseStore::new(
-        authority_object_store,
-        30_000,
-    )));
+    controller.set_leader_lease_store(Arc::new(
+        laminar_core::cluster::control::LeaderLeaseStore::new(authority_object_store, 30_000),
+    ));
 
     let registry = Arc::new(VnodeRegistry::single_owner(1, StateNodeId(node_id.0)));
     let fence = CheckpointAssignmentFence::from_owner_map(
@@ -304,6 +317,356 @@ async fn fault_audit_activation_fixture() -> FaultAuditActivationFixture {
         sender,
         receiver,
         fence,
+    }
+}
+
+#[cfg(feature = "cluster")]
+async fn commit_recovery_terminal(
+    controller: &Arc<laminar_core::cluster::control::ClusterController>,
+    pending: &Arc<std::sync::atomic::AtomicU64>,
+    generation: u64,
+    epoch: u64,
+) {
+    use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+    use laminar_core::cluster::control::{
+        RecoverPhase, RecoveryAnnouncement, RecoveryRound, ReleaseCommitStatus,
+    };
+    let node = controller.instance_id();
+    let boot = controller.recovery_incarnation();
+    crate::coordinated_recovery::request_local_fault(controller, pending)
+        .await
+        .unwrap();
+    let inventory = controller.read_recovery_fault_inventory().await.unwrap();
+    let fence = CheckpointAssignmentFence::from_owner_map(
+        1,
+        &[node.0],
+        vec![CheckpointParticipant {
+            node_id: node.0,
+            boot_incarnation: boot,
+        }],
+    )
+    .unwrap();
+    let proof = controller.capture_leader_proof().unwrap();
+    let round = RecoveryRound::new(
+        generation,
+        proof,
+        fence.clone(),
+        Vec::new(),
+        inventory.revision(),
+        inventory.faults().to_vec(),
+    )
+    .unwrap();
+    controller.publish_checkpoint_assignment_fence(Some(fence));
+    controller.announce_recover_prepare(&round).await.unwrap();
+    controller
+        .announce_recover_start(&round, epoch)
+        .await
+        .unwrap();
+    controller
+        .announce_recover_release(&round, epoch)
+        .await
+        .unwrap();
+    let release = RecoveryAnnouncement {
+        round,
+        phase: RecoverPhase::Release { epoch },
+    };
+    controller.announce_release_ready(&release).await.unwrap();
+    assert!(matches!(
+        controller
+            .try_commit_recover_release(&release)
+            .await
+            .unwrap(),
+        ReleaseCommitStatus::Committed { .. }
+    ));
+    controller
+        .retire_committed_recover_release_hint(&release.round, epoch)
+        .await
+        .unwrap();
+}
+
+#[cfg(feature = "cluster")]
+async fn committed_recovery_terminal(
+    generation: u64,
+    epoch: u64,
+) -> (
+    Arc<laminar_core::cluster::control::ClusterController>,
+    Arc<dyn object_store::ObjectStore>,
+    Arc<std::sync::atomic::AtomicU64>,
+) {
+    use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+    use laminar_core::cluster::discovery::{NodeId, NodeInfo};
+
+    let node = NodeId(1);
+    let boot = uuid::Uuid::from_u128(11);
+    let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
+    let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
+        node,
+        Arc::clone(&kv),
+        kv,
+        None,
+        members_rx,
+        boot,
+    ));
+    controller.set_active(true);
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    install_test_process_and_leader_authority(
+        &controller,
+        Arc::clone(&store),
+        std::time::Duration::from_millis(1),
+    )
+    .await;
+    let pending = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    commit_recovery_terminal(&controller, &pending, generation, epoch).await;
+    (controller, store, pending)
+}
+
+#[cfg(feature = "cluster")]
+async fn db_with_fresh_shuffle(
+    controller: Arc<laminar_core::cluster::control::ClusterController>,
+) -> (
+    Arc<LaminarDB>,
+    Arc<laminar_core::shuffle::ShuffleSender>,
+    Arc<laminar_core::shuffle::ShuffleReceiver>,
+) {
+    use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
+    use laminar_core::state::{InProcessBackend, NodeId as StateNodeId, VnodeRegistry};
+
+    let node = controller.instance_id();
+    let boot = controller.recovery_incarnation();
+    let receiver = Arc::new(
+        ShuffleReceiver::bind(node.0, "127.0.0.1:0".parse().unwrap(), boot)
+            .await
+            .unwrap(),
+    );
+    let sender = Arc::new(ShuffleSender::new(node.0, boot));
+    let db = LaminarDB::builder()
+        .cluster_controller(controller)
+        .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
+        .state_backend(Arc::new(InProcessBackend::new(1)))
+        .vnode_registry(Arc::new(VnodeRegistry::single_owner(
+            1,
+            StateNodeId(node.0),
+        )))
+        .shuffle_sender(Arc::clone(&sender))
+        .shuffle_receiver(Arc::clone(&receiver))
+        .build()
+        .await
+        .unwrap();
+    (db, sender, receiver)
+}
+
+#[cfg(feature = "cluster")]
+async fn fresh_rejoin_db(
+    authority_store: Arc<dyn object_store::ObjectStore>,
+    node: laminar_core::cluster::discovery::NodeId,
+    boot: uuid::Uuid,
+) -> (
+    Arc<LaminarDB>,
+    Arc<laminar_core::cluster::control::ClusterController>,
+    Arc<laminar_core::shuffle::ShuffleSender>,
+    Arc<laminar_core::shuffle::ShuffleReceiver>,
+) {
+    use laminar_core::cluster::control::{
+        ClusterController, ClusterKv, InMemoryKv, LeaderLeaseStore, ProcessLeaseAuthority,
+        ProcessLeaseOutcome,
+    };
+    use laminar_core::cluster::discovery::NodeInfo;
+
+    let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
+    let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
+        node,
+        Arc::clone(&kv),
+        kv,
+        None,
+        members_rx,
+        boot,
+    ));
+    install_test_process_deadline(&controller);
+    let process_authority = Arc::new(
+        ProcessLeaseAuthority::new(
+            Arc::clone(&authority_store),
+            std::time::Duration::from_millis(1),
+        )
+        .unwrap(),
+    );
+    let process_store = process_authority.store_for(node);
+    let process_lease = match process_store.try_acquire(boot, 0).await.unwrap() {
+        ProcessLeaseOutcome::Acquired(lease) => lease,
+        ProcessLeaseOutcome::Held(incumbent) => {
+            let observation = process_store.observe_rival(&incumbent).unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            let ProcessLeaseOutcome::Acquired(lease) = process_store
+                .try_takeover(boot, &observation, 2)
+                .await
+                .unwrap()
+            else {
+                panic!("expired test process must be replaced");
+            };
+            lease
+        }
+    };
+    controller
+        .set_process_lease_authority(process_authority)
+        .unwrap();
+    controller
+        .publish_leased_recovery_incarnation(&process_lease)
+        .await
+        .unwrap();
+    controller.set_leader_lease_store(Arc::new(LeaderLeaseStore::new(authority_store, 30_000)));
+    let (db, sender, receiver) = db_with_fresh_shuffle(Arc::clone(&controller)).await;
+    (db, controller, sender, receiver)
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn fresh_rejoin_imports_committed_shuffle_generation_not_allocation_high_water() {
+    let (_old_process, authority_store, _pending) = committed_recovery_terminal(7, 4).await;
+    let boot = uuid::Uuid::from_u128(12);
+    let (db, controller, sender, receiver) = fresh_rejoin_db(
+        authority_store,
+        laminar_core::cluster::discovery::NodeId(1),
+        boot,
+    )
+    .await;
+    let terminal = controller
+        .latest_committed_recover_release()
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!controller.recovery_round_requires_current_process_stop(&terminal.round));
+    controller.adopt_recovery_generation(8).await.unwrap();
+    assert_eq!(controller.max_recovery_generation().await.unwrap(), 8);
+    assert_eq!(sender.recovery_gen(), 0);
+    assert_eq!(receiver.recovery_gen(), 0);
+
+    db.prepare_cluster_startup_recovery_generation(
+        tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(receiver.recovery_gen(), 7);
+    assert_eq!(sender.recovery_gen(), 7);
+    assert_eq!(receiver.assignment_version(), 0);
+    assert_eq!(sender.assignment_version(), 0);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn fresh_rejoin_rejects_divergent_shuffle_generations() {
+    let (_old_process, authority_store, _pending) = committed_recovery_terminal(7, 4).await;
+    let (db, _controller, sender, receiver) = fresh_rejoin_db(
+        authority_store,
+        laminar_core::cluster::discovery::NodeId(2),
+        uuid::Uuid::from_u128(12),
+    )
+    .await;
+    receiver.set_recovery_gen(6);
+
+    let error = db
+        .prepare_cluster_startup_recovery_generation(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("shuffle endpoints disagree"),
+        "{error}"
+    );
+    assert_eq!(receiver.recovery_gen(), 6);
+    assert_eq!(sender.recovery_gen(), 0);
+    assert_eq!(receiver.assignment_version(), 0);
+    assert_eq!(sender.assignment_version(), 0);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn existing_recovery_participant_cannot_boot_fresh_transports_at_its_terminal() {
+    let (controller, _authority_store, _pending) = committed_recovery_terminal(7, 4).await;
+    let (db, sender, receiver) = db_with_fresh_shuffle(controller).await;
+
+    let error = db
+        .prepare_cluster_startup_recovery_generation(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("conflicts with committed"),
+        "{error}"
+    );
+    assert_eq!(receiver.recovery_gen(), 0);
+    assert_eq!(sender.recovery_gen(), 0);
+    assert_eq!(receiver.assignment_version(), 0);
+    assert_eq!(sender.assignment_version(), 0);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn assignment_activation_independently_fences_stale_transport_and_state() {
+    use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+
+    for (local_generation, local_epoch) in [(7, 5), (8, 4)] {
+        let (old_process, authority_store, old_pending) = committed_recovery_terminal(7, 4).await;
+        let boot = uuid::Uuid::from_u128(12);
+        let (db, controller, sender, receiver) = fresh_rejoin_db(
+            authority_store,
+            laminar_core::cluster::discovery::NodeId(2),
+            boot,
+        )
+        .await;
+        db.prepare_cluster_startup_recovery_generation(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(receiver.recovery_gen(), 7);
+        assert_eq!(sender.recovery_gen(), 7);
+        commit_recovery_terminal(&old_process, &old_pending, 8, 5).await;
+        db.set_shuffle_recovery_gen(local_generation);
+        *db.last_recovery_epoch.lock() = Some(local_epoch);
+        let fence = CheckpointAssignmentFence::from_owner_map(
+            1,
+            &[controller.instance_id().0],
+            vec![CheckpointParticipant {
+                node_id: controller.instance_id().0,
+                boot_incarnation: boot,
+            }],
+        )
+        .unwrap();
+        db.set_source_gate(true);
+
+        let activation = db
+            .activate_assignment_authority(
+                &fence,
+                None,
+                db.assignment_authority_revision
+                    .load(std::sync::atomic::Ordering::Acquire),
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+
+        assert!(activation.installed);
+        assert!(!activation.intake_open);
+        assert!(db.cluster_intake_fenced());
+        assert!(controller.is_recovering());
+        let pending = db
+            .pending_recovery_fault
+            .load(std::sync::atomic::Ordering::Acquire);
+        assert_ne!(pending, 0);
+        let inventory = controller.read_recovery_fault_inventory().await.unwrap();
+        assert_eq!(inventory.faults().len(), 1);
+        assert_eq!(inventory.faults()[0].reporter, controller.instance_id());
+        assert_eq!(inventory.faults()[0].sequence, inventory.revision());
+        assert_eq!(receiver.recovery_gen(), local_generation);
+        assert_eq!(sender.recovery_gen(), local_generation);
+        assert_eq!(receiver.assignment_version(), 1);
+        assert_eq!(sender.assignment_version(), 1);
     }
 }
 
@@ -854,8 +1217,12 @@ async fn assignment_activation_installs_transport_before_controller_publication(
     controller.set_active(true);
     let authority_store: Arc<dyn object_store::ObjectStore> =
         Arc::new(object_store::memory::InMemory::new());
-    let leader_proof =
-        install_test_process_and_leader_authority(&controller, Arc::clone(&authority_store)).await;
+    let leader_proof = install_test_process_and_leader_authority(
+        &controller,
+        Arc::clone(&authority_store),
+        std::time::Duration::from_secs(30),
+    )
+    .await;
     let registry = Arc::new(VnodeRegistry::single_owner(1, StateNodeId(node_id.0)));
     let fence = CheckpointAssignmentFence::from_owner_map(
         registry.assignment_version(),
@@ -976,7 +1343,7 @@ async fn assignment_activation_installs_transport_before_controller_publication(
 
 #[cfg(feature = "cluster")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn assignment_activation_keeps_intake_fenced_until_peer_transport_is_ready() {
+async fn assignment_activation_revalidates_recovery_admission_after_mesh_wait() {
     use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
     use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
     use laminar_core::cluster::discovery::{NodeId, NodeInfo, NodeMetadata, NodeState};
@@ -1007,7 +1374,17 @@ async fn assignment_activation_keeps_intake_fenced_until_peer_transport_is_ready
     controller.set_active(true);
     let authority_store: Arc<dyn object_store::ObjectStore> =
         Arc::new(object_store::memory::InMemory::new());
-    install_test_process_and_leader_authority(&controller, Arc::clone(&authority_store)).await;
+    install_test_process_and_leader_authority(
+        &controller,
+        Arc::clone(&authority_store),
+        std::time::Duration::from_secs(30),
+    )
+    .await;
+    let authority = Arc::new(FaultAuditStore::new(Arc::clone(&authority_store)));
+    let audited_store: Arc<dyn object_store::ObjectStore> = authority.clone();
+    controller.set_leader_lease_store(Arc::new(
+        laminar_core::cluster::control::LeaderLeaseStore::new(audited_store, 30_000),
+    ));
 
     let registry = Arc::new(VnodeRegistry::new_unassigned(2));
     registry.set_assignment_and_version(
@@ -1064,6 +1441,7 @@ async fn assignment_activation_keeps_intake_fenced_until_peer_transport_is_ready
     let revision = db
         .assignment_authority_revision
         .load(std::sync::atomic::Ordering::Acquire);
+    let authority_reads = authority.authority_read_count();
     let activation = {
         let db = Arc::clone(&db);
         let fence = fence.clone();
@@ -1081,6 +1459,7 @@ async fn assignment_activation_keeps_intake_fenced_until_peer_transport_is_ready
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         while local_sender.assignment_version() == 0
             || controller.checkpoint_assignment_fence(1).as_ref() != Some(&fence)
+            || authority.authority_read_count() <= authority_reads
         {
             tokio::task::yield_now().await;
         }
@@ -1096,18 +1475,133 @@ async fn assignment_activation_keeps_intake_fenced_until_peer_transport_is_ready
         Some(fence.clone())
     );
 
+    crate::coordinated_recovery::request_local_fault(&controller, &db.pending_recovery_fault)
+        .await
+        .unwrap();
     peer_receiver
         .install_assignment_fence(&fence, &[local_id.0, peer_id.0])
         .unwrap();
     let activated = activation.await.unwrap().unwrap();
-    assert!(activated.installed);
-    assert!(activated.intake_open);
-    assert!(!db.cluster_intake_fenced());
+    assert!(!activated.installed);
+    assert!(!activated.intake_open);
+    assert!(db.cluster_intake_fenced());
+    assert_eq!(local_sender.assignment_version(), 0);
+    assert_eq!(local_receiver.assignment_version(), 0);
+    assert_eq!(controller.checkpoint_assignment_fence(1), None);
+    assert!(!controller.read_fault_reports().await.unwrap().is_empty());
 }
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn assignment_activation_withdraws_partial_authority_when_fault_audit_fails() {
+async fn assignment_activation_skips_admission_io_while_recovering() {
+    let fixture = fault_audit_activation_fixture().await;
+    let faults_before = fixture
+        .controller
+        .read_recovery_fault_inventory()
+        .await
+        .unwrap();
+    let pending_before = fixture
+        .db
+        .pending_recovery_fault
+        .load(std::sync::atomic::Ordering::Acquire);
+    fixture.controller.set_recovering(true);
+    fixture.authority.fail_authority_reads();
+
+    let activation = fixture
+        .db
+        .activate_assignment_authority(
+            &fixture.fence,
+            None,
+            fixture
+                .db
+                .assignment_authority_revision
+                .load(std::sync::atomic::Ordering::Acquire),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+    assert!(activation.installed);
+    assert!(!activation.intake_open);
+    assert!(fixture.db.cluster_intake_fenced());
+    assert_eq!(fixture.sender.assignment_version(), 1);
+    assert_eq!(fixture.receiver.assignment_version(), 1);
+    assert_eq!(
+        fixture
+            .db
+            .pending_recovery_fault
+            .load(std::sync::atomic::Ordering::Acquire),
+        pending_before
+    );
+    fixture.authority.restore_authority_reads();
+    assert_eq!(
+        fixture
+            .controller
+            .read_recovery_fault_inventory()
+            .await
+            .unwrap(),
+        faults_before
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn assignment_activation_does_not_duplicate_an_active_durable_fault() {
+    let fixture = fault_audit_activation_fixture().await;
+    let external_pending = std::sync::atomic::AtomicU64::new(0);
+    crate::coordinated_recovery::request_local_fault(&fixture.controller, &external_pending)
+        .await
+        .unwrap();
+    let faults_before = fixture
+        .controller
+        .read_recovery_fault_inventory()
+        .await
+        .unwrap();
+    let local_pending_before = fixture
+        .db
+        .pending_recovery_fault
+        .load(std::sync::atomic::Ordering::Acquire);
+
+    let activation = fixture
+        .db
+        .activate_assignment_authority(
+            &fixture.fence,
+            None,
+            fixture
+                .db
+                .assignment_authority_revision
+                .load(std::sync::atomic::Ordering::Acquire),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+    assert!(activation.installed);
+    assert!(!activation.intake_open);
+    assert!(fixture.db.cluster_intake_fenced());
+    assert!(fixture.controller.is_recovering());
+    assert_eq!(fixture.sender.assignment_version(), 1);
+    assert_eq!(fixture.receiver.assignment_version(), 1);
+    assert_eq!(
+        fixture
+            .db
+            .pending_recovery_fault
+            .load(std::sync::atomic::Ordering::Acquire),
+        local_pending_before
+    );
+    assert_eq!(
+        fixture
+            .controller
+            .read_recovery_fault_inventory()
+            .await
+            .unwrap(),
+        faults_before
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn assignment_activation_withdraws_partial_authority_when_recovery_admission_fails() {
     let fixture = fault_audit_activation_fixture().await;
     let initial_revision = fixture
         .db
@@ -1135,7 +1629,7 @@ async fn assignment_activation_withdraws_partial_authority_when_fault_audit_fail
 
 #[cfg(feature = "cluster")]
 #[tokio::test(start_paused = true)]
-async fn assignment_activation_withdraws_partial_authority_when_fault_audit_times_out() {
+async fn assignment_activation_withdraws_partial_authority_when_recovery_admission_times_out() {
     let fixture = fault_audit_activation_fixture().await;
     let initial_revision = fixture
         .db
@@ -1172,7 +1666,12 @@ async fn assignment_activation_withdraws_partial_authority_when_fault_audit_time
 
     tokio::time::advance(std::time::Duration::from_secs(1)).await;
     let error = activation.await.unwrap().unwrap_err();
-    assert!(error.to_string().contains("fault audit timed out"));
+    assert!(
+        error
+            .to_string()
+            .contains("recovery admission audit timed out before opening intake"),
+        "{error}"
+    );
     assert_fault_audit_withdrew_authority(&fixture, initial_revision);
     assert_fault_audit_retry_reopens(&fixture).await;
 }

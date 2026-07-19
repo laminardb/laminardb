@@ -29,8 +29,9 @@ use super::catalog_manifest::{
     CatalogManifest, CatalogManifestError, CatalogManifestRef, CatalogSealOutcome,
 };
 use super::controller::{
-    RecoverPhase, RecoveryAnnouncement, RecoveryFault, RecoveryFaultInventory,
-    RecoveryFaultPublisher, RecoveryReleaseId, MAX_RECOVERY_ANNOUNCEMENT_BYTES,
+    RecoverPhase, RecoveryAdmissionSnapshot, RecoveryAnnouncement, RecoveryFault,
+    RecoveryFaultInventory, RecoveryFaultPublisher, RecoveryReleaseId,
+    MAX_RECOVERY_ANNOUNCEMENT_BYTES,
 };
 use super::lease_deadline::LeaseDeadline;
 use super::process_lease::{ProcessLease, ProcessLeaseFence};
@@ -374,7 +375,7 @@ impl AuthorityRecoveryReleaseCommit {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RecoveryReleaseLink {
+pub(crate) struct RecoveryReleaseLink {
     sequence: u64,
     terminal: RecoveryReleaseTerminalRef,
 }
@@ -1665,6 +1666,103 @@ impl LeaderLeaseStore {
         }
     }
 
+    async fn recovery_release_terminal_from(
+        &self,
+        head: &LeaderAuthorityRecord,
+        link: &RecoveryReleaseLink,
+    ) -> Result<RecoveryAnnouncement, ClusterCheckpointAuthorityError> {
+        let admission = if link.sequence == head.lease.seq {
+            head.clone()
+        } else {
+            read_authority_record(self.store.as_ref(), link.sequence)
+                .await?
+                .ok_or_else(|| {
+                    LeaseError::Invalid(
+                        "recovery release admission is missing from retained authority history"
+                            .into(),
+                    )
+                })?
+        };
+        let commit = admission
+            .recovery_release_commit
+            .as_ref()
+            .filter(|commit| {
+                commit.terminal == link.terminal
+                    && admission.recovery_release_head.as_ref() == Some(link)
+            })
+            .ok_or_else(|| {
+                LeaseError::Invalid(
+                    "recovery release head does not match its admitting authority record".into(),
+                )
+            })?;
+        let terminal = self.load_recovery_release_terminal(&link.terminal).await?;
+        if terminal.round.leader_proof != commit.leader_proof {
+            return Err(LeaseError::Invalid(
+                "recovery release terminal does not match its admitting leader proof".into(),
+            )
+            .into());
+        }
+        Ok(terminal)
+    }
+
+    pub(crate) async fn recovery_admission_snapshot(
+        &self,
+    ) -> Result<RecoveryAdmissionSnapshot, ClusterCheckpointAuthorityError> {
+        for _ in 0..MAX_LEASE_HEAD_READ_ATTEMPTS {
+            let head = self
+                .load_record()
+                .await?
+                .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+            let Some(link) = head.recovery_release_head.clone() else {
+                return Ok(RecoveryAdmissionSnapshot {
+                    committed_release: None,
+                    fault_inventory: Self::recovery_fault_inventory_from(&head),
+                    authority_sequence: head.lease.seq,
+                    release_head: None,
+                });
+            };
+            let terminal = self.recovery_release_terminal_from(&head, &link).await;
+            let rechecked = self
+                .load_record()
+                .await?
+                .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+            if rechecked.lease.seq >= head.lease.seq
+                && rechecked.recovery_release_head == head.recovery_release_head
+                && rechecked.recovery_fault_revision == head.recovery_fault_revision
+                && rechecked.recovery_fault_slots == head.recovery_fault_slots
+            {
+                return Ok(RecoveryAdmissionSnapshot {
+                    committed_release: Some(terminal?),
+                    fault_inventory: Self::recovery_fault_inventory_from(&rechecked),
+                    authority_sequence: rechecked.lease.seq,
+                    release_head: rechecked.recovery_release_head,
+                });
+            }
+            tokio::task::yield_now().await;
+        }
+        Err(LeaseError::Io(format!(
+            "recovery admission changed during {MAX_LEASE_HEAD_READ_ATTEMPTS} read attempts"
+        ))
+        .into())
+    }
+
+    pub(crate) async fn recovery_admission_is_current(
+        &self,
+        snapshot: &RecoveryAdmissionSnapshot,
+        leader_proof: &LeaderProof,
+    ) -> Result<bool, ClusterCheckpointAuthorityError> {
+        let current = self
+            .load_record()
+            .await?
+            .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+        let inventory = Self::recovery_fault_inventory_from(&current);
+        Ok(current.lease.matches_proof(leader_proof)
+            && current.lease.seq >= snapshot.authority_sequence
+            && current.recovery_release_head == snapshot.release_head
+            && inventory == snapshot.fault_inventory
+            && inventory.faults().is_empty())
+    }
+
     pub(crate) async fn latest_recovery_release_terminal(
         &self,
     ) -> Result<Option<RecoveryAnnouncement>, ClusterCheckpointAuthorityError> {
@@ -1675,44 +1773,13 @@ impl LeaderLeaseStore {
             let Some(link) = head.recovery_release_head.clone() else {
                 return Ok(None);
             };
-            let admission = if link.sequence == head.lease.seq {
-                head.clone()
-            } else {
-                read_authority_record(self.store.as_ref(), link.sequence)
-                    .await?
-                    .ok_or_else(|| {
-                        LeaseError::Invalid(
-                            "recovery release admission is missing from retained authority history"
-                                .into(),
-                        )
-                    })?
-            };
-            let commit = admission
-                .recovery_release_commit
-                .as_ref()
-                .filter(|commit| {
-                    commit.terminal == link.terminal
-                        && admission.recovery_release_head.as_ref() == Some(&link)
-                })
-                .ok_or_else(|| {
-                    LeaseError::Invalid(
-                        "recovery release head does not match its admitting authority record"
-                            .into(),
-                    )
-                })?;
-            let terminal = self.load_recovery_release_terminal(&link.terminal).await?;
-            if terminal.round.leader_proof != commit.leader_proof {
-                return Err(LeaseError::Invalid(
-                    "recovery release terminal does not match its admitting leader proof".into(),
-                )
-                .into());
-            }
+            let terminal = self.recovery_release_terminal_from(&head, &link).await;
             let rechecked = self
                 .load_record()
                 .await?
                 .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
             if rechecked.recovery_release_head.as_ref() == Some(&link) {
-                return Ok(Some(terminal));
+                return Ok(Some(terminal?));
             }
             tokio::task::yield_now().await;
         }
@@ -5319,6 +5386,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_admission_snapshot_retries_when_faults_change_during_terminal_read() {
+        let inner = Arc::new(InMemory::new());
+        let object_store: Arc<dyn ObjectStore> = inner.clone();
+        let setup = LeaderLeaseStore::new(Arc::clone(&object_store), 1_000);
+        let incumbent = owner(1, 1, 1);
+        let LeaseOutcome::Acquired(lease) = setup.begin_new_term(&incumbent, 0).await.unwrap()
+        else {
+            panic!("empty authority must be acquired");
+        };
+        let initial = setup.recovery_admission_snapshot().await.unwrap();
+        assert_eq!(initial.committed_release(), None);
+        assert!(initial.fault_inventory().faults().is_empty());
+        assert!(setup
+            .recovery_admission_is_current(&initial, &lease.proof())
+            .await
+            .unwrap());
+        let publisher = owner_recovery_fault_publisher(&incumbent);
+        let terminal = recovery_release_terminal_after_owner_fault(&setup, &lease, 7, 4).await;
+        let reference = commit_recovery_release(&setup, &lease, &terminal).await;
+        let settled = setup.recovery_admission_snapshot().await.unwrap();
+        assert_eq!(settled.committed_release(), Some(&terminal));
+        assert!(settled.fault_inventory().faults().is_empty());
+        assert!(setup
+            .recovery_admission_is_current(&settled, &lease.proof())
+            .await
+            .unwrap());
+
+        assert_eq!(
+            setup.record_recovery_fault(publisher, 8).await.unwrap(),
+            RecordRecoveryFaultResult::Active
+        );
+        let changed = setup.load_record().await.unwrap().unwrap();
+        let changed_path = lease_path(changed.lease.seq);
+        let changed_body = encode_authority_record(&changed).unwrap();
+        inner.delete(&changed_path).await.unwrap();
+
+        let terminal_path = recovery_release_terminal_path(&reference);
+        let (raw, store) = replacing_once_on_get(
+            1_000,
+            object_store,
+            terminal_path.clone(),
+            changed_path,
+            changed_body,
+            false,
+        );
+        let current = store.recovery_admission_snapshot().await.unwrap();
+
+        assert!(raw.did_replace.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(raw.get_count(&terminal_path), 2);
+        assert_eq!(current.committed_release(), Some(&terminal));
+        assert_eq!(current.authority_sequence, changed.lease.seq);
+        assert_eq!(current.fault_inventory().revision(), changed.lease.seq);
+        assert_eq!(
+            current.fault_inventory().faults(),
+            &[RecoveryFault {
+                reporter: incumbent.node,
+                sequence: changed.lease.seq,
+            }]
+        );
+
+        raw.clear_get_counts();
+        assert!(!store
+            .recovery_admission_is_current(&settled, &lease.proof())
+            .await
+            .unwrap());
+        assert!(!store
+            .recovery_admission_is_current(&current, &lease.proof())
+            .await
+            .unwrap());
+        assert_eq!(raw.get_count(&terminal_path), 0);
+    }
+
+    #[tokio::test]
+    async fn recovery_admission_revalidation_rejects_leader_takeover() {
+        let store = store(1);
+        let incumbent = owner(1, 1, 1);
+        let rival = owner(2, 2, 1);
+        let LeaseOutcome::Acquired(lease) = store.begin_new_term(&incumbent, 0).await.unwrap()
+        else {
+            panic!("empty authority must be acquired");
+        };
+        let terminal = recovery_release_terminal_after_owner_fault(&store, &lease, 7, 4).await;
+        commit_recovery_release(&store, &lease, &terminal).await;
+        let snapshot = store.recovery_admission_snapshot().await.unwrap();
+        assert!(store
+            .recovery_admission_is_current(&snapshot, &lease.proof())
+            .await
+            .unwrap());
+
+        let observed = store.load().await.unwrap().unwrap();
+        let observation = LeaderLeaseObservation {
+            lease: observed,
+            started: Instant::now()
+                .checked_sub(Duration::from_millis(2))
+                .unwrap(),
+        };
+        let LeaseOutcome::Acquired(takeover) =
+            store.try_takeover(&rival, &observation, 2).await.unwrap()
+        else {
+            panic!("expired incumbent must be replaced");
+        };
+
+        let after = store.recovery_admission_snapshot().await.unwrap();
+        assert_eq!(after.committed_release(), snapshot.committed_release());
+        assert_eq!(after.fault_inventory(), snapshot.fault_inventory());
+        assert!(!store
+            .recovery_admission_is_current(&snapshot, &lease.proof())
+            .await
+            .unwrap());
+        assert!(store
+            .recovery_admission_is_current(&snapshot, &takeover.proof())
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
     async fn recovery_release_compacts_tombstones_without_reusing_fault_sequences() {
         let store = store(1_000);
         let incumbent = owner(1, 1, 1);
@@ -6026,29 +6209,14 @@ mod tests {
             )
             .await
             .unwrap();
-        let raw = Arc::new(BlockingStore {
+        let (raw, store) = replacing_once_on_get(
+            1_000,
             inner,
-            blocked_path: lease_path(1),
-            block_once: true,
-            block_after_put: false,
-            did_block: std::sync::atomic::AtomicBool::new(false),
-            ambiguous_path: None,
-            did_return_ambiguous: std::sync::atomic::AtomicBool::new(false),
-            replacement_on_get: Some((
-                lease_path(2),
-                Bytes::from(serde_json::to_vec(&second).unwrap()),
-            )),
-            did_replace: std::sync::atomic::AtomicBool::new(false),
-            entered: tokio::sync::Semaphore::new(0),
-            release: tokio::sync::Semaphore::new(0),
-            get_counts: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
-            fail_delete_once: Arc::new(std::sync::Mutex::new(None)),
-            track_capsule_get_concurrency: std::sync::atomic::AtomicBool::new(false),
-            active_capsule_gets: std::sync::atomic::AtomicUsize::new(0),
-            max_capsule_gets: std::sync::atomic::AtomicUsize::new(0),
-        });
-        let object_store: Arc<dyn ObjectStore> = raw.clone();
-        let store = LeaderLeaseStore::new(object_store, 1_000);
+            lease_path(1),
+            lease_path(2),
+            Bytes::from(serde_json::to_vec(&second).unwrap()),
+            true,
+        );
 
         assert_eq!(store.load().await.unwrap(), Some(second_lease));
         assert!(raw.did_replace.load(std::sync::atomic::Ordering::Acquire));
@@ -6062,7 +6230,7 @@ mod tests {
         did_block: std::sync::atomic::AtomicBool,
         ambiguous_path: Option<OsPath>,
         did_return_ambiguous: std::sync::atomic::AtomicBool,
-        replacement_on_get: Option<(OsPath, Bytes)>,
+        replacement_on_get: Option<(OsPath, Bytes, bool)>,
         did_replace: std::sync::atomic::AtomicBool,
         entered: tokio::sync::Semaphore,
         release: tokio::sync::Semaphore,
@@ -6196,7 +6364,9 @@ mod tests {
                     .did_replace
                     .swap(true, std::sync::atomic::Ordering::AcqRel)
             {
-                if let Some((replacement_path, replacement)) = &self.replacement_on_get {
+                if let Some((replacement_path, replacement, remove_blocked)) =
+                    &self.replacement_on_get
+                {
                     self.inner
                         .put_opts(
                             replacement_path,
@@ -6207,7 +6377,9 @@ mod tests {
                             },
                         )
                         .await?;
-                    self.inner.delete(location).await?;
+                    if *remove_blocked {
+                        self.inner.delete(location).await?;
+                    }
                 }
             }
             let track_concurrency = location
@@ -6305,6 +6477,37 @@ mod tests {
             ambiguous_path: None,
             did_return_ambiguous: std::sync::atomic::AtomicBool::new(false),
             replacement_on_get: None,
+            did_replace: std::sync::atomic::AtomicBool::new(false),
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+            get_counts: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
+            fail_delete_once: Arc::new(std::sync::Mutex::new(None)),
+            track_capsule_get_concurrency: std::sync::atomic::AtomicBool::new(false),
+            active_capsule_gets: std::sync::atomic::AtomicUsize::new(0),
+            max_capsule_gets: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let object_store: Arc<dyn ObjectStore> = raw.clone();
+        let authority = Arc::new(LeaderLeaseStore::new(object_store, ttl_ms));
+        (raw, authority)
+    }
+
+    fn replacing_once_on_get(
+        ttl_ms: i64,
+        inner: Arc<dyn ObjectStore>,
+        blocked_path: OsPath,
+        replacement_path: OsPath,
+        replacement: Bytes,
+        remove_blocked: bool,
+    ) -> (Arc<BlockingStore>, Arc<LeaderLeaseStore>) {
+        let raw = Arc::new(BlockingStore {
+            inner,
+            blocked_path,
+            block_once: true,
+            block_after_put: false,
+            did_block: std::sync::atomic::AtomicBool::new(false),
+            ambiguous_path: None,
+            did_return_ambiguous: std::sync::atomic::AtomicBool::new(false),
+            replacement_on_get: Some((replacement_path, replacement, remove_blocked)),
             did_replace: std::sync::atomic::AtomicBool::new(false),
             entered: tokio::sync::Semaphore::new(0),
             release: tokio::sync::Semaphore::new(0),

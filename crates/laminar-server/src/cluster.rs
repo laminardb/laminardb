@@ -2150,6 +2150,42 @@ pub async fn start_cluster(
     // Coordinated recovery is the only cluster fault path. Before start() so an early
     // fault is observed.
     db.fence_cluster_startup();
+    let recovery_generation = tokio::select! {
+        biased;
+        () = process_lease_terminal.cancelled() => None,
+        result = db.prepare_cluster_startup_recovery_generation(
+            tokio::time::Instant::now() + PROCESS_LEASE_IO_TIMEOUT,
+        ) => Some(result),
+    };
+    match recovery_generation {
+        Some(Ok(_)) => {}
+        Some(Err(error)) => {
+            cleanup_cluster_startup(
+                &mut discovery,
+                &db,
+                &mut leader_lease,
+                &process_lease_terminal,
+                false,
+            )
+            .await;
+            return Err(ClusterStartupError::EngineConstruction(format!(
+                "cluster recovery generation bootstrap: {error}"
+            )));
+        }
+        None => {
+            cleanup_cluster_startup(
+                &mut discovery,
+                &db,
+                &mut leader_lease,
+                &process_lease_terminal,
+                true,
+            )
+            .await;
+            return Err(ClusterStartupError::AuthorityLost(
+                "stable node identity lease was lost while restoring recovery generation".into(),
+            ));
+        }
+    }
     if let Err(error) = db.enable_coordinated_recovery() {
         cleanup_cluster_startup(
             &mut discovery,

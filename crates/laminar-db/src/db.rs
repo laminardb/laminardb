@@ -1303,6 +1303,81 @@ impl LaminarDB {
         result
     }
 
+    #[cfg(feature = "cluster")]
+    async fn assignment_recovery_admission(
+        &self,
+        controller: &laminar_core::cluster::control::ClusterController,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<laminar_core::cluster::control::RecoveryAdmissionSnapshot>, DbError> {
+        let snapshot =
+            tokio::time::timeout_at(deadline, controller.read_recovery_admission_snapshot())
+                .await
+                .map_err(|_| {
+                    DbError::Checkpoint(
+                        "recovery admission audit timed out before opening intake".into(),
+                    )
+                })?
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "recovery admission authority is unavailable: {error}"
+                    ))
+                })?;
+        let (committed_generation, committed_epoch) = match snapshot.committed_release() {
+            None => (0, 0),
+            Some(release) => match release.phase {
+                laminar_core::cluster::control::RecoverPhase::ReleaseCommitted { epoch } => {
+                    (release.round.id.generation, epoch)
+                }
+                _ => {
+                    return Err(DbError::Checkpoint(
+                        "latest recovery terminal is not a committed Release".into(),
+                    ));
+                }
+            },
+        };
+        let local_generation = self.shuffle_recovery_generation()?;
+        if !snapshot.fault_inventory().faults().is_empty() {
+            controller.set_recovering(true);
+            return Ok(None);
+        }
+        let transport_is_current =
+            local_generation.is_none_or(|generation| generation == committed_generation);
+        let restored_epoch = *self.last_recovery_epoch.lock();
+        let state_is_current =
+            committed_epoch == 0 || restored_epoch.is_some_and(|epoch| epoch >= committed_epoch);
+        if transport_is_current && state_is_current {
+            return Ok(Some(snapshot));
+        }
+
+        controller.set_recovering(true);
+        tokio::time::timeout_at(
+            deadline,
+            crate::coordinated_recovery::request_local_fault(
+                controller,
+                &self.pending_recovery_fault,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            DbError::Checkpoint(
+                "recovery fault publication timed out for stale recovery admission".into(),
+            )
+        })?
+        .map_err(|error| {
+            DbError::Checkpoint(format!(
+                "could not publish recovery fault for stale recovery admission: {error}"
+            ))
+        })?;
+        tracing::debug!(
+            ?local_generation,
+            committed_generation,
+            ?restored_epoch,
+            committed_epoch,
+            "assignment intake remains fenced for coordinated recovery"
+        );
+        Ok(None)
+    }
+
     /// Install shuffle authority, publish its controller certificate, and conditionally open
     /// source intake at one local assignment/execution boundary.
     ///
@@ -1480,39 +1555,37 @@ impl LaminarDB {
                     .load(std::sync::atomic::Ordering::Acquire),
             });
         }
-
         let mut intake_open = false;
         let preserve_predecessor_execution = source_drain_active && !intake_was_closed;
         if !controller.is_recovering() && (!source_drain_active || preserve_predecessor_execution) {
-            // This read is inside the serialized assignment/execution boundary. A startup or
-            // topology watcher that derived authority before a durable fault appeared must not
-            // open intake over that fault while waiting for the recovery monitor's next poll.
-            let fault_reports =
-                match tokio::time::timeout_at(deadline, controller.read_fault_reports()).await {
-                    Ok(Ok(reports)) => reports,
-                    Ok(Err(error)) => {
-                        self.withdraw_assignment_authority(&controller);
-                        return Err(DbError::Checkpoint(format!(
-                        "could not audit recovery faults before opening assignment intake: {error}"
-                    )));
-                    }
-                    Err(_) => {
-                        self.withdraw_assignment_authority(&controller);
-                        return Err(DbError::Checkpoint(
-                            "recovery fault audit timed out before opening assignment intake"
-                                .into(),
-                        ));
-                    }
-                };
-            if fault_reports.iter().any(|(_, sequence)| *sequence != 0) {
-                controller.set_recovering(true);
+            // Recovery authority and active faults must come from one durable view. Reading them
+            // independently can pair an old terminal with the empty fault set created by a newer
+            // committed Release.
+            let recovery_admission = match self
+                .assignment_recovery_admission(&controller, deadline)
+                .await
+            {
+                Ok(Some(snapshot)) => snapshot,
+                Ok(None) => {
+                    return Ok(AssignmentAuthorityActivation {
+                        installed: true,
+                        intake_open: false,
+                        revision: expected_revision,
+                    });
+                }
+                Err(error) => {
+                    self.withdraw_assignment_authority(&controller);
+                    return Err(error);
+                }
+            };
+
+            if controller.is_recovering() {
                 return Ok(AssignmentAuthorityActivation {
                     installed: true,
                     intake_open: false,
                     revision: expected_revision,
                 });
             }
-
             let shuffle_sender = { self.shuffle_sender.lock().clone() };
             if let Some(sender) = shuffle_sender {
                 let mut retry_delay = std::time::Duration::from_millis(25);
@@ -1599,6 +1672,36 @@ impl LaminarDB {
                     )));
                 }
             };
+            let recovery_admission_current = match tokio::time::timeout_at(
+                deadline,
+                controller.recovery_admission_is_current(&recovery_admission, &audited_leader),
+            )
+            .await
+            {
+                Ok(Ok(current)) => current,
+                Ok(Err(error)) => {
+                    self.withdraw_assignment_authority(&controller);
+                    return Err(DbError::Checkpoint(format!(
+                        "recovery admission revalidation failed before opening intake: {error}"
+                    )));
+                }
+                Err(_) => {
+                    self.withdraw_assignment_authority(&controller);
+                    return Err(DbError::Checkpoint(
+                        "recovery admission revalidation timed out before opening intake".into(),
+                    ));
+                }
+            };
+            if !recovery_admission_current {
+                self.withdraw_assignment_authority(&controller);
+                return Ok(AssignmentAuthorityActivation {
+                    installed: false,
+                    intake_open: false,
+                    revision: self
+                        .assignment_authority_revision
+                        .load(std::sync::atomic::Ordering::Acquire),
+                });
+            }
             let authority_unchanged = || {
                 tokio::time::Instant::now() < deadline
                     && self
