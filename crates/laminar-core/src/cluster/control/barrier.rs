@@ -2511,8 +2511,8 @@ impl BarrierCoordinator {
     ///
     /// # Errors
     /// Assignment-certified Prepare must use [`Self::announce_prepare`] so its retry cadence is
-    /// derived from the configured quorum window. Other errors propagate validation and encoding
-    /// failures.
+    /// derived from the configured quorum window. Other errors propagate validation, encoding,
+    /// and publication failures.
     pub async fn announce(&self, ann: &BarrierAnnouncement) -> Result<(), String> {
         #[cfg(feature = "cluster")]
         if ann.phase == Phase::Prepare && ann.assignment_fence.is_some() {
@@ -2527,7 +2527,7 @@ impl BarrierCoordinator {
     ///
     /// # Errors
     /// Rejects a different phase, an assignment-less announcement, a zero/indivisible quorum
-    /// window, malformed authority, or conflicting in-flight Prepare state.
+    /// window, malformed authority, conflicting in-flight Prepare state, or publication failure.
     #[cfg(feature = "cluster")]
     pub async fn announce_prepare(
         &self,
@@ -2608,7 +2608,10 @@ impl BarrierCoordinator {
                 // still see this epoch even if a peer RPC below fails and returns
                 // early (the RPC receiver does not persist the announcement).
                 let json = serde_json::to_string(ann).map_err(|e| e.to_string())?;
-                self.kv.write(ANNOUNCEMENT_KEY, json).await;
+                self.kv
+                    .write_checked(ANNOUNCEMENT_KEY, json)
+                    .await
+                    .map_err(|error| format!("publish barrier announcement: {error}"))?;
                 if ann.phase == Phase::Prepare {
                     if let Some(expected) = prepare_roster.filter(|_| replace_prepare_fanout) {
                         // Start the exact assignment-complete batch only after Prepare is durable.
@@ -2686,7 +2689,10 @@ impl BarrierCoordinator {
         #[cfg(not(feature = "cluster"))]
         let _ = prepare_quorum_window;
         let json = serde_json::to_string(ann).map_err(|e| e.to_string())?;
-        self.kv.write(ANNOUNCEMENT_KEY, json).await;
+        self.kv
+            .write_checked(ANNOUNCEMENT_KEY, json)
+            .await
+            .map_err(|error| format!("publish barrier announcement: {error}"))?;
         Ok(())
     }
 
@@ -3575,6 +3581,34 @@ mod tests {
             coordinator
         }
 
+        #[derive(Debug)]
+        struct RejectAnnouncementKv {
+            inner: Arc<InMemoryKv>,
+        }
+
+        #[async_trait]
+        impl ClusterKv for RejectAnnouncementKv {
+            async fn write(&self, key: &str, value: String) {
+                let _ = self.write_checked(key, value).await;
+            }
+
+            async fn write_checked(&self, key: &str, value: String) -> Result<(), String> {
+                if key == ANNOUNCEMENT_KEY {
+                    return Err("injected durable write failure".into());
+                }
+                self.inner.write(key, value).await;
+                Ok(())
+            }
+
+            async fn read_from(&self, who: NodeId, key: &str) -> Option<String> {
+                self.inner.read_from(who, key).await
+            }
+
+            async fn scan(&self, key: &str) -> Vec<(NodeId, String)> {
+                self.inner.scan(key).await
+            }
+        }
+
         fn test_process_lease(
             node_id: u64,
             boot: u128,
@@ -4411,6 +4445,62 @@ mod tests {
                 endpoint_advertisement(follower_addr, 2, 22, 1),
             );
             (leader, follower, proof)
+        }
+
+        #[tokio::test]
+        async fn failed_durable_prepare_publication_prevents_direct_delivery() {
+            let leader_inner = kv(NodeId(1));
+            let leader_kv = Arc::new(RejectAnnouncementKv {
+                inner: Arc::clone(&leader_inner),
+            });
+            let follower_kv = kv(NodeId(2));
+            let (store, proof) = lease_authority().await;
+            let leader = coordinator(leader_kv, Arc::clone(&store));
+            let follower = coordinator(follower_kv, store);
+            bind_process(&leader, 1, 1, 1);
+            bind_process(&follower, 2, 22, 1);
+            leader
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
+                .await
+                .unwrap();
+            let follower_addr = follower
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
+                .await
+                .unwrap();
+            leader_inner.seed(
+                NodeId(2),
+                BARRIER_ADDR_KEY,
+                endpoint_advertisement(follower_addr, 2, 22, 1),
+            );
+
+            let prepare = BarrierAnnouncement {
+                epoch: 1,
+                checkpoint_id: 41,
+                assignment_fence: Some(test_fence(9, &[1, 2], &[(1, 1), (2, 22)])),
+                leader_proof: Some(proof),
+                phase: Phase::Prepare,
+                flags: crate::checkpoint::flags::FULL_SNAPSHOT,
+                min_watermark_ms: None,
+            };
+            let mut follower_watch = follower.announcement_watch().unwrap();
+
+            let error = leader
+                .announce_prepare(&prepare, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+
+            assert!(error.contains("injected durable write failure"), "{error}");
+            assert!(leader_inner
+                .read_from(NodeId(1), ANNOUNCEMENT_KEY)
+                .await
+                .is_none());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), follower_watch.changed())
+                    .await
+                    .is_err(),
+                "failed durable publication must not deliver a direct announcement"
+            );
+            assert!(follower.prepare_received_at(&prepare).is_none());
         }
 
         #[tokio::test]
