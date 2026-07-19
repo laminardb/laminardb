@@ -16,6 +16,6 @@ pub use routing::{
 #[cfg(feature = "cluster")]
 pub use transport::SHUFFLE_ADDR_KEY;
 pub use transport::{
-    ReceivedBatch, ReceivedShuffle, ShuffleBatchAdmission, ShufflePeerId, ShuffleReceiver,
-    ShuffleSender,
+    is_scope_cancelled, ReceivedBatch, ReceivedShuffle, ShuffleBatchAdmission, ShufflePeerId,
+    ShuffleReceiver, ShuffleSender,
 };

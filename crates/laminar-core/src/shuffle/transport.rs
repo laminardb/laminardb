@@ -13,6 +13,33 @@ const SHUFFLE_RECV_QUEUE: usize = 256;
 /// Peer identifier on the wire; matches `cluster::discovery::NodeId`'s inner type.
 pub type ShufflePeerId = u64;
 
+const SCOPE_CANCELLED: &str = "shuffle assignment or recovery scope was cancelled";
+
+#[derive(Debug)]
+struct ScopeCancelled;
+
+impl std::fmt::Display for ScopeCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(SCOPE_CANCELLED)
+    }
+}
+
+impl std::error::Error for ScopeCancelled {}
+
+fn scope_cancelled_io() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::ConnectionAborted, ScopeCancelled)
+}
+
+/// Whether an outbound shuffle operation was cancelled by an assignment or recovery scope
+/// transition. Generic connection cancellation is deliberately not classified as a scope change.
+#[must_use]
+pub fn is_scope_cancelled(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<ScopeCancelled>())
+        .is_some()
+}
+
 /// Gossip KV key under which a receiver publishes its listener address for peer
 /// discovery.
 #[cfg(feature = "cluster")]
@@ -321,8 +348,9 @@ mod grpc {
         ShuffleSummary,
     };
     use super::{
-        Holdover, InboundReservation, ReceivedBatch, ReceivedShuffle, ShuffleMessage,
-        ShufflePeerId, SHUFFLE_ADDR_KEY, SHUFFLE_RECV_QUEUE,
+        is_scope_cancelled, scope_cancelled_io, Holdover, InboundReservation, ReceivedBatch,
+        ReceivedShuffle, ShuffleMessage, ShufflePeerId, SCOPE_CANCELLED, SHUFFLE_ADDR_KEY,
+        SHUFFLE_RECV_QUEUE,
     };
     use crate::checkpoint::{CheckpointAssignmentFence, CheckpointBarrier};
     use crate::cluster::control::{ClusterKv, LeaseDeadline};
@@ -378,7 +406,6 @@ mod grpc {
     const MAX_TRACKED_PEERS: usize = 4096;
     const MAX_PENDING_HANDSHAKES: usize = 4096;
     const HANDSHAKE_TOKEN_TTL: std::time::Duration = std::time::Duration::from_secs(30);
-    const SCOPE_CANCELLED: &str = "shuffle assignment or recovery scope was cancelled";
     const PROCESS_LEASE_EXPIRED: &str = "shuffle process lease is no longer live";
 
     type InboundRx = AsyncRx<mpsc::Array<Inbound>>;
@@ -388,12 +415,16 @@ mod grpc {
         io::Error::other(e.to_string())
     }
 
-    fn scope_cancelled_io() -> io::Error {
-        io::Error::new(io::ErrorKind::ConnectionAborted, SCOPE_CANCELLED)
-    }
-
     fn scope_cancelled_status() -> tonic::Status {
         tonic::Status::cancelled(SCOPE_CANCELLED)
+    }
+
+    fn status_io(status: tonic::Status) -> io::Error {
+        if status.code() == tonic::Code::Cancelled && status.message() == SCOPE_CANCELLED {
+            scope_cancelled_io()
+        } else {
+            io_err(status)
+        }
     }
 
     fn process_lease_expired_io() -> io::Error {
@@ -2339,7 +2370,8 @@ mod grpc {
             self.validate_expected_assignment(Some(assignment_fence.assignment_version))?;
             let cid = barrier.checkpoint_id;
             let msg = ShuffleMessage::Barrier(barrier);
-            let mut first_err = None;
+            let mut first_scope_cancel = None;
+            let mut first_peer_error = None;
             let results = futures::future::join_all(peers.iter().map(|&peer| {
                 let msg = &msg;
                 async move {
@@ -2366,13 +2398,15 @@ mod grpc {
                             error = %e,
                             "shuffle barrier fan-out: required peer unreachable"
                         );
-                        if first_err.is_none() {
-                            first_err = Some(e);
+                        if is_scope_cancelled(&e) {
+                            first_scope_cancel.get_or_insert(e);
+                        } else {
+                            first_peer_error.get_or_insert(e);
                         }
                     }
                 }
             }
-            match first_err {
+            match first_peer_error.or(first_scope_cancel) {
                 Some(error) => Err(error),
                 None => Ok(()),
             }
@@ -2542,7 +2576,7 @@ mod grpc {
                 assignment_version: call.assignment_version,
                 recovery_gen: call.recovery_gen,
                 assignment_certificate_digest: call.assignment_certificate_digest.to_vec(),
-            })) => response.map_err(io_err)?.into_inner(),
+            })) => response.map_err(status_io)?.into_inner(),
         };
         let receiver_incarnation = parse_uuid(
             &response.receiver_incarnation,
@@ -7113,6 +7147,7 @@ mod tests {
             .expect("superseded outbound admission remained blocked")
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(is_scope_cancelled(&error));
 
         sender
             .send_to_for_assignment(
@@ -7990,6 +8025,43 @@ mod tests {
             received.message(),
             ShuffleMessage::Barrier(received) if *received == barrier
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn barrier_fan_out_does_not_mask_peer_failure_with_scope_cancellation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sender = sender(1);
+        sender
+            .register_peer(2, listener.local_addr().unwrap())
+            .await;
+        let fence = assignment_fence(2, &[1, 2, 99]);
+        sender
+            .install_assignment_fence(&fence, &assignment_owners(&[1, 2, 99]))
+            .unwrap();
+        let accepted = Arc::new(tokio::sync::Notify::new());
+        let stalled_peer = {
+            let accepted = Arc::clone(&accepted);
+            tokio::spawn(async move {
+                let (_socket, _) = listener.accept().await.unwrap();
+                accepted.notify_one();
+                std::future::pending::<()>().await;
+            })
+        };
+        let fanout = sender.fan_out_barrier(&[2, 99], CheckpointBarrier::new(5, 1), &fence);
+        tokio::pin!(fanout);
+        tokio::select! {
+            () = accepted.notified() => {}
+            result = &mut fanout => panic!("fan-out completed before scope cancellation: {result:?}"),
+        }
+
+        sender.suspend_assignment_fence();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), fanout)
+            .await
+            .expect("scope cancellation did not release the stalled peer")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(!is_scope_cancelled(&error));
+        stalled_peer.abort();
     }
 
     #[tokio::test]
