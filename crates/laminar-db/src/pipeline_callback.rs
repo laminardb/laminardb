@@ -6367,7 +6367,8 @@ mod tests {
         use laminar_core::cluster::control::barrier::BARRIER_ADDR_KEY;
         use laminar_core::cluster::control::{
             ClusterController, ClusterKv, InMemoryKv, LeaderLeaseOwner, LeaderLeaseStore,
-            LeaseDeadline, LeaseOutcome, ANNOUNCEMENT_KEY,
+            LeaseDeadline, LeaseOutcome, ProcessLeaseAuthority, ProcessLeaseOutcome,
+            ANNOUNCEMENT_KEY,
         };
         use laminar_core::cluster::discovery::{NodeId, NodeInfo, NodeMetadata, NodeState};
         use laminar_core::state::VnodeRegistry;
@@ -6404,6 +6405,52 @@ mod tests {
             follower_members_rx,
         ));
 
+        let process_authority = Arc::new(
+            ProcessLeaseAuthority::new(
+                Arc::new(object_store::memory::InMemory::new()),
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+        );
+        let ProcessLeaseOutcome::Acquired(leader_process) = process_authority
+            .store_for(leader_id)
+            .try_acquire(leader.recovery_incarnation(), 0)
+            .await
+            .unwrap()
+        else {
+            panic!("test leader must acquire its stable-node process lease");
+        };
+        let ProcessLeaseOutcome::Acquired(follower_process) = process_authority
+            .store_for(follower_id)
+            .try_acquire(follower.recovery_incarnation(), 0)
+            .await
+            .unwrap()
+        else {
+            panic!("test follower must acquire its stable-node process lease");
+        };
+        let leader_deadline = Arc::new(LeaseDeadline::live_for(Duration::from_secs(30)));
+        let follower_deadline = Arc::new(LeaseDeadline::live_for(Duration::from_secs(30)));
+        leader
+            .set_process_lease_deadline(Arc::clone(&leader_deadline))
+            .unwrap();
+        follower
+            .set_process_lease_deadline(follower_deadline)
+            .unwrap();
+        leader
+            .set_process_lease_authority(Arc::clone(&process_authority))
+            .unwrap();
+        follower
+            .set_process_lease_authority(process_authority)
+            .unwrap();
+        leader
+            .publish_leased_recovery_incarnation(&leader_process)
+            .await
+            .unwrap();
+        follower
+            .publish_leased_recovery_incarnation(&follower_process)
+            .await
+            .unwrap();
+
         let authority = Arc::new(LeaderLeaseStore::new(
             Arc::new(object_store::memory::InMemory::new()),
             1_000,
@@ -6411,24 +6458,20 @@ mod tests {
         let owner = LeaderLeaseOwner {
             node: leader_id,
             boot: leader.recovery_incarnation(),
-            process_term: 1,
+            process_term: leader_process.term,
         };
         let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap()
         else {
             panic!("test leader must acquire its first durable term");
         };
-        let deadline = Arc::new(LeaseDeadline::live_for(Duration::from_secs(30)));
-        leader
-            .set_process_lease_deadline(Arc::clone(&deadline))
-            .unwrap();
         let (_lease_tx, lease_rx) = tokio::sync::watch::channel(Some(lease));
         leader
-            .set_leader_lease_watch(lease_rx, owner, deadline)
+            .set_leader_lease_watch(lease_rx, owner, leader_deadline)
             .unwrap();
         leader.set_leader_lease_store(Arc::clone(&authority));
         follower.set_leader_lease_store(authority);
 
-        let follower_addr = follower
+        follower
             .start_barrier_server("127.0.0.1:0".parse().unwrap(), None)
             .await
             .unwrap();
@@ -6436,7 +6479,11 @@ mod tests {
             .start_barrier_server("127.0.0.1:0".parse().unwrap(), None)
             .await
             .unwrap();
-        leader_kv.seed(follower_id, BARRIER_ADDR_KEY, follower_addr.to_string());
+        let follower_advertisement = follower_kv
+            .read_from(follower_id, BARRIER_ADDR_KEY)
+            .await
+            .unwrap();
+        leader_kv.seed(follower_id, BARRIER_ADDR_KEY, follower_advertisement);
 
         let fence = CheckpointAssignmentFence::from_owner_map(
             1,

@@ -272,7 +272,7 @@ placement_isolation_tier = 1     # 0=region, 1=zone, 2=rack — what counts as a
 
 ## Cluster Control-Plane TLS (mTLS)
 
-In `mode = "cluster"`, the inter-node control plane (barrier sync, the distributed-query `RemoteScan` service, and the row shuffle) is plaintext and unauthenticated by default — run it on a trusted/isolated network. To require mutual TLS between nodes, set all four `[discovery]` keys together (omit them for plaintext):
+In `mode = "cluster"`, the inter-node control plane (barrier sync and row shuffle) is plaintext and unauthenticated by default — run it on a trusted/isolated network. To require mutual TLS between nodes, set all four `[discovery]` keys together (omit them for plaintext):
 
 ```toml
 [discovery]

@@ -2600,14 +2600,6 @@ impl LaminarDB {
                 "cluster controller cannot be installed on a local runtime".into(),
             ));
         }
-        // Weak store handles avoid a reference cycle with the DB.
-        controller.register_query_handler(Arc::new(DbQueryHandler {
-            mv_store: Arc::downgrade(&self.mv_store),
-            table_store: Arc::downgrade(&self.table_store),
-            // Isolated context: a pushed `filter_sql` is compiled with only its
-            // temp table visible, so it can't reference other registered tables.
-            filter_ctx: SessionContext::new(),
-        }));
         *self.cluster_controller.lock() = Some(controller);
         Ok(())
     }
@@ -4480,81 +4472,6 @@ impl datafusion::execution::context::QueryPlanner for LookupQueryPlanner {
         planner
             .create_physical_plan(logical_plan, session_state)
             .await
-    }
-}
-
-/// Serves local MV / reference-table rows to peers. Weak store handles so
-/// it never keeps the database alive.
-#[cfg(feature = "cluster")]
-struct DbQueryHandler {
-    mv_store: std::sync::Weak<parking_lot::RwLock<crate::mv_store::MvStore>>,
-    table_store: std::sync::Weak<parking_lot::RwLock<crate::table_store::TableStore>>,
-    /// Isolated context: only the temp table is visible, so a pushed predicate
-    /// can't reference other registered tables.
-    filter_ctx: SessionContext,
-}
-
-#[cfg(feature = "cluster")]
-#[async_trait::async_trait]
-impl laminar_core::cluster::control::RemoteQueryHandler for DbQueryHandler {
-    async fn remote_scan(
-        &self,
-        table_name: &str,
-        projection: Option<Vec<usize>>,
-        filter_sql: Option<String>,
-    ) -> Result<arrow::array::RecordBatch, String> {
-        // A materialization error surfaces as a scan failure rather than a missing-table fallthrough.
-        let from_mv = match self.mv_store.upgrade() {
-            Some(s) => s
-                .read()
-                .to_record_batch(table_name)
-                .map_err(|e| e.to_string())?,
-            None => None,
-        };
-        let batch = if let Some(b) = from_mv {
-            b
-        } else {
-            let store = self
-                .table_store
-                .upgrade()
-                .ok_or_else(|| "table store is unavailable".to_string())?;
-            let batch = store
-                .read()
-                .to_record_batch(table_name)
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| format!("table '{table_name}' not found"))?;
-            batch
-        };
-
-        // Apply before projecting (predicate may reference dropped columns);
-        // on any failure skip — the coordinator re-applies it.
-        let batch = match filter_sql {
-            Some(sql) => {
-                let schema = batch.schema();
-                match crate::filter_compile::compile(&self.filter_ctx, &sql, &schema).await {
-                    Ok(expr) => match crate::filter_compile::apply(&batch, expr.as_ref()) {
-                        Ok(Some(filtered)) => filtered,
-                        Ok(None) => arrow::array::RecordBatch::new_empty(schema),
-                        Err(e) => {
-                            tracing::debug!(table = table_name, error = %e,
-                                "remote_scan: skipping pushed filter (apply failed)");
-                            batch
-                        }
-                    },
-                    Err(e) => {
-                        tracing::debug!(table = table_name, error = %e,
-                            "remote_scan: skipping pushed filter (compile failed)");
-                        batch
-                    }
-                }
-            }
-            None => batch,
-        };
-
-        match projection {
-            Some(proj) => batch.project(&proj).map_err(|e| e.to_string()),
-            None => Ok(batch),
-        }
     }
 }
 

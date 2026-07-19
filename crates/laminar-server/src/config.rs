@@ -868,7 +868,7 @@ pub struct DiscoverySection {
     /// Locality tier the placement/blast-radius metrics group by (0 = coarsest).
     #[serde(default)]
     pub placement_isolation_tier: usize,
-    /// PEM cert for control-plane (barrier/query/shuffle) mTLS; enable by
+    /// PEM cert for control-plane (barrier/shuffle) mTLS; enable by
     /// setting cert + key + client_ca + server_name together.
     #[serde(default)]
     pub cluster_tls_cert: Option<std::path::PathBuf>,

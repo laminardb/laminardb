@@ -776,10 +776,8 @@ impl ClusterEngineHarness {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
 
-        // Mirror production cluster startup: the barrier and remote-query services share one
-        // control-plane listener, and its address is published through the cluster KV. Starting
-        // it before the DB is built is safe because the query service reads the handler slot per
-        // request; `LaminarDB::builder().build()` registers the handler below.
+        // Mirror production cluster startup: the barrier service publishes its process-bound
+        // control-plane address through the cluster KV before the DB starts.
         for node in &cluster.nodes {
             node.controller.install_local_leader_proof_provider();
             node.controller
@@ -1003,8 +1001,8 @@ impl ClusterEngineHarness {
         }
         // Gate on every controller seeing full membership and every peer's published
         // control-plane address. Discovery polls chitchat on its own cadence, so without this a
-        // checkpoint can fire before `members_rx` is populated or a distributed scan can observe
-        // a member before its query service is resolvable.
+        // checkpoint can fire before `members_rx` is populated or a peer's barrier endpoint is
+        // resolvable.
         let expected = self.cluster.nodes.len();
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         loop {

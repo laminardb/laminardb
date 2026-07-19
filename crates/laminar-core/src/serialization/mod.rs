@@ -6,13 +6,11 @@
 /// Canonical JSONB binary format type tag constants.
 pub mod jsonb_tags;
 
-use std::sync::Arc;
-
 use arrow::buffer::Buffer;
 use arrow_array::RecordBatch;
 use arrow_ipc::reader::{StreamDecoder, StreamReader};
 use arrow_ipc::writer::StreamWriter;
-use arrow_schema::{ArrowError, Schema, SchemaRef};
+use arrow_schema::{ArrowError, Schema};
 
 /// A growable byte writer that rejects payloads and retained capacities above a fixed limit.
 /// This is shared by Arrow IPC and archive encoders at checkpoint/shuffle boundaries.
@@ -104,29 +102,22 @@ pub fn deserialize_batch_stream(bytes: &[u8]) -> Result<RecordBatch, arrow_schem
     })?
 }
 
-/// Incremental Arrow IPC encoder that writes the schema once: concatenating the
-/// per-call blobs in order yields one IPC stream for [`BatchStreamDecoder`].
-pub struct BatchStreamEncoder {
+/// Test encoder for exercising incrementally chunked Arrow IPC streams.
+#[cfg(test)]
+pub(crate) struct BatchStreamEncoder {
     writer: StreamWriter<Vec<u8>>,
-    schema: SchemaRef,
 }
 
+#[cfg(test)]
 impl BatchStreamEncoder {
     /// Encoder for `schema`; the schema message flushes out with the first batch.
     ///
     /// # Errors
     /// [`ArrowError`] if the schema header can't be IPC-encoded.
-    pub fn new(schema: &Schema) -> Result<Self, ArrowError> {
+    pub(crate) fn new(schema: &Schema) -> Result<Self, ArrowError> {
         Ok(Self {
             writer: StreamWriter::try_new(Vec::new(), schema)?,
-            schema: Arc::new(schema.clone()),
         })
-    }
-
-    /// Schema this encoder was created with; every encoded batch must match it.
-    #[must_use]
-    pub fn schema(&self) -> &SchemaRef {
-        &self.schema
     }
 
     /// Encode one batch, returning the bytes written since the last call (the
@@ -134,7 +125,7 @@ impl BatchStreamEncoder {
     ///
     /// # Errors
     /// [`ArrowError`] if IPC encoding fails.
-    pub fn encode(&mut self, batch: &RecordBatch) -> Result<Vec<u8>, ArrowError> {
+    pub(crate) fn encode(&mut self, batch: &RecordBatch) -> Result<Vec<u8>, ArrowError> {
         self.writer.write(batch)?;
         Ok(std::mem::take(self.writer.get_mut()))
     }
@@ -145,14 +136,14 @@ impl BatchStreamEncoder {
     ///
     /// # Errors
     /// [`ArrowError`] if writing the marker fails.
-    pub fn finish(&mut self) -> Result<Vec<u8>, ArrowError> {
+    pub(crate) fn finish(&mut self) -> Result<Vec<u8>, ArrowError> {
         self.writer.finish()?;
         Ok(std::mem::take(self.writer.get_mut()))
     }
 }
 
-/// Decoder for a stream produced by [`BatchStreamEncoder`]: feed each chunk in
-/// order; the first chunk's schema decodes all later schema-less chunks.
+/// Decoder for an incrementally chunked Arrow IPC stream. The first chunk's
+/// schema decodes all later schema-less chunks.
 #[derive(Debug, Default)]
 pub struct BatchStreamDecoder {
     decoder: StreamDecoder,

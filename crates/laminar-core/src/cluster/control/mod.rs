@@ -58,13 +58,6 @@ pub mod chitchat_kv;
 pub use chitchat_kv::ChitchatKv;
 
 #[cfg(feature = "cluster")]
-pub mod query;
-#[cfg(feature = "cluster")]
-pub use query::{
-    remote_scan_client, QueryClientPool, QueryHandlerSlot, RemoteBatchStream, RemoteQueryHandler,
-};
-
-#[cfg(feature = "cluster")]
 pub mod tls;
 #[cfg(feature = "cluster")]
 pub use tls::{claim_cluster_plaintext, set_cluster_tls, ClusterTls};

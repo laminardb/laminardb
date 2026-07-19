@@ -22,7 +22,7 @@ helm install my-laminardb deploy/helm/laminardb
 
 ## 🌐 Durable Clustered Setup (`cluster` mode)
 
-LaminarDB supports distributed query execution across multiple nodes.
+LaminarDB supports distributed streaming execution across multiple nodes.
 
 Cluster mode is still pre-production while the open security and operability work is completed. To run a durable 3-node cluster configuration for evaluation:
 

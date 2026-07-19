@@ -29,6 +29,157 @@ pub const ACK_KEY: &str = "control:barrier-ack";
 #[cfg(feature = "cluster")]
 pub const BARRIER_ADDR_KEY: &str = "barrier:addr";
 
+#[cfg(feature = "cluster")]
+const BARRIER_ENDPOINT_VERSION: u8 = 1;
+
+#[cfg(feature = "cluster")]
+const MAX_BARRIER_ENDPOINT_BYTES: usize = 1_024;
+
+/// Process identity attached to one control-plane endpoint. The durable process lease remains the
+/// authority; this value prevents a stable node id from resolving to a different process boot.
+#[cfg(feature = "cluster")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BarrierProcessIdentity {
+    node_id: u64,
+    boot_incarnation: uuid::Uuid,
+    process_term: u64,
+}
+
+#[cfg(feature = "cluster")]
+impl BarrierProcessIdentity {
+    fn from_process_lease(lease: &super::ProcessLease) -> Result<Self, String> {
+        lease
+            .validate(lease.node)
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            node_id: lease.node.0,
+            boot_incarnation: lease.owner,
+            process_term: lease.term,
+        })
+    }
+
+    const fn is_canonical(self) -> bool {
+        self.node_id != 0 && !self.boot_incarnation.is_nil() && self.process_term != 0
+    }
+
+    fn matches_participant(self, participant: &crate::checkpoint::CheckpointParticipant) -> bool {
+        self.node_id == participant.node_id && self.boot_incarnation == participant.boot_incarnation
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BarrierEndpointRecord {
+    version: u8,
+    address: String,
+    process: BarrierProcessIdentity,
+}
+
+#[cfg(feature = "cluster")]
+impl BarrierEndpointRecord {
+    fn new(address: String, process: BarrierProcessIdentity) -> Result<Self, String> {
+        let record = Self {
+            version: BARRIER_ENDPOINT_VERSION,
+            address,
+            process,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.version != BARRIER_ENDPOINT_VERSION {
+            return Err(format!(
+                "unsupported cluster control endpoint version {}",
+                self.version
+            ));
+        }
+        if self.address.is_empty() || self.address.len() > MAX_BARRIER_ENDPOINT_BYTES / 2 {
+            return Err("cluster control endpoint address is empty or oversized".into());
+        }
+        if !self.process.is_canonical() {
+            return Err("cluster control endpoint process identity is not canonical".into());
+        }
+        Ok(())
+    }
+
+    fn encode(&self) -> Result<String, String> {
+        let encoded = serde_json::to_string(self).map_err(|error| error.to_string())?;
+        if encoded.len() > MAX_BARRIER_ENDPOINT_BYTES {
+            return Err("cluster control endpoint advertisement is oversized".into());
+        }
+        Ok(encoded)
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[derive(Debug, Clone, Copy)]
+struct ExpectedBarrierProcess {
+    node_id: u64,
+    boot_incarnation: uuid::Uuid,
+    process_term: Option<u64>,
+}
+
+#[cfg(feature = "cluster")]
+impl ExpectedBarrierProcess {
+    const fn participant(node_id: u64, boot_incarnation: uuid::Uuid) -> Self {
+        Self {
+            node_id,
+            boot_incarnation,
+            process_term: None,
+        }
+    }
+
+    const fn exact(process: &crate::checkpoint::LeaderProofOwner) -> Self {
+        Self {
+            node_id: process.node_id,
+            boot_incarnation: process.boot_id,
+            process_term: Some(process.process_term),
+        }
+    }
+
+    fn matches(self, actual: BarrierProcessIdentity) -> bool {
+        self.node_id == actual.node_id
+            && self.boot_incarnation == actual.boot_incarnation
+            && self
+                .process_term
+                .is_none_or(|term| term == actual.process_term)
+    }
+}
+
+#[cfg(feature = "cluster")]
+fn decode_barrier_endpoint(raw: &str) -> Result<(String, Option<BarrierProcessIdentity>), String> {
+    if raw.len() > MAX_BARRIER_ENDPOINT_BYTES {
+        return Err("cluster control endpoint advertisement is oversized".into());
+    }
+    if !raw.trim_start().starts_with('{') {
+        if raw.is_empty() {
+            return Err("cluster control endpoint address is empty".into());
+        }
+        return Ok((raw.to_string(), None));
+    }
+    let record: BarrierEndpointRecord = serde_json::from_str(raw)
+        .map_err(|error| format!("invalid cluster control endpoint advertisement: {error}"))?;
+    record.validate()?;
+    Ok((record.address, Some(record.process)))
+}
+
+#[cfg(feature = "cluster")]
+fn encode_barrier_endpoint(
+    address: &str,
+    process: Option<BarrierProcessIdentity>,
+) -> Result<String, String> {
+    if address.is_empty() || address.len() > MAX_BARRIER_ENDPOINT_BYTES / 2 {
+        return Err("cluster control endpoint address is empty or oversized".into());
+    }
+    process.map_or_else(
+        || Ok(address.to_string()),
+        |process| BarrierEndpointRecord::new(address.to_string(), process)?.encode(),
+    )
+}
+
 /// Upper bound for a non-Prepare phase notification round. The durable KV
 /// announcement is authoritative; direct gRPC delivery is only the low-latency
 /// path and must never hold the checkpoint coordinator indefinitely.
@@ -527,17 +678,47 @@ impl PrepareAckState {
     }
 }
 
-/// Per-peer barrier gRPC client pool, keyed by `NodeId`. Entries are evicted on
-/// RPC failure so a restarted/moved peer is re-resolved on the next round.
+/// Per-peer barrier gRPC client pool. A stable node id may be reused by a replacement process,
+/// so every cached channel is bound to the boot incarnation certified by its assignment or
+/// leader proof.
 #[cfg(feature = "cluster")]
-type BarrierClientPool = Arc<
-    parking_lot::Mutex<
-        FxHashMap<
-            NodeId,
-            barrier_v1::barrier_sync_client::BarrierSyncClient<tonic::transport::Channel>,
-        >,
-    >,
->;
+#[derive(Clone)]
+struct BarrierClientEntry {
+    process: Option<BarrierProcessIdentity>,
+    client: barrier_v1::barrier_sync_client::BarrierSyncClient<tonic::transport::Channel>,
+}
+
+#[cfg(feature = "cluster")]
+type BarrierClientPool = Arc<parking_lot::Mutex<FxHashMap<NodeId, BarrierClientEntry>>>;
+
+#[cfg(feature = "cluster")]
+#[derive(Debug)]
+enum BarrierClientResolutionError {
+    ProcessMismatch,
+    Invalid(String),
+}
+
+#[cfg(feature = "cluster")]
+impl std::fmt::Display for BarrierClientResolutionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProcessMismatch => formatter.write_str("endpoint belongs to a different process"),
+            Self::Invalid(error) => formatter.write_str(error),
+        }
+    }
+}
+
+#[cfg(feature = "cluster")]
+fn barrier_client_process_matches(
+    expected: Option<ExpectedBarrierProcess>,
+    actual: Option<BarrierProcessIdentity>,
+) -> bool {
+    match (expected, actual) {
+        (None, None) => true,
+        (Some(expected), Some(actual)) => expected.matches(actual),
+        (None, Some(_)) | (Some(_), None) => false,
+    }
+}
 
 #[cfg(feature = "cluster")]
 struct GrpcState {
@@ -560,6 +741,17 @@ struct GrpcState {
     server_handle: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     relay_handle: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     advertise_addr: String,
+    local_process: Arc<std::sync::OnceLock<BarrierProcessIdentity>>,
+}
+
+#[cfg(feature = "cluster")]
+fn abort_grpc_tasks(state: &GrpcState) {
+    if let Some(handle) = state.server_handle.lock().take() {
+        handle.abort();
+    }
+    if let Some(handle) = state.relay_handle.lock().take() {
+        handle.abort();
+    }
 }
 
 #[cfg(feature = "cluster")]
@@ -593,6 +785,8 @@ struct GrpcBarrierServer {
     prepare_acks: Arc<parking_lot::Mutex<PrepareAckState>>,
     leader_lease_store: Arc<parking_lot::Mutex<Option<Arc<super::LeaderLeaseStore>>>>,
     local_leader_proof: Arc<parking_lot::Mutex<Option<LocalLeaderProofProvider>>>,
+    local_process: Arc<std::sync::OnceLock<BarrierProcessIdentity>>,
+    process_lease_deadline: Arc<std::sync::OnceLock<Arc<super::LeaseDeadline>>>,
 }
 
 #[cfg(feature = "cluster")]
@@ -786,6 +980,117 @@ fn validate_phase_ack(ack: &barrier_v1::Ack, ann: &BarrierAnnouncement) -> Resul
 
 #[cfg(feature = "cluster")]
 impl GrpcBarrierServer {
+    fn require_live_process_lease(&self) -> Result<Option<&super::LeaseDeadline>, tonic::Status> {
+        if self.local_process.get().is_none() {
+            return Ok(None);
+        }
+        let deadline = self.process_lease_deadline.get().ok_or_else(|| {
+            tonic::Status::failed_precondition("Process lease deadline is not installed")
+        })?;
+        if !deadline.is_live() {
+            return Err(tonic::Status::failed_precondition(
+                "Process lease deadline has expired",
+            ));
+        }
+        Ok(Some(deadline))
+    }
+
+    fn require_exact_local_proof_process(
+        &self,
+        proof: &super::LeaderProof,
+    ) -> Result<(), tonic::Status> {
+        let local = self.local_process.get().copied().ok_or_else(|| {
+            tonic::Status::failed_precondition(
+                "Leader proof confirmation requires a process-bound endpoint",
+            )
+        })?;
+        if local.node_id != proof.owner.node_id
+            || local.boot_incarnation != proof.owner.boot_id
+            || local.process_term != proof.owner.process_term
+        {
+            return Err(tonic::Status::failed_precondition(
+                "Leader proof challenge does not target this exact process",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn enqueue_while_process_live(
+        &self,
+        announcement: BarrierAnnouncement,
+    ) -> Result<(), tonic::Status> {
+        let deadline = self.require_live_process_lease()?;
+        let send_result = if let Some(deadline) = deadline {
+            tokio::select! {
+                biased;
+                () = deadline.wait_until_expired() => {
+                    return Err(tonic::Status::failed_precondition(
+                        "Process lease deadline expired before barrier delivery",
+                    ));
+                }
+                result = self.incoming_tx.send(announcement) => result,
+            }
+        } else {
+            self.incoming_tx.send(announcement).await
+        };
+        if send_result.is_err() {
+            return Err(tonic::Status::aborted("Follower coordinator shutdown"));
+        }
+        self.require_live_process_lease()?;
+        Ok(())
+    }
+
+    async fn wait_for_prepare_ack(
+        &self,
+        rx: tokio::sync::oneshot::Receiver<BarrierAck>,
+    ) -> Result<BarrierAck, tonic::Status> {
+        let deadline = self.require_live_process_lease()?;
+        let wait_for_ack = async {
+            match tokio::time::timeout(PREPARE_RPC_TIMEOUT, rx).await {
+                Ok(Ok(ack)) => Ok(ack),
+                Ok(Err(_)) => Err(tonic::Status::internal("Ack sender dropped")),
+                Err(_) => Err(tonic::Status::deadline_exceeded(
+                    "Follower checkpoint prepare timed out",
+                )),
+            }
+        };
+        tokio::pin!(wait_for_ack);
+        if let Some(deadline) = deadline {
+            tokio::select! {
+                biased;
+                () = deadline.wait_until_expired() => Err(tonic::Status::failed_precondition(
+                    "Process lease deadline expired while awaiting Prepare acknowledgement",
+                )),
+                result = &mut wait_for_ack => result,
+            }
+        } else {
+            wait_for_ack.await
+        }
+    }
+
+    fn require_local_assignment_process(
+        &self,
+        fence: Option<&super::CheckpointAssignmentFence>,
+    ) -> Result<(), tonic::Status> {
+        match (self.local_process.get().copied(), fence) {
+            (None, None) => Ok(()),
+            (Some(_), None) => Err(tonic::Status::failed_precondition(
+                "Assignment-less barrier cannot target a process-bound cluster endpoint",
+            )),
+            (None, Some(_)) => Err(tonic::Status::failed_precondition(
+                "Certified barrier cannot target a process-unbound control endpoint",
+            )),
+            (Some(local), Some(fence))
+                if fence.participant_incarnation(local.node_id) == Some(local.boot_incarnation) =>
+            {
+                Ok(())
+            }
+            (Some(_), Some(_)) => Err(tonic::Status::failed_precondition(
+                "Certified barrier does not target this exact process",
+            )),
+        }
+    }
+
     async fn require_latest_proof(&self, proof: &super::LeaderProof) -> Result<(), tonic::Status> {
         let store = self.leader_lease_store.lock().clone().ok_or_else(|| {
             tonic::Status::failed_precondition("Durable leader lease store is not installed")
@@ -823,10 +1128,12 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
         &self,
         request: tonic::Request<barrier_v1::LeaderProofChallenge>,
     ) -> Result<tonic::Response<barrier_v1::LeaderProofAck>, tonic::Status> {
+        self.require_live_process_lease()?;
         let requested = request.into_inner();
         let expected = leader_proof_from_wire(requested.expected_proof)?
             .ok_or_else(|| tonic::Status::invalid_argument("Leader proof challenge is missing"))?;
         leader_proof_challenge_from_wire(&requested.challenge_id)?;
+        self.require_exact_local_proof_process(&expected)?;
         let provider = self.local_leader_proof.lock().clone().ok_or_else(|| {
             tonic::Status::failed_precondition("Local leader proof provider is not installed")
         })?;
@@ -838,6 +1145,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
                 "Live process-local leader grant does not match the durable proof challenge",
             ));
         }
+        self.require_live_process_lease()?;
         Ok(tonic::Response::new(barrier_v1::LeaderProofAck {
             challenge_id: requested.challenge_id,
         }))
@@ -847,17 +1155,19 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
         &self,
         request: tonic::Request<barrier_v1::PrepareRequest>,
     ) -> Result<tonic::Response<barrier_v1::Ack>, tonic::Status> {
+        self.require_live_process_lease()?;
         let req = request.into_inner();
-        let leader_proof = self
-            .validate_reversible_leader(req.leader_proof.clone())
-            .await?;
-        let attempt = CheckpointAttempt::new(req.epoch, req.checkpoint_id);
         let assignment_fence = assignment_fence_from_wire(
             req.assignment_version,
             req.assignment_vnode_count,
             req.assignment_map_digest,
             req.assignment_participants,
         )?;
+        self.require_local_assignment_process(assignment_fence.as_ref())?;
+        let leader_proof = self
+            .validate_reversible_leader(req.leader_proof.clone())
+            .await?;
+        let attempt = CheckpointAttempt::new(req.epoch, req.checkpoint_id);
         let assignment_digest = assignment_fence
             .as_ref()
             .map(super::CheckpointAssignmentFence::digest);
@@ -866,10 +1176,12 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
             assignment_digest,
         };
 
+        self.require_live_process_lease()?;
         let (waiter_id, rx) = {
             let mut state = self.prepare_acks.lock();
             state.record_receipt(identity);
             if let Some(ack) = state.completed.get(&identity) {
+                self.require_live_process_lease()?;
                 return Ok(tonic::Response::new(grpc_ack(ack.clone())));
             }
             if state.pending.get(&identity).map_or(0, Vec::len) >= MAX_PREPARE_WAITERS_PER_IDENTITY
@@ -914,42 +1226,36 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
             min_watermark_ms: None,
         };
 
-        if self.incoming_tx.send(ann).await.is_err() {
-            return Err(tonic::Status::aborted("Follower coordinator shutdown"));
-        }
+        self.enqueue_while_process_live(ann).await?;
 
-        match tokio::time::timeout(PREPARE_RPC_TIMEOUT, rx).await {
-            Ok(Ok(ack))
-                if ack.checkpoint_id == attempt.checkpoint_id
-                    && ack.assignment_digest == assignment_digest =>
-            {
-                self.require_latest_proof(&leader_proof).await?;
-                Ok(tonic::Response::new(grpc_ack(ack)))
-            }
-            Ok(Ok(_)) => Err(tonic::Status::failed_precondition(
+        let ack = self.wait_for_prepare_ack(rx).await?;
+        if ack.checkpoint_id != attempt.checkpoint_id || ack.assignment_digest != assignment_digest
+        {
+            return Err(tonic::Status::failed_precondition(
                 "Follower acknowledgement identity mismatch",
-            )),
-            Ok(Err(_)) => Err(tonic::Status::internal("Ack sender dropped")),
-            Err(_) => Err(tonic::Status::deadline_exceeded(
-                "Follower checkpoint prepare timed out",
-            )),
+            ));
         }
+        self.require_latest_proof(&leader_proof).await?;
+        self.require_live_process_lease()?;
+        Ok(tonic::Response::new(grpc_ack(ack)))
     }
 
     async fn aligned(
         &self,
         request: tonic::Request<barrier_v1::AlignedRequest>,
     ) -> Result<tonic::Response<barrier_v1::Ack>, tonic::Status> {
+        self.require_live_process_lease()?;
         let req = request.into_inner();
-        let leader_proof = self
-            .validate_reversible_leader(req.leader_proof.clone())
-            .await?;
         let assignment_fence = assignment_fence_from_wire(
             req.assignment_version,
             req.assignment_vnode_count,
             req.assignment_map_digest,
             req.assignment_participants,
         )?;
+        self.require_local_assignment_process(assignment_fence.as_ref())?;
+        let leader_proof = self
+            .validate_reversible_leader(req.leader_proof.clone())
+            .await?;
 
         // Unlike Commit/Abort, Aligned is mid-protocol: the epoch's ack
         // bookkeeping stays untouched — only the announcement is relayed
@@ -963,9 +1269,8 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
             flags: req.flags,
             min_watermark_ms: req.min_watermark_ms,
         };
-        if self.incoming_tx.send(ann).await.is_err() {
-            return Err(tonic::Status::aborted("Follower coordinator shutdown"));
-        }
+        self.enqueue_while_process_live(ann).await?;
+        self.require_live_process_lease()?;
         Ok(tonic::Response::new(barrier_v1::Ack {
             epoch: req.epoch,
             ok: true,
@@ -983,6 +1288,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
         &self,
         request: tonic::Request<barrier_v1::CommitRequest>,
     ) -> Result<tonic::Response<barrier_v1::Ack>, tonic::Status> {
+        self.require_live_process_lease()?;
         let req = request.into_inner();
         let leader_proof = leader_proof_from_wire(req.leader_proof.clone())?;
         let assignment_fence = assignment_fence_from_wire(
@@ -991,6 +1297,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
             req.assignment_map_digest,
             req.assignment_participants,
         )?;
+        self.require_local_assignment_process(assignment_fence.as_ref())?;
 
         let ann = BarrierAnnouncement {
             epoch: req.epoch,
@@ -1001,9 +1308,8 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
             flags: req.flags,
             min_watermark_ms: req.min_watermark_ms,
         };
-        if self.incoming_tx.send(ann).await.is_err() {
-            return Err(tonic::Status::aborted("Follower coordinator shutdown"));
-        }
+        self.enqueue_while_process_live(ann).await?;
+        self.require_live_process_lease()?;
         Ok(tonic::Response::new(barrier_v1::Ack {
             epoch: req.epoch,
             ok: true,
@@ -1021,6 +1327,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
         &self,
         request: tonic::Request<barrier_v1::AbortRequest>,
     ) -> Result<tonic::Response<barrier_v1::Ack>, tonic::Status> {
+        self.require_live_process_lease()?;
         let req = request.into_inner();
         let leader_proof = leader_proof_from_wire(req.leader_proof.clone())?;
         let assignment_fence = assignment_fence_from_wire(
@@ -1029,6 +1336,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
             req.assignment_map_digest,
             req.assignment_participants,
         )?;
+        self.require_local_assignment_process(assignment_fence.as_ref())?;
 
         let ann = BarrierAnnouncement {
             epoch: req.epoch,
@@ -1039,9 +1347,8 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
             flags: req.flags,
             min_watermark_ms: None,
         };
-        if self.incoming_tx.send(ann).await.is_err() {
-            return Err(tonic::Status::aborted("Follower coordinator shutdown"));
-        }
+        self.enqueue_while_process_live(ann).await?;
+        self.require_live_process_lease()?;
         Ok(tonic::Response::new(barrier_v1::Ack {
             epoch: req.epoch,
             ok: true,
@@ -1059,20 +1366,168 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
 #[cfg(feature = "cluster")]
 async fn get_barrier_client(
     peer: NodeId,
+    expected_process: Option<ExpectedBarrierProcess>,
     pool: &BarrierClientPool,
     kv: &Arc<dyn ClusterKv>,
-) -> Option<barrier_v1::barrier_sync_client::BarrierSyncClient<tonic::transport::Channel>> {
-    if let Some(client) = pool.lock().get(&peer) {
-        return Some(client.clone());
+) -> Result<
+    Option<barrier_v1::barrier_sync_client::BarrierSyncClient<tonic::transport::Channel>>,
+    BarrierClientResolutionError,
+> {
+    {
+        let pool = pool.lock();
+        if let Some(entry) = pool.get(&peer) {
+            if barrier_client_process_matches(expected_process, entry.process) {
+                return Ok(Some(entry.client.clone()));
+            }
+        }
     }
 
-    let addr_str = kv.read_from(peer, BARRIER_ADDR_KEY).await?;
-    let endpoint = super::tls::client_endpoint(&addr_str).ok()?;
+    let Some(raw_endpoint) = kv.read_from(peer, BARRIER_ADDR_KEY).await else {
+        return Ok(None);
+    };
+    let (address, published_process) =
+        decode_barrier_endpoint(&raw_endpoint).map_err(BarrierClientResolutionError::Invalid)?;
+    if let Some(expected) = expected_process {
+        let actual = published_process.ok_or(BarrierClientResolutionError::ProcessMismatch)?;
+        if actual.node_id != peer.0 {
+            return Err(BarrierClientResolutionError::Invalid(format!(
+                "cluster control endpoint slot {} advertises node {}",
+                peer.0, actual.node_id
+            )));
+        }
+        if !expected.matches(actual) {
+            return Err(BarrierClientResolutionError::ProcessMismatch);
+        }
+    } else if let Some(process) = published_process {
+        if process.node_id != peer.0 {
+            return Err(BarrierClientResolutionError::Invalid(format!(
+                "cluster control endpoint slot {} advertises a different node",
+                peer.0
+            )));
+        }
+        return Err(BarrierClientResolutionError::ProcessMismatch);
+    }
+    let endpoint =
+        super::tls::client_endpoint(&address).map_err(BarrierClientResolutionError::Invalid)?;
     let channel = endpoint.connect_lazy();
     let client = barrier_v1::barrier_sync_client::BarrierSyncClient::new(channel);
 
-    pool.lock().insert(peer, client.clone());
-    Some(client)
+    let mut pool = pool.lock();
+    if let Some(entry) = pool.get(&peer) {
+        if barrier_client_process_matches(expected_process, entry.process) {
+            return Ok(Some(entry.client.clone()));
+        }
+        if expected_process.is_none() && entry.process.is_some() {
+            return Ok(Some(client));
+        }
+    }
+    while pool.len() >= crate::checkpoint::MAX_CHECKPOINT_PARTICIPANTS && !pool.contains_key(&peer)
+    {
+        let victim = if expected_process.is_none() {
+            pool.iter()
+                .find_map(|(node, entry)| entry.process.is_none().then_some(*node))
+        } else {
+            pool.keys().next().copied()
+        };
+        let Some(victim) = victim else {
+            break;
+        };
+        pool.remove(&victim);
+    }
+    if pool.len() >= crate::checkpoint::MAX_CHECKPOINT_PARTICIPANTS && !pool.contains_key(&peer) {
+        return Ok(Some(client));
+    }
+    pool.insert(
+        peer,
+        BarrierClientEntry {
+            process: published_process,
+            client: client.clone(),
+        },
+    );
+    Ok(Some(client))
+}
+
+#[cfg(feature = "cluster")]
+fn evict_barrier_client(
+    pool: &BarrierClientPool,
+    peer: NodeId,
+    expected_process: Option<ExpectedBarrierProcess>,
+) {
+    let mut pool = pool.lock();
+    let remove = pool
+        .get(&peer)
+        .is_some_and(|entry| barrier_client_process_matches(expected_process, entry.process));
+    if remove {
+        pool.remove(&peer);
+    }
+}
+
+#[cfg(feature = "cluster")]
+async fn call_phase_rpc(
+    client: &mut barrier_v1::barrier_sync_client::BarrierSyncClient<tonic::transport::Channel>,
+    ann: &BarrierAnnouncement,
+    request_timeout: Duration,
+) -> Result<(), String> {
+    let assignment = assignment_fence_to_wire(ann.assignment_fence.as_ref());
+    match ann.phase {
+        Phase::Aligned => {
+            let mut request = tonic::Request::new(barrier_v1::AlignedRequest {
+                epoch: ann.epoch,
+                checkpoint_id: ann.checkpoint_id,
+                flags: ann.flags,
+                min_watermark_ms: ann.min_watermark_ms,
+                assignment_version: assignment.version,
+                assignment_participants: assignment.participants,
+                assignment_vnode_count: assignment.vnode_count,
+                assignment_map_digest: assignment.map_digest,
+                leader_proof: leader_proof_to_wire(ann.leader_proof.as_ref()),
+            });
+            request.set_timeout(request_timeout);
+            client
+                .aligned(request)
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|response| validate_phase_ack(&response.into_inner(), ann))
+        }
+        Phase::Commit => {
+            let mut request = tonic::Request::new(barrier_v1::CommitRequest {
+                epoch: ann.epoch,
+                checkpoint_id: ann.checkpoint_id,
+                flags: ann.flags,
+                min_watermark_ms: ann.min_watermark_ms,
+                assignment_version: assignment.version,
+                assignment_participants: assignment.participants,
+                assignment_vnode_count: assignment.vnode_count,
+                assignment_map_digest: assignment.map_digest,
+                leader_proof: leader_proof_to_wire(ann.leader_proof.as_ref()),
+            });
+            request.set_timeout(request_timeout);
+            client
+                .commit(request)
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|response| validate_phase_ack(&response.into_inner(), ann))
+        }
+        Phase::Abort => {
+            let mut request = tonic::Request::new(barrier_v1::AbortRequest {
+                epoch: ann.epoch,
+                checkpoint_id: ann.checkpoint_id,
+                flags: ann.flags,
+                assignment_version: assignment.version,
+                assignment_participants: assignment.participants,
+                assignment_vnode_count: assignment.vnode_count,
+                assignment_map_digest: assignment.map_digest,
+                leader_proof: leader_proof_to_wire(ann.leader_proof.as_ref()),
+            });
+            request.set_timeout(request_timeout);
+            client
+                .abort(request)
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|response| validate_phase_ack(&response.into_inner(), ann))
+        }
+        Phase::Prepare => Err("Prepare cannot use the phase-notification RPC path".into()),
+    }
 }
 
 /// Fan a non-Prepare phase announcement to one peer over gRPC. A failed
@@ -1092,80 +1547,32 @@ async fn send_phase_rpc(
         Phase::Prepare => "prepare",
     };
 
+    let expected_process = ann
+        .assignment_fence
+        .as_ref()
+        .map(|fence| {
+            fence
+                .participant_incarnation(peer.0)
+                .map(|boot| ExpectedBarrierProcess::participant(peer.0, boot))
+                .ok_or_else(|| {
+                    format!("{rpc} RPC peer {} is outside the assignment roster", peer.0)
+                })
+        })
+        .transpose()?;
     let result = tokio::time::timeout_at(deadline, async {
-        let mut client = get_barrier_client(peer, &clients_pool, &kv)
+        let mut client = get_barrier_client(peer, expected_process, &clients_pool, &kv)
             .await
+            .map_err(|error| format!("failed to resolve peer {}: {error}", peer.0))?
             .ok_or_else(|| format!("failed to get client for peer {}", peer.0))?;
         let request_timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let assignment = assignment_fence_to_wire(ann.assignment_fence.as_ref());
-
-        match ann.phase {
-            Phase::Aligned => {
-                let mut req = tonic::Request::new(barrier_v1::AlignedRequest {
-                    epoch: ann.epoch,
-                    checkpoint_id: ann.checkpoint_id,
-                    flags: ann.flags,
-                    min_watermark_ms: ann.min_watermark_ms,
-                    assignment_version: assignment.version,
-                    assignment_participants: assignment.participants,
-                    assignment_vnode_count: assignment.vnode_count,
-                    assignment_map_digest: assignment.map_digest,
-                    leader_proof: leader_proof_to_wire(ann.leader_proof.as_ref()),
-                });
-                req.set_timeout(request_timeout);
-                client
-                    .aligned(req)
-                    .await
-                    .map_err(|e| e.to_string())
-                    .and_then(|response| validate_phase_ack(&response.into_inner(), &ann))
-            }
-            Phase::Commit => {
-                let mut req = tonic::Request::new(barrier_v1::CommitRequest {
-                    epoch: ann.epoch,
-                    checkpoint_id: ann.checkpoint_id,
-                    flags: ann.flags,
-                    min_watermark_ms: ann.min_watermark_ms,
-                    assignment_version: assignment.version,
-                    assignment_participants: assignment.participants,
-                    assignment_vnode_count: assignment.vnode_count,
-                    assignment_map_digest: assignment.map_digest,
-                    leader_proof: leader_proof_to_wire(ann.leader_proof.as_ref()),
-                });
-                req.set_timeout(request_timeout);
-                client
-                    .commit(req)
-                    .await
-                    .map_err(|e| e.to_string())
-                    .and_then(|response| validate_phase_ack(&response.into_inner(), &ann))
-            }
-            Phase::Abort => {
-                let mut req = tonic::Request::new(barrier_v1::AbortRequest {
-                    epoch: ann.epoch,
-                    checkpoint_id: ann.checkpoint_id,
-                    flags: ann.flags,
-                    assignment_version: assignment.version,
-                    assignment_participants: assignment.participants,
-                    assignment_vnode_count: assignment.vnode_count,
-                    assignment_map_digest: assignment.map_digest,
-                    leader_proof: leader_proof_to_wire(ann.leader_proof.as_ref()),
-                });
-                req.set_timeout(request_timeout);
-                client
-                    .abort(req)
-                    .await
-                    .map_err(|e| e.to_string())
-                    .and_then(|response| validate_phase_ack(&response.into_inner(), &ann))
-            }
-            // Prepare uses its dedicated acknowledgement-bearing eager batch.
-            Phase::Prepare => Err("Prepare cannot use the phase-notification RPC path".into()),
-        }
+        call_phase_rpc(&mut client, &ann, request_timeout).await
     })
     .await;
 
     match result {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => {
-            clients_pool.lock().remove(&peer);
+            evict_barrier_client(&clients_pool, peer, expected_process);
             if tokio::time::Instant::now() >= deadline || error.contains("Timeout expired") {
                 Err(format!(
                     "{rpc} RPC to peer {} exceeded its request deadline",
@@ -1176,7 +1583,7 @@ async fn send_phase_rpc(
             }
         }
         Err(_) => {
-            clients_pool.lock().remove(&peer);
+            evict_barrier_client(&clients_pool, peer, expected_process);
             Err(format!(
                 "{rpc} RPC to peer {} exceeded its request deadline",
                 peer.0
@@ -1274,6 +1681,59 @@ fn clustered_prepare_roster(prepare: &BarrierAnnouncement) -> Result<Option<Vec<
             .participants
             .iter()
             .filter(|participant| participant.node_id != proof.owner.node_id)
+            .map(|participant| NodeId(participant.node_id))
+            .collect(),
+    ))
+}
+
+#[cfg(feature = "cluster")]
+fn clustered_phase_roster(
+    announcement: &BarrierAnnouncement,
+    local_process: Option<BarrierProcessIdentity>,
+) -> Result<Option<Vec<NodeId>>, String> {
+    if announcement.phase == Phase::Prepare {
+        return Err("non-Prepare fan-out received a Prepare announcement".into());
+    }
+    let Some(fence) = announcement.assignment_fence.as_ref() else {
+        return Ok(None);
+    };
+    if !fence.is_canonical() {
+        return Err("clustered barrier has a non-canonical assignment certificate".into());
+    }
+
+    let local_process = local_process
+        .ok_or_else(|| "assignment-certified phase has no local process identity".to_string())?;
+    if announcement.phase == Phase::Aligned {
+        let proof = announcement
+            .leader_proof
+            .as_ref()
+            .filter(|proof| proof.is_canonical())
+            .ok_or_else(|| "clustered Aligned has no canonical leader proof".to_string())?;
+        if fence.participant_incarnation(proof.owner.node_id) != Some(proof.owner.boot_id) {
+            return Err(
+                "clustered Aligned leader proof is outside its exact assignment process roster"
+                    .into(),
+            );
+        }
+        if local_process.node_id != proof.owner.node_id
+            || local_process.boot_incarnation != proof.owner.boot_id
+            || local_process.process_term != proof.owner.process_term
+        {
+            return Err("clustered Aligned sender does not own its live leader proof".into());
+        }
+    }
+
+    Ok(Some(
+        fence
+            .participants
+            .iter()
+            .filter(|participant| {
+                if is_terminal_phase(announcement.phase) {
+                    participant.node_id != local_process.node_id
+                } else {
+                    !local_process.matches_participant(participant)
+                }
+            })
             .map(|participant| NodeId(participant.node_id))
             .collect(),
     ))
@@ -1422,6 +1882,75 @@ async fn wait_for_prepare_retry(deadline: tokio::time::Instant, backoff: &mut Du
 }
 
 #[cfg(feature = "cluster")]
+fn prepare_rpc_request(
+    prepare: &BarrierAnnouncement,
+    assignment: &WireAssignmentFence,
+    leader_proof: Option<&barrier_v1::LeaderProof>,
+    timeout: Duration,
+) -> tonic::Request<barrier_v1::PrepareRequest> {
+    let mut request = tonic::Request::new(barrier_v1::PrepareRequest {
+        epoch: prepare.epoch,
+        checkpoint_id: prepare.checkpoint_id,
+        flags: prepare.flags,
+        assignment_version: assignment.version,
+        assignment_participants: assignment.participants.clone(),
+        assignment_vnode_count: assignment.vnode_count,
+        assignment_map_digest: assignment.map_digest.clone(),
+        leader_proof: leader_proof.cloned(),
+    });
+    request.set_timeout(timeout);
+    request
+}
+
+#[cfg(feature = "cluster")]
+fn validate_prepare_ack(
+    peer: NodeId,
+    prepare: &BarrierAnnouncement,
+    assignment_digest: Option<&[u8; 32]>,
+    ack: barrier_v1::Ack,
+) -> Result<(NodeId, CheckpointWatermark), (NodeId, PeerFailure)> {
+    if ack.epoch != prepare.epoch
+        || ack.checkpoint_id != prepare.checkpoint_id
+        || ack.assignment_digest.as_slice()
+            != assignment_digest.map_or(&[][..], <[u8; 32]>::as_slice)
+    {
+        return Err((
+            peer,
+            PeerFailure::Nack("Prepare acknowledgement identity mismatch".into()),
+        ));
+    }
+    if !ack.ok {
+        return Err((
+            peer,
+            PeerFailure::Nack(
+                ack.error
+                    .unwrap_or_else(|| "Unknown prepare failure".to_string()),
+            ),
+        ));
+    }
+    checkpoint_watermark_from_wire(ack.watermark_status, ack.local_watermark_ms)
+        .map(|watermark| (peer, watermark))
+        .map_err(|error| (peer, PeerFailure::Nack(error)))
+}
+
+#[cfg(feature = "cluster")]
+fn prepare_expected_process(
+    peer: NodeId,
+    prepare: &BarrierAnnouncement,
+) -> Result<Option<ExpectedBarrierProcess>, (NodeId, PeerFailure)> {
+    let Some(fence) = prepare.assignment_fence.as_ref() else {
+        return Ok(None);
+    };
+    let boot = fence.participant_incarnation(peer.0).ok_or_else(|| {
+        (
+            peer,
+            PeerFailure::Nack("Prepare peer is outside the assignment process roster".into()),
+        )
+    })?;
+    Ok(Some(ExpectedBarrierProcess::participant(peer.0, boot)))
+}
+
+#[cfg(feature = "cluster")]
 async fn prepare_peer_until_deadline(
     peer: NodeId,
     clients_pool: BarrierClientPool,
@@ -1436,6 +1965,7 @@ async fn prepare_peer_until_deadline(
         .as_ref()
         .map(super::CheckpointAssignmentFence::digest);
     let leader_proof = leader_proof_to_wire(prepare.leader_proof.as_ref());
+    let expected_process = prepare_expected_process(peer, &prepare)?;
     let mut backoff = PREPARE_RETRY_INITIAL_BACKOFF;
 
     loop {
@@ -1443,10 +1973,25 @@ async fn prepare_peer_until_deadline(
             return Err((peer, PeerFailure::Unreachable));
         }
 
-        let Ok(client) =
-            tokio::time::timeout_at(deadline, get_barrier_client(peer, &clients_pool, &kv)).await
+        let Ok(client) = tokio::time::timeout_at(
+            deadline,
+            get_barrier_client(peer, expected_process, &clients_pool, &kv),
+        )
+        .await
         else {
             return Err((peer, PeerFailure::Unreachable));
+        };
+        let client = match client {
+            Ok(client) => client,
+            Err(BarrierClientResolutionError::ProcessMismatch) => {
+                if wait_for_prepare_retry(deadline, &mut backoff).await {
+                    continue;
+                }
+                return Err((peer, PeerFailure::Unreachable));
+            }
+            Err(BarrierClientResolutionError::Invalid(error)) => {
+                return Err((peer, PeerFailure::Nack(error)));
+            }
         };
         let Some(mut client) = client else {
             if wait_for_prepare_retry(deadline, &mut backoff).await {
@@ -1458,7 +2003,7 @@ async fn prepare_peer_until_deadline(
         let now = tokio::time::Instant::now();
         let remaining = deadline.saturating_duration_since(now);
         if remaining.is_zero() {
-            clients_pool.lock().remove(&peer);
+            evict_barrier_client(&clients_pool, peer, expected_process);
             return Err((peer, PeerFailure::Unreachable));
         }
         // Leave part of the existing quorum budget available to evict and re-resolve a lazy
@@ -1466,56 +2011,25 @@ async fn prepare_peer_until_deadline(
         // follower may safely complete an earlier attempt and serve its cached acknowledgement.
         let attempt_budget = (remaining / 2).min(max_attempt_duration);
         if attempt_budget.is_zero() {
-            clients_pool.lock().remove(&peer);
+            evict_barrier_client(&clients_pool, peer, expected_process);
             return Err((peer, PeerFailure::Unreachable));
         }
         let attempt_deadline = now + attempt_budget;
 
-        let mut request = tonic::Request::new(barrier_v1::PrepareRequest {
-            epoch: prepare.epoch,
-            checkpoint_id: prepare.checkpoint_id,
-            flags: prepare.flags,
-            assignment_version: assignment.version,
-            assignment_participants: assignment.participants.clone(),
-            assignment_vnode_count: assignment.vnode_count,
-            assignment_map_digest: assignment.map_digest.clone(),
-            leader_proof: leader_proof.clone(),
-        });
-        request.set_timeout(attempt_budget);
+        let request =
+            prepare_rpc_request(&prepare, &assignment, leader_proof.as_ref(), attempt_budget);
 
         match tokio::time::timeout_at(attempt_deadline, client.prepare(request)).await {
             Ok(Ok(response)) => {
-                let ack = response.into_inner();
-                if ack.epoch != prepare.epoch
-                    || ack.checkpoint_id != prepare.checkpoint_id
-                    || ack.assignment_digest.as_slice()
-                        != assignment_digest
-                            .as_ref()
-                            .map_or(&[][..], <[u8; 32]>::as_slice)
-                {
-                    return Err((
-                        peer,
-                        PeerFailure::Nack("Prepare acknowledgement identity mismatch".into()),
-                    ));
-                }
-                if !ack.ok {
-                    return Err((
-                        peer,
-                        PeerFailure::Nack(
-                            ack.error
-                                .unwrap_or_else(|| "Unknown prepare failure".to_string()),
-                        ),
-                    ));
-                }
-                return checkpoint_watermark_from_wire(
-                    ack.watermark_status,
-                    ack.local_watermark_ms,
-                )
-                .map(|watermark| (peer, watermark))
-                .map_err(|error| (peer, PeerFailure::Nack(error)));
+                return validate_prepare_ack(
+                    peer,
+                    &prepare,
+                    assignment_digest.as_ref(),
+                    response.into_inner(),
+                );
             }
             Ok(Err(status)) => {
-                clients_pool.lock().remove(&peer);
+                evict_barrier_client(&clients_pool, peer, expected_process);
                 if retryable_prepare_status(&status) {
                     if wait_for_prepare_retry(deadline, &mut backoff).await {
                         continue;
@@ -1525,7 +2039,7 @@ async fn prepare_peer_until_deadline(
                 return Err((peer, PeerFailure::Nack(status.to_string())));
             }
             Err(_) => {
-                clients_pool.lock().remove(&peer);
+                evict_barrier_client(&clients_pool, peer, expected_process);
                 if wait_for_prepare_retry(deadline, &mut backoff).await {
                     continue;
                 }
@@ -1546,6 +2060,12 @@ pub struct BarrierCoordinator {
     leader_lease_store: Arc<parking_lot::Mutex<Option<Arc<super::LeaderLeaseStore>>>>,
     #[cfg(feature = "cluster")]
     local_leader_proof: Arc<parking_lot::Mutex<Option<LocalLeaderProofProvider>>>,
+    #[cfg(feature = "cluster")]
+    local_process: Arc<std::sync::OnceLock<BarrierProcessIdentity>>,
+    #[cfg(feature = "cluster")]
+    unbound_endpoint_started: parking_lot::Mutex<bool>,
+    #[cfg(feature = "cluster")]
+    process_lease_deadline: Arc<std::sync::OnceLock<Arc<super::LeaseDeadline>>>,
 }
 
 impl std::fmt::Debug for BarrierCoordinator {
@@ -1560,14 +2080,7 @@ impl Drop for BarrierCoordinator {
         {
             let grpc_opt = self.grpc.lock().take();
             if let Some(state) = grpc_opt {
-                let handle_opt = state.server_handle.lock().take();
-                if let Some(handle) = handle_opt {
-                    handle.abort();
-                }
-                let relay_opt = state.relay_handle.lock().take();
-                if let Some(handle) = relay_opt {
-                    handle.abort();
-                }
+                abort_grpc_tasks(&state);
             }
         }
     }
@@ -1587,6 +2100,75 @@ impl BarrierCoordinator {
             leader_lease_store: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "cluster")]
             local_leader_proof: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(feature = "cluster")]
+            local_process: Arc::new(std::sync::OnceLock::new()),
+            #[cfg(feature = "cluster")]
+            unbound_endpoint_started: parking_lot::Mutex::new(false),
+            #[cfg(feature = "cluster")]
+            process_lease_deadline: Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    fn require_live_bound_process_lease(&self) -> Result<(), String> {
+        if self.local_process.get().is_none() {
+            return Ok(());
+        }
+        let deadline = self
+            .process_lease_deadline
+            .get()
+            .ok_or_else(|| "process lease deadline is not installed".to_string())?;
+        if !deadline.is_live() {
+            return Err("process lease deadline has expired".into());
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    fn claim_endpoint_process(&self) -> Option<BarrierProcessIdentity> {
+        let mut unbound_endpoint_started = self.unbound_endpoint_started.lock();
+        let process = self.local_process.get().copied();
+        if process.is_none() {
+            *unbound_endpoint_started = true;
+        }
+        process
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) fn install_process_lease_deadline(
+        &self,
+        deadline: Arc<super::LeaseDeadline>,
+    ) -> Result<(), String> {
+        match self.process_lease_deadline.set(deadline) {
+            Ok(()) => Ok(()),
+            Err(deadline)
+                if self
+                    .process_lease_deadline
+                    .get()
+                    .is_some_and(|current| Arc::ptr_eq(current, &deadline)) =>
+            {
+                Ok(())
+            }
+            Err(_) => Err("process lease deadline is already installed".into()),
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) fn install_local_process_lease(
+        &self,
+        lease: &super::ProcessLease,
+    ) -> Result<(), String> {
+        let process = BarrierProcessIdentity::from_process_lease(lease)?;
+        let unbound_endpoint_started = self.unbound_endpoint_started.lock();
+        if *unbound_endpoint_started {
+            return Err(
+                "an assignment-less cluster control endpoint cannot be promoted in place".into(),
+            );
+        }
+        match self.local_process.set(process) {
+            Ok(()) => Ok(()),
+            Err(_) if self.local_process.get() == Some(&process) => Ok(()),
+            Err(_) => Err("cluster control endpoint process identity is already installed".into()),
         }
     }
 
@@ -1606,6 +2188,9 @@ impl BarrierCoordinator {
     ///
     /// Embedded and single-node runtimes do not call this path. A cluster runtime that omitted
     /// authority wiring fails closed instead of falling back to standalone outcome objects.
+    ///
+    /// # Errors
+    /// Returns `NotConfigured` when durable cluster checkpoint authority is not installed.
     #[cfg(feature = "cluster")]
     pub fn checkpoint_authority(
         &self,
@@ -1728,49 +2313,18 @@ impl BarrierCoordinator {
         &self,
         bind_addr: std::net::SocketAddr,
         advertise_host: Option<String>,
-        query_handler: super::QueryHandlerSlot,
     ) -> Result<std::net::SocketAddr, String> {
-        use super::query::query_service_server;
         use barrier_v1::barrier_sync_server::BarrierSyncServer;
         use std::net::TcpListener;
         use tonic::transport::Server;
 
+        self.require_live_bound_process_lease()?;
+        let advertised_process = self.claim_endpoint_process();
         let listener = TcpListener::bind(bind_addr).map_err(|e| e.to_string())?;
         let local_addr = listener.local_addr().map_err(|e| e.to_string())?;
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         let tokio_listener =
             tokio::net::TcpListener::from_std(listener).map_err(|e| e.to_string())?;
-
-        let (incoming_tx, incoming_rx) = crossfire::mpsc::bounded_async::<BarrierAnnouncement>(128);
-        let prepare_acks = Arc::new(parking_lot::Mutex::new(PrepareAckState::default()));
-        let clients = Arc::new(parking_lot::Mutex::new(FxHashMap::default()));
-
-        let server_impl = GrpcBarrierServer {
-            incoming_tx: incoming_tx.clone(),
-            prepare_acks: Arc::clone(&prepare_acks),
-            leader_lease_store: Arc::clone(&self.leader_lease_store),
-            local_leader_proof: Arc::clone(&self.local_leader_proof),
-        };
-
-        // The pull-path query service shares this control-plane port; peers
-        // reach it at the same address published under `BARRIER_ADDR_KEY`.
-        let query_svc = query_service_server(query_handler);
-        // Apply TLS synchronously so a bad cert fails start_server (before
-        // publishing BARRIER_ADDR_KEY) rather than silently never serving.
-        let mut builder = Server::builder();
-        if let Some(tls) = super::tls::server_tls() {
-            builder = builder
-                .tls_config(tls.clone())
-                .map_err(|e| format!("cluster control-plane TLS config: {e}"))?;
-        }
-        let router = builder
-            .add_service(BarrierSyncServer::new(server_impl))
-            .add_service(query_svc);
-        let server_task = tokio::spawn(async move {
-            let incoming_stream = tokio_stream::wrappers::TcpListenerStream::new(tokio_listener);
-            let _ = router.serve_with_incoming(incoming_stream).await;
-        });
-
         let advertise_addr = if let Some(ref host) = advertise_host {
             format!("{host}:{}", local_addr.port())
         } else if local_addr.ip().is_unspecified() {
@@ -1784,6 +2338,35 @@ impl BarrierCoordinator {
         } else {
             local_addr.to_string()
         };
+        let advertisement = encode_barrier_endpoint(&advertise_addr, advertised_process)?;
+
+        let (incoming_tx, incoming_rx) = crossfire::mpsc::bounded_async::<BarrierAnnouncement>(128);
+        let prepare_acks = Arc::new(parking_lot::Mutex::new(PrepareAckState::default()));
+        let clients = Arc::new(parking_lot::Mutex::new(FxHashMap::default()));
+        let local_process = Arc::clone(&self.local_process);
+
+        let server_impl = GrpcBarrierServer {
+            incoming_tx: incoming_tx.clone(),
+            prepare_acks: Arc::clone(&prepare_acks),
+            leader_lease_store: Arc::clone(&self.leader_lease_store),
+            local_leader_proof: Arc::clone(&self.local_leader_proof),
+            local_process: Arc::clone(&local_process),
+            process_lease_deadline: Arc::clone(&self.process_lease_deadline),
+        };
+
+        // Apply TLS synchronously so a bad cert fails start_server (before
+        // publishing BARRIER_ADDR_KEY) rather than silently never serving.
+        let mut builder = Server::builder();
+        if let Some(tls) = super::tls::server_tls() {
+            builder = builder
+                .tls_config(tls.clone())
+                .map_err(|e| format!("cluster control-plane TLS config: {e}"))?;
+        }
+        let router = builder.add_service(BarrierSyncServer::new(server_impl));
+        let server_task = tokio::spawn(async move {
+            let incoming_stream = tokio_stream::wrappers::TcpListenerStream::new(tokio_listener);
+            let _ = router.serve_with_incoming(incoming_stream).await;
+        });
 
         // Relay every gRPC-delivered announcement into a relation-validated
         // watch in arrival order. Observation is then non-destructive,
@@ -1827,11 +2410,21 @@ impl BarrierCoordinator {
             server_handle: Arc::new(parking_lot::Mutex::new(Some(server_task))),
             relay_handle: Arc::new(parking_lot::Mutex::new(Some(relay_task))),
             advertise_addr: advertise_addr.clone(),
+            local_process: Arc::clone(&local_process),
         });
 
-        *self.grpc.lock() = Some(grpc_state);
+        if let Err(error) = self.require_live_bound_process_lease() {
+            abort_grpc_tasks(&grpc_state);
+            return Err(error);
+        }
+        if let Err(error) = self.kv.write_checked(BARRIER_ADDR_KEY, advertisement).await {
+            abort_grpc_tasks(&grpc_state);
+            return Err(format!(
+                "publish cluster control endpoint advertisement: {error}"
+            ));
+        }
 
-        self.kv.write(BARRIER_ADDR_KEY, advertise_addr).await;
+        *self.grpc.lock() = Some(grpc_state);
 
         Ok(local_addr)
     }
@@ -1861,12 +2454,20 @@ impl BarrierCoordinator {
         let clients = Arc::clone(&state.clients);
         let request_timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
         let challenge = uuid::Uuid::new_v4();
+        let expected_process = Some(ExpectedBarrierProcess::exact(&proof.owner));
         let result = tokio::time::timeout_at(deadline, async {
-            let mut client = get_barrier_client(peer, &clients, &self.kv)
-                .await
-                .ok_or_else(|| {
-                    format!("cluster control address for peer {} is unavailable", peer.0)
-                })?;
+            let mut client =
+                match get_barrier_client(peer, expected_process, &clients, &self.kv).await {
+                    Ok(Some(client)) => client,
+                    Ok(None) => {
+                        return Err(format!(
+                            "cluster control address for peer {} is unavailable",
+                            peer.0
+                        ));
+                    }
+                    Err(BarrierClientResolutionError::ProcessMismatch) => return Ok(false),
+                    Err(BarrierClientResolutionError::Invalid(error)) => return Err(error),
+                };
             let mut request = tonic::Request::new(barrier_v1::LeaderProofChallenge {
                 expected_proof: leader_proof_to_wire(Some(proof)),
                 challenge_id: challenge.as_bytes().to_vec(),
@@ -1883,7 +2484,7 @@ impl BarrierCoordinator {
                 Err(status) if status.code() == tonic::Code::FailedPrecondition => {
                     // The stable node id may now advertise a replacement process. Do not pin
                     // subsequent proof attempts to a still-responsive channel for the old boot.
-                    clients.lock().remove(&peer);
+                    evict_barrier_client(&clients, peer, expected_process);
                     Ok(false)
                 }
                 Err(status) => Err(status.to_string()),
@@ -1893,11 +2494,11 @@ impl BarrierCoordinator {
         match result {
             Ok(Ok(confirmed)) => Ok(confirmed),
             Ok(Err(error)) => {
-                clients.lock().remove(&peer);
+                evict_barrier_client(&clients, peer, expected_process);
                 Err(error)
             }
             Err(_) => {
-                clients.lock().remove(&peer);
+                evict_barrier_client(&clients, peer, expected_process);
                 Err(format!(
                     "remote leader proof request for peer {} timed out",
                     peer.0
@@ -1939,6 +2540,43 @@ impl BarrierCoordinator {
         self.announce_inner(ann, Some(quorum_window)).await
     }
 
+    #[cfg(feature = "cluster")]
+    async fn discover_assignment_less_phase_peers(&self, local_address: &str) -> Vec<NodeId> {
+        let live: Option<FxHashSet<NodeId>> =
+            self.leader_election
+                .lock()
+                .clone()
+                .map(|(_, members_rx, _)| {
+                    members_rx
+                        .borrow()
+                        .iter()
+                        .filter(|member| {
+                            matches!(member.state, NodeState::Active | NodeState::Draining)
+                        })
+                        .map(|member| member.id)
+                        .collect()
+                });
+        let mut discovered = Vec::new();
+        for (node_id, raw_endpoint) in self.kv.scan(BARRIER_ADDR_KEY).await {
+            let address = match decode_barrier_endpoint(&raw_endpoint) {
+                Ok((address, None)) => address,
+                Ok((_, Some(_))) => continue,
+                Err(error) => {
+                    tracing::warn!(peer = node_id.0, %error, "ignoring invalid cluster control endpoint");
+                    continue;
+                }
+            };
+            if address == local_address {
+                continue;
+            }
+            if live.as_ref().is_some_and(|live| !live.contains(&node_id)) {
+                continue;
+            }
+            discovered.push(node_id);
+        }
+        discovered
+    }
+
     async fn announce_inner(
         &self,
         ann: &BarrierAnnouncement,
@@ -1950,6 +2588,12 @@ impl BarrierCoordinator {
             let (prepare_roster, prepare_budget) = prepare_fanout_plan(ann, prepare_quorum_window)?;
             let grpc_opt = self.grpc.lock().clone();
             if let Some(state) = grpc_opt {
+                let local_process = state.local_process.get().copied();
+                let phase_roster = if ann.phase == Phase::Prepare {
+                    None
+                } else {
+                    clustered_phase_roster(ann, local_process)?
+                };
                 let announcement_guard = state.announcement_lock.lock().await;
                 let replace_prepare_fanout = if prepare_roster.is_some() {
                     // Reject stale/equivocating retries before they can overwrite the durable
@@ -1985,37 +2629,17 @@ impl BarrierCoordinator {
                     // before it publishes this terminal/successor phase.
                     retire_prepare_fanout(&state, ann);
                     drop(announcement_guard);
-                    // A node's barrier address lingers in the KV after it dies,
-                    // so announce to peers still Active in membership — a Commit
-                    // RPC to a departed peer returns Err and wedges every epoch.
-                    // The KV-fallback write below still lets a recovering peer
-                    // observe the announcement.
-                    let live: Option<FxHashSet<NodeId>> =
-                        self.leader_election
-                            .lock()
-                            .clone()
-                            .map(|(_, members_rx, _)| {
-                                members_rx
-                                    .borrow()
-                                    .iter()
-                                    // A draining owner remains a checkpoint participant until its
-                                    // handoff cut commits; it must receive Aligned/Commit/Abort too.
-                                    .filter(|m| {
-                                        matches!(m.state, NodeState::Active | NodeState::Draining)
-                                    })
-                                    .map(|m| m.id)
-                                    .collect()
-                            });
-                    let mut expected = Vec::new();
-                    for (node_id, addr) in self.kv.scan(BARRIER_ADDR_KEY).await {
-                        if addr == state.advertise_addr {
-                            continue;
-                        }
-                        if live.as_ref().is_some_and(|live| !live.contains(&node_id)) {
-                            continue;
-                        }
-                        expected.push(node_id);
-                    }
+                    let expected = if let Some(roster) = phase_roster {
+                        // The checkpoint certificate, not mutable membership, is the phase roster.
+                        // This also removes a discovery/object-store scan from the clustered hot
+                        // path and excludes Active processes outside the frozen cut.
+                        roster
+                    } else {
+                        // Feature-enabled embedded and single-node use remains assignment-less.
+                        // Only that compatibility path discovers direct peers from membership.
+                        self.discover_assignment_less_phase_peers(&state.advertise_addr)
+                            .await
+                    };
 
                     // One absolute deadline bounds the whole concurrent fan-out.
                     // Reusing it for every peer prevents a slow address lookup or
@@ -2480,6 +3104,41 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[test]
+    fn process_bound_endpoint_advertisement_is_strict_and_bounded() {
+        let process = BarrierProcessIdentity {
+            node_id: 7,
+            boot_incarnation: uuid::Uuid::from_u128(70),
+            process_term: 9,
+        };
+        let encoded = BarrierEndpointRecord::new("127.0.0.1:9000".into(), process)
+            .unwrap()
+            .encode()
+            .unwrap();
+        assert_eq!(
+            decode_barrier_endpoint(&encoded).unwrap(),
+            ("127.0.0.1:9000".into(), Some(process))
+        );
+        assert_eq!(
+            decode_barrier_endpoint("127.0.0.1:9001").unwrap(),
+            ("127.0.0.1:9001".into(), None)
+        );
+
+        let mut wrong_version: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        wrong_version["version"] = serde_json::json!(2);
+        assert!(decode_barrier_endpoint(&wrong_version.to_string()).is_err());
+
+        let mut unknown_field: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        unknown_field["unexpected"] = serde_json::json!(true);
+        assert!(decode_barrier_endpoint(&unknown_field.to_string()).is_err());
+
+        let mut nil_boot: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        nil_boot["process"]["boot_incarnation"] = serde_json::json!(uuid::Uuid::nil());
+        assert!(decode_barrier_endpoint(&nil_boot.to_string()).is_err());
+        assert!(decode_barrier_endpoint(&"x".repeat(MAX_BARRIER_ENDPOINT_BYTES + 1)).is_err());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
     fn wire_watermark_requires_an_exact_status_value_shape() {
         use barrier_v1::CheckpointWatermarkStatus as WireStatus;
 
@@ -2568,6 +3227,109 @@ mod tests {
         assert_eq!(
             assignment_fence_from_wire(0, 0, Vec::new(), Vec::new()).unwrap(),
             None
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn successor_terminal_targets_historical_proof_owner_and_excludes_actual_sender() {
+        let announcement = BarrierAnnouncement {
+            epoch: 9,
+            checkpoint_id: 90,
+            assignment_fence: Some(test_fence(17, &[1, 2, 3], &[(1, 11), (2, 22), (3, 33)])),
+            leader_proof: Some(crate::cluster::control::LeaderProof {
+                owner: crate::checkpoint::LeaderProofOwner {
+                    node_id: 1,
+                    boot_id: uuid::Uuid::from_u128(11),
+                    process_term: 7,
+                },
+                fencing_token: 9,
+            }),
+            phase: Phase::Commit,
+            flags: 0,
+            min_watermark_ms: None,
+        };
+
+        assert_eq!(
+            clustered_phase_roster(
+                &announcement,
+                Some(BarrierProcessIdentity {
+                    node_id: 3,
+                    boot_incarnation: uuid::Uuid::from_u128(33),
+                    process_term: 8,
+                }),
+            )
+            .unwrap(),
+            Some(vec![NodeId(1), NodeId(2)])
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn restarted_same_node_terminal_skips_the_unaddressable_predecessor() {
+        let announcement = BarrierAnnouncement {
+            epoch: 9,
+            checkpoint_id: 90,
+            assignment_fence: Some(test_fence(17, &[1, 2], &[(1, 11), (2, 22)])),
+            leader_proof: Some(crate::cluster::control::LeaderProof {
+                owner: crate::checkpoint::LeaderProofOwner {
+                    node_id: 1,
+                    boot_id: uuid::Uuid::from_u128(11),
+                    process_term: 7,
+                },
+                fencing_token: 9,
+            }),
+            phase: Phase::Commit,
+            flags: 0,
+            min_watermark_ms: None,
+        };
+
+        assert_eq!(
+            clustered_phase_roster(
+                &announcement,
+                Some(BarrierProcessIdentity {
+                    node_id: 1,
+                    boot_incarnation: uuid::Uuid::from_u128(111),
+                    process_term: 8,
+                }),
+            )
+            .unwrap(),
+            Some(vec![NodeId(2)])
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn restarted_same_node_cannot_send_aligned_with_the_predecessor_proof() {
+        let announcement = BarrierAnnouncement {
+            epoch: 9,
+            checkpoint_id: 90,
+            assignment_fence: Some(test_fence(17, &[1, 2], &[(1, 11), (2, 22)])),
+            leader_proof: Some(crate::cluster::control::LeaderProof {
+                owner: crate::checkpoint::LeaderProofOwner {
+                    node_id: 1,
+                    boot_id: uuid::Uuid::from_u128(11),
+                    process_term: 7,
+                },
+                fencing_token: 9,
+            }),
+            phase: Phase::Aligned,
+            flags: 0,
+            min_watermark_ms: None,
+        };
+
+        let error = clustered_phase_roster(
+            &announcement,
+            Some(BarrierProcessIdentity {
+                node_id: 1,
+                boot_incarnation: uuid::Uuid::from_u128(111),
+                process_term: 8,
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("does not own its live leader proof"),
+            "{error}"
         );
     }
 
@@ -2685,6 +3447,8 @@ mod tests {
             prepare_acks: Arc::new(parking_lot::Mutex::new(PrepareAckState::default())),
             leader_lease_store: Arc::new(parking_lot::Mutex::new(Some(Arc::clone(&store)))),
             local_leader_proof: Arc::new(parking_lot::Mutex::new(None)),
+            local_process: Arc::new(std::sync::OnceLock::new()),
+            process_lease_deadline: Arc::new(std::sync::OnceLock::new()),
         };
         assert!(server
             .require_latest_proof(&replacement_lease.proof())
@@ -2811,6 +3575,495 @@ mod tests {
             coordinator
         }
 
+        fn test_process_lease(
+            node_id: u64,
+            boot: u128,
+            term: u64,
+        ) -> crate::cluster::control::ProcessLease {
+            crate::cluster::control::ProcessLease {
+                node: NodeId(node_id),
+                owner: uuid::Uuid::from_u128(boot),
+                term,
+                seq: term,
+                expires_at_ms: i64::MAX,
+            }
+        }
+
+        fn bind_process(coordinator: &BarrierCoordinator, node_id: u64, boot: u128, term: u64) {
+            coordinator
+                .install_process_lease_deadline(Arc::new(
+                    crate::cluster::control::LeaseDeadline::live_for(Duration::from_secs(60)),
+                ))
+                .unwrap();
+            coordinator
+                .install_local_process_lease(&test_process_lease(node_id, boot, term))
+                .unwrap();
+        }
+
+        #[tokio::test]
+        async fn process_bound_server_requires_a_live_shared_deadline() {
+            let coordinator = BarrierCoordinator::new(kv(NodeId(2)));
+            coordinator
+                .install_local_process_lease(&test_process_lease(2, 22, 1))
+                .unwrap();
+            let error = coordinator
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
+                .await
+                .unwrap_err();
+            assert!(error.contains("not installed"), "{error}");
+
+            let deadline = Arc::new(crate::cluster::control::LeaseDeadline::fenced());
+            coordinator
+                .install_process_lease_deadline(Arc::clone(&deadline))
+                .unwrap();
+            coordinator
+                .install_process_lease_deadline(Arc::clone(&deadline))
+                .unwrap();
+            assert!(coordinator
+                .install_process_lease_deadline(Arc::new(
+                    crate::cluster::control::LeaseDeadline::live_for(Duration::from_secs(60)),
+                ))
+                .is_err());
+            let error = coordinator
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
+                .await
+                .unwrap_err();
+            assert!(error.contains("expired"), "{error}");
+        }
+
+        #[tokio::test]
+        async fn assignment_less_server_cannot_be_promoted_after_first_publication() {
+            let control = kv(NodeId(2));
+            let coordinator = BarrierCoordinator::new(control.clone());
+            coordinator
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
+                .await
+                .unwrap();
+            let original = control
+                .read_from(NodeId(2), BARRIER_ADDR_KEY)
+                .await
+                .unwrap();
+            assert_eq!(decode_barrier_endpoint(&original).unwrap().1, None);
+
+            let error = coordinator
+                .install_local_process_lease(&test_process_lease(2, 22, 1))
+                .unwrap_err();
+
+            assert!(error.contains("cannot be promoted"), "{error}");
+            assert_eq!(
+                control.read_from(NodeId(2), BARRIER_ADDR_KEY).await,
+                Some(original)
+            );
+        }
+
+        #[tokio::test]
+        async fn invalid_advertisement_fails_before_server_state_or_publication() {
+            let control = kv(NodeId(2));
+            let coordinator = BarrierCoordinator::new(control.clone());
+
+            let error = coordinator
+                .start_server(
+                    "127.0.0.1:0".parse().unwrap(),
+                    Some("x".repeat(MAX_BARRIER_ENDPOINT_BYTES)),
+                )
+                .await
+                .unwrap_err();
+
+            assert!(error.contains("oversized"), "{error}");
+            assert!(coordinator.grpc.lock().is_none());
+            assert!(control
+                .read_from(NodeId(2), BARRIER_ADDR_KEY)
+                .await
+                .is_none());
+        }
+
+        fn endpoint_advertisement(
+            address: SocketAddr,
+            node_id: u64,
+            boot: u128,
+            term: u64,
+        ) -> String {
+            BarrierEndpointRecord::new(
+                address.to_string(),
+                BarrierProcessIdentity {
+                    node_id,
+                    boot_incarnation: uuid::Uuid::from_u128(boot),
+                    process_term: term,
+                },
+            )
+            .unwrap()
+            .encode()
+            .unwrap()
+        }
+
+        #[tokio::test]
+        async fn process_bound_client_pool_is_bounded_and_eviction_is_incarnation_safe() {
+            let kv = kv(NodeId(999));
+            let kv_dyn: Arc<dyn ClusterKv> = kv.clone();
+            let pool: BarrierClientPool = Arc::new(parking_lot::Mutex::new(FxHashMap::default()));
+            let count = u64::try_from(crate::checkpoint::MAX_CHECKPOINT_PARTICIPANTS).unwrap() + 5;
+            for node_id in 1..=count {
+                let boot = u128::from(node_id) + 1_000;
+                kv.seed(
+                    NodeId(node_id),
+                    BARRIER_ADDR_KEY,
+                    endpoint_advertisement("127.0.0.1:1".parse().unwrap(), node_id, boot, 1),
+                );
+                assert!(get_barrier_client(
+                    NodeId(node_id),
+                    Some(ExpectedBarrierProcess::participant(
+                        node_id,
+                        uuid::Uuid::from_u128(boot),
+                    )),
+                    &pool,
+                    &kv_dyn,
+                )
+                .await
+                .unwrap()
+                .is_some());
+            }
+            assert_eq!(
+                pool.lock().len(),
+                crate::checkpoint::MAX_CHECKPOINT_PARTICIPANTS
+            );
+
+            let peer = NodeId(count);
+            let current = ExpectedBarrierProcess::participant(
+                peer.0,
+                uuid::Uuid::from_u128(u128::from(peer.0) + 1_000),
+            );
+            let predecessor = ExpectedBarrierProcess::participant(
+                peer.0,
+                uuid::Uuid::from_u128(u128::from(peer.0) + 999),
+            );
+            assert!(matches!(
+                get_barrier_client(peer, None, &pool, &kv_dyn).await,
+                Err(BarrierClientResolutionError::ProcessMismatch)
+            ));
+            evict_barrier_client(&pool, peer, None);
+            assert!(pool.lock().contains_key(&peer));
+            evict_barrier_client(&pool, peer, Some(predecessor));
+            assert!(pool.lock().contains_key(&peer));
+            evict_barrier_client(&pool, peer, Some(current));
+            assert!(!pool.lock().contains_key(&peer));
+
+            let mismatched_peer = NodeId(count + 1);
+            kv.seed(
+                mismatched_peer,
+                BARRIER_ADDR_KEY,
+                endpoint_advertisement(
+                    "127.0.0.1:1".parse().unwrap(),
+                    mismatched_peer.0 + 1,
+                    9_999,
+                    1,
+                ),
+            );
+            let started = std::time::Instant::now();
+            assert!(matches!(
+                get_barrier_client(
+                    mismatched_peer,
+                    Some(ExpectedBarrierProcess::participant(
+                        mismatched_peer.0,
+                        uuid::Uuid::from_u128(9_999),
+                    )),
+                    &pool,
+                    &kv_dyn,
+                )
+                .await,
+                Err(BarrierClientResolutionError::Invalid(_))
+            ));
+            assert!(started.elapsed() < Duration::from_millis(100));
+        }
+
+        #[tokio::test]
+        async fn every_certified_phase_rejects_a_wrong_recipient_before_mutation() {
+            use barrier_v1::barrier_sync_server::BarrierSync;
+
+            let (incoming_tx, incoming_rx) =
+                crossfire::mpsc::bounded_async::<BarrierAnnouncement>(8);
+            let local_process = Arc::new(std::sync::OnceLock::new());
+            local_process
+                .set(BarrierProcessIdentity {
+                    node_id: 2,
+                    boot_incarnation: uuid::Uuid::from_u128(22),
+                    process_term: 1,
+                })
+                .unwrap();
+            let process_lease_deadline = Arc::new(std::sync::OnceLock::new());
+            process_lease_deadline
+                .set(Arc::new(crate::cluster::control::LeaseDeadline::live_for(
+                    Duration::from_secs(60),
+                )))
+                .unwrap();
+            let prepare_acks = Arc::new(parking_lot::Mutex::new(PrepareAckState::default()));
+            let server = GrpcBarrierServer {
+                incoming_tx,
+                prepare_acks: Arc::clone(&prepare_acks),
+                leader_lease_store: Arc::new(parking_lot::Mutex::new(None)),
+                local_leader_proof: Arc::new(parking_lot::Mutex::new(None)),
+                local_process,
+                process_lease_deadline,
+            };
+            let wrong =
+                assignment_fence_to_wire(Some(&test_fence(1, &[1, 2], &[(1, 11), (2, 23)])));
+
+            let status = server
+                .prepare(tonic::Request::new(barrier_v1::PrepareRequest {
+                    epoch: 1,
+                    checkpoint_id: 1,
+                    flags: 0,
+                    assignment_version: wrong.version,
+                    assignment_participants: wrong.participants.clone(),
+                    assignment_vnode_count: wrong.vnode_count,
+                    assignment_map_digest: wrong.map_digest.clone(),
+                    leader_proof: None,
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+
+            let status = server
+                .aligned(tonic::Request::new(barrier_v1::AlignedRequest {
+                    epoch: 1,
+                    checkpoint_id: 1,
+                    flags: 0,
+                    min_watermark_ms: None,
+                    assignment_version: wrong.version,
+                    assignment_participants: wrong.participants.clone(),
+                    assignment_vnode_count: wrong.vnode_count,
+                    assignment_map_digest: wrong.map_digest.clone(),
+                    leader_proof: None,
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+
+            let status = server
+                .commit(tonic::Request::new(barrier_v1::CommitRequest {
+                    epoch: 1,
+                    checkpoint_id: 1,
+                    flags: 0,
+                    min_watermark_ms: None,
+                    assignment_version: wrong.version,
+                    assignment_participants: wrong.participants.clone(),
+                    assignment_vnode_count: wrong.vnode_count,
+                    assignment_map_digest: wrong.map_digest.clone(),
+                    leader_proof: None,
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+
+            let status = server
+                .abort(tonic::Request::new(barrier_v1::AbortRequest {
+                    epoch: 1,
+                    checkpoint_id: 1,
+                    flags: 0,
+                    assignment_version: wrong.version,
+                    assignment_participants: wrong.participants,
+                    assignment_vnode_count: wrong.vnode_count,
+                    assignment_map_digest: wrong.map_digest,
+                    leader_proof: None,
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+            assert!(incoming_rx.try_recv().is_err());
+            assert!(prepare_acks.lock().pending.is_empty());
+            assert!(prepare_acks.lock().received_at.is_empty());
+        }
+
+        async fn assert_fenced_phase_rejections(
+            server: &GrpcBarrierServer,
+            assignment: WireAssignmentFence,
+            proof: Option<barrier_v1::LeaderProof>,
+            epoch: u64,
+            checkpoint_id: u64,
+        ) {
+            use barrier_v1::barrier_sync_server::BarrierSync;
+
+            let status = server
+                .aligned(tonic::Request::new(barrier_v1::AlignedRequest {
+                    epoch,
+                    checkpoint_id,
+                    flags: 0,
+                    min_watermark_ms: None,
+                    assignment_version: assignment.version,
+                    assignment_participants: assignment.participants.clone(),
+                    assignment_vnode_count: assignment.vnode_count,
+                    assignment_map_digest: assignment.map_digest.clone(),
+                    leader_proof: proof.clone(),
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+            let status = server
+                .commit(tonic::Request::new(barrier_v1::CommitRequest {
+                    epoch,
+                    checkpoint_id,
+                    flags: 0,
+                    min_watermark_ms: None,
+                    assignment_version: assignment.version,
+                    assignment_participants: assignment.participants.clone(),
+                    assignment_vnode_count: assignment.vnode_count,
+                    assignment_map_digest: assignment.map_digest.clone(),
+                    leader_proof: proof.clone(),
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+            let status = server
+                .abort(tonic::Request::new(barrier_v1::AbortRequest {
+                    epoch,
+                    checkpoint_id,
+                    flags: 0,
+                    assignment_version: assignment.version,
+                    assignment_participants: assignment.participants,
+                    assignment_vnode_count: assignment.vnode_count,
+                    assignment_map_digest: assignment.map_digest,
+                    leader_proof: proof,
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        }
+
+        #[tokio::test]
+        async fn fenced_process_rejects_cached_prepare_and_every_phase_before_mutation() {
+            use barrier_v1::barrier_sync_server::BarrierSync;
+
+            let (store, proof) = lease_authority().await;
+            let (incoming_tx, incoming_rx) =
+                crossfire::mpsc::bounded_async::<BarrierAnnouncement>(8);
+            let local_process = Arc::new(std::sync::OnceLock::new());
+            local_process
+                .set(BarrierProcessIdentity {
+                    node_id: 2,
+                    boot_incarnation: uuid::Uuid::from_u128(22),
+                    process_term: 1,
+                })
+                .unwrap();
+            let deadline = Arc::new(crate::cluster::control::LeaseDeadline::live_for(
+                Duration::from_secs(60),
+            ));
+            let process_lease_deadline = Arc::new(std::sync::OnceLock::new());
+            process_lease_deadline.set(Arc::clone(&deadline)).unwrap();
+
+            let epoch = 7;
+            let checkpoint_id = 70;
+            let fence = test_fence(9, &[1, 2], &[(1, 1), (2, 22)]);
+            let assignment_digest = Some(fence.digest());
+            let identity = BarrierIdentity {
+                attempt: CheckpointAttempt::new(epoch, checkpoint_id),
+                assignment_digest,
+            };
+            let cached_ack = BarrierAck {
+                epoch,
+                checkpoint_id,
+                assignment_digest,
+                ok: true,
+                error: None,
+                watermark: CheckpointWatermark::Active(17),
+            };
+            let mut ack_state = PrepareAckState::default();
+            ack_state.completed.insert(identity, cached_ack.clone());
+            let prepare_acks = Arc::new(parking_lot::Mutex::new(ack_state));
+            let server = GrpcBarrierServer {
+                incoming_tx,
+                prepare_acks: Arc::clone(&prepare_acks),
+                leader_lease_store: Arc::new(parking_lot::Mutex::new(Some(store))),
+                local_leader_proof: Arc::new(parking_lot::Mutex::new(None)),
+                local_process,
+                process_lease_deadline,
+            };
+            let assignment = assignment_fence_to_wire(Some(&fence));
+            let proof = leader_proof_to_wire(Some(&proof));
+            deadline.fence();
+
+            let status = server
+                .prepare(tonic::Request::new(barrier_v1::PrepareRequest {
+                    epoch,
+                    checkpoint_id,
+                    flags: 0,
+                    assignment_version: assignment.version,
+                    assignment_participants: assignment.participants.clone(),
+                    assignment_vnode_count: assignment.vnode_count,
+                    assignment_map_digest: assignment.map_digest.clone(),
+                    leader_proof: proof.clone(),
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+
+            assert_fenced_phase_rejections(&server, assignment, proof, epoch, checkpoint_id).await;
+
+            let state = prepare_acks.lock();
+            assert_eq!(state.completed.get(&identity), Some(&cached_ack));
+            assert!(state.pending.is_empty());
+            assert!(state.received_at.is_empty());
+            assert!(incoming_rx.try_recv().is_err());
+        }
+
+        #[tokio::test]
+        async fn process_fence_wakes_an_in_flight_prepare_without_an_ack() {
+            use barrier_v1::barrier_sync_server::BarrierSync;
+
+            let (store, proof) = lease_authority().await;
+            let (incoming_tx, incoming_rx) =
+                crossfire::mpsc::bounded_async::<BarrierAnnouncement>(1);
+            let local_process = Arc::new(std::sync::OnceLock::new());
+            local_process
+                .set(BarrierProcessIdentity {
+                    node_id: 2,
+                    boot_incarnation: uuid::Uuid::from_u128(22),
+                    process_term: 1,
+                })
+                .unwrap();
+            let deadline = Arc::new(crate::cluster::control::LeaseDeadline::live_for(
+                Duration::from_secs(60),
+            ));
+            let process_lease_deadline = Arc::new(std::sync::OnceLock::new());
+            process_lease_deadline.set(Arc::clone(&deadline)).unwrap();
+            let prepare_acks = Arc::new(parking_lot::Mutex::new(PrepareAckState::default()));
+            let server = GrpcBarrierServer {
+                incoming_tx,
+                prepare_acks: Arc::clone(&prepare_acks),
+                leader_lease_store: Arc::new(parking_lot::Mutex::new(Some(store))),
+                local_leader_proof: Arc::new(parking_lot::Mutex::new(None)),
+                local_process,
+                process_lease_deadline,
+            };
+            let fence = test_fence(9, &[1, 2], &[(1, 1), (2, 22)]);
+            let assignment = assignment_fence_to_wire(Some(&fence));
+            let request = tonic::Request::new(barrier_v1::PrepareRequest {
+                epoch: 8,
+                checkpoint_id: 80,
+                flags: 0,
+                assignment_version: assignment.version,
+                assignment_participants: assignment.participants,
+                assignment_vnode_count: assignment.vnode_count,
+                assignment_map_digest: assignment.map_digest,
+                leader_proof: leader_proof_to_wire(Some(&proof)),
+            });
+            let call = server.prepare(request);
+            tokio::pin!(call);
+            tokio::select! {
+                result = &mut call => panic!("Prepare returned before fencing: {result:?}"),
+                announcement = incoming_rx.recv() => {
+                    assert_eq!(announcement.unwrap().phase, Phase::Prepare);
+                }
+            }
+
+            deadline.fence();
+            let status = tokio::time::timeout(Duration::from_secs(1), &mut call)
+                .await
+                .expect("fencing did not wake Prepare")
+                .unwrap_err();
+            assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+            assert!(prepare_acks.lock().pending.is_empty());
+            assert!(prepare_acks.lock().completed.is_empty());
+        }
+
         fn proof(
             node_id: u64,
             boot: u128,
@@ -2875,25 +4128,26 @@ mod tests {
             let caller = BarrierCoordinator::new(caller_kv.clone());
             let remote = BarrierCoordinator::new(remote_kv);
             let expected = proof(2, 22, 7, 41);
+            bind_process(&remote, 2, 22, 7);
 
             caller
-                .start_server(
-                    "127.0.0.1:0".parse().unwrap(),
-                    None,
-                    Arc::new(parking_lot::RwLock::new(None)),
-                )
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
                 .await
                 .unwrap();
             let remote_addr = remote
-                .start_server(
-                    "127.0.0.1:0".parse().unwrap(),
-                    None,
-                    Arc::new(parking_lot::RwLock::new(None)),
-                )
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
                 .await
                 .unwrap();
-            caller_kv.seed(NodeId(2), BARRIER_ADDR_KEY, remote_addr.to_string());
-            caller_kv.seed(NodeId(3), BARRIER_ADDR_KEY, remote_addr.to_string());
+            caller_kv.seed(
+                NodeId(2),
+                BARRIER_ADDR_KEY,
+                endpoint_advertisement(remote_addr, 2, 22, 7),
+            );
+            caller_kv.seed(
+                NodeId(3),
+                BARRIER_ADDR_KEY,
+                endpoint_advertisement(remote_addr, 3, 22, 7),
+            );
 
             let deadline = || tokio::time::Instant::now() + std::time::Duration::from_secs(1);
             assert!(
@@ -2924,12 +4178,22 @@ mod tests {
 
             let mut wrong_process = expected.clone();
             wrong_process.owner.process_term += 1;
+            caller_kv.seed(
+                NodeId(2),
+                BARRIER_ADDR_KEY,
+                endpoint_advertisement(remote_addr, 2, 22, 8),
+            );
             assert!(
                 !caller
                     .confirm_remote_leader_proof(&wrong_process, deadline())
                     .await
                     .unwrap(),
                 "the acknowledgement must bind the process term"
+            );
+            caller_kv.seed(
+                NodeId(2),
+                BARRIER_ADDR_KEY,
+                endpoint_advertisement(remote_addr, 2, 22, 7),
             );
 
             let mut wrong_boot = expected.clone();
@@ -2959,6 +4223,95 @@ mod tests {
                     .await
                     .unwrap(),
                 "an expired process-local grant must fail closed"
+            );
+        }
+
+        #[tokio::test]
+        async fn proof_confirmation_rotates_a_same_node_endpoint_without_stale_eviction() {
+            let caller_kv = kv(NodeId(1));
+            let caller = BarrierCoordinator::new(caller_kv.clone());
+            caller
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
+                .await
+                .unwrap();
+
+            let predecessor = BarrierCoordinator::new(kv(NodeId(2)));
+            let successor = BarrierCoordinator::new(kv(NodeId(2)));
+            let predecessor_proof = proof(2, 22, 7, 41);
+            let successor_proof = proof(2, 23, 8, 42);
+            bind_process(&predecessor, 2, 22, 7);
+            bind_process(&successor, 2, 23, 8);
+            let predecessor_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let successor_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let calls = Arc::clone(&predecessor_calls);
+            let live = predecessor_proof.clone();
+            predecessor.set_local_leader_proof_provider(Arc::new(move || {
+                calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                Some(live.clone())
+            }));
+            let calls = Arc::clone(&successor_calls);
+            let live = successor_proof.clone();
+            successor.set_local_leader_proof_provider(Arc::new(move || {
+                calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                Some(live.clone())
+            }));
+            let predecessor_addr = predecessor
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
+                .await
+                .unwrap();
+            let successor_addr = successor
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
+                .await
+                .unwrap();
+            caller_kv.seed(
+                NodeId(2),
+                BARRIER_ADDR_KEY,
+                endpoint_advertisement(predecessor_addr, 2, 22, 7),
+            );
+            let deadline = || tokio::time::Instant::now() + Duration::from_secs(1);
+            assert!(caller
+                .confirm_remote_leader_proof(&predecessor_proof, deadline())
+                .await
+                .unwrap());
+
+            caller_kv.seed(
+                NodeId(2),
+                BARRIER_ADDR_KEY,
+                endpoint_advertisement(successor_addr, 2, 23, 8),
+            );
+            assert!(caller
+                .confirm_remote_leader_proof(&successor_proof, deadline())
+                .await
+                .unwrap());
+            assert_eq!(
+                predecessor_calls.load(std::sync::atomic::Ordering::Acquire),
+                1
+            );
+            assert_eq!(
+                successor_calls.load(std::sync::atomic::Ordering::Acquire),
+                1
+            );
+
+            assert!(!caller
+                .confirm_remote_leader_proof(&predecessor_proof, deadline())
+                .await
+                .unwrap());
+            assert_eq!(
+                predecessor_calls.load(std::sync::atomic::Ordering::Acquire),
+                1
+            );
+            assert_eq!(
+                successor_calls.load(std::sync::atomic::Ordering::Acquire),
+                1
+            );
+            let cached = caller.grpc.lock().clone().unwrap();
+            assert_eq!(
+                cached.clients.lock().get(&NodeId(2)).unwrap().process,
+                Some(BarrierProcessIdentity {
+                    node_id: 2,
+                    boot_incarnation: uuid::Uuid::from_u128(23),
+                    process_term: 8,
+                })
             );
         }
 
@@ -3042,16 +4395,21 @@ mod tests {
             let (store, proof) = lease_authority().await;
             let leader = coordinator(leader_kv.clone(), Arc::clone(&store));
             let follower = coordinator(follower_kv, store);
-            let slot = || Arc::new(parking_lot::RwLock::new(None));
+            bind_process(&leader, 1, 1, 1);
+            bind_process(&follower, 2, 22, 1);
             leader
-                .start_server("127.0.0.1:0".parse().unwrap(), None, slot())
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
                 .await
                 .unwrap();
             let follower_addr = follower
-                .start_server("127.0.0.1:0".parse().unwrap(), None, slot())
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
                 .await
                 .unwrap();
-            leader_kv.seed(NodeId(2), BARRIER_ADDR_KEY, follower_addr.to_string());
+            leader_kv.seed(
+                NodeId(2),
+                BARRIER_ADDR_KEY,
+                endpoint_advertisement(follower_addr, 2, 22, 1),
+            );
             (leader, follower, proof)
         }
 
@@ -3356,17 +4714,23 @@ mod tests {
             let (store, proof) = lease_authority().await;
             let leader_coord = coordinator(leader_kv.clone(), Arc::clone(&store));
             let follower_coord = coordinator(follower_kv.clone(), store);
+            bind_process(&leader_coord, 1, 1, 1);
+            bind_process(&follower_coord, 2, 22, 1);
 
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let slot = || Arc::new(parking_lot::RwLock::new(None));
-            let leader_addr = leader_coord.start_server(addr, None, slot()).await.unwrap();
-            let bound_addr = follower_coord
-                .start_server(addr, None, slot())
-                .await
-                .unwrap();
+            let leader_addr = leader_coord.start_server(addr, None).await.unwrap();
+            let bound_addr = follower_coord.start_server(addr, None).await.unwrap();
 
-            leader_kv.seed(NodeId(2), BARRIER_ADDR_KEY, bound_addr.to_string());
-            follower_kv.seed(NodeId(1), BARRIER_ADDR_KEY, leader_addr.to_string());
+            leader_kv.seed(
+                NodeId(2),
+                BARRIER_ADDR_KEY,
+                endpoint_advertisement(bound_addr, 2, 22, 1),
+            );
+            follower_kv.seed(
+                NodeId(1),
+                BARRIER_ADDR_KEY,
+                endpoint_advertisement(leader_addr, 1, 1, 1),
+            );
 
             // Sequencing handshake: observation is latest-wins, so the
             // leader must not announce Commit until the follower has
@@ -3465,23 +4829,113 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn certified_phase_uses_frozen_roster_not_active_membership() {
+            let leader_kv = kv(NodeId(1));
+            let follower_kv = kv(NodeId(2));
+            let outsider_kv = kv(NodeId(3));
+            let (store, leader_proof) = lease_authority().await;
+            let mut leader = coordinator(leader_kv.clone(), Arc::clone(&store));
+            let follower = coordinator(follower_kv, Arc::clone(&store));
+            let outsider = coordinator(outsider_kv, store);
+            bind_process(&leader, 1, 1, 1);
+            bind_process(&follower, 2, 22, 1);
+            bind_process(&outsider, 3, 33, 1);
+
+            let member = |node_id: u64, state| NodeInfo {
+                id: NodeId(node_id),
+                name: format!("node-{node_id}"),
+                rpc_address: String::new(),
+                raft_address: String::new(),
+                state,
+                metadata: crate::cluster::discovery::NodeMetadata::default(),
+                last_heartbeat_ms: 0,
+            };
+            let (_members_tx, members_rx) = watch::channel(vec![
+                member(1, NodeState::Active),
+                member(2, NodeState::Draining),
+                member(3, NodeState::Active),
+            ]);
+            leader.set_leader_election(NodeId(1), members_rx, Arc::new(AtomicBool::new(true)));
+
+            leader
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
+                .await
+                .unwrap();
+            let follower_addr = follower
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
+                .await
+                .unwrap();
+            let outsider_addr = outsider
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
+                .await
+                .unwrap();
+            leader_kv.seed(
+                NodeId(2),
+                BARRIER_ADDR_KEY,
+                endpoint_advertisement(follower_addr, 2, 22, 1),
+            );
+            leader_kv.seed(
+                NodeId(3),
+                BARRIER_ADDR_KEY,
+                endpoint_advertisement(outsider_addr, 3, 33, 1),
+            );
+
+            let fence = test_fence(9, &[1, 2], &[(1, 1), (2, 22)]);
+            let aligned = BarrierAnnouncement {
+                epoch: 4,
+                checkpoint_id: 44,
+                assignment_fence: Some(fence),
+                leader_proof: Some(leader_proof),
+                phase: Phase::Aligned,
+                flags: 0,
+                min_watermark_ms: Some(100),
+            };
+            leader.announce(&aligned).await.unwrap();
+            let observed = wait_observe_exact(
+                &follower,
+                NodeId(1),
+                CheckpointAttempt::new(4, 44),
+                Phase::Aligned,
+            )
+            .await;
+            assert_eq!(observed, aligned);
+            assert!(outsider
+                .grpc
+                .lock()
+                .as_ref()
+                .unwrap()
+                .latest_rx
+                .borrow()
+                .is_none());
+        }
+
+        #[tokio::test]
         async fn prepare_reconnects_a_stale_client_within_the_same_quorum_deadline() {
             let leader_kv = kv(NodeId(1));
             let follower_kv = kv(NodeId(2));
             let (store, proof) = lease_authority().await;
             let leader_coord = coordinator(leader_kv.clone(), Arc::clone(&store));
             let follower_coord = coordinator(follower_kv.clone(), store);
-            let slot = || Arc::new(parking_lot::RwLock::new(None));
+            bind_process(&leader_coord, 1, 1, 1);
+            bind_process(&follower_coord, 2, 22, 1);
             let leader_addr = leader_coord
-                .start_server("127.0.0.1:0".parse().unwrap(), None, slot())
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
                 .await
                 .unwrap();
             let follower_addr = follower_coord
-                .start_server("127.0.0.1:0".parse().unwrap(), None, slot())
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
                 .await
                 .unwrap();
-            leader_kv.seed(NodeId(2), BARRIER_ADDR_KEY, follower_addr.to_string());
-            follower_kv.seed(NodeId(1), BARRIER_ADDR_KEY, leader_addr.to_string());
+            leader_kv.seed(
+                NodeId(2),
+                BARRIER_ADDR_KEY,
+                endpoint_advertisement(follower_addr, 2, 22, 1),
+            );
+            follower_kv.seed(
+                NodeId(1),
+                BARRIER_ADDR_KEY,
+                endpoint_advertisement(leader_addr, 1, 1, 1),
+            );
 
             let dead_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let dead_addr = dead_listener.local_addr().unwrap();
@@ -3493,7 +4947,14 @@ mod tests {
             let state = leader_coord.grpc.lock().clone().unwrap();
             state.clients.lock().insert(
                 NodeId(2),
-                barrier_v1::barrier_sync_client::BarrierSyncClient::new(dead_channel),
+                BarrierClientEntry {
+                    process: Some(BarrierProcessIdentity {
+                        node_id: 2,
+                        boot_incarnation: uuid::Uuid::from_u128(22),
+                        process_term: 1,
+                    }),
+                    client: barrier_v1::barrier_sync_client::BarrierSyncClient::new(dead_channel),
+                },
             );
 
             let assignment_fence = test_fence(9, &[1, 2], &[(1, 1), (2, 22)]);
@@ -3549,13 +5010,12 @@ mod tests {
             let (store, proof) = lease_authority().await;
             let leader_coord = coordinator(leader_kv.clone(), Arc::clone(&store));
             let follower_coord = coordinator(follower_kv.clone(), store);
-            let slot = || Arc::new(parking_lot::RwLock::new(None));
             let leader_addr = leader_coord
-                .start_server("127.0.0.1:0".parse().unwrap(), None, slot())
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
                 .await
                 .unwrap();
             let follower_addr = follower_coord
-                .start_server("127.0.0.1:0".parse().unwrap(), None, slot())
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
                 .await
                 .unwrap();
             leader_kv.seed(NodeId(2), BARRIER_ADDR_KEY, follower_addr.to_string());
@@ -3631,13 +5091,12 @@ mod tests {
             let (store, proof) = lease_authority().await;
             let leader_coord = coordinator(leader_kv.clone(), Arc::clone(&store));
             let follower_coord = coordinator(follower_kv.clone(), store);
-            let slot = || Arc::new(parking_lot::RwLock::new(None));
             let leader_addr = leader_coord
-                .start_server("127.0.0.1:0".parse().unwrap(), None, slot())
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
                 .await
                 .unwrap();
             let follower_addr = follower_coord
-                .start_server("127.0.0.1:0".parse().unwrap(), None, slot())
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
                 .await
                 .unwrap();
             leader_kv.seed(NodeId(2), BARRIER_ADDR_KEY, follower_addr.to_string());
@@ -3713,17 +5172,26 @@ mod tests {
             let (store, proof) = lease_authority().await;
             let leader_coord = coordinator(leader_kv.clone(), Arc::clone(&store));
             let follower_coord = coordinator(follower_kv.clone(), store);
-            let slot = || Arc::new(parking_lot::RwLock::new(None));
+            bind_process(&leader_coord, 1, 1, 1);
+            bind_process(&follower_coord, 2, 22, 1);
             let leader_addr = leader_coord
-                .start_server("127.0.0.1:0".parse().unwrap(), None, slot())
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
                 .await
                 .unwrap();
             let follower_addr = follower_coord
-                .start_server("127.0.0.1:0".parse().unwrap(), None, slot())
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
                 .await
                 .unwrap();
-            leader_kv.seed(NodeId(2), BARRIER_ADDR_KEY, follower_addr.to_string());
-            follower_kv.seed(NodeId(1), BARRIER_ADDR_KEY, leader_addr.to_string());
+            leader_kv.seed(
+                NodeId(2),
+                BARRIER_ADDR_KEY,
+                endpoint_advertisement(follower_addr, 2, 22, 1),
+            );
+            follower_kv.seed(
+                NodeId(1),
+                BARRIER_ADDR_KEY,
+                endpoint_advertisement(leader_addr, 1, 1, 1),
+            );
 
             let accepted_fence = test_fence(9, &[1, 2, 1, 2], &[(1, 1), (2, 22)]);
             let conflicting_fence = test_fence(9, &[2, 1, 1, 2], &[(1, 1), (2, 22)]);
@@ -3814,19 +5282,35 @@ mod tests {
 
             let leader_kv = kv(NodeId(1));
             let follower_kv = kv(NodeId(2));
+            let successor_kv = kv(NodeId(3));
             let leader = coordinator(leader_kv.clone(), Arc::clone(&authority));
             let follower = coordinator(follower_kv.clone(), Arc::clone(&authority));
-            let slot = || Arc::new(parking_lot::RwLock::new(None));
-            let leader_addr = leader
-                .start_server("127.0.0.1:0".parse().unwrap(), None, slot())
+            let successor = coordinator(successor_kv.clone(), Arc::clone(&authority));
+            bind_process(&leader, 1, 1, 1);
+            bind_process(&follower, 2, 2, 1);
+            bind_process(&successor, 3, 3, 2);
+            leader
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
                 .await
                 .unwrap();
             let follower_addr = follower
-                .start_server("127.0.0.1:0".parse().unwrap(), None, slot())
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
                 .await
                 .unwrap();
-            leader_kv.seed(NodeId(2), BARRIER_ADDR_KEY, follower_addr.to_string());
-            follower_kv.seed(NodeId(1), BARRIER_ADDR_KEY, leader_addr.to_string());
+            successor
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
+                .await
+                .unwrap();
+            leader_kv.seed(
+                NodeId(2),
+                BARRIER_ADDR_KEY,
+                endpoint_advertisement(follower_addr, 2, 2, 1),
+            );
+            successor_kv.seed(
+                NodeId(2),
+                BARRIER_ADDR_KEY,
+                endpoint_advertisement(follower_addr, 2, 2, 1),
+            );
 
             let aligned = BarrierAnnouncement {
                 epoch: 12,
@@ -3852,7 +5336,7 @@ mod tests {
                 Phase::Aligned,
             )
             .await;
-            leader.announce(&abort).await.unwrap();
+            successor.announce(&abort).await.unwrap();
             wait_observe_exact(
                 &follower,
                 NodeId(1),
@@ -3879,7 +5363,7 @@ mod tests {
                 phase: Phase::Aligned,
                 ..abort
             };
-            leader.announce(&successor_aligned).await.unwrap();
+            successor.announce(&successor_aligned).await.unwrap();
             wait_observe_exact(
                 &follower,
                 NodeId(1),
@@ -3915,14 +5399,18 @@ mod tests {
             durable.config_mut(|config| config.wait_get_per_call = Duration::from_secs(5));
 
             let follower_coord = coordinator(kv(NodeId(2)), store);
-            let slot = Arc::new(parking_lot::RwLock::new(None));
+            bind_process(&follower_coord, 2, 22, 1);
             let bound_addr = follower_coord
-                .start_server("127.0.0.1:0".parse().unwrap(), None, slot)
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
                 .await
                 .unwrap();
 
             let leader_kv = kv(NodeId(1));
-            leader_kv.seed(NodeId(2), BARRIER_ADDR_KEY, bound_addr.to_string());
+            leader_kv.seed(
+                NodeId(2),
+                BARRIER_ADDR_KEY,
+                endpoint_advertisement(bound_addr, 2, 22, 1),
+            );
             let clients = Arc::new(parking_lot::Mutex::new(FxHashMap::default()));
             let started = tokio::time::Instant::now();
             let error = send_phase_rpc(
@@ -4180,12 +5668,8 @@ mod tests {
         let follower_coord = BarrierCoordinator::new(follower_kv.clone());
 
         let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let slot = || Arc::new(parking_lot::RwLock::new(None));
-        let leader_addr = leader_coord.start_server(addr, None, slot()).await.unwrap();
-        let bound_addr = follower_coord
-            .start_server(addr, None, slot())
-            .await
-            .unwrap();
+        let leader_addr = leader_coord.start_server(addr, None).await.unwrap();
+        let bound_addr = follower_coord.start_server(addr, None).await.unwrap();
         leader_kv.seed(NodeId(2), BARRIER_ADDR_KEY, bound_addr.to_string());
         follower_kv.seed(NodeId(1), BARRIER_ADDR_KEY, leader_addr.to_string());
 

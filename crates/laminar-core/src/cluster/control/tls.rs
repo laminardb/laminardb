@@ -1,4 +1,4 @@
-//! Process-wide transport mode for the cluster control plane (barrier, query,
+//! Process-wide transport mode for the cluster control plane (barrier and
 //! shuffle), resolved once at startup with at most one TLS identity.
 
 use std::sync::atomic::{AtomicU8, Ordering};

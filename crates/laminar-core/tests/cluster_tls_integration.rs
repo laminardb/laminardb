@@ -2,39 +2,15 @@
 
 use std::sync::Arc;
 
-use arrow::array::Int32Array;
-use arrow::record_batch::RecordBatch;
-use arrow_schema::{DataType, Field, Schema};
-use futures::StreamExt;
 use laminar_core::cluster::control::barrier::BARRIER_ADDR_KEY;
 use laminar_core::cluster::control::{
-    remote_scan_client, set_cluster_tls, BarrierCoordinator, ClusterKv, ClusterTls, InMemoryKv,
-    QueryClientPool, QueryHandlerSlot, RemoteQueryHandler,
+    set_cluster_tls, ClusterController, ClusterKv, ClusterTls, InMemoryKv, LeaderLease,
+    LeaderLeaseOwner, LeaseDeadline, ProcessLease,
 };
 use laminar_core::cluster::discovery::NodeId;
 
-struct StaticHandler(RecordBatch);
-
-#[async_trait::async_trait]
-impl RemoteQueryHandler for StaticHandler {
-    async fn remote_scan(
-        &self,
-        _table_name: &str,
-        projection: Option<Vec<usize>>,
-        _filter_sql: Option<String>,
-    ) -> Result<RecordBatch, String> {
-        match projection {
-            Some(projection) => self
-                .0
-                .project(&projection)
-                .map_err(|error| error.to_string()),
-            None => Ok(self.0.clone()),
-        }
-    }
-}
-
 #[tokio::test]
-async fn remote_scan_uses_mutual_tls() {
+async fn barrier_proof_confirmation_uses_mutual_tls() {
     const SAN: &str = "laminar-cluster";
 
     let mut ca_params = rcgen::CertificateParams::new(vec!["laminar-test-ca".into()]).unwrap();
@@ -57,35 +33,100 @@ async fn remote_scan_uses_mutual_tls() {
     ))
     .unwrap();
 
-    let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, false)]));
-    let batch =
-        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))]).unwrap();
     let peer = NodeId(7);
-    let remote = BarrierCoordinator::new(Arc::new(InMemoryKv::new(peer)));
-    let handler: Arc<dyn RemoteQueryHandler> = Arc::new(StaticHandler(batch));
-    let slot: QueryHandlerSlot = Arc::new(parking_lot::RwLock::new(Some(handler)));
-    let remote_addr = remote
-        .start_server("127.0.0.1:0".parse().unwrap(), None, slot)
+    let boot = uuid::Uuid::from_u128(77);
+    let remote_kv = Arc::new(InMemoryKv::new(peer));
+    let remote = Arc::new(ClusterController::new_with_recovery_incarnation(
+        peer,
+        remote_kv.clone(),
+        remote_kv.clone(),
+        None,
+        tokio::sync::watch::channel(Vec::new()).1,
+        boot,
+    ));
+    remote
+        .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
+            std::time::Duration::from_secs(30),
+        )))
+        .unwrap();
+    remote.set_active(true);
+
+    let owner = LeaderLeaseOwner {
+        node: peer,
+        boot,
+        process_term: 1,
+    };
+    let lease = LeaderLease {
+        seq: 1,
+        renewal_sequence: 1,
+        token: 1,
+        owner: owner.clone(),
+        expires_at_ms: i64::MAX,
+        catalog_manifest: None,
+    };
+    let proof = lease.proof();
+    remote
+        .set_leader_lease_watch(
+            tokio::sync::watch::channel(Some(lease)).1,
+            owner,
+            Arc::new(LeaseDeadline::live_for(std::time::Duration::from_secs(30))),
+        )
+        .unwrap();
+    remote.install_local_leader_proof_provider();
+
+    let process_lease = ProcessLease {
+        node: peer,
+        owner: boot,
+        term: 1,
+        seq: 1,
+        expires_at_ms: i64::MAX,
+    };
+    let bound = remote
+        .start_leased_barrier_server("127.0.0.1:0".parse().unwrap(), None, &process_lease)
+        .await
+        .unwrap();
+    assert_ne!(bound.port(), 0);
+
+    let caller_node = NodeId(1);
+    let caller_kv = Arc::new(InMemoryKv::new(caller_node));
+    caller_kv.seed(
+        peer,
+        BARRIER_ADDR_KEY,
+        remote_kv.read_from(peer, BARRIER_ADDR_KEY).await.unwrap(),
+    );
+    let caller = ClusterController::new_with_recovery_incarnation(
+        caller_node,
+        caller_kv.clone(),
+        caller_kv,
+        None,
+        tokio::sync::watch::channel(Vec::new()).1,
+        uuid::Uuid::from_u128(1),
+    );
+    caller
+        .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
+            std::time::Duration::from_secs(30),
+        )))
+        .unwrap();
+    caller
+        .start_leased_barrier_server(
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            &ProcessLease {
+                node: caller_node,
+                owner: uuid::Uuid::from_u128(1),
+                term: 1,
+                seq: 1,
+                expires_at_ms: i64::MAX,
+            },
+        )
         .await
         .unwrap();
 
-    let caller = Arc::new(InMemoryKv::new(NodeId(1)));
-    caller.seed(peer, BARRIER_ADDR_KEY, remote_addr.to_string());
-    let kv: Arc<dyn ClusterKv> = caller;
-    let pool: QueryClientPool = Arc::new(parking_lot::Mutex::new(Default::default()));
-    let stream = remote_scan_client(&pool, &kv, peer, "mv", None, None)
+    assert!(caller
+        .confirm_remote_leader_proof(
+            &proof,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
         .await
-        .unwrap()
-        .expect("peer is resolvable");
-    let batches = stream
-        .map(|batch| batch.expect("mTLS remote scan batch"))
-        .collect::<Vec<_>>()
-        .await;
-    let combined = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
-    let values = combined
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .unwrap();
-    assert_eq!(values.values(), &[1, 2, 3]);
+        .unwrap());
 }

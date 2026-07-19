@@ -3349,10 +3349,14 @@ async fn install_cluster_controller(
         ClusterStartupError::EngineConstruction(format!("invalid barrier sync bind host: {e}"))
     })?;
     let bound = controller
-        .start_barrier_server(bind, Some(advertise_host.to_string()))
+        .start_leased_barrier_server(
+            bind,
+            Some(advertise_host.to_string()),
+            &process_lease.acquired,
+        )
         .await
         .map_err(|e| {
-            ClusterStartupError::EngineConstruction(format!("barrier sync server bind: {e}"))
+            ClusterStartupError::EngineConstruction(format!("cluster control endpoint start: {e}"))
         })?;
     info!("Barrier sync gRPC server listening on {bound}");
     info!(
@@ -6692,10 +6696,6 @@ mod tests {
         for controller in [&observer, &leader] {
             controller.install_local_leader_proof_provider();
             controller
-                .start_barrier_server("127.0.0.1:0".parse().unwrap(), None)
-                .await
-                .unwrap();
-            controller
                 .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
                     std::time::Duration::from_secs(30),
                 )))
@@ -6733,6 +6733,26 @@ mod tests {
         else {
             panic!("remote process lease must be acquired");
         };
+        let ProcessLeaseOutcome::Acquired(observer_process_lease) = process_authority
+            .store_for(observer_node)
+            .try_acquire(observer_boot, 0)
+            .await
+            .unwrap()
+        else {
+            panic!("observer process lease must be acquired");
+        };
+        observer
+            .start_leased_barrier_server(
+                "127.0.0.1:0".parse().unwrap(),
+                None,
+                &observer_process_lease,
+            )
+            .await
+            .unwrap();
+        leader
+            .start_leased_barrier_server("127.0.0.1:0".parse().unwrap(), None, &process_lease)
+            .await
+            .unwrap();
         observer
             .set_process_lease_authority(Arc::clone(&process_authority))
             .unwrap();

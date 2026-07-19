@@ -402,8 +402,8 @@ With the `cluster` feature enabled, multi-node operation provides:
 - **Coordination** -- Shared-store assignment CAS and a renewable leader lease; no embedded Raft service
 - **Partition Ownership** -- Epoch-fenced partition guards with consistent assignment
 - **Distributed Checkpoints** -- Cross-node capture and shared durable state for at-least-once recovery
-- **Cross-Node Aggregation** -- Gossip partial aggregates and gRPC fan-out
-- **Inter-Node RPC** -- gRPC service definitions for remote lookups, barrier forwarding, aggregate fan-out
+- **Cross-Node Streaming** -- Vnode-keyed row shuffle with assignment and process-generation fencing
+- **Inter-Node Control** -- Process-bound gRPC barrier delivery with durable authority validation
 
 **Delivery boundary**: cluster mode currently admits only `at_least_once` and
 requires cluster-shared S3/GCS/Azure state. Cluster `exactly_once` fails closed

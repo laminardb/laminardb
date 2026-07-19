@@ -1031,12 +1031,6 @@ pub struct ClusterController {
     unresponsive: Arc<parking_lot::Mutex<rustc_hash::FxHashMap<u64, Option<Uuid>>>>,
     /// This node's own failure-domain locality; peers carry theirs in `members_rx`.
     self_locality: parking_lot::RwLock<Locality>,
-    /// Handler serving cross-node `RemoteScan`, shared with the query server.
-    #[cfg(feature = "cluster")]
-    query_handler: super::query::QueryHandlerSlot,
-    /// Pooled channels to peers for cross-node `RemoteScan`.
-    #[cfg(feature = "cluster")]
-    query_client_pool: super::query::QueryClientPool,
     /// When wired, leadership is lease-fenced: [`Self::is_leader`] also requires the durable
     /// lease. Absent in embedded / static-discovery deployments (gossip-only leadership).
     #[cfg(feature = "cluster")]
@@ -1132,27 +1126,10 @@ impl ClusterController {
             unresponsive: Arc::new(parking_lot::Mutex::new(rustc_hash::FxHashMap::default())),
             self_locality: parking_lot::RwLock::new(Locality::default()),
             #[cfg(feature = "cluster")]
-            query_handler: Arc::new(parking_lot::RwLock::new(None)),
-            #[cfg(feature = "cluster")]
-            query_client_pool: Arc::new(parking_lot::Mutex::new(rustc_hash::FxHashMap::default())),
-            #[cfg(feature = "cluster")]
             leader_lease: std::sync::OnceLock::new(),
         };
         controller.notify_leader_eligibility_change();
         controller
-    }
-
-    /// Register the handler serving cross-node `RemoteScan`.
-    #[cfg(feature = "cluster")]
-    pub fn register_query_handler(&self, handler: Arc<dyn super::query::RemoteQueryHandler>) {
-        *self.query_handler.write() = Some(handler);
-    }
-
-    /// Access the connection pool for remote queries.
-    #[cfg(feature = "cluster")]
-    #[must_use]
-    pub fn query_client_pool(&self) -> &super::query::QueryClientPool {
-        &self.query_client_pool
     }
 
     /// Install the durable authority used to validate clustered checkpoint barriers.
@@ -1176,6 +1153,9 @@ impl ClusterController {
     /// Exact durable authority installed for this cluster controller.
     ///
     /// Cluster checkpoint code must use this handle rather than standalone outcome keys.
+    ///
+    /// # Errors
+    /// Returns [`super::ClusterCheckpointAuthorityError::NotConfigured`] when no authority exists.
     #[cfg(feature = "cluster")]
     pub fn checkpoint_authority(
         &self,
@@ -1547,6 +1527,9 @@ impl ClusterController {
     /// Reinstalling the same shared deadline is idempotent. A different deadline, or installation
     /// after terminal process fencing, is rejected so controller and data-plane gates cannot
     /// silently follow different lease clocks.
+    ///
+    /// # Errors
+    /// Rejects installation after fencing or replacement with a different deadline.
     pub fn set_process_lease_deadline(
         &self,
         deadline: Arc<super::LeaseDeadline>,
@@ -1556,12 +1539,16 @@ impl ClusterController {
             return Err("process lease authority is already terminally fenced".into());
         }
         if let Some(current) = self.process_lease_deadline.get() {
-            return if Arc::ptr_eq(current, &deadline) {
-                Ok(())
-            } else {
-                Err("process lease deadline is already installed".into())
-            };
+            if !Arc::ptr_eq(current, &deadline) {
+                return Err("process lease deadline is already installed".into());
+            }
+            #[cfg(feature = "cluster")]
+            self.barrier.install_process_lease_deadline(deadline)?;
+            return Ok(());
         }
+        #[cfg(feature = "cluster")]
+        self.barrier
+            .install_process_lease_deadline(Arc::clone(&deadline))?;
         self.process_lease_deadline
             .set(deadline)
             .map_err(|_| "process lease deadline is already installed".to_string())
@@ -2096,16 +2083,33 @@ impl ClusterController {
         {
             return Err("process lease is not the current durable stable-node term".into());
         }
-        self.publish_recovery_incarnation().await?;
-        self.recovery_process_term
-            .store(lease.term, Ordering::Release);
-        if !self
-            .recovery_fault_publisher_is_current(publisher)
-            .await
-            .map_err(|error| error.to_string())?
-        {
+        if !self.recovery_process_lease_is_live() {
+            return Err("process lease changed before publishing recovery identity".into());
+        }
+        self.barrier.install_local_process_lease(lease)?;
+        if let Err(error) = self.publish_recovery_incarnation().await {
+            self.fence_process_lease();
+            return Err(error);
+        }
+        if !self.recovery_process_lease_is_live() {
+            self.fence_process_lease();
             return Err("process lease changed while publishing recovery identity".into());
         }
+        match self.recovery_fault_publisher_is_current(publisher).await {
+            Ok(true) if self.recovery_process_lease_is_live() => {}
+            Ok(_) => {
+                self.fence_process_lease();
+                return Err("process lease changed while publishing recovery identity".into());
+            }
+            Err(error) => {
+                self.fence_process_lease();
+                return Err(format!(
+                    "process lease authority became uncertain after recovery publication: {error}"
+                ));
+            }
+        }
+        self.recovery_process_term
+            .store(lease.term, Ordering::Release);
         Ok(())
     }
 
@@ -3107,9 +3111,32 @@ impl ClusterController {
         bind_addr: std::net::SocketAddr,
         advertise_host: Option<String>,
     ) -> Result<std::net::SocketAddr, String> {
-        self.barrier
-            .start_server(bind_addr, advertise_host, Arc::clone(&self.query_handler))
-            .await
+        self.barrier.start_server(bind_addr, advertise_host).await
+    }
+
+    /// Start a cluster control endpoint whose first advertisement is bound to an acquired
+    /// stable-node process lease.
+    ///
+    /// # Errors
+    /// Rejects a lease for another node or boot, a conflicting prior identity, or server start.
+    #[cfg(feature = "cluster")]
+    pub async fn start_leased_barrier_server(
+        &self,
+        bind_addr: std::net::SocketAddr,
+        advertise_host: Option<String>,
+        process_lease: &super::ProcessLease,
+    ) -> Result<std::net::SocketAddr, String> {
+        process_lease
+            .validate(self.instance_id)
+            .map_err(|error| error.to_string())?;
+        if process_lease.owner != self.recovery_incarnation {
+            return Err("control endpoint lease does not bind this process incarnation".into());
+        }
+        if !self.recovery_process_lease_is_live() {
+            return Err("live process lease deadline is not installed".into());
+        }
+        self.barrier.install_local_process_lease(process_lease)?;
+        self.barrier.start_server(bind_addr, advertise_host).await
     }
 
     /// Confirm that one exact remote process still holds a proof read from durable authority.
@@ -4376,7 +4403,7 @@ mod tests {
         }
 
         async fn write_checked(&self, key: &str, value: String) -> Result<(), String> {
-            if key == "control:recover"
+            if (key == "control:recover" || key == RECOVERY_INCARNATION_KEY)
                 && self.block_next_recovery_write.swap(false, Ordering::AcqRel)
             {
                 self.entered.add_permits(1);
@@ -4791,7 +4818,15 @@ mod tests {
             .start_barrier_server("127.0.0.1:0".parse().unwrap(), None)
             .await
             .unwrap();
-        let remote = BarrierCoordinator::new(Arc::new(InMemoryKv::new(leader_node)));
+        let remote_kv = Arc::new(InMemoryKv::new(leader_node));
+        let remote_control: Arc<dyn ClusterKv> = remote_kv.clone();
+        let remote = BarrierCoordinator::new(remote_control);
+        remote
+            .install_process_lease_deadline(Arc::new(super::super::LeaseDeadline::live_for(
+                Duration::from_secs(30),
+            )))
+            .unwrap();
+        remote.install_local_process_lease(&process_lease).unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let (second_tx, mut second_rx) = tokio::sync::mpsc::unbounded_channel();
         let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
@@ -4809,15 +4844,15 @@ mod tests {
             }
             Some(provider_proof.clone())
         }));
-        let remote_addr = remote
-            .start_server(
-                "127.0.0.1:0".parse().unwrap(),
-                None,
-                Arc::new(parking_lot::RwLock::new(None)),
-            )
+        remote
+            .start_server("127.0.0.1:0".parse().unwrap(), None)
             .await
             .unwrap();
-        observer_kv.seed(leader_node, BARRIER_ADDR_KEY, remote_addr.to_string());
+        let endpoint = remote_kv
+            .read_from(leader_node, BARRIER_ADDR_KEY)
+            .await
+            .unwrap();
+        observer_kv.seed(leader_node, BARRIER_ADDR_KEY, endpoint);
 
         let successor = LeaderLeaseOwner {
             node: observer_node,
@@ -5298,6 +5333,11 @@ mod tests {
             panic!("empty process authority must be acquired");
         };
         controller.set_process_lease_authority(authority).unwrap();
+        controller
+            .start_barrier_server("127.0.0.1:0".parse().unwrap(), None)
+            .await
+            .unwrap();
+        let unbound_endpoint = kv.read_from(node, BARRIER_ADDR_KEY).await.unwrap();
 
         let error = controller
             .publish_leased_recovery_incarnation(&lease)
@@ -5307,6 +5347,205 @@ mod tests {
         assert!(error.contains("deadline"), "{error}");
         assert_eq!(controller.recovery_process_term.load(Ordering::Acquire), 0);
         assert!(kv.read_from(node, RECOVERY_INCARNATION_KEY).await.is_none());
+        assert_eq!(
+            kv.read_from(node, BARRIER_ADDR_KEY).await.as_deref(),
+            Some(unbound_endpoint.as_str()),
+            "failed lease publication must not process-bind an assignment-less endpoint"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn superseded_live_process_lease_cannot_replace_endpoint_advertisement() {
+        use super::super::{ProcessLeaseAuthority, ProcessLeaseOutcome};
+
+        let node = NodeId(1);
+        let boot = Uuid::from_u128(91);
+        let kv = Arc::new(InMemoryKv::new(node));
+        let controller = ClusterController::new_with_recovery_incarnation(
+            node,
+            kv.clone(),
+            kv.clone(),
+            None,
+            watch::channel(Vec::new()).1,
+            boot,
+        );
+        controller
+            .set_process_lease_deadline(Arc::new(super::super::LeaseDeadline::live_for(
+                Duration::from_secs(30),
+            )))
+            .unwrap();
+        controller
+            .start_barrier_server("127.0.0.1:0".parse().unwrap(), None)
+            .await
+            .unwrap();
+        let original_endpoint = kv.read_from(node, BARRIER_ADDR_KEY).await.unwrap();
+
+        let backing: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let authority =
+            Arc::new(ProcessLeaseAuthority::new(backing, Duration::from_millis(1)).unwrap());
+        let store = authority.store_for(node);
+        let ProcessLeaseOutcome::Acquired(incumbent) = store.try_acquire(boot, 0).await.unwrap()
+        else {
+            panic!("empty process authority must be acquired");
+        };
+        controller.set_process_lease_authority(authority).unwrap();
+        let observation = store.observe_rival(&incumbent).unwrap();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let ProcessLeaseOutcome::Acquired(successor) = store
+            .try_takeover(Uuid::from_u128(92), &observation, 2)
+            .await
+            .unwrap()
+        else {
+            panic!("expired process lease must be superseded");
+        };
+        assert_ne!(successor.owner, incumbent.owner);
+        assert!(controller.recovery_process_lease_is_live());
+
+        let error = controller
+            .publish_leased_recovery_incarnation(&incumbent)
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("not the current durable"), "{error}");
+        assert_eq!(
+            kv.read_from(node, BARRIER_ADDR_KEY).await.as_deref(),
+            Some(original_endpoint.as_str()),
+            "a superseded term must not replace the published endpoint"
+        );
+        assert_eq!(controller.recovery_process_term.load(Ordering::Acquire), 0);
+        assert!(kv.read_from(node, RECOVERY_INCARNATION_KEY).await.is_none());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn takeover_during_recovery_identity_publication_terminally_fences_the_process() {
+        use super::super::{ProcessLeaseAuthority, ProcessLeaseOutcome};
+
+        let node = NodeId(1);
+        let boot = Uuid::from_u128(91);
+        let control = Arc::new(InMemoryKv::new(node));
+        let recovery = Arc::new(DelayedRecoveryKv::new(node));
+        let control_kv: Arc<dyn ClusterKv> = control.clone();
+        let recovery_kv: Arc<dyn ClusterKv> = recovery.clone();
+        let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
+            node,
+            control_kv,
+            recovery_kv,
+            None,
+            watch::channel(Vec::new()).1,
+            boot,
+        ));
+        let deadline = Arc::new(super::super::LeaseDeadline::live_for(Duration::from_secs(
+            30,
+        )));
+        controller
+            .set_process_lease_deadline(Arc::clone(&deadline))
+            .unwrap();
+
+        let backing: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let authority =
+            Arc::new(ProcessLeaseAuthority::new(backing, Duration::from_millis(1)).unwrap());
+        let store = authority.store_for(node);
+        let ProcessLeaseOutcome::Acquired(incumbent) = store.try_acquire(boot, 0).await.unwrap()
+        else {
+            panic!("empty process authority must be acquired");
+        };
+        controller
+            .set_process_lease_authority(Arc::clone(&authority))
+            .unwrap();
+        controller
+            .start_leased_barrier_server("127.0.0.1:0".parse().unwrap(), None, &incumbent)
+            .await
+            .unwrap();
+
+        recovery.block_next_recovery_write();
+        let publishing = {
+            let controller = Arc::clone(&controller);
+            let incumbent = incumbent.clone();
+            tokio::spawn(async move {
+                controller
+                    .publish_leased_recovery_incarnation(&incumbent)
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), recovery.wait_until_blocked())
+            .await
+            .expect("recovery identity publication did not reach the injected write gate");
+
+        let observation = store.observe_rival(&incumbent).unwrap();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let ProcessLeaseOutcome::Acquired(successor) = store
+            .try_takeover(Uuid::from_u128(92), &observation, 2)
+            .await
+            .unwrap()
+        else {
+            panic!("expired process lease must be superseded");
+        };
+        assert_ne!(successor.owner, incumbent.owner);
+        recovery.release_blocked_write();
+
+        let error = publishing.await.unwrap().unwrap_err();
+        assert!(error.contains("changed while publishing"), "{error}");
+        assert!(!controller.process_lease_is_live());
+        assert!(!deadline.is_live());
+        assert_eq!(controller.recovery_process_term.load(Ordering::Acquire), 0);
+        assert!(recovery
+            .read_from(node, RECOVERY_INCARNATION_KEY)
+            .await
+            .is_some());
+        assert!(control.read_from(node, BARRIER_ADDR_KEY).await.is_some());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn leased_barrier_server_first_publication_contains_exact_process_identity() {
+        let node = NodeId(7);
+        let boot = Uuid::from_u128(77);
+        let kv = Arc::new(InMemoryKv::new(node));
+        let controller = ClusterController::new_with_recovery_incarnation(
+            node,
+            kv.clone(),
+            kv.clone(),
+            None,
+            watch::channel(Vec::new()).1,
+            boot,
+        );
+        let lease = super::super::ProcessLease {
+            node,
+            owner: boot,
+            term: 9,
+            seq: 9,
+            expires_at_ms: i64::MAX,
+        };
+        let error = controller
+            .start_leased_barrier_server("127.0.0.1:0".parse().unwrap(), None, &lease)
+            .await
+            .unwrap_err();
+        assert!(error.contains("deadline"), "{error}");
+        assert!(kv.read_from(node, BARRIER_ADDR_KEY).await.is_none());
+
+        controller
+            .set_process_lease_deadline(Arc::new(super::super::LeaseDeadline::live_for(
+                Duration::from_secs(30),
+            )))
+            .unwrap();
+
+        controller
+            .start_leased_barrier_server("127.0.0.1:0".parse().unwrap(), None, &lease)
+            .await
+            .unwrap();
+        let raw = kv.read_from(node, BARRIER_ADDR_KEY).await.unwrap();
+        let record: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(record["version"], 1);
+        assert_eq!(record["process"]["node_id"], node.0);
+        assert_eq!(record["process"]["boot_incarnation"], boot.to_string());
+        assert_eq!(record["process"]["process_term"], lease.term);
+        assert!(record["address"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
     }
 
     #[test]
