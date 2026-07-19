@@ -5352,32 +5352,94 @@ impl CheckpointCoordinator {
         if remaining.is_zero() {
             return Err(Self::follower_decision_timeout(epoch, checkpoint_id));
         }
-        let outcome = tokio::time::timeout(
-            remaining,
-            authority.cluster_outcome_with_recovery_capsule(epoch),
-        )
-        .await
-        .map_err(|_| {
-            DbError::Checkpoint(format!(
-                "[LDB-6046] durable outcome read timed out for epoch {epoch}, checkpoint \
+        let attempt = CheckpointAttempt::new(epoch, checkpoint_id);
+        let settlement =
+            tokio::time::timeout(remaining, authority.cluster_attempt_settlement(attempt))
+                .await
+                .map_err(|_| {
+                    DbError::Checkpoint(format!(
+                "[LDB-6046] durable settlement read timed out for epoch {epoch}, checkpoint \
                      {checkpoint_id}; participant remains prepared"
             ))
-        })?
-        .map_err(|e| {
-            DbError::Checkpoint(format!(
-                "[LDB-6045] failed to read durable outcome for epoch {epoch}; participant \
+                })?
+                .map_err(|e| {
+                    DbError::Checkpoint(format!(
+                "[LDB-6045] failed to read durable settlement for epoch {epoch}; participant \
                      remains prepared: {e}"
             ))
-        })?;
-        let (outcome, capsule) = outcome.unzip();
-        Self::match_follower_outcome(
-            outcome.as_ref(),
-            capsule.as_ref().and_then(Option::as_ref),
-            participant_id,
-            epoch,
-            checkpoint_id,
-            assignment_fence,
-        )
+                })?;
+        let Some(settlement) = settlement else {
+            return Ok(FollowerOutcomeMatch::Pending);
+        };
+        let settled = CheckpointAttempt::new(settlement.epoch, settlement.checkpoint_id);
+        match settled.relation_to(attempt) {
+            laminar_core::state::CheckpointAttemptRelation::Exact if settlement.is_commit() => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(Self::follower_decision_timeout(epoch, checkpoint_id));
+                }
+                let exact = tokio::time::timeout(
+                    remaining,
+                    authority.cluster_outcome_with_recovery_capsule(epoch),
+                )
+                .await
+                .map_err(|_| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6046] durable Commit capsule read timed out for epoch {epoch}, \
+                         checkpoint {checkpoint_id}; participant remains prepared"
+                    ))
+                })?
+                .map_err(|e| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6045] failed to read durable Commit capsule for epoch {epoch}; \
+                         participant remains prepared: {e}"
+                    ))
+                })?;
+                let Some((outcome, capsule)) = exact else {
+                    return Ok(FollowerOutcomeMatch::Pending);
+                };
+                if outcome != settlement {
+                    return Err(DbError::Checkpoint(format!(
+                        "[LDB-6045] exact durable Commit changed while follower epoch {epoch}, \
+                         checkpoint {checkpoint_id} was validating its recovery capsule"
+                    )));
+                }
+                Self::match_follower_outcome(
+                    Some(&outcome),
+                    capsule.as_ref(),
+                    participant_id,
+                    epoch,
+                    checkpoint_id,
+                    assignment_fence,
+                )
+            }
+            laminar_core::state::CheckpointAttemptRelation::Exact => Self::match_follower_outcome(
+                Some(&settlement),
+                None,
+                participant_id,
+                epoch,
+                checkpoint_id,
+                assignment_fence,
+            ),
+            laminar_core::state::CheckpointAttemptRelation::Newer => {
+                if settlement.scope != laminar_core::checkpoint_decision::CheckpointScope::Cluster {
+                    return Err(DbError::Checkpoint(format!(
+                        "[LDB-6045] follower epoch {epoch}, checkpoint {checkpoint_id} observed \
+                         non-cluster durable settlement epoch {}, checkpoint {}",
+                        settlement.epoch, settlement.checkpoint_id
+                    )));
+                }
+                Ok(FollowerOutcomeMatch::Abort)
+            }
+            laminar_core::state::CheckpointAttemptRelation::Older
+            | laminar_core::state::CheckpointAttemptRelation::Conflict => {
+                Err(DbError::Checkpoint(format!(
+                    "[LDB-6045] durable settlement epoch {}, checkpoint {} does not close \
+                     follower epoch {epoch}, checkpoint {checkpoint_id}",
+                    settlement.epoch, settlement.checkpoint_id
+                )))
+            }
+        }
     }
 
     #[cfg(feature = "cluster")]

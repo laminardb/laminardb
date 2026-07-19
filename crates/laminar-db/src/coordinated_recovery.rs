@@ -27,6 +27,7 @@ use laminar_core::cluster::control::{
     ReleaseCommitStatus,
 };
 use laminar_core::cluster::discovery::NodeId;
+use laminar_core::state::{CheckpointAttempt, CheckpointAttemptRelation};
 
 use crate::LaminarDB;
 
@@ -2640,7 +2641,7 @@ async fn driver_owns_prepare(
 
 async fn audit_cluster_outcome_until(
     authority: &laminar_core::cluster::control::LeaderLeaseStore,
-    epoch: u64,
+    attempt: CheckpointAttempt,
     deadline: tokio::time::Instant,
 ) -> Result<CheckpointOutcome, String> {
     let mut last_failure = None;
@@ -2650,7 +2651,12 @@ async fn audit_cluster_outcome_until(
             break;
         }
         let attempt_deadline = std::cmp::min(now + DECISION_AUDIT_ATTEMPT_TIMEOUT, deadline);
-        match tokio::time::timeout_at(attempt_deadline, authority.cluster_outcome(epoch)).await {
+        match tokio::time::timeout_at(
+            attempt_deadline,
+            authority.cluster_attempt_settlement(attempt),
+        )
+        .await
+        {
             Ok(Ok(Some(outcome))) => return Ok(outcome),
             Ok(Ok(None)) => last_failure = None,
             Ok(Err(error)) => last_failure = Some(error.to_string()),
@@ -2664,10 +2670,37 @@ async fn audit_cluster_outcome_until(
     }
     match last_failure {
         Some(error) => Err(format!(
-            "checkpoint settlement ambiguity audit for epoch {epoch} exhausted: {error}"
+            "checkpoint settlement ambiguity audit for epoch {} checkpoint {} exhausted: {error}",
+            attempt.epoch, attempt.checkpoint_id
         )),
         None => Err(format!(
-            "checkpoint settlement ambiguity audit found no immutable outcome for epoch {epoch}"
+            "checkpoint settlement ambiguity audit found no immutable outcome for epoch {} checkpoint {}",
+            attempt.epoch, attempt.checkpoint_id
+        )),
+    }
+}
+
+fn validate_cluster_attempt_settlement(
+    outcome: &CheckpointOutcome,
+    attempt: CheckpointAttempt,
+    deployment_id: &str,
+) -> Result<(), String> {
+    if outcome.deployment_id != deployment_id || outcome.scope != CheckpointScope::Cluster {
+        return Err(format!(
+            "checkpoint settlement for epoch {} checkpoint {} has foreign provenance",
+            attempt.epoch, attempt.checkpoint_id
+        ));
+    }
+    let settled = CheckpointAttempt::new(outcome.epoch, outcome.checkpoint_id);
+    match settled.relation_to(attempt) {
+        CheckpointAttemptRelation::Exact | CheckpointAttemptRelation::Newer => Ok(()),
+        CheckpointAttemptRelation::Older => Err(format!(
+            "checkpoint settlement for epoch {} checkpoint {} returned older outcome epoch {} checkpoint {}",
+            attempt.epoch, attempt.checkpoint_id, outcome.epoch, outcome.checkpoint_id
+        )),
+        CheckpointAttemptRelation::Conflict => Err(format!(
+            "checkpoint settlement for epoch {} checkpoint {} conflicts with outcome epoch {} checkpoint {}",
+            attempt.epoch, attempt.checkpoint_id, outcome.epoch, outcome.checkpoint_id
         )),
     }
 }
@@ -2832,7 +2865,7 @@ async fn settle_stopped_prepared_witnesses(
                     %write_error,
                     "recovery Abort write failed; auditing the create-once winner"
                 );
-                audit_cluster_outcome_until(authority.as_ref(), attempt.epoch, deadline)
+                audit_cluster_outcome_until(authority.as_ref(), attempt, deadline)
                     .await
                     .map_err(|audit_error| {
                         format!(
@@ -2841,7 +2874,7 @@ async fn settle_stopped_prepared_witnesses(
                         )
                     })?
             }
-            Err(_) => audit_cluster_outcome_until(authority.as_ref(), attempt.epoch, deadline)
+            Err(_) => audit_cluster_outcome_until(authority.as_ref(), attempt, deadline)
                 .await
                 .map_err(|audit_error| {
                     format!(
@@ -2850,16 +2883,7 @@ async fn settle_stopped_prepared_witnesses(
                     )
                 })?,
         };
-        if outcome.epoch != attempt.epoch
-            || outcome.checkpoint_id != attempt.checkpoint_id
-            || outcome.deployment_id != deployment_id
-            || outcome.scope != CheckpointScope::Cluster
-        {
-            return Err(format!(
-                "Prepared checkpoint {} epoch {} was not settled by its exact immutable outcome",
-                attempt.checkpoint_id, attempt.epoch
-            ));
-        }
+        validate_cluster_attempt_settlement(&outcome, attempt, &deployment_id)?;
         outcomes.push(outcome);
         outcomes.sort_unstable_by_key(|outcome| (outcome.epoch, outcome.checkpoint_id));
     }
@@ -4933,6 +4957,7 @@ mod tests {
         let round = round_for_current_faults(&controller, 8, &[1]).await;
         publish_round_roster(&controller, &kv, &round).await;
         let authority = controller.checkpoint_authority().unwrap();
+        let attempt = CheckpointAttempt::new(6, 60);
         let writer = {
             let authority = Arc::clone(&authority);
             let proof = round.leader_proof.clone();
@@ -4948,17 +4973,36 @@ mod tests {
 
         let outcome = audit_cluster_outcome_until(
             authority.as_ref(),
-            6,
+            attempt,
             tokio::time::Instant::now() + Duration::from_millis(250),
         )
         .await
         .unwrap();
         assert_eq!(outcome.checkpoint_id, 60);
         assert_eq!(outcome.verdict, CheckpointVerdict::Abort);
-        assert!(matches!(
-            writer.await.unwrap(),
-            RecordOutcomeResult::Created(_) | RecordOutcomeResult::Unchanged(_)
-        ));
+        let durable = match writer.await.unwrap() {
+            RecordOutcomeResult::Created(outcome) | RecordOutcomeResult::Unchanged(outcome) => {
+                outcome
+            }
+            RecordOutcomeResult::Conflict { winner } => winner,
+        };
+        validate_cluster_attempt_settlement(&outcome, attempt, &durable.deployment_id).unwrap();
+
+        let mut conflicting = outcome.clone();
+        conflicting.checkpoint_id += 1;
+        assert!(
+            validate_cluster_attempt_settlement(&conflicting, attempt, &durable.deployment_id)
+                .unwrap_err()
+                .contains("conflicts")
+        );
+
+        let mut foreign = outcome;
+        foreign.deployment_id.push_str("-foreign");
+        assert!(
+            validate_cluster_attempt_settlement(&foreign, attempt, &durable.deployment_id)
+                .unwrap_err()
+                .contains("foreign provenance")
+        );
     }
 
     #[tokio::test]
@@ -4968,12 +5012,73 @@ mod tests {
 
         let error = audit_cluster_outcome_until(
             authority.as_ref(),
-            99,
+            CheckpointAttempt::new(99, 990),
             tokio::time::Instant::now() + Duration::from_millis(25),
         )
         .await
         .unwrap_err();
         assert!(error.contains("found no immutable outcome"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn ambiguity_audit_accepts_a_newer_dominator_after_exact_abort_compaction() {
+        let (controller, _members_tx, kv) = controller(Vec::new()).await;
+        report_test_fault(&controller).await;
+        let round = round_for_current_faults(&controller, 8, &[1]).await;
+        publish_round_roster(&controller, &kv, &round).await;
+        let authority = controller.checkpoint_authority().unwrap();
+        let attempt = CheckpointAttempt::new(1, 10);
+
+        // Model a create-once Abort whose successful write response was lost. Enough newer
+        // terminals then arrive to compact its exact record before reconciliation begins.
+        let first = authority
+            .record_cluster_outcome(
+                &round.leader_proof,
+                attempt.epoch,
+                attempt.checkpoint_id,
+                round.assignment_fence.clone(),
+                CheckpointVerdict::Abort,
+                None,
+            )
+            .await
+            .unwrap();
+        let first = match first {
+            RecordOutcomeResult::Created(outcome) | RecordOutcomeResult::Unchanged(outcome) => {
+                outcome
+            }
+            RecordOutcomeResult::Conflict { winner } => winner,
+        };
+        for epoch in 2..=80 {
+            authority
+                .record_cluster_outcome(
+                    &round.leader_proof,
+                    epoch,
+                    epoch * 10,
+                    round.assignment_fence.clone(),
+                    CheckpointVerdict::Abort,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        assert!(authority
+            .cluster_outcome(attempt.epoch)
+            .await
+            .unwrap()
+            .is_none());
+
+        let settlement = audit_cluster_outcome_until(
+            authority.as_ref(),
+            attempt,
+            tokio::time::Instant::now() + Duration::from_millis(250),
+        )
+        .await
+        .unwrap();
+        validate_cluster_attempt_settlement(&settlement, attempt, &first.deployment_id).unwrap();
+        assert_eq!(
+            CheckpointAttempt::new(settlement.epoch, settlement.checkpoint_id).relation_to(attempt),
+            CheckpointAttemptRelation::Newer
+        );
     }
 
     #[tokio::test]

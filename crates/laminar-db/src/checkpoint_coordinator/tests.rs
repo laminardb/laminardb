@@ -2916,6 +2916,67 @@ async fn immutable_abort_outcome_wins_over_commit_hint() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
+async fn restarted_follower_settles_after_its_exact_abort_was_compacted() {
+    let (writer, _kv, leader_id) = follower_decision_controller();
+    let assignment_fence = follower_test_fence(1, &[1, 7]);
+    let backing: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let decision_store = in_memory_decision_store_on(Arc::clone(&backing));
+    install_test_fence_authority(
+        &writer,
+        &assignment_fence,
+        leader_id.0,
+        Arc::clone(&backing),
+    )
+    .await;
+
+    let mut compacted = false;
+    for epoch in 1..=256 {
+        record_follower_outcome(
+            writer.as_ref(),
+            decision_store.as_ref(),
+            epoch,
+            epoch * 10,
+            &assignment_fence,
+            laminar_core::checkpoint_decision::CheckpointVerdict::Abort,
+        )
+        .await;
+        let authority = writer.checkpoint_authority().unwrap();
+        if authority
+            .cluster_outcome_retention_boundary()
+            .await
+            .unwrap()
+            .terminal_before_epoch
+            > 1
+        {
+            assert!(authority.cluster_outcome(1).await.unwrap().is_none());
+            compacted = true;
+            break;
+        }
+    }
+    assert!(compacted, "test did not reach a compacted terminal history");
+
+    // A fresh controller and authority reader have no hot outcome cache from the writer.
+    let (restarted, _kv, _leader_id) = follower_decision_controller();
+    install_test_checkpoint_authority_reader(&restarted, backing);
+    let committed = CheckpointCoordinator::await_follower_decision(
+        &restarted,
+        1,
+        10,
+        &assignment_fence,
+        Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !committed,
+        "a strictly newer immutable terminal must release the compacted prepared attempt"
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
 async fn abort_hint_without_outcome_leaves_follower_in_doubt() {
     use laminar_core::cluster::control::{BarrierAnnouncement, Phase, ANNOUNCEMENT_KEY};
 
@@ -2986,7 +3047,7 @@ async fn abort_outcome_for_another_checkpoint_is_in_doubt() {
     assert!(
         error
             .to_string()
-            .contains("durably resolved for checkpoint 999, not prepared checkpoint 58"),
+            .contains("belongs to checkpoint 999, not pending checkpoint 58"),
         "{error}"
     );
 }
