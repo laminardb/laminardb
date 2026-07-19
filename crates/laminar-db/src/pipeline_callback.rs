@@ -1531,7 +1531,6 @@ impl ConnectorPipelineCallback {
                         leader_proof: Some(leader_proof.clone()),
                         phase: Phase::Aligned,
                         flags: 0,
-                        min_watermark_ms: cluster_watermark.active_value(),
                     }),
                 )
                 .await;
@@ -5014,7 +5013,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                         leader_proof: Some(leader_proof.clone()),
                         phase: Phase::Prepare,
                         flags: 0,
-                        min_watermark_ms: None,
                     },
                     quorum_window,
                 ),
@@ -6205,7 +6203,6 @@ mod tests {
 
         let aligned = BarrierAnnouncement {
             phase: Phase::Aligned,
-            min_watermark_ms: Some(100),
             ..prepare
         };
         leader.controller.announce_barrier(&aligned).await.unwrap();
@@ -6550,7 +6547,6 @@ mod tests {
             leader_proof: Some(leader_proof),
             phase,
             flags: 0,
-            min_watermark_ms: None,
         }
     }
 
@@ -8632,7 +8628,6 @@ mod tests {
             leader_proof: Some(leader_proof(1)),
             phase: Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         };
         let identity = ConnectorPipelineCallback::certified_announcement(&announcement).unwrap();
         let mut callback = empty_callback_fixture();
@@ -8704,7 +8699,6 @@ mod tests {
                 leader_proof: Some(leader_proof(1)),
                 phase: Phase::Prepare,
                 flags: 0,
-                min_watermark_ms: None,
             };
             let control = install_pending_follower_attempt(&mut callback, announcement);
 
@@ -8835,7 +8829,6 @@ mod tests {
             leader_proof: Some(leader_proof.clone()),
             phase: Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         };
         let mut follower_callback = empty_callback_fixture();
         follower_callback.cluster_controller = Some(Arc::clone(&follower));
@@ -8967,7 +8960,6 @@ mod tests {
             leader_proof: Some(leader_proof(1)),
             phase: Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         };
         let control = install_pending_follower_attempt(&mut callback, announcement.clone());
         announcement.phase = Phase::Abort;
@@ -9013,7 +9005,6 @@ mod tests {
                 leader_proof: Some(leader_proof(1)),
                 phase: Phase::Prepare,
                 flags: 0,
-                min_watermark_ms: None,
             },
         );
 
@@ -9113,7 +9104,6 @@ mod tests {
             leader_proof: Some(leader_proof(1)),
             phase: Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         };
         let identity = ConnectorPipelineCallback::certified_announcement(&announcement).unwrap();
         let mut callback = empty_callback_fixture();
@@ -9178,7 +9168,6 @@ mod tests {
                 leader_proof: Some(leader_proof(1)),
                 phase: Phase::Prepare,
                 flags: 0,
-                min_watermark_ms: None,
             },
         );
 
@@ -9244,7 +9233,6 @@ mod tests {
             leader_proof: Some(leader_proof(1)),
             phase: Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         };
         kv.seed(
             leader_id,
@@ -9355,7 +9343,6 @@ mod tests {
             leader_proof: Some(identity.leader_proof.clone()),
             phase: Phase::Aligned,
             flags: 0,
-            min_watermark_ms: Some(42),
         })
         .unwrap();
         kv.seed(leader_id, ANNOUNCEMENT_KEY, aligned);
@@ -9404,7 +9391,6 @@ mod tests {
                 leader_proof: Some(identity.leader_proof.clone()),
                 phase: Phase::Commit,
                 flags: 0,
-                min_watermark_ms: Some(99_999),
             })
             .unwrap(),
         );
@@ -9421,7 +9407,7 @@ mod tests {
         assert_eq!(
             controller.cluster_min_watermark(),
             Some(42),
-            "the immutable capsule, not the terminal hint, owns the watermark"
+            "the immutable capsule owns the recovery-safe watermark"
         );
     }
 
@@ -9469,7 +9455,6 @@ mod tests {
                 leader_proof: Some(successor.proof()),
                 phase: Phase::Abort,
                 flags: 0,
-                min_watermark_ms: None,
             })
             .unwrap(),
         );
@@ -9555,7 +9540,6 @@ mod tests {
                     leader_proof: Some(leader_proof(if phase == Phase::Commit { 1 } else { 2 })),
                     phase,
                     flags: 0,
-                    min_watermark_ms: None,
                 })
                 .unwrap(),
             );
@@ -9609,7 +9593,6 @@ mod tests {
                 leader_proof: None,
                 phase: Phase::Abort,
                 flags: 0,
-                min_watermark_ms: None,
             },
             BarrierAnnouncement {
                 epoch: 3,
@@ -9618,7 +9601,6 @@ mod tests {
                 leader_proof: Some(leader_proof(1)),
                 phase: Phase::Aligned,
                 flags: 0,
-                min_watermark_ms: Some(99),
             },
             BarrierAnnouncement {
                 epoch: 3,
@@ -9627,7 +9609,6 @@ mod tests {
                 leader_proof: Some(leader_proof(2)),
                 phase: Phase::Aligned,
                 flags: 0,
-                min_watermark_ms: Some(99),
             },
         ] {
             let (kv, controller, leader_id, _members_tx, _decision_store) = gate_controller().await;
@@ -9685,7 +9666,6 @@ mod tests {
                 leader_proof: Some(leader_proof(2)),
                 phase: Phase::Commit,
                 flags: 0,
-                min_watermark_ms: Some(99),
             })
             .unwrap(),
         );
@@ -9726,7 +9706,6 @@ mod tests {
             leader_proof: Some(leader_proof(1)),
             phase: Phase::Aligned,
             flags: 0,
-            min_watermark_ms: Some(77),
         })
         .unwrap();
         kv.seed(leader_id, ANNOUNCEMENT_KEY, newer);
@@ -9764,7 +9743,6 @@ mod tests {
                 leader_proof: Some(leader_proof(1)),
                 phase: Phase::Prepare,
                 flags: 0,
-                min_watermark_ms: None,
             },
             BarrierAnnouncement {
                 epoch: 4,
@@ -9773,7 +9751,6 @@ mod tests {
                 leader_proof: None,
                 phase: Phase::Aligned,
                 flags: 0,
-                min_watermark_ms: None,
             },
             BarrierAnnouncement {
                 epoch: 4,
@@ -9782,7 +9759,6 @@ mod tests {
                 leader_proof: Some(leader_proof(1)),
                 phase: Phase::Aligned,
                 flags: 0,
-                min_watermark_ms: None,
             },
             BarrierAnnouncement {
                 epoch: 4,
@@ -9791,7 +9767,6 @@ mod tests {
                 leader_proof: None,
                 phase: Phase::Aligned,
                 flags: 0,
-                min_watermark_ms: None,
             },
         ] {
             let (kv, controller, leader_id, _members_tx, _decision_store) = gate_controller().await;
@@ -9848,7 +9823,6 @@ mod tests {
                     leader_proof: Some(leader_proof(1)),
                     phase: Phase::Aligned,
                     flags: 0,
-                    min_watermark_ms: None,
                 })
                 .unwrap(),
             );
@@ -9888,7 +9862,6 @@ mod tests {
                     leader_proof: Some(leader_proof(1)),
                     phase,
                     flags: 0,
-                    min_watermark_ms: Some(99_999),
                 })
                 .unwrap(),
             );
@@ -9943,7 +9916,6 @@ mod tests {
                 leader_proof: Some(proof),
                 phase: Phase::Abort,
                 flags: 0,
-                min_watermark_ms: None,
             })
             .unwrap(),
         );
@@ -9992,7 +9964,6 @@ mod tests {
                 leader_proof: Some(proof),
                 phase: Phase::Commit,
                 flags: 0,
-                min_watermark_ms: Some(99_999),
             })
             .unwrap(),
         );

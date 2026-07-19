@@ -1821,7 +1821,6 @@ mod two_pc {
             leader_proof: Some(leader_proof),
             phase: Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         };
 
         let follower_request = certified_request(&fence);
@@ -1918,7 +1917,6 @@ mod two_pc {
             leader_proof: Some(leader_proof),
             phase: Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         };
         let follower_request = certified_request(&fence);
         let follower_handle = tokio::spawn(async move {
@@ -2006,7 +2004,6 @@ mod two_pc {
             leader_proof: Some(leader_proof),
             phase: Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         };
         let committed = follower_coord
             .follower_checkpoint(certified_request(&fence), ann, Duration::from_millis(500))
@@ -2067,7 +2064,6 @@ mod two_pc {
             leader_proof: Some(leader_proof),
             phase: Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         };
         let error = follower_coord
             .follower_checkpoint(certified_request(&fence), ann, Duration::from_millis(500))
@@ -2237,7 +2233,6 @@ mod minio {
             ),
             phase: Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         };
 
         let follower_request = certified_request(&follower_node.controller, assignment_version);

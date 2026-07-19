@@ -4371,7 +4371,6 @@ mod tests {
                     leader_proof: Some(proof),
                     phase: Phase::Abort,
                     flags: 0,
-                    min_watermark_ms: None,
                 })
                 .unwrap(),
             );

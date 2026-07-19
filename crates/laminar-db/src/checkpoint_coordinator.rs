@@ -3988,7 +3988,6 @@ impl CheckpointCoordinator {
                 laminar_core::cluster::control::Phase::Abort,
                 abort_outcome.assignment_fence.as_ref(),
                 abort_outcome.leader_proof.as_ref(),
-                None,
             ),
         )
         .await
@@ -4305,7 +4304,6 @@ impl CheckpointCoordinator {
                 phase,
                 outcome.assignment_fence.as_ref(),
                 outcome.leader_proof.as_ref(),
-                None,
             )
             .await;
         }
@@ -4384,7 +4382,6 @@ impl CheckpointCoordinator {
         phase: laminar_core::cluster::control::Phase,
         assignment_fence: Option<&laminar_core::cluster::control::CheckpointAssignmentFence>,
         leader_proof: Option<&LeaderProof>,
-        min_watermark_ms: Option<i64>,
     ) {
         let Some(cc) = self.cluster_controller.as_ref() else {
             return;
@@ -4432,7 +4429,6 @@ impl CheckpointCoordinator {
             leader_proof: leader_proof.cloned(),
             phase,
             flags: 0,
-            min_watermark_ms,
         };
         if let Err(e) = cc.announce_barrier(&ann).await {
             warn!(
@@ -4448,8 +4444,8 @@ impl CheckpointCoordinator {
     /// Announce PREPARE and wait for follower acks.
     ///
     /// On quorum, returns the capture-time follower set and retains the exact cluster watermark
-    /// status for the recovery capsule and Commit announcement. The caller records a durable
-    /// Abort before publishing its terminal wake-up hint on failure.
+    /// status for the recovery capsule. The caller records a durable Abort before publishing its
+    /// terminal wake-up hint on failure.
     #[cfg(feature = "cluster")]
     async fn await_prepare_quorum(
         &mut self,
@@ -4623,7 +4619,6 @@ impl CheckpointCoordinator {
             leader_proof: Some(leader_proof.clone()),
             phase: Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         };
         if !cc.proof_is_live(leader_proof) {
             return Err("[LDB-6054] exact leader proof was stale before Prepare".into());
@@ -5773,7 +5768,6 @@ impl CheckpointCoordinator {
                     laminar_core::cluster::control::Phase::Aligned,
                     assignment_fence.as_ref(),
                     checkpoint_leadership.as_ref(),
-                    self.cluster_watermark.active_value(),
                 )
                 .await;
             }
@@ -6112,7 +6106,6 @@ impl CheckpointCoordinator {
             laminar_core::cluster::control::Phase::Commit,
             assignment_fence.as_ref(),
             checkpoint_leadership.as_ref(),
-            self.cluster_watermark.active_value(),
         )
         .await;
 

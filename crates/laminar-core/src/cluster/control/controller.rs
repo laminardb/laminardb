@@ -992,8 +992,8 @@ pub struct ClusterController {
     recovery_process_term: AtomicU64,
     /// Per-process request identity; shared authority assigns the cluster-visible fault sequence.
     recovery_fault_request_sequence: AtomicU64,
-    /// Cluster-wide minimum watermark from the leader's `Commit`; operators read this instead
-    /// of their local watermark for consistent event-time. `i64::MIN` = uninitialised.
+    /// Recovery-safe cluster watermark installed after an immutable Commit outcome or from a
+    /// validated recovery capsule. `i64::MIN` = uninitialised.
     cluster_min_watermark: Arc<AtomicI64>,
     /// While draining, the node excludes itself from [`Self::assignable_instances`] so the
     /// next rotation sheds its vnodes before it exits.
@@ -1163,9 +1163,8 @@ impl ClusterController {
         self.barrier.checkpoint_authority()
     }
 
-    /// Latest cluster-wide minimum watermark seen by this instance.
-    /// `None` until the leader has published a `Commit` with a
-    /// populated `min_watermark_ms`.
+    /// Latest recovery-safe cluster watermark installed from an immutable Commit outcome or a
+    /// validated recovery capsule.
     #[must_use]
     pub fn cluster_min_watermark(&self) -> Option<i64> {
         let v = self.cluster_min_watermark.load(Ordering::Acquire);
@@ -5968,7 +5967,6 @@ mod tests {
             leader_proof: None,
             phase: crate::cluster::control::Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         })
         .await
         .unwrap();
@@ -6026,7 +6024,6 @@ mod tests {
             leader_proof: Some(proof),
             phase: Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         };
         follower_kv.seed(
             NodeId(1),
@@ -6079,7 +6076,6 @@ mod tests {
                 leader_proof: Some(test_leader_proof(1, Uuid::from_u128(11), 1)),
                 phase: Phase::Prepare,
                 flags: 0,
-                min_watermark_ms: None,
             })
             .unwrap(),
         );
@@ -6135,7 +6131,6 @@ mod tests {
             leader_proof: Some(lease.proof()),
             phase: Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         };
         follower_kv.seed(
             NodeId(1),
@@ -6217,7 +6212,6 @@ mod tests {
                 leader_proof: None,
                 phase: Phase::Abort,
                 flags: 0,
-                min_watermark_ms: None,
             })
             .await
             .unwrap();
@@ -6246,7 +6240,6 @@ mod tests {
                 leader_proof: None,
                 phase: Phase::Abort,
                 flags: 0,
-                min_watermark_ms: None,
             })
             .unwrap(),
         );

@@ -7167,7 +7167,6 @@ mod tests {
                 leader_proof: None,
                 phase: laminar_core::cluster::control::Phase::Commit,
                 flags: 0,
-                min_watermark_ms: None,
             }))
             .unwrap();
         tokio::time::timeout(Duration::from_millis(10), async {

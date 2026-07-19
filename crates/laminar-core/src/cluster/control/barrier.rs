@@ -233,18 +233,6 @@ pub struct BarrierAnnouncement {
     pub phase: Phase,
     /// Reserved for unaligned/other flags.
     pub flags: u64,
-    /// Cluster-wide minimum watermark at announce time: the `min` across every participant's
-    /// local watermark, computed by the leader from follower acks (see [`BarrierAck::watermark`])
-    /// plus its own watermark. Populated on [`Phase::Aligned`] and retained on [`Phase::Commit`].
-    /// `None` on `Prepare`/`Abort`, when the cut has no active watermark, and on legacy payloads
-    /// deserialised via the `#[serde(default)]` fallback.
-    ///
-    /// Consumers consult this value instead of their local watermark
-    /// when deciding whether an event-time window has closed
-    /// cluster-wide — local progress on one node is stale if another
-    /// node is still processing earlier events.
-    #[serde(default)]
-    pub min_watermark_ms: Option<i64>,
 }
 
 fn announcement_attempt(ann: &BarrierAnnouncement) -> CheckpointAttempt {
@@ -1256,7 +1244,6 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
             leader_proof: Some(leader_proof.clone()),
             phase: Phase::Prepare,
             flags: req.flags,
-            min_watermark_ms: None,
         };
 
         self.enqueue_while_process_live(ann).await?;
@@ -1300,7 +1287,6 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
             leader_proof: Some(leader_proof),
             phase: Phase::Aligned,
             flags: req.flags,
-            min_watermark_ms: req.min_watermark_ms,
         };
         self.enqueue_while_process_live(ann).await?;
         self.require_live_process_lease()?;
@@ -1339,7 +1325,6 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
             leader_proof,
             phase: Phase::Commit,
             flags: req.flags,
-            min_watermark_ms: req.min_watermark_ms,
         };
         self.enqueue_while_process_live(ann).await?;
         self.require_live_process_lease()?;
@@ -1378,7 +1363,6 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
             leader_proof,
             phase: Phase::Abort,
             flags: req.flags,
-            min_watermark_ms: None,
         };
         self.enqueue_while_process_live(ann).await?;
         self.require_live_process_lease()?;
@@ -1508,7 +1492,6 @@ async fn call_phase_rpc(
                 epoch: ann.epoch,
                 checkpoint_id: ann.checkpoint_id,
                 flags: ann.flags,
-                min_watermark_ms: ann.min_watermark_ms,
                 assignment_version: assignment.version,
                 assignment_participants: assignment.participants,
                 assignment_vnode_count: assignment.vnode_count,
@@ -1527,7 +1510,6 @@ async fn call_phase_rpc(
                 epoch: ann.epoch,
                 checkpoint_id: ann.checkpoint_id,
                 flags: ann.flags,
-                min_watermark_ms: ann.min_watermark_ms,
                 assignment_version: assignment.version,
                 assignment_participants: assignment.participants,
                 assignment_vnode_count: assignment.vnode_count,
@@ -1732,9 +1714,6 @@ impl PrepareFanoutState {
 fn clustered_prepare_roster(prepare: &BarrierAnnouncement) -> Result<Option<Vec<NodeId>>, String> {
     if prepare.phase != Phase::Prepare {
         return Err("Prepare fan-out received a different barrier phase".into());
-    }
-    if prepare.min_watermark_ms.is_some() {
-        return Err("Prepare fan-out cannot carry a committed watermark".into());
     }
     let Some(fence) = prepare.assignment_fence.as_ref() else {
         // A build with the cluster feature may still run embedded or single-node. Those modes
@@ -3521,7 +3500,6 @@ mod tests {
             }),
             phase: Phase::Commit,
             flags: 0,
-            min_watermark_ms: None,
         };
 
         assert_eq!(
@@ -3555,7 +3533,6 @@ mod tests {
             }),
             phase: Phase::Commit,
             flags: 0,
-            min_watermark_ms: None,
         };
 
         assert_eq!(
@@ -3589,7 +3566,6 @@ mod tests {
             }),
             phase: Phase::Aligned,
             flags: 0,
-            min_watermark_ms: None,
         };
 
         let error = clustered_phase_roster(
@@ -3771,7 +3747,6 @@ mod tests {
             leader_proof: Some(proof),
             phase: Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         };
 
         coordinator
@@ -3799,7 +3774,6 @@ mod tests {
             leader_proof: None,
             phase: Phase::Commit,
             flags: 0,
-            min_watermark_ms: None,
         };
         let ack = barrier_v1::Ack {
             epoch: announcement.epoch,
@@ -4196,7 +4170,6 @@ mod tests {
                     epoch: 1,
                     checkpoint_id: 1,
                     flags: 0,
-                    min_watermark_ms: None,
                     assignment_version: wrong.version,
                     assignment_participants: wrong.participants.clone(),
                     assignment_vnode_count: wrong.vnode_count,
@@ -4212,7 +4185,6 @@ mod tests {
                     epoch: 1,
                     checkpoint_id: 1,
                     flags: 0,
-                    min_watermark_ms: None,
                     assignment_version: wrong.version,
                     assignment_participants: wrong.participants.clone(),
                     assignment_vnode_count: wrong.vnode_count,
@@ -4256,7 +4228,6 @@ mod tests {
                     epoch,
                     checkpoint_id,
                     flags: 0,
-                    min_watermark_ms: None,
                     assignment_version: assignment.version,
                     assignment_participants: assignment.participants.clone(),
                     assignment_vnode_count: assignment.vnode_count,
@@ -4271,7 +4242,6 @@ mod tests {
                     epoch,
                     checkpoint_id,
                     flags: 0,
-                    min_watermark_ms: None,
                     assignment_version: assignment.version,
                     assignment_participants: assignment.participants.clone(),
                     assignment_vnode_count: assignment.vnode_count,
@@ -4461,7 +4431,6 @@ mod tests {
                 leader_proof: Some(leader_proof.clone()),
                 phase: Phase::Prepare,
                 flags: 0,
-                min_watermark_ms: None,
             };
 
             assert!(leader
@@ -4859,7 +4828,6 @@ mod tests {
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
                 flags: crate::checkpoint::flags::FULL_SNAPSHOT,
-                min_watermark_ms: None,
             };
             let mut follower_watch = follower.announcement_watch().unwrap();
 
@@ -4903,7 +4871,6 @@ mod tests {
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
                 flags: 0,
-                min_watermark_ms: None,
             };
             let mut follower_watch = follower.announcement_watch().unwrap();
             let publication_guard = leader.publication.lock().await;
@@ -4956,7 +4923,6 @@ mod tests {
                 leader_proof: Some(proof.clone()),
                 phase: Phase::Prepare,
                 flags: 0,
-                min_watermark_ms: None,
             };
             leader_kv.arm();
             let write_started = leader_kv.write_started.notified();
@@ -5015,7 +4981,6 @@ mod tests {
                     leader_proof: None,
                     phase: Phase::Prepare,
                     flags: 0,
-                    min_watermark_ms: None,
                 };
                 coordinator.announce(&prepare).await.unwrap();
                 let terminal = BarrierAnnouncement {
@@ -5046,7 +5011,6 @@ mod tests {
                 leader_proof: None,
                 phase: Phase::Prepare,
                 flags: 0,
-                min_watermark_ms: None,
             };
             first.announce(&prepare).await.unwrap();
             let commit = BarrierAnnouncement {
@@ -5084,7 +5048,6 @@ mod tests {
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
                 flags: 0,
-                min_watermark_ms: None,
             };
             leader
                 .announce_prepare(&prepare, Duration::from_secs(1))
@@ -5137,7 +5100,6 @@ mod tests {
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
                 flags: 0,
-                min_watermark_ms: None,
             };
 
             let prepare_error = leader
@@ -5195,7 +5157,6 @@ mod tests {
                         leader_proof: None,
                         phase,
                         flags: 0,
-                        min_watermark_ms: None,
                     })
                     .await
                     .unwrap_err();
@@ -5261,7 +5222,6 @@ mod tests {
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
                 flags: 0,
-                min_watermark_ms: None,
             };
             reach_two_node_prepare_quorum(
                 &leader,
@@ -5324,7 +5284,6 @@ mod tests {
                 leader_proof: Some(proof.clone()),
                 phase: Phase::Prepare,
                 flags: 0,
-                min_watermark_ms: None,
             };
             reach_two_node_prepare_quorum(
                 &leader,
@@ -5398,7 +5357,6 @@ mod tests {
                 leader_proof: None,
                 phase: Phase::Aligned,
                 flags: 0,
-                min_watermark_ms: None,
             };
             leader_kv.arm();
             let write_started = leader_kv.write_started.notified();
@@ -5457,7 +5415,6 @@ mod tests {
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
                 flags: 0,
-                min_watermark_ms: None,
             };
             leader
                 .announce_prepare(&prepare, Duration::from_secs(1))
@@ -5491,7 +5448,6 @@ mod tests {
 
             let commit = BarrierAnnouncement {
                 phase: Phase::Commit,
-                min_watermark_ms: None,
                 ..aligned.clone()
             };
             leader.announce(&commit).await.unwrap();
@@ -5546,7 +5502,6 @@ mod tests {
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
                 flags: crate::checkpoint::flags::FULL_SNAPSHOT,
-                min_watermark_ms: None,
             };
             reach_two_node_prepare_quorum(
                 &leader,
@@ -5557,7 +5512,6 @@ mod tests {
             .await;
             let aligned = BarrierAnnouncement {
                 phase: Phase::Aligned,
-                min_watermark_ms: Some(100),
                 ..prepare.clone()
             };
             let mut leader_watch = leader.announcement_watch().unwrap();
@@ -5597,7 +5551,6 @@ mod tests {
 
             let abort = BarrierAnnouncement {
                 phase: Phase::Abort,
-                min_watermark_ms: None,
                 ..aligned.clone()
             };
             let abort_call = leader.announce(&abort);
@@ -5666,7 +5619,6 @@ mod tests {
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
                 flags: crate::checkpoint::flags::FULL_SNAPSHOT,
-                min_watermark_ms: None,
             };
             reach_two_node_prepare_quorum(
                 &leader,
@@ -5677,7 +5629,6 @@ mod tests {
             .await;
             let aligned = BarrierAnnouncement {
                 phase: Phase::Aligned,
-                min_watermark_ms: Some(100),
                 ..prepare.clone()
             };
             let mut leader_watch = leader.announcement_watch().unwrap();
@@ -5722,7 +5673,6 @@ mod tests {
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
                 flags: crate::checkpoint::flags::FULL_SNAPSHOT,
-                min_watermark_ms: None,
             };
 
             assert!(leader.announce(&prepare).await.is_err());
@@ -5822,7 +5772,6 @@ mod tests {
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
                 flags: 0,
-                min_watermark_ms: None,
             };
 
             leader
@@ -5866,7 +5815,6 @@ mod tests {
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
                 flags: 0,
-                min_watermark_ms: None,
             };
             leader
                 .announce_prepare(&prepare, Duration::from_millis(50))
@@ -5909,7 +5857,6 @@ mod tests {
                 leader_proof: Some(proof.clone()),
                 phase: Phase::Prepare,
                 flags: 0,
-                min_watermark_ms: None,
             };
             leader
                 .announce_prepare(&first, Duration::from_secs(1))
@@ -6001,7 +5948,6 @@ mod tests {
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
                 flags: 0,
-                min_watermark_ms: None,
             };
             leader
                 .announce_prepare(&first, Duration::from_secs(1))
@@ -6060,7 +6006,6 @@ mod tests {
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
                 flags: 0,
-                min_watermark_ms: None,
             };
             leader
                 .announce_prepare(&prepare, Duration::from_millis(100))
@@ -6142,12 +6087,10 @@ mod tests {
 
                 let aligned_ann = wait_observe(&follower_coord, NodeId(1), Phase::Aligned).await;
                 assert_eq!(aligned_ann.epoch, 1);
-                assert_eq!(aligned_ann.min_watermark_ms, Some(100));
                 assert_eq!(aligned_ann.assignment_fence.as_ref(), Some(&follower_fence));
                 aligned_seen_tx.send(()).unwrap();
 
                 let commit_ann = wait_observe(&follower_coord, NodeId(1), Phase::Commit).await;
-                assert_eq!(commit_ann.min_watermark_ms, Some(100));
                 assert_eq!(commit_ann.assignment_fence.as_ref(), Some(&follower_fence));
             });
 
@@ -6158,7 +6101,6 @@ mod tests {
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
                 flags: 0,
-                min_watermark_ms: None,
             };
             leader_coord
                 .announce_prepare(&prepare, Duration::from_secs(5))
@@ -6185,7 +6127,6 @@ mod tests {
                             leader_proof: prepare.leader_proof.clone(),
                             phase: Phase::Aligned,
                             flags: 0,
-                            min_watermark_ms: follower_watermark.active_value(),
                         })
                         .await
                         .unwrap();
@@ -6200,7 +6141,6 @@ mod tests {
                             leader_proof: prepare.leader_proof.clone(),
                             phase: Phase::Commit,
                             flags: 0,
-                            min_watermark_ms: follower_watermark.active_value(),
                         })
                         .await
                         .unwrap();
@@ -6272,7 +6212,6 @@ mod tests {
                 leader_proof: Some(leader_proof),
                 phase: Phase::Prepare,
                 flags: 0,
-                min_watermark_ms: None,
             };
             reach_two_node_prepare_quorum(
                 &leader,
@@ -6283,7 +6222,6 @@ mod tests {
             .await;
             let aligned = BarrierAnnouncement {
                 phase: Phase::Aligned,
-                min_watermark_ms: Some(100),
                 ..prepare
             };
             leader.announce(&aligned).await.unwrap();
@@ -6363,7 +6301,6 @@ mod tests {
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
                 flags: 0,
-                min_watermark_ms: None,
             };
             leader_coord
                 .announce_prepare(&prepare, Duration::from_secs(2))
@@ -6425,7 +6362,6 @@ mod tests {
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
                 flags: 0,
-                min_watermark_ms: None,
             };
             leader_coord.announce(&prepare).await.unwrap();
 
@@ -6468,7 +6404,6 @@ mod tests {
 
             let commit = BarrierAnnouncement {
                 phase: Phase::Commit,
-                min_watermark_ms: Some(77),
                 ..prepare.clone()
             };
             leader_coord.announce(&commit).await.unwrap();
@@ -6506,7 +6441,6 @@ mod tests {
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
                 flags: 0,
-                min_watermark_ms: None,
             };
             leader_coord.announce(&prepare).await.unwrap();
             let capture_wait =
@@ -6600,7 +6534,6 @@ mod tests {
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
                 flags: 0,
-                min_watermark_ms: None,
             };
             let conflicting = BarrierAnnouncement {
                 assignment_fence: Some(conflicting_fence),
@@ -6719,7 +6652,6 @@ mod tests {
                 leader_proof: Some(original_lease.proof()),
                 phase: Phase::Prepare,
                 flags: 0,
-                min_watermark_ms: None,
             };
             reach_two_node_prepare_quorum(
                 &leader,
@@ -6846,7 +6778,6 @@ mod tests {
                     leader_proof: Some(lease.proof()),
                     phase: Phase::Aligned,
                     flags: 0,
-                    min_watermark_ms: None,
                 },
                 started + Duration::from_millis(500),
             )
@@ -6876,7 +6807,6 @@ mod tests {
             leader_proof: None,
             phase: Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         };
 
         for terminal in [Phase::Commit, Phase::Abort] {
@@ -6948,29 +6878,6 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[test]
-    fn exact_reversible_payloads_cannot_change_the_cluster_watermark() {
-        let aligned = BarrierAnnouncement {
-            epoch: 20,
-            checkpoint_id: 200,
-            assignment_fence: None,
-            leader_proof: None,
-            phase: Phase::Aligned,
-            flags: 0,
-            min_watermark_ms: Some(100),
-        };
-        let conflicting = BarrierAnnouncement {
-            min_watermark_ms: Some(101),
-            ..aligned.clone()
-        };
-
-        assert!(merge_direct_announcement(aligned.clone(), conflicting.clone()).is_err());
-        assert!(merge_observed_announcement(aligned.clone(), conflicting.clone()).is_err());
-        assert!(validate_publication_order(&aligned, &conflicting).is_err());
-        assert!(validate_scanned_announcements(vec![aligned, conflicting]).is_err());
-    }
-
-    #[cfg(feature = "cluster")]
-    #[test]
     fn successor_terminal_supersedes_a_reversible_direct_certificate() {
         let (aligned, abort) = failover_aligned_and_abort();
 
@@ -7009,7 +6916,6 @@ mod tests {
             leader_proof: None,
             phase: Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         };
 
         for (direct, durable) in [(Phase::Commit, Phase::Abort), (Phase::Abort, Phase::Commit)] {
@@ -7128,7 +7034,6 @@ mod tests {
                 leader_proof: None,
                 phase: Phase::Abort,
                 flags: 0,
-                min_watermark_ms: None,
             })
             .await
             .unwrap();
@@ -7150,7 +7055,6 @@ mod tests {
             leader_proof: None,
             phase: Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         })
         .unwrap();
         follower_kv.seed(NodeId(1), ANNOUNCEMENT_KEY, next);
@@ -7171,7 +7075,6 @@ mod tests {
             leader_proof: None,
             phase: Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         })
         .unwrap();
         follower_kv.seed(NodeId(1), ANNOUNCEMENT_KEY, stale);
@@ -7199,7 +7102,6 @@ mod tests {
                 leader_proof: None,
                 phase: Phase::Prepare,
                 flags: 0,
-                min_watermark_ms: None,
             };
             coord.announce(&prepare).await.unwrap();
             let got = coord.observe_hint(NodeId(1)).await.unwrap().unwrap();
@@ -7239,7 +7141,6 @@ mod tests {
             leader_proof: None,
             phase: Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         })
         .unwrap()
     }
@@ -7293,7 +7194,6 @@ mod tests {
             leader_proof: Some(proof),
             phase,
             flags: 0,
-            min_watermark_ms: None,
         }
     }
 
@@ -7340,7 +7240,6 @@ mod tests {
             leader_proof: None,
             phase: Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         }
     }
 
@@ -7577,7 +7476,6 @@ mod tests {
             leader_proof: None,
             phase: Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         };
         let outcome = coord
             .wait_for_quorum(
@@ -7630,7 +7528,6 @@ mod tests {
                     leader_proof: None,
                     phase: Phase::Prepare,
                     flags: 0,
-                    min_watermark_ms: None,
                 },
                 &[NodeId(2), NodeId(3)],
                 Duration::from_millis(200),
@@ -7677,7 +7574,6 @@ mod tests {
                     leader_proof: None,
                     phase: Phase::Prepare,
                     flags: 0,
-                    min_watermark_ms: None,
                 },
                 &[NodeId(2), NodeId(3)],
                 Duration::from_millis(200),
@@ -7715,7 +7611,6 @@ mod tests {
             leader_proof: None,
             phase: Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         };
         let outcome = coord
             .wait_for_quorum(
@@ -7765,7 +7660,6 @@ mod tests {
             leader_proof: None,
             phase: Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         };
         let outcome = coord
             .wait_for_quorum(&prepare, &[NodeId(2), NodeId(3)], Duration::from_secs(2))
@@ -7802,7 +7696,6 @@ mod tests {
             leader_proof: None,
             phase: Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         };
         let outcome = coord
             .wait_for_quorum(&prepare, &[NodeId(2)], Duration::from_millis(100))
@@ -7823,7 +7716,6 @@ mod tests {
             leader_proof: None,
             phase: Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         };
         let wrong_fence = test_fence(4, &[1, 2], &[(1, 111), (2, 22)]);
 

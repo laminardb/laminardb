@@ -2285,7 +2285,6 @@ async fn follower_checkpoint_commits_on_leader_commit() {
         leader_proof: Some(leader_proof.clone()),
         phase: Phase::Prepare,
         flags: 0,
-        min_watermark_ms: None,
     })
     .unwrap();
     let commit_json = serde_json::to_string(&BarrierAnnouncement {
@@ -2295,7 +2294,6 @@ async fn follower_checkpoint_commits_on_leader_commit() {
         leader_proof: Some(leader_proof.clone()),
         phase: Phase::Commit,
         flags: 0,
-        min_watermark_ms: None,
     })
     .unwrap();
     // Overwrite the prepare with commit — observe_barrier reads the
@@ -2311,7 +2309,6 @@ async fn follower_checkpoint_commits_on_leader_commit() {
         leader_proof: Some(leader_proof),
         phase: Phase::Prepare,
         flags: 0,
-        min_watermark_ms: None,
     };
     let request = certified_cluster_request(&coord);
     let committed = coord
@@ -2777,7 +2774,6 @@ async fn follower_polls_exact_decision_when_commit_announcement_is_lost() {
         leader_proof: Some(leader_lease.proof()),
         phase: Phase::Prepare,
         flags: 0,
-        min_watermark_ms: None,
     })
     .unwrap();
     kv.seed(leader_id, ANNOUNCEMENT_KEY, prepare);
@@ -2857,7 +2853,6 @@ async fn immutable_commit_outcome_wins_over_abort_hint() {
         leader_proof: None,
         phase: Phase::Abort,
         flags: 0,
-        min_watermark_ms: None,
     })
     .unwrap();
     kv.seed(leader_id, ANNOUNCEMENT_KEY, abort);
@@ -2903,7 +2898,6 @@ async fn immutable_abort_outcome_wins_over_commit_hint() {
         leader_proof: None,
         phase: Phase::Commit,
         flags: 0,
-        min_watermark_ms: None,
     })
     .unwrap();
     kv.seed(leader_id, ANNOUNCEMENT_KEY, fake_commit);
@@ -3003,7 +2997,6 @@ async fn abort_hint_without_outcome_leaves_follower_in_doubt() {
         leader_proof: None,
         phase: Phase::Abort,
         flags: 0,
-        min_watermark_ms: None,
     })
     .unwrap();
     kv.seed(leader_id, ANNOUNCEMENT_KEY, abort);
@@ -3082,7 +3075,6 @@ async fn follower_rejects_request_prepare_fence_mismatch_before_ack() {
         assignment_fence: Some(announced_fence),
         phase: Phase::Prepare,
         flags: 0,
-        min_watermark_ms: None,
     };
 
     let error = coordinator
@@ -3126,7 +3118,6 @@ async fn follower_prepare_requires_boot_bound_leader_proof() {
         leader_proof: None,
         phase: Phase::Prepare,
         flags: 0,
-        min_watermark_ms: None,
     };
 
     let missing = CheckpointCoordinator::validate_follower_prepare_context(
@@ -3287,7 +3278,6 @@ async fn follower_checkpoint_rolls_back_only_on_durable_abort() {
         leader_proof: Some(leader_proof.clone()),
         phase: Phase::Abort,
         flags: 0,
-        min_watermark_ms: None,
     })
     .unwrap();
     kv.seed(leader_id, ANNOUNCEMENT_KEY, abort_json);
@@ -3299,7 +3289,6 @@ async fn follower_checkpoint_rolls_back_only_on_durable_abort() {
         leader_proof: Some(leader_proof),
         phase: Phase::Prepare,
         flags: 0,
-        min_watermark_ms: None,
     };
     let request = certified_cluster_request(&coord);
     let committed = coord
@@ -3754,7 +3743,6 @@ async fn follower_prepare_failure_overwrites_capture_ack() {
         leader_proof: Some(leader_proof),
         phase: Phase::Prepare,
         flags: 0,
-        min_watermark_ms: None,
     };
     let request = certified_cluster_request(&coord);
     let result = coord
