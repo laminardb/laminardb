@@ -16,6 +16,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
+use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use tokio::time::{sleep, Instant as TokioInstant};
 
@@ -27,22 +28,27 @@ use laminar_connectors::connector::{
 use laminar_connectors::kafka::testing::partition_vnodes;
 use laminar_connectors::kafka::{KafkaSource, KafkaSourceConfig, StartupMode, TopicSubscription};
 use laminar_core::checkpoint::AssignmentDrainId;
-use laminar_core::state::{NodeId, VnodeRegistry};
+use laminar_core::state::{CheckpointAttempt, NodeId, VnodeRegistry};
 
 const DEFAULT_BROKERS: &str = "127.0.0.1:19092";
 
 fn broker() -> Result<Option<String>, String> {
     let configured = std::env::var("LAMINAR_KAFKA_BROKERS").ok();
     let brokers = configured.clone().unwrap_or_else(|| DEFAULT_BROKERS.into());
-    let address = brokers
-        .split(',')
-        .next()
-        .ok_or_else(|| "Kafka broker list is empty".to_string())?
-        .trim()
-        .parse::<std::net::SocketAddr>()
-        .map_err(|error| format!("invalid Kafka broker address '{brokers}': {error}"))?;
-    match std::net::TcpStream::connect_timeout(&address, Duration::from_secs(1)) {
-        Ok(_) => Ok(Some(brokers)),
+    let consumer: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", &brokers)
+        .set(
+            "group.id",
+            format!("global-drain-probe-{}", uuid::Uuid::new_v4()),
+        )
+        .create()
+        .map_err(|error| format!("invalid Kafka broker configuration '{brokers}': {error}"))?;
+    match consumer.fetch_metadata(None, Duration::from_secs(1)) {
+        Ok(metadata) if !metadata.brokers().is_empty() => Ok(Some(brokers)),
+        Ok(_) if configured.is_some() => Err(format!(
+            "configured Kafka broker '{brokers}' returned no broker metadata"
+        )),
+        Ok(_) => Ok(None),
         Err(error) if configured.is_some() => Err(format!(
             "configured Kafka broker '{brokers}' is unreachable: {error}"
         )),
@@ -64,8 +70,24 @@ async fn create_topic(brokers: &str, topic: &str, partitions: i32) {
         .create_topics([&new], &AdminOptions::new())
         .await
         .expect("create_topics request");
+    assert_eq!(results.len(), 1, "create_topics result cardinality");
     for result in results {
         result.expect("create topic");
+    }
+}
+
+async fn delete_topic(brokers: &str, topic: &str) {
+    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()
+        .expect("admin client");
+    let results = admin
+        .delete_topics(&[topic], &AdminOptions::new())
+        .await
+        .expect("delete_topics request");
+    assert_eq!(results.len(), 1, "delete_topics result cardinality");
+    for result in results {
+        result.expect("delete topic");
     }
 }
 
@@ -162,10 +184,13 @@ async fn assert_cut_held(source: &mut KafkaSource, topic: &str, cut: &[(i32, i64
     }
 }
 
-async fn first_resumed_offsets(source: &mut KafkaSource, partitions: i32) -> Vec<i64> {
-    let mut first = vec![None::<i64>; partitions as usize];
+async fn first_offsets(source: &mut KafkaSource, expected_partitions: &[i32]) -> Vec<(i32, i64)> {
+    let mut first: Vec<_> = expected_partitions
+        .iter()
+        .map(|partition| (*partition, None::<i64>))
+        .collect();
     let deadline = Instant::now() + Duration::from_secs(6);
-    while first.iter().any(Option::is_none) {
+    while first.iter().any(|(_, offset)| offset.is_none()) {
         if let Some(batch) = source.poll_batch(1_000).await.unwrap() {
             let schema = batch.records.schema();
             let partition_index = schema.index_of("_partition").unwrap();
@@ -178,18 +203,48 @@ async fn first_resumed_offsets(source: &mut KafkaSource, partitions: i32) -> Vec
             let batch_offsets = batch.records.column(offset_index);
             let batch_offsets = batch_offsets.as_any().downcast_ref::<Int64Array>().unwrap();
             for row in 0..batch.records.num_rows() {
-                let partition = batch_partitions.value(row) as usize;
+                let partition = batch_partitions.value(row);
                 let offset = batch_offsets.value(row);
-                first[partition] = Some(first[partition].map_or(offset, |seen| seen.min(offset)));
+                let (_, first_offset) = first
+                    .iter_mut()
+                    .find(|(expected, _)| *expected == partition)
+                    .unwrap_or_else(|| panic!("source emitted unowned partition {partition}"));
+                first_offset.get_or_insert(offset);
             }
         }
         assert!(
             Instant::now() < deadline,
-            "Kafka abort did not resume every predecessor input"
+            "Kafka source did not resume every expected input: {first:?}"
         );
         sleep(Duration::from_millis(20)).await;
     }
-    first.into_iter().map(Option::unwrap).collect()
+    first
+        .into_iter()
+        .map(|(partition, offset)| (partition, offset.unwrap()))
+        .collect()
+}
+
+async fn assert_partitions_not_emitted(
+    source: &mut KafkaSource,
+    forbidden_partitions: &[i32],
+    dur: Duration,
+) {
+    let deadline = Instant::now() + dur;
+    while Instant::now() < deadline {
+        if let Some(batch) = source.poll_batch(1_000).await.unwrap() {
+            let partition_index = batch.records.schema().index_of("_partition").unwrap();
+            let partitions = batch.records.column(partition_index);
+            let partitions = partitions.as_any().downcast_ref::<Int32Array>().unwrap();
+            for row in 0..batch.records.num_rows() {
+                let partition = partitions.value(row);
+                assert!(
+                    !forbidden_partitions.contains(&partition),
+                    "predecessor emitted moved partition {partition} after the ownership cut"
+                );
+            }
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -200,7 +255,8 @@ async fn source_holds_global_cuts_across_abort_and_commit() {
     };
 
     const PARTS: i32 = 4;
-    let topic = format!("global-drain-{}", std::process::id());
+    let run_id = uuid::Uuid::new_v4().simple().to_string();
+    let topic = format!("global-drain-{run_id}");
     create_topic(&brokers, &topic, PARTS).await;
     produce_each_partition(&brokers, &topic, PARTS, 0, 100).await;
 
@@ -215,13 +271,13 @@ async fn source_holds_global_cuts_across_abort_and_commit() {
         .expect("test input must cover retained and removed target inputs");
     let cfg = KafkaSourceConfig {
         bootstrap_servers: brokers.clone(),
-        group_id: format!("global-drain-grp-{}", std::process::id()),
+        group_id: format!("global-drain-grp-{run_id}"),
         subscription: TopicSubscription::Topics(vec![topic.clone()]),
         startup_mode: StartupMode::Earliest,
         include_metadata: true,
         ..KafkaSourceConfig::default()
     };
-    let mut source = KafkaSource::new(schema(), cfg, None);
+    let mut source = KafkaSource::new(schema(), cfg.clone(), None);
     source
         .set_vnode_assignment(&source_identity, Arc::clone(&registry), NodeId(1))
         .unwrap();
@@ -272,10 +328,16 @@ async fn source_holds_global_cuts_across_abort_and_commit() {
         )
         .await
         .unwrap();
-    let resumed = first_resumed_offsets(&mut source, PARTS).await;
+    let all_partitions: Vec<_> = (0..PARTS).collect();
+    let resumed = first_offsets(&mut source, &all_partitions).await;
     for (partition, cut_offset) in &abort_cut {
         assert_eq!(
-            resumed[*partition as usize],
+            resumed
+                .iter()
+                .find_map(|(resumed_partition, offset)| {
+                    (*resumed_partition == *partition).then_some(*offset)
+                })
+                .unwrap(),
             cut_offset + 1,
             "partition {partition} did not resume at its saved cut"
         );
@@ -283,6 +345,16 @@ async fn source_holds_global_cuts_across_abort_and_commit() {
 
     let (commit_round, commit_cut, _commit_prepare_deadline) =
         take_global_cut(&mut source, &registry, &topic, PARTS, 10).await;
+    let successor_checkpoint = source.checkpoint();
+    for (partition, cut_offset) in &commit_cut {
+        assert_eq!(
+            successor_checkpoint
+                .get_offset(&format!("{topic}:{partition}"))
+                .and_then(|offset| offset.parse::<i64>().ok()),
+            Some(*cut_offset),
+            "successor checkpoint does not match the committed drain cut"
+        );
+    }
     produce_each_partition(&brokers, &topic, PARTS, 1_000, 150).await;
     assert_cut_held(&mut source, &topic, &commit_cut).await;
 
@@ -310,7 +382,42 @@ async fn source_holds_global_cuts_across_abort_and_commit() {
         )
         .await
         .unwrap();
-    poll_for(&mut source, Duration::from_secs(6)).await;
+
+    let mut successor = KafkaSource::new(schema(), cfg, None);
+    successor
+        .set_vnode_assignment(&source_identity, Arc::clone(&registry), NodeId(2))
+        .unwrap();
+    successor
+        .start(SourceStart {
+            config: ConnectorConfig::new("kafka"),
+            position: SourcePosition::Resume {
+                attempt: CheckpointAttempt::new(1, 1),
+                checkpoint: successor_checkpoint,
+            },
+            delivery: DeliveryGuarantee::AtLeastOnce,
+        })
+        .await
+        .unwrap();
+
+    let (successor_first, ()) = tokio::join!(
+        first_offsets(&mut successor, &removed_partitions),
+        assert_partitions_not_emitted(&mut source, &removed_partitions, Duration::from_secs(6))
+    );
+    for (partition, cut_offset) in &commit_cut {
+        if removed_partitions.contains(partition) {
+            assert_eq!(
+                successor_first
+                    .iter()
+                    .find_map(|(resumed_partition, offset)| {
+                        (resumed_partition == partition).then_some(*offset)
+                    })
+                    .unwrap(),
+                cut_offset + 1,
+                "successor partition {partition} did not resume at the committed cut"
+            );
+        }
+    }
+
     for (partition, cut_offset) in commit_cut {
         let after = part_offset(&source, &topic, partition);
         if retained_partitions.contains(&partition) {
@@ -327,5 +434,7 @@ async fn source_holds_global_cuts_across_abort_and_commit() {
         }
     }
 
+    successor.close().await.unwrap();
     source.close().await.unwrap();
+    delete_topic(&brokers, &topic).await;
 }

@@ -142,6 +142,30 @@ async fn expand_topic_and_wait(brokers: &str, topic: &str, partition_count: usiz
     }
 }
 
+async fn wait_for_kafka(brokers: &str) {
+    let observer: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("group.id", "startup-readiness-observer")
+        .set("socket.timeout.ms", "1000")
+        .create()
+        .expect("Kafka readiness observer creation");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+
+    loop {
+        if observer
+            .fetch_metadata(None, Duration::from_secs(1))
+            .is_ok_and(|metadata| !metadata.brokers().is_empty())
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Kafka metadata protocol was not ready within 30 seconds"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
 async fn poll_all(
     source: &mut KafkaSource,
     expected: usize,
@@ -178,11 +202,8 @@ fn make_config(brokers: &str, group_id: &str, topic: &str) -> KafkaSourceConfig 
 /// scenarios sequentially to avoid fixed-port conflicts.
 #[tokio::test]
 async fn kafka_source_integration() {
-    let _container = GenericImage::new("redpandadata/redpanda", "v24.3.1")
+    let _container = GenericImage::new("docker.redpanda.com/redpandadata/redpanda", "v26.1.13")
         .with_exposed_port(9092.into())
-        .with_wait_for(testcontainers::core::WaitFor::message_on_stderr(
-            "Successfully started Redpanda",
-        ))
         .with_mapped_port(REDPANDA_HOST_PORT, 9092.tcp())
         .with_cmd([
             "redpanda",
@@ -204,7 +225,7 @@ async fn kafka_source_integration() {
         .expect("failed to start Redpanda container");
 
     let brokers = format!("127.0.0.1:{REDPANDA_HOST_PORT}");
-    sleep(Duration::from_secs(2)).await;
+    wait_for_kafka(&brokers).await;
 
     roundtrip(&brokers).await;
     checkpoint_restore(&brokers).await;
@@ -267,7 +288,7 @@ async fn checkpoint_restore(brokers: &str) {
         .start(SourceStart {
             config: connector_cfg.clone(),
             position: SourcePosition::Initial,
-            delivery: DeliveryGuarantee::ExactlyOnce,
+            delivery: DeliveryGuarantee::AtLeastOnce,
         })
         .await
         .unwrap();
@@ -285,7 +306,7 @@ async fn checkpoint_restore(brokers: &str) {
                 attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
                 checkpoint: before_first_record,
             },
-            delivery: DeliveryGuarantee::ExactlyOnce,
+            delivery: DeliveryGuarantee::AtLeastOnce,
         })
         .await
         .unwrap();
@@ -309,7 +330,7 @@ async fn checkpoint_restore(brokers: &str) {
                 attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
                 checkpoint: checkpoint.clone(),
             },
-            delivery: DeliveryGuarantee::ExactlyOnce,
+            delivery: DeliveryGuarantee::AtLeastOnce,
         })
         .await
         .unwrap();
@@ -339,7 +360,7 @@ async fn checkpoint_restore(brokers: &str) {
                 attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
                 checkpoint,
             },
-            delivery: DeliveryGuarantee::ExactlyOnce,
+            delivery: DeliveryGuarantee::AtLeastOnce,
         })
         .await
         .expect_err("partition expansion must fail a guaranteed resume closed");

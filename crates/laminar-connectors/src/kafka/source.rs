@@ -3516,8 +3516,8 @@ impl SourceConnector for KafkaSource {
             ));
         }
 
-        // Exactly-once never joins Kafka's rebalance protocol. Cluster mode assigns the vnode
-        // subset; embedded/single-node mode manually assigns the full explicit inventory. A
+        // Guaranteed delivery never joins Kafka's rebalance protocol. Cluster mode assigns the
+        // vnode subset; embedded/single-node mode manually assigns the full explicit inventory. A
         // topology change is picked up only by a fresh, checkpoint-positioned source instance.
 
         let deterministic_unrecorded = is_resume || delivery != DeliveryGuarantee::BestEffort;
@@ -5307,49 +5307,44 @@ mod tests {
 
     #[tokio::test]
     async fn guaranteed_dynamic_broker_ownership_fails_before_activation() {
-        for delivery in [
-            DeliveryGuarantee::AtLeastOnce,
-            DeliveryGuarantee::ExactlyOnce,
-        ] {
-            let mut source = KafkaSource::new(test_schema(), test_config(), None);
-            let mut request_config = ConnectorConfig::new("kafka");
-            request_config.set("bootstrap.servers", "unreachable.invalid:9092");
-            request_config.set("group.id", "replacement-group");
-            request_config.set("topic.pattern", "replacement-.*");
-            request_config.set("laminar.source.name", "replacement-source");
+        let mut source = KafkaSource::new(test_schema(), test_config(), None);
+        let mut request_config = ConnectorConfig::new("kafka");
+        request_config.set("bootstrap.servers", "unreachable.invalid:9092");
+        request_config.set("group.id", "replacement-group");
+        request_config.set("topic.pattern", "replacement-.*");
+        request_config.set("laminar.source.name", "replacement-source");
 
-            let checkpoint = SourceCheckpoint::with_offsets(std::collections::HashMap::from([(
-                "replacement-topic:0".to_string(),
-                "42".to_string(),
-            )]));
-            let error = source
-                .start(SourceStart {
-                    config: request_config,
-                    position: SourcePosition::Resume {
-                        attempt: laminar_core::state::CheckpointAttempt::new(17, 23),
-                        checkpoint,
-                    },
-                    delivery,
-                })
-                .await
-                .expect_err("dynamic broker-managed ownership must fail closed");
+        let checkpoint = SourceCheckpoint::with_offsets(std::collections::HashMap::from([(
+            "replacement-topic:0".to_string(),
+            "42".to_string(),
+        )]));
+        let error = source
+            .start(SourceStart {
+                config: request_config,
+                position: SourcePosition::Resume {
+                    attempt: laminar_core::state::CheckpointAttempt::new(17, 23),
+                    checkpoint,
+                },
+                delivery: DeliveryGuarantee::AtLeastOnce,
+            })
+            .await
+            .expect_err("dynamic broker-managed ownership must fail closed");
 
-            assert!(matches!(
-                error,
-                ConnectorError::ConfigurationError(message)
-                    if message.contains("topic patterns") && message.contains("engine-owned")
-            ));
-            assert_eq!(source.state(), ConnectorState::Created);
-            assert!(source.consumer.is_none());
-            assert!(source.msg_rx.is_none());
-            assert!(source.reader_handle.is_none());
-            assert_eq!(source.config.group_id, "test-group");
-            assert_eq!(source.offsets.partition_count(), 0);
-            assert!(source.source_name.is_empty());
-            assert!(!source
-                .deterministic_unrecorded_position
-                .load(Ordering::Acquire));
-        }
+        assert!(matches!(
+            error,
+            ConnectorError::ConfigurationError(message)
+                if message.contains("topic patterns") && message.contains("engine-owned")
+        ));
+        assert_eq!(source.state(), ConnectorState::Created);
+        assert!(source.consumer.is_none());
+        assert!(source.msg_rx.is_none());
+        assert!(source.reader_handle.is_none());
+        assert_eq!(source.config.group_id, "test-group");
+        assert_eq!(source.offsets.partition_count(), 0);
+        assert!(source.source_name.is_empty());
+        assert!(!source
+            .deterministic_unrecorded_position
+            .load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -5368,7 +5363,7 @@ mod tests {
             .start(SourceStart {
                 config: ConnectorConfig::new("kafka"),
                 position: SourcePosition::Initial,
-                delivery: DeliveryGuarantee::ExactlyOnce,
+                delivery: DeliveryGuarantee::AtLeastOnce,
             })
             .await
             .expect_err("dynamic topic inventory cannot be fenced by vnode assignment");
@@ -5604,45 +5599,40 @@ mod tests {
             StartupMode::SpecificOffsets(std::collections::HashMap::from([(0, 0), (1, 0)])),
         ];
         for (start_index, startup_mode) in starts.into_iter().enumerate() {
-            for delivery in [
-                DeliveryGuarantee::AtLeastOnce,
-                DeliveryGuarantee::ExactlyOnce,
-            ] {
-                let mut config = test_config();
-                config.bootstrap_servers = cluster.bootstrap_servers();
-                config.group_id = format!("manual-assignment-{start_index}-{delivery}");
-                config.startup_mode = startup_mode.clone();
-                let mut source = KafkaSource::new(test_schema(), config, None);
+            let mut config = test_config();
+            config.bootstrap_servers = cluster.bootstrap_servers();
+            config.group_id = format!("manual-assignment-{start_index}");
+            config.startup_mode = startup_mode.clone();
+            let mut source = KafkaSource::new(test_schema(), config, None);
 
-                source
-                    .start(SourceStart {
-                        config: ConnectorConfig::new("kafka"),
-                        position: SourcePosition::Initial,
-                        delivery,
-                    })
-                    .await
-                    .expect("supported guaranteed start must activate against explicit inventory");
+            source
+                .start(SourceStart {
+                    config: ConnectorConfig::new("kafka"),
+                    position: SourcePosition::Initial,
+                    delivery: DeliveryGuarantee::AtLeastOnce,
+                })
+                .await
+                .expect("supported guaranteed start must activate against explicit inventory");
 
-                let consumer = source.consumer.as_ref().expect("active consumer");
-                assert_eq!(
-                    consumer.subscription().expect("read subscription").count(),
-                    0,
-                    "guaranteed mode must not join broker-managed subscription"
-                );
-                let assignment = consumer.assignment().expect("read manual assignment");
-                let mut partitions: Vec<_> = assignment
-                    .elements()
-                    .iter()
-                    .map(|element| (element.topic().to_string(), element.partition()))
-                    .collect();
-                partitions.sort_unstable();
-                assert_eq!(
-                    partitions,
-                    vec![("events".to_string(), 0), ("events".to_string(), 1)]
-                );
+            let consumer = source.consumer.as_ref().expect("active consumer");
+            assert_eq!(
+                consumer.subscription().expect("read subscription").count(),
+                0,
+                "guaranteed mode must not join broker-managed subscription"
+            );
+            let assignment = consumer.assignment().expect("read manual assignment");
+            let mut partitions: Vec<_> = assignment
+                .elements()
+                .iter()
+                .map(|element| (element.topic().to_string(), element.partition()))
+                .collect();
+            partitions.sort_unstable();
+            assert_eq!(
+                partitions,
+                vec![("events".to_string(), 0), ("events".to_string(), 1)]
+            );
 
-                source.close().await.expect("close mock consumer");
-            }
+            source.close().await.expect("close mock consumer");
         }
     }
 
