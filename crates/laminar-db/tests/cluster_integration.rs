@@ -5,7 +5,7 @@
 #[path = "common/cluster_harness.rs"]
 mod cluster_harness;
 
-#[path = "common/mod.rs"]
+#[path = "common/minio.rs"]
 mod common;
 
 fn test_assignment_fence(
