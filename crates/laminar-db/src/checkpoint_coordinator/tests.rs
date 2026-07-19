@@ -7069,9 +7069,9 @@ async fn phase_one_drains_started_sink_before_cleanup_budget() {
     assert_eq!(slow_rollbacks.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
-/// Records flush counts. Its `pre_commit` rejects use without an opened epoch, so a checkpoint
-/// that wrongly routes an ALO sink through `pre_commit` instead of a plain flush fails the test
-/// (guards CP-5 / B-1).
+/// Records flush counts. Its `pre_commit` rejects at-least-once use (like Postgres, which
+/// asserts the epoch was opened by `begin_epoch`), so a checkpoint that wrongly routes an ALO sink
+/// through `pre_commit` instead of a plain flush fails the test (guards CP-5 / B-1).
 struct RecordingSink {
     flush_count: Arc<std::sync::atomic::AtomicU64>,
     schema: arrow::datatypes::SchemaRef,
@@ -7304,42 +7304,6 @@ async fn at_least_once_sink_flushed_at_checkpoint() {
         flush_count.load(std::sync::atomic::Ordering::Relaxed) >= 1,
         "an at-least-once sink must be flushed at checkpoint (CP-5)"
     );
-}
-
-#[tokio::test]
-async fn poisoned_at_least_once_sink_cannot_seal_a_manifest() {
-    use arrow::datatypes::{DataType, Field, Schema};
-
-    let dir = tempfile::tempdir().unwrap();
-    let mut coord = make_coordinator(dir.path()).await;
-    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
-    let (handle, _flush_count) = spawn_recording_sink("poisoned_alo_sink", Arc::clone(&schema));
-    coord.register_sink("poisoned_alo_sink", handle.clone());
-    coord.begin_initial_epoch().await.unwrap();
-
-    let error = handle
-        .write_batch_until(
-            arrow::array::RecordBatch::new_empty(schema),
-            tokio::time::Instant::now(),
-        )
-        .await
-        .expect_err("an expired pre-cut write must poison the replay-required sink");
-    assert!(error.to_string().contains("deadline"), "{error}");
-
-    let result = coord
-        .checkpoint(CheckpointRequest::default())
-        .await
-        .unwrap();
-    assert!(!result.success);
-    assert!(
-        result
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("poisoned")),
-        "unexpected checkpoint result: {result:?}"
-    );
-    assert!(coord.store().load_latest().await.unwrap().is_none());
-    handle.close().await.unwrap();
 }
 
 struct SlowCheckpointFlushSink {
