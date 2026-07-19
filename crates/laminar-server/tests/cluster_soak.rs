@@ -70,6 +70,8 @@ const ACTIVE_LOAD_MINIMUM_RATIO: f64 = 0.9;
 #[cfg(feature = "kafka")]
 const CHECKPOINT_PIPELINE_STALL_SLO_SECONDS: f64 = 1.024;
 #[cfg(feature = "kafka")]
+const MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS: u64 = 100;
+#[cfg(feature = "kafka")]
 const RECOVERY_RELEASE_LOG: &str = "coordinated recovery: releasing source gate";
 #[cfg(feature = "kafka")]
 const CHECKPOINT_ATTEMPT_RESERVED_LOG: &str = "checkpoint attempt reserved";
@@ -1063,6 +1065,17 @@ impl CheckpointLatencySnapshot {
         Ok(())
     }
 
+    fn pipeline_stall_profile(self) -> String {
+        let Some(within_slo_percent) = self.pipeline_stall_within_slo_percent() else {
+            return "no observations".into();
+        };
+        format!(
+            "<= {:.0}ms={within_slo_percent:.2}% of {} obs",
+            CHECKPOINT_PIPELINE_STALL_SLO_SECONDS * 1_000.0,
+            self.pipeline_stall_observations as u64,
+        )
+    }
+
     fn phase_profile(sum_seconds: f64, observations: f64, within_slo: f64) -> String {
         if observations == 0.0 {
             return "no observations".into();
@@ -1127,15 +1140,42 @@ impl CheckpointLatencyEvidence {
         aggregate.validate()
     }
 
+    fn aggregate_by_node(&self) -> Result<BTreeMap<usize, CheckpointLatencySnapshot>, String> {
+        let mut nodes = BTreeMap::<usize, CheckpointLatencySnapshot>::new();
+        for (generation, snapshot) in &self.generations {
+            if snapshot.pipeline_stall_observations <= 0.0 {
+                return Err(format!(
+                    "node{} process generation {} captured no checkpoint pipeline-stall observations",
+                    generation.node_id, generation.generation
+                ));
+            }
+            nodes
+                .entry(generation.node_id)
+                .or_default()
+                .merge(*snapshot);
+        }
+        for snapshot in nodes.values_mut() {
+            snapshot.validate()?;
+        }
+        Ok(nodes)
+    }
+
     fn validate_slos(&self) -> Result<CheckpointLatencySnapshot, String> {
         let aggregate = self.aggregate()?;
         if aggregate.checkpoint_observations <= 0.0 {
             return Err("aggregate captured no checkpoint latency observations".into());
         }
-        for (generation, snapshot) in &self.generations {
+        for (node_id, snapshot) in self.aggregate_by_node()? {
+            if snapshot.pipeline_stall_observations
+                < MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS as f64
+            {
+                return Err(format!(
+                    "node{node_id} captured only {} checkpoint pipeline-stall observations across process generations; at least {MIN_CHECKPOINT_PIPELINE_STALL_OBSERVATIONS} are required for the observed 99% SLO",
+                    snapshot.pipeline_stall_observations as u64,
+                ));
+            }
             snapshot.validate_pipeline_stall_slo(&format!(
-                "node{} process generation {}",
-                generation.node_id, generation.generation
+                "node{node_id} across process generations"
             ))?;
         }
         aggregate.validate_pipeline_stall_slo("aggregate")?;
@@ -1146,9 +1186,10 @@ impl CheckpointLatencyEvidence {
         let aggregate = self.aggregate().unwrap_or_else(|error| panic!("{error}"));
         for (generation, snapshot) in &self.generations {
             eprintln!(
-                "soak: PROFILE node{} process generation {}: local barrier {}; aligned resume {}",
+                "soak: PROFILE node{} process generation {}: total stall {}; local barrier {}; aligned resume {}",
                 generation.node_id,
                 generation.generation,
+                snapshot.pipeline_stall_profile(),
                 CheckpointLatencySnapshot::phase_profile(
                     snapshot.barrier_local_seconds,
                     snapshot.barrier_local_observations,
@@ -4019,7 +4060,7 @@ fn checkpoint_latency_snapshot_rejects_malformed_histograms() {
 
 #[cfg(feature = "kafka")]
 #[test]
-fn checkpoint_latency_generation_gate_prevents_follower_dilution() {
+fn checkpoint_latency_node_gate_prevents_cluster_dilution() {
     let mut evidence = CheckpointLatencyEvidence::default();
     evidence
         .record_generation(
@@ -4027,7 +4068,16 @@ fn checkpoint_latency_generation_gate_prevents_follower_dilution() {
                 node_id: 0,
                 generation: 1,
             },
-            test_checkpoint_latency_snapshot(100.0, 100.0, 98.0),
+            test_checkpoint_latency_snapshot(60.0, 60.0, 59.0),
+        )
+        .unwrap();
+    evidence
+        .record_generation(
+            ProcessGeneration {
+                node_id: 0,
+                generation: 2,
+            },
+            test_checkpoint_latency_snapshot(60.0, 60.0, 59.0),
         )
         .unwrap();
     evidence
@@ -4043,8 +4093,8 @@ fn checkpoint_latency_generation_gate_prevents_follower_dilution() {
     let aggregate = evidence.aggregate().unwrap();
     assert!(aggregate.pipeline_stall_within_slo_percent().unwrap() > 99.0);
     let error = evidence.validate_slos().unwrap_err();
-    assert!(error.contains("node0 process generation 1"));
-    assert!(error.contains("98.00%"));
+    assert!(error.contains("node0 across process generations"));
+    assert!(error.contains("98.33%"));
 
     let mut missing_generation = CheckpointLatencyEvidence::default();
     missing_generation
@@ -4079,7 +4129,7 @@ fn checkpoint_latency_generation_gate_prevents_follower_dilution() {
                 node_id: 0,
                 generation: 1,
             },
-            test_checkpoint_latency_snapshot(10.0, 10.0, 10.0),
+            test_checkpoint_latency_snapshot(100.0, 100.0, 100.0),
         )
         .unwrap();
     healthy_follower
@@ -4088,10 +4138,40 @@ fn checkpoint_latency_generation_gate_prevents_follower_dilution() {
                 node_id: 1,
                 generation: 1,
             },
-            test_checkpoint_latency_snapshot(0.0, 10.0, 10.0),
+            test_checkpoint_latency_snapshot(0.0, 100.0, 100.0),
         )
         .unwrap();
     assert!(healthy_follower.validate_slos().is_ok());
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn checkpoint_latency_slo_window_survives_process_restart() {
+    let mut evidence = CheckpointLatencyEvidence::default();
+    evidence
+        .record_generation(
+            ProcessGeneration {
+                node_id: 0,
+                generation: 1,
+            },
+            test_checkpoint_latency_snapshot(61.0, 61.0, 60.0),
+        )
+        .unwrap();
+    evidence
+        .record_generation(
+            ProcessGeneration {
+                node_id: 0,
+                generation: 2,
+            },
+            test_checkpoint_latency_snapshot(61.0, 61.0, 61.0),
+        )
+        .unwrap();
+
+    let nodes = evidence.aggregate_by_node().unwrap();
+    let node = nodes.get(&0).unwrap();
+    assert_eq!(node.pipeline_stall_observations, 122.0);
+    assert_eq!(node.pipeline_stall_within_slo, 121.0);
+    assert!(evidence.validate_slos().is_ok());
 }
 
 #[cfg(feature = "kafka")]
