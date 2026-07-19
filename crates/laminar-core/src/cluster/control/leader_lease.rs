@@ -42,6 +42,10 @@ use super::snapshot::{
 
 const LEASE_PREFIX: &str = "control/leader-lease/";
 const AUTHORITY_HEAD_PATH: &str = "control/leader-lease-head/v1.json";
+const STORE_CONTRACT_PROBE_PREFIX: &str = "control/object-store-contract-probes/v1/";
+const STORE_CONTRACT_PROBE_V1: &[u8] = b"laminardb-control-store-contract-v1";
+const STORE_CONTRACT_PROBE_V2: &[u8] = b"laminardb-control-store-contract-v2";
+const STORE_CONTRACT_PROBE_STALE: &[u8] = b"laminardb-control-store-contract-stale";
 const RECOVERY_RELEASE_TERMINAL_PREFIX: &str = "control/recovery-release-terminals/v2/";
 const AUTHORITY_RECORD_VERSION: u32 = 9;
 const AUTHORITY_HEAD_VERSION: u32 = 1;
@@ -1605,6 +1609,225 @@ impl LeaderLeaseStore {
         }
     }
 
+    /// Verify the conditional-write contract required by the mutable authority head.
+    ///
+    /// Validation and cleanup each receive the supplied timeout. The probe uses a unique path and
+    /// cleanup is attempted after every validation outcome.
+    ///
+    /// # Errors
+    /// Returns an error when the store does not enforce native conditional writes, omits update
+    /// metadata, times out, or cannot remove the probe.
+    pub async fn verify_store_contract(&self, timeout: Duration) -> Result<(), LeaseError> {
+        if timeout.is_zero() {
+            return Err(LeaseError::Invalid(
+                "object-store contract probe timeout must be nonzero".into(),
+            ));
+        }
+
+        let path = OsPath::from(format!(
+            "{STORE_CONTRACT_PROBE_PREFIX}{}.probe",
+            Uuid::new_v4()
+        ));
+        let validation = tokio::time::timeout(timeout, self.validate_store_contract_at(&path))
+            .await
+            .unwrap_or_else(|_| {
+                Err(LeaseError::Io(format!(
+                    "object-store contract probe exceeded {timeout:?}"
+                )))
+            });
+        let cleanup = tokio::time::timeout(timeout, self.cleanup_store_contract_probe(&path))
+            .await
+            .unwrap_or_else(|_| {
+                Err(LeaseError::Io(format!(
+                    "object-store contract probe cleanup exceeded {timeout:?}"
+                )))
+            });
+
+        match (validation, cleanup) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(validation), Err(cleanup)) => Err(LeaseError::Io(format!(
+                "object-store contract validation failed ({validation}); cleanup failed ({cleanup})"
+            ))),
+        }
+    }
+
+    async fn validate_store_contract_at(&self, path: &OsPath) -> Result<(), LeaseError> {
+        self.store
+            .put_opts(
+                path,
+                PutPayload::from(Bytes::from_static(STORE_CONTRACT_PROBE_V1)),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..PutOptions::default()
+                },
+            )
+            .await
+            .map_err(|error| {
+                LeaseError::Io(format!(
+                    "object-store contract PutMode::Create failed: {error}"
+                ))
+            })?;
+
+        self.require_store_contract_create_conflict(path).await?;
+
+        let version_v1 = self
+            .read_store_contract_probe(path, STORE_CONTRACT_PROBE_V1)
+            .await?;
+        self.store
+            .put_opts(
+                path,
+                PutPayload::from(Bytes::from_static(STORE_CONTRACT_PROBE_V2)),
+                PutOptions {
+                    mode: PutMode::Update(version_v1.clone()),
+                    ..PutOptions::default()
+                },
+            )
+            .await
+            .map_err(|error| {
+                LeaseError::Io(format!(
+                    "object-store contract PutMode::Update failed: {error}"
+                ))
+            })?;
+
+        let version_v2 = self
+            .read_store_contract_probe(path, STORE_CONTRACT_PROBE_V2)
+            .await?;
+        if version_v2 == version_v1 {
+            return Err(LeaseError::Invalid(
+                "object-store conditional-update version did not change after PutMode::Update"
+                    .into(),
+            ));
+        }
+
+        match self
+            .store
+            .put_opts(
+                path,
+                PutPayload::from(Bytes::from_static(STORE_CONTRACT_PROBE_STALE)),
+                PutOptions {
+                    mode: PutMode::Update(version_v1),
+                    ..PutOptions::default()
+                },
+            )
+            .await
+        {
+            Err(object_store::Error::Precondition { .. }) => {}
+            Ok(_) => {
+                return Err(LeaseError::Invalid(
+                    "object-store accepted a stale PutMode::Update token".into(),
+                ));
+            }
+            Err(error) => {
+                return Err(LeaseError::Io(format!(
+                    "object-store stale PutMode::Update failed unexpectedly: {error}"
+                )));
+            }
+        }
+
+        let durable_version = self
+            .read_store_contract_probe(path, STORE_CONTRACT_PROBE_V2)
+            .await?;
+        if durable_version != version_v2 {
+            return Err(LeaseError::Invalid(
+                "object-store version changed after rejecting stale PutMode::Update".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn require_store_contract_create_conflict(
+        &self,
+        path: &OsPath,
+    ) -> Result<(), LeaseError> {
+        match self
+            .store
+            .put_opts(
+                path,
+                PutPayload::from(Bytes::from_static(STORE_CONTRACT_PROBE_STALE)),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..PutOptions::default()
+                },
+            )
+            .await
+        {
+            Err(
+                object_store::Error::AlreadyExists { .. }
+                | object_store::Error::Precondition { .. },
+            ) => Ok(()),
+            Ok(_) => Err(LeaseError::Invalid(
+                "object-store contract PutMode::Create overwrote an existing object".into(),
+            )),
+            Err(error) => Err(LeaseError::Io(format!(
+                "object-store contract duplicate PutMode::Create failed unexpectedly: {error}"
+            ))),
+        }
+    }
+
+    async fn read_store_contract_probe(
+        &self,
+        path: &OsPath,
+        expected: &[u8],
+    ) -> Result<UpdateVersion, LeaseError> {
+        let result = self.store.get(path).await.map_err(|error| {
+            LeaseError::Io(format!("object-store contract probe GET failed: {error}"))
+        })?;
+        let version = UpdateVersion {
+            e_tag: result.meta.e_tag.clone(),
+            version: result.meta.version.clone(),
+        };
+        if version.e_tag.is_none() && version.version.is_none() {
+            return Err(LeaseError::Invalid(
+                "object-store contract probe GET returned neither ETag nor version".into(),
+            ));
+        }
+        if result.meta.size != u64::try_from(expected.len()).unwrap_or(u64::MAX) {
+            return Err(LeaseError::Invalid(format!(
+                "object-store contract probe is {} bytes; expected {}",
+                result.meta.size,
+                expected.len()
+            )));
+        }
+        let bytes = result.bytes().await.map_err(|error| {
+            LeaseError::Io(format!(
+                "object-store contract probe payload read failed: {error}"
+            ))
+        })?;
+        if bytes.as_ref() != expected {
+            return Err(LeaseError::Invalid(
+                "object-store contract probe content changed unexpectedly".into(),
+            ));
+        }
+        Ok(version)
+    }
+
+    async fn cleanup_store_contract_probe(&self, path: &OsPath) -> Result<(), LeaseError> {
+        let delete_error = match self.store.delete(path).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => None,
+            Err(error) => Some(error.to_string()),
+        };
+        match self.store.get(path).await {
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Ok(_) => Err(LeaseError::Io(delete_error.map_or_else(
+                || "object-store contract probe remained visible after deletion".into(),
+                |error| {
+                    format!(
+                        "object-store contract probe deletion failed ({error}) and the object remained visible"
+                    )
+                },
+            ))),
+            Err(error) => Err(LeaseError::Io(delete_error.map_or_else(
+                || format!("verify object-store contract probe deletion: {error}"),
+                |delete| {
+                    format!(
+                        "object-store contract probe deletion failed ({delete}); verification failed ({error})"
+                    )
+                },
+            ))),
+        }
+    }
+
     fn recovery_fault_inventory_from(record: &LeaderAuthorityRecord) -> RecoveryFaultInventory {
         RecoveryFaultInventory {
             revision: record.recovery_fault_revision,
@@ -1641,10 +1864,11 @@ impl LeaderLeaseStore {
         }
 
         loop {
-            let current = self
-                .load_record()
+            let published = self
+                .load_published_authority_head()
                 .await?
                 .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+            let current = &published.record;
             let node_id = publisher.participant.node_id;
             let slot_index = current
                 .recovery_fault_slots
@@ -1706,7 +1930,10 @@ impl LeaderLeaseStore {
             candidate.recovery_fault_revision = sequence;
             candidate.validate()?;
 
-            match self.create_authority_record(&candidate).await? {
+            match self
+                .create_authority_record(Some(&published), &candidate)
+                .await?
+            {
                 AuthorityCreateOutcome::Created | AuthorityCreateOutcome::ExistingIdentical => {
                     return Ok(RecordRecoveryFaultResult::Active);
                 }
@@ -1867,10 +2094,11 @@ impl LeaderLeaseStore {
         }
 
         loop {
-            let current = self
-                .load_record()
+            let published = self
+                .load_published_authority_head()
                 .await?
                 .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+            let current = &published.record;
             if let Some(winner) = current.recovery_release_head.as_ref() {
                 if winner.terminal == reference
                     || winner.terminal.generation() >= reference.generation()
@@ -1931,7 +2159,10 @@ impl LeaderLeaseStore {
             });
             candidate.validate()?;
 
-            match self.create_authority_record(&candidate).await? {
+            match self
+                .create_authority_record(Some(&published), &candidate)
+                .await?
+            {
                 AuthorityCreateOutcome::Created | AuthorityCreateOutcome::ExistingIdentical => {
                     return Ok(RecordRecoveryReleaseCommitResult::Created(reference));
                 }
@@ -2874,10 +3105,11 @@ impl LeaderLeaseStore {
 
     async fn create_authority_record(
         &self,
+        expected: Option<&PublishedAuthorityHead>,
         candidate: &LeaderAuthorityRecord,
     ) -> Result<AuthorityCreateOutcome, LeaseError> {
         let encoded = encode_authority_record(candidate)?;
-        let expected = match self.load_published_authority_head().await? {
+        let expected_pointer = match expected {
             None => {
                 if candidate.lease.seq != 1 {
                     return Err(LeaseError::Invalid(format!(
@@ -2891,14 +3123,14 @@ impl LeaderLeaseStore {
                 return if head.record == *candidate {
                     Ok(AuthorityCreateOutcome::ExistingIdentical)
                 } else {
-                    Ok(AuthorityCreateOutcome::Contended(head.record))
+                    Ok(AuthorityCreateOutcome::Contended(head.record.clone()))
                 };
             }
             Some(head) if head.record.lease.seq > candidate.lease.seq => {
-                return Ok(AuthorityCreateOutcome::Contended(head.record));
+                return Ok(AuthorityCreateOutcome::Contended(head.record.clone()));
             }
             Some(head) if head.record.lease.seq.checked_add(1) == Some(candidate.lease.seq) => {
-                Some(head.pointer)
+                Some(&head.pointer)
             }
             Some(head) => {
                 return Err(LeaseError::Invalid(format!(
@@ -2938,7 +3170,7 @@ impl LeaderLeaseStore {
         }
 
         let published_sequence = self
-            .publish_authority_head(candidate.lease.seq, expected.as_ref())
+            .publish_authority_head(candidate.lease.seq, expected_pointer)
             .await?;
         if published_sequence > candidate.lease.seq {
             if created {
@@ -2995,10 +3227,11 @@ impl LeaderLeaseStore {
             .await?;
 
         loop {
-            let current = self
-                .load_record()
+            let published = self
+                .load_published_authority_head()
                 .await?
                 .ok_or(CatalogManifestError::Fenced)?;
+            let current = &published.record;
             if let Some(sealed) = &current.lease.catalog_manifest {
                 let durable = self.load_catalog_manifest(sealed).await?;
                 return if durable == *manifest {
@@ -3025,7 +3258,10 @@ impl LeaderLeaseStore {
                 catalog_manifest: Some(reference.clone()),
             };
             let candidate = current.preserve_with_lease(candidate_lease);
-            match self.create_authority_record(&candidate).await? {
+            match self
+                .create_authority_record(Some(&published), &candidate)
+                .await?
+            {
                 AuthorityCreateOutcome::Created => return Ok(CatalogSealOutcome::Created),
                 AuthorityCreateOutcome::ExistingIdentical => {
                     return Ok(CatalogSealOutcome::ExistingIdentical);
@@ -3599,10 +3835,11 @@ impl LeaderLeaseStore {
             .await?;
         // Floor construction may perform remote reads. Publish only if the audited chain and both
         // horizons are still the exact authority snapshot used to select the anchors.
-        let rechecked = self
-            .load_record()
+        let published = self
+            .load_published_authority_head()
             .await?
             .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+        let rechecked = &published.record;
         if !rechecked.lease.matches_proof(proof) {
             return Err(ClusterCheckpointAuthorityError::Fenced);
         }
@@ -3623,7 +3860,10 @@ impl LeaderLeaseStore {
         let mut next = rechecked.preserve_with_lease(lease);
         next.outcome_floor = Some(floor.clone());
         next.validate()?;
-        match self.create_authority_record(&next).await? {
+        match self
+            .create_authority_record(Some(&published), &next)
+            .await?
+        {
             AuthorityCreateOutcome::Created | AuthorityCreateOutcome::ExistingIdentical => {
                 self.install_cluster_outcome_audit(
                     Self::cluster_outcome_audit_key(&next),
@@ -3841,10 +4081,11 @@ impl LeaderLeaseStore {
             .await?;
 
         loop {
-            let current = self
-                .load_record()
+            let published = self
+                .load_published_authority_head()
                 .await?
                 .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+            let current = &published.record;
             if !current.lease.matches_proof(proof) {
                 return Err(ClusterCheckpointAuthorityError::Fenced);
             }
@@ -3921,7 +4162,10 @@ impl LeaderLeaseStore {
                 next.commit_head = Some(new_link);
             }
             next.validate()?;
-            match self.create_authority_record(&next).await? {
+            match self
+                .create_authority_record(Some(&published), &next)
+                .await?
+            {
                 AuthorityCreateOutcome::Created => {
                     let mut appended = outcomes.to_vec();
                     appended.push(candidate.clone());
@@ -4036,10 +4280,11 @@ impl LeaderLeaseStore {
         }
 
         loop {
-            let current = self
-                .load_record()
+            let published = self
+                .load_published_authority_head()
                 .await?
                 .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+            let current = &published.record;
             if !current.lease.matches_proof(proof) {
                 return Err(ClusterCheckpointAuthorityError::Fenced);
             }
@@ -4102,7 +4347,10 @@ impl LeaderLeaseStore {
             });
             candidate.validate()?;
 
-            match self.create_authority_record(&candidate).await? {
+            match self
+                .create_authority_record(Some(&published), &candidate)
+                .await?
+            {
                 AuthorityCreateOutcome::Created => {
                     return Ok(RecordAuthorityAssignmentDecisionResult::Created(decision));
                 }
@@ -4395,10 +4643,11 @@ impl LeaderLeaseStore {
             return Err(ClusterCheckpointAuthorityError::Fenced);
         }
         loop {
-            let current = self
-                .load_record()
+            let published = self
+                .load_published_authority_head()
                 .await?
                 .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+            let current = &published.record;
             if !current.lease.matches_proof(proof) {
                 return Err(ClusterCheckpointAuthorityError::Fenced);
             }
@@ -4450,7 +4699,10 @@ impl LeaderLeaseStore {
             next.assignment_decision_floor = Some(floor);
             next.validate()?;
 
-            match self.create_authority_record(&next).await? {
+            match self
+                .create_authority_record(Some(&published), &next)
+                .await?
+            {
                 AuthorityCreateOutcome::Created | AuthorityCreateOutcome::ExistingIdentical => {
                     return Ok(before_target_version);
                 }
@@ -5054,10 +5306,11 @@ impl LeaderLeaseStore {
             // Lease renewals and catalog seals may advance the shared sequence while the complete
             // recovery metadata preflight performs remote reads. They are harmless only when both the
             // outcome heads and retention floor remain exactly the same.
-            let rechecked = self
-                .load_record()
+            let published = self
+                .load_published_authority_head()
                 .await?
                 .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+            let rechecked = &published.record;
             if !rechecked.lease.matches_proof(proof) {
                 return Err(ClusterCheckpointAuthorityError::Fenced);
             }
@@ -5082,7 +5335,10 @@ impl LeaderLeaseStore {
             });
             next.outcome_floor = Some(floor.clone());
             next.validate()?;
-            match self.create_authority_record(&next).await? {
+            match self
+                .create_authority_record(Some(&published), &next)
+                .await?
+            {
                 AuthorityCreateOutcome::Created => {
                     self.install_cluster_outcome_audit(
                         Self::cluster_outcome_audit_key(&next),
@@ -5190,8 +5446,8 @@ impl LeaderLeaseStore {
         self.ttl()?;
         let expires_at_ms = self.diagnostic_expiry(now_ms)?;
         loop {
-            let current = self.load_record().await?;
-            let candidate = match current {
+            let published = self.load_published_authority_head().await?;
+            let candidate = match published.as_ref() {
                 None => {
                     if matches!(same_owner_token, SameOwnerToken::Exact(_)) {
                         return Err(LeaseError::Fenced(
@@ -5207,7 +5463,8 @@ impl LeaderLeaseStore {
                         catalog_manifest: None,
                     })
                 }
-                Some(record) if record.lease.owner == *owner => {
+                Some(head) if head.record.lease.owner == *owner => {
+                    let record = &head.record;
                     let token = match same_owner_token {
                         #[cfg(test)]
                         SameOwnerToken::Preserve => record.lease.token,
@@ -5239,16 +5496,19 @@ impl LeaderLeaseStore {
                     };
                     record.preserve_with_lease(lease)
                 }
-                Some(record) => {
+                Some(head) => {
                     if matches!(same_owner_token, SameOwnerToken::Exact(_)) {
                         return Err(LeaseError::Fenced(
                             "exact leader renewal was superseded by a rival owner".into(),
                         ));
                     }
-                    return Ok(LeaseOutcome::Held(record.lease));
+                    return Ok(LeaseOutcome::Held(head.record.lease.clone()));
                 }
             };
-            match self.create_authority_record(&candidate).await? {
+            match self
+                .create_authority_record(published.as_ref(), &candidate)
+                .await?
+            {
                 AuthorityCreateOutcome::Created | AuthorityCreateOutcome::ExistingIdentical => {
                     return Ok(LeaseOutcome::Acquired(candidate.lease));
                 }
@@ -5322,12 +5582,13 @@ impl LeaderLeaseStore {
         }
         let expires_at_ms = self.diagnostic_expiry(now_ms)?;
         loop {
-            let current = self
-                .load_record()
+            let published = self
+                .load_published_authority_head()
                 .await?
                 .ok_or_else(|| LeaseError::Invalid("observed leader lease disappeared".into()))?;
+            let current = &published.record;
             if !current.lease.has_same_liveness_identity(&observation.lease) {
-                return Ok(LeaseOutcome::Held(current.lease));
+                return Ok(LeaseOutcome::Held(current.lease.clone()));
             }
             let candidate_lease = LeaderLease {
                 seq: current
@@ -5348,7 +5609,10 @@ impl LeaderLeaseStore {
                 catalog_manifest: current.lease.catalog_manifest.clone(),
             };
             let candidate = current.preserve_with_lease(candidate_lease);
-            match self.create_authority_record(&candidate).await? {
+            match self
+                .create_authority_record(Some(&published), &candidate)
+                .await?
+            {
                 AuthorityCreateOutcome::Created | AuthorityCreateOutcome::ExistingIdentical => {
                     return Ok(LeaseOutcome::Acquired(candidate.lease));
                 }
@@ -5761,6 +6025,11 @@ mod tests {
             seq: 1,
             expires_at_ms: 1,
         }
+    }
+
+    async fn assert_store_contract_probe_prefix_empty(store: &dyn ObjectStore) {
+        let mut entries = store.list(Some(&OsPath::from(STORE_CONTRACT_PROBE_PREFIX)));
+        assert!(FuturesStreamExt::next(&mut entries).await.is_none());
     }
 
     fn store(ttl_ms: i64) -> LeaderLeaseStore {
@@ -7323,6 +7592,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn store_contract_probe_accepts_in_memory_and_cleans_up() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = LeaderLeaseStore::new(Arc::clone(&object_store), 1_000);
+
+        store
+            .verify_store_contract(Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert_store_contract_probe_prefix_empty(object_store.as_ref()).await;
+    }
+
+    #[tokio::test]
+    async fn store_contract_probe_rejects_local_filesystem_and_cleans_up() {
+        let temp = tempfile::tempdir().unwrap();
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(object_store::local::LocalFileSystem::new_with_prefix(temp.path()).unwrap());
+        let store = LeaderLeaseStore::new(Arc::clone(&object_store), 1_000);
+
+        let error = store
+            .verify_store_contract(Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("PutMode::Update"), "{error}");
+        assert_store_contract_probe_prefix_empty(object_store.as_ref()).await;
+    }
+
+    #[tokio::test]
+    async fn store_contract_probe_rejects_update_as_overwrite_and_cleans_up() {
+        let faulty = Arc::new(ContractFaultStore::new(ContractFault::UpdateAsOverwrite));
+        let object_store: Arc<dyn ObjectStore> = faulty.clone();
+        let store = LeaderLeaseStore::new(Arc::clone(&object_store), 1_000);
+
+        let error = store
+            .verify_store_contract(Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("accepted a stale PutMode::Update"),
+            "{error}"
+        );
+        assert_eq!(
+            faulty
+                .update_count
+                .load(std::sync::atomic::Ordering::Acquire),
+            2
+        );
+        assert_store_contract_probe_prefix_empty(object_store.as_ref()).await;
+    }
+
+    #[tokio::test]
+    async fn store_contract_probe_rejects_versionless_get_before_update_and_cleans_up() {
+        let faulty = Arc::new(ContractFaultStore::new(ContractFault::VersionlessGet));
+        let object_store: Arc<dyn ObjectStore> = faulty.clone();
+        let store = LeaderLeaseStore::new(Arc::clone(&object_store), 1_000);
+
+        let error = store
+            .verify_store_contract(Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("returned neither ETag nor version"),
+            "{error}"
+        );
+        assert_eq!(
+            faulty
+                .update_count
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+        assert_store_contract_probe_prefix_empty(object_store.as_ref()).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_store_contract_probes_are_isolated_and_clean_up() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let first = LeaderLeaseStore::new(Arc::clone(&object_store), 1_000);
+        let second = LeaderLeaseStore::new(Arc::clone(&object_store), 1_000);
+        let third = LeaderLeaseStore::new(Arc::clone(&object_store), 1_000);
+        let fourth = LeaderLeaseStore::new(Arc::clone(&object_store), 1_000);
+
+        let results = tokio::join!(
+            first.verify_store_contract(Duration::from_secs(1)),
+            second.verify_store_contract(Duration::from_secs(1)),
+            third.verify_store_contract(Duration::from_secs(1)),
+            fourth.verify_store_contract(Duration::from_secs(1)),
+        );
+
+        results.0.unwrap();
+        results.1.unwrap();
+        results.2.unwrap();
+        results.3.unwrap();
+        assert_store_contract_probe_prefix_empty(object_store.as_ref()).await;
+    }
+
+    #[tokio::test]
     async fn renewal_history_pruning_has_a_reader_grace_period() {
         let store = store(1);
         let owner = owner(1, 1, 1);
@@ -7385,6 +7757,113 @@ mod tests {
                 .unwrap();
         assert!(exhausted);
         assert_eq!(candidates, vec![lease_path(1)]);
+    }
+
+    #[derive(Clone, Copy)]
+    enum ContractFault {
+        VersionlessGet,
+        UpdateAsOverwrite,
+    }
+
+    struct ContractFaultStore {
+        inner: Arc<dyn ObjectStore>,
+        fault: ContractFault,
+        update_count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ContractFaultStore {
+        fn new(fault: ContractFault) -> Self {
+            Self {
+                inner: Arc::new(InMemory::new()),
+                fault,
+                update_count: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl std::fmt::Debug for ContractFaultStore {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("ContractFaultStore")
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl std::fmt::Display for ContractFaultStore {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("ContractFaultStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for ContractFaultStore {
+        async fn put_opts(
+            &self,
+            location: &OsPath,
+            payload: PutPayload,
+            mut options: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if matches!(&options.mode, PutMode::Update(_)) {
+                self.update_count
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                if matches!(self.fault, ContractFault::UpdateAsOverwrite) {
+                    options.mode = PutMode::Overwrite;
+                }
+            }
+            self.inner.put_opts(location, payload, options).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &OsPath,
+            options: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, options).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &OsPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            let mut result = self.inner.get_opts(location, options).await?;
+            if matches!(self.fault, ContractFault::VersionlessGet) {
+                result.meta.e_tag = None;
+                result.meta.version = None;
+            }
+            Ok(result)
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<OsPath>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<OsPath>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&OsPath>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&OsPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &OsPath,
+            to: &OsPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
     }
 
     struct BlockingStore {
@@ -8165,6 +8644,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn healthy_renewal_reuses_the_loaded_head_without_extra_reads_or_listing() {
+        let (raw, store) = blocking_store_at(
+            1_000,
+            OsPath::from("control/never-block-healthy-authority-append"),
+        );
+        let incumbent = owner(1, 1, 1);
+        let first = bare_authority_record(&incumbent, 1);
+        seed_authority_record(&raw, &first).await;
+        seed_authority_head(&raw, 1).await;
+        store.prune_running.store(true, Ordering::Release);
+        raw.clear_authority_io_counts();
+
+        let LeaseOutcome::Acquired(renewed) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 1)
+            .await
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(renewed.seq, 2);
+        assert_eq!(raw.get_count(&authority_head_path()), 1);
+        assert_eq!(raw.get_count(&lease_path(1)), 1);
+        assert_eq!(raw.get_count(&lease_path(2)), 1);
+        assert_eq!(raw.put_count(&lease_path(2), "create"), 1);
+        assert_eq!(raw.put_count(&authority_head_path(), "update"), 1);
+        assert_eq!(raw.list_count(), 0);
+    }
+
+    #[tokio::test]
     async fn contenders_and_stale_repair_cannot_regress_the_pointer() {
         let (raw, store) = blocking_store_at(
             1_000,
@@ -8191,11 +8699,16 @@ mod tests {
             expires_at_ms: 3_000,
             ..first_candidate.lease.clone()
         });
+        let expected = store
+            .load_published_authority_head()
+            .await
+            .unwrap()
+            .unwrap();
         raw.clear_authority_io_counts();
 
         let (first_result, second_result) = tokio::join!(
-            store.create_authority_record(&first_candidate),
-            store.create_authority_record(&second_candidate)
+            store.create_authority_record(Some(&expected), &first_candidate),
+            store.create_authority_record(Some(&expected), &second_candidate)
         );
         let first_result = first_result.unwrap();
         let second_result = second_result.unwrap();
@@ -8215,8 +8728,12 @@ mod tests {
             1
         );
 
-        let winner = store.load_record().await.unwrap().unwrap();
-        let third = winner.preserve_with_lease(LeaderLease {
+        let winner = store
+            .load_published_authority_head()
+            .await
+            .unwrap()
+            .unwrap();
+        let third = winner.record.preserve_with_lease(LeaderLease {
             seq: 3,
             renewal_sequence: 3,
             token: 1,
@@ -8225,7 +8742,10 @@ mod tests {
             catalog_manifest: None,
         });
         assert!(matches!(
-            store.create_authority_record(&third).await.unwrap(),
+            store
+                .create_authority_record(Some(&winner), &third)
+                .await
+                .unwrap(),
             AuthorityCreateOutcome::Created
         ));
         let before_stale = read_authority_head_pointer(raw.inner.as_ref())
@@ -8264,11 +8784,17 @@ mod tests {
             catalog_manifest: None,
         });
         let stale_retry = stale_candidate.clone();
+        let stale_expected = store
+            .load_published_authority_head()
+            .await
+            .unwrap()
+            .unwrap();
         let stale_store = Arc::clone(&store);
-        let stalled =
-            tokio::spawn(
-                async move { stale_store.create_authority_record(&stale_candidate).await },
-            );
+        let stalled = tokio::spawn(async move {
+            stale_store
+                .create_authority_record(Some(&stale_expected), &stale_candidate)
+                .await
+        });
         tokio::time::timeout(Duration::from_secs(1), raw.entered.acquire())
             .await
             .unwrap()
@@ -8336,8 +8862,15 @@ mod tests {
             .await
             .unwrap()
             .is_some());
-        let AuthorityCreateOutcome::Contended(current) =
-            store.create_authority_record(&stale_retry).await.unwrap()
+        let current = store
+            .load_published_authority_head()
+            .await
+            .unwrap()
+            .unwrap();
+        let AuthorityCreateOutcome::Contended(current) = store
+            .create_authority_record(Some(&current), &stale_retry)
+            .await
+            .unwrap()
         else {
             panic!("stale exact residue must remain contended on retry");
         };
@@ -10565,8 +11098,8 @@ mod tests {
         let counts = (1..=9)
             .map(|sequence| raw.get_count(&lease_path(sequence)))
             .collect::<Vec<_>>();
-        assert_eq!(counts, vec![3, 6, 6, 6, 6, 6, 6, 6, 3]);
-        assert_eq!(raw.get_count(&authority_head_path()), 24);
+        assert_eq!(counts, vec![2, 4, 4, 4, 4, 4, 4, 4, 2]);
+        assert_eq!(raw.get_count(&authority_head_path()), 16);
         store.prune_running.store(false, Ordering::Release);
     }
 
@@ -11162,12 +11695,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             raw.get_count(&authority_head_path()),
-            6,
+            4,
             "hot compaction must use a fixed number of pointer reads"
         );
         assert_eq!(
             raw.get_count_prefix(LEASE_PREFIX),
-            12,
+            8,
             "hot compaction must use only bounded head and successor reads"
         );
     }
@@ -11229,12 +11762,12 @@ mod tests {
         assert!(snapshot.terminal_links.len() <= OUTCOME_HISTORY_COMPACTION_TRIGGER);
         assert_eq!(
             raw.get_count(&authority_head_path()),
-            7,
+            5,
             "cold compaction must use a fixed number of pointer reads"
         );
         assert_eq!(
             raw.get_count_prefix(LEASE_PREFIX),
-            u64::try_from(OUTCOME_HISTORY_COMPACTION_TRIGGER + 14).unwrap(),
+            u64::try_from(OUTCOME_HISTORY_COMPACTION_TRIGGER + 10).unwrap(),
             "cold compaction must perform exactly one bounded authority-chain audit"
         );
         assert!(head.outcome_floor.as_ref().unwrap().authority_before_epoch > 1);

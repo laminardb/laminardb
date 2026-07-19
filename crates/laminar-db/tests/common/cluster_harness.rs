@@ -42,6 +42,7 @@ use tokio_util::sync::CancellationToken;
 
 const CONVERGENCE_DEADLINE: Duration = Duration::from_secs(10);
 const ASSIGNMENT_CERTIFICATION_DEADLINE: Duration = Duration::from_secs(60);
+const CONTROL_STORE_CONTRACT_TIMEOUT: Duration = Duration::from_secs(5);
 const TEST_LEASE_TTL: Duration = Duration::from_secs(2);
 const TEST_LEASE_RENEW_INTERVAL: Duration = Duration::from_millis(500);
 pub const TEST_SOURCE_DDL: &str =
@@ -615,6 +616,18 @@ impl ClusterEngineHarness {
             LocalFileSystem::new_with_prefix(shared_state_dir.path())
                 .expect("LocalFileSystem over shared state dir"),
         );
+        let leader_config = LeaderLeaseConfig {
+            ttl: TEST_LEASE_TTL,
+            renew_interval: TEST_LEASE_RENEW_INTERVAL,
+        };
+        let leader_store = Arc::new(LeaderLeaseStore::new(
+            Arc::clone(&control_store),
+            i64::try_from(TEST_LEASE_TTL.as_millis()).expect("test lease TTL fits i64"),
+        ));
+        leader_store
+            .verify_store_contract(CONTROL_STORE_CONTRACT_TIMEOUT)
+            .await
+            .expect("cluster control store fencing contract");
 
         // Shared snapshot store — one CAS-creator wins, peers adopt.
         let snapshot_store = Arc::new(AssignmentSnapshotStore::new(Arc::clone(&control_store)));
@@ -660,14 +673,6 @@ impl ClusterEngineHarness {
             .collect();
         participants.sort_unstable_by_key(|participant| participant.node_id);
 
-        let leader_config = LeaderLeaseConfig {
-            ttl: TEST_LEASE_TTL,
-            renew_interval: TEST_LEASE_RENEW_INTERVAL,
-        };
-        let leader_store = Arc::new(LeaderLeaseStore::new(
-            Arc::clone(&control_store),
-            i64::try_from(TEST_LEASE_TTL.as_millis()).expect("test lease TTL fits i64"),
-        ));
         let catalog_store = Arc::new(CatalogManifestStore::new(Arc::clone(&leader_store)));
         let mut control_leases = Vec::with_capacity(n);
         let mut leader_managers = Vec::with_capacity(n);

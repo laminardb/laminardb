@@ -1475,6 +1475,24 @@ pub async fn start_cluster(
         ));
     }
     let control_store = build_control_store(&config)?;
+    let lease_cfg = laminar_core::cluster::control::LeaderLeaseConfig::default();
+    let lease_ttl_ms = i64::try_from(lease_cfg.ttl.as_millis()).map_err(|_| {
+        ClusterStartupError::EngineConstruction(
+            "leader lease TTL exceeds the durable diagnostic range".into(),
+        )
+    })?;
+    let lease_store = Arc::new(laminar_core::cluster::control::LeaderLeaseStore::new(
+        Arc::clone(&control_store),
+        lease_ttl_ms,
+    ));
+    lease_store
+        .verify_store_contract(OBJECT_STORE_CONTROL_IO_TIMEOUT)
+        .await
+        .map_err(|error| {
+            ClusterStartupError::EngineConstruction(format!(
+                "cluster control store does not provide required create/update fencing: {error}"
+            ))
+        })?;
     install_cluster_tls(&cluster_cfg.discovery)?;
     let process_incarnation = uuid::Uuid::new_v4();
     let process_lease_config = laminar_core::cluster::control::ProcessLeaseConfig::default();
@@ -1883,23 +1901,7 @@ pub async fn start_cluster(
     // so the snapshot watcher and rebalance controller share one backing object.
     builder = builder.assignment_snapshot_store(Arc::clone(&snapshot_store));
 
-    // Catalog sealing and leader fencing share one append-only CAS sequence. A catalog write can
-    // therefore linearize before a takeover or be rejected by it; there is no check-then-write
-    // gap across independent objects.
-    let lease_cfg = laminar_core::cluster::control::LeaderLeaseConfig::default();
-    let ttl_ms = match i64::try_from(lease_cfg.ttl.as_millis()) {
-        Ok(ttl_ms) => ttl_ms,
-        Err(_) => {
-            let _ = discovery.stop().await;
-            return Err(ClusterStartupError::EngineConstruction(
-                "leader lease TTL exceeds the durable diagnostic range".into(),
-            ));
-        }
-    };
-    let lease_store = Arc::new(laminar_core::cluster::control::LeaderLeaseStore::new(
-        Arc::clone(&control_store),
-        ttl_ms,
-    ));
+    // Catalog sealing and leader fencing share one append-only CAS sequence.
     let catalog_store = Arc::new(laminar_core::cluster::control::CatalogManifestStore::new(
         Arc::clone(&lease_store),
     ));

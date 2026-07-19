@@ -2110,11 +2110,7 @@ mod minio {
     use super::common::{minio_endpoint, minio_store};
 
     fn unique_bucket(prefix: &str) -> String {
-        let millis = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before Unix epoch")
-            .as_millis();
-        format!("{prefix}-{millis}")
+        format!("{prefix}-{}", uuid::Uuid::new_v4())
     }
 
     fn certified_request(
