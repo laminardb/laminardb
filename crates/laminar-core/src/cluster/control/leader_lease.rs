@@ -1434,7 +1434,7 @@ impl ClusterOutcomeRetentionBoundary {
 /// Live cluster outcomes and their retention horizons from one audited authority head.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterOutcomeInventory {
-    /// Outcomes whose checkpoint artifacts remain live, in ascending epoch order.
+    /// Outcomes at or above the artifact-retention horizon, in ascending epoch order.
     pub outcomes: Vec<CheckpointOutcome>,
     /// Artifact and terminal-history horizons paired with `outcomes`.
     pub retention_boundary: ClusterOutcomeRetentionBoundary,
@@ -4643,22 +4643,6 @@ impl LeaderLeaseStore {
             }
             tokio::task::yield_now().await;
         }
-    }
-
-    /// Read an existing cluster retention boundary only after its selected live Commit passes the
-    /// caller's durable recovery metadata preflight and both outcome heads remain unchanged.
-    pub async fn validated_cluster_outcome_retention_boundary<V, Fut>(
-        &self,
-        validate_artifacts: V,
-    ) -> Result<ClusterOutcomeRetentionBoundary, ClusterCheckpointAuthorityError>
-    where
-        V: Fn(CheckpointOutcome) -> Fut,
-        Fut: std::future::Future<Output = Result<(), String>>,
-    {
-        Ok(self
-            .validated_cluster_outcome_inventory(validate_artifacts)
-            .await?
-            .retention_boundary)
     }
 
     /// Run one bounded recovery-capsule cleanup step below the durable artifact horizon.
