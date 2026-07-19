@@ -2776,17 +2776,12 @@ async fn settle_stopped_prepared_witnesses(
     let authority = controller
         .checkpoint_authority()
         .map_err(|error| format!("checkpoint settlement authority is unavailable: {error}"))?;
-    let boundary = tokio::time::timeout_at(
-        write_deadline,
-        authority.cluster_outcome_retention_boundary(),
-    )
-    .await
-    .map_err(|_| "checkpoint settlement retention-boundary read timed out".to_string())?
-    .map_err(|error| format!("checkpoint settlement retention boundary is invalid: {error}"))?;
-    let mut outcomes = tokio::time::timeout_at(write_deadline, authority.cluster_outcomes())
+    let inventory = tokio::time::timeout_at(write_deadline, authority.cluster_outcome_inventory())
         .await
         .map_err(|_| "checkpoint settlement outcome inventory timed out".to_string())?
         .map_err(|error| format!("checkpoint settlement outcome inventory is invalid: {error}"))?;
+    let boundary = inventory.retention_boundary;
+    let mut outcomes = inventory.outcomes;
 
     for (attempt, deployment_id, _) in attempts {
         if let Some(outcome) = outcomes

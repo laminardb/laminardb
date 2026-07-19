@@ -503,8 +503,9 @@ impl<'a> RecoveryOutcomeAuthority<'a> {
                 .map_err(|error| DbError::Checkpoint(error.to_string())),
             #[cfg(feature = "cluster")]
             Self::Cluster { outcomes, .. } => outcomes
-                .cluster_outcomes()
+                .cluster_outcome_inventory()
                 .await
+                .map(|inventory| inventory.outcomes)
                 .map_err(|error| DbError::Checkpoint(error.to_string())),
         }
     }
@@ -985,21 +986,21 @@ impl<'a> RecoveryManager<'a> {
     }
 
     #[cfg(feature = "cluster")]
-    async fn validated_cluster_prepared_dominance(
+    async fn validated_cluster_recovery_outcomes(
         &self,
         authority: &laminar_core::cluster::control::LeaderLeaseStore,
         capsule_store: &laminar_core::checkpoint_decision::CheckpointDecisionStore,
-    ) -> Result<(), DbError> {
-        authority
-            .validated_cluster_outcome_retention_boundary(|outcome| async move {
+    ) -> Result<Vec<CheckpointOutcome>, DbError> {
+        let inventory = authority
+            .validated_cluster_outcome_inventory(|outcome| async move {
                 self.preflight_cluster_committed_outcome(&outcome, capsule_store)
                     .await
                     .map(drop)
                     .map_err(|error| error.to_string())
             })
             .await
-            .map(drop)
-            .map_err(|error| DbError::Checkpoint(error.to_string()))
+            .map_err(|error| DbError::Checkpoint(error.to_string()))?;
+        Ok(inventory.outcomes)
     }
 
     async fn settle_local_prepared_attempts(
@@ -1356,9 +1357,9 @@ impl<'a> RecoveryManager<'a> {
                     outcomes: cluster_authority,
                     capsules,
                 } => {
-                    self.validated_cluster_prepared_dominance(cluster_authority, capsules)
+                    let outcomes = self
+                        .validated_cluster_recovery_outcomes(cluster_authority, capsules)
                         .await?;
-                    let outcomes = authority.outcomes().await?;
                     let dominance = ClusterPreparedDominance::from_outcomes(&outcomes);
                     (outcomes, dominance)
                 }
@@ -1446,9 +1447,9 @@ impl<'a> RecoveryManager<'a> {
                     outcomes: cluster_authority,
                     capsules,
                 } => {
-                    self.validated_cluster_prepared_dominance(cluster_authority, capsules)
+                    let outcomes = self
+                        .validated_cluster_recovery_outcomes(cluster_authority, capsules)
                         .await?;
-                    let outcomes = authority.outcomes().await?;
                     let dominance = ClusterPreparedDominance::from_outcomes(&outcomes);
                     (outcomes, dominance)
                 }

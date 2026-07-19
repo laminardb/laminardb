@@ -512,24 +512,19 @@ impl CoordinatedCommitter {
                     "committer: cluster outcome inventory requires the exact checkpoint authority: {error}"
                 ))
             })?;
-            let outcomes = self
+            let inventory = self
                 .storage_io(
                     "cluster checkpoint outcome inventory read",
-                    authority.cluster_outcomes(),
+                    authority.cluster_outcome_inventory(),
                 )
                 .await?;
-            let boundary = self
-                .storage_io(
-                    "cluster checkpoint outcome retention boundary read",
-                    authority.cluster_outcome_retention_boundary(),
-                )
-                .await?;
+            let boundary = inventory.retention_boundary;
             let committed_checkpoint_id = boundary
                 .committed_anchor
                 .as_ref()
                 .map(|outcome| outcome.checkpoint_id);
             (
-                outcomes,
+                inventory.outcomes,
                 RetainedOutcomeContinuity {
                     artifact_before_epoch: boundary.artifact_before_epoch,
                     committed_checkpoint_id,

@@ -1412,6 +1412,34 @@ pub struct ClusterOutcomeRetentionBoundary {
     pub terminal_anchor: Option<CheckpointOutcome>,
 }
 
+impl ClusterOutcomeRetentionBoundary {
+    fn from_floor(floor: Option<&AuthorityOutcomeFloor>) -> Self {
+        floor.map_or(
+            Self {
+                artifact_before_epoch: 0,
+                terminal_before_epoch: 0,
+                committed_anchor: None,
+                terminal_anchor: None,
+            },
+            |floor| Self {
+                artifact_before_epoch: floor.artifact_before_epoch,
+                terminal_before_epoch: floor.authority_before_epoch,
+                committed_anchor: floor.committed_anchor.clone(),
+                terminal_anchor: floor.terminal_anchor.clone(),
+            },
+        )
+    }
+}
+
+/// Live cluster outcomes and their retention horizons from one audited authority head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterOutcomeInventory {
+    /// Outcomes whose checkpoint artifacts remain live, in ascending epoch order.
+    pub outcomes: Vec<CheckpointOutcome>,
+    /// Artifact and terminal-history horizons paired with `outcomes`.
+    pub retention_boundary: ClusterOutcomeRetentionBoundary,
+}
+
 /// Append-only object-store authority for the cluster leader.
 pub struct LeaderLeaseStore {
     store: Arc<dyn ObjectStore>,
@@ -4394,15 +4422,37 @@ impl LeaderLeaseStore {
     }
 
     /// Audit and return every live cluster outcome in ascending epoch order.
+    pub async fn cluster_outcome_inventory(
+        &self,
+    ) -> Result<ClusterOutcomeInventory, ClusterCheckpointAuthorityError> {
+        let (head, outcomes) = self.audited_cluster_outcomes().await?;
+        Ok(Self::cluster_outcome_inventory_from_audit(
+            head.as_ref(),
+            &outcomes,
+        ))
+    }
+
+    fn cluster_outcome_inventory_from_audit(
+        head: Option<&LeaderAuthorityRecord>,
+        outcomes: &[CheckpointOutcome],
+    ) -> ClusterOutcomeInventory {
+        let floor = head.and_then(|head| head.outcome_floor.as_ref());
+        let artifact_before_epoch = floor.map_or(0, |floor| floor.artifact_before_epoch);
+        ClusterOutcomeInventory {
+            outcomes: outcomes
+                .iter()
+                .filter(|outcome| outcome.epoch >= artifact_before_epoch)
+                .cloned()
+                .collect(),
+            retention_boundary: ClusterOutcomeRetentionBoundary::from_floor(floor),
+        }
+    }
+
+    /// Audit and return every live cluster outcome in ascending epoch order.
     pub async fn cluster_outcomes(
         &self,
     ) -> Result<Vec<CheckpointOutcome>, ClusterCheckpointAuthorityError> {
-        let (head, outcomes) = self.audited_cluster_outcomes().await?;
-        let mut outcomes = outcomes.to_vec();
-        if let Some(floor) = head.and_then(|head| head.outcome_floor) {
-            outcomes.retain(|outcome| outcome.epoch >= floor.artifact_before_epoch);
-        }
-        Ok(outcomes)
+        Ok(self.cluster_outcome_inventory().await?.outcomes)
     }
 
     /// Greatest live cluster commit recovery cut.
@@ -4536,27 +4586,9 @@ impl LeaderLeaseStore {
     pub async fn cluster_outcome_retention_boundary(
         &self,
     ) -> Result<ClusterOutcomeRetentionBoundary, ClusterCheckpointAuthorityError> {
-        let Some(head) = self.load_record().await? else {
-            return Ok(ClusterOutcomeRetentionBoundary {
-                artifact_before_epoch: 0,
-                terminal_before_epoch: 0,
-                committed_anchor: None,
-                terminal_anchor: None,
-            });
-        };
-        Ok(head.outcome_floor.map_or(
-            ClusterOutcomeRetentionBoundary {
-                artifact_before_epoch: 0,
-                terminal_before_epoch: 0,
-                committed_anchor: None,
-                terminal_anchor: None,
-            },
-            |floor| ClusterOutcomeRetentionBoundary {
-                artifact_before_epoch: floor.artifact_before_epoch,
-                terminal_before_epoch: floor.authority_before_epoch,
-                committed_anchor: floor.committed_anchor,
-                terminal_anchor: floor.terminal_anchor,
-            },
+        let head = self.load_record().await?;
+        Ok(ClusterOutcomeRetentionBoundary::from_floor(
+            head.as_ref().and_then(|head| head.outcome_floor.as_ref()),
         ))
     }
 
@@ -4569,8 +4601,48 @@ impl LeaderLeaseStore {
     pub async fn audited_cluster_outcome_retention_boundary(
         &self,
     ) -> Result<ClusterOutcomeRetentionBoundary, ClusterCheckpointAuthorityError> {
-        self.validated_cluster_outcome_retention_boundary(|_| async { Ok(()) })
-            .await
+        Ok(self
+            .validated_cluster_outcome_inventory(|_| async { Ok(()) })
+            .await?
+            .retention_boundary)
+    }
+
+    /// Read live outcomes and their retention boundary only after the selected live Commit passes
+    /// the caller's durable recovery metadata preflight and both outcome heads and the floor remain
+    /// unchanged.
+    pub async fn validated_cluster_outcome_inventory<V, Fut>(
+        &self,
+        validate_artifacts: V,
+    ) -> Result<ClusterOutcomeInventory, ClusterCheckpointAuthorityError>
+    where
+        V: Fn(CheckpointOutcome) -> Fut,
+        Fut: std::future::Future<Output = Result<(), String>>,
+    {
+        loop {
+            let current = self
+                .load_record()
+                .await?
+                .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+            let snapshot = self.cached_audited_cluster_outcomes_from(&current).await?;
+            if let Some(floor) = current.outcome_floor.as_ref() {
+                self.preflight_cluster_recovery_cut(floor, &snapshot.outcomes, &validate_artifacts)
+                    .await?;
+            }
+            let rechecked = self
+                .load_record()
+                .await?
+                .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
+            if rechecked.outcome_head == current.outcome_head
+                && rechecked.commit_head == current.commit_head
+                && rechecked.outcome_floor == current.outcome_floor
+            {
+                return Ok(Self::cluster_outcome_inventory_from_audit(
+                    Some(&current),
+                    &snapshot.outcomes,
+                ));
+            }
+            tokio::task::yield_now().await;
+        }
     }
 
     /// Read an existing cluster retention boundary only after its selected live Commit passes the
@@ -4583,39 +4655,10 @@ impl LeaderLeaseStore {
         V: Fn(CheckpointOutcome) -> Fut,
         Fut: std::future::Future<Output = Result<(), String>>,
     {
-        loop {
-            let current = self
-                .load_record()
-                .await?
-                .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
-            let Some(floor) = current.outcome_floor.as_ref() else {
-                return Ok(ClusterOutcomeRetentionBoundary {
-                    artifact_before_epoch: 0,
-                    terminal_before_epoch: 0,
-                    committed_anchor: None,
-                    terminal_anchor: None,
-                });
-            };
-            let snapshot = self.cached_audited_cluster_outcomes_from(&current).await?;
-            self.preflight_cluster_recovery_cut(floor, &snapshot.outcomes, &validate_artifacts)
-                .await?;
-            let rechecked = self
-                .load_record()
-                .await?
-                .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
-            if rechecked.outcome_head == current.outcome_head
-                && rechecked.commit_head == current.commit_head
-                && rechecked.outcome_floor == current.outcome_floor
-            {
-                return Ok(ClusterOutcomeRetentionBoundary {
-                    artifact_before_epoch: floor.artifact_before_epoch,
-                    terminal_before_epoch: floor.authority_before_epoch,
-                    committed_anchor: floor.committed_anchor.clone(),
-                    terminal_anchor: floor.terminal_anchor.clone(),
-                });
-            }
-            tokio::task::yield_now().await;
-        }
+        Ok(self
+            .validated_cluster_outcome_inventory(validate_artifacts)
+            .await?
+            .retention_boundary)
     }
 
     /// Run one bounded recovery-capsule cleanup step below the durable artifact horizon.
@@ -9854,6 +9897,138 @@ mod tests {
                 .unwrap()
                 .epoch,
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn outcome_inventory_pairs_divergent_horizons_with_one_audited_head() {
+        let (raw, store) = blocking_store_at(
+            1_000,
+            OsPath::from("control/never-block-paired-outcome-inventory"),
+        );
+        let incumbent = owner(1, 1, 1);
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        disable_history_pruning_for_test(&store).await;
+        let proof = first.proof();
+        let fence = assignment_fence(&incumbent);
+        record_commit(&store, &proof, &fence, 1, 10).await;
+        record_commit(&store, &proof, &fence, 3, 30).await;
+        store
+            .prune_cluster_outcomes_before(&proof, 3, accept_recovery_artifacts)
+            .await
+            .unwrap();
+        let last_epoch = u64::try_from(OUTCOME_HISTORY_COMPACTION_TRIGGER + 3).unwrap();
+        for epoch in 4..=last_epoch {
+            store
+                .record_cluster_outcome(
+                    &proof,
+                    epoch,
+                    epoch * 10,
+                    fence.clone(),
+                    CheckpointVerdict::Abort,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        raw.clear_get_counts();
+        let inventory = store.cluster_outcome_inventory().await.unwrap();
+
+        assert_eq!(inventory.retention_boundary.artifact_before_epoch, 3);
+        assert!(inventory.retention_boundary.terminal_before_epoch > 3);
+        assert_eq!(
+            inventory
+                .retention_boundary
+                .committed_anchor
+                .as_ref()
+                .unwrap()
+                .epoch,
+            1
+        );
+        assert_eq!(
+            inventory.outcomes.first().map(|outcome| outcome.epoch),
+            Some(3)
+        );
+        assert!(inventory
+            .outcomes
+            .iter()
+            .all(|outcome| outcome.epoch >= inventory.retention_boundary.artifact_before_epoch));
+        assert_eq!(
+            raw.get_count_prefix(LEASE_PREFIX),
+            1,
+            "paired inventory must not load the authority head again for its boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn validated_outcome_inventory_retries_after_heads_and_floor_advance() {
+        let store = Arc::new(store(1_000));
+        let incumbent = owner(1, 1, 1);
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        disable_history_pruning_for_test(&store).await;
+        let proof = first.proof();
+        let fence = assignment_fence(&incumbent);
+        for (epoch, checkpoint_id) in [(1, 10), (3, 30), (5, 50)] {
+            record_commit(&store, &proof, &fence, epoch, checkpoint_id).await;
+        }
+        store
+            .prune_cluster_outcomes_before(&proof, 2, accept_recovery_artifacts)
+            .await
+            .unwrap();
+
+        let mutated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let preflighted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mutation_store = Arc::clone(&store);
+        let mutation_proof = proof.clone();
+        let mutation_fence = fence.clone();
+        let inventory = store
+            .validated_cluster_outcome_inventory({
+                let mutated = Arc::clone(&mutated);
+                let preflighted = Arc::clone(&preflighted);
+                move |outcome| {
+                    let mutated = Arc::clone(&mutated);
+                    let preflighted = Arc::clone(&preflighted);
+                    let store = Arc::clone(&mutation_store);
+                    let proof = mutation_proof.clone();
+                    let fence = mutation_fence.clone();
+                    async move {
+                        preflighted.lock().unwrap().push(outcome.epoch);
+                        if !mutated.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                            record_commit(&store, &proof, &fence, 7, 70).await;
+                            store
+                                .prune_cluster_outcomes_before(&proof, 5, accept_recovery_artifacts)
+                                .await
+                                .unwrap();
+                        }
+                        Ok(())
+                    }
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(*preflighted.lock().unwrap(), vec![5, 7]);
+        assert_eq!(inventory.retention_boundary.artifact_before_epoch, 5);
+        assert_eq!(
+            inventory
+                .outcomes
+                .iter()
+                .map(|outcome| outcome.epoch)
+                .collect::<Vec<_>>(),
+            vec![5, 7]
         );
     }
 

@@ -37,10 +37,10 @@ pub use catalog_manifest::{
 pub use leader::leader_of;
 pub use leader_lease::{
     lease_grants_leadership, lease_grants_proof, AssignmentDrainDecision, AssignmentDrainVerdict,
-    AssignmentRecoveryDecision, ClusterCheckpointAuthorityError, ClusterOutcomeRetentionBoundary,
-    LeaderCandidacy, LeaderLease, LeaderLeaseConfig, LeaderLeaseManager, LeaderLeaseObservation,
-    LeaderLeaseOwner, LeaderLeaseStore, LeaseError, LeaseOutcome,
-    RecordAssignmentDrainDecisionResult, RecordAssignmentRecoveryDecisionResult,
+    AssignmentRecoveryDecision, ClusterCheckpointAuthorityError, ClusterOutcomeInventory,
+    ClusterOutcomeRetentionBoundary, LeaderCandidacy, LeaderLease, LeaderLeaseConfig,
+    LeaderLeaseManager, LeaderLeaseObservation, LeaderLeaseOwner, LeaderLeaseStore, LeaseError,
+    LeaseOutcome, RecordAssignmentDrainDecisionResult, RecordAssignmentRecoveryDecisionResult,
 };
 pub use lease_deadline::LeaseDeadline;
 pub use process_lease::{

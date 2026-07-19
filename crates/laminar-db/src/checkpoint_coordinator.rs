@@ -4118,15 +4118,11 @@ impl CheckpointCoordinator {
             ))
         })?;
         tokio::time::timeout(self.config.checkpoint_timeout, async {
-            let outcomes = authority
-                .cluster_outcomes()
+            let inventory = authority
+                .cluster_outcome_inventory()
                 .await
                 .map_err(|error| DbError::Checkpoint(format!("[LDB-6040] {error}")))?;
-            let boundary = authority
-                .cluster_outcome_retention_boundary()
-                .await
-                .map_err(|error| DbError::Checkpoint(format!("[LDB-6040] {error}")))?;
-            Ok((outcomes, boundary))
+            Ok((inventory.outcomes, inventory.retention_boundary))
         })
         .await
         .map_err(|_| {
