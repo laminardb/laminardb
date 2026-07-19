@@ -100,6 +100,9 @@ impl DbState {
 }
 
 const DB_IO_WORKER_THREADS: usize = 2;
+// Cluster recovery has a finite, non-recursive async call chain that exceeds Tokio's 2 MiB
+// default worker stack. Keep the larger stack out of embedded and single-node runtimes.
+const CLUSTER_IO_WORKER_STACK_BYTES: usize = 4 * 1024 * 1024;
 
 struct DbControlRuntimeInner {
     handle: tokio::runtime::Handle,
@@ -112,12 +115,16 @@ struct DbControlRuntimeInner {
 /// blocks on Tokio shutdown. The fixed two-worker size keeps control and feedback traffic live
 /// while one connector future is temporarily busy without adding a public tuning dimension.
 pub(crate) struct DbControlRuntime {
+    worker_stack_bytes: Option<usize>,
     inner: parking_lot::Mutex<Option<DbControlRuntimeInner>>,
 }
 
 impl DbControlRuntime {
-    fn new() -> Self {
+    fn new(runtime_mode: RuntimeMode) -> Self {
         Self {
+            worker_stack_bytes: runtime_mode
+                .is_cluster()
+                .then_some(CLUSTER_IO_WORKER_STACK_BYTES),
             inner: parking_lot::Mutex::new(None),
         }
     }
@@ -130,15 +137,19 @@ impl DbControlRuntime {
 
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let worker_stack_bytes = self.worker_stack_bytes;
         let owner = std::thread::Builder::new()
             .name("laminar-io-owner".into())
             .spawn(move || {
-                let runtime = match tokio::runtime::Builder::new_multi_thread()
+                let mut builder = tokio::runtime::Builder::new_multi_thread();
+                builder
                     .worker_threads(DB_IO_WORKER_THREADS)
                     .thread_name("laminar-io")
-                    .enable_all()
-                    .build()
-                {
+                    .enable_all();
+                if let Some(bytes) = worker_stack_bytes {
+                    builder.thread_stack_size(bytes);
+                }
+                let runtime = match builder.build() {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         let _ = ready_tx.send(Err(error.to_string()));
@@ -1014,7 +1025,7 @@ impl LaminarDB {
             supervisor_self: Arc::new(parking_lot::Mutex::new(std::sync::Weak::new())),
             restart_history: Arc::new(parking_lot::Mutex::new(Vec::new())),
             lifecycle_lock: tokio::sync::Mutex::new(()),
-            control_runtime: DbControlRuntime::new(),
+            control_runtime: DbControlRuntime::new(runtime_mode),
             startup_attempt: parking_lot::Mutex::new(None),
             topology_ddl_lock: tokio::sync::RwLock::new(()),
             catalog_namespace: parking_lot::Mutex::new(HashMap::new()),

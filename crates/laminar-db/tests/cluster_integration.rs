@@ -153,13 +153,14 @@ mod failures {
             .iter()
             .map(|n| (n.instance_id, n.owned_vnodes()))
             .collect();
-        let (shared_dir, checkpoint_dirs) = harness_a.shutdown_keep_dirs().await;
+        let (shared_dir, checkpoint_dirs, control_store) = harness_a.shutdown_keep_dirs().await;
 
         let mut harness_b = super::cluster_harness::ClusterEngineHarness::spawn_with_dirs(
             N_NODES,
             VNODE_COUNT,
             shared_dir,
             checkpoint_dirs,
+            control_store,
         )
         .await;
         harness_b.start_all().await;
@@ -240,11 +241,16 @@ mod failures {
             .expect("inject structurally valid but unsupported catalog manifest");
 
         assert_cluster_nodes_reject_materialized_manifest(&harness).await;
-        let (shared_dir, checkpoint_dirs) = harness.shutdown_keep_dirs().await;
+        let (shared_dir, checkpoint_dirs, control_store) = harness.shutdown_keep_dirs().await;
 
-        let restarted =
-            ClusterEngineHarness::spawn_with_dirs(3, VNODE_COUNT, shared_dir, checkpoint_dirs)
-                .await;
+        let restarted = ClusterEngineHarness::spawn_with_dirs(
+            3,
+            VNODE_COUNT,
+            shared_dir,
+            checkpoint_dirs,
+            control_store,
+        )
+        .await;
         assert_eq!(
             restarted
                 .catalog_manifest_store
@@ -1503,12 +1509,13 @@ mod rebalance {
             Some(predecessor_fence.clone())
         );
 
-        let (shared_dir, checkpoint_dirs) = harness.shutdown_keep_dirs().await;
+        let (shared_dir, checkpoint_dirs, control_store) = harness.shutdown_keep_dirs().await;
         let mut restarted = ClusterEngineHarness::spawn_with_dirs(
             N_NODES,
             VNODE_COUNT,
             shared_dir,
             checkpoint_dirs,
+            control_store,
         )
         .await;
         assert_eq!(
@@ -1643,7 +1650,6 @@ mod two_pc {
     use laminar_db::checkpoint_coordinator::{
         CheckpointConfig, CheckpointCoordinator, CheckpointRequest,
     };
-    use object_store::local::LocalFileSystem;
     use object_store::ObjectStore;
 
     fn certified_request(assignment_fence: &CheckpointAssignmentFence) -> CheckpointRequest {
@@ -1711,11 +1717,8 @@ mod two_pc {
         coord
     }
 
-    fn make_decision_store(dir: &std::path::Path) -> Arc<CheckpointDecisionStore> {
-        let os: Arc<dyn ObjectStore> = Arc::new(
-            LocalFileSystem::new_with_prefix(dir).expect("LocalFileSystem for decision store"),
-        );
-        Arc::new(CheckpointDecisionStore::new(os))
+    fn make_decision_store(store: Arc<dyn ObjectStore>) -> Arc<CheckpointDecisionStore> {
+        Arc::new(CheckpointDecisionStore::new(store))
     }
 
     async fn create_test_recovery_capsule(
@@ -1787,7 +1790,7 @@ mod two_pc {
 
         let leader_dir = tempfile::tempdir().unwrap();
         let follower_dir = tempfile::tempdir().unwrap();
-        let decision_store = make_decision_store(harness.shared_state_dir.path());
+        let decision_store = make_decision_store(harness.control_store());
         let fence = super::test_assignment_fence(&harness.cluster, &registry);
 
         let mut leader_coord = make_coord(
@@ -1882,7 +1885,7 @@ mod two_pc {
             .into(),
         );
 
-        let decision_store = make_decision_store(harness.shared_state_dir.path());
+        let decision_store = make_decision_store(harness.control_store());
         let fence = super::test_assignment_fence(&harness.cluster, &registry);
 
         let leader_dir = tempfile::tempdir().unwrap();
@@ -1968,7 +1971,7 @@ mod two_pc {
             .into(),
         );
 
-        let decision_store = make_decision_store(harness.shared_state_dir.path());
+        let decision_store = make_decision_store(harness.control_store());
         let fence = super::test_assignment_fence(&harness.cluster, &registry);
         let leader_proof = live_leader_proof(&leader_node.controller);
         let recovery_capsule =
@@ -2042,7 +2045,7 @@ mod two_pc {
             .into(),
         );
 
-        let decision_store = make_decision_store(harness.shared_state_dir.path());
+        let decision_store = make_decision_store(harness.control_store());
         let fence = super::test_assignment_fence(&harness.cluster, &registry);
 
         let follower_dir = tempfile::tempdir().unwrap();
@@ -2087,7 +2090,7 @@ mod two_pc {
 }
 
 mod minio {
-    use super::cluster_harness::ClusterEngineHarness;
+    use super::cluster_harness::{ClusterEngineHarness, TEST_SOURCE_DDL};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -2102,10 +2105,17 @@ mod minio {
     use laminar_db::checkpoint_coordinator::{
         CheckpointConfig, CheckpointCoordinator, CheckpointRequest,
     };
-    use object_store::local::LocalFileSystem;
-    use object_store::{ObjectStore, ObjectStoreExt};
+    use object_store::ObjectStoreExt;
 
     use super::common::{minio_endpoint, minio_store};
+
+    fn unique_bucket(prefix: &str) -> String {
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_millis();
+        format!("{prefix}-{millis}")
+    }
 
     fn certified_request(
         controller: &laminar_core::cluster::control::ClusterController,
@@ -2155,7 +2165,10 @@ mod minio {
             eprintln!("skipping: MinIO not reachable at 127.0.0.1:19000");
             return;
         }
-        let harness = ClusterEngineHarness::spawn(2, 4).await;
+        let bucket = unique_bucket("laminar-test");
+        let store = minio_store(&bucket).await;
+        let harness =
+            ClusterEngineHarness::spawn_with_control_store(2, 4, Arc::clone(&store)).await;
         let cluster = &harness.cluster;
 
         let (leader_node, follower_node) = if cluster.nodes[0].controller.is_leader() {
@@ -2164,19 +2177,7 @@ mod minio {
             (&cluster.nodes[1], &cluster.nodes[0])
         };
 
-        let bucket = format!(
-            "laminar-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
-        );
-        let store = minio_store(&bucket).await;
-        let decision_objects: Arc<dyn ObjectStore> = Arc::new(
-            LocalFileSystem::new_with_prefix(harness.shared_state_dir.path())
-                .expect("LocalFileSystem for decision store"),
-        );
-        let decision_store = Arc::new(CheckpointDecisionStore::new(decision_objects));
+        let decision_store = Arc::new(CheckpointDecisionStore::new(Arc::clone(&store)));
 
         let leader_backend = Arc::new(ObjectStoreBackend::cluster_shared(
             Arc::clone(&store),
@@ -2288,6 +2289,136 @@ mod minio {
         harness.shutdown().await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cluster_control_state_survives_fresh_minio_client_restart() {
+        if minio_endpoint().is_none() {
+            eprintln!("skipping: MinIO not reachable at 127.0.0.1:19000");
+            return;
+        }
+        let bucket = unique_bucket("laminar-restart");
+        let mut harness =
+            ClusterEngineHarness::spawn_with_control_store(2, 4, minio_store(&bucket).await).await;
+        harness
+            .bootstrap_catalog(&[
+                TEST_SOURCE_DDL,
+                "CREATE STREAM projected AS SELECT key, value FROM src",
+            ])
+            .await
+            .expect("bootstrap cluster catalog");
+        harness.start_all().await;
+
+        let first = harness.nodes[harness.leader_idx()]
+            .db
+            .checkpoint()
+            .await
+            .expect("checkpoint before restart");
+        assert!(
+            first.success,
+            "checkpoint before restart: {:?}",
+            first.error
+        );
+        let predecessor = harness.nodes[0]
+            .assignment_snapshot_store
+            .load()
+            .await
+            .expect("load assignment before restart")
+            .expect("assignment before restart");
+        let predecessor_fence = predecessor
+            .assignment_fence()
+            .expect("canonical assignment before restart");
+        let first_certified = harness.cluster.nodes[harness.leader_idx()]
+            .controller
+            .checkpoint_authority()
+            .expect("checkpoint authority before restart")
+            .cluster_outcome_with_recovery_capsule(first.epoch)
+            .await
+            .expect("load certified checkpoint before restart")
+            .expect("certified checkpoint before restart");
+        assert!(first_certified.0.is_commit());
+        assert!(first_certified.1.is_some());
+
+        let (shared_dir, checkpoint_dirs, old_control_store) = harness.shutdown_keep_dirs().await;
+        drop(old_control_store);
+        let fresh_control_store = minio_store(&bucket).await;
+        let mut restarted = ClusterEngineHarness::spawn_with_dirs(
+            2,
+            4,
+            shared_dir,
+            checkpoint_dirs,
+            fresh_control_store,
+        )
+        .await;
+        assert_eq!(
+            restarted.nodes[0]
+                .assignment_snapshot_store
+                .load()
+                .await
+                .expect("load assignment through fresh MinIO client")
+                .expect("durable assignment after restart"),
+            predecessor,
+            "process construction must recover the persisted assignment head",
+        );
+        let recovered_first = restarted.cluster.nodes[0]
+            .controller
+            .checkpoint_authority()
+            .expect("checkpoint authority through fresh MinIO client")
+            .cluster_outcome_with_recovery_capsule(first.epoch)
+            .await
+            .expect("load certified checkpoint through fresh MinIO client")
+            .expect("certified checkpoint after restart");
+        assert_eq!(recovered_first, first_certified);
+        restarted.start_all().await;
+
+        let leader_idx = restarted.leader_idx();
+        let successor = restarted.nodes[leader_idx]
+            .assignment_snapshot_store
+            .load()
+            .await
+            .expect("load restart successor through fresh MinIO client")
+            .expect("restart successor assignment");
+        assert_eq!(successor.version, predecessor.version + 1);
+        assert_eq!(successor.vnodes, predecessor.vnodes);
+        let successor_fence = successor
+            .assignment_fence()
+            .expect("canonical restart successor");
+        let authority = restarted.cluster.nodes[leader_idx]
+            .controller
+            .checkpoint_authority()
+            .expect("checkpoint authority after restart");
+        let recovery_decision = authority
+            .assignment_recovery_decision(successor.version)
+            .await
+            .expect("load restart recovery decision through fresh MinIO client")
+            .expect("durable restart recovery decision");
+        assert_eq!(recovery_decision.predecessor, predecessor_fence);
+        assert_eq!(recovery_decision.target, successor_fence);
+
+        let second = restarted.nodes[leader_idx]
+            .db
+            .checkpoint()
+            .await
+            .expect("checkpoint after restart");
+        assert!(
+            second.success,
+            "checkpoint after restart: {:?}",
+            second.error
+        );
+        assert!(second.epoch > first.epoch);
+        let (outcome, capsule) = authority
+            .cluster_outcome_with_recovery_capsule(second.epoch)
+            .await
+            .expect("read checkpoint outcome through fresh MinIO client")
+            .expect("durable checkpoint outcome after restart");
+        assert!(outcome.is_commit());
+        assert_eq!(outcome.checkpoint_id, second.checkpoint_id);
+        let capsule = capsule.expect("durable recovery capsule after restart");
+        assert_eq!(capsule.attempt.epoch, second.epoch);
+        assert_eq!(capsule.attempt.checkpoint_id, second.checkpoint_id);
+        assert_eq!(capsule.assignment_fence, successor_fence);
+
+        restarted.shutdown().await;
+    }
+
     /// Coordinated-commit descriptors written by two nodes to shared MinIO seal
     /// the leader's gate only when both are present. The designated committer reads
     /// the exact keys bound into that seal rather than listing the descriptor prefix.
@@ -2303,13 +2434,7 @@ mod minio {
             eprintln!("skipping: MinIO not reachable at 127.0.0.1:19000");
             return;
         }
-        let bucket = format!(
-            "laminar-coord-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
-        );
+        let bucket = unique_bucket("laminar-coord");
         let store = minio_store(&bucket).await;
         let node1 = ObjectStoreBackend::cluster_shared(Arc::clone(&store), "1".to_string(), 4);
         let node2 = ObjectStoreBackend::cluster_shared(Arc::clone(&store), "2".to_string(), 4);

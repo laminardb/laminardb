@@ -173,34 +173,8 @@ pub fn json_i64(payload: &str, field: &str) -> i64 {
         .unwrap_or_else(|| panic!("payload missing integer field '{field}': {payload}"))
 }
 
-/// Run `docker compose -f tests/docker/compose.yml <args>` and ignore
-/// non-zero exit codes (useful for kill/restart that may race with the
-/// health-checker).
-#[cfg(feature = "kafka")]
-pub fn compose(args: &[&str]) {
-    let cwd = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    // Tests run from `crates/laminar-db/`; compose file is two levels up.
-    let compose_path = std::path::Path::new(&cwd)
-        .join("..")
-        .join("..")
-        .join("tests")
-        .join("docker")
-        .join("compose.yml");
-    let compose_path = compose_path.canonicalize().unwrap_or(compose_path);
-    let status = Command::new("docker")
-        .arg("compose")
-        .arg("-f")
-        .arg(&compose_path)
-        .args(args)
-        .status();
-    if let Err(e) = status {
-        eprintln!("docker compose {args:?} failed to spawn: {e}");
-    }
-}
-
 /// Wait until the Kafka broker is reachable (or the deadline expires).
-/// Useful after `compose(&["start", "redpanda"])` to block until the
-/// broker is serving again.
+/// Useful after restarting Redpanda to block until the broker is serving again.
 #[cfg(feature = "kafka")]
 pub async fn wait_for_broker(deadline: Duration) -> bool {
     let start = Instant::now();
@@ -221,14 +195,22 @@ pub async fn wait_for_broker(deadline: Duration) -> bool {
 pub const MINIO_ENDPOINT: &str = "http://127.0.0.1:19000";
 pub const MINIO_ACCESS_KEY: &str = "laminar";
 pub const MINIO_SECRET_KEY: &str = "laminar-test-secret";
+const REQUIRE_MINIO_ENV: &str = "LAMINAR_REQUIRE_MINIO";
 
-/// Returns `Some(MINIO_ENDPOINT)` when MinIO is reachable, `None`
-/// otherwise.
+/// Returns `Some(MINIO_ENDPOINT)` when MinIO is reachable. Returns `None` when
+/// it is unavailable unless release validation sets `LAMINAR_REQUIRE_MINIO=1`.
 pub fn minio_endpoint() -> Option<&'static str> {
     let addr: std::net::SocketAddr = "127.0.0.1:19000".parse().ok()?;
-    TcpStream::connect_timeout(&addr, Duration::from_millis(500))
+    let endpoint = TcpStream::connect_timeout(&addr, Duration::from_millis(500))
         .ok()
-        .map(|_| MINIO_ENDPOINT)
+        .map(|_| MINIO_ENDPOINT);
+    if endpoint.is_none()
+        && std::env::var(REQUIRE_MINIO_ENV)
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    {
+        panic!("MinIO is required by {REQUIRE_MINIO_ENV} but is not reachable");
+    }
+    endpoint
 }
 
 /// Build an `object_store::ObjectStore` pointing at a MinIO bucket. The

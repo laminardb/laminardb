@@ -1703,19 +1703,16 @@ async fn bridge_writes_markers_and_gate_passes() {
 #[tokio::test]
 async fn reconcile_announces_commit_when_marker_present() {
     use laminar_core::cluster::control::{
-        BarrierAnnouncement, CheckpointDecisionStore, ClusterController, ClusterKv, InMemoryKv,
-        Phase, ANNOUNCEMENT_KEY,
+        BarrierAnnouncement, ClusterController, ClusterKv, InMemoryKv, Phase, ANNOUNCEMENT_KEY,
     };
     use laminar_core::cluster::discovery::NodeId;
-    use object_store::local::LocalFileSystem;
     use tokio::sync::watch;
 
     let ckpt_dir = tempfile::tempdir().unwrap();
-    let decision_dir = tempfile::tempdir().unwrap();
     let store = Box::new(FileSystemCheckpointStore::new(ckpt_dir.path()).with_participant_id(1));
     let decision_os: Arc<dyn object_store::ObjectStore> =
-        Arc::new(LocalFileSystem::new_with_prefix(decision_dir.path()).unwrap());
-    let decision_store = Arc::new(CheckpointDecisionStore::new(Arc::clone(&decision_os)));
+        Arc::new(object_store::memory::InMemory::new());
+    let decision_store = in_memory_decision_store_on(Arc::clone(&decision_os));
     let deployment_id = decision_store.load_or_create_deployment_id().await.unwrap();
     let mut orphan = CheckpointManifest::new(42, 7);
     orphan.deployment_id.clone_from(&deployment_id);
@@ -1779,18 +1776,16 @@ async fn reconcile_announces_commit_when_marker_present() {
 #[tokio::test]
 async fn certified_successor_does_not_synthesize_an_orphaned_outcome() {
     use laminar_core::cluster::control::{
-        CheckpointDecisionStore, ClusterController, ClusterKv, InMemoryKv, ANNOUNCEMENT_KEY,
+        ClusterController, ClusterKv, InMemoryKv, ANNOUNCEMENT_KEY,
     };
     use laminar_core::cluster::discovery::NodeId;
-    use object_store::local::LocalFileSystem;
     use tokio::sync::watch;
 
     let ckpt_dir = tempfile::tempdir().unwrap();
-    let decision_dir = tempfile::tempdir().unwrap();
     let store = Box::new(FileSystemCheckpointStore::new(ckpt_dir.path()).with_participant_id(1));
     let decision_os: Arc<dyn object_store::ObjectStore> =
-        Arc::new(LocalFileSystem::new_with_prefix(decision_dir.path()).unwrap());
-    let decision_store = Arc::new(CheckpointDecisionStore::new(Arc::clone(&decision_os)));
+        Arc::new(object_store::memory::InMemory::new());
+    let decision_store = in_memory_decision_store_on(Arc::clone(&decision_os));
     let deployment_id = decision_store.load_or_create_deployment_id().await.unwrap();
     let mut orphan = CheckpointManifest::new(11, 3);
     orphan.deployment_id.clone_from(&deployment_id);
@@ -3798,23 +3793,19 @@ async fn cluster_watermark_remains_decision_bound_across_commit_and_recovery() {
     // followers pick up via matching `Commit` observation — otherwise
     // the leader would drive event-time decisions off a watermark
     // that none of its peers have acked yet.
-    use laminar_core::cluster::control::{
-        CheckpointDecisionStore, ClusterController, ClusterKv, InMemoryKv,
-    };
+    use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
     use laminar_core::cluster::discovery::NodeId;
-    use object_store::local::LocalFileSystem;
     use tokio::sync::watch;
 
     let dir = tempfile::tempdir().unwrap();
-    let decision_dir = tempfile::tempdir().unwrap();
     let store = Box::new(FileSystemCheckpointStore::new(dir.path()).with_participant_id(1));
     let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
         .await
         .unwrap();
 
     let decision_os: Arc<dyn object_store::ObjectStore> =
-        Arc::new(LocalFileSystem::new_with_prefix(decision_dir.path()).unwrap());
-    let decision_store = Arc::new(CheckpointDecisionStore::new(Arc::clone(&decision_os)));
+        Arc::new(object_store::memory::InMemory::new());
+    let decision_store = in_memory_decision_store_on(Arc::clone(&decision_os));
     let deployment_id = decision_store.load_or_create_deployment_id().await.unwrap();
     coord
         .set_decision_store(Arc::clone(&decision_store))
@@ -3996,22 +3987,20 @@ async fn cluster_watermark_remains_decision_bound_across_commit_and_recovery() {
 #[tokio::test]
 async fn leader_announces_prepare_and_commit_on_solo_cluster() {
     use laminar_core::cluster::control::{
-        CheckpointDecisionStore, ClusterController, ClusterKv, InMemoryKv, Phase, ANNOUNCEMENT_KEY,
+        ClusterController, ClusterKv, InMemoryKv, Phase, ANNOUNCEMENT_KEY,
     };
     use laminar_core::cluster::discovery::NodeId;
-    use object_store::local::LocalFileSystem;
     use tokio::sync::watch;
 
     let dir = tempfile::tempdir().unwrap();
-    let decision_dir = tempfile::tempdir().unwrap();
     let store = Box::new(FileSystemCheckpointStore::new(dir.path()).with_participant_id(1));
     let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
         .await
         .unwrap();
 
     let decision_os: Arc<dyn object_store::ObjectStore> =
-        Arc::new(LocalFileSystem::new_with_prefix(decision_dir.path()).unwrap());
-    let decision_store = Arc::new(CheckpointDecisionStore::new(Arc::clone(&decision_os)));
+        Arc::new(object_store::memory::InMemory::new());
+    let decision_store = in_memory_decision_store_on(Arc::clone(&decision_os));
     let deployment_id = decision_store.load_or_create_deployment_id().await.unwrap();
     coord
         .set_decision_store(Arc::clone(&decision_store))

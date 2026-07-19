@@ -5,6 +5,18 @@
 
 use super::*;
 
+#[test]
+fn control_runtime_stack_override_is_cluster_only() {
+    assert_eq!(
+        DbControlRuntime::new(RuntimeMode::Local).worker_stack_bytes,
+        None
+    );
+    assert_eq!(
+        DbControlRuntime::new(RuntimeMode::Cluster).worker_stack_bytes,
+        Some(CLUSTER_IO_WORKER_STACK_BYTES)
+    );
+}
+
 #[cfg(feature = "cluster")]
 #[test]
 fn local_runtime_ignores_cluster_authority_revocation() {

@@ -1,6 +1,6 @@
 //! Shared cluster harness for `cluster_e2e_*` tests: per-node checkpoint dirs,
-//! one shared state backend dir (production's single-bucket layout). Bootstrap
-//! DDL through [`ClusterEngineHarness::bootstrap_catalog`] before startup.
+//! a shared state tier, and a CAS-capable control store. Bootstrap DDL through
+//! [`ClusterEngineHarness::bootstrap_catalog`] before startup.
 
 #![cfg(feature = "cluster")]
 #![allow(clippy::disallowed_types)]
@@ -35,6 +35,7 @@ use laminar_core::state::{
 use laminar_core::streaming::StreamCheckpointConfig;
 use laminar_db::{ClusterStartupDisposition, LaminarDB};
 use object_store::local::LocalFileSystem;
+use object_store::memory::InMemory;
 use object_store::ObjectStore;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -539,9 +540,11 @@ pub struct ClusterEngineHarness {
     /// Per-node engine state, in `cluster.nodes` order.
     pub nodes: Vec<NodeRuntime>,
     /// Shared state backend dir. Survives `shutdown_keep_dirs`.
-    pub shared_state_dir: TempDir,
+    shared_state_dir: TempDir,
     /// Per-node checkpoint dirs. Survives `shutdown_keep_dirs`.
-    pub checkpoint_dirs: Vec<TempDir>,
+    checkpoint_dirs: Vec<TempDir>,
+    /// Shared cluster control storage. Survives `shutdown_keep_dirs`.
+    control_store: Arc<dyn ObjectStore>,
     /// Shared immutable startup catalog authority.
     pub catalog_manifest_store: Arc<CatalogManifestStore>,
     /// Durable scripted input shared by every test connector instance.
@@ -558,11 +561,27 @@ impl ClusterEngineHarness {
     /// On convergence timeout, leader-election mismatch, or engine
     /// build failure.
     pub async fn spawn(n: usize, vnode_count: u32) -> Self {
+        Self::spawn_with_control_store(n, vnode_count, Arc::new(InMemory::new())).await
+    }
+
+    /// Spawn with an explicit CAS-capable cluster control store.
+    pub async fn spawn_with_control_store(
+        n: usize,
+        vnode_count: u32,
+        control_store: Arc<dyn ObjectStore>,
+    ) -> Self {
         let shared_state_dir = tempfile::tempdir().expect("shared state tempdir");
         let checkpoint_dirs: Vec<TempDir> = (0..n)
             .map(|_| tempfile::tempdir().expect("checkpoint tempdir"))
             .collect();
-        Self::spawn_with_dirs(n, vnode_count, shared_state_dir, checkpoint_dirs).await
+        Self::spawn_with_dirs(
+            n,
+            vnode_count,
+            shared_state_dir,
+            checkpoint_dirs,
+            control_store,
+        )
+        .await
     }
 
     /// Like `spawn`, reusing dirs from `shutdown_keep_dirs`.
@@ -571,8 +590,16 @@ impl ClusterEngineHarness {
         vnode_count: u32,
         shared_state_dir: TempDir,
         checkpoint_dirs: Vec<TempDir>,
+        control_store: Arc<dyn ObjectStore>,
     ) -> Self {
-        Self::spawn_inner(n, vnode_count, shared_state_dir, checkpoint_dirs).await
+        Self::spawn_inner(
+            n,
+            vnode_count,
+            shared_state_dir,
+            checkpoint_dirs,
+            control_store,
+        )
+        .await
     }
 
     async fn spawn_inner(
@@ -580,6 +607,7 @@ impl ClusterEngineHarness {
         vnode_count: u32,
         shared_state_dir: TempDir,
         checkpoint_dirs: Vec<TempDir>,
+        control_store: Arc<dyn ObjectStore>,
     ) -> Self {
         assert_eq!(checkpoint_dirs.len(), n, "one checkpoint dir per node");
 
@@ -589,7 +617,7 @@ impl ClusterEngineHarness {
         );
 
         // Shared snapshot store — one CAS-creator wins, peers adopt.
-        let snapshot_store = Arc::new(AssignmentSnapshotStore::new(Arc::clone(&shared_store)));
+        let snapshot_store = Arc::new(AssignmentSnapshotStore::new(Arc::clone(&control_store)));
 
         let cluster = MiniCluster::spawn_with_snapshot(n, Arc::clone(&snapshot_store)).await;
         cluster
@@ -605,7 +633,7 @@ impl ClusterEngineHarness {
             renew_interval: TEST_LEASE_RENEW_INTERVAL,
         };
         let process_lease_authority = Arc::new(
-            ProcessLeaseAuthority::new(Arc::clone(&shared_store), TEST_LEASE_TTL)
+            ProcessLeaseAuthority::new(Arc::clone(&control_store), TEST_LEASE_TTL)
                 .expect("shared process lease authority"),
         );
         let process_leases = futures::future::join_all(cluster.nodes.iter().map(|node| {
@@ -637,7 +665,7 @@ impl ClusterEngineHarness {
             renew_interval: TEST_LEASE_RENEW_INTERVAL,
         };
         let leader_store = Arc::new(LeaderLeaseStore::new(
-            Arc::clone(&shared_store),
+            Arc::clone(&control_store),
             i64::try_from(TEST_LEASE_TTL.as_millis()).expect("test lease TTL fits i64"),
         ));
         let catalog_store = Arc::new(CatalogManifestStore::new(Arc::clone(&leader_store)));
@@ -844,8 +872,9 @@ impl ClusterEngineHarness {
                 ..StreamCheckpointConfig::default()
             };
 
-            // Reuse the same shared namespace for checkpoint participants and decisions.
-            let decision_store = Arc::new(CheckpointDecisionStore::new(Arc::clone(&shared_store)));
+            // Keep decisions and their recovery capsules beside the leader authority, matching
+            // the production cluster object-store namespace.
+            let decision_store = Arc::new(CheckpointDecisionStore::new(Arc::clone(&control_store)));
             let source_state = Arc::new(ClusterHarnessSourceState::default());
             let connector_source_state = Arc::clone(&source_state);
             let connector_source_log = Arc::clone(&source_log);
@@ -863,7 +892,7 @@ impl ClusterEngineHarness {
                 .decision_store(Arc::clone(&decision_store))
                 .assignment_snapshot_store(Arc::clone(&snapshot_store))
                 .catalog_manifest_store(Arc::clone(&catalog_store))
-                .cluster_checkpoint_object_store(Arc::clone(&shared_store))
+                .cluster_checkpoint_object_store(Arc::clone(&control_store))
                 .register_connector(move |registry| {
                     let source_state = Arc::clone(&connector_source_state);
                     let source_log = Arc::clone(&connector_source_log);
@@ -933,10 +962,16 @@ impl ClusterEngineHarness {
             nodes: node_runtimes,
             shared_state_dir,
             checkpoint_dirs,
+            control_store,
             catalog_manifest_store: catalog_store,
             source_log,
             sink_state,
         }
+    }
+
+    /// Return the shared control store used by leases, assignments, and checkpoint decisions.
+    pub fn control_store(&self) -> Arc<dyn ObjectStore> {
+        Arc::clone(&self.control_store)
     }
 
     /// Start every pipeline under the production assignment fence, certify shuffle ownership,
@@ -1253,13 +1288,14 @@ impl ClusterEngineHarness {
         instance_id
     }
 
-    /// Shut down and return the durable dirs for a restart scenario.
-    pub async fn shutdown_keep_dirs(self) -> (TempDir, Vec<TempDir>) {
+    /// Shut down and return the durable stores for a restart scenario.
+    pub async fn shutdown_keep_dirs(self) -> (TempDir, Vec<TempDir>, Arc<dyn ObjectStore>) {
         let Self {
             cluster,
             nodes,
             shared_state_dir,
             checkpoint_dirs,
+            control_store,
             catalog_manifest_store: _,
             source_log: _,
             sink_state: _,
@@ -1276,7 +1312,7 @@ impl ClusterEngineHarness {
             node.control_leases.shutdown().await;
         }
         cluster.shutdown().await;
-        (shared_state_dir, checkpoint_dirs)
+        (shared_state_dir, checkpoint_dirs, control_store)
     }
 
     /// Drop the cluster cleanly. Tempdirs are removed.
