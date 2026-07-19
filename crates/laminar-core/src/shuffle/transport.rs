@@ -5,6 +5,8 @@
 //! the HTTP/2 stream.
 
 use super::message::ShuffleMessage;
+#[cfg(feature = "cluster")]
+use crate::state::{CheckpointAttempt, CheckpointAttemptRelation};
 
 /// Secondary queue and holdover item bound; byte semaphores are the primary
 /// admission control in cluster mode.
@@ -26,6 +28,7 @@ impl std::fmt::Display for ScopeCancelled {
 
 impl std::error::Error for ScopeCancelled {}
 
+#[cfg(feature = "cluster")]
 fn scope_cancelled_io() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::ConnectionAborted, ScopeCancelled)
 }
@@ -63,18 +66,46 @@ pub(crate) mod shuffle_v1 {
 /// checkpoint under the same item bound as the receive queue.
 struct Holdover {
     staged: parking_lot::Mutex<rustc_hash::FxHashMap<String, Vec<ReceivedBatch>>>,
-    staged_barriers: parking_lot::Mutex<Vec<ReceivedShuffle>>,
+    barriers: parking_lot::Mutex<BarrierHoldover>,
     /// Shared across data and barriers so repeatedly draining the bounded receive
     /// queue cannot turn it into an unbounded secondary queue.
     items: std::sync::atomic::AtomicUsize,
     capacity: usize,
 }
 
+#[derive(Default)]
+struct BarrierHoldover {
+    staged: Vec<ReceivedShuffle>,
+    #[cfg(feature = "cluster")]
+    retired_through: Option<RetiredCheckpoint>,
+}
+
+#[cfg(feature = "cluster")]
+#[derive(Clone, Copy)]
+struct RetiredCheckpoint {
+    attempt: CheckpointAttempt,
+    assignment_digest: [u8; 32],
+}
+
+impl BarrierHoldover {
+    #[cfg(feature = "cluster")]
+    fn is_retired(&self, attempt: CheckpointAttempt, assignment_digest: Option<[u8; 32]>) -> bool {
+        self.retired_through
+            .is_some_and(|retired| match attempt.relation_to(retired.attempt) {
+                CheckpointAttemptRelation::Older => true,
+                CheckpointAttemptRelation::Exact => {
+                    assignment_digest == Some(retired.assignment_digest)
+                }
+                CheckpointAttemptRelation::Newer | CheckpointAttemptRelation::Conflict => false,
+            })
+    }
+}
+
 impl Holdover {
     fn new(capacity: usize) -> Self {
         Self {
             staged: parking_lot::Mutex::default(),
-            staged_barriers: parking_lot::Mutex::default(),
+            barriers: parking_lot::Mutex::default(),
             items: std::sync::atomic::AtomicUsize::new(0),
             capacity,
         }
@@ -103,6 +134,141 @@ impl Holdover {
             released.is_ok(),
             "shuffle holdover item accounting underflow"
         );
+    }
+
+    #[cfg(feature = "cluster")]
+    fn barrier_attempt(received: &ReceivedShuffle) -> Option<CheckpointAttempt> {
+        let ShuffleMessage::Barrier(barrier) = received.message() else {
+            return None;
+        };
+        Some(CheckpointAttempt::new(barrier.epoch, barrier.checkpoint_id))
+    }
+
+    #[cfg(feature = "cluster")]
+    fn is_retired_barrier(&self, received: &ReceivedShuffle) -> bool {
+        let Some(attempt) = Self::barrier_attempt(received) else {
+            return false;
+        };
+        self.barriers
+            .lock()
+            .is_retired(attempt, received.assignment_digest)
+    }
+
+    fn has_staged_barriers(&self) -> bool {
+        !self.barriers.lock().staged.is_empty()
+    }
+
+    fn stage_barrier(&self, barrier: ReceivedShuffle) -> bool {
+        let mut holdover = self.barriers.lock();
+        #[cfg(feature = "cluster")]
+        {
+            debug_assert!(Self::barrier_attempt(&barrier).is_some());
+        }
+        #[cfg(feature = "cluster")]
+        if Self::barrier_attempt(&barrier)
+            .is_some_and(|attempt| holdover.is_retired(attempt, barrier.assignment_digest))
+        {
+            return false;
+        }
+        holdover.staged.push(barrier);
+        true
+    }
+
+    fn take_staged_barriers(&self) -> Vec<ReceivedShuffle> {
+        std::mem::take(&mut self.barriers.lock().staged)
+    }
+
+    #[cfg(feature = "cluster")]
+    fn retire_checkpoint_attempt(
+        &self,
+        attempt: CheckpointAttempt,
+        assignment_digest: [u8; 32],
+    ) -> std::io::Result<()> {
+        if attempt.epoch == 0 || attempt.checkpoint_id == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "retired checkpoint attempt dimensions must be nonzero",
+            ));
+        }
+
+        let removed = {
+            let mut holdover = self.barriers.lock();
+            let retired = match holdover.retired_through {
+                None => RetiredCheckpoint {
+                    attempt,
+                    assignment_digest,
+                },
+                Some(retired) => match attempt.relation_to(retired.attempt) {
+                    CheckpointAttemptRelation::Newer => RetiredCheckpoint {
+                        attempt,
+                        assignment_digest,
+                    },
+                    CheckpointAttemptRelation::Exact => {
+                        if assignment_digest != retired.assignment_digest {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "checkpoint retirement {attempt:?} has a different assignment digest from its high-water"
+                                ),
+                            ));
+                        }
+                        retired
+                    }
+                    CheckpointAttemptRelation::Older => retired,
+                    CheckpointAttemptRelation::Conflict => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "checkpoint retirement {attempt:?} conflicts with high-water {:?}",
+                                retired.attempt
+                            ),
+                        ));
+                    }
+                },
+            };
+            for barrier in &holdover.staged {
+                let Some(candidate) = Self::barrier_attempt(barrier) else {
+                    continue;
+                };
+                match candidate.relation_to(retired.attempt) {
+                    CheckpointAttemptRelation::Conflict => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "staged checkpoint barrier {candidate:?} conflicts with retirement {:?}",
+                                retired.attempt
+                            ),
+                        ));
+                    }
+                    CheckpointAttemptRelation::Exact
+                        if barrier.assignment_digest != Some(retired.assignment_digest) =>
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "staged checkpoint barrier {candidate:?} has a different assignment digest from its durable terminal outcome"
+                            ),
+                        ));
+                    }
+                    CheckpointAttemptRelation::Exact
+                    | CheckpointAttemptRelation::Older
+                    | CheckpointAttemptRelation::Newer => {}
+                }
+            }
+            holdover.retired_through = Some(retired);
+            let staged_before = holdover.staged.len();
+            holdover.staged.retain(|barrier| {
+                !Self::barrier_attempt(barrier).is_some_and(|candidate| {
+                    matches!(
+                        candidate.relation_to(retired.attempt),
+                        CheckpointAttemptRelation::Exact | CheckpointAttemptRelation::Older
+                    )
+                })
+            });
+            staged_before - holdover.staged.len()
+        };
+        self.release_items(removed);
+        Ok(())
     }
 }
 
@@ -348,9 +514,9 @@ mod grpc {
         ShuffleSummary,
     };
     use super::{
-        is_scope_cancelled, scope_cancelled_io, Holdover, InboundReservation, ReceivedBatch,
-        ReceivedShuffle, ShuffleMessage, ShufflePeerId, SCOPE_CANCELLED, SHUFFLE_ADDR_KEY,
-        SHUFFLE_RECV_QUEUE,
+        is_scope_cancelled, scope_cancelled_io, CheckpointAttempt, Holdover, InboundReservation,
+        ReceivedBatch, ReceivedShuffle, ShuffleMessage, ShufflePeerId, SCOPE_CANCELLED,
+        SHUFFLE_ADDR_KEY, SHUFFLE_RECV_QUEUE,
     };
     use crate::checkpoint::{CheckpointAssignmentFence, CheckpointBarrier};
     use crate::cluster::control::{ClusterKv, LeaseDeadline};
@@ -2406,10 +2572,13 @@ mod grpc {
                     }
                 }
             }
-            match first_peer_error.or(first_scope_cancel) {
-                Some(error) => Err(error),
-                None => Ok(()),
+            if let Some(error) = first_peer_error.or(first_scope_cancel) {
+                if is_scope_cancelled(&error) {
+                    self.process_lease.require_live_io()?;
+                }
+                return Err(error);
             }
+            Ok(())
         }
 
         /// Resolve and cache `peer`'s address from the KV; `None` when unavailable.
@@ -2766,6 +2935,9 @@ mod grpc {
         assignment_wait_pause: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
         server: JoinHandle<()>,
         holdover: Arc<Holdover>,
+        /// Monotonic notification that an in-band barrier reached the bounded receive queue.
+        barrier_arrivals: Arc<AtomicU64>,
+        barrier_reconciled: AtomicU64,
         /// Inbound data frames stamped below this are pre-rewind and discarded.
         recovery_gen: Arc<AtomicU64>,
         recovery_transition: Mutex<()>,
@@ -2828,6 +3000,7 @@ mod grpc {
             let process_lease = Arc::new(ProcessLeaseGate::default());
             let pending_handshakes = Arc::new(PendingHandshakes::default());
             let delivery = Arc::new(DeliveryTracker::default());
+            let barrier_arrivals = Arc::new(AtomicU64::new(0));
             let inbound_budget = Arc::new(InboundBudget::new(INBOUND_NODE_BUDGET_BYTES));
             let active_streams = Arc::new(Semaphore::new(MAX_ACTIVE_STREAMS));
             let active_stream_registry = Arc::new(ActiveStreamRegistry::default());
@@ -2842,6 +3015,7 @@ mod grpc {
                 tx,
                 recovery_gen: Arc::clone(&recovery_gen),
                 delivery: Arc::clone(&delivery),
+                barrier_arrivals: Arc::clone(&barrier_arrivals),
                 inbound_budget,
                 active_streams: Arc::clone(&active_streams),
                 active_stream_registry,
@@ -2888,6 +3062,8 @@ mod grpc {
                 assignment_wait_pause: Mutex::new(None),
                 server,
                 holdover: Arc::new(Holdover::new(SHUFFLE_RECV_QUEUE)),
+                barrier_arrivals,
+                barrier_reconciled: AtomicU64::new(0),
                 recovery_gen,
                 recovery_transition: Mutex::new(()),
                 assignment,
@@ -3251,6 +3427,32 @@ mod grpc {
             let Some(assignment) = self.consumption_scope() else {
                 return false;
             };
+            let Some(assignment) = assignment.as_ref() else {
+                return false;
+            };
+            let current = self.retain_queued_scope_for_assignment(
+                assignment,
+                peer,
+                sender_incarnation,
+                receiver_incarnation,
+                assignment_version,
+                recovery_gen,
+            );
+            if self.process_lease.require_live_io().is_err() {
+                return false;
+            }
+            current
+        }
+
+        fn retain_queued_scope_for_assignment(
+            &self,
+            assignment: &InstalledAssignment,
+            peer: ShufflePeerId,
+            sender_incarnation: Uuid,
+            receiver_incarnation: Uuid,
+            assignment_version: u64,
+            recovery_gen: u64,
+        ) -> bool {
             let current_recovery = self.recovery_gen.load(Ordering::Acquire);
             if receiver_incarnation != self.receiver_incarnation {
                 self.delivery
@@ -3263,14 +3465,11 @@ mod grpc {
                 return false;
             }
             let current_assignment = self.assignment_version.load(Ordering::Acquire);
-            let certified_process = assignment.as_ref().is_some_and(|installed| {
-                installed.fence.assignment_version == assignment_version
-                    && installed.certifies(peer, sender_incarnation)
-                    && installed.certifies(self.local_id, receiver_incarnation)
-            });
             let current = recovery_gen == current_recovery
                 && assignment_version == current_assignment
-                && certified_process
+                && assignment.fence.assignment_version == assignment_version
+                && assignment.certifies(peer, sender_incarnation)
+                && assignment.certifies(self.local_id, receiver_incarnation)
                 && self.delivery.matches_process_scope(
                     peer,
                     sender_incarnation,
@@ -3278,9 +3477,6 @@ mod grpc {
                     assignment_version,
                     recovery_gen,
                 );
-            if self.process_lease.require_live_io().is_err() {
-                return false;
-            }
             if !current {
                 self.delivery.note_loss(peer, 1, "queued-stream-scope");
             }
@@ -3288,13 +3484,14 @@ mod grpc {
         }
 
         fn retain_received(&self, received: &ReceivedShuffle) -> bool {
-            self.retain_queued_scope(
-                received.peer,
-                received.sender_incarnation,
-                received.receiver_incarnation,
-                received.assignment_version,
-                received.recovery_gen,
-            )
+            !self.holdover.is_retired_barrier(received)
+                && self.retain_queued_scope(
+                    received.peer,
+                    received.sender_incarnation,
+                    received.receiver_incarnation,
+                    received.assignment_version,
+                    received.recovery_gen,
+                )
         }
 
         fn retain_batch(&self, received: &ReceivedBatch) -> bool {
@@ -3402,13 +3599,13 @@ mod grpc {
         /// alignment takes it, preserving every following frame's position relative to that cut.
         /// Once the shared holdover is full, leave the bounded receive queue intact so transport
         /// admission backpressures peers.
-        fn drain_inbound_into(&self, staged: &mut FxHashMap<String, Vec<ReceivedBatch>>) {
-            if !self.holdover.staged_barriers.lock().is_empty() {
-                return;
+        fn drain_inbound_into(&self, staged: &mut FxHashMap<String, Vec<ReceivedBatch>>) -> bool {
+            if self.holdover.has_staged_barriers() {
+                return false;
             }
             let slot = self.rx.lock();
             let Some(rx) = slot.as_ref() else {
-                return;
+                return false;
             };
             while self.holdover.try_reserve_item() {
                 let inbound = if let Some(deferred) = self.take_deferred_recv() {
@@ -3416,7 +3613,7 @@ mod grpc {
                 } else {
                     let Ok(inbound) = rx.try_recv() else {
                         self.holdover.release_items(1);
-                        break;
+                        return true;
                     };
                     inbound
                 };
@@ -3454,7 +3651,7 @@ mod grpc {
                         });
                     }
                     ShuffleMessage::Barrier(b) => {
-                        self.holdover.staged_barriers.lock().push(ReceivedShuffle {
+                        let barrier = ReceivedShuffle {
                             peer,
                             message: ShuffleMessage::Barrier(b),
                             reservation,
@@ -3465,18 +3662,22 @@ mod grpc {
                             assignment_digest,
                             recovery_gen,
                             checkpoint_sequence,
-                        });
-                        break;
+                        };
+                        if self.holdover.stage_barrier(barrier) {
+                            return false;
+                        }
+                        self.holdover.release_items(1);
                     }
                 }
             }
+            false
         }
 
         /// Non-blocking drain of checkpointed operator batches for `stage`.
         #[must_use]
         pub fn drain_checkpointed_data_for(&self, stage: &str) -> Vec<ReceivedBatch> {
             let mut staged = self.holdover.staged.lock();
-            self.drain_inbound_into(&mut staged);
+            let _ = self.drain_inbound_into(&mut staged);
             let mut batches = staged.remove(stage).unwrap_or_default();
             self.holdover.release_items(batches.len());
             batches.retain(|batch| self.retain_batch(batch));
@@ -3486,12 +3687,49 @@ mod grpc {
         /// Take the barriers stashed by [`Self::drain_checkpointed_data_for`].
         #[must_use]
         pub fn drain_staged_barriers(&self) -> Vec<ReceivedShuffle> {
-            let mut staged = self.holdover.staged_barriers.lock();
-            let mut barriers = std::mem::take(&mut *staged);
-            drop(staged);
+            let mut barriers = self.holdover.take_staged_barriers();
             self.holdover.release_items(barriers.len());
             barriers.retain(|barrier| self.retain_received(barrier));
             barriers
+        }
+
+        /// Whether an in-band barrier currently blocks normal holdover draining.
+        #[must_use]
+        pub fn has_staged_checkpoint_barriers(&self) -> bool {
+            self.holdover.has_staged_barriers()
+        }
+
+        /// Move available inbound frames into the bounded holdover through the first barrier.
+        /// Data remains keyed for its owning stage.
+        #[must_use]
+        pub fn stage_checkpointed_inbound(&self) -> bool {
+            if self.holdover.has_staged_barriers() {
+                return true;
+            }
+            let arrived = self.barrier_arrivals.load(Ordering::Acquire);
+            if arrived == self.barrier_reconciled.load(Ordering::Acquire) {
+                return false;
+            }
+            let mut staged = self.holdover.staged.lock();
+            let exhausted = self.drain_inbound_into(&mut staged);
+            let has_barrier = self.holdover.has_staged_barriers();
+            if exhausted && !has_barrier {
+                self.barrier_reconciled.store(arrived, Ordering::Release);
+            }
+            has_barrier
+        }
+
+        /// Retire barrier markers through a certified terminal checkpoint without dropping data.
+        /// # Errors
+        /// Rejects zero attempt dimensions, conflicting attempts, and exact markers whose
+        /// assignment digest differs from the durable terminal outcome.
+        pub fn retire_checkpoint_barriers(
+            &self,
+            attempt: CheckpointAttempt,
+            assignment_digest: [u8; 32],
+        ) -> io::Result<()> {
+            self.holdover
+                .retire_checkpoint_attempt(attempt, assignment_digest)
         }
 
         /// Re-stash a peer barrier pulled while aligning a *different* checkpoint, so a
@@ -3506,24 +3744,63 @@ mod grpc {
                     .note_loss(barrier.peer, 1, "barrier-holdover-capacity");
                 return;
             }
-            self.holdover.staged_barriers.lock().push(barrier);
+            if !self.holdover.stage_barrier(barrier) {
+                self.holdover.release_items(1);
+            }
         }
 
         /// Drain every staged checkpointed operator batch.
         #[must_use]
         pub fn drain_checkpointed_staged(&self) -> Vec<(String, ReceivedBatch)> {
             let mut staged = self.holdover.staged.lock();
-            self.drain_inbound_into(&mut staged);
+            let _ = self.drain_inbound_into(&mut staged);
             self.take_checkpointed_staged(&mut staged)
         }
 
         /// Drain only the checkpointed batches already in the holdover. Unlike
         /// [`Self::drain_checkpointed_staged`], this does not consume the live receive queue, whose
         /// data/barrier order must remain visible to checkpoint alignment.
-        #[must_use]
-        pub fn drain_checkpointed_holdover(&self) -> Vec<(String, ReceivedBatch)> {
+        ///
+        /// # Errors
+        /// Returns a typed cancellation while assignment consumption is suspended, or a process
+        /// lease error after this receiver loses execution authority. An error observed before
+        /// extraction leaves the holdover untouched; the caller revalidates authority immediately
+        /// after a successful transfer.
+        pub fn drain_checkpointed_holdover(&self) -> io::Result<Vec<(String, ReceivedBatch)>> {
             let mut staged = self.holdover.staged.lock();
-            self.take_checkpointed_staged(&mut staged)
+            self.process_lease.require_live_io()?;
+            let Some(assignment) = self.consumption_scope() else {
+                self.process_lease.require_live_io()?;
+                return Err(scope_cancelled_io());
+            };
+            let Some(assignment) = assignment.as_ref() else {
+                self.process_lease.require_live_io()?;
+                return Err(scope_cancelled_io());
+            };
+            if self.assignment_version.load(Ordering::Acquire) == 0 {
+                self.process_lease.require_live_io()?;
+                return Err(scope_cancelled_io());
+            }
+
+            let item_count = staged.values().map(Vec::len).sum();
+            let drained = staged
+                .drain()
+                .flat_map(|(stage, batches)| {
+                    batches.into_iter().filter_map(move |batch| {
+                        let current = self.retain_queued_scope_for_assignment(
+                            assignment,
+                            batch.peer,
+                            batch.sender_incarnation,
+                            batch.receiver_incarnation,
+                            batch.assignment_version,
+                            batch.recovery_gen,
+                        );
+                        current.then(|| (stage.clone(), batch))
+                    })
+                })
+                .collect();
+            self.holdover.release_items(item_count);
+            Ok(drained)
         }
 
         fn take_checkpointed_staged(
@@ -3977,6 +4254,7 @@ mod grpc {
         tx: InboundTx,
         recovery_gen: Arc<AtomicU64>,
         delivery: Arc<DeliveryTracker>,
+        barrier_arrivals: Arc<AtomicU64>,
         inbound_budget: Arc<InboundBudget>,
         active_streams: Arc<Semaphore>,
         active_stream_registry: Arc<ActiveStreamRegistry>,
@@ -4249,6 +4527,7 @@ mod grpc {
     /// would let the consumer observe the barrier before its loss fence.
     async fn publish_barrier(
         tx: &InboundTx,
+        barrier_arrivals: &AtomicU64,
         assignment_version: &AtomicU64,
         recovery_gen: &AtomicU64,
         delivery: &DeliveryTracker,
@@ -4287,7 +4566,13 @@ mod grpc {
                 fence,
                 assignment_digest: Some(assignment_digest),
                 checkpoint_sequence: last_seq,
-            }) => Ok(result.is_ok()),
+            }) => {
+                let enqueued = result.is_ok();
+                if enqueued {
+                    barrier_arrivals.fetch_add(1, Ordering::Release);
+                }
+                Ok(enqueued)
+            },
         }
     }
 
@@ -4305,6 +4590,7 @@ mod grpc {
             process_lease,
             pending_handshakes,
             tx,
+            barrier_arrivals,
             recovery_gen,
             delivery,
             inbound_budget,
@@ -4410,6 +4696,7 @@ mod grpc {
                     });
                     if !publish_barrier(
                         tx,
+                        barrier_arrivals,
                         assignment_version,
                         recovery_gen,
                         delivery,
@@ -4630,6 +4917,16 @@ mod grpc {
         use super::*;
 
         const ACQUIRE: Ordering = Ordering::Acquire;
+
+        #[test]
+        fn only_exact_remote_scope_cancellation_is_typed() {
+            let exact = status_io(scope_cancelled_status());
+            assert!(is_scope_cancelled(&exact));
+
+            let unrelated = status_io(tonic::Status::cancelled("shuffle caller stopped"));
+            assert!(!is_scope_cancelled(&unrelated));
+            assert!(!is_scope_cancelled(&process_lease_expired_io()));
+        }
 
         fn live_process_lease() -> ProcessLeaseGate {
             let gate = ProcessLeaseGate::default();
@@ -4883,11 +5180,13 @@ mod grpc {
             d.observe_hello(stream).unwrap();
             let assignment = AtomicU64::new(stream.assignment_version);
             let recovery = AtomicU64::new(stream.recovery_gen);
+            let barrier_arrivals = AtomicU64::new(0);
             let cancel = CancellationToken::new();
             let process_lease = live_process_lease();
             let (tx, rx) = mpsc::bounded_async::<Inbound>(1);
             let publish = publish_barrier(
                 &tx,
+                &barrier_arrivals,
                 &assignment,
                 &recovery,
                 &d,
@@ -4908,6 +5207,7 @@ mod grpc {
 
             assert!(published.unwrap());
             assert_eq!(loss_at_visibility, 1);
+            assert_eq!(barrier_arrivals.load(ACQUIRE), 1);
         }
 
         #[test]
@@ -6317,8 +6617,7 @@ mod shim {
                     notify: &self.rx_returned,
                     rx: Some(rx),
                 };
-                let rx = guard.rx.as_mut()?;
-                return rx.recv().await.ok();
+                return guard.rx.as_mut()?.recv().await.ok();
             }
         }
 
@@ -6336,7 +6635,7 @@ mod shim {
         }
 
         fn drain_inbound_into(&self, staged: &mut FxHashMap<String, Vec<ReceivedBatch>>) {
-            if !self.holdover.staged_barriers.lock().is_empty() {
+            if self.holdover.has_staged_barriers() {
                 return;
             }
             let slot = self.rx.lock();
@@ -6373,7 +6672,7 @@ mod shim {
                             });
                         }
                         ShuffleMessage::Barrier(barrier) => {
-                            self.holdover.staged_barriers.lock().push(ReceivedShuffle {
+                            let barrier = ReceivedShuffle {
                                 peer,
                                 message: ShuffleMessage::Barrier(barrier),
                                 reservation,
@@ -6384,8 +6683,11 @@ mod shim {
                                 assignment_digest: None,
                                 recovery_gen,
                                 checkpoint_sequence,
-                            });
-                            break;
+                            };
+                            if self.holdover.stage_barrier(barrier) {
+                                break;
+                            }
+                            self.holdover.release_items(1);
                         }
                     }
                 }
@@ -6405,7 +6707,7 @@ mod shim {
         /// Take the barriers stashed by [`Self::drain_checkpointed_data_for`].
         #[must_use]
         pub fn drain_staged_barriers(&self) -> Vec<ReceivedShuffle> {
-            let barriers = std::mem::take(&mut *self.holdover.staged_barriers.lock());
+            let barriers = self.holdover.take_staged_barriers();
             self.holdover.release_items(barriers.len());
             barriers
         }
@@ -6483,6 +6785,7 @@ mod tests {
     use super::*;
     use crate::checkpoint::{CheckpointAssignmentFence, CheckpointBarrier, CheckpointParticipant};
     use crate::cluster::control::LeaseDeadline;
+    use crate::state::CheckpointAttempt;
     use uuid::Uuid;
 
     fn assignment_owners(nodes: &[ShufflePeerId]) -> Vec<ShufflePeerId> {
@@ -6974,6 +7277,48 @@ mod tests {
             receiver.delivery_loss_incidents().load(O::Acquire),
             0,
             "same-version reactivation must preserve the sender and receiver sequence domain"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suspended_receiver_does_not_consume_checkpoint_holdover() {
+        let fence = assignment_fence(1, &[1, 2]);
+        let owners = assignment_owners(&[1, 2]);
+        let receiver = bind_on_loopback(2).await;
+        let sender = sender(1);
+        sender.register_peer(2, receiver.local_addr()).await;
+
+        sender
+            .send_to(
+                2,
+                &ShuffleMessage::checkpointed("held".into(), 0, one_row(5)),
+            )
+            .await
+            .unwrap();
+        send_barrier(&sender, &[2], CheckpointBarrier::new(70, 7))
+            .await
+            .unwrap();
+        wait_until(|| receiver.committed_sequence_for_test(1) == Some(1)).await;
+        assert!(receiver.drain_checkpointed_data_for("absent").is_empty());
+
+        receiver.suspend_assignment_fence();
+        let error = receiver.drain_checkpointed_holdover().unwrap_err();
+        assert!(is_scope_cancelled(&error));
+
+        assert!(receiver.install_assignment_fence(&fence, &owners).unwrap());
+        let drained = receiver.drain_checkpointed_holdover().unwrap();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].0, "held");
+        assert_eq!(
+            drained[0]
+                .1
+                .batch()
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            5
         );
     }
 
@@ -7563,6 +7908,229 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_reconciliation_does_not_scan_ordinary_shuffle_traffic() {
+        let receiver = bind_on_loopback(2).await;
+        let sender = sender(1);
+        sender.register_peer(2, receiver.local_addr()).await;
+        sender
+            .send_to(
+                2,
+                &ShuffleMessage::checkpointed("live".into(), 0, one_row(1)),
+            )
+            .await
+            .unwrap();
+
+        assert!(!receiver.stage_checkpointed_inbound());
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("ordinary traffic must remain on the live receive path")
+            .expect("shuffle receiver closed");
+        assert!(matches!(received.message(), ShuffleMessage::Data { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_barrier_retirement_unblocks_data_and_preserves_data_holdover() {
+        let receiver = bind_on_loopback(2).await;
+        let sender = sender(1);
+        sender.register_peer(2, receiver.local_addr()).await;
+
+        sender
+            .send_to(
+                2,
+                &ShuffleMessage::checkpointed("held".into(), 0, one_row(1)),
+            )
+            .await
+            .unwrap();
+        let terminal = CheckpointBarrier::new(70, 7);
+        send_barrier(&sender, &[2], terminal).await.unwrap();
+        let older = CheckpointBarrier::new(60, 6);
+        send_barrier(&sender, &[2], older).await.unwrap();
+        sender
+            .send_to(
+                2,
+                &ShuffleMessage::checkpointed("after".into(), 0, one_row(2)),
+            )
+            .await
+            .unwrap();
+        wait_until(|| receiver.committed_sequence_for_test(1) == Some(2)).await;
+
+        assert!(!receiver.has_staged_checkpoint_barriers());
+        assert!(receiver.stage_checkpointed_inbound());
+        let queued_older = receiver.recv().await.unwrap();
+        assert!(matches!(
+            queued_older.message(),
+            ShuffleMessage::Barrier(barrier) if *barrier == older
+        ));
+        receiver.stash_barrier(queued_older);
+
+        receiver
+            .retire_checkpoint_barriers(
+                CheckpointAttempt::new(7, 70),
+                receiver.assignment_fence_for_test().digest(),
+            )
+            .unwrap();
+        assert!(receiver.drain_staged_barriers().is_empty());
+
+        let after = receiver.drain_checkpointed_data_for("after");
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            after[0]
+                .batch()
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            2
+        );
+
+        let held = receiver.drain_checkpointed_data_for("held");
+        assert_eq!(held.len(), 1);
+        assert_eq!(
+            held[0]
+                .batch()
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn barrier_retirement_rejects_staged_conflict_and_exact_digest_mismatch() {
+        let receiver = bind_on_loopback(2).await;
+        let sender = sender(1);
+        sender.register_peer(2, receiver.local_addr()).await;
+        let terminal = CheckpointAttempt::new(7, 70);
+        let assignment_digest = receiver.assignment_fence_for_test().digest();
+
+        send_barrier(&sender, &[2], CheckpointBarrier::new(70, 7))
+            .await
+            .unwrap();
+        let mut wrong_digest = receiver.recv().await.unwrap();
+        wrong_digest.assignment_digest = Some([9; 32]);
+        receiver.stash_barrier(wrong_digest);
+        let error = receiver
+            .retire_checkpoint_barriers(terminal, assignment_digest)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("different assignment digest"));
+        assert_eq!(receiver.drain_staged_barriers().len(), 1);
+
+        send_barrier(&sender, &[2], CheckpointBarrier::new(69, 8))
+            .await
+            .unwrap();
+        receiver.stash_barrier(receiver.recv().await.unwrap());
+        let error = receiver
+            .retire_checkpoint_barriers(terminal, assignment_digest)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("conflicts with retirement"));
+        assert!(receiver.has_staged_checkpoint_barriers());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_retired_barrier_does_not_block_normal_drain() {
+        let receiver = bind_on_loopback(2).await;
+        let sender = sender(1);
+        sender.register_peer(2, receiver.local_addr()).await;
+
+        let terminal = CheckpointAttempt::new(7, 70);
+        let assignment_digest = receiver.assignment_fence_for_test().digest();
+        receiver
+            .retire_checkpoint_barriers(terminal, assignment_digest)
+            .unwrap();
+        receiver
+            .retire_checkpoint_barriers(CheckpointAttempt::new(6, 60), assignment_digest)
+            .unwrap();
+        assert_eq!(
+            receiver
+                .retire_checkpoint_barriers(CheckpointAttempt::new(8, 69), assignment_digest,)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        send_barrier(&sender, &[2], CheckpointBarrier::new(70, 7))
+            .await
+            .unwrap();
+        sender
+            .send_to(
+                2,
+                &ShuffleMessage::checkpointed("after".into(), 0, one_row(3)),
+            )
+            .await
+            .unwrap();
+        wait_until(|| receiver.committed_sequence_for_test(1) == Some(1)).await;
+
+        let after = receiver.drain_checkpointed_data_for("after");
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            after[0]
+                .batch()
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            3
+        );
+        assert!(receiver.drain_staged_barriers().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retired_barrier_crossing_assignment_rotation_is_not_delivery_loss() {
+        use std::sync::atomic::Ordering as O;
+
+        let receiver = bind_on_loopback(2).await;
+        let sender = sender(1);
+        sender.register_peer(2, receiver.local_addr()).await;
+
+        let terminal = CheckpointAttempt::new(7, 70);
+        send_barrier(&sender, &[2], CheckpointBarrier::new(70, 7))
+            .await
+            .unwrap();
+        wait_until(|| receiver.committed_sequence_for_test(1) == Some(0)).await;
+        receiver
+            .retire_checkpoint_barriers(terminal, receiver.assignment_fence_for_test().digest())
+            .unwrap();
+
+        let successor = assignment_fence(2, &[1, 2]);
+        let owners = assignment_owners(&[1, 2]);
+        assert!(receiver
+            .install_assignment_fence(&successor, &owners)
+            .unwrap());
+        assert!(sender
+            .install_assignment_fence(&successor, &owners)
+            .unwrap());
+        sender
+            .send_to(
+                2,
+                &ShuffleMessage::checkpointed("after".into(), 0, one_row(4)),
+            )
+            .await
+            .unwrap();
+        wait_until(|| receiver.committed_sequence_for_test(1) == Some(1)).await;
+
+        let after = receiver.drain_checkpointed_data_for("after");
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            after[0]
+                .batch()
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            4
+        );
+        assert_eq!(receiver.delivery_loss_incidents().load(O::Acquire), 0);
+        assert!(receiver.drain_staged_barriers().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn barrier_holdover_is_bounded_faults_the_cut_and_reopens_after_drain() {
         use std::sync::atomic::Ordering as O;
 
@@ -8061,6 +8629,110 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         assert!(!is_scope_cancelled(&error));
+        stalled_peer.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn barrier_fan_out_process_lease_expiry_preserves_remote_holdover() {
+        let receiver = ShuffleReceiver::bind(2, "127.0.0.1:0".parse().unwrap(), Uuid::from_u128(3))
+            .await
+            .unwrap();
+        receiver
+            .install_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
+                std::time::Duration::from_secs(60),
+            )))
+            .unwrap();
+
+        let sender = ShuffleSender::new(1, Uuid::from_u128(2));
+        let sender_deadline = Arc::new(LeaseDeadline::live_for(std::time::Duration::from_secs(60)));
+        sender
+            .install_process_lease_deadline(Arc::clone(&sender_deadline))
+            .unwrap();
+        let fence = assignment_fence(2, &[1, 2, 3]);
+        let owners = assignment_owners(&[1, 2, 3]);
+        receiver.install_assignment_fence(&fence, &owners).unwrap();
+        sender.install_assignment_fence(&fence, &owners).unwrap();
+        sender.register_peer(2, receiver.local_addr()).await;
+
+        sender
+            .send_to(
+                2,
+                &ShuffleMessage::checkpointed("held".into(), 0, one_row(7)),
+            )
+            .await
+            .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .register_peer(3, listener.local_addr().unwrap())
+            .await;
+        let accepted = Arc::new(tokio::sync::Notify::new());
+        let stalled_peer = {
+            let accepted = Arc::clone(&accepted);
+            tokio::spawn(async move {
+                let (_socket, _) = listener.accept().await.unwrap();
+                accepted.notify_one();
+                std::future::pending::<()>().await;
+            })
+        };
+
+        let barrier = CheckpointBarrier::new(5, 1);
+        let fanout = sender.fan_out_barrier(&[2, 3], barrier, &fence);
+        tokio::pin!(fanout);
+        tokio::select! {
+            () = accepted.notified() => {}
+            result = &mut fanout => panic!("fan-out completed before peer 3 stalled: {result:?}"),
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    result = &mut fanout => {
+                        panic!("fan-out completed before process lease expiry: {result:?}");
+                    }
+                    () = tokio::time::sleep(std::time::Duration::from_millis(5)) => {
+                        if receiver.stage_checkpointed_inbound() {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("reachable peer did not stage its checkpoint cut");
+
+        sender_deadline.fence();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), fanout)
+            .await
+            .expect("process lease expiry did not release the stalled fan-out")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "shuffle process lease is no longer live");
+        assert!(
+            !is_scope_cancelled(&error),
+            "process lease loss must enter recovery, not clean topology cancellation"
+        );
+
+        assert!(receiver.has_staged_checkpoint_barriers());
+        let held = receiver.drain_checkpointed_holdover().unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].0, "held");
+        assert_eq!(
+            held[0]
+                .1
+                .batch()
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            7
+        );
+        let barriers = receiver.drain_staged_barriers();
+        assert_eq!(barriers.len(), 1);
+        assert!(matches!(
+            barriers[0].message(),
+            ShuffleMessage::Barrier(received) if *received == barrier
+        ));
         stalled_peer.abort();
     }
 

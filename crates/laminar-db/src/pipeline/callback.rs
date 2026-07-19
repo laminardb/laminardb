@@ -200,6 +200,8 @@ pub enum BarrierOutcome {
     Async,
     /// Deliberately skipped (see `SkipReason`).
     Skipped(SkipReason),
+    /// Topology authority closed before state capture; retry after a stable assignment.
+    CancelledBeforeCapture,
     /// The exact attempt was terminated by authoritative cluster control before capture.
     Aborted,
     /// Attempted and failed; retry on the next interval.
@@ -250,11 +252,25 @@ pub enum CheckpointControlOutcome {
     },
     /// The exact leader-prepared attempt was authoritatively aborted before capture.
     Aborted { attempt: CheckpointAttempt },
+    /// The exact attempt was cleanly rejected after its shuffle scope closed before capture.
+    Cancelled { attempt: CheckpointAttempt },
     /// The exact leader-prepared attempt was rejected before it could remain in flight.
     Failed {
         attempt: CheckpointAttempt,
         error: String,
     },
+}
+
+/// Assignment gate result before a checkpoint attempt ID is reserved.
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum CheckpointAssignmentAdmission {
+    /// Admission may continue with a local cut or the exact certified cluster assignment.
+    Ready(Option<CheckpointAssignmentFence>),
+    /// Topology is transitioning; retry later without faulting or reserving an attempt.
+    Deferred(String),
+    /// Assignment authority is invalid or unavailable and the pipeline must fail closed.
+    Fault(String),
 }
 
 impl CheckpointCompletion {
@@ -543,13 +559,11 @@ pub trait PipelineCallback: Send + 'static {
         Err("authoritative follower Abort cleanup is not implemented by this callback".into())
     }
 
-    /// Capture the exact assignment certificate for a new attempt. `Ok(None)` is a local runtime,
-    /// `Ok(Some(_))` is a certified clustered cut, and `Err` closes admission with a reason.
+    /// Capture the exact assignment certificate for a new attempt.
     fn checkpoint_assignment_for_admission(
         &mut self,
-    ) -> impl std::future::Future<Output = Result<Option<CheckpointAssignmentFence>, String>> + Send
-    {
-        std::future::ready(Ok(None))
+    ) -> impl std::future::Future<Output = CheckpointAssignmentAdmission> + Send {
+        std::future::ready(CheckpointAssignmentAdmission::Ready(None))
     }
 
     /// Wake the coordinator for leader-originated checkpoint control. `None` keeps local

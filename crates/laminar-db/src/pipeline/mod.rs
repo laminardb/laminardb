@@ -10,8 +10,8 @@ pub mod streaming_coordinator;
 
 pub(crate) use callback::CheckpointCompletion;
 pub use callback::{
-    BarrierOutcome, CheckpointControlOutcome, CycleError, CycleOutcome, PipelineCallback,
-    SkipReason, SourceRegistration,
+    BarrierOutcome, CheckpointAssignmentAdmission, CheckpointControlOutcome, CycleError,
+    CycleOutcome, PipelineCallback, SkipReason, SourceRegistration,
 };
 pub use config::PipelineConfig;
 pub use streaming_coordinator::{ExitReason, StreamingCoordinator, StreamingCoordinatorRuntime};

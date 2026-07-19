@@ -34,8 +34,9 @@ use laminar_core::state::{CheckpointAttempt, CheckpointAttemptRelation};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::callback::{
-    BarrierOutcome, CheckpointCompletion, CheckpointControlOutcome, CycleError, CycleOutcome,
-    PipelineCallback, SourceBarrierControl, SourceBarrierSignal, SourceRegistration,
+    BarrierOutcome, CheckpointAssignmentAdmission, CheckpointCompletion, CheckpointControlOutcome,
+    CycleError, CycleOutcome, PipelineCallback, SourceBarrierControl, SourceBarrierSignal,
+    SourceRegistration,
 };
 use super::config::PipelineConfig;
 use crate::connector_task_fence::{ConnectorTaskFenceRegistration, OwnedConnectorTaskFences};
@@ -1028,6 +1029,8 @@ pub struct StreamingCoordinator {
     terminal_shutdown: tokio_util::sync::CancellationToken,
     pending_barrier: PendingBarrier,
     last_checkpoint: Instant,
+    checkpoint_retry_not_before: Option<Instant>,
+    checkpoint_retry_backoff: Duration,
     source_batches_buf: FxHashMap<Arc<str>, Vec<RecordBatch>>,
     /// At most one FIFO message removed just as the external intake gate closes. Exact source
     /// barrier holds make post-barrier data impossible; this slot exists only for that gate race.
@@ -1205,6 +1208,10 @@ impl PendingBarrier {
 
 /// Fallback timeout for idle wake.
 const IDLE_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Internal topology-retry floor and cap. Assignment admission remains the authoritative gate.
+const CHECKPOINT_RETRY_BASE: Duration = Duration::from_millis(100);
+const CHECKPOINT_RETRY_MAX: Duration = Duration::from_secs(5);
 
 /// Cap on a source task's post-shutdown flush so a hot source can't stall shutdown.
 const SHUTDOWN_DRAIN_BUDGET: Duration = Duration::from_secs(2);
@@ -3974,6 +3981,8 @@ impl StreamingCoordinator {
             terminal_shutdown: tokio_util::sync::CancellationToken::new(),
             pending_barrier: PendingBarrier::new(),
             last_checkpoint: Instant::now(),
+            checkpoint_retry_not_before: None,
+            checkpoint_retry_backoff: Duration::ZERO,
             source_batches_buf: FxHashMap::default(),
             parked_source_msg: None,
             pending_watermark_batches: Vec::new(),
@@ -5515,7 +5524,6 @@ impl StreamingCoordinator {
                 return publication_error.map_or(Ok(()), Err);
             }
             BarrierOutcome::Async => {
-                self.last_checkpoint = Instant::now();
                 return Ok(());
             }
             BarrierOutcome::Committed(epoch) => {
@@ -5537,6 +5545,15 @@ impl StreamingCoordinator {
                     format!("manual checkpoint skipped: {reason}"),
                     false,
                 )
+            }
+            BarrierOutcome::CancelledBeforeCapture => {
+                tracing::info!(
+                    checkpoint_id = attempt.checkpoint_id,
+                    epoch = attempt.epoch,
+                    "barrier checkpoint topology closed before state capture"
+                );
+                let reason = "checkpoint topology closed before state capture";
+                (reason.into(), format!("manual {reason}"), false)
             }
             BarrierOutcome::Aborted => {
                 tracing::info!(
@@ -5708,6 +5725,7 @@ impl StreamingCoordinator {
                     assignment_fence.clone(),
                 )
                 .await;
+            let topology_cancelled = matches!(&outcome, BarrierOutcome::CancelledBeforeCapture);
             self.handle_aligned_checkpoint_outcome(
                 callback,
                 outcome,
@@ -5727,7 +5745,13 @@ impl StreamingCoordinator {
             // Capture or exact cleanup has completed. A cleanup failure or sticky replay fault
             // returns above and deliberately leaves the sources held for coordinated recovery.
             self.release_source_barrier_attempt(attempt);
-            self.last_checkpoint = Instant::now();
+            match (topology_cancelled, cleanup_owner) {
+                (true, CheckpointCleanupOwner::Originator) => {
+                    self.defer_checkpoint_until_topology_ready();
+                }
+                (true, CheckpointCleanupOwner::Follower) => {}
+                (false, _) => self.advance_checkpoint_cadence(),
+            }
         }
         Ok(())
     }
@@ -5742,6 +5766,24 @@ impl StreamingCoordinator {
             return false;
         }
         true
+    }
+
+    fn advance_checkpoint_cadence(&mut self) {
+        self.last_checkpoint = Instant::now();
+        self.checkpoint_retry_not_before = None;
+        self.checkpoint_retry_backoff = Duration::ZERO;
+    }
+
+    fn defer_checkpoint_until_topology_ready(&mut self) {
+        let backoff = if self.checkpoint_retry_backoff.is_zero() {
+            CHECKPOINT_RETRY_BASE
+        } else {
+            self.checkpoint_retry_backoff
+                .saturating_mul(2)
+                .min(CHECKPOINT_RETRY_MAX)
+        };
+        self.checkpoint_retry_backoff = backoff;
+        self.checkpoint_retry_not_before = Some(Instant::now() + backoff);
     }
 
     async fn checkpoint_admission(
@@ -5765,7 +5807,10 @@ impl StreamingCoordinator {
                 .config
                 .checkpoint_interval
                 .is_some_and(|value| self.last_checkpoint.elapsed() >= value);
-        if !manual && !interval {
+        let retry_ready = self
+            .checkpoint_retry_not_before
+            .is_none_or(|deadline| Instant::now() >= deadline);
+        if !manual && (!interval || !retry_ready) {
             return None;
         }
 
@@ -5781,8 +5826,18 @@ impl StreamingCoordinator {
             return None;
         }
         let assignment_fence = match callback.checkpoint_assignment_for_admission().await {
-            Ok(fence) => fence,
-            Err(reason) => {
+            CheckpointAssignmentAdmission::Ready(fence) => fence,
+            CheckpointAssignmentAdmission::Deferred(reason) => {
+                tracing::debug!(reason = %reason, "checkpoint admission waits for stable topology");
+                self.defer_checkpoint_until_topology_ready();
+                if manual {
+                    self.fail_waiting_manual(format!(
+                        "[LDB-6056] manual checkpoint rejected: {reason}"
+                    ));
+                }
+                return None;
+            }
+            CheckpointAssignmentAdmission::Fault(reason) => {
                 callback.record_checkpoint_admission_failure(&reason);
                 if manual {
                     self.fail_waiting_manual(format!(
@@ -5917,6 +5972,10 @@ impl StreamingCoordinator {
                     false,
                 )
             }
+            BarrierOutcome::CancelledBeforeCapture => {
+                let reason = "checkpoint topology closed before state capture";
+                (reason.into(), format!("manual {reason}"), false)
+            }
             BarrierOutcome::Aborted => {
                 tracing::info!(
                     checkpoint_id = attempt.checkpoint_id,
@@ -6014,7 +6073,7 @@ impl StreamingCoordinator {
                     &format!("checkpoint cleanup failed after graph drain: {cleanup_error}"),
                 );
             }
-            self.last_checkpoint = Instant::now();
+            self.advance_checkpoint_cadence();
             return;
         }
         #[cfg(feature = "cluster")]
@@ -6036,7 +6095,7 @@ impl StreamingCoordinator {
                     &format!("{reason}; checkpoint cleanup failed: {cleanup_error}"),
                 );
             }
-            self.last_checkpoint = Instant::now();
+            self.advance_checkpoint_cadence();
             return;
         }
         if let Err(error) = callback.reserve_subscription_cut(attempt) {
@@ -6055,7 +6114,7 @@ impl StreamingCoordinator {
                     &format!("{error}; checkpoint cleanup failed: {cleanup_error}"),
                 );
             }
-            self.last_checkpoint = Instant::now();
+            self.advance_checkpoint_cadence();
             return;
         }
         #[cfg(feature = "cluster")]
@@ -6078,7 +6137,7 @@ impl StreamingCoordinator {
                     &format!("{reason}; checkpoint cleanup failed: {cleanup_error}"),
                 );
             }
-            self.last_checkpoint = Instant::now();
+            self.advance_checkpoint_cadence();
             return;
         }
         let outcome = callback
@@ -6089,13 +6148,19 @@ impl StreamingCoordinator {
                 admission.assignment_fence.clone(),
             )
             .await;
+        let retry_after_topology_change =
+            matches!(&outcome, BarrierOutcome::CancelledBeforeCapture);
         if let Err(error) = self
             .handle_source_less_checkpoint_outcome(callback, admission, attempt, outcome)
             .await
         {
             callback.record_checkpoint_continuation_fault(attempt, &error);
         }
-        self.last_checkpoint = Instant::now();
+        if retry_after_topology_change {
+            self.defer_checkpoint_until_topology_ready();
+        } else {
+            self.advance_checkpoint_cadence();
+        }
     }
 
     async fn admit_source_barrier_checkpoint(
@@ -6250,7 +6315,9 @@ impl StreamingCoordinator {
                         .record_checkpoint_admission_failure(&format!(
                             "{error}; {authority_reason}"
                         )),
-                    CheckpointControlOutcome::Idle | CheckpointControlOutcome::Aborted { .. } => {
+                    CheckpointControlOutcome::Idle
+                    | CheckpointControlOutcome::Aborted { .. }
+                    | CheckpointControlOutcome::Cancelled { .. } => {
                         callback.record_checkpoint_admission_failure(&authority_reason);
                     }
                 }
@@ -6276,6 +6343,17 @@ impl StreamingCoordinator {
                     self.fail_manual_attempt(
                         attempt,
                         "manual checkpoint was aborted by authoritative cluster control",
+                    );
+                }
+                CheckpointControlOutcome::Cancelled { attempt } => {
+                    if self.pending_barrier.attempt == Some(attempt) {
+                        self.pending_barrier.clear();
+                        self.barrier_seen.clear();
+                    }
+                    self.release_source_barrier_attempt(attempt);
+                    self.fail_manual_attempt(
+                        attempt,
+                        "manual checkpoint was cancelled after its shuffle scope closed",
                     );
                 }
                 CheckpointControlOutcome::Failed { attempt, error } => {
@@ -6524,6 +6602,7 @@ mod tests {
         >,
         barrier_captures: Vec<(CheckpointAttempt, usize)>,
         runtime: MockRuntimeState,
+        assignment_fault: Option<String>,
         assignment_fence: Option<laminar_core::cluster::control::CheckpointAssignmentFence>,
         prepared_attempts: Vec<(
             CheckpointAttempt,
@@ -6603,6 +6682,7 @@ mod tests {
                     recovering: false,
                     assignment_ready: true,
                 },
+                assignment_fault: None,
                 assignment_fence: None,
                 prepared_attempts: Vec::new(),
                 prepare_error: None,
@@ -6774,17 +6854,16 @@ mod tests {
             self.runtime.recovering
         }
 
-        async fn checkpoint_assignment_for_admission(
-            &mut self,
-        ) -> Result<Option<laminar_core::cluster::control::CheckpointAssignmentFence>, String>
-        {
+        async fn checkpoint_assignment_for_admission(&mut self) -> CheckpointAssignmentAdmission {
             self.checkpoint_assignment_calls += 1;
             #[cfg(feature = "cluster")]
             self.fence_process_authority_at(ProcessAuthorityFencePoint::AssignmentAdmission);
-            if self.runtime.assignment_ready {
-                Ok(self.assignment_fence.clone())
+            if let Some(error) = self.assignment_fault.take() {
+                CheckpointAssignmentAdmission::Fault(error)
+            } else if self.runtime.assignment_ready {
+                CheckpointAssignmentAdmission::Ready(self.assignment_fence.clone())
             } else {
-                Err("assignment is not checkpoint-ready".into())
+                CheckpointAssignmentAdmission::Deferred("assignment is not checkpoint-ready".into())
             }
         }
 
@@ -7324,6 +7403,8 @@ mod tests {
             terminal_shutdown: tokio_util::sync::CancellationToken::new(),
             pending_barrier: PendingBarrier::new(),
             last_checkpoint: Instant::now(),
+            checkpoint_retry_not_before: None,
+            checkpoint_retry_backoff: Duration::ZERO,
             source_batches_buf: FxHashMap::default(),
             parked_source_msg: None,
             pending_watermark_batches: Vec::new(),
@@ -8050,6 +8131,24 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[tokio::test]
+    async fn follower_scope_cancellation_is_not_recorded_as_a_failure() {
+        let mut coordinator = admission_coordinator(Vec::new());
+        install_test_process_authority(&mut coordinator, 53);
+        let attempt = CheckpointAttempt::new(53, 4_053);
+        let mut callback = MockCallback::new();
+        callback.runtime.leader = false;
+        callback.control_checkpoint_outcome = Some(CheckpointControlOutcome::Cancelled { attempt });
+
+        coordinator.maybe_checkpoint(&mut callback).await;
+
+        assert_eq!(callback.control_checkpoint_calls, 1);
+        assert!(callback.checkpoint_failures.is_empty());
+        assert!(callback.checkpoint_admission_failures.is_empty());
+        assert!(!coordinator.pending_barrier.active);
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
     async fn source_barrier_state_is_not_installed_after_process_lease_loss() {
         let (source, poll) = checkpoint_source_handle("source");
         let mut coordinator = admission_coordinator(vec![source]);
@@ -8318,14 +8417,29 @@ mod tests {
         callback.runtime.assignment_ready = false;
         coordinator.maybe_checkpoint(&mut callback).await;
         assert_eq!(callback.reserve_calls, 0);
-        assert_eq!(
-            callback.checkpoint_admission_failures,
-            ["assignment is not checkpoint-ready"]
-        );
+        assert!(callback.checkpoint_admission_failures.is_empty());
+        assert!(coordinator.checkpoint_retry_not_before.is_some());
 
+        coordinator.checkpoint_retry_not_before = Some(Instant::now() - Duration::from_millis(1));
         callback.runtime.assignment_ready = true;
         coordinator.maybe_checkpoint(&mut callback).await;
         assert_eq!(callback.reserve_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn assignment_authority_fault_fails_closed_before_attempt_reservation() {
+        let mut coordinator = admission_coordinator(Vec::new());
+        let mut callback = MockCallback::new();
+        callback.assignment_fault = Some("assignment authority is invalid".into());
+
+        coordinator.maybe_checkpoint(&mut callback).await;
+
+        assert_eq!(callback.reserve_calls, 0);
+        assert_eq!(
+            callback.checkpoint_admission_failures,
+            ["assignment authority is invalid"]
+        );
+        assert!(coordinator.checkpoint_retry_not_before.is_none());
     }
 
     #[tokio::test]
@@ -8790,7 +8904,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skipped_aborted_or_failed_aligned_checkpoint_abandons_the_exact_attempt() {
+    async fn noncommitted_aligned_checkpoint_abandons_exact_attempt_with_correct_cadence() {
         use super::super::callback::SkipReason;
 
         let outcomes = [
@@ -8798,20 +8912,29 @@ mod tests {
                 BarrierOutcome::Skipped(SkipReason::PreservingReplayWindowAfterSinkTimeout),
                 "preserving_replay_window_after_sink_timeout",
                 false,
+                true,
+            ),
+            (
+                BarrierOutcome::CancelledBeforeCapture,
+                "checkpoint topology closed before state capture",
+                false,
+                false,
             ),
             (
                 BarrierOutcome::Aborted,
                 "checkpoint was aborted by authoritative cluster control before state capture",
                 false,
+                true,
             ),
             (
                 BarrierOutcome::Failed,
                 "barrier-aligned checkpoint failed before durable tail",
                 true,
+                true,
             ),
         ];
 
-        for (outcome, expected_reason, records_failure) in outcomes {
+        for (outcome, expected_reason, records_failure, advances_cadence) in outcomes {
             let (_tx, rx) = mpsc::bounded_async::<SourceMsg>(8);
             let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
             let mut coordinator = test_coordinator(
@@ -8821,6 +8944,8 @@ mod tests {
                 DeliveryGuarantee::ExactlyOnce,
                 None,
             );
+            coordinator.last_checkpoint = Instant::now() - Duration::from_secs(60);
+            let previous_cadence = coordinator.last_checkpoint;
             let attempt = CheckpointAttempt::new(53, 90_053);
             coordinator.pending_barrier.reset(attempt, 1);
             let mut callback = MockCallback::new();
@@ -8843,7 +8968,104 @@ mod tests {
             if records_failure {
                 assert_eq!(callback.checkpoint_failures[0].0, attempt.checkpoint_id);
             }
+            if advances_cadence {
+                assert!(coordinator.last_checkpoint > previous_cadence);
+                assert!(coordinator.checkpoint_retry_not_before.is_none());
+            } else {
+                assert_eq!(coordinator.last_checkpoint, previous_cadence);
+                assert!(coordinator.checkpoint_retry_not_before.is_some());
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn topology_retry_waits_for_backoff_and_ready_assignment_without_burning_an_attempt() {
+        let (source, poll) = checkpoint_source_handle("topology-retry");
+        let mut coordinator = admission_coordinator(vec![source]);
+        coordinator.config.checkpoint_interval = Some(Duration::from_secs(60));
+        coordinator.last_checkpoint = Instant::now() - Duration::from_secs(60);
+        let cancelled = CheckpointAttempt::new(53, 90_053);
+        coordinator.pending_barrier.reset(cancelled, 1);
+        let mut callback = MockCallback::new();
+        callback.barrier_outcome = Some(BarrierOutcome::CancelledBeforeCapture);
+
+        coordinator
+            .handle_barrier(
+                0,
+                &CheckpointBarrier::new(cancelled.checkpoint_id, cancelled.epoch),
+                &checkpoint_at(cancelled.epoch),
+                &mut callback,
+            )
+            .await
+            .unwrap();
+
+        let assignment_calls = callback.checkpoint_assignment_calls;
+        coordinator.maybe_checkpoint(&mut callback).await;
+        assert_eq!(callback.checkpoint_assignment_calls, assignment_calls);
+        assert_eq!(callback.reserve_calls, 0);
+
+        coordinator.checkpoint_retry_not_before = Some(Instant::now() - Duration::from_millis(1));
+        callback.runtime.assignment_ready = false;
+        coordinator.maybe_checkpoint(&mut callback).await;
+        assert_eq!(callback.reserve_calls, 0);
+        assert!(callback.checkpoint_admission_failures.is_empty());
+
+        let successor = CheckpointAttempt::new(54, 90_054);
+        coordinator.checkpoint_retry_not_before = Some(Instant::now() - Duration::from_millis(1));
+        callback.runtime.assignment_ready = true;
+        callback.attempt_to_reserve = successor;
+        coordinator.maybe_checkpoint(&mut callback).await;
+        assert_eq!(callback.reserve_calls, 1);
+        assert_eq!(
+            poll.poll(),
+            Some(CheckpointBarrier::new(
+                successor.checkpoint_id,
+                successor.epoch
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn source_less_topology_cancellation_keeps_periodic_checkpoint_due() {
+        let mut coordinator = admission_coordinator(Vec::new());
+        coordinator.config.checkpoint_interval = Some(Duration::from_secs(60));
+        coordinator.last_checkpoint = Instant::now() - Duration::from_secs(60);
+        let previous_cadence = coordinator.last_checkpoint;
+        let cancelled = CheckpointAttempt::new(55, 90_055);
+        let mut callback = MockCallback::new();
+        callback.attempt_to_reserve = cancelled;
+        callback.barrier_outcome = Some(BarrierOutcome::CancelledBeforeCapture);
+
+        coordinator.maybe_checkpoint(&mut callback).await;
+
+        assert_eq!(callback.reserve_calls, 1);
+        assert_eq!(coordinator.last_checkpoint, previous_cadence);
+        assert!(coordinator.checkpoint_retry_not_before.is_some());
+        assert_eq!(callback.abandoned_attempts.lock()[0].0, cancelled);
+    }
+
+    #[test]
+    fn topology_retry_backoff_is_bounded_and_resets_with_checkpoint_cadence() {
+        let mut coordinator = admission_coordinator(Vec::new());
+
+        for expected in [
+            Duration::from_millis(100),
+            Duration::from_millis(200),
+            Duration::from_millis(400),
+            Duration::from_millis(800),
+            Duration::from_millis(1_600),
+            Duration::from_millis(3_200),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        ] {
+            coordinator.defer_checkpoint_until_topology_ready();
+            assert_eq!(coordinator.checkpoint_retry_backoff, expected);
+            assert!(coordinator.checkpoint_retry_not_before.is_some());
+        }
+
+        coordinator.advance_checkpoint_cadence();
+        assert_eq!(coordinator.checkpoint_retry_backoff, Duration::ZERO);
+        assert!(coordinator.checkpoint_retry_not_before.is_none());
     }
 
     #[tokio::test]
@@ -8912,6 +9134,38 @@ mod tests {
         assert_eq!(
             *release.borrow_and_update(),
             Some(SourceBarrierSignal::Release(attempt))
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn follower_topology_cancellation_preserves_checkpoint_cadence_after_promotion() {
+        let (source, _poll) = checkpoint_source_handle("source");
+        let mut coordinator = admission_coordinator(vec![source]);
+        install_test_process_authority(&mut coordinator, 56);
+        coordinator.last_checkpoint = Instant::now() - Duration::from_secs(60);
+        let previous_cadence = coordinator.last_checkpoint;
+        let attempt = CheckpointAttempt::new(56, 91_056);
+        coordinator.pending_barrier.reset_follower(attempt, 1);
+        let mut callback = MockCallback::new();
+        callback.runtime.leader = true;
+        callback.barrier_outcome = Some(BarrierOutcome::CancelledBeforeCapture);
+
+        coordinator
+            .handle_barrier(
+                0,
+                &CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch),
+                &checkpoint_at(attempt.epoch),
+                &mut callback,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(coordinator.last_checkpoint, previous_cadence);
+        assert!(coordinator.checkpoint_retry_not_before.is_none());
+        assert_eq!(
+            callback.cancelled_source_barrier_attempts.lock()[0].0,
+            attempt
         );
     }
 
@@ -12878,6 +13132,8 @@ mod tests {
             terminal_shutdown: tokio_util::sync::CancellationToken::new(),
             pending_barrier: PendingBarrier::new(),
             last_checkpoint: Instant::now(),
+            checkpoint_retry_not_before: None,
+            checkpoint_retry_backoff: Duration::ZERO,
             source_batches_buf: FxHashMap::default(),
             parked_source_msg: None,
             pending_watermark_batches: Vec::new(),
@@ -13339,6 +13595,8 @@ mod tests {
             terminal_shutdown: tokio_util::sync::CancellationToken::new(),
             pending_barrier: PendingBarrier::new(),
             last_checkpoint: Instant::now(),
+            checkpoint_retry_not_before: None,
+            checkpoint_retry_backoff: Duration::ZERO,
             source_batches_buf: FxHashMap::default(),
             parked_source_msg: None,
             pending_watermark_batches: Vec::new(),
@@ -13601,6 +13859,8 @@ mod tests {
             terminal_shutdown: tokio_util::sync::CancellationToken::new(),
             pending_barrier: PendingBarrier::new(),
             last_checkpoint: Instant::now(),
+            checkpoint_retry_not_before: None,
+            checkpoint_retry_backoff: Duration::ZERO,
             source_batches_buf: FxHashMap::default(),
             parked_source_msg: None,
             pending_watermark_batches: Vec::new(),
@@ -13792,6 +14052,8 @@ mod tests {
             terminal_shutdown: tokio_util::sync::CancellationToken::new(),
             pending_barrier: PendingBarrier::new(),
             last_checkpoint: Instant::now(),
+            checkpoint_retry_not_before: None,
+            checkpoint_retry_backoff: Duration::ZERO,
             source_batches_buf: FxHashMap::default(),
             parked_source_msg: None,
             pending_watermark_batches: Vec::new(),
@@ -14080,6 +14342,8 @@ mod tests {
             terminal_shutdown: tokio_util::sync::CancellationToken::new(),
             pending_barrier: PendingBarrier::new(),
             last_checkpoint: Instant::now(),
+            checkpoint_retry_not_before: None,
+            checkpoint_retry_backoff: Duration::ZERO,
             source_batches_buf: FxHashMap::default(),
             parked_source_msg: None,
             pending_watermark_batches: Vec::new(),

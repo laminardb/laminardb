@@ -330,6 +330,7 @@ impl GraphOperator for ChangelogEnrichOperator {
 pub(crate) enum ShuffleAlignmentOutcome {
     Aligned,
     Aborted,
+    ScopeCancelledBeforeStaging,
 }
 
 #[allow(clippy::struct_excessive_bools)] // distinct independent flags, not a state enum
@@ -2721,99 +2722,129 @@ impl OperatorGraph {
     }
 
     #[cfg(feature = "cluster")]
-    fn classify_shuffle_alignment_control(
+    fn is_shuffle_alignment_terminal_hint(
         attempt: laminar_core::state::CheckpointAttempt,
         announcement: &laminar_core::cluster::control::BarrierAnnouncement,
-    ) -> Result<Option<ShuffleAlignmentOutcome>, DbError> {
+        ignored: Option<(u64, u64, laminar_core::cluster::control::Phase)>,
+    ) -> bool {
         use laminar_core::cluster::control::Phase;
 
+        if ignored
+            == Some((
+                announcement.epoch,
+                announcement.checkpoint_id,
+                announcement.phase,
+            ))
+            || !matches!(announcement.phase, Phase::Commit | Phase::Abort)
+        {
+            return false;
+        }
         let announced = laminar_core::state::CheckpointAttempt::new(
             announcement.epoch,
             announcement.checkpoint_id,
         );
-        match Self::compare_shuffle_attempts(attempt, announced)? {
-            std::cmp::Ordering::Equal if announcement.phase == Phase::Abort => {
-                Ok(Some(ShuffleAlignmentOutcome::Aborted))
-            }
-            std::cmp::Ordering::Greater => Err(DbError::Pipeline(format!(
-                "checkpoint {} epoch {} was superseded by {announced:?}",
-                attempt.checkpoint_id, attempt.epoch
-            ))),
-            std::cmp::Ordering::Equal | std::cmp::Ordering::Less => Ok(None),
-        }
+        !matches!(
+            announced.relation_to(attempt),
+            laminar_core::state::CheckpointAttemptRelation::Older
+        )
     }
 
     #[cfg(feature = "cluster")]
-    async fn observe_shuffle_alignment_control(
+    async fn wait_for_shuffle_alignment_terminal_hint(
         controller: Option<&laminar_core::cluster::control::ClusterController>,
         attempt: laminar_core::state::CheckpointAttempt,
-    ) -> Result<Option<ShuffleAlignmentOutcome>, DbError> {
-        use laminar_core::cluster::control::Phase;
-
+        ignored: Option<(u64, u64, laminar_core::cluster::control::Phase)>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<laminar_core::cluster::control::BarrierAnnouncement>, DbError> {
         let Some(controller) = controller else {
+            tokio::time::sleep_until(deadline).await;
             return Ok(None);
         };
-        let announcement = controller
-            .observe_barrier_matching(|announcement| {
-                let announced = laminar_core::state::CheckpointAttempt::new(
-                    announcement.epoch,
-                    announcement.checkpoint_id,
-                );
-                match announced.relation_to(attempt) {
-                    laminar_core::state::CheckpointAttemptRelation::Newer
-                    | laminar_core::state::CheckpointAttemptRelation::Conflict => true,
-                    laminar_core::state::CheckpointAttemptRelation::Exact => {
-                        announcement.phase == Phase::Abort
-                    }
-                    laminar_core::state::CheckpointAttemptRelation::Older => false,
-                }
-            })
+        controller
+            .wait_for_barrier(
+                |announcement| {
+                    Self::is_shuffle_alignment_terminal_hint(attempt, announcement, ignored)
+                },
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
             .await
             .map_err(|error| {
                 DbError::Pipeline(format!(
                     "shuffle barrier control observation failed: {error}"
                 ))
-            })?;
-        let Some(announcement) = announcement.as_ref() else {
-            return Ok(None);
-        };
-        let Some(outcome) = Self::classify_shuffle_alignment_control(attempt, announcement)? else {
+            })
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn audit_shuffle_alignment_settlement(
+        controller: Option<&laminar_core::cluster::control::ClusterController>,
+        attempt: laminar_core::state::CheckpointAttempt,
+        assignment_fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
+    ) -> Result<Option<ShuffleAlignmentOutcome>, DbError> {
+        let Some(controller) = controller else {
             return Ok(None);
         };
 
-        // Abort gossip is only a wake-up hint. The immutable cluster outcome is the terminal
-        // authority; accepting the hint itself would let an unauthorised or stale announcement
-        // release a partially aligned channel cut.
+        // Announcements only wake this audit; immutable authority alone settles alignment.
         let authority = controller.checkpoint_authority().map_err(|error| {
             DbError::Pipeline(format!(
-                "shuffle barrier Abort authority is unavailable: {error}"
+                "shuffle barrier terminal authority is unavailable: {error}"
             ))
         })?;
         let durable = authority
-            .cluster_outcome(attempt.epoch)
+            .cluster_attempt_settlement(attempt)
             .await
             .map_err(|error| {
                 DbError::Pipeline(format!(
-                    "shuffle barrier Abort outcome read failed: {error}"
+                    "shuffle barrier terminal outcome audit failed: {error}"
                 ))
             })?;
         let Some(durable) = durable else {
             return Ok(None);
         };
-        if durable.scope != laminar_core::checkpoint_decision::CheckpointScope::Cluster
-            || durable.checkpoint_id != attempt.checkpoint_id
-            || durable.verdict != laminar_core::checkpoint_decision::CheckpointVerdict::Abort
-        {
+        if durable.scope != laminar_core::checkpoint_decision::CheckpointScope::Cluster {
             return Err(DbError::Pipeline(format!(
-                "shuffle barrier Abort hint for checkpoint {} epoch {} conflicts with durable outcome scope={:?} checkpoint={} verdict={:?}",
-                attempt.checkpoint_id,
-                attempt.epoch,
-                durable.scope,
-                durable.checkpoint_id,
-                durable.verdict
+                "shuffle barrier settlement for checkpoint {} epoch {} has non-cluster scope {:?}",
+                attempt.checkpoint_id, attempt.epoch, durable.scope
             )));
         }
-        Ok(Some(outcome))
+        let durable_attempt =
+            laminar_core::state::CheckpointAttempt::new(durable.epoch, durable.checkpoint_id);
+        match durable_attempt.relation_to(attempt) {
+            laminar_core::state::CheckpointAttemptRelation::Exact => {
+                if durable.assignment_fence.as_ref() != Some(assignment_fence) {
+                    return Err(DbError::Pipeline(format!(
+                        "shuffle barrier terminal outcome for checkpoint {} epoch {} has a different assignment certificate",
+                        attempt.checkpoint_id, attempt.epoch
+                    )));
+                }
+                if durable.verdict
+                    != laminar_core::checkpoint_decision::CheckpointVerdict::Abort
+                {
+                    return Err(DbError::Pipeline(format!(
+                        "shuffle barrier alignment for checkpoint {} epoch {} observed durable {:?} instead of Abort",
+                        attempt.checkpoint_id, attempt.epoch, durable.verdict
+                    )));
+                }
+                Ok(Some(ShuffleAlignmentOutcome::Aborted))
+            }
+            laminar_core::state::CheckpointAttemptRelation::Newer => Err(DbError::Pipeline(
+                format!(
+                    "checkpoint {} epoch {} was superseded by durable terminal checkpoint {} epoch {} ({:?})",
+                    attempt.checkpoint_id,
+                    attempt.epoch,
+                    durable.checkpoint_id,
+                    durable.epoch,
+                    durable.verdict
+                ),
+            )),
+            laminar_core::state::CheckpointAttemptRelation::Older
+            | laminar_core::state::CheckpointAttemptRelation::Conflict => {
+                Err(DbError::Pipeline(format!(
+                    "shuffle barrier authority returned invalid settlement {durable_attempt:?} for pending attempt {attempt:?}"
+                )))
+            }
+        }
     }
 
     /// Aligned shuffle checkpointing: fan out an in-band barrier, retain each peer's pre-barrier
@@ -2822,9 +2853,10 @@ impl OperatorGraph {
     /// other peers are outstanding is a protocol violation and requires recovery.
     ///
     /// An exact, authority-validated leader Abort is a normal terminal outcome: rows dequeued
-    /// before observing it remain staged in the live graph, and no snapshot was captured. Every
-    /// actual alignment failure still requires coordinated recovery because partial staging may
-    /// otherwise lose or double-apply channel data.
+    /// before observing it remain staged in the live graph, and no snapshot was captured. A
+    /// transport scope cancellation before local staging preserves the complete holdover for
+    /// exact-attempt cleanup and a later checkpoint. Every failure after staging still requires
+    /// coordinated recovery because partial staging may otherwise lose or double-apply data.
     ///
     /// # Errors
     /// Returns a recovery-classified error for timeout, loss, scope conflict, or supersession.
@@ -2848,6 +2880,9 @@ impl OperatorGraph {
             return Ok(ShuffleAlignmentOutcome::Aligned);
         };
         let alignment = tokio::time::timeout_at(deadline, async {
+            if cfg.receiver.assignment_version() == 0 || cfg.sender.assignment_version() == 0 {
+                return Ok(ShuffleAlignmentOutcome::ScopeCancelledBeforeStaging);
+            }
             let recovery_gen = cfg.receiver.recovery_gen();
             Self::validate_shuffle_attempt_scope(
                 &cfg,
@@ -2875,18 +2910,34 @@ impl OperatorGraph {
                 return Ok(ShuffleAlignmentOutcome::Aligned);
             }
 
-            // Take only previously staged data. Consuming the live queue here would split its
-            // data/barrier order into separate holdovers before alignment can inspect the cut.
-            let staged_batches = cfg.receiver.drain_checkpointed_holdover();
-            ensure_no_delivery_loss()?;
-
             let barrier = CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch);
-            cfg.sender
+            if let Err(error) = cfg
+                .sender
                 .fan_out_barrier(&peers, barrier, assignment_fence)
                 .await
-                .map_err(|error| {
-                    DbError::Pipeline(format!("shuffle barrier fan-out: {error}"))
-                })?;
+            {
+                if laminar_core::shuffle::is_scope_cancelled(&error) {
+                    return Ok(ShuffleAlignmentOutcome::ScopeCancelledBeforeStaging);
+                }
+                return Err(DbError::Pipeline(format!(
+                    "shuffle barrier fan-out: {error}"
+                )));
+            }
+
+            // Fan-out can cancel while waiting on admission. Keep holdover ownership in the
+            // receiver until every failed peer has either accepted or explicitly left the scope.
+            let staged_batches = match cfg.receiver.drain_checkpointed_holdover() {
+                Ok(staged) => staged,
+                Err(error) if laminar_core::shuffle::is_scope_cancelled(&error) => {
+                    return Ok(ShuffleAlignmentOutcome::ScopeCancelledBeforeStaging);
+                }
+                Err(error) => {
+                    return Err(DbError::Pipeline(format!(
+                        "shuffle checkpoint holdover drain: {error}"
+                    )));
+                }
+            };
+            ensure_no_delivery_loss()?;
 
             let mut remaining: FxHashSet<u64> = peers.iter().copied().collect();
             let mut barrier_cuts: FxHashMap<u64, u64> = FxHashMap::default();
@@ -2973,7 +3024,12 @@ impl OperatorGraph {
             ensure_no_delivery_loss()?;
             if let Some(error) = post_cut_error {
                 if let Some(outcome) =
-                    Self::observe_shuffle_alignment_control(controller, attempt).await?
+                    Self::audit_shuffle_alignment_settlement(
+                        controller,
+                        attempt,
+                        assignment_fence,
+                    )
+                    .await?
                 {
                     for (stage, received) in post_cut_batches {
                         self.stage_checkpointed_shuffle(
@@ -2995,7 +3051,12 @@ impl OperatorGraph {
                 )?;
                 ensure_no_delivery_loss()?;
                 if let Some(outcome) =
-                    Self::observe_shuffle_alignment_control(controller, attempt).await?
+                    Self::audit_shuffle_alignment_settlement(
+                        controller,
+                        attempt,
+                        assignment_fence,
+                    )
+                    .await?
                 {
                     return Ok(outcome);
                 }
@@ -3007,6 +3068,14 @@ impl OperatorGraph {
                 RECHECK,
             );
             check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut ignored_terminal_hint = None;
+            let terminal_hint = Self::wait_for_shuffle_alignment_terminal_hint(
+                controller,
+                attempt,
+                ignored_terminal_hint,
+                deadline,
+            );
+            tokio::pin!(terminal_hint);
             loop {
                 tokio::select! {
                     res = cfg.receiver.recv() => {
@@ -3023,9 +3092,10 @@ impl OperatorGraph {
                             let peer = received.peer();
                             let sequence = received.checkpoint_sequence();
                             if let Some(cut) = barrier_cuts.get(&peer) {
-                                if let Some(outcome) = Self::observe_shuffle_alignment_control(
+                                if let Some(outcome) = Self::audit_shuffle_alignment_settlement(
                                     controller,
                                     attempt,
+                                    assignment_fence,
                                 )
                                 .await?
                                 {
@@ -3075,6 +3145,42 @@ impl OperatorGraph {
                             std::cmp::Ordering::Less => {}
                         }
                     }
+                    hint = &mut terminal_hint => {
+                        let Some(hint) = hint? else {
+                            return Err(DbError::Checkpoint(format!(
+                                "shuffle barrier control wait exhausted the absolute deadline for checkpoint {} epoch {}",
+                                attempt.checkpoint_id, attempt.epoch
+                            )));
+                        };
+                        ignored_terminal_hint = Some((
+                            hint.epoch,
+                            hint.checkpoint_id,
+                            hint.phase,
+                        ));
+                        Self::validate_shuffle_attempt_scope(
+                            &cfg,
+                            assignment_fence,
+                            recovery_gen,
+                            controller,
+                        )?;
+                        ensure_no_delivery_loss()?;
+                        if let Some(outcome) = Self::audit_shuffle_alignment_settlement(
+                            controller,
+                            attempt,
+                            assignment_fence,
+                        )
+                        .await?
+                        {
+                            return Ok(outcome);
+                        }
+                        check_interval.reset_at(tokio::time::Instant::now() + RECHECK);
+                        terminal_hint.set(Self::wait_for_shuffle_alignment_terminal_hint(
+                            controller,
+                            attempt,
+                            ignored_terminal_hint,
+                            deadline,
+                        ));
+                    }
                     _ = check_interval.tick() => {
                         Self::validate_shuffle_attempt_scope(
                             &cfg,
@@ -3084,7 +3190,12 @@ impl OperatorGraph {
                         )?;
                         ensure_no_delivery_loss()?;
                         if let Some(outcome) =
-                            Self::observe_shuffle_alignment_control(controller, attempt).await?
+                            Self::audit_shuffle_alignment_settlement(
+                                controller,
+                                attempt,
+                                assignment_fence,
+                            )
+                            .await?
                         {
                             return Ok(outcome);
                         }
@@ -3099,7 +3210,8 @@ impl OperatorGraph {
             )?;
             ensure_no_delivery_loss()?;
             if let Some(outcome) =
-                Self::observe_shuffle_alignment_control(controller, attempt).await?
+                Self::audit_shuffle_alignment_settlement(controller, attempt, assignment_fence)
+                    .await?
             {
                 return Ok(outcome);
             }
@@ -3916,8 +4028,9 @@ mod tests {
         graph: OperatorGraph,
         local_receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
         _peer_two_receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
-        _waiting_peer_receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
+        waiting_peer_receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
         peer_two_sender: laminar_core::shuffle::ShuffleSender,
+        peer_three_sender: laminar_core::shuffle::ShuffleSender,
         fence: laminar_core::checkpoint::CheckpointAssignmentFence,
         recorded: Arc<parking_lot::Mutex<Vec<RetainedBatch>>>,
     }
@@ -3978,12 +4091,12 @@ mod tests {
         peer_two_receiver
             .install_process_lease_deadline(Arc::clone(&peer_two_process_deadline))
             .unwrap();
+        let peer_three_process_deadline =
+            Arc::new(laminar_core::cluster::control::LeaseDeadline::live_for(
+                std::time::Duration::from_secs(60),
+            ));
         waiting_peer_receiver
-            .install_process_lease_deadline(Arc::new(
-                laminar_core::cluster::control::LeaseDeadline::live_for(
-                    std::time::Duration::from_secs(60),
-                ),
-            ))
+            .install_process_lease_deadline(Arc::clone(&peer_three_process_deadline))
             .unwrap();
         for receiver in [&local_receiver, &peer_two_receiver, &waiting_peer_receiver] {
             receiver
@@ -4017,6 +4130,19 @@ mod tests {
         peer_two_sender
             .install_assignment_fence(&fence, &[1, 2, 3])
             .unwrap();
+        let peer_three_sender = ShuffleSender::new(3, uuid::Uuid::from_u128(3));
+        peer_three_sender
+            .register_peer(1, local_receiver.local_addr())
+            .await;
+        peer_three_sender
+            .register_peer(2, peer_two_receiver.local_addr())
+            .await;
+        peer_three_sender
+            .install_process_lease_deadline(peer_three_process_deadline)
+            .unwrap();
+        peer_three_sender
+            .install_assignment_fence(&fence, &[1, 2, 3])
+            .unwrap();
 
         let recorded = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
@@ -4032,10 +4158,58 @@ mod tests {
             graph,
             local_receiver,
             _peer_two_receiver: peer_two_receiver,
-            _waiting_peer_receiver: waiting_peer_receiver,
+            waiting_peer_receiver,
             peer_two_sender,
+            peer_three_sender,
             fence,
             recorded,
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn stage_peer_two_data_and_barrier(
+        harness: &ThreeNodeAlignmentHarness,
+        attempt: laminar_core::state::CheckpointAttempt,
+    ) -> RecordBatch {
+        use laminar_core::checkpoint::CheckpointBarrier;
+        use laminar_core::shuffle::ShuffleMessage;
+
+        let batch = test_batch();
+        harness
+            .peer_two_sender
+            .send_to(
+                1,
+                &ShuffleMessage::checkpointed("out".into(), 0, batch.clone()),
+            )
+            .await
+            .unwrap();
+        harness
+            .peer_two_sender
+            .fan_out_barrier(
+                &[1, 3],
+                CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch),
+                &harness.fence,
+            )
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let _ = harness
+                .local_receiver
+                .drain_checkpointed_data_for("__alignment_probe");
+            let barriers = harness.local_receiver.drain_staged_barriers();
+            if !barriers.is_empty() {
+                for barrier in barriers {
+                    harness.local_receiver.stash_barrier(barrier);
+                }
+                return batch;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "peer data and barrier did not reach the holdover"
+            );
+            tokio::task::yield_now().await;
         }
     }
 
@@ -4112,6 +4286,16 @@ mod tests {
         attempt: laminar_core::state::CheckpointAttempt,
         durable: bool,
     ) -> Arc<laminar_core::cluster::control::ClusterController> {
+        alignment_abort_controller_with_announcement(fence, attempt, durable, true).await
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn alignment_abort_controller_with_announcement(
+        fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
+        attempt: laminar_core::state::CheckpointAttempt,
+        durable: bool,
+        announce: bool,
+    ) -> Arc<laminar_core::cluster::control::ClusterController> {
         use laminar_core::checkpoint_decision::CheckpointVerdict;
         use laminar_core::cluster::control::{
             BarrierAnnouncement, ClusterController, ClusterKv, InMemoryKv, LeaderLeaseOwner,
@@ -4176,20 +4360,22 @@ mod tests {
                 .unwrap();
         }
         controller.set_leader_lease_store(authority);
-        kv.seed(
-            node_id,
-            ANNOUNCEMENT_KEY,
-            serde_json::to_string(&BarrierAnnouncement {
-                epoch: attempt.epoch,
-                checkpoint_id: attempt.checkpoint_id,
-                assignment_fence: Some(fence.clone()),
-                leader_proof: Some(proof),
-                phase: Phase::Abort,
-                flags: 0,
-                min_watermark_ms: None,
-            })
-            .unwrap(),
-        );
+        if announce {
+            kv.seed(
+                node_id,
+                ANNOUNCEMENT_KEY,
+                serde_json::to_string(&BarrierAnnouncement {
+                    epoch: attempt.epoch,
+                    checkpoint_id: attempt.checkpoint_id,
+                    assignment_fence: Some(fence.clone()),
+                    leader_proof: Some(proof),
+                    phase: Phase::Abort,
+                    flags: 0,
+                    min_watermark_ms: None,
+                })
+                .unwrap(),
+            );
+        }
         controller
     }
 
@@ -4253,6 +4439,157 @@ mod tests {
             "peer's pre-barrier row retained by the operator"
         );
         assert_eq!(got[0].num_rows(), batch.num_rows());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shuffle_scope_cancellation_preserves_holdover_for_the_next_attempt() {
+        use laminar_core::checkpoint::CheckpointBarrier;
+        use laminar_core::state::CheckpointAttempt;
+
+        let mut harness = three_node_alignment_harness().await;
+        let cancelled = CheckpointAttempt::new(7, 70);
+        let retained = stage_peer_two_data_and_barrier(&harness, cancelled).await;
+        let sender = Arc::clone(
+            &harness
+                .graph
+                .cluster_shuffle_config()
+                .expect("cluster shuffle")
+                .sender,
+        );
+        let live_peer_three = harness.waiting_peer_receiver.local_addr();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        sender
+            .register_peer(3, listener.local_addr().unwrap())
+            .await;
+        let accepted = Arc::new(tokio::sync::Notify::new());
+        let stalled_peer = {
+            let accepted = Arc::clone(&accepted);
+            tokio::spawn(async move {
+                let (_socket, _) = listener.accept().await.unwrap();
+                accepted.notify_one();
+                std::future::pending::<()>().await;
+            })
+        };
+        let outcome = {
+            let alignment = harness.graph.align_shuffle_barriers(
+                cancelled,
+                0,
+                &harness.fence,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                None,
+            );
+            tokio::pin!(alignment);
+            tokio::select! {
+                () = accepted.notified() => {}
+                result = &mut alignment => panic!("alignment completed before scope cancellation: {result:?}"),
+            }
+
+            sender.suspend_assignment_fence();
+            tokio::time::timeout(std::time::Duration::from_secs(1), &mut alignment)
+                .await
+                .expect("scope cancellation did not release barrier fan-out")
+                .unwrap()
+        };
+        assert_eq!(
+            outcome,
+            ShuffleAlignmentOutcome::ScopeCancelledBeforeStaging
+        );
+        assert!(
+            harness.recorded.lock().is_empty(),
+            "cancelled alignment staged checkpoint holdover"
+        );
+
+        harness
+            .local_receiver
+            .retire_checkpoint_barriers(cancelled, harness.fence.digest())
+            .unwrap();
+        sender.register_peer(3, live_peer_three).await;
+        assert!(sender
+            .install_assignment_fence(&harness.fence, &[1, 2, 3])
+            .unwrap());
+        let successor = CheckpointAttempt::new(8, 71);
+        harness
+            .peer_two_sender
+            .fan_out_barrier(
+                &[1, 3],
+                CheckpointBarrier::new(successor.checkpoint_id, successor.epoch),
+                &harness.fence,
+            )
+            .await
+            .unwrap();
+        harness
+            .peer_three_sender
+            .fan_out_barrier(
+                &[1, 2],
+                CheckpointBarrier::new(successor.checkpoint_id, successor.epoch),
+                &harness.fence,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            harness
+                .graph
+                .align_shuffle_barriers(
+                    successor,
+                    0,
+                    &harness.fence,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                    None,
+                )
+                .await
+                .unwrap(),
+            ShuffleAlignmentOutcome::Aligned
+        );
+        let recorded = harness.recorded.lock();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].num_rows(), retained.num_rows());
+        stalled_peer.abort();
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn receiver_scope_suspension_preserves_holdover_before_graph_staging() {
+        use laminar_core::state::CheckpointAttempt;
+
+        let mut harness = three_node_alignment_harness().await;
+        let cancelled = CheckpointAttempt::new(7, 70);
+        let retained = stage_peer_two_data_and_barrier(&harness, cancelled).await;
+        harness.local_receiver.suspend_assignment_fence();
+
+        let outcome = harness
+            .graph
+            .align_shuffle_barriers(
+                cancelled,
+                0,
+                &harness.fence,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ShuffleAlignmentOutcome::ScopeCancelledBeforeStaging
+        );
+        assert!(harness.recorded.lock().is_empty());
+
+        assert!(harness
+            .local_receiver
+            .install_assignment_fence(&harness.fence, &[1, 2, 3])
+            .unwrap());
+        harness
+            .local_receiver
+            .retire_checkpoint_barriers(cancelled, harness.fence.digest())
+            .unwrap();
+        let preserved = harness
+            .local_receiver
+            .drain_checkpointed_holdover()
+            .unwrap();
+        assert_eq!(preserved.len(), 1);
+        assert_eq!(preserved[0].0, "out");
+        assert_eq!(preserved[0].1.batch().num_rows(), retained.num_rows());
     }
 
     #[cfg(feature = "cluster")]
@@ -4321,6 +4658,36 @@ mod tests {
     }
 
     #[cfg(feature = "cluster")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shuffle_alignment_audits_durable_abort_when_announcement_is_lost() {
+        use laminar_core::state::CheckpointAttempt;
+
+        let mut harness = three_node_alignment_harness().await;
+        let attempt = CheckpointAttempt::new(9, 90);
+        let retained = stage_peer_two_data_and_barrier(&harness, attempt).await;
+        let controller =
+            alignment_abort_controller_with_announcement(&harness.fence, attempt, true, false)
+                .await;
+
+        let outcome = harness
+            .graph
+            .align_shuffle_barriers(
+                attempt,
+                0,
+                &harness.fence,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                Some(controller.as_ref()),
+            )
+            .await
+            .expect("the periodic authority audit must observe an Abort without gossip");
+
+        assert_eq!(outcome, ShuffleAlignmentOutcome::Aborted);
+        let recorded = harness.recorded.lock();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].num_rows(), retained.num_rows());
+    }
+
+    #[cfg(feature = "cluster")]
     #[tokio::test]
     async fn shuffle_alignment_does_not_trust_abort_hint_without_durable_outcome() {
         use laminar_core::state::CheckpointAttempt;
@@ -4329,11 +4696,59 @@ mod tests {
         let attempt = CheckpointAttempt::new(9, 90);
         let controller = alignment_abort_controller(&harness.fence, attempt, false).await;
 
+        let hint = OperatorGraph::wait_for_shuffle_alignment_terminal_hint(
+            Some(controller.as_ref()),
+            attempt,
+            None,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap()
+        .expect("Abort announcement must wake alignment");
+        assert_eq!(hint.epoch, attempt.epoch);
+        assert_eq!(hint.checkpoint_id, attempt.checkpoint_id);
+        assert_eq!(hint.phase, laminar_core::cluster::control::Phase::Abort);
         assert_eq!(
-            OperatorGraph::observe_shuffle_alignment_control(Some(controller.as_ref()), attempt)
-                .await
-                .unwrap(),
+            OperatorGraph::audit_shuffle_alignment_settlement(
+                Some(controller.as_ref()),
+                attempt,
+                &harness.fence,
+            )
+            .await
+            .unwrap(),
             None
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn shuffle_alignment_rejects_abort_with_a_different_assignment_certificate() {
+        use laminar_core::checkpoint::CheckpointAssignmentFence;
+        use laminar_core::state::CheckpointAttempt;
+
+        let harness = three_node_alignment_harness().await;
+        let attempt = CheckpointAttempt::new(9, 90);
+        let other_fence = CheckpointAssignmentFence::from_owner_map(
+            harness.fence.assignment_version,
+            &[1, 3, 2],
+            harness.fence.participants.clone(),
+        )
+        .unwrap();
+        let controller = alignment_abort_controller(&other_fence, attempt, true).await;
+
+        let error = OperatorGraph::audit_shuffle_alignment_settlement(
+            Some(controller.as_ref()),
+            attempt,
+            &harness.fence,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("different assignment certificate"),
+            "{error}"
         );
     }
 
@@ -4386,46 +4801,26 @@ mod tests {
     }
 
     #[cfg(feature = "cluster")]
-    #[test]
-    fn shuffle_alignment_treats_only_the_exact_abort_as_a_terminal_outcome() {
-        use laminar_core::cluster::control::{BarrierAnnouncement, Phase};
+    #[tokio::test]
+    async fn shuffle_alignment_rejects_newer_durable_terminal_without_announcement() {
         use laminar_core::state::CheckpointAttempt;
 
         let attempt = CheckpointAttempt::new(7, 70);
-        let announcement = |attempt: CheckpointAttempt, phase| BarrierAnnouncement {
-            epoch: attempt.epoch,
-            checkpoint_id: attempt.checkpoint_id,
-            assignment_fence: None,
-            leader_proof: None,
-            phase,
-            flags: 0,
-            min_watermark_ms: None,
-        };
-
-        assert_eq!(
-            OperatorGraph::classify_shuffle_alignment_control(
-                attempt,
-                &announcement(attempt, Phase::Abort),
-            )
-            .unwrap(),
-            Some(ShuffleAlignmentOutcome::Aborted)
-        );
-        assert_eq!(
-            OperatorGraph::classify_shuffle_alignment_control(
-                attempt,
-                &announcement(attempt, Phase::Prepare),
-            )
-            .unwrap(),
-            None
-        );
-
         let newer = CheckpointAttempt::new(8, 71);
-        let error = OperatorGraph::classify_shuffle_alignment_control(
+        let harness = three_node_alignment_harness().await;
+        let controller =
+            alignment_abort_controller_with_announcement(&harness.fence, newer, true, false).await;
+        let error = OperatorGraph::audit_shuffle_alignment_settlement(
+            Some(controller.as_ref()),
             attempt,
-            &announcement(newer, Phase::Abort),
+            &harness.fence,
         )
+        .await
         .unwrap_err();
-        assert!(error.to_string().contains("superseded"), "{error}");
+        assert!(
+            error.to_string().contains("superseded by durable terminal"),
+            "{error}"
+        );
     }
 
     #[cfg(feature = "cluster")]

@@ -2,12 +2,13 @@
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use object_store::path::Path as OsPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio::sync::watch;
@@ -1274,6 +1275,25 @@ pub struct LeaderLeaseStore {
     store: Arc<dyn ObjectStore>,
     ttl_ms: i64,
     prune_running: Arc<AtomicBool>,
+    outcome_audit_cache: Mutex<Option<ClusterOutcomeAuditCache>>,
+    outcome_audit_flights: Mutex<Vec<ClusterOutcomeAuditFlight>>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ClusterOutcomeAuditKey {
+    head: Option<OutcomeLink>,
+    floor: Option<AuthorityOutcomeFloor>,
+}
+
+struct ClusterOutcomeAuditCache {
+    key: ClusterOutcomeAuditKey,
+    authority_sequence: u64,
+    outcomes: Arc<[CheckpointOutcome]>,
+}
+
+struct ClusterOutcomeAuditFlight {
+    key: ClusterOutcomeAuditKey,
+    gate: Weak<tokio::sync::Mutex<()>>,
 }
 
 struct PruneLatchGuard(Arc<AtomicBool>);
@@ -1301,6 +1321,8 @@ impl LeaderLeaseStore {
             store,
             ttl_ms,
             prune_running: Arc::new(AtomicBool::new(false)),
+            outcome_audit_cache: Mutex::new(None),
+            outcome_audit_flights: Mutex::new(Vec::new()),
         }
     }
 
@@ -2551,24 +2573,105 @@ impl LeaderLeaseStore {
         Ok(outcomes)
     }
 
+    fn cluster_outcome_audit_key(head: &LeaderAuthorityRecord) -> ClusterOutcomeAuditKey {
+        ClusterOutcomeAuditKey {
+            head: head.outcome_head,
+            floor: head.outcome_floor.clone(),
+        }
+    }
+
+    fn cached_cluster_outcomes(
+        &self,
+        key: &ClusterOutcomeAuditKey,
+        authority_sequence: u64,
+    ) -> Option<Arc<[CheckpointOutcome]>> {
+        let mut cache = self.outcome_audit_cache.lock();
+        let cached = cache.as_mut().filter(|cached| cached.key == *key)?;
+        cached.authority_sequence = cached.authority_sequence.max(authority_sequence);
+        Some(cached.outcomes.clone())
+    }
+
+    fn install_cluster_outcome_audit(
+        &self,
+        key: ClusterOutcomeAuditKey,
+        authority_sequence: u64,
+        outcomes: Arc<[CheckpointOutcome]>,
+    ) {
+        let mut cache = self.outcome_audit_cache.lock();
+        if cache.as_ref().is_none_or(|cached| {
+            cached.authority_sequence < authority_sequence
+                || (cached.authority_sequence == authority_sequence && cached.key == key)
+        }) {
+            *cache = Some(ClusterOutcomeAuditCache {
+                key,
+                authority_sequence,
+                outcomes,
+            });
+        }
+    }
+
+    fn cluster_outcome_audit_gate(
+        &self,
+        key: &ClusterOutcomeAuditKey,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        let mut flights = self.outcome_audit_flights.lock();
+        flights.retain(|flight| flight.gate.strong_count() != 0);
+        if let Some(gate) = flights
+            .iter()
+            .find(|flight| flight.key == *key)
+            .and_then(|flight| flight.gate.upgrade())
+        {
+            return gate;
+        }
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        flights.push(ClusterOutcomeAuditFlight {
+            key: key.clone(),
+            gate: Arc::downgrade(&gate),
+        });
+        gate
+    }
+
+    async fn cached_audited_cluster_outcomes_from(
+        &self,
+        head: &LeaderAuthorityRecord,
+    ) -> Result<Arc<[CheckpointOutcome]>, ClusterCheckpointAuthorityError> {
+        let key = Self::cluster_outcome_audit_key(head);
+        if let Some(outcomes) = self.cached_cluster_outcomes(&key, head.lease.seq) {
+            return Ok(outcomes);
+        }
+
+        let gate = self.cluster_outcome_audit_gate(&key);
+        let _guard = gate.lock().await;
+        if let Some(outcomes) = self.cached_cluster_outcomes(&key, head.lease.seq) {
+            return Ok(outcomes);
+        }
+
+        let outcomes: Arc<[CheckpointOutcome]> =
+            Arc::from(self.audited_cluster_outcomes_from(head).await?);
+        self.install_cluster_outcome_audit(key, head.lease.seq, outcomes.clone());
+        Ok(outcomes)
+    }
+
     async fn audited_cluster_outcomes(
         &self,
     ) -> Result<
-        (Option<LeaderAuthorityRecord>, Vec<CheckpointOutcome>),
+        (Option<LeaderAuthorityRecord>, Arc<[CheckpointOutcome]>),
         ClusterCheckpointAuthorityError,
     > {
         const AUDIT_RETRIES: usize = 3;
         for attempt in 0..AUDIT_RETRIES {
             let Some(head) = self.load_record().await? else {
-                return Ok((None, Vec::new()));
+                *self.outcome_audit_cache.lock() = None;
+                return Ok((None, Arc::from([])));
             };
-            match self.audited_cluster_outcomes_from(&head).await {
+            match self.cached_audited_cluster_outcomes_from(&head).await {
                 Err(ClusterCheckpointAuthorityError::Decision(
                     DecisionError::InventoryChanged(_),
                 )) if attempt + 1 < AUDIT_RETRIES => {
                     tokio::task::yield_now().await;
                 }
-                result => return result.map(|outcomes| (Some(head), outcomes)),
+                Ok(outcomes) => return Ok((Some(head), outcomes)),
+                Err(error) => return Err(error),
             }
         }
         Err(DecisionError::InventoryChanged(
@@ -2800,7 +2903,7 @@ impl LeaderLeaseStore {
             if !current.lease.matches_proof(proof) {
                 return Err(ClusterCheckpointAuthorityError::Fenced);
             }
-            let outcomes = self.audited_cluster_outcomes_from(&current).await?;
+            let outcomes = self.cached_audited_cluster_outcomes_from(&current).await?;
             if let Some(winner) = outcomes
                 .iter()
                 .find(|outcome| outcome.epoch == candidate.epoch)
@@ -2865,6 +2968,13 @@ impl LeaderLeaseStore {
                 .await
             {
                 Ok(_) => {
+                    let mut appended = outcomes.to_vec();
+                    appended.push(candidate.clone());
+                    self.install_cluster_outcome_audit(
+                        Self::cluster_outcome_audit_key(&next),
+                        next.lease.seq,
+                        Arc::from(appended),
+                    );
                     self.schedule_history_prune();
                     return Ok(RecordOutcomeResult::Created(candidate));
                 }
@@ -3601,7 +3711,8 @@ impl LeaderLeaseStore {
     pub async fn cluster_outcomes(
         &self,
     ) -> Result<Vec<CheckpointOutcome>, ClusterCheckpointAuthorityError> {
-        let (head, mut outcomes) = self.audited_cluster_outcomes().await?;
+        let (head, outcomes) = self.audited_cluster_outcomes().await?;
+        let mut outcomes = outcomes.to_vec();
         if let Some(floor) = head.and_then(|head| head.outcome_floor) {
             outcomes.retain(|outcome| outcome.epoch >= floor.before_epoch);
         }
@@ -3624,7 +3735,65 @@ impl LeaderLeaseStore {
     pub async fn highest_cluster_terminal_outcome(
         &self,
     ) -> Result<Option<CheckpointOutcome>, ClusterCheckpointAuthorityError> {
-        Ok(self.audited_cluster_outcomes().await?.1.pop())
+        Ok(self.audited_cluster_outcomes().await?.1.last().cloned())
+    }
+
+    /// Return the exact immutable outcome for `attempt`, or an audited terminal outcome
+    /// that durably dominates it in both identity dimensions. Compacted continuity anchors are
+    /// included in the audit.
+    ///
+    /// # Errors
+    /// Returns an error for malformed attempt identity, conflicting outcome dimensions, or an
+    /// unavailable or invalid durable authority chain.
+    pub async fn cluster_attempt_settlement(
+        &self,
+        attempt: crate::state::CheckpointAttempt,
+    ) -> Result<Option<CheckpointOutcome>, ClusterCheckpointAuthorityError> {
+        use crate::state::CheckpointAttemptRelation;
+
+        if attempt.epoch == 0 || attempt.checkpoint_id == 0 {
+            return Err(DecisionError::Conflict(
+                "cluster checkpoint settlement requires nonzero attempt dimensions".into(),
+            )
+            .into());
+        }
+        let outcomes = self.audited_cluster_outcomes().await?.1;
+        if let Ok(index) = outcomes.binary_search_by_key(&attempt.epoch, |outcome| outcome.epoch) {
+            let exact_epoch = &outcomes[index];
+            if exact_epoch.checkpoint_id != attempt.checkpoint_id {
+                return Err(DecisionError::Conflict(format!(
+                    "cluster outcome epoch {} belongs to checkpoint {}, not pending checkpoint {}",
+                    attempt.epoch, exact_epoch.checkpoint_id, attempt.checkpoint_id
+                ))
+                .into());
+            }
+            return Ok(Some(exact_epoch.clone()));
+        }
+        if let Ok(index) =
+            outcomes.binary_search_by_key(&attempt.checkpoint_id, |outcome| outcome.checkpoint_id)
+        {
+            let exact_checkpoint = &outcomes[index];
+            return Err(DecisionError::Conflict(format!(
+                "cluster outcome checkpoint {} belongs to epoch {}, not pending epoch {}",
+                attempt.checkpoint_id, exact_checkpoint.epoch, attempt.epoch
+            ))
+            .into());
+        }
+        let Some(highest) = outcomes.last() else {
+            return Ok(None);
+        };
+        let highest_attempt =
+            crate::state::CheckpointAttempt::new(highest.epoch, highest.checkpoint_id);
+        match highest_attempt.relation_to(attempt) {
+            CheckpointAttemptRelation::Newer => Ok(Some(highest.clone())),
+            CheckpointAttemptRelation::Older => Ok(None),
+            CheckpointAttemptRelation::Exact => unreachable!("exact epoch was handled above"),
+            CheckpointAttemptRelation::Conflict => Err(DecisionError::Conflict(format!(
+                "cluster terminal outcome epoch {} checkpoint {} conflicts with pending epoch {} checkpoint {}",
+                highest.epoch, highest.checkpoint_id, attempt.epoch, attempt.checkpoint_id
+            ))
+            .into()),
+        }
     }
 
     async fn validate_cluster_recovery_cut(
@@ -6225,8 +6394,10 @@ mod tests {
     struct BlockingStore {
         inner: Arc<dyn ObjectStore>,
         blocked_path: OsPath,
+        block_put: bool,
         block_once: bool,
         block_after_put: bool,
+        block_get_once: bool,
         did_block: std::sync::atomic::AtomicBool,
         ambiguous_path: Option<OsPath>,
         did_return_ambiguous: std::sync::atomic::AtomicBool,
@@ -6298,7 +6469,8 @@ mod tests {
             payload: PutPayload,
             options: PutOptions,
         ) -> object_store::Result<object_store::PutResult> {
-            let should_block = location == &self.blocked_path
+            let should_block = self.block_put
+                && location == &self.blocked_path
                 && (!self.block_once
                     || !self
                         .did_block
@@ -6358,6 +6530,23 @@ mod tests {
             {
                 let mut get_counts = self.get_counts.lock().unwrap();
                 *get_counts.entry(location.to_string()).or_default() += 1;
+            }
+            if self.block_get_once
+                && location == &self.blocked_path
+                && !self
+                    .did_block
+                    .swap(true, std::sync::atomic::Ordering::AcqRel)
+            {
+                self.entered.add_permits(1);
+                let permit =
+                    self.release
+                        .acquire()
+                        .await
+                        .map_err(|error| object_store::Error::Generic {
+                            store: "BlockingStore",
+                            source: Box::new(error),
+                        })?;
+                permit.forget();
             }
             if location == &self.blocked_path
                 && !self
@@ -6471,8 +6660,39 @@ mod tests {
         let raw = Arc::new(BlockingStore {
             inner: Arc::new(InMemory::new()),
             blocked_path,
+            block_put: true,
             block_once: false,
             block_after_put: false,
+            block_get_once: false,
+            did_block: std::sync::atomic::AtomicBool::new(false),
+            ambiguous_path: None,
+            did_return_ambiguous: std::sync::atomic::AtomicBool::new(false),
+            replacement_on_get: None,
+            did_replace: std::sync::atomic::AtomicBool::new(false),
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+            get_counts: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
+            fail_delete_once: Arc::new(std::sync::Mutex::new(None)),
+            track_capsule_get_concurrency: std::sync::atomic::AtomicBool::new(false),
+            active_capsule_gets: std::sync::atomic::AtomicUsize::new(0),
+            max_capsule_gets: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let object_store: Arc<dyn ObjectStore> = raw.clone();
+        let authority = Arc::new(LeaderLeaseStore::new(object_store, ttl_ms));
+        (raw, authority)
+    }
+
+    fn blocking_get_once_at(
+        ttl_ms: i64,
+        blocked_path: OsPath,
+    ) -> (Arc<BlockingStore>, Arc<LeaderLeaseStore>) {
+        let raw = Arc::new(BlockingStore {
+            inner: Arc::new(InMemory::new()),
+            blocked_path,
+            block_put: false,
+            block_once: true,
+            block_after_put: false,
+            block_get_once: true,
             did_block: std::sync::atomic::AtomicBool::new(false),
             ambiguous_path: None,
             did_return_ambiguous: std::sync::atomic::AtomicBool::new(false),
@@ -6502,8 +6722,10 @@ mod tests {
         let raw = Arc::new(BlockingStore {
             inner,
             blocked_path,
+            block_put: true,
             block_once: true,
             block_after_put: false,
+            block_get_once: false,
             did_block: std::sync::atomic::AtomicBool::new(false),
             ambiguous_path: None,
             did_return_ambiguous: std::sync::atomic::AtomicBool::new(false),
@@ -6529,8 +6751,10 @@ mod tests {
         let raw = Arc::new(BlockingStore {
             inner: Arc::new(InMemory::new()),
             blocked_path,
+            block_put: true,
             block_once: true,
             block_after_put: false,
+            block_get_once: false,
             did_block: std::sync::atomic::AtomicBool::new(false),
             ambiguous_path: None,
             did_return_ambiguous: std::sync::atomic::AtomicBool::new(false),
@@ -6557,8 +6781,10 @@ mod tests {
         let raw = Arc::new(BlockingStore {
             inner: Arc::new(InMemory::new()),
             blocked_path,
+            block_put: true,
             block_once: true,
             block_after_put: true,
+            block_get_once: false,
             did_block: std::sync::atomic::AtomicBool::new(false),
             ambiguous_path: None,
             did_return_ambiguous: std::sync::atomic::AtomicBool::new(false),
@@ -6584,8 +6810,10 @@ mod tests {
         let raw = Arc::new(BlockingStore {
             inner: Arc::new(InMemory::new()),
             blocked_path: OsPath::from("control/never-block"),
+            block_put: true,
             block_once: true,
             block_after_put: false,
+            block_get_once: false,
             did_block: std::sync::atomic::AtomicBool::new(false),
             ambiguous_path: Some(ambiguous_path),
             did_return_ambiguous: std::sync::atomic::AtomicBool::new(false),
@@ -8204,6 +8432,499 @@ mod tests {
                 DecisionError::Conflict(_)
             ))
         ));
+    }
+
+    #[tokio::test]
+    async fn cluster_attempt_settlement_returns_exact_or_strict_dominator() {
+        let store = store(1_000);
+        let incumbent = owner(1, 1, 1);
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let proof = first.proof();
+        let fence = assignment_fence(&incumbent);
+        store
+            .record_cluster_outcome(&proof, 1, 10, fence.clone(), CheckpointVerdict::Abort, None)
+            .await
+            .unwrap();
+        store
+            .record_cluster_outcome(&proof, 3, 30, fence, CheckpointVerdict::Abort, None)
+            .await
+            .unwrap();
+
+        let exact = store
+            .cluster_attempt_settlement(crate::state::CheckpointAttempt::new(1, 10))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((exact.epoch, exact.checkpoint_id), (1, 10));
+        let dominator = store
+            .cluster_attempt_settlement(crate::state::CheckpointAttempt::new(2, 20))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((dominator.epoch, dominator.checkpoint_id), (3, 30));
+        assert!(store
+            .cluster_attempt_settlement(crate::state::CheckpointAttempt::new(4, 40))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            store
+                .cluster_attempt_settlement(crate::state::CheckpointAttempt::new(2, 35))
+                .await,
+            Err(ClusterCheckpointAuthorityError::Decision(
+                DecisionError::Conflict(_)
+            ))
+        ));
+        assert!(matches!(
+            store
+                .cluster_attempt_settlement(crate::state::CheckpointAttempt::new(2, 10))
+                .await,
+            Err(ClusterCheckpointAuthorityError::Decision(
+                DecisionError::Conflict(_)
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn cluster_attempt_settlement_preserves_fences_across_outcome_compaction() {
+        let store = store(1);
+        let incumbent = owner(1, 11, 7);
+        let successor = owner(2, 22, 8);
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let incumbent_proof = first.proof();
+        let incumbent_fence = assignment_fence(&incumbent);
+        store
+            .record_cluster_outcome(
+                &incumbent_proof,
+                1,
+                10,
+                incumbent_fence.clone(),
+                CheckpointVerdict::Abort,
+                None,
+            )
+            .await
+            .unwrap();
+        let compacted_sequence = store.load_record().await.unwrap().unwrap().lease.seq;
+
+        let observation = store.observe_rival(&successor, &first).unwrap();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let LeaseOutcome::Acquired(takeover) = store
+            .try_takeover(&successor, &observation, 2)
+            .await
+            .unwrap()
+        else {
+            panic!("successor must acquire after a full observation");
+        };
+        let successor_proof = takeover.proof();
+        let successor_fence = CheckpointAssignmentFence::from_owner_map(
+            2,
+            &[successor.node.0],
+            vec![crate::checkpoint::CheckpointParticipant {
+                node_id: successor.node.0,
+                boot_incarnation: successor.boot,
+            }],
+        )
+        .unwrap();
+        record_commit(&store, &successor_proof, &successor_fence, 3, 30).await;
+
+        assert_eq!(
+            store
+                .prune_cluster_outcomes_before(&successor_proof, 3, accept_recovery_artifacts,)
+                .await
+                .unwrap(),
+            3
+        );
+        LeaderLeaseStore::prune_history(&store.store, 0)
+            .await
+            .unwrap();
+        assert!(
+            read_authority_record(store.store.as_ref(), compacted_sequence)
+                .await
+                .unwrap()
+                .is_none(),
+            "the exact outcome record must be physically pruned"
+        );
+
+        let exact_anchor = store
+            .cluster_attempt_settlement(crate::state::CheckpointAttempt::new(1, 10))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(exact_anchor.verdict, CheckpointVerdict::Abort);
+        assert_eq!(
+            exact_anchor.assignment_fence.as_ref(),
+            Some(&incumbent_fence)
+        );
+        assert_eq!(exact_anchor.leader_proof.as_ref(), Some(&incumbent_proof));
+        assert_eq!(
+            exact_anchor
+                .leader_proof
+                .as_ref()
+                .unwrap()
+                .owner
+                .process_term,
+            incumbent.process_term
+        );
+
+        let strict_dominator = store
+            .cluster_attempt_settlement(crate::state::CheckpointAttempt::new(2, 20))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (strict_dominator.epoch, strict_dominator.checkpoint_id),
+            (3, 30)
+        );
+        assert_eq!(strict_dominator.verdict, CheckpointVerdict::Commit);
+        assert_eq!(
+            strict_dominator.assignment_fence.as_ref(),
+            Some(&successor_fence)
+        );
+        assert_eq!(
+            strict_dominator.leader_proof.as_ref(),
+            Some(&successor_proof)
+        );
+        assert_eq!(
+            strict_dominator
+                .leader_proof
+                .as_ref()
+                .unwrap()
+                .owner
+                .process_term,
+            successor.process_term
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_outcome_audit_cache_reuses_unchanged_head_and_reaudits_changed_head() {
+        let (raw, store) = blocking_store_at(
+            1_000,
+            OsPath::from("control/never-block-outcome-audit-cache"),
+        );
+        let incumbent = owner(1, 1, 1);
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let proof = first.proof();
+        let fence = assignment_fence(&incumbent);
+        store
+            .record_cluster_outcome(&proof, 1, 10, fence.clone(), CheckpointVerdict::Abort, None)
+            .await
+            .unwrap();
+        store
+            .record_cluster_outcome(&proof, 2, 20, fence.clone(), CheckpointVerdict::Abort, None)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while store.prune_running.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        *store.outcome_audit_cache.lock() = None;
+        raw.clear_get_counts();
+        let exact = store
+            .cluster_attempt_settlement(crate::state::CheckpointAttempt::new(1, 10))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((exact.epoch, exact.checkpoint_id), (1, 10));
+        assert_eq!(raw.get_count(&lease_path(2)), 1);
+
+        raw.clear_get_counts();
+        let highest = store
+            .highest_cluster_terminal_outcome()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((highest.epoch, highest.checkpoint_id), (2, 20));
+        assert_eq!(raw.get_count(&lease_path(3)), 1);
+        assert_eq!(raw.get_count(&lease_path(2)), 0);
+
+        let external = LeaderLeaseStore::new(raw.clone(), 1_000);
+        external
+            .record_cluster_outcome(&proof, 3, 30, fence, CheckpointVerdict::Abort, None)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while external.prune_running.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        raw.clear_get_counts();
+        let highest = store
+            .highest_cluster_terminal_outcome()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((highest.epoch, highest.checkpoint_id), (3, 30));
+        assert_eq!(raw.get_count(&lease_path(3)), 1);
+        assert_eq!(raw.get_count(&lease_path(2)), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_outcome_audits_read_each_history_link_once() {
+        let (raw, store) = blocking_get_once_at(1_000, lease_path(3));
+        raw.did_block.store(true, Ordering::Release);
+        let incumbent = owner(1, 1, 1);
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let proof = first.proof();
+        let fence = assignment_fence(&incumbent);
+        for (epoch, checkpoint_id) in [(1, 10), (2, 20), (3, 30)] {
+            store
+                .record_cluster_outcome(
+                    &proof,
+                    epoch,
+                    checkpoint_id,
+                    fence.clone(),
+                    CheckpointVerdict::Abort,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while store.prune_running.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        *store.outcome_audit_cache.lock() = None;
+        raw.clear_get_counts();
+        raw.did_block.store(false, Ordering::Release);
+        let first_store = Arc::clone(&store);
+        let first_audit =
+            tokio::spawn(async move { first_store.highest_cluster_terminal_outcome().await });
+        raw.entered.acquire().await.unwrap().forget();
+
+        let mut followers = Vec::new();
+        for _ in 0..16 {
+            let follower = Arc::clone(&store);
+            followers.push(tokio::spawn(async move {
+                follower.highest_cluster_terminal_outcome().await
+            }));
+        }
+        tokio::task::yield_now().await;
+        raw.release.add_permits(1);
+
+        assert_eq!(first_audit.await.unwrap().unwrap().unwrap().epoch, 3);
+        for follower in followers {
+            assert_eq!(follower.await.unwrap().unwrap().unwrap().epoch, 3);
+        }
+        assert_eq!(raw.get_count(&lease_path(3)), 1);
+        assert_eq!(raw.get_count(&lease_path(2)), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_outcome_audit_is_not_retained() {
+        let (raw, store) = blocking_store_at(
+            1_000,
+            OsPath::from("control/never-block-failed-outcome-audit"),
+        );
+        let incumbent = owner(1, 1, 1);
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let proof = first.proof();
+        let fence = assignment_fence(&incumbent);
+        for (epoch, checkpoint_id) in [(1, 10), (2, 20)] {
+            store
+                .record_cluster_outcome(
+                    &proof,
+                    epoch,
+                    checkpoint_id,
+                    fence.clone(),
+                    CheckpointVerdict::Abort,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while store.prune_running.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let path = lease_path(2);
+        let saved = raw.inner.get(&path).await.unwrap().bytes().await.unwrap();
+        raw.inner.delete(&path).await.unwrap();
+        *store.outcome_audit_cache.lock() = None;
+        assert!(matches!(
+            store.highest_cluster_terminal_outcome().await,
+            Err(ClusterCheckpointAuthorityError::Decision(
+                DecisionError::InventoryChanged(_)
+            ))
+        ));
+
+        raw.inner.put(&path, PutPayload::from(saved)).await.unwrap();
+        raw.clear_get_counts();
+        assert_eq!(
+            store
+                .highest_cluster_terminal_outcome()
+                .await
+                .unwrap()
+                .unwrap()
+                .epoch,
+            2
+        );
+        assert_eq!(raw.get_count(&path), 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_cluster_outcome_appends_do_not_reaudit_history() {
+        let (raw, store) = blocking_store_at(
+            1_000,
+            OsPath::from("control/never-block-outcome-hot-appends"),
+        );
+        let incumbent = owner(1, 1, 1);
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while store.prune_running.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        store.prune_running.store(true, Ordering::Release);
+        raw.clear_get_counts();
+
+        let proof = first.proof();
+        let fence = assignment_fence(&incumbent);
+        for epoch in 1..=8 {
+            store
+                .record_cluster_outcome(
+                    &proof,
+                    epoch,
+                    epoch * 10,
+                    fence.clone(),
+                    CheckpointVerdict::Abort,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        for sequence in 1..=8 {
+            assert_eq!(
+                raw.get_count(&lease_path(sequence)),
+                2,
+                "authority sequence {sequence} was re-read as append history"
+            );
+        }
+        assert_eq!(raw.get_count(&lease_path(9)), 0);
+        store.prune_running.store(false, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn older_concurrent_outcome_audit_cannot_replace_a_newer_cache_entry() {
+        let (raw, store) = blocking_get_once_at(1_000, lease_path(3));
+        let incumbent = owner(1, 1, 1);
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let proof = first.proof();
+        let fence = assignment_fence(&incumbent);
+        for (epoch, checkpoint_id) in [(1, 10), (2, 20)] {
+            store
+                .record_cluster_outcome(
+                    &proof,
+                    epoch,
+                    checkpoint_id,
+                    fence.clone(),
+                    CheckpointVerdict::Abort,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        *store.outcome_audit_cache.lock() = None;
+        let old_store = Arc::clone(&store);
+        let old_audit = tokio::spawn(async move {
+            old_store
+                .cluster_attempt_settlement(crate::state::CheckpointAttempt::new(1, 10))
+                .await
+        });
+        raw.entered.acquire().await.unwrap().forget();
+
+        store
+            .record_cluster_outcome(&proof, 3, 30, fence, CheckpointVerdict::Abort, None)
+            .await
+            .unwrap();
+        let newest = store
+            .highest_cluster_terminal_outcome()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((newest.epoch, newest.checkpoint_id), (3, 30));
+
+        raw.release.add_permits(1);
+        let old = old_audit.await.unwrap().unwrap().unwrap();
+        assert_eq!((old.epoch, old.checkpoint_id), (1, 10));
+        let cache = store.outcome_audit_cache.lock();
+        let cached = cache.as_ref().expect("newer audit must remain cached");
+        assert_eq!(cached.authority_sequence, 4);
+        assert_eq!(cached.outcomes.last().map(|outcome| outcome.epoch), Some(3));
+        drop(cache);
+
+        raw.clear_get_counts();
+        assert_eq!(
+            store
+                .highest_cluster_terminal_outcome()
+                .await
+                .unwrap()
+                .unwrap()
+                .epoch,
+            3
+        );
+        assert_eq!(raw.get_count(&lease_path(4)), 1);
+        assert_eq!(raw.get_count(&lease_path(3)), 0);
     }
 
     #[tokio::test]

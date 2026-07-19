@@ -2147,6 +2147,143 @@ impl ConnectorPipelineCallback {
         }
     }
 
+    #[cfg(feature = "cluster")]
+    async fn await_rejected_follower_settlement(
+        controller: &laminar_core::cluster::control::ClusterController,
+        attempt: CheckpointAttempt,
+        assignment_fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
+        deadline: tokio::time::Instant,
+    ) -> Result<(CheckpointAttempt, [u8; 32]), String> {
+        use laminar_core::cluster::control::Phase;
+
+        const AUDIT_FALLBACK_INITIAL: Duration = Duration::from_millis(250);
+        const AUDIT_FALLBACK_MAX: Duration = Duration::from_secs(2);
+
+        let authority = controller.checkpoint_authority().map_err(|error| {
+            format!("rejected follower checkpoint {attempt:?} has no durable authority: {error}")
+        })?;
+        let mut audit_fallback = AUDIT_FALLBACK_INITIAL;
+        let mut terminal_hint_consumed = false;
+        loop {
+            if !controller.process_lease_is_live() {
+                return Err(format!(
+                    "rejected follower checkpoint {attempt:?} lost process authority during durable settlement"
+                ));
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(format!(
+                    "rejected follower checkpoint {attempt:?} has no immutable Abort or newer terminal outcome"
+                ));
+            }
+            let settlement = tokio::select! {
+                biased;
+                () = controller.wait_for_process_lease_loss() => {
+                    return Err(format!(
+                        "rejected follower checkpoint {attempt:?} lost process authority during durable settlement"
+                    ));
+                }
+                result = tokio::time::timeout_at(
+                    deadline,
+                    authority.cluster_attempt_settlement(attempt),
+                ) => result,
+            }
+            .map_err(|_| {
+                format!(
+                    "durable settlement audit for rejected follower checkpoint {attempt:?} timed out"
+                )
+            })?
+            .map_err(|error| {
+                format!(
+                    "durable settlement audit for rejected follower checkpoint {attempt:?} failed: {error}"
+                )
+            })?;
+            let Some(outcome) = settlement else {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    continue;
+                }
+                let wait = audit_fallback.min(remaining);
+                if terminal_hint_consumed {
+                    tokio::select! {
+                        biased;
+                        () = controller.wait_for_process_lease_loss() => {
+                            return Err(format!(
+                                "rejected follower checkpoint {attempt:?} lost process authority during durable settlement"
+                            ));
+                        }
+                        () = tokio::time::sleep(wait) => {}
+                    }
+                } else {
+                    let observed = tokio::select! {
+                        biased;
+                        () = controller.wait_for_process_lease_loss() => {
+                            return Err(format!(
+                                "rejected follower checkpoint {attempt:?} lost process authority during durable settlement"
+                            ));
+                        }
+                        result = controller.wait_for_barrier(
+                                |candidate| {
+                                    let candidate_attempt = CheckpointAttempt::new(
+                                        candidate.epoch,
+                                        candidate.checkpoint_id,
+                                    );
+                                    match candidate_attempt.relation_to(attempt) {
+                                        CheckpointAttemptRelation::Newer => {
+                                            matches!(candidate.phase, Phase::Commit | Phase::Abort)
+                                        }
+                                        CheckpointAttemptRelation::Exact => {
+                                            candidate.phase == Phase::Abort
+                                        }
+                                        CheckpointAttemptRelation::Older
+                                        | CheckpointAttemptRelation::Conflict => false,
+                                    }
+                                },
+                                wait,
+                            ) => result,
+                    }
+                    .map_err(|error| {
+                            format!(
+                                "terminal hint observation for rejected follower checkpoint {attempt:?} failed: {error}"
+                            )
+                        })?;
+                    terminal_hint_consumed = observed.is_some();
+                }
+                audit_fallback = audit_fallback.saturating_mul(2).min(AUDIT_FALLBACK_MAX);
+                continue;
+            };
+            let settled = CheckpointAttempt::new(outcome.epoch, outcome.checkpoint_id);
+            match settled.relation_to(attempt) {
+                CheckpointAttemptRelation::Exact => {
+                    if outcome.assignment_fence.as_ref() != Some(assignment_fence) {
+                        return Err(format!(
+                            "durable outcome for rejected follower checkpoint {attempt:?} has a different assignment certificate"
+                        ));
+                    }
+                    if outcome.is_commit() {
+                        return Err(format!(
+                            "rejected follower checkpoint {attempt:?} conflicts with its durable Commit"
+                        ));
+                    }
+                    return Ok((settled, assignment_fence.digest()));
+                }
+                CheckpointAttemptRelation::Newer => {
+                    let fence = outcome.assignment_fence.as_ref().ok_or_else(|| {
+                        format!(
+                            "newer durable settlement {settled:?} has no assignment certificate"
+                        )
+                    })?;
+                    return Ok((settled, fence.digest()));
+                }
+                CheckpointAttemptRelation::Older | CheckpointAttemptRelation::Conflict => {
+                    return Err(format!(
+                        "durable settlement {settled:?} does not close rejected follower checkpoint {attempt:?}"
+                    ));
+                }
+            }
+        }
+    }
+
     /// Hold the pipeline until the leader announces `Aligned` (or `Commit`/`Abort`/newer epoch).
     ///
     /// Prevents epoch-N+1 shuffle rows from reaching a peer still snapshotting epoch-N.
@@ -2695,7 +2832,26 @@ impl ConnectorPipelineCallback {
     }
 
     #[cfg(feature = "cluster")]
-    async fn abort_pending_follower_control(
+    async fn cancel_pending_follower_control(
+        &mut self,
+        attempt: CheckpointAttempt,
+    ) -> crate::pipeline::CheckpointControlOutcome {
+        let reason = "shuffle scope was cancelled before follower checkpoint staging";
+        match <Self as crate::pipeline::PipelineCallback>::cancel_source_barrier_attempt(
+            self, attempt, reason,
+        )
+        .await
+        {
+            Ok(()) => crate::pipeline::CheckpointControlOutcome::Cancelled { attempt },
+            Err(error) => {
+                set_checkpoint_fault(&self.checkpoint_fault, error.clone());
+                crate::pipeline::CheckpointControlOutcome::Failed { attempt, error }
+            }
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    fn abort_pending_follower_control(
         &mut self,
         attempt: CheckpointAttempt,
     ) -> crate::pipeline::CheckpointControlOutcome {
@@ -2834,7 +2990,21 @@ impl ConnectorPipelineCallback {
                     epoch = attempt.epoch,
                     "follower shuffle alignment observed the leader's checkpoint Abort"
                 );
-                return self.abort_pending_follower_control(attempt).await;
+                return self.abort_pending_follower_control(attempt);
+            }
+            Ok(ShuffleAlignmentOutcome::ScopeCancelledBeforeStaging) => {
+                if let Err(error) = self.require_process_authority("follower shuffle cancellation")
+                {
+                    return self
+                        .fail_pending_follower_control(attempt, error.to_string())
+                        .await;
+                }
+                tracing::info!(
+                    checkpoint_id = attempt.checkpoint_id,
+                    epoch = attempt.epoch,
+                    "follower shuffle scope closed before checkpoint staging"
+                );
+                return self.cancel_pending_follower_control(attempt).await;
             }
             Err(error) => {
                 tracing::warn!(%error, "follower shuffle alignment failed — skipping");
@@ -2984,6 +3154,15 @@ impl ConnectorPipelineCallback {
         {
             Ok(ShuffleAlignmentOutcome::Aligned) => {}
             Ok(ShuffleAlignmentOutcome::Aborted) => return BarrierOutcome::Aborted,
+            Ok(ShuffleAlignmentOutcome::ScopeCancelledBeforeStaging) => {
+                if self
+                    .require_process_authority("deferred follower shuffle cancellation")
+                    .is_err()
+                {
+                    return BarrierOutcome::Failed;
+                }
+                return BarrierOutcome::CancelledBeforeCapture;
+            }
             Err(error) => {
                 tracing::warn!(%error, "follower deferred shuffle alignment failed");
                 set_checkpoint_fault(&self.checkpoint_fault, error.to_string());
@@ -3063,13 +3242,17 @@ impl ConnectorPipelineCallback {
         let outcome = self
             .align_follower_shuffle_until(controller, attempt, assignment_fence, deadline)
             .await?;
-        if outcome == ShuffleAlignmentOutcome::Aborted {
-            tracing::info!(
-                checkpoint_id = attempt.checkpoint_id,
-                epoch = attempt.epoch,
-                "follower shuffle alignment observed the leader's checkpoint Abort"
-            );
-            return Ok(outcome);
+        match outcome {
+            ShuffleAlignmentOutcome::Aligned => {}
+            ShuffleAlignmentOutcome::Aborted => {
+                tracing::info!(
+                    checkpoint_id = attempt.checkpoint_id,
+                    epoch = attempt.epoch,
+                    "follower shuffle alignment observed the leader's checkpoint Abort"
+                );
+                return Ok(outcome);
+            }
+            ShuffleAlignmentOutcome::ScopeCancelledBeforeStaging => return Ok(outcome),
         }
 
         // A trailing shuffle gap discovered during alignment must not be sealed cluster-wide.
@@ -3163,6 +3346,10 @@ impl ConnectorPipelineCallback {
         let leader_proof = self.checkpoint_leader_proofs.remove(&attempt);
         #[cfg(not(feature = "cluster"))]
         let leader_proof = None;
+        #[cfg(feature = "cluster")]
+        let retirement_digest = assignment_fence
+            .as_ref()
+            .map(laminar_core::checkpoint::CheckpointAssignmentFence::digest);
         let deadline = tokio::time::Instant::now() + self.checkpoint_cleanup_timeout;
         let mut cleanup_errors = Vec::new();
         let cleanup_result = cleanup_reserved_attempt_until(
@@ -3177,6 +3364,13 @@ impl ConnectorPipelineCallback {
         if let Err(error) = cleanup_result {
             cleanup_errors.push(error);
         }
+        #[cfg(feature = "cluster")]
+        if cleanup_errors.is_empty() {
+            if let Err(error) = self.retire_shuffle_checkpoint_barriers(attempt, retirement_digest)
+            {
+                cleanup_errors.push(error);
+            }
+        }
         if cleanup_errors.is_empty() {
             Ok(())
         } else {
@@ -3190,6 +3384,69 @@ impl ConnectorPipelineCallback {
             set_checkpoint_fault(&self.checkpoint_fault, error.clone());
             Err(error)
         }
+    }
+
+    #[cfg(feature = "cluster")]
+    fn retire_shuffle_checkpoint_barriers(
+        &self,
+        attempt: CheckpointAttempt,
+        assignment_digest: Option<[u8; 32]>,
+    ) -> Result<(), String> {
+        let Some(shuffle) = self.graph.cluster_shuffle_config() else {
+            return Ok(());
+        };
+        let assignment_digest = assignment_digest.ok_or_else(|| {
+            let error = format!(
+                "checkpoint {} epoch {} barrier retirement has no durable assignment digest",
+                attempt.checkpoint_id, attempt.epoch
+            );
+            set_checkpoint_fault(&self.checkpoint_fault, error.clone());
+            error
+        })?;
+        shuffle
+            .receiver
+            .retire_checkpoint_barriers(attempt, assignment_digest)
+            .map_err(|error| {
+                let error = format!(
+                    "checkpoint {} epoch {} barrier retirement failed: {error}",
+                    attempt.checkpoint_id, attempt.epoch
+                );
+                set_checkpoint_fault(&self.checkpoint_fault, error.clone());
+                error
+            })
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn reconcile_terminal_shuffle_barriers(
+        &mut self,
+        controller: &laminar_core::cluster::control::ClusterController,
+    ) -> Result<(), String> {
+        let has_staged_barrier = self
+            .graph
+            .cluster_shuffle_config()
+            .is_some_and(|shuffle| shuffle.receiver.stage_checkpointed_inbound());
+        if !has_staged_barrier {
+            return Ok(());
+        }
+        let authority = controller.checkpoint_authority().map_err(|error| {
+            format!("shuffle terminal reconciliation has no authority: {error}")
+        })?;
+        let terminal = tokio::time::timeout(
+            self.checkpoint_cleanup_timeout,
+            authority.highest_cluster_terminal_outcome(),
+        )
+        .await
+        .map_err(|_| "shuffle terminal authority audit timed out".to_string())?
+        .map_err(|error| format!("shuffle terminal authority audit failed: {error}"))?;
+        if let Some(terminal) = terminal {
+            let attempt = CheckpointAttempt::new(terminal.epoch, terminal.checkpoint_id);
+            let assignment_digest = terminal
+                .assignment_fence
+                .as_ref()
+                .map(laminar_core::checkpoint::CheckpointAssignmentFence::digest);
+            self.retire_shuffle_checkpoint_barriers(attempt, assignment_digest)?;
+        }
+        Ok(())
     }
 
     /// Align the cross-node shuffle for an already announced exact attempt.
@@ -4756,16 +5013,22 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     #[cfg(feature = "cluster")]
     async fn checkpoint_assignment_for_admission(
         &mut self,
-    ) -> Result<Option<laminar_core::cluster::control::CheckpointAssignmentFence>, String> {
-        self.reconcile_source_handoff_watermarks()?;
+    ) -> crate::pipeline::CheckpointAssignmentAdmission {
+        use crate::pipeline::CheckpointAssignmentAdmission;
+
+        if let Err(error) = self.reconcile_source_handoff_watermarks() {
+            return CheckpointAssignmentAdmission::Fault(error);
+        }
         let Some(controller) = self.cluster_controller.as_ref() else {
-            return Ok(None);
+            return CheckpointAssignmentAdmission::Ready(None);
         };
         let Some(registry) = self.vnode_registry.as_ref() else {
             tracing::error!(
                 "cluster checkpoint admission has no vnode registry; failing assignment fence"
             );
-            return Err("cluster checkpoint admission has no vnode registry".into());
+            return CheckpointAssignmentAdmission::Fault(
+                "cluster checkpoint admission has no vnode registry".into(),
+            );
         };
         let publication = registry.versioned_snapshot();
         if publication
@@ -4775,29 +5038,29 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                     .is_none_or(|reconciled| reconciled < installed)
             })
         {
-            return Err(format!(
+            return CheckpointAssignmentAdmission::Deferred(format!(
                 "assignment {} source handoff is not installed",
                 publication.version()
             ));
         }
         // The snapshot watcher performs the gossip scan off the hot path. Retain the exact
         // certificate so later capture/quorum/durable phases cannot silently switch generations.
-        let fence = controller
-            .checkpoint_assignment_fence(publication.version())
-            .ok_or_else(|| {
-                format!(
-                    "assignment {} is not checkpoint-ready",
-                    publication.version()
-                )
-            })?;
+        let Some(fence) = controller.checkpoint_assignment_fence(publication.version()) else {
+            return CheckpointAssignmentAdmission::Deferred(format!(
+                "assignment {} is not checkpoint-ready",
+                publication.version()
+            ));
+        };
         let verified = registry.versioned_snapshot();
         if verified.version() != publication.version()
             || verified.source_handoff_installed_version()
                 != publication.source_handoff_installed_version()
         {
-            return Err("assignment changed while checkpoint admission was being certified".into());
+            return CheckpointAssignmentAdmission::Deferred(
+                "assignment changed while checkpoint admission was being certified".into(),
+            );
         }
-        Ok(Some(fence))
+        CheckpointAssignmentAdmission::Ready(Some(fence))
     }
 
     fn checkpoint_control_wake(&self) -> Option<crate::pipeline::callback::CheckpointControlWake> {
@@ -4883,6 +5146,10 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 return crate::pipeline::CheckpointControlOutcome::AdmissionFailed {
                     error: format!("follower source handoff reconciliation failed: {error}"),
                 };
+            }
+            if let Err(error) = self.reconcile_terminal_shuffle_barriers(cc.as_ref()).await {
+                set_checkpoint_fault(&self.checkpoint_fault, error.clone());
+                return crate::pipeline::CheckpointControlOutcome::AdmissionFailed { error };
             }
             self.last_checkpoint_admission_failure = None;
             return if cc.is_leader() {
@@ -5029,6 +5296,20 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                     "leader shuffle alignment observed its checkpoint Abort"
                 );
                 return BarrierOutcome::Aborted;
+            }
+            Ok(ShuffleAlignmentOutcome::ScopeCancelledBeforeStaging) => {
+                if self
+                    .require_process_authority("checkpoint shuffle cancellation")
+                    .is_err()
+                {
+                    return BarrierOutcome::Failed;
+                }
+                tracing::info!(
+                    checkpoint_id = attempt.checkpoint_id,
+                    epoch = attempt.epoch,
+                    "leader shuffle scope closed before checkpoint staging"
+                );
+                return BarrierOutcome::CancelledBeforeCapture;
             }
             Err(error) => {
                 tracing::warn!(%error, "shuffle barrier alignment failed");
@@ -5332,6 +5613,14 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 set_checkpoint_fault(&self.checkpoint_fault, error.clone());
                 return Err(error);
             };
+            let Some(assignment_fence) = announcement.assignment_fence.clone() else {
+                let error = format!(
+                    "follower checkpoint {} epoch {} lost its assignment certificate during cancellation",
+                    attempt.checkpoint_id, attempt.epoch
+                );
+                set_checkpoint_fault(&self.checkpoint_fault, error.clone());
+                return Err(error);
+            };
             let cleanup_deadline = tokio::time::Instant::now() + self.checkpoint_cleanup_timeout;
             Self::reject_follower_capture(
                 Some(controller.as_ref()),
@@ -5343,49 +5632,47 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             )
             .await?;
 
-            if self.graph.cluster_shuffle_config().is_some() {
-                use laminar_core::cluster::control::Phase;
-
-                let released = tokio::time::timeout_at(
+            let retirement = if self.graph.cluster_shuffle_config().is_some() {
+                match Self::await_rejected_follower_settlement(
+                    controller.as_ref(),
+                    attempt,
+                    &assignment_fence,
                     cleanup_deadline,
-                    controller.wait_for_barrier(
-                        |candidate| {
-                            let candidate_attempt =
-                                CheckpointAttempt::new(candidate.epoch, candidate.checkpoint_id);
-                            match candidate_attempt.relation_to(attempt) {
-                                CheckpointAttemptRelation::Newer => true,
-                                CheckpointAttemptRelation::Exact => candidate.phase == Phase::Abort,
-                                CheckpointAttemptRelation::Older
-                                | CheckpointAttemptRelation::Conflict => false,
-                            }
-                        },
-                        self.checkpoint_cleanup_timeout,
-                    ),
                 )
-                .await;
-                let released = match released {
-                    Ok(Ok(released)) => released,
-                    Ok(Err(observation_error)) => {
+                .await
+                {
+                    Ok(retirement) => Some(retirement),
+                    Err(observation_error) => {
                         let error = format!(
-                            "follower checkpoint {} epoch {} cleanup observation failed; \
+                            "follower checkpoint {} epoch {} rejection has no verified durable settlement; \
                              reservation remains fenced: {observation_error}",
-                            attempt.checkpoint_id, attempt.epoch
+                            attempt.checkpoint_id, attempt.epoch,
                         );
                         set_checkpoint_fault(&self.checkpoint_fault, error.clone());
                         return Err(error);
                     }
-                    Err(_) => None,
-                };
-                if released.is_none() {
-                    let error = format!(
-                        "follower checkpoint {} epoch {} rejection was published but no Abort or newer epoch arrived before cleanup deadline",
-                        attempt.checkpoint_id, attempt.epoch
-                    );
-                    set_checkpoint_fault(&self.checkpoint_fault, error.clone());
-                    return Err(error);
                 }
-            }
+            } else {
+                None
+            };
 
+            if let Err(authority_error) =
+                self.require_process_authority("follower cancellation settlement")
+            {
+                let error = authority_error.to_string();
+                set_checkpoint_fault(&self.checkpoint_fault, error.clone());
+                return Err(error);
+            }
+            if let Some((settled, assignment_digest)) = retirement {
+                self.retire_shuffle_checkpoint_barriers(settled, Some(assignment_digest))?;
+            }
+            if let Err(authority_error) =
+                self.require_process_authority("follower cancellation release")
+            {
+                let error = authority_error.to_string();
+                set_checkpoint_fault(&self.checkpoint_fault, error.clone());
+                return Err(error);
+            }
             self.finish_pending_follower_attempt(attempt)
         }
         #[cfg(not(feature = "cluster"))]
@@ -5401,6 +5688,16 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     ) -> Result<(), String> {
         #[cfg(feature = "cluster")]
         {
+            let assignment_digest = self
+                .pending_follower_checkpoint
+                .as_ref()
+                .filter(|announcement| {
+                    CheckpointAttempt::new(announcement.epoch, announcement.checkpoint_id)
+                        == attempt
+                })
+                .and_then(|announcement| announcement.assignment_fence.as_ref())
+                .map(laminar_core::checkpoint::CheckpointAssignmentFence::digest);
+            self.retire_shuffle_checkpoint_barriers(attempt, assignment_digest)?;
             self.finish_pending_follower_attempt(attempt)
         }
         #[cfg(not(feature = "cluster"))]
@@ -7953,6 +8250,176 @@ mod tests {
     }
 
     #[cfg(feature = "cluster")]
+    async fn install_callback_shuffle(
+        callback: &mut ConnectorPipelineCallback,
+        fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
+    ) -> (
+        Arc<laminar_core::shuffle::ShuffleSender>,
+        Arc<laminar_core::shuffle::ShuffleReceiver>,
+    ) {
+        use laminar_core::cluster::control::LeaseDeadline;
+        use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
+        use laminar_core::state::{NodeId, VnodeRegistry};
+
+        let receiver = Arc::new(
+            ShuffleReceiver::bind(
+                7,
+                "127.0.0.1:0".parse().unwrap(),
+                "00000000-0000-0000-0000-000000000007".parse().unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        let sender = Arc::new(ShuffleSender::new(
+            1,
+            "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+        ));
+        let process_lease = Arc::new(LeaseDeadline::live_for(Duration::from_secs(60)));
+        receiver
+            .install_process_lease_deadline(Arc::clone(&process_lease))
+            .unwrap();
+        sender
+            .install_process_lease_deadline(process_lease)
+            .unwrap();
+        receiver.install_assignment_fence(fence, &[1, 7]).unwrap();
+        sender.install_assignment_fence(fence, &[1, 7]).unwrap();
+        sender.register_peer(7, receiver.local_addr()).await;
+        callback
+            .graph
+            .set_cluster_shuffle(crate::operator::sql_query::ClusterShuffleConfig {
+                registry: Arc::new(VnodeRegistry::single_owner(2, NodeId(7))),
+                sender: Arc::clone(&sender),
+                receiver: Arc::clone(&receiver),
+                self_id: NodeId(7),
+            });
+        (sender, receiver)
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn send_callback_shuffle_barrier(
+        sender: &laminar_core::shuffle::ShuffleSender,
+        fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
+        attempt: CheckpointAttempt,
+    ) {
+        use arrow_array::Int64Array;
+        use arrow_schema::{DataType, Field, Schema};
+        use laminar_core::checkpoint::CheckpointBarrier;
+        use laminar_core::shuffle::ShuffleMessage;
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![9]))],
+        )
+        .unwrap();
+        sender
+            .send_to(7, &ShuffleMessage::checkpointed("held".into(), 1, batch))
+            .await
+            .unwrap();
+        sender
+            .fan_out_barrier(
+                &[7],
+                CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch),
+                fence,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn stage_callback_shuffle_barrier(
+        sender: &laminar_core::shuffle::ShuffleSender,
+        receiver: &laminar_core::shuffle::ShuffleReceiver,
+        fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
+        attempt: CheckpointAttempt,
+    ) {
+        send_callback_shuffle_barrier(sender, fence, attempt).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !receiver.has_staged_checkpoint_barriers() {
+                assert!(receiver.drain_checkpointed_data_for("absent").is_empty());
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shuffle barrier did not enter the holdover");
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn await_callback_shuffle_data(
+        receiver: &laminar_core::shuffle::ShuffleReceiver,
+        stage: &str,
+    ) -> Vec<laminar_core::shuffle::ReceivedBatch> {
+        let result = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let batches = receiver.drain_checkpointed_data_for(stage);
+                if !batches.is_empty() {
+                    return batches;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        result.unwrap_or_else(|_| {
+            panic!(
+                "shuffle data did not become drainable: assignment={}, staged_barrier={}, loss={}",
+                receiver.assignment_version(),
+                receiver.has_staged_checkpoint_barriers(),
+                receiver
+                    .delivery_loss_incidents()
+                    .load(std::sync::atomic::Ordering::Acquire)
+            )
+        })
+    }
+
+    #[cfg(feature = "cluster")]
+    fn install_pending_follower_attempt(
+        callback: &mut ConnectorPipelineCallback,
+        announcement: laminar_core::cluster::control::BarrierAnnouncement,
+    ) -> crate::pipeline::callback::SourceBarrierControl {
+        use laminar_core::checkpoint::{CheckpointBarrier, CheckpointBarrierInjector};
+
+        let identity = ConnectorPipelineCallback::certified_announcement(&announcement).unwrap();
+        assert_eq!(
+            callback.follower_tail.reserve(identity),
+            Ok(FollowerAdmission::Reserved)
+        );
+        let attempt = CheckpointAttempt::new(announcement.epoch, announcement.checkpoint_id);
+        let (release_tx, _release_rx) = tokio::sync::watch::channel(None);
+        let control = crate::pipeline::callback::SourceBarrierControl::new(
+            CheckpointBarrierInjector::new(),
+            release_tx,
+        );
+        assert!(control.trigger(CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch)));
+        callback.barrier_injectors.push(control.clone());
+        callback.pending_follower_checkpoint = Some(announcement);
+        control
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn record_gate_abort(
+        controller: &laminar_core::cluster::control::ClusterController,
+        attempt: CheckpointAttempt,
+        fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
+    ) {
+        let authority = controller.checkpoint_authority().unwrap();
+        let proof = authority.load().await.unwrap().unwrap().proof();
+        authority
+            .record_cluster_outcome(
+                &proof,
+                attempt.epoch,
+                attempt.checkpoint_id,
+                fence.clone(),
+                laminar_core::checkpoint_decision::CheckpointVerdict::Abort,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "cluster")]
     #[tokio::test]
     async fn follower_rejection_publishes_negative_ack_and_cleans_local_attempt() {
         use laminar_core::checkpoint::{CheckpointBarrier, CheckpointBarrierInjector};
@@ -8016,6 +8483,422 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[tokio::test]
+    async fn shuffle_follower_rejection_accepts_exact_abort_or_newer_terminal() {
+        use laminar_core::cluster::control::{BarrierAnnouncement, Phase};
+
+        for dominated_by_successor in [false, true] {
+            let (_kv, controller, _leader_id, _members_tx, _decision_store) =
+                gate_controller().await;
+            let controller = Arc::new(controller);
+            let fence = assignment_fence(19, &[1, 7]);
+            let attempt = CheckpointAttempt::new(30, 300);
+            let mut callback = empty_callback_fixture();
+            callback.cluster_controller = Some(Arc::clone(&controller));
+            let (sender, receiver) = install_callback_shuffle(&mut callback, &fence).await;
+            stage_callback_shuffle_barrier(&sender, &receiver, &fence, attempt).await;
+
+            if dominated_by_successor {
+                let successor = CheckpointAttempt::new(31, 301);
+                let successor_fence = assignment_fence(20, &[1, 7]);
+                record_gate_abort(&controller, successor, &successor_fence).await;
+            } else {
+                record_gate_abort(&controller, attempt, &fence).await;
+            }
+            let announcement = BarrierAnnouncement {
+                epoch: attempt.epoch,
+                checkpoint_id: attempt.checkpoint_id,
+                assignment_fence: Some(fence.clone()),
+                leader_proof: Some(leader_proof(1)),
+                phase: Phase::Prepare,
+                flags: 0,
+                min_watermark_ms: None,
+            };
+            let control = install_pending_follower_attempt(&mut callback, announcement);
+
+            crate::pipeline::PipelineCallback::cancel_source_barrier_attempt(
+                &mut callback,
+                attempt,
+                "shuffle scope cancelled",
+            )
+            .await
+            .unwrap();
+
+            assert!(callback.pending_follower_checkpoint.is_none());
+            assert!(callback.follower_tail.in_flight().is_empty());
+            assert!(control.can_trigger());
+            assert!(callback.checkpoint_fault.lock().is_none());
+            assert!(!receiver.has_staged_checkpoint_barriers());
+            let held = await_callback_shuffle_data(&receiver, "held").await;
+            assert_eq!(held.len(), 1);
+            assert_eq!(held[0].batch().num_rows(), 1);
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn live_leader_durably_aborts_shuffle_follower_nack_before_retirement() {
+        use laminar_core::checkpoint_decision::CheckpointVerdict;
+        use laminar_core::cluster::control::barrier::BARRIER_ADDR_KEY;
+        use laminar_core::cluster::control::{
+            BarrierAnnouncement, ClusterController, ClusterKv, InMemoryKv, LeaseDeadline, Phase,
+            ProcessLease,
+        };
+        use laminar_core::cluster::discovery::{NodeInfo, NodeMetadata, NodeState};
+
+        let (follower_kv, follower, leader_id, follower_members_tx, decision_store) =
+            gate_controller().await;
+        let authority = follower.checkpoint_authority().unwrap();
+        let leader_grant = authority.load().await.unwrap().unwrap();
+        let leader_proof = leader_grant.proof();
+
+        let follower = Arc::new(follower);
+        let follower_deadline = Arc::new(LeaseDeadline::live_for(Duration::from_secs(60)));
+        follower
+            .set_process_lease_deadline(Arc::clone(&follower_deadline))
+            .unwrap();
+        let follower_lease = ProcessLease {
+            node: follower.instance_id(),
+            owner: follower.recovery_incarnation(),
+            term: 1,
+            seq: 1,
+            expires_at_ms: i64::MAX,
+        };
+        follower
+            .start_leased_barrier_server("127.0.0.1:0".parse().unwrap(), None, &follower_lease)
+            .await
+            .unwrap();
+
+        let leader_kv = Arc::new(InMemoryKv::new(leader_id));
+        let leader_control: Arc<dyn ClusterKv> = leader_kv.clone();
+        let follower_info = NodeInfo {
+            id: follower.instance_id(),
+            name: "follower".into(),
+            rpc_address: String::new(),
+            raft_address: String::new(),
+            state: NodeState::Active,
+            metadata: NodeMetadata::default(),
+            last_heartbeat_ms: 0,
+        };
+        let (leader_members_tx, leader_members_rx) =
+            tokio::sync::watch::channel(vec![follower_info]);
+        let leader = Arc::new(ClusterController::new_with_recovery_incarnation(
+            leader_id,
+            Arc::clone(&leader_control),
+            leader_control,
+            None,
+            leader_members_rx,
+            leader_grant.owner.boot,
+        ));
+        leader.set_leader_lease_store(Arc::clone(&authority));
+        let leader_deadline = Arc::new(LeaseDeadline::live_for(Duration::from_secs(60)));
+        leader
+            .set_process_lease_deadline(Arc::clone(&leader_deadline))
+            .unwrap();
+        let (leader_grant_tx, leader_grant_rx) =
+            tokio::sync::watch::channel(Some(leader_grant.clone()));
+        leader
+            .set_leader_lease_watch(
+                leader_grant_rx,
+                leader_grant.owner.clone(),
+                Arc::clone(&leader_deadline),
+            )
+            .unwrap();
+        let leader_process_lease = ProcessLease {
+            node: leader_id,
+            owner: leader_grant.owner.boot,
+            term: leader_grant.owner.process_term,
+            seq: 1,
+            expires_at_ms: i64::MAX,
+        };
+        leader
+            .start_leased_barrier_server(
+                "127.0.0.1:0".parse().unwrap(),
+                None,
+                &leader_process_lease,
+            )
+            .await
+            .unwrap();
+        let follower_endpoint = follower_kv
+            .read_from(follower.instance_id(), BARRIER_ADDR_KEY)
+            .await
+            .expect("follower control endpoint must be advertised");
+        leader_kv.seed(follower.instance_id(), BARRIER_ADDR_KEY, follower_endpoint);
+        let leader_endpoint = leader_kv
+            .read_from(leader_id, BARRIER_ADDR_KEY)
+            .await
+            .expect("leader control endpoint must be advertised");
+        follower_kv.seed(leader_id, BARRIER_ADDR_KEY, leader_endpoint);
+
+        let fence = assignment_fence(19, &[leader_id.0, follower.instance_id().0]);
+        leader.publish_checkpoint_assignment_fence(Some(fence.clone()));
+        follower.publish_checkpoint_assignment_fence(Some(fence.clone()));
+        assert_eq!(leader.capture_leader_proof().as_ref(), Some(&leader_proof));
+
+        let attempt = CheckpointAttempt::new(30, 300);
+        let announcement = BarrierAnnouncement {
+            epoch: attempt.epoch,
+            checkpoint_id: attempt.checkpoint_id,
+            assignment_fence: Some(fence.clone()),
+            leader_proof: Some(leader_proof.clone()),
+            phase: Phase::Prepare,
+            flags: 0,
+            min_watermark_ms: None,
+        };
+        let mut follower_callback = empty_callback_fixture();
+        follower_callback.cluster_controller = Some(Arc::clone(&follower));
+        let (sender, receiver) = install_callback_shuffle(&mut follower_callback, &fence).await;
+        stage_callback_shuffle_barrier(&sender, &receiver, &fence, attempt).await;
+        let control =
+            install_pending_follower_attempt(&mut follower_callback, announcement.clone());
+
+        let checkpoint_dir = tempfile::tempdir().unwrap();
+        let store = Box::new(
+            laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
+                checkpoint_dir.path(),
+            ),
+        );
+        let mut coordinator = crate::checkpoint_coordinator::CheckpointCoordinator::new(
+            crate::checkpoint_coordinator::CheckpointConfig::default(),
+            store,
+        )
+        .await
+        .unwrap();
+        coordinator
+            .bind_durable_decision_store(Arc::clone(&decision_store))
+            .await
+            .unwrap();
+        coordinator.set_cluster_controller(Arc::clone(&leader));
+        coordinator.set_assignment_version(fence.assignment_version);
+        let coordinator = Arc::new(tokio::sync::Mutex::new(Some(coordinator)));
+        let (complete_tx, _complete_rx) =
+            crossfire::mpsc::bounded_async::<crate::pipeline::CheckpointCompletion>(1);
+        let in_flight = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let staged_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut request = crate::checkpoint_coordinator::CheckpointRequest::default();
+        request.assignment_fence = Some(fence.clone());
+        let tail = LeaderTail {
+            _in_flight: EpochInFlightGuard::claim(&in_flight, &staged_bytes, 0),
+            coordinator,
+            complete_tx,
+            request,
+            operator_state: None,
+            operator_state_encoded_budget: 0,
+            mutable_operator_capture_guard: None,
+            vnode_states: Default::default(),
+            fan_out: FxHashMap::default(),
+            local_watermark: CheckpointWatermark::Uninitialized,
+            attempt,
+            attempt_started: std::time::Instant::now(),
+            checkpoint_timeout: Duration::from_secs(2),
+            serialization_timeout: Duration::from_secs(1),
+            checkpoint_cleanup_timeout: Duration::from_secs(1),
+            fault_on_failure: false,
+            checkpoint_fault: Arc::new(parking_lot::Mutex::new(None)),
+            controller: Some(Arc::clone(&leader)),
+            leader_proof: Some(leader_proof),
+            quorum_timeout: Duration::from_secs(1),
+            delta_rebase_needed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        leader
+            .announce_prepare_barrier(&announcement, Duration::from_secs(1))
+            .await
+            .unwrap();
+        {
+            let cancellation = crate::pipeline::PipelineCallback::cancel_source_barrier_attempt(
+                &mut follower_callback,
+                attempt,
+                "shuffle scope cancelled",
+            );
+            tokio::pin!(cancellation);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut cancellation)
+                    .await
+                    .is_err(),
+                "a follower NACK must remain fenced without a durable terminal outcome"
+            );
+            assert!(authority
+                .cluster_attempt_settlement(attempt)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(receiver.has_staged_checkpoint_barriers());
+            assert!(!control.can_trigger());
+
+            let leader_tail = ConnectorPipelineCallback::prepare_leader_quorum(
+                &tail,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            );
+            let (quorum, cancellation_result) = tokio::join!(leader_tail, &mut cancellation);
+            assert!(
+                quorum.is_none(),
+                "the follower NACK must reject leader quorum"
+            );
+            cancellation_result.unwrap();
+        }
+
+        let outcome = authority
+            .cluster_attempt_settlement(attempt)
+            .await
+            .unwrap()
+            .expect("the live leader must durably settle the rejected attempt");
+        assert_eq!(outcome.epoch, attempt.epoch);
+        assert_eq!(outcome.checkpoint_id, attempt.checkpoint_id);
+        assert_eq!(outcome.verdict, CheckpointVerdict::Abort);
+        assert_eq!(outcome.assignment_fence.as_ref(), Some(&fence));
+        assert!(follower_callback.pending_follower_checkpoint.is_none());
+        assert!(follower_callback.follower_tail.in_flight().is_empty());
+        assert!(control.can_trigger());
+        assert!(!receiver.has_staged_checkpoint_barriers());
+
+        drop((leader_grant_tx, leader_members_tx, follower_members_tx));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn shuffle_follower_rejection_does_not_trust_abort_hint_without_outcome() {
+        use laminar_core::cluster::control::{BarrierAnnouncement, Phase, ANNOUNCEMENT_KEY};
+
+        let (kv, controller, leader_id, _members_tx, _decision_store) = gate_controller().await;
+        let controller = Arc::new(controller);
+        let fence = assignment_fence(19, &[1, 7]);
+        let attempt = CheckpointAttempt::new(30, 300);
+        let mut callback = empty_callback_fixture();
+        callback.checkpoint_cleanup_timeout = Duration::from_millis(30);
+        callback.cluster_controller = Some(Arc::clone(&controller));
+        let _ = install_callback_shuffle(&mut callback, &fence).await;
+        let mut announcement = BarrierAnnouncement {
+            epoch: attempt.epoch,
+            checkpoint_id: attempt.checkpoint_id,
+            assignment_fence: Some(fence),
+            leader_proof: Some(leader_proof(1)),
+            phase: Phase::Prepare,
+            flags: 0,
+            min_watermark_ms: None,
+        };
+        let control = install_pending_follower_attempt(&mut callback, announcement.clone());
+        announcement.phase = Phase::Abort;
+        kv.seed(
+            leader_id,
+            ANNOUNCEMENT_KEY,
+            serde_json::to_string(&announcement).unwrap(),
+        );
+
+        let error = crate::pipeline::PipelineCallback::cancel_source_barrier_attempt(
+            &mut callback,
+            attempt,
+            "shuffle scope cancelled",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("no verified durable settlement"), "{error}");
+        assert!(callback.pending_follower_checkpoint.is_some());
+        assert!(!control.can_trigger());
+        assert!(callback.checkpoint_fault.lock().is_some());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn shuffle_follower_rejection_faults_on_exact_durable_commit() {
+        use laminar_core::cluster::control::{BarrierAnnouncement, Phase};
+
+        let (_kv, controller, _leader_id, _members_tx, decision_store) = gate_controller().await;
+        let controller = Arc::new(controller);
+        let fence = assignment_fence(19, &[1, 7]);
+        let attempt = CheckpointAttempt::new(30, 300);
+        record_gate_commit(&controller, &decision_store, attempt, &fence).await;
+        let mut callback = empty_callback_fixture();
+        callback.cluster_controller = Some(Arc::clone(&controller));
+        let _ = install_callback_shuffle(&mut callback, &fence).await;
+        let control = install_pending_follower_attempt(
+            &mut callback,
+            BarrierAnnouncement {
+                epoch: attempt.epoch,
+                checkpoint_id: attempt.checkpoint_id,
+                assignment_fence: Some(fence),
+                leader_proof: Some(leader_proof(1)),
+                phase: Phase::Prepare,
+                flags: 0,
+                min_watermark_ms: None,
+            },
+        );
+
+        let error = crate::pipeline::PipelineCallback::cancel_source_barrier_attempt(
+            &mut callback,
+            attempt,
+            "shuffle scope cancelled",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("durable Commit"), "{error}");
+        assert!(callback.pending_follower_checkpoint.is_some());
+        assert!(!control.can_trigger());
+        assert!(callback.checkpoint_fault.lock().is_some());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn terminal_reconciliation_retires_barrier_without_local_prepare_admission() {
+        use laminar_core::cluster::control::LeaseDeadline;
+
+        let (_kv, controller, _leader_id, _members_tx, _decision_store) = gate_controller().await;
+        controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+            .unwrap();
+        let controller = Arc::new(controller);
+        let fence = assignment_fence(19, &[1, 7]);
+        let attempt = CheckpointAttempt::new(30, 300);
+        let mut callback = empty_callback_fixture();
+        callback.cluster_controller = Some(Arc::clone(&controller));
+        let (sender, receiver) = install_callback_shuffle(&mut callback, &fence).await;
+        send_callback_shuffle_barrier(&sender, &fence, attempt).await;
+        assert!(!receiver.has_staged_checkpoint_barriers());
+        record_gate_abort(&controller, attempt, &fence).await;
+
+        let outcome = crate::pipeline::PipelineCallback::service_checkpoint_control(
+            &mut callback,
+            FxHashMap::default(),
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            crate::pipeline::CheckpointControlOutcome::Idle
+        ));
+        assert!(callback.pending_follower_checkpoint.is_none());
+        assert!(callback.checkpoint_fault.lock().is_none());
+        assert!(!receiver.has_staged_checkpoint_barriers());
+        let held = await_callback_shuffle_data(&receiver, "held").await;
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].batch().num_rows(), 1);
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn barrier_retirement_conflict_faults_at_least_once_callback() {
+        let (_kv, _controller, _leader_id, _members_tx, _decision_store) = gate_controller().await;
+        let fence = assignment_fence(19, &[1, 7]);
+        let mut callback = empty_callback_fixture();
+        let (_sender, receiver) = install_callback_shuffle(&mut callback, &fence).await;
+        receiver
+            .retire_checkpoint_barriers(CheckpointAttempt::new(40, 400), fence.digest())
+            .unwrap();
+
+        let error = callback
+            .retire_shuffle_checkpoint_barriers(
+                CheckpointAttempt::new(41, 399),
+                Some(fence.digest()),
+            )
+            .unwrap_err();
+
+        assert!(error.contains("conflicts with high-water"), "{error}");
+        assert!(callback.checkpoint_fault.lock().is_some());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
     async fn follower_rejection_keeps_source_fenced_when_ack_publication_fails() {
         use laminar_core::checkpoint::{CheckpointBarrier, CheckpointBarrierInjector};
         use laminar_core::cluster::control::{
@@ -8071,6 +8954,76 @@ mod tests {
             "an unpublished rejection cannot reopen source intake"
         );
         assert_eq!(kv.read_from(controller.instance_id(), ACK_KEY).await, None);
+        assert!(callback.checkpoint_fault.lock().is_some());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn follower_rejection_keeps_source_fenced_when_process_lease_expires_during_settlement() {
+        use laminar_core::cluster::control::{
+            BarrierAnnouncement, ClusterKv, LeaseDeadline, Phase, ACK_KEY,
+        };
+
+        let (kv, controller, _leader_id, _members_tx, _decision_store) = gate_controller().await;
+        let process_lease = Arc::new(LeaseDeadline::live_for(Duration::from_secs(60)));
+        controller
+            .set_process_lease_deadline(Arc::clone(&process_lease))
+            .unwrap();
+        let controller = Arc::new(controller);
+        let fence = assignment_fence(20, &[1, 7]);
+        let attempt = CheckpointAttempt::new(31, 301);
+        let mut callback = empty_callback_fixture();
+        callback.cluster_controller = Some(Arc::clone(&controller));
+        let (sender, receiver) = install_callback_shuffle(&mut callback, &fence).await;
+        stage_callback_shuffle_barrier(&sender, &receiver, &fence, attempt).await;
+        let control = install_pending_follower_attempt(
+            &mut callback,
+            BarrierAnnouncement {
+                epoch: attempt.epoch,
+                checkpoint_id: attempt.checkpoint_id,
+                assignment_fence: Some(fence),
+                leader_proof: Some(leader_proof(1)),
+                phase: Phase::Prepare,
+                flags: 0,
+                min_watermark_ms: None,
+            },
+        );
+
+        let error = {
+            let cancellation = crate::pipeline::PipelineCallback::cancel_source_barrier_attempt(
+                &mut callback,
+                attempt,
+                "injected rejection",
+            );
+            tokio::pin!(cancellation);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    tokio::select! {
+                        result = &mut cancellation => {
+                            panic!("cancellation completed before settlement lease loss: {result:?}");
+                        }
+                        () = tokio::time::sleep(Duration::from_millis(5)) => {
+                            if kv.read_from(controller.instance_id(), ACK_KEY).await.is_some() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("follower rejection did not publish its negative acknowledgement");
+
+            process_lease.fence();
+            tokio::time::timeout(Duration::from_secs(1), &mut cancellation)
+                .await
+                .expect("process lease loss did not stop durable settlement")
+                .unwrap_err()
+        };
+
+        assert!(error.contains("lost process authority"), "{error}");
+        assert!(callback.pending_follower_checkpoint.is_some());
+        assert!(!control.can_trigger());
+        assert!(receiver.has_staged_checkpoint_barriers());
         assert!(callback.checkpoint_fault.lock().is_some());
     }
 
