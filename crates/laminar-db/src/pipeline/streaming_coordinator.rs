@@ -8372,8 +8372,7 @@ mod tests {
         coordinator.config.checkpoint_schedule =
             CheckpointSchedule::Periodic(Duration::from_secs(60));
         coordinator.last_checkpoint = Instant::now() - Duration::from_secs(60);
-        coordinator.checkpoint_retry_not_before =
-            Some(Instant::now() - Duration::from_millis(1));
+        coordinator.checkpoint_retry_not_before = Some(Instant::now() - Duration::from_millis(1));
         coordinator.checkpoint_retry_backoff = Duration::from_millis(400);
         let previous_cadence = coordinator.last_checkpoint;
         let previous_retry = coordinator.checkpoint_retry_not_before;
@@ -8383,14 +8382,11 @@ mod tests {
         callback.barrier_outcome = Some(BarrierOutcome::Async);
 
         coordinator.maybe_checkpoint(&mut callback).await;
-        let barrier = poll.poll().expect("periodic source barrier was not injected");
+        let barrier = poll
+            .poll()
+            .expect("periodic source barrier was not injected");
         coordinator
-            .handle_barrier(
-                0,
-                &barrier,
-                &checkpoint_at(attempt.epoch),
-                &mut callback,
-            )
+            .handle_barrier(0, &barrier, &checkpoint_at(attempt.epoch), &mut callback)
             .await
             .unwrap();
 
@@ -8408,8 +8404,7 @@ mod tests {
         coordinator.config.checkpoint_schedule =
             CheckpointSchedule::Periodic(Duration::from_secs(60));
         coordinator.last_checkpoint = Instant::now() - Duration::from_secs(60);
-        coordinator.checkpoint_retry_not_before =
-            Some(Instant::now() - Duration::from_millis(1));
+        coordinator.checkpoint_retry_not_before = Some(Instant::now() - Duration::from_millis(1));
         coordinator.checkpoint_retry_backoff = Duration::from_millis(400);
         let previous_cadence = coordinator.last_checkpoint;
         let previous_retry = coordinator.checkpoint_retry_not_before;
@@ -8475,10 +8470,8 @@ mod tests {
             assert_eq!(callback.reserve_calls, 0);
 
             coordinator.last_checkpoint = Instant::now() - interval;
-            let successor = CheckpointAttempt::new(
-                attempt.epoch + 100,
-                attempt.checkpoint_id + 1_000,
-            );
+            let successor =
+                CheckpointAttempt::new(attempt.epoch + 100, attempt.checkpoint_id + 1_000);
             callback.attempt_to_reserve = successor;
             callback.barrier_outcome = Some(BarrierOutcome::Committed(successor.epoch));
             coordinator.maybe_checkpoint(&mut callback).await;
@@ -8492,8 +8485,7 @@ mod tests {
         coordinator.config.checkpoint_schedule =
             CheckpointSchedule::Periodic(Duration::from_secs(60));
         coordinator.last_checkpoint = Instant::now() - Duration::from_secs(60);
-        coordinator.checkpoint_retry_not_before =
-            Some(Instant::now() - Duration::from_millis(1));
+        coordinator.checkpoint_retry_not_before = Some(Instant::now() - Duration::from_millis(1));
         coordinator.checkpoint_retry_backoff = Duration::from_millis(400);
         let previous_cadence = coordinator.last_checkpoint;
         let attempt = CheckpointAttempt::new(19, 190);

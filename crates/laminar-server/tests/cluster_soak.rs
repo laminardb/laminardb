@@ -1435,10 +1435,66 @@ fn initialized_offset_sum(label: &str, offsets: &[i64]) -> u64 {
 }
 
 #[cfg(feature = "kafka")]
+fn all_partition_offsets_advanced(start: &[i64], end: &[i64]) -> Result<bool, String> {
+    if start.is_empty() {
+        return Err("committed-offset frontier has no partitions".to_string());
+    }
+    if start.len() != end.len() {
+        return Err(format!(
+            "partition count changed from {} to {}",
+            start.len(),
+            end.len()
+        ));
+    }
+    let mut all_advanced = true;
+    for (partition, (start, end)) in start.iter().zip(end).enumerate() {
+        if *start < 0 || end < start {
+            return Err(format!(
+                "partition {partition} regressed or was uninitialized: {start}->{end}"
+            ));
+        }
+        all_advanced &= end > start;
+    }
+    Ok(all_advanced)
+}
+
+#[cfg(feature = "kafka")]
 fn timed_snapshot<T>(snapshot: impl FnOnce() -> T) -> (Instant, Instant, T) {
     let started = Instant::now();
     let value = snapshot();
     (started, Instant::now(), value)
+}
+
+#[cfg(feature = "kafka")]
+fn wait_for_committed_offset_advance(
+    nodes: &mut [Node],
+    producer: &mut ProducerGuard,
+    input: &KafkaCommitOracle,
+    baseline: &[i64],
+    window: Duration,
+    label: &str,
+) -> (Instant, Vec<i64>) {
+    let mut observed = None;
+    wait_for(
+        &format!("{label}: every Kafka source partition to advance its committed offset"),
+        window,
+        || {
+            assert_running_nodes(nodes);
+            producer.assert_running();
+            let Some(current) = input.committed_offsets() else {
+                return false;
+            };
+            match all_partition_offsets_advanced(baseline, &current) {
+                Ok(true) => {
+                    observed = Some((Instant::now(), current));
+                    true
+                }
+                Ok(false) => false,
+                Err(error) => panic!("{label}: invalid Kafka committed-offset frontier: {error}"),
+            }
+        },
+    );
+    observed.expect("committed-offset wait completed without an offset frontier")
 }
 
 #[cfg(feature = "kafka")]
@@ -1448,18 +1504,33 @@ fn assert_active_load_throughput(
     input: &KafkaCommitOracle,
     output: &KafkaOutputOracle,
     target_rps: u64,
+    recovery_ceiling: Duration,
 ) {
     assert_running_nodes(nodes);
     producer.assert_running();
+    let committed_seed = input
+        .committed_offsets()
+        .expect("active-load initial input committed-offset snapshot");
+    initialized_offset_sum(
+        "active-load initial input committed offsets",
+        &committed_seed,
+    );
+    // Kafka's committed frontier advances only after the asynchronous checkpoint tail completes.
+    // Anchor both ends on observable terminal cuts so a wall-clock endpoint cannot omit an entire
+    // in-flight checkpoint from an otherwise healthy throughput window.
+    let (durable_start_at, committed_start_offsets) = wait_for_committed_offset_advance(
+        nodes,
+        producer,
+        input,
+        &committed_seed,
+        recovery_ceiling,
+        "active-load durable baseline",
+    );
+    let committed_start = initialized_offset_sum(
+        "active-load input committed offsets",
+        &committed_start_offsets,
+    );
     let (offered_start_at, _, offered_start) = timed_snapshot(|| producer.enqueued());
-    let (durable_start_at, _, committed_start) = timed_snapshot(|| {
-        initialized_offset_sum(
-            "active-load input committed offsets",
-            &input
-                .committed_offsets()
-                .expect("active-load input committed-offset snapshot"),
-        )
-    });
     let (emitted_start_at, _, output_start) = timed_snapshot(|| {
         output
             .high_watermarks()
@@ -1472,19 +1543,28 @@ fn assert_active_load_throughput(
         std::thread::sleep(Duration::from_millis(100));
     }
     let (_, offered_end_at, offered_end) = timed_snapshot(|| producer.enqueued());
-    let (_, durable_end_at, committed_end) = timed_snapshot(|| {
-        initialized_offset_sum(
-            "active-load final input committed offsets",
-            &input
-                .committed_offsets()
-                .expect("active-load final input committed-offset snapshot"),
-        )
-    });
     let (_, emitted_end_at, output_end) = timed_snapshot(|| {
         output
             .high_watermarks()
             .expect("active-load final output high-watermark snapshot")
     });
+    let committed_at_deadline = input
+        .committed_offsets()
+        .expect("active-load deadline input committed-offset snapshot");
+    all_partition_offsets_advanced(&committed_start_offsets, &committed_at_deadline)
+        .unwrap_or_else(|error| panic!("active-load durable deadline: {error}"));
+    let (durable_end_at, committed_end_offsets) = wait_for_committed_offset_advance(
+        nodes,
+        producer,
+        input,
+        &committed_at_deadline,
+        recovery_ceiling,
+        "active-load durable endpoint",
+    );
+    let committed_end = initialized_offset_sum(
+        "active-load final input committed offsets",
+        &committed_end_offsets,
+    );
     let offered = offered_end
         .checked_sub(offered_start)
         .expect("producer enqueue count regressed");
@@ -1505,6 +1585,9 @@ fn assert_active_load_throughput(
     let durable_rps = durable as f64 / durable_elapsed;
     let emitted_rps = emitted as f64 / emitted_elapsed;
     let minimum_rps = target_rps as f64 * ACTIVE_LOAD_MINIMUM_RATIO;
+    eprintln!(
+        "soak: ACTIVE LOAD producer_accepted={offered_rps:.1} rps/{offered} records/{offered_elapsed:.1}s, durable_input={durable_rps:.1} rps/{durable} records/{durable_elapsed:.1}s, sink_output={emitted_rps:.1} rps/{emitted} records/{emitted_elapsed:.1}s"
+    );
     assert!(
         offered_rps >= minimum_rps,
         "active-load producer accepted only {offered_rps:.1} rps against target {target_rps} rps"
@@ -1516,9 +1599,6 @@ fn assert_active_load_throughput(
     assert!(
         emitted_rps >= minimum_rps,
         "LaminarDB sink output advanced at only {emitted_rps:.1} rps against target {target_rps} rps"
-    );
-    eprintln!(
-        "soak: ACTIVE LOAD producer_accepted={offered_rps:.1} rps/{offered_elapsed:.1}s, durable_input={durable_rps:.1} rps/{durable_elapsed:.1}s, sink_output={emitted_rps:.1} rps/{emitted_elapsed:.1}s"
     );
 }
 
@@ -3370,6 +3450,7 @@ fn three_node_kill9_soak() {
         &commit_oracle,
         &output_oracle,
         source_rps,
+        recovery_ceiling,
     );
     if let Some(evidence) = &explicit_fault_evidence {
         assert_explicit_fault_recovery_evidence(&nodes, evidence);
@@ -3984,6 +4065,29 @@ fn post_release_lifecycle_rejects_missing_or_pre_release_evidence() {
             .unwrap_err()
             .contains("duplicate checkpoint reservation")
     );
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn committed_offset_frontier_requires_every_partition_to_advance() {
+    assert!(all_partition_offsets_advanced(&[10, 20, 30], &[11, 21, 31]).unwrap());
+    assert!(!all_partition_offsets_advanced(&[10, 20, 30], &[11, 20, 31]).unwrap());
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn committed_offset_frontier_rejects_malformed_samples() {
+    let empty = all_partition_offsets_advanced(&[], &[]).unwrap_err();
+    assert!(empty.contains("no partitions"), "{empty}");
+
+    let changed = all_partition_offsets_advanced(&[10, 20], &[11]).unwrap_err();
+    assert!(changed.contains("partition count changed"), "{changed}");
+
+    let regressed = all_partition_offsets_advanced(&[10, 20], &[11, 19]).unwrap_err();
+    assert!(regressed.contains("partition 1 regressed"), "{regressed}");
+
+    let uninitialized = all_partition_offsets_advanced(&[-1, 20], &[0, 21]).unwrap_err();
+    assert!(uninitialized.contains("uninitialized"), "{uninitialized}");
 }
 
 #[cfg(feature = "kafka")]
