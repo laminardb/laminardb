@@ -1468,7 +1468,7 @@ impl ConnectorPipelineCallback {
             return Some(QuorumStage::RunInline);
         };
         let Some(assignment_fence) = tail.request.assignment_fence.as_ref() else {
-            Self::handle_leader_quorum_failure(
+            Self::handle_leader_pre_tail_failure(
                 tail,
                 "[LDB-6055] clustered durable tail lost its assignment certificate".into(),
             )
@@ -1476,7 +1476,7 @@ impl ConnectorPipelineCallback {
             return None;
         };
         let Some(leader_proof) = tail.leader_proof.as_ref() else {
-            Self::handle_leader_quorum_failure(
+            Self::handle_leader_pre_tail_failure(
                 tail,
                 "clustered durable tail lost its exact leader proof".into(),
             )
@@ -1484,7 +1484,7 @@ impl ConnectorPipelineCallback {
             return None;
         };
         if !controller.proof_is_live(leader_proof) {
-            Self::handle_leader_quorum_failure(
+            Self::handle_leader_pre_tail_failure(
                 tail,
                 "leadership changed before checkpoint quorum".into(),
             )
@@ -1522,7 +1522,7 @@ impl ConnectorPipelineCallback {
 
         match quorum_result {
             Ok((cluster_watermark, participants)) => {
-                if let Ok(Err(error)) = tokio::time::timeout_at(
+                let aligned_result = tokio::time::timeout_at(
                     deadline,
                     controller.announce_barrier(&BarrierAnnouncement {
                         epoch,
@@ -1534,12 +1534,44 @@ impl ConnectorPipelineCallback {
                         min_watermark_ms: cluster_watermark.active_value(),
                     }),
                 )
-                .await
-                {
-                    tracing::warn!(
-                        epoch, %error,
-                        "[LDB-6031] aligned announcement failed; peers resume on Commit"
-                    );
+                .await;
+                match aligned_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) if !controller.proof_is_live(leader_proof) => {
+                        Self::handle_leader_pre_tail_failure(
+                            tail,
+                            format!(
+                                "leadership changed while publishing checkpoint Aligned: {error}"
+                            ),
+                        )
+                        .await;
+                        return None;
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            epoch, %error,
+                            "[LDB-6031] aligned announcement failed; peers resume on Commit"
+                        );
+                    }
+                    Err(_) => {
+                        Self::handle_leader_pre_tail_failure(
+                            tail,
+                            format!(
+                                "Aligned publication exhausted the {:?} end-to-end checkpoint deadline",
+                                tail.checkpoint_timeout
+                            ),
+                        )
+                        .await;
+                        return None;
+                    }
+                }
+                if !controller.proof_is_live(leader_proof) {
+                    Self::handle_leader_pre_tail_failure(
+                        tail,
+                        "leadership changed after checkpoint Aligned publication".into(),
+                    )
+                    .await;
+                    return None;
                 }
                 Some(QuorumStage::Done {
                     cluster_watermark,
@@ -1548,19 +1580,25 @@ impl ConnectorPipelineCallback {
                 })
             }
             Err(message) => {
-                Self::handle_leader_quorum_failure(tail, message).await;
+                Self::handle_leader_pre_tail_failure(tail, message).await;
                 None
             }
         }
     }
 
     #[cfg(feature = "cluster")]
-    async fn handle_leader_quorum_failure(tail: &LeaderTail, message: String) {
+    async fn handle_leader_pre_tail_failure(tail: &LeaderTail, message: String) {
         let attempt = tail.attempt;
         let (epoch, checkpoint_id) = (attempt.epoch, attempt.checkpoint_id);
-        tracing::error!(checkpoint_id, epoch, error = %message, "[LDB-6032] quorum miss");
-        let terminal_error =
-            format!("checkpoint {checkpoint_id} epoch {epoch} quorum failed: {message}");
+        tracing::error!(
+            checkpoint_id,
+            epoch,
+            error = %message,
+            "[LDB-6032] checkpoint failed before its durable tail"
+        );
+        let terminal_error = format!(
+            "checkpoint {checkpoint_id} epoch {epoch} failed before its durable tail: {message}"
+        );
         fail_reserved_leader_attempt(tail, terminal_error, message).await;
     }
 
@@ -6025,6 +6063,157 @@ mod tests {
     #[cfg(feature = "cluster")]
     fn local_controller() -> Arc<laminar_core::cluster::control::ClusterController> {
         local_controller_with_kv().0
+    }
+
+    #[cfg(feature = "cluster")]
+    struct AuthoritativeLocalLeader {
+        controller: Arc<laminar_core::cluster::control::ClusterController>,
+        fence: laminar_core::checkpoint::CheckpointAssignmentFence,
+        proof: laminar_core::checkpoint::LeaderProof,
+    }
+
+    #[cfg(feature = "cluster")]
+    impl AuthoritativeLocalLeader {
+        fn prepare(
+            &self,
+            attempt: CheckpointAttempt,
+        ) -> laminar_core::cluster::control::BarrierAnnouncement {
+            use laminar_core::cluster::control::Phase;
+
+            certified_barrier(
+                attempt,
+                self.fence.clone(),
+                self.proof.clone(),
+                Phase::Prepare,
+            )
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn authoritative_local_leader(
+        control_kv: Arc<dyn laminar_core::cluster::control::ClusterKv>,
+    ) -> AuthoritativeLocalLeader {
+        use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
+        use laminar_core::cluster::control::{
+            ClusterController, LeaderLeaseOwner, LeaderLeaseStore, LeaseDeadline, LeaseOutcome,
+            ProcessLease,
+        };
+        use laminar_core::cluster::discovery::{NodeId, NodeInfo};
+
+        let node = NodeId(1);
+        let boot = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
+        let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
+            node,
+            Arc::clone(&control_kv),
+            control_kv,
+            None,
+            members_rx,
+            boot,
+        ));
+        let deadline = Arc::new(LeaseDeadline::live_for(Duration::from_secs(30)));
+        controller
+            .set_process_lease_deadline(Arc::clone(&deadline))
+            .unwrap();
+
+        let backing: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let authority = Arc::new(LeaderLeaseStore::new(backing, 1_000));
+        let owner = LeaderLeaseOwner {
+            node,
+            boot,
+            process_term: 1,
+        };
+        let LeaseOutcome::Acquired(grant) = authority.begin_new_term(&owner, 0).await.unwrap()
+        else {
+            panic!("test leader must acquire its durable term");
+        };
+        let (_grant_tx, grant_rx) = tokio::sync::watch::channel(Some(grant));
+        controller
+            .set_leader_lease_watch(grant_rx, owner, Arc::clone(&deadline))
+            .unwrap();
+        controller.set_leader_lease_store(authority);
+        controller.install_local_leader_proof_provider();
+        controller
+            .start_leased_barrier_server(
+                "127.0.0.1:0".parse().unwrap(),
+                None,
+                &ProcessLease {
+                    node,
+                    owner: boot,
+                    term: 1,
+                    seq: 1,
+                    expires_at_ms: i64::MAX,
+                },
+            )
+            .await
+            .unwrap();
+
+        let fence = CheckpointAssignmentFence::from_owner_map(
+            1,
+            &[node.0],
+            vec![CheckpointParticipant {
+                node_id: node.0,
+                boot_incarnation: boot,
+            }],
+        )
+        .unwrap();
+        controller.publish_checkpoint_assignment_fence(Some(fence.clone()));
+        let proof = controller.capture_leader_proof().unwrap();
+        AuthoritativeLocalLeader {
+            controller,
+            fence,
+            proof,
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn leader_only_prepare_quorum_admits_exact_aligned() {
+        use crate::checkpoint_coordinator::{CheckpointCoordinator, PrepareQuorum};
+        use laminar_core::cluster::control::{
+            BarrierAnnouncement, ClusterKv, InMemoryKv, Phase, ANNOUNCEMENT_KEY,
+        };
+        use laminar_core::cluster::discovery::NodeId;
+
+        let kv = Arc::new(InMemoryKv::new(NodeId(1)));
+        let control_kv: Arc<dyn ClusterKv> = kv.clone();
+        let leader = authoritative_local_leader(control_kv).await;
+        let attempt = CheckpointAttempt::new(7, 41);
+        let prepare = leader.prepare(attempt);
+        leader
+            .controller
+            .announce_prepare_barrier(&prepare, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        let (watermark, participants) = CheckpointCoordinator::run_prepare_quorum(
+            &leader.controller,
+            Duration::from_secs(1),
+            PrepareQuorum::new(
+                attempt,
+                CheckpointWatermark::Active(100),
+                &leader.fence,
+                &leader.proof,
+                false,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(watermark, CheckpointWatermark::Active(100));
+        assert!(participants.is_empty());
+
+        let aligned = BarrierAnnouncement {
+            phase: Phase::Aligned,
+            min_watermark_ms: Some(100),
+            ..prepare
+        };
+        leader.controller.announce_barrier(&aligned).await.unwrap();
+        let durable = kv.read_from(NodeId(1), ANNOUNCEMENT_KEY).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<BarrierAnnouncement>(&durable).unwrap(),
+            aligned
+        );
     }
 
     #[cfg(feature = "cluster")]

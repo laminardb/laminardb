@@ -233,12 +233,10 @@ pub struct BarrierAnnouncement {
     pub phase: Phase,
     /// Reserved for unaligned/other flags.
     pub flags: u64,
-    /// Cluster-wide minimum watermark at announce time: the `min`
-    /// across every live node's local watermark, computed by the
-    /// leader from follower acks (see [`BarrierAck::watermark`])
-    /// plus the leader's own watermark. Populated on
-    /// [`Phase::Commit`] announcements. `None` on `Prepare`/`Abort`
-    /// (computed only after acks are in) and on legacy payloads
+    /// Cluster-wide minimum watermark at announce time: the `min` across every participant's
+    /// local watermark, computed by the leader from follower acks (see [`BarrierAck::watermark`])
+    /// plus its own watermark. Populated on [`Phase::Aligned`] and retained on [`Phase::Commit`].
+    /// `None` on `Prepare`/`Abort`, when the cut has no active watermark, and on legacy payloads
     /// deserialised via the `#[serde(default)]` fallback.
     ///
     /// Consumers consult this value instead of their local watermark
@@ -274,16 +272,16 @@ fn merge_history_exact(
             current.epoch, current.checkpoint_id
         ));
     }
+    if current.phase == incoming.phase && current != incoming {
+        return Err(format!(
+            "conflicting {history} {:?} payloads for exact attempt ({}, {})",
+            current.phase, current.epoch, current.checkpoint_id
+        ));
+    }
     if is_terminal_phase(current.phase) && is_terminal_phase(incoming.phase) {
         if current.phase != incoming.phase {
             return Err(format!(
                 "conflicting {history} terminal phases for exact attempt ({}, {})",
-                current.epoch, current.checkpoint_id
-            ));
-        }
-        if !same_announcement_identity(&current, &incoming) {
-            return Err(format!(
-                "conflicting {history} barrier certificates for exact attempt ({}, {})",
                 current.epoch, current.checkpoint_id
             ));
         }
@@ -340,7 +338,12 @@ fn merge_observed_announcement(
             grpc.epoch, grpc.checkpoint_id, durable.epoch, durable.checkpoint_id
         )),
         CheckpointAttemptRelation::Exact => {
-            if is_terminal_phase(durable.phase) {
+            if grpc.phase == durable.phase && !is_terminal_phase(grpc.phase) && grpc != durable {
+                Err(format!(
+                    "conflicting direct and durable {:?} payloads for exact attempt ({}, {})",
+                    grpc.phase, grpc.epoch, grpc.checkpoint_id
+                ))
+            } else if is_terminal_phase(durable.phase) {
                 Ok(durable)
             } else if is_terminal_phase(grpc.phase) {
                 Ok(grpc)
@@ -372,6 +375,36 @@ fn merge_scanned_announcement(
             current.epoch, current.checkpoint_id, incoming.epoch, incoming.checkpoint_id
         )),
         CheckpointAttemptRelation::Exact => merge_history_exact(current, incoming, "durable"),
+    }
+}
+
+fn validate_publication_order(
+    current: &BarrierAnnouncement,
+    incoming: &BarrierAnnouncement,
+) -> Result<(), String> {
+    match announcement_attempt(incoming).relation_to(announcement_attempt(current)) {
+        CheckpointAttemptRelation::Newer => Ok(()),
+        CheckpointAttemptRelation::Older => Err(format!(
+            "stale barrier publication ({}, {}) cannot replace newer admitted attempt ({}, {})",
+            incoming.epoch, incoming.checkpoint_id, current.epoch, current.checkpoint_id
+        )),
+        CheckpointAttemptRelation::Conflict => Err(format!(
+            "conflicting barrier publication attempts: admitted ({}, {}), incoming ({}, {})",
+            current.epoch, current.checkpoint_id, incoming.epoch, incoming.checkpoint_id
+        )),
+        CheckpointAttemptRelation::Exact if current == incoming => Ok(()),
+        CheckpointAttemptRelation::Exact => {
+            let merged =
+                merge_history_exact(current.clone(), incoming.clone(), "local publication")?;
+            if merged == *incoming {
+                Ok(())
+            } else {
+                Err(format!(
+                    "barrier publication cannot regress exact attempt ({}, {}) from {:?} to {:?}",
+                    current.epoch, current.checkpoint_id, current.phase, incoming.phase
+                ))
+            }
+        }
     }
 }
 
@@ -728,15 +761,15 @@ struct GrpcState {
     /// pipeline's resume gate and the background durable tail — never
     /// steal announcements from each other.
     latest_rx: watch::Receiver<Option<BarrierAnnouncement>>,
+    /// Local half of the same ordered announcement stream used by the gRPC server. Cluster
+    /// leaders use it to observe their own reversible Aligned notification without polling the
+    /// durable fallback.
+    incoming_tx: crossfire::MAsyncTx<BarrierFlavor>,
     merge_error: Arc<parking_lot::Mutex<Option<String>>>,
     prepare_acks: Arc<parking_lot::Mutex<PrepareAckState>>,
-    /// The one clustered Prepare batch admitted after its durable announcement. Pending tasks are
-    /// owned here; once claimed, `wait_for_quorum` owns their structured cancellation. The
-    /// orchestration must finish or drop that future before publishing a terminal or successor.
+    /// The one clustered Prepare admitted after durable publication. It progresses from pending
+    /// fan-out through claimed quorum collection to an exact quorum-ready Aligned admission.
     prepare_fanout: parking_lot::Mutex<Option<PrepareFanoutState>>,
-    /// Serializes local durable publication with the corresponding Prepare fan-out transition.
-    /// Non-Prepare network delivery runs after this lock is released.
-    announcement_lock: tokio::sync::Mutex<()>,
     clients: BarrierClientPool,
     server_handle: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     relay_handle: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
@@ -1592,6 +1625,51 @@ async fn send_phase_rpc(
     }
 }
 
+/// Deliver a non-Prepare phase to remote participants over the low-latency notification path.
+#[cfg(feature = "cluster")]
+async fn send_phase_notifications(
+    state: &GrpcState,
+    kv: &Arc<dyn ClusterKv>,
+    ann: &BarrierAnnouncement,
+    expected: Vec<NodeId>,
+) -> Vec<Result<(), String>> {
+    let deadline = tokio::time::Instant::now() + PHASE_RPC_TIMEOUT;
+    futures::future::join_all(expected.into_iter().map(|peer| {
+        send_phase_rpc(
+            peer,
+            Arc::clone(&state.clients),
+            Arc::clone(kv),
+            ann.clone(),
+            deadline,
+        )
+    }))
+    .await
+}
+
+#[cfg(feature = "cluster")]
+fn send_local_phase_notification(
+    state: &GrpcState,
+    ann: &BarrierAnnouncement,
+    process_lease: &super::LeaseDeadline,
+) -> Result<(), String> {
+    if !process_lease.is_live() {
+        return Err("local process lease expired before barrier delivery".into());
+    }
+    match state.incoming_tx.try_send(ann.clone()) {
+        Ok(()) => {}
+        Err(crossfire::TrySendError::Full(_)) => {
+            return Err("local barrier announcement relay is full".into());
+        }
+        Err(crossfire::TrySendError::Disconnected(_)) => {
+            return Err("local barrier announcement relay is closed".into());
+        }
+    }
+    if !process_lease.is_live() {
+        return Err("local process lease expired during barrier delivery".into());
+    }
+    Ok(())
+}
+
 /// Typed prepare-failure classification for the quorum wait:
 /// `Unreachable` counts toward `TimedOut{missing}` (the peer cannot
 /// participate), `Nack` toward `Failed` (a live follower answered
@@ -1637,6 +1715,7 @@ fn prepare_fanout_budget(quorum_window: Duration) -> Result<PrepareFanoutBudget,
 enum PrepareFanoutState {
     Pending(PrepareFanoutBatch),
     Claimed(BarrierAnnouncement),
+    QuorumReached(BarrierAnnouncement),
 }
 
 #[cfg(feature = "cluster")]
@@ -1644,7 +1723,7 @@ impl PrepareFanoutState {
     const fn announcement(&self) -> &BarrierAnnouncement {
         match self {
             Self::Pending(batch) => &batch.announcement,
-            Self::Claimed(announcement) => announcement,
+            Self::Claimed(announcement) | Self::QuorumReached(announcement) => announcement,
         }
     }
 }
@@ -1813,13 +1892,26 @@ fn preflight_prepare_fanout(
     state: &GrpcState,
     prepare: &BarrierAnnouncement,
 ) -> Result<bool, String> {
-    let pending = state.prepare_fanout.lock();
+    let mut pending = state.prepare_fanout.lock();
     let Some(current) = pending.as_ref() else {
         return Ok(true);
     };
     match announcement_attempt(prepare).relation_to(announcement_attempt(current.announcement())) {
-        CheckpointAttemptRelation::Newer => Ok(true),
-        CheckpointAttemptRelation::Exact if current.announcement() == prepare => Ok(false),
+        CheckpointAttemptRelation::Newer => {
+            // Admission has already rejected attempt regression. Cancel the obsolete structured
+            // fan-out before cancellable durable I/O so it cannot complete after being superseded.
+            pending.take();
+            Ok(true)
+        }
+        CheckpointAttemptRelation::Exact if current.announcement() == prepare => match current {
+            PrepareFanoutState::Pending(_) => Ok(false),
+            PrepareFanoutState::Claimed(_) => {
+                Err("Prepare cannot be republished while its quorum is being collected".into())
+            }
+            PrepareFanoutState::QuorumReached(_) => {
+                Err("Prepare cannot regress an exact quorum-ready checkpoint".into())
+            }
+        },
         CheckpointAttemptRelation::Older => {
             Err("stale Prepare cannot replace a newer in-flight fan-out".into())
         }
@@ -1833,24 +1925,39 @@ fn preflight_prepare_fanout(
 }
 
 #[cfg(feature = "cluster")]
-fn retire_prepare_fanout(state: &GrpcState, announcement: &BarrierAnnouncement) {
-    let mut pending = state.prepare_fanout.lock();
-    let Some(current) = pending.as_ref() else {
-        return;
-    };
-    match announcement_attempt(announcement)
-        .relation_to(announcement_attempt(current.announcement()))
-    {
-        CheckpointAttemptRelation::Newer => {
-            pending.take();
+fn mark_prepare_quorum_reached(
+    state: &GrpcState,
+    prepare: &BarrierAnnouncement,
+) -> Result<(), String> {
+    let mut fanout = state.prepare_fanout.lock();
+    match fanout.take() {
+        Some(PrepareFanoutState::Claimed(claimed)) if claimed == *prepare => {
+            *fanout = Some(PrepareFanoutState::QuorumReached(claimed));
+            Ok(())
         }
-        CheckpointAttemptRelation::Exact if announcement.phase != Phase::Prepare => {
-            pending.take();
+        Some(other) => {
+            *fanout = Some(other);
+            Err("Prepare quorum completion lost its exact claimed fan-out".into())
         }
-        CheckpointAttemptRelation::Older
-        | CheckpointAttemptRelation::Conflict
-        | CheckpointAttemptRelation::Exact => {}
+        None => Err("Prepare quorum completion has no claimed fan-out".into()),
     }
+}
+
+#[cfg(feature = "cluster")]
+fn require_aligned_quorum(state: &GrpcState, aligned: &BarrierAnnouncement) -> Result<(), String> {
+    let fanout = state.prepare_fanout.lock();
+    let Some(PrepareFanoutState::QuorumReached(prepare)) = fanout.as_ref() else {
+        return Err("clustered Aligned requires a successful exact Prepare quorum".into());
+    };
+    if !same_announcement_identity(prepare, aligned) {
+        return Err("clustered Aligned does not match the exact reached Prepare quorum".into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cluster")]
+fn retire_prepare_fanout(state: &GrpcState) {
+    state.prepare_fanout.lock().take();
 }
 
 #[cfg(feature = "cluster")]
@@ -2049,9 +2156,18 @@ async fn prepare_peer_until_deadline(
     }
 }
 
+#[derive(Default)]
+struct AnnouncementPublicationState {
+    initialized: bool,
+    latest: Option<BarrierAnnouncement>,
+}
+
 /// Cross-instance barrier coordination.
 pub struct BarrierCoordinator {
     kv: Arc<dyn ClusterKv>,
+    /// Serializes local publication across every runtime mode. The latest admitted value advances
+    /// before cancellable I/O so an ambiguous write result cannot reopen an older phase.
+    publication: tokio::sync::Mutex<AnnouncementPublicationState>,
     #[cfg(feature = "cluster")]
     grpc: Arc<parking_lot::Mutex<Option<Arc<GrpcState>>>>,
     #[cfg(feature = "cluster")]
@@ -2092,6 +2208,7 @@ impl BarrierCoordinator {
     pub fn new(kv: Arc<dyn ClusterKv>) -> Self {
         Self {
             kv,
+            publication: tokio::sync::Mutex::new(AnnouncementPublicationState::default()),
             #[cfg(feature = "cluster")]
             grpc: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "cluster")]
@@ -2222,6 +2339,25 @@ impl BarrierCoordinator {
             )
         })?;
         self.validate_announcement_leader(ann, proof).await
+    }
+
+    #[cfg(feature = "cluster")]
+    fn require_exact_local_leader_proof(&self, ann: &BarrierAnnouncement) -> Result<(), String> {
+        let expected = ann
+            .leader_proof
+            .as_ref()
+            .ok_or_else(|| "assignment-certified barrier has no exact leader proof".to_string())?;
+        let provider = self
+            .local_leader_proof
+            .lock()
+            .clone()
+            .ok_or_else(|| "local leader proof provider is not installed".to_string())?;
+        if provider().as_ref() != Some(expected) {
+            return Err(
+                "assignment-certified barrier sender no longer owns its exact leader proof".into(),
+            );
+        }
+        Ok(())
     }
 
     #[cfg(feature = "cluster")]
@@ -2402,10 +2538,10 @@ impl BarrierCoordinator {
 
         let grpc_state = Arc::new(GrpcState {
             latest_rx,
+            incoming_tx,
             merge_error,
             prepare_acks,
             prepare_fanout: parking_lot::Mutex::new(None),
-            announcement_lock: tokio::sync::Mutex::new(()),
             clients,
             server_handle: Arc::new(parking_lot::Mutex::new(Some(server_task))),
             relay_handle: Arc::new(parking_lot::Mutex::new(Some(relay_task))),
@@ -2510,9 +2646,10 @@ impl BarrierCoordinator {
     /// Leader-side announcement for terminal, aligned, and assignment-less local/KV phases.
     ///
     /// # Errors
-    /// Assignment-certified Prepare must use [`Self::announce_prepare`] so its retry cadence is
-    /// derived from the configured quorum window. Other errors propagate validation, encoding,
-    /// and publication failures.
+    /// Assignment-certified Prepare must use [`Self::announce_prepare`]. Assignment-certified
+    /// reversible phases require a started leased barrier server, and Aligned requires the exact
+    /// Prepare to have completed [`Self::wait_for_quorum`]. Other errors propagate validation,
+    /// encoding, and publication failures.
     pub async fn announce(&self, ann: &BarrierAnnouncement) -> Result<(), String> {
         #[cfg(feature = "cluster")]
         if ann.phase == Phase::Prepare && ann.assignment_fence.is_some() {
@@ -2587,32 +2724,145 @@ impl BarrierCoordinator {
             self.validate_reversible_announcement(ann).await?;
             let (prepare_roster, prepare_budget) = prepare_fanout_plan(ann, prepare_quorum_window)?;
             let grpc_opt = self.grpc.lock().clone();
-            if let Some(state) = grpc_opt {
+            let process_bound = self.local_process.get().is_some();
+            match (process_bound, ann.assignment_fence.is_some()) {
+                (true, false) => {
+                    return Err(format!(
+                        "process-bound cluster {:?} requires an assignment certificate",
+                        ann.phase
+                    ));
+                }
+                (false, true) => {
+                    return Err(format!(
+                        "assignment-certified {:?} requires a process-bound leased endpoint",
+                        ann.phase
+                    ));
+                }
+                (true, true) | (false, false) => {}
+            }
+            if ann.assignment_fence.is_some()
+                && matches!(ann.phase, Phase::Prepare | Phase::Aligned)
+                && grpc_opt.is_none()
+            {
+                return Err(format!(
+                    "assignment-certified {:?} requires a started leased barrier server",
+                    ann.phase
+                ));
+            }
+            let phase_roster = if let Some(state) = grpc_opt.as_ref() {
                 let local_process = state.local_process.get().copied();
-                let phase_roster = if ann.phase == Phase::Prepare {
+                if ann.phase == Phase::Prepare {
                     None
                 } else {
                     clustered_phase_roster(ann, local_process)?
-                };
-                let announcement_guard = state.announcement_lock.lock().await;
+                }
+            } else {
+                None
+            };
+            let json = serde_json::to_string(ann).map_err(|e| e.to_string())?;
+            let mut publication = self.publication.lock().await;
+            if !publication.initialized {
+                publication.latest = self.scan_latest_announcement().await?;
+                publication.initialized = true;
+            }
+            if let Some(current) = publication.latest.as_ref() {
+                validate_publication_order(current, ann)?;
+            }
+
+            if let Some(state) = grpc_opt {
+                let certified_prepare = ann.phase == Phase::Prepare && prepare_roster.is_some();
+                if certified_prepare {
+                    self.require_live_bound_process_lease()?;
+                    self.require_exact_local_leader_proof(ann)?;
+                }
                 let replace_prepare_fanout = if prepare_roster.is_some() {
                     // Reject stale/equivocating retries before they can overwrite the durable
-                    // gossip slot. The announcement lock keeps this check and publication atomic
-                    // with respect to every local phase transition.
+                    // gossip slot. The publication lock keeps this check and durable mutation
+                    // atomic with respect to every local phase transition.
                     preflight_prepare_fanout(&state, ann)?
                 } else {
                     false
                 };
-                // Record the decision in KV before delivery, so a reclaiming
-                // leader's `max_announced()` and a recovering peer's KV fallback
-                // still see this epoch even if a peer RPC below fails and returns
-                // early (the RPC receiver does not persist the announcement).
-                let json = serde_json::to_string(ann).map_err(|e| e.to_string())?;
+                let certified_aligned = ann.phase == Phase::Aligned && phase_roster.is_some();
+                if certified_aligned {
+                    // Recheck authority after lock contention and require the exact Prepare quorum
+                    // before releasing any participant. Aligned remains reversible: it cannot
+                    // advance sources, commit sinks, authorize recovery, or collect old state.
+                    self.require_live_bound_process_lease()?;
+                    self.require_exact_local_leader_proof(ann)?;
+                    require_aligned_quorum(&state, ann)?;
+                    let process_lease = self
+                        .process_lease_deadline
+                        .get()
+                        .cloned()
+                        .ok_or_else(|| "process lease deadline is not installed".to_string())?;
+                    // Admission advances before cancellable I/O. An ambiguous durable error must
+                    // not reopen Prepare or allow a terminal attempt to regress locally.
+                    publication.latest = Some(ann.clone());
+
+                    let expected =
+                        phase_roster.expect("certified Aligned has an assignment roster");
+                    let remote = send_phase_notifications(&state, &self.kv, ann, expected);
+                    let local_result = send_local_phase_notification(&state, ann, &process_lease);
+                    let durable = self.kv.write_checked(ANNOUNCEMENT_KEY, json);
+                    tokio::pin!(remote);
+                    tokio::pin!(durable);
+                    let mut completed_remote = None;
+                    let durable_result = tokio::select! {
+                        result = &mut durable => result,
+                        results = &mut remote => {
+                            completed_remote = Some(results);
+                            durable.await
+                        }
+                    };
+                    let authority_result = self
+                        .require_live_bound_process_lease()
+                        .and_then(|()| self.require_exact_local_leader_proof(ann));
+                    drop(publication);
+                    authority_result?;
+
+                    let direct_results = match completed_remote {
+                        Some(results) => results,
+                        None => remote.await,
+                    };
+                    if let Err(error) = local_result {
+                        tracing::warn!(
+                            epoch = ann.epoch,
+                            error = %error,
+                            "local aligned announcement delivery failed; resume falls back to durable observation or Commit"
+                        );
+                    }
+                    for error in direct_results.into_iter().filter_map(Result::err) {
+                        tracing::warn!(
+                            epoch = ann.epoch,
+                            error = %error,
+                            "aligned announcement delivery failed; resume falls back to durable observation or Commit"
+                        );
+                    }
+                    self.require_live_bound_process_lease()?;
+                    self.require_exact_local_leader_proof(ann)?;
+                    durable_result
+                        .map_err(|error| format!("publish barrier announcement: {error}"))?;
+                    return Ok(());
+                }
+                // Prepare, terminal, and assignment-less phases remain durable-first. Recovery
+                // and irreversible decisions never depend on best-effort notification delivery.
+                if is_terminal_phase(ann.phase) {
+                    // Cancel superseded transport work at admission, before a cancellable durable
+                    // write. Publication ordering retains the terminal identity if I/O is
+                    // ambiguous, so the old Prepare must not remain actionable.
+                    retire_prepare_fanout(&state);
+                }
+                publication.latest = Some(ann.clone());
                 self.kv
                     .write_checked(ANNOUNCEMENT_KEY, json)
                     .await
                     .map_err(|error| format!("publish barrier announcement: {error}"))?;
                 if ann.phase == Phase::Prepare {
+                    if certified_prepare {
+                        self.require_live_bound_process_lease()?;
+                        self.require_exact_local_leader_proof(ann)?;
+                    }
                     if let Some(expected) = prepare_roster.filter(|_| replace_prepare_fanout) {
                         // Start the exact assignment-complete batch only after Prepare is durable.
                         // Local source fencing, shuffle alignment, and state capture can now run
@@ -2625,13 +2875,9 @@ impl BarrierCoordinator {
                             prepare_budget.expect("certified Prepare budget was validated"),
                         );
                     }
-                    drop(announcement_guard);
+                    drop(publication);
                 } else {
-                    // Retire a still-pending batch. A claimed batch's tasks are owned by the
-                    // quorum future; checkpoint orchestration completes or drops that future
-                    // before it publishes this terminal/successor phase.
-                    retire_prepare_fanout(&state, ann);
-                    drop(announcement_guard);
+                    drop(publication);
                     let expected = if let Some(roster) = phase_roster {
                         // The checkpoint certificate, not mutable membership, is the phase roster.
                         // This also removes a discovery/object-store scan from the clustered hot
@@ -2644,24 +2890,7 @@ impl BarrierCoordinator {
                             .await
                     };
 
-                    // One absolute deadline bounds the whole concurrent fan-out.
-                    // Reusing it for every peer prevents a slow address lookup or
-                    // live handler from extending the round one timeout at a time.
-                    let rpc_deadline = tokio::time::Instant::now() + PHASE_RPC_TIMEOUT;
-                    let mut futures = Vec::new();
-                    for peer in expected {
-                        let clients_pool = Arc::clone(&state.clients);
-                        let kv = Arc::clone(&self.kv);
-                        let ann_clone = ann.clone();
-                        futures.push(send_phase_rpc(
-                            peer,
-                            clients_pool,
-                            kv,
-                            ann_clone,
-                            rpc_deadline,
-                        ));
-                    }
-                    let results = futures::future::join_all(futures).await;
+                    let results = send_phase_notifications(&state, &self.kv, ann, expected).await;
                     for res in results {
                         match res {
                             Ok(()) => {}
@@ -2684,16 +2913,34 @@ impl BarrierCoordinator {
 
                 return Ok(());
             }
+
+            publication.latest = Some(ann.clone());
+            self.kv
+                .write_checked(ANNOUNCEMENT_KEY, json)
+                .await
+                .map_err(|error| format!("publish barrier announcement: {error}"))?;
+            return Ok(());
         }
 
         #[cfg(not(feature = "cluster"))]
-        let _ = prepare_quorum_window;
-        let json = serde_json::to_string(ann).map_err(|e| e.to_string())?;
-        self.kv
-            .write_checked(ANNOUNCEMENT_KEY, json)
-            .await
-            .map_err(|error| format!("publish barrier announcement: {error}"))?;
-        Ok(())
+        {
+            let _ = prepare_quorum_window;
+            let json = serde_json::to_string(ann).map_err(|e| e.to_string())?;
+            let mut publication = self.publication.lock().await;
+            if !publication.initialized {
+                publication.latest = self.scan_latest_announcement().await?;
+                publication.initialized = true;
+            }
+            if let Some(current) = publication.latest.as_ref() {
+                validate_publication_order(current, ann)?;
+            }
+            publication.latest = Some(ann.clone());
+            self.kv
+                .write_checked(ANNOUNCEMENT_KEY, json)
+                .await
+                .map_err(|error| format!("publish barrier announcement: {error}"))?;
+            Ok(())
+        }
     }
 
     /// Watch over gRPC-delivered announcements, for push-driven waits
@@ -2756,19 +3003,23 @@ impl BarrierCoordinator {
         self.validate_reversible_announcement(announcement).await
     }
 
-    /// Highest valid attempt any node has announced across the gossiped per-node keys.
-    ///
-    /// # Errors
-    /// Returns an error for malformed values or histories whose epoch and checkpoint ID do not
-    /// move together; a reclaiming leader must not advance from a lexicographically invented cut.
-    pub async fn max_announced(&self) -> Result<Option<CheckpointAttempt>, String> {
+    async fn scan_latest_announcement(&self) -> Result<Option<BarrierAnnouncement>, String> {
         let mut announcements = Vec::new();
         for (node, json) in self.kv.scan_checked(ANNOUNCEMENT_KEY).await? {
             let announcement: BarrierAnnouncement = serde_json::from_str(&json)
                 .map_err(|error| format!("malformed barrier announcement from {node}: {error}"))?;
             announcements.push(announcement);
         }
-        let highest = validate_scanned_announcements(announcements)?;
+        validate_scanned_announcements(announcements)
+    }
+
+    /// Highest valid attempt any node has announced across the gossiped per-node keys.
+    ///
+    /// # Errors
+    /// Returns an error for malformed values or histories whose epoch and checkpoint ID do not
+    /// move together; a reclaiming leader must not advance from a lexicographically invented cut.
+    pub async fn max_announced(&self) -> Result<Option<CheckpointAttempt>, String> {
+        let highest = self.scan_latest_announcement().await?;
         Ok(highest.as_ref().map(announcement_attempt))
     }
 
@@ -2871,7 +3122,10 @@ impl BarrierCoordinator {
                                 )],
                             };
                         }
-                        Some(state @ PrepareFanoutState::Claimed(_)) => {
+                        Some(
+                            state @ (PrepareFanoutState::Claimed(_)
+                            | PrepareFanoutState::QuorumReached(_)),
+                        ) => {
                             let exact = state.announcement() == prepare;
                             *pending = Some(state);
                             return QuorumOutcome::Failed {
@@ -2881,7 +3135,7 @@ impl BarrierCoordinator {
                                         .copied()
                                         .unwrap_or(NodeId::UNASSIGNED),
                                     if exact {
-                                        "clustered Prepare fan-out was already claimed"
+                                        "clustered Prepare fan-out was already claimed or completed"
                                     } else {
                                         "Prepare quorum does not match the claimed fan-out"
                                     }
@@ -2985,6 +3239,20 @@ impl BarrierCoordinator {
                     }
                     missing.sort_unstable_by_key(|peer| peer.0);
                     return QuorumOutcome::TimedOut { got, missing };
+                }
+
+                if prepare.assignment_fence.is_some() {
+                    if let Err(error) = mark_prepare_quorum_reached(&state, prepare) {
+                        return QuorumOutcome::Failed {
+                            failures: vec![(
+                                expected_roster
+                                    .first()
+                                    .copied()
+                                    .unwrap_or(NodeId::UNASSIGNED),
+                                error,
+                            )],
+                        };
+                    }
                 }
 
                 return QuorumOutcome::Reached {
@@ -3584,6 +3852,7 @@ mod tests {
         #[derive(Debug)]
         struct RejectAnnouncementKv {
             inner: Arc<InMemoryKv>,
+            rejected_phase: Option<Phase>,
         }
 
         #[async_trait]
@@ -3593,8 +3862,66 @@ mod tests {
             }
 
             async fn write_checked(&self, key: &str, value: String) -> Result<(), String> {
-                if key == ANNOUNCEMENT_KEY {
-                    return Err("injected durable write failure".into());
+                let reject = self.rejected_phase.is_none_or(|phase| {
+                    serde_json::from_str::<BarrierAnnouncement>(&value)
+                        .is_ok_and(|announcement| announcement.phase == phase)
+                });
+                if key == ANNOUNCEMENT_KEY && reject {
+                    return Err(self.rejected_phase.map_or_else(
+                        || "injected durable write failure".to_string(),
+                        |phase| format!("injected {phase:?} durable write failure"),
+                    ));
+                }
+                self.inner.write(key, value).await;
+                Ok(())
+            }
+
+            async fn read_from(&self, who: NodeId, key: &str) -> Option<String> {
+                self.inner.read_from(who, key).await
+            }
+
+            async fn scan(&self, key: &str) -> Vec<(NodeId, String)> {
+                self.inner.scan(key).await
+            }
+        }
+
+        struct GateNextAnnouncementKv {
+            inner: Arc<InMemoryKv>,
+            write_started: tokio::sync::Notify,
+            release_write: tokio::sync::Notify,
+            gate_next: AtomicBool,
+        }
+
+        impl GateNextAnnouncementKv {
+            fn new(inner: Arc<InMemoryKv>) -> Self {
+                Self {
+                    inner,
+                    write_started: tokio::sync::Notify::new(),
+                    release_write: tokio::sync::Notify::new(),
+                    gate_next: AtomicBool::new(false),
+                }
+            }
+
+            fn arm(&self) {
+                self.gate_next
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        #[async_trait]
+        impl ClusterKv for GateNextAnnouncementKv {
+            async fn write(&self, key: &str, value: String) {
+                let _ = self.write_checked(key, value).await;
+            }
+
+            async fn write_checked(&self, key: &str, value: String) -> Result<(), String> {
+                if key == ANNOUNCEMENT_KEY
+                    && self
+                        .gate_next
+                        .swap(false, std::sync::atomic::Ordering::AcqRel)
+                {
+                    self.write_started.notify_one();
+                    self.release_write.notified().await;
                 }
                 self.inner.write(key, value).await;
                 Ok(())
@@ -3632,6 +3959,14 @@ mod tests {
             coordinator
                 .install_local_process_lease(&test_process_lease(node_id, boot, term))
                 .unwrap();
+        }
+
+        fn install_local_proof(
+            coordinator: &BarrierCoordinator,
+            proof: &crate::cluster::control::LeaderProof,
+        ) {
+            let proof = proof.clone();
+            coordinator.set_local_leader_proof_provider(Arc::new(move || Some(proof.clone())));
         }
 
         #[tokio::test]
@@ -4409,7 +4744,14 @@ mod tests {
         ) {
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
-                    if coordinator.prepare_received_at(prepare).is_some() {
+                    let relayed = coordinator
+                        .grpc
+                        .lock()
+                        .as_ref()
+                        .and_then(|state| state.latest_rx.borrow().clone())
+                        .as_ref()
+                        == Some(prepare);
+                    if coordinator.prepare_received_at(prepare).is_some() && relayed {
                         return;
                     }
                     tokio::task::yield_now().await;
@@ -4431,6 +4773,7 @@ mod tests {
             let follower = coordinator(follower_kv, store);
             bind_process(&leader, 1, 1, 1);
             bind_process(&follower, 2, 22, 1);
+            install_local_proof(&leader, &proof);
             leader
                 .start_server("127.0.0.1:0".parse().unwrap(), None)
                 .await
@@ -4447,11 +4790,46 @@ mod tests {
             (leader, follower, proof)
         }
 
+        async fn reach_two_node_prepare_quorum(
+            leader: &BarrierCoordinator,
+            follower: &BarrierCoordinator,
+            prepare: &BarrierAnnouncement,
+            watermark: CheckpointWatermark,
+        ) {
+            leader
+                .announce_prepare(prepare, Duration::from_secs(1))
+                .await
+                .unwrap();
+            wait_for_direct_prepare(follower, prepare).await;
+            follower
+                .ack(&BarrierAck {
+                    epoch: prepare.epoch,
+                    checkpoint_id: prepare.checkpoint_id,
+                    assignment_digest: prepare
+                        .assignment_fence
+                        .as_ref()
+                        .map(crate::checkpoint::CheckpointAssignmentFence::digest),
+                    ok: true,
+                    error: None,
+                    watermark,
+                })
+                .await
+                .unwrap();
+            let outcome = leader
+                .wait_for_quorum(prepare, &[NodeId(2)], Duration::from_secs(1))
+                .await;
+            assert!(
+                matches!(outcome, QuorumOutcome::Reached { .. }),
+                "Prepare did not reach its exact quorum: {outcome:?}"
+            );
+        }
+
         #[tokio::test]
         async fn failed_durable_prepare_publication_prevents_direct_delivery() {
             let leader_inner = kv(NodeId(1));
             let leader_kv = Arc::new(RejectAnnouncementKv {
                 inner: Arc::clone(&leader_inner),
+                rejected_phase: None,
             });
             let follower_kv = kv(NodeId(2));
             let (store, proof) = lease_authority().await;
@@ -4459,6 +4837,7 @@ mod tests {
             let follower = coordinator(follower_kv, store);
             bind_process(&leader, 1, 1, 1);
             bind_process(&follower, 2, 22, 1);
+            install_local_proof(&leader, &proof);
             leader
                 .start_server("127.0.0.1:0".parse().unwrap(), None)
                 .await
@@ -4501,6 +4880,834 @@ mod tests {
                 "failed durable publication must not deliver a direct announcement"
             );
             assert!(follower.prepare_received_at(&prepare).is_none());
+            assert!(leader
+                .grpc
+                .lock()
+                .as_ref()
+                .unwrap()
+                .prepare_fanout
+                .lock()
+                .is_none());
+        }
+
+        #[tokio::test]
+        async fn certified_prepare_rechecks_leadership_after_publication_lock_contention() {
+            let (leader, follower, proof) = started_barrier_pair().await;
+            let live_proof = Arc::new(parking_lot::Mutex::new(Some(proof.clone())));
+            let provider = Arc::clone(&live_proof);
+            leader.set_local_leader_proof_provider(Arc::new(move || provider.lock().clone()));
+            let prepare = BarrierAnnouncement {
+                epoch: 1,
+                checkpoint_id: 41,
+                assignment_fence: Some(test_fence(9, &[1, 2], &[(1, 1), (2, 22)])),
+                leader_proof: Some(proof),
+                phase: Phase::Prepare,
+                flags: 0,
+                min_watermark_ms: None,
+            };
+            let mut follower_watch = follower.announcement_watch().unwrap();
+            let publication_guard = leader.publication.lock().await;
+            let announce = leader.announce_prepare(&prepare, Duration::from_secs(1));
+            tokio::pin!(announce);
+            let first_poll = std::future::poll_fn(|context| {
+                std::task::Poll::Ready(std::future::Future::poll(announce.as_mut(), context))
+            })
+            .await;
+            assert!(first_poll.is_pending());
+
+            live_proof.lock().take();
+            drop(publication_guard);
+            let error = announce.await.unwrap_err();
+
+            assert!(
+                error.contains("no longer owns its exact leader proof"),
+                "{error}"
+            );
+            assert!(leader
+                .kv
+                .read_from(NodeId(1), ANNOUNCEMENT_KEY)
+                .await
+                .is_none());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), follower_watch.changed())
+                    .await
+                    .is_err()
+            );
+        }
+
+        #[tokio::test]
+        async fn certified_prepare_does_not_fan_out_after_leadership_loss_during_write() {
+            let leader_inner = kv(NodeId(1));
+            let leader_kv = Arc::new(GateNextAnnouncementKv::new(Arc::clone(&leader_inner)));
+            let (store, proof) = lease_authority().await;
+            let leader = Arc::new(coordinator(leader_kv.clone(), store));
+            bind_process(&leader, 1, 1, 1);
+            let live_proof = Arc::new(parking_lot::Mutex::new(Some(proof.clone())));
+            let provider = Arc::clone(&live_proof);
+            leader.set_local_leader_proof_provider(Arc::new(move || provider.lock().clone()));
+            leader
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
+                .await
+                .unwrap();
+            let prepare = BarrierAnnouncement {
+                epoch: 1,
+                checkpoint_id: 41,
+                assignment_fence: Some(test_fence(9, &[1], &[(1, 1)])),
+                leader_proof: Some(proof.clone()),
+                phase: Phase::Prepare,
+                flags: 0,
+                min_watermark_ms: None,
+            };
+            leader_kv.arm();
+            let write_started = leader_kv.write_started.notified();
+            tokio::pin!(write_started);
+            let announce_task = tokio::spawn({
+                let leader = Arc::clone(&leader);
+                let prepare = prepare.clone();
+                async move {
+                    leader
+                        .announce_prepare(&prepare, Duration::from_secs(1))
+                        .await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(1), &mut write_started)
+                .await
+                .expect("Prepare durable write did not reach the gate");
+
+            live_proof.lock().take();
+            leader_kv.release_write.notify_one();
+            let error = announce_task.await.unwrap().unwrap_err();
+
+            assert!(
+                error.contains("no longer owns its exact leader proof"),
+                "{error}"
+            );
+            let durable = leader_inner
+                .read_from(NodeId(1), ANNOUNCEMENT_KEY)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<BarrierAnnouncement>(&durable).unwrap(),
+                prepare
+            );
+            assert!(leader
+                .grpc
+                .lock()
+                .as_ref()
+                .unwrap()
+                .prepare_fanout
+                .lock()
+                .is_none());
+        }
+
+        #[tokio::test]
+        async fn failed_terminal_write_keeps_the_attempt_closed_locally() {
+            for terminal_phase in [Phase::Commit, Phase::Abort] {
+                let inner = kv(NodeId(1));
+                let coordinator = BarrierCoordinator::new(Arc::new(RejectAnnouncementKv {
+                    inner: Arc::clone(&inner),
+                    rejected_phase: Some(terminal_phase),
+                }));
+                let prepare = BarrierAnnouncement {
+                    epoch: 1,
+                    checkpoint_id: 41,
+                    assignment_fence: None,
+                    leader_proof: None,
+                    phase: Phase::Prepare,
+                    flags: 0,
+                    min_watermark_ms: None,
+                };
+                coordinator.announce(&prepare).await.unwrap();
+                let terminal = BarrierAnnouncement {
+                    phase: terminal_phase,
+                    ..prepare.clone()
+                };
+
+                let error = coordinator.announce(&terminal).await.unwrap_err();
+                assert!(error.contains("injected"), "{error}");
+                let error = coordinator.announce(&prepare).await.unwrap_err();
+                assert!(error.contains("cannot regress"), "{error}");
+                let durable = inner.read_from(NodeId(1), ANNOUNCEMENT_KEY).await.unwrap();
+                assert_eq!(
+                    serde_json::from_str::<BarrierAnnouncement>(&durable).unwrap(),
+                    prepare
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn publication_order_rehydrates_observed_history_after_restart() {
+            let shared = kv(NodeId(1));
+            let first = BarrierCoordinator::new(shared.clone());
+            let prepare = BarrierAnnouncement {
+                epoch: 1,
+                checkpoint_id: 41,
+                assignment_fence: None,
+                leader_proof: None,
+                phase: Phase::Prepare,
+                flags: 0,
+                min_watermark_ms: None,
+            };
+            first.announce(&prepare).await.unwrap();
+            let commit = BarrierAnnouncement {
+                phase: Phase::Commit,
+                ..prepare.clone()
+            };
+            first.announce(&commit).await.unwrap();
+            drop(first);
+
+            let restarted = BarrierCoordinator::new(shared.clone());
+            for late in [
+                prepare,
+                BarrierAnnouncement {
+                    phase: Phase::Aligned,
+                    ..commit.clone()
+                },
+            ] {
+                let error = restarted.announce(&late).await.unwrap_err();
+                assert!(error.contains("cannot regress"), "{error}");
+            }
+            let durable = shared.read_from(NodeId(1), ANNOUNCEMENT_KEY).await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<BarrierAnnouncement>(&durable).unwrap(),
+                commit
+            );
+        }
+
+        #[tokio::test]
+        async fn certified_aligned_requires_the_exact_reached_prepare_quorum() {
+            let (leader, follower, proof) = started_barrier_pair().await;
+            let prepare = BarrierAnnouncement {
+                epoch: 1,
+                checkpoint_id: 41,
+                assignment_fence: Some(test_fence(9, &[1, 2], &[(1, 1), (2, 22)])),
+                leader_proof: Some(proof),
+                phase: Phase::Prepare,
+                flags: 0,
+                min_watermark_ms: None,
+            };
+            leader
+                .announce_prepare(&prepare, Duration::from_secs(1))
+                .await
+                .unwrap();
+            wait_for_direct_prepare(&follower, &prepare).await;
+            let mut leader_watch = leader.announcement_watch().unwrap();
+            let mut follower_watch = follower.announcement_watch().unwrap();
+            let _ = follower_watch.borrow_and_update();
+            let aligned = BarrierAnnouncement {
+                phase: Phase::Aligned,
+                ..prepare.clone()
+            };
+
+            let error = leader.announce(&aligned).await.unwrap_err();
+
+            assert!(error.contains("successful exact Prepare quorum"), "{error}");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), leader_watch.changed())
+                    .await
+                    .is_err()
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), follower_watch.changed())
+                    .await
+                    .is_err()
+            );
+            let durable = leader
+                .kv
+                .read_from(NodeId(1), ANNOUNCEMENT_KEY)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<BarrierAnnouncement>(&durable).unwrap(),
+                prepare
+            );
+        }
+
+        #[tokio::test]
+        async fn leased_cluster_sender_enforces_certified_runtime_boundaries() {
+            let leader_kv = kv(NodeId(1));
+            let (store, proof) = lease_authority().await;
+            let leader = coordinator(leader_kv.clone(), store);
+            bind_process(&leader, 1, 1, 1);
+            install_local_proof(&leader, &proof);
+            let prepare = BarrierAnnouncement {
+                epoch: 1,
+                checkpoint_id: 41,
+                assignment_fence: Some(test_fence(9, &[1], &[(1, 1)])),
+                leader_proof: Some(proof),
+                phase: Phase::Prepare,
+                flags: 0,
+                min_watermark_ms: None,
+            };
+
+            let prepare_error = leader
+                .announce_prepare(&prepare, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+            assert!(prepare_error.contains("started leased barrier server"));
+            let aligned_error = leader
+                .announce(&BarrierAnnouncement {
+                    phase: Phase::Aligned,
+                    ..prepare.clone()
+                })
+                .await
+                .unwrap_err();
+            assert!(aligned_error.contains("started leased barrier server"));
+            assert!(leader_kv
+                .read_from(NodeId(1), ANNOUNCEMENT_KEY)
+                .await
+                .is_none());
+
+            let commit = BarrierAnnouncement {
+                phase: Phase::Commit,
+                ..prepare.clone()
+            };
+            leader.announce(&commit).await.unwrap();
+            leader
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
+                .await
+                .unwrap();
+
+            for late in [
+                prepare,
+                BarrierAnnouncement {
+                    phase: Phase::Aligned,
+                    ..commit.clone()
+                },
+            ] {
+                let error = if late.phase == Phase::Prepare {
+                    leader
+                        .announce_prepare(&late, Duration::from_secs(1))
+                        .await
+                        .unwrap_err()
+                } else {
+                    leader.announce(&late).await.unwrap_err()
+                };
+                assert!(error.contains("cannot regress"), "{error}");
+            }
+
+            for phase in [Phase::Prepare, Phase::Aligned, Phase::Commit, Phase::Abort] {
+                let error = leader
+                    .announce(&BarrierAnnouncement {
+                        epoch: 2,
+                        checkpoint_id: 42,
+                        assignment_fence: None,
+                        leader_proof: None,
+                        phase,
+                        flags: 0,
+                        min_watermark_ms: None,
+                    })
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.contains("requires an assignment certificate"),
+                    "{error}"
+                );
+            }
+            let durable = leader_kv
+                .read_from(NodeId(1), ANNOUNCEMENT_KEY)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<BarrierAnnouncement>(&durable).unwrap(),
+                commit
+            );
+
+            let unbound_kv = kv(NodeId(3));
+            let unbound = BarrierCoordinator::new(unbound_kv.clone());
+            let error = unbound.announce(&commit).await.unwrap_err();
+            assert!(error.contains("process-bound leased endpoint"), "{error}");
+            assert!(unbound_kv
+                .read_from(NodeId(3), ANNOUNCEMENT_KEY)
+                .await
+                .is_none());
+        }
+
+        #[tokio::test]
+        async fn certified_aligned_rechecks_the_local_process_lease_after_lock_contention() {
+            let leader_kv = kv(NodeId(1));
+            let follower_kv = kv(NodeId(2));
+            let (store, proof) = lease_authority().await;
+            let leader = coordinator(leader_kv.clone(), Arc::clone(&store));
+            let follower = coordinator(follower_kv, store);
+            let process_deadline = Arc::new(crate::cluster::control::LeaseDeadline::live_for(
+                Duration::from_secs(60),
+            ));
+            leader
+                .install_process_lease_deadline(Arc::clone(&process_deadline))
+                .unwrap();
+            leader
+                .install_local_process_lease(&test_process_lease(1, 1, 1))
+                .unwrap();
+            bind_process(&follower, 2, 22, 1);
+            install_local_proof(&leader, &proof);
+            leader
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
+                .await
+                .unwrap();
+            let follower_addr = follower
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
+                .await
+                .unwrap();
+            leader_kv.seed(
+                NodeId(2),
+                BARRIER_ADDR_KEY,
+                endpoint_advertisement(follower_addr, 2, 22, 1),
+            );
+            let prepare = BarrierAnnouncement {
+                epoch: 1,
+                checkpoint_id: 41,
+                assignment_fence: Some(test_fence(9, &[1, 2], &[(1, 1), (2, 22)])),
+                leader_proof: Some(proof),
+                phase: Phase::Prepare,
+                flags: 0,
+                min_watermark_ms: None,
+            };
+            reach_two_node_prepare_quorum(
+                &leader,
+                &follower,
+                &prepare,
+                CheckpointWatermark::Uninitialized,
+            )
+            .await;
+            let mut leader_watch = leader.announcement_watch().unwrap();
+            let mut follower_watch = follower.announcement_watch().unwrap();
+            let _ = follower_watch.borrow_and_update();
+            let announcement_guard = leader.publication.lock().await;
+            let aligned = BarrierAnnouncement {
+                phase: Phase::Aligned,
+                ..prepare.clone()
+            };
+            let aligned_call = leader.announce(&aligned);
+            tokio::pin!(aligned_call);
+            let first_poll = std::future::poll_fn(|context| {
+                std::task::Poll::Ready(std::future::Future::poll(aligned_call.as_mut(), context))
+            })
+            .await;
+            assert!(first_poll.is_pending());
+
+            process_deadline.fence();
+            drop(announcement_guard);
+            let error = aligned_call.await.unwrap_err();
+
+            assert!(
+                error.contains("process lease deadline has expired"),
+                "{error}"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), leader_watch.changed())
+                    .await
+                    .is_err()
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), follower_watch.changed())
+                    .await
+                    .is_err()
+            );
+            let durable = leader_kv
+                .read_from(NodeId(1), ANNOUNCEMENT_KEY)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<BarrierAnnouncement>(&durable).unwrap(),
+                prepare
+            );
+        }
+
+        #[tokio::test]
+        async fn certified_aligned_rechecks_local_leadership_after_lock_contention() {
+            let (leader, follower, proof) = started_barrier_pair().await;
+            let prepare = BarrierAnnouncement {
+                epoch: 1,
+                checkpoint_id: 41,
+                assignment_fence: Some(test_fence(9, &[1, 2], &[(1, 1), (2, 22)])),
+                leader_proof: Some(proof.clone()),
+                phase: Phase::Prepare,
+                flags: 0,
+                min_watermark_ms: None,
+            };
+            reach_two_node_prepare_quorum(
+                &leader,
+                &follower,
+                &prepare,
+                CheckpointWatermark::Uninitialized,
+            )
+            .await;
+            let live_proof = Arc::new(parking_lot::Mutex::new(Some(proof)));
+            let provider = Arc::clone(&live_proof);
+            leader.set_local_leader_proof_provider(Arc::new(move || provider.lock().clone()));
+            let mut leader_watch = leader.announcement_watch().unwrap();
+            let mut follower_watch = follower.announcement_watch().unwrap();
+            let _ = follower_watch.borrow_and_update();
+            let announcement_guard = leader.publication.lock().await;
+            let aligned = BarrierAnnouncement {
+                phase: Phase::Aligned,
+                ..prepare.clone()
+            };
+            let aligned_call = leader.announce(&aligned);
+            tokio::pin!(aligned_call);
+            let first_poll = std::future::poll_fn(|context| {
+                std::task::Poll::Ready(std::future::Future::poll(aligned_call.as_mut(), context))
+            })
+            .await;
+            assert!(first_poll.is_pending());
+
+            live_proof.lock().take();
+            drop(announcement_guard);
+            let error = aligned_call.await.unwrap_err();
+
+            assert!(
+                error.contains("no longer owns its exact leader proof"),
+                "{error}"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), leader_watch.changed())
+                    .await
+                    .is_err()
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), follower_watch.changed())
+                    .await
+                    .is_err()
+            );
+            let durable = leader
+                .kv
+                .read_from(NodeId(1), ANNOUNCEMENT_KEY)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<BarrierAnnouncement>(&durable).unwrap(),
+                prepare
+            );
+        }
+
+        #[tokio::test]
+        async fn assignment_less_single_node_aligned_remains_durable_first() {
+            let leader_inner = kv(NodeId(1));
+            let leader_kv = Arc::new(GateNextAnnouncementKv::new(Arc::clone(&leader_inner)));
+            let leader = Arc::new(BarrierCoordinator::new(leader_kv.clone()));
+            leader
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
+                .await
+                .unwrap();
+            let mut local_watch = leader.announcement_watch().unwrap();
+            let aligned = BarrierAnnouncement {
+                epoch: 1,
+                checkpoint_id: 41,
+                assignment_fence: None,
+                leader_proof: None,
+                phase: Phase::Aligned,
+                flags: 0,
+                min_watermark_ms: None,
+            };
+            leader_kv.arm();
+            let write_started = leader_kv.write_started.notified();
+            tokio::pin!(write_started);
+            let announce_task = tokio::spawn({
+                let leader = Arc::clone(&leader);
+                let aligned = aligned.clone();
+                async move { leader.announce(&aligned).await }
+            });
+
+            tokio::time::timeout(Duration::from_secs(1), &mut write_started)
+                .await
+                .expect("assignment-less Aligned write did not reach the gate");
+            assert!(leader_inner
+                .read_from(NodeId(1), ANNOUNCEMENT_KEY)
+                .await
+                .is_none());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), local_watch.changed())
+                    .await
+                    .is_err()
+            );
+
+            leader_kv.release_write.notify_one();
+            announce_task.await.unwrap().unwrap();
+            let durable = leader_inner
+                .read_from(NodeId(1), ANNOUNCEMENT_KEY)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<BarrierAnnouncement>(&durable).unwrap(),
+                aligned
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), local_watch.changed())
+                    .await
+                    .is_err()
+            );
+        }
+
+        #[tokio::test]
+        async fn leader_only_cluster_closes_prepare_quorum_before_aligned() {
+            let leader_kv = kv(NodeId(1));
+            let (store, proof) = lease_authority().await;
+            let leader = coordinator(leader_kv.clone(), store);
+            bind_process(&leader, 1, 1, 1);
+            install_local_proof(&leader, &proof);
+            leader
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
+                .await
+                .unwrap();
+            let prepare = BarrierAnnouncement {
+                epoch: 1,
+                checkpoint_id: 41,
+                assignment_fence: Some(test_fence(9, &[1], &[(1, 1)])),
+                leader_proof: Some(proof),
+                phase: Phase::Prepare,
+                flags: 0,
+                min_watermark_ms: None,
+            };
+            leader
+                .announce_prepare(&prepare, Duration::from_secs(1))
+                .await
+                .unwrap();
+            assert!(matches!(
+                leader
+                    .wait_for_quorum(&prepare, &[], Duration::from_secs(1))
+                    .await,
+                QuorumOutcome::Reached { ref acks, .. } if acks.is_empty()
+            ));
+            let late_prepare = prepare.clone();
+            let error = leader
+                .announce_prepare(&late_prepare, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+            assert!(error.contains("quorum-ready"), "{error}");
+            let aligned = BarrierAnnouncement {
+                phase: Phase::Aligned,
+                ..prepare
+            };
+            let mut local_watch = leader.announcement_watch().unwrap();
+
+            leader.announce(&aligned).await.unwrap();
+
+            tokio::time::timeout(Duration::from_secs(1), local_watch.changed())
+                .await
+                .expect("leader-only cluster did not observe its local Aligned")
+                .unwrap();
+            assert_eq!(local_watch.borrow().as_ref(), Some(&aligned));
+
+            let commit = BarrierAnnouncement {
+                phase: Phase::Commit,
+                min_watermark_ms: None,
+                ..aligned.clone()
+            };
+            leader.announce(&commit).await.unwrap();
+            let durable_commit = leader_kv
+                .read_from(NodeId(1), ANNOUNCEMENT_KEY)
+                .await
+                .unwrap();
+            for error in [
+                leader
+                    .announce_prepare(&late_prepare, Duration::from_secs(1))
+                    .await
+                    .unwrap_err(),
+                leader.announce(&aligned).await.unwrap_err(),
+            ] {
+                assert!(error.contains("cannot regress"), "{error}");
+            }
+            assert_eq!(
+                leader_kv.read_from(NodeId(1), ANNOUNCEMENT_KEY).await,
+                Some(durable_commit)
+            );
+        }
+
+        #[tokio::test]
+        async fn certified_aligned_notifies_all_participants_while_durable_write_is_pending() {
+            let leader_inner = kv(NodeId(1));
+            let leader_kv = Arc::new(GateNextAnnouncementKv::new(Arc::clone(&leader_inner)));
+            let follower_kv = kv(NodeId(2));
+            let (store, proof) = lease_authority().await;
+            let leader = Arc::new(coordinator(leader_kv.clone(), Arc::clone(&store)));
+            let follower = coordinator(follower_kv, store);
+            bind_process(&leader, 1, 1, 1);
+            bind_process(&follower, 2, 22, 1);
+            install_local_proof(&leader, &proof);
+            leader
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
+                .await
+                .unwrap();
+            let follower_addr = follower
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
+                .await
+                .unwrap();
+            leader_inner.seed(
+                NodeId(2),
+                BARRIER_ADDR_KEY,
+                endpoint_advertisement(follower_addr, 2, 22, 1),
+            );
+
+            let prepare = BarrierAnnouncement {
+                epoch: 1,
+                checkpoint_id: 41,
+                assignment_fence: Some(test_fence(9, &[1, 2], &[(1, 1), (2, 22)])),
+                leader_proof: Some(proof),
+                phase: Phase::Prepare,
+                flags: crate::checkpoint::flags::FULL_SNAPSHOT,
+                min_watermark_ms: None,
+            };
+            reach_two_node_prepare_quorum(
+                &leader,
+                &follower,
+                &prepare,
+                CheckpointWatermark::Active(100),
+            )
+            .await;
+            let aligned = BarrierAnnouncement {
+                phase: Phase::Aligned,
+                min_watermark_ms: Some(100),
+                ..prepare.clone()
+            };
+            let mut leader_watch = leader.announcement_watch().unwrap();
+            let mut follower_watch = follower.announcement_watch().unwrap();
+            let _ = follower_watch.borrow_and_update();
+            leader_kv.arm();
+            let write_started = leader_kv.write_started.notified();
+            tokio::pin!(write_started);
+            let announce_task = tokio::spawn({
+                let leader = Arc::clone(&leader);
+                let aligned = aligned.clone();
+                async move { leader.announce(&aligned).await }
+            });
+
+            tokio::time::timeout(Duration::from_secs(1), &mut write_started)
+                .await
+                .expect("Aligned durable write did not reach the injected gate");
+            tokio::time::timeout(Duration::from_secs(1), leader_watch.changed())
+                .await
+                .expect("leader did not receive its local Aligned notification")
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), follower_watch.changed())
+                .await
+                .expect("follower did not receive direct Aligned notification")
+                .unwrap();
+            assert_eq!(leader_watch.borrow().as_ref(), Some(&aligned));
+            assert_eq!(follower_watch.borrow().as_ref(), Some(&aligned));
+            let pending_durable = leader_inner
+                .read_from(NodeId(1), ANNOUNCEMENT_KEY)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<BarrierAnnouncement>(&pending_durable).unwrap(),
+                prepare
+            );
+            assert!(!announce_task.is_finished());
+
+            let abort = BarrierAnnouncement {
+                phase: Phase::Abort,
+                min_watermark_ms: None,
+                ..aligned.clone()
+            };
+            let abort_call = leader.announce(&abort);
+            tokio::pin!(abort_call);
+            let first_poll = std::future::poll_fn(|context| {
+                std::task::Poll::Ready(std::future::Future::poll(abort_call.as_mut(), context))
+            })
+            .await;
+            assert!(
+                first_poll.is_pending(),
+                "terminal publication overtook the pending Aligned durable write"
+            );
+            assert_eq!(
+                leader_inner
+                    .read_from(NodeId(1), ANNOUNCEMENT_KEY)
+                    .await
+                    .as_deref(),
+                Some(pending_durable.as_str())
+            );
+
+            leader_kv.release_write.notify_one();
+            announce_task.await.unwrap().unwrap();
+            abort_call.await.unwrap();
+            let durable = leader_inner
+                .read_from(NodeId(1), ANNOUNCEMENT_KEY)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<BarrierAnnouncement>(&durable).unwrap(),
+                abort
+            );
+        }
+
+        #[tokio::test]
+        async fn failed_durable_aligned_publication_still_reports_after_reversible_delivery() {
+            let leader_inner = kv(NodeId(1));
+            let leader_kv = Arc::new(RejectAnnouncementKv {
+                inner: Arc::clone(&leader_inner),
+                rejected_phase: Some(Phase::Aligned),
+            });
+            let follower_kv = kv(NodeId(2));
+            let (store, proof) = lease_authority().await;
+            let leader = coordinator(leader_kv, Arc::clone(&store));
+            let follower = coordinator(follower_kv, store);
+            bind_process(&leader, 1, 1, 1);
+            bind_process(&follower, 2, 22, 1);
+            install_local_proof(&leader, &proof);
+            leader
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
+                .await
+                .unwrap();
+            let follower_addr = follower
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
+                .await
+                .unwrap();
+            leader_inner.seed(
+                NodeId(2),
+                BARRIER_ADDR_KEY,
+                endpoint_advertisement(follower_addr, 2, 22, 1),
+            );
+
+            let prepare = BarrierAnnouncement {
+                epoch: 1,
+                checkpoint_id: 41,
+                assignment_fence: Some(test_fence(9, &[1, 2], &[(1, 1), (2, 22)])),
+                leader_proof: Some(proof),
+                phase: Phase::Prepare,
+                flags: crate::checkpoint::flags::FULL_SNAPSHOT,
+                min_watermark_ms: None,
+            };
+            reach_two_node_prepare_quorum(
+                &leader,
+                &follower,
+                &prepare,
+                CheckpointWatermark::Active(100),
+            )
+            .await;
+            let aligned = BarrierAnnouncement {
+                phase: Phase::Aligned,
+                min_watermark_ms: Some(100),
+                ..prepare.clone()
+            };
+            let mut leader_watch = leader.announcement_watch().unwrap();
+            let mut follower_watch = follower.announcement_watch().unwrap();
+            let _ = follower_watch.borrow_and_update();
+
+            let error = leader.announce(&aligned).await.unwrap_err();
+
+            assert!(
+                error.contains("injected Aligned durable write failure"),
+                "{error}"
+            );
+            tokio::time::timeout(Duration::from_secs(1), leader_watch.changed())
+                .await
+                .expect("leader did not retain reversible Aligned delivery")
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), follower_watch.changed())
+                .await
+                .expect("follower did not retain reversible Aligned delivery")
+                .unwrap();
+            assert_eq!(leader_watch.borrow().as_ref(), Some(&aligned));
+            assert_eq!(follower_watch.borrow().as_ref(), Some(&aligned));
+            let durable = leader_inner
+                .read_from(NodeId(1), ANNOUNCEMENT_KEY)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<BarrierAnnouncement>(&durable).unwrap(),
+                prepare
+            );
         }
 
         #[tokio::test]
@@ -4692,7 +5899,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn newer_and_terminal_announcements_retire_eager_prepare_tasks() {
+        async fn publication_order_rejects_a_stale_terminal_and_terminal_cancels_tasks() {
             let (leader, follower, proof) = started_barrier_pair().await;
             let fence = test_fence(11, &[1, 2], &[(1, 1), (2, 22)]);
             let first = BarrierAnnouncement {
@@ -4730,13 +5937,28 @@ mod tests {
             .expect("the newer Prepare did not cancel its predecessor task");
             assert_eq!(pending_prepare_waiters(&follower, &successor), 1);
 
-            leader
-                .announce(&BarrierAnnouncement {
-                    phase: Phase::Abort,
-                    ..successor.clone()
-                })
+            let durable_successor = leader
+                .kv
+                .read_from(NodeId(1), ANNOUNCEMENT_KEY)
                 .await
                 .unwrap();
+            let stale_abort = BarrierAnnouncement {
+                phase: Phase::Abort,
+                ..first
+            };
+            let error = leader.announce(&stale_abort).await.unwrap_err();
+            assert!(error.contains("stale barrier publication"), "{error}");
+            assert_eq!(
+                leader.kv.read_from(NodeId(1), ANNOUNCEMENT_KEY).await,
+                Some(durable_successor)
+            );
+            assert_eq!(pending_prepare_waiters(&follower, &successor), 1);
+
+            let abort = BarrierAnnouncement {
+                phase: Phase::Abort,
+                ..successor.clone()
+            };
+            leader.announce(&abort).await.unwrap();
             tokio::time::timeout(Duration::from_secs(1), async {
                 while pending_prepare_waiters(&follower, &successor) != 0 {
                     tokio::task::yield_now().await;
@@ -4744,17 +5966,87 @@ mod tests {
             })
             .await
             .expect("the terminal announcement did not cancel its Prepare task");
-            assert!(
-                leader
-                    .grpc
-                    .lock()
-                    .as_ref()
-                    .unwrap()
-                    .prepare_fanout
-                    .lock()
-                    .is_none(),
-                "the terminal announcement must retire the batch identity"
+            let state = leader.grpc.lock().clone().unwrap();
+            assert!(state.prepare_fanout.lock().is_none());
+        }
+
+        #[tokio::test]
+        async fn newer_prepare_cancels_obsolete_fanout_before_its_durable_write() {
+            let leader_inner = kv(NodeId(1));
+            let leader_kv = Arc::new(GateNextAnnouncementKv::new(Arc::clone(&leader_inner)));
+            let follower_kv = kv(NodeId(2));
+            let (store, proof) = lease_authority().await;
+            let leader = Arc::new(coordinator(leader_kv.clone(), Arc::clone(&store)));
+            let follower = coordinator(follower_kv, store);
+            bind_process(&leader, 1, 1, 1);
+            bind_process(&follower, 2, 22, 1);
+            install_local_proof(&leader, &proof);
+            leader
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
+                .await
+                .unwrap();
+            let follower_addr = follower
+                .start_server("127.0.0.1:0".parse().unwrap(), None)
+                .await
+                .unwrap();
+            leader_inner.seed(
+                NodeId(2),
+                BARRIER_ADDR_KEY,
+                endpoint_advertisement(follower_addr, 2, 22, 1),
             );
+            let first = BarrierAnnouncement {
+                epoch: 1,
+                checkpoint_id: 41,
+                assignment_fence: Some(test_fence(9, &[1, 2], &[(1, 1), (2, 22)])),
+                leader_proof: Some(proof),
+                phase: Phase::Prepare,
+                flags: 0,
+                min_watermark_ms: None,
+            };
+            leader
+                .announce_prepare(&first, Duration::from_secs(1))
+                .await
+                .unwrap();
+            wait_for_direct_prepare(&follower, &first).await;
+            assert_eq!(pending_prepare_waiters(&follower, &first), 1);
+            let successor = BarrierAnnouncement {
+                epoch: 2,
+                checkpoint_id: 42,
+                ..first.clone()
+            };
+            leader_kv.arm();
+            let write_started = leader_kv.write_started.notified();
+            tokio::pin!(write_started);
+            let announce_task = tokio::spawn({
+                let leader = Arc::clone(&leader);
+                let successor = successor.clone();
+                async move {
+                    leader
+                        .announce_prepare(&successor, Duration::from_secs(1))
+                        .await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(1), &mut write_started)
+                .await
+                .expect("successor Prepare durable write did not reach the gate");
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while pending_prepare_waiters(&follower, &first) != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("admitting the successor did not cancel the obsolete Prepare RPC");
+            let durable = leader_inner
+                .read_from(NodeId(1), ANNOUNCEMENT_KEY)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<BarrierAnnouncement>(&durable).unwrap(),
+                first
+            );
+
+            leader_kv.release_write.notify_one();
+            announce_task.await.unwrap().unwrap();
         }
 
         #[tokio::test]
@@ -4804,6 +6096,7 @@ mod tests {
             let (store, proof) = lease_authority().await;
             let leader_coord = coordinator(leader_kv.clone(), Arc::clone(&store));
             let follower_coord = coordinator(follower_kv.clone(), store);
+            install_local_proof(&leader_coord, &proof);
             bind_process(&leader_coord, 1, 1, 1);
             bind_process(&follower_coord, 2, 22, 1);
 
@@ -4930,6 +6223,7 @@ mod tests {
             bind_process(&leader, 1, 1, 1);
             bind_process(&follower, 2, 22, 1);
             bind_process(&outsider, 3, 33, 1);
+            install_local_proof(&leader, &leader_proof);
 
             let member = |node_id: u64, state| NodeInfo {
                 id: NodeId(node_id),
@@ -4971,14 +6265,26 @@ mod tests {
             );
 
             let fence = test_fence(9, &[1, 2], &[(1, 1), (2, 22)]);
-            let aligned = BarrierAnnouncement {
+            let prepare = BarrierAnnouncement {
                 epoch: 4,
                 checkpoint_id: 44,
                 assignment_fence: Some(fence),
                 leader_proof: Some(leader_proof),
-                phase: Phase::Aligned,
+                phase: Phase::Prepare,
                 flags: 0,
+                min_watermark_ms: None,
+            };
+            reach_two_node_prepare_quorum(
+                &leader,
+                &follower,
+                &prepare,
+                CheckpointWatermark::Active(100),
+            )
+            .await;
+            let aligned = BarrierAnnouncement {
+                phase: Phase::Aligned,
                 min_watermark_ms: Some(100),
+                ..prepare
             };
             leader.announce(&aligned).await.unwrap();
             let observed = wait_observe_exact(
@@ -5006,6 +6312,7 @@ mod tests {
             let (store, proof) = lease_authority().await;
             let leader_coord = coordinator(leader_kv.clone(), Arc::clone(&store));
             let follower_coord = coordinator(follower_kv.clone(), store);
+            install_local_proof(&leader_coord, &proof);
             bind_process(&leader_coord, 1, 1, 1);
             bind_process(&follower_coord, 2, 22, 1);
             let leader_addr = leader_coord
@@ -5262,6 +6569,7 @@ mod tests {
             let (store, proof) = lease_authority().await;
             let leader_coord = coordinator(leader_kv.clone(), Arc::clone(&store));
             let follower_coord = coordinator(follower_kv.clone(), store);
+            install_local_proof(&leader_coord, &proof);
             bind_process(&leader_coord, 1, 1, 1);
             bind_process(&follower_coord, 2, 22, 1);
             let leader_addr = leader_coord
@@ -5379,6 +6687,8 @@ mod tests {
             bind_process(&leader, 1, 1, 1);
             bind_process(&follower, 2, 2, 1);
             bind_process(&successor, 3, 3, 2);
+            install_local_proof(&leader, &original_lease.proof());
+            install_local_proof(&successor, &successor_proof);
             leader
                 .start_server("127.0.0.1:0".parse().unwrap(), None)
                 .await
@@ -5402,14 +6712,25 @@ mod tests {
                 endpoint_advertisement(follower_addr, 2, 2, 1),
             );
 
-            let aligned = BarrierAnnouncement {
+            let prepare = BarrierAnnouncement {
                 epoch: 12,
                 checkpoint_id: 12,
                 assignment_fence: Some(test_fence(1, &[1, 2], &[(1, 1), (2, 2)])),
                 leader_proof: Some(original_lease.proof()),
-                phase: Phase::Aligned,
+                phase: Phase::Prepare,
                 flags: 0,
                 min_watermark_ms: None,
+            };
+            reach_two_node_prepare_quorum(
+                &leader,
+                &follower,
+                &prepare,
+                CheckpointWatermark::Uninitialized,
+            )
+            .await;
+            let aligned = BarrierAnnouncement {
+                phase: Phase::Aligned,
+                ..prepare
             };
             let abort = BarrierAnnouncement {
                 assignment_fence: Some(test_fence(2, &[2, 3], &[(2, 2), (3, 3)])),
@@ -5447,11 +6768,22 @@ mod tests {
             };
             assert_eq!(successor_lease.proof(), successor_proof);
 
-            let successor_aligned = BarrierAnnouncement {
+            let successor_prepare = BarrierAnnouncement {
                 epoch: 13,
                 checkpoint_id: 13,
-                phase: Phase::Aligned,
+                phase: Phase::Prepare,
                 ..abort
+            };
+            reach_two_node_prepare_quorum(
+                &successor,
+                &follower,
+                &successor_prepare,
+                CheckpointWatermark::Uninitialized,
+            )
+            .await;
+            let successor_aligned = BarrierAnnouncement {
+                phase: Phase::Aligned,
+                ..successor_prepare
             };
             successor.announce(&successor_aligned).await.unwrap();
             wait_observe_exact(
@@ -5612,6 +6944,29 @@ mod tests {
         ] {
             assert!(merge_direct_announcement(newer_attempt.clone(), conflicting).is_err());
         }
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn exact_reversible_payloads_cannot_change_the_cluster_watermark() {
+        let aligned = BarrierAnnouncement {
+            epoch: 20,
+            checkpoint_id: 200,
+            assignment_fence: None,
+            leader_proof: None,
+            phase: Phase::Aligned,
+            flags: 0,
+            min_watermark_ms: Some(100),
+        };
+        let conflicting = BarrierAnnouncement {
+            min_watermark_ms: Some(101),
+            ..aligned.clone()
+        };
+
+        assert!(merge_direct_announcement(aligned.clone(), conflicting.clone()).is_err());
+        assert!(merge_observed_announcement(aligned.clone(), conflicting.clone()).is_err());
+        assert!(validate_publication_order(&aligned, &conflicting).is_err());
+        assert!(validate_scanned_announcements(vec![aligned, conflicting]).is_err());
     }
 
     #[cfg(feature = "cluster")]
@@ -5834,10 +7189,10 @@ mod tests {
 
     #[tokio::test]
     async fn leader_announces_follower_observes() {
-        let leader_kv = kv(NodeId(1));
-        let coord = BarrierCoordinator::new(leader_kv.clone());
-        coord
-            .announce(&BarrierAnnouncement {
+        for terminal_phase in [Phase::Commit, Phase::Abort] {
+            let leader_kv = kv(NodeId(1));
+            let coord = BarrierCoordinator::new(leader_kv.clone());
+            let prepare = BarrierAnnouncement {
                 epoch: 5,
                 checkpoint_id: 42,
                 assignment_fence: None,
@@ -5845,12 +7200,28 @@ mod tests {
                 phase: Phase::Prepare,
                 flags: 0,
                 min_watermark_ms: None,
-            })
-            .await
-            .unwrap();
-        let got = coord.observe_hint(NodeId(1)).await.unwrap().unwrap();
-        assert_eq!(got.epoch, 5);
-        assert_eq!(got.checkpoint_id, 42);
+            };
+            coord.announce(&prepare).await.unwrap();
+            let got = coord.observe_hint(NodeId(1)).await.unwrap().unwrap();
+            assert_eq!(got.epoch, 5);
+            assert_eq!(got.checkpoint_id, 42);
+
+            let terminal = BarrierAnnouncement {
+                phase: terminal_phase,
+                ..prepare.clone()
+            };
+            coord.announce(&terminal).await.unwrap();
+            let error = coord.announce(&prepare).await.unwrap_err();
+            assert!(error.contains("cannot regress"), "{error}");
+            let durable = leader_kv
+                .read_from(NodeId(1), ANNOUNCEMENT_KEY)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<BarrierAnnouncement>(&durable).unwrap(),
+                terminal
+            );
+        }
     }
 
     #[tokio::test]

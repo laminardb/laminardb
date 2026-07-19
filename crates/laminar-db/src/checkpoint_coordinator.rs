@@ -4643,7 +4643,20 @@ impl CheckpointCoordinator {
             .collect();
         followers.retain(|id| *id != cc.instance_id());
         if followers.is_empty() {
-            // Leader-only cluster; min is the leader's local watermark.
+            // Even an empty remote roster must close the exact Prepare quorum in the barrier
+            // state machine before Aligned is admissible.
+            let outcome = cc
+                .wait_for_quorum(&prepare, &followers, quorum_timeout)
+                .await;
+            if !matches!(
+                outcome,
+                laminar_core::cluster::control::QuorumOutcome::Reached { ref acks, .. }
+                    if acks.is_empty()
+            ) {
+                return Err(format!(
+                    "leader-only Prepare failed to close its exact quorum: {outcome:?}"
+                ));
+            }
             if !cc.proof_is_live(leader_proof) {
                 return Err(
                     "[LDB-6054] exact leader proof expired during leader-only Prepare".into(),

@@ -426,12 +426,19 @@ async fn install_test_leader_lease_on_store(
     controller: &Arc<laminar_core::cluster::control::ClusterController>,
     object_store: Arc<dyn object_store::ObjectStore>,
 ) -> tokio::sync::watch::Sender<Option<laminar_core::cluster::control::LeaderLease>> {
-    use laminar_core::cluster::control::{LeaderLeaseOwner, LeaseDeadline};
+    use laminar_core::cluster::control::{LeaderLeaseOwner, LeaseDeadline, ProcessLease};
 
     let owner = LeaderLeaseOwner {
         node: controller.instance_id(),
         boot: controller.recovery_incarnation(),
         process_term: 1,
+    };
+    let process_lease = ProcessLease {
+        node: owner.node,
+        owner: owner.boot,
+        term: owner.process_term,
+        seq: 1,
+        expires_at_ms: i64::MAX,
     };
     let lease = install_test_durable_lease_on(controller, &owner, object_store).await;
     controller
@@ -444,6 +451,11 @@ async fn install_test_leader_lease_on_store(
             owner,
             Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))),
         )
+        .unwrap();
+    controller.install_local_leader_proof_provider();
+    controller
+        .start_leased_barrier_server("127.0.0.1:0".parse().unwrap(), None, &process_lease)
+        .await
         .unwrap();
     sender
 }
