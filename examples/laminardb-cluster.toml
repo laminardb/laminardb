@@ -32,6 +32,12 @@ seeds = [
     "star-3.laminardb.svc:7946",
 ]
 gossip_port = 7946
+# Optional barrier/shuffle mTLS. Uncomment all four fields together.
+# Protect Chitchat gossip separately at the network layer.
+# cluster_tls_cert = "${LAMINAR_CLUSTER_TLS_CERT}"
+# cluster_tls_key = "${LAMINAR_CLUSTER_TLS_KEY}"
+# cluster_tls_client_ca = "${LAMINAR_CLUSTER_TLS_CLIENT_CA}"
+# cluster_tls_server_name = "${LAMINAR_CLUSTER_TLS_SERVER_NAME}"
 
 # ── Sources ─────────────────────────────────────────────────────────────
 

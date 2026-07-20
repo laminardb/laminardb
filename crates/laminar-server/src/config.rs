@@ -666,22 +666,26 @@ impl TaskSpec {
 /// Control-plane mTLS is all-or-nothing: cert, key, client_ca, and server_name
 /// must be set together, and each path must exist.
 fn validate_cluster_tls(config: &ServerConfig, errors: &mut Vec<String>) {
+    if config.server.mode != ServerMode::Cluster {
+        return;
+    }
     let Some(d) = &config.discovery else {
         return;
     };
-    let set = [
+    let configured = [
         d.cluster_tls_cert.is_some(),
         d.cluster_tls_key.is_some(),
         d.cluster_tls_client_ca.is_some(),
-        // A whitespace-only server name is no name.
-        d.cluster_tls_server_name
-            .as_ref()
-            .is_some_and(|s| !s.trim().is_empty()),
+        d.cluster_tls_server_name.is_some(),
     ];
-    if !set.iter().any(|s| *s) {
-        return; // TLS disabled
+    if !configured.iter().any(|is_set| *is_set) {
+        return;
     }
-    if !set.iter().all(|s| *s) {
+    let complete = configured.iter().all(|is_set| *is_set)
+        && d.cluster_tls_server_name
+            .as_ref()
+            .is_some_and(|name| cluster_tls_server_name_is_valid(name));
+    if !complete {
         errors.push(
             "cluster_tls requires cluster_tls_cert, cluster_tls_key, \
              cluster_tls_client_ca, and cluster_tls_server_name together"
@@ -700,6 +704,12 @@ fn validate_cluster_tls(config: &ServerConfig, errors: &mut Vec<String>) {
             }
         }
     }
+}
+
+pub(crate) fn cluster_tls_server_name_is_valid(name: &str) -> bool {
+    !name.is_empty()
+        && name.trim() == name
+        && tokio_rustls::rustls::pki_types::ServerName::try_from(name.to_string()).is_ok()
 }
 
 /// Structural validation of `[ai]`/`[models]`; semantic checks happen when the registry is built.
@@ -868,8 +878,8 @@ pub struct DiscoverySection {
     /// Locality tier the placement/blast-radius metrics group by (0 = coarsest).
     #[serde(default)]
     pub placement_isolation_tier: usize,
-    /// PEM cert for control-plane (barrier/shuffle) mTLS; enable by
-    /// setting cert + key + client_ca + server_name together.
+    /// Optional PEM cert for control-plane (barrier/shuffle) mTLS; when set,
+    /// key + client_ca + server_name must also be set.
     #[serde(default)]
     pub cluster_tls_cert: Option<std::path::PathBuf>,
     /// PEM private key paired with `cluster_tls_cert`.
@@ -1585,6 +1595,115 @@ bind = "not-a-socket-addr"
             }
             _ => panic!("expected ValidationErrors"),
         }
+    }
+
+    #[test]
+    fn remote_cluster_plaintext_is_accepted() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+node_id = "node-1"
+
+[server]
+mode = "cluster"
+bind = "0.0.0.0:8080"
+delivery = "at_least_once"
+
+[state]
+backend = "object_store"
+url = "s3://bucket/state"
+
+[checkpoint]
+url = "s3://bucket/checkpoints"
+
+[discovery]
+strategy = "static"
+seeds = ["node-1:7946"]
+"#,
+        )
+        .unwrap();
+        validate_config(&config).expect("remote cluster may explicitly run without TLS");
+    }
+
+    #[test]
+    fn cluster_plaintext_and_complete_mtls_are_accepted() {
+        let mut config: ServerConfig = toml::from_str(
+            r#"
+node_id = "node-1"
+
+[server]
+mode = "cluster"
+bind = "127.0.0.1:8080"
+delivery = "at_least_once"
+
+[state]
+backend = "object_store"
+url = "s3://bucket/state"
+
+[checkpoint]
+url = "s3://bucket/checkpoints"
+
+[discovery]
+strategy = "static"
+seeds = ["127.0.0.1:7946"]
+"#,
+        )
+        .unwrap();
+        validate_config(&config).expect("cluster control may remain plaintext");
+
+        let directory = tempfile::tempdir().unwrap();
+        let cert = directory.path().join("node.crt");
+        let key = directory.path().join("node.key");
+        let ca = directory.path().join("cluster-ca.crt");
+        for path in [&cert, &key, &ca] {
+            std::fs::write(path, b"test material").unwrap();
+        }
+        config.server.bind = "0.0.0.0:8080".into();
+        let discovery = config.discovery.as_mut().unwrap();
+        discovery.seeds = vec!["10.0.0.2:7946".into()];
+        discovery.cluster_tls_cert = Some(cert);
+        discovery.cluster_tls_key = Some(key);
+        discovery.cluster_tls_client_ca = Some(ca);
+        discovery.cluster_tls_server_name = Some("laminardb-cluster.internal".into());
+        validate_config(&config).expect("complete remote cluster mTLS should be admitted");
+    }
+
+    #[test]
+    fn invalid_cluster_tls_server_name_is_not_treated_as_absent() {
+        let mut config: ServerConfig = toml::from_str(
+            r#"
+node_id = "node-1"
+
+[server]
+mode = "cluster"
+bind = "127.0.0.1:8080"
+delivery = "at_least_once"
+
+[state]
+backend = "object_store"
+url = "s3://bucket/state"
+
+[checkpoint]
+url = "s3://bucket/checkpoints"
+
+[discovery]
+strategy = "static"
+seeds = ["127.0.0.1:7946"]
+cluster_tls_server_name = "bad name"
+"#,
+        )
+        .unwrap();
+        let ConfigError::ValidationErrors { errors } = validate_config(&config).unwrap_err() else {
+            panic!("expected validation errors");
+        };
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("cluster_tls requires")),
+            "errors: {errors:?}"
+        );
+
+        config.server.mode = ServerMode::Single;
+        validate_config(&config).expect("cluster TLS settings do not affect single-node mode");
     }
 
     #[test]

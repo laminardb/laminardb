@@ -167,6 +167,10 @@ strategy = "gossip" # "gossip" or "static"
 gossip_port = 7946
 advertise_host = "10.0.0.1"
 seeds = ["10.0.0.1:7946", "10.0.0.2:7946"]
+cluster_tls_cert = "/etc/laminardb/tls/node.crt"
+cluster_tls_key = "/etc/laminardb/tls/node.key"
+cluster_tls_client_ca = "/etc/laminardb/tls/cluster-ca.crt"
+cluster_tls_server_name = "laminardb-cluster.internal"
 
 [state]
 backend = "object_store"
@@ -177,6 +181,8 @@ url = "s3://my-bucket/laminardb/checkpoints"
 interval = "30s"
 timeout = "120s"
 ```
+
+Cluster barrier/shuffle RPC uses plaintext when all four `cluster_tls_*` fields are omitted. To enable mTLS, configure all four fields; every node certificate must chain to the configured CA and contain `cluster_tls_server_name` as a SAN. These fields do not wrap Chitchat gossip, so restrict `gossip_port` to a trusted network. Use mTLS for production clusters unless transport security is provided by the deployment network.
 
 > [!NOTE]
 > If `server.mode` is set to `"single"` (the default), no discovery, cluster control-plane, or shuffle services are started or bound, even when the binary includes cluster support.

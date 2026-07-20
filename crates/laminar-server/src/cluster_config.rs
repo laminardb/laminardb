@@ -3,7 +3,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use crate::config::{DiscoverySection, ServerConfig, ServerMode};
+use crate::config::{cluster_tls_server_name_is_valid, DiscoverySection, ServerConfig, ServerMode};
 
 /// Node identity for cluster mode (non-empty, max 64 chars).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +90,21 @@ impl ClusterConfig {
             return Err(ClusterConfigError::EmptySeeds);
         }
 
+        let tls_configured = [
+            discovery.cluster_tls_cert.is_some(),
+            discovery.cluster_tls_key.is_some(),
+            discovery.cluster_tls_client_ca.is_some(),
+            discovery.cluster_tls_server_name.is_some(),
+        ];
+        let tls_complete = tls_configured.iter().all(|is_set| *is_set)
+            && discovery
+                .cluster_tls_server_name
+                .as_ref()
+                .is_some_and(|name| cluster_tls_server_name_is_valid(name));
+        if tls_configured.iter().any(|is_set| *is_set) && !tls_complete {
+            return Err(ClusterConfigError::IncompleteControlPlaneTls);
+        }
+
         let node_id = match &config.node_id {
             Some(id) => ClusterNodeId::from_config(id.clone())?,
             None => ClusterNodeId::auto_generate(&config.server.bind),
@@ -113,6 +128,8 @@ pub enum ClusterConfigError {
     EmptySeeds,
     #[error("unsupported discovery strategy {0:?}; expected \"gossip\" or \"static\"")]
     InvalidDiscoveryStrategy(String),
+    #[error("cluster mutual TLS configuration must be complete and use a valid server name")]
+    IncompleteControlPlaneTls,
 }
 
 #[cfg(test)]
@@ -211,6 +228,40 @@ mod tests {
         assert!(ClusterConfigError::EmptySeeds
             .to_string()
             .contains("at least one seed"));
+        assert!(ClusterConfigError::IncompleteControlPlaneTls
+            .to_string()
+            .contains("complete"));
+    }
+
+    #[test]
+    fn programmatic_remote_cluster_config_accepts_plaintext() {
+        let mut config = cluster_config();
+        config.server.bind = "0.0.0.0:8080".into();
+        let discovery = config.discovery.as_mut().unwrap();
+        discovery.advertise_host = Some("10.0.0.7".into());
+        discovery.seeds = vec!["10.0.0.8:7946".into()];
+
+        assert!(ClusterConfig::from_server_config(&config).is_ok());
+    }
+
+    #[test]
+    fn programmatic_partial_cluster_tls_fails() {
+        let mut config = cluster_config();
+        config.discovery.as_mut().unwrap().cluster_tls_cert = Some("node.pem".into());
+
+        assert!(matches!(
+            ClusterConfig::from_server_config(&config),
+            Err(ClusterConfigError::IncompleteControlPlaneTls)
+        ));
+
+        for invalid_name in ["", " bad.example", "bad name"] {
+            let mut config = cluster_config();
+            config.discovery.as_mut().unwrap().cluster_tls_server_name = Some(invalid_name.into());
+            assert!(matches!(
+                ClusterConfig::from_server_config(&config),
+                Err(ClusterConfigError::IncompleteControlPlaneTls)
+            ));
+        }
     }
 
     #[test]
