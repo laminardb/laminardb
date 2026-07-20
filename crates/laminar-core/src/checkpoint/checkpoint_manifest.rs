@@ -84,9 +84,9 @@ pub enum DurableCheckpointPhase {
 pub struct CheckpointManifest {
     /// Manifest format version (for future evolution).
     pub version: u32,
-    /// Unique, monotonically increasing checkpoint ID.
+    /// Unique, monotonically increasing checkpoint ID; must equal `epoch`.
     pub checkpoint_id: u64,
-    /// Epoch number for exactly-once coordination.
+    /// The same checkpoint ID retained in the persisted field named `epoch`.
     pub epoch: u64,
     /// Timestamp when checkpoint was created (millis since Unix epoch).
     pub timestamp_ms: u64,
@@ -204,15 +204,9 @@ impl CheckpointManifest {
             });
         }
 
-        if self.checkpoint_id == 0 {
+        if self.checkpoint_id == 0 || self.epoch != self.checkpoint_id {
             errors.push(ManifestValidationError {
-                message: "checkpoint_id is 0".into(),
-            });
-        }
-
-        if self.epoch == 0 {
-            errors.push(ManifestValidationError {
-                message: "epoch is 0".into(),
+                message: "checkpoint attempt must use one nonzero canonical checkpoint ID".into(),
             });
         }
 
@@ -269,12 +263,16 @@ impl CheckpointManifest {
     }
 
     /// Creates a new manifest for an embedded or single-node runtime.
+    ///
+    /// Validation rejects values where `checkpoint_id` and `epoch` differ.
     #[must_use]
     pub fn new(checkpoint_id: u64, epoch: u64) -> Self {
         Self::new_with_key_group_count(checkpoint_id, epoch, LOCAL_KEY_GROUP_COUNT)
     }
 
     /// Creates a new manifest with an explicit stable key-group count.
+    ///
+    /// Validation rejects values where `checkpoint_id` and `epoch` differ.
     #[must_use]
     pub fn new_with_key_group_count(
         checkpoint_id: u64,
@@ -497,11 +495,11 @@ mod tests {
 
     #[test]
     fn test_manifest_new() {
-        let m = CheckpointManifest::new(1, 5);
+        let m = CheckpointManifest::new(5, 5);
         assert_eq!(m.version, CHECKPOINT_MANIFEST_VERSION);
         assert_eq!(m.partitioning_abi_version, PARTITIONING_ABI_VERSION);
         assert_eq!(m.durable_phase, DurableCheckpointPhase::Prepared);
-        assert_eq!(m.checkpoint_id, 1);
+        assert_eq!(m.checkpoint_id, 5);
         assert_eq!(m.epoch, 5);
         assert_eq!(m.vnode_count, LOCAL_KEY_GROUP_COUNT.get());
         assert!(m.timestamp_ms > 0);
@@ -512,7 +510,7 @@ mod tests {
     #[test]
     fn test_manifest_new_with_explicit_key_group_count() {
         let key_group_count = KeyGroupCount::try_from(256_u16).unwrap();
-        let manifest = CheckpointManifest::new_with_key_group_count(1, 5, key_group_count);
+        let manifest = CheckpointManifest::new_with_key_group_count(5, 5, key_group_count);
 
         assert_eq!(manifest.vnode_count, key_group_count.get());
         assert!(manifest.validate(key_group_count).is_empty());
@@ -521,7 +519,7 @@ mod tests {
 
     #[test]
     fn test_manifest_json_round_trip() {
-        let mut m = CheckpointManifest::new(42, 10);
+        let mut m = CheckpointManifest::new(42, 42);
         let mut source_checkpoint = ConnectorCheckpoint::with_offsets(HashMap::from([
             ("events:0".into(), "1234".into()),
             ("events:1".into(), "5678".into()),
@@ -537,7 +535,7 @@ mod tests {
         let restored: CheckpointManifest = serde_json::from_str(&json).unwrap();
 
         assert_eq!(restored.checkpoint_id, 42);
-        assert_eq!(restored.epoch, 10);
+        assert_eq!(restored.epoch, 42);
         assert_eq!(restored.watermark, Some(999_000));
         let src = restored.source_offsets.get("kafka-src").unwrap();
         assert_eq!(src.offsets.get("events:0"), Some(&"1234".into()));
@@ -561,6 +559,20 @@ mod tests {
                 .contains(&format!("unsupported manifest version {previous}"))),
             "{errors:?}"
         );
+    }
+
+    #[test]
+    fn test_manifest_rejects_noncanonical_attempt_identity() {
+        for (checkpoint_id, epoch) in [(0, 0), (5, 0), (0, 5), (5, 6)] {
+            let manifest = CheckpointManifest::new(checkpoint_id, epoch);
+            let errors = manifest.validate(LOCAL_KEY_GROUP_COUNT);
+            assert!(
+                errors.iter().any(|error| error
+                    .message
+                    .contains("one nonzero canonical checkpoint ID")),
+                "{checkpoint_id}/{epoch}: {errors:?}"
+            );
+        }
     }
 
     #[test]
@@ -647,7 +659,7 @@ mod tests {
 
     #[test]
     fn test_manifest_requires_pipeline_identity() {
-        let manifest = CheckpointManifest::new(5, 3);
+        let manifest = CheckpointManifest::new(5, 5);
         let mut value = serde_json::to_value(manifest).unwrap();
         value.as_object_mut().unwrap().remove("pipeline_identity");
         assert!(serde_json::from_value::<CheckpointManifest>(value).is_err());
@@ -655,7 +667,7 @@ mod tests {
 
     #[test]
     fn test_manifest_requires_partitioning_abi() {
-        let manifest = CheckpointManifest::new(5, 3);
+        let manifest = CheckpointManifest::new(5, 5);
         let mut value = serde_json::to_value(manifest).unwrap();
         value
             .as_object_mut()
@@ -666,7 +678,7 @@ mod tests {
 
     #[test]
     fn test_manifest_rejects_wrong_partitioning_abi() {
-        let mut manifest = CheckpointManifest::new(5, 3);
+        let mut manifest = CheckpointManifest::new(5, 5);
         manifest.partitioning_abi_version = PARTITIONING_ABI_VERSION + 1;
 
         let errors = manifest.validate(LOCAL_KEY_GROUP_COUNT);

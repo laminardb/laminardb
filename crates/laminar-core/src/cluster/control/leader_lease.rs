@@ -389,6 +389,19 @@ struct OutcomeLink {
     checkpoint_id: u64,
 }
 
+impl OutcomeLink {
+    fn validate(self) -> Result<(), LeaseError> {
+        let attempt = crate::state::CheckpointAttempt::new(self.epoch, self.checkpoint_id);
+        if self.sequence == 0 || !attempt.is_canonical() {
+            return Err(LeaseError::Invalid(
+                "checkpoint outcome link requires a nonzero authority sequence and one canonical checkpoint ID"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AssignmentDecisionLink {
@@ -894,6 +907,12 @@ impl AuthorityOutcomeFloor {
                     .into(),
             ));
         }
+        for link in [self.terminal_anchor_link, self.committed_anchor_link]
+            .into_iter()
+            .flatten()
+        {
+            link.validate()?;
+        }
         for (name, anchor) in [
             ("terminal", self.terminal_anchor.as_ref()),
             ("committed", self.committed_anchor.as_ref()),
@@ -1057,6 +1076,17 @@ impl LeaderAuthorityRecord {
             )));
         }
         self.lease.validate()?;
+        for link in [
+            self.previous_outcome,
+            self.outcome_head,
+            self.previous_commit,
+            self.commit_head,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            link.validate()?;
+        }
         if let Some(floor) = &self.outcome_floor {
             floor.validate()?;
         }
@@ -4061,6 +4091,13 @@ impl LeaderLeaseStore {
         if !proof.is_canonical() {
             return Err(ClusterCheckpointAuthorityError::Fenced);
         }
+        let attempt = crate::state::CheckpointAttempt::new(epoch, checkpoint_id);
+        if !attempt.is_canonical() {
+            return Err(DecisionError::Conflict(
+                "cluster checkpoint outcomes require one nonzero canonical checkpoint ID".into(),
+            )
+            .into());
+        }
         let initial = self
             .load_record()
             .await?
@@ -4104,10 +4141,10 @@ impl LeaderLeaseStore {
                 };
             }
             if let Some(last) = outcomes.last() {
-                if candidate.epoch <= last.epoch || candidate.checkpoint_id <= last.checkpoint_id {
+                if candidate.checkpoint_id <= last.checkpoint_id {
                     return Err(DecisionError::Conflict(format!(
-                        "cluster outcome epoch {} checkpoint {} does not advance durable epoch {} checkpoint {}",
-                        candidate.epoch, candidate.checkpoint_id, last.epoch, last.checkpoint_id
+                        "cluster checkpoint {} does not advance durable checkpoint {}",
+                        candidate.checkpoint_id, last.checkpoint_id
                     ))
                     .into());
                 }
@@ -5020,61 +5057,34 @@ impl LeaderLeaseStore {
         Ok(self.audited_cluster_outcomes().await?.1.last().cloned())
     }
 
-    /// Return the exact immutable outcome for `attempt`, or an audited terminal outcome
-    /// that durably dominates it in both identity dimensions. Compacted continuity anchors are
-    /// included in the audit.
+    /// Return the exact immutable outcome for `attempt`, or the first audited terminal outcome
+    /// known to close that older checkpoint. Compacted continuity anchors are included in the
+    /// audit.
     ///
     /// # Errors
-    /// Returns an error for malformed attempt identity, conflicting outcome dimensions, or an
-    /// unavailable or invalid durable authority chain.
+    /// Returns an error for a noncanonical attempt identity or an unavailable or invalid durable
+    /// authority chain.
     pub async fn cluster_attempt_settlement(
         &self,
         attempt: crate::state::CheckpointAttempt,
     ) -> Result<Option<CheckpointOutcome>, ClusterCheckpointAuthorityError> {
-        use crate::state::CheckpointAttemptRelation;
-
-        if attempt.epoch == 0 || attempt.checkpoint_id == 0 {
+        if !attempt.is_canonical() {
             return Err(DecisionError::Conflict(
-                "cluster checkpoint settlement requires nonzero attempt dimensions".into(),
+                "cluster checkpoint settlement requires one nonzero canonical checkpoint ID".into(),
             )
             .into());
         }
         let outcomes = self.audited_cluster_outcomes().await?.1;
         if let Ok(index) = outcomes.binary_search_by_key(&attempt.epoch, |outcome| outcome.epoch) {
-            let exact_epoch = &outcomes[index];
-            if exact_epoch.checkpoint_id != attempt.checkpoint_id {
-                return Err(DecisionError::Conflict(format!(
-                    "cluster outcome epoch {} belongs to checkpoint {}, not pending checkpoint {}",
-                    attempt.epoch, exact_epoch.checkpoint_id, attempt.checkpoint_id
-                ))
-                .into());
-            }
-            return Ok(Some(exact_epoch.clone()));
-        }
-        if let Ok(index) =
-            outcomes.binary_search_by_key(&attempt.checkpoint_id, |outcome| outcome.checkpoint_id)
-        {
-            let exact_checkpoint = &outcomes[index];
-            return Err(DecisionError::Conflict(format!(
-                "cluster outcome checkpoint {} belongs to epoch {}, not pending epoch {}",
-                attempt.checkpoint_id, exact_checkpoint.epoch, attempt.epoch
-            ))
-            .into());
+            return Ok(Some(outcomes[index].clone()));
         }
         let Some(highest) = outcomes.last() else {
             return Ok(None);
         };
-        let highest_attempt =
-            crate::state::CheckpointAttempt::new(highest.epoch, highest.checkpoint_id);
-        match highest_attempt.relation_to(attempt) {
-            CheckpointAttemptRelation::Newer => Ok(Some(highest.clone())),
-            CheckpointAttemptRelation::Older => Ok(None),
-            CheckpointAttemptRelation::Exact => unreachable!("exact epoch was handled above"),
-            CheckpointAttemptRelation::Conflict => Err(DecisionError::Conflict(format!(
-                "cluster terminal outcome epoch {} checkpoint {} conflicts with pending epoch {} checkpoint {}",
-                highest.epoch, highest.checkpoint_id, attempt.epoch, attempt.checkpoint_id
-            ))
-            .into()),
+        if highest.checkpoint_id > attempt.checkpoint_id {
+            Ok(Some(highest.clone()))
+        } else {
+            Ok(None)
         }
     }
 
@@ -6047,6 +6057,45 @@ mod tests {
     }
 
     #[test]
+    fn outcome_link_requires_one_canonical_checkpoint_identity() {
+        assert!(OutcomeLink {
+            sequence: 1,
+            epoch: 7,
+            checkpoint_id: 7,
+        }
+        .validate()
+        .is_ok());
+
+        for link in [
+            OutcomeLink {
+                sequence: 0,
+                epoch: 7,
+                checkpoint_id: 7,
+            },
+            OutcomeLink {
+                sequence: 1,
+                epoch: 0,
+                checkpoint_id: 0,
+            },
+            OutcomeLink {
+                sequence: 1,
+                epoch: 7,
+                checkpoint_id: 8,
+            },
+        ] {
+            assert!(matches!(link.validate(), Err(LeaseError::Invalid(_))));
+        }
+
+        let mut record = bare_authority_record(&owner(1, 1, 1), 1);
+        record.outcome_head = Some(OutcomeLink {
+            sequence: 1,
+            epoch: 7,
+            checkpoint_id: 8,
+        });
+        assert!(matches!(record.validate(), Err(LeaseError::Invalid(_))));
+    }
+
+    #[test]
     fn prune_latch_guard_releases_on_every_drop_path() {
         let latch = Arc::new(AtomicBool::new(true));
         {
@@ -6334,12 +6383,22 @@ mod tests {
         epoch: u64,
         checkpoint_id: u64,
     ) -> RecoveryCapsuleRef {
+        assert_eq!(epoch, checkpoint_id, "test capsule must be canonical");
+        recovery_capsule_variant(store, fence, checkpoint_id, 9).await
+    }
+
+    async fn recovery_capsule_variant(
+        store: &LeaderLeaseStore,
+        fence: &CheckpointAssignmentFence,
+        checkpoint_id: u64,
+        variant: u8,
+    ) -> RecoveryCapsuleRef {
         let decisions = CheckpointDecisionStore::new(Arc::clone(&store.store));
         let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
-        let portable_state_sha256 = digest(9);
+        let portable_state_sha256 = digest(variant);
         let capsule = crate::checkpoint::ClusterRecoveryCapsule {
             version: crate::checkpoint::CLUSTER_RECOVERY_CAPSULE_VERSION,
-            attempt: crate::state::CheckpointAttempt::new(epoch, checkpoint_id),
+            attempt: crate::state::CheckpointAttempt::canonical(checkpoint_id),
             deployment_id,
             pipeline_identity: crate::checkpoint::PipelineIdentity::empty(),
             assignment_fence: fence.clone(),
@@ -6368,6 +6427,7 @@ mod tests {
         epoch: u64,
         checkpoint_id: u64,
     ) -> RecordOutcomeResult {
+        assert_eq!(epoch, checkpoint_id, "test outcome must be canonical");
         let capsule = recovery_capsule(store, fence, epoch, checkpoint_id).await;
         store
             .record_cluster_outcome(
@@ -6396,8 +6456,8 @@ mod tests {
         };
         let proof = first.proof();
         let fence = assignment_fence(&incumbent);
-        record_commit(store.as_ref(), &proof, &fence, 1, 10).await;
-        record_commit(store.as_ref(), &proof, &fence, 3, 30).await;
+        record_commit(store.as_ref(), &proof, &fence, 1, 1).await;
+        record_commit(store.as_ref(), &proof, &fence, 3, 3).await;
         (store, incumbent, proof)
     }
 
@@ -10125,7 +10185,7 @@ mod tests {
         let decision_store = Arc::clone(&store);
         let decision = tokio::spawn(async move {
             decision_store
-                .record_cluster_outcome(&proof, 1, 10, fence, CheckpointVerdict::Abort, None)
+                .record_cluster_outcome(&proof, 1, 1, fence, CheckpointVerdict::Abort, None)
                 .await
         });
         tokio::time::timeout(Duration::from_secs(1), raw.entered.acquire())
@@ -10166,7 +10226,7 @@ mod tests {
         let decision_store = Arc::clone(&store);
         let decision = tokio::spawn(async move {
             decision_store
-                .record_cluster_outcome(&proof, 1, 10, fence, CheckpointVerdict::Abort, None)
+                .record_cluster_outcome(&proof, 1, 1, fence, CheckpointVerdict::Abort, None)
                 .await
         });
         tokio::time::timeout(Duration::from_secs(1), raw.entered.acquire())
@@ -10212,7 +10272,7 @@ mod tests {
                 .record_cluster_outcome(
                     &decision_proof,
                     1,
-                    10,
+                    1,
                     fence,
                     CheckpointVerdict::Abort,
                     None,
@@ -10258,8 +10318,8 @@ mod tests {
         };
         let proof = first.proof();
         let fence = assignment_fence(&incumbent);
-        record_commit(&store, &proof, &fence, 1, 10).await;
-        record_commit(&store, &proof, &fence, 3, 30).await;
+        record_commit(&store, &proof, &fence, 1, 1).await;
+        record_commit(&store, &proof, &fence, 3, 3).await;
 
         let decision_store = Arc::clone(&store);
         let decision_proof = proof.clone();
@@ -10269,7 +10329,7 @@ mod tests {
                 .record_cluster_outcome(
                     &decision_proof,
                     4,
-                    40,
+                    4,
                     decision_fence,
                     CheckpointVerdict::Abort,
                     None,
@@ -10329,7 +10389,7 @@ mod tests {
             .record_cluster_outcome(
                 &first.proof(),
                 1,
-                10,
+                1,
                 assignment_fence(&incumbent),
                 CheckpointVerdict::Abort,
                 None,
@@ -10346,7 +10406,7 @@ mod tests {
                 .iter()
                 .map(|outcome| (outcome.epoch, outcome.checkpoint_id))
                 .collect::<Vec<_>>(),
-            vec![(1, 10)]
+            vec![(1, 1)]
         );
     }
 
@@ -10372,7 +10432,7 @@ mod tests {
                 .record_cluster_outcome(
                     &delayed_proof,
                     1,
-                    10,
+                    1,
                     delayed_fence,
                     CheckpointVerdict::Abort,
                     None,
@@ -10390,7 +10450,7 @@ mod tests {
                 .record_cluster_outcome(
                     &proof,
                     epoch,
-                    epoch * 10,
+                    epoch,
                     fence.clone(),
                     CheckpointVerdict::Abort,
                     None,
@@ -10452,7 +10512,7 @@ mod tests {
                 .record_cluster_outcome(
                     &proof,
                     epoch,
-                    epoch * 10,
+                    epoch,
                     fence.clone(),
                     CheckpointVerdict::Abort,
                     None,
@@ -10471,7 +10531,7 @@ mod tests {
 
         raw.clear_get_counts();
         let latest = store.cluster_outcome(4).await.unwrap().unwrap();
-        assert_eq!((latest.epoch, latest.checkpoint_id), (4, 40));
+        assert_eq!((latest.epoch, latest.checkpoint_id), (4, 4));
         assert_eq!(raw.get_count(&lease_path(5)), 1);
         assert_eq!(raw.get_count(&lease_path(4)), 0);
         assert_eq!(raw.get_count(&deployment_path), 0);
@@ -10484,7 +10544,7 @@ mod tests {
 
         raw.clear_get_counts();
         let older = store.cluster_outcome(2).await.unwrap().unwrap();
-        assert_eq!((older.epoch, older.checkpoint_id), (2, 20));
+        assert_eq!((older.epoch, older.checkpoint_id), (2, 2));
         assert_eq!(raw.get_count(&lease_path(5)), 1);
         assert_eq!(raw.get_count(&lease_path(4)), 0);
         assert_eq!(raw.get_count(&lease_path(3)), 0);
@@ -10494,14 +10554,14 @@ mod tests {
         let restarted = LeaderLeaseStore::new(raw.clone(), 1_000);
         raw.clear_get_counts();
         let cold_older = restarted.cluster_outcome(2).await.unwrap().unwrap();
-        assert_eq!((cold_older.epoch, cold_older.checkpoint_id), (2, 20));
+        assert_eq!((cold_older.epoch, cold_older.checkpoint_id), (2, 2));
         assert_eq!(raw.get_count(&lease_path(5)), 1);
         assert_eq!(raw.get_count(&lease_path(4)), 1);
         assert_eq!(raw.get_count(&lease_path(3)), 1);
         assert_eq!(raw.get_count(&lease_path(2)), 0);
         assert_eq!(raw.get_count(&deployment_path), 1);
 
-        record_commit(store.as_ref(), &proof, &fence, 5, 50).await;
+        record_commit(store.as_ref(), &proof, &fence, 5, 5).await;
         tokio::time::timeout(Duration::from_secs(1), async {
             while store.prune_running.load(Ordering::Acquire) {
                 tokio::task::yield_now().await;
@@ -10555,7 +10615,7 @@ mod tests {
                 .record_cluster_outcome(
                     &proof,
                     epoch,
-                    epoch * 10,
+                    epoch,
                     fence.clone(),
                     CheckpointVerdict::Abort,
                     None,
@@ -10602,7 +10662,7 @@ mod tests {
         let proof = first.proof();
         let fence = assignment_fence(&incumbent);
         store
-            .record_cluster_outcome(&proof, 1, 10, fence.clone(), CheckpointVerdict::Abort, None)
+            .record_cluster_outcome(&proof, 1, 1, fence.clone(), CheckpointVerdict::Abort, None)
             .await
             .unwrap();
         store
@@ -10610,7 +10670,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .record_cluster_outcome(&proof, 3, 30, fence, CheckpointVerdict::Abort, None)
+            .record_cluster_outcome(&proof, 3, 3, fence, CheckpointVerdict::Abort, None)
             .await
             .unwrap();
 
@@ -10618,7 +10678,7 @@ mod tests {
         corrupt.previous_outcome = Some(OutcomeLink {
             sequence: 3,
             epoch: 1,
-            checkpoint_id: 10,
+            checkpoint_id: 1,
         });
         store
             .store
@@ -10652,18 +10712,18 @@ mod tests {
         disable_history_pruning_for_test(&store).await;
         let proof = first.proof();
         let fence = assignment_fence(&incumbent);
-        record_commit(&store, &proof, &fence, 1, 10).await;
+        record_commit(&store, &proof, &fence, 1, 1).await;
         store
-            .record_cluster_outcome(&proof, 2, 20, fence.clone(), CheckpointVerdict::Abort, None)
+            .record_cluster_outcome(&proof, 2, 2, fence.clone(), CheckpointVerdict::Abort, None)
             .await
             .unwrap();
-        record_commit(&store, &proof, &fence, 3, 30).await;
+        record_commit(&store, &proof, &fence, 3, 3).await;
 
         let mut corrupt = store.load_record().await.unwrap().unwrap();
         corrupt.previous_commit = Some(OutcomeLink {
             sequence: corrupt.lease.seq - 1,
             epoch: 2,
-            checkpoint_id: 20,
+            checkpoint_id: 2,
         });
         store
             .store
@@ -10684,7 +10744,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cluster_attempt_settlement_returns_exact_or_strict_dominator() {
+    async fn cluster_attempt_settlement_returns_exact_or_newer_closure() {
         let store = store(1_000);
         let incumbent = owner(1, 1, 1);
         let LeaseOutcome::Acquired(first) = store
@@ -10697,42 +10757,34 @@ mod tests {
         let proof = first.proof();
         let fence = assignment_fence(&incumbent);
         store
-            .record_cluster_outcome(&proof, 1, 10, fence.clone(), CheckpointVerdict::Abort, None)
+            .record_cluster_outcome(&proof, 1, 1, fence.clone(), CheckpointVerdict::Abort, None)
             .await
             .unwrap();
         store
-            .record_cluster_outcome(&proof, 3, 30, fence, CheckpointVerdict::Abort, None)
+            .record_cluster_outcome(&proof, 3, 3, fence, CheckpointVerdict::Abort, None)
             .await
             .unwrap();
 
         let exact = store
-            .cluster_attempt_settlement(crate::state::CheckpointAttempt::new(1, 10))
+            .cluster_attempt_settlement(crate::state::CheckpointAttempt::canonical(1))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!((exact.epoch, exact.checkpoint_id), (1, 10));
-        let dominator = store
-            .cluster_attempt_settlement(crate::state::CheckpointAttempt::new(2, 20))
+        assert_eq!((exact.epoch, exact.checkpoint_id), (1, 1));
+        let newer_closure = store
+            .cluster_attempt_settlement(crate::state::CheckpointAttempt::canonical(2))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!((dominator.epoch, dominator.checkpoint_id), (3, 30));
+        assert_eq!((newer_closure.epoch, newer_closure.checkpoint_id), (3, 3));
         assert!(store
-            .cluster_attempt_settlement(crate::state::CheckpointAttempt::new(4, 40))
+            .cluster_attempt_settlement(crate::state::CheckpointAttempt::canonical(4))
             .await
             .unwrap()
             .is_none());
         assert!(matches!(
             store
                 .cluster_attempt_settlement(crate::state::CheckpointAttempt::new(2, 35))
-                .await,
-            Err(ClusterCheckpointAuthorityError::Decision(
-                DecisionError::Conflict(_)
-            ))
-        ));
-        assert!(matches!(
-            store
-                .cluster_attempt_settlement(crate::state::CheckpointAttempt::new(2, 10))
                 .await,
             Err(ClusterCheckpointAuthorityError::Decision(
                 DecisionError::Conflict(_)
@@ -10758,7 +10810,7 @@ mod tests {
             .record_cluster_outcome(
                 &incumbent_proof,
                 1,
-                10,
+                1,
                 incumbent_fence.clone(),
                 CheckpointVerdict::Abort,
                 None,
@@ -10786,7 +10838,7 @@ mod tests {
             }],
         )
         .unwrap();
-        record_commit(&store, &successor_proof, &successor_fence, 3, 30).await;
+        record_commit(&store, &successor_proof, &successor_fence, 3, 3).await;
 
         assert_eq!(
             store
@@ -10807,7 +10859,7 @@ mod tests {
         );
 
         let exact_anchor = store
-            .cluster_attempt_settlement(crate::state::CheckpointAttempt::new(1, 10))
+            .cluster_attempt_settlement(crate::state::CheckpointAttempt::canonical(1))
             .await
             .unwrap()
             .unwrap();
@@ -10827,26 +10879,20 @@ mod tests {
             incumbent.process_term
         );
 
-        let strict_dominator = store
-            .cluster_attempt_settlement(crate::state::CheckpointAttempt::new(2, 20))
+        let newer_closure = store
+            .cluster_attempt_settlement(crate::state::CheckpointAttempt::canonical(2))
             .await
             .unwrap()
             .unwrap();
+        assert_eq!((newer_closure.epoch, newer_closure.checkpoint_id), (3, 3));
+        assert_eq!(newer_closure.verdict, CheckpointVerdict::Commit);
         assert_eq!(
-            (strict_dominator.epoch, strict_dominator.checkpoint_id),
-            (3, 30)
-        );
-        assert_eq!(strict_dominator.verdict, CheckpointVerdict::Commit);
-        assert_eq!(
-            strict_dominator.assignment_fence.as_ref(),
+            newer_closure.assignment_fence.as_ref(),
             Some(&successor_fence)
         );
+        assert_eq!(newer_closure.leader_proof.as_ref(), Some(&successor_proof));
         assert_eq!(
-            strict_dominator.leader_proof.as_ref(),
-            Some(&successor_proof)
-        );
-        assert_eq!(
-            strict_dominator
+            newer_closure
                 .leader_proof
                 .as_ref()
                 .unwrap()
@@ -10873,11 +10919,11 @@ mod tests {
         let proof = first.proof();
         let fence = assignment_fence(&incumbent);
         store
-            .record_cluster_outcome(&proof, 1, 10, fence.clone(), CheckpointVerdict::Abort, None)
+            .record_cluster_outcome(&proof, 1, 1, fence.clone(), CheckpointVerdict::Abort, None)
             .await
             .unwrap();
         store
-            .record_cluster_outcome(&proof, 2, 20, fence.clone(), CheckpointVerdict::Abort, None)
+            .record_cluster_outcome(&proof, 2, 2, fence.clone(), CheckpointVerdict::Abort, None)
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -10891,11 +10937,11 @@ mod tests {
         *store.outcome_audit_cache.lock() = None;
         raw.clear_get_counts();
         let exact = store
-            .cluster_attempt_settlement(crate::state::CheckpointAttempt::new(1, 10))
+            .cluster_attempt_settlement(crate::state::CheckpointAttempt::canonical(1))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!((exact.epoch, exact.checkpoint_id), (1, 10));
+        assert_eq!((exact.epoch, exact.checkpoint_id), (1, 1));
         assert_eq!(raw.get_count(&lease_path(2)), 1);
 
         raw.clear_get_counts();
@@ -10904,13 +10950,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!((highest.epoch, highest.checkpoint_id), (2, 20));
+        assert_eq!((highest.epoch, highest.checkpoint_id), (2, 2));
         assert_eq!(raw.get_count(&lease_path(3)), 1);
         assert_eq!(raw.get_count(&lease_path(2)), 0);
 
         let external = LeaderLeaseStore::new(raw.clone(), 1_000);
         external
-            .record_cluster_outcome(&proof, 3, 30, fence, CheckpointVerdict::Abort, None)
+            .record_cluster_outcome(&proof, 3, 3, fence, CheckpointVerdict::Abort, None)
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -10927,7 +10973,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!((highest.epoch, highest.checkpoint_id), (3, 30));
+        assert_eq!((highest.epoch, highest.checkpoint_id), (3, 3));
         assert_eq!(raw.get_count(&lease_path(3)), 1);
         assert_eq!(raw.get_count(&lease_path(2)), 1);
     }
@@ -10946,11 +10992,11 @@ mod tests {
         };
         let proof = first.proof();
         let fence = assignment_fence(&incumbent);
-        for (epoch, checkpoint_id) in [(1, 10), (2, 20), (3, 30)] {
+        for checkpoint_id in 1..=3 {
             store
                 .record_cluster_outcome(
                     &proof,
-                    epoch,
+                    checkpoint_id,
                     checkpoint_id,
                     fence.clone(),
                     CheckpointVerdict::Abort,
@@ -11009,11 +11055,11 @@ mod tests {
         };
         let proof = first.proof();
         let fence = assignment_fence(&incumbent);
-        for (epoch, checkpoint_id) in [(1, 10), (2, 20)] {
+        for checkpoint_id in 1..=2 {
             store
                 .record_cluster_outcome(
                     &proof,
-                    epoch,
+                    checkpoint_id,
                     checkpoint_id,
                     fence.clone(),
                     CheckpointVerdict::Abort,
@@ -11086,7 +11132,7 @@ mod tests {
                 .record_cluster_outcome(
                     &proof,
                     epoch,
-                    epoch * 10,
+                    epoch,
                     fence.clone(),
                     CheckpointVerdict::Abort,
                     None,
@@ -11129,7 +11175,7 @@ mod tests {
                 .record_cluster_outcome(
                     &proof,
                     epoch,
-                    epoch * 10,
+                    epoch,
                     fence.clone(),
                     CheckpointVerdict::Abort,
                     None,
@@ -11163,7 +11209,7 @@ mod tests {
         );
 
         let compacted_attempt = restarted
-            .cluster_attempt_settlement(crate::state::CheckpointAttempt::new(1, 10))
+            .cluster_attempt_settlement(crate::state::CheckpointAttempt::canonical(1))
             .await
             .unwrap()
             .unwrap();
@@ -11196,13 +11242,13 @@ mod tests {
         disable_history_pruning_for_test(&store).await;
         let proof = first.proof();
         let fence = assignment_fence(&incumbent);
-        record_commit(&store, &proof, &fence, 1, 10).await;
+        record_commit(&store, &proof, &fence, 1, 1).await;
         for epoch in 2..=u64::try_from(OUTCOME_HISTORY_COMPACTION_TRIGGER + 1).unwrap() {
             store
                 .record_cluster_outcome(
                     &proof,
                     epoch,
-                    epoch * 10,
+                    epoch,
                     fence.clone(),
                     CheckpointVerdict::Abort,
                     None,
@@ -11251,8 +11297,8 @@ mod tests {
         disable_history_pruning_for_test(&store).await;
         let proof = first.proof();
         let fence = assignment_fence(&incumbent);
-        record_commit(&store, &proof, &fence, 1, 10).await;
-        record_commit(&store, &proof, &fence, 3, 30).await;
+        record_commit(&store, &proof, &fence, 1, 1).await;
+        record_commit(&store, &proof, &fence, 3, 3).await;
         store
             .prune_cluster_outcomes_before(&proof, 3, accept_recovery_artifacts)
             .await
@@ -11263,7 +11309,7 @@ mod tests {
                 .record_cluster_outcome(
                     &proof,
                     epoch,
-                    epoch * 10,
+                    epoch,
                     fence.clone(),
                     CheckpointVerdict::Abort,
                     None,
@@ -11316,8 +11362,8 @@ mod tests {
         disable_history_pruning_for_test(&store).await;
         let proof = first.proof();
         let fence = assignment_fence(&incumbent);
-        for (epoch, checkpoint_id) in [(1, 10), (3, 30), (5, 50)] {
-            record_commit(&store, &proof, &fence, epoch, checkpoint_id).await;
+        for checkpoint_id in [1, 3, 5] {
+            record_commit(&store, &proof, &fence, checkpoint_id, checkpoint_id).await;
         }
         store
             .prune_cluster_outcomes_before(&proof, 2, accept_recovery_artifacts)
@@ -11342,7 +11388,7 @@ mod tests {
                     async move {
                         preflighted.lock().unwrap().push(outcome.epoch);
                         if !mutated.swap(true, std::sync::atomic::Ordering::AcqRel) {
-                            record_commit(&store, &proof, &fence, 7, 70).await;
+                            record_commit(&store, &proof, &fence, 7, 7).await;
                             store
                                 .prune_cluster_outcomes_before(&proof, 5, accept_recovery_artifacts)
                                 .await
@@ -11387,13 +11433,13 @@ mod tests {
         let commit_epochs = [1, 17, 49, 97, 145, 193, 241, 257];
         for epoch in 1..=260 {
             if commit_epochs.contains(&epoch) {
-                record_commit(&store, &proof, &fence, epoch, epoch * 10).await;
+                record_commit(&store, &proof, &fence, epoch, epoch).await;
             } else {
                 store
                     .record_cluster_outcome(
                         &proof,
                         epoch,
-                        epoch * 10,
+                        epoch,
                         fence.clone(),
                         CheckpointVerdict::Abort,
                         None,
@@ -11529,12 +11575,12 @@ mod tests {
         disable_history_pruning_for_test(&store).await;
         let proof = first.proof();
         let fence = assignment_fence(&incumbent);
-        let first_capsule = recovery_capsule(&store, &fence, 1, 10).await;
+        let first_capsule = recovery_capsule(&store, &fence, 1, 1).await;
         store
             .record_cluster_outcome(
                 &proof,
                 1,
-                10,
+                1,
                 fence.clone(),
                 CheckpointVerdict::Commit,
                 Some(first_capsule),
@@ -11554,7 +11600,7 @@ mod tests {
         let mut terminal_anchor_link = None;
         for epoch in 2..=maximum {
             let sequence = current.lease.seq.checked_add(1).unwrap();
-            let checkpoint_id = epoch.checked_mul(10).unwrap();
+            let checkpoint_id = epoch;
             let mut outcome = template.clone();
             outcome.epoch = epoch;
             outcome.checkpoint_id = checkpoint_id;
@@ -11622,7 +11668,7 @@ mod tests {
         *store.outcome_audit_cache.lock() = None;
 
         let next_epoch = maximum.checked_add(1).unwrap();
-        let next_checkpoint_id = next_epoch.checked_mul(10).unwrap();
+        let next_checkpoint_id = next_epoch;
         let next_capsule = recovery_capsule(&store, &fence, next_epoch, next_checkpoint_id).await;
         let error = store
             .record_cluster_outcome(
@@ -11671,7 +11717,7 @@ mod tests {
                 .record_cluster_outcome(
                     &proof,
                     epoch,
-                    epoch * 10,
+                    epoch,
                     fence.clone(),
                     CheckpointVerdict::Abort,
                     None,
@@ -11686,7 +11732,7 @@ mod tests {
             .record_cluster_outcome(
                 &proof,
                 next_epoch,
-                next_epoch * 10,
+                next_epoch,
                 fence,
                 CheckpointVerdict::Abort,
                 None,
@@ -11729,7 +11775,7 @@ mod tests {
                 .record_cluster_outcome(
                     &proof,
                     epoch,
-                    epoch * 10,
+                    epoch,
                     fence.clone(),
                     CheckpointVerdict::Abort,
                     None,
@@ -11746,7 +11792,7 @@ mod tests {
             .record_cluster_outcome(
                 &proof,
                 next_epoch,
-                next_epoch * 10,
+                next_epoch,
                 fence,
                 CheckpointVerdict::Abort,
                 None,
@@ -11787,12 +11833,12 @@ mod tests {
         disable_history_pruning_for_test(&store).await;
         let proof = first.proof();
         let fence = assignment_fence(&incumbent);
-        let capsule = recovery_capsule(&store, &fence, 1, 10).await;
+        let capsule = recovery_capsule(&store, &fence, 1, 1).await;
         store
             .record_cluster_outcome(
                 &proof,
                 1,
-                10,
+                1,
                 fence.clone(),
                 CheckpointVerdict::Commit,
                 Some(capsule.clone()),
@@ -11804,7 +11850,7 @@ mod tests {
                 .record_cluster_outcome(
                     &proof,
                     epoch,
-                    epoch * 10,
+                    epoch,
                     fence.clone(),
                     CheckpointVerdict::Abort,
                     None,
@@ -11826,7 +11872,7 @@ mod tests {
             .record_cluster_outcome(
                 &proof,
                 next_epoch,
-                next_epoch * 10,
+                next_epoch,
                 fence,
                 CheckpointVerdict::Abort,
                 None,
@@ -11863,13 +11909,13 @@ mod tests {
         disable_history_pruning_for_test(&store).await;
         let proof = first.proof();
         let fence = assignment_fence(&incumbent);
-        let obsolete = recovery_capsule(&store, &fence, 1, 10).await;
-        let live = recovery_capsule(&store, &fence, 3, 30).await;
+        let obsolete = recovery_capsule(&store, &fence, 1, 1).await;
+        let live = recovery_capsule(&store, &fence, 3, 3).await;
         store
             .record_cluster_outcome(
                 &proof,
                 1,
-                10,
+                1,
                 fence.clone(),
                 CheckpointVerdict::Commit,
                 Some(obsolete.clone()),
@@ -11880,7 +11926,7 @@ mod tests {
             .record_cluster_outcome(
                 &proof,
                 3,
-                30,
+                3,
                 fence.clone(),
                 CheckpointVerdict::Commit,
                 Some(live),
@@ -11914,7 +11960,7 @@ mod tests {
                 .record_cluster_outcome(
                     &proof,
                     epoch,
-                    epoch * 10,
+                    epoch,
                     fence.clone(),
                     CheckpointVerdict::Abort,
                     None,
@@ -11959,19 +12005,19 @@ mod tests {
         disable_history_pruning_for_test(&setup).await;
         let proof = first.proof();
         let fence = assignment_fence(&incumbent);
-        let capsule = recovery_capsule(&setup, &fence, 1, 10).await;
+        let capsule = recovery_capsule(&setup, &fence, 1, 1).await;
         setup
             .record_cluster_outcome(
                 &proof,
                 1,
-                10,
+                1,
                 fence.clone(),
                 CheckpointVerdict::Commit,
                 Some(capsule.clone()),
             )
             .await
             .unwrap();
-        record_commit(&setup, &proof, &fence, 3, 30).await;
+        record_commit(&setup, &proof, &fence, 3, 3).await;
         assert_eq!(
             setup
                 .prune_cluster_outcomes_before(&proof, 2, accept_recovery_artifacts)
@@ -11984,7 +12030,7 @@ mod tests {
                 .record_cluster_outcome(
                     &proof,
                     epoch,
-                    epoch * 10,
+                    epoch,
                     fence.clone(),
                     CheckpointVerdict::Abort,
                     None,
@@ -12008,7 +12054,7 @@ mod tests {
                 .record_cluster_outcome(
                     &compact_proof,
                     next_epoch,
-                    next_epoch * 10,
+                    next_epoch,
                     compact_fence,
                     CheckpointVerdict::Abort,
                     None,
@@ -12057,11 +12103,11 @@ mod tests {
         };
         let proof = first.proof();
         let fence = assignment_fence(&incumbent);
-        for (epoch, checkpoint_id) in [(1, 10), (2, 20)] {
+        for checkpoint_id in 1..=2 {
             setup
                 .record_cluster_outcome(
                     &proof,
-                    epoch,
+                    checkpoint_id,
                     checkpoint_id,
                     fence.clone(),
                     CheckpointVerdict::Abort,
@@ -12076,13 +12122,13 @@ mod tests {
         let old_store = Arc::clone(&store);
         let old_audit = tokio::spawn(async move {
             old_store
-                .cluster_attempt_settlement(crate::state::CheckpointAttempt::new(1, 10))
+                .cluster_attempt_settlement(crate::state::CheckpointAttempt::canonical(1))
                 .await
         });
         raw.entered.acquire().await.unwrap().forget();
 
         store
-            .record_cluster_outcome(&proof, 3, 30, fence, CheckpointVerdict::Abort, None)
+            .record_cluster_outcome(&proof, 3, 3, fence, CheckpointVerdict::Abort, None)
             .await
             .unwrap();
         let newest = store
@@ -12090,11 +12136,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!((newest.epoch, newest.checkpoint_id), (3, 30));
+        assert_eq!((newest.epoch, newest.checkpoint_id), (3, 3));
 
         raw.release.add_permits(1);
         let old = old_audit.await.unwrap().unwrap().unwrap();
-        assert_eq!((old.epoch, old.checkpoint_id), (1, 10));
+        assert_eq!((old.epoch, old.checkpoint_id), (1, 1));
         let cache = store.outcome_audit_cache.lock();
         let cached = cache.as_ref().expect("newer audit must remain cached");
         assert_eq!(cached.authority_sequence, 4);
@@ -12134,8 +12180,8 @@ mod tests {
         };
         let proof = first.proof();
         let fence = assignment_fence(&incumbent);
-        record_commit(store.as_ref(), &proof, &fence, 1, 10).await;
-        record_commit(store.as_ref(), &proof, &fence, 5, 50).await;
+        record_commit(store.as_ref(), &proof, &fence, 1, 1).await;
+        record_commit(store.as_ref(), &proof, &fence, 5, 5).await;
         store
             .prune_cluster_outcomes_before(&proof, 3, accept_recovery_artifacts)
             .await
@@ -12198,6 +12244,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cluster_decision_rejects_noncanonical_attempt_before_mutation() {
+        let store = store(1_000);
+        let incumbent = owner(1, 1, 1);
+        let LeaseOutcome::Acquired(first) = store
+            .acquire_or_renew_current_term_for_test(&incumbent, 0)
+            .await
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let before = store.load_record().await.unwrap().unwrap();
+
+        assert!(matches!(
+            store
+                .record_cluster_outcome(
+                    &first.proof(),
+                    1,
+                    10,
+                    assignment_fence(&incumbent),
+                    CheckpointVerdict::Abort,
+                    None,
+                )
+                .await,
+            Err(ClusterCheckpointAuthorityError::Decision(
+                DecisionError::Conflict(_)
+            ))
+        ));
+        assert_eq!(store.load_record().await.unwrap().unwrap(), before);
+        assert!(matches!(
+            store
+                .store
+                .head(&OsPath::from("checkpoint-deployment/identity.json"))
+                .await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn cluster_decision_rejects_foreign_owner_and_fencing_token() {
         let store = store(1_000);
         let incumbent = owner(1, 1, 1);
@@ -12216,7 +12300,7 @@ mod tests {
                 .record_cluster_outcome(
                     &wrong_token,
                     1,
-                    10,
+                    1,
                     fence.clone(),
                     CheckpointVerdict::Abort,
                     None,
@@ -12230,7 +12314,7 @@ mod tests {
         };
         assert!(matches!(
             store
-                .record_cluster_outcome(&foreign, 1, 10, fence, CheckpointVerdict::Abort, None,)
+                .record_cluster_outcome(&foreign, 1, 1, fence, CheckpointVerdict::Abort, None,)
                 .await,
             Err(ClusterCheckpointAuthorityError::Fenced)
         ));
@@ -12385,11 +12469,11 @@ mod tests {
         };
         let proof = first.proof();
         let fence = assignment_fence(&incumbent);
-        let first_capsule = recovery_capsule(&store, &fence, 1, 10).await;
-        let selected_capsule = recovery_capsule(&store, &fence, 2, 20).await;
+        let first_capsule = recovery_capsule(&store, &fence, 1, 1).await;
+        let selected_capsule = recovery_capsule(&store, &fence, 2, 2).await;
         for (epoch, checkpoint_id, capsule) in [
-            (1, 10, first_capsule.clone()),
-            (2, 20, selected_capsule.clone()),
+            (1, 1, first_capsule.clone()),
+            (2, 2, selected_capsule.clone()),
         ] {
             assert!(matches!(
                 store
@@ -12406,7 +12490,7 @@ mod tests {
                 RecordOutcomeResult::Created(_)
             ));
         }
-        let old_orphan = recovery_capsule(&store, &fence, 1, 11).await;
+        let old_orphan = recovery_capsule_variant(&store, &fence, 1, 11).await;
         let old_orphan_path = recovery_capsule_path(&old_orphan);
         let selected_path = recovery_capsule_path(&selected_capsule);
         if corrupt {
@@ -12617,7 +12701,7 @@ mod tests {
             .record_cluster_outcome(
                 &proof,
                 4,
-                40,
+                4,
                 assignment_fence(&incumbent),
                 CheckpointVerdict::Abort,
                 None,
@@ -12708,11 +12792,11 @@ mod tests {
         };
         let proof = first.proof();
         let fence = assignment_fence(&incumbent);
-        let first_capsule = recovery_capsule(store.as_ref(), &fence, 1, 10).await;
-        let selected_capsule = recovery_capsule(store.as_ref(), &fence, 2, 20).await;
+        let first_capsule = recovery_capsule(store.as_ref(), &fence, 1, 1).await;
+        let selected_capsule = recovery_capsule(store.as_ref(), &fence, 2, 2).await;
         for (epoch, checkpoint_id, capsule) in [
-            (1, 10, first_capsule.clone()),
-            (2, 20, selected_capsule.clone()),
+            (1, 1, first_capsule.clone()),
+            (2, 2, selected_capsule.clone()),
         ] {
             assert!(matches!(
                 store
@@ -12760,13 +12844,13 @@ mod tests {
         let proof = first.proof();
         let fence = assignment_fence(&incumbent);
 
-        let first_capsule = recovery_capsule(store.as_ref(), &fence, 1, 10).await;
-        let second_capsule = recovery_capsule(store.as_ref(), &fence, 2, 20).await;
-        let third_capsule = recovery_capsule(store.as_ref(), &fence, 3, 30).await;
+        let first_capsule = recovery_capsule(store.as_ref(), &fence, 1, 1).await;
+        let second_capsule = recovery_capsule(store.as_ref(), &fence, 2, 2).await;
+        let third_capsule = recovery_capsule(store.as_ref(), &fence, 3, 3).await;
         for (epoch, checkpoint_id, capsule) in [
-            (1, 10, first_capsule.clone()),
-            (2, 20, second_capsule.clone()),
-            (3, 30, third_capsule.clone()),
+            (1, 1, first_capsule.clone()),
+            (2, 2, second_capsule.clone()),
+            (3, 3, third_capsule.clone()),
         ] {
             assert!(matches!(
                 store
@@ -12784,12 +12868,12 @@ mod tests {
             ));
         }
 
-        let old_orphan = recovery_capsule(store.as_ref(), &fence, 1, 11).await;
-        let deletable_old_orphan = recovery_capsule(store.as_ref(), &fence, 1, 12).await;
-        let another_old_orphan = recovery_capsule(store.as_ref(), &fence, 1, 14).await;
-        let corrupt_old_orphan = recovery_capsule(store.as_ref(), &fence, 1, 13).await;
-        let at_floor_unpublished = recovery_capsule(store.as_ref(), &fence, 2, 21).await;
-        let above_floor_unpublished = recovery_capsule(store.as_ref(), &fence, 4, 41).await;
+        let old_orphan = recovery_capsule_variant(store.as_ref(), &fence, 1, 11).await;
+        let deletable_old_orphan = recovery_capsule_variant(store.as_ref(), &fence, 1, 12).await;
+        let another_old_orphan = recovery_capsule_variant(store.as_ref(), &fence, 1, 14).await;
+        let corrupt_old_orphan = recovery_capsule_variant(store.as_ref(), &fence, 1, 13).await;
+        let at_floor_unpublished = recovery_capsule_variant(store.as_ref(), &fence, 2, 21).await;
+        let above_floor_unpublished = recovery_capsule_variant(store.as_ref(), &fence, 4, 41).await;
         let old_orphan_path = recovery_capsule_path(&old_orphan);
         let deletable_old_orphan_path = recovery_capsule_path(&deletable_old_orphan);
         let another_old_orphan_path = recovery_capsule_path(&another_old_orphan);
@@ -12933,13 +13017,13 @@ mod tests {
         let proof = first.proof();
         let fence = assignment_fence(&incumbent);
         let decisions = CheckpointDecisionStore::new(Arc::clone(&store.store));
-        let first_capsule = recovery_capsule(&store, &fence, 1, 10).await;
-        let second_capsule = recovery_capsule(&store, &fence, 2, 20).await;
-        let third_capsule = recovery_capsule(&store, &fence, 3, 30).await;
+        let first_capsule = recovery_capsule(&store, &fence, 1, 1).await;
+        let second_capsule = recovery_capsule(&store, &fence, 2, 2).await;
+        let third_capsule = recovery_capsule(&store, &fence, 3, 3).await;
         for (epoch, checkpoint_id, capsule) in [
-            (1, 10, first_capsule.clone()),
-            (2, 20, second_capsule.clone()),
-            (3, 30, third_capsule.clone()),
+            (1, 1, first_capsule.clone()),
+            (2, 2, second_capsule.clone()),
+            (3, 3, third_capsule.clone()),
         ] {
             assert!(matches!(
                 store
@@ -12992,20 +13076,20 @@ mod tests {
                 .into_iter()
                 .map(|outcome| (outcome.epoch, outcome.checkpoint_id))
                 .collect::<Vec<_>>(),
-            vec![(3, 30)]
+            vec![(3, 3)]
         );
         let boundary = store.cluster_outcome_retention_boundary().await.unwrap();
         assert_eq!(boundary.artifact_before_epoch, 3);
         let committed_anchor = boundary.committed_anchor.unwrap();
         assert_eq!(
             (committed_anchor.epoch, committed_anchor.checkpoint_id),
-            (2, 20)
+            (2, 2)
         );
         assert_eq!(committed_anchor.leader_proof.as_ref(), Some(&proof));
         assert_eq!(boundary.terminal_anchor, Some(committed_anchor));
         assert!(matches!(
             store
-                .record_cluster_outcome(&proof, 4, 40, fence, CheckpointVerdict::Abort, None,)
+                .record_cluster_outcome(&proof, 4, 4, fence, CheckpointVerdict::Abort, None,)
                 .await,
             Err(ClusterCheckpointAuthorityError::Fenced)
         ));
@@ -13046,7 +13130,7 @@ mod tests {
         let proof = first.proof();
         let fence = assignment_fence(&incumbent);
         for epoch in 1..=4 {
-            record_commit(&store, &proof, &fence, epoch, epoch * 10).await;
+            record_commit(&store, &proof, &fence, epoch, epoch).await;
         }
         let head = store.load_record().await.unwrap().unwrap();
         let mut by_epoch = std::collections::BTreeMap::new();
@@ -13134,12 +13218,12 @@ mod tests {
         };
         let proof = first.proof();
         let fence = assignment_fence(&incumbent);
-        record_commit(&store, &proof, &fence, 1, 10).await;
+        record_commit(&store, &proof, &fence, 1, 1).await;
         store
-            .record_cluster_outcome(&proof, 2, 20, fence.clone(), CheckpointVerdict::Abort, None)
+            .record_cluster_outcome(&proof, 2, 2, fence.clone(), CheckpointVerdict::Abort, None)
             .await
             .unwrap();
-        record_commit(&store, &proof, &fence, 3, 30).await;
+        record_commit(&store, &proof, &fence, 3, 3).await;
         store
             .prune_cluster_outcomes_before(&proof, 3, accept_recovery_artifacts)
             .await

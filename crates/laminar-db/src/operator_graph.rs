@@ -4388,7 +4388,7 @@ mod tests {
         use laminar_core::state::CheckpointAttempt;
 
         let mut harness = alignment_harness().await;
-        let attempt = CheckpointAttempt::new(7, 70);
+        let attempt = CheckpointAttempt::new(70, 70);
 
         let batch = test_batch();
         harness
@@ -4447,7 +4447,7 @@ mod tests {
         use laminar_core::state::CheckpointAttempt;
 
         let mut harness = three_node_alignment_harness().await;
-        let cancelled = CheckpointAttempt::new(7, 70);
+        let cancelled = CheckpointAttempt::new(70, 70);
         let retained = stage_peer_two_data_and_barrier(&harness, cancelled).await;
         let sender = Arc::clone(
             &harness
@@ -4507,7 +4507,7 @@ mod tests {
         assert!(sender
             .install_assignment_fence(&harness.fence, &[1, 2, 3])
             .unwrap());
-        let successor = CheckpointAttempt::new(8, 71);
+        let successor = CheckpointAttempt::new(71, 71);
         harness
             .peer_two_sender
             .fan_out_barrier(
@@ -4553,7 +4553,7 @@ mod tests {
         use laminar_core::state::CheckpointAttempt;
 
         let mut harness = three_node_alignment_harness().await;
-        let cancelled = CheckpointAttempt::new(7, 70);
+        let cancelled = CheckpointAttempt::new(70, 70);
         let retained = stage_peer_two_data_and_barrier(&harness, cancelled).await;
         harness.local_receiver.suspend_assignment_fence();
 
@@ -4597,7 +4597,7 @@ mod tests {
         use laminar_core::state::CheckpointAttempt;
 
         let mut harness = three_node_alignment_harness().await;
-        let attempt = CheckpointAttempt::new(7, 70);
+        let attempt = CheckpointAttempt::new(70, 70);
         let (before_barrier, _after_barrier) =
             stage_peer_two_data_barrier_data(&harness, attempt).await;
 
@@ -4628,7 +4628,7 @@ mod tests {
         use laminar_core::state::CheckpointAttempt;
 
         let mut harness = three_node_alignment_harness().await;
-        let attempt = CheckpointAttempt::new(8, 80);
+        let attempt = CheckpointAttempt::new(80, 80);
         let (before_barrier, after_barrier) =
             stage_peer_two_data_barrier_data(&harness, attempt).await;
         let controller = alignment_abort_controller(&harness.fence, attempt, true).await;
@@ -4696,7 +4696,7 @@ mod tests {
         use laminar_core::state::CheckpointAttempt;
 
         let mut harness = three_node_alignment_harness().await;
-        let attempt = CheckpointAttempt::new(9, 90);
+        let attempt = CheckpointAttempt::new(90, 90);
         let retained = stage_peer_two_data_and_barrier(&harness, attempt).await;
         let controller =
             alignment_abort_controller_with_announcement(&harness.fence, attempt, true, false)
@@ -4726,7 +4726,7 @@ mod tests {
         use laminar_core::state::CheckpointAttempt;
 
         let harness = three_node_alignment_harness().await;
-        let attempt = CheckpointAttempt::new(9, 90);
+        let attempt = CheckpointAttempt::new(90, 90);
         let controller = alignment_abort_controller(&harness.fence, attempt, false).await;
 
         let hint = OperatorGraph::wait_for_shuffle_alignment_terminal_hint(
@@ -4760,7 +4760,7 @@ mod tests {
         use laminar_core::state::CheckpointAttempt;
 
         let harness = three_node_alignment_harness().await;
-        let attempt = CheckpointAttempt::new(9, 90);
+        let attempt = CheckpointAttempt::new(90, 90);
         let other_fence = CheckpointAssignmentFence::from_owner_map(
             harness.fence.assignment_version,
             &[1, 3, 2],
@@ -4787,29 +4787,26 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn shuffle_alignment_rejects_wrong_epoch_for_same_checkpoint_id() {
+    async fn shuffle_sender_rejects_wrong_epoch_for_same_checkpoint_id() {
         use laminar_core::checkpoint::CheckpointBarrier;
         use laminar_core::state::CheckpointAttempt;
 
-        let mut harness = alignment_harness().await;
-        let expected = CheckpointAttempt::new(7, 70);
-        harness
-            .remote_sender
-            .fan_out_barrier(&[1], CheckpointBarrier::new(70, 8), &harness.fence)
-            .await
-            .unwrap();
+        let harness = alignment_harness().await;
+        let expected = CheckpointAttempt::new(70, 70);
         let error = harness
-            .graph
-            .align_shuffle_barriers(
-                expected,
-                0,
+            .remote_sender
+            .fan_out_barrier(
+                &[1],
+                CheckpointBarrier::new(expected.checkpoint_id, 8),
                 &harness.fence,
-                tokio::time::Instant::now() + std::time::Duration::from_secs(2),
-                None,
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("attempt mismatch"), "{error}");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            error.to_string().contains("canonical checkpoint ID"),
+            "{error}"
+        );
     }
 
     #[cfg(feature = "cluster")]
@@ -4817,14 +4814,14 @@ mod tests {
     fn shuffle_attempt_comparison_rejects_all_conflicting_orders() {
         use laminar_core::state::CheckpointAttempt;
 
-        let expected = CheckpointAttempt::new(7, 70);
+        let expected = CheckpointAttempt::new(70, 70);
         for observed in [
-            CheckpointAttempt::new(6, 71),
-            CheckpointAttempt::new(8, 69),
-            CheckpointAttempt::new(7, 69),
-            CheckpointAttempt::new(7, 71),
-            CheckpointAttempt::new(6, 70),
-            CheckpointAttempt::new(8, 70),
+            CheckpointAttempt::new(69, 71),
+            CheckpointAttempt::new(71, 69),
+            CheckpointAttempt::new(70, 69),
+            CheckpointAttempt::new(70, 71),
+            CheckpointAttempt::new(69, 70),
+            CheckpointAttempt::new(71, 70),
         ] {
             assert!(
                 OperatorGraph::compare_shuffle_attempts(expected, observed).is_err(),
@@ -4838,8 +4835,8 @@ mod tests {
     async fn shuffle_alignment_rejects_newer_durable_terminal_without_announcement() {
         use laminar_core::state::CheckpointAttempt;
 
-        let attempt = CheckpointAttempt::new(7, 70);
-        let newer = CheckpointAttempt::new(8, 71);
+        let attempt = CheckpointAttempt::new(70, 70);
+        let newer = CheckpointAttempt::new(71, 71);
         let harness = three_node_alignment_harness().await;
         let controller =
             alignment_abort_controller_with_announcement(&harness.fence, newer, true, false).await;
@@ -4869,7 +4866,7 @@ mod tests {
             harness.fence.participants.clone(),
         )
         .unwrap();
-        let attempt = CheckpointAttempt::new(7, 70);
+        let attempt = CheckpointAttempt::new(70, 70);
         let error = harness
             .remote_sender
             .fan_out_barrier(
@@ -4905,7 +4902,7 @@ mod tests {
         let error = harness
             .graph
             .align_shuffle_barriers(
-                CheckpointAttempt::new(7, 70),
+                CheckpointAttempt::new(70, 70),
                 0,
                 &harness.fence,
                 tokio::time::Instant::now() + std::time::Duration::from_secs(2),
@@ -4923,7 +4920,7 @@ mod tests {
         use laminar_core::state::CheckpointAttempt;
 
         let harness = alignment_harness().await;
-        let attempt = CheckpointAttempt::new(7, 70);
+        let attempt = CheckpointAttempt::new(70, 70);
         harness
             .remote_sender
             .fan_out_barrier(
@@ -4963,7 +4960,7 @@ mod tests {
         use laminar_core::state::CheckpointAttempt;
 
         let mut harness = alignment_harness().await;
-        let attempt = CheckpointAttempt::new(7, 70);
+        let attempt = CheckpointAttempt::new(70, 70);
         harness
             .remote_sender
             .send_to(
@@ -5007,7 +5004,7 @@ mod tests {
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             harness.graph.align_shuffle_barriers(
-                CheckpointAttempt::new(7, 70),
+                CheckpointAttempt::new(70, 70),
                 0,
                 &harness.fence,
                 tokio::time::Instant::now() + std::time::Duration::from_millis(30),

@@ -117,26 +117,17 @@ async fn await_sink_publication<T>(
 /// at the attempt deadline must still release its manual caller and exact-attempt bookkeeping.
 const CHECKPOINT_FAILURE_REPORT_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// RAII guard that releases an epoch's admission slot and staged-byte budget on drop.
+/// RAII guard that releases an epoch's admission slot on drop.
 struct EpochInFlightGuard {
     in_flight: Arc<std::sync::atomic::AtomicU64>,
-    staged_bytes: Arc<std::sync::atomic::AtomicU64>,
-    bytes: u64,
 }
 
 impl EpochInFlightGuard {
-    /// Claim one admission slot and `bytes` of staged budget.
-    fn claim(
-        in_flight: &Arc<std::sync::atomic::AtomicU64>,
-        staged_bytes: &Arc<std::sync::atomic::AtomicU64>,
-        bytes: u64,
-    ) -> Self {
+    /// Claim one admission slot.
+    fn claim(in_flight: &Arc<std::sync::atomic::AtomicU64>) -> Self {
         in_flight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        staged_bytes.fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
         Self {
             in_flight: Arc::clone(in_flight),
-            staged_bytes: Arc::clone(staged_bytes),
-            bytes,
         }
     }
 }
@@ -145,8 +136,6 @@ impl Drop for EpochInFlightGuard {
     fn drop(&mut self) {
         self.in_flight
             .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-        self.staged_bytes
-            .fetch_sub(self.bytes, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
@@ -1076,7 +1065,6 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) checkpoint_tail_tasks: tokio::task::JoinSet<()>,
     /// In-flight epoch count; the coordinator serializes durable checkpoint tails.
     pub(crate) checkpoint_in_flight: Arc<std::sync::atomic::AtomicU64>,
-    pub(crate) staged_bytes: Arc<std::sync::atomic::AtomicU64>,
     /// Set by a checkpoint tail on epoch failure; the next capture consumes it to force a FULL
     /// re-base. Serialized checkpoint tails ensure the flag is observed before the next capture.
     #[cfg(feature = "cluster")]
@@ -1833,12 +1821,7 @@ impl ConnectorPipelineCallback {
             );
         }
 
-        // Charge followers too; otherwise their capture-to-upload memory is unaccounted.
-        let in_flight = EpochInFlightGuard::claim(
-            &self.checkpoint_in_flight,
-            &self.staged_bytes,
-            self.checkpoint_state_cap_bytes,
-        );
+        let in_flight = EpochInFlightGuard::claim(&self.checkpoint_in_flight);
         let tail = FollowerDurableTail {
             _in_flight: in_flight,
             coordinator: Arc::clone(&self.coordinator),
@@ -3349,32 +3332,13 @@ impl ConnectorPipelineCallback {
                     "only the cluster leader may reserve checkpoint attempts".into(),
                 ));
             }
-            // A reclaiming leader can lag an in-flight announced epoch. Checkpoint IDs come from
-            // the shared durable allocator; only the execution epoch needs a local high-watermark.
-            let max_announced = tokio::time::timeout_at(deadline, cc.max_announced_epoch())
-                .await
-                .map_err(|_| {
-                    DbError::Checkpoint(format!(
-                        "checkpoint admission exhausted its {:?} end-to-end deadline while \
-                         reading the cluster epoch high-watermark",
-                        self.checkpoint_timeout
-                    ))
-                })?
-                .map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "cannot reserve a checkpoint from conflicting cluster announcement \
-                         history: {error}"
-                    ))
-                })?;
-            if let Some(max_announced) = max_announced {
-                allocator.advance_past(
-                    max_announced.epoch,
-                    "advancing past the cluster announcement high-watermark",
-                )?;
-            }
         }
 
-        allocator.allocate_until(deadline).await
+        if self.checkpoint_committable_sinks {
+            allocator.consume_sink_epoch_until(deadline).await
+        } else {
+            allocator.allocate_until(deadline).await
+        }
     }
 
     async fn abandon_reserved_attempt(
@@ -4522,6 +4486,17 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         Ok(())
     }
 
+    async fn settle_sink_epoch_for_shutdown(&mut self) -> Result<(), String> {
+        let mut coordinator = self.coordinator.lock().await;
+        let Some(coordinator) = coordinator.as_mut() else {
+            return Ok(());
+        };
+        coordinator
+            .reconcile_sink_open_witness()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn close_sinks(&mut self) -> Result<(), String> {
         let mut failures = Vec::new();
 
@@ -5469,11 +5444,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 });
         request.assignment_fence = assignment_fence;
 
-        let in_flight = EpochInFlightGuard::claim(
-            &self.checkpoint_in_flight,
-            &self.staged_bytes,
-            self.checkpoint_state_cap_bytes,
-        );
+        let in_flight = EpochInFlightGuard::claim(&self.checkpoint_in_flight);
         let tail = LeaderTail {
             _in_flight: in_flight,
             coordinator: Arc::clone(&self.coordinator),
@@ -5972,7 +5943,6 @@ mod tests {
             checkpoint_complete_tx,
             checkpoint_tail_tasks: tokio::task::JoinSet::new(),
             checkpoint_in_flight: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            staged_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "cluster")]
             delta_rebase_needed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "cluster")]
@@ -6012,7 +5982,7 @@ mod tests {
         let outcome = crate::pipeline::PipelineCallback::checkpoint_with_barrier(
             &mut callback,
             source_checkpoints,
-            CheckpointAttempt::new(38, 40),
+            CheckpointAttempt::new(38, 38),
             std::time::Instant::now(),
             None,
         )
@@ -6177,7 +6147,7 @@ mod tests {
         let kv = Arc::new(InMemoryKv::new(NodeId(1)));
         let control_kv: Arc<dyn ClusterKv> = kv.clone();
         let leader = authoritative_local_leader(control_kv).await;
-        let attempt = CheckpointAttempt::new(7, 41);
+        let attempt = CheckpointAttempt::new(7, 7);
         let prepare = leader.prepare(attempt);
         leader
             .controller
@@ -6260,7 +6230,7 @@ mod tests {
             "fixture must model follower promotion"
         );
 
-        let attempt = CheckpointAttempt::new(23, 230);
+        let attempt = CheckpointAttempt::new(23, 23);
         let (announcement, identity) = local_follower_prepare(&controller, attempt);
         let mut callback = empty_callback_fixture();
         callback.cluster_controller = Some(Arc::clone(&controller));
@@ -6310,7 +6280,7 @@ mod tests {
         use laminar_core::checkpoint::{CheckpointBarrier, CheckpointBarrierInjector};
 
         let controller = local_controller();
-        let attempt = CheckpointAttempt::new(24, 240);
+        let attempt = CheckpointAttempt::new(24, 24);
         let (announcement, identity) = local_follower_prepare(&controller, attempt);
         let mut callback = empty_callback_fixture();
         callback.pending_follower_checkpoint = Some(announcement.clone());
@@ -6352,7 +6322,7 @@ mod tests {
         use laminar_core::checkpoint::{CheckpointBarrier, CheckpointBarrierInjector};
 
         let controller = local_controller();
-        let attempt = CheckpointAttempt::new(25, 250);
+        let attempt = CheckpointAttempt::new(25, 25);
         let (announcement, _identity) = local_follower_prepare(&controller, attempt);
         let mut callback = empty_callback_fixture();
         callback.pending_follower_checkpoint = Some(announcement.clone());
@@ -6390,7 +6360,7 @@ mod tests {
         use laminar_core::cluster::control::{ClusterKv, ACK_KEY};
 
         let (controller, kv) = local_controller_with_kv();
-        let attempt = CheckpointAttempt::new(29, 290);
+        let attempt = CheckpointAttempt::new(29, 29);
         let (mut announcement, _identity) = local_follower_prepare(&controller, attempt);
         announcement.leader_proof = None;
         let mut callback = empty_callback_fixture();
@@ -6446,7 +6416,7 @@ mod tests {
         let mut fixture = cluster_callback_fixture(registry, Arc::clone(&controller), None, None);
         fixture.callback.checkpoint_committable_sinks = true;
 
-        let attempt = CheckpointAttempt::new(26, 260);
+        let attempt = CheckpointAttempt::new(26, 26);
         let announcement = certified_barrier(
             attempt,
             fence,
@@ -6492,7 +6462,7 @@ mod tests {
             controller.is_leader(),
             "fixture must model follower promotion"
         );
-        let retained = CheckpointAttempt::new(27, 270);
+        let retained = CheckpointAttempt::new(27, 27);
         let (announcement, _identity) = local_follower_prepare(&controller, retained);
         let mut callback = empty_callback_fixture();
         callback.cluster_controller = Some(controller);
@@ -6501,7 +6471,7 @@ mod tests {
         let outcome = crate::pipeline::PipelineCallback::checkpoint_with_barrier(
             &mut callback,
             FxHashMap::default(),
-            CheckpointAttempt::new(28, 280),
+            CheckpointAttempt::new(28, 28),
             std::time::Instant::now(),
             None,
         )
@@ -6552,72 +6522,21 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[tokio::test]
-    async fn reserve_attempt_is_newer_than_successor_abort_in_both_dimensions() {
-        use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
-        use laminar_core::cluster::control::{Phase, ANNOUNCEMENT_KEY};
-        use laminar_core::cluster::discovery::NodeId;
-
-        let (controller, kv) = local_controller_with_kv();
-        let local_boot = controller.recovery_incarnation();
-        let old_fence = CheckpointAssignmentFence::from_owner_map(
-            1,
-            &[1, 2],
-            vec![
-                CheckpointParticipant {
-                    node_id: 1,
-                    boot_incarnation: local_boot,
-                },
-                CheckpointParticipant {
-                    node_id: 2,
-                    boot_incarnation: uuid::Uuid::from_u128(2),
-                },
-            ],
-        )
-        .unwrap();
-        let successor_fence = CheckpointAssignmentFence::from_owner_map(
-            2,
-            &[1, 1],
-            vec![CheckpointParticipant {
-                node_id: 1,
-                boot_incarnation: local_boot,
-            }],
-        )
-        .unwrap();
-        let announced = CheckpointAttempt::new(7, 3);
-        let aligned = certified_barrier(
-            announced,
-            old_fence,
-            test_leader_proof(2, uuid::Uuid::from_u128(2), 1, 1),
-            Phase::Aligned,
-        );
-        let abort = certified_barrier(
-            announced,
-            successor_fence,
-            test_leader_proof(1, local_boot, 2, 2),
-            Phase::Abort,
-        );
-        kv.seed(
-            NodeId(2),
-            ANNOUNCEMENT_KEY,
-            serde_json::to_string(&aligned).unwrap(),
-        );
-        kv.seed(
-            NodeId(1),
-            ANNOUNCEMENT_KEY,
-            serde_json::to_string(&abort).unwrap(),
-        );
-        assert_eq!(
-            controller.max_announced_epoch().await.unwrap(),
-            Some(announced)
-        );
-
+    async fn reserve_attempt_uses_durable_order_after_unannounced_leader_crash() {
+        let (controller, _kv) = local_controller_with_kv();
+        let abandoned = CheckpointAttempt::canonical(7);
         let object_store: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::memory::InMemory::new());
         let initial = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(Arc::clone(
             &object_store,
         ));
-        for expected in 1..=announced.checkpoint_id {
-            assert_eq!(initial.allocate_checkpoint_id().await.unwrap(), expected);
+        // The former leader reserves its identity before publication and crashes. There is no
+        // gossip record to reconstruct, so the fixed durable counter must be authoritative.
+        for expected in 1..=abandoned.checkpoint_id {
+            assert_eq!(
+                initial.allocate_checkpoint_id_at_least(1).await.unwrap(),
+                expected
+            );
         }
         let restarted =
             Arc::new(laminar_core::checkpoint_decision::CheckpointDecisionStore::new(object_store));
@@ -6644,12 +6563,11 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(reserved, CheckpointAttempt::canonical(8));
         assert_eq!(
-            reserved.relation_to(announced),
+            reserved.relation_to(abandoned),
             CheckpointAttemptRelation::Newer
         );
-        assert!(reserved.epoch > announced.epoch);
-        assert!(reserved.checkpoint_id > announced.checkpoint_id);
     }
 
     #[cfg(feature = "cluster")]
@@ -6955,6 +6873,7 @@ mod tests {
             .set_leader_lease_watch(lease_rx, owner, leader_deadline)
             .unwrap();
         leader.set_leader_lease_store(Arc::clone(&authority));
+        leader.install_local_leader_proof_provider();
         follower.set_leader_lease_store(authority);
 
         follower
@@ -6996,7 +6915,7 @@ mod tests {
         callback.checkpoint_timeout = Duration::from_secs(1);
         callback.quorum_timeout = Duration::from_millis(200);
 
-        let expired = CheckpointAttempt::new(1, 40);
+        let expired = CheckpointAttempt::new(1, 1);
         let error = crate::pipeline::PipelineCallback::publish_checkpoint_prepare(
             &mut callback,
             expired,
@@ -7012,7 +6931,7 @@ mod tests {
             .await
             .is_none());
 
-        let attempt = CheckpointAttempt::new(2, 41);
+        let attempt = CheckpointAttempt::new(2, 2);
         let expected = certified_barrier(
             attempt,
             fence.clone(),
@@ -7129,7 +7048,7 @@ mod tests {
         let portable_state_sha256 = digest(6);
         let capsule = ClusterRecoveryCapsule {
             version: CLUSTER_RECOVERY_CAPSULE_VERSION,
-            attempt: CheckpointAttempt::new(7, assignment_fence.assignment_version),
+            attempt: CheckpointAttempt::canonical(7),
             deployment_id: "00000000-0000-0000-0000-000000000007".into(),
             pipeline_identity: PipelineIdentity {
                 canonical_version: PIPELINE_IDENTITY_VERSION,
@@ -7267,7 +7186,6 @@ mod tests {
                 checkpoint_complete_tx,
                 checkpoint_tail_tasks: tokio::task::JoinSet::new(),
                 checkpoint_in_flight: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                staged_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 delta_rebase_needed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 last_vnode_capture_epoch: None,
                 epoch_allocator: None,
@@ -7831,7 +7749,7 @@ mod tests {
     fn ambiguous_decision_faults_at_least_once_pipeline() {
         let result = crate::checkpoint_coordinator::CheckpointResult {
             success: false,
-            checkpoint_id: 22,
+            checkpoint_id: 7,
             epoch: 7,
             duration: std::time::Duration::ZERO,
             error: Some("decision outcome is in doubt".into()),
@@ -7891,7 +7809,7 @@ mod tests {
 
     #[tokio::test]
     async fn source_checkpoint_materialization_rejects_expired_deadline() {
-        let attempt = CheckpointAttempt::new(7, 11);
+        let attempt = CheckpointAttempt::new(7, 7);
         let result = materialize_source_checkpoints_until(
             FxHashMap::default(),
             attempt,
@@ -7901,7 +7819,7 @@ mod tests {
         let Err(error) = result else {
             panic!("an expired absolute deadline must reject materialization");
         };
-        assert!(error.contains("checkpoint 11 epoch 7"));
+        assert!(error.contains("checkpoint 7 epoch 7"));
         assert!(error.contains("before source-offset materialization"));
     }
 
@@ -8030,7 +7948,7 @@ mod tests {
 
         let error = cleanup_reserved_attempt_until(
             &coordinator,
-            CheckpointAttempt::new(7, 11),
+            CheckpointAttempt::new(7, 7),
             "injected admission failure".into(),
             None,
             None,
@@ -8161,9 +8079,9 @@ mod tests {
     #[test]
     fn follower_admission_allows_only_exact_retry_after_failure() {
         let state = FollowerTailState::default();
-        let exact = follower_identity(5, 50, 1);
-        let wrong_checkpoint = follower_identity(5, 51, 1);
-        let wrong_certificate = follower_identity(5, 50, 2);
+        let exact = follower_identity(5, 5, 1);
+        let wrong_checkpoint = follower_identity(5, 6, 1);
+        let wrong_certificate = follower_identity(5, 5, 2);
         let mut wrong_authority = exact.clone();
         wrong_authority.leader_proof = leader_proof(2);
 
@@ -8186,7 +8104,7 @@ mod tests {
         assert!(state.reserve(wrong_authority).is_err());
 
         assert_eq!(state.finish(&exact, false), Ok(()));
-        let newer = follower_identity(6, 60, 1);
+        let newer = follower_identity(6, 6, 1);
         assert_eq!(
             state.reserve(newer.clone()),
             Ok(FollowerAdmission::Reserved)
@@ -8205,7 +8123,7 @@ mod tests {
     #[test]
     fn follower_commit_and_admission_are_atomic() {
         let state = Arc::new(FollowerTailState::default());
-        let identity = follower_identity(8, 80, 3);
+        let identity = follower_identity(8, 8, 3);
         assert_eq!(
             state.reserve(identity.clone()),
             Ok(FollowerAdmission::Reserved)
@@ -8240,8 +8158,8 @@ mod tests {
     #[test]
     fn follower_tail_tracks_multiple_in_flight_identities() {
         let state = FollowerTailState::default();
-        let five = follower_identity(5, 50, 1);
-        let seven = follower_identity(7, 70, 1);
+        let five = follower_identity(5, 5, 1);
+        let seven = follower_identity(7, 7, 1);
 
         assert_eq!(state.reserve(five.clone()), Ok(FollowerAdmission::Reserved));
         assert_eq!(
@@ -8265,7 +8183,7 @@ mod tests {
     #[test]
     fn follower_committed_highwater_rejects_conflicting_attempt_dimensions() {
         let state = FollowerTailState::default();
-        let committed = follower_identity(10, 100, 1);
+        let committed = follower_identity(10, 10, 1);
         assert_eq!(
             state.reserve(committed.clone()),
             Ok(FollowerAdmission::Reserved)
@@ -8273,10 +8191,10 @@ mod tests {
         assert_eq!(state.finish(&committed, true), Ok(()));
 
         for conflicting in [
-            follower_identity(10, 101, 1),
-            follower_identity(11, 100, 1),
-            follower_identity(9, 101, 1),
-            follower_identity(11, 99, 1),
+            follower_identity(10, 11, 1),
+            follower_identity(11, 10, 1),
+            follower_identity(9, 11, 1),
+            follower_identity(11, 9, 1),
         ] {
             let error = state.reserve(conflicting).unwrap_err();
             assert!(error.contains("conflicting checkpoint"), "{error}");
@@ -8288,8 +8206,8 @@ mod tests {
     #[cfg(feature = "cluster")]
     #[test]
     fn follower_rejected_terminal_keeps_its_admission_fence() {
-        let terminal = follower_identity(11, 99, 1);
-        for committed in [follower_identity(10, 100, 1), follower_identity(11, 99, 2)] {
+        let terminal = follower_identity(11, 11, 1);
+        for committed in [follower_identity(10, 12, 1), follower_identity(11, 11, 2)] {
             let state = FollowerTailState::default();
             assert_eq!(
                 state.reserve(terminal.clone()),
@@ -8310,8 +8228,8 @@ mod tests {
     #[test]
     fn follower_terminal_rejects_same_attempt_with_different_certificate() {
         let state = FollowerTailState::default();
-        let exact = follower_identity(9, 90, 1);
-        let wrong_certificate = follower_identity(9, 90, 2);
+        let exact = follower_identity(9, 9, 1);
+        let wrong_certificate = follower_identity(9, 9, 2);
 
         assert_eq!(
             state.reserve(exact.clone()),
@@ -8330,7 +8248,7 @@ mod tests {
     #[test]
     fn follower_in_doubt_completion_retains_in_flight_identity() {
         let state = FollowerTailState::default();
-        let identity = follower_identity(10, 100, 4);
+        let identity = follower_identity(10, 10, 4);
         assert_eq!(
             state.reserve(identity.clone()),
             Ok(FollowerAdmission::Reserved)
@@ -8620,7 +8538,7 @@ mod tests {
         let controller = Arc::new(controller);
         let fence = assignment_fence(19, &[1, 7]);
         controller.publish_checkpoint_assignment_fence(Some(fence.clone()));
-        let attempt = CheckpointAttempt::new(30, 300);
+        let attempt = CheckpointAttempt::new(30, 30);
         let announcement = BarrierAnnouncement {
             epoch: attempt.epoch,
             checkpoint_id: attempt.checkpoint_id,
@@ -8679,14 +8597,14 @@ mod tests {
                 gate_controller().await;
             let controller = Arc::new(controller);
             let fence = assignment_fence(19, &[1, 7]);
-            let attempt = CheckpointAttempt::new(30, 300);
+            let attempt = CheckpointAttempt::new(30, 30);
             let mut callback = empty_callback_fixture();
             callback.cluster_controller = Some(Arc::clone(&controller));
             let (sender, receiver) = install_callback_shuffle(&mut callback, &fence).await;
             stage_callback_shuffle_barrier(&sender, &receiver, &fence, attempt).await;
 
             if dominated_by_successor {
-                let successor = CheckpointAttempt::new(31, 301);
+                let successor = CheckpointAttempt::new(31, 31);
                 let successor_fence = assignment_fence(20, &[1, 7]);
                 record_gate_abort(&controller, successor, &successor_fence).await;
             } else {
@@ -8790,6 +8708,7 @@ mod tests {
                 Arc::clone(&leader_deadline),
             )
             .unwrap();
+        leader.install_local_leader_proof_provider();
         let leader_process_lease = ProcessLease {
             node: leader_id,
             owner: leader_grant.owner.boot,
@@ -8821,7 +8740,7 @@ mod tests {
         follower.publish_checkpoint_assignment_fence(Some(fence.clone()));
         assert_eq!(leader.capture_leader_proof().as_ref(), Some(&leader_proof));
 
-        let attempt = CheckpointAttempt::new(30, 300);
+        let attempt = CheckpointAttempt::new(30, 30);
         let announcement = BarrierAnnouncement {
             epoch: attempt.epoch,
             checkpoint_id: attempt.checkpoint_id,
@@ -8859,11 +8778,10 @@ mod tests {
         let (complete_tx, _complete_rx) =
             crossfire::mpsc::bounded_async::<crate::pipeline::CheckpointCompletion>(1);
         let in_flight = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let staged_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let mut request = crate::checkpoint_coordinator::CheckpointRequest::default();
         request.assignment_fence = Some(fence.clone());
         let tail = LeaderTail {
-            _in_flight: EpochInFlightGuard::claim(&in_flight, &staged_bytes, 0),
+            _in_flight: EpochInFlightGuard::claim(&in_flight),
             coordinator,
             complete_tx,
             request,
@@ -8948,7 +8866,7 @@ mod tests {
         let (kv, controller, leader_id, _members_tx, _decision_store) = gate_controller().await;
         let controller = Arc::new(controller);
         let fence = assignment_fence(19, &[1, 7]);
-        let attempt = CheckpointAttempt::new(30, 300);
+        let attempt = CheckpointAttempt::new(30, 30);
         let mut callback = empty_callback_fixture();
         callback.checkpoint_cleanup_timeout = Duration::from_millis(30);
         callback.cluster_controller = Some(Arc::clone(&controller));
@@ -8991,7 +8909,7 @@ mod tests {
         let (_kv, controller, _leader_id, _members_tx, decision_store) = gate_controller().await;
         let controller = Arc::new(controller);
         let fence = assignment_fence(19, &[1, 7]);
-        let attempt = CheckpointAttempt::new(30, 300);
+        let attempt = CheckpointAttempt::new(30, 30);
         record_gate_commit(&controller, &decision_store, attempt, &fence).await;
         let mut callback = empty_callback_fixture();
         callback.cluster_controller = Some(Arc::clone(&controller));
@@ -9033,7 +8951,7 @@ mod tests {
             .unwrap();
         let controller = Arc::new(controller);
         let fence = assignment_fence(19, &[1, 7]);
-        let attempt = CheckpointAttempt::new(30, 300);
+        let attempt = CheckpointAttempt::new(30, 30);
         let mut callback = empty_callback_fixture();
         callback.cluster_controller = Some(Arc::clone(&controller));
         let (sender, receiver) = install_callback_shuffle(&mut callback, &fence).await;
@@ -9061,13 +8979,13 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[tokio::test]
-    async fn barrier_retirement_conflict_faults_at_least_once_callback() {
+    async fn barrier_retirement_rejects_noncanonical_attempt() {
         let (_kv, _controller, _leader_id, _members_tx, _decision_store) = gate_controller().await;
         let fence = assignment_fence(19, &[1, 7]);
         let mut callback = empty_callback_fixture();
         let (_sender, receiver) = install_callback_shuffle(&mut callback, &fence).await;
         receiver
-            .retire_checkpoint_barriers(CheckpointAttempt::new(40, 400), fence.digest())
+            .retire_checkpoint_barriers(CheckpointAttempt::new(40, 40), fence.digest())
             .unwrap();
 
         let error = callback
@@ -9077,7 +8995,7 @@ mod tests {
             )
             .unwrap_err();
 
-        assert!(error.contains("conflicts with high-water"), "{error}");
+        assert!(error.contains("canonical checkpoint ID"), "{error}");
         assert!(callback.checkpoint_fault.lock().is_some());
     }
 
@@ -9096,7 +9014,7 @@ mod tests {
         let controller = Arc::new(controller);
         let fence = assignment_fence(20, &[1, 7]);
         controller.publish_checkpoint_assignment_fence(Some(fence.clone()));
-        let attempt = CheckpointAttempt::new(31, 301);
+        let attempt = CheckpointAttempt::new(31, 31);
         let announcement = BarrierAnnouncement {
             epoch: attempt.epoch,
             checkpoint_id: attempt.checkpoint_id,
@@ -9154,7 +9072,7 @@ mod tests {
             .unwrap();
         let controller = Arc::new(controller);
         let fence = assignment_fence(20, &[1, 7]);
-        let attempt = CheckpointAttempt::new(31, 301);
+        let attempt = CheckpointAttempt::new(31, 31);
         let mut callback = empty_callback_fixture();
         callback.cluster_controller = Some(Arc::clone(&controller));
         let (sender, receiver) = install_callback_shuffle(&mut callback, &fence).await;
@@ -9228,7 +9146,7 @@ mod tests {
         controller.publish_checkpoint_assignment_fence(Some(local_fence));
         let announcement = BarrierAnnouncement {
             epoch: 20,
-            checkpoint_id: 200,
+            checkpoint_id: 20,
             assignment_fence: Some(announced_fence.clone()),
             leader_proof: Some(leader_proof(1)),
             phase: Phase::Prepare,
@@ -9245,7 +9163,7 @@ mod tests {
         let FollowerPrepareAdmission::Failed { attempt, error } = admission else {
             panic!("a mismatched local assignment must reject follower admission");
         };
-        assert_eq!(attempt, CheckpointAttempt::new(20, 200));
+        assert_eq!(attempt, CheckpointAttempt::new(20, 20));
         assert!(error.contains("follower assignment differs"), "{error}");
 
         let encoded = kv
@@ -9254,7 +9172,7 @@ mod tests {
             .expect("assignment rejection must publish a prompt negative acknowledgement");
         let acknowledgement: BarrierAck = serde_json::from_str(&encoded).unwrap();
         assert_eq!(acknowledgement.epoch, 20);
-        assert_eq!(acknowledgement.checkpoint_id, 200);
+        assert_eq!(acknowledgement.checkpoint_id, 20);
         assert_eq!(
             acknowledgement.assignment_digest,
             Some(announced_fence.digest())
@@ -10018,7 +9936,7 @@ mod tests {
         let state = FollowerTailState::default();
         for epoch in 1..=MAX_RETAINED_FOLLOWER_IDENTITIES as u64 {
             assert_eq!(
-                state.reserve(follower_identity(epoch, epoch * 10, 1)),
+                state.reserve(follower_identity(epoch, epoch, 1)),
                 Ok(FollowerAdmission::Reserved)
             );
         }
@@ -10026,16 +9944,20 @@ mod tests {
             state
                 .reserve(follower_identity(
                     MAX_RETAINED_FOLLOWER_IDENTITIES as u64 + 1,
-                    9_999,
+                    MAX_RETAINED_FOLLOWER_IDENTITIES as u64 + 1,
                     1,
                 ))
                 .is_err(),
             "all-active capacity must fail closed"
         );
 
-        let oldest = follower_identity(1, 10, 1);
+        let oldest = follower_identity(1, 1, 1);
         assert_eq!(state.finish(&oldest, false), Ok(()));
-        let newest = follower_identity(MAX_RETAINED_FOLLOWER_IDENTITIES as u64 + 1, 9_999, 1);
+        let newest = follower_identity(
+            MAX_RETAINED_FOLLOWER_IDENTITIES as u64 + 1,
+            MAX_RETAINED_FOLLOWER_IDENTITIES as u64 + 1,
+            1,
+        );
         assert_eq!(state.reserve(newest), Ok(FollowerAdmission::Reserved));
         assert_eq!(state.in_flight().len(), MAX_RETAINED_FOLLOWER_IDENTITIES);
     }

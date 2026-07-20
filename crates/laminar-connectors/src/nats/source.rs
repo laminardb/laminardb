@@ -351,9 +351,7 @@ impl SourceConnector for NatsSource {
     }
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
-        let SourceStart {
-            config, position, ..
-        } = request;
+        let (config, position, _) = request.into_parts();
         if let SourcePosition::Resume { attempt, .. } = position {
             return Err(ConnectorError::ConfigurationError(format!(
                 "NATS is an ephemeral source and cannot resume checkpoint attempt {attempt:?}"

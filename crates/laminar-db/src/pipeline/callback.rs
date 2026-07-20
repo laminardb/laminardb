@@ -148,6 +148,9 @@ impl SourceBarrierControl {
 
     /// Release a source that has already emitted this exact attempt's barrier.
     pub(crate) fn release_exact(&self, attempt: CheckpointAttempt) {
+        if !attempt.is_canonical() {
+            return;
+        }
         self.release_tx.send_if_modified(|signal| match *signal {
             Some(SourceBarrierSignal::Stop) => false,
             Some(SourceBarrierSignal::Release(released)) => match released.relation_to(attempt) {
@@ -170,6 +173,35 @@ impl SourceBarrierControl {
 
     pub(crate) fn stop_hold(&self) {
         let _ = self.release_tx.send(Some(SourceBarrierSignal::Stop));
+    }
+}
+
+#[cfg(test)]
+mod source_barrier_tests {
+    use super::*;
+
+    #[test]
+    fn noncanonical_release_cannot_publish_or_advance_source_release() {
+        let injector = CheckpointBarrierInjector::new();
+        let (release_tx, release_rx) = tokio::sync::watch::channel(None);
+        let control = SourceBarrierControl::new(injector, release_tx);
+        let invalid = CheckpointAttempt::new(6, 7);
+
+        control.release_exact(invalid);
+        assert_eq!(*release_rx.borrow(), None);
+
+        let canonical = CheckpointAttempt::canonical(5);
+        control.release_exact(canonical);
+        assert_eq!(
+            *release_rx.borrow(),
+            Some(SourceBarrierSignal::Release(canonical))
+        );
+
+        control.release_exact(invalid);
+        assert_eq!(
+            *release_rx.borrow(),
+            Some(SourceBarrierSignal::Release(canonical))
+        );
     }
 }
 
@@ -634,6 +666,14 @@ pub trait PipelineCallback: Send + 'static {
 
     /// Terminate provisional subscription delivery before shutdown or recovery replay.
     fn invalidate_subscriptions(&self, _reason: &str) {}
+
+    /// Resolve durable ownership of any open checkpoint-committable sink epoch while its actor is
+    /// still live. A failure must leave the actors open so lifecycle teardown can retry.
+    fn settle_sink_epoch_for_shutdown(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        std::future::ready(Ok(()))
+    }
 
     /// Gracefully close sinks on shutdown (abort open transactions, flush) so a restart
     /// re-initialises cleanly. Every sink must be attempted; the result aggregates failures.

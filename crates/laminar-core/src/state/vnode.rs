@@ -917,7 +917,7 @@ mod tests {
         };
         let capsule = ClusterRecoveryCapsule {
             version: CLUSTER_RECOVERY_CAPSULE_VERSION,
-            attempt: CheckpointAttempt::new(5, 9),
+            attempt: CheckpointAttempt::canonical(9),
             deployment_id: uuid::Uuid::from_u128(99).to_string(),
             pipeline_identity: PipelineIdentity {
                 canonical_version: PIPELINE_IDENTITY_VERSION,
@@ -1057,7 +1057,7 @@ mod tests {
         );
         assert_eq!(
             version_one.source_handoff_attempt(),
-            Some(CheckpointAttempt::new(5, 9))
+            Some(CheckpointAttempt::canonical(9))
         );
         assert_eq!(version_one.source_handoff_assignment_version(), Some(17));
         assert_eq!(version_one.source_handoff_installed_version(), Some(1));

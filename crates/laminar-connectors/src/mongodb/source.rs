@@ -909,9 +909,7 @@ impl SourceConnector for MongoDbCdcSource {
                 actual: self.state.to_string(),
             });
         }
-        let SourceStart {
-            config, position, ..
-        } = request;
+        let (config, position, _) = request.into_parts();
         let parsed_config = if config.properties().is_empty() {
             let mut config = self.config.clone();
             config.normalize_pipeline()?;
@@ -3152,14 +3150,17 @@ mod tests {
         let config = MongoDbSourceConfig::new("mongodb://localhost:27017", "db", "coll");
         let mut source = MongoDbCdcSource::new(config, None);
         let error = source
-            .start(SourceStart {
-                config: ConnectorConfig::new("mongodb-cdc"),
-                position: SourcePosition::Resume {
-                    attempt: laminar_core::state::CheckpointAttempt::new(7, 11),
-                    checkpoint: SourceCheckpoint::new(),
-                },
-                delivery: crate::connector::DeliveryGuarantee::BestEffort,
-            })
+            .start(
+                SourceStart::new(
+                    ConnectorConfig::new("mongodb-cdc"),
+                    SourcePosition::Resume {
+                        attempt: laminar_core::state::CheckpointAttempt::canonical(11),
+                        checkpoint: SourceCheckpoint::new(),
+                    },
+                    crate::connector::DeliveryGuarantee::BestEffort,
+                )
+                .unwrap(),
+            )
             .await
             .expect_err("an unbound empty checkpoint must be rejected");
         assert!(error.to_string().contains("checkpoint identity"));
@@ -3173,11 +3174,14 @@ mod tests {
         let mut source = MongoDbCdcSource::new(config, None);
         source.state = ConnectorState::Running;
         let error = source
-            .start(SourceStart {
-                config: ConnectorConfig::new("mongodb-cdc"),
-                position: SourcePosition::Initial,
-                delivery: crate::connector::DeliveryGuarantee::BestEffort,
-            })
+            .start(
+                SourceStart::new(
+                    ConnectorConfig::new("mongodb-cdc"),
+                    SourcePosition::Initial,
+                    crate::connector::DeliveryGuarantee::BestEffort,
+                )
+                .unwrap(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(error, ConnectorError::InvalidState { .. }));
@@ -3704,14 +3708,17 @@ mod tests {
         );
 
         let first_error = source
-            .start(SourceStart {
-                config: candidate.clone(),
-                position: SourcePosition::Resume {
-                    attempt: laminar_core::state::CheckpointAttempt::new(7, 11),
-                    checkpoint,
-                },
-                delivery: crate::connector::DeliveryGuarantee::BestEffort,
-            })
+            .start(
+                SourceStart::new(
+                    candidate.clone(),
+                    SourcePosition::Resume {
+                        attempt: laminar_core::state::CheckpointAttempt::canonical(11),
+                        checkpoint,
+                    },
+                    crate::connector::DeliveryGuarantee::BestEffort,
+                )
+                .unwrap(),
+            )
             .await
             .unwrap_err();
         assert!(
@@ -3732,11 +3739,14 @@ mod tests {
         assert!(source.reader_error.is_none());
 
         let retry_error = source
-            .start(SourceStart {
-                config: candidate,
-                position: SourcePosition::Initial,
-                delivery: crate::connector::DeliveryGuarantee::BestEffort,
-            })
+            .start(
+                SourceStart::new(
+                    candidate,
+                    SourcePosition::Initial,
+                    crate::connector::DeliveryGuarantee::BestEffort,
+                )
+                .unwrap(),
+            )
             .await
             .unwrap_err();
         assert!(

@@ -8,6 +8,107 @@
 use std::io;
 use std::path::Path;
 
+/// Creates every missing directory component with a crash-durable parent
+/// publication before returning.
+///
+/// Existing directories are re-synchronized on Unix. Windows treats them as a
+/// pre-established namespace because it has no documented directory flush
+/// primitive. A concurrent creator is accepted only after the winner is
+/// verified to be a real directory.
+///
+/// # Errors
+///
+/// Returns an I/O error if a component is not a directory, the path escapes
+/// through `..`, or the platform cannot durably publish a missing component.
+pub fn ensure_durable_directory(path: &Path) -> io::Result<()> {
+    if path.as_os_str().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "durable directory path is empty",
+        ));
+    }
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            return establish_existing_directory(&path);
+        }
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} exists and is not a directory", path.display()),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let mut ancestor = path.as_path();
+    loop {
+        ancestor = ancestor.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "durable directory has no existing ancestor",
+            )
+        })?;
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata.file_type().is_dir() => break,
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{} exists and is not a directory", ancestor.display()),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    let relative = path.strip_prefix(ancestor).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "durable directory is outside its existing ancestor",
+        )
+    })?;
+    let mut current = ancestor.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "durable directory contains a non-normal path component",
+            ));
+        };
+        let destination = current.join(component);
+        publish_directory_component(&current, &destination)?;
+        current = destination;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn establish_existing_directory(path: &Path) -> io::Result<()> {
+    sync_directory(path)?;
+    if let Some(parent) = path.parent() {
+        sync_directory(parent)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[allow(clippy::unnecessary_wraps)] // Shared caller is fallible on Unix.
+fn establish_existing_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn establish_existing_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 /// Whether publication may replace an existing destination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DurableRenameMode {
@@ -43,6 +144,67 @@ pub fn durable_rename(
 }
 
 #[cfg(unix)]
+fn publish_directory_component(parent: &Path, destination: &Path) -> io::Result<()> {
+    match std::fs::create_dir(destination) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(destination)?;
+            if !metadata.file_type().is_dir() {
+                return Err(error);
+            }
+        }
+        Err(error) => return Err(error),
+    }
+    sync_directory(destination)?;
+    sync_directory(parent)
+}
+
+#[cfg(windows)]
+fn publish_directory_component(parent: &Path, destination: &Path) -> io::Result<()> {
+    let temporary = loop {
+        let candidate = parent.join(format!(
+            ".laminardb-directory#{}",
+            uuid::Uuid::new_v4().as_u128()
+        ));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => break candidate,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    };
+    let cleanup = TemporaryDirectory(temporary.clone());
+    match durable_rename(&temporary, destination, DurableRenameMode::NoReplace) {
+        Ok(()) => {}
+        Err(error) => match std::fs::symlink_metadata(destination) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            _ => {
+                return Err(error);
+            }
+        },
+    }
+    drop(cleanup);
+    Ok(())
+}
+
+#[cfg(windows)]
+struct TemporaryDirectory(std::path::PathBuf);
+
+#[cfg(windows)]
+impl Drop for TemporaryDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn publish_directory_component(_parent: &Path, _destination: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no proven crash-durable directory publication primitive for this platform",
+    ))
+}
+
+#[cfg(unix)]
 fn durable_rename_platform(
     source: &Path,
     destination: &Path,
@@ -68,7 +230,7 @@ fn durable_rename_platform(
 }
 
 #[cfg(unix)]
-fn sync_directory(parent: &Path) -> io::Result<()> {
+pub(crate) fn sync_directory(parent: &Path) -> io::Result<()> {
     std::fs::File::open(parent)?.sync_all()
 }
 
@@ -147,5 +309,36 @@ mod tests {
         durable_rename(&source, &destination, DurableRenameMode::Replace).unwrap();
         assert_eq!(std::fs::read(&destination).unwrap(), b"new");
         assert!(!source.exists());
+    }
+
+    #[test]
+    fn creates_nested_durable_directories_and_is_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("one").join("two").join("three");
+        ensure_durable_directory(&nested).unwrap();
+        assert!(nested.is_dir());
+        ensure_durable_directory(&nested).unwrap();
+    }
+
+    #[test]
+    fn rejects_a_file_in_the_directory_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("file");
+        std::fs::write(&file, b"not a directory").unwrap();
+        let error = ensure_durable_directory(&file.join("child")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn directory_publication_accepts_a_competing_real_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("winner");
+        std::fs::create_dir(&destination).unwrap();
+
+        publish_directory_component(directory.path(), &destination).unwrap();
+
+        assert!(destination.is_dir());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 }

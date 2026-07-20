@@ -149,10 +149,8 @@ fn build_checkpoint_store(
 ) -> Result<Box<dyn laminar_core::storage::checkpoint_store::CheckpointStore>> {
     let cp = &config.checkpoint;
     let url = &cp.url;
-
-    let obj_store =
-        laminar_core::storage::object_store_builder::build_object_store(url, &cp.storage)
-            .map_err(|e| anyhow::anyhow!("checkpoint url '{url}': {e}"))?;
+    let max_state_data_bytes = server::resolved_checkpoint_state_bytes(cp)
+        .map_err(|error| anyhow::anyhow!("checkpoint state budget: {error}"))?;
 
     let key_group_count = config.server.resolved_key_groups();
     let participant = if config.server.mode == config::ServerMode::Cluster {
@@ -182,23 +180,26 @@ fn build_checkpoint_store(
         // (`file:///C:/x` must become `C:/x`, not `/C:/x`).
         let path = laminar_core::storage::object_store_builder::file_url_path(url)
             .map_err(|e| anyhow::anyhow!("checkpoint url '{url}': {e}"))?;
-        Ok(Box::new(
-            laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
-                std::path::Path::new(path),
-            )
+        let store = laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(path)
             .with_key_group_count(key_group_count)
-            .with_participant_id(participant_id),
-        ))
+            .with_participant_id(participant_id)
+            .with_max_state_data_bytes(max_state_data_bytes)
+            .map_err(|error| anyhow::anyhow!("checkpoint state budget: {error}"))?;
+        Ok(Box::new(store))
     } else {
+        let obj_store =
+            laminar_core::storage::object_store_builder::build_object_store(url, &cp.storage)
+                .map_err(|e| anyhow::anyhow!("checkpoint url '{url}': {e}"))?;
         // The builder already rooted the store at the URL's path prefix.
-        Ok(Box::new(
-            laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore::new(
-                obj_store,
-                participant.map_or_else(String::new, |id| format!("nodes/{id}/")),
-            )
-            .with_key_group_count(key_group_count)
-            .with_participant_id(participant_id),
-        ))
+        let store = laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore::new(
+            obj_store,
+            participant.map_or_else(String::new, |id| format!("nodes/{id}/")),
+        )
+        .with_key_group_count(key_group_count)
+        .with_participant_id(participant_id)
+        .with_max_state_data_bytes(max_state_data_bytes)
+        .map_err(|error| anyhow::anyhow!("checkpoint state budget: {error}"))?;
+        Ok(Box::new(store))
     }
 }
 
@@ -243,7 +244,8 @@ mod tests {
     #[test]
     fn checkpoint_store_uses_the_runtime_key_group_topology() {
         let root = tempfile::tempdir().unwrap();
-        let normalized = root.path().to_string_lossy().replace('\\', "/");
+        let checkpoint_root = root.path().join("checkpoint-store");
+        let normalized = checkpoint_root.to_string_lossy().replace('\\', "/");
         let checkpoint_url = if normalized.starts_with('/') {
             format!("file://{normalized}")
         } else {
@@ -257,6 +259,21 @@ mod tests {
             store.key_group_count(),
             laminar_core::state::LOCAL_KEY_GROUP_COUNT
         );
+        assert_eq!(
+            store.max_state_data_bytes(),
+            laminar_core::checkpoint::checkpoint_store::DEFAULT_MAX_CHECKPOINT_STATE_BYTES
+        );
+        assert_eq!(store.participant_id(), 0);
+        assert!(
+            !checkpoint_root.exists(),
+            "local validation store construction must not mutate checkpoint storage"
+        );
+        drop(store);
+
+        config.checkpoint.max_staged_bytes = Some(8 * 1024 * 1024);
+        let store = build_checkpoint_store(&config).unwrap();
+        assert_eq!(store.max_state_data_bytes(), 8 * 1024 * 1024);
+        drop(store);
 
         #[cfg(feature = "cluster")]
         {
@@ -266,6 +283,65 @@ mod tests {
             config.node_id = Some("checkpoint-validator".into());
             let store = build_checkpoint_store(&config).unwrap();
             assert_eq!(store.key_group_count(), key_groups);
+            assert_eq!(store.max_state_data_bytes(), 8 * 1024 * 1024);
+            assert_eq!(
+                store.participant_id(),
+                crate::cluster::numeric_node_id("checkpoint-validator")
+            );
+            assert!(
+                checkpoint_root.exists(),
+                "cluster validation must route file:// through its participant object-store layout"
+            );
         }
+    }
+
+    #[test]
+    fn checkpoint_store_rejects_a_zero_state_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let checkpoint_root = root.path().join("must-not-be-created");
+        let normalized = checkpoint_root.to_string_lossy().replace('\\', "/");
+        let checkpoint_url = if normalized.starts_with('/') {
+            format!("file://{normalized}")
+        } else {
+            format!("file:///{normalized}")
+        };
+
+        let mut config: crate::config::ServerConfig = toml::from_str("").unwrap();
+        config.checkpoint.url = checkpoint_url;
+        config.checkpoint.max_staged_bytes = Some(0);
+        let Err(error) = build_checkpoint_store(&config) else {
+            panic!("zero checkpoint state budget was admitted");
+        };
+        assert!(
+            error.to_string().contains("checkpoint state budget"),
+            "{error}"
+        );
+        assert!(!checkpoint_root.exists());
+    }
+
+    #[test]
+    fn checkpoint_store_rejects_an_unaddressable_state_budget_before_storage_setup() {
+        let root = tempfile::tempdir().unwrap();
+        let checkpoint_root = root.path().join("must-not-be-created");
+        let normalized = checkpoint_root.to_string_lossy().replace('\\', "/");
+        let checkpoint_url = if normalized.starts_with('/') {
+            format!("file://{normalized}")
+        } else {
+            format!("file:///{normalized}")
+        };
+
+        let mut config: crate::config::ServerConfig = toml::from_str("").unwrap();
+        config.checkpoint.url = checkpoint_url;
+        config.checkpoint.max_staged_bytes = Some((isize::MAX as u64) + 1);
+        let Err(error) = build_checkpoint_store(&config) else {
+            panic!("unaddressable checkpoint state budget was admitted");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds this process address space"),
+            "{error}"
+        );
+        assert!(!checkpoint_root.exists());
     }
 }

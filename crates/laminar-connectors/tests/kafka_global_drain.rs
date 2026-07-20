@@ -282,11 +282,14 @@ async fn source_holds_global_cuts_across_abort_and_commit() {
         .set_vnode_assignment(&source_identity, Arc::clone(&registry), NodeId(1))
         .unwrap();
     source
-        .start(SourceStart {
-            config: ConnectorConfig::new("kafka"),
-            position: SourcePosition::Initial,
-            delivery: DeliveryGuarantee::AtLeastOnce,
-        })
+        .start(
+            SourceStart::new(
+                ConnectorConfig::new("kafka"),
+                SourcePosition::Initial,
+                DeliveryGuarantee::AtLeastOnce,
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
 
@@ -388,14 +391,17 @@ async fn source_holds_global_cuts_across_abort_and_commit() {
         .set_vnode_assignment(&source_identity, Arc::clone(&registry), NodeId(2))
         .unwrap();
     successor
-        .start(SourceStart {
-            config: ConnectorConfig::new("kafka"),
-            position: SourcePosition::Resume {
-                attempt: CheckpointAttempt::new(1, 1),
-                checkpoint: successor_checkpoint,
-            },
-            delivery: DeliveryGuarantee::AtLeastOnce,
-        })
+        .start(
+            SourceStart::new(
+                ConnectorConfig::new("kafka"),
+                SourcePosition::Resume {
+                    attempt: CheckpointAttempt::new(1, 1),
+                    checkpoint: successor_checkpoint,
+                },
+                DeliveryGuarantee::AtLeastOnce,
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
 

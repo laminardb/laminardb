@@ -199,6 +199,17 @@ impl ObjectStoreBackend {
         )
     }
 
+    fn ensure_canonical_attempt(attempt: CheckpointAttempt) -> Result<(), StateBackendError> {
+        if attempt.is_canonical() {
+            Ok(())
+        } else {
+            Err(StateBackendError::Conflict {
+                resource: Self::attempt_prefix(attempt),
+                message: "state attempt must use one nonzero canonical checkpoint ID".into(),
+            })
+        }
+    }
+
     fn partial_path(attempt: CheckpointAttempt, vnode: u32) -> OsPath {
         OsPath::from(format!(
             "{}vnode={vnode}/partial.bin",
@@ -394,15 +405,14 @@ impl ObjectStoreBackend {
         }
     }
 
-    /// Parse an attempt from `state-v2/epoch=N/checkpoint=M/...`.
-    fn attempt_from_path(loc: &str) -> Option<CheckpointAttempt> {
-        let mut parts = loc.split('/');
-        if parts.next()? != "state-v2" {
+    /// Parse one immediate `state-v2/epoch=N` delimiter prefix.
+    fn epoch_from_prefix(prefix: &OsPath) -> Option<u64> {
+        let encoded = prefix.as_ref().strip_prefix("state-v2/epoch=")?;
+        if encoded.is_empty() || encoded.contains('/') {
             return None;
         }
-        let epoch = parts.next()?.strip_prefix("epoch=")?.parse().ok()?;
-        let checkpoint_id = parts.next()?.strip_prefix("checkpoint=")?.parse().ok()?;
-        Some(CheckpointAttempt::new(epoch, checkpoint_id))
+        let epoch = encoded.parse::<u64>().ok()?;
+        (epoch != 0 && epoch.to_string() == encoded).then_some(epoch)
     }
 
     /// Wrap raw operator state in a fixed-width provenance header. The fixed width lets the
@@ -857,6 +867,7 @@ impl ObjectStoreBackend {
         &self,
         attempt: CheckpointAttempt,
     ) -> Result<bool, StateBackendError> {
+        Self::ensure_canonical_attempt(attempt)?;
         Ok(self
             .read_prune_floor()
             .await?
@@ -867,6 +878,7 @@ impl ObjectStoreBackend {
         &self,
         attempt: CheckpointAttempt,
     ) -> Result<(), StateBackendError> {
+        Self::ensure_canonical_attempt(attempt)?;
         if let Some(versioned) = self.read_prune_floor().await? {
             if attempt.epoch < versioned.floor.before_epoch {
                 return Err(StateBackendError::Conflict {
@@ -1026,6 +1038,10 @@ impl StateBackend for ObjectStoreBackend {
 
     fn durability_scope(&self) -> StateBackendDurability {
         self.durability_scope
+    }
+
+    fn uses_exact_object_store(&self, expected: &Arc<dyn ObjectStore>) -> bool {
+        Arc::ptr_eq(&self.store, expected)
     }
 
     async fn write_partial(
@@ -1293,6 +1309,7 @@ impl StateBackend for ObjectStoreBackend {
         use rustc_hash::FxHashSet;
         use tokio_stream::StreamExt;
 
+        Self::ensure_canonical_attempt(attempt)?;
         let assignment_version = self.seal_assignment_version(attempt, assignment_fence)?;
         self.check_assignment_version(assignment_version)?;
         self.ensure_attempt_live(attempt).await?;
@@ -1525,7 +1542,7 @@ impl StateBackend for ObjectStoreBackend {
     }
 
     async fn prune_before(&self, before: u64) -> Result<(), StateBackendError> {
-        use futures::stream::{self, StreamExt};
+        use futures::StreamExt;
 
         if before == 0 {
             return Ok(());
@@ -1556,51 +1573,46 @@ impl StateBackend for ObjectStoreBackend {
             tokio::task::yield_now().await;
         }
 
-        loop {
-            let current =
+        'sweep: loop {
+            let mut current =
                 self.read_prune_floor()
                     .await?
                     .ok_or_else(|| StateBackendError::Conflict {
                         resource: Self::prune_floor_path().to_string(),
                         message: "state prune floor disappeared after publication".into(),
                     })?;
-            let start = current.floor.swept_before_epoch;
             let target = current.floor.before_epoch;
-            if start == target {
-                return Ok(());
-            }
 
-            let mut victims = Vec::new();
-            if start == 0 {
-                // One cold-start baseline also repairs a process that crashed after publishing its
-                // first floor. Later passes list only newly retired epoch prefixes.
-                let mut entries = self.store.list(Some(&OsPath::from("state-v2/")));
-                while let Some(entry) = entries.next().await {
-                    let entry = entry.map_err(|error| StateBackendError::Io(error.to_string()))?;
-                    if Self::attempt_from_path(entry.location.as_ref())
-                        .is_some_and(|attempt| attempt.epoch < target)
-                    {
-                        victims.push(entry.location);
-                    }
-                }
-            } else {
-                for epoch in start..target {
-                    let prefix = OsPath::from(format!("state-v2/epoch={epoch}/"));
-                    let mut entries = self.store.list(Some(&prefix));
-                    while let Some(entry) = entries.next().await {
-                        victims.push(
-                            entry
-                                .map_err(|error| StateBackendError::Io(error.to_string()))?
-                                .location,
-                        );
-                    }
-                }
-            }
+            // Discover materialized epochs rather than issuing one LIST for every numeric ID in
+            // the retired range. Sparse checkpoint IDs are normal after allocation failures and
+            // can otherwise turn one retention pass into tens of thousands of remote requests.
+            // Revisit prefixes below the durable cursor too: a writer whose publication raced the
+            // floor can leave garbage after an ambiguously failed cleanup, even though readers
+            // already reject it.
+            let state_root = OsPath::from("state-v2");
+            let discovered = self
+                .store
+                .list_with_delimiter(Some(&state_root))
+                .await
+                .map_err(|error| StateBackendError::Io(error.to_string()))?;
+            let mut retired_prefixes = discovered
+                .common_prefixes
+                .into_iter()
+                .filter_map(|prefix| {
+                    let epoch = Self::epoch_from_prefix(&prefix)?;
+                    (epoch < target).then_some((epoch, prefix))
+                })
+                .collect::<Vec<_>>();
+            retired_prefixes.sort_unstable_by_key(|(epoch, _)| *epoch);
 
-            if !victims.is_empty() {
-                let locations =
-                    stream::iter(victims.into_iter().map(Ok::<OsPath, object_store::Error>))
-                        .boxed();
+            for (epoch, prefix) in retired_prefixes {
+                // Feed one prefix directly into bounded object-store deletion. Never retain every
+                // artifact location for the whole sweep in memory.
+                let locations = self
+                    .store
+                    .list(Some(&prefix))
+                    .map(|entry| entry.map(|metadata| metadata.location))
+                    .boxed();
                 let mut deletes = self.store.delete_stream(locations);
                 while let Some(result) = deletes.next().await {
                     match result {
@@ -1612,14 +1624,45 @@ impl StateBackend for ObjectStoreBackend {
                         }
                     }
                 }
+
+                // The numeric cursor can represent completion of a sparse materialized prefix:
+                // every lower prefix was absent from the same delimiter snapshot or was already
+                // swept. Publishing after deletion makes a crash resume at this prefix unless the
+                // entire prefix was removed.
+                let next = epoch.saturating_add(1).min(target);
+                if current.floor.swept_before_epoch < next {
+                    let swept = StatePruneFloor {
+                        swept_before_epoch: next,
+                        ..current.floor.clone()
+                    };
+                    if !self
+                        .compare_and_swap_prune_floor(&swept, Some(current.update_version.clone()))
+                        .await?
+                    {
+                        tokio::task::yield_now().await;
+                        continue 'sweep;
+                    }
+                    current = self.read_prune_floor().await?.ok_or_else(|| {
+                        StateBackendError::Conflict {
+                            resource: Self::prune_floor_path().to_string(),
+                            message: "state prune floor disappeared after sweep progress".into(),
+                        }
+                    })?;
+                    if current.floor.before_epoch != target {
+                        continue 'sweep;
+                    }
+                }
             }
 
+            if current.floor.swept_before_epoch >= target {
+                return Ok(());
+            }
             let swept = StatePruneFloor {
                 swept_before_epoch: target,
-                ..current.floor
+                ..current.floor.clone()
             };
             if self
-                .compare_and_swap_prune_floor(&swept, Some(current.update_version))
+                .compare_and_swap_prune_floor(&swept, Some(current.update_version.clone()))
                 .await?
             {
                 return Ok(());
@@ -1878,7 +1921,8 @@ mod tests {
     struct RetentionLogStore {
         inner: Arc<dyn ObjectStore>,
         operations: Arc<parking_lot::Mutex<Vec<String>>>,
-        fail_delete: Arc<std::sync::atomic::AtomicBool>,
+        delete_calls: Arc<AtomicU64>,
+        fail_delete_call: u64,
     }
 
     impl std::fmt::Debug for RetentionLogStore {
@@ -1931,16 +1975,18 @@ mod tests {
         ) -> futures::stream::BoxStream<'static, object_store::Result<OsPath>> {
             let inner = Arc::clone(&self.inner);
             let operations = Arc::clone(&self.operations);
-            let fail_delete = Arc::clone(&self.fail_delete);
+            let delete_calls = Arc::clone(&self.delete_calls);
+            let fail_delete_call = self.fail_delete_call;
             locations
                 .then(move |location| {
                     let inner = Arc::clone(&inner);
                     let operations = Arc::clone(&operations);
-                    let fail_delete = Arc::clone(&fail_delete);
+                    let delete_calls = Arc::clone(&delete_calls);
                     async move {
                         let location = location?;
                         operations.lock().push(format!("delete:{location}"));
-                        if fail_delete.swap(false, Ordering::AcqRel) {
+                        let delete_call = delete_calls.fetch_add(1, Ordering::AcqRel) + 1;
+                        if delete_call == fail_delete_call {
                             return Err(object_store::Error::Generic {
                                 store: "retention-test",
                                 source: Box::new(std::io::Error::other("injected delete failure")),
@@ -1958,6 +2004,10 @@ mod tests {
             prefix: Option<&OsPath>,
         ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
         {
+            self.operations.lock().push(format!(
+                "list:{}",
+                prefix.map_or("<root>", |path| path.as_ref())
+            ));
             self.inner.list(prefix)
         }
 
@@ -1965,6 +2015,10 @@ mod tests {
             &self,
             prefix: Option<&OsPath>,
         ) -> object_store::Result<object_store::ListResult> {
+            self.operations.lock().push(format!(
+                "delimiter:{}",
+                prefix.map_or("<root>", |path| path.as_ref())
+            ));
             self.inner.list_with_delimiter(prefix).await
         }
 
@@ -2073,8 +2127,8 @@ mod tests {
         }
     }
 
-    fn attempt(epoch: u64) -> CheckpointAttempt {
-        CheckpointAttempt::new(epoch, epoch * 10)
+    fn attempt(checkpoint_id: u64) -> CheckpointAttempt {
+        CheckpointAttempt::canonical(checkpoint_id)
     }
 
     fn assignment_fence(version: u64, vnode_count: usize) -> CheckpointAssignmentFence {
@@ -2255,6 +2309,26 @@ mod tests {
         assert_eq!(&got[..], b"hello");
     }
 
+    #[tokio::test]
+    async fn noncanonical_attempt_is_rejected_before_object_creation() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let backend = ObjectStoreBackend::new(Arc::clone(&store), "node-0", 4);
+        let invalid = CheckpointAttempt::new(1, 2);
+
+        let error = backend
+            .write_partial(invalid, 0, 0, Bytes::from_static(b"invalid"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("canonical checkpoint ID"));
+        assert!(matches!(
+            store
+                .head(&ObjectStoreBackend::partial_path(invalid, 0))
+                .await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+        assert!(backend.read_partial(invalid, 0).await.is_err());
+    }
+
     #[test]
     fn decode_partial_realigns_an_unaligned_transport_buffer() {
         const ARCHIVE_ALIGNMENT: usize = rkyv::util::AlignedVec::<16>::ALIGNMENT;
@@ -2374,11 +2448,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reused_epoch_isolated_by_checkpoint_id() {
+    async fn checkpoint_attempts_are_isolated() {
         let dir = tempdir().unwrap();
         let backend = ObjectStoreBackend::new(make_store(dir.path()), "node-0", 4);
-        let old = CheckpointAttempt::new(5, 50);
-        let new = CheckpointAttempt::new(5, 99);
+        let old = CheckpointAttempt::canonical(5);
+        let new = CheckpointAttempt::canonical(99);
         backend
             .write_partial(old, 0, 0, Bytes::from_static(b"old"))
             .await
@@ -2504,7 +2578,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = make_store(dir.path());
         let backend = ObjectStoreBackend::new(Arc::clone(&store), "stable-node", 2);
-        let checkpoint = CheckpointAttempt::new(4, 401);
+        let checkpoint = CheckpointAttempt::canonical(401);
         let fence = assignment_fence(7, 2);
         backend.set_authoritative_version(7);
         backend
@@ -3243,7 +3317,7 @@ mod tests {
         let store = make_store(dir.path());
         let stale = ObjectStoreBackend::new(Arc::clone(&store), "node-stale", 4);
         let fresh = ObjectStoreBackend::new(store, "node-fresh", 4);
-        let checkpoint = CheckpointAttempt::new(9, 901);
+        let checkpoint = CheckpointAttempt::canonical(901);
 
         // The stale process has not learned generation 2 and wins the create-once path first.
         stale
@@ -3343,6 +3417,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prune_before_discovers_sparse_epochs_without_scanning_the_id_gap() {
+        let dir = tempdir().unwrap();
+        let operations = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let physical_store = make_store(dir.path());
+        let store: Arc<dyn ObjectStore> = Arc::new(RetentionLogStore {
+            inner: Arc::clone(&physical_store),
+            operations: Arc::clone(&operations),
+            delete_calls: Arc::new(AtomicU64::new(0)),
+            fail_delete_call: 0,
+        });
+        let backend = ObjectStoreBackend::new(store, "node-0", 1);
+        let retired = attempt(1);
+        let retained = attempt(65_537);
+
+        backend
+            .write_partial(retired, 0, 0, Bytes::from_static(b"retired"))
+            .await
+            .unwrap();
+        backend
+            .write_partial(retained, 0, 0, Bytes::from_static(b"retained"))
+            .await
+            .unwrap();
+
+        operations.lock().clear();
+        backend.prune_before(65_537).await.unwrap();
+
+        assert!(matches!(
+            physical_store
+                .head(&ObjectStoreBackend::partial_path(retired, 0))
+                .await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+        assert!(physical_store
+            .head(&ObjectStoreBackend::partial_path(retained, 0))
+            .await
+            .is_ok());
+
+        let listings = operations
+            .lock()
+            .iter()
+            .filter(|operation| {
+                operation.starts_with("delimiter:") || operation.starts_with("list:")
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            listings,
+            vec![
+                "delimiter:state-v2".to_string(),
+                "list:state-v2/epoch=1".to_string(),
+            ],
+            "retention must list only materialized retired epoch prefixes"
+        );
+    }
+
+    #[tokio::test]
     async fn cluster_shared_prune_requires_native_conditional_update() {
         let dir = tempdir().unwrap();
         let backend = ObjectStoreBackend::cluster_shared(make_store(dir.path()), "cluster", 2);
@@ -3366,7 +3496,8 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(RetentionLogStore {
             inner: make_store(dir.path()),
             operations: Arc::clone(&operations),
-            fail_delete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            delete_calls: Arc::new(AtomicU64::new(0)),
+            fail_delete_call: 0,
         });
         let backend = ObjectStoreBackend::new(Arc::clone(&store), "node-0", 4);
         let ready_key = "participant-ready/0.json";
@@ -3476,33 +3607,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prune_failure_leaves_a_fenced_repairable_sweep() {
+    async fn prune_failure_preserves_completed_prefix_progress_and_repairs_the_rest() {
         let dir = tempdir().unwrap();
-        let fail_delete = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let physical_store = make_store(dir.path());
         let store: Arc<dyn ObjectStore> = Arc::new(RetentionLogStore {
-            inner: make_store(dir.path()),
+            inner: Arc::clone(&physical_store),
             operations: Arc::new(parking_lot::Mutex::new(Vec::new())),
-            fail_delete,
+            delete_calls: Arc::new(AtomicU64::new(0)),
+            fail_delete_call: 2,
         });
         let backend = ObjectStoreBackend::new(store, "node-0", 2);
-        backend
-            .write_partial(attempt(1), 0, 0, Bytes::from_static(b"state"))
-            .await
-            .unwrap();
+        for checkpoint_id in 1..=2 {
+            backend
+                .write_partial(attempt(checkpoint_id), 0, 0, Bytes::from_static(b"state"))
+                .await
+                .unwrap();
+        }
 
-        let error = backend.prune_before(2).await.unwrap_err();
+        let error = backend.prune_before(3).await.unwrap_err();
         assert!(matches!(error, StateBackendError::Io(_)));
         assert!(error.to_string().contains("injected delete failure"));
         let floor = backend.read_prune_floor().await.unwrap().unwrap().floor;
-        assert_eq!(floor.before_epoch, 2);
-        assert_eq!(floor.swept_before_epoch, 0);
-        assert!(backend.read_partial(attempt(1), 0).await.unwrap().is_none());
-
-        backend.prune_before(2).await.unwrap();
-        let floor = backend.read_prune_floor().await.unwrap().unwrap().floor;
-        assert_eq!(floor.before_epoch, 2);
+        assert_eq!(floor.before_epoch, 3);
         assert_eq!(floor.swept_before_epoch, 2);
-        assert!(backend.read_partial(attempt(1), 0).await.unwrap().is_none());
+        assert!(matches!(
+            physical_store
+                .head(&ObjectStoreBackend::partial_path(attempt(1), 0))
+                .await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+        assert!(physical_store
+            .head(&ObjectStoreBackend::partial_path(attempt(2), 0))
+            .await
+            .is_ok());
+
+        backend.prune_before(3).await.unwrap();
+        let floor = backend.read_prune_floor().await.unwrap().unwrap().floor;
+        assert_eq!(floor.before_epoch, 3);
+        assert_eq!(floor.swept_before_epoch, 3);
+        assert!(matches!(
+            physical_store
+                .head(&ObjectStoreBackend::partial_path(attempt(2), 0))
+                .await,
+            Err(object_store::Error::NotFound { .. })
+        ));
     }
 
     /// The durable sweep cursor advances so later retention lists only newly retired epochs.

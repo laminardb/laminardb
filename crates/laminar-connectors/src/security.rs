@@ -34,6 +34,7 @@ pub fn is_secret_option_key(key: &str) -> bool {
         || key.contains("credential")
         || key.contains("private_key")
         || key.contains("sasl_jaas")
+        || key.contains("oauthbearer")
         || key.contains("api_key")
         || key.contains("account_key")
         || key.contains("session_key")
@@ -217,6 +218,12 @@ mod tests {
             "mongodb://user:${MONGO_PASSWORD}@db.test/data",
             true
         ));
+    }
+
+    #[test]
+    fn oauth_bearer_options_are_classified_without_provider_specific_callers() {
+        assert!(is_secret_option_key("sasl.oauthbearer.config"));
+        assert!(is_secret_option_key("oauthbearer-token"));
     }
 
     #[test]

@@ -654,6 +654,10 @@ impl SinkTaskHandle {
         }
     }
 
+    pub(crate) fn epoch_requires_recovery(&self) -> bool {
+        self.epoch_poisoned.load(Ordering::Acquire)
+    }
+
     fn ensure_open(&self) -> Result<(), ConnectorError> {
         if self.closing.load(Ordering::Acquire) {
             return Err(self.closed_err());
@@ -3804,7 +3808,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        let attempt = CheckpointAttempt::new(1, 101);
+        let attempt = CheckpointAttempt::canonical(101);
         let namespace = CoordinatedCommitNamespace::try_new(
             PipelineIdentity::empty(),
             "018f0000-0000-7000-8000-000000000001",

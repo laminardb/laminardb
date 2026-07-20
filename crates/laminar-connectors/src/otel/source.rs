@@ -210,9 +210,7 @@ impl SourceConnector for OtelSource {
     }
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
-        let SourceStart {
-            config, position, ..
-        } = request;
+        let (config, position, _) = request.into_parts();
         if let SourcePosition::Resume { attempt, .. } = position {
             return Err(ConnectorError::ConfigurationError(format!(
                 "OTLP is an ephemeral source and cannot resume checkpoint attempt {attempt:?}"
@@ -533,11 +531,12 @@ mod tests {
         let mut config = ConnectorConfig::new("otel");
         config.set("bind.address", "127.0.0.1");
         config.set("port", "0");
-        SourceStart {
+        SourceStart::new(
             config,
-            position: SourcePosition::Initial,
-            delivery: DeliveryGuarantee::BestEffort,
-        }
+            SourcePosition::Initial,
+            DeliveryGuarantee::BestEffort,
+        )
+        .unwrap()
     }
 
     #[tokio::test]

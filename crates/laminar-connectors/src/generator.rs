@@ -105,9 +105,7 @@ impl SourceConnector for GeneratorSource {
     }
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
-        let SourceStart {
-            config, position, ..
-        } = request;
+        let (config, position, _) = request.into_parts();
         if let Some(rps) = config.get_parsed::<u64>("rows.per.second")? {
             if rps == 0 {
                 return Err(ConnectorError::ConfigurationError(
@@ -228,11 +226,7 @@ mod tests {
     use laminar_core::state::CheckpointAttempt;
 
     fn start_request(config: ConnectorConfig, position: SourcePosition) -> SourceStart {
-        SourceStart {
-            config,
-            position,
-            delivery: DeliveryGuarantee::AtLeastOnce,
-        }
+        SourceStart::new(config, position, DeliveryGuarantee::AtLeastOnce).unwrap()
     }
 
     #[test]

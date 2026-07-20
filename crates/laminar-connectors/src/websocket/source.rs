@@ -413,9 +413,7 @@ impl SourceConnector for WebSocketSource {
     }
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
-        let SourceStart {
-            config, position, ..
-        } = request;
+        let (config, position, _) = request.into_parts();
         if !matches!(self.state, ConnectorState::Created | ConnectorState::Closed) {
             return Err(ConnectorError::InvalidState {
                 expected: "Created or Closed".into(),
@@ -859,11 +857,14 @@ mod tests {
         let mut source =
             WebSocketSource::new(test_schema(), config, WebSocketSourceMetrics::local());
         source
-            .start(SourceStart {
-                config: ConnectorConfig::new("websocket"),
-                position: SourcePosition::Initial,
-                delivery: DeliveryGuarantee::BestEffort,
-            })
+            .start(
+                SourceStart::new(
+                    ConnectorConfig::new("websocket"),
+                    SourcePosition::Initial,
+                    DeliveryGuarantee::BestEffort,
+                )
+                .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -910,11 +911,14 @@ mod tests {
             WebSocketSourceMetrics::local(),
         );
         source
-            .start(SourceStart {
-                config,
-                position: SourcePosition::Initial,
-                delivery: DeliveryGuarantee::BestEffort,
-            })
+            .start(
+                SourceStart::new(
+                    config,
+                    SourcePosition::Initial,
+                    DeliveryGuarantee::BestEffort,
+                )
+                .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -935,10 +939,13 @@ mod tests {
             test_config(),
             WebSocketSourceMetrics::local(),
         );
-        let request = || SourceStart {
-            config: ConnectorConfig::new("websocket"),
-            position: SourcePosition::Initial,
-            delivery: DeliveryGuarantee::BestEffort,
+        let request = || {
+            SourceStart::new(
+                ConnectorConfig::new("websocket"),
+                SourcePosition::Initial,
+                DeliveryGuarantee::BestEffort,
+            )
+            .unwrap()
         };
         source.start(request()).await.unwrap();
 
@@ -965,11 +972,14 @@ mod tests {
         let mut source =
             WebSocketSource::new(test_schema(), config, WebSocketSourceMetrics::local());
         source
-            .start(SourceStart {
-                config: ConnectorConfig::new("websocket"),
-                position: SourcePosition::Initial,
-                delivery: DeliveryGuarantee::BestEffort,
-            })
+            .start(
+                SourceStart::new(
+                    ConnectorConfig::new("websocket"),
+                    SourcePosition::Initial,
+                    DeliveryGuarantee::BestEffort,
+                )
+                .unwrap(),
+            )
             .await
             .unwrap();
         accepted_rx.await.unwrap();
@@ -994,11 +1004,14 @@ mod tests {
         );
 
         let error = source
-            .start(SourceStart {
-                config,
-                position: SourcePosition::Initial,
-                delivery: DeliveryGuarantee::BestEffort,
-            })
+            .start(
+                SourceStart::new(
+                    config,
+                    SourcePosition::Initial,
+                    DeliveryGuarantee::BestEffort,
+                )
+                .unwrap(),
+            )
             .await
             .unwrap_err()
             .to_string();
@@ -1018,11 +1031,14 @@ mod tests {
         );
 
         let error = source
-            .start(SourceStart {
-                config,
-                position: SourcePosition::Initial,
-                delivery: DeliveryGuarantee::BestEffort,
-            })
+            .start(
+                SourceStart::new(
+                    config,
+                    SourcePosition::Initial,
+                    DeliveryGuarantee::BestEffort,
+                )
+                .unwrap(),
+            )
             .await
             .unwrap_err()
             .to_string();
@@ -1048,11 +1064,14 @@ mod tests {
         );
 
         let error = source
-            .start(SourceStart {
-                config,
-                position: SourcePosition::Initial,
-                delivery: DeliveryGuarantee::BestEffort,
-            })
+            .start(
+                SourceStart::new(
+                    config,
+                    SourcePosition::Initial,
+                    DeliveryGuarantee::BestEffort,
+                )
+                .unwrap(),
+            )
             .await
             .unwrap_err();
 
@@ -1068,11 +1087,14 @@ mod tests {
             WebSocketSource::new(test_schema(), typed_config, WebSocketSourceMetrics::local());
 
         let error = source
-            .start(SourceStart {
-                config: ConnectorConfig::new("websocket"),
-                position: SourcePosition::Initial,
-                delivery: DeliveryGuarantee::BestEffort,
-            })
+            .start(
+                SourceStart::new(
+                    ConnectorConfig::new("websocket"),
+                    SourcePosition::Initial,
+                    DeliveryGuarantee::BestEffort,
+                )
+                .unwrap(),
+            )
             .await
             .unwrap_err();
 

@@ -1525,9 +1525,7 @@ impl SourceConnector for PostgresCdcSource {
                 actual: self.state.to_string(),
             });
         }
-        let SourceStart {
-            config, position, ..
-        } = request;
+        let (config, position, _) = request.into_parts();
 
         // Parse all configuration and validate the exact engine cursor before
         // changing lifecycle state or opening either the control or replication
@@ -2398,11 +2396,14 @@ mod tests {
     async fn initial_start_fails_closed_before_external_io() {
         let mut src = default_source();
         let error = src
-            .start(SourceStart {
-                config: ConnectorConfig::new("postgres-cdc"),
-                position: SourcePosition::Initial,
-                delivery: crate::connector::DeliveryGuarantee::AtLeastOnce,
-            })
+            .start(
+                SourceStart::new(
+                    ConnectorConfig::new("postgres-cdc"),
+                    SourcePosition::Initial,
+                    crate::connector::DeliveryGuarantee::AtLeastOnce,
+                )
+                .unwrap(),
+            )
             .await
             .expect_err("initial startup must wait for certified snapshot/WAL bootstrap");
         assert!(error.to_string().contains("[LDB-5060]"), "{error}");
@@ -2426,14 +2427,17 @@ mod tests {
         checkpoint.set_offset("lsn", "1/10");
         write_checkpoint_binding(&mut checkpoint, &test_binding(&expected_config));
 
-        src.start(SourceStart {
-            config: ConnectorConfig::new("postgres-cdc"),
-            position: SourcePosition::Resume {
-                attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
-                checkpoint,
-            },
-            delivery: crate::connector::DeliveryGuarantee::AtLeastOnce,
-        })
+        src.start(
+            SourceStart::new(
+                ConnectorConfig::new("postgres-cdc"),
+                SourcePosition::Resume {
+                    attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
+                    checkpoint,
+                },
+                crate::connector::DeliveryGuarantee::AtLeastOnce,
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
 
@@ -3126,14 +3130,17 @@ mod tests {
         let cp = committed_lsn_checkpoint("2/FF00");
 
         let result = src
-            .start(SourceStart {
-                config: ConnectorConfig::new("postgres-cdc"),
-                position: SourcePosition::Resume {
-                    attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
-                    checkpoint: cp,
-                },
-                delivery: crate::connector::DeliveryGuarantee::AtLeastOnce,
-            })
+            .start(
+                SourceStart::new(
+                    ConnectorConfig::new("postgres-cdc"),
+                    SourcePosition::Resume {
+                        attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
+                        checkpoint: cp,
+                    },
+                    crate::connector::DeliveryGuarantee::AtLeastOnce,
+                )
+                .unwrap(),
+            )
             .await;
         result.unwrap();
         assert_eq!(src.confirmed_flush_lsn.as_u64(), 0x2_0000_FF00);
@@ -3151,14 +3158,17 @@ mod tests {
         let cp = committed_lsn_checkpoint("not_an_lsn");
 
         let error = src
-            .start(SourceStart {
-                config: ConnectorConfig::new("postgres-cdc"),
-                position: SourcePosition::Resume {
-                    attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
-                    checkpoint: cp,
-                },
-                delivery: crate::connector::DeliveryGuarantee::AtLeastOnce,
-            })
+            .start(
+                SourceStart::new(
+                    ConnectorConfig::new("postgres-cdc"),
+                    SourcePosition::Resume {
+                        attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
+                        checkpoint: cp,
+                    },
+                    crate::connector::DeliveryGuarantee::AtLeastOnce,
+                )
+                .unwrap(),
+            )
             .await
             .expect_err("invalid durable LSN must fail closed");
         assert!(error.to_string().contains("invalid LSN"));
@@ -3172,14 +3182,17 @@ mod tests {
         checkpoint.set_metadata("checkpoint_version", "2");
 
         let error = src
-            .start(SourceStart {
-                config: ConnectorConfig::new("postgres-cdc"),
-                position: SourcePosition::Resume {
-                    attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
-                    checkpoint,
-                },
-                delivery: crate::connector::DeliveryGuarantee::AtLeastOnce,
-            })
+            .start(
+                SourceStart::new(
+                    ConnectorConfig::new("postgres-cdc"),
+                    SourcePosition::Resume {
+                        attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
+                        checkpoint,
+                    },
+                    crate::connector::DeliveryGuarantee::AtLeastOnce,
+                )
+                .unwrap(),
+            )
             .await
             .unwrap_err();
         assert!(error.to_string().contains("expected '3'"), "{error}");
@@ -4124,14 +4137,17 @@ mod tests {
         cp.set_metadata("slot_name", "different_slot");
 
         let error = src
-            .start(SourceStart {
-                config: ConnectorConfig::new("postgres-cdc"),
-                position: SourcePosition::Resume {
-                    attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
-                    checkpoint: cp,
-                },
-                delivery: crate::connector::DeliveryGuarantee::AtLeastOnce,
-            })
+            .start(
+                SourceStart::new(
+                    ConnectorConfig::new("postgres-cdc"),
+                    SourcePosition::Resume {
+                        attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
+                        checkpoint: cp,
+                    },
+                    crate::connector::DeliveryGuarantee::AtLeastOnce,
+                )
+                .unwrap(),
+            )
             .await
             .expect_err("checkpoint for another slot must fail closed");
         assert!(error.to_string().contains("different_slot"));

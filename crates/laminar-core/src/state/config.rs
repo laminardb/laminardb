@@ -15,6 +15,7 @@ use super::{
 };
 
 const LOCAL_STATE_WRITER_ID: &str = "local";
+const LOCAL_STATE_LOCK: &str = ".laminardb-state.lock";
 
 /// Cloud credential/config overrides for the state object store.
 /// `Debug` redacts values — they can hold secrets
@@ -145,18 +146,15 @@ impl StateBackendConfig {
         match self {
             Self::InProcess => Ok(Arc::new(InProcessBackend::new(key_group_count))),
             Self::Local { path } => {
-                std::fs::create_dir_all(path)
-                    .map_err(|e| StateBackendBuildError::Io(e.to_string()))?;
-                let fs = ::object_store::local::LocalFileSystem::new_with_prefix(path)
-                    .map_err(|e| StateBackendBuildError::Io(e.to_string()))?;
+                let fs = durable_local_store(path)?;
                 Ok(Arc::new(ObjectStoreBackend::node_durable(
-                    Arc::new(fs),
+                    fs,
                     LOCAL_STATE_WRITER_ID,
                     key_group_count,
                 )))
             }
             Self::ObjectStore { url, storage } => {
-                let store = cloud_store(url, storage)?;
+                let store = state_store(url, storage)?;
                 let backend = match self.durability_scope() {
                     StateBackendDurability::Volatile => {
                         ObjectStoreBackend::new(store, LOCAL_STATE_WRITER_ID, key_group_count)
@@ -199,14 +197,8 @@ impl StateBackendConfig {
     ) -> Result<Option<Arc<dyn ::object_store::ObjectStore>>, StateBackendBuildError> {
         match self {
             Self::InProcess => Ok(None),
-            Self::Local { path } => {
-                std::fs::create_dir_all(path)
-                    .map_err(|e| StateBackendBuildError::Io(e.to_string()))?;
-                let fs = ::object_store::local::LocalFileSystem::new_with_prefix(path)
-                    .map_err(|e| StateBackendBuildError::Io(e.to_string()))?;
-                Ok(Some(Arc::new(fs)))
-            }
-            Self::ObjectStore { url, storage, .. } => Ok(Some(cloud_store(url, storage)?)),
+            Self::Local { path } => Ok(Some(durable_local_store(path)?)),
+            Self::ObjectStore { url, storage, .. } => Ok(Some(state_store(url, storage)?)),
         }
     }
 
@@ -222,6 +214,26 @@ impl StateBackendConfig {
             Self::Local { .. } => StateBackendDurability::NodeDurable,
             Self::ObjectStore { url, .. } => StateBackendDurability::for_storage_url(url),
         }
+    }
+}
+
+fn durable_local_store(
+    path: &std::path::Path,
+) -> Result<Arc<dyn ::object_store::ObjectStore>, StateBackendBuildError> {
+    crate::durable_local_store::DurableLocalObjectStore::new_exclusive(path, LOCAL_STATE_LOCK)
+        .map(|store| Arc::new(store) as Arc<dyn ::object_store::ObjectStore>)
+        .map_err(|error| StateBackendBuildError::Io(error.to_string()))
+}
+
+fn state_store(
+    url: &str,
+    storage: &StorageOptions,
+) -> Result<Arc<dyn ::object_store::ObjectStore>, StateBackendBuildError> {
+    if url.starts_with("file://") {
+        let path = crate::checkpoint::object_store_builder::file_url_path(url)?;
+        durable_local_store(&path)
+    } else {
+        cloud_store(url, storage)
     }
 }
 
@@ -287,9 +299,24 @@ path = "/var/laminar"
 
     #[test]
     fn storage_url_durability_is_fail_closed() {
+        let local_url = url::Url::from_file_path(std::env::temp_dir().join("laminar-state"))
+            .unwrap()
+            .to_string();
         assert_eq!(
-            StateBackendDurability::for_storage_url("file:///var/lib/laminar"),
+            StateBackendDurability::for_storage_url(&local_url),
             StateBackendDurability::NodeDurable
+        );
+        assert_eq!(
+            StateBackendDurability::for_storage_url("file:///tmp/laminar-state"),
+            StateBackendDurability::NodeDurable
+        );
+        assert_eq!(
+            StateBackendDurability::for_storage_url("file://remote-host/state"),
+            StateBackendDurability::Volatile
+        );
+        assert_eq!(
+            StateBackendDurability::for_storage_url("file://./relative"),
+            StateBackendDurability::Volatile
         );
         assert_eq!(
             StateBackendDurability::for_storage_url("s3://bucket/state"),
@@ -406,16 +433,37 @@ url = "s3://bucket/laminar"
             &backend.read_partial(attempt, 0).await.unwrap().unwrap()[..],
             b"z",
         );
+        drop(backend);
+        let restarted = c.build(super::super::LOCAL_KEY_GROUP_COUNT).unwrap();
+        assert_eq!(
+            &restarted.read_partial(attempt, 0).await.unwrap().unwrap()[..],
+            b"z",
+        );
+    }
+
+    #[test]
+    fn local_state_root_has_one_live_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StateBackendConfig::local(dir.path());
+        let first = config.build(super::super::LOCAL_KEY_GROUP_COUNT).unwrap();
+        let Err(error) = config.build(super::super::LOCAL_KEY_GROUP_COUNT) else {
+            panic!("a second local state owner was admitted");
+        };
+        assert!(error.to_string().contains("already owned"));
+        drop(first);
+        config.build(super::super::LOCAL_KEY_GROUP_COUNT).unwrap();
     }
 
     #[tokio::test]
     async fn build_object_store_file_url_instantiates_backend() {
         use crate::state::CheckpointAttempt;
         let dir = tempfile::tempdir().unwrap();
-        let url = format!(
-            "file://{}",
-            dir.path().display().to_string().replace('\\', "/")
-        );
+        let normalized = dir.path().display().to_string().replace('\\', "/");
+        let url = if normalized.starts_with('/') {
+            format!("file://{normalized}")
+        } else {
+            format!("file:///{normalized}")
+        };
         let c = StateBackendConfig::object_store(url);
         let backend = c.build(super::super::LOCAL_KEY_GROUP_COUNT).unwrap();
         assert_eq!(

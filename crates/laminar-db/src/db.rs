@@ -273,10 +273,10 @@ pub struct LaminarDB {
     /// Decoupled coordinated-commit committer task. Awaited in place so cancellation cannot lose
     /// the sole handle while an issued external commit is still completing.
     pub(crate) committer_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// OS-released exclusive lock for a local exactly-once checkpoint namespace. Deployment
+    /// OS-released exclusive lock for a local checkpoint namespace. Deployment
     /// identity prevents reuse after reset; this lock prevents two live processes from writing
     /// divergent cuts into the same deployment.
-    pub(crate) exact_deployment_lock: parking_lot::Mutex<Option<std::fs::File>>,
+    pub(crate) checkpoint_namespace_lock: parking_lot::Mutex<Option<std::fs::File>>,
     /// Every sink actor in the active generation, retained from spawn until terminal observation.
     /// A replacement cannot start while any prior actor can still mutate an external system.
     pub(crate) owned_sink_handles: Arc<parking_lot::Mutex<Vec<crate::sink_task::SinkTaskHandle>>>,
@@ -419,11 +419,11 @@ impl Drop for LaminarDB {
             // Dropping Tokio handles detaches their tasks. A local decision hard-link already in
             // a blocking filesystem worker could therefore outlive this facade. Keep the OS lock
             // until process exit rather than let another in-process deployment acquire the same
-            // exactly-once namespace while old work can still publish. Graceful stop/shutdown
+            // checkpoint namespace while old work can still publish. Graceful stop/shutdown
             // clears the lock before reaching a terminal state and does not leak it.
-            if let Some(lock) = self.exact_deployment_lock.get_mut().take() {
+            if let Some(lock) = self.checkpoint_namespace_lock.get_mut().take() {
                 tracing::error!(
-                    "dropping an active exactly-once deployment; retaining its namespace lock until process exit"
+                    "dropping an active checkpoint writer; retaining its namespace lock until process exit"
                 );
                 std::mem::forget(lock);
             }
@@ -677,8 +677,7 @@ fn catalog_property_contains_unsupported_secret(
 ) -> bool {
     let lower = key.to_ascii_lowercase();
     let normalized = lower.replace(['.', '-'], "_");
-    let secret_key = laminar_connectors::security::is_secret_option_key(key)
-        || normalized == "sasl_oauthbearer_config";
+    let secret_key = laminar_connectors::security::is_secret_option_key(key);
     if secret_key {
         return !(allow_reference && laminar_connectors::security::is_env_reference(value));
     }
@@ -954,7 +953,7 @@ impl LaminarDB {
     #[allow(clippy::unnecessary_wraps)]
     #[allow(clippy::too_many_lines)] // flat field-init of a large struct
     pub(crate) fn open_with_config_and_vars_and_rules(
-        config: LaminarConfig,
+        mut config: LaminarConfig,
         config_vars: HashMap<String, String>,
         extra_optimizer_rules: &[Arc<
             dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync,
@@ -962,6 +961,17 @@ impl LaminarDB {
         target_partitions: Option<usize>,
         runtime_mode: RuntimeMode,
     ) -> Result<Self, DbError> {
+        if let Some(checkpoint) = config.checkpoint.as_mut() {
+            let max_state_data_bytes = checkpoint.max_staged_bytes.unwrap_or(
+                laminar_core::storage::checkpoint_store::DEFAULT_MAX_CHECKPOINT_STATE_BYTES,
+            );
+            laminar_core::storage::checkpoint_store::validate_max_checkpoint_state_bytes(
+                max_state_data_bytes,
+            )
+            .map_err(|error| DbError::Config(format!("checkpoint.max_staged_bytes: {error}")))?;
+            checkpoint.max_staged_bytes = Some(max_state_data_bytes);
+        }
+
         // One-time crossfire backoff tuning; idempotent, only helps single-core VMs.
         crossfire::detect_backoff_cfg();
 
@@ -1037,7 +1047,7 @@ impl LaminarDB {
             catalog_seal_gate: parking_lot::Mutex::new(None),
             runtime_handle: tokio::sync::Mutex::new(None),
             committer_handle: tokio::sync::Mutex::new(None),
-            exact_deployment_lock: parking_lot::Mutex::new(None),
+            checkpoint_namespace_lock: parking_lot::Mutex::new(None),
             owned_sink_handles: Arc::new(parking_lot::Mutex::new(Vec::new())),
             owned_source_tasks: Arc::new(parking_lot::Mutex::new(Vec::new())),
             owned_connector_task_fences: Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -4258,27 +4268,66 @@ impl LaminarDB {
             })
     }
 
-    /// Return a checkpoint store for the current configuration, if any.
-    pub fn checkpoint_store(&self) -> Option<Box<dyn laminar_core::storage::CheckpointStore>> {
-        let cp_config = self.config.checkpoint.as_ref()?;
+    /// Return a checkpoint store for the resolved runtime configuration, if any.
+    pub(crate) fn checkpoint_store(
+        &self,
+    ) -> Result<Option<Box<dyn laminar_core::storage::CheckpointStore>>, DbError> {
+        let Some(cp_config) = self.config.checkpoint.as_ref() else {
+            return Ok(None);
+        };
         let key_group_count = self.checkpoint_key_groups();
         let participant = self.checkpoint_participant();
         let participant_id = participant.unwrap_or(0);
+        let max_state_data_bytes = cp_config.max_staged_bytes.ok_or_else(|| {
+            DbError::Config("checkpoint.max_staged_bytes was not resolved at construction".into())
+        })?;
 
-        if let Some(ref url) = self.config.object_store_url {
+        #[cfg(feature = "cluster")]
+        if let Some(object_store) = self.cluster_checkpoint_object_store() {
+            return Ok(Some(Box::new(
+                laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore::new(
+                    object_store,
+                    participant.map_or_else(String::new, |id| format!("nodes/{id}/")),
+                )
+                .with_max_state_data_bytes(max_state_data_bytes)?
+                .with_key_group_count(key_group_count)
+                .with_participant_id(participant_id),
+            )));
+        }
+
+        if let Some(url) = self
+            .config
+            .object_store_url
+            .as_deref()
+            .filter(|url| url.starts_with("file://"))
+        {
+            let root = laminar_core::storage::object_store_builder::file_url_path(url)
+                .map_err(|error| DbError::Checkpoint(format!("checkpoint storage URL: {error}")))?;
+            let checkpoint_dir =
+                participant.map_or(root.clone(), |id| root.join("nodes").join(id.to_string()));
+            Ok(Some(Box::new(
+                laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
+                    checkpoint_dir,
+                )
+                .with_max_state_data_bytes(max_state_data_bytes)?
+                .with_key_group_count(key_group_count)
+                .with_participant_id(participant_id),
+            )))
+        } else if let Some(ref url) = self.config.object_store_url {
             let obj_store = laminar_core::storage::object_store_builder::build_object_store(
                 url,
                 &self.config.object_store_options,
             )
-            .ok()?;
-            Some(Box::new(
+            .map_err(|error| DbError::Checkpoint(format!("checkpoint object store: {error}")))?;
+            Ok(Some(Box::new(
                 laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore::new(
                     obj_store,
                     participant.map_or_else(String::new, |id| format!("nodes/{id}/")),
                 )
+                .with_max_state_data_bytes(max_state_data_bytes)?
                 .with_key_group_count(key_group_count)
                 .with_participant_id(participant_id),
-            ))
+            )))
         } else {
             let data_dir = cp_config
                 .data_dir
@@ -4288,13 +4337,14 @@ impl LaminarDB {
             let checkpoint_dir = participant.map_or(data_dir.clone(), |id| {
                 data_dir.join("nodes").join(id.to_string())
             });
-            Some(Box::new(
+            Ok(Some(Box::new(
                 laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
                     checkpoint_dir,
                 )
+                .with_max_state_data_bytes(max_state_data_bytes)?
                 .with_key_group_count(key_group_count)
                 .with_participant_id(participant_id),
-            ))
+            )))
         }
     }
 

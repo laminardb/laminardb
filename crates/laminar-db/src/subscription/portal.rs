@@ -270,7 +270,7 @@ mod tests {
         let registry = SubscriptionRegistry::new();
         let mut portal = open(&registry, SubscribeStart::Tail);
         registry.send_batch("mv", batch(vec![1, 2])).unwrap();
-        registry.broadcast_barrier(7, 99);
+        registry.broadcast_barrier(7, 7);
 
         assert!(matches!(
             portal.next_frame().await,
@@ -281,7 +281,7 @@ mod tests {
             Some(PortalFrame::Barrier {
                 sequence: 1,
                 epoch: 7,
-                checkpoint_id: 99,
+                checkpoint_id: 7,
                 through_sequence: 1,
             })
         ));
@@ -294,7 +294,7 @@ mod tests {
         assert!(portal.try_next_frame().is_none());
 
         registry.send_batch("mv", batch(vec![1])).unwrap();
-        registry.broadcast_barrier(3, 4);
+        registry.broadcast_barrier(3, 3);
         assert!(matches!(
             portal.try_next_frame(),
             Some(PortalFrame::Batch { batch, sequence: 0, .. }) if batch.num_rows() == 1
@@ -304,7 +304,7 @@ mod tests {
             Some(PortalFrame::Barrier {
                 sequence: 1,
                 epoch: 3,
-                checkpoint_id: 4,
+                checkpoint_id: 3,
                 through_sequence: 1,
             })
         ));

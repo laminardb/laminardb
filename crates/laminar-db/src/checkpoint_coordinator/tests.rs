@@ -96,14 +96,13 @@ fn one_vnode_delta_state(bytes: &'static [u8]) -> StagedVnodeStates {
 }
 
 fn committed_outcome_result(
-    epoch: u64,
     checkpoint_id: u64,
 ) -> laminar_core::checkpoint_decision::RecordOutcomeResult {
     laminar_core::checkpoint_decision::RecordOutcomeResult::Created(
         laminar_core::checkpoint_decision::CheckpointOutcome {
             version: 2,
             scope: laminar_core::checkpoint_decision::CheckpointScope::Local,
-            epoch,
+            epoch: checkpoint_id,
             checkpoint_id,
             deployment_id: "00000000-0000-0000-0000-000000000001".into(),
             assignment_fence: None,
@@ -153,10 +152,10 @@ async fn teardown_timeout_retains_owned_decision_task_until_retry_settles_it() {
     let task_release = Arc::clone(&release);
     coord.pending_decision_write = Some(PendingDecisionWrite {
         epoch: 9,
-        checkpoint_id: 90,
+        checkpoint_id: 9,
         handle: tokio::spawn(async move {
             task_release.notified().await;
-            Ok::<_, String>(committed_outcome_result(9, 90))
+            Ok::<_, String>(committed_outcome_result(9))
         }),
     });
 
@@ -189,17 +188,17 @@ async fn retained_ambiguous_decision_requires_recovery_before_any_delivery_mode_
     let task_release = Arc::clone(&release);
     coord.pending_decision_write = Some(PendingDecisionWrite {
         epoch: 9,
-        checkpoint_id: 90,
+        checkpoint_id: 9,
         handle: tokio::spawn(async move {
             task_release.notified().await;
-            Ok::<_, String>(committed_outcome_result(9, 90))
+            Ok::<_, String>(committed_outcome_result(9))
         }),
     });
 
     let result = coord
         .run_checkpoint_attempt(
             CheckpointRequest::default(),
-            CheckpointAttempt::new(10, 100),
+            CheckpointAttempt::canonical(10),
             QuorumStage::RunInline,
             Instant::now(),
         )
@@ -627,15 +626,7 @@ async fn record_solo_cluster_outcome(coord: &CheckpointCoordinator, attempt: Che
             .await
             .unwrap()
     } else {
-        create_test_recovery_capsule(
-            decision_store,
-            attempt.epoch,
-            attempt.checkpoint_id,
-            assignment_fence,
-            None,
-            None,
-        )
-        .await
+        create_test_recovery_capsule(decision_store, attempt, assignment_fence, None, None).await
     };
     let authority = coord
         .cluster_controller
@@ -676,6 +667,79 @@ async fn test_coordinator_new() {
 }
 
 #[tokio::test]
+async fn coordinator_rejects_a_store_with_a_different_state_budget_before_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FileSystemCheckpointStore::new(dir.path())
+        .with_max_state_data_bytes(17)
+        .unwrap();
+
+    let error = CheckpointCoordinator::new(CheckpointConfig::default(), Box::new(store))
+        .await
+        .expect_err("an injected checkpoint store must enforce the coordinator budget");
+
+    assert!(error.to_string().contains("does not match"), "{error}");
+}
+
+#[tokio::test]
+async fn coordinator_rejects_an_unbounded_retention_window_before_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = CheckpointConfig {
+        max_retained: MAX_CHECKPOINT_INVENTORY_ENTRIES,
+        ..CheckpointConfig::default()
+    };
+
+    let error =
+        CheckpointCoordinator::new(config, Box::new(FileSystemCheckpointStore::new(dir.path())))
+            .await
+            .expect_err("retention history must fit the bounded checkpoint inventory");
+
+    assert!(matches!(
+        error,
+        DbError::Config(message)
+            if message
+                == "checkpoint.max_retained must be less than 65536"
+    ));
+}
+
+#[tokio::test]
+async fn noncanonical_attempts_are_rejected_before_checkpoint_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut coord, decisions) = make_coordinator_with_decision_store(dir.path()).await;
+    let attempt = CheckpointAttempt::new(7, 8);
+
+    let admission_error = coord
+        .run_checkpoint_attempt(
+            CheckpointRequest::default(),
+            attempt,
+            QuorumStage::RunInline,
+            Instant::now(),
+        )
+        .await
+        .expect_err("split checkpoint identity must fail at admission");
+    assert!(admission_error.to_string().contains("checkpoint admission"));
+
+    let abandonment_error = coord
+        .abandon_epoch_until(
+            attempt.checkpoint_id,
+            attempt.epoch,
+            "unused".into(),
+            None,
+            None,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .expect_err("split checkpoint identity must fail before abandonment");
+    assert!(abandonment_error
+        .to_string()
+        .contains("checkpoint abandonment"));
+
+    assert_eq!(coord.phase(), CheckpointPhase::Idle);
+    assert!(coord.store().list_ids().await.unwrap().is_empty());
+    assert!(decisions.outcome(attempt.epoch).await.unwrap().is_none());
+    assert!(decisions.sink_open_witness().await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn state_backend_capacity_must_match_checkpoint_store_before_installation() {
     let dir = tempfile::tempdir().unwrap();
     let mut coord = make_coordinator(dir.path()).await;
@@ -698,7 +762,7 @@ async fn coordinator_construction_rejects_exhausted_manifest_epoch() {
     let dir = tempfile::tempdir().unwrap();
     let store = FileSystemCheckpointStore::new(dir.path());
     store
-        .save(&CheckpointManifest::new(1, u64::MAX))
+        .save(&CheckpointManifest::new(u64::MAX, u64::MAX))
         .await
         .unwrap();
 
@@ -812,7 +876,7 @@ async fn assert_follower_source_cut_rejected_without_readiness(
     checkpoint.source_assignment_version = assignment_version.and_then(std::num::NonZeroU64::new);
     let mut request = certified_cluster_request(&coord);
     request.source_offset_overrides = HashMap::from([("events".to_string(), checkpoint)]);
-    let attempt = CheckpointAttempt::new(4, 5);
+    let attempt = CheckpointAttempt::canonical(5);
 
     let error = coord
         .follower_prepare_acked_until(
@@ -883,6 +947,47 @@ async fn retention_requests_coalesce_into_one_owned_worker() {
     assert_eq!(coord.maintenance_tasks.len(), 1);
 }
 
+#[tokio::test]
+async fn retention_counts_committed_cuts_instead_of_checkpoint_id_distance() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = FileSystemCheckpointStore::new(dir.path());
+    for checkpoint_id in [1, 2, 3, 65_537] {
+        let mut manifest = CheckpointManifest::new(checkpoint_id, checkpoint_id);
+        manifest.durable_phase =
+            laminar_core::storage::checkpoint_manifest::DurableCheckpointPhase::Finalized;
+        writer.save(&manifest).await.unwrap();
+    }
+
+    let config = CheckpointConfig {
+        max_retained: 3,
+        ..CheckpointConfig::default()
+    };
+    let mut coord = CheckpointCoordinator::new(config, Box::new(writer))
+        .await
+        .unwrap();
+    // Manifest publication is not commit authority when a decision store is configured. Startup
+    // therefore waits for recovery to certify a cut instead of trusting phase bits for GC.
+    assert!(coord.recent_committed_checkpoints.is_empty());
+
+    assert_eq!(coord.record_committed_checkpoint(1).unwrap(), None);
+    assert_eq!(coord.record_committed_checkpoint(65_537).unwrap(), None);
+    assert_eq!(coord.record_committed_checkpoint(65_538).unwrap(), None);
+    assert_eq!(
+        coord.record_committed_checkpoint(65_539).unwrap(),
+        Some(1),
+        "the first complete window still retains the pre-restart cut"
+    );
+    assert_eq!(
+        coord.record_committed_checkpoint(65_540).unwrap(),
+        Some(65_537),
+        "retention advances by one actual finalized cut, not across the numeric gap"
+    );
+    assert_eq!(
+        coord.recent_committed_checkpoints,
+        VecDeque::from([65_537, 65_538, 65_539, 65_540])
+    );
+}
+
 #[cfg(feature = "cluster")]
 async fn cluster_authority_with_retention_floor() -> (
     Arc<laminar_core::cluster::control::LeaderLeaseStore>,
@@ -905,21 +1010,17 @@ async fn cluster_authority_with_retention_floor() -> (
     let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap() else {
         unreachable!()
     };
-    for (epoch, checkpoint_id) in [(1, 10), (3, 30)] {
-        let capsule = create_test_recovery_capsule(
-            decisions.as_ref(),
-            epoch,
-            checkpoint_id,
-            &fence,
-            None,
-            None,
-        )
-        .await;
+    for attempt in [
+        CheckpointAttempt::canonical(1),
+        CheckpointAttempt::canonical(3),
+    ] {
+        let capsule =
+            create_test_recovery_capsule(decisions.as_ref(), attempt, &fence, None, None).await;
         authority
             .record_cluster_outcome(
                 &lease.proof(),
-                epoch,
-                checkpoint_id,
+                attempt.epoch,
+                attempt.checkpoint_id,
                 fence.clone(),
                 CheckpointVerdict::Commit,
                 Some(capsule),
@@ -1247,11 +1348,11 @@ async fn test_coordinator_resumes_from_stored_checkpoint() {
 
     // Save a checkpoint manually
     let store = FileSystemCheckpointStore::new(dir.path());
-    let m = CheckpointManifest::new(5, 10);
+    let m = CheckpointManifest::new(10, 10);
     store.save(&m).await.unwrap();
 
-    // Manifest history seeds the local epoch. Durable decision-store reservations independently
-    // own checkpoint ID continuity.
+    // Manifest history seeds the local floor; the durable allocator advances the same canonical
+    // checkpoint order before admission.
     let coord = make_coordinator(dir.path()).await;
     assert_eq!(coord.epoch(), 11);
 }
@@ -1489,7 +1590,7 @@ async fn test_coordinator_debug() {
     let coord = make_coordinator(dir.path()).await;
     let debug = format!("{coord:?}");
     assert!(debug.contains("CheckpointCoordinator"));
-    assert!(debug.contains("epoch: 1"));
+    assert!(debug.contains("next_id_floor: 1"));
 }
 
 #[tokio::test]
@@ -1702,7 +1803,7 @@ async fn bridge_writes_markers_and_gate_passes() {
         .unwrap();
     assert!(result.success, "bridge writes markers → gate passes");
     // Every owned vnode has a marker for the completed epoch.
-    let attempt = CheckpointAttempt::new(result.epoch, result.checkpoint_id);
+    let attempt = CheckpointAttempt::canonical(result.checkpoint_id);
     for v in 0..4 {
         assert!(
             backend.read_partial(attempt, v).await.unwrap().is_some(),
@@ -1726,39 +1827,40 @@ async fn reconcile_announces_commit_when_marker_present() {
         Arc::new(object_store::memory::InMemory::new());
     let decision_store = in_memory_decision_store_on(Arc::clone(&decision_os));
     let deployment_id = decision_store.load_or_create_deployment_id().await.unwrap();
-    let mut orphan = CheckpointManifest::new(42, 7);
+    let attempt = CheckpointAttempt::canonical(42);
+    let mut orphan = CheckpointManifest::new(attempt.checkpoint_id, attempt.epoch);
     orphan.deployment_id.clone_from(&deployment_id);
     orphan.participant_id = 1;
     store.save_with_state(&orphan, None).await.unwrap();
-    let fence = test_assignment_fence(1, &[1]);
-
-    let coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
-        .await
-        .unwrap();
     let self_id = NodeId(1);
     let kv = Arc::new(InMemoryKv::new(self_id));
     let kv_trait: Arc<dyn ClusterKv> = kv.clone();
     let (_tx, rx) = watch::channel(Vec::new());
     let controller = Arc::new(ClusterController::new(self_id, kv_trait, None, rx));
-    let leader_lease = install_test_fence_authority(&controller, &fence, 1, decision_os).await;
+    let _lease_watch = install_test_leader_lease_on_store(&controller, decision_os).await;
+    publish_test_assignment_fence(&controller, 1);
+    let fence = controller
+        .checkpoint_assignment_fence(1)
+        .expect("solo assignment certificate");
+    let leader_proof = controller
+        .capture_leader_proof()
+        .expect("live local leader proof");
+
+    let coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
+        .await
+        .unwrap();
     let mut coord = coord;
     coord.set_cluster_controller(Arc::clone(&controller));
+    coord.set_assignment_version(fence.assignment_version);
     coord
         .set_decision_store(Arc::clone(&decision_store))
         .unwrap();
     coord.bind_deployment_id(deployment_id).unwrap();
     let backend = Arc::new(laminar_core::state::InProcessBackend::new(1));
-    let seal_inventory_sha256 = seed_decision_seal(
-        &backend,
-        CheckpointAttempt::new(7, 42),
-        &fence,
-        &leader_lease.proof(),
-    )
-    .await;
+    let seal_inventory_sha256 = seed_decision_seal(&backend, attempt, &fence, &leader_proof).await;
     let capsule = create_test_recovery_capsule(
         decision_store.as_ref(),
-        7,
-        42,
+        attempt,
         &fence,
         Some(seal_inventory_sha256),
         None,
@@ -1766,8 +1868,7 @@ async fn reconcile_announces_commit_when_marker_present() {
     .await;
     record_follower_outcome_with_capsule(
         controller.as_ref(),
-        7,
-        42,
+        attempt,
         &fence,
         laminar_core::checkpoint_decision::CheckpointVerdict::Commit,
         Some(capsule),
@@ -1780,8 +1881,8 @@ async fn reconcile_announces_commit_when_marker_present() {
     let raw = kv.read_from(self_id, ANNOUNCEMENT_KEY).await.unwrap();
     let ann: BarrierAnnouncement = serde_json::from_str(&raw).unwrap();
     assert_eq!(ann.phase, Phase::Commit);
-    assert_eq!(ann.epoch, 7);
-    assert_eq!(ann.checkpoint_id, 42);
+    assert_eq!(ann.epoch, attempt.epoch);
+    assert_eq!(ann.checkpoint_id, attempt.checkpoint_id);
 }
 
 #[cfg(feature = "cluster")]
@@ -1799,7 +1900,8 @@ async fn certified_successor_does_not_synthesize_an_orphaned_outcome() {
         Arc::new(object_store::memory::InMemory::new());
     let decision_store = in_memory_decision_store_on(Arc::clone(&decision_os));
     let deployment_id = decision_store.load_or_create_deployment_id().await.unwrap();
-    let mut orphan = CheckpointManifest::new(11, 3);
+    let attempt = CheckpointAttempt::canonical(11);
+    let mut orphan = CheckpointManifest::new(attempt.checkpoint_id, attempt.epoch);
     orphan.deployment_id.clone_from(&deployment_id);
     orphan.participant_id = 1;
     store.save_with_state(&orphan, None).await.unwrap();
@@ -1835,7 +1937,7 @@ async fn certified_successor_does_not_synthesize_an_orphaned_outcome() {
 
     let witnesses = coord.prepared_checkpoint_witnesses().await.unwrap();
     assert_eq!(witnesses.len(), 1);
-    assert_eq!(witnesses[0].attempt, CheckpointAttempt::new(3, 11));
+    assert_eq!(witnesses[0].attempt, attempt);
     assert_eq!(witnesses[0].participant_id, 1);
 
     let error = coord
@@ -1852,7 +1954,7 @@ async fn certified_successor_does_not_synthesize_an_orphaned_outcome() {
     assert!(controller
         .checkpoint_authority()
         .unwrap()
-        .cluster_outcome(3)
+        .cluster_outcome(attempt.epoch)
         .await
         .unwrap()
         .is_none());
@@ -1876,7 +1978,7 @@ async fn prepared_inventory_rejects_foreign_deployment_without_creating_outcome(
         Arc::new(object_store::memory::InMemory::new());
     let decision_store = in_memory_decision_store_on(Arc::clone(&authority_store));
     let deployment_id = decision_store.load_or_create_deployment_id().await.unwrap();
-    let mut foreign = CheckpointManifest::new(11, 3);
+    let mut foreign = CheckpointManifest::new(11, 11);
     foreign.participant_id = 1;
     foreign.deployment_id = uuid::Uuid::from_u128(99).to_string();
     store.save(&foreign).await.unwrap();
@@ -1933,11 +2035,21 @@ async fn prepared_inventory_rejects_invalid_manifest_without_creating_outcome() 
         Arc::new(object_store::memory::InMemory::new());
     let decision_store = in_memory_decision_store_on(Arc::clone(&authority_store));
     let deployment_id = decision_store.load_or_create_deployment_id().await.unwrap();
-    let mut invalid = CheckpointManifest::new(12, 4);
+    let mut invalid = CheckpointManifest::new(12, 12);
     invalid.participant_id = 1;
     invalid.deployment_id.clone_from(&deployment_id);
     invalid.vnode_count = 0;
-    store.save(&invalid).await.unwrap();
+    let invalid_dir = checkpoint_dir
+        .path()
+        .join("checkpoints")
+        .join("checkpoint_000012");
+    tokio::fs::create_dir_all(&invalid_dir).await.unwrap();
+    tokio::fs::write(
+        invalid_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&invalid).unwrap(),
+    )
+    .await
+    .unwrap();
 
     let self_id = NodeId(1);
     let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(self_id));
@@ -1979,7 +2091,7 @@ async fn prepared_inventory_rejects_invalid_manifest_without_creating_outcome() 
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn prepared_witness_validation_rejects_incomparable_attempts() {
+async fn prepared_witness_validation_rejects_noncanonical_attempts() {
     use laminar_core::checkpoint::PreparedCheckpointWitness;
 
     let checkpoint_dir = tempfile::tempdir().unwrap();
@@ -1993,35 +2105,35 @@ async fn prepared_witness_validation_rejects_incomparable_attempts() {
         .bind_deployment_id(deployment_id.clone())
         .unwrap();
     let pipeline_identity = PipelineIdentity::empty();
-    let witnesses = vec![
-        PreparedCheckpointWitness::new(
-            CheckpointAttempt::new(2, 3),
-            1,
-            deployment_id.clone(),
-            pipeline_identity.clone(),
-        )
-        .unwrap(),
-        PreparedCheckpointWitness::new(
-            CheckpointAttempt::new(3, 2),
-            2,
-            deployment_id,
-            pipeline_identity,
-        )
-        .unwrap(),
-    ];
+    let valid = PreparedCheckpointWitness::new(
+        CheckpointAttempt::canonical(2),
+        1,
+        deployment_id.clone(),
+        pipeline_identity.clone(),
+    )
+    .unwrap();
+    let mut noncanonical = PreparedCheckpointWitness::new(
+        CheckpointAttempt::canonical(3),
+        2,
+        deployment_id,
+        pipeline_identity,
+    )
+    .unwrap();
+    noncanonical.attempt.epoch = 4;
+    let witnesses = vec![valid, noncanonical];
 
     let error = coordinator
         .validate_prepared_checkpoint_witnesses(&witnesses)
-        .expect_err("epoch and checkpoint dimensions must advance together");
+        .expect_err("split checkpoint identity must fail closed");
     assert!(
-        error.to_string().contains("monotonically compatible"),
+        error.to_string().contains("non-canonical witness"),
         "{error}"
     );
 }
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn compacted_prepared_attempt_requires_two_dimensional_dominance() {
+async fn compacted_terminal_settles_equal_and_older_but_not_newer_prepared_attempts() {
     use laminar_core::checkpoint_decision::CheckpointVerdict;
     use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
     use laminar_core::cluster::discovery::NodeId;
@@ -2039,6 +2151,10 @@ async fn compacted_prepared_attempt_requires_two_dimensional_dominance() {
     old_prepare.participant_id = 1;
     old_prepare.deployment_id.clone_from(&deployment_id);
     store.save(&old_prepare).await.unwrap();
+    let mut exact_prepare = CheckpointManifest::new(5, 5);
+    exact_prepare.participant_id = 1;
+    exact_prepare.deployment_id.clone_from(&deployment_id);
+    store.save(&exact_prepare).await.unwrap();
 
     let self_id = NodeId(1);
     let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(self_id));
@@ -2046,12 +2162,21 @@ async fn compacted_prepared_attempt_requires_two_dimensional_dominance() {
     let controller = Arc::new(ClusterController::new(self_id, kv, None, rx));
     let fence = test_assignment_fence(1, &[1]);
     let lease = install_test_fence_authority(&controller, &fence, 1, authority_store).await;
-    let capsule =
-        create_test_recovery_capsule(decision_store.as_ref(), 5, 5, &fence, None, None).await;
+    let committed_attempt = CheckpointAttempt::canonical(5);
+    let backend = Arc::new(laminar_core::state::InProcessBackend::new(1));
+    let seal_inventory_sha256 =
+        seed_decision_seal(&backend, committed_attempt, &fence, &lease.proof()).await;
+    let capsule = create_test_recovery_capsule(
+        decision_store.as_ref(),
+        committed_attempt,
+        &fence,
+        Some(seal_inventory_sha256),
+        None,
+    )
+    .await;
     record_follower_outcome_with_capsule(
         controller.as_ref(),
-        5,
-        5,
+        committed_attempt,
         &fence,
         CheckpointVerdict::Commit,
         Some(capsule),
@@ -2069,6 +2194,7 @@ async fn compacted_prepared_attempt_requires_two_dimensional_dominance() {
     coordinator
         .bind_deployment_id(deployment_id.clone())
         .unwrap();
+    coordinator.set_state_backend(backend).unwrap();
 
     assert_eq!(
         authority
@@ -2084,7 +2210,7 @@ async fn compacted_prepared_attempt_requires_two_dimensional_dominance() {
             .await
             .unwrap()
             .is_empty(),
-        "a strictly newer terminal attempt dominates an outcome gap"
+        "a terminal attempt settles both its exact prepare and older prepares"
     );
 
     assert_eq!(
@@ -2102,20 +2228,23 @@ async fn compacted_prepared_attempt_requires_two_dimensional_dominance() {
     coordinator.reconcile_prepared_on_init().await.unwrap();
     let stored = coordinator.store().load_by_id(2).await.unwrap().unwrap();
     assert_eq!(stored.durable_phase, DurableCheckpointPhase::Prepared);
+    let stored = coordinator.store().load_by_id(5).await.unwrap().unwrap();
+    assert_eq!(stored.durable_phase, DurableCheckpointPhase::Finalized);
     assert!(authority.cluster_outcome(2).await.unwrap().is_none());
 
-    let mut incomparable = CheckpointManifest::new(99, 3);
-    incomparable.participant_id = 1;
-    incomparable.deployment_id = deployment_id;
-    coordinator.store().save(&incomparable).await.unwrap();
+    let newer_attempt = CheckpointAttempt::canonical(99);
+    let mut newer = CheckpointManifest::new(newer_attempt.checkpoint_id, newer_attempt.epoch);
+    newer.participant_id = 1;
+    newer.deployment_id = deployment_id;
+    coordinator.store().save(&newer).await.unwrap();
 
     let witnesses = coordinator.prepared_checkpoint_witnesses().await.unwrap();
     assert_eq!(witnesses.len(), 1);
-    assert_eq!(witnesses[0].attempt, CheckpointAttempt::new(3, 99));
+    assert_eq!(witnesses[0].attempt, newer_attempt);
     let error = coordinator
         .reconcile_prepared_on_init()
         .await
-        .expect_err("the retention floor cannot settle an incomparable Prepared attempt");
+        .expect_err("the retention floor cannot settle a newer Prepared attempt");
     assert!(
         error.to_string().contains("no immutable terminal outcome"),
         "{error}"
@@ -2137,7 +2266,8 @@ async fn reconcile_rolls_back_participant_excluded_from_exact_decision() {
         Arc::new(object_store::memory::InMemory::new());
     let decision_store = in_memory_decision_store_on(Arc::clone(&decision_os));
     let deployment_id = decision_store.load_or_create_deployment_id().await.unwrap();
-    let mut late_prepare = CheckpointManifest::new(91, 9);
+    let attempt = CheckpointAttempt::canonical(91);
+    let mut late_prepare = CheckpointManifest::new(attempt.checkpoint_id, attempt.epoch);
     late_prepare.deployment_id.clone_from(&deployment_id);
     late_prepare.participant_id = 7;
     store.save_with_state(&late_prepare, None).await.unwrap();
@@ -2167,17 +2297,11 @@ async fn reconcile_rolls_back_participant_excluded_from_exact_decision() {
     let leader_lease = install_test_fence_authority(&controller, &fence, 1, decision_os).await;
     coordinator.set_cluster_controller(Arc::clone(&controller));
     let backend = Arc::new(laminar_core::state::InProcessBackend::new(1));
-    let seal_inventory_sha256 = seed_decision_seal(
-        &backend,
-        CheckpointAttempt::new(9, 91),
-        &fence,
-        &leader_lease.proof(),
-    )
-    .await;
+    let seal_inventory_sha256 =
+        seed_decision_seal(&backend, attempt, &fence, &leader_lease.proof()).await;
     let capsule = create_test_recovery_capsule(
         decision_store.as_ref(),
-        9,
-        91,
+        attempt,
         &fence,
         Some(seal_inventory_sha256),
         None,
@@ -2185,8 +2309,7 @@ async fn reconcile_rolls_back_participant_excluded_from_exact_decision() {
     .await;
     record_follower_outcome_with_capsule(
         controller.as_ref(),
-        9,
-        91,
+        attempt,
         &fence,
         laminar_core::checkpoint_decision::CheckpointVerdict::Commit,
         Some(capsule),
@@ -2267,8 +2390,7 @@ async fn follower_checkpoint_commits_on_leader_commit() {
     record_follower_outcome(
         controller.as_ref(),
         decision_store.as_ref(),
-        1,
-        1,
+        CheckpointAttempt::canonical(1),
         &assignment_fence,
         laminar_core::checkpoint_decision::CheckpointVerdict::Commit,
     )
@@ -2352,6 +2474,8 @@ async fn follower_commit_prunes_its_local_manifests_without_advancing_shared_gc(
     let mut retained_manifest = None;
     for epoch in 1..=4 {
         let mut manifest = CheckpointManifest::new(epoch, epoch);
+        manifest.durable_phase =
+            laminar_core::storage::checkpoint_manifest::DurableCheckpointPhase::Finalized;
         manifest.participant_id = PARTICIPANT_ID;
         manifest.deployment_id.clone_from(&deployment_id);
         manifest.pipeline_identity.clone_from(&pipeline_identity);
@@ -2373,6 +2497,11 @@ async fn follower_commit_prunes_its_local_manifests_without_advancing_shared_gc(
             .with_participant_id(PARTICIPANT_ID),
     );
     let mut coord = CheckpointCoordinator::new(config, store).await.unwrap();
+    assert_eq!(
+        coord.record_committed_checkpoint(3).unwrap(),
+        None,
+        "startup recovery certifies the predecessor before follower checkpoints resume"
+    );
     coord
         .set_decision_store(Arc::clone(&decision_store))
         .unwrap();
@@ -2385,7 +2514,7 @@ async fn follower_commit_prunes_its_local_manifests_without_advancing_shared_gc(
             .await;
     coord.set_cluster_controller(Arc::clone(&controller));
 
-    let attempt = CheckpointAttempt::new(4, 4);
+    let attempt = CheckpointAttempt::canonical(4);
     let backend = Arc::new(InProcessBackend::new(2));
     let partial = crate::vnode_partial::VnodePartial {
         operators: vec![("agg".into(), b"state".to_vec())],
@@ -2617,16 +2746,14 @@ fn follower_test_proof(
 #[cfg(feature = "cluster")]
 async fn create_test_recovery_capsule(
     store: &laminar_core::checkpoint_decision::CheckpointDecisionStore,
-    epoch: u64,
-    checkpoint_id: u64,
+    attempt: CheckpointAttempt,
     fence: &laminar_core::cluster::control::CheckpointAssignmentFence,
     seal_inventory_sha256: Option<String>,
     manifest: Option<&CheckpointManifest>,
 ) -> laminar_core::checkpoint::RecoveryCapsuleRef {
     create_test_recovery_capsule_with_watermark(
         store,
-        epoch,
-        checkpoint_id,
+        attempt,
         fence,
         seal_inventory_sha256,
         manifest,
@@ -2637,11 +2764,9 @@ async fn create_test_recovery_capsule(
 }
 
 #[cfg(feature = "cluster")]
-#[allow(clippy::too_many_arguments)]
 async fn create_test_recovery_capsule_with_watermark(
     store: &laminar_core::checkpoint_decision::CheckpointDecisionStore,
-    epoch: u64,
-    checkpoint_id: u64,
+    attempt: CheckpointAttempt,
     fence: &laminar_core::cluster::control::CheckpointAssignmentFence,
     seal_inventory_sha256: Option<String>,
     manifest: Option<&CheckpointManifest>,
@@ -2675,7 +2800,7 @@ async fn create_test_recovery_capsule_with_watermark(
         .collect();
     let capsule = ClusterRecoveryCapsule {
         version: CLUSTER_RECOVERY_CAPSULE_VERSION,
-        attempt: CheckpointAttempt::new(epoch, checkpoint_id),
+        attempt,
         deployment_id,
         pipeline_identity: PipelineIdentity::empty(),
         assignment_fence: fence.clone(),
@@ -2696,33 +2821,24 @@ async fn create_test_recovery_capsule_with_watermark(
 async fn record_follower_outcome(
     controller: &laminar_core::cluster::control::ClusterController,
     store: &laminar_core::checkpoint_decision::CheckpointDecisionStore,
-    epoch: u64,
-    checkpoint_id: u64,
+    attempt: CheckpointAttempt,
     fence: &laminar_core::cluster::control::CheckpointAssignmentFence,
     verdict: laminar_core::checkpoint_decision::CheckpointVerdict,
 ) {
     let recovery_capsule = match &verdict {
         laminar_core::checkpoint_decision::CheckpointVerdict::Commit => {
-            Some(create_test_recovery_capsule(store, epoch, checkpoint_id, fence, None, None).await)
+            Some(create_test_recovery_capsule(store, attempt, fence, None, None).await)
         }
         laminar_core::checkpoint_decision::CheckpointVerdict::Abort => None,
     };
-    record_follower_outcome_with_capsule(
-        controller,
-        epoch,
-        checkpoint_id,
-        fence,
-        verdict,
-        recovery_capsule,
-    )
-    .await;
+    record_follower_outcome_with_capsule(controller, attempt, fence, verdict, recovery_capsule)
+        .await;
 }
 
 #[cfg(feature = "cluster")]
 async fn record_follower_outcome_with_capsule(
     controller: &laminar_core::cluster::control::ClusterController,
-    epoch: u64,
-    checkpoint_id: u64,
+    attempt: CheckpointAttempt,
     fence: &laminar_core::cluster::control::CheckpointAssignmentFence,
     verdict: laminar_core::checkpoint_decision::CheckpointVerdict,
     recovery_capsule: Option<laminar_core::checkpoint::RecoveryCapsuleRef>,
@@ -2734,8 +2850,8 @@ async fn record_follower_outcome_with_capsule(
     let result = authority
         .record_cluster_outcome(
             &proof,
-            epoch,
-            checkpoint_id,
+            attempt.epoch,
+            attempt.checkpoint_id,
             fence.clone(),
             verdict,
             recovery_capsule,
@@ -2767,9 +2883,10 @@ async fn follower_polls_exact_decision_when_commit_announcement_is_lost() {
     let decision_store = in_memory_decision_store_on(Arc::clone(&backing));
     decision_store.load_or_create_deployment_id().await.unwrap();
     let leader_lease = install_test_durable_lease_on(&controller, &lease_owner, backing).await;
+    let attempt = CheckpointAttempt::canonical(34);
     let prepare = serde_json::to_string(&BarrierAnnouncement {
-        epoch: 12,
-        checkpoint_id: 34,
+        epoch: attempt.epoch,
+        checkpoint_id: attempt.checkpoint_id,
         assignment_fence: Some(assignment_fence.clone()),
         leader_proof: Some(leader_lease.proof()),
         phase: Phase::Prepare,
@@ -2785,8 +2902,7 @@ async fn follower_polls_exact_decision_when_commit_announcement_is_lost() {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let capsule = create_test_recovery_capsule_with_watermark(
             writer.as_ref(),
-            12,
-            34,
+            attempt,
             &decision_fence,
             None,
             None,
@@ -2796,8 +2912,7 @@ async fn follower_polls_exact_decision_when_commit_announcement_is_lost() {
         .await;
         record_follower_outcome_with_capsule(
             writer_controller.as_ref(),
-            12,
-            34,
+            attempt,
             &decision_fence,
             laminar_core::checkpoint_decision::CheckpointVerdict::Commit,
             Some(capsule),
@@ -2806,8 +2921,8 @@ async fn follower_polls_exact_decision_when_commit_announcement_is_lost() {
     });
     let committed = CheckpointCoordinator::await_follower_decision(
         &controller,
-        12,
-        34,
+        attempt.epoch,
+        attempt.checkpoint_id,
         &assignment_fence,
         Duration::from_secs(1),
     )
@@ -2837,18 +2952,18 @@ async fn immutable_commit_outcome_wins_over_abort_hint() {
         Arc::new(object_store::memory::InMemory::new());
     let decision_store = in_memory_decision_store_on(Arc::clone(&backing));
     install_test_fence_authority(&controller, &assignment_fence, 1, backing).await;
+    let attempt = CheckpointAttempt::canonical(55);
     record_follower_outcome(
         controller.as_ref(),
         decision_store.as_ref(),
-        21,
-        55,
+        attempt,
         &assignment_fence,
         laminar_core::checkpoint_decision::CheckpointVerdict::Commit,
     )
     .await;
     let abort = serde_json::to_string(&BarrierAnnouncement {
-        epoch: 21,
-        checkpoint_id: 55,
+        epoch: attempt.epoch,
+        checkpoint_id: attempt.checkpoint_id,
         assignment_fence: Some(assignment_fence.clone()),
         leader_proof: None,
         phase: Phase::Abort,
@@ -2859,8 +2974,8 @@ async fn immutable_commit_outcome_wins_over_abort_hint() {
 
     let committed = CheckpointCoordinator::await_follower_decision(
         &controller,
-        21,
-        55,
+        attempt.epoch,
+        attempt.checkpoint_id,
         &assignment_fence,
         Duration::from_secs(1),
     )
@@ -2882,30 +2997,31 @@ async fn immutable_abort_outcome_wins_over_commit_hint() {
         Arc::new(object_store::memory::InMemory::new());
     let decision_store = in_memory_decision_store_on(Arc::clone(&backing));
     install_test_fence_authority(&controller, &successor_fence, 2, backing).await;
+    let attempt = CheckpointAttempt::canonical(56);
     record_follower_outcome(
         controller.as_ref(),
         decision_store.as_ref(),
-        22,
-        56,
+        attempt,
         &successor_fence,
         laminar_core::checkpoint_decision::CheckpointVerdict::Abort,
     )
     .await;
-    let fake_commit = serde_json::to_string(&BarrierAnnouncement {
-        epoch: 22,
-        checkpoint_id: 999,
+    let mut fake_commit = BarrierAnnouncement {
+        epoch: attempt.epoch,
+        checkpoint_id: attempt.checkpoint_id,
         assignment_fence: Some(prepared_fence.clone()),
         leader_proof: None,
         phase: Phase::Commit,
         flags: 0,
-    })
-    .unwrap();
+    };
+    fake_commit.checkpoint_id = 999;
+    let fake_commit = serde_json::to_string(&fake_commit).unwrap();
     kv.seed(leader_id, ANNOUNCEMENT_KEY, fake_commit);
 
     let committed = CheckpointCoordinator::await_follower_decision(
         &controller,
-        22,
-        56,
+        attempt.epoch,
+        attempt.checkpoint_id,
         &prepared_fence,
         Duration::from_secs(1),
     )
@@ -2932,12 +3048,12 @@ async fn restarted_follower_settles_after_its_exact_abort_was_compacted() {
     .await;
 
     let mut compacted = false;
-    for epoch in 1..=256 {
+    for checkpoint_id in 1..=256 {
+        let attempt = CheckpointAttempt::canonical(checkpoint_id);
         record_follower_outcome(
             writer.as_ref(),
             decision_store.as_ref(),
-            epoch,
-            epoch * 10,
+            attempt,
             &assignment_fence,
             laminar_core::checkpoint_decision::CheckpointVerdict::Abort,
         )
@@ -2963,7 +3079,7 @@ async fn restarted_follower_settles_after_its_exact_abort_was_compacted() {
     let committed = CheckpointCoordinator::await_follower_decision(
         &restarted,
         1,
-        10,
+        1,
         &assignment_fence,
         Duration::from_secs(1),
     )
@@ -2990,9 +3106,10 @@ async fn abort_hint_without_outcome_leaves_follower_in_doubt() {
         Arc::new(object_store::memory::InMemory::new()),
     )
     .await;
+    let attempt = CheckpointAttempt::canonical(58);
     let abort = serde_json::to_string(&BarrierAnnouncement {
-        epoch: 24,
-        checkpoint_id: 58,
+        epoch: attempt.epoch,
+        checkpoint_id: attempt.checkpoint_id,
         assignment_fence: Some(assignment_fence.clone()),
         leader_proof: None,
         phase: Phase::Abort,
@@ -3003,8 +3120,8 @@ async fn abort_hint_without_outcome_leaves_follower_in_doubt() {
 
     let error = CheckpointCoordinator::await_follower_decision(
         &controller,
-        24,
-        58,
+        attempt.epoch,
+        attempt.checkpoint_id,
         &assignment_fence,
         Duration::from_millis(100),
     )
@@ -3018,38 +3135,34 @@ async fn abort_hint_without_outcome_leaves_follower_in_doubt() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
-async fn abort_outcome_for_another_checkpoint_is_in_doubt() {
+async fn newer_abort_outcome_settles_older_prepared_attempt() {
     let (controller, _kv, _leader_id) = follower_decision_controller();
     let assignment_fence = follower_test_fence(3, &[1, 7]);
     let backing: Arc<dyn object_store::ObjectStore> =
         Arc::new(object_store::memory::InMemory::new());
     let decision_store = in_memory_decision_store_on(Arc::clone(&backing));
     install_test_fence_authority(&controller, &assignment_fence, 1, backing).await;
+    let prepared = CheckpointAttempt::canonical(58);
+    let newer = CheckpointAttempt::canonical(999);
     record_follower_outcome(
         controller.as_ref(),
         decision_store.as_ref(),
-        24,
-        999,
+        newer,
         &assignment_fence,
         laminar_core::checkpoint_decision::CheckpointVerdict::Abort,
     )
     .await;
 
-    let error = CheckpointCoordinator::await_follower_decision(
+    let committed = CheckpointCoordinator::await_follower_decision(
         &controller,
-        24,
-        58,
+        prepared.epoch,
+        prepared.checkpoint_id,
         &assignment_fence,
         Duration::from_secs(1),
     )
     .await
-    .expect_err("an Abort for another checkpoint must not release prepared state");
-    assert!(
-        error
-            .to_string()
-            .contains("belongs to checkpoint 999, not pending checkpoint 58"),
-        "{error}"
-    );
+    .expect("a newer terminal outcome closes an older prepared attempt");
+    assert!(!committed);
 }
 
 #[cfg(feature = "cluster")]
@@ -3191,8 +3304,7 @@ async fn follower_rejects_a_decision_for_a_different_assignment() {
     record_follower_outcome(
         controller.as_ref(),
         decision_store.as_ref(),
-        22,
-        56,
+        CheckpointAttempt::canonical(56),
         &different_fence,
         laminar_core::checkpoint_decision::CheckpointVerdict::Commit,
     )
@@ -3200,7 +3312,7 @@ async fn follower_rejects_a_decision_for_a_different_assignment() {
 
     let error = CheckpointCoordinator::await_follower_decision(
         &controller,
-        22,
+        56,
         56,
         &assignment_fence,
         Duration::from_secs(1),
@@ -3262,8 +3374,7 @@ async fn follower_checkpoint_rolls_back_only_on_durable_abort() {
     record_follower_outcome(
         controller.as_ref(),
         decision_store.as_ref(),
-        1,
-        1,
+        CheckpointAttempt::canonical(1),
         &durable_fence,
         laminar_core::checkpoint_decision::CheckpointVerdict::Abort,
     )
@@ -3412,7 +3523,7 @@ async fn solo_prepare_quorum_propagates_publication_failure() {
         &controller,
         Duration::ZERO,
         PrepareQuorum::new(
-            CheckpointAttempt::new(1, 1),
+            CheckpointAttempt::canonical(1),
             CheckpointWatermark::Active(10),
             &fence,
             &proof,
@@ -4080,7 +4191,7 @@ async fn gate_checks_full_registry_not_just_owned() {
     coord.set_state_backend(backend.clone()).unwrap();
     coord.set_vnode_set(vec![0, 1]); // leader's owned subset
     coord.set_gate_vnode_set(vec![0, 1, 2, 3]); // full cluster registry
-    let attempt = CheckpointAttempt::new(1, 1);
+    let attempt = CheckpointAttempt::canonical(1);
     for vnode in [0, 1] {
         backend
             .write_partial(attempt, vnode, 0, bytes::Bytes::from_static(b"leader"))
@@ -4127,7 +4238,7 @@ async fn source_offset_handoff_round_trip() {
         .metadata
         .insert("connector".into(), "partitioned-source".into());
     partitioned_checkpoint.source_assignment_version = std::num::NonZeroU64::new(1);
-    let attempt = CheckpointAttempt::new(5, 5);
+    let attempt = CheckpointAttempt::canonical(5);
     let mut manifest = CheckpointManifest::new(attempt.checkpoint_id, attempt.epoch);
     manifest.participant_id = 1;
     manifest.deployment_id = coord.expected_deployment_id().unwrap().to_string();
@@ -4238,8 +4349,8 @@ async fn cluster_recovery_rejects_finalized_manifest_without_outcome() {
 async fn source_handoff_ignores_a_newer_undecided_seal() {
     let dir = tempfile::tempdir().unwrap();
     let mut coord = make_cluster_coordinator(dir.path(), 1).await;
-    let decided = CheckpointAttempt::new(4, 5);
-    let prepared = CheckpointAttempt::new(8, 9);
+    let decided = CheckpointAttempt::canonical(5);
+    let prepared = CheckpointAttempt::canonical(9);
     let backend = Arc::new(laminar_core::state::InProcessBackend::new(1));
     coord.set_state_backend(backend.clone()).unwrap();
     coord.set_assignment_version(1);
@@ -4307,8 +4418,8 @@ async fn source_handoff_ignores_a_newer_undecided_seal() {
 async fn source_handoff_rejects_a_highest_decision_without_its_exact_seal() {
     let dir = tempfile::tempdir().unwrap();
     let mut coord = make_cluster_coordinator(dir.path(), 1).await;
-    let valid = CheckpointAttempt::new(4, 5);
-    let missing = CheckpointAttempt::new(8, 9);
+    let valid = CheckpointAttempt::canonical(5);
+    let missing = CheckpointAttempt::canonical(9);
     let backend = Arc::new(laminar_core::state::InProcessBackend::new(1));
     coord.set_state_backend(backend.clone()).unwrap();
     coord.set_assignment_version(1);
@@ -4354,7 +4465,7 @@ async fn source_handoff_rejects_a_highest_decision_without_its_exact_seal() {
         .acquired_source_handoff()
         .await
         .expect_err("the highest decision cannot fall back to an older sealed cut");
-    assert!(error.to_string().contains("decided checkpoint 9 epoch 8"));
+    assert!(error.to_string().contains("decided checkpoint 9 epoch 9"));
     assert!(error.to_string().contains("no exact state seal"));
 }
 
@@ -4382,8 +4493,8 @@ async fn recovery_capsules_preserve_each_decided_source_cut() {
             )])),
         )])
     };
-    let attempt5 = CheckpointAttempt::new(5, 5);
-    let attempt8 = CheckpointAttempt::new(8, 8);
+    let attempt5 = CheckpointAttempt::canonical(5);
+    let attempt8 = CheckpointAttempt::canonical(8);
     for (attempt, offsets) in [(attempt5, handoff("100")), (attempt8, handoff("200"))] {
         let mut manifest = CheckpointManifest::new(attempt.checkpoint_id, attempt.epoch);
         manifest.participant_id = 1;
@@ -4494,7 +4605,7 @@ async fn readiness_rejects_overlapping_vnode_ownership() {
         .unwrap()
         .capture_leader_proof()
         .unwrap();
-    let attempt = CheckpointAttempt::new(5, 8);
+    let attempt = CheckpointAttempt::canonical(8);
     let mut manifest = CheckpointManifest::new(attempt.checkpoint_id, attempt.epoch);
     manifest.participant_id = 1;
     manifest.deployment_id = coord.expected_deployment_id().unwrap().to_string();
@@ -4603,7 +4714,7 @@ async fn readiness_encoding_is_canonical_for_idempotent_reconstruction() {
     use laminar_core::state::{InProcessBackend, StateBackend};
 
     let backend = InProcessBackend::new(1);
-    let attempt = CheckpointAttempt::new(9, 11);
+    let attempt = CheckpointAttempt::canonical(11);
     let assignment_fence = test_assignment_fence(4, &[3]);
     let ready = |offsets: [(&str, &str); 2]| ParticipantReady {
         version: PARTICIPANT_READY_VERSION,
@@ -4657,7 +4768,7 @@ async fn recovery_rejects_decision_with_a_different_sealed_assignment() {
     coord.set_assignment_version(2);
     coord.set_vnode_set(vec![0]);
     let _leader_lease = attach_cluster_controller(&mut coord, 1, &[]).await;
-    let attempt = CheckpointAttempt::new(6, 7);
+    let attempt = CheckpointAttempt::canonical(7);
     let mut manifest = CheckpointManifest::new(attempt.checkpoint_id, attempt.epoch);
     manifest.participant_id = 1;
     manifest.deployment_id = coord.expected_deployment_id().unwrap().to_string();
@@ -4704,8 +4815,7 @@ async fn recovery_rejects_decision_with_a_different_sealed_assignment() {
     .unwrap();
     let capsule = create_test_recovery_capsule(
         decisions.as_ref(),
-        attempt.epoch,
-        attempt.checkpoint_id,
+        attempt,
         &different_fence,
         None,
         Some(&manifest),
@@ -4713,8 +4823,7 @@ async fn recovery_rejects_decision_with_a_different_sealed_assignment() {
     .await;
     record_follower_outcome_with_capsule(
         controller.as_ref(),
-        attempt.epoch,
-        attempt.checkpoint_id,
+        attempt,
         &different_fence,
         laminar_core::checkpoint_decision::CheckpointVerdict::Commit,
         Some(capsule),
@@ -4741,7 +4850,7 @@ async fn restorable_gate_waits_for_async_follower_uploads() {
     // Leader's own partials are present; the "follower's" vnodes
     // {2, 3} land only after a delay, simulating its background
     // upload completing while the leader polls.
-    let attempt = CheckpointAttempt::new(1, 1);
+    let attempt = CheckpointAttempt::canonical(1);
     backend
         .write_partial(attempt, 0, 0, Bytes::from_static(b"leader"))
         .await
@@ -4801,7 +4910,7 @@ async fn restorable_gate_exits_when_assignment_fence_changes_while_waiting() {
         #[cfg(feature = "cluster")]
         retention_read_probe: None,
     });
-    let attempt = CheckpointAttempt::new(1, 1);
+    let attempt = CheckpointAttempt::canonical(1);
     backend
         .write_partial(attempt, 0, 1, Bytes::from_static(b"leader"))
         .await
@@ -4865,7 +4974,7 @@ async fn restorable_gate_rejects_same_version_roster_replacement() {
         #[cfg(feature = "cluster")]
         retention_read_probe: None,
     });
-    let attempt = CheckpointAttempt::new(1, 2);
+    let attempt = CheckpointAttempt::canonical(2);
     backend
         .write_partial(attempt, 0, 1, Bytes::from_static(b"leader"))
         .await
@@ -4923,7 +5032,7 @@ async fn gate_passes_when_all_registry_markers_present() {
     let backend = Arc::new(InProcessBackend::new(4));
     // Simulate the follower's prior write on vnodes {2, 3} for the
     // epoch the leader is about to use (fresh store starts at 1).
-    let attempt = CheckpointAttempt::new(1, 1);
+    let attempt = CheckpointAttempt::canonical(1);
     backend
         .write_partial(attempt, 2, 0, Bytes::from_static(b"follower"))
         .await
@@ -5007,7 +5116,7 @@ async fn unchanged_vnode_state_becomes_reference_partial() {
         .await
         .unwrap();
     assert!(r1.success);
-    let a1 = CheckpointAttempt::new(r1.epoch, r1.checkpoint_id);
+    let a1 = CheckpointAttempt::canonical(r1.checkpoint_id);
     let p1 = crate::vnode_partial::VnodePartial::decode(
         &backend.read_partial(a1, 0).await.unwrap().unwrap(),
     )
@@ -5022,7 +5131,7 @@ async fn unchanged_vnode_state_becomes_reference_partial() {
         .await
         .unwrap();
     assert!(r2.success);
-    let a2 = CheckpointAttempt::new(r2.epoch, r2.checkpoint_id);
+    let a2 = CheckpointAttempt::canonical(r2.checkpoint_id);
     let p2 = crate::vnode_partial::VnodePartial::decode(
         &backend.read_partial(a2, 0).await.unwrap().unwrap(),
     )
@@ -5038,7 +5147,7 @@ async fn unchanged_vnode_state_becomes_reference_partial() {
         .await
         .unwrap();
     assert!(r3.success);
-    let a3 = CheckpointAttempt::new(r3.epoch, r3.checkpoint_id);
+    let a3 = CheckpointAttempt::canonical(r3.checkpoint_id);
     let p3 = crate::vnode_partial::VnodePartial::decode(
         &backend.read_partial(a3, 0).await.unwrap().unwrap(),
     )
@@ -5061,7 +5170,7 @@ async fn unchanged_vnode_state_becomes_reference_partial() {
         .await
         .unwrap();
     assert!(r4.success);
-    let a4 = CheckpointAttempt::new(r4.epoch, r4.checkpoint_id);
+    let a4 = CheckpointAttempt::canonical(r4.checkpoint_id);
     let p4 = crate::vnode_partial::VnodePartial::decode(
         &backend.read_partial(a4, 0).await.unwrap().unwrap(),
     )
@@ -5085,7 +5194,7 @@ async fn unchanged_vnode_state_becomes_reference_partial() {
         .await
         .unwrap();
     assert!(r5.success);
-    let a5 = CheckpointAttempt::new(r5.epoch, r5.checkpoint_id);
+    let a5 = CheckpointAttempt::canonical(r5.checkpoint_id);
     let p5 = crate::vnode_partial::VnodePartial::decode(
         &backend.read_partial(a5, 0).await.unwrap().unwrap(),
     )
@@ -5114,7 +5223,7 @@ async fn allocator_epoch_jump_rejects_delta_before_prepared_artifacts() {
         .await
         .unwrap();
     assert!(full.success);
-    let full_attempt = CheckpointAttempt::new(full.epoch, full.checkpoint_id);
+    let full_attempt = CheckpointAttempt::canonical(full.checkpoint_id);
     assert!(backend
         .checkpoint_seal_inventory(full_attempt)
         .await
@@ -5140,7 +5249,7 @@ async fn allocator_epoch_jump_rejects_delta_before_prepared_artifacts() {
         "{:?}",
         rejected.error
     );
-    let rejected_attempt = CheckpointAttempt::new(rejected.epoch, rejected.checkpoint_id);
+    let rejected_attempt = CheckpointAttempt::canonical(rejected.checkpoint_id);
     assert!(coord
         .store()
         .load_by_id(rejected.checkpoint_id)
@@ -5166,7 +5275,7 @@ async fn allocator_epoch_jump_rejects_delta_before_prepared_artifacts() {
         .await
         .unwrap();
     assert!(rebased.success, "{:?}", rebased.error);
-    let rebased_attempt = CheckpointAttempt::new(rebased.epoch, rebased.checkpoint_id);
+    let rebased_attempt = CheckpointAttempt::canonical(rebased.checkpoint_id);
     let partial = crate::vnode_partial::VnodePartial::decode(
         &backend
             .read_partial(rebased_attempt, 0)
@@ -5221,7 +5330,7 @@ async fn coordinator_rejects_delta_depth_beyond_runtime_bound() {
         "{:?}",
         rejected.error
     );
-    let attempt = CheckpointAttempt::new(rejected.epoch, rejected.checkpoint_id);
+    let attempt = CheckpointAttempt::canonical(rejected.checkpoint_id);
     assert!(coord
         .store()
         .load_by_id(rejected.checkpoint_id)
@@ -5269,7 +5378,7 @@ async fn reference_resets_bounded_delta_depth_without_hiding_its_root() {
         .await
         .unwrap();
     assert!(full.success);
-    let full_attempt = CheckpointAttempt::new(full.epoch, full.checkpoint_id);
+    let full_attempt = CheckpointAttempt::canonical(full.checkpoint_id);
 
     coord.set_pending_vnode_states(one_vnode_full_state(b"stable-full"));
     let referenced = coord
@@ -5277,7 +5386,7 @@ async fn reference_resets_bounded_delta_depth_without_hiding_its_root() {
         .await
         .unwrap();
     assert!(referenced.success);
-    let referenced_attempt = CheckpointAttempt::new(referenced.epoch, referenced.checkpoint_id);
+    let referenced_attempt = CheckpointAttempt::canonical(referenced.checkpoint_id);
     let reference = crate::vnode_partial::VnodePartial::decode(
         &backend
             .read_partial(referenced_attempt, 0)
@@ -5296,7 +5405,7 @@ async fn reference_resets_bounded_delta_depth_without_hiding_its_root() {
         .await
         .unwrap();
     assert!(allowed.success, "{:?}", allowed.error);
-    let allowed_attempt = CheckpointAttempt::new(allowed.epoch, allowed.checkpoint_id);
+    let allowed_attempt = CheckpointAttempt::canonical(allowed.checkpoint_id);
     let delta = crate::vnode_partial::VnodePartial::decode(
         &backend
             .read_partial(allowed_attempt, 0)
@@ -5433,7 +5542,7 @@ async fn mixed_delta_partial_cannot_seed_a_reference_chain() {
         .await
         .unwrap();
     assert!(rebased.success, "{:?}", rebased.error);
-    let attempt = CheckpointAttempt::new(rebased.epoch, rebased.checkpoint_id);
+    let attempt = CheckpointAttempt::canonical(rebased.checkpoint_id);
     let partial = crate::vnode_partial::VnodePartial::decode(
         &backend.read_partial(attempt, 0).await.unwrap().unwrap(),
     )
@@ -5459,7 +5568,7 @@ async fn mixed_delta_partial_cannot_seed_a_reference_chain() {
         .await
         .unwrap();
     assert!(referenced.success, "{:?}", referenced.error);
-    let referenced_attempt = CheckpointAttempt::new(referenced.epoch, referenced.checkpoint_id);
+    let referenced_attempt = CheckpointAttempt::canonical(referenced.checkpoint_id);
     let reference = crate::vnode_partial::VnodePartial::decode(
         &backend
             .read_partial(referenced_attempt, 0)
@@ -5471,7 +5580,7 @@ async fn mixed_delta_partial_cannot_seed_a_reference_chain() {
     assert_eq!(reference.base, Some(attempt));
     assert_ne!(
         reference.base,
-        Some(CheckpointAttempt::new(delta.epoch, delta.checkpoint_id)),
+        Some(CheckpointAttempt::canonical(delta.checkpoint_id)),
         "a reference must never target a DELTA partial",
     );
     assert!(reference.operators.is_empty());
@@ -5789,7 +5898,7 @@ async fn vnode_partial_write_fanout_is_bounded() {
         .unwrap();
     coord.set_vnode_set((0..vnode_count_u32).collect());
 
-    let attempt = CheckpointAttempt::new(1, 1);
+    let attempt = CheckpointAttempt::canonical(1);
     let writes = coord.write_vnode_partials_inner(attempt.epoch, attempt.checkpoint_id);
     tokio::pin!(writes);
 
@@ -5953,10 +6062,10 @@ async fn overlapping_epoch_failure_is_isolated() {
         .error
         .as_deref()
         .is_some_and(|e| e.contains("vnode partial write failed")));
-    let attempt_a = CheckpointAttempt::new(results[0].epoch, results[0].checkpoint_id);
-    let attempt_b = CheckpointAttempt::new(results[1].epoch, results[1].checkpoint_id);
-    let attempt_c = CheckpointAttempt::new(results[2].epoch, results[2].checkpoint_id);
-    let attempt_d = CheckpointAttempt::new(results[3].epoch, results[3].checkpoint_id);
+    let attempt_a = CheckpointAttempt::canonical(results[0].checkpoint_id);
+    let attempt_b = CheckpointAttempt::canonical(results[1].checkpoint_id);
+    let attempt_c = CheckpointAttempt::canonical(results[2].checkpoint_id);
+    let attempt_d = CheckpointAttempt::canonical(results[3].checkpoint_id);
 
     // The failed epoch was never sealed; its successful successor has an exact inventory.
     assert!(backend
@@ -6000,8 +6109,8 @@ async fn overlapping_epoch_failure_is_isolated() {
 
 /// A follower persists its Prepared manifest before learning the leader aborted, so an aborted
 /// epoch can be the highest on disk at restart. Recovery from an older committed cut
-/// must not walk the local epoch backwards. Checkpoint ID continuity is independent and comes
-/// solely from durable reservations.
+/// must not walk the local checkpoint order backwards. Continuity comes from durable
+/// reservations rather than reconstructing IDs from retained manifests.
 #[tokio::test]
 async fn recovery_never_walks_epoch_back_onto_aborted_attempt() {
     let dir = tempfile::tempdir().unwrap();
@@ -6045,6 +6154,7 @@ async fn recovery_never_walks_epoch_back_onto_aborted_attempt() {
 
     let recovered = coord.recover().await.unwrap().expect("recovers");
     assert_eq!(recovered.epoch(), 3, "restores from the committed epoch");
+    assert_eq!(coord.recent_committed_checkpoints, VecDeque::from([3]));
     assert_eq!(
         coord.epoch(),
         6,
@@ -6057,7 +6167,7 @@ async fn recovery_rejects_a_max_epoch_cut_instead_of_wrapping() {
     let dir = tempfile::tempdir().unwrap();
     let (mut coord, decision_store) = make_coordinator_with_decision_store(dir.path()).await;
     let deployment_id = decision_store.load_or_create_deployment_id().await.unwrap();
-    let mut manifest = CheckpointManifest::new(17, u64::MAX);
+    let mut manifest = CheckpointManifest::new(u64::MAX, u64::MAX);
     manifest.deployment_id = deployment_id;
     manifest.durable_phase =
         laminar_core::storage::checkpoint_manifest::DurableCheckpointPhase::Finalized;
@@ -6065,7 +6175,7 @@ async fn recovery_rejects_a_max_epoch_cut_instead_of_wrapping() {
     decision_store
         .record_outcome(
             u64::MAX,
-            17,
+            u64::MAX,
             laminar_core::checkpoint_decision::CheckpointScope::Local,
             None,
             None,
@@ -6098,7 +6208,7 @@ async fn epoch_allocator_reservations_survive_restart() {
     assert_eq!(first.peek_epoch(), 5);
     assert_eq!(
         first.allocate().await.unwrap(),
-        CheckpointAttempt::new(5, 1)
+        CheckpointAttempt::canonical(5)
     );
     assert_eq!(first.peek_epoch(), 6);
 
@@ -6112,12 +6222,106 @@ async fn epoch_allocator_reservations_survive_restart() {
         .unwrap();
     assert_eq!(
         restarted.allocate().await.unwrap(),
-        CheckpointAttempt::new(1, 2)
+        CheckpointAttempt::canonical(6)
     );
 
     restarted.advance_epoch_to(20);
     restarted.advance_epoch_to(5); // Monotonic: never walks backwards.
     assert_eq!(restarted.peek_epoch(), 20);
+}
+
+#[tokio::test]
+async fn sink_epoch_reservation_must_be_ready_and_is_consumed_exactly_once() {
+    let allocator = EpochAllocator::new(1, Duration::from_secs(1));
+    allocator
+        .bind_decision_store(in_memory_decision_store())
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+
+    let missing = allocator
+        .consume_sink_epoch_until(deadline)
+        .await
+        .unwrap_err();
+    assert!(missing
+        .to_string()
+        .contains("no pre-opened durable attempt"));
+
+    let attempt = allocator.reserve_sink_epoch_until(deadline).await.unwrap();
+    assert!(attempt.is_canonical());
+    let opening = allocator
+        .consume_sink_epoch_until(deadline)
+        .await
+        .unwrap_err();
+    assert!(opening.to_string().contains("not ready"));
+
+    allocator.mark_sink_epoch_ready(attempt).unwrap();
+    assert_eq!(
+        allocator.consume_sink_epoch_until(deadline).await.unwrap(),
+        attempt
+    );
+    assert!(allocator.consume_sink_epoch_until(deadline).await.is_err());
+}
+
+#[tokio::test]
+async fn opening_sink_epoch_is_burned_across_restart() {
+    use object_store::ObjectStore;
+
+    let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let first = EpochAllocator::new(1, Duration::from_secs(1));
+    first
+        .bind_decision_store(in_memory_decision_store_on(Arc::clone(&object_store)))
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let abandoned = first.reserve_sink_epoch_until(deadline).await.unwrap();
+    assert_eq!(abandoned, CheckpointAttempt::canonical(1));
+    drop(first);
+
+    let restarted = EpochAllocator::new(1, Duration::from_secs(1));
+    restarted
+        .bind_decision_store(in_memory_decision_store_on(object_store))
+        .unwrap();
+    assert_eq!(
+        restarted.allocate().await.unwrap(),
+        CheckpointAttempt::canonical(2)
+    );
+}
+
+#[tokio::test]
+async fn advanced_floor_poisons_a_preopened_sink_epoch() {
+    let allocator = EpochAllocator::new(1, Duration::from_secs(1));
+    allocator
+        .bind_decision_store(in_memory_decision_store())
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let attempt = allocator.reserve_sink_epoch_until(deadline).await.unwrap();
+    allocator.mark_sink_epoch_ready(attempt).unwrap();
+
+    allocator.advance_epoch_to(10);
+    let error = allocator
+        .consume_sink_epoch_until(deadline)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("in-doubt"), "{error}");
+    assert!(allocator.allocate_until(deadline).await.is_err());
+}
+
+#[tokio::test]
+async fn exact_successor_floor_poisons_a_preopened_sink_epoch() {
+    let allocator = EpochAllocator::new(1, Duration::from_secs(1));
+    allocator
+        .bind_decision_store(in_memory_decision_store())
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let attempt = allocator.reserve_sink_epoch_until(deadline).await.unwrap();
+    allocator.mark_sink_epoch_ready(attempt).unwrap();
+
+    allocator.advance_epoch_to(attempt.checkpoint_id + 1);
+    let error = allocator
+        .consume_sink_epoch_until(deadline)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("in-doubt"), "{error}");
+    assert!(allocator.allocate_until(deadline).await.is_err());
 }
 
 #[tokio::test]
@@ -6130,13 +6334,12 @@ async fn epoch_allocator_never_wraps_at_u64_max() {
 
     assert_eq!(
         allocator.allocate().await.unwrap(),
-        CheckpointAttempt::new(u64::MAX - 1, 1)
+        CheckpointAttempt::canonical(u64::MAX - 1)
     );
     assert_eq!(allocator.peek_epoch(), u64::MAX);
 
     let error = allocator.allocate().await.unwrap_err();
     assert!(error.to_string().contains("epoch space exhausted"));
-    assert!(error.to_string().contains("checkpoint ID 2"));
     assert_eq!(
         allocator.peek_epoch(),
         u64::MAX,
@@ -6145,11 +6348,8 @@ async fn epoch_allocator_never_wraps_at_u64_max() {
 
     let restarted = EpochAllocator::new(7, Duration::from_secs(1));
     restarted.bind_decision_store(decision_store).unwrap();
-    assert_eq!(
-        restarted.allocate().await.unwrap(),
-        CheckpointAttempt::new(7, 3),
-        "the exhausted epoch abandons its already-durable checkpoint ID"
-    );
+    let error = restarted.allocate().await.unwrap_err();
+    assert!(error.to_string().contains("checkpoint ID space exhausted"));
 }
 
 #[cfg(feature = "cluster")]
@@ -6182,17 +6382,19 @@ async fn epoch_allocator_concurrent_stores_reserve_unique_ids() {
                 )),
             ))
             .unwrap();
-        tasks.push(tokio::spawn(
-            async move { allocator.allocate().await.unwrap() },
-        ));
+        tasks.push(tokio::spawn(async move {
+            (epoch, allocator.allocate().await.unwrap())
+        }));
     }
 
-    let mut ids = Vec::new();
+    let mut ids = std::collections::BTreeSet::new();
     for task in tasks {
-        ids.push(task.await.unwrap().checkpoint_id);
+        let (floor, attempt) = task.await.unwrap();
+        assert!(attempt.is_canonical());
+        assert!(attempt.checkpoint_id >= floor);
+        assert!(ids.insert(attempt.checkpoint_id));
     }
-    ids.sort_unstable();
-    assert_eq!(ids, (1..=16).collect::<Vec<_>>());
+    assert_eq!(ids.len(), 16);
 }
 
 #[tokio::test]
@@ -6202,7 +6404,7 @@ async fn epoch_allocator_error_does_not_advance_epoch() {
     let object_store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     object_store
         .put(
-            &object_store::path::Path::from("checkpoint-id-reservations/malformed"),
+            &object_store::path::Path::from("checkpoint-deployment/identity.json"),
             PutPayload::from(bytes::Bytes::from_static(b"bad")),
         )
         .await
@@ -6243,7 +6445,11 @@ async fn failed_epoch_is_abandoned_not_retried() {
         max_staged_bytes: 16,
         ..CheckpointConfig::default()
     };
-    let store = Box::new(FileSystemCheckpointStore::new(dir.path()));
+    let store = Box::new(
+        FileSystemCheckpointStore::new(dir.path())
+            .with_max_state_data_bytes(config.max_staged_bytes)
+            .unwrap(),
+    );
     let mut coord = CheckpointCoordinator::new(config, store).await.unwrap();
     bind_in_memory_decision_store(&mut coord).await;
 
@@ -6296,6 +6502,7 @@ async fn test_stats_include_percentiles_after_checkpoints() {
 /// Sink whose `pre_commit` always fails; counts `rollback_epoch` calls.
 struct FailingPreCommitSink {
     rollback_count: Arc<std::sync::atomic::AtomicU64>,
+    events: Arc<parking_lot::Mutex<Vec<(&'static str, u64)>>>,
     schema: arrow::datatypes::SchemaRef,
 }
 
@@ -6308,6 +6515,68 @@ struct BeginRollbackProbeSink {
     fail_rollback: bool,
     rollback_count: Option<Arc<std::sync::atomic::AtomicU64>>,
     schema: arrow::datatypes::SchemaRef,
+}
+
+struct SinkWitnessRestartProbe {
+    events: Arc<parking_lot::Mutex<Vec<(&'static str, u64)>>>,
+    fail_rollback: bool,
+    schema: arrow::datatypes::SchemaRef,
+}
+
+#[async_trait::async_trait]
+impl laminar_connectors::connector::SinkConnector for SinkWitnessRestartProbe {
+    fn cancellation_policy(&self) -> laminar_connectors::connector::ConnectorCancellationPolicy {
+        laminar_connectors::connector::ConnectorCancellationPolicy::CancelSafe
+    }
+
+    async fn open(
+        &mut self,
+        _config: &laminar_connectors::config::ConnectorConfig,
+    ) -> Result<(), laminar_connectors::error::ConnectorError> {
+        Ok(())
+    }
+
+    async fn write_batch(
+        &mut self,
+        _batch: &arrow::array::RecordBatch,
+    ) -> Result<laminar_connectors::connector::WriteResult, laminar_connectors::error::ConnectorError>
+    {
+        Ok(laminar_connectors::connector::WriteResult::new(0, 0))
+    }
+
+    async fn begin_epoch(
+        &mut self,
+        epoch: u64,
+    ) -> Result<(), laminar_connectors::error::ConnectorError> {
+        self.events.lock().push(("begin", epoch));
+        Ok(())
+    }
+
+    async fn rollback_epoch(
+        &mut self,
+        epoch: u64,
+    ) -> Result<(), laminar_connectors::error::ConnectorError> {
+        self.events.lock().push(("rollback", epoch));
+        if self.fail_rollback {
+            Err(laminar_connectors::error::ConnectorError::TransactionError(
+                "injected restart rollback failure".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn close(&mut self) -> Result<(), laminar_connectors::error::ConnectorError> {
+        Ok(())
+    }
+
+    fn schema(&self) -> arrow::datatypes::SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn suggested_write_timeout(&self) -> Duration {
+        Duration::from_secs(5)
+    }
 }
 
 #[async_trait::async_trait]
@@ -6411,6 +6680,673 @@ fn spawn_begin_rollback_probe(
     })
 }
 
+fn spawn_sink_witness_restart_probe(
+    name: &str,
+    events: Arc<parking_lot::Mutex<Vec<(&'static str, u64)>>>,
+    fail_rollback: bool,
+    schema: arrow::datatypes::SchemaRef,
+    event_tx: laminar_core::streaming::channel::Producer<crate::sink_task::SinkEvent>,
+) -> crate::sink_task::SinkTaskHandle {
+    crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+        name: name.into(),
+        sink_id: Arc::from(name),
+        connector: Box::new(SinkWitnessRestartProbe {
+            events,
+            fail_rollback,
+            schema,
+        }),
+        contract: checkpoint_committable_sink_contract(),
+        requires_recovery_on_error: true,
+        channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+        flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
+        write_timeout: Duration::from_secs(1),
+        event_tx,
+        terminal_tasks: None,
+        #[cfg(feature = "cluster")]
+        process_authority: None,
+    })
+}
+
+async fn coordinator_with_decision_backing(
+    checkpoint_dir: &std::path::Path,
+    backing: Arc<dyn object_store::ObjectStore>,
+) -> (
+    CheckpointCoordinator,
+    Arc<laminar_core::checkpoint_decision::CheckpointDecisionStore>,
+) {
+    let mut coordinator = CheckpointCoordinator::new(
+        CheckpointConfig::default(),
+        Box::new(FileSystemCheckpointStore::new(checkpoint_dir)),
+    )
+    .await
+    .unwrap();
+    let decisions = in_memory_decision_store_on(backing);
+    let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
+    coordinator
+        .set_decision_store(Arc::clone(&decisions))
+        .unwrap();
+    coordinator.bind_deployment_id(deployment_id).unwrap();
+    (coordinator, decisions)
+}
+
+const BLOCK_OUTCOME_READ: u8 = 1;
+const BLOCK_SINK_WITNESS_CLEAR: u8 = 2;
+
+struct CheckpointDecisionFaultStore {
+    inner: Arc<dyn object_store::ObjectStore>,
+    armed: std::sync::atomic::AtomicU8,
+    intercepted: std::sync::atomic::AtomicBool,
+    blocked: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl CheckpointDecisionFaultStore {
+    fn new(inner: Arc<dyn object_store::ObjectStore>) -> Self {
+        Self {
+            inner,
+            armed: std::sync::atomic::AtomicU8::new(0),
+            intercepted: std::sync::atomic::AtomicBool::new(false),
+            blocked: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn arm(&self, fault: u8) {
+        self.intercepted
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.armed
+            .store(fault, std::sync::atomic::Ordering::Release);
+    }
+
+    fn block_outcome_read(&self) {
+        self.arm(BLOCK_OUTCOME_READ);
+    }
+
+    fn block_sink_witness_clear(&self) {
+        self.arm(BLOCK_SINK_WITNESS_CLEAR);
+    }
+
+    async fn wait_until_blocked(&self) {
+        self.blocked.notified().await;
+    }
+
+    fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+impl std::fmt::Debug for CheckpointDecisionFaultStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CheckpointDecisionFaultStore")
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for CheckpointDecisionFaultStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CheckpointDecisionFaultStore")
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for CheckpointDecisionFaultStore {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        options: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        if location.as_ref() == "checkpoint-sink-open-witness/witness.json"
+            && self.armed.load(std::sync::atomic::Ordering::Acquire) == BLOCK_SINK_WITNESS_CLEAR
+            && !self
+                .intercepted
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            let result = self.inner.put_opts(location, payload, options).await;
+            self.blocked.notify_one();
+            self.release.notified().await;
+            result?;
+            return Err(object_store::Error::Generic {
+                store: "CheckpointDecisionFaultStore",
+                source: Box::new(std::io::Error::other(
+                    "injected lost sink-witness clear acknowledgement",
+                )),
+            });
+        }
+        self.inner.put_opts(location, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if location.as_ref() == "checkpoint-outcomes/epoch=1/outcome"
+            && self.armed.load(std::sync::atomic::Ordering::Acquire) == BLOCK_OUTCOME_READ
+            && !self
+                .intercepted
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            let result = self.inner.get_opts(location, options).await;
+            self.blocked.notify_one();
+            self.release.notified().await;
+            return result;
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn sink_epoch_begin_latency_is_bounded_by_the_slowest_sink() {
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut coord = make_coordinator(dir.path()).await;
+    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+    let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    for name in ["slow-a", "slow-b"] {
+        coord.register_sink(
+            name,
+            spawn_begin_rollback_probe(
+                name,
+                BeginRollbackProbeSink {
+                    cancellation_policy:
+                        laminar_connectors::connector::ConnectorCancellationPolicy::CancelSafe,
+                    fail_begin_on_call: None,
+                    begin_calls: 0,
+                    begin_delay: Duration::from_millis(100),
+                    fail_pre_commit: false,
+                    fail_rollback: false,
+                    rollback_count: None,
+                    schema: Arc::clone(&schema),
+                },
+                event_tx.clone(),
+            ),
+        );
+    }
+
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_millis(150);
+    coord
+        .begin_epoch_for_sinks_until(7, deadline, deadline)
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::Instant::now().duration_since(started),
+        Duration::from_millis(100),
+        "independent connector begins must run concurrently"
+    );
+}
+
+#[tokio::test]
+async fn idle_timeout_settles_the_consumed_exact_sink_epoch() {
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let dir = tempfile::tempdir().unwrap();
+    let backing: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let (mut coord, decisions) = coordinator_with_decision_backing(dir.path(), backing).await;
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+    let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    coord.register_sink(
+        "durable",
+        spawn_sink_witness_restart_probe("durable", Arc::clone(&events), false, schema, event_tx),
+    );
+    coord.begin_initial_epoch().await.unwrap();
+    let attempt = coord
+        .allocate_attempt_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(coord.phase, CheckpointPhase::Idle);
+
+    let result = coord
+        .resolve_attempt_timeout(attempt, Instant::now(), "injected pre-poll timeout".into())
+        .await;
+
+    assert!(!result.success, "{result:?}");
+    assert!(matches!(
+        decisions.outcome(1).await.unwrap().unwrap().verdict,
+        laminar_core::checkpoint_decision::CheckpointVerdict::Abort
+    ));
+    assert_eq!(
+        events.lock().as_slice(),
+        &[("begin", 1), ("rollback", 1), ("begin", 2)]
+    );
+    assert_eq!(
+        coord.allocator.sink_epoch_reservation(),
+        Some(SinkEpochReservation::Ready(CheckpointAttempt::canonical(2)))
+    );
+    assert_eq!(
+        decisions
+            .sink_open_witness()
+            .await
+            .unwrap()
+            .unwrap()
+            .attempt,
+        CheckpointAttempt::canonical(2)
+    );
+}
+
+#[tokio::test]
+async fn restart_rolls_back_the_exact_witness_before_opening_a_successor() {
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let dir = tempfile::tempdir().unwrap();
+    let backing: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+    let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    let (mut first, decisions) =
+        coordinator_with_decision_backing(dir.path(), Arc::clone(&backing)).await;
+    first.register_sink(
+        "durable",
+        spawn_sink_witness_restart_probe(
+            "durable",
+            Arc::new(parking_lot::Mutex::new(Vec::new())),
+            false,
+            Arc::clone(&schema),
+            event_tx,
+        ),
+    );
+    first.begin_initial_epoch().await.unwrap();
+    assert_eq!(
+        decisions
+            .sink_open_witness()
+            .await
+            .unwrap()
+            .unwrap()
+            .attempt,
+        CheckpointAttempt::canonical(1)
+    );
+    drop(first);
+
+    let restarted_events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    let (mut restarted, _) =
+        coordinator_with_decision_backing(dir.path(), Arc::clone(&backing)).await;
+    restarted.register_sink(
+        "durable",
+        spawn_sink_witness_restart_probe(
+            "durable",
+            Arc::clone(&restarted_events),
+            false,
+            schema,
+            event_tx,
+        ),
+    );
+    restarted.reconcile_sink_open_witness().await.unwrap();
+    assert_eq!(restarted_events.lock().as_slice(), &[("rollback", 1)]);
+    assert!(decisions.sink_open_witness().await.unwrap().is_none());
+    assert!(matches!(
+        decisions.outcome(1).await.unwrap().unwrap().verdict,
+        laminar_core::checkpoint_decision::CheckpointVerdict::Abort
+    ));
+
+    restarted.begin_initial_epoch().await.unwrap();
+    assert_eq!(
+        restarted_events.lock().as_slice(),
+        &[("rollback", 1), ("begin", 2)]
+    );
+}
+
+#[tokio::test]
+async fn topology_mismatch_is_rejected_before_connector_epoch_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let backing: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let (first, decisions) =
+        coordinator_with_decision_backing(dir.path(), Arc::clone(&backing)).await;
+    decisions
+        .create_sink_open_witness(
+            first.expected_pipeline_identity(),
+            0,
+            CheckpointAttempt::canonical(1),
+            vec!["original".into()],
+        )
+        .await
+        .unwrap();
+
+    let error = first
+        .audit_sink_open_witness_topology(vec!["replacement".into()])
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("active committable sinks"));
+    assert_eq!(
+        decisions
+            .sink_open_witness()
+            .await
+            .unwrap()
+            .unwrap()
+            .attempt,
+        CheckpointAttempt::canonical(1)
+    );
+}
+
+#[tokio::test]
+async fn commit_winning_after_an_absent_read_is_never_rolled_back() {
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let dir = tempfile::tempdir().unwrap();
+    let raw: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let blocking = Arc::new(CheckpointDecisionFaultStore::new(raw));
+    let backing: Arc<dyn object_store::ObjectStore> = blocking.clone();
+    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+    let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    let (mut first, decisions) =
+        coordinator_with_decision_backing(dir.path(), Arc::clone(&backing)).await;
+    first.register_sink(
+        "durable",
+        spawn_sink_witness_restart_probe(
+            "durable",
+            Arc::new(parking_lot::Mutex::new(Vec::new())),
+            false,
+            Arc::clone(&schema),
+            event_tx,
+        ),
+    );
+    first.begin_initial_epoch().await.unwrap();
+    drop(first);
+
+    let restarted_events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    let (mut restarted, _) = coordinator_with_decision_backing(dir.path(), backing).await;
+    restarted.register_sink(
+        "durable",
+        spawn_sink_witness_restart_probe(
+            "durable",
+            Arc::clone(&restarted_events),
+            false,
+            schema,
+            event_tx,
+        ),
+    );
+
+    blocking.block_outcome_read();
+    let mut reconciliation = Box::pin(restarted.reconcile_sink_open_witness());
+    tokio::select! {
+        () = blocking.wait_until_blocked() => {}
+        result = &mut reconciliation => panic!("reconciliation completed before the injected stale read: {result:?}"),
+    }
+    decisions
+        .record_outcome(
+            1,
+            1,
+            laminar_core::checkpoint_decision::CheckpointScope::Local,
+            None,
+            None,
+            laminar_core::checkpoint_decision::CheckpointVerdict::Commit,
+            None,
+        )
+        .await
+        .unwrap();
+    blocking.release();
+    reconciliation.await.unwrap();
+
+    assert!(restarted_events.lock().is_empty());
+    assert!(decisions.sink_open_witness().await.unwrap().is_none());
+    assert!(decisions.outcome(1).await.unwrap().unwrap().is_commit());
+}
+
+#[tokio::test]
+async fn cancelled_sink_witness_clear_converges_after_the_tombstone_lands() {
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let dir = tempfile::tempdir().unwrap();
+    let raw: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let fault = Arc::new(CheckpointDecisionFaultStore::new(raw));
+    let backing: Arc<dyn object_store::ObjectStore> = fault.clone();
+    let (mut coord, decisions) = coordinator_with_decision_backing(dir.path(), backing).await;
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+    let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    coord.register_sink(
+        "durable",
+        spawn_sink_witness_restart_probe("durable", Arc::clone(&events), false, schema, event_tx),
+    );
+    coord.begin_initial_epoch().await.unwrap();
+
+    fault.block_sink_witness_clear();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let mut reconciliation = Box::pin(coord.reconcile_sink_open_witness_until(deadline));
+    tokio::select! {
+        () = fault.wait_until_blocked() => {}
+        result = &mut reconciliation => panic!("reconciliation completed before the clear response was withheld: {result:?}"),
+    }
+    assert!(
+        decisions.sink_open_witness().await.unwrap().is_none(),
+        "the exact close tombstone must already be visible while its acknowledgement is lost"
+    );
+    // Cancel the lifecycle waiter while the independently owned clear task is still awaiting its
+    // acknowledgement. The next lifecycle attempt must resume that exact task before inventory.
+    drop(reconciliation);
+    assert!(coord.pending_sink_witness_clear.lock().await.is_some());
+    assert!(coord.active_sink_witness.lock().is_some());
+
+    fault.release();
+    coord
+        .reconcile_sink_open_witness_until(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert!(coord.pending_sink_witness_clear.lock().await.is_none());
+    assert!(coord.active_sink_witness.lock().is_none());
+    assert!(coord.allocator.sink_epoch_reservation().is_none());
+    assert_eq!(coord.allocator.peek_epoch(), 2);
+    assert_eq!(events.lock().as_slice(), &[("begin", 1), ("rollback", 1)]);
+
+    coord.begin_initial_epoch().await.unwrap();
+    assert_eq!(
+        events.lock().as_slice(),
+        &[("begin", 1), ("rollback", 1), ("begin", 2)]
+    );
+}
+
+#[tokio::test]
+async fn restart_clears_a_committed_witness_without_rollback() {
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let dir = tempfile::tempdir().unwrap();
+    let backing: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+    let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    let (mut first, decisions) =
+        coordinator_with_decision_backing(dir.path(), Arc::clone(&backing)).await;
+    first.register_sink(
+        "durable",
+        spawn_sink_witness_restart_probe(
+            "durable",
+            Arc::new(parking_lot::Mutex::new(Vec::new())),
+            false,
+            Arc::clone(&schema),
+            event_tx,
+        ),
+    );
+    first.begin_initial_epoch().await.unwrap();
+    decisions
+        .record_outcome(
+            1,
+            1,
+            laminar_core::checkpoint_decision::CheckpointScope::Local,
+            None,
+            None,
+            laminar_core::checkpoint_decision::CheckpointVerdict::Commit,
+            None,
+        )
+        .await
+        .unwrap();
+    drop(first);
+
+    let restarted_events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    let (mut restarted, _) = coordinator_with_decision_backing(dir.path(), backing).await;
+    restarted.register_sink(
+        "durable",
+        spawn_sink_witness_restart_probe(
+            "durable",
+            Arc::clone(&restarted_events),
+            false,
+            schema,
+            event_tx,
+        ),
+    );
+    restarted.reconcile_sink_open_witness().await.unwrap();
+    assert!(restarted_events.lock().is_empty());
+    assert!(decisions.sink_open_witness().await.unwrap().is_none());
+
+    restarted.begin_initial_epoch().await.unwrap();
+    assert_eq!(restarted_events.lock().as_slice(), &[("begin", 2)]);
+}
+
+#[tokio::test]
+async fn failed_restart_rollback_retains_the_witness_and_fences_successors() {
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let dir = tempfile::tempdir().unwrap();
+    let backing: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+    let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    let (mut first, decisions) =
+        coordinator_with_decision_backing(dir.path(), Arc::clone(&backing)).await;
+    first.register_sink(
+        "durable",
+        spawn_sink_witness_restart_probe(
+            "durable",
+            Arc::new(parking_lot::Mutex::new(Vec::new())),
+            false,
+            Arc::clone(&schema),
+            event_tx,
+        ),
+    );
+    first.begin_initial_epoch().await.unwrap();
+    drop(first);
+
+    let failed_events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    let (mut failed_restart, _) =
+        coordinator_with_decision_backing(dir.path(), Arc::clone(&backing)).await;
+    failed_restart.register_sink(
+        "durable",
+        spawn_sink_witness_restart_probe(
+            "durable",
+            Arc::clone(&failed_events),
+            true,
+            Arc::clone(&schema),
+            event_tx,
+        ),
+    );
+    let error = failed_restart
+        .reconcile_sink_open_witness()
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("rollback failed"), "{error}");
+    assert_eq!(failed_events.lock().as_slice(), &[("rollback", 1)]);
+    assert_eq!(
+        decisions
+            .sink_open_witness()
+            .await
+            .unwrap()
+            .unwrap()
+            .attempt,
+        CheckpointAttempt::canonical(1)
+    );
+    assert!(failed_restart.begin_initial_epoch().await.is_err());
+    assert_eq!(
+        failed_events.lock().as_slice(),
+        &[("rollback", 1)],
+        "a live older witness must reject the higher attempt before connector begin"
+    );
+    drop(failed_restart);
+
+    let recovered_events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    let (mut recovered, _) = coordinator_with_decision_backing(dir.path(), backing).await;
+    recovered.register_sink(
+        "durable",
+        spawn_sink_witness_restart_probe(
+            "durable",
+            Arc::clone(&recovered_events),
+            false,
+            schema,
+            event_tx,
+        ),
+    );
+    recovered.reconcile_sink_open_witness().await.unwrap();
+    recovered.begin_initial_epoch().await.unwrap();
+    assert_eq!(
+        recovered_events.lock().as_slice(),
+        &[("rollback", 1), ("begin", 3)],
+        "the failed direct admission burns ID 2 without invoking a connector begin"
+    );
+}
+
 #[tokio::test]
 async fn begin_epoch_reports_in_doubt_rollback_failure() {
     use arrow::datatypes::{DataType, Field, Schema};
@@ -6463,7 +7399,7 @@ async fn begin_epoch_reports_in_doubt_rollback_failure() {
     let error = coord.begin_initial_epoch().await.unwrap_err();
     let message = error.to_string();
     assert!(message.contains("begin-failure"), "{message}");
-    assert!(message.contains("started: "), "{message}");
+    assert!(message.contains("sink 'started'"), "{message}");
     assert!(message.contains("state in-doubt"), "{message}");
     assert!(error.requires_pipeline_recovery());
     assert_eq!(
@@ -6475,6 +7411,110 @@ async fn begin_epoch_reports_in_doubt_rollback_failure() {
         started_rollbacks.load(std::sync::atomic::Ordering::SeqCst),
         1
     );
+
+    let retry = coord.begin_initial_epoch().await.unwrap_err();
+    assert!(retry.to_string().contains("in-doubt"), "{retry}");
+    assert_eq!(
+        failing_rollbacks.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "an in-doubt reservation must fence a higher sink epoch"
+    );
+    assert_eq!(
+        started_rollbacks.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "an in-doubt reservation must not retry connector begin or rollback"
+    );
+}
+
+#[tokio::test]
+async fn clean_begin_failure_burns_the_attempt_before_retry() {
+    use arrow::datatypes::{DataType, Field, Schema};
+    use laminar_core::state::{InProcessBackend, StateBackend};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut coord = make_coordinator_with_key_groups(dir.path(), 2).await;
+    coord
+        .set_state_backend(Arc::new(InProcessBackend::new(2)) as Arc<dyn StateBackend>)
+        .unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+    let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    let rollbacks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    coord.register_sink(
+        "fail-first-begin",
+        spawn_begin_rollback_probe(
+            "fail-first-begin",
+            BeginRollbackProbeSink {
+                cancellation_policy:
+                    laminar_connectors::connector::ConnectorCancellationPolicy::RetireConnector,
+                fail_begin_on_call: Some(1),
+                begin_calls: 0,
+                begin_delay: Duration::ZERO,
+                fail_pre_commit: false,
+                fail_rollback: false,
+                rollback_count: Some(Arc::clone(&rollbacks)),
+                schema,
+            },
+            event_tx,
+        ),
+    );
+
+    assert!(coord.begin_initial_epoch().await.is_err());
+    assert_eq!(coord.epoch(), 2, "failed begin must burn checkpoint ID 1");
+    assert_eq!(rollbacks.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    coord.begin_initial_epoch().await.unwrap();
+    let result = coord
+        .checkpoint(CheckpointRequest::default())
+        .await
+        .unwrap();
+    assert!(result.success, "checkpoint failed: {:?}", result.error);
+    assert_eq!(
+        CheckpointAttempt::canonical(result.checkpoint_id),
+        CheckpointAttempt::canonical(2)
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_committable_sink_without_open_epoch_fails_closed() {
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut coord = make_coordinator(dir.path()).await;
+    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+    let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    let rollbacks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    coord.register_sink(
+        "not-opened",
+        spawn_begin_rollback_probe(
+            "not-opened",
+            BeginRollbackProbeSink {
+                cancellation_policy:
+                    laminar_connectors::connector::ConnectorCancellationPolicy::RetireConnector,
+                fail_begin_on_call: None,
+                begin_calls: 0,
+                begin_delay: Duration::ZERO,
+                fail_pre_commit: false,
+                fail_rollback: false,
+                rollback_count: Some(Arc::clone(&rollbacks)),
+                schema,
+            },
+            event_tx,
+        ),
+    );
+
+    let error = coord
+        .checkpoint(CheckpointRequest::default())
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("no pre-opened durable attempt"),
+        "{error}"
+    );
+    assert_eq!(rollbacks.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
 #[tokio::test(start_paused = true)]
@@ -6508,8 +7548,9 @@ async fn timed_out_begin_uses_a_fresh_rollback_deadline() {
     );
 
     let attempt_deadline = tokio::time::Instant::now() + Duration::from_millis(10);
+    let rollback_deadline = attempt_deadline + coord.config.cleanup_timeout;
     let error = coord
-        .begin_epoch_for_sinks_until(7, attempt_deadline)
+        .begin_epoch_for_sinks_until(7, attempt_deadline, rollback_deadline)
         .await
         .unwrap_err();
     let message = error.to_string();
@@ -6554,8 +7595,9 @@ async fn timed_out_begin_retires_unsafe_generation_without_cleanup_delay() {
 
     let started = tokio::time::Instant::now();
     let attempt_deadline = started + Duration::from_millis(10);
+    let rollback_deadline = attempt_deadline + coord.config.cleanup_timeout;
     let error = coord
-        .begin_epoch_for_sinks_until(7, attempt_deadline)
+        .begin_epoch_for_sinks_until(7, attempt_deadline, rollback_deadline)
         .await
         .unwrap_err();
     let message = error.to_string();
@@ -6609,12 +7651,13 @@ async fn follower_prepare_rollback_failure_retains_in_doubt_phase() {
     coord.begin_initial_epoch().await.unwrap();
 
     let request = certified_cluster_request(&coord);
+    let attempt = CheckpointAttempt::canonical(8);
     let error = coord
         .follower_prepare_acked_until(
             request,
             leader_proof,
-            5,
-            8,
+            attempt.epoch,
+            attempt.checkpoint_id,
             tokio::time::Instant::now() + Duration::from_secs(1),
         )
         .await
@@ -6625,8 +7668,8 @@ async fn follower_prepare_rollback_failure_retains_in_doubt_phase() {
     assert_ne!(coord.phase(), CheckpointPhase::Idle);
     assert_eq!(
         coord.epoch(),
-        5,
-        "an in-doubt epoch must not open a successor"
+        1,
+        "the unresolved pre-opened sink epoch must remain fenced"
     );
 }
 
@@ -6679,7 +7722,7 @@ async fn landed_follower_readiness_with_lost_ack_never_rolls_back() {
     );
     coord.begin_initial_epoch().await.unwrap();
 
-    let attempt = CheckpointAttempt::new(5, 8);
+    let attempt = CheckpointAttempt::canonical(8);
     let request = certified_cluster_request(&coord);
     let leader_proof = coord
         .cluster_controller
@@ -6701,7 +7744,11 @@ async fn landed_follower_readiness_with_lost_ack_never_rolls_back() {
     assert!(message.contains("write may be durable"), "{message}");
     assert_eq!(rollbacks.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert_eq!(coord.participant_ready_write, Some(attempt));
-    assert_eq!(coord.epoch(), attempt.epoch);
+    assert_eq!(
+        coord.epoch(),
+        1,
+        "lost readiness acknowledgement must retain the pre-opened sink fence"
+    );
     assert!(
         backend
             .read_commit_descriptor(attempt, &participant_ready_key(1))
@@ -6787,7 +7834,13 @@ async fn follower_successor_begin_failure_faults_instead_of_returning_idle() {
             event_tx,
         ),
     );
-    coord.begin_initial_epoch().await.unwrap();
+    // `follower_finish` is the terminal stage, so model the prior stage having already consumed
+    // checkpoint 1's allocator reservation while leaving its sink epoch open.
+    coord.sinks[0]
+        .handle
+        .begin_epoch_until(1, tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
     coord.phase = CheckpointPhase::PreCommitting;
 
     let error = coord.follower_finish(1, 1, false).await.unwrap_err();
@@ -6797,7 +7850,11 @@ async fn follower_successor_begin_failure_faults_instead_of_returning_idle() {
         "{message}"
     );
     assert!(error.requires_pipeline_recovery());
-    assert_eq!(coord.epoch(), 2, "the terminal epoch remains consumed");
+    assert_eq!(
+        coord.epoch(),
+        3,
+        "the terminal epoch and rolled-back successor reservation remain consumed"
+    );
     assert_ne!(coord.phase(), CheckpointPhase::Idle);
 }
 
@@ -6818,10 +7875,19 @@ impl laminar_connectors::connector::SinkConnector for FailingPreCommitSink {
         Ok(laminar_connectors::connector::WriteResult::new(0, 0))
     }
 
+    async fn begin_epoch(
+        &mut self,
+        epoch: u64,
+    ) -> Result<(), laminar_connectors::error::ConnectorError> {
+        self.events.lock().push(("begin", epoch));
+        Ok(())
+    }
+
     async fn pre_commit(
         &mut self,
         epoch: u64,
     ) -> Result<Option<Vec<u8>>, laminar_connectors::error::ConnectorError> {
+        self.events.lock().push(("pre_commit", epoch));
         Err(laminar_connectors::error::ConnectorError::TransactionError(
             format!("synthetic pre_commit failure at epoch {epoch}"),
         ))
@@ -6829,8 +7895,9 @@ impl laminar_connectors::connector::SinkConnector for FailingPreCommitSink {
 
     async fn rollback_epoch(
         &mut self,
-        _epoch: u64,
+        epoch: u64,
     ) -> Result<(), laminar_connectors::error::ConnectorError> {
+        self.events.lock().push(("rollback", epoch));
         self.rollback_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
@@ -6952,9 +8019,11 @@ async fn pre_commit_failure_rolls_back_coordinated_prepare() {
     let mut coord = make_coordinator(dir.path()).await;
 
     let rollback_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
     let sink = FailingPreCommitSink {
         rollback_count: Arc::clone(&rollback_count),
+        events: Arc::clone(&events),
         schema,
     };
     let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
@@ -6984,6 +8053,7 @@ async fn pre_commit_failure_rolls_back_coordinated_prepare() {
         .unwrap();
 
     assert!(!result.success);
+    assert_eq!(result.epoch, result.checkpoint_id);
     assert!(
         result
             .error
@@ -6996,6 +8066,23 @@ async fn pre_commit_failure_rolls_back_coordinated_prepare() {
         rollback_count.load(std::sync::atomic::Ordering::Relaxed),
         1,
         "an undecided coordinated prepare must be rolled back"
+    );
+    let events = events.lock();
+    assert_eq!(
+        events.get(0..3),
+        Some(
+            [
+                ("begin", result.checkpoint_id),
+                ("pre_commit", result.checkpoint_id),
+                ("rollback", result.checkpoint_id),
+            ]
+            .as_slice()
+        )
+    );
+    assert_eq!(
+        events.get(3),
+        Some(&("begin", result.checkpoint_id + 1)),
+        "clean rollback must open only the canonical successor"
     );
 }
 
@@ -7056,7 +8143,8 @@ async fn phase_one_drains_started_sink_before_cleanup_budget() {
     assert!(!result.success);
     assert_eq!(
         result.failure_disposition,
-        Some(CheckpointFailureDisposition::Retryable)
+        Some(CheckpointFailureDisposition::Retryable),
+        "{result:?}"
     );
     let error = result.error.expect("checkpoint failure has an error");
     assert!(error.contains("pre-commit failed"), "{error}");
@@ -7069,9 +8157,8 @@ async fn phase_one_drains_started_sink_before_cleanup_budget() {
     assert_eq!(slow_rollbacks.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
-/// Records flush counts. Its `pre_commit` rejects at-least-once use (like Postgres, which
-/// asserts the epoch was opened by `begin_epoch`), so a checkpoint that wrongly routes an ALO sink
-/// through `pre_commit` instead of a plain flush fails the test (guards CP-5 / B-1).
+/// Records flush counts. Its `pre_commit` rejects at-least-once use, so a checkpoint that wrongly
+/// routes an ALO sink through `pre_commit` instead of a plain flush fails the test.
 struct RecordingSink {
     flush_count: Arc<std::sync::atomic::AtomicU64>,
     schema: arrow::datatypes::SchemaRef,
@@ -7306,6 +8393,302 @@ async fn at_least_once_sink_flushed_at_checkpoint() {
     );
 }
 
+struct PostCommitContinuationProbeSink {
+    schema: arrow::datatypes::SchemaRef,
+    begin_calls: u64,
+    successor_started: Arc<tokio::sync::Notify>,
+    successor_release: Option<Arc<tokio::sync::Notify>>,
+    hang_rollback: bool,
+    events: Arc<parking_lot::Mutex<Vec<(&'static str, u64)>>>,
+}
+
+#[async_trait::async_trait]
+impl laminar_connectors::connector::SinkConnector for PostCommitContinuationProbeSink {
+    fn cancellation_policy(&self) -> laminar_connectors::connector::ConnectorCancellationPolicy {
+        laminar_connectors::connector::ConnectorCancellationPolicy::CancelSafe
+    }
+
+    async fn open(
+        &mut self,
+        _config: &laminar_connectors::config::ConnectorConfig,
+    ) -> Result<(), laminar_connectors::error::ConnectorError> {
+        Ok(())
+    }
+
+    async fn write_batch(
+        &mut self,
+        _batch: &arrow::array::RecordBatch,
+    ) -> Result<laminar_connectors::connector::WriteResult, laminar_connectors::error::ConnectorError>
+    {
+        Ok(laminar_connectors::connector::WriteResult::new(0, 0))
+    }
+
+    async fn begin_epoch(
+        &mut self,
+        epoch: u64,
+    ) -> Result<(), laminar_connectors::error::ConnectorError> {
+        self.begin_calls += 1;
+        self.events.lock().push(("begin", epoch));
+        if self.begin_calls == 2 {
+            self.successor_started.notify_one();
+            if let Some(release) = self.successor_release.as_ref() {
+                release.notified().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn pre_commit(
+        &mut self,
+        epoch: u64,
+    ) -> Result<Option<Vec<u8>>, laminar_connectors::error::ConnectorError> {
+        self.events.lock().push(("pre_commit", epoch));
+        Ok(None)
+    }
+
+    async fn rollback_epoch(
+        &mut self,
+        epoch: u64,
+    ) -> Result<(), laminar_connectors::error::ConnectorError> {
+        self.events.lock().push(("rollback", epoch));
+        if self.hang_rollback {
+            std::future::pending::<()>().await;
+        }
+        Ok(())
+    }
+
+    async fn close(&mut self) -> Result<(), laminar_connectors::error::ConnectorError> {
+        Ok(())
+    }
+
+    fn schema(&self) -> arrow::datatypes::SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn suggested_write_timeout(&self) -> Duration {
+        Duration::from_secs(5)
+    }
+}
+
+fn spawn_post_commit_continuation_probe(
+    sink: PostCommitContinuationProbeSink,
+    event_tx: laminar_core::streaming::channel::Producer<crate::sink_task::SinkEvent>,
+) -> crate::sink_task::SinkTaskHandle {
+    crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+        name: "post-commit-probe".into(),
+        sink_id: Arc::from("post-commit-probe"),
+        connector: Box::new(sink),
+        contract: checkpoint_committable_sink_contract(),
+        requires_recovery_on_error: true,
+        channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+        flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
+        write_timeout: Duration::from_secs(5),
+        event_tx,
+        terminal_tasks: None,
+        #[cfg(feature = "cluster")]
+        process_authority: None,
+    })
+}
+
+async fn in_memory_coordinator_with_config(
+    config: CheckpointConfig,
+) -> (
+    CheckpointCoordinator,
+    Arc<laminar_core::checkpoint_decision::CheckpointDecisionStore>,
+) {
+    let checkpoint_backing: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let checkpoint_store = Box::new(
+        laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore::new(
+            checkpoint_backing,
+            "post-commit-test/".into(),
+        )
+        .with_max_state_data_bytes(config.max_staged_bytes)
+        .unwrap(),
+    );
+    let mut coordinator = CheckpointCoordinator::new(config, checkpoint_store)
+        .await
+        .unwrap();
+    let decisions = in_memory_decision_store();
+    let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
+    coordinator
+        .set_decision_store(Arc::clone(&decisions))
+        .unwrap();
+    coordinator.bind_deployment_id(deployment_id).unwrap();
+    coordinator
+        .set_state_backend(Arc::new(laminar_core::state::InProcessBackend::new(1)))
+        .unwrap();
+    (coordinator, decisions)
+}
+
+#[tokio::test(start_paused = true)]
+async fn durable_commit_continues_after_the_attempt_deadline() {
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let checkpoint_timeout = Duration::from_secs(1);
+    let config = CheckpointConfig {
+        checkpoint_timeout,
+        cleanup_timeout: Duration::from_secs(10),
+        ..CheckpointConfig::default()
+    };
+    let (mut coord, decisions) = in_memory_coordinator_with_config(config).await;
+    let successor_started = Arc::new(tokio::sync::Notify::new());
+    let successor_release = Arc::new(tokio::sync::Notify::new());
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+    let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    coord.register_sink(
+        "post-commit-probe",
+        spawn_post_commit_continuation_probe(
+            PostCommitContinuationProbeSink {
+                schema,
+                begin_calls: 0,
+                successor_started: Arc::clone(&successor_started),
+                successor_release: Some(Arc::clone(&successor_release)),
+                hang_rollback: false,
+                events: Arc::clone(&events),
+            },
+            event_tx,
+        ),
+    );
+    coord.begin_initial_epoch().await.unwrap();
+
+    let started = tokio::time::Instant::now();
+    let attempt_deadline = started + checkpoint_timeout;
+    let mut checkpoint = Box::pin(coord.checkpoint(CheckpointRequest::default()));
+    tokio::select! {
+        () = successor_started.notified() => {}
+        result = &mut checkpoint => panic!("checkpoint completed before its committed continuation blocked: {result:?}"),
+    }
+    let outcome = decisions.outcome(1).await.unwrap().unwrap();
+    if !outcome.is_commit() {
+        successor_release.notify_one();
+        let result = checkpoint.await.unwrap();
+        panic!("successor opened after {outcome:?}: {result:?}");
+    }
+    assert!(
+        tokio::time::Instant::now() < attempt_deadline,
+        "test did not intercept the continuation before the attempt deadline"
+    );
+
+    tokio::time::advance(
+        attempt_deadline.saturating_duration_since(tokio::time::Instant::now())
+            + Duration::from_millis(100),
+    )
+    .await;
+    tokio::select! {
+        biased;
+        result = &mut checkpoint => panic!("attempt deadline cancelled a committed continuation: {result:?}"),
+        () = tokio::task::yield_now() => {}
+    }
+
+    successor_release.notify_one();
+    let result = checkpoint.await.unwrap();
+    assert!(result.success, "committed checkpoint failed: {result:?}");
+    assert!(
+        result.error.is_none(),
+        "unexpected continuation error: {result:?}"
+    );
+    assert_eq!(
+        events.lock().as_slice(),
+        &[("begin", 1), ("pre_commit", 1), ("begin", 2)]
+    );
+    let outcomes = decisions.outcomes().await.unwrap();
+    assert_eq!(outcomes.len(), 1);
+    assert!(outcomes[0].is_commit());
+    assert_eq!(
+        decisions
+            .sink_open_witness()
+            .await
+            .unwrap()
+            .unwrap()
+            .attempt,
+        CheckpointAttempt::canonical(2)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn committed_continuation_uses_one_cleanup_deadline() {
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let cleanup_timeout = Duration::from_millis(100);
+    let config = CheckpointConfig {
+        checkpoint_timeout: Duration::from_secs(60),
+        cleanup_timeout,
+        ..CheckpointConfig::default()
+    };
+    let (mut coord, decisions) = in_memory_coordinator_with_config(config).await;
+    let successor_started = Arc::new(tokio::sync::Notify::new());
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+    let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+        crate::sink_task::SinkEvent,
+    >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+    coord.register_sink(
+        "post-commit-probe",
+        spawn_post_commit_continuation_probe(
+            PostCommitContinuationProbeSink {
+                schema,
+                begin_calls: 0,
+                successor_started: Arc::clone(&successor_started),
+                successor_release: None,
+                hang_rollback: true,
+                events,
+            },
+            event_tx,
+        ),
+    );
+    coord.begin_initial_epoch().await.unwrap();
+
+    let mut checkpoint = Box::pin(coord.checkpoint(CheckpointRequest::default()));
+    tokio::select! {
+        () = successor_started.notified() => {}
+        result = &mut checkpoint => panic!("checkpoint completed before its successor begin blocked: {result:?}"),
+    }
+    assert!(decisions.outcome(1).await.unwrap().unwrap().is_commit());
+    let continuation_started = tokio::time::Instant::now();
+
+    let result = checkpoint.await.unwrap();
+    let continuation_duration = tokio::time::Instant::now() - continuation_started;
+    assert!(
+        continuation_duration <= cleanup_timeout,
+        "committed continuation exceeded one cleanup deadline: {continuation_duration:?}"
+    );
+    assert!(
+        result.success,
+        "durable Commit was retroactively failed: {result:?}"
+    );
+    assert!(
+        result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("successor") && error.contains("in-doubt")),
+        "expected a recovery-fenced successor error: {result:?}"
+    );
+    assert_eq!(
+        coord.allocator.sink_epoch_reservation(),
+        Some(SinkEpochReservation::InDoubt(CheckpointAttempt::canonical(
+            2
+        )))
+    );
+    assert_eq!(
+        decisions
+            .sink_open_witness()
+            .await
+            .unwrap()
+            .unwrap()
+            .attempt,
+        CheckpointAttempt::canonical(2)
+    );
+    let outcomes = decisions.outcomes().await.unwrap();
+    assert_eq!(outcomes.len(), 1);
+    assert!(outcomes[0].is_commit());
+}
+
 struct SlowCheckpointFlushSink {
     schema: arrow::datatypes::SchemaRef,
     slow_next_flush: bool,
@@ -7352,7 +8735,7 @@ impl laminar_connectors::connector::SinkConnector for SlowCheckpointFlushSink {
     }
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn checkpoint_deadline_cancels_actor_flush_before_sink_write_timeout() {
     use arrow::datatypes::{DataType, Field, Schema};
 
@@ -7363,7 +8746,10 @@ async fn checkpoint_deadline_cancels_actor_flush_before_sink_write_timeout() {
     };
     let store = Box::new(FileSystemCheckpointStore::new(dir.path()));
     let mut coord = CheckpointCoordinator::new(config, store).await.unwrap();
-    bind_in_memory_decision_store(&mut coord).await;
+    let decisions = in_memory_decision_store();
+    let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
+    coord.set_decision_store(Arc::clone(&decisions)).unwrap();
+    coord.bind_deployment_id(deployment_id).unwrap();
 
     let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
     let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
@@ -7395,6 +8781,35 @@ async fn checkpoint_deadline_cancels_actor_flush_before_sink_write_timeout() {
         .await
         .unwrap();
     assert!(!result.success);
+    assert_eq!(
+        result.failure_disposition,
+        Some(CheckpointFailureDisposition::RequiresRecovery),
+        "{result:?}"
+    );
+    let mut outcome = decisions.outcome(result.epoch).await.unwrap();
+    if outcome.is_none() {
+        assert_eq!(
+            coord
+                .pending_decision_write
+                .as_ref()
+                .map(|pending| (pending.epoch, pending.checkpoint_id)),
+            Some((result.epoch, result.checkpoint_id)),
+            "an issued Abort may be unacknowledged, but its task must remain owned"
+        );
+        coord
+            .quiesce_pending_decision_write_until(
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        outcome = decisions.outcome(result.epoch).await.unwrap();
+    }
+    assert!(matches!(
+        outcome
+            .expect("owned Abort create must converge before teardown")
+            .verdict,
+        laminar_core::checkpoint_decision::CheckpointVerdict::Abort
+    ));
 
     // The actor must have cancelled the connector flush at the attempt deadline. If the command
     // retained its independent 5s timeout, this fence would remain queued behind it.
@@ -7476,7 +8891,10 @@ async fn attempt_timeout_during_failure_cleanup_requires_recovery() {
         laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(dir.path()),
     );
     let mut coord = CheckpointCoordinator::new(config, store).await.unwrap();
-    bind_in_memory_decision_store(&mut coord).await;
+    let decisions = in_memory_decision_store();
+    let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
+    coord.set_decision_store(Arc::clone(&decisions)).unwrap();
+    coord.bind_deployment_id(deployment_id).unwrap();
 
     let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
     let sink = StuckRollbackSink { schema };
@@ -7525,15 +8943,33 @@ async fn attempt_timeout_during_failure_cleanup_requires_recovery() {
         Some(CheckpointFailureDisposition::RequiresRecovery)
     );
     assert!(
-        coord.failure_cleanup_in_doubt,
+        coord.failure_recovery_required,
         "cancelled rollback must remain latched until recovery"
+    );
+    assert!(matches!(
+        decisions
+            .outcome(result.epoch)
+            .await
+            .unwrap()
+            .unwrap()
+            .verdict,
+        laminar_core::checkpoint_decision::CheckpointVerdict::Abort
+    ));
+    assert_eq!(
+        decisions
+            .sink_open_witness()
+            .await
+            .unwrap()
+            .unwrap()
+            .attempt,
+        CheckpointAttempt::canonical(result.checkpoint_id)
     );
     assert!(
         result
             .error
             .as_deref()
-            .is_some_and(|e| e.contains("cleanup was cancelled")),
-        "checkpoint result should identify cancelled cleanup: got {:?}",
+            .is_some_and(|e| e.contains("sink state remains in-doubt")),
+        "checkpoint result should identify unresolved sink state: got {:?}",
         result.error
     );
 }
@@ -7542,6 +8978,7 @@ async fn attempt_timeout_during_failure_cleanup_requires_recovery() {
 struct CoordinatedMockSink {
     schema: arrow::datatypes::SchemaRef,
     descriptor: Vec<u8>,
+    opened_epoch: Option<u64>,
 }
 
 #[async_trait::async_trait]
@@ -7561,10 +8998,26 @@ impl laminar_connectors::connector::SinkConnector for CoordinatedMockSink {
         Ok(laminar_connectors::connector::WriteResult::new(0, 0))
     }
 
+    async fn begin_epoch(
+        &mut self,
+        epoch: u64,
+    ) -> Result<(), laminar_connectors::error::ConnectorError> {
+        self.opened_epoch = Some(epoch);
+        Ok(())
+    }
+
     async fn pre_commit(
         &mut self,
-        _epoch: u64,
+        epoch: u64,
     ) -> Result<Option<Vec<u8>>, laminar_connectors::error::ConnectorError> {
+        if self.opened_epoch != Some(epoch) {
+            return Err(laminar_connectors::error::ConnectorError::TransactionError(
+                format!(
+                    "pre_commit epoch {epoch} does not match opened epoch {:?}",
+                    self.opened_epoch
+                ),
+            ));
+        }
         // An empty descriptor models an idle epoch (no data produced).
         if self.descriptor.is_empty() {
             Ok(None)
@@ -7609,6 +9062,7 @@ async fn coordinated_sink_idle_epoch_still_seals() {
         connector: Box::new(CoordinatedMockSink {
             schema,
             descriptor: Vec::new(), // idle: pre_commit returns None
+            opened_epoch: None,
         }),
         contract: checkpoint_committable_sink_contract(),
         requires_recovery_on_error: true,
@@ -7636,7 +9090,8 @@ async fn coordinated_sink_idle_epoch_still_seals() {
     tokio::time::timeout(Duration::from_millis(50), committer_notify.notified())
         .await
         .expect("sealed coordinated checkpoint must wake the designated committer");
-    let attempt = CheckpointAttempt::new(result.epoch, result.checkpoint_id);
+    let attempt = CheckpointAttempt::canonical(result.checkpoint_id);
+    assert!(attempt.is_canonical());
     let namespace = laminar_connectors::connector::CoordinatedCommitNamespace::try_new(
         laminar_core::storage::checkpoint_manifest::PipelineIdentity::empty(),
         coord.expected_deployment_id().unwrap(),
@@ -7693,6 +9148,7 @@ async fn coordinated_sink_descriptor_persisted_and_gated() {
         connector: Box::new(CoordinatedMockSink {
             schema,
             descriptor: b"datafiles".to_vec(),
+            opened_epoch: None,
         }),
         contract: checkpoint_committable_sink_contract(),
         requires_recovery_on_error: true,
@@ -7713,7 +9169,8 @@ async fn coordinated_sink_descriptor_persisted_and_gated() {
         .unwrap();
     assert!(result.success, "checkpoint failed: {:?}", result.error);
 
-    let attempt = CheckpointAttempt::new(result.epoch, result.checkpoint_id);
+    let attempt = CheckpointAttempt::canonical(result.checkpoint_id);
+    assert!(attempt.is_canonical());
     let namespace = laminar_connectors::connector::CoordinatedCommitNamespace::try_new(
         laminar_core::storage::checkpoint_manifest::PipelineIdentity::empty(),
         coord.expected_deployment_id().unwrap(),

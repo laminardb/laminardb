@@ -1713,8 +1713,12 @@ impl LaminarDB {
                         "failed-start cleanup could not reacquire checkpoint coordinator ownership; durability fences remain held"
                             .into(),
                     )
-                })?;
+            })?;
             if let Some(coordinator) = coordinator.as_mut() {
+                let expected_sinks = coordinator.committable_sink_names()?;
+                coordinator
+                    .audit_sink_open_witness_topology(expected_sinks)
+                    .await?;
                 tokio::time::timeout_at(deadline, coordinator.reconcile_prepared_on_init())
                     .await
                     .map_err(|_| {
@@ -1722,13 +1726,16 @@ impl LaminarDB {
                             "failed-start checkpoint reconciliation exceeded {CLEANUP_TIMEOUT:?}; durability fences remain held"
                         ))
                     })??;
-                coordinator.clear_sinks();
+                coordinator
+                    .reconcile_sink_open_witness_until(deadline)
+                    .await?;
+                coordinator.clear_sinks()?;
             }
         }
         *self.control_tx.lock() = None;
         *self.force_ckpt_tx.lock() = None;
         self.quiesce_connector_generation_until(deadline).await?;
-        *self.exact_deployment_lock.lock() = None;
+        *self.checkpoint_namespace_lock.lock() = None;
         Ok(())
     }
 
@@ -2347,14 +2354,19 @@ impl LaminarDB {
         #[cfg(not(feature = "cluster"))]
         let has_injected_decision_store = false;
         if startup_runtime == RuntimeMode::Local
-            && self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
-            && (self.config.object_store_url.is_some() || has_injected_decision_store)
+            && self.config.delivery_guarantee != DeliveryGuarantee::BestEffort
+            && (self
+                .config
+                .object_store_url
+                .as_deref()
+                .is_some_and(|url| !url.starts_with("file://"))
+                || has_injected_decision_store)
         {
             return Err(DbError::Config(
-                "[LDB-0014] local exactly-once with a shared/object-store checkpoint namespace \
-                 or an injected decision store is not admitted until the deployment lease is \
-                 term-fenced. Use the built-in local checkpoint directory (node-durable), or \
-                 at_least_once delivery"
+                "[LDB-0014] a local replay-capable deployment with a shared cloud checkpoint \
+                 namespace or injected decision store is not admitted until its writer lease is \
+                 term-fenced. Use a built-in or file:// local checkpoint directory, or \
+                 best_effort delivery"
                     .into(),
             ));
         }
@@ -2373,17 +2385,19 @@ impl LaminarDB {
             let checkpoint_scope = if injected_cluster_checkpoint_store.is_some() {
                 StateBackendDurability::ClusterShared
             } else {
-                self.config.object_store_url.as_deref().map_or(
-                    StateBackendDurability::NodeDurable,
-                    StateBackendDurability::for_storage_url,
-                )
+                match self.config.object_store_url.as_deref() {
+                    Some(url) if url.starts_with("file://") => StateBackendDurability::NodeDurable,
+                    Some(url) => StateBackendDurability::for_storage_url(url),
+                    None => StateBackendDurability::NodeDurable,
+                }
             };
             let required = required_recovery_scope(startup_runtime);
             if !checkpoint_scope.satisfies(required) {
                 return Err(DbError::Config(format!(
                     "[LDB-5036] {startup_runtime:?} {:?} delivery requires {required:?} \
                      checkpoint/decision storage, but the configured checkpoint store is \
-                     {checkpoint_scope:?}",
+                     {checkpoint_scope:?}; use the built-in checkpoint data_dir for \
+                     node-local recovery, or a supported shared object store",
                     self.config.delivery_guarantee
                 )));
             }
@@ -2434,11 +2448,11 @@ impl LaminarDB {
                     "checkpoint.max_retained must be greater than zero".into(),
                 ));
             }
-            if cp_config.max_staged_bytes == Some(0) {
-                return Err(DbError::Config(
-                    "checkpoint.max_staged_bytes must be greater than zero".into(),
-                ));
-            }
+            let max_staged_bytes = cp_config.max_staged_bytes.ok_or_else(|| {
+                DbError::Config(
+                    "checkpoint.max_staged_bytes was not resolved at construction".into(),
+                )
+            })?;
             if cp_config.interval_ms == Some(0) {
                 return Err(DbError::Config(
                     "checkpoint.interval_ms must be greater than zero; use None for manual-only"
@@ -2457,17 +2471,33 @@ impl LaminarDB {
                 .clone()
                 .or_else(|| self.config.storage_dir.clone())
                 .unwrap_or_else(|| std::path::PathBuf::from("./data"));
+            let explicit_file_checkpoint_root = self
+                .config
+                .object_store_url
+                .as_deref()
+                .filter(|url| url.starts_with("file://"))
+                .map(|url| {
+                    laminar_core::storage::object_store_builder::file_url_path(url)
+                        .map_err(|error| DbError::Config(format!("object store: {error}")))
+                })
+                .transpose()?;
+            let local_checkpoint_root = explicit_file_checkpoint_root.as_ref().unwrap_or(&data_dir);
+            let uses_local_checkpoint_store = injected_cluster_checkpoint_store.is_none()
+                && (self.config.object_store_url.is_none()
+                    || explicit_file_checkpoint_root.is_some());
             if startup_runtime == RuntimeMode::Local
-                && self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
-                && self.exact_deployment_lock.lock().is_none()
+                && uses_local_checkpoint_store
+                && self.checkpoint_namespace_lock.lock().is_none()
             {
-                std::fs::create_dir_all(&data_dir).map_err(|error| {
-                    DbError::Config(format!(
-                        "create exactly-once checkpoint directory {}: {error}",
-                        data_dir.display()
-                    ))
-                })?;
-                let lock_path = data_dir.join(".laminardb-exact.lock");
+                laminar_core::durable_fs::ensure_durable_directory(local_checkpoint_root).map_err(
+                    |error| {
+                        DbError::Config(format!(
+                            "create local checkpoint directory {}: {error}",
+                            local_checkpoint_root.display()
+                        ))
+                    },
+                )?;
+                let lock_path = local_checkpoint_root.join(".laminardb-checkpoint.lock");
                 let lock = std::fs::OpenOptions::new()
                     .read(true)
                     .write(true)
@@ -2476,18 +2506,18 @@ impl LaminarDB {
                     .open(&lock_path)
                     .map_err(|error| {
                         DbError::Config(format!(
-                            "[LDB-0014] open exactly-once deployment lock {}: {error}",
+                            "[LDB-0014] open checkpoint namespace lock {}: {error}",
                             lock_path.display()
                         ))
                     })?;
                 lock.try_lock().map_err(|error| {
                     DbError::Config(format!(
-                        "[LDB-0014] exactly-once checkpoint namespace {} is already owned by \
+                        "[LDB-0014] checkpoint namespace {} is already owned by \
                          another live process: {error}",
-                        data_dir.display()
+                        local_checkpoint_root.display()
                     ))
                 })?;
-                *self.exact_deployment_lock.lock() = Some(lock);
+                *self.checkpoint_namespace_lock.lock() = Some(lock);
             }
             let participant = self.checkpoint_participant();
             let participant_id = participant.unwrap_or(0);
@@ -2509,15 +2539,33 @@ impl LaminarDB {
 
             let (store, decision_backing): (
                 Box<dyn laminar_core::storage::CheckpointStore>,
-                Arc<dyn object_store::ObjectStore>,
+                Option<Arc<dyn object_store::ObjectStore>>,
             ) = if let Some(obj) = injected_cluster_checkpoint_store.as_ref() {
                 let cs = laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore::new(
                     Arc::clone(obj),
                     participant.map_or_else(String::new, |id| format!("nodes/{id}/")),
                 )
+                .with_max_state_data_bytes(max_staged_bytes)?
                 .with_key_group_count(key_group_count)
                 .with_participant_id(participant_id);
-                (Box::new(cs), Arc::clone(obj))
+                (Box::new(cs), Some(Arc::clone(obj)))
+            } else if let Some(file_root) = explicit_file_checkpoint_root.as_ref() {
+                laminar_core::durable_fs::ensure_durable_directory(file_root).map_err(|error| {
+                    DbError::Config(format!(
+                        "create file checkpoint directory {}: {error}",
+                        file_root.display()
+                    ))
+                })?;
+                let checkpoint_dir = participant.map_or(file_root.clone(), |id| {
+                    file_root.join("nodes").join(id.to_string())
+                });
+                let cs = laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
+                    checkpoint_dir,
+                )
+                .with_max_state_data_bytes(max_staged_bytes)?
+                .with_key_group_count(key_group_count)
+                .with_participant_id(participant_id);
+                (Box::new(cs), None)
             } else if let Some(ref url) = self.config.object_store_url {
                 let obj = laminar_core::storage::object_store_builder::build_object_store(
                     url,
@@ -2528,26 +2576,24 @@ impl LaminarDB {
                     Arc::clone(&obj),
                     participant.map_or_else(String::new, |id| format!("nodes/{id}/")),
                 )
+                .with_max_state_data_bytes(max_staged_bytes)?
                 .with_key_group_count(key_group_count)
                 .with_participant_id(participant_id);
-                (Box::new(cs), obj)
+                (Box::new(cs), Some(obj))
             } else {
-                std::fs::create_dir_all(&data_dir).map_err(|e| {
+                laminar_core::durable_fs::ensure_durable_directory(&data_dir).map_err(|e| {
                     DbError::Config(format!("data dir {}: {e}", data_dir.display()))
                 })?;
-                let obj: Arc<dyn object_store::ObjectStore> = Arc::new(
-                    object_store::local::LocalFileSystem::new_with_prefix(&data_dir)
-                        .map_err(|e| DbError::Config(format!("local fs: {e}")))?,
-                );
                 let checkpoint_dir = participant.map_or(data_dir.clone(), |id| {
                     data_dir.join("nodes").join(id.to_string())
                 });
                 let cs = laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
                     checkpoint_dir,
                 )
+                .with_max_state_data_bytes(max_staged_bytes)?
                 .with_key_group_count(key_group_count)
                 .with_participant_id(participant_id);
-                (Box::new(cs), obj)
+                (Box::new(cs), None)
             };
 
             let defaults = CkpConfig::default();
@@ -2557,9 +2603,7 @@ impl LaminarDB {
                     defaults.checkpoint_timeout,
                     std::time::Duration::from_millis,
                 ),
-                max_staged_bytes: cp_config
-                    .max_staged_bytes
-                    .unwrap_or(defaults.max_staged_bytes),
+                max_staged_bytes,
                 ..defaults
             };
             let mut coord = CheckpointCoordinator::new(config, store).await?;
@@ -2591,25 +2635,47 @@ impl LaminarDB {
             let ds = {
                 #[cfg(feature = "cluster")]
                 {
-                    self.decision_store.lock().clone().unwrap_or_else(|| {
-                        Arc::new(if startup_runtime == RuntimeMode::Local {
-                            laminar_core::checkpoint_decision::CheckpointDecisionStore::local_single_writer(
-                                Arc::clone(&decision_backing),
-                            )
-                        } else {
+                    if let Some(injected) = self.decision_store.lock().clone() {
+                        injected
+                    } else if let Some(backing) = decision_backing.as_ref() {
+                        Arc::new(
                             laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
-                                Arc::clone(&decision_backing),
+                                Arc::clone(backing),
+                            ),
+                        )
+                    } else {
+                        Arc::new(
+                            laminar_core::checkpoint_decision::CheckpointDecisionStore::local_filesystem(
+                                local_checkpoint_root,
                             )
-                        })
-                    })
+                            .map_err(|error| {
+                                DbError::Config(format!(
+                                    "open durable local checkpoint metadata store: {error}"
+                                ))
+                            })?,
+                        )
+                    }
                 }
                 #[cfg(not(feature = "cluster"))]
                 {
-                    Arc::new(
-                        laminar_core::checkpoint_decision::CheckpointDecisionStore::local_single_writer(
-                            Arc::clone(&decision_backing),
-                        ),
-                    )
+                    if let Some(backing) = decision_backing.as_ref() {
+                        Arc::new(
+                            laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
+                                Arc::clone(backing),
+                            ),
+                        )
+                    } else {
+                        Arc::new(
+                            laminar_core::checkpoint_decision::CheckpointDecisionStore::local_filesystem(
+                                local_checkpoint_root,
+                            )
+                            .map_err(|error| {
+                                DbError::Config(format!(
+                                    "open durable local checkpoint metadata store: {error}"
+                                ))
+                            })?,
+                        )
+                    }
                 }
             };
             let deployment_id = ds.load_or_create_deployment_id().await.map_err(|error| {
@@ -3390,6 +3456,20 @@ impl LaminarDB {
             None
         };
 
+        let expected_committable_sinks = prepared_sinks
+            .iter()
+            .filter(|sink| sink.contract.is_checkpoint_committable())
+            .map(|sink| sink.name.clone())
+            .collect();
+        {
+            let coordinator = self.coordinator.lock().await;
+            if let Some(coordinator) = coordinator.as_ref() {
+                coordinator
+                    .audit_sink_open_witness_topology(expected_committable_sinks)
+                    .await?;
+            }
+        }
+
         // Opening is one atomic startup stage: a slow connector consumes the remaining shared
         // checkpoint-derived budget rather than receiving a fresh timeout of its own. Cluster
         // opens use the exact authority later installed in the actor and callback.
@@ -3477,8 +3557,8 @@ impl LaminarDB {
 
         #[cfg(feature = "cluster")]
         {
-            let guard = self.coordinator.lock().await;
-            if let Some(ref coord) = *guard {
+            let mut guard = self.coordinator.lock().await;
+            if let Some(ref mut coord) = *guard {
                 // Stopped-quorum recovery records Abort before recovery-owned Start. Reconcile
                 // that terminal decision before selecting the coordinated cut.
                 if runtime_mode == RuntimeMode::Cluster {
@@ -3818,9 +3898,10 @@ impl LaminarDB {
         };
 
         {
-            let guard = self.coordinator.lock().await;
-            if let Some(ref coord) = *guard {
+            let mut guard = self.coordinator.lock().await;
+            if let Some(ref mut coord) = *guard {
                 // Recovery and Prepared-manifest reconciliation completed before epoch admission.
+                coord.reconcile_sink_open_witness().await?;
                 coord.begin_initial_epoch().await?;
             }
         }
@@ -4220,7 +4301,6 @@ impl LaminarDB {
             .iter()
             .any(|(_, handle, _, _, _)| handle.checkpoint_committable());
         let checkpoint_in_flight = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let staged_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (
             epoch_allocator,
             ckpt_quorum_timeout,
@@ -4238,7 +4318,7 @@ impl LaminarDB {
                         cfg.quorum_timeout,
                         cfg.checkpoint_timeout,
                         cfg.cleanup_timeout,
-                        cfg.max_staged_bytes.max(1), // 0 would pause admission permanently
+                        cfg.max_staged_bytes,
                         coord.coordinated_commit_admission(),
                     )
                 }
@@ -4343,7 +4423,6 @@ impl LaminarDB {
             checkpoint_complete_tx,
             checkpoint_tail_tasks: tokio::task::JoinSet::new(),
             checkpoint_in_flight: Arc::clone(&checkpoint_in_flight),
-            staged_bytes: Arc::clone(&staged_bytes),
             #[cfg(feature = "cluster")]
             delta_rebase_needed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "cluster")]
@@ -4383,7 +4462,7 @@ impl LaminarDB {
                 .with_terminal_shutdown(runtime_shutdown.clone())
                 .with_force_checkpoint_rx(force_ckpt_rx)
                 .with_checkpoint_complete_rx(checkpoint_complete_rx)
-                .with_checkpoint_admission(checkpoint_in_flight, staged_bytes, max_staged_bytes)
+                .with_checkpoint_admission(checkpoint_in_flight)
                 .with_coordinated_commit_admission(coordinated_commit_admission);
 
             let (done_tx, done_rx) = crossfire::oneshot::oneshot::<crate::pipeline::ExitReason>();
@@ -4678,6 +4757,26 @@ impl LaminarDB {
         Ok(())
     }
 
+    async fn reconcile_sink_open_witness_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), DbError> {
+        let mut coordinator = tokio::time::timeout_at(deadline, self.coordinator.lock())
+            .await
+            .map_err(|_| {
+                DbError::Checkpoint(
+                    "[LDB-6050] teardown could not acquire checkpoint coordinator ownership for sink-open reconciliation"
+                        .into(),
+                )
+            })?;
+        if let Some(coordinator) = coordinator.as_mut() {
+            coordinator
+                .reconcile_sink_open_witness_until(deadline)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Shut down the streaming pipeline gracefully. Idempotent.
     ///
     /// # Errors
@@ -4795,9 +4894,10 @@ impl LaminarDB {
         // until an already-issued remote decision create reaches a terminal client-side state.
         self.quiesce_checkpoint_decision_until(deadline).await?;
         self.quiesce_committer_until(deadline).await?;
+        self.reconcile_sink_open_witness_until(deadline).await?;
         self.quiesce_connector_generation_until(deadline).await?;
 
-        *self.exact_deployment_lock.lock() = None;
+        *self.checkpoint_namespace_lock.lock() = None;
         DbState::Stopped.store(&self.state);
         watcher_error.map_or(Ok(()), Err)
     }
@@ -4935,9 +5035,10 @@ impl LaminarDB {
         // decision create can still mutate the recovery frontier. A later stop retry resumes here.
         self.quiesce_checkpoint_decision_until(deadline).await?;
         self.quiesce_committer_until(deadline).await?;
+        self.reconcile_sink_open_witness_until(deadline).await?;
         self.quiesce_connector_generation_until(deadline).await?;
 
-        *self.exact_deployment_lock.lock() = None;
+        *self.checkpoint_namespace_lock.lock() = None;
         if self.is_closed() {
             // A concurrent shutdown owns the terminal transition. Leaving ShuttingDown in place
             // is intentional if that shutdown was cancelled; a retry must finish its teardown.
@@ -6881,7 +6982,7 @@ mod resolver_tests {
 }
 
 #[cfg(test)]
-mod exact_deployment_lock_tests {
+mod checkpoint_namespace_lock_tests {
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
@@ -6902,7 +7003,6 @@ mod exact_deployment_lock_tests {
             .storage_dir(checkpoint_dir)
             .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
                 interval_ms: Some(1_000),
-                data_dir: Some(checkpoint_dir.to_owned()),
                 ..Default::default()
             })
             .delivery_guarantee(DeliveryGuarantee::ExactlyOnce)
@@ -6963,6 +7063,32 @@ mod exact_deployment_lock_tests {
     }
 
     #[tokio::test]
+    async fn startup_uses_one_checkpoint_state_budget_for_admission_and_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let max_staged_bytes = 29;
+        let db = crate::db::LaminarDB::builder()
+            .storage_dir(root.path())
+            .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
+                max_staged_bytes: Some(max_staged_bytes),
+                ..Default::default()
+            })
+            .build()
+            .await
+            .unwrap();
+
+        db.start().await.unwrap();
+        {
+            let coordinator = db.coordinator.lock().await;
+            let coordinator = coordinator
+                .as_ref()
+                .expect("checkpoint configuration must install a coordinator");
+            assert_eq!(coordinator.config().max_staged_bytes, max_staged_bytes);
+            assert_eq!(coordinator.store().max_state_data_bytes(), max_staged_bytes);
+        }
+        db.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn local_startup_settles_prepared_witness_before_reconciliation() {
         let root = tempfile::tempdir().unwrap();
         let checkpoint_dir = root.path().join("checkpoints");
@@ -6997,11 +7123,11 @@ mod exact_deployment_lock_tests {
             .await
             .expect("startup recovery must settle the Prepared witness before reconciliation");
 
-        let decision_backing: Arc<dyn object_store::ObjectStore> = Arc::new(
-            object_store::local::LocalFileSystem::new_with_prefix(&checkpoint_dir).unwrap(),
-        );
         let decisions =
-            laminar_core::checkpoint_decision::CheckpointDecisionStore::new(decision_backing);
+            laminar_core::checkpoint_decision::CheckpointDecisionStore::local_filesystem(
+                &checkpoint_dir,
+            )
+            .unwrap();
         let winner = decisions
             .outcome(prepared_epoch)
             .await
@@ -7110,21 +7236,133 @@ mod exact_deployment_lock_tests {
     }
 
     #[tokio::test]
-    async fn local_exact_file_url_is_rejected_until_its_root_is_lock_fenced() {
+    async fn local_exact_file_url_uses_the_durable_locked_namespace() {
         let root = tempfile::tempdir().unwrap();
         let object_root = root.path().join("remote-shaped-checkpoints");
         std::fs::create_dir_all(&object_root).unwrap();
-        let db = exact_builder(root.path())
-            .object_store_url(format!("file://{}", object_root.display()))
+        let normalized = object_root.display().to_string().replace('\\', "/");
+        let checkpoint_url = if normalized.starts_with('/') {
+            format!("file://{normalized}")
+        } else {
+            format!("file:///{normalized}")
+        };
+        let first = exact_builder(root.path())
+            .object_store_url(checkpoint_url.clone())
+            .build()
+            .await
+            .unwrap();
+        let second = exact_builder(root.path())
+            .object_store_url(checkpoint_url)
+            .build()
+            .await
+            .unwrap();
+        install_generator_pipeline(&first).await;
+        install_generator_pipeline(&second).await;
+
+        first.start().await.unwrap();
+        assert!(first.checkpoint_namespace_lock.lock().is_some());
+        wait_for_processing_cycle(&first).await;
+        let checkpoint = first.checkpoint().await.unwrap();
+        assert!(checkpoint.success, "{:?}", checkpoint.error);
+        assert!(object_root
+            .join("checkpoints")
+            .join(format!("checkpoint_{:06}", checkpoint.checkpoint_id))
+            .join("manifest.json")
+            .is_file());
+        let error = second
+            .start()
+            .await
+            .expect_err("a second process must not share the file:// checkpoint root");
+        assert!(error.to_string().contains("[LDB-0014]"), "{error}");
+
+        let decisions =
+            laminar_core::checkpoint_decision::CheckpointDecisionStore::local_filesystem(
+                &object_root,
+            )
+            .unwrap();
+        assert!(decisions.load_or_create_deployment_id().await.is_ok());
+
+        first.shutdown().await.unwrap();
+        second.start().await.unwrap();
+        second.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_at_least_once_file_url_is_node_durable_and_exclusive() {
+        let root = tempfile::tempdir().unwrap();
+        let object_root = root.path().join("remote-shaped-checkpoints");
+        std::fs::create_dir_all(&object_root).unwrap();
+        let normalized = object_root.display().to_string().replace('\\', "/");
+        let checkpoint_url = if normalized.starts_with('/') {
+            format!("file://{normalized}")
+        } else {
+            format!("file:///{normalized}")
+        };
+        let first = exact_builder(root.path())
+            .delivery_guarantee(DeliveryGuarantee::AtLeastOnce)
+            .object_store_url(checkpoint_url.clone())
+            .build()
+            .await
+            .unwrap();
+        let second = exact_builder(root.path())
+            .delivery_guarantee(DeliveryGuarantee::AtLeastOnce)
+            .object_store_url(checkpoint_url)
             .build()
             .await
             .unwrap();
 
-        let error = db
+        first.start().await.unwrap();
+        assert!(first.checkpoint_namespace_lock.lock().is_some());
+        let error = second
             .start()
             .await
-            .expect_err("file:// is not protected by the data-dir deployment lock");
+            .expect_err("a second process must not share the file:// checkpoint root");
         assert!(error.to_string().contains("[LDB-0014]"), "{error}");
+
+        first.shutdown().await.unwrap();
+        second.start().await.unwrap();
+        second.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_at_least_once_rejects_an_unfenced_shared_checkpoint_namespace() {
+        let root = tempfile::tempdir().unwrap();
+        let error = exact_builder(root.path())
+            .delivery_guarantee(DeliveryGuarantee::AtLeastOnce)
+            .object_store_url("s3://shared-checkpoints/deployment")
+            .build()
+            .await
+            .expect_err("a shared replay writer requires a remote fencing lease");
+        assert!(error.to_string().contains("[LDB-0014]"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn local_best_effort_cannot_bypass_a_replay_namespace_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let checkpoint_dir = root.path().join("checkpoints");
+        let best_effort =
+            exact_builder_with_roots(&root.path().join("best-effort-state"), &checkpoint_dir)
+                .delivery_guarantee(DeliveryGuarantee::BestEffort)
+                .build()
+                .await
+                .unwrap();
+        let replay = exact_builder_with_roots(&root.path().join("replay-state"), &checkpoint_dir)
+            .delivery_guarantee(DeliveryGuarantee::AtLeastOnce)
+            .build()
+            .await
+            .unwrap();
+
+        best_effort.start().await.unwrap();
+        assert!(best_effort.checkpoint_namespace_lock.lock().is_some());
+        let error = replay
+            .start()
+            .await
+            .expect_err("best-effort must not bypass the checkpoint namespace lease");
+        assert!(error.to_string().contains("[LDB-0014]"), "{error}");
+
+        best_effort.shutdown().await.unwrap();
+        replay.start().await.unwrap();
+        replay.shutdown().await.unwrap();
     }
 
     #[cfg(feature = "cluster")]
@@ -7457,6 +7695,11 @@ mod cluster_fault_watcher_tests {
             .unwrap();
         controller
             .publish_leased_recovery_incarnation(&process_lease)
+            .await
+            .unwrap();
+        controller.install_local_leader_proof_provider();
+        controller
+            .start_leased_barrier_server("127.0.0.1:0".parse().unwrap(), None, &process_lease)
             .await
             .unwrap();
         let authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&checkpoint_store), 10_000));

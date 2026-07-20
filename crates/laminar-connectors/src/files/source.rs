@@ -208,9 +208,7 @@ impl SourceConnector for FileSource {
             });
         }
 
-        let SourceStart {
-            config, position, ..
-        } = request;
+        let (config, position, _) = request.into_parts();
         let src_config = FileSourceConfig::from_connector_config(&config)?;
 
         // Decode and validate the durable manifest before discovery can observe a
@@ -769,11 +767,7 @@ mod tests {
     }
 
     fn start_request(config: ConnectorConfig, position: SourcePosition) -> SourceStart {
-        SourceStart {
-            config,
-            position,
-            delivery: DeliveryGuarantee::AtLeastOnce,
-        }
+        SourceStart::new(config, position, DeliveryGuarantee::AtLeastOnce).unwrap()
     }
 
     async fn started_text_source(
@@ -1202,7 +1196,7 @@ mod tests {
         let mut resumed = started_text_source(
             directory.path(),
             SourcePosition::Resume {
-                attempt: CheckpointAttempt::new(7, 11),
+                attempt: CheckpointAttempt::canonical(11),
                 checkpoint,
             },
         )

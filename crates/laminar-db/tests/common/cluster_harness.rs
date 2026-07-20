@@ -26,6 +26,7 @@ use laminar_core::cluster::control::{
     AssignmentSnapshot, AssignmentSnapshotStore, CatalogManifestStore, CheckpointDecisionStore,
     CheckpointParticipant, LeaderLeaseConfig, LeaderLeaseManager, LeaderLeaseStore, ProcessLease,
     ProcessLeaseConfig, ProcessLeaseManager, ProcessLeaseOutcome, ProcessLeaseStore,
+    VerifiedClusterNamespaces,
 };
 use laminar_core::cluster::testing::MiniCluster;
 use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
@@ -236,7 +237,7 @@ impl ScriptedClusterHarnessSource {
 #[async_trait]
 impl SourceConnector for ScriptedClusterHarnessSource {
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
-        match request.position {
+        match request.into_parts().1 {
             SourcePosition::Initial => {
                 self.cursor = 0;
             }
@@ -733,7 +734,8 @@ impl ClusterEngineHarness {
         // exclude the cold-start node, so granting that node a term first creates a real but
         // transient mismatch between elected assignment leader and durable lease owner.
         let initial_assignment =
-            resolve_initial_assignment(&snapshot_store, vnode_count, &peer_ids, participants).await;
+            resolve_initial_assignment(&snapshot_store, vnode_count, &peer_ids, &participants)
+                .await;
         let retained_snapshot = snapshot_store
             .load()
             .await
@@ -822,6 +824,25 @@ impl ClusterEngineHarness {
                 .expect("cluster control-plane server start");
         }
 
+        let verified_namespaces: Vec<VerifiedClusterNamespaces> =
+            futures::future::join_all(cluster.nodes.iter().map(|node| {
+                laminar_core::cluster::control::prove_shared_object_store_namespaces(
+                    CheckpointParticipant {
+                        node_id: node.instance_id.0,
+                        boot_incarnation: node.controller.recovery_incarnation(),
+                    },
+                    &participants,
+                    Arc::clone(node.controller.kv()),
+                    Arc::clone(&control_store),
+                    Arc::clone(&shared_store),
+                    Duration::from_secs(5),
+                )
+            }))
+            .await
+            .into_iter()
+            .collect::<Result<_, _>>()
+            .expect("shared checkpoint/state namespace proof");
+
         let source_log = Arc::new(ScriptedClusterHarnessLog::default());
         let sink_state = Arc::new(ClusterHarnessSinkState::default());
 
@@ -839,9 +860,13 @@ impl ClusterEngineHarness {
         }
 
         let mut control_leases = control_leases.into_iter();
+        let mut verified_namespaces = verified_namespaces.into_iter();
         let mut node_runtimes = Vec::with_capacity(n);
         for (idx, nh) in cluster.nodes.iter().enumerate() {
             let self_id = nh.instance_id;
+            let verified_namespaces = verified_namespaces
+                .next()
+                .expect("one namespace proof per cluster node");
 
             let sender = ShuffleSender::new(self_id.0, nh.controller.recovery_incarnation());
             for (p_idx, p_nh) in cluster.nodes.iter().enumerate() {
@@ -858,7 +883,7 @@ impl ClusterEngineHarness {
             // wiring that lifts the snapshot version into the fence on `db.start()`.
             let state_backend: Arc<dyn StateBackend> =
                 Arc::new(ObjectStoreBackend::cluster_shared(
-                    Arc::clone(&shared_store),
+                    verified_namespaces.state_store(),
                     self_id.0.to_string(),
                     vnode_count,
                 ));
@@ -872,7 +897,6 @@ impl ClusterEngineHarness {
                 // Cluster at-least-once admission requires a periodic coordinator. Keep the
                 // interval outside the test horizon so manual checkpoints remain deterministic.
                 interval_ms: Some(3_600_000),
-                data_dir: Some(checkpoint_dirs[idx].path().to_path_buf()),
                 max_retained: Some(3),
                 ..StreamCheckpointConfig::default()
             };
@@ -897,7 +921,7 @@ impl ClusterEngineHarness {
                 .decision_store(Arc::clone(&decision_store))
                 .assignment_snapshot_store(Arc::clone(&snapshot_store))
                 .catalog_manifest_store(Arc::clone(&catalog_store))
-                .cluster_checkpoint_object_store(Arc::clone(&control_store))
+                .verified_cluster_namespaces(verified_namespaces)
                 .register_connector(move |registry| {
                     let source_state = Arc::clone(&connector_source_state);
                     let source_log = Arc::clone(&connector_source_log);
@@ -1371,7 +1395,7 @@ async fn resolve_initial_assignment(
     store: &AssignmentSnapshotStore,
     vnode_count: u32,
     peer_ids: &[NodeId],
-    participants: Vec<CheckpointParticipant>,
+    participants: &[CheckpointParticipant],
 ) -> Option<(Arc<[NodeId]>, u64)> {
     if let Some(snapshot) = store.load().await.expect("load snapshot") {
         snapshot
@@ -1383,7 +1407,8 @@ async fn resolve_initial_assignment(
     let fresh = rendezvous_assignment(vnode_count, peer_ids);
     let owner_ids: std::collections::BTreeSet<u64> = fresh.iter().map(|owner| owner.0).collect();
     let owner_participants: Vec<_> = participants
-        .into_iter()
+        .iter()
+        .copied()
         .filter(|participant| owner_ids.contains(&participant.node_id))
         .collect();
     assert_eq!(owner_participants.len(), owner_ids.len());

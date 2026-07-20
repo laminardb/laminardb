@@ -15,7 +15,7 @@ use crate::checkpoint::CheckpointWatermark;
 use crate::cluster::discovery::NodeId;
 #[cfg(feature = "cluster")]
 use crate::cluster::discovery::{NodeInfo, NodeState};
-use crate::state::{CheckpointAttempt, CheckpointAttemptRelation};
+use crate::state::CheckpointAttempt;
 #[cfg(feature = "cluster")]
 use tokio::sync::watch;
 
@@ -215,9 +215,9 @@ const fn is_terminal_phase(phase: Phase) -> bool {
 /// Leader-written barrier announcement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BarrierAnnouncement {
-    /// Monotonic epoch id.
+    /// Monotonic checkpoint ID retained in the wire field named `epoch`.
     pub epoch: u64,
-    /// Coordinator-assigned checkpoint id.
+    /// The same nonzero coordinator-assigned checkpoint ID.
     pub checkpoint_id: u64,
     /// Exact clustered assignment cut captured when this attempt was admitted. Required on every
     /// clustered `Prepare` and retained on terminal phases for exact follower validation.
@@ -237,6 +237,39 @@ pub struct BarrierAnnouncement {
 
 fn announcement_attempt(ann: &BarrierAnnouncement) -> CheckpointAttempt {
     CheckpointAttempt::new(ann.epoch, ann.checkpoint_id)
+}
+
+fn validate_announcement_attempt(ann: &BarrierAnnouncement) -> Result<(), String> {
+    if announcement_attempt(ann).is_canonical() {
+        Ok(())
+    } else {
+        Err(format!(
+            "barrier announcement must use one nonzero canonical checkpoint ID; received epoch {} and checkpoint ID {}",
+            ann.epoch, ann.checkpoint_id
+        ))
+    }
+}
+
+fn validate_ack_attempt(ack: &BarrierAck) -> Result<(), String> {
+    if CheckpointAttempt::new(ack.epoch, ack.checkpoint_id).is_canonical() {
+        Ok(())
+    } else {
+        Err(format!(
+            "barrier acknowledgement must use one nonzero canonical checkpoint ID; received epoch {} and checkpoint ID {}",
+            ack.epoch, ack.checkpoint_id
+        ))
+    }
+}
+
+#[cfg(feature = "cluster")]
+fn validate_wire_checkpoint_attempt(epoch: u64, checkpoint_id: u64) -> Result<(), tonic::Status> {
+    if CheckpointAttempt::new(epoch, checkpoint_id).is_canonical() {
+        Ok(())
+    } else {
+        Err(tonic::Status::invalid_argument(
+            "Barrier request must use one nonzero canonical checkpoint ID",
+        ))
+    }
 }
 
 fn same_announcement_identity(left: &BarrierAnnouncement, right: &BarrierAnnouncement) -> bool {
@@ -300,14 +333,12 @@ fn merge_direct_announcement(
     current: BarrierAnnouncement,
     incoming: BarrierAnnouncement,
 ) -> Result<BarrierAnnouncement, String> {
-    match announcement_attempt(&incoming).relation_to(announcement_attempt(&current)) {
-        CheckpointAttemptRelation::Newer => Ok(incoming),
-        CheckpointAttemptRelation::Older => Ok(current),
-        CheckpointAttemptRelation::Conflict => Err(format!(
-            "conflicting direct barrier attempts: retained ({}, {}), incoming ({}, {})",
-            current.epoch, current.checkpoint_id, incoming.epoch, incoming.checkpoint_id
-        )),
-        CheckpointAttemptRelation::Exact => merge_history_exact(current, incoming, "direct"),
+    validate_announcement_attempt(&current)?;
+    validate_announcement_attempt(&incoming)?;
+    match incoming.checkpoint_id.cmp(&current.checkpoint_id) {
+        std::cmp::Ordering::Greater => Ok(incoming),
+        std::cmp::Ordering::Less => Ok(current),
+        std::cmp::Ordering::Equal => merge_history_exact(current, incoming, "direct"),
     }
 }
 
@@ -318,14 +349,12 @@ fn merge_observed_announcement(
     grpc: BarrierAnnouncement,
     durable: BarrierAnnouncement,
 ) -> Result<BarrierAnnouncement, String> {
-    match announcement_attempt(&durable).relation_to(announcement_attempt(&grpc)) {
-        CheckpointAttemptRelation::Newer => Ok(durable),
-        CheckpointAttemptRelation::Older => Ok(grpc),
-        CheckpointAttemptRelation::Conflict => Err(format!(
-            "conflicting direct and durable barrier attempts: direct ({}, {}), durable ({}, {})",
-            grpc.epoch, grpc.checkpoint_id, durable.epoch, durable.checkpoint_id
-        )),
-        CheckpointAttemptRelation::Exact => {
+    validate_announcement_attempt(&grpc)?;
+    validate_announcement_attempt(&durable)?;
+    match durable.checkpoint_id.cmp(&grpc.checkpoint_id) {
+        std::cmp::Ordering::Greater => Ok(durable),
+        std::cmp::Ordering::Less => Ok(grpc),
+        std::cmp::Ordering::Equal => {
             if grpc.phase == durable.phase && !is_terminal_phase(grpc.phase) && grpc != durable {
                 Err(format!(
                     "conflicting direct and durable {:?} payloads for exact attempt ({}, {})",
@@ -355,14 +384,12 @@ fn merge_scanned_announcement(
     current: BarrierAnnouncement,
     incoming: BarrierAnnouncement,
 ) -> Result<BarrierAnnouncement, String> {
-    match announcement_attempt(&incoming).relation_to(announcement_attempt(&current)) {
-        CheckpointAttemptRelation::Newer => Ok(incoming),
-        CheckpointAttemptRelation::Older => Ok(current),
-        CheckpointAttemptRelation::Conflict => Err(format!(
-            "conflicting announced checkpoint history: ({}, {}) versus ({}, {})",
-            current.epoch, current.checkpoint_id, incoming.epoch, incoming.checkpoint_id
-        )),
-        CheckpointAttemptRelation::Exact => merge_history_exact(current, incoming, "durable"),
+    validate_announcement_attempt(&current)?;
+    validate_announcement_attempt(&incoming)?;
+    match incoming.checkpoint_id.cmp(&current.checkpoint_id) {
+        std::cmp::Ordering::Greater => Ok(incoming),
+        std::cmp::Ordering::Less => Ok(current),
+        std::cmp::Ordering::Equal => merge_history_exact(current, incoming, "durable"),
     }
 }
 
@@ -370,18 +397,16 @@ fn validate_publication_order(
     current: &BarrierAnnouncement,
     incoming: &BarrierAnnouncement,
 ) -> Result<(), String> {
-    match announcement_attempt(incoming).relation_to(announcement_attempt(current)) {
-        CheckpointAttemptRelation::Newer => Ok(()),
-        CheckpointAttemptRelation::Older => Err(format!(
+    validate_announcement_attempt(current)?;
+    validate_announcement_attempt(incoming)?;
+    match incoming.checkpoint_id.cmp(&current.checkpoint_id) {
+        std::cmp::Ordering::Greater => Ok(()),
+        std::cmp::Ordering::Less => Err(format!(
             "stale barrier publication ({}, {}) cannot replace newer admitted attempt ({}, {})",
             incoming.epoch, incoming.checkpoint_id, current.epoch, current.checkpoint_id
         )),
-        CheckpointAttemptRelation::Conflict => Err(format!(
-            "conflicting barrier publication attempts: admitted ({}, {}), incoming ({}, {})",
-            current.epoch, current.checkpoint_id, incoming.epoch, incoming.checkpoint_id
-        )),
-        CheckpointAttemptRelation::Exact if current == incoming => Ok(()),
-        CheckpointAttemptRelation::Exact => {
+        std::cmp::Ordering::Equal if current == incoming => Ok(()),
+        std::cmp::Ordering::Equal => {
             let merged =
                 merge_history_exact(current.clone(), incoming.clone(), "local publication")?;
             if merged == *incoming {
@@ -399,11 +424,13 @@ fn validate_publication_order(
 fn validate_scanned_announcements(
     mut announcements: Vec<BarrierAnnouncement>,
 ) -> Result<Option<BarrierAnnouncement>, String> {
+    for announcement in &announcements {
+        validate_announcement_attempt(announcement)?;
+    }
     // Group exact attempts and audit every reversible certificate before a terminal can absorb it.
-    // Ordering authority remains `relation_to`.
+    // Canonical attempt IDs are the only ordering authority.
     announcements.sort_unstable_by_key(|announcement| {
         (
-            announcement.epoch,
             announcement.checkpoint_id,
             is_terminal_phase(announcement.phase),
         )
@@ -421,9 +448,9 @@ fn validate_scanned_announcements(
 /// Follower ack. `ok = false` forces the leader to abort instead of wait.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BarrierAck {
-    /// Epoch being acknowledged.
+    /// Canonical checkpoint ID retained in the wire field named `epoch`.
     pub epoch: u64,
-    /// Exact coordinator-assigned checkpoint id being acknowledged.
+    /// The same nonzero coordinator-assigned checkpoint ID being acknowledged.
     #[serde(default)]
     pub checkpoint_id: u64,
     /// SHA-256 binding of the announcement's assignment certificate.
@@ -977,6 +1004,9 @@ fn grpc_ack(ack: BarrierAck) -> barrier_v1::Ack {
 
 #[cfg(feature = "cluster")]
 fn validate_phase_ack(ack: &barrier_v1::Ack, ann: &BarrierAnnouncement) -> Result<(), String> {
+    if !CheckpointAttempt::new(ack.epoch, ack.checkpoint_id).is_canonical() {
+        return Err("Barrier phase acknowledgement has a non-canonical checkpoint ID".into());
+    }
     let expected_digest = ann
         .assignment_fence
         .as_ref()
@@ -1178,6 +1208,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
     ) -> Result<tonic::Response<barrier_v1::Ack>, tonic::Status> {
         self.require_live_process_lease()?;
         let req = request.into_inner();
+        validate_wire_checkpoint_attempt(req.epoch, req.checkpoint_id)?;
         let assignment_fence = assignment_fence_from_wire(
             req.assignment_version,
             req.assignment_vnode_count,
@@ -1249,7 +1280,9 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
         self.enqueue_while_process_live(ann).await?;
 
         let ack = self.wait_for_prepare_ack(rx).await?;
-        if ack.checkpoint_id != attempt.checkpoint_id || ack.assignment_digest != assignment_digest
+        if ack.epoch != attempt.epoch
+            || ack.checkpoint_id != attempt.checkpoint_id
+            || ack.assignment_digest != assignment_digest
         {
             return Err(tonic::Status::failed_precondition(
                 "Follower acknowledgement identity mismatch",
@@ -1266,6 +1299,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
     ) -> Result<tonic::Response<barrier_v1::Ack>, tonic::Status> {
         self.require_live_process_lease()?;
         let req = request.into_inner();
+        validate_wire_checkpoint_attempt(req.epoch, req.checkpoint_id)?;
         let assignment_fence = assignment_fence_from_wire(
             req.assignment_version,
             req.assignment_vnode_count,
@@ -1309,6 +1343,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
     ) -> Result<tonic::Response<barrier_v1::Ack>, tonic::Status> {
         self.require_live_process_lease()?;
         let req = request.into_inner();
+        validate_wire_checkpoint_attempt(req.epoch, req.checkpoint_id)?;
         let leader_proof = leader_proof_from_wire(req.leader_proof.clone())?;
         let assignment_fence = assignment_fence_from_wire(
             req.assignment_version,
@@ -1347,6 +1382,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
     ) -> Result<tonic::Response<barrier_v1::Ack>, tonic::Status> {
         self.require_live_process_lease()?;
         let req = request.into_inner();
+        validate_wire_checkpoint_attempt(req.epoch, req.checkpoint_id)?;
         let leader_proof = leader_proof_from_wire(req.leader_proof.clone())?;
         let assignment_fence = assignment_fence_from_wire(
             req.assignment_version,
@@ -1875,14 +1911,19 @@ fn preflight_prepare_fanout(
     let Some(current) = pending.as_ref() else {
         return Ok(true);
     };
-    match announcement_attempt(prepare).relation_to(announcement_attempt(current.announcement())) {
-        CheckpointAttemptRelation::Newer => {
+    validate_announcement_attempt(prepare)?;
+    validate_announcement_attempt(current.announcement())?;
+    match prepare
+        .checkpoint_id
+        .cmp(&current.announcement().checkpoint_id)
+    {
+        std::cmp::Ordering::Greater => {
             // Admission has already rejected attempt regression. Cancel the obsolete structured
             // fan-out before cancellable durable I/O so it cannot complete after being superseded.
             pending.take();
             Ok(true)
         }
-        CheckpointAttemptRelation::Exact if current.announcement() == prepare => match current {
+        std::cmp::Ordering::Equal if current.announcement() == prepare => match current {
             PrepareFanoutState::Pending(_) => Ok(false),
             PrepareFanoutState::Claimed(_) => {
                 Err("Prepare cannot be republished while its quorum is being collected".into())
@@ -1891,13 +1932,10 @@ fn preflight_prepare_fanout(
                 Err("Prepare cannot regress an exact quorum-ready checkpoint".into())
             }
         },
-        CheckpointAttemptRelation::Older => {
+        std::cmp::Ordering::Less => {
             Err("stale Prepare cannot replace a newer in-flight fan-out".into())
         }
-        CheckpointAttemptRelation::Conflict => {
-            Err("conflicting Prepare attempt cannot replace the in-flight fan-out".into())
-        }
-        CheckpointAttemptRelation::Exact => {
+        std::cmp::Ordering::Equal => {
             Err("conflicting Prepare certificate cannot replace the in-flight fan-out".into())
         }
     }
@@ -2302,6 +2340,7 @@ impl BarrierCoordinator {
         &self,
         ann: &BarrierAnnouncement,
     ) -> Result<(), String> {
+        validate_announcement_attempt(ann)?;
         if !matches!(ann.phase, Phase::Prepare | Phase::Aligned) {
             return Ok(());
         }
@@ -2377,6 +2416,7 @@ impl BarrierCoordinator {
         &self,
         announcement: &BarrierAnnouncement,
     ) -> Result<(), String> {
+        validate_announcement_attempt(announcement)?;
         if announcement.phase != Phase::Prepare {
             return Err("checkpoint Prepare validation received a different barrier phase".into());
         }
@@ -2698,6 +2738,7 @@ impl BarrierCoordinator {
         ann: &BarrierAnnouncement,
         prepare_quorum_window: Option<Duration>,
     ) -> Result<(), String> {
+        validate_announcement_attempt(ann)?;
         #[cfg(feature = "cluster")]
         {
             self.validate_reversible_announcement(ann).await?;
@@ -2934,8 +2975,8 @@ impl BarrierCoordinator {
 
     /// Merge the latest direct and gossip announcements without consulting remote authority.
     /// Callers may inspect the result, but must validate a matching reversible phase before use.
-    /// Observation is non-destructive, and direct plus gossip histories must remain related in
-    /// both attempt dimensions. Terminal durable KV values remain the decision authority.
+    /// Observation is non-destructive, and direct plus gossip histories must remain related by
+    /// canonical checkpoint ID. Terminal durable KV values remain the decision authority.
     ///
     /// # Errors
     /// Returns a string on transport, decode, or conflicting-history failure.
@@ -2970,6 +3011,9 @@ impl BarrierCoordinator {
             (Some(g), None) => Some(g),
             (None, k) => k,
         };
+        if let Some(announcement) = observed.as_ref() {
+            validate_announcement_attempt(announcement)?;
+        }
         Ok(observed)
     }
 
@@ -2992,21 +3036,12 @@ impl BarrierCoordinator {
         validate_scanned_announcements(announcements)
     }
 
-    /// Highest valid attempt any node has announced across the gossiped per-node keys.
-    ///
-    /// # Errors
-    /// Returns an error for malformed values or histories whose epoch and checkpoint ID do not
-    /// move together; a reclaiming leader must not advance from a lexicographically invented cut.
-    pub async fn max_announced(&self) -> Result<Option<CheckpointAttempt>, String> {
-        let highest = self.scan_latest_announcement().await?;
-        Ok(highest.as_ref().map(announcement_attempt))
-    }
-
     /// Follower-side ack.
     ///
     /// # Errors
     /// Returns a string on JSON encode failure.
     pub async fn ack(&self, ack: &BarrierAck) -> Result<(), String> {
+        validate_ack_attempt(ack)?;
         #[cfg(feature = "cluster")]
         {
             let grpc_opt = self.grpc.lock().clone();
@@ -3040,6 +3075,14 @@ impl BarrierCoordinator {
         expected: &[NodeId],
         deadline: Duration,
     ) -> QuorumOutcome {
+        if let Err(error) = validate_announcement_attempt(prepare) {
+            return QuorumOutcome::Failed {
+                failures: vec![(
+                    expected.first().copied().unwrap_or(NodeId::UNASSIGNED),
+                    error,
+                )],
+            };
+        }
         let epoch = prepare.epoch;
         let checkpoint_id = prepare.checkpoint_id;
         let assignment_digest = prepare
@@ -3488,7 +3531,7 @@ mod tests {
     fn successor_terminal_targets_historical_proof_owner_and_excludes_actual_sender() {
         let announcement = BarrierAnnouncement {
             epoch: 9,
-            checkpoint_id: 90,
+            checkpoint_id: 9,
             assignment_fence: Some(test_fence(17, &[1, 2, 3], &[(1, 11), (2, 22), (3, 33)])),
             leader_proof: Some(crate::cluster::control::LeaderProof {
                 owner: crate::checkpoint::LeaderProofOwner {
@@ -3521,7 +3564,7 @@ mod tests {
     fn restarted_same_node_terminal_skips_the_unaddressable_predecessor() {
         let announcement = BarrierAnnouncement {
             epoch: 9,
-            checkpoint_id: 90,
+            checkpoint_id: 9,
             assignment_fence: Some(test_fence(17, &[1, 2], &[(1, 11), (2, 22)])),
             leader_proof: Some(crate::cluster::control::LeaderProof {
                 owner: crate::checkpoint::LeaderProofOwner {
@@ -3554,7 +3597,7 @@ mod tests {
     fn restarted_same_node_cannot_send_aligned_with_the_predecessor_proof() {
         let announcement = BarrierAnnouncement {
             epoch: 9,
-            checkpoint_id: 90,
+            checkpoint_id: 9,
             assignment_fence: Some(test_fence(17, &[1, 2], &[(1, 11), (2, 22)])),
             leader_proof: Some(crate::cluster::control::LeaderProof {
                 owner: crate::checkpoint::LeaderProofOwner {
@@ -3742,7 +3785,7 @@ mod tests {
         coordinator.set_local_leader_proof_provider(Arc::new(move || Some(local.clone())));
         let mut announcement = BarrierAnnouncement {
             epoch: 20,
-            checkpoint_id: 200,
+            checkpoint_id: 20,
             assignment_fence: Some(test_fence(9, &[1], &[(1, 11)])),
             leader_proof: Some(proof),
             phase: Phase::Prepare,
@@ -3769,7 +3812,7 @@ mod tests {
         let restarted = test_fence(17, &[1, 2], &[(1, 111), (2, 22)]);
         let announcement = BarrierAnnouncement {
             epoch: 20,
-            checkpoint_id: 200,
+            checkpoint_id: 20,
             assignment_fence: Some(expected),
             leader_proof: None,
             phase: Phase::Commit,
@@ -4289,7 +4332,7 @@ mod tests {
             process_lease_deadline.set(Arc::clone(&deadline)).unwrap();
 
             let epoch = 7;
-            let checkpoint_id = 70;
+            let checkpoint_id = 7;
             let fence = test_fence(9, &[1, 2], &[(1, 1), (2, 22)]);
             let assignment_digest = Some(fence.digest());
             let identity = BarrierIdentity {
@@ -4376,7 +4419,7 @@ mod tests {
             let assignment = assignment_fence_to_wire(Some(&fence));
             let request = tonic::Request::new(barrier_v1::PrepareRequest {
                 epoch: 8,
-                checkpoint_id: 80,
+                checkpoint_id: 8,
                 flags: 0,
                 assignment_version: assignment.version,
                 assignment_participants: assignment.participants,
@@ -4426,7 +4469,7 @@ mod tests {
             let leader = coordinator(leader_kv.clone(), store);
             let valid = BarrierAnnouncement {
                 epoch: 1,
-                checkpoint_id: 40,
+                checkpoint_id: 1,
                 assignment_fence: Some(test_fence(9, &[1, 2], &[(1, 1), (2, 22)])),
                 leader_proof: Some(leader_proof.clone()),
                 phase: Phase::Prepare,
@@ -4444,7 +4487,7 @@ mod tests {
 
             let leader_outside_roster = BarrierAnnouncement {
                 epoch: 1,
-                checkpoint_id: 41,
+                checkpoint_id: 1,
                 assignment_fence: Some(test_fence(10, &[2], &[(2, 22)])),
                 leader_proof: Some(leader_proof),
                 ..valid
@@ -4823,7 +4866,7 @@ mod tests {
 
             let prepare = BarrierAnnouncement {
                 epoch: 1,
-                checkpoint_id: 41,
+                checkpoint_id: 1,
                 assignment_fence: Some(test_fence(9, &[1, 2], &[(1, 1), (2, 22)])),
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
@@ -4866,7 +4909,7 @@ mod tests {
             leader.set_local_leader_proof_provider(Arc::new(move || provider.lock().clone()));
             let prepare = BarrierAnnouncement {
                 epoch: 1,
-                checkpoint_id: 41,
+                checkpoint_id: 1,
                 assignment_fence: Some(test_fence(9, &[1, 2], &[(1, 1), (2, 22)])),
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
@@ -4918,7 +4961,7 @@ mod tests {
                 .unwrap();
             let prepare = BarrierAnnouncement {
                 epoch: 1,
-                checkpoint_id: 41,
+                checkpoint_id: 1,
                 assignment_fence: Some(test_fence(9, &[1], &[(1, 1)])),
                 leader_proof: Some(proof.clone()),
                 phase: Phase::Prepare,
@@ -4976,7 +5019,7 @@ mod tests {
                 }));
                 let prepare = BarrierAnnouncement {
                     epoch: 1,
-                    checkpoint_id: 41,
+                    checkpoint_id: 1,
                     assignment_fence: None,
                     leader_proof: None,
                     phase: Phase::Prepare,
@@ -5006,7 +5049,7 @@ mod tests {
             let first = BarrierCoordinator::new(shared.clone());
             let prepare = BarrierAnnouncement {
                 epoch: 1,
-                checkpoint_id: 41,
+                checkpoint_id: 1,
                 assignment_fence: None,
                 leader_proof: None,
                 phase: Phase::Prepare,
@@ -5043,7 +5086,7 @@ mod tests {
             let (leader, follower, proof) = started_barrier_pair().await;
             let prepare = BarrierAnnouncement {
                 epoch: 1,
-                checkpoint_id: 41,
+                checkpoint_id: 1,
                 assignment_fence: Some(test_fence(9, &[1, 2], &[(1, 1), (2, 22)])),
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
@@ -5095,7 +5138,7 @@ mod tests {
             install_local_proof(&leader, &proof);
             let prepare = BarrierAnnouncement {
                 epoch: 1,
-                checkpoint_id: 41,
+                checkpoint_id: 1,
                 assignment_fence: Some(test_fence(9, &[1], &[(1, 1)])),
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
@@ -5152,7 +5195,7 @@ mod tests {
                 let error = leader
                     .announce(&BarrierAnnouncement {
                         epoch: 2,
-                        checkpoint_id: 42,
+                        checkpoint_id: 2,
                         assignment_fence: None,
                         leader_proof: None,
                         phase,
@@ -5217,7 +5260,7 @@ mod tests {
             );
             let prepare = BarrierAnnouncement {
                 epoch: 1,
-                checkpoint_id: 41,
+                checkpoint_id: 1,
                 assignment_fence: Some(test_fence(9, &[1, 2], &[(1, 1), (2, 22)])),
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
@@ -5279,7 +5322,7 @@ mod tests {
             let (leader, follower, proof) = started_barrier_pair().await;
             let prepare = BarrierAnnouncement {
                 epoch: 1,
-                checkpoint_id: 41,
+                checkpoint_id: 1,
                 assignment_fence: Some(test_fence(9, &[1, 2], &[(1, 1), (2, 22)])),
                 leader_proof: Some(proof.clone()),
                 phase: Phase::Prepare,
@@ -5352,7 +5395,7 @@ mod tests {
             let mut local_watch = leader.announcement_watch().unwrap();
             let aligned = BarrierAnnouncement {
                 epoch: 1,
-                checkpoint_id: 41,
+                checkpoint_id: 1,
                 assignment_fence: None,
                 leader_proof: None,
                 phase: Phase::Aligned,
@@ -5410,7 +5453,7 @@ mod tests {
                 .unwrap();
             let prepare = BarrierAnnouncement {
                 epoch: 1,
-                checkpoint_id: 41,
+                checkpoint_id: 1,
                 assignment_fence: Some(test_fence(9, &[1], &[(1, 1)])),
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
@@ -5497,7 +5540,7 @@ mod tests {
 
             let prepare = BarrierAnnouncement {
                 epoch: 1,
-                checkpoint_id: 41,
+                checkpoint_id: 1,
                 assignment_fence: Some(test_fence(9, &[1, 2], &[(1, 1), (2, 22)])),
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
@@ -5614,7 +5657,7 @@ mod tests {
 
             let prepare = BarrierAnnouncement {
                 epoch: 1,
-                checkpoint_id: 41,
+                checkpoint_id: 1,
                 assignment_fence: Some(test_fence(9, &[1, 2], &[(1, 1), (2, 22)])),
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
@@ -5668,7 +5711,7 @@ mod tests {
             let fence = test_fence(9, &[1, 2], &[(1, 1), (2, 22)]);
             let prepare = BarrierAnnouncement {
                 epoch: 1,
-                checkpoint_id: 41,
+                checkpoint_id: 1,
                 assignment_fence: Some(fence.clone()),
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
@@ -5767,7 +5810,7 @@ mod tests {
             let fence = test_fence(10, &[1, 2], &[(1, 1), (2, 22)]);
             let prepare = BarrierAnnouncement {
                 epoch: 2,
-                checkpoint_id: 42,
+                checkpoint_id: 2,
                 assignment_fence: Some(fence.clone()),
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
@@ -5810,7 +5853,7 @@ mod tests {
             let fence = test_fence(10, &[1, 2], &[(1, 1), (2, 22)]);
             let prepare = BarrierAnnouncement {
                 epoch: 2,
-                checkpoint_id: 42,
+                checkpoint_id: 2,
                 assignment_fence: Some(fence),
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
@@ -5852,7 +5895,7 @@ mod tests {
             let fence = test_fence(11, &[1, 2], &[(1, 1), (2, 22)]);
             let first = BarrierAnnouncement {
                 epoch: 3,
-                checkpoint_id: 43,
+                checkpoint_id: 3,
                 assignment_fence: Some(fence.clone()),
                 leader_proof: Some(proof.clone()),
                 phase: Phase::Prepare,
@@ -5867,7 +5910,7 @@ mod tests {
 
             let successor = BarrierAnnouncement {
                 epoch: 4,
-                checkpoint_id: 44,
+                checkpoint_id: 4,
                 ..first.clone()
             };
             leader
@@ -5943,7 +5986,7 @@ mod tests {
             );
             let first = BarrierAnnouncement {
                 epoch: 1,
-                checkpoint_id: 41,
+                checkpoint_id: 1,
                 assignment_fence: Some(test_fence(9, &[1, 2], &[(1, 1), (2, 22)])),
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
@@ -5957,7 +6000,7 @@ mod tests {
             assert_eq!(pending_prepare_waiters(&follower, &first), 1);
             let successor = BarrierAnnouncement {
                 epoch: 2,
-                checkpoint_id: 42,
+                checkpoint_id: 2,
                 ..first.clone()
             };
             leader_kv.arm();
@@ -6001,7 +6044,7 @@ mod tests {
             let fence = test_fence(12, &[1, 2], &[(1, 1), (2, 22)]);
             let prepare = BarrierAnnouncement {
                 epoch: 5,
-                checkpoint_id: 45,
+                checkpoint_id: 5,
                 assignment_fence: Some(fence),
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
@@ -6070,13 +6113,13 @@ mod tests {
             let follower_task = tokio::spawn(async move {
                 let ann = wait_observe(&follower_coord, NodeId(1), Phase::Prepare).await;
                 assert_eq!(ann.epoch, 1);
-                assert_eq!(ann.checkpoint_id, 42);
+                assert_eq!(ann.checkpoint_id, 1);
                 assert_eq!(ann.assignment_fence.as_ref(), Some(&follower_fence));
 
                 follower_coord
                     .ack(&BarrierAck {
                         epoch: 1,
-                        checkpoint_id: 42,
+                        checkpoint_id: 1,
                         assignment_digest: Some(follower_fence.digest()),
                         ok: true,
                         error: None,
@@ -6096,7 +6139,7 @@ mod tests {
 
             let prepare = BarrierAnnouncement {
                 epoch: 1,
-                checkpoint_id: 42,
+                checkpoint_id: 1,
                 assignment_fence: Some(assignment_fence),
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
@@ -6122,7 +6165,7 @@ mod tests {
                     leader_coord
                         .announce(&BarrierAnnouncement {
                             epoch: 1,
-                            checkpoint_id: 42,
+                            checkpoint_id: 1,
                             assignment_fence: prepare.assignment_fence.clone(),
                             leader_proof: prepare.leader_proof.clone(),
                             phase: Phase::Aligned,
@@ -6136,7 +6179,7 @@ mod tests {
                     leader_coord
                         .announce(&BarrierAnnouncement {
                             epoch: 1,
-                            checkpoint_id: 42,
+                            checkpoint_id: 1,
                             assignment_fence: prepare.assignment_fence.clone(),
                             leader_proof: prepare.leader_proof.clone(),
                             phase: Phase::Commit,
@@ -6207,7 +6250,7 @@ mod tests {
             let fence = test_fence(9, &[1, 2], &[(1, 1), (2, 22)]);
             let prepare = BarrierAnnouncement {
                 epoch: 4,
-                checkpoint_id: 44,
+                checkpoint_id: 4,
                 assignment_fence: Some(fence),
                 leader_proof: Some(leader_proof),
                 phase: Phase::Prepare,
@@ -6228,7 +6271,7 @@ mod tests {
             let observed = wait_observe_exact(
                 &follower,
                 NodeId(1),
-                CheckpointAttempt::new(4, 44),
+                CheckpointAttempt::canonical(4),
                 Phase::Aligned,
             )
             .await;
@@ -6296,7 +6339,7 @@ mod tests {
             let follower_fence = assignment_fence.clone();
             let prepare = BarrierAnnouncement {
                 epoch: 2,
-                checkpoint_id: 43,
+                checkpoint_id: 2,
                 assignment_fence: Some(assignment_fence),
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
@@ -6357,7 +6400,7 @@ mod tests {
 
             let prepare = BarrierAnnouncement {
                 epoch: 11,
-                checkpoint_id: 101,
+                checkpoint_id: 11,
                 assignment_fence: None,
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
@@ -6436,7 +6479,7 @@ mod tests {
 
             let prepare = BarrierAnnouncement {
                 epoch: 12,
-                checkpoint_id: 102,
+                checkpoint_id: 12,
                 assignment_fence: None,
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
@@ -6529,7 +6572,7 @@ mod tests {
             let conflicting_fence = test_fence(9, &[2, 1, 1, 2], &[(1, 1), (2, 22)]);
             let accepted = BarrierAnnouncement {
                 epoch: 12,
-                checkpoint_id: 102,
+                checkpoint_id: 12,
                 assignment_fence: Some(accepted_fence.clone()),
                 leader_proof: Some(proof),
                 phase: Phase::Prepare,
@@ -6773,7 +6816,7 @@ mod tests {
                 leader_kv,
                 BarrierAnnouncement {
                     epoch: 7,
-                    checkpoint_id: 9,
+                    checkpoint_id: 7,
                     assignment_fence: Some(test_fence(1, &[1, 2], &[(1, 11), (2, 22)])),
                     leader_proof: Some(lease.proof()),
                     phase: Phase::Aligned,
@@ -6802,7 +6845,7 @@ mod tests {
     fn direct_phase_merge_is_monotonic_for_an_exact_attempt() {
         let base = BarrierAnnouncement {
             epoch: 20,
-            checkpoint_id: 200,
+            checkpoint_id: 20,
             assignment_fence: None,
             leader_proof: None,
             phase: Phase::Prepare,
@@ -6846,7 +6889,7 @@ mod tests {
             merge_direct_announcement(
                 BarrierAnnouncement {
                     epoch: 20,
-                    checkpoint_id: 200,
+                    checkpoint_id: 20,
                     phase: Phase::Commit,
                     ..newer_attempt.clone()
                 },
@@ -6854,20 +6897,20 @@ mod tests {
             )
             .unwrap()
             .checkpoint_id,
-            201,
-            "both attempt dimensions advanced"
+            21,
+            "the canonical checkpoint order advanced"
         );
 
         for conflicting in [
             BarrierAnnouncement {
                 epoch: 20,
-                checkpoint_id: 201,
+                checkpoint_id: 21,
                 phase: Phase::Prepare,
                 ..newer_attempt.clone()
             },
             BarrierAnnouncement {
                 epoch: 21,
-                checkpoint_id: 200,
+                checkpoint_id: 20,
                 phase: Phase::Prepare,
                 ..newer_attempt.clone()
             },
@@ -6911,7 +6954,7 @@ mod tests {
     fn durable_terminal_is_authoritative_during_channel_merge() {
         let base = BarrierAnnouncement {
             epoch: 21,
-            checkpoint_id: 210,
+            checkpoint_id: 21,
             assignment_fence: None,
             leader_proof: None,
             phase: Phase::Prepare,
@@ -7029,7 +7072,7 @@ mod tests {
         leader_coord
             .announce(&BarrierAnnouncement {
                 epoch: 5,
-                checkpoint_id: 9,
+                checkpoint_id: 5,
                 assignment_fence: None,
                 leader_proof: None,
                 phase: Phase::Abort,
@@ -7050,7 +7093,7 @@ mod tests {
         // over the stale watch value.
         let next = serde_json::to_string(&BarrierAnnouncement {
             epoch: 6,
-            checkpoint_id: 10,
+            checkpoint_id: 6,
             assignment_fence: None,
             leader_proof: None,
             phase: Phase::Prepare,
@@ -7070,7 +7113,7 @@ mod tests {
         // value (RPC arrival order is authoritative within an epoch).
         let stale = serde_json::to_string(&BarrierAnnouncement {
             epoch: 5,
-            checkpoint_id: 9,
+            checkpoint_id: 5,
             assignment_fence: None,
             leader_proof: None,
             phase: Phase::Prepare,
@@ -7097,7 +7140,7 @@ mod tests {
             let coord = BarrierCoordinator::new(leader_kv.clone());
             let prepare = BarrierAnnouncement {
                 epoch: 5,
-                checkpoint_id: 42,
+                checkpoint_id: 5,
                 assignment_fence: None,
                 leader_proof: None,
                 phase: Phase::Prepare,
@@ -7106,7 +7149,7 @@ mod tests {
             coord.announce(&prepare).await.unwrap();
             let got = coord.observe_hint(NodeId(1)).await.unwrap().unwrap();
             assert_eq!(got.epoch, 5);
-            assert_eq!(got.checkpoint_id, 42);
+            assert_eq!(got.checkpoint_id, 5);
 
             let terminal = BarrierAnnouncement {
                 phase: terminal_phase,
@@ -7133,6 +7176,45 @@ mod tests {
         assert!(coord.observe_hint(NodeId(1)).await.unwrap().is_none());
     }
 
+    #[tokio::test]
+    async fn coordinator_rejects_noncanonical_attempts_before_publication() {
+        for (epoch, checkpoint_id) in [(0, 0), (5, 0), (0, 5), (5, 6)] {
+            let store = kv(NodeId(1));
+            let coordinator = BarrierCoordinator::new(store.clone());
+            let announcement = BarrierAnnouncement {
+                epoch,
+                checkpoint_id,
+                assignment_fence: None,
+                leader_proof: None,
+                phase: Phase::Prepare,
+                flags: 0,
+            };
+            assert!(coordinator.announce(&announcement).await.is_err());
+            assert!(store.read_from(NodeId(1), ANNOUNCEMENT_KEY).await.is_none());
+
+            let acknowledgement = BarrierAck {
+                epoch,
+                checkpoint_id,
+                assignment_digest: None,
+                ok: true,
+                error: None,
+                watermark: CheckpointWatermark::Uninitialized,
+            };
+            assert!(coordinator.ack(&acknowledgement).await.is_err());
+            assert!(store.read_from(NodeId(1), ACK_KEY).await.is_none());
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn wire_requests_require_a_canonical_attempt() {
+        validate_wire_checkpoint_attempt(7, 7).unwrap();
+        for (epoch, checkpoint_id) in [(0, 0), (7, 0), (0, 7), (7, 8)] {
+            let error = validate_wire_checkpoint_attempt(epoch, checkpoint_id).unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        }
+    }
+
     fn announcement_json(epoch: u64, checkpoint_id: u64) -> String {
         serde_json::to_string(&BarrierAnnouncement {
             epoch,
@@ -7146,39 +7228,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn max_announced_requires_consistent_attempt_dimensions() {
+    async fn scan_latest_rejects_noncanonical_attempts() {
         let valid = kv(NodeId(1));
-        valid.seed(NodeId(1), ANNOUNCEMENT_KEY, announcement_json(5, 50));
-        valid.seed(NodeId(2), ANNOUNCEMENT_KEY, announcement_json(6, 60));
+        valid.seed(NodeId(1), ANNOUNCEMENT_KEY, announcement_json(5, 5));
+        valid.seed(NodeId(2), ANNOUNCEMENT_KEY, announcement_json(6, 6));
         assert_eq!(
             BarrierCoordinator::new(valid)
-                .max_announced()
+                .scan_latest_announcement()
                 .await
-                .unwrap(),
-            Some(CheckpointAttempt::new(6, 60))
+                .unwrap()
+                .as_ref()
+                .map(announcement_attempt),
+            Some(CheckpointAttempt::canonical(6))
         );
 
-        for ((left_epoch, left_id), (right_epoch, right_id)) in [
-            ((5, 50), (5, 51)),
-            ((5, 50), (6, 50)),
-            ((5, 51), (6, 50)),
-            ((6, 50), (5, 51)),
-        ] {
-            let conflicting = kv(NodeId(1));
-            conflicting.seed(
+        for (epoch, checkpoint_id) in [(0, 0), (5, 0), (0, 5), (5, 6), (6, 5)] {
+            let invalid = kv(NodeId(1));
+            invalid.seed(
                 NodeId(1),
                 ANNOUNCEMENT_KEY,
-                announcement_json(left_epoch, left_id),
+                announcement_json(epoch, checkpoint_id),
             );
-            conflicting.seed(
-                NodeId(2),
-                ANNOUNCEMENT_KEY,
-                announcement_json(right_epoch, right_id),
-            );
-            assert!(BarrierCoordinator::new(conflicting)
-                .max_announced()
+            let error = BarrierCoordinator::new(invalid)
+                .scan_latest_announcement()
                 .await
-                .is_err());
+                .unwrap_err();
+            assert!(
+                error.contains("one nonzero canonical checkpoint ID"),
+                "{error}"
+            );
         }
     }
 
@@ -7189,7 +7267,7 @@ mod tests {
     ) -> BarrierAnnouncement {
         BarrierAnnouncement {
             epoch: 5,
-            checkpoint_id: 50,
+            checkpoint_id: 5,
             assignment_fence: Some(fence),
             leader_proof: Some(proof),
             phase,
@@ -7244,7 +7322,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn max_announced_rejects_exact_attempt_equivocation() {
+    async fn scan_latest_rejects_exact_attempt_equivocation() {
         let fence = test_fence(9, &[1, 2], &[(1, 11), (2, 22)]);
         let proof = test_leader_proof();
 
@@ -7302,7 +7380,7 @@ mod tests {
                 serde_json::to_string(&right).unwrap(),
             );
             assert!(BarrierCoordinator::new(conflicting)
-                .max_announced()
+                .scan_latest_announcement()
                 .await
                 .is_err());
         }
@@ -7325,15 +7403,17 @@ mod tests {
         );
         assert_eq!(
             BarrierCoordinator::new(progressing)
-                .max_announced()
+                .scan_latest_announcement()
                 .await
-                .unwrap(),
-            Some(CheckpointAttempt::new(5, 50))
+                .unwrap()
+                .as_ref()
+                .map(announcement_attempt),
+            Some(CheckpointAttempt::canonical(5))
         );
     }
 
     #[tokio::test]
-    async fn max_announced_accepts_successor_settlement_and_later_attempt() {
+    async fn scan_latest_accepts_successor_settlement_and_later_attempt() {
         let (aligned, abort) = failover_aligned_and_abort();
         let history = kv(NodeId(1));
         history.seed(
@@ -7348,14 +7428,24 @@ mod tests {
         );
         let coordinator = BarrierCoordinator::new(history.clone());
         assert_eq!(
-            coordinator.max_announced().await.unwrap(),
-            Some(CheckpointAttempt::new(5, 50))
+            coordinator
+                .scan_latest_announcement()
+                .await
+                .unwrap()
+                .as_ref()
+                .map(announcement_attempt),
+            Some(CheckpointAttempt::canonical(5))
         );
 
-        history.seed(NodeId(3), ANNOUNCEMENT_KEY, announcement_json(6, 60));
+        history.seed(NodeId(3), ANNOUNCEMENT_KEY, announcement_json(6, 6));
         assert_eq!(
-            coordinator.max_announced().await.unwrap(),
-            Some(CheckpointAttempt::new(6, 60))
+            coordinator
+                .scan_latest_announcement()
+                .await
+                .unwrap()
+                .as_ref()
+                .map(announcement_attempt),
+            Some(CheckpointAttempt::canonical(6))
         );
     }
 
@@ -7388,12 +7478,15 @@ mod tests {
     fn scanned_history_cannot_hide_earlier_conflicts_behind_a_newer_attempt() {
         let fence = test_fence(9, &[1, 2], &[(1, 11), (2, 22)]);
         let proof = test_leader_proof();
-        let newer = plain_announcement(6, 60);
+        let newer = plain_announcement(6, 6);
         let cases = [
             vec![
-                plain_announcement(5, 50),
+                plain_announcement(5, 5),
                 newer.clone(),
-                plain_announcement(5, 51),
+                BarrierAnnouncement {
+                    flags: crate::checkpoint::flags::FULL_SNAPSHOT,
+                    ..plain_announcement(5, 5)
+                },
             ],
             vec![
                 certified_announcement(fence.clone(), proof.clone(), Phase::Prepare),
@@ -7417,11 +7510,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn max_announced_rejects_malformed_history() {
+    async fn scan_latest_rejects_malformed_history() {
         let malformed = kv(NodeId(1));
         malformed.seed(NodeId(2), ANNOUNCEMENT_KEY, "not-json".to_string());
         assert!(BarrierCoordinator::new(malformed)
-            .max_announced()
+            .scan_latest_announcement()
             .await
             .is_err());
     }
@@ -7447,9 +7540,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn max_announced_propagates_scan_failure() {
+    async fn scan_latest_propagates_scan_failure() {
         let coordinator = BarrierCoordinator::new(Arc::new(FailingScanKv));
-        let error = coordinator.max_announced().await.unwrap_err();
+        let error = coordinator.scan_latest_announcement().await.unwrap_err();
         assert_eq!(error, "injected scan failure");
     }
 
@@ -7707,11 +7800,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wrong_checkpoint_or_assignment_ack_is_ignored() {
+    async fn wrong_attempt_or_assignment_ack_is_ignored() {
         let expected_fence = test_fence(4, &[1, 2], &[(1, 11), (2, 22)]);
         let prepare = BarrierAnnouncement {
             epoch: 10,
-            checkpoint_id: 100,
+            checkpoint_id: 10,
             assignment_fence: Some(expected_fence.clone()),
             leader_proof: None,
             phase: Phase::Prepare,
@@ -7721,8 +7814,8 @@ mod tests {
 
         for ack in [
             BarrierAck {
-                epoch: 10,
-                checkpoint_id: 99,
+                epoch: 9,
+                checkpoint_id: 9,
                 assignment_digest: Some(expected_fence.digest()),
                 ok: true,
                 error: None,
@@ -7730,7 +7823,7 @@ mod tests {
             },
             BarrierAck {
                 epoch: 10,
-                checkpoint_id: 100,
+                checkpoint_id: 10,
                 assignment_digest: Some(wrong_fence.digest()),
                 ok: true,
                 error: None,

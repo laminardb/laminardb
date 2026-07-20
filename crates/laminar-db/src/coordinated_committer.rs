@@ -1820,7 +1820,10 @@ mod tests {
     async fn decisions_on(
         store: Arc<dyn ObjectStore>,
     ) -> Arc<laminar_core::checkpoint_decision::CheckpointDecisionStore> {
-        let identity_json = format!(r#"{{"version":1,"id":"{}"}}"#, deployment_id());
+        let identity_json = format!(
+            r#"{{"version":2,"id":"{}","allocator_mode":"native_cas","checkpoint_id":0,"allocation_id":"018f0000-0000-7000-8000-000000000002"}}"#,
+            deployment_id()
+        );
         store
             .put(
                 &object_store::path::Path::from("checkpoint-deployment/identity.json"),
@@ -1945,12 +1948,11 @@ mod tests {
 
     async fn record_local_commit(
         store: &laminar_core::checkpoint_decision::CheckpointDecisionStore,
-        epoch: u64,
         checkpoint_id: u64,
     ) {
         store
             .record_outcome(
-                epoch,
+                checkpoint_id,
                 checkpoint_id,
                 CheckpointScope::Local,
                 None,
@@ -1964,12 +1966,11 @@ mod tests {
 
     async fn record_local_abort(
         store: &laminar_core::checkpoint_decision::CheckpointDecisionStore,
-        epoch: u64,
         checkpoint_id: u64,
     ) {
         store
             .record_outcome(
-                epoch,
+                checkpoint_id,
                 checkpoint_id,
                 CheckpointScope::Local,
                 None,
@@ -1985,31 +1986,22 @@ mod tests {
     async fn record_cluster_commit<B: StateBackend>(
         store: &ClusterDecisions,
         backend: &Arc<B>,
-        epoch: u64,
         checkpoint_id: u64,
         fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
     ) {
-        record_cluster_commit_with_inventory_digest(
-            store,
-            backend,
-            epoch,
-            checkpoint_id,
-            fence,
-            None,
-        )
-        .await;
+        record_cluster_commit_with_inventory_digest(store, backend, checkpoint_id, fence, None)
+            .await;
     }
 
     #[cfg(feature = "cluster")]
     async fn record_cluster_commit_with_inventory_digest<B: StateBackend>(
         store: &ClusterDecisions,
         backend: &Arc<B>,
-        epoch: u64,
         checkpoint_id: u64,
         fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
         seal_inventory_sha256: Option<String>,
     ) {
-        let attempt = CheckpointAttempt::new(epoch, checkpoint_id);
+        let attempt = CheckpointAttempt::canonical(checkpoint_id);
         let inventory = backend
             .checkpoint_seal_inventory(attempt)
             .await
@@ -2046,7 +2038,7 @@ mod tests {
             .authority
             .record_cluster_outcome(
                 &store.proof,
-                epoch,
+                checkpoint_id,
                 checkpoint_id,
                 fence.clone(),
                 CheckpointVerdict::Commit,
@@ -2060,8 +2052,8 @@ mod tests {
     #[tokio::test]
     async fn batches_sealed_epochs_into_one_commit() {
         let backend = Arc::new(InProcessBackend::new(2));
-        let first = CheckpointAttempt::new(1, 11);
-        let second = CheckpointAttempt::new(2, 22);
+        let first = CheckpointAttempt::canonical(1);
+        let second = CheckpointAttempt::canonical(2);
         let fence = assignment_fence(3, &[7, 9]);
         let decisions = cluster_decisions(&fence, 7).await;
         seal_with_fence(
@@ -2085,8 +2077,8 @@ mod tests {
 
         let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
         let handle = spawn_recording_sink(Arc::clone(&recorded));
-        record_cluster_commit(&decisions, &backend, 1, 11, &fence).await;
-        record_cluster_commit(&decisions, &backend, 2, 22, &fence).await;
+        record_cluster_commit(&decisions, &backend, 1, &fence).await;
+        record_cluster_commit(&decisions, &backend, 2, &fence).await;
         let floor = Arc::new(AtomicU64::new(0));
         let mut committer = CoordinatedCommitter::new(
             Arc::clone(&backend) as Arc<dyn StateBackend>,
@@ -2138,9 +2130,9 @@ mod tests {
     async fn split_batches_use_their_flushed_targets_authority() {
         let backend = Arc::new(InProcessBackend::new(1));
         let attempts = [
-            CheckpointAttempt::new(1, 11),
-            CheckpointAttempt::new(2, 22),
-            CheckpointAttempt::new(3, 33),
+            CheckpointAttempt::canonical(1),
+            CheckpointAttempt::canonical(2),
+            CheckpointAttempt::canonical(3),
         ];
         let tokens = [1, 2, 3];
         let fence = assignment_fence(3, &[7]);
@@ -2156,14 +2148,7 @@ mod tests {
                 Some(&outcomes.proof),
             )
             .await;
-            record_cluster_commit(
-                &outcomes,
-                &backend,
-                attempt.epoch,
-                attempt.checkpoint_id,
-                &fence,
-            )
-            .await;
+            record_cluster_commit(&outcomes, &backend, attempt.checkpoint_id, &fence).await;
             if index + 1 < attempts.len() {
                 let next_owner = laminar_core::cluster::control::LeaderLeaseOwner {
                     node: outcomes.owner.node,
@@ -2206,7 +2191,7 @@ mod tests {
         assert_eq!(
             cursor,
             CoordinatedCommitCursor {
-                checkpoint_id: 33,
+                checkpoint_id: 3,
                 fencing_token: 3,
             }
         );
@@ -2227,23 +2212,23 @@ mod tests {
                         checkpoint_id: 0,
                         fencing_token: 0,
                     },
-                    11,
+                    1,
                     1,
                 ),
                 (
                     CoordinatedCommitCursor {
-                        checkpoint_id: 11,
+                        checkpoint_id: 1,
                         fencing_token: 1,
                     },
-                    22,
+                    2,
                     2,
                 ),
                 (
                     CoordinatedCommitCursor {
-                        checkpoint_id: 22,
+                        checkpoint_id: 2,
                         fencing_token: 2,
                     },
-                    33,
+                    3,
                     3,
                 ),
             ]
@@ -2254,7 +2239,7 @@ mod tests {
     #[tokio::test]
     async fn live_cluster_cursor_must_match_its_outcome_authority() {
         let backend = Arc::new(InProcessBackend::new(1));
-        let attempt = CheckpointAttempt::new(1, 11);
+        let attempt = CheckpointAttempt::canonical(1);
         let fence = assignment_fence(3, &[7]);
         let mut outcomes = cluster_decisions(&fence, 7).await;
         let next_owner = laminar_core::cluster::control::LeaderLeaseOwner {
@@ -2272,14 +2257,7 @@ mod tests {
             Some(&outcomes.proof),
         )
         .await;
-        record_cluster_commit(
-            &outcomes,
-            &backend,
-            attempt.epoch,
-            attempt.checkpoint_id,
-            &fence,
-        )
-        .await;
+        record_cluster_commit(&outcomes, &backend, attempt.checkpoint_id, &fence).await;
         let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
         let handle = spawn_recording_sink_with_cursor(
             Arc::clone(&recorded),
@@ -2306,7 +2284,7 @@ mod tests {
     #[tokio::test]
     async fn external_commit_rejects_capsule_bound_to_another_seal_inventory() {
         let backend = Arc::new(InProcessBackend::new(2));
-        let attempt = CheckpointAttempt::new(1, 11);
+        let attempt = CheckpointAttempt::canonical(1);
         let fence = assignment_fence(3, &[7, 9]);
         let decisions = cluster_decisions(&fence, 7).await;
         seal_with_fence(
@@ -2323,7 +2301,6 @@ mod tests {
         record_cluster_commit_with_inventory_digest(
             &decisions,
             &backend,
-            attempt.epoch,
             attempt.checkpoint_id,
             &fence,
             Some("ff".repeat(32)),
@@ -2353,7 +2330,7 @@ mod tests {
     #[tokio::test]
     async fn current_leader_finishes_commit_selected_by_predecessor_proof() {
         let backend = Arc::new(InProcessBackend::new(2));
-        let attempt = CheckpointAttempt::new(1, 11);
+        let attempt = CheckpointAttempt::canonical(1);
         let fence = assignment_fence(3, &[7, 9]);
         let mut outcomes = cluster_decisions(&fence, 7).await;
         seal_with_fence(
@@ -2370,7 +2347,7 @@ mod tests {
         let handle = spawn_recording_sink(Arc::clone(&recorded));
         // The immutable outcome is certified by predecessor node 7. Node 9 is the current
         // designated committer and must finish it without asking whether proof 7 is still live.
-        record_cluster_commit(&outcomes, &backend, 1, 11, &fence).await;
+        record_cluster_commit(&outcomes, &backend, 1, &fence).await;
         let successor = laminar_core::cluster::control::LeaderLeaseOwner {
             node: laminar_core::cluster::discovery::NodeId(9),
             boot: fence.participant_incarnation(9).unwrap(),
@@ -2399,9 +2376,9 @@ mod tests {
     #[tokio::test]
     async fn skips_abort_outcome_with_partial_descriptor() {
         let backend = Arc::new(InProcessBackend::new(2));
-        let first = CheckpointAttempt::new(1, 11);
-        let abandoned = CheckpointAttempt::new(2, 19);
-        let third = CheckpointAttempt::new(3, 31);
+        let first = CheckpointAttempt::canonical(1);
+        let abandoned = CheckpointAttempt::canonical(2);
+        let third = CheckpointAttempt::canonical(3);
         seal(&backend, first, &[(0, Some(b"e1"))]).await;
         // Epoch 2 wrote a descriptor but durably selected abort (and was never sealed).
         let namespace = namespace();
@@ -2416,9 +2393,9 @@ mod tests {
         let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
         let handle = spawn_recording_sink(Arc::clone(&recorded));
         let decisions = decisions().await;
-        record_local_commit(&decisions, 1, 11).await;
-        record_local_abort(&decisions, 2, 19).await;
-        record_local_commit(&decisions, 3, 31).await;
+        record_local_commit(&decisions, 1).await;
+        record_local_abort(&decisions, 2).await;
+        record_local_commit(&decisions, 3).await;
         let mut committer = CoordinatedCommitter::new(
             Arc::clone(&backend) as Arc<dyn StateBackend>,
             vec![(TEST_SINK_ID.into(), handle)],
@@ -2451,14 +2428,16 @@ mod tests {
     #[tokio::test]
     async fn restart_resumes_from_exact_external_cursor() {
         let backend = Arc::new(InProcessBackend::new(2));
-        seal(&backend, CheckpointAttempt::new(1, 11), &[(0, Some(b"e1"))]).await;
-        seal(&backend, CheckpointAttempt::new(2, 22), &[(0, Some(b"e2"))]).await;
+        let first_attempt = CheckpointAttempt::canonical(1);
+        let second_attempt = CheckpointAttempt::canonical(2);
+        seal(&backend, first_attempt, &[(0, Some(b"e1"))]).await;
+        seal(&backend, second_attempt, &[(0, Some(b"e2"))]).await;
 
         let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
         let handle = spawn_recording_sink(Arc::clone(&recorded));
         let decisions = decisions().await;
-        record_local_commit(&decisions, 1, 11).await;
-        record_local_commit(&decisions, 2, 22).await;
+        record_local_commit(&decisions, first_attempt.checkpoint_id).await;
+        record_local_commit(&decisions, second_attempt.checkpoint_id).await;
 
         let mut first = CoordinatedCommitter::new(
             Arc::clone(&backend) as Arc<dyn StateBackend>,
@@ -2469,7 +2448,23 @@ mod tests {
         )
         .with_decision_store(Some(Arc::clone(&decisions)));
         first.commit_ready().await.unwrap();
-        assert_eq!(recorded.lock().len(), 1);
+        {
+            let batches = recorded.lock();
+            assert_eq!(batches.len(), 1);
+            assert_eq!(batches[0].target, second_attempt);
+            assert_eq!(
+                batches[0]
+                    .entries
+                    .iter()
+                    .map(|entry| entry.attempt)
+                    .collect::<Vec<_>>(),
+                vec![first_attempt, second_attempt]
+            );
+            assert!(batches[0]
+                .entries
+                .iter()
+                .all(|entry| entry.attempt.is_canonical()));
+        }
 
         // Fresh committer (restart) over the same sink — seeds from committed_through.
         let mut restarted = CoordinatedCommitter::new(
@@ -2491,10 +2486,10 @@ mod tests {
     #[tokio::test]
     async fn live_local_cursor_uses_the_fixed_local_authority() {
         let backend = Arc::new(InProcessBackend::new(1));
-        let attempt = CheckpointAttempt::new(1, 11);
+        let attempt = CheckpointAttempt::canonical(1);
         seal(&backend, attempt, &[(0, Some(b"payload"))]).await;
         let outcomes = decisions().await;
-        record_local_commit(&outcomes, attempt.epoch, attempt.checkpoint_id).await;
+        record_local_commit(&outcomes, attempt.checkpoint_id).await;
         let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
         let handle = spawn_recording_sink_with_cursor(
             Arc::clone(&recorded),
@@ -2519,17 +2514,17 @@ mod tests {
     #[tokio::test]
     async fn outcome_gc_anchor_is_cursor_continuity_only() {
         let backend = Arc::new(InProcessBackend::new(1));
-        let anchor = CheckpointAttempt::new(1, 11);
-        let aborted = CheckpointAttempt::new(2, 22);
-        let live = CheckpointAttempt::new(3, 33);
+        let anchor = CheckpointAttempt::canonical(1);
+        let aborted = CheckpointAttempt::canonical(2);
+        let live = CheckpointAttempt::canonical(3);
         seal(&backend, anchor, &[(0, Some(b"e1"))]).await;
         seal(&backend, aborted, &[(0, Some(b"must-not-commit"))]).await;
         seal(&backend, live, &[(0, Some(b"e3"))]).await;
 
         let outcomes = decisions().await;
-        record_local_commit(&outcomes, anchor.epoch, anchor.checkpoint_id).await;
-        record_local_abort(&outcomes, aborted.epoch, aborted.checkpoint_id).await;
-        record_local_commit(&outcomes, live.epoch, live.checkpoint_id).await;
+        record_local_commit(&outcomes, anchor.checkpoint_id).await;
+        record_local_abort(&outcomes, aborted.checkpoint_id).await;
+        record_local_commit(&outcomes, live.checkpoint_id).await;
         assert_eq!(outcomes.prune_outcomes_before(3).await.unwrap(), 3);
         let boundary = outcomes.outcome_retention_boundary().await.unwrap();
         assert_eq!(boundary.committed_checkpoint_id, Some(anchor.checkpoint_id));
@@ -2571,12 +2566,12 @@ mod tests {
         let backend = Arc::new(InProcessBackend::new(1));
         let fence = assignment_fence(3, &[7]);
         let decisions = cluster_decisions(&fence, 7).await;
-        let commits = [1_u64, 3, 20, 40, 60, 80].map(|epoch| CheckpointAttempt::new(epoch, epoch));
+        let commits = [1_u64, 3, 20, 40, 60, 80].map(CheckpointAttempt::canonical);
         let anchor = commits[0];
         let live_commits = &commits[1..];
 
         for epoch in 1..=80 {
-            let attempt = CheckpointAttempt::new(epoch, epoch);
+            let attempt = CheckpointAttempt::canonical(epoch);
             if commits.contains(&attempt) {
                 seal_with_fence(
                     &backend,
@@ -2587,7 +2582,7 @@ mod tests {
                     Some(&decisions.proof),
                 )
                 .await;
-                record_cluster_commit(&decisions, &backend, epoch, epoch, &fence).await;
+                record_cluster_commit(&decisions, &backend, epoch, &fence).await;
             } else {
                 decisions
                     .authority
@@ -2637,7 +2632,7 @@ mod tests {
             .unwrap()
             .into_iter()
             .filter(CheckpointOutcome::is_commit)
-            .map(|outcome| CheckpointAttempt::new(outcome.epoch, outcome.checkpoint_id))
+            .map(|outcome| CheckpointAttempt::canonical(outcome.checkpoint_id))
             .collect::<Vec<_>>();
         assert_eq!(retained_commits.as_slice(), live_commits);
 
@@ -2680,8 +2675,8 @@ mod tests {
     #[tokio::test]
     async fn compacted_cluster_cursor_must_match_anchor_authority() {
         let backend = Arc::new(InProcessBackend::new(1));
-        let anchor = CheckpointAttempt::new(1, 11);
-        let live = CheckpointAttempt::new(3, 33);
+        let anchor = CheckpointAttempt::canonical(1);
+        let live = CheckpointAttempt::canonical(3);
         let fence = assignment_fence(3, &[7]);
         let mut decisions = cluster_decisions(&fence, 7).await;
         seal_with_fence(
@@ -2693,14 +2688,7 @@ mod tests {
             Some(&decisions.proof),
         )
         .await;
-        record_cluster_commit(
-            &decisions,
-            &backend,
-            anchor.epoch,
-            anchor.checkpoint_id,
-            &fence,
-        )
-        .await;
+        record_cluster_commit(&decisions, &backend, anchor.checkpoint_id, &fence).await;
         let next_owner = laminar_core::cluster::control::LeaderLeaseOwner {
             node: decisions.owner.node,
             boot: decisions.owner.boot,
@@ -2716,7 +2704,7 @@ mod tests {
             Some(&decisions.proof),
         )
         .await;
-        record_cluster_commit(&decisions, &backend, live.epoch, live.checkpoint_id, &fence).await;
+        record_cluster_commit(&decisions, &backend, live.checkpoint_id, &fence).await;
         assert_eq!(
             decisions
                 .authority
@@ -2744,7 +2732,7 @@ mod tests {
         let error = committer.commit_ready().await.unwrap_err();
         assert!(error
             .to_string()
-            .contains("compacted external cursor checkpoint 11 fencing token 2"));
+            .contains("compacted external cursor checkpoint 1 fencing token 2"));
         assert!(error.to_string().contains("authoritative token 1"));
         assert!(recorded.lock().is_empty());
     }
@@ -2752,7 +2740,7 @@ mod tests {
     #[tokio::test]
     async fn tampered_marker_checksum_fails_without_external_commit() {
         let backend = Arc::new(InProcessBackend::new(1));
-        let attempt = CheckpointAttempt::new(4, 44);
+        let attempt = CheckpointAttempt::canonical(4);
         let namespace = namespace();
         let key = descriptor_key(&namespace, 0);
         let mut marker = encode_prepared_marker(&namespace, attempt, 0, Some(b"original")).unwrap();
@@ -2769,7 +2757,7 @@ mod tests {
         let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
         let handle = spawn_recording_sink(Arc::clone(&recorded));
         let decisions = decisions().await;
-        record_local_commit(&decisions, 4, 44).await;
+        record_local_commit(&decisions, 4).await;
         let mut committer = CoordinatedCommitter::new(
             backend as Arc<dyn StateBackend>,
             vec![(TEST_SINK_ID.into(), handle)],
@@ -2787,7 +2775,7 @@ mod tests {
     #[tokio::test]
     async fn local_outcome_rejects_a_cluster_assignment_seal() {
         let backend = Arc::new(InProcessBackend::new(1));
-        let attempt = CheckpointAttempt::new(4, 45);
+        let attempt = CheckpointAttempt::canonical(4);
         let fence = assignment_fence(4, &[1]);
         let proof = leader_proof(&fence, 1, 1, 1);
         seal_with_fence(
@@ -2802,7 +2790,7 @@ mod tests {
         let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
         let handle = spawn_recording_sink(Arc::clone(&recorded));
         let decisions = decisions().await;
-        record_local_commit(&decisions, 4, 45).await;
+        record_local_commit(&decisions, 4).await;
         let mut committer = CoordinatedCommitter::new(
             backend as Arc<dyn StateBackend>,
             vec![(TEST_SINK_ID.into(), handle)],
@@ -2821,10 +2809,9 @@ mod tests {
     async fn caught_up_history_still_rejects_a_different_deployment() {
         let backend = Arc::new(InProcessBackend::new(1));
         let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
-        let handle =
-            spawn_recording_sink_with_cursor(Arc::clone(&recorded), external_cursor(44, 1));
+        let handle = spawn_recording_sink_with_cursor(Arc::clone(&recorded), external_cursor(4, 1));
         let decisions = decisions().await;
-        record_local_commit(&decisions, 4, 44).await;
+        record_local_commit(&decisions, 4).await;
         let mut committer = CoordinatedCommitter::new(
             backend as Arc<dyn StateBackend>,
             vec![(TEST_SINK_ID.into(), handle)],
@@ -2850,7 +2837,7 @@ mod tests {
             "version": 2,
             "scope": "cluster",
             "epoch": 4,
-            "checkpoint_id": 44,
+            "checkpoint_id": 4,
             "deployment_id": deployment_id(),
             "assignment_fence": null,
             "leader_proof": {
@@ -2893,7 +2880,7 @@ mod tests {
     #[tokio::test]
     async fn cluster_commit_rejects_marker_written_by_another_certified_participant() {
         let backend = Arc::new(InProcessBackend::new(2));
-        let attempt = CheckpointAttempt::new(5, 54);
+        let attempt = CheckpointAttempt::canonical(5);
         let fence = assignment_fence(4, &[7, 9]);
         let decisions = cluster_decisions(&fence, 7).await;
         backend.set_authoritative_version(fence.assignment_version);
@@ -2973,14 +2960,7 @@ mod tests {
             .seal_checkpoint(attempt, Some(&fence), &[0, 1], &keys)
             .await
             .unwrap());
-        record_cluster_commit(
-            &decisions,
-            &backend,
-            attempt.epoch,
-            attempt.checkpoint_id,
-            &fence,
-        )
-        .await;
+        record_cluster_commit(&decisions, &backend, attempt.checkpoint_id, &fence).await;
 
         let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
         let mut committer = CoordinatedCommitter::new(
@@ -3007,7 +2987,7 @@ mod tests {
     #[tokio::test]
     async fn external_commit_rejects_participants_outside_the_outcome() {
         let backend = Arc::new(InProcessBackend::new(2));
-        let attempt = CheckpointAttempt::new(5, 55);
+        let attempt = CheckpointAttempt::canonical(5);
         let fence = assignment_fence(4, &[7, 9]);
         let decisions = cluster_decisions(&fence, 7).await;
         seal_with_fence(
@@ -3021,7 +3001,7 @@ mod tests {
         .await;
         let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
         let handle = spawn_recording_sink(Arc::clone(&recorded));
-        record_cluster_commit(&decisions, &backend, 5, 55, &fence).await;
+        record_cluster_commit(&decisions, &backend, 5, &fence).await;
         let mut committer = CoordinatedCommitter::new(
             backend as Arc<dyn StateBackend>,
             vec![(TEST_SINK_ID.into(), handle)],
@@ -3045,7 +3025,7 @@ mod tests {
         let raw = Arc::new(InMemory::new());
         let store: Arc<dyn ObjectStore> = raw.clone();
         let backend = Arc::new(ObjectStoreBackend::cluster_shared(store, "node-7", 2));
-        let attempt = CheckpointAttempt::new(5, 56);
+        let attempt = CheckpointAttempt::canonical(5);
         let fence = assignment_fence(4, &[7, 9]);
         let decisions = cluster_decisions(&fence, 7).await;
         seal_with_fence(
@@ -3059,7 +3039,7 @@ mod tests {
         .await;
         let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
         let handle = spawn_recording_sink(Arc::clone(&recorded));
-        record_cluster_commit(&decisions, &backend, 5, 56, &fence).await;
+        record_cluster_commit(&decisions, &backend, 5, &fence).await;
         let deleted_key = participant_ready_key(9);
         raw.delete(&descriptor_object_path(attempt, &deleted_key))
             .await
@@ -3087,7 +3067,7 @@ mod tests {
         let raw = Arc::new(InMemory::new());
         let store: Arc<dyn ObjectStore> = raw.clone();
         let backend = Arc::new(ObjectStoreBackend::cluster_shared(store, "node-7", 2));
-        let attempt = CheckpointAttempt::new(5, 57);
+        let attempt = CheckpointAttempt::canonical(5);
         let fence = assignment_fence(4, &[7, 9]);
         let decisions = cluster_decisions(&fence, 7).await;
         seal_with_fence(
@@ -3100,7 +3080,7 @@ mod tests {
         )
         .await;
         let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
-        record_cluster_commit(&decisions, &backend, 5, 57, &fence).await;
+        record_cluster_commit(&decisions, &backend, 5, &fence).await;
 
         let mutated_key = participant_ready_key(9);
         let mut mutated = serde_json::from_slice::<ParticipantReady>(
@@ -3151,7 +3131,7 @@ mod tests {
     #[tokio::test]
     async fn external_commit_rejects_a_different_outcome_assignment() {
         let backend = Arc::new(InProcessBackend::new(1));
-        let attempt = CheckpointAttempt::new(6, 66);
+        let attempt = CheckpointAttempt::canonical(6);
         let sealed_fence = assignment_fence(4, &[7]);
         let decision_fence = assignment_fence(5, &[7]);
         let decisions = cluster_decisions(&decision_fence, 7).await;
@@ -3166,7 +3146,7 @@ mod tests {
         .await;
         let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
         let handle = spawn_recording_sink(Arc::clone(&recorded));
-        record_cluster_commit(&decisions, &backend, 6, 66, &decision_fence).await;
+        record_cluster_commit(&decisions, &backend, 6, &decision_fence).await;
         let mut committer = CoordinatedCommitter::new(
             backend as Arc<dyn StateBackend>,
             vec![(TEST_SINK_ID.into(), handle)],
@@ -3190,7 +3170,7 @@ mod tests {
         let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
         let handle = spawn_recording_sink(Arc::clone(&recorded));
         let decisions = decisions().await;
-        record_local_commit(&decisions, 4, 44).await;
+        record_local_commit(&decisions, 4).await;
         let lag = Arc::new(AtomicU64::new(7));
         let lag_known = Arc::new(AtomicBool::new(true));
         let mut committer = CoordinatedCommitter::new(
@@ -3217,13 +3197,13 @@ mod tests {
     #[tokio::test]
     async fn live_external_cursor_rollback_fails_closed() {
         let backend = Arc::new(InProcessBackend::new(1));
-        let attempt = CheckpointAttempt::new(1, 11);
+        let attempt = CheckpointAttempt::canonical(1);
         seal(&backend, attempt, &[(0, Some(b"e1"))]).await;
         let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
         let cursor: ExternalCursor = Arc::new(Mutex::new(None));
         let handle = spawn_recording_sink_with_cursor(Arc::clone(&recorded), Arc::clone(&cursor));
         let decisions = decisions().await;
-        record_local_commit(&decisions, 1, 11).await;
+        record_local_commit(&decisions, 1).await;
         let mut committer = CoordinatedCommitter::new(
             backend as Arc<dyn StateBackend>,
             vec![(TEST_SINK_ID.into(), handle)],
@@ -3244,7 +3224,7 @@ mod tests {
         *cursor.lock() = None;
 
         let error = committer.commit_ready().await.unwrap_err();
-        assert!(error.to_string().contains("rolled back from 11 to 0"));
+        assert!(error.to_string().contains("rolled back from 1 to 0"));
         assert_eq!(recorded.lock().len(), 1);
     }
 }

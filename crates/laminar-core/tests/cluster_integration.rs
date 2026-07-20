@@ -120,7 +120,7 @@ async fn barrier_announce_then_follower_observes_and_acks() {
     let follower_ids: Vec<_> = followers.iter().map(|n| n.instance_id).collect();
     let announcement = BarrierAnnouncement {
         epoch: 7,
-        checkpoint_id: 101,
+        checkpoint_id: 7,
         assignment_fence: None,
         leader_proof: None,
         phase: laminar_core::cluster::control::Phase::Prepare,
@@ -158,7 +158,7 @@ async fn barrier_announce_then_follower_observes_and_acks() {
             .controller
             .ack_barrier(&BarrierAck {
                 epoch: 7,
-                checkpoint_id: 101,
+                checkpoint_id: 7,
                 assignment_digest: None,
                 ok: true,
                 error: None,
@@ -573,7 +573,7 @@ async fn quorum_times_out_when_follower_silent() {
 
     let announcement = BarrierAnnouncement {
         epoch: 42,
-        checkpoint_id: 1,
+        checkpoint_id: 42,
         assignment_fence: None,
         leader_proof: None,
         phase: laminar_core::cluster::control::Phase::Prepare,
@@ -592,7 +592,7 @@ async fn quorum_times_out_when_follower_silent() {
         .controller
         .ack_barrier(&BarrierAck {
             epoch: 42,
-            checkpoint_id: 1,
+            checkpoint_id: 42,
             assignment_digest: None,
             ok: true,
             error: None,

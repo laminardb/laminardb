@@ -10,6 +10,7 @@
 #![allow(clippy::disallowed_types)] // cold path: object store setup
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use object_store::local::LocalFileSystem;
@@ -107,22 +108,67 @@ fn url_path_prefix(url: &str) -> &str {
         .map_or("", |i| after_scheme[i + 1..].trim_matches('/'))
 }
 
-/// Normalized filesystem path from a `file://` URL: scheme stripped and
-/// the Windows drive-letter slash removed (`file:///C:/x` → `C:/x`).
+/// Absolute local filesystem path from a canonical lowercase `file://` URL.
 ///
 /// # Errors
-/// Returns [`ObjectStoreBuilderError::InvalidUrl`] when the scheme is
-/// missing or the path is empty.
-pub fn file_url_path(url: &str) -> Result<&str, ObjectStoreBuilderError> {
-    let path = url
-        .strip_prefix("file://")
-        .ok_or_else(|| ObjectStoreBuilderError::InvalidUrl(url.to_string()))?;
-    if path.is_empty() {
+/// Returns [`ObjectStoreBuilderError::InvalidUrl`] for a non-file scheme,
+/// remote authority, relative path, query, fragment, or invalid encoding.
+pub fn file_url_path(url: &str) -> Result<PathBuf, ObjectStoreBuilderError> {
+    let parsed = parse_absolute_local_file_url(url)?;
+    let path = parsed.to_file_path().map_err(|()| {
+        ObjectStoreBuilderError::InvalidUrl("file URL is not a local filesystem path".to_string())
+    })?;
+    if !path.is_absolute() {
         return Err(ObjectStoreBuilderError::InvalidUrl(
-            "file:// URL has empty path".to_string(),
+            "file URL path must be absolute".to_string(),
         ));
     }
-    Ok(strip_windows_leading_slash(path))
+    Ok(path)
+}
+
+/// Whether a file URL syntactically names an absolute local namespace.
+///
+/// This failure-domain classification is deliberately independent of the current host's path
+/// syntax. Actual store construction still calls [`file_url_path`] and rejects paths the current
+/// operating system cannot represent before any runtime starts.
+#[must_use]
+pub fn is_absolute_local_file_url(url: &str) -> bool {
+    parse_absolute_local_file_url(url).is_ok()
+}
+
+fn parse_absolute_local_file_url(url: &str) -> Result<url::Url, ObjectStoreBuilderError> {
+    if !url.starts_with("file://") {
+        return Err(ObjectStoreBuilderError::InvalidUrl(
+            "file URL scheme must be lowercase 'file://'".to_string(),
+        ));
+    }
+    let parsed = url::Url::parse(url)
+        .map_err(|error| ObjectStoreBuilderError::InvalidUrl(error.to_string()))?;
+    if parsed.scheme() != "file" {
+        return Err(ObjectStoreBuilderError::InvalidUrl(format!(
+            "expected file URL, found scheme '{}'",
+            parsed.scheme()
+        )));
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(ObjectStoreBuilderError::InvalidUrl(
+            "file URL must not contain a query or fragment".to_string(),
+        ));
+    }
+    if parsed
+        .host_str()
+        .is_some_and(|host| !host.eq_ignore_ascii_case("localhost"))
+    {
+        return Err(ObjectStoreBuilderError::InvalidUrl(
+            "file URL must not name a remote host".to_string(),
+        ));
+    }
+    if !parsed.path().starts_with('/') {
+        return Err(ObjectStoreBuilderError::InvalidUrl(
+            "file URL path must be absolute".to_string(),
+        ));
+    }
+    Ok(parsed)
 }
 
 /// Extract the local path from a `file://` URL and create a `LocalFileSystem`.
@@ -130,33 +176,15 @@ fn build_local_file_system(url: &str) -> Result<Arc<dyn ObjectStore>, ObjectStor
     let path = file_url_path(url)?;
 
     // Ensure the directory exists — LocalFileSystem doesn't create it.
-    std::fs::create_dir_all(path).map_err(|e| {
-        ObjectStoreBuilderError::InvalidUrl(format!("failed to create directory '{path}': {e}"))
+    std::fs::create_dir_all(&path).map_err(|e| {
+        ObjectStoreBuilderError::InvalidUrl(format!(
+            "failed to create directory '{}': {e}",
+            path.display()
+        ))
     })?;
 
-    let fs = LocalFileSystem::new_with_prefix(path)?;
+    let fs = LocalFileSystem::new_with_prefix(&path)?;
     Ok(Arc::new(fs))
-}
-
-/// Strip the leading `/` that precedes a Windows drive letter.
-///
-/// `"/C:/foo"` → `"C:/foo"`. Only active on Windows; on other platforms
-/// the path is returned unchanged.
-#[cfg(windows)]
-fn strip_windows_leading_slash(path: &str) -> &str {
-    let bytes = path.as_bytes();
-    // Pattern: `/X:/...` where X is an ASCII letter
-    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
-        &path[1..]
-    } else {
-        path
-    }
-}
-
-/// No-op on non-Windows platforms — the leading slash is the valid root.
-#[cfg(not(windows))]
-fn strip_windows_leading_slash(path: &str) -> &str {
-    path
 }
 
 // ---------------------------------------------------------------------------
@@ -271,8 +299,8 @@ mod tests {
     #[test]
     fn test_file_scheme_creates_local_fs() {
         let dir = tempfile::tempdir().unwrap();
-        let url = format!("file://{}", dir.path().to_str().unwrap());
-        let store = build_object_store(&url, &HashMap::new());
+        let url = url::Url::from_directory_path(dir.path()).unwrap();
+        let store = build_object_store(url.as_str(), &HashMap::new());
         assert!(store.is_ok(), "file:// should succeed: {store:?}");
     }
 
@@ -280,8 +308,39 @@ mod tests {
     fn test_file_scheme_empty_path_errors() {
         let result = build_object_store("file://", &HashMap::new());
         assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("empty path"), "got: {err}");
+    }
+
+    #[test]
+    fn file_url_requires_an_absolute_local_path() {
+        assert!(file_url_path("file://checkpoint-host/path").is_err());
+        assert!(file_url_path("file://./relative").is_err());
+        assert!(file_url_path("FILE:///tmp/path").is_err());
+        assert!(file_url_path("file:///tmp/path?version=1").is_err());
+        assert!(file_url_path("file:///tmp/path#fragment").is_err());
+    }
+
+    #[test]
+    fn absolute_local_file_url_classification_is_platform_independent() {
+        assert!(is_absolute_local_file_url("file:///tmp/checkpoints"));
+
+        let directory = tempfile::tempdir().unwrap();
+        let local_url = url::Url::from_directory_path(directory.path()).unwrap();
+        assert!(is_absolute_local_file_url(local_url.as_str()));
+
+        assert!(!is_absolute_local_file_url("file://checkpoint-host/path"));
+        assert!(!is_absolute_local_file_url("file://./relative"));
+        assert!(!is_absolute_local_file_url("FILE:///tmp/path"));
+        assert!(!is_absolute_local_file_url("file:///tmp/path?version=1"));
+        assert!(!is_absolute_local_file_url("file:///tmp/path#fragment"));
+    }
+
+    #[test]
+    fn file_url_decodes_escaped_path_segments() {
+        let directory = tempfile::tempdir().unwrap();
+        let expected = directory.path().join("laminar checkpoint");
+        let encoded = url::Url::from_directory_path(&expected).unwrap();
+        assert!(encoded.as_str().contains("laminar%20checkpoint"));
+        assert_eq!(file_url_path(encoded.as_str()).unwrap(), expected);
     }
 
     #[test]
@@ -350,32 +409,5 @@ mod tests {
             url_path_prefix("abfss://container@account.dfs.core.windows.net/p/q"),
             "p/q"
         );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn test_strip_windows_leading_slash() {
-        // Windows drive letter patterns — slash stripped
-        assert_eq!(strip_windows_leading_slash("/C:/foo"), "C:/foo");
-        assert_eq!(strip_windows_leading_slash("/D:/"), "D:/");
-        assert_eq!(strip_windows_leading_slash("/c:/bar"), "c:/bar");
-
-        // Non-drive paths — no change
-        assert_eq!(strip_windows_leading_slash("/path/to"), "/path/to");
-        assert_eq!(strip_windows_leading_slash("/tmp"), "/tmp");
-
-        // Edge cases
-        assert_eq!(strip_windows_leading_slash("/"), "/");
-        assert_eq!(strip_windows_leading_slash(""), "");
-        assert_eq!(strip_windows_leading_slash("C:/foo"), "C:/foo");
-    }
-
-    #[test]
-    #[cfg(not(windows))]
-    fn test_strip_windows_leading_slash() {
-        // On non-Windows, all paths are returned unchanged
-        assert_eq!(strip_windows_leading_slash("/C:/foo"), "/C:/foo");
-        assert_eq!(strip_windows_leading_slash("/path/to"), "/path/to");
-        assert_eq!(strip_windows_leading_slash(""), "");
     }
 }

@@ -43,6 +43,7 @@ arrow-schema = { workspace = true }
 arrow-ipc = { workspace = true }
 arrow-row = { workspace = true }
 chrono = { workspace = true }
+url = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }

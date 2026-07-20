@@ -55,26 +55,38 @@ mod durable_backend_gate {
         let self_id = NodeId(1);
         let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(self_id));
         let (_tx, rx) = watch::channel(Vec::new());
-        let controller = Arc::new(ClusterController::new(self_id, kv, None, rx));
+        let controller = Arc::new(ClusterController::new(self_id, Arc::clone(&kv), None, rx));
         controller
             .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
                 std::time::Duration::from_secs(30),
             )))
             .expect("install the process authority deadline required by cluster construction");
 
-        let db = LaminarDB::builder()
+        let checkpoint_store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let participant = laminar_core::checkpoint::CheckpointParticipant {
+            node_id: self_id.0,
+            boot_incarnation: controller.recovery_incarnation(),
+        };
+        let verified_namespaces =
+            laminar_core::cluster::control::prove_shared_object_store_namespaces(
+                participant,
+                &[participant],
+                kv,
+                Arc::clone(&checkpoint_store),
+                Arc::clone(&checkpoint_store),
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        let err = LaminarDB::builder()
             .cluster_controller(controller)
-            .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
+            .verified_cluster_namespaces(verified_namespaces)
             .state_backend(Arc::new(InProcessBackend::new(4)))
             .vnode_registry(Arc::new(VnodeRegistry::new(4)))
             .build()
             .await
-            .expect("build succeeds; durability is enforced at start");
-
-        let err = db
-            .start()
-            .await
-            .expect_err("cluster start must reject a non-durable backend");
+            .expect_err("cluster construction must reject a non-durable backend");
         assert!(
             err.to_string().contains("LDB-0011"),
             "expected LDB-0011 durable-backend error, got: {err}"
@@ -1723,7 +1735,6 @@ mod two_pc {
 
     async fn create_test_recovery_capsule(
         store: &CheckpointDecisionStore,
-        epoch: u64,
         checkpoint_id: u64,
         fence: &CheckpointAssignmentFence,
     ) -> laminar_core::checkpoint::RecoveryCapsuleRef {
@@ -1750,7 +1761,7 @@ mod two_pc {
             .collect();
         let capsule = ClusterRecoveryCapsule {
             version: CLUSTER_RECOVERY_CAPSULE_VERSION,
-            attempt: CheckpointAttempt::new(epoch, checkpoint_id),
+            attempt: CheckpointAttempt::new(checkpoint_id, checkpoint_id),
             deployment_id,
             pipeline_identity: PipelineIdentity::empty(),
             assignment_fence: fence.clone(),
@@ -1950,6 +1961,8 @@ mod two_pc {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn follower_timeout_commits_when_decision_recorded() {
+        const CHECKPOINT_ID: u64 = 42;
+
         let harness = ClusterEngineHarness::spawn(2, 4).await;
         let leader_idx = harness.leader_idx();
         let follower_idx = harness.follower_idxs()[0];
@@ -1973,12 +1986,12 @@ mod two_pc {
         let fence = super::test_assignment_fence(&harness.cluster, &registry);
         let leader_proof = live_leader_proof(&leader_node.controller);
         let recovery_capsule =
-            create_test_recovery_capsule(decision_store.as_ref(), 42, 100, &fence).await;
+            create_test_recovery_capsule(decision_store.as_ref(), CHECKPOINT_ID, &fence).await;
         authority
             .record_cluster_outcome(
                 &leader_proof,
-                42,
-                100,
+                CHECKPOINT_ID,
+                CHECKPOINT_ID,
                 fence.clone(),
                 laminar_core::checkpoint_decision::CheckpointVerdict::Commit,
                 Some(recovery_capsule),
@@ -1998,8 +2011,8 @@ mod two_pc {
         .await;
 
         let ann = BarrierAnnouncement {
-            epoch: 42,
-            checkpoint_id: 100,
+            epoch: CHECKPOINT_ID,
+            checkpoint_id: CHECKPOINT_ID,
             assignment_fence: Some(fence.clone()),
             leader_proof: Some(leader_proof),
             phase: Phase::Prepare,
@@ -2012,17 +2025,20 @@ mod two_pc {
 
         assert!(committed);
         let outcome = authority
-            .cluster_outcome(42)
+            .cluster_outcome(CHECKPOINT_ID)
             .await
             .expect("cluster outcome read")
             .expect("pre-recorded cluster outcome");
         assert!(outcome.is_commit());
+        assert_eq!(outcome.checkpoint_id, CHECKPOINT_ID);
         assert_eq!(outcome.assignment_fence.as_ref(), Some(&fence));
         harness.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn follower_timeout_stays_in_doubt_when_no_decision() {
+        const CHECKPOINT_ID: u64 = 99;
+
         let harness = ClusterEngineHarness::spawn(2, 4).await;
         let leader_idx = harness.leader_idx();
         let follower_idx = harness.follower_idxs()[0];
@@ -2058,8 +2074,8 @@ mod two_pc {
 
         let leader_proof = live_leader_proof(&leader_node.controller);
         let ann = BarrierAnnouncement {
-            epoch: 99,
-            checkpoint_id: 200,
+            epoch: CHECKPOINT_ID,
+            checkpoint_id: CHECKPOINT_ID,
             assignment_fence: Some(fence.clone()),
             leader_proof: Some(leader_proof),
             phase: Phase::Prepare,
@@ -2075,7 +2091,7 @@ mod two_pc {
         );
         assert!(
             authority
-                .cluster_outcome(99)
+                .cluster_outcome(CHECKPOINT_ID)
                 .await
                 .expect("cluster outcome read")
                 .is_none(),

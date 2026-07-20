@@ -3,7 +3,7 @@
 //! Checkpoint manifest is the source of truth; external source progress commits are advisory.
 #![allow(clippy::disallowed_types)] // cold path
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,7 +22,9 @@ use laminar_core::state::{CheckpointAttempt, StateBackend, StateBackendError};
 use laminar_core::storage::checkpoint_manifest::{
     CheckpointManifest, ConnectorCheckpoint, PipelineIdentity,
 };
-use laminar_core::storage::checkpoint_store::{CheckpointStore, CheckpointStoreError};
+use laminar_core::storage::checkpoint_store::{
+    CheckpointStore, CheckpointStoreError, MAX_CHECKPOINT_INVENTORY_ENTRIES,
+};
 use tracing::{debug, error, info, warn};
 
 #[cfg(all(feature = "cluster", test))]
@@ -138,6 +140,24 @@ enum PendingDecisionWait {
     },
 }
 
+struct PendingSinkWitnessCreate {
+    attempt: CheckpointAttempt,
+    handle: tokio::task::JoinHandle<
+        Result<laminar_core::checkpoint_decision::CheckpointSinkOpenWitness, String>,
+    >,
+}
+
+enum PendingSinkWitnessClearState {
+    Running(tokio::task::JoinHandle<Result<(), String>>),
+    NeedsRetry,
+    Verified,
+}
+
+struct PendingSinkWitnessClear {
+    witness: laminar_core::checkpoint_decision::CheckpointSinkOpenWitness,
+    state: PendingSinkWitnessClearState,
+}
+
 struct PreparedVnodePartial {
     vnode: u32,
     payload: bytes::Bytes,
@@ -187,7 +207,7 @@ pub struct CheckpointConfig {
     pub(crate) cleanup_timeout: Duration,
     /// Private cluster-control health limit; the absolute checkpoint deadline remains authoritative.
     pub(crate) quorum_timeout: Duration,
-    /// Cap on in-flight captured-state bytes. At the cap, barrier admission pauses.
+    /// Hard byte budget shared by capture, durable storage, validation, and recovery.
     pub max_staged_bytes: u64,
     /// Runtime-owned safety cap on sealed-but-not-externally-committed epochs rather than
     /// another public checkpoint tuning dimension.
@@ -201,7 +221,8 @@ impl Default for CheckpointConfig {
             checkpoint_timeout: Duration::from_secs(120),
             cleanup_timeout: Duration::from_secs(30),
             quorum_timeout: Duration::from_secs(3),
-            max_staged_bytes: 512 * 1024 * 1024,
+            max_staged_bytes:
+                laminar_core::storage::checkpoint_store::DEFAULT_MAX_CHECKPOINT_STATE_BYTES,
             max_uncommitted_epochs: 16,
         }
     }
@@ -286,15 +307,54 @@ pub struct CheckpointRequest {
     pub source_offset_overrides: HashMap<String, ConnectorCheckpoint>,
 }
 
-/// Serializes durable checkpoint-id reservation with the corresponding local epoch claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SinkEpochReservation {
+    Opening(CheckpointAttempt),
+    Ready(CheckpointAttempt),
+    InDoubt(CheckpointAttempt),
+}
+
+impl SinkEpochReservation {
+    const fn attempt(self) -> CheckpointAttempt {
+        match self {
+            Self::Opening(attempt) | Self::Ready(attempt) | Self::InDoubt(attempt) => attempt,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SinkEpochOpenFailure {
+    error: DbError,
+    rollback_complete: bool,
+}
+
+impl SinkEpochOpenFailure {
+    #[cfg(test)]
+    const fn requires_pipeline_recovery(&self) -> bool {
+        !self.rollback_complete
+    }
+}
+
+impl std::fmt::Display for SinkEpochOpenFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+/// Serializes allocation from the single durable checkpoint order.
 ///
-/// Checkpoint IDs come exclusively from the durable decision store. Epochs are process-local
-/// ordering labels and advance only after a durable ID reservation succeeds. Failed checkpoint
-/// attempts are abandoned, so both values may have gaps across crashes.
+/// Runtime-generated attempts use the durable checkpoint ID as their epoch. A checkpoint-
+/// committable sink reserves that identity before opening its transaction and checkpoint
+/// admission consumes the exact same reservation.
 #[derive(Debug)]
 pub(crate) struct EpochAllocator {
-    epoch: std::sync::atomic::AtomicU64,
+    next_id_floor: std::sync::atomic::AtomicU64,
+    /// Highest floor observed from recovery or another cluster participant. Kept separate from
+    /// the allocator's own successor so an exact `attempt + 1` observation fences a pre-opened
+    /// sink epoch, including when it races between durable allocation and in-memory publication.
+    observed_id_floor: std::sync::atomic::AtomicU64,
     allocation_lock: tokio::sync::Mutex<()>,
+    sink_epoch_reservation: parking_lot::Mutex<Option<SinkEpochReservation>>,
     allocation_timeout: Duration,
     decision_store:
         std::sync::OnceLock<Arc<laminar_core::checkpoint_decision::CheckpointDecisionStore>>,
@@ -308,11 +368,27 @@ fn checked_successor_epoch(epoch: u64, context: &str) -> Result<u64, DbError> {
     })
 }
 
+fn require_canonical_attempt(
+    attempt: CheckpointAttempt,
+    context: &str,
+) -> Result<CheckpointAttempt, DbError> {
+    if attempt.is_canonical() {
+        Ok(attempt)
+    } else {
+        Err(DbError::Checkpoint(format!(
+            "[LDB-6050] {context} requires one nonzero canonical checkpoint ID; received epoch {} and checkpoint ID {}",
+            attempt.epoch, attempt.checkpoint_id
+        )))
+    }
+}
+
 impl EpochAllocator {
-    fn new(epoch: u64, allocation_timeout: Duration) -> Self {
+    fn new(next_id_floor: u64, allocation_timeout: Duration) -> Self {
         Self {
-            epoch: std::sync::atomic::AtomicU64::new(epoch),
+            next_id_floor: std::sync::atomic::AtomicU64::new(next_id_floor),
+            observed_id_floor: std::sync::atomic::AtomicU64::new(0),
             allocation_lock: tokio::sync::Mutex::new(()),
+            sink_epoch_reservation: parking_lot::Mutex::new(None),
             allocation_timeout,
             decision_store: std::sync::OnceLock::new(),
         }
@@ -352,10 +428,7 @@ impl EpochAllocator {
         }
     }
 
-    /// Durably reserve a checkpoint ID, then claim the matching local epoch.
-    ///
-    /// The lock keeps concurrent admissions in epoch order. An ID reservation error returns
-    /// without advancing the epoch; once the reservation lands, a later failure may leave a gap.
+    /// Durably reserve the next canonical checkpoint attempt.
     #[cfg(test)]
     pub(crate) async fn allocate(&self) -> Result<CheckpointAttempt, DbError> {
         self.allocate_until(tokio::time::Instant::now() + self.allocation_timeout)
@@ -368,7 +441,6 @@ impl EpochAllocator {
         &self,
         deadline: tokio::time::Instant,
     ) -> Result<CheckpointAttempt, DbError> {
-        use std::sync::atomic::Ordering;
         let timeout = self.allocation_timeout;
         let _guard = tokio::time::timeout_at(deadline, self.allocation_lock.lock())
             .await
@@ -377,12 +449,34 @@ impl EpochAllocator {
                     "[LDB-6050] checkpoint ID allocator lock exhausted its {timeout:?} admission deadline"
                 ))
             })?;
+        if let Some(reservation) = *self.sink_epoch_reservation.lock() {
+            let attempt = reservation.attempt();
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6050] pre-opened sink epoch {} must be consumed before allocating another checkpoint attempt",
+                attempt.epoch
+            )));
+        }
+        self.allocate_fresh_until(deadline).await
+    }
+
+    async fn allocate_fresh_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<CheckpointAttempt, DbError> {
+        use std::sync::atomic::Ordering;
+
+        let timeout = self.allocation_timeout;
         let store = self.decision_store.get().ok_or_else(|| {
             DbError::Checkpoint(
                 "[LDB-6050] checkpoint ID allocation requires a durable decision store".into(),
             )
         })?;
-        let checkpoint_id = tokio::time::timeout_at(deadline, store.allocate_checkpoint_id())
+        loop {
+            let minimum = self.next_id_floor.load(Ordering::Acquire).max(1);
+            let checkpoint_id = tokio::time::timeout_at(
+                deadline,
+                store.allocate_checkpoint_id_at_least(minimum),
+            )
             .await
             .map_err(|_| {
                 DbError::Checkpoint(format!(
@@ -394,29 +488,194 @@ impl EpochAllocator {
                     "[LDB-6050] durable checkpoint ID reservation failed: {e}"
                 ))
             })?;
-        let epoch = self
-            .epoch
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_add(1)
-            })
-            .map_err(|current| {
-                DbError::Checkpoint(format!(
-                    "[LDB-6050] checkpoint epoch space exhausted at {current} after reserving durable checkpoint ID {checkpoint_id}"
-                ))
-            })?;
-        Ok(CheckpointAttempt::new(epoch, checkpoint_id))
+            let successor = checked_successor_epoch(
+                checkpoint_id,
+                "advancing the durable checkpoint ID allocator",
+            )?;
+
+            // Recovery and follower observation may raise the floor without taking the async
+            // allocator lock. Accept this reservation only if its CAS linearizes before that
+            // advance; otherwise burn it and retry at the observed floor.
+            let mut floor = self.next_id_floor.load(Ordering::Acquire);
+            loop {
+                if checkpoint_id < floor {
+                    break;
+                }
+                match self.next_id_floor.compare_exchange_weak(
+                    floor,
+                    successor.max(floor),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return Ok(CheckpointAttempt::canonical(checkpoint_id)),
+                    Err(observed) => floor = observed,
+                }
+            }
+            tokio::task::yield_now().await;
+        }
     }
 
-    /// The epoch the next successful allocation will claim.
+    /// Reserve the attempt a checkpoint-committable sink is about to open.
+    async fn reserve_sink_epoch_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<CheckpointAttempt, DbError> {
+        let timeout = self.allocation_timeout;
+        let _guard = tokio::time::timeout_at(deadline, self.allocation_lock.lock())
+            .await
+            .map_err(|_| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6050] checkpoint ID allocator lock exhausted its {timeout:?} sink-epoch deadline"
+                ))
+            })?;
+        if let Some(reservation) = *self.sink_epoch_reservation.lock() {
+            let attempt = reservation.attempt();
+            let state = match reservation {
+                SinkEpochReservation::Opening(_) => "opening",
+                SinkEpochReservation::Ready(_) => "ready",
+                SinkEpochReservation::InDoubt(_) => "in-doubt and requires recovery",
+            };
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6050] sink epoch {} is already reserved ({state})",
+                attempt.epoch
+            )));
+        }
+        loop {
+            let attempt = self.allocate_fresh_until(deadline).await?;
+            *self.sink_epoch_reservation.lock() = Some(SinkEpochReservation::Opening(attempt));
+            if !self.sink_reservation_is_stale(attempt) {
+                return Ok(attempt);
+            }
+            self.burn_sink_epoch_reservation(attempt)?;
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn mark_sink_epoch_ready(&self, attempt: CheckpointAttempt) -> Result<(), DbError> {
+        let mut reservation = self.sink_epoch_reservation.lock();
+        match *reservation {
+            Some(SinkEpochReservation::Opening(opening)) if opening == attempt => {
+                *reservation = Some(SinkEpochReservation::Ready(attempt));
+                Ok(())
+            }
+            Some(current) => Err(DbError::Checkpoint(format!(
+                "[LDB-6050] sink epoch reservation mismatch: expected {attempt:?}, found {current:?}"
+            ))),
+            None => Err(DbError::Checkpoint(format!(
+                "[LDB-6050] sink epoch {attempt:?} lost its durable reservation before activation"
+            ))),
+        }
+    }
+
+    fn mark_sink_epoch_in_doubt(&self, attempt: CheckpointAttempt) -> Result<(), DbError> {
+        let mut reservation = self.sink_epoch_reservation.lock();
+        match *reservation {
+            Some(SinkEpochReservation::Opening(opening)) if opening == attempt => {
+                *reservation = Some(SinkEpochReservation::InDoubt(attempt));
+                Ok(())
+            }
+            Some(SinkEpochReservation::InDoubt(current)) if current == attempt => Ok(()),
+            Some(current) => Err(DbError::Checkpoint(format!(
+                "[LDB-6050] cannot poison sink epoch {attempt:?}; current reservation is {current:?}"
+            ))),
+            None => Err(DbError::Checkpoint(format!(
+                "[LDB-6050] cannot poison sink epoch {attempt:?}; its reservation is missing"
+            ))),
+        }
+    }
+
+    fn burn_sink_epoch_reservation(&self, attempt: CheckpointAttempt) -> Result<(), DbError> {
+        let mut reservation = self.sink_epoch_reservation.lock();
+        match *reservation {
+            Some(current) if current.attempt() == attempt => {
+                reservation.take();
+                Ok(())
+            }
+            Some(current) => Err(DbError::Checkpoint(format!(
+                "[LDB-6050] cannot burn sink epoch {attempt:?}; current reservation is {current:?}"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) async fn consume_sink_epoch_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<CheckpointAttempt, DbError> {
+        let timeout = self.allocation_timeout;
+        let _guard = tokio::time::timeout_at(deadline, self.allocation_lock.lock())
+            .await
+            .map_err(|_| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6050] checkpoint ID allocator lock exhausted its {timeout:?} admission deadline"
+                ))
+            })?;
+        let mut reservation = self.sink_epoch_reservation.lock();
+        match *reservation {
+            Some(SinkEpochReservation::Ready(attempt))
+                if !self.sink_reservation_is_stale(attempt) =>
+            {
+                reservation.take();
+                Ok(attempt)
+            }
+            Some(SinkEpochReservation::Ready(attempt)) => {
+                *reservation = Some(SinkEpochReservation::InDoubt(attempt));
+                Err(DbError::Checkpoint(format!(
+                    "[LDB-6050] sink epoch {} fell below an advanced checkpoint floor and requires recovery",
+                    attempt.epoch
+                )))
+            }
+            Some(SinkEpochReservation::Opening(attempt)) => Err(DbError::Checkpoint(format!(
+                "[LDB-6050] sink epoch {} is not ready for checkpoint admission",
+                attempt.epoch
+            ))),
+            Some(SinkEpochReservation::InDoubt(attempt)) => Err(DbError::Checkpoint(format!(
+                "[LDB-6050] sink epoch {} is in-doubt and requires recovery before checkpoint admission",
+                attempt.epoch
+            ))),
+            None => Err(DbError::Checkpoint(
+                "[LDB-6050] checkpoint-committable sinks have no pre-opened durable attempt".into(),
+            )),
+        }
+    }
+
+    fn sink_epoch_reservation(&self) -> Option<SinkEpochReservation> {
+        *self.sink_epoch_reservation.lock()
+    }
+
+    fn sink_reservation_is_stale(&self, attempt: CheckpointAttempt) -> bool {
+        use std::sync::atomic::Ordering;
+
+        self.observed_id_floor.load(Ordering::Acquire) > attempt.checkpoint_id
+    }
+
+    /// Active pre-opened sink epoch, or the floor the next successful allocation will claim.
     pub(crate) fn peek_epoch(&self) -> u64 {
         use std::sync::atomic::Ordering;
-        self.epoch.load(Ordering::Acquire)
+        if let Some(reservation) = *self.sink_epoch_reservation.lock() {
+            reservation.attempt().epoch
+        } else {
+            self.next_id_floor.load(Ordering::Acquire)
+        }
     }
 
     /// Monotonically advance the local epoch after recovery or observing a cluster attempt.
     pub(crate) fn advance_epoch_to(&self, epoch: u64) {
         use std::sync::atomic::Ordering;
-        self.epoch.fetch_max(epoch, Ordering::AcqRel);
+        // Publish the allocation fence first. An allocator that races this update must either
+        // observe the new floor or lose its CAS before the observation watermark becomes visible.
+        self.next_id_floor.fetch_max(epoch, Ordering::AcqRel);
+        self.observed_id_floor.fetch_max(epoch, Ordering::AcqRel);
+        let mut reservation = self.sink_epoch_reservation.lock();
+        if let Some(current) = *reservation {
+            if matches!(
+                current,
+                SinkEpochReservation::Opening(_) | SinkEpochReservation::Ready(_)
+            ) && self.sink_reservation_is_stale(current.attempt())
+            {
+                *reservation = Some(SinkEpochReservation::InDoubt(current.attempt()));
+            }
+        }
     }
 
     #[cfg(feature = "cluster")]
@@ -1155,10 +1414,20 @@ pub struct CheckpointCoordinator {
     // node as stopped only after this handle settles, otherwise it could choose a cut and then
     // observe this process publish a newer decision behind that cut.
     pending_decision_write: Option<PendingDecisionWrite>,
+    // Owns the create-before-begin write across caller cancellation. Until it settles, teardown
+    // retains the deployment fence and no higher external sink epoch may open.
+    pending_sink_witness_create: tokio::sync::Mutex<Option<PendingSinkWitnessCreate>>,
+    // Owns the close tombstone write across timeout, caller cancellation, and lost
+    // acknowledgements. Exact in-memory ownership is released only after this task is quiescent.
+    pending_sink_witness_clear: tokio::sync::Mutex<Option<PendingSinkWitnessClear>>,
+    // Live witness retained through pre-commit and the terminal decision. Recovery reconstructs
+    // this from the durable inventory after a process crash.
+    active_sink_witness:
+        parking_lot::Mutex<Option<laminar_core::checkpoint_decision::CheckpointSinkOpenWitness>>,
     // Set before failed-epoch rollback/successor setup starts and cleared only after both finish.
     // Cancellation must leave this latched: `phase == Idle` is not proof that connector cleanup
     // completed, because failure accounting intentionally precedes the bounded cleanup awaits.
-    failure_cleanup_in_doubt: bool,
+    failure_recovery_required: bool,
     // A participant-readiness PUT is the follower's irrevocable prepare boundary. Its error can be
     // an acknowledgement loss after the descriptor landed, so only a durable terminal outcome may
     // authorize rollback once this exact attempt has started the write.
@@ -1254,6 +1523,10 @@ pub struct CheckpointCoordinator {
     // recovery/external-commit-safe horizon. The JoinSet owns exactly one worker and aborts it on
     // coordinator drop, so remote GC can neither enter source-ack latency nor detach.
     retention_requests: tokio::sync::watch::Sender<Option<RetentionRequest>>,
+    // Bounded suffix of outcome-certified committed cuts. Checkpoint IDs may contain arbitrary
+    // burned gaps, so retention counts entries here instead of subtracting from the numeric ID.
+    recent_committed_checkpoints: VecDeque<u64>,
+    recent_committed_capacity: usize,
     retention_requested_horizon: u64,
     // Additional state-only history required by retained reference/delta partials. Decisions and
     // manifests retain exactly `max_retained`; only their transitive state ancestors get slack.
@@ -1283,7 +1556,7 @@ async fn load_highest(
     let ids = store.list_ids().await?;
     for id in ids.iter().rev() {
         match store.load_by_id(*id).await {
-            Ok(Some(m)) if m.checkpoint_id == *id => return Ok(Some(m)),
+            Ok(Some(manifest)) if manifest.checkpoint_id == *id => return Ok(Some(manifest)),
             Ok(Some(m)) => {
                 warn!(
                     storage_id = *id,
@@ -1327,6 +1600,25 @@ impl CheckpointCoordinator {
         config: CheckpointConfig,
         store: Box<dyn CheckpointStore>,
     ) -> Result<Self, DbError> {
+        laminar_core::storage::checkpoint_store::validate_max_checkpoint_state_bytes(
+            config.max_staged_bytes,
+        )
+        .map_err(|error| DbError::Config(format!("checkpoint.max_staged_bytes: {error}")))?;
+        let store_state_limit = store.max_state_data_bytes();
+        if store_state_limit != config.max_staged_bytes {
+            return Err(DbError::Config(format!(
+                "checkpoint store state limit {store_state_limit} does not match checkpoint.max_staged_bytes {}",
+                config.max_staged_bytes
+            )));
+        }
+        let recent_committed_capacity = config.max_retained.checked_add(1).ok_or_else(|| {
+            DbError::Config("checkpoint.max_retained is too large to count the current cut".into())
+        })?;
+        if recent_committed_capacity > MAX_CHECKPOINT_INVENTORY_ENTRIES {
+            return Err(DbError::Config(format!(
+                "checkpoint.max_retained must be less than {MAX_CHECKPOINT_INVENTORY_ENTRIES}"
+            )));
+        }
         let store: Arc<dyn CheckpointStore> = Arc::from(store);
         let highest = load_highest(store.as_ref()).await.map_err(|e| {
             DbError::Checkpoint(format!(
@@ -1359,7 +1651,10 @@ impl CheckpointCoordinator {
             phase: CheckpointPhase::Idle,
             decision_write_started: false,
             pending_decision_write: None,
-            failure_cleanup_in_doubt: false,
+            pending_sink_witness_create: tokio::sync::Mutex::new(None),
+            pending_sink_witness_clear: tokio::sync::Mutex::new(None),
+            active_sink_witness: parking_lot::Mutex::new(None),
+            failure_recovery_required: false,
             #[cfg(feature = "cluster")]
             participant_ready_write: None,
             checkpoints_completed: 0,
@@ -1399,6 +1694,8 @@ impl CheckpointCoordinator {
             #[cfg(feature = "cluster")]
             cluster_controller: None,
             retention_requests,
+            recent_committed_checkpoints: VecDeque::new(),
+            recent_committed_capacity,
             retention_requested_horizon: 0,
             state_ancestry_slack: 0,
             delta_chain_bound: None,
@@ -1546,10 +1843,7 @@ impl CheckpointCoordinator {
             Some(PendingDecisionWait::Completed {
                 outcome: Ok(Ok(result)),
                 ..
-            }) => {
-                self.decision_write_started = false;
-                Ok(*result)
-            }
+            }) => Ok(*result),
             Some(PendingDecisionWait::Completed {
                 outcome: Ok(Err(error)),
                 ..
@@ -1575,6 +1869,10 @@ impl CheckpointCoordinator {
         &mut self,
         deadline: tokio::time::Instant,
     ) -> Result<(), DbError> {
+        self.quiesce_pending_sink_witness_create_until(deadline)
+            .await?;
+        self.quiesce_pending_sink_witness_clear_until(deadline)
+            .await?;
         match self.wait_pending_decision_until(deadline).await {
             None => Ok(()),
             Some(PendingDecisionWait::Completed {
@@ -1632,6 +1930,31 @@ impl CheckpointCoordinator {
             }) => Err(DbError::Checkpoint(format!(
                 "[LDB-6038] checkpoint {checkpoint_id} epoch {epoch} still has an in-flight durable decision write; teardown remains fenced and must be retried"
             ))),
+        }
+    }
+
+    fn record_committed_checkpoint(&mut self, checkpoint_id: u64) -> Result<Option<u64>, DbError> {
+        if checkpoint_id == 0 {
+            return Err(DbError::Checkpoint(
+                "[LDB-6041] committed checkpoint ID must be nonzero".into(),
+            ));
+        }
+        match self.recent_committed_checkpoints.back().copied() {
+            Some(latest) if checkpoint_id < latest => {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6041] committed checkpoint {checkpoint_id} regresses retained cut {latest}"
+                )));
+            }
+            Some(latest) if checkpoint_id == latest => {}
+            _ => self.recent_committed_checkpoints.push_back(checkpoint_id),
+        }
+        while self.recent_committed_checkpoints.len() > self.recent_committed_capacity {
+            self.recent_committed_checkpoints.pop_front();
+        }
+        if self.recent_committed_checkpoints.len() < self.recent_committed_capacity {
+            Ok(None)
+        } else {
+            Ok(self.recent_committed_checkpoints.front().copied())
         }
     }
 
@@ -1891,6 +2214,399 @@ impl CheckpointCoordinator {
         })
     }
 
+    pub(crate) fn committable_sink_names(&self) -> Result<Vec<String>, DbError> {
+        let mut names = self
+            .sinks
+            .iter()
+            .filter(|sink| sink.handle.checkpoint_committable())
+            .map(|sink| sink.name.clone())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        if names.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(DbError::Checkpoint(
+                "checkpoint-committable sink names must be unique".into(),
+            ));
+        }
+        Ok(names)
+    }
+
+    fn validate_sink_open_witness(
+        &self,
+        witness: &laminar_core::checkpoint_decision::CheckpointSinkOpenWitness,
+    ) -> Result<(), DbError> {
+        let expected_sinks = self.committable_sink_names()?;
+        self.validate_sink_open_witness_for_sinks(witness, &expected_sinks)
+    }
+
+    fn validate_sink_open_witness_for_sinks(
+        &self,
+        witness: &laminar_core::checkpoint_decision::CheckpointSinkOpenWitness,
+        expected_sinks: &[String],
+    ) -> Result<(), DbError> {
+        if !witness.attempt.is_canonical() {
+            return Err(DbError::Checkpoint(
+                "[LDB-6050] sink-open witness has a non-canonical checkpoint identity".into(),
+            ));
+        }
+        if witness.deployment_id != self.expected_deployment_id()?
+            || witness.pipeline_identity != self.expected_pipeline_identity()
+            || witness.participant_id != self.store.participant_id()
+        {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6043] sink-open witness for checkpoint {} does not match the active deployment, pipeline, and participant",
+                witness.attempt.checkpoint_id
+            )));
+        }
+        if witness.committable_sinks != expected_sinks {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6043] sink-open witness for checkpoint {} names {:?}, but the active committable sinks are {:?}",
+                witness.attempt.checkpoint_id, witness.committable_sinks, expected_sinks
+            )));
+        }
+        Ok(())
+    }
+
+    /// Audit durable sink ownership against the configured topology before any connector is
+    /// opened or asked to reconcile an epoch. Settlement re-reads the witness after recovery.
+    pub(crate) async fn audit_sink_open_witness_topology(
+        &self,
+        mut expected_sinks: Vec<String>,
+    ) -> Result<(), DbError> {
+        expected_sinks.sort_unstable();
+        if expected_sinks.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(DbError::Checkpoint(
+                "checkpoint-committable sink names must be unique".into(),
+            ));
+        }
+        let store = self.decision_store.as_ref().ok_or_else(|| {
+            DbError::Checkpoint(
+                "[LDB-6050] sink-open audit requires a durable decision store".into(),
+            )
+        })?;
+        let witness = tokio::time::timeout(self.config.cleanup_timeout, store.sink_open_witness())
+            .await
+            .map_err(|_| {
+                DbError::Checkpoint(
+                    "[LDB-6050] sink-open witness inventory timed out during topology audit".into(),
+                )
+            })?
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6050] sink-open witness inventory failed during topology audit: {error}"
+                ))
+            })?;
+        let Some(witness) = witness else {
+            return Ok(());
+        };
+        self.validate_sink_open_witness_for_sinks(&witness, &expected_sinks)?;
+        #[cfg(feature = "cluster")]
+        if self.cluster_controller.is_some() {
+            return Err(DbError::Checkpoint(
+                "[LDB-0013] cluster exactly-once sink recovery is unavailable until connector epoch operations are leader-term fenced"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn create_sink_open_witness_until(
+        &self,
+        attempt: CheckpointAttempt,
+        deadline: tokio::time::Instant,
+    ) -> Result<laminar_core::checkpoint_decision::CheckpointSinkOpenWitness, DbError> {
+        if self.active_sink_witness.lock().is_some() {
+            return Err(DbError::Checkpoint(
+                "[LDB-6050] a prior durable sink-open witness is still active".into(),
+            ));
+        }
+        let store = self.decision_store.clone().ok_or_else(|| {
+            DbError::Checkpoint(
+                "[LDB-6050] sink epoch open requires a durable decision store".into(),
+            )
+        })?;
+        let pipeline_identity = self.expected_pipeline_identity();
+        let participant_id = self.store.participant_id();
+        let committable_sinks = self.committable_sink_names()?;
+        let mut pending =
+            tokio::time::timeout_at(deadline, self.pending_sink_witness_create.lock())
+                .await
+                .map_err(|_| {
+                    DbError::Checkpoint(
+                        "[LDB-6050] sink-open witness ownership deadline expired".into(),
+                    )
+                })?;
+        if let Some(existing) = pending.as_ref() {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6050] checkpoint {} still owns an in-flight sink-open witness create",
+                existing.attempt.checkpoint_id
+            )));
+        }
+        let handle = tokio::spawn(async move {
+            store
+                .create_sink_open_witness(
+                    pipeline_identity,
+                    participant_id,
+                    attempt,
+                    committable_sinks,
+                )
+                .await
+                .map_err(|error| error.to_string())
+        });
+        *pending = Some(PendingSinkWitnessCreate { attempt, handle });
+        let outcome = tokio::time::timeout_at(
+            deadline,
+            &mut pending.as_mut().expect("pending create installed").handle,
+        )
+        .await;
+        match outcome {
+            Ok(Ok(Ok(witness))) => {
+                pending.take();
+                drop(pending);
+                self.validate_sink_open_witness(&witness)?;
+                *self.active_sink_witness.lock() = Some(witness.clone());
+                Ok(witness)
+            }
+            Ok(Ok(Err(error))) => {
+                pending.take();
+                Err(DbError::Checkpoint(format!(
+                    "[LDB-6050] durable sink-open witness create failed: {error}"
+                )))
+            }
+            Ok(Err(error)) => {
+                pending.take();
+                Err(DbError::Checkpoint(format!(
+                    "[LDB-6050] sink-open witness task failed: {error}"
+                )))
+            }
+            Err(_) => Err(DbError::Checkpoint(format!(
+                "[LDB-6050] durable sink-open witness for checkpoint {} did not settle before its deadline",
+                attempt.checkpoint_id
+            ))),
+        }
+    }
+
+    async fn quiesce_pending_sink_witness_create_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), DbError> {
+        let mut pending =
+            tokio::time::timeout_at(deadline, self.pending_sink_witness_create.lock())
+                .await
+                .map_err(|_| {
+                    DbError::Checkpoint(
+                        "[LDB-6050] teardown could not acquire sink-open witness ownership".into(),
+                    )
+                })?;
+        let Some(write) = pending.as_mut() else {
+            return Ok(());
+        };
+        let attempt = write.attempt;
+        match tokio::time::timeout_at(deadline, &mut write.handle).await {
+            Ok(Ok(Ok(witness))) => {
+                pending.take();
+                drop(pending);
+                self.validate_sink_open_witness(&witness)?;
+                *self.active_sink_witness.lock() = Some(witness);
+                Ok(())
+            }
+            Ok(Ok(Err(error))) => {
+                pending.take();
+                warn!(
+                    checkpoint_id = attempt.checkpoint_id,
+                    %error,
+                    "[LDB-6050] sink-open witness create ended with an I/O error; recovery will audit the durable inventory"
+                );
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                pending.take();
+                warn!(
+                    checkpoint_id = attempt.checkpoint_id,
+                    %error,
+                    "[LDB-6050] sink-open witness task terminated; recovery will audit the durable inventory"
+                );
+                Ok(())
+            }
+            Err(_) => Err(DbError::Checkpoint(format!(
+                "[LDB-6050] checkpoint {} still has an in-flight sink-open witness create; teardown remains fenced",
+                attempt.checkpoint_id
+            ))),
+        }
+    }
+
+    fn spawn_sink_open_witness_clear(
+        &self,
+        witness: laminar_core::checkpoint_decision::CheckpointSinkOpenWitness,
+    ) -> Result<tokio::task::JoinHandle<Result<(), String>>, DbError> {
+        let store = self.decision_store.clone().ok_or_else(|| {
+            DbError::Checkpoint(
+                "[LDB-6050] sink-open witness cleanup requires a durable decision store".into(),
+            )
+        })?;
+        Ok(tokio::spawn(async move {
+            store
+                .clear_sink_open_witness(&witness)
+                .await
+                .map_err(|error| error.to_string())
+        }))
+    }
+
+    fn require_active_sink_open_witness(
+        &self,
+        witness: &laminar_core::checkpoint_decision::CheckpointSinkOpenWitness,
+    ) -> Result<(), DbError> {
+        match self.active_sink_witness.lock().as_ref() {
+            Some(active) if active == witness => Ok(()),
+            Some(active) => Err(DbError::Checkpoint(format!(
+                "[LDB-6050] sink-open witness cleanup for checkpoint {} conflicts with the exact active witness for checkpoint {}",
+                witness.attempt.checkpoint_id, active.attempt.checkpoint_id
+            ))),
+            None => Err(DbError::Checkpoint(format!(
+                "[LDB-6050] sink-open witness cleanup for checkpoint {} has no exact in-memory owner",
+                witness.attempt.checkpoint_id
+            ))),
+        }
+    }
+
+    fn finalize_sink_open_witness_clear(
+        &self,
+        witness: &laminar_core::checkpoint_decision::CheckpointSinkOpenWitness,
+    ) -> Result<(), DbError> {
+        let successor = checked_successor_epoch(
+            witness.attempt.epoch,
+            "advancing after sink-open witness cleanup",
+        )?;
+        let mut active = self.active_sink_witness.lock();
+        match active.as_ref() {
+            Some(current) if current == witness => {}
+            Some(current) => {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6050] durable sink-open cleanup for checkpoint {} conflicts with the exact active witness for checkpoint {}",
+                    witness.attempt.checkpoint_id, current.attempt.checkpoint_id
+                )));
+            }
+            None => {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6050] durable sink-open cleanup for checkpoint {} lost its in-memory owner",
+                    witness.attempt.checkpoint_id
+                )));
+            }
+        }
+        self.allocator
+            .burn_sink_epoch_reservation(witness.attempt)?;
+        self.allocator.advance_epoch_to(successor);
+        active.take();
+        Ok(())
+    }
+
+    async fn settle_sink_open_witness_clear_until(
+        &self,
+        requested: Option<laminar_core::checkpoint_decision::CheckpointSinkOpenWitness>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), DbError> {
+        if let Some(witness) = requested.as_ref() {
+            self.validate_sink_open_witness(witness)?;
+        }
+        let mut pending = tokio::time::timeout_at(deadline, self.pending_sink_witness_clear.lock())
+            .await
+            .map_err(|_| {
+                DbError::Checkpoint(
+                    "[LDB-6050] sink-open witness cleanup ownership deadline expired".into(),
+                )
+            })?;
+
+        if let Some(requested) = requested {
+            match pending.as_ref() {
+                Some(existing) if existing.witness != requested => {
+                    return Err(DbError::Checkpoint(format!(
+                        "[LDB-6050] checkpoint {} cannot clear the sink-open witness while checkpoint {} owns an unresolved cleanup",
+                        requested.attempt.checkpoint_id,
+                        existing.witness.attempt.checkpoint_id
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    self.require_active_sink_open_witness(&requested)?;
+                    *pending = Some(PendingSinkWitnessClear {
+                        witness: requested,
+                        state: PendingSinkWitnessClearState::NeedsRetry,
+                    });
+                }
+            }
+        }
+
+        let Some(write) = pending.as_mut() else {
+            return Ok(());
+        };
+        self.validate_sink_open_witness(&write.witness)?;
+        checked_successor_epoch(
+            write.witness.attempt.epoch,
+            "preparing sink-open witness cleanup",
+        )?;
+        if matches!(&write.state, PendingSinkWitnessClearState::NeedsRetry) {
+            write.state = PendingSinkWitnessClearState::Running(
+                self.spawn_sink_open_witness_clear(write.witness.clone())?,
+            );
+        }
+
+        let outcome = match &mut write.state {
+            PendingSinkWitnessClearState::Running(handle) => {
+                Some(tokio::time::timeout_at(deadline, handle).await)
+            }
+            PendingSinkWitnessClearState::Verified => None,
+            PendingSinkWitnessClearState::NeedsRetry => unreachable!("clear retry was started"),
+        };
+        if let Some(outcome) = outcome {
+            match outcome {
+                Ok(Ok(Ok(()))) => {
+                    write.state = PendingSinkWitnessClearState::Verified;
+                }
+                Ok(Ok(Err(error))) => {
+                    write.state = PendingSinkWitnessClearState::NeedsRetry;
+                    return Err(DbError::Checkpoint(format!(
+                        "[LDB-6050] sink-open witness cleanup failed for checkpoint {}: {error}",
+                        write.witness.attempt.checkpoint_id
+                    )));
+                }
+                Ok(Err(error)) => {
+                    write.state = PendingSinkWitnessClearState::NeedsRetry;
+                    return Err(DbError::Checkpoint(format!(
+                        "[LDB-6050] sink-open witness cleanup task failed for checkpoint {}: {error}",
+                        write.witness.attempt.checkpoint_id
+                    )));
+                }
+                Err(_) => {
+                    return Err(DbError::Checkpoint(format!(
+                        "[LDB-6050] sink-open witness cleanup timed out for checkpoint {}",
+                        write.witness.attempt.checkpoint_id
+                    )));
+                }
+            }
+        }
+
+        let witness = write.witness.clone();
+        self.finalize_sink_open_witness_clear(&witness)?;
+        pending.take();
+        Ok(())
+    }
+
+    async fn clear_sink_open_witness_until(
+        &self,
+        witness: &laminar_core::checkpoint_decision::CheckpointSinkOpenWitness,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), DbError> {
+        self.settle_sink_open_witness_clear_until(Some(witness.clone()), deadline)
+            .await
+    }
+
+    async fn quiesce_pending_sink_witness_clear_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), DbError> {
+        self.settle_sink_open_witness_clear_until(None, deadline)
+            .await
+    }
+
     /// Participant bound to the checkpoint-store namespace.
     #[must_use]
     #[cfg(feature = "cluster")]
@@ -2142,8 +2858,26 @@ impl CheckpointCoordinator {
         self.cached_sorted_sink_names = None;
     }
 
-    /// Drop every registered sink handle after an aborted pipeline startup.
-    pub(crate) fn clear_sinks(&mut self) {
+    /// Drop every registered sink handle after durable sink-open ownership is settled.
+    pub(crate) fn clear_sinks(&mut self) -> Result<(), DbError> {
+        let pending_witness = self
+            .pending_sink_witness_create
+            .try_lock()
+            .map_or(true, |pending| pending.is_some());
+        let pending_witness_clear = self
+            .pending_sink_witness_clear
+            .try_lock()
+            .map_or(true, |pending| pending.is_some());
+        if pending_witness
+            || pending_witness_clear
+            || self.active_sink_witness.lock().is_some()
+            || self.allocator.sink_epoch_reservation().is_some()
+        {
+            return Err(DbError::Checkpoint(
+                "[LDB-6050] cannot clear sink handles while durable sink-open ownership remains unresolved"
+                    .into(),
+            ));
+        }
         self.sinks.clear();
         self.cached_sorted_sink_names = None;
         self.coordinated_commit_lag
@@ -2151,6 +2885,7 @@ impl CheckpointCoordinator {
         self.coordinated_commit_lag_known
             .store(true, std::sync::atomic::Ordering::Release);
         self.coordinated_commit_progress.notify_one();
+        Ok(())
     }
 
     /// Build the decoupled committer for coordinated-commit sinks, or `None`
@@ -2680,8 +3415,16 @@ impl CheckpointCoordinator {
     /// # Errors
     /// Returns the first sink error.
     pub async fn begin_initial_epoch(&self) -> Result<(), DbError> {
-        self.begin_epoch_for_sinks_bounded(self.allocator.peek_epoch())
+        let timeout = self.config.cleanup_timeout;
+        let deadline = tokio::time::Instant::now() + timeout;
+        self.open_next_sink_epoch_until(deadline)
             .await
+            .map(|_| ())
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "initial sink epoch failed within its {timeout:?} cleanup deadline: {error}"
+                ))
+            })
     }
 
     /// Shared id allocator — the pipeline callback clones this to allocate without the mutex.
@@ -2689,70 +3432,130 @@ impl CheckpointCoordinator {
         Arc::clone(&self.allocator)
     }
 
+    fn has_checkpoint_committable_sinks(&self) -> bool {
+        self.sinks
+            .iter()
+            .any(|sink| sink.handle.checkpoint_committable())
+    }
+
+    async fn open_next_sink_epoch_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<CheckpointAttempt>, DbError> {
+        if !self.has_checkpoint_committable_sinks() {
+            return Ok(None);
+        }
+
+        let attempt = self.allocator.reserve_sink_epoch_until(deadline).await?;
+        let witness = match self.create_sink_open_witness_until(attempt, deadline).await {
+            Ok(witness) => witness,
+            Err(error) => {
+                self.allocator.mark_sink_epoch_in_doubt(attempt)?;
+                return Err(error);
+            }
+        };
+        if let Err(failure) = self
+            .begin_epoch_for_sinks_until(attempt.epoch, deadline, deadline)
+            .await
+        {
+            // A failed or timed-out rollback leaves the external transaction in-doubt. Keep the
+            // reservation as a poison fence so this process cannot open a higher epoch over it.
+            if failure.rollback_complete {
+                if let Err(clear_error) =
+                    self.clear_sink_open_witness_until(&witness, deadline).await
+                {
+                    self.allocator.mark_sink_epoch_in_doubt(attempt)?;
+                    return Err(DbError::Checkpoint(format!(
+                        "{}; connector rollback completed but durable sink-open cleanup failed: {clear_error}",
+                        failure.error
+                    )));
+                }
+            } else {
+                self.allocator.mark_sink_epoch_in_doubt(attempt)?;
+            }
+            return Err(failure.error);
+        }
+        if let Err(error) = self.allocator.mark_sink_epoch_ready(attempt) {
+            let rollback_error = self
+                .rollback_sinks_until(attempt.epoch, deadline)
+                .await
+                .err();
+            let cleanup_error = if rollback_error.is_none() {
+                self.clear_sink_open_witness_until(&witness, deadline)
+                    .await
+                    .err()
+            } else {
+                None
+            };
+            if rollback_error.is_some() || cleanup_error.is_some() {
+                self.allocator.mark_sink_epoch_in_doubt(attempt)?;
+            }
+            let rollback_detail = match (rollback_error, cleanup_error) {
+                (None, None) => "completed".to_owned(),
+                (Some(rollback), _) => {
+                    format!("failed, leaving epoch state in-doubt: {rollback}")
+                }
+                (None, Some(cleanup)) => format!(
+                    "completed, but durable witness cleanup failed and left epoch state in-doubt: {cleanup}"
+                ),
+            };
+            return Err(DbError::Checkpoint(format!(
+                "{error}; cleanup for opened sink epoch {} {rollback_detail}",
+                attempt.epoch
+            )));
+        }
+        Ok(Some(attempt))
+    }
+
     /// Begin an epoch on all exactly-once sinks, rolling back already-started sinks on failure.
     async fn begin_epoch_for_sinks_until(
         &self,
         epoch: u64,
-        deadline: tokio::time::Instant,
-    ) -> Result<(), DbError> {
-        let mut started: Vec<&RegisteredSink> = Vec::new();
-        for sink in &self.sinks {
-            if sink.handle.checkpoint_committable() {
-                match sink.handle.begin_epoch_until(epoch, deadline).await {
-                    Ok(()) => {
-                        started.push(sink);
-                        debug!(sink = %sink.name, epoch, "began epoch");
-                    }
-                    Err(e) => {
-                        let mut rollback_errors = Vec::new();
-                        // `begin_epoch` is a remote mutation: an error or timeout may be an
-                        // acknowledgement loss after the transaction opened. Roll back the
-                        // failing sink as well as every sink that returned success. Begin may
-                        // consume its whole attempt deadline, so cleanup owns a fresh, bounded
-                        // deadline rather than inheriting an already-expired one.
-                        let rollback_deadline =
-                            tokio::time::Instant::now() + self.config.cleanup_timeout;
-                        for s in std::iter::once(sink).chain(started.iter().rev().copied()) {
-                            if let Err(re) = s
-                                .handle
-                                .rollback_epoch_until(epoch, rollback_deadline)
-                                .await
-                            {
-                                error!(sink = %s.name, epoch, error = %re,
-                                    "[LDB-6016] sink rollback failed during begin_epoch recovery");
-                                rollback_errors.push(format!("{}: {re}", s.name));
-                            }
-                        }
-                        let rollback_detail = if rollback_errors.is_empty() {
-                            String::new()
-                        } else {
-                            format!(
-                                "; rollback failed for sink(s) that may have started, leaving epoch state in-doubt: {}",
-                                rollback_errors.join("; ")
-                            )
-                        };
-                        return Err(DbError::Checkpoint(format!(
-                            "sink '{}' failed to begin epoch {epoch}: {e}{rollback_detail}",
-                            sink.name
-                        )));
-                    }
-                }
+        begin_deadline: tokio::time::Instant,
+        rollback_deadline: tokio::time::Instant,
+    ) -> Result<(), SinkEpochOpenFailure> {
+        let begins = self
+            .sinks
+            .iter()
+            .filter(|sink| sink.handle.checkpoint_committable())
+            .map(|sink| {
+                let name = sink.name.clone();
+                let handle = sink.handle.clone();
+                async move { (name, handle.begin_epoch_until(epoch, begin_deadline).await) }
+            });
+        let results = futures::future::join_all(begins).await;
+        let mut begin_errors = Vec::new();
+        for (name, result) in results {
+            match result {
+                Ok(()) => debug!(sink = %name, epoch, "began epoch"),
+                Err(error) => begin_errors.push(format!("{name}: {error}")),
             }
         }
-        Ok(())
-    }
+        if begin_errors.is_empty() {
+            return Ok(());
+        }
 
-    async fn begin_epoch_for_sinks_bounded(&self, epoch: u64) -> Result<(), DbError> {
-        let timeout = self.config.cleanup_timeout;
-        let deadline = tokio::time::Instant::now() + timeout;
-        self.begin_epoch_for_sinks_until(epoch, deadline)
+        // Every begin was invoked concurrently and is a remote mutation. Even an error may be an
+        // acknowledgement loss after the transaction opened, so roll back every committable sink
+        // concurrently under the caller-owned cleanup bound. Post-Commit continuation passes its
+        // original absolute deadline here so a failed successor cannot extend that budget.
+        let rollback_error = self
+            .rollback_sinks_until(epoch, rollback_deadline)
             .await
-            .map_err(|error| {
-                DbError::Checkpoint(format!(
-                    "sink begin_epoch {epoch} failed within its {timeout:?} cleanup deadline: \
-                     {error}"
-                ))
-            })
+            .err();
+        let rollback_complete = rollback_error.is_none();
+        let rollback_detail = rollback_error.map_or_else(String::new, |error| {
+            format!(
+                "; rollback failed for sink(s) that may have started, leaving epoch state in-doubt: {error}"
+            )
+        });
+        Err(SinkEpochOpenFailure {
+            error: DbError::Checkpoint(format!(
+                "sink(s) failed to begin epoch {epoch}: {}{rollback_detail}",
+                begin_errors.join("; ")
+            )),
+            rollback_complete,
+        })
     }
 
     /// Wire Prometheus engine metrics.
@@ -2780,6 +3583,17 @@ impl CheckpointCoordinator {
         }
     }
 
+    async fn allocate_attempt_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<CheckpointAttempt, DbError> {
+        if self.has_checkpoint_committable_sinks() {
+            self.allocator.consume_sink_epoch_until(deadline).await
+        } else {
+            self.allocator.allocate_until(deadline).await
+        }
+    }
+
     /// Run a full checkpoint cycle.
     ///
     /// Barrier propagation and operator snapshots (steps 1-2) are handled by the caller and
@@ -2793,7 +3607,7 @@ impl CheckpointCoordinator {
     ) -> Result<CheckpointResult, DbError> {
         let started = Instant::now();
         let deadline = tokio::time::Instant::from_std(started) + self.config.checkpoint_timeout;
-        let attempt = self.allocator.allocate_until(deadline).await?;
+        let attempt = self.allocate_attempt_until(deadline).await?;
         self.run_checkpoint_attempt(request, attempt, QuorumStage::RunInline, started)
             .await
     }
@@ -2824,14 +3638,15 @@ impl CheckpointCoordinator {
         quorum: QuorumStage,
         started: Instant,
     ) -> Result<CheckpointResult, DbError> {
-        if self.failure_cleanup_in_doubt {
+        require_canonical_attempt(attempt, "checkpoint admission")?;
+        if self.failure_recovery_required {
             return Ok(CheckpointResult {
                 success: false,
                 checkpoint_id: attempt.checkpoint_id,
                 epoch: attempt.epoch,
                 duration: started.elapsed(),
                 error: Some(
-                    "[LDB-6048] a prior failed checkpoint has unresolved sink cleanup; recovery is required before another attempt"
+                    "[LDB-6048] a prior failed checkpoint has unresolved sink state; recovery is required before another attempt"
                         .into(),
                 ),
                 failure_disposition: Some(CheckpointFailureDisposition::RequiresRecovery),
@@ -2889,61 +3704,79 @@ impl CheckpointCoordinator {
                 .await);
         }
 
-        let Ok(result) = tokio::time::timeout_at(
+        let commit_is_durable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut work = Box::pin(self.checkpoint_inner(
+            request,
+            attempt,
+            quorum,
+            started,
             deadline,
-            self.checkpoint_inner(request, attempt, quorum, started, deadline),
-        )
-        .await
-        else {
-            let timed_out_phase = self.phase;
+            Arc::clone(&commit_is_durable),
+        ));
+        let result = tokio::select! {
+            result = &mut work => Some(result),
+            () = tokio::time::sleep_until(deadline) => {
+                if commit_is_durable.load(std::sync::atomic::Ordering::Acquire) {
+                    // Commit is irrevocable. Finish the separately bounded continuation instead
+                    // of cancelling it at the reversible-attempt deadline.
+                    Some(work.as_mut().await)
+                } else {
+                    None
+                }
+            }
+        };
+        let Some(result) = result else {
+            // Release the mutable coordinator borrow before classifying the timeout.
+            drop(work);
             let error = format!(
                 "checkpoint {} epoch {} exceeded its {:?} end-to-end deadline during {}",
-                attempt.checkpoint_id,
-                attempt.epoch,
-                self.config.checkpoint_timeout,
-                timed_out_phase
+                attempt.checkpoint_id, attempt.epoch, self.config.checkpoint_timeout, self.phase
             );
-            if self.failure_cleanup_in_doubt {
-                self.pending_vnode_states.clear();
-                self.pending_sink_descriptors.clear();
-                return Ok(CheckpointResult {
-                    success: false,
-                    checkpoint_id: attempt.checkpoint_id,
-                    epoch: attempt.epoch,
-                    duration: started.elapsed(),
-                    error: Some(format!(
-                        "{error}; failed-epoch sink cleanup was cancelled and remains in-doubt"
-                    )),
-                    failure_disposition: Some(CheckpointFailureDisposition::RequiresRecovery),
-                });
-            }
-            if self.decision_write_started {
-                return Ok(self.fail_after_irrevocable_work(
-                    attempt.checkpoint_id,
-                    attempt.epoch,
-                    started,
-                    error,
-                ));
-            }
-            // `Idle` is only safe here when no failed-epoch cleanup was started. The explicit
-            // latch above, rather than this presentation phase, owns cancellation safety.
-            if self.phase == CheckpointPhase::Idle {
-                self.pending_vnode_states.clear();
-                self.pending_sink_descriptors.clear();
-                return Ok(CheckpointResult {
-                    success: false,
-                    checkpoint_id: attempt.checkpoint_id,
-                    epoch: attempt.epoch,
-                    duration: started.elapsed(),
-                    error: Some(error),
-                    failure_disposition: Some(CheckpointFailureDisposition::Retryable),
-                });
-            }
-            return Ok(self
-                .fail_epoch(attempt.checkpoint_id, attempt.epoch, started, error)
-                .await);
+            return Ok(self.resolve_attempt_timeout(attempt, started, error).await);
         };
         result
+    }
+
+    async fn resolve_attempt_timeout(
+        &mut self,
+        attempt: CheckpointAttempt,
+        started: Instant,
+        error: String,
+    ) -> CheckpointResult {
+        if self.decision_write_started {
+            return self.fail_after_irrevocable_work(
+                attempt.checkpoint_id,
+                attempt.epoch,
+                started,
+                error,
+            );
+        }
+        // `Idle` only means the durable tail was not polled. A committable sink attempt has
+        // already consumed its open epoch before entering this method and must still publish
+        // Abort, roll back, and rotate its witness. Non-committable attempts have no mutation to
+        // compensate before the first poll.
+        if self.phase == CheckpointPhase::Idle
+            && !self.has_checkpoint_committable_sinks()
+            && !self.failure_recovery_required
+        {
+            self.pending_vnode_states.clear();
+            self.pending_sink_descriptors.clear();
+            return CheckpointResult {
+                success: false,
+                checkpoint_id: attempt.checkpoint_id,
+                epoch: attempt.epoch,
+                duration: started.elapsed(),
+                error: Some(error),
+                failure_disposition: Some(CheckpointFailureDisposition::Retryable),
+            };
+        }
+        let error = if self.failure_recovery_required {
+            format!("{error}; failed-epoch sink state remains in-doubt")
+        } else {
+            error
+        };
+        self.fail_epoch(attempt.checkpoint_id, attempt.epoch, started, error)
+            .await
     }
 
     fn validate_attempt_request(&self, request: &CheckpointRequest) -> Result<(), DbError> {
@@ -3976,7 +4809,7 @@ impl CheckpointCoordinator {
                 );
             }
         };
-        self.failure_cleanup_in_doubt = true;
+        self.failure_recovery_required = true;
         let mut result = self.record_failed_epoch(checkpoint_id, epoch, started, reason);
         // The terminal RPC is a wake-up hint only and is never sent ahead of durable authority.
         #[cfg(feature = "cluster")]
@@ -4003,10 +4836,13 @@ impl CheckpointCoordinator {
         #[cfg(not(feature = "cluster"))]
         let _ = abort_outcome;
         match self
-            .cleanup_failed_epoch_until(epoch, cleanup_deadline)
+            .cleanup_failed_epoch_until(
+                CheckpointAttempt::new(epoch, checkpoint_id),
+                cleanup_deadline,
+            )
             .await
         {
-            Ok(()) => self.failure_cleanup_in_doubt = false,
+            Ok(()) => self.failure_recovery_required = false,
             Err(cleanup_error) => {
                 error!(
                     checkpoint_id, epoch, error = %cleanup_error,
@@ -4017,6 +4853,23 @@ impl CheckpointCoordinator {
                 }
                 result.failure_disposition = Some(CheckpointFailureDisposition::RequiresRecovery);
             }
+        }
+        let mut poisoned_sinks = self
+            .sinks
+            .iter()
+            .filter(|sink| sink.handle.epoch_requires_recovery())
+            .map(|sink| sink.name.clone())
+            .collect::<Vec<_>>();
+        if !poisoned_sinks.is_empty() {
+            poisoned_sinks.sort_unstable();
+            self.failure_recovery_required = true;
+            if let Some(error) = result.error.as_mut() {
+                *error = format!(
+                    "{error}; sink actor state requires replay recovery: {}",
+                    poisoned_sinks.join(", ")
+                );
+            }
+            result.failure_disposition = Some(CheckpointFailureDisposition::RequiresRecovery);
         }
         result
     }
@@ -4049,11 +4902,36 @@ impl CheckpointCoordinator {
 
     async fn cleanup_failed_epoch_until(
         &self,
-        epoch: u64,
+        attempt: CheckpointAttempt,
         deadline: tokio::time::Instant,
     ) -> Result<(), DbError> {
-        self.rollback_sinks_until(epoch, deadline).await?;
+        self.rollback_sinks_until(attempt.epoch, deadline).await?;
+        self.clear_owned_sink_witness_for_attempt_until(attempt, deadline)
+            .await?;
         self.begin_next_epoch_until(deadline).await
+    }
+
+    async fn clear_owned_sink_witness_for_attempt_until(
+        &self,
+        attempt: CheckpointAttempt,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), DbError> {
+        if !self.has_checkpoint_committable_sinks() {
+            return Ok(());
+        }
+        let witness = self.active_sink_witness.lock().clone().ok_or_else(|| {
+            DbError::Checkpoint(format!(
+                "[LDB-6050] checkpoint {} has no owned durable sink-open witness",
+                attempt.checkpoint_id
+            ))
+        })?;
+        if witness.attempt != attempt {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6050] checkpoint {attempt:?} conflicts with active sink-open witness {:?}",
+                witness.attempt
+            )));
+        }
+        self.clear_sink_open_witness_until(&witness, deadline).await
     }
 
     /// Fail after the durable decision write has started.
@@ -4086,13 +4964,11 @@ impl CheckpointCoordinator {
     }
 
     async fn begin_next_epoch_until(&self, deadline: tokio::time::Instant) -> Result<(), DbError> {
-        let next_epoch = self.allocator.peek_epoch();
-        self.begin_epoch_for_sinks_until(next_epoch, deadline)
+        self.open_next_sink_epoch_until(deadline)
             .await
+            .map(|_| ())
             .map_err(|error| {
-                DbError::Checkpoint(format!(
-                    "failed to begin successor epoch {next_epoch}: {error}"
-                ))
+                DbError::Checkpoint(format!("failed to begin successor sink epoch: {error}"))
             })
     }
 
@@ -4317,6 +5193,14 @@ impl CheckpointCoordinator {
     /// coordinator finalizes an exact Commit, rolls back an exact Abort, or rolls back a prepare
     /// that immutable outcome continuity proves can no longer receive a decision.
     pub async fn reconcile_prepared_on_init(&self) -> Result<(), DbError> {
+        #[cfg(feature = "cluster")]
+        if self.cluster_controller.is_some() {
+            // `load_highest` deliberately skips corrupt recovery cuts so a valid older finalized
+            // cut remains usable. Cluster Prepared evidence is different: silently skipping one
+            // could abandon an external sink transaction. Audit the complete participant
+            // inventory before selecting a local reconciliation candidate.
+            self.prepared_checkpoint_witnesses().await?;
+        }
         let Some(last) = load_highest(self.store.as_ref())
             .await
             .map_err(DbError::from)?
@@ -4371,6 +5255,187 @@ impl CheckpointCoordinator {
         };
         self.finish_prepared_reconciliation(epoch, checkpoint_id, outcome)
             .await
+    }
+
+    /// Settle any durable external sink epoch left open by a prior process before a successor can
+    /// begin. This runs after checkpoint recovery and Prepared-manifest reconciliation, when an
+    /// exact terminal decision (if any) is authoritative.
+    pub(crate) async fn reconcile_sink_open_witness(&mut self) -> Result<(), DbError> {
+        let deadline = tokio::time::Instant::now() + self.config.cleanup_timeout;
+        self.reconcile_sink_open_witness_until(deadline).await
+    }
+
+    pub(crate) async fn reconcile_sink_open_witness_until(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), DbError> {
+        if !self.has_checkpoint_committable_sinks() {
+            return Ok(());
+        }
+        self.quiesce_pending_sink_witness_create_until(deadline)
+            .await?;
+        self.quiesce_pending_sink_witness_clear_until(deadline)
+            .await?;
+        let store = self.decision_store.as_ref().ok_or_else(|| {
+            DbError::Checkpoint(
+                "[LDB-6050] sink-open reconciliation requires a durable decision store".into(),
+            )
+        })?;
+        let witness = tokio::time::timeout_at(deadline, store.sink_open_witness())
+            .await
+            .map_err(|_| {
+                DbError::Checkpoint(
+                    "[LDB-6050] sink-open witness inventory timed out during recovery".into(),
+                )
+            })?
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6050] sink-open witness inventory failed during recovery: {error}"
+                ))
+            })?;
+        let Some(witness) = witness else {
+            if self.active_sink_witness.lock().is_some() {
+                return Err(DbError::Checkpoint(
+                    "[LDB-6050] in-memory sink ownership exists without its durable witness".into(),
+                ));
+            }
+            if let Some(reservation) = self.allocator.sink_epoch_reservation() {
+                match reservation {
+                    SinkEpochReservation::Opening(attempt) => {
+                        // Connector begin cannot run until witness creation returns successfully.
+                        // Confirmed durable absence therefore makes this pre-begin reservation safe
+                        // to burn.
+                        self.allocator.burn_sink_epoch_reservation(attempt)?;
+                    }
+                    SinkEpochReservation::Ready(attempt)
+                    | SinkEpochReservation::InDoubt(attempt) => {
+                        return Err(DbError::Checkpoint(format!(
+                            "[LDB-6050] sink epoch {} is active without its durable witness",
+                            attempt.checkpoint_id
+                        )));
+                    }
+                }
+            }
+            return Ok(());
+        };
+        self.validate_sink_open_witness(&witness)?;
+        #[cfg(feature = "cluster")]
+        if self.cluster_controller.is_some() {
+            return Err(DbError::Checkpoint(
+                "[LDB-0013] cluster exactly-once sink recovery is unavailable until connector epoch operations are leader-term fenced"
+                    .into(),
+            ));
+        }
+        *self.active_sink_witness.lock() = Some(witness.clone());
+        let attempt = witness.attempt;
+        let outcome = tokio::time::timeout_at(deadline, store.outcome(attempt.epoch))
+            .await
+            .map_err(|_| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6050] terminal outcome lookup timed out for sink-open checkpoint {}",
+                    attempt.checkpoint_id
+                ))
+            })?
+            .map_err(|error| {
+                DbError::Checkpoint(format!(
+                    "[LDB-6050] terminal outcome lookup failed for sink-open checkpoint {}: {error}",
+                    attempt.checkpoint_id
+                ))
+            })?;
+
+        let rollback_required = match outcome {
+            Some(outcome) => {
+                if outcome.epoch != attempt.epoch
+                    || outcome.checkpoint_id != attempt.checkpoint_id
+                    || outcome.deployment_id != witness.deployment_id
+                    || outcome.scope != laminar_core::checkpoint_decision::CheckpointScope::Local
+                {
+                    return Err(DbError::Checkpoint(format!(
+                        "[LDB-6043] terminal outcome does not match sink-open checkpoint {}",
+                        attempt.checkpoint_id
+                    )));
+                }
+                !outcome.is_commit()
+            }
+            None => {
+                let floor = tokio::time::timeout_at(deadline, store.outcome_gc_floor_horizon())
+                    .await
+                    .map_err(|_| {
+                        DbError::Checkpoint(
+                            "[LDB-6050] outcome-retention lookup timed out during sink recovery"
+                                .into(),
+                        )
+                    })?
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!(
+                        "[LDB-6050] outcome-retention lookup failed during sink recovery: {error}"
+                    ))
+                    })?;
+                if attempt.epoch < floor {
+                    return Err(DbError::Checkpoint(format!(
+                        "[LDB-6040] sink-open checkpoint {} is below retained outcome history at {floor}; refusing to guess rollback",
+                        attempt.checkpoint_id
+                    )));
+                }
+                let highest = tokio::time::timeout_at(deadline, store.highest_terminal_outcome())
+                    .await
+                    .map_err(|_| {
+                        DbError::Checkpoint(
+                            "[LDB-6050] terminal outcome inventory timed out during sink recovery"
+                                .into(),
+                        )
+                    })?
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!(
+                        "[LDB-6050] terminal outcome inventory failed during sink recovery: {error}"
+                    ))
+                    })?;
+                if highest.is_some_and(|terminal| terminal.epoch > attempt.epoch) {
+                    return Err(DbError::Checkpoint(format!(
+                        "[LDB-6041] sink-open checkpoint {} was bypassed by a newer terminal outcome",
+                        attempt.checkpoint_id
+                    )));
+                }
+                let result = self
+                    .record_terminal_outcome_until(
+                        attempt,
+                        laminar_core::checkpoint_decision::CheckpointVerdict::Abort,
+                        None,
+                        deadline,
+                    )
+                    .await
+                    .map_err(|error| {
+                        DbError::Checkpoint(format!(
+                            "[LDB-6050] could not durably resolve sink-open checkpoint {} before rollback: {error}",
+                            attempt.checkpoint_id
+                        ))
+                    })?;
+                let winner = match result {
+                    laminar_core::checkpoint_decision::RecordOutcomeResult::Created(outcome)
+                    | laminar_core::checkpoint_decision::RecordOutcomeResult::Unchanged(outcome) => {
+                        outcome
+                    }
+                    laminar_core::checkpoint_decision::RecordOutcomeResult::Conflict { winner } => {
+                        winner
+                    }
+                };
+                if !self.outcome_matches_active_authority(&winner, attempt) {
+                    return Err(DbError::Checkpoint(format!(
+                        "[LDB-6043] durable winner does not match sink-open checkpoint {}",
+                        attempt.checkpoint_id
+                    )));
+                }
+                !winner.is_commit()
+            }
+        };
+        // Any decision issued above now has an exact, validated immutable winner.
+        self.decision_write_started = false;
+        if rollback_required {
+            self.rollback_sinks_until(attempt.epoch, deadline).await?;
+        }
+        self.clear_sink_open_witness_until(&witness, deadline)
+            .await?;
+        Ok(())
     }
 
     /// No-op when not the leader. Errors are logged; worst case is a longer follower timeout.
@@ -4808,7 +5873,7 @@ impl CheckpointCoordinator {
         self.phase
     }
 
-    /// Next epoch to be allocated.
+    /// Active pre-opened sink epoch, or the next allocation floor.
     #[must_use]
     pub fn epoch(&self) -> u64 {
         self.allocator.peek_epoch()
@@ -4857,7 +5922,7 @@ impl CheckpointCoordinator {
     ) -> Result<CheckpointResult, DbError> {
         let started = Instant::now();
         let deadline = tokio::time::Instant::from_std(started) + self.config.checkpoint_timeout;
-        let attempt = self.allocator.allocate_until(deadline).await?;
+        let attempt = self.allocate_attempt_until(deadline).await?;
         self.run_checkpoint_attempt(request, attempt, QuorumStage::RunInline, started)
             .await
     }
@@ -4895,6 +5960,10 @@ impl CheckpointCoordinator {
         leader_proof: Option<LeaderProof>,
         deadline: tokio::time::Instant,
     ) -> Result<CheckpointResult, DbError> {
+        require_canonical_attempt(
+            CheckpointAttempt::new(epoch, checkpoint_id),
+            "checkpoint abandonment",
+        )?;
         self.active_assignment_fence = assignment_fence;
         self.active_leader_proof = leader_proof;
         let started = Instant::now();
@@ -4938,6 +6007,10 @@ impl CheckpointCoordinator {
     > {
         use laminar_core::cluster::control::Phase;
 
+        require_canonical_attempt(
+            CheckpointAttempt::new(announcement.epoch, announcement.checkpoint_id),
+            "follower Prepare admission",
+        )?;
         if announcement.phase != Phase::Prepare {
             return Err(DbError::Checkpoint(format!(
                 "[LDB-6055] follower checkpoint {} epoch {} did not originate from Prepare",
@@ -5089,6 +6162,10 @@ impl CheckpointCoordinator {
         deadline: tokio::time::Instant,
     ) -> Result<(), DbError> {
         use laminar_core::cluster::control::BarrierAck;
+        require_canonical_attempt(
+            CheckpointAttempt::new(epoch, checkpoint_id),
+            "follower prepare",
+        )?;
         if let Some(in_doubt) = self.participant_ready_write {
             return Err(DbError::Checkpoint(format!(
                 "[LDB-6048] follower cannot prepare epoch {epoch}, checkpoint {checkpoint_id} while participant readiness for epoch {}, checkpoint {} remains in-doubt",
@@ -5202,6 +6279,10 @@ impl CheckpointCoordinator {
         assignment_fence: &laminar_core::cluster::control::CheckpointAssignmentFence,
         decision_timeout: Duration,
     ) -> Result<bool, DbError> {
+        require_canonical_attempt(
+            CheckpointAttempt::new(epoch, checkpoint_id),
+            "follower decision wait",
+        )?;
         let deadline = Instant::now() + decision_timeout;
         let participant_id = cc.instance_id().0;
         let authority = cc.checkpoint_authority().map_err(|error| {
@@ -5352,11 +6433,14 @@ impl CheckpointCoordinator {
         assignment_fence: &laminar_core::cluster::control::CheckpointAssignmentFence,
         deadline: Instant,
     ) -> Result<FollowerOutcomeMatch, DbError> {
+        let attempt = require_canonical_attempt(
+            CheckpointAttempt::new(epoch, checkpoint_id),
+            "follower outcome read",
+        )?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(Self::follower_decision_timeout(epoch, checkpoint_id));
         }
-        let attempt = CheckpointAttempt::new(epoch, checkpoint_id);
         let settlement =
             tokio::time::timeout(remaining, authority.cluster_attempt_settlement(attempt))
                 .await
@@ -5533,10 +6617,14 @@ impl CheckpointCoordinator {
         checkpoint_id: u64,
         committed: bool,
     ) -> Result<bool, DbError> {
+        let attempt = require_canonical_attempt(
+            CheckpointAttempt::new(epoch, checkpoint_id),
+            "follower terminal application",
+        )?;
         let clean = if committed {
             // A valid Commit can only be published after the leader created the exact state seal.
             // Record that durable fact before this follower admits a successor delta/reference.
-            self.mark_vnode_partials_sealed(CheckpointAttempt::new(epoch, checkpoint_id));
+            self.mark_vnode_partials_sealed(attempt);
             // Followers never publish external sink state. The exact decision makes their
             // prepared state recoverable; finalization merely publishes the local recovery cut.
             self.finalize_manifest(checkpoint_id).await.map_err(|e| {
@@ -5545,13 +6633,13 @@ impl CheckpointCoordinator {
                      {checkpoint_id}: {e}"
                 ))
             })?;
+            let horizon = self.record_committed_checkpoint(checkpoint_id)?;
             self.checkpoints_completed += 1;
             self.allocator
                 .advance_past(epoch, "finalizing a follower commit")?;
             // The shared backend and decision namespace are leader-owned, but each follower owns
             // a participant-specific manifest namespace and must bound that local inventory too.
-            let horizon = epoch.saturating_sub(self.config.max_retained as u64);
-            if horizon > 0 {
+            if let Some(horizon) = horizon.filter(|horizon| *horizon > 0) {
                 self.schedule_local_manifest_retention_prune(horizon, epoch);
             }
             true
@@ -5575,7 +6663,7 @@ impl CheckpointCoordinator {
                     "[LDB-6048] follower could not open the successor after terminal epoch {epoch}, checkpoint {checkpoint_id}: {error}"
                 ))
             })?;
-        if self.participant_ready_write == Some(CheckpointAttempt::new(epoch, checkpoint_id)) {
+        if self.participant_ready_write == Some(attempt) {
             self.participant_ready_write = None;
         }
         self.phase = CheckpointPhase::Idle;
@@ -5591,6 +6679,10 @@ impl CheckpointCoordinator {
         checkpoint_id: u64,
         deadline: tokio::time::Instant,
     ) -> Result<(), DbError> {
+        require_canonical_attempt(
+            CheckpointAttempt::new(epoch, checkpoint_id),
+            "follower durable prepare",
+        )?;
         // Source cuts are captured before the deferred follower tail acquires the
         // coordinator mutex. An assignment adoption may win that interval, so
         // revalidate against the coordinator's now-current generation before any
@@ -5693,6 +6785,7 @@ impl CheckpointCoordinator {
         quorum: QuorumStage,
         start: Instant,
         attempt_deadline: tokio::time::Instant,
+        commit_is_durable: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<CheckpointResult, DbError> {
         #[cfg(feature = "cluster")]
         let assignment_fence = request.assignment_fence.clone();
@@ -6056,6 +7149,10 @@ impl CheckpointCoordinator {
                     ));
                 }
             }
+            // Keep the write latch set until the exact immutable Commit has been validated. The
+            // outer deadline can now distinguish reversible work from the committed continuation.
+            commit_is_durable.store(true, std::sync::atomic::Ordering::Release);
+            self.decision_write_started = false;
             #[cfg(feature = "cluster")]
             if let (Some(controller), CheckpointWatermark::Active(watermark)) =
                 (self.cluster_controller.as_ref(), self.cluster_watermark)
@@ -6067,6 +7164,12 @@ impl CheckpointCoordinator {
             self.highest_decided = self.highest_decided.max(epoch);
         }
 
+        let post_commit_deadline = if commit_is_durable.load(std::sync::atomic::Ordering::Acquire) {
+            tokio::time::Instant::now() + self.config.cleanup_timeout
+        } else {
+            attempt_deadline
+        };
+
         // The authority append fenced the outcome against the exact captured term. Re-check the
         // live term before local finalization so a demoted task cannot acknowledge sources.
         #[cfg(feature = "cluster")]
@@ -6076,19 +7179,24 @@ impl CheckpointCoordinator {
             return Ok(self.fail_after_irrevocable_work(checkpoint_id, epoch, start, error));
         }
 
-        if let Err(e) = self
-            .finalize_manifest_until(checkpoint_id, attempt_deadline)
+        let manifest_finalized = match self
+            .finalize_manifest_until(checkpoint_id, post_commit_deadline)
             .await
         {
-            // The exact decision is irrevocable and the Prepared manifest already contains the
-            // source/state cut. Recovery finalizes this exact pair; live rollback is forbidden.
-            error!(
-                checkpoint_id,
-                epoch,
-                error = %e,
-                "[LDB-6047] commit decided but manifest finalization failed; recovery will repair"
-            );
-        }
+            Ok(_) => true,
+            Err(e) => {
+                // The exact decision is irrevocable and the Prepared manifest already contains
+                // the source/state cut. Recovery finalizes this exact pair; live rollback is
+                // forbidden. Do not advance retention until that repair is durable.
+                error!(
+                    checkpoint_id,
+                    epoch,
+                    error = %e,
+                    "[LDB-6047] commit decided but manifest finalization failed; recovery will repair"
+                );
+                false
+            }
+        };
 
         // Finalization can outlive a lease. A finalized artifact is safe for the next leader to
         // recover, but the stale task must still return failure so source offsets are not acked.
@@ -6100,14 +7208,26 @@ impl CheckpointCoordinator {
         }
 
         #[cfg(feature = "cluster")]
-        self.announce_if_leader(
-            epoch,
-            checkpoint_id,
-            laminar_core::cluster::control::Phase::Commit,
-            assignment_fence.as_ref(),
-            checkpoint_leadership.as_ref(),
+        if tokio::time::timeout_at(
+            post_commit_deadline,
+            self.announce_if_leader(
+                epoch,
+                checkpoint_id,
+                laminar_core::cluster::control::Phase::Commit,
+                assignment_fence.as_ref(),
+                checkpoint_leadership.as_ref(),
+            ),
         )
-        .await;
+        .await
+        .is_err()
+        {
+            warn!(
+                checkpoint_id,
+                epoch,
+                timeout = ?self.config.cleanup_timeout,
+                "[LDB-6031] checkpoint Commit announcement exhausted the post-commit deadline",
+            );
+        }
 
         // `announce_if_leader` intentionally degrades to a no-op after demotion. Re-check here so
         // that observation cannot be followed by success accounting or source acknowledgement.
@@ -6119,9 +7239,22 @@ impl CheckpointCoordinator {
             return Ok(self.fail_after_irrevocable_work(checkpoint_id, epoch, start, error));
         }
 
-        // Completion latency ends at the durable decision/finalization/announcement boundary;
-        // retention cleanup and successor-epoch setup are maintenance, not checkpoint latency.
-        let committed_duration = start.elapsed();
+        let retention_horizon = if manifest_finalized {
+            match self.record_committed_checkpoint(checkpoint_id) {
+                Ok(Some(horizon)) => horizon,
+                Ok(None) => 0,
+                Err(error) => {
+                    return Ok(self.fail_after_irrevocable_work(
+                        checkpoint_id,
+                        epoch,
+                        start,
+                        error.to_string(),
+                    ));
+                }
+            }
+        } else {
+            0
+        };
 
         if let Some(ref m) = self.prom {
             #[allow(clippy::cast_possible_wrap)]
@@ -6132,7 +7265,7 @@ impl CheckpointCoordinator {
         // the state backend is shared in cluster mode, so the leader (which
         // advances the committer floor) owns GC; a follower's floor stays 0.
         if self.is_designated_commit_leader() {
-            let mut horizon = epoch.saturating_sub(self.config.max_retained as u64);
+            let mut horizon = retention_horizon;
             // Never prune descriptors the designated committer hasn't committed
             // yet — hold the horizon at the commit floor for coordinated sinks.
             if self.sinks.iter().any(|s| s.handle.checkpoint_committable()) {
@@ -6164,21 +7297,22 @@ impl CheckpointCoordinator {
             return Ok(self.fail_after_irrevocable_work(checkpoint_id, epoch, start, error));
         }
 
-        let next_epoch = self.allocator.peek_epoch();
-        let begin_epoch_error = match self
-            .begin_epoch_for_sinks_until(next_epoch, attempt_deadline)
-            .await
-        {
+        let continuation = async {
+            self.clear_owned_sink_witness_for_attempt_until(attempt, post_commit_deadline)
+                .await?;
+            self.begin_next_epoch_until(post_commit_deadline).await
+        }
+        .await;
+        let begin_epoch_error = match continuation {
             Ok(()) => None,
             Err(e) => {
                 error!(
-                    next_epoch,
                     error = %e,
-                    "[LDB-6015] failed to begin next epoch — pipeline must stop before further writes"
+                    "[LDB-6015] failed to settle the committed sink epoch and begin its successor — pipeline must stop before further writes"
                 );
                 Some(format!(
-                    "checkpoint {checkpoint_id} epoch {epoch} committed, but successor sink \
-                     epoch {next_epoch} failed to begin: {e}"
+                    "checkpoint {checkpoint_id} epoch {epoch} committed, but sink continuation \
+                     failed before the successor opened: {e}"
                 ))
             }
         };
@@ -6196,7 +7330,7 @@ impl CheckpointCoordinator {
         self.decision_write_started = false;
         self.checkpoints_completed += 1;
         self.total_bytes_written += checkpoint_bytes;
-        let duration = committed_duration;
+        let duration = start.elapsed();
         self.last_checkpoint_duration = Some(duration);
         self.duration_histogram.record(duration);
         self.emit_checkpoint_metrics(true, checkpoint_id, epoch, duration);
@@ -6543,6 +7677,7 @@ impl CheckpointCoordinator {
                 self.validate_recovered_cluster_cut(recovered).await?;
                 self.install_recovered_cluster_watermark(recovered)?;
             }
+            self.record_committed_checkpoint(recovered.manifest.checkpoint_id)?;
             let successor =
                 checked_successor_epoch(recovered.epoch(), "advancing after checkpoint recovery")?;
             self.allocator.advance_epoch_to(successor);
@@ -6605,6 +7740,7 @@ impl CheckpointCoordinator {
                 self.validate_recovered_cluster_cut(recovered).await?;
                 self.install_recovered_cluster_watermark(recovered)?;
             }
+            self.record_committed_checkpoint(recovered.manifest.checkpoint_id)?;
             let successor = checked_successor_epoch(
                 recovered.epoch(),
                 "advancing after coordinated checkpoint recovery",

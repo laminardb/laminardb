@@ -23,7 +23,7 @@ use crate::connector::{
     SourceConnector, SourceConsistency, SourceContract, SourceDrainOutcome, SourceDrainRequest,
     SourceDrainResolution, SourcePosition, SourceStart, SourceTopology,
 };
-use crate::error::ConnectorError;
+use crate::error::{ConnectorError, SerdeError};
 use crate::serde::{self, Format, RecordDeserializer};
 
 use super::avro::AvroDeserializer;
@@ -64,6 +64,37 @@ fn publish_reader_fault(
     }
     drop(published);
     data_ready.notify_one();
+}
+
+/// A guaranteed-delivery poll cannot retry in place after removing input from the reader queue.
+/// The Kafka consumer has already moved past that input, so only a fresh generation seeking the
+/// durable checkpoint can retry it safely. Preserve terminal errors, but turn transient errors into
+/// terminal-for-this-generation failures so the source actor cannot consume later records.
+fn terminalize_guaranteed_poll_error(
+    delivery: DeliveryGuarantee,
+    state: &mut ConnectorState,
+    metrics: &KafkaSourceMetrics,
+    reader_shutdown: Option<&tokio::sync::watch::Sender<bool>>,
+    error: ConnectorError,
+) -> ConnectorError {
+    if delivery == DeliveryGuarantee::BestEffort {
+        return error;
+    }
+
+    metrics.record_error();
+    *state = ConnectorState::Failed;
+    if let Some(shutdown) = reader_shutdown {
+        let _ = shutdown.send(true);
+    }
+    warn!(delivery = %delivery, %error, "Kafka source generation stopped after a post-drain failure");
+
+    if error.is_transient() {
+        ConnectorError::Internal(format!(
+            "Kafka guaranteed-delivery poll failed after draining input; recovery from the durable cursor is required: {error}"
+        ))
+    } else {
+        error
+    }
 }
 
 /// Payload sent from the background Kafka reader task to [`KafkaSource::poll_batch`].
@@ -944,6 +975,9 @@ type KafkaReaderRx = crossfire::AsyncRx<crossfire::mpsc::Array<KafkaReaderItem>>
 pub struct KafkaSource {
     consumer: Option<Arc<StreamConsumer<LaminarConsumerContext>>>,
     config: KafkaSourceConfig,
+    /// Delivery contract selected by the engine for this connector generation.
+    /// Only `BestEffort` may discard records that fail deserialization.
+    delivery: DeliveryGuarantee,
     deserializer: Box<dyn RecordDeserializer>,
     offsets: OffsetTracker,
     state: ConnectorState,
@@ -1029,9 +1063,9 @@ pub struct KafkaSource {
     poll_meta_offsets: Vec<i64>,
     poll_meta_timestamps: Vec<Option<i64>>,
     poll_meta_headers: Vec<Option<String>>,
-    /// This poll's (topic, partition, offset) triples, folded into `offsets` only after the batch
-    /// deserializes — so a decode failure / poison-pill escalation doesn't advance offsets past the
-    /// lost batch (CN-4). Reused across polls.
+    /// This poll's (topic, partition, offset) triples, folded into `offsets` only after the complete
+    /// output batch is constructed — so decode or finalization failure cannot advance beyond data
+    /// that was never emitted. Reused across polls.
     poll_staged_offsets: Vec<(Arc<str>, i32, i64)>,
 }
 
@@ -1104,6 +1138,7 @@ impl KafkaSource {
         Self {
             consumer: None,
             config,
+            delivery: DeliveryGuarantee::BestEffort,
             deserializer,
             offsets: OffsetTracker::new(),
             state: ConnectorState::Created,
@@ -3418,11 +3453,7 @@ impl SourceConnector for KafkaSource {
                 actual: self.state.to_string(),
             });
         }
-        let SourceStart {
-            config,
-            position,
-            delivery,
-        } = request;
+        let (config, position, delivery) = request.into_parts();
 
         // Resolve and validate the complete cursor policy before creating a
         // consumer. `StreamConsumer` construction starts librdkafka background
@@ -3538,6 +3569,7 @@ impl SourceConnector for KafkaSource {
         }
         self.state = ConnectorState::Initializing;
         self.config = kafka_config.clone();
+        self.delivery = delivery;
         self.offsets = installed_offsets;
         self.manual_topic_partitions.clear();
         self.manual_partition_baselines.clear();
@@ -4226,7 +4258,7 @@ impl SourceConnector for KafkaSource {
         let limit = max_records.min(self.config.max_poll_records);
 
         // Reuse struct-level buffers — clear without freeing capacity. Clearing staged offsets
-        // here also discards any left by a prior poll whose batch failed to deserialize (CN-4).
+        // here also discards any left by a prior poll whose output failed to finalize.
         self.poll_payloads.clear();
         self.poll_payload_buf.clear();
         self.poll_payload_offsets.clear();
@@ -4324,7 +4356,7 @@ impl SourceConnector for KafkaSource {
                                 break;
                             }
                         };
-                        if !vnode_payload_is_current(
+                        let payload_is_current = vnode_payload_is_current(
                             vnode_ownership
                                 .as_ref()
                                 .map(|(assignment, self_id)| (*assignment, *self_id)),
@@ -4337,7 +4369,17 @@ impl SourceConnector for KafkaSource {
                                 )
                             }),
                             kp.offset,
-                        )? {
+                        )
+                        .map_err(|error| {
+                            terminalize_guaranteed_poll_error(
+                                self.delivery,
+                                &mut self.state,
+                                &self.metrics,
+                                self.reader_shutdown.as_ref(),
+                                error,
+                            )
+                        })?;
+                        if !payload_is_current {
                             debug!(
                                 topic = kp.topic.as_ref(),
                                 partition = kp.partition,
@@ -4381,8 +4423,8 @@ impl SourceConnector for KafkaSource {
             self.poll_payload_buf.extend_from_slice(&kp.data);
             self.poll_payload_offsets.push((start, kp.data.len()));
 
-            // Stage the offset; it is folded into `self.offsets` only after this batch
-            // deserializes (CN-4), so an escalated decode failure can't advance past it.
+            // Stage the offset; it is folded into `self.offsets` only after the complete output
+            // finalizes, so decode or metadata construction failure cannot advance past it.
             self.poll_staged_offsets
                 .push((Arc::clone(&kp.topic), kp.partition, kp.offset));
 
@@ -4437,7 +4479,18 @@ impl SourceConnector for KafkaSource {
                 if let Some(schema_id) = AvroDeserializer::extract_confluent_id(
                     &self.poll_payload_buf[start..start + len],
                 ) {
-                    let is_new = avro_deser.ensure_schema_registered(schema_id).await?;
+                    let is_new = avro_deser
+                        .ensure_schema_registered(schema_id)
+                        .await
+                        .map_err(|error| {
+                            terminalize_guaranteed_poll_error(
+                                self.delivery,
+                                &mut self.state,
+                                &self.metrics,
+                                self.reader_shutdown.as_ref(),
+                                error,
+                            )
+                        })?;
                     if is_new {
                         new_schema_ids.push(schema_id);
                     }
@@ -4456,7 +4509,15 @@ impl SourceConnector for KafkaSource {
                     let evolver = SchemaEvolution::new(compat);
 
                     for id in new_schema_ids {
-                        let cached = sr.resolve_confluent_id(id).await?;
+                        let cached = sr.resolve_confluent_id(id).await.map_err(|error| {
+                            terminalize_guaranteed_poll_error(
+                                self.delivery,
+                                &mut self.state,
+                                &self.metrics,
+                                self.reader_shutdown.as_ref(),
+                                error,
+                            )
+                        })?;
 
                         let Some(ref prev) = self.last_avro_schema else {
                             // First schema — establish baseline, nothing to diff.
@@ -4491,9 +4552,16 @@ impl SourceConnector for KafkaSource {
                                 if self.config.schema_evolution_strategy
                                     == SchemaEvolutionStrategy::Reject
                                 {
-                                    return Err(ConnectorError::SchemaMismatch(format!(
+                                    let error = ConnectorError::SchemaMismatch(format!(
                                         "incompatible schema evolution for ID {id}: {reason}"
-                                    )));
+                                    ));
+                                    return Err(terminalize_guaranteed_poll_error(
+                                        self.delivery,
+                                        &mut self.state,
+                                        &self.metrics,
+                                        self.reader_shutdown.as_ref(),
+                                        error,
+                                    ));
                                 }
                                 warn!(
                                     schema_id = id, %reason, ?changes,
@@ -4516,9 +4584,21 @@ impl SourceConnector for KafkaSource {
         // to per-record deserialization to isolate poison pills.
         let (batch, good_indices) = match self.deserializer.deserialize_batch(&refs, &self.schema) {
             Ok(batch) => (batch, None),
+            Err(batch_err) if self.delivery != DeliveryGuarantee::BestEffort => {
+                // Without a checkpoint-coupled dead-letter path, skipping even one input would
+                // let a later checkpoint seal a cursor beyond data that was never emitted. Stop
+                // this connector generation so recovery must restart from its durable cursor.
+                return Err(terminalize_guaranteed_poll_error(
+                    self.delivery,
+                    &mut self.state,
+                    &self.metrics,
+                    self.reader_shutdown.as_ref(),
+                    ConnectorError::Serde(batch_err),
+                ));
+            }
             Err(batch_err) => {
-                // Per-record fallback: deserialize one at a time, collect
-                // successful batches directly (avoids double-deserialization).
+                // Best-effort-only fallback: deserialize one at a time, collect successful
+                // batches directly (avoids double-deserialization).
                 // Track indices of successful records so metadata vectors can
                 // be filtered to match the reduced row count.
                 let mut good_batches = Vec::with_capacity(refs.len());
@@ -4566,35 +4646,21 @@ impl SourceConnector for KafkaSource {
             }
         };
 
-        // Deserialization succeeded — every Ok path reaches here; the two escalation errors above
-        // returned first. Fold this poll's staged offsets into the committed tracker only now, so a
-        // decode failure never advances offsets past the lost batch (CN-4). Poison pills isolated
-        // below the error-rate threshold are intentionally dropped, so advancing past them is
-        // correct. update_arc is monotonic, so fold order is irrelevant.
-        if !self.poll_staged_offsets.is_empty() {
-            {
-                let mut snapshot = lock_or_recover(&self.offset_snapshot);
-                for (topic, partition, offset) in &self.poll_staged_offsets {
-                    self.offsets.update_arc(topic, *partition, *offset);
-                    snapshot.update_arc(topic, *partition, *offset);
-                }
-            }
-            if retires_rotation_baseline {
-                if let Some(version) = drained_assignment_version {
-                    let mut published = lock_or_recover(&self.assignment_publication);
-                    if published.assignment_version == version {
-                        let publication = Arc::make_mut(&mut published);
-                        retire_accepted_rotation_baselines(
-                            &mut publication.baselines,
-                            &self.poll_staged_offsets,
-                        );
-                        let count = rotation_baselines_len(&publication.baselines);
-                        self.rotation_partition_baseline_count
-                            .store(count, Ordering::Release);
-                    }
-                }
-            }
-            self.poll_staged_offsets.clear();
+        // Kafka source formats map one broker message to one row. A short successful decode is a
+        // silent drop unless it is rejected before the message offsets become checkpointable.
+        let expected_rows = good_indices.as_ref().map_or(refs.len(), Vec::len);
+        if batch.num_rows() != expected_rows {
+            let error = ConnectorError::Serde(SerdeError::RecordCountMismatch {
+                expected: expected_rows,
+                got: batch.num_rows(),
+            });
+            return Err(terminalize_guaranteed_poll_error(
+                self.delivery,
+                &mut self.state,
+                &self.metrics,
+                self.reader_shutdown.as_ref(),
+                error,
+            ));
         }
 
         // If poison pill fallback filtered records, also filter metadata
@@ -4653,13 +4719,50 @@ impl SourceConnector for KafkaSource {
 
             let meta_schema = Arc::new(arrow_schema::Schema::new(fields));
             arrow_array::RecordBatch::try_new(meta_schema, columns).map_err(|e| {
-                ConnectorError::Internal(format!("failed to append metadata columns: {e}"))
+                terminalize_guaranteed_poll_error(
+                    self.delivery,
+                    &mut self.state,
+                    &self.metrics,
+                    self.reader_shutdown.as_ref(),
+                    ConnectorError::Internal(format!("failed to append metadata columns: {e}")),
+                )
             })?
         } else {
             batch
         };
 
-        let num_rows = batch.num_rows();
+        // Construct the complete output before publishing its cursor. In particular,
+        // metadata/header column validation above is fallible and must not retire a rotation
+        // baseline or advance the recovery position for a batch that cannot be returned.
+        let output = SourceBatch::new(batch);
+        let num_rows = output.num_rows();
+
+        if !self.poll_staged_offsets.is_empty() {
+            {
+                let mut snapshot = lock_or_recover(&self.offset_snapshot);
+                for (topic, partition, offset) in &self.poll_staged_offsets {
+                    self.offsets.update_arc(topic, *partition, *offset);
+                    snapshot.update_arc(topic, *partition, *offset);
+                }
+            }
+            if retires_rotation_baseline {
+                if let Some(version) = drained_assignment_version {
+                    let mut published = lock_or_recover(&self.assignment_publication);
+                    if published.assignment_version == version {
+                        let publication = Arc::make_mut(&mut published);
+                        retire_accepted_rotation_baselines(
+                            &mut publication.baselines,
+                            &self.poll_staged_offsets,
+                        );
+                        let count = rotation_baselines_len(&publication.baselines);
+                        self.rotation_partition_baseline_count
+                            .store(count, Ordering::Release);
+                    }
+                }
+            }
+            self.poll_staged_offsets.clear();
+        }
+
         self.metrics.record_poll(num_rows as u64, total_bytes);
 
         debug!(
@@ -4668,7 +4771,7 @@ impl SourceConnector for KafkaSource {
             "polled batch from Kafka"
         );
 
-        Ok(Some(SourceBatch::new(batch)))
+        Ok(Some(output))
     }
 
     fn schema(&self) -> SchemaRef {
@@ -4794,6 +4897,7 @@ impl std::fmt::Debug for KafkaSource {
             .field("subscription", &self.config.subscription)
             .field("group_id", &self.config.group_id)
             .field("format", &self.config.format)
+            .field("delivery", &self.delivery)
             .field("partitions", &self.offsets.partition_count())
             .finish_non_exhaustive()
     }
@@ -4857,6 +4961,8 @@ mod tests {
         cfg
     }
 
+    const COMMITTED_HANDOFF_CHECKPOINT_ID: u64 = 9;
+
     fn committed_kafka_handoff(
         source_name: &str,
         checkpoint_assignment_version: u64,
@@ -4877,7 +4983,10 @@ mod tests {
         });
         let capsule = ClusterRecoveryCapsule {
             version: CLUSTER_RECOVERY_CAPSULE_VERSION,
-            attempt: CheckpointAttempt::new(3, 9),
+            attempt: CheckpointAttempt::new(
+                COMMITTED_HANDOFF_CHECKPOINT_ID,
+                COMMITTED_HANDOFF_CHECKPOINT_ID,
+            ),
             deployment_id: uuid::Uuid::from_u128(2).to_string(),
             pipeline_identity: PipelineIdentity {
                 canonical_version: PIPELINE_IDENTITY_VERSION,
@@ -4932,6 +5041,260 @@ mod tests {
             timestamp_ms: None,
             headers_json: None,
         }
+    }
+
+    struct FirstRecordOnlyDeserializer;
+
+    impl RecordDeserializer for FirstRecordOnlyDeserializer {
+        fn deserialize(
+            &self,
+            data: &[u8],
+            schema: &SchemaRef,
+        ) -> Result<arrow_array::RecordBatch, crate::error::SerdeError> {
+            serde::json::JsonDeserializer::new().deserialize(data, schema)
+        }
+
+        fn deserialize_batch(
+            &self,
+            records: &[&[u8]],
+            schema: &SchemaRef,
+        ) -> Result<arrow_array::RecordBatch, crate::error::SerdeError> {
+            records.first().map_or_else(
+                || Ok(arrow_array::RecordBatch::new_empty(Arc::clone(schema))),
+                |record| self.deserialize(record, schema),
+            )
+        }
+
+        fn format(&self) -> Format {
+            Format::Json
+        }
+    }
+
+    #[tokio::test]
+    async fn guaranteed_delivery_rejects_any_decode_failure_without_advancing_cursor() {
+        let mut config = test_config();
+        config.max_deser_error_rate = 1.0;
+        let mut source = KafkaSource::new(test_schema(), config, None);
+        source.state = ConnectorState::Running;
+        source.delivery = DeliveryGuarantee::AtLeastOnce;
+        source.offsets.update_force("events", 1, 9);
+        lock_or_recover(&source.offset_snapshot).update_force("events", 1, 9);
+        source
+            .manual_topic_partitions
+            .insert(("events".to_string(), 1));
+        let checkpoint_before = source.try_checkpoint().unwrap().unwrap();
+
+        let (tx, rx) = crossfire::mpsc::bounded_async::<KafkaReaderItem>(3);
+        for (offset, data) in [
+            (10, br#"{"id":10,"value":"good"}"#.as_slice()),
+            (11, b"not-json".as_slice()),
+            (12, br#"{"id":12,"value":"good"}"#.as_slice()),
+        ] {
+            tx.send(KafkaReaderItem::Payload(KafkaPayload {
+                data: data.to_vec(),
+                topic: Arc::from("events"),
+                partition: 1,
+                partition_vnode: None,
+                offset,
+                timestamp_ms: None,
+                headers_json: None,
+            }))
+            .await
+            .unwrap();
+        }
+        source.channel_len.store(3, Ordering::Release);
+        source.msg_rx = Some(rx);
+
+        let error = source
+            .poll_batch(3)
+            .await
+            .expect_err("guaranteed delivery must not skip a poison pill");
+        assert!(matches!(error, ConnectorError::Serde(_)));
+        assert_eq!(source.state, ConnectorState::Failed);
+        assert_eq!(source.offsets.get("events", 1), Some(9));
+        assert_eq!(
+            lock_or_recover(&source.offset_snapshot).get("events", 1),
+            Some(9)
+        );
+        assert_eq!(source.try_checkpoint().unwrap().unwrap(), checkpoint_before);
+    }
+
+    #[tokio::test]
+    async fn guaranteed_post_drain_registry_failure_requires_a_fresh_generation() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let registry_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/schemas/ids/42"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .mount(&registry_server)
+            .await;
+
+        let mut config = test_config();
+        config.format = Format::Avro;
+        config.schema_registry_url = Some(registry_server.uri());
+        let registry = SchemaRegistryClient::new(registry_server.uri(), None).unwrap();
+        let mut source = KafkaSource::with_schema_registry(test_schema(), config, registry);
+        source.state = ConnectorState::Running;
+        source.delivery = DeliveryGuarantee::AtLeastOnce;
+        source.offsets.update_force("events", 1, 9);
+        lock_or_recover(&source.offset_snapshot).update_force("events", 1, 9);
+        source
+            .manual_topic_partitions
+            .insert(("events".to_string(), 1));
+        let checkpoint_before = source.try_checkpoint().unwrap().unwrap();
+        let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+        source.reader_shutdown = Some(shutdown);
+
+        let (tx, rx) = crossfire::mpsc::bounded_async::<KafkaReaderItem>(1);
+        tx.send(KafkaReaderItem::Payload(KafkaPayload {
+            data: vec![0, 0, 0, 0, 42],
+            topic: Arc::from("events"),
+            partition: 1,
+            partition_vnode: None,
+            offset: 10,
+            timestamp_ms: None,
+            headers_json: None,
+        }))
+        .await
+        .unwrap();
+        source.channel_len.store(1, Ordering::Release);
+        source.msg_rx = Some(rx);
+
+        let error = source
+            .poll_batch(1)
+            .await
+            .expect_err("a post-drain registry failure must retire guaranteed delivery");
+        assert!(
+            matches!(error, ConnectorError::Internal(message) if message.contains("durable cursor"))
+        );
+        assert_eq!(source.state, ConnectorState::Failed);
+        assert!(*shutdown_rx.borrow());
+        assert_eq!(source.offsets.get("events", 1), Some(9));
+        assert_eq!(source.try_checkpoint().unwrap().unwrap(), checkpoint_before);
+    }
+
+    #[tokio::test]
+    async fn best_effort_retains_explicit_poison_pill_threshold() {
+        let mut config = test_config();
+        config.max_deser_error_rate = 1.0;
+        let mut source = KafkaSource::new(test_schema(), config, None);
+        source.state = ConnectorState::Running;
+        source.delivery = DeliveryGuarantee::BestEffort;
+        source.offsets.update_force("events", 1, 9);
+        lock_or_recover(&source.offset_snapshot).update_force("events", 1, 9);
+
+        let (tx, rx) = crossfire::mpsc::bounded_async::<KafkaReaderItem>(3);
+        for (offset, data) in [
+            (10, br#"{"id":10,"value":"good"}"#.as_slice()),
+            (11, b"not-json".as_slice()),
+            (12, br#"{"id":12,"value":"good"}"#.as_slice()),
+        ] {
+            tx.send(KafkaReaderItem::Payload(KafkaPayload {
+                data: data.to_vec(),
+                topic: Arc::from("events"),
+                partition: 1,
+                partition_vnode: None,
+                offset,
+                timestamp_ms: None,
+                headers_json: None,
+            }))
+            .await
+            .unwrap();
+        }
+        source.channel_len.store(3, Ordering::Release);
+        source.msg_rx = Some(rx);
+
+        let batch = source.poll_batch(3).await.unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(source.state, ConnectorState::Running);
+        assert_eq!(source.offsets.get("events", 1), Some(12));
+        assert_eq!(
+            lock_or_recover(&source.offset_snapshot).get("events", 1),
+            Some(12)
+        );
+    }
+
+    #[tokio::test]
+    async fn decoded_row_count_mismatch_preserves_cursor_and_rotation_baseline() {
+        let node = laminar_core::state::NodeId(1);
+        let registry = Arc::new(laminar_core::state::VnodeRegistry::single_owner(1, node));
+        let version = registry.assignment_version();
+        let mut source = KafkaSource::new(test_schema(), test_config(), None);
+        source.state = ConnectorState::Running;
+        source.delivery = DeliveryGuarantee::AtLeastOnce;
+        source.deserializer = Box::new(FirstRecordOnlyDeserializer);
+        source.vnode_assignment = Some((Arc::clone(&registry), node));
+        source
+            .reconciled_assignment_version
+            .store(version, Ordering::Release);
+        source.applied_rotation_baseline_version = Some(version);
+        source.offsets.update_force("events", 1, 9);
+        lock_or_recover(&source.offset_snapshot).update_force("events", 1, 9);
+
+        let baselines = KafkaRotationBaselines::from([(
+            Arc::from("events"),
+            std::collections::HashMap::from([(1, 10)]),
+        )]);
+        *lock_or_recover(&source.assignment_publication) =
+            Arc::new(KafkaAssignmentPublication::new(
+                version,
+                Arc::new(KafkaPartitionSet::from([("events".to_string(), 1)])),
+                baselines,
+            ));
+        source
+            .rotation_partition_baseline_count
+            .store(1, Ordering::Release);
+        let checkpoint_before = source.try_checkpoint().unwrap().unwrap();
+
+        let (tx, rx) = crossfire::mpsc::bounded_async::<KafkaReaderItem>(2);
+        for offset in [10, 11] {
+            tx.send(KafkaReaderItem::Payload(KafkaPayload {
+                data: format!(r#"{{"id":{offset},"value":"good"}}"#).into_bytes(),
+                topic: Arc::from("events"),
+                partition: 1,
+                partition_vnode: Some(0),
+                offset,
+                timestamp_ms: None,
+                headers_json: None,
+            }))
+            .await
+            .unwrap();
+        }
+        source.channel_len.store(2, Ordering::Release);
+        source.msg_rx = Some(rx);
+
+        let error = source
+            .poll_batch(2)
+            .await
+            .expect_err("a partial successful decode must reject cursor publication");
+        assert!(matches!(
+            error,
+            ConnectorError::Serde(SerdeError::RecordCountMismatch {
+                expected: 2,
+                got: 1
+            })
+        ));
+        assert_eq!(source.state, ConnectorState::Failed);
+        assert_eq!(source.offsets.get("events", 1), Some(9));
+        assert_eq!(
+            lock_or_recover(&source.offset_snapshot).get("events", 1),
+            Some(9)
+        );
+        let publication = lock_or_recover(&source.assignment_publication);
+        assert_eq!(
+            rotation_partition_baseline(&publication.baselines, "events", 1),
+            Some(10)
+        );
+        assert_eq!(
+            source
+                .rotation_partition_baseline_count
+                .load(Ordering::Acquire),
+            1
+        );
+        drop(publication);
+        assert_eq!(source.try_checkpoint().unwrap().unwrap(), checkpoint_before);
     }
 
     #[test]
@@ -5119,6 +5482,13 @@ mod tests {
             committed_kafka_handoff("orders", 7, NonZeroU64::new(7), Some("kafka")).unwrap();
         let (offsets, baselines) = decode_committed_kafka_handoff(&handoff, "orders").unwrap();
 
+        assert_eq!(
+            handoff.attempt(),
+            CheckpointAttempt::new(
+                COMMITTED_HANDOFF_CHECKPOINT_ID,
+                COMMITTED_HANDOFF_CHECKPOINT_ID,
+            )
+        );
         assert_eq!(offsets.get("events", 0), Some(41));
         assert_eq!(baselines.get(&("events".to_string(), 0)), Some(&42));
         assert_eq!(handoff.source("orders").unwrap().watermark(), Some(1_000));
@@ -5213,11 +5583,14 @@ mod tests {
     async fn progress_commit_enqueues_before_first_poll() {
         let mut source = KafkaSource::new(test_schema(), test_config(), None);
         source
-            .start(SourceStart {
-                config: ConnectorConfig::new("kafka"),
-                position: SourcePosition::Initial,
-                delivery: DeliveryGuarantee::BestEffort,
-            })
+            .start(
+                SourceStart::new(
+                    ConnectorConfig::new("kafka"),
+                    SourcePosition::Initial,
+                    DeliveryGuarantee::BestEffort,
+                )
+                .unwrap(),
+            )
             .await
             .expect("consumer creation and subscription are non-blocking");
 
@@ -5235,11 +5608,14 @@ mod tests {
         assert_eq!(source.channel_len.load(Ordering::Acquire), 0);
 
         let error = source
-            .start(SourceStart {
-                config: ConnectorConfig::new("kafka"),
-                position: SourcePosition::Initial,
-                delivery: DeliveryGuarantee::AtLeastOnce,
-            })
+            .start(
+                SourceStart::new(
+                    ConnectorConfig::new("kafka"),
+                    SourcePosition::Initial,
+                    DeliveryGuarantee::AtLeastOnce,
+                )
+                .unwrap(),
+            )
             .await
             .expect_err("a closed connector instance is not restartable");
         assert!(matches!(error, ConnectorError::InvalidState { .. }));
@@ -5319,14 +5695,17 @@ mod tests {
             "42".to_string(),
         )]));
         let error = source
-            .start(SourceStart {
-                config: request_config,
-                position: SourcePosition::Resume {
-                    attempt: laminar_core::state::CheckpointAttempt::new(17, 23),
-                    checkpoint,
-                },
-                delivery: DeliveryGuarantee::AtLeastOnce,
-            })
+            .start(
+                SourceStart::new(
+                    request_config,
+                    SourcePosition::Resume {
+                        attempt: laminar_core::state::CheckpointAttempt::canonical(23),
+                        checkpoint,
+                    },
+                    DeliveryGuarantee::AtLeastOnce,
+                )
+                .unwrap(),
+            )
             .await
             .expect_err("dynamic broker-managed ownership must fail closed");
 
@@ -5360,11 +5739,14 @@ mod tests {
             )
             .unwrap();
         let error = source
-            .start(SourceStart {
-                config: ConnectorConfig::new("kafka"),
-                position: SourcePosition::Initial,
-                delivery: DeliveryGuarantee::AtLeastOnce,
-            })
+            .start(
+                SourceStart::new(
+                    ConnectorConfig::new("kafka"),
+                    SourcePosition::Initial,
+                    DeliveryGuarantee::AtLeastOnce,
+                )
+                .unwrap(),
+            )
             .await
             .expect_err("dynamic topic inventory cannot be fenced by vnode assignment");
         assert!(matches!(
@@ -5427,11 +5809,14 @@ mod tests {
         request_config.set("laminar.source.name", "other_source");
 
         let error = source
-            .start(SourceStart {
-                config: request_config,
-                position: SourcePosition::Initial,
-                delivery: DeliveryGuarantee::AtLeastOnce,
-            })
+            .start(
+                SourceStart::new(
+                    request_config,
+                    SourcePosition::Initial,
+                    DeliveryGuarantee::AtLeastOnce,
+                )
+                .unwrap(),
+            )
             .await
             .expect_err("catalog identity mismatch must fail before Kafka construction");
         assert!(matches!(
@@ -5549,11 +5934,14 @@ mod tests {
             let mut source = KafkaSource::new(test_schema(), config, None);
 
             let error = source
-                .start(SourceStart {
-                    config: ConnectorConfig::new("kafka"),
-                    position: SourcePosition::Initial,
-                    delivery: DeliveryGuarantee::AtLeastOnce,
-                })
+                .start(
+                    SourceStart::new(
+                        ConnectorConfig::new("kafka"),
+                        SourcePosition::Initial,
+                        DeliveryGuarantee::AtLeastOnce,
+                    )
+                    .unwrap(),
+                )
                 .await
                 .expect_err("a moving initial cut can skip records after recovery");
             assert!(matches!(
@@ -5571,11 +5959,14 @@ mod tests {
         let mut source = KafkaSource::new(test_schema(), test_config(), None);
 
         let error = source
-            .start(SourceStart {
-                config: ConnectorConfig::new("kafka"),
-                position: SourcePosition::Initial,
-                delivery: DeliveryGuarantee::AtLeastOnce,
-            })
+            .start(
+                SourceStart::new(
+                    ConnectorConfig::new("kafka"),
+                    SourcePosition::Initial,
+                    DeliveryGuarantee::AtLeastOnce,
+                )
+                .unwrap(),
+            )
             .await
             .expect_err("a mutable broker group cursor cannot define a guaranteed initial cut");
         assert!(matches!(
@@ -5606,11 +5997,14 @@ mod tests {
             let mut source = KafkaSource::new(test_schema(), config, None);
 
             source
-                .start(SourceStart {
-                    config: ConnectorConfig::new("kafka"),
-                    position: SourcePosition::Initial,
-                    delivery: DeliveryGuarantee::AtLeastOnce,
-                })
+                .start(
+                    SourceStart::new(
+                        ConnectorConfig::new("kafka"),
+                        SourcePosition::Initial,
+                        DeliveryGuarantee::AtLeastOnce,
+                    )
+                    .unwrap(),
+                )
                 .await
                 .expect("supported guaranteed start must activate against explicit inventory");
 
@@ -5657,11 +6051,14 @@ mod tests {
             .unwrap();
 
         source
-            .start(SourceStart {
-                config: ConnectorConfig::new("kafka"),
-                position: SourcePosition::Initial,
-                delivery: DeliveryGuarantee::AtLeastOnce,
-            })
+            .start(
+                SourceStart::new(
+                    ConnectorConfig::new("kafka"),
+                    SourcePosition::Initial,
+                    DeliveryGuarantee::AtLeastOnce,
+                )
+                .unwrap(),
+            )
             .await
             .expect("vnode assignment must activate");
 
@@ -5727,11 +6124,14 @@ mod tests {
             .unwrap();
 
         source
-            .start(SourceStart {
-                config: ConnectorConfig::new("kafka"),
-                position: SourcePosition::Initial,
-                delivery: DeliveryGuarantee::AtLeastOnce,
-            })
+            .start(
+                SourceStart::new(
+                    ConnectorConfig::new("kafka"),
+                    SourcePosition::Initial,
+                    DeliveryGuarantee::AtLeastOnce,
+                )
+                .unwrap(),
+            )
             .await
             .expect("canonical unassigned bootstrap must start fenced");
 
@@ -5815,11 +6215,14 @@ mod tests {
             .set_vnode_assignment("events_source", Arc::clone(&registry), node1)
             .unwrap();
         source
-            .start(SourceStart {
-                config: ConnectorConfig::new("kafka"),
-                position: SourcePosition::Initial,
-                delivery: DeliveryGuarantee::AtLeastOnce,
-            })
+            .start(
+                SourceStart::new(
+                    ConnectorConfig::new("kafka"),
+                    SourcePosition::Initial,
+                    DeliveryGuarantee::AtLeastOnce,
+                )
+                .unwrap(),
+            )
             .await
             .expect("initial vnode assignment must activate");
         registry.set_assignment_and_version(
@@ -6696,11 +7099,14 @@ mod tests {
         // start() will fail to connect (no broker), but the deserializer
         // re-selection happens before the connection attempt.
         let _ = source
-            .start(SourceStart {
-                config: empty_config,
-                position: SourcePosition::Initial,
-                delivery: DeliveryGuarantee::BestEffort,
-            })
+            .start(
+                SourceStart::new(
+                    empty_config,
+                    SourcePosition::Initial,
+                    DeliveryGuarantee::BestEffort,
+                )
+                .unwrap(),
+            )
             .await;
         assert!(source.schema_registry.is_some());
         assert_eq!(source.deserializer.format(), Format::Avro);
@@ -6897,11 +7303,14 @@ mod tests {
         let mut source = KafkaSource::with_schema_registry(test_schema(), config, registry);
 
         let error = source
-            .start(SourceStart {
-                config: ConnectorConfig::new("kafka"),
-                position: SourcePosition::Initial,
-                delivery: DeliveryGuarantee::BestEffort,
-            })
+            .start(
+                SourceStart::new(
+                    ConnectorConfig::new("kafka"),
+                    SourcePosition::Initial,
+                    DeliveryGuarantee::BestEffort,
+                )
+                .unwrap(),
+            )
             .await
             .unwrap_err();
 
@@ -7105,11 +7514,14 @@ mod tests {
 
         let empty_cfg = crate::config::ConnectorConfig::new("kafka");
         let _ = source
-            .start(SourceStart {
-                config: empty_cfg,
-                position: SourcePosition::Initial,
-                delivery: DeliveryGuarantee::BestEffort,
-            })
+            .start(
+                SourceStart::new(
+                    empty_cfg,
+                    SourcePosition::Initial,
+                    DeliveryGuarantee::BestEffort,
+                )
+                .unwrap(),
+            )
             .await; // broker unreachable — later errors irrelevant
 
         assert_eq!(

@@ -140,6 +140,7 @@ impl CommittedSourceHandoff {
     }
 
     /// Iterate the complete source cut in canonical source-name order.
+    #[must_use]
     pub fn sources(
         &self,
     ) -> impl ExactSizeIterator<Item = (&str, &SourceHandoffState)> + DoubleEndedIterator {
@@ -184,8 +185,10 @@ impl RecoveryCapsuleRef {
     /// # Errors
     /// Returns a description when the digest or encoded length is not canonical.
     pub fn validate(&self) -> Result<(), String> {
-        if self.epoch == 0 || self.checkpoint_id == 0 {
-            return Err("recovery capsule reference attempt dimensions must be non-zero".into());
+        if !CheckpointAttempt::new(self.epoch, self.checkpoint_id).is_canonical() {
+            return Err(
+                "recovery capsule reference must use one nonzero canonical checkpoint ID".into(),
+            );
         }
         validate_digest("recovery capsule", &self.sha256)?;
         if self.len == 0 || self.len > u64::try_from(MAX_RECOVERY_CAPSULE_BYTES).unwrap_or(u64::MAX)
@@ -277,8 +280,10 @@ impl ClusterRecoveryCapsule {
                 self.version
             ));
         }
-        if self.attempt.epoch == 0 || self.attempt.checkpoint_id == 0 {
-            return Err("recovery capsule attempt dimensions must be non-zero".into());
+        if !self.attempt.is_canonical() {
+            return Err(
+                "recovery capsule attempt must use one nonzero canonical checkpoint ID".into(),
+            );
         }
 
         let deployment = uuid::Uuid::parse_str(&self.deployment_id)
@@ -600,7 +605,7 @@ mod tests {
         .unwrap();
         ClusterRecoveryCapsule {
             version: CLUSTER_RECOVERY_CAPSULE_VERSION,
-            attempt: CheckpointAttempt::new(10, 100),
+            attempt: CheckpointAttempt::canonical(10),
             deployment_id: uuid::Uuid::from_u128(500).to_string(),
             pipeline_identity: PipelineIdentity {
                 canonical_version: PIPELINE_IDENTITY_VERSION,
@@ -666,6 +671,13 @@ mod tests {
         let valid = capsule();
         valid.validate().unwrap();
 
+        let mut noncanonical_attempt = valid.clone();
+        noncanonical_attempt.attempt.checkpoint_id += 1;
+        assert!(noncanonical_attempt
+            .validate()
+            .unwrap_err()
+            .contains("one nonzero canonical checkpoint ID"));
+
         let mut previous_version = valid.clone();
         previous_version.version = 4;
         assert!(previous_version
@@ -700,6 +712,13 @@ mod tests {
         assert_eq!(reference.len, u64::try_from(encoded.len()).unwrap());
         assert_eq!(reference.sha256, sha256_hex(&encoded));
         reference.validate().unwrap();
+
+        let mut noncanonical_reference = reference;
+        noncanonical_reference.checkpoint_id += 1;
+        assert!(noncanonical_reference
+            .validate()
+            .unwrap_err()
+            .contains("one nonzero canonical checkpoint ID"));
     }
 
     #[test]
@@ -707,7 +726,7 @@ mod tests {
         let capsule = capsule();
         let handoff = CommittedSourceHandoff::try_from(&capsule).unwrap();
 
-        assert_eq!(handoff.attempt(), CheckpointAttempt::new(10, 100));
+        assert_eq!(handoff.attempt(), CheckpointAttempt::canonical(10));
         assert_eq!(handoff.checkpoint_assignment_version(), 7);
         assert_eq!(
             handoff.cluster_watermark(),

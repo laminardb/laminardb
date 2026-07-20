@@ -602,11 +602,14 @@ async fn test_sink_source_roundtrip() {
     let mut source = DeltaSource::new(source_config, None);
     let source_connector_config = ConnectorConfig::new("delta-lake");
     source
-        .start(SourceStart {
-            config: source_connector_config,
-            position: SourcePosition::Initial,
-            delivery: DeliveryGuarantee::BestEffort,
-        })
+        .start(
+            SourceStart::new(
+                source_connector_config,
+                SourcePosition::Initial,
+                DeliveryGuarantee::BestEffort,
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
 
@@ -672,11 +675,14 @@ async fn test_source_checkpoint_resume_is_rejected_until_delta_replay_is_certifi
     let mut source = DeltaSource::new(source_config.clone(), None);
     let connector_config = ConnectorConfig::new("delta-lake");
     source
-        .start(SourceStart {
-            config: connector_config.clone(),
-            position: SourcePosition::Initial,
-            delivery: DeliveryGuarantee::BestEffort,
-        })
+        .start(
+            SourceStart::new(
+                connector_config.clone(),
+                SourcePosition::Initial,
+                DeliveryGuarantee::BestEffort,
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
 
@@ -693,14 +699,17 @@ async fn test_source_checkpoint_resume_is_rejected_until_delta_replay_is_certifi
     // Delta replay is not admitted until its snapshot/CDF cut is certified.
     let mut source2 = DeltaSource::new(source_config, None);
     let error = source2
-        .start(SourceStart {
-            config: connector_config,
-            position: SourcePosition::Resume {
-                attempt: laminar_core::state::CheckpointAttempt::new(2, 2),
-                checkpoint: cp,
-            },
-            delivery: DeliveryGuarantee::AtLeastOnce,
-        })
+        .start(
+            SourceStart::new(
+                connector_config,
+                SourcePosition::Resume {
+                    attempt: laminar_core::state::CheckpointAttempt::new(2, 2),
+                    checkpoint: cp,
+                },
+                DeliveryGuarantee::AtLeastOnce,
+            )
+            .unwrap(),
+        )
         .await
         .expect_err("uncertified Delta replay must fail closed");
     assert!(error.to_string().contains("ephemeral"));
@@ -978,8 +987,8 @@ async fn coordinated_batch_filters_overlap_only_after_refreshing_stale_handle() 
         encode_commit_descriptor(&binding, &staged_adds(&writer, test_batch(1)).await).unwrap();
     let second_descriptor =
         encode_commit_descriptor(&binding, &staged_adds(&writer, test_batch(2)).await).unwrap();
-    let first_attempt = CheckpointAttempt::new(1, 101);
-    let second_attempt = CheckpointAttempt::new(2, 102);
+    let first_attempt = CheckpointAttempt::canonical(101);
+    let second_attempt = CheckpointAttempt::canonical(102);
     let namespace = CoordinatedCommitNamespace::try_new(
         PipelineIdentity::empty(),
         "018f0000-0000-7000-8000-000000000001",
@@ -1124,8 +1133,8 @@ async fn coordinated_late_exact_commit_and_higher_batch_cannot_both_win() {
         encode_commit_descriptor(&binding, &staged_adds(&writer, test_batch(1)).await).unwrap();
     let higher_descriptor =
         encode_commit_descriptor(&binding, &staged_adds(&writer, test_batch(2)).await).unwrap();
-    let second = CheckpointAttempt::new(2, 102);
-    let third = CheckpointAttempt::new(3, 103);
+    let second = CheckpointAttempt::canonical(102);
+    let third = CheckpointAttempt::canonical(103);
     let namespace = CoordinatedCommitNamespace::try_new(
         PipelineIdentity::empty(),
         "018f0000-0000-7000-8000-000000000001",
@@ -1230,7 +1239,7 @@ async fn coordinated_empty_batch_commits_cursor_without_object_io() {
         "delta_empty",
     )
     .unwrap();
-    let target = CheckpointAttempt::new(1, 101);
+    let target = CheckpointAttempt::canonical(101);
     let batch = CoordinatedCommitBatch {
         namespace: namespace.clone(),
         expected_predecessor: crate::connector::CoordinatedCommitCursor {

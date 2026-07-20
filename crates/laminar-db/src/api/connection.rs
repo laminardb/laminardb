@@ -540,7 +540,7 @@ mod tests {
         });
         assert!(db.owned_source_tasks.lock().is_empty());
         assert!(db.owned_sink_handles.lock().is_empty());
-        assert!(db.exact_deployment_lock.lock().is_none());
+        assert!(db.checkpoint_namespace_lock.lock().is_none());
     }
 
     #[test]

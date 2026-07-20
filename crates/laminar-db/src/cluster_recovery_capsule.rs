@@ -499,7 +499,7 @@ mod tests {
 
     #[test]
     fn source_assignment_versions_merge_only_one_generation() {
-        let attempt = CheckpointAttempt::new(3, 4);
+        let attempt = CheckpointAttempt::new(4, 4);
         let mut merged = BTreeMap::new();
         let version = std::num::NonZeroU64::new(7).unwrap();
         merge_source_assignment_versions(
@@ -623,7 +623,7 @@ mod tests {
 
     #[tokio::test]
     async fn assembly_rejects_mixed_source_assignment_presence() {
-        let attempt = CheckpointAttempt::new(3, 30);
+        let attempt = CheckpointAttempt::new(30, 30);
         let fence = fence();
         let inventory = sealed_inventory(attempt, &fence, [(0, 1), (1, 2)]).await;
         let version = std::num::NonZeroU64::new(fence.assignment_version).unwrap();
@@ -678,7 +678,7 @@ mod tests {
 
     #[tokio::test]
     async fn assembly_rejects_forged_vnode_owner() {
-        let attempt = CheckpointAttempt::new(3, 30);
+        let attempt = CheckpointAttempt::new(30, 30);
         let fence = fence();
         // Node 2 forges vnode 0 even though the certified owner map assigns it to node 1.
         let inventory = sealed_inventory(attempt, &fence, [(0, 2), (1, 2)]).await;

@@ -7,6 +7,7 @@ pub mod controller;
 pub mod leader;
 pub mod leader_lease;
 mod lease_deadline;
+mod namespace_proof;
 pub mod process_lease;
 pub mod snapshot;
 
@@ -43,6 +44,10 @@ pub use leader_lease::{
     LeaseOutcome, RecordAssignmentDrainDecisionResult, RecordAssignmentRecoveryDecisionResult,
 };
 pub use lease_deadline::LeaseDeadline;
+pub use namespace_proof::{
+    prove_shared_object_store_namespaces, NamespaceProofError, VerifiedClusterNamespaces,
+    MAX_SHARED_NAMESPACE_PROOF_TIMEOUT,
+};
 pub use process_lease::{
     ProcessLease, ProcessLeaseAuthority, ProcessLeaseConfig, ProcessLeaseError, ProcessLeaseFence,
     ProcessLeaseManager, ProcessLeaseObservation, ProcessLeaseOutcome, ProcessLeaseStore,

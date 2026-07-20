@@ -150,9 +150,7 @@ impl SourceConnector for DeltaSource {
     }
 
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
-        let SourceStart {
-            config, position, ..
-        } = request;
+        let (config, position, _) = request.into_parts();
         if let SourcePosition::Resume { attempt, .. } = position {
             return Err(ConnectorError::ConfigurationError(format!(
                 "Delta Lake is an ephemeral source and cannot resume checkpoint attempt {attempt:?}"
@@ -618,14 +616,17 @@ mod tests {
     async fn resume_fails_before_opening_the_ephemeral_source() {
         let mut source = DeltaSource::new(test_config(), None);
         let error = source
-            .start(SourceStart {
-                config: ConnectorConfig::new("delta-lake"),
-                position: SourcePosition::Resume {
-                    attempt: laminar_core::state::CheckpointAttempt::new(7, 11),
-                    checkpoint: SourceCheckpoint::new(),
-                },
-                delivery: crate::connector::DeliveryGuarantee::BestEffort,
-            })
+            .start(
+                SourceStart::new(
+                    ConnectorConfig::new("delta-lake"),
+                    SourcePosition::Resume {
+                        attempt: laminar_core::state::CheckpointAttempt::canonical(11),
+                        checkpoint: SourceCheckpoint::new(),
+                    },
+                    crate::connector::DeliveryGuarantee::BestEffort,
+                )
+                .unwrap(),
+            )
             .await
             .expect_err("ephemeral Delta source must reject recovery");
         assert!(error.to_string().contains("ephemeral"));
@@ -761,11 +762,14 @@ mod tests {
         let mut source = DeltaSource::new(test_config(), None);
         let connector_config = crate::config::ConnectorConfig::new("delta-lake");
         let result = source
-            .start(SourceStart {
-                config: connector_config,
-                position: SourcePosition::Initial,
-                delivery: crate::connector::DeliveryGuarantee::BestEffort,
-            })
+            .start(
+                SourceStart::new(
+                    connector_config,
+                    SourcePosition::Initial,
+                    crate::connector::DeliveryGuarantee::BestEffort,
+                )
+                .unwrap(),
+            )
             .await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();

@@ -121,7 +121,7 @@ async fn two_nodes_exchange_data_bidirectionally() {
         .unwrap();
     // B → A: one barrier proves the reverse stream is independently scoped.
     send_b
-        .fan_out_barrier(&[1], CheckpointBarrier::new(2, 1), &assignment_fence())
+        .fan_out_barrier(&[1], CheckpointBarrier::new(2, 2), &assignment_fence())
         .await
         .unwrap();
     send_a
@@ -150,7 +150,7 @@ async fn two_nodes_exchange_data_bidirectionally() {
     assert_eq!(received.peer(), 2, "B's frame must carry peer=2");
     assert_eq!(
         received.message(),
-        &ShuffleMessage::Barrier(CheckpointBarrier::new(2, 1))
+        &ShuffleMessage::Barrier(CheckpointBarrier::new(2, 2))
     );
 
     // FIFO: the three A→B batches arrive in send order.
@@ -233,7 +233,7 @@ async fn fragmented_batch_is_delivered_before_its_barrier() {
         .await
         .unwrap();
     sender
-        .fan_out_barrier(&[2], CheckpointBarrier::new(9, 3), &assignment_fence())
+        .fan_out_barrier(&[2], CheckpointBarrier::new(9, 9), &assignment_fence())
         .await
         .unwrap();
 
@@ -260,7 +260,7 @@ async fn fragmented_batch_is_delivered_before_its_barrier() {
         .unwrap();
     assert_eq!(
         received.message(),
-        &ShuffleMessage::Barrier(CheckpointBarrier::new(9, 3))
+        &ShuffleMessage::Barrier(CheckpointBarrier::new(9, 9))
     );
     assert_eq!(
         receiver

@@ -590,12 +590,12 @@ pub struct KafkaSourceConfig {
     pub backpressure_low_watermark: f64,
 
     // -- Error handling --
-    /// Maximum tolerated deserialization error rate per batch (0.0-1.0).
+    /// Maximum tolerated deserialization error rate per `BestEffort` batch (0.0-1.0).
     ///
     /// When the poison pill fallback is active and the error rate exceeds
     /// this threshold, the batch is rejected instead of returning partial
-    /// results. Prevents silent data loss when a schema change makes most
-    /// records unparseable. Default: 0.5 (50%).
+    /// results. Guaranteed-delivery modes reject any deserialization failure;
+    /// they never use this threshold. Default: 0.5 (50%).
     pub max_deser_error_rate: f64,
 
     // -- Pass-through --

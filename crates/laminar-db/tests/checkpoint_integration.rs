@@ -861,6 +861,10 @@ mod performance {
 
     #[async_trait]
     impl CheckpointStore for SlowCheckpointStore {
+        fn max_state_data_bytes(&self) -> u64 {
+            laminar_core::storage::checkpoint_store::DEFAULT_MAX_CHECKPOINT_STATE_BYTES
+        }
+
         async fn list_ids(&self) -> Result<Vec<u64>, CheckpointStoreError> {
             Ok(vec![])
         }
@@ -1085,7 +1089,8 @@ mod recovery {
         let dir = tempfile::tempdir().unwrap();
 
         let store = make_store(dir.path());
-        let mut manifest = CheckpointManifest::new(1, 5);
+        let checkpoint_id = 5;
+        let mut manifest = CheckpointManifest::new(checkpoint_id, checkpoint_id);
         manifest.source_offsets.insert(
             "kafka-trades".into(),
             ConnectorCheckpoint {
@@ -1108,6 +1113,8 @@ mod recovery {
         save_finalized(&store, &manifest).await;
 
         let manifest = store.load_latest().await.unwrap().unwrap();
+        assert_eq!(manifest.epoch, checkpoint_id);
+        assert_eq!(manifest.checkpoint_id, checkpoint_id);
 
         let kafka = manifest.source_offsets.get("kafka-trades").unwrap();
         assert_eq!(kafka.offsets.get("trades:0"), Some(&"1234".into()));
@@ -1123,7 +1130,8 @@ mod recovery {
         let dir = tempfile::tempdir().unwrap();
         let store = make_store(dir.path());
 
-        let mut manifest = CheckpointManifest::new(1, 10);
+        let checkpoint_id = 10;
+        let mut manifest = CheckpointManifest::new(checkpoint_id, checkpoint_id);
         let executor_state = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
         let filter_state = vec![0xDE, 0xAD, 0xBE, 0xEF];
 
@@ -1137,6 +1145,8 @@ mod recovery {
         save_finalized(&store, &manifest).await;
 
         let manifest = store.load_latest().await.unwrap().unwrap();
+        assert_eq!(manifest.epoch, checkpoint_id);
+        assert_eq!(manifest.checkpoint_id, checkpoint_id);
 
         assert_eq!(manifest.operator_states.len(), 2);
 
@@ -1264,7 +1274,8 @@ mod recovery {
 
     #[test]
     fn test_manifest_full_round_trip() {
-        let mut manifest = CheckpointManifest::new(42, 100);
+        const CHECKPOINT_ID: u64 = 42;
+        let mut manifest = CheckpointManifest::new(CHECKPOINT_ID, CHECKPOINT_ID);
         manifest.watermark = Some(999_999);
         manifest.table_store_checkpoint_path = Some("/tmp/cp".into());
 
@@ -1285,8 +1296,8 @@ mod recovery {
 
         let restored: CheckpointManifest = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(restored.checkpoint_id, 42);
-        assert_eq!(restored.epoch, 100);
+        assert_eq!(restored.checkpoint_id, CHECKPOINT_ID);
+        assert_eq!(restored.epoch, CHECKPOINT_ID);
         assert_eq!(restored.watermark, Some(999_999));
         assert_eq!(
             restored.table_store_checkpoint_path.as_deref(),
@@ -1378,7 +1389,7 @@ mod restart {
             assert!(cp.success, "checkpoint must succeed");
             assert!(cp.checkpoint_id > 0);
 
-            db.close();
+            db.shutdown().await.unwrap();
         }
 
         {
@@ -1426,7 +1437,7 @@ mod restart {
                 "pipeline must have executed cycles after restart"
             );
 
-            db.close();
+            db.shutdown().await.unwrap();
         }
     }
 }

@@ -130,22 +130,24 @@ fn lookup_config(host: &str, port: u16, table: &str) -> PostgresLookupSourceConf
 }
 
 fn initial_start(config: &ConnectorConfig) -> SourceStart {
-    SourceStart {
-        config: config.clone(),
-        position: SourcePosition::Initial,
-        delivery: DeliveryGuarantee::AtLeastOnce,
-    }
+    SourceStart::new(
+        config.clone(),
+        SourcePosition::Initial,
+        DeliveryGuarantee::AtLeastOnce,
+    )
+    .unwrap()
 }
 
 fn resume_start(config: &ConnectorConfig, checkpoint: SourceCheckpoint) -> SourceStart {
-    SourceStart {
-        config: config.clone(),
-        position: SourcePosition::Resume {
+    SourceStart::new(
+        config.clone(),
+        SourcePosition::Resume {
             attempt: CheckpointAttempt::new(1, 1),
             checkpoint,
         },
-        delivery: DeliveryGuarantee::AtLeastOnce,
-    }
+        DeliveryGuarantee::AtLeastOnce,
+    )
+    .unwrap()
 }
 
 fn checkpoint_lsn(checkpoint: &SourceCheckpoint) -> Lsn {

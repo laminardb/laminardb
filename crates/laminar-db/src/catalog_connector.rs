@@ -47,7 +47,7 @@ impl CatalogSourceConnector {
 #[async_trait]
 impl SourceConnector for CatalogSourceConnector {
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
-        match request.position {
+        match request.into_parts().1 {
             SourcePosition::Initial => Ok(()),
             SourcePosition::Resume { attempt, .. } => {
                 Err(ConnectorError::ConfigurationError(format!(

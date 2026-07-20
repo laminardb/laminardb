@@ -482,11 +482,43 @@ pub enum SourcePosition {
 #[derive(Debug, Clone)]
 pub struct SourceStart {
     /// Fully resolved connector configuration.
-    pub config: ConnectorConfig,
+    config: ConnectorConfig,
     /// Initial or exact recovery position.
-    pub position: SourcePosition,
+    position: SourcePosition,
     /// Pipeline-wide delivery guarantee used for fail-closed cursor policy.
-    pub delivery: DeliveryGuarantee,
+    delivery: DeliveryGuarantee,
+}
+
+impl SourceStart {
+    /// Construct a source startup request before any connector I/O.
+    ///
+    /// # Errors
+    /// Returns a configuration error when a resume attempt is zero or split across two identities.
+    pub fn new(
+        config: ConnectorConfig,
+        position: SourcePosition,
+        delivery: DeliveryGuarantee,
+    ) -> Result<Self, ConnectorError> {
+        if matches!(
+            &position,
+            SourcePosition::Resume { attempt, .. } if !attempt.is_canonical()
+        ) {
+            return Err(ConnectorError::ConfigurationError(
+                "source resume must use one nonzero canonical checkpoint ID".into(),
+            ));
+        }
+        Ok(Self {
+            config,
+            position,
+            delivery,
+        })
+    }
+
+    /// Consume the request into connector-owned startup inputs.
+    #[must_use]
+    pub fn into_parts(self) -> (ConnectorConfig, SourcePosition, DeliveryGuarantee) {
+        (self.config, self.position, self.delivery)
+    }
 }
 
 /// Exact cluster transition for which a source must stop advancing input.
@@ -1112,6 +1144,21 @@ impl CoordinatedCommitBatch {
     pub fn validate_shape(&self) -> Result<(), String> {
         use laminar_core::state::CheckpointAttemptRelation;
 
+        if !self.target.is_canonical() {
+            return Err(
+                "coordinated batch target must use one nonzero canonical checkpoint ID".into(),
+            );
+        }
+        if let Some(entry) = self
+            .entries
+            .iter()
+            .find(|entry| !entry.attempt.is_canonical())
+        {
+            return Err(format!(
+                "coordinated batch entry for participant {} must use one nonzero canonical checkpoint ID",
+                entry.participant_id
+            ));
+        }
         if self.expected_predecessor.checkpoint_id >= self.target.checkpoint_id {
             return Err(format!(
                 "invalid coordinated batch predecessor {} for target {}",
@@ -1438,6 +1485,45 @@ mod tests {
     }
 
     #[test]
+    fn source_start_rejects_split_and_zero_resume_before_connector_start() {
+        use laminar_core::state::CheckpointAttempt;
+
+        for attempt in [CheckpointAttempt::new(7, 8), CheckpointAttempt::new(0, 0)] {
+            let error = SourceStart::new(
+                ConnectorConfig::new("test"),
+                SourcePosition::Resume {
+                    attempt,
+                    checkpoint: SourceCheckpoint::new(),
+                },
+                DeliveryGuarantee::AtLeastOnce,
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                ConnectorError::ConfigurationError(message)
+                    if message.contains("one nonzero canonical checkpoint ID")
+            ));
+        }
+    }
+
+    #[test]
+    fn source_start_accepts_initial_and_exposes_validated_parts() {
+        let mut config = ConnectorConfig::new("test");
+        config.set("endpoint", "local");
+        let request = SourceStart::new(
+            config,
+            SourcePosition::Initial,
+            DeliveryGuarantee::BestEffort,
+        )
+        .unwrap();
+
+        let (config, position, delivery) = request.into_parts();
+        assert_eq!(config.get("endpoint"), Some("local"));
+        assert!(matches!(position, SourcePosition::Initial));
+        assert_eq!(delivery, DeliveryGuarantee::BestEffort);
+    }
+
+    #[test]
     fn sink_contract_defaults_fail_closed() {
         let contract = SinkContract::default();
         assert_eq!(contract.consistency, SinkConsistency::Ephemeral);
@@ -1562,13 +1648,77 @@ mod tests {
             .all(|variant| variant.exact_fingerprint() != expected));
     }
 
+    fn valid_coordinated_batch() -> CoordinatedCommitBatch {
+        use laminar_core::state::CheckpointAttempt;
+        use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+
+        let target = CheckpointAttempt::canonical(102);
+        CoordinatedCommitBatch {
+            namespace: CoordinatedCommitNamespace::try_new(
+                PipelineIdentity::empty(),
+                "018f0000-0000-7000-8000-000000000001",
+                "orders",
+            )
+            .unwrap(),
+            expected_predecessor: CoordinatedCommitCursor {
+                checkpoint_id: 101,
+                fencing_token: 1,
+            },
+            fencing_token: 2,
+            target,
+            entries: vec![CoordinatedCommitPayload {
+                attempt: target,
+                participant_id: 0,
+                payload: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn coordinated_batch_rejects_noncanonical_target_before_other_shape_checks() {
+        use laminar_core::state::CheckpointAttempt;
+
+        for target in [
+            CheckpointAttempt::new(102, 103),
+            CheckpointAttempt::new(0, 0),
+        ] {
+            let mut batch = valid_coordinated_batch();
+            batch.target = target;
+            let error = batch.validate_shape().unwrap_err();
+            assert!(
+                error.contains("target must use one nonzero canonical checkpoint ID"),
+                "unexpected validation error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn coordinated_batch_rejects_noncanonical_entry_before_other_shape_checks() {
+        use laminar_core::state::CheckpointAttempt;
+
+        for attempt in [
+            CheckpointAttempt::new(101, 102),
+            CheckpointAttempt::new(0, 0),
+        ] {
+            let mut batch = valid_coordinated_batch();
+            batch.entries[0].attempt = attempt;
+            let error = batch.validate_shape().unwrap_err();
+            assert!(
+                error.contains(
+                    "entry for participant 0 must use one nonzero canonical checkpoint ID"
+                ),
+                "unexpected validation error: {error}"
+            );
+        }
+    }
+
     #[test]
     fn coordinated_batch_rejects_cursor_rollback_and_unproven_overlap() {
         use laminar_core::state::CheckpointAttempt;
         use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
 
-        let first = CheckpointAttempt::new(8, 108);
-        let target = CheckpointAttempt::new(10, 110);
+        let first = CheckpointAttempt::canonical(108);
+        let target = CheckpointAttempt::canonical(110);
         let batch = CoordinatedCommitBatch {
             namespace: CoordinatedCommitNamespace::try_new(
                 PipelineIdentity::empty(),
@@ -1623,7 +1773,7 @@ mod tests {
             "orders",
         )
         .unwrap();
-        let target = CheckpointAttempt::new(2, 102);
+        let target = CheckpointAttempt::canonical(102);
         let batch = |entries| CoordinatedCommitBatch {
             namespace: namespace.clone(),
             expected_predecessor: CoordinatedCommitCursor {
@@ -1652,14 +1802,14 @@ mod tests {
             .unwrap_err()
             .contains("out-of-order"));
 
-        let conflicting = batch(vec![
+        let noncanonical = batch(vec![
             payload(CheckpointAttempt::new(3, 101), 0),
             payload(target, 0),
         ]);
-        assert!(conflicting
+        assert!(noncanonical
             .validate_shape()
             .unwrap_err()
-            .contains("coherent"));
+            .contains("one nonzero canonical checkpoint ID"));
     }
 
     #[test]
@@ -1673,7 +1823,7 @@ mod tests {
             "orders",
         )
         .unwrap();
-        let target = CheckpointAttempt::new(1, 101);
+        let target = CheckpointAttempt::canonical(101);
         let make_batch = |count: usize| CoordinatedCommitBatch {
             namespace: namespace.clone(),
             expected_predecessor: CoordinatedCommitCursor {

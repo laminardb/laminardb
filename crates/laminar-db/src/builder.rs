@@ -58,7 +58,9 @@ pub struct LaminarDbBuilder {
     catalog_manifest_store:
         Option<std::sync::Arc<laminar_core::cluster::control::CatalogManifestStore>>,
     #[cfg(feature = "cluster")]
-    cluster_checkpoint_object_store: Option<Arc<dyn object_store::ObjectStore>>,
+    verified_cluster_namespaces: Option<laminar_core::cluster::control::VerifiedClusterNamespaces>,
+    #[cfg(all(feature = "cluster", test))]
+    unchecked_cluster_checkpoint_store: Option<Arc<dyn object_store::ObjectStore>>,
     state_backend: Option<std::sync::Arc<dyn laminar_core::state::StateBackend>>,
     vnode_registry: Option<std::sync::Arc<laminar_core::state::VnodeRegistry>>,
     physical_optimizer_rules: Vec<
@@ -96,7 +98,9 @@ impl LaminarDbBuilder {
             #[cfg(feature = "cluster")]
             catalog_manifest_store: None,
             #[cfg(feature = "cluster")]
-            cluster_checkpoint_object_store: None,
+            verified_cluster_namespaces: None,
+            #[cfg(all(feature = "cluster", test))]
+            unchecked_cluster_checkpoint_store: None,
             state_backend: None,
             vnode_registry: None,
             physical_optimizer_rules: Vec::new(),
@@ -218,18 +222,25 @@ impl LaminarDbBuilder {
         self
     }
 
-    /// Install a pre-built shared checkpoint object store for low-level cluster wiring.
-    ///
-    /// This is an alternative to [`Self::object_store_url`], not an override. A cluster
-    /// controller is required so the store can only be used with cluster runtime semantics.
+    /// Install the exact checkpoint handle admitted by the cluster namespace proof.
     #[cfg(feature = "cluster")]
-    #[doc(hidden)]
     #[must_use]
-    pub fn cluster_checkpoint_object_store(
+    pub fn verified_cluster_namespaces(
+        mut self,
+        namespaces: laminar_core::cluster::control::VerifiedClusterNamespaces,
+    ) -> Self {
+        self.verified_cluster_namespaces = Some(namespaces);
+        self
+    }
+
+    /// Install an unchecked checkpoint store in crate unit tests.
+    #[cfg(all(feature = "cluster", test))]
+    #[must_use]
+    pub(crate) fn cluster_checkpoint_object_store(
         mut self,
         store: Arc<dyn object_store::ObjectStore>,
     ) -> Self {
-        self.cluster_checkpoint_object_store = Some(store);
+        self.unchecked_cluster_checkpoint_store = Some(store);
         self
     }
 
@@ -420,16 +431,44 @@ impl LaminarDbBuilder {
     /// Returns `DbError` if database creation fails.
     #[allow(clippy::unused_async)]
     pub async fn build(mut self) -> Result<Arc<LaminarDB>, DbError> {
-        #[cfg(feature = "cluster")]
-        if self.cluster_checkpoint_object_store.is_some() && self.object_store_url.is_some() {
+        let has_checkpoint_data_dir = self
+            .config
+            .checkpoint
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.data_dir.as_ref())
+            .is_some();
+        if self.object_store_url.is_some() && has_checkpoint_data_dir {
             return Err(DbError::Config(
-                "cluster_checkpoint_object_store conflicts with object_store_url; configure exactly one checkpoint object store"
+                "object_store_url conflicts with checkpoint.data_dir; configure exactly one checkpoint store"
+                    .into(),
+            ));
+        }
+        #[cfg(feature = "cluster")]
+        if self.has_cluster_checkpoint_store() && self.object_store_url.is_some() {
+            return Err(DbError::Config(
+                "verified cluster namespaces conflict with object_store_url; configure exactly one checkpoint object store"
+                    .into(),
+            ));
+        }
+        #[cfg(feature = "cluster")]
+        if self.has_cluster_checkpoint_store() && has_checkpoint_data_dir {
+            return Err(DbError::Config(
+                "verified cluster namespaces conflict with checkpoint.data_dir; configure exactly one checkpoint store"
                     .into(),
             ));
         }
 
         self.config.object_store_url = self.object_store_url.take();
         self.config.object_store_options = std::mem::take(&mut self.object_store_options);
+        if let Some(url) = self
+            .config
+            .object_store_url
+            .as_deref()
+            .filter(|url| url.starts_with("file://"))
+        {
+            laminar_core::storage::object_store_builder::file_url_path(url)
+                .map_err(|error| DbError::Config(format!("checkpoint storage URL: {error}")))?;
+        }
 
         if !self.profile_explicit {
             self.profile = Profile::from_config(&self.config, false);
@@ -447,11 +486,64 @@ impl LaminarDbBuilder {
         self.profile
             .validate_features()
             .map_err(|e| DbError::Config(e.to_string()))?;
+        Self::validate_cluster_delivery(runtime_mode, self.config.delivery_guarantee)?;
+        #[cfg(feature = "cluster")]
+        if runtime_mode == RuntimeMode::Cluster {
+            if self.config.object_store_url.is_some() || has_checkpoint_data_dir {
+                return Err(DbError::Config(
+                    "[LDB-0011] cluster checkpoint storage must be supplied by a successful shared namespace proof; object_store_url and checkpoint.data_dir are not cluster authorities"
+                        .into(),
+                ));
+            }
+            if !self.has_cluster_checkpoint_store() {
+                return Err(DbError::Config(
+                    "[LDB-0011] cluster runtime requires VerifiedClusterNamespaces from the shared checkpoint/state namespace proof"
+                        .into(),
+                ));
+            }
+            if let Some(namespaces) = &self.verified_cluster_namespaces {
+                let controller = self.cluster_controller.as_ref().ok_or_else(|| {
+                    DbError::Config("cluster namespace proof requires a cluster controller".into())
+                })?;
+                let expected = laminar_core::checkpoint::CheckpointParticipant {
+                    node_id: controller.instance_id().0,
+                    boot_incarnation: controller.recovery_incarnation(),
+                };
+                if namespaces.local_participant() != expected {
+                    let proved = namespaces.local_participant();
+                    return Err(DbError::Config(format!(
+                        "[LDB-0011] verified cluster namespaces belong to node {} boot {}, but the controller is node {} boot {}",
+                        proved.node_id,
+                        proved.boot_incarnation,
+                        expected.node_id,
+                        expected.boot_incarnation,
+                    )));
+                }
+                let state_backend = self.state_backend.as_ref().ok_or_else(|| {
+                    DbError::Config(
+                        "[LDB-0011] cluster runtime requires a ClusterShared state_backend built from the verified state namespace"
+                            .into(),
+                    )
+                })?;
+                let durability = state_backend.durability_scope();
+                if durability != laminar_core::state::StateBackendDurability::ClusterShared {
+                    return Err(DbError::Config(format!(
+                        "[LDB-0011] cluster state_backend must be ClusterShared, but is {durability:?}"
+                    )));
+                }
+                let verified_state_store = namespaces.state_store();
+                if !state_backend.uses_exact_object_store(&verified_state_store) {
+                    return Err(DbError::Config(
+                        "[LDB-0011] cluster state_backend does not use the exact object-store handle admitted by the namespace proof"
+                            .into(),
+                    ));
+                }
+            }
+        }
         #[cfg(feature = "cluster")]
         let profile_object_store = self.config.object_store_url.as_deref().or_else(|| {
-            self.cluster_checkpoint_object_store
-                .as_ref()
-                .map(|_| "injected-cluster-checkpoint-store")
+            self.has_cluster_checkpoint_store()
+                .then_some("verified-cluster-checkpoint-store")
         });
         #[cfg(not(feature = "cluster"))]
         let profile_object_store = self.config.object_store_url.as_deref();
@@ -459,7 +551,20 @@ impl LaminarDbBuilder {
             .validate_config(&self.config, profile_object_store)
             .map_err(|e| DbError::Config(e.to_string()))?;
 
-        Self::validate_cluster_delivery(runtime_mode, self.config.delivery_guarantee)?;
+        if runtime_mode == RuntimeMode::Local
+            && self.config.delivery_guarantee
+                != laminar_connectors::connector::DeliveryGuarantee::BestEffort
+            && self
+                .config
+                .object_store_url
+                .as_deref()
+                .is_some_and(|url| !url.starts_with("file://"))
+        {
+            return Err(DbError::Config(
+                "[LDB-0014] a local replay-capable deployment with a shared cloud checkpoint namespace is not admitted until its writer lease is term-fenced; use a built-in or file:// local checkpoint directory, or best_effort delivery"
+                    .into(),
+            ));
+        }
 
         Self::validate_backpressure(&self.config)?;
         self.validate_state_topology(runtime_mode)?;
@@ -468,6 +573,8 @@ impl LaminarDbBuilder {
 
         self.profile.apply_defaults(&mut self.config);
 
+        #[cfg(feature = "cluster")]
+        let cluster_checkpoint_store = self.cluster_checkpoint_store();
         let mut db = LaminarDB::open_with_config_and_vars_and_rules(
             self.config,
             self.config_vars,
@@ -499,7 +606,7 @@ impl LaminarDbBuilder {
             db.set_cluster_controller(controller)?;
         }
         #[cfg(feature = "cluster")]
-        if let Some(store) = self.cluster_checkpoint_object_store {
+        if let Some(store) = cluster_checkpoint_store {
             db.set_cluster_checkpoint_object_store(store)?;
         }
         #[cfg(feature = "cluster")]
@@ -650,6 +757,25 @@ impl LaminarDbBuilder {
         Ok(())
     }
 
+    #[cfg(feature = "cluster")]
+    fn has_cluster_checkpoint_store(&self) -> bool {
+        let has_store = self.verified_cluster_namespaces.is_some();
+        #[cfg(test)]
+        let has_store = has_store || self.unchecked_cluster_checkpoint_store.is_some();
+        has_store
+    }
+
+    #[cfg(feature = "cluster")]
+    fn cluster_checkpoint_store(&self) -> Option<Arc<dyn object_store::ObjectStore>> {
+        let store = self
+            .verified_cluster_namespaces
+            .as_ref()
+            .map(laminar_core::cluster::control::VerifiedClusterNamespaces::checkpoint_store);
+        #[cfg(test)]
+        let store = store.or_else(|| self.unchecked_cluster_checkpoint_store.clone());
+        store
+    }
+
     /// Resolve the distributed execution scope exactly once and reject partial or contradictory
     /// cluster wiring before constructing the database.
     fn resolve_runtime_mode(&self) -> Result<RuntimeMode, DbError> {
@@ -672,7 +798,7 @@ impl LaminarDbBuilder {
                 || self.decision_store.is_some()
                 || self.assignment_snapshot_store.is_some()
                 || self.catalog_manifest_store.is_some()
-                || self.cluster_checkpoint_object_store.is_some();
+                || self.has_cluster_checkpoint_store();
 
             if has_cluster_only_handle && !has_controller {
                 return Err(DbError::Config(
@@ -791,6 +917,51 @@ mod tests {
         Arc::new(object_store::memory::InMemory::new())
     }
 
+    #[cfg(feature = "cluster")]
+    async fn test_verified_cluster_namespaces(
+        controller: &laminar_core::cluster::control::ClusterController,
+        checkpoint_store: Arc<dyn object_store::ObjectStore>,
+    ) -> laminar_core::cluster::control::VerifiedClusterNamespaces {
+        use laminar_core::checkpoint::CheckpointParticipant;
+        use laminar_core::cluster::control::{
+            prove_shared_object_store_namespaces, ClusterKv, InMemoryKv,
+        };
+
+        let participant = CheckpointParticipant {
+            node_id: controller.instance_id().0,
+            boot_incarnation: controller.recovery_incarnation(),
+        };
+        let control: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(controller.instance_id()));
+        prove_shared_object_store_namespaces(
+            participant,
+            &[participant],
+            control,
+            checkpoint_store,
+            test_cluster_checkpoint_store(),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[cfg(feature = "cluster")]
+    fn test_verified_state_topology(
+        namespaces: &laminar_core::cluster::control::VerifiedClusterNamespaces,
+    ) -> (
+        Arc<dyn laminar_core::state::StateBackend>,
+        Arc<laminar_core::state::VnodeRegistry>,
+    ) {
+        let vnode_count = u32::from(laminar_core::state::DEFAULT_CLUSTER_KEY_GROUP_COUNT);
+        (
+            Arc::new(laminar_core::state::ObjectStoreBackend::cluster_shared(
+                namespaces.state_store(),
+                "test-node",
+                vnode_count,
+            )),
+            Arc::new(laminar_core::state::VnodeRegistry::new(vnode_count)),
+        )
+    }
+
     #[tokio::test]
     async fn test_default_builder() {
         let db = LaminarDbBuilder::new().build().await.unwrap();
@@ -824,6 +995,126 @@ mod tests {
             .await
             .expect_err("ShedOldest + ExactlyOnce must be rejected");
         assert!(err.to_string().contains("exactly-once"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn local_replay_delivery_rejects_cloud_checkpoint_storage_at_build() {
+        use laminar_connectors::connector::DeliveryGuarantee;
+
+        let error = LaminarDbBuilder::new()
+            .checkpoint(StreamCheckpointConfig::default())
+            .delivery_guarantee(DeliveryGuarantee::AtLeastOnce)
+            .object_store_url("s3://shared-checkpoints/deployment")
+            .build()
+            .await
+            .expect_err("an unfenced local cloud writer must fail before startup");
+        assert!(error.to_string().contains("[LDB-0014]"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_url_conflicts_with_checkpoint_data_dir() {
+        let error = LaminarDbBuilder::new()
+            .checkpoint(StreamCheckpointConfig {
+                data_dir: Some(std::path::PathBuf::from("checkpoint-data")),
+                ..StreamCheckpointConfig::default()
+            })
+            .object_store_url("memory://checkpoint-test")
+            .build()
+            .await
+            .expect_err("two checkpoint authorities must be rejected");
+        assert!(error.to_string().contains("conflicts"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_state_budget_is_resolved_and_propagated_to_status_stores() {
+        for max_staged_bytes in [17, isize::MAX as u64] {
+            let directory = tempfile::tempdir().unwrap();
+            let db = LaminarDbBuilder::new()
+                .storage_dir(directory.path())
+                .checkpoint(StreamCheckpointConfig {
+                    max_staged_bytes: Some(max_staged_bytes),
+                    ..StreamCheckpointConfig::default()
+                })
+                .build()
+                .await
+                .unwrap();
+
+            assert_eq!(
+                db.config
+                    .checkpoint
+                    .as_ref()
+                    .and_then(|checkpoint| checkpoint.max_staged_bytes),
+                Some(max_staged_bytes)
+            );
+            assert_eq!(
+                db.checkpoint_store()
+                    .unwrap()
+                    .unwrap()
+                    .max_state_data_bytes(),
+                max_staged_bytes
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_state_budget_defaults_to_the_core_storage_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = LaminarDbBuilder::new()
+            .storage_dir(directory.path())
+            .checkpoint(StreamCheckpointConfig::default())
+            .build()
+            .await
+            .unwrap();
+        let expected = laminar_core::storage::checkpoint_store::DEFAULT_MAX_CHECKPOINT_STATE_BYTES;
+
+        assert_eq!(
+            db.config
+                .checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.max_staged_bytes),
+            Some(expected)
+        );
+        assert_eq!(
+            db.checkpoint_store()
+                .unwrap()
+                .unwrap()
+                .max_state_data_bytes(),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_state_budget_rejects_an_unaddressable_limit_at_build() {
+        let unaddressable = (isize::MAX as u64) + 1;
+        let error = LaminarDbBuilder::new()
+            .checkpoint(StreamCheckpointConfig {
+                max_staged_bytes: Some(unaddressable),
+                ..StreamCheckpointConfig::default()
+            })
+            .build()
+            .await
+            .expect_err("checkpoint recovery must not accept an unaddressable sidecar limit");
+
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds this process address space"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_profile_cannot_bypass_file_url_validation() {
+        let error = LaminarDbBuilder::new()
+            .profile(Profile::BareMetal)
+            .object_store_url("file://./relative")
+            .build()
+            .await
+            .expect_err("malformed checkpoint URLs must fail independently of tuning profile");
+        assert!(
+            error.to_string().contains("invalid object store URL"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -869,9 +1160,17 @@ mod tests {
     #[tokio::test]
     async fn controller_selects_cluster_runtime_when_profile_is_inferred() {
         let checkpoint_store = test_cluster_checkpoint_store();
+        let controller = test_cluster_controller();
+        let verified_namespaces =
+            test_verified_cluster_namespaces(controller.as_ref(), Arc::clone(&checkpoint_store))
+                .await;
+        let verified_state_store = verified_namespaces.state_store();
+        let (state_backend, vnode_registry) = test_verified_state_topology(&verified_namespaces);
         let db = LaminarDbBuilder::new()
-            .cluster_controller(test_cluster_controller())
-            .cluster_checkpoint_object_store(Arc::clone(&checkpoint_store))
+            .cluster_controller(controller)
+            .verified_cluster_namespaces(verified_namespaces)
+            .state_backend(state_backend)
+            .vnode_registry(vnode_registry)
             .build()
             .await
             .unwrap();
@@ -881,10 +1180,89 @@ mod tests {
             &db.cluster_checkpoint_object_store().unwrap(),
             &checkpoint_store
         ));
+        assert!(db
+            .state_backend
+            .lock()
+            .as_ref()
+            .unwrap()
+            .uses_exact_object_store(&verified_state_store));
         assert_eq!(
             db.config.delivery_guarantee,
             laminar_connectors::connector::DeliveryGuarantee::AtLeastOnce
         );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn injected_checkpoint_store_conflicts_with_checkpoint_data_dir() {
+        let error = LaminarDbBuilder::new()
+            .cluster_controller(test_cluster_controller())
+            .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
+            .checkpoint(StreamCheckpointConfig {
+                data_dir: Some(std::path::PathBuf::from("checkpoint-data")),
+                ..StreamCheckpointConfig::default()
+            })
+            .build()
+            .await
+            .expect_err("two checkpoint authorities must be rejected");
+        assert!(error.to_string().contains("conflict"), "{error}");
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn checkpoint_status_reads_the_injected_participant_store() {
+        use arrow::array::UInt64Array;
+        use laminar_core::checkpoint::checkpoint_manifest::DurableCheckpointPhase;
+        use laminar_core::storage::CheckpointStore;
+
+        let controller = test_cluster_controller();
+        let participant_id = controller.instance_id().0;
+        let object_store = test_cluster_checkpoint_store();
+        let max_staged_bytes = 97;
+        let db = LaminarDbBuilder::new()
+            .cluster_controller(controller)
+            .cluster_checkpoint_object_store(Arc::clone(&object_store))
+            .checkpoint(StreamCheckpointConfig {
+                max_staged_bytes: Some(max_staged_bytes),
+                ..StreamCheckpointConfig::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        let status_store = db.checkpoint_store().unwrap().unwrap();
+        assert_eq!(status_store.participant_id(), participant_id);
+        assert_eq!(status_store.max_state_data_bytes(), max_staged_bytes);
+        let participant_store =
+            laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore::new(
+                object_store,
+                format!("nodes/{participant_id}/"),
+            )
+            .with_max_state_data_bytes(max_staged_bytes)
+            .unwrap()
+            .with_key_group_count(db.checkpoint_key_groups())
+            .with_participant_id(participant_id);
+        let mut manifest = laminar_core::checkpoint::CheckpointManifest::new_with_key_group_count(
+            7,
+            7,
+            db.checkpoint_key_groups(),
+        );
+        manifest.participant_id = participant_id;
+        manifest.durable_phase = DurableCheckpointPhase::Finalized;
+        participant_store.save(&manifest).await.unwrap();
+
+        let status = db.build_show_checkpoint_status().await.unwrap();
+        let checkpoint_ids = status
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let total = status
+            .column(5)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(checkpoint_ids.value(0), 7);
+        assert_eq!(total.value(0), 1);
     }
 
     #[cfg(feature = "cluster")]
@@ -1021,20 +1399,144 @@ mod tests {
             .build()
             .await
             .expect_err("cluster runtime must not retain bare-metal storage admission");
-        assert!(error.to_string().contains("object_store_url"), "{error}");
+        assert!(
+            error.to_string().contains("VerifiedClusterNamespaces"),
+            "{error}"
+        );
     }
 
     #[cfg(feature = "cluster")]
     #[tokio::test]
     async fn complete_cluster_profile_selects_cluster_runtime() {
+        let controller = test_cluster_controller();
+        let verified_namespaces =
+            test_verified_cluster_namespaces(controller.as_ref(), test_cluster_checkpoint_store())
+                .await;
+        let (state_backend, vnode_registry) = test_verified_state_topology(&verified_namespaces);
         let db = LaminarDbBuilder::new()
             .profile(Profile::Cluster)
-            .object_store_url("memory://checkpoint-test")
-            .cluster_controller(test_cluster_controller())
+            .cluster_controller(controller)
+            .verified_cluster_namespaces(verified_namespaces)
+            .state_backend(state_backend)
+            .vnode_registry(vnode_registry)
             .build()
             .await
             .unwrap();
         assert!(db.is_cluster_runtime());
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn cluster_runtime_rejects_node_local_checkpoint_url() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().display().to_string().replace('\\', "/");
+        let url = if path.starts_with('/') {
+            format!("file://{path}")
+        } else {
+            format!("file:///{path}")
+        };
+
+        let error = LaminarDbBuilder::new()
+            .profile(Profile::Cluster)
+            .object_store_url(url)
+            .cluster_controller(test_cluster_controller())
+            .build()
+            .await
+            .expect_err("cluster recovery must not depend on node-local checkpoint storage");
+        assert!(error.to_string().contains("[LDB-0011]"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("successful shared namespace proof"),
+            "{error}"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn cluster_runtime_rejects_shared_checkpoint_url_without_proof() {
+        let error = LaminarDbBuilder::new()
+            .profile(Profile::Cluster)
+            .object_store_url("s3://checkpoint-test/cluster")
+            .cluster_controller(test_cluster_controller())
+            .build()
+            .await
+            .expect_err("a shared URL must not bypass the exact namespace proof");
+        assert!(error.to_string().contains("[LDB-0011]"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("successful shared namespace proof"),
+            "{error}"
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn cluster_runtime_rejects_namespace_proof_from_another_process() {
+        let proved_controller = test_cluster_controller();
+        let verified_namespaces = test_verified_cluster_namespaces(
+            proved_controller.as_ref(),
+            test_cluster_checkpoint_store(),
+        )
+        .await;
+        let runtime_controller = test_cluster_controller();
+
+        let error = LaminarDbBuilder::new()
+            .cluster_controller(runtime_controller)
+            .verified_cluster_namespaces(verified_namespaces)
+            .build()
+            .await
+            .expect_err("a namespace proof must remain bound to its process incarnation");
+        assert!(error.to_string().contains("[LDB-0011]"), "{error}");
+        assert!(error.to_string().contains("belong to node"), "{error}");
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn cluster_runtime_rejects_in_process_state_backend() {
+        let controller = test_cluster_controller();
+        let verified_namespaces =
+            test_verified_cluster_namespaces(controller.as_ref(), test_cluster_checkpoint_store())
+                .await;
+        let error = LaminarDbBuilder::new()
+            .cluster_controller(controller)
+            .verified_cluster_namespaces(verified_namespaces)
+            .state_backend(Arc::new(laminar_core::state::InProcessBackend::new(1)))
+            .vnode_registry(Arc::new(laminar_core::state::VnodeRegistry::new(1)))
+            .build()
+            .await
+            .expect_err("volatile state must not enter cluster runtime");
+        assert!(error.to_string().contains("[LDB-0011]"), "{error}");
+        assert!(error.to_string().contains("ClusterShared"), "{error}");
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn cluster_runtime_rejects_different_state_object_store() {
+        let controller = test_cluster_controller();
+        let verified_namespaces =
+            test_verified_cluster_namespaces(controller.as_ref(), test_cluster_checkpoint_store())
+                .await;
+        let wrong_backend: Arc<dyn laminar_core::state::StateBackend> =
+            Arc::new(laminar_core::state::ObjectStoreBackend::cluster_shared(
+                test_cluster_checkpoint_store(),
+                "wrong-state-store",
+                1,
+            ));
+        let error = LaminarDbBuilder::new()
+            .cluster_controller(controller)
+            .verified_cluster_namespaces(verified_namespaces)
+            .state_backend(wrong_backend)
+            .vnode_registry(Arc::new(laminar_core::state::VnodeRegistry::new(1)))
+            .build()
+            .await
+            .expect_err("a different ClusterShared handle must not bypass namespace proof");
+        assert!(error.to_string().contains("[LDB-0011]"), "{error}");
+        assert!(
+            error.to_string().contains("exact object-store handle"),
+            "{error}"
+        );
     }
 
     #[cfg(feature = "cluster")]
@@ -1106,7 +1608,7 @@ mod tests {
             .build()
             .await
             .expect_err("two checkpoint namespace authorities must be rejected");
-        assert!(error.to_string().contains("conflicts"), "{error}");
+        assert!(error.to_string().contains("conflict"), "{error}");
     }
 
     #[cfg(feature = "cluster")]

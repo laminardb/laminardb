@@ -42,11 +42,12 @@ fn test_schema() -> SchemaRef {
 const REDPANDA_HOST_PORT: u16 = 19092;
 
 fn initial_source_start(config: &ConnectorConfig) -> SourceStart {
-    SourceStart {
-        config: config.clone(),
-        position: SourcePosition::Initial,
-        delivery: DeliveryGuarantee::BestEffort,
-    }
+    SourceStart::new(
+        config.clone(),
+        SourcePosition::Initial,
+        DeliveryGuarantee::BestEffort,
+    )
+    .unwrap()
 }
 
 async fn produce_messages(brokers: &str, topic: &str, count: usize) {
@@ -285,11 +286,14 @@ async fn checkpoint_restore(brokers: &str) {
 
     let mut source = KafkaSource::new(test_schema(), cfg.clone(), None);
     source
-        .start(SourceStart {
-            config: connector_cfg.clone(),
-            position: SourcePosition::Initial,
-            delivery: DeliveryGuarantee::AtLeastOnce,
-        })
+        .start(
+            SourceStart::new(
+                connector_cfg.clone(),
+                SourcePosition::Initial,
+                DeliveryGuarantee::AtLeastOnce,
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
 
@@ -300,14 +304,17 @@ async fn checkpoint_restore(brokers: &str) {
     source.close().await.unwrap();
     let mut source = KafkaSource::new(test_schema(), cfg.clone(), None);
     source
-        .start(SourceStart {
-            config: connector_cfg.clone(),
-            position: SourcePosition::Resume {
-                attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
-                checkpoint: before_first_record,
-            },
-            delivery: DeliveryGuarantee::AtLeastOnce,
-        })
+        .start(
+            SourceStart::new(
+                connector_cfg.clone(),
+                SourcePosition::Resume {
+                    attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
+                    checkpoint: before_first_record,
+                },
+                DeliveryGuarantee::AtLeastOnce,
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
 
@@ -324,14 +331,17 @@ async fn checkpoint_restore(brokers: &str) {
 
     let mut source2 = KafkaSource::new(test_schema(), cfg.clone(), None);
     source2
-        .start(SourceStart {
-            config: connector_cfg,
-            position: SourcePosition::Resume {
-                attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
-                checkpoint: checkpoint.clone(),
-            },
-            delivery: DeliveryGuarantee::AtLeastOnce,
-        })
+        .start(
+            SourceStart::new(
+                connector_cfg,
+                SourcePosition::Resume {
+                    attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
+                    checkpoint: checkpoint.clone(),
+                },
+                DeliveryGuarantee::AtLeastOnce,
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
 
@@ -354,14 +364,17 @@ async fn checkpoint_restore(brokers: &str) {
     expand_topic_and_wait(brokers, topic, 2).await;
     let mut changed = KafkaSource::new(test_schema(), cfg, None);
     let error = changed
-        .start(SourceStart {
-            config: ConnectorConfig::new("kafka"),
-            position: SourcePosition::Resume {
-                attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
-                checkpoint,
-            },
-            delivery: DeliveryGuarantee::AtLeastOnce,
-        })
+        .start(
+            SourceStart::new(
+                ConnectorConfig::new("kafka"),
+                SourcePosition::Resume {
+                    attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
+                    checkpoint,
+                },
+                DeliveryGuarantee::AtLeastOnce,
+            )
+            .unwrap(),
+        )
         .await
         .expect_err("partition expansion must fail a guaranteed resume closed");
     assert!(error.to_string().contains("partition inventory changed"));

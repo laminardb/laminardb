@@ -17,7 +17,7 @@ impl LaminarDB {
     /// Returns [`DbError::Checkpoint`] if the metadata batch cannot be
     /// assembled from the latest checkpoint.
     pub async fn build_show_checkpoint_status(&self) -> Result<RecordBatch, DbError> {
-        let store = self.checkpoint_store();
+        let store = self.checkpoint_store()?;
         let (latest, list) = match &store {
             Some(s) => {
                 let latest = s.load_latest().await.map_err(|e| {

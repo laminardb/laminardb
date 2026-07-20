@@ -2,37 +2,76 @@
 
 #[cfg(feature = "cluster")]
 use std::collections::BinaryHeap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::path::{Path as FsPath, PathBuf};
+use std::sync::{Arc, OnceLock, Weak};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use object_store::path::Path as OsPath;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
+use object_store::{
+    GetOptions, GetRange, GetResult, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
+    UpdateVersion,
+};
 #[cfg(feature = "cluster")]
 use sha2::{Digest, Sha256};
 
 use crate::checkpoint::{
-    CheckpointAssignmentFence, ClusterRecoveryCapsule, LeaderProof, RecoveryCapsuleRef,
+    CheckpointAssignmentFence, ClusterRecoveryCapsule, LeaderProof, PipelineIdentity,
+    RecoveryCapsuleRef,
 };
+use crate::state::CheckpointAttempt;
 
 /// Durable checkpoint metadata store.
 pub struct CheckpointDecisionStore {
     store: Arc<dyn ObjectStore>,
     update_mode: DecisionStoreUpdateMode,
-    /// Serializes candidates from this instance so its durable creates cannot reorder.
-    reservation_lock: tokio::sync::Mutex<()>,
-    /// Serializes the fallback for a certified single-writer local namespace.
-    outcome_floor_update_lock: tokio::sync::Mutex<()>,
-    /// Highest reservation observed or attempted by this store instance.
-    reservation_hint: AtomicU64,
+    /// Serializes deployment creation and checkpoint-ID allocation from this instance.
+    metadata_write_lock: tokio::sync::Mutex<()>,
+    /// Serializes local read/compare/overwrite transitions across every store instance that owns
+    /// this namespace. Shared stores use native object-store CAS instead.
+    local_metadata_rmw_lock: Option<Arc<tokio::sync::Mutex<()>>>,
+    /// Last checkpoint-ID head observed by this instance. Shared-store CAS detects stale entries.
+    checkpoint_id_head: parking_lot::Mutex<Option<VersionedCheckpointIdHead>>,
+    /// Active immutable reservation block for the certified local single writer.
+    local_reservation: parking_lot::Mutex<LocalReservationState>,
     deployment_id: tokio::sync::OnceCell<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 enum DecisionStoreUpdateMode {
     NativeCas,
     LocalSingleWriter,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum LocalMetadataNamespace {
+    /// Generic local stores share an authority by cloning the same `Arc<dyn ObjectStore>`.
+    #[cfg(test)]
+    StoreAuthority(usize),
+    /// Filesystem constructors can identify independently opened stores by canonical root.
+    Filesystem(PathBuf),
+}
+
+fn shared_local_metadata_rmw_lock(
+    namespace: LocalMetadataNamespace,
+) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<
+        parking_lot::Mutex<
+            rustc_hash::FxHashMap<LocalMetadataNamespace, Weak<tokio::sync::Mutex<()>>>,
+        >,
+    > = OnceLock::new();
+
+    let mut locks = LOCKS
+        .get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+        .lock();
+    locks.retain(|_, lock| lock.strong_count() != 0);
+    if let Some(lock) = locks.get(&namespace).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(namespace, Arc::downgrade(&lock));
+    lock
 }
 
 impl std::fmt::Debug for CheckpointDecisionStore {
@@ -130,8 +169,12 @@ pub struct OutcomeRetentionBoundary {
 }
 
 const CHECKPOINT_OUTCOME_VERSION: u32 = 2;
+const CHECKPOINT_OUTCOME_MAX_BYTES: u64 = 64 * 1_024;
+const OUTCOME_GC_FLOOR_MAX_BYTES: u64 = 256 * 1_024;
 #[cfg(feature = "cluster")]
 const RECOVERY_CAPSULE_GC_BATCH_SIZE: usize = 64;
+#[cfg(feature = "cluster")]
+const RECOVERY_CAPSULE_GC_CURSOR_MAX_BYTES: u64 = 1_024;
 
 impl CheckpointOutcome {
     pub(crate) fn validate_shape(&self, path_epoch: u64) -> Result<(), DecisionError> {
@@ -151,6 +194,13 @@ impl CheckpointOutcome {
         if self.checkpoint_id == 0 {
             return Err(DecisionError::Conflict(format!(
                 "outcome for epoch {path_epoch} has checkpoint ID 0"
+            )));
+        }
+        if self.epoch != self.checkpoint_id {
+            return Err(DecisionError::Conflict(format!(
+                "outcome for epoch {path_epoch} has non-canonical checkpoint ID {}; runtime \
+                 outcomes require epoch == checkpoint ID",
+                self.checkpoint_id
             )));
         }
 
@@ -241,27 +291,122 @@ impl CheckpointOutcome {
     }
 }
 
-/// Durable allocator state for globally unique checkpoint IDs.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-struct CheckpointIdReservation {
-    /// Reservation payload format.
-    version: u32,
-    /// Reserved checkpoint ID, matching the object name.
-    checkpoint_id: u64,
-}
-
-const CHECKPOINT_ID_RESERVATION_VERSION: u32 = 1;
-
-/// Create-once identity for one durable checkpoint/decision-store incarnation.
-/// A storage reset deliberately creates a new value so surviving external sinks cannot mistake
-/// a restarted checkpoint-id sequence for their prior writer.
+/// Durable checkpoint namespace identity and its shared-store allocation head.
+///
+/// `id` never changes. Deleting this single authority creates a new deployment identity before
+/// checkpoint IDs restart, so surviving external sinks cannot confuse the new sequence with the
+/// previous writer. `allocation_id` identifies the last CAS proposal for lost-response recovery.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct DeploymentIdentity {
     version: u32,
     id: String,
+    allocator_mode: DecisionStoreUpdateMode,
+    checkpoint_id: u64,
+    allocation_id: String,
 }
 
-const DEPLOYMENT_IDENTITY_VERSION: u32 = 1;
+const DEPLOYMENT_IDENTITY_VERSION: u32 = 2;
+const DEPLOYMENT_IDENTITY_MAX_BYTES: u64 = 1_024;
+
+/// Durable proof that every named checkpoint-committable sink may have opened this attempt.
+///
+/// The witness is created before any external begin call and remains live until the exact attempt
+/// reaches a terminal outcome or every named sink confirms rollback. Recovery must reconcile the
+/// attempt before opening a later one.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointSinkOpenWitness {
+    version: u32,
+    /// Durable deployment incarnation that owns this witness.
+    pub deployment_id: String,
+    /// Logical pipeline and recovery-state ABI identity.
+    pub pipeline_identity: PipelineIdentity,
+    /// Runtime participant that owns the named sink handles (`0` in embedded/local mode).
+    pub participant_id: u64,
+    /// Exact canonical attempt that may be externally open.
+    pub attempt: CheckpointAttempt,
+    /// Canonically sorted, unique checkpoint-committable sink names.
+    pub committable_sinks: Vec<String>,
+    /// Unique create proposal used to reconcile an ambiguous object-store response.
+    create_token: String,
+}
+
+const CHECKPOINT_SINK_OPEN_WITNESS_VERSION: u32 = 1;
+const CHECKPOINT_SINK_OPEN_WITNESS_MAX_BYTES: u64 = 64 * 1_024;
+const CHECKPOINT_SINK_OPEN_WITNESS_MAX_SINKS: usize = 1_024;
+
+/// Versioned singleton that never returns to an absent state after its first open transition.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CheckpointSinkOpenWitnessSlot {
+    version: u32,
+    state: CheckpointSinkOpenWitnessSlotState,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+enum CheckpointSinkOpenWitnessSlotState {
+    Open {
+        witness: CheckpointSinkOpenWitness,
+    },
+    Closed {
+        witness: CheckpointSinkOpenWitness,
+        close_token: String,
+    },
+}
+
+impl CheckpointSinkOpenWitnessSlot {
+    fn open(witness: CheckpointSinkOpenWitness) -> Self {
+        Self {
+            version: CHECKPOINT_SINK_OPEN_WITNESS_SLOT_VERSION,
+            state: CheckpointSinkOpenWitnessSlotState::Open { witness },
+        }
+    }
+
+    fn closed(witness: CheckpointSinkOpenWitness) -> Self {
+        Self {
+            version: CHECKPOINT_SINK_OPEN_WITNESS_SLOT_VERSION,
+            state: CheckpointSinkOpenWitnessSlotState::Closed {
+                witness,
+                close_token: uuid::Uuid::now_v7().to_string(),
+            },
+        }
+    }
+
+    const fn witness(&self) -> &CheckpointSinkOpenWitness {
+        match &self.state {
+            CheckpointSinkOpenWitnessSlotState::Open { witness }
+            | CheckpointSinkOpenWitnessSlotState::Closed { witness, .. } => witness,
+        }
+    }
+}
+
+const CHECKPOINT_SINK_OPEN_WITNESS_SLOT_VERSION: u32 = 1;
+
+#[derive(Debug)]
+struct VersionedCheckpointSinkOpenWitnessSlot {
+    slot: CheckpointSinkOpenWitnessSlot,
+    update_version: UpdateVersion,
+}
+
+#[derive(Debug, Clone)]
+struct VersionedCheckpointIdHead {
+    head: DeploymentIdentity,
+    update_version: UpdateVersion,
+}
+
+/// In-memory cursor within a durable immutable local ID block. A restarted process always claims
+/// a later block and therefore burns any IDs the previous process did not consume.
+#[derive(Debug, Default)]
+struct LocalReservationState {
+    initialized: bool,
+    highest_block: Option<u64>,
+    next_id: Option<u64>,
+    block_end: u64,
+}
+
+const LOCAL_RESERVATION_BLOCK_SIZE: u64 = 65_536;
 
 /// Monotonic tombstone for terminal outcomes below `before_epoch`.
 ///
@@ -304,6 +449,14 @@ const RECOVERY_CAPSULE_GC_CURSOR_VERSION: u32 = 1;
 struct RecoveryCapsuleListCandidate {
     location: String,
     meta: object_store::ObjectMeta,
+}
+
+#[cfg(feature = "cluster")]
+enum RecoveryCapsuleObjectWork {
+    Retained,
+    Deleted,
+    Quarantined,
+    Failed,
 }
 
 #[cfg(feature = "cluster")]
@@ -369,28 +522,187 @@ pub struct RecoveryCapsuleGcStep {
 }
 
 impl CheckpointDecisionStore {
+    fn ensure_control_record_size(
+        record: &str,
+        size: u64,
+        maximum: u64,
+    ) -> Result<(), DecisionError> {
+        if size > maximum {
+            return Err(DecisionError::Conflict(format!(
+                "{record} is {size} bytes; maximum is {maximum}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn encode_control_record<T: serde::Serialize>(
+        record: &str,
+        value: &T,
+        maximum: u64,
+    ) -> Result<Bytes, DecisionError> {
+        let payload = serde_json::to_vec(value)
+            .map(Bytes::from)
+            .map_err(|error| DecisionError::Conflict(error.to_string()))?;
+        let size = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+        Self::ensure_control_record_size(record, size, maximum)?;
+        Ok(payload)
+    }
+
+    async fn read_control_record_bytes(
+        result: GetResult,
+        record: &str,
+        maximum: u64,
+        expected_size: Option<u64>,
+    ) -> Result<Bytes, DecisionError> {
+        Self::ensure_control_record_size(record, result.meta.size, maximum)?;
+        if let Some(expected_size) = expected_size {
+            if result.meta.size != expected_size {
+                return Err(DecisionError::Conflict(format!(
+                    "{record} is {} bytes, expected {expected_size}",
+                    result.meta.size
+                )));
+            }
+        }
+        let metadata_size = result.meta.size;
+        if result.range.start != 0 || result.range.end != metadata_size {
+            return Err(DecisionError::Conflict(format!(
+                "{record} returned byte range {}..{}, expected 0..{metadata_size}",
+                result.range.start, result.range.end
+            )));
+        }
+        let capacity = usize::try_from(metadata_size).map_err(|_| {
+            DecisionError::Conflict(format!(
+                "{record} length {metadata_size} exceeds this process address space"
+            ))
+        })?;
+        let mut bytes = BytesMut::with_capacity(capacity);
+        let mut stream = result.into_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| DecisionError::Io(error.to_string()))?;
+            let next_len = bytes.len().checked_add(chunk.len()).ok_or_else(|| {
+                DecisionError::Conflict(format!("{record} payload length overflow"))
+            })?;
+            if next_len > capacity {
+                return Err(DecisionError::Conflict(format!(
+                    "{record} payload exceeded its advertised {metadata_size}-byte length"
+                )));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.len() != capacity {
+            return Err(DecisionError::Conflict(format!(
+                "{record} payload length changed while reading"
+            )));
+        }
+        Ok(bytes.freeze())
+    }
+
+    async fn get_control_record(
+        &self,
+        path: &OsPath,
+        record: &str,
+        maximum: u64,
+    ) -> Result<Option<GetResult>, DecisionError> {
+        let request_end = maximum.checked_add(1).ok_or_else(|| {
+            DecisionError::Conflict(format!("{record} maximum cannot be range-bounded"))
+        })?;
+        let result = match self
+            .store
+            .get_opts(
+                path,
+                GetOptions {
+                    range: Some(GetRange::Bounded(0..request_end)),
+                    ..GetOptions::default()
+                },
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(DecisionError::Io(error.to_string())),
+        };
+        Self::ensure_control_record_size(record, result.meta.size, maximum)?;
+        if result.range.start != 0 || result.range.end != result.meta.size {
+            return Err(DecisionError::Conflict(format!(
+                "{record} returned byte range {}..{}, inconsistent with advertised size {}",
+                result.range.start, result.range.end, result.meta.size
+            )));
+        }
+        Ok(Some(result))
+    }
+
+    fn require_native_cas_token(
+        &self,
+        record: &str,
+        update_version: &UpdateVersion,
+    ) -> Result<(), DecisionError> {
+        if self.update_mode == DecisionStoreUpdateMode::NativeCas
+            && update_version.e_tag.is_none()
+            && update_version.version.is_none()
+        {
+            return Err(DecisionError::Conflict(format!(
+                "shared {record} has neither an ETag nor an object version for CAS"
+            )));
+        }
+        Ok(())
+    }
+
     /// Wrap shared storage that must provide native conditional updates.
     #[must_use]
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self::with_update_mode(store, DecisionStoreUpdateMode::NativeCas)
+        Self::with_update_mode(store, DecisionStoreUpdateMode::NativeCas, None)
     }
 
-    /// Wrap node-local storage whose namespace has exactly one process writer.
+    #[cfg(test)]
+    fn local_single_writer(store: Arc<dyn ObjectStore>) -> Self {
+        let authority = Arc::as_ptr(&store) as *const () as usize;
+        let lock =
+            shared_local_metadata_rmw_lock(LocalMetadataNamespace::StoreAuthority(authority));
+        Self::with_update_mode(
+            store,
+            DecisionStoreUpdateMode::LocalSingleWriter,
+            Some(lock),
+        )
+    }
+
+    /// Open crash-durable checkpoint metadata in a caller-owned local directory.
+    /// The caller must retain its exclusive namespace lease for the store's write lifetime.
     ///
-    /// Stores without conditional-update support use a serialized atomic overwrite for mutable
-    /// retention metadata. Do not use this constructor for storage shared by cluster nodes.
-    #[must_use]
-    pub fn local_single_writer(store: Arc<dyn ObjectStore>) -> Self {
-        Self::with_update_mode(store, DecisionStoreUpdateMode::LocalSingleWriter)
+    /// # Errors
+    /// Returns an I/O error when the directory cannot be created, synchronized, or opened.
+    pub fn local_filesystem(root: impl AsRef<FsPath>) -> Result<Self, DecisionError> {
+        let root = root.as_ref();
+        let store: Arc<dyn ObjectStore> = Arc::new(
+            crate::durable_local_store::DurableLocalObjectStore::new(root)
+                .map_err(|error| DecisionError::Io(error.to_string()))?,
+        );
+        let canonical_root =
+            std::fs::canonicalize(root).map_err(|error| DecisionError::Io(error.to_string()))?;
+        let lock =
+            shared_local_metadata_rmw_lock(LocalMetadataNamespace::Filesystem(canonical_root));
+        Ok(Self::with_update_mode(
+            store,
+            DecisionStoreUpdateMode::LocalSingleWriter,
+            Some(lock),
+        ))
     }
 
-    fn with_update_mode(store: Arc<dyn ObjectStore>, update_mode: DecisionStoreUpdateMode) -> Self {
+    fn with_update_mode(
+        store: Arc<dyn ObjectStore>,
+        update_mode: DecisionStoreUpdateMode,
+        local_metadata_rmw_lock: Option<Arc<tokio::sync::Mutex<()>>>,
+    ) -> Self {
+        debug_assert_eq!(
+            update_mode == DecisionStoreUpdateMode::LocalSingleWriter,
+            local_metadata_rmw_lock.is_some()
+        );
         Self {
             store,
             update_mode,
-            reservation_lock: tokio::sync::Mutex::new(()),
-            outcome_floor_update_lock: tokio::sync::Mutex::new(()),
-            reservation_hint: AtomicU64::new(0),
+            metadata_write_lock: tokio::sync::Mutex::new(()),
+            local_metadata_rmw_lock,
+            checkpoint_id_head: parking_lot::Mutex::new(None),
+            local_reservation: parking_lot::Mutex::new(LocalReservationState::default()),
             deployment_id: tokio::sync::OnceCell::new(),
         }
     }
@@ -451,16 +763,20 @@ impl CheckpointDecisionStore {
         ))
     }
 
-    fn reservation_root() -> OsPath {
-        OsPath::from("checkpoint-id-reservations/")
+    fn local_reservation_root() -> OsPath {
+        OsPath::from("checkpoint-id-blocks/")
     }
 
-    fn reservation_path(checkpoint_id: u64) -> OsPath {
-        OsPath::from(format!("checkpoint-id-reservations/id={checkpoint_id}"))
+    fn local_reservation_path(block: u64) -> OsPath {
+        OsPath::from(format!("checkpoint-id-blocks/block={block:020}"))
     }
 
     fn deployment_identity_path() -> OsPath {
         OsPath::from("checkpoint-deployment/identity.json")
+    }
+
+    fn sink_open_witness_path() -> OsPath {
+        OsPath::from("checkpoint-sink-open-witness/witness.json")
     }
 
     #[cfg(feature = "cluster")]
@@ -469,19 +785,28 @@ impl CheckpointDecisionStore {
         deployment_id: &str,
     ) -> Result<Option<VersionedRecoveryCapsuleGcCursor>, DecisionError> {
         let path = Self::recovery_capsule_gc_cursor_path(deployment_id);
-        let result = match self.store.get(&path).await {
-            Ok(result) => result,
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(error) => return Err(DecisionError::Io(error.to_string())),
+        let Some(result) = self
+            .get_control_record(
+                &path,
+                "recovery capsule GC cursor",
+                RECOVERY_CAPSULE_GC_CURSOR_MAX_BYTES,
+            )
+            .await?
+        else {
+            return Ok(None);
         };
         let update_version = UpdateVersion {
             e_tag: result.meta.e_tag.clone(),
             version: result.meta.version.clone(),
         };
-        let bytes = result
-            .bytes()
-            .await
-            .map_err(|error| DecisionError::Io(error.to_string()))?;
+        self.require_native_cas_token("recovery capsule GC cursor", &update_version)?;
+        let bytes = Self::read_control_record_bytes(
+            result,
+            "recovery capsule GC cursor",
+            RECOVERY_CAPSULE_GC_CURSOR_MAX_BYTES,
+            None,
+        )
+        .await?;
         let cursor: RecoveryCapsuleGcCursor = serde_json::from_slice(&bytes).map_err(|error| {
             DecisionError::Conflict(format!("recovery capsule GC cursor: {error}"))
         })?;
@@ -517,9 +842,11 @@ impl CheckpointDecisionStore {
         expected: Option<UpdateVersion>,
     ) -> Result<bool, DecisionError> {
         let path = Self::recovery_capsule_gc_cursor_path(&cursor.deployment_id);
-        let payload = serde_json::to_vec(cursor)
-            .map(Bytes::from)
-            .map_err(|error| DecisionError::Conflict(error.to_string()))?;
+        let payload = Self::encode_control_record(
+            "recovery capsule GC cursor",
+            cursor,
+            RECOVERY_CAPSULE_GC_CURSOR_MAX_BYTES,
+        )?;
         let options = PutOptions {
             mode: expected.map_or(PutMode::Create, PutMode::Update),
             ..PutOptions::default()
@@ -572,31 +899,22 @@ impl CheckpointDecisionStore {
             mode: PutMode::Create,
             ..PutOptions::default()
         };
-        let put_error = self
+        match self
             .store
-            .put_opts(
-                &path,
-                PutPayload::from(Bytes::copy_from_slice(&encoded)),
-                options,
-            )
+            .put_opts(&path, PutPayload::from(Bytes::from(encoded)), options)
             .await
-            .err();
-
-        match self.load_recovery_capsule(&reference).await {
-            Ok(stored) if stored == *capsule => Ok(reference),
-            Ok(_) => Err(DecisionError::Conflict(format!(
-                "recovery capsule '{}' differs from the proposed content",
-                reference.sha256
-            ))),
-            Err(reconcile_error) => {
-                if let Some(put_error) = put_error {
-                    Err(DecisionError::Io(format!(
-                        "recovery capsule write failed ({put_error}); reconciliation failed ({reconcile_error})"
-                    )))
-                } else {
-                    Err(reconcile_error)
-                }
-            }
+        {
+            Ok(_) => Ok(reference),
+            Err(put_error) => match self.load_recovery_capsule(&reference).await {
+                Ok(stored) if stored == *capsule => Ok(reference),
+                Ok(_) => Err(DecisionError::Conflict(format!(
+                    "recovery capsule '{}' differs from the proposed content",
+                    reference.sha256
+                ))),
+                Err(reconcile_error) => Err(DecisionError::Io(format!(
+                    "recovery capsule write failed ({put_error}); reconciliation failed ({reconcile_error})"
+                ))),
+            },
         }
     }
 
@@ -612,36 +930,27 @@ impl CheckpointDecisionStore {
         reference: &RecoveryCapsuleRef,
     ) -> Result<ClusterRecoveryCapsule, DecisionError> {
         reference.validate().map_err(DecisionError::Conflict)?;
-        let result = match self
-            .store
-            .get(&Self::recovery_capsule_path(reference))
-            .await
-        {
-            Ok(result) => result,
-            Err(object_store::Error::NotFound { .. }) => {
-                return Err(DecisionError::Conflict(format!(
+        let record = format!("recovery capsule '{}'", reference.sha256);
+        let result = self
+            .get_control_record(
+                &Self::recovery_capsule_path(reference),
+                &record,
+                u64::try_from(crate::checkpoint::MAX_RECOVERY_CAPSULE_BYTES).unwrap_or(u64::MAX),
+            )
+            .await?
+            .ok_or_else(|| {
+                DecisionError::Conflict(format!(
                     "recovery capsule '{}' is missing",
                     reference.sha256
-                )));
-            }
-            Err(error) => return Err(DecisionError::Io(error.to_string())),
-        };
-        if result.meta.size != reference.len {
-            return Err(DecisionError::Conflict(format!(
-                "recovery capsule '{}' is {} bytes, expected {}",
-                reference.sha256, result.meta.size, reference.len
-            )));
-        }
-        let bytes = result
-            .bytes()
-            .await
-            .map_err(|error| DecisionError::Io(error.to_string()))?;
-        if u64::try_from(bytes.len()).ok() != Some(reference.len) {
-            return Err(DecisionError::Conflict(format!(
-                "recovery capsule '{}' payload length changed while reading",
-                reference.sha256
-            )));
-        }
+                ))
+            })?;
+        let bytes = Self::read_control_record_bytes(
+            result,
+            &record,
+            u64::try_from(crate::checkpoint::MAX_RECOVERY_CAPSULE_BYTES).unwrap_or(u64::MAX),
+            Some(reference.len),
+        )
+        .await?;
         let capsule: ClusterRecoveryCapsule = serde_json::from_slice(&bytes).map_err(|error| {
             DecisionError::Conflict(format!("recovery capsule '{}': {error}", reference.sha256))
         })?;
@@ -689,9 +998,9 @@ impl CheckpointDecisionStore {
         Ok(())
     }
 
-    fn decode_deployment_identity(bytes: &[u8]) -> Result<String, DecisionError> {
-        let identity: DeploymentIdentity = serde_json::from_slice(bytes)
-            .map_err(|error| DecisionError::Conflict(format!("deployment identity: {error}")))?;
+    fn validate_deployment_identity(
+        identity: &DeploymentIdentity,
+    ) -> Result<String, DecisionError> {
         if identity.version != DEPLOYMENT_IDENTITY_VERSION {
             return Err(DecisionError::Conflict(format!(
                 "deployment identity version {} is unsupported (expected \
@@ -708,20 +1017,64 @@ impl CheckpointDecisionStore {
                 "deployment identity must be a canonical non-nil UUID".into(),
             ));
         }
+        let allocation_id = uuid::Uuid::parse_str(&identity.allocation_id).map_err(|error| {
+            DecisionError::Conflict(format!(
+                "deployment identity has invalid allocation identity: {error}"
+            ))
+        })?;
+        if allocation_id.is_nil() || allocation_id.to_string() != identity.allocation_id {
+            return Err(DecisionError::Conflict(
+                "deployment identity must use a canonical non-nil allocation identity".into(),
+            ));
+        }
         Ok(canonical)
     }
 
-    async fn read_deployment_identity(&self) -> Result<Option<String>, DecisionError> {
-        let result = match self.store.get(&Self::deployment_identity_path()).await {
-            Ok(result) => result,
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(error) => return Err(DecisionError::Io(error.to_string())),
+    async fn read_deployment_identity(
+        &self,
+    ) -> Result<Option<VersionedCheckpointIdHead>, DecisionError> {
+        let Some(result) = self
+            .get_control_record(
+                &Self::deployment_identity_path(),
+                "deployment identity",
+                DEPLOYMENT_IDENTITY_MAX_BYTES,
+            )
+            .await?
+        else {
+            return Ok(None);
         };
-        let bytes = result
-            .bytes()
-            .await
-            .map_err(|error| DecisionError::Io(error.to_string()))?;
-        Self::decode_deployment_identity(&bytes).map(Some)
+        let update_version = UpdateVersion {
+            e_tag: result.meta.e_tag.clone(),
+            version: result.meta.version.clone(),
+        };
+        self.require_native_cas_token("deployment identity", &update_version)?;
+        let bytes = Self::read_control_record_bytes(
+            result,
+            "deployment identity",
+            DEPLOYMENT_IDENTITY_MAX_BYTES,
+            None,
+        )
+        .await?;
+        let identity: DeploymentIdentity = serde_json::from_slice(&bytes)
+            .map_err(|error| DecisionError::Conflict(format!("deployment identity: {error}")))?;
+        Self::validate_deployment_identity(&identity)?;
+        if identity.allocator_mode != self.update_mode {
+            return Err(DecisionError::Conflict(format!(
+                "deployment identity allocator mode {:?} cannot be opened as {:?}",
+                identity.allocator_mode, self.update_mode
+            )));
+        }
+        let canonical = serde_json::to_vec(&identity)
+            .map_err(|error| DecisionError::Conflict(error.to_string()))?;
+        if canonical.as_slice() != bytes.as_ref() {
+            return Err(DecisionError::Conflict(
+                "deployment identity does not use its canonical body".into(),
+            ));
+        }
+        Ok(Some(VersionedCheckpointIdHead {
+            head: identity,
+            update_version,
+        }))
     }
 
     /// Load the checkpoint namespace's create-once deployment incarnation, creating it when the
@@ -733,11 +1086,13 @@ impl CheckpointDecisionStore {
         if let Some(identity) = self.deployment_id.get() {
             return Ok(identity.clone());
         }
-        let _guard = self.reservation_lock.lock().await;
+        let _guard = self.metadata_write_lock.lock().await;
         if let Some(identity) = self.deployment_id.get() {
             return Ok(identity.clone());
         }
-        if let Some(identity) = self.read_deployment_identity().await? {
+        if let Some(stored) = self.read_deployment_identity().await? {
+            let identity = stored.head.id.clone();
+            self.cache_checkpoint_id_head(Some(stored));
             let _ = self.deployment_id.set(identity.clone());
             return Ok(identity);
         }
@@ -745,10 +1100,15 @@ impl CheckpointDecisionStore {
         let identity = DeploymentIdentity {
             version: DEPLOYMENT_IDENTITY_VERSION,
             id: uuid::Uuid::now_v7().to_string(),
+            allocator_mode: self.update_mode,
+            checkpoint_id: 0,
+            allocation_id: uuid::Uuid::now_v7().to_string(),
         };
-        let payload = serde_json::to_vec(&identity)
-            .map(Bytes::from)
-            .map_err(|error| DecisionError::Conflict(error.to_string()))?;
+        let payload = Self::encode_control_record(
+            "deployment identity",
+            &identity,
+            DEPLOYMENT_IDENTITY_MAX_BYTES,
+        )?;
         let options = PutOptions {
             mode: PutMode::Create,
             ..PutOptions::default()
@@ -762,7 +1122,19 @@ impl CheckpointDecisionStore {
             )
             .await
         {
-            Ok(_) => {
+            Ok(put_result) => {
+                let update_version: UpdateVersion = put_result.into();
+                if self.update_mode == DecisionStoreUpdateMode::NativeCas
+                    && update_version.e_tag.is_none()
+                    && update_version.version.is_none()
+                {
+                    self.cache_checkpoint_id_head(None);
+                } else {
+                    self.cache_checkpoint_id_head(Some(VersionedCheckpointIdHead {
+                        head: identity.clone(),
+                        update_version,
+                    }));
+                }
                 let _ = self.deployment_id.set(identity.id.clone());
                 Ok(identity.id)
             }
@@ -775,123 +1147,810 @@ impl CheckpointDecisionStore {
                         "deployment identity disappeared after create conflict".into(),
                     )
                 })?;
-                let _ = self.deployment_id.set(stored.clone());
-                Ok(stored)
+                let identity = stored.head.id.clone();
+                self.cache_checkpoint_id_head(Some(stored));
+                let _ = self.deployment_id.set(identity.clone());
+                Ok(identity)
             }
-            Err(error) => Err(DecisionError::Io(error.to_string())),
+            Err(error) => match self.read_deployment_identity().await? {
+                Some(stored) => {
+                    let identity = stored.head.id.clone();
+                    self.cache_checkpoint_id_head(Some(stored));
+                    let _ = self.deployment_id.set(identity.clone());
+                    Ok(identity)
+                }
+                None => Err(DecisionError::Io(error.to_string())),
+            },
         }
     }
 
-    fn reservation_id(location: &str) -> Result<u64, DecisionError> {
+    fn local_reservation_block(location: &str) -> Result<u64, DecisionError> {
         let value = location
-            .strip_prefix("checkpoint-id-reservations/id=")
+            .strip_prefix("checkpoint-id-blocks/block=")
             .ok_or_else(|| {
-                DecisionError::Conflict(format!(
-                    "malformed checkpoint ID reservation path: {location}"
-                ))
+                DecisionError::Conflict(format!("malformed checkpoint ID block path: {location}"))
             })?;
-        if value.is_empty() || value.contains('/') {
+        if value.len() != 20 || value.contains('/') {
             return Err(DecisionError::Conflict(format!(
-                "malformed checkpoint ID reservation path: {location}"
+                "malformed checkpoint ID block path: {location}"
             )));
         }
-        let checkpoint_id = value.parse::<u64>().map_err(|_| {
-            DecisionError::Conflict(format!(
-                "malformed checkpoint ID reservation path: {location}"
-            ))
+        let block = value.parse::<u64>().map_err(|_| {
+            DecisionError::Conflict(format!("malformed checkpoint ID block path: {location}"))
         })?;
-        if checkpoint_id == 0 {
-            return Err(DecisionError::Conflict(
-                "checkpoint ID reservation cannot contain ID 0".to_owned(),
-            ));
+        if Self::local_reservation_path(block).as_ref() != location {
+            return Err(DecisionError::Conflict(format!(
+                "checkpoint ID block path is not canonical: {location}"
+            )));
         }
-        Ok(checkpoint_id)
+        Self::local_reservation_block_bounds(block)?;
+        Ok(block)
     }
 
-    fn encode_reservation(reservation: CheckpointIdReservation) -> Result<Bytes, DecisionError> {
-        serde_json::to_vec(&reservation)
-            .map(Bytes::from)
-            .map_err(|e| DecisionError::Conflict(e.to_string()))
+    const fn local_reservation_block_for(checkpoint_id: u64) -> u64 {
+        (checkpoint_id - 1) / LOCAL_RESERVATION_BLOCK_SIZE
     }
 
-    async fn initialize_reservation_hint(&self) -> Result<(), DecisionError> {
-        if self.reservation_hint.load(Ordering::Acquire) != 0 {
+    fn local_reservation_block_bounds(block: u64) -> Result<(u64, u64), DecisionError> {
+        let start = block
+            .checked_mul(LOCAL_RESERVATION_BLOCK_SIZE)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| {
+                DecisionError::Conflict("checkpoint ID space exhausted u64".to_owned())
+            })?;
+        let end = start.saturating_add(LOCAL_RESERVATION_BLOCK_SIZE - 1);
+        Ok((start, end))
+    }
+
+    async fn initialize_local_reservation(&self) -> Result<(), DecisionError> {
+        if self.local_reservation.lock().initialized {
             return Ok(());
         }
 
-        let root = Self::reservation_root();
-        let mut entries = self.store.list(Some(&root));
-        let mut highest = 0_u64;
+        let mut entries = self.store.list(Some(&Self::local_reservation_root()));
+        let mut highest = None;
         while let Some(entry) = entries.next().await {
-            let entry = entry.map_err(|e| DecisionError::Io(e.to_string()))?;
-            highest = highest.max(Self::reservation_id(entry.location.as_ref())?);
+            let entry = entry.map_err(|error| DecisionError::Io(error.to_string()))?;
+            let block = Self::local_reservation_block(entry.location.as_ref())?;
+            highest = Some(highest.map_or(block, |current: u64| current.max(block)));
         }
-        self.reservation_hint.fetch_max(highest, Ordering::AcqRel);
+        let mut state = self.local_reservation.lock();
+        state.initialized = true;
+        state.highest_block = highest;
+        state.next_id = None;
+        state.block_end = 0;
         Ok(())
     }
 
-    fn next_reservation_candidate(&self) -> Result<u64, DecisionError> {
-        let prior = self
-            .reservation_hint
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |last| {
-                last.checked_add(1)
-            })
-            .map_err(|_| DecisionError::Conflict("checkpoint ID space exhausted u64".to_owned()))?;
-        Ok(prior + 1)
+    fn consume_local_reservation(&self, minimum: u64) -> Option<u64> {
+        let mut state = self.local_reservation.lock();
+        let Some(next_id) = state.next_id else {
+            return None;
+        };
+        let checkpoint_id = next_id.max(minimum);
+        if checkpoint_id > state.block_end {
+            state.next_id = None;
+            return None;
+        }
+        state.next_id = checkpoint_id
+            .checked_add(1)
+            .filter(|next| *next <= state.block_end);
+        Some(checkpoint_id)
     }
 
-    /// Allocate a globally unique, monotonically increasing checkpoint ID.
-    ///
-    /// Each allocation is an immutable, versioned reservation object. A store
-    /// instance lists the durable reservations once to seed a local hint, then
-    /// uses `PutMode::Create` to atomically claim candidates. Create races retry
-    /// with the next candidate, so concurrent coordinators cannot return the
-    /// same ID. IDs may have gaps when a caller crashes after allocation. These
-    /// reservation objects are permanent: deleting them can permit ID reuse.
-    ///
-    /// # Errors
-    /// Object-store I/O, a malformed durable reservation path, or exhaustion
-    /// of the `u64` ID space.
-    pub async fn allocate_checkpoint_id(&self) -> Result<u64, DecisionError> {
-        let _guard = self.reservation_lock.lock().await;
-        self.initialize_reservation_hint().await?;
+    async fn allocate_local_checkpoint_id_at_least(
+        &self,
+        minimum: u64,
+    ) -> Result<u64, DecisionError> {
+        self.initialize_local_reservation().await?;
+        if let Some(checkpoint_id) = self.consume_local_reservation(minimum) {
+            return Ok(checkpoint_id);
+        }
+
+        let minimum_block = Self::local_reservation_block_for(minimum);
+        let highest_block = self.local_reservation.lock().highest_block;
+        let mut candidate = match highest_block {
+            Some(block) => block
+                .checked_add(1)
+                .map(|next| next.max(minimum_block))
+                .ok_or_else(|| {
+                    DecisionError::Conflict("checkpoint ID space exhausted u64".to_owned())
+                })?,
+            None => minimum_block,
+        };
 
         loop {
-            let checkpoint_id = self.next_reservation_candidate()?;
-            let reservation = CheckpointIdReservation {
-                version: CHECKPOINT_ID_RESERVATION_VERSION,
-                checkpoint_id,
-            };
-            let opts = PutOptions {
-                mode: PutMode::Create,
-                ..PutOptions::default()
-            };
-            match self
+            let (start, end) = Self::local_reservation_block_bounds(candidate)?;
+            let result = self
                 .store
                 .put_opts(
-                    &Self::reservation_path(checkpoint_id),
-                    PutPayload::from(Self::encode_reservation(reservation)?),
-                    opts,
+                    &Self::local_reservation_path(candidate),
+                    PutPayload::from(Bytes::new()),
+                    PutOptions {
+                        mode: PutMode::Create,
+                        ..PutOptions::default()
+                    },
                 )
-                .await
-            {
-                Ok(_) => return Ok(checkpoint_id),
+                .await;
+            match result {
+                Ok(_) => {
+                    let checkpoint_id = start.max(minimum);
+                    let mut state = self.local_reservation.lock();
+                    state.highest_block = Some(
+                        state
+                            .highest_block
+                            .map_or(candidate, |current| current.max(candidate)),
+                    );
+                    state.block_end = end;
+                    state.next_id = checkpoint_id
+                        .checked_add(1)
+                        .filter(|next| *next <= state.block_end);
+                    return Ok(checkpoint_id);
+                }
                 Err(
                     object_store::Error::Precondition { .. }
                     | object_store::Error::AlreadyExists { .. },
                 ) => {
+                    candidate = candidate.checked_add(1).ok_or_else(|| {
+                        DecisionError::Conflict("checkpoint ID space exhausted u64".to_owned())
+                    })?;
+                    self.local_reservation.lock().highest_block = Some(candidate - 1);
                     tokio::task::yield_now().await;
                 }
-                Err(e) => return Err(DecisionError::Io(e.to_string())),
+                Err(error) => return Err(DecisionError::Io(error.to_string())),
             }
+        }
+    }
+
+    async fn read_checkpoint_id_head(
+        &self,
+        deployment_id: &str,
+    ) -> Result<Option<VersionedCheckpointIdHead>, DecisionError> {
+        let observed = self.read_deployment_identity().await?;
+        if let Some(observed) = observed.as_ref() {
+            if observed.head.id != deployment_id {
+                return Err(DecisionError::Conflict(format!(
+                    "checkpoint ID head belongs to deployment {}, current deployment is {deployment_id}",
+                    observed.head.id
+                )));
+            }
+        }
+        Ok(observed)
+    }
+
+    fn cache_checkpoint_id_head(&self, head: Option<VersionedCheckpointIdHead>) {
+        *self.checkpoint_id_head.lock() = head;
+    }
+
+    fn validate_checkpoint_id_head_progress(
+        prior: Option<&VersionedCheckpointIdHead>,
+        observed: Option<&VersionedCheckpointIdHead>,
+    ) -> Result<(), DecisionError> {
+        match (prior, observed) {
+            (Some(prior), None) => Err(DecisionError::Conflict(format!(
+                "checkpoint ID head disappeared after durable ID {}",
+                prior.head.checkpoint_id
+            ))),
+            (Some(prior), Some(observed))
+                if observed.head.checkpoint_id < prior.head.checkpoint_id =>
+            {
+                Err(DecisionError::Conflict(format!(
+                    "checkpoint ID head regressed from {} to {}",
+                    prior.head.checkpoint_id, observed.head.checkpoint_id
+                )))
+            }
+            (Some(prior), Some(observed))
+                if observed.head.checkpoint_id == prior.head.checkpoint_id
+                    && observed.head != prior.head =>
+            {
+                Err(DecisionError::Conflict(format!(
+                    "checkpoint ID {} changed allocation identity without advancing",
+                    prior.head.checkpoint_id
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    async fn allocate_shared_checkpoint_id_at_least(
+        &self,
+        deployment_id: &str,
+        minimum: u64,
+    ) -> Result<u64, DecisionError> {
+        let allocation_id = uuid::Uuid::now_v7().to_string();
+        let mut current = self.checkpoint_id_head.lock().clone();
+        if current.is_none() {
+            current = self.read_checkpoint_id_head(deployment_id).await?;
+            if current.is_none() {
+                return Err(DecisionError::Conflict(format!(
+                    "checkpoint ID authority for deployment {deployment_id} disappeared"
+                )));
+            }
+            self.cache_checkpoint_id_head(current.clone());
+        }
+
+        loop {
+            let versioned = current.as_ref().ok_or_else(|| {
+                DecisionError::Conflict(format!(
+                    "checkpoint ID authority for deployment {deployment_id} disappeared"
+                ))
+            })?;
+            let checkpoint_id = versioned
+                .head
+                .checkpoint_id
+                .checked_add(1)
+                .map(|next| next.max(minimum))
+                .ok_or_else(|| {
+                    DecisionError::Conflict("checkpoint ID space exhausted u64".to_owned())
+                })?;
+            let head = DeploymentIdentity {
+                version: DEPLOYMENT_IDENTITY_VERSION,
+                id: deployment_id.to_owned(),
+                allocator_mode: self.update_mode,
+                checkpoint_id,
+                allocation_id: allocation_id.clone(),
+            };
+            let payload = serde_json::to_vec(&head)
+                .map(Bytes::from)
+                .map_err(|error| DecisionError::Conflict(error.to_string()))?;
+            let mode = PutMode::Update(versioned.update_version.clone());
+            let result = self
+                .store
+                .put_opts(
+                    &Self::deployment_identity_path(),
+                    PutPayload::from(payload),
+                    PutOptions {
+                        mode,
+                        ..PutOptions::default()
+                    },
+                )
+                .await;
+            match result {
+                Ok(put_result) => {
+                    let update_version: UpdateVersion = put_result.into();
+                    if update_version.e_tag.is_none() && update_version.version.is_none() {
+                        // The create/update itself is authoritative, but this response cannot
+                        // safely seed the next CAS. Force a metadata read on the next allocation.
+                        self.cache_checkpoint_id_head(None);
+                    } else {
+                        self.cache_checkpoint_id_head(Some(VersionedCheckpointIdHead {
+                            head,
+                            update_version,
+                        }));
+                    }
+                    return Ok(checkpoint_id);
+                }
+                Err(
+                    object_store::Error::Precondition { .. }
+                    | object_store::Error::AlreadyExists { .. }
+                    | object_store::Error::NotFound { .. },
+                ) => {
+                    let observed = self.read_checkpoint_id_head(deployment_id).await?;
+                    Self::validate_checkpoint_id_head_progress(
+                        current.as_ref(),
+                        observed.as_ref(),
+                    )?;
+                    current = observed;
+                    self.cache_checkpoint_id_head(current.clone());
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => {
+                    let observed = self.read_checkpoint_id_head(deployment_id).await?;
+                    Self::validate_checkpoint_id_head_progress(
+                        current.as_ref(),
+                        observed.as_ref(),
+                    )?;
+                    if observed.as_ref().is_some_and(|value| value.head == head) {
+                        self.cache_checkpoint_id_head(observed);
+                        return Ok(checkpoint_id);
+                    }
+                    if observed
+                        .as_ref()
+                        .is_some_and(|value| value.head.checkpoint_id >= checkpoint_id)
+                    {
+                        current = observed;
+                        self.cache_checkpoint_id_head(current.clone());
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                    self.cache_checkpoint_id_head(observed);
+                    return Err(DecisionError::Io(error.to_string()));
+                }
+            }
+        }
+    }
+
+    /// Allocate the next globally ordered checkpoint ID at or above `minimum`.
+    ///
+    /// Shared stores advance one fixed-size durable high-water object with native compare-and-
+    /// swap. The allocation identity in each proposal reconciles a lost write response without
+    /// returning an ID won by another coordinator. Node-local filesystems claim immutable blocks
+    /// and allocate from the active block in memory. They are cancellation-safe under the
+    /// constructor's exclusive single-writer namespace contract, remove durable I/O from the hot
+    /// path, and burn the unused block tail on restart. Gaps are valid and IDs are never reused.
+    ///
+    /// # Errors
+    /// Object-store I/O, malformed or foreign durable state, a shared store without conditional
+    /// update support, or exhaustion of the `u64` ID space.
+    pub async fn allocate_checkpoint_id_at_least(
+        &self,
+        minimum: u64,
+    ) -> Result<u64, DecisionError> {
+        if minimum == 0 {
+            return Err(DecisionError::Conflict(
+                "minimum checkpoint ID must be nonzero".to_owned(),
+            ));
+        }
+
+        let deployment_id = self.load_or_create_deployment_id().await?;
+        let _guard = self.metadata_write_lock.lock().await;
+        match self.update_mode {
+            DecisionStoreUpdateMode::NativeCas => {
+                self.allocate_shared_checkpoint_id_at_least(&deployment_id, minimum)
+                    .await
+            }
+            DecisionStoreUpdateMode::LocalSingleWriter => {
+                self.allocate_local_checkpoint_id_at_least(minimum).await
+            }
+        }
+    }
+
+    #[cfg(test)]
+    /// Allocate from the default floor in unit tests.
+    pub async fn allocate_checkpoint_id(&self) -> Result<u64, DecisionError> {
+        self.allocate_checkpoint_id_at_least(1).await
+    }
+
+    fn validate_sink_open_witness_shape(
+        witness: &CheckpointSinkOpenWitness,
+    ) -> Result<(), DecisionError> {
+        if witness.version != CHECKPOINT_SINK_OPEN_WITNESS_VERSION {
+            return Err(DecisionError::Conflict(format!(
+                "sink-open witness version {} is unsupported (expected \
+                 {CHECKPOINT_SINK_OPEN_WITNESS_VERSION})",
+                witness.version
+            )));
+        }
+        let deployment = uuid::Uuid::parse_str(&witness.deployment_id).map_err(|error| {
+            DecisionError::Conflict(format!(
+                "sink-open witness has invalid deployment identity: {error}"
+            ))
+        })?;
+        if deployment.is_nil() || deployment.to_string() != witness.deployment_id {
+            return Err(DecisionError::Conflict(
+                "sink-open witness must use a canonical non-nil deployment identity".into(),
+            ));
+        }
+        if let Some(error) = witness.pipeline_identity.validation_error() {
+            return Err(DecisionError::Conflict(format!(
+                "sink-open witness has an invalid pipeline identity: {error}"
+            )));
+        }
+        if !witness.attempt.is_canonical() {
+            return Err(DecisionError::Conflict(
+                "sink-open witness must use one nonzero canonical checkpoint ID".into(),
+            ));
+        }
+        if witness.committable_sinks.is_empty()
+            || witness.committable_sinks.len() > CHECKPOINT_SINK_OPEN_WITNESS_MAX_SINKS
+        {
+            return Err(DecisionError::Conflict(format!(
+                "sink-open witness must name between 1 and \
+                 {CHECKPOINT_SINK_OPEN_WITNESS_MAX_SINKS} committable sinks"
+            )));
+        }
+        if witness
+            .committable_sinks
+            .iter()
+            .any(|name| name.is_empty() || name.trim() != name)
+        {
+            return Err(DecisionError::Conflict(
+                "sink-open witness contains a non-canonical sink name".into(),
+            ));
+        }
+        if witness
+            .committable_sinks
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(DecisionError::Conflict(
+                "sink-open witness sink names must be strictly sorted and unique".into(),
+            ));
+        }
+        let create_token = uuid::Uuid::parse_str(&witness.create_token).map_err(|error| {
+            DecisionError::Conflict(format!(
+                "sink-open witness has invalid create token: {error}"
+            ))
+        })?;
+        if create_token.is_nil() || create_token.to_string() != witness.create_token {
+            return Err(DecisionError::Conflict(
+                "sink-open witness must use a canonical non-nil create token".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_sink_open_witness_slot_shape(
+        slot: &CheckpointSinkOpenWitnessSlot,
+    ) -> Result<(), DecisionError> {
+        if slot.version != CHECKPOINT_SINK_OPEN_WITNESS_SLOT_VERSION {
+            return Err(DecisionError::Conflict(format!(
+                "sink-open witness slot version {} is unsupported (expected \
+                 {CHECKPOINT_SINK_OPEN_WITNESS_SLOT_VERSION})",
+                slot.version
+            )));
+        }
+        Self::validate_sink_open_witness_shape(slot.witness())?;
+        if let CheckpointSinkOpenWitnessSlotState::Closed { close_token, .. } = &slot.state {
+            let token = uuid::Uuid::parse_str(close_token).map_err(|error| {
+                DecisionError::Conflict(format!(
+                    "sink-open witness slot has invalid close token: {error}"
+                ))
+            })?;
+            if token.is_nil() || token.to_string() != *close_token {
+                return Err(DecisionError::Conflict(
+                    "sink-open witness slot must use a canonical non-nil close token".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn encode_sink_open_witness_slot(
+        slot: &CheckpointSinkOpenWitnessSlot,
+    ) -> Result<Bytes, DecisionError> {
+        Self::validate_sink_open_witness_slot_shape(slot)?;
+        Self::encode_control_record(
+            "sink-open witness slot",
+            slot,
+            CHECKPOINT_SINK_OPEN_WITNESS_MAX_BYTES,
+        )
+    }
+
+    async fn read_sink_open_witness_record(
+        &self,
+    ) -> Result<Option<VersionedCheckpointSinkOpenWitnessSlot>, DecisionError> {
+        let Some(result) = self
+            .get_control_record(
+                &Self::sink_open_witness_path(),
+                "sink-open witness",
+                CHECKPOINT_SINK_OPEN_WITNESS_MAX_BYTES,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let update_version = UpdateVersion {
+            e_tag: result.meta.e_tag.clone(),
+            version: result.meta.version.clone(),
+        };
+        self.require_native_cas_token("sink-open witness slot", &update_version)?;
+        let bytes = Self::read_control_record_bytes(
+            result,
+            "sink-open witness",
+            CHECKPOINT_SINK_OPEN_WITNESS_MAX_BYTES,
+            None,
+        )
+        .await?;
+        let slot: CheckpointSinkOpenWitnessSlot = serde_json::from_slice(&bytes)
+            .map_err(|error| DecisionError::Conflict(format!("sink-open witness slot: {error}")))?;
+        Self::validate_sink_open_witness_slot_shape(&slot)?;
+        let canonical = serde_json::to_vec(&slot)
+            .map_err(|error| DecisionError::Conflict(error.to_string()))?;
+        if canonical.as_slice() != bytes.as_ref() {
+            return Err(DecisionError::Conflict(format!(
+                "sink-open witness slot for checkpoint {} does not use its canonical body",
+                slot.witness().attempt.checkpoint_id
+            )));
+        }
+        Ok(Some(VersionedCheckpointSinkOpenWitnessSlot {
+            slot,
+            update_version,
+        }))
+    }
+
+    fn validate_sink_open_witness_slot_deployment(
+        slot: &CheckpointSinkOpenWitnessSlot,
+        deployment_id: &str,
+    ) -> Result<(), DecisionError> {
+        if slot.witness().deployment_id == deployment_id {
+            return Ok(());
+        }
+        Err(DecisionError::Conflict(format!(
+            "sink-open witness belongs to deployment {}, current deployment is {deployment_id}",
+            slot.witness().deployment_id
+        )))
+    }
+
+    fn sink_open_witness_put_mode(&self, expected: Option<UpdateVersion>) -> PutMode {
+        match (self.update_mode, expected) {
+            (_, None) => PutMode::Create,
+            (DecisionStoreUpdateMode::NativeCas, Some(version)) => PutMode::Update(version),
+            (DecisionStoreUpdateMode::LocalSingleWriter, Some(_)) => PutMode::Overwrite,
+        }
+    }
+
+    async fn put_sink_open_witness_slot(
+        &self,
+        slot: &CheckpointSinkOpenWitnessSlot,
+        expected: Option<UpdateVersion>,
+    ) -> Result<(), object_store::Error> {
+        let payload = Self::encode_sink_open_witness_slot(slot).map_err(|error| {
+            object_store::Error::Generic {
+                store: "CheckpointDecisionStore",
+                source: Box::new(error),
+            }
+        })?;
+        self.store
+            .put_opts(
+                &Self::sink_open_witness_path(),
+                PutPayload::from(payload),
+                PutOptions {
+                    mode: self.sink_open_witness_put_mode(expected),
+                    ..PutOptions::default()
+                },
+            )
+            .await
+            .map(|_| ())
+    }
+
+    /// Read the singleton sink-open owner record.
+    ///
+    /// # Errors
+    /// Object-store I/O, malformed/non-canonical metadata, or foreign deployment state.
+    pub async fn sink_open_witness(
+        &self,
+    ) -> Result<Option<CheckpointSinkOpenWitness>, DecisionError> {
+        let deployment_id = self.load_or_create_deployment_id().await?;
+        let Some(versioned) = self.read_sink_open_witness_record().await? else {
+            return Ok(None);
+        };
+        Self::validate_sink_open_witness_slot_deployment(&versioned.slot, &deployment_id)?;
+        match versioned.slot.state {
+            CheckpointSinkOpenWitnessSlotState::Open { witness } => Ok(Some(witness)),
+            CheckpointSinkOpenWitnessSlotState::Closed { .. } => Ok(None),
+        }
+    }
+
+    /// Create the durable witness before invoking any checkpoint-committable sink begin call.
+    ///
+    /// `committable_sinks` must already be strictly sorted and unique so duplicate runtime names
+    /// cannot be silently collapsed into one recovery participant.
+    ///
+    /// # Errors
+    /// Object-store I/O, invalid input, or any malformed, foreign, or conflicting live witness.
+    pub async fn create_sink_open_witness(
+        &self,
+        pipeline_identity: PipelineIdentity,
+        participant_id: u64,
+        attempt: CheckpointAttempt,
+        committable_sinks: Vec<String>,
+    ) -> Result<CheckpointSinkOpenWitness, DecisionError> {
+        let candidate = CheckpointSinkOpenWitness {
+            version: CHECKPOINT_SINK_OPEN_WITNESS_VERSION,
+            deployment_id: self.load_or_create_deployment_id().await?,
+            pipeline_identity,
+            participant_id,
+            attempt,
+            committable_sinks,
+            create_token: uuid::Uuid::now_v7().to_string(),
+        };
+        Self::validate_sink_open_witness_shape(&candidate)?;
+        Self::encode_sink_open_witness_slot(&CheckpointSinkOpenWitnessSlot::open(
+            candidate.clone(),
+        ))?;
+        // An accepted open must always have enough room for its mandatory close tombstone.
+        Self::encode_sink_open_witness_slot(&CheckpointSinkOpenWitnessSlot::closed(
+            candidate.clone(),
+        ))?;
+
+        match self.update_mode {
+            DecisionStoreUpdateMode::NativeCas => {
+                self.create_sink_open_witness_inner(candidate).await
+            }
+            DecisionStoreUpdateMode::LocalSingleWriter => {
+                let local_lock = self.local_metadata_rmw_lock.as_ref().ok_or_else(|| {
+                    DecisionError::Conflict(
+                        "local decision store is missing its namespace write lock".to_owned(),
+                    )
+                })?;
+                let _guard = local_lock.lock().await;
+                self.create_sink_open_witness_inner(candidate).await
+            }
+        }
+    }
+
+    async fn create_sink_open_witness_inner(
+        &self,
+        candidate: CheckpointSinkOpenWitness,
+    ) -> Result<CheckpointSinkOpenWitness, DecisionError> {
+        let current = self.read_sink_open_witness_record().await?;
+        let (expected, prior_slot) = match current {
+            None => (None, None),
+            Some(versioned) => {
+                Self::validate_sink_open_witness_slot_deployment(
+                    &versioned.slot,
+                    &candidate.deployment_id,
+                )?;
+                match &versioned.slot.state {
+                    CheckpointSinkOpenWitnessSlotState::Open { witness } => {
+                        return Err(DecisionError::Conflict(format!(
+                            "sink-open witness create for checkpoint {} observed conflicting \
+                             checkpoint {}",
+                            candidate.attempt.checkpoint_id, witness.attempt.checkpoint_id
+                        )));
+                    }
+                    CheckpointSinkOpenWitnessSlotState::Closed { witness, .. }
+                        if candidate.attempt.checkpoint_id <= witness.attempt.checkpoint_id =>
+                    {
+                        return Err(DecisionError::Conflict(format!(
+                            "sink-open witness checkpoint {} does not advance closed checkpoint {}",
+                            candidate.attempt.checkpoint_id, witness.attempt.checkpoint_id
+                        )));
+                    }
+                    CheckpointSinkOpenWitnessSlotState::Closed { .. } => {}
+                }
+                (Some(versioned.update_version), Some(versioned.slot))
+            }
+        };
+        let candidate_slot = CheckpointSinkOpenWitnessSlot::open(candidate.clone());
+        let create_error = match self
+            .put_sink_open_witness_slot(&candidate_slot, expected)
+            .await
+        {
+            Ok(()) => return Ok(candidate),
+            Err(error) => error,
+        };
+
+        // Only this proposal's exact create token proves that an ambiguous open transition won.
+        if let Some(observed) = self.read_sink_open_witness_record().await? {
+            Self::validate_sink_open_witness_slot_deployment(
+                &observed.slot,
+                &candidate.deployment_id,
+            )?;
+            if observed.slot == candidate_slot {
+                return Ok(candidate);
+            }
+            let conditional_conflict = matches!(
+                &create_error,
+                object_store::Error::Precondition { .. }
+                    | object_store::Error::AlreadyExists { .. }
+                    | object_store::Error::NotFound { .. }
+            );
+            if !conditional_conflict
+                && prior_slot
+                    .as_ref()
+                    .is_some_and(|prior| prior == &observed.slot)
+            {
+                return Err(DecisionError::Io(create_error.to_string()));
+            }
+            return Err(DecisionError::Conflict(format!(
+                "sink-open witness create for checkpoint {} observed conflicting checkpoint {}",
+                candidate.attempt.checkpoint_id,
+                observed.slot.witness().attempt.checkpoint_id
+            )));
+        }
+
+        match create_error {
+            object_store::Error::Precondition { .. }
+            | object_store::Error::AlreadyExists { .. }
+            | object_store::Error::NotFound { .. } => Err(DecisionError::Conflict(format!(
+                "sink-open witness for checkpoint {} disappeared after create conflict",
+                candidate.attempt.checkpoint_id
+            ))),
+            error => Err(DecisionError::Io(error.to_string())),
+        }
+    }
+
+    /// Close exactly the supplied witness after its attempt is terminal or fully rolled back.
+    ///
+    /// Closure durably replaces the open state. The tombstone makes an old conditional write
+    /// harmless after a successor opens and gives ambiguous responses an exact state to reconcile.
+    ///
+    /// # Errors
+    /// Object-store I/O or a malformed, foreign, or different live witness.
+    pub async fn clear_sink_open_witness(
+        &self,
+        expected: &CheckpointSinkOpenWitness,
+    ) -> Result<(), DecisionError> {
+        Self::validate_sink_open_witness_shape(expected)?;
+        let deployment_id = self.load_or_create_deployment_id().await?;
+        if expected.deployment_id != deployment_id {
+            return Err(DecisionError::Conflict(format!(
+                "cannot clear sink-open witness from deployment {}; current deployment is \
+                 {deployment_id}",
+                expected.deployment_id
+            )));
+        }
+        match self.update_mode {
+            DecisionStoreUpdateMode::NativeCas => {
+                self.clear_sink_open_witness_inner(expected).await
+            }
+            DecisionStoreUpdateMode::LocalSingleWriter => {
+                let local_lock = self.local_metadata_rmw_lock.as_ref().ok_or_else(|| {
+                    DecisionError::Conflict(
+                        "local decision store is missing its namespace write lock".to_owned(),
+                    )
+                })?;
+                let _guard = local_lock.lock().await;
+                self.clear_sink_open_witness_inner(expected).await
+            }
+        }
+    }
+
+    async fn clear_sink_open_witness_inner(
+        &self,
+        expected: &CheckpointSinkOpenWitness,
+    ) -> Result<(), DecisionError> {
+        let Some(current) = self.read_sink_open_witness_record().await? else {
+            return Err(DecisionError::Conflict(format!(
+                "sink-open witness slot for checkpoint {} is missing",
+                expected.attempt.checkpoint_id
+            )));
+        };
+        Self::validate_sink_open_witness_slot_deployment(&current.slot, &expected.deployment_id)?;
+        match &current.slot.state {
+            CheckpointSinkOpenWitnessSlotState::Closed { witness, .. } if witness == expected => {
+                return Ok(());
+            }
+            CheckpointSinkOpenWitnessSlotState::Open { witness } if witness == expected => {}
+            _ => {
+                return Err(DecisionError::Conflict(format!(
+                    "cannot clear sink-open witness for checkpoint {}; current slot names \
+                     checkpoint {} with a different create identity",
+                    expected.attempt.checkpoint_id,
+                    current.slot.witness().attempt.checkpoint_id
+                )));
+            }
+        }
+
+        let closed = CheckpointSinkOpenWitnessSlot::closed(expected.clone());
+        let close_error = match self
+            .put_sink_open_witness_slot(&closed, Some(current.update_version))
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        match self.read_sink_open_witness_record().await? {
+            Some(observed) if observed.slot == closed => Ok(()),
+            Some(observed) => {
+                Self::validate_sink_open_witness_slot_deployment(
+                    &observed.slot,
+                    &expected.deployment_id,
+                )?;
+                match &observed.slot.state {
+                    CheckpointSinkOpenWitnessSlotState::Closed { witness, .. }
+                        if witness == expected =>
+                    {
+                        // Another exact close is equivalent even though its token differs.
+                        Ok(())
+                    }
+                    CheckpointSinkOpenWitnessSlotState::Open { witness } if witness == expected => {
+                        Err(DecisionError::Io(close_error.to_string()))
+                    }
+                    _ => {
+                        // A different valid generation can only follow a successful close CAS.
+                        // The stale transition cannot touch it because its object version differs.
+                        Ok(())
+                    }
+                }
+            }
+            None => Err(DecisionError::Conflict(format!(
+                "sink-open witness slot disappeared while closing checkpoint {}: {close_error}",
+                expected.attempt.checkpoint_id
+            ))),
         }
     }
 
     /// Epoch segment of a canonical create-once terminal outcome object.
     fn outcome_epoch_segment(loc: &str) -> Option<&str> {
-        loc.strip_prefix("checkpoint-outcomes/")?
+        let segment = loc
+            .strip_prefix("checkpoint-outcomes/")?
             .strip_suffix("/outcome")?
-            .strip_prefix("epoch=")
+            .strip_prefix("epoch=")?;
+        let epoch = segment.parse::<u64>().ok()?;
+        (epoch != 0 && Self::outcome_path(epoch).as_ref() == loc).then_some(segment)
     }
 
     pub(crate) async fn canonical_outcome(
@@ -928,15 +1987,16 @@ impl CheckpointDecisionStore {
         path: &OsPath,
         epoch: u64,
     ) -> Result<Option<CheckpointOutcome>, DecisionError> {
-        let result = match self.store.get(path).await {
-            Ok(result) => result,
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(error) => return Err(DecisionError::Io(error.to_string())),
+        let record = format!("checkpoint outcome for epoch {epoch}");
+        let Some(result) = self
+            .get_control_record(path, &record, CHECKPOINT_OUTCOME_MAX_BYTES)
+            .await?
+        else {
+            return Ok(None);
         };
-        let bytes = result
-            .bytes()
-            .await
-            .map_err(|error| DecisionError::Io(error.to_string()))?;
+        let bytes =
+            Self::read_control_record_bytes(result, &record, CHECKPOINT_OUTCOME_MAX_BYTES, None)
+                .await?;
         let outcome: CheckpointOutcome = serde_json::from_slice(&bytes)
             .map_err(|error| DecisionError::Conflict(format!("outcome epoch {epoch}: {error}")))?;
         outcome.validate_shape(epoch)?;
@@ -968,9 +2028,11 @@ impl CheckpointDecisionStore {
         candidate: CheckpointOutcome,
     ) -> Result<RecordOutcomeResult, DecisionError> {
         let path = Self::outcome_path(candidate.epoch);
-        let payload = serde_json::to_vec(&candidate)
-            .map(Bytes::from)
-            .map_err(|error| DecisionError::Conflict(error.to_string()))?;
+        let payload = Self::encode_control_record(
+            "checkpoint outcome",
+            &candidate,
+            CHECKPOINT_OUTCOME_MAX_BYTES,
+        )?;
         let options = PutOptions {
             mode: PutMode::Create,
             ..PutOptions::default()
@@ -1009,19 +2071,24 @@ impl CheckpointDecisionStore {
         deployment_id: &str,
     ) -> Result<Option<VersionedOutcomeGcFloor>, DecisionError> {
         let path = Self::outcome_gc_floor_path(deployment_id);
-        let result = match self.store.get(&path).await {
-            Ok(result) => result,
-            Err(object_store::Error::NotFound { .. }) => return Ok(None),
-            Err(error) => return Err(DecisionError::Io(error.to_string())),
+        let Some(result) = self
+            .get_control_record(&path, "outcome GC floor", OUTCOME_GC_FLOOR_MAX_BYTES)
+            .await?
+        else {
+            return Ok(None);
         };
         let update_version = UpdateVersion {
             e_tag: result.meta.e_tag.clone(),
             version: result.meta.version.clone(),
         };
-        let bytes = result
-            .bytes()
-            .await
-            .map_err(|error| DecisionError::Io(error.to_string()))?;
+        self.require_native_cas_token("outcome GC floor", &update_version)?;
+        let bytes = Self::read_control_record_bytes(
+            result,
+            "outcome GC floor",
+            OUTCOME_GC_FLOOR_MAX_BYTES,
+            None,
+        )
+        .await?;
         let floor: OutcomeGcFloor = serde_json::from_slice(&bytes)
             .map_err(|error| DecisionError::Conflict(format!("outcome GC floor: {error}")))?;
         let before_epoch = floor.before_epoch;
@@ -1130,9 +2197,8 @@ impl CheckpointDecisionStore {
         expected: Option<UpdateVersion>,
     ) -> Result<bool, DecisionError> {
         let path = Self::outcome_gc_floor_path(&floor.deployment_id);
-        let payload = serde_json::to_vec(floor)
-            .map(Bytes::from)
-            .map_err(|error| DecisionError::Conflict(error.to_string()))?;
+        let payload =
+            Self::encode_control_record("outcome GC floor", floor, OUTCOME_GC_FLOOR_MAX_BYTES)?;
         let options = PutOptions {
             mode: expected.clone().map_or(PutMode::Create, PutMode::Update),
             ..PutOptions::default()
@@ -1156,7 +2222,12 @@ impl CheckpointDecisionStore {
                 // an ETag. The runtime topology guarantees one process writer for this namespace;
                 // serialize its read/compare/replace so concurrent maintenance tasks cannot
                 // regress the floor. Shared stores never enter this path.
-                let _guard = self.outcome_floor_update_lock.lock().await;
+                let _guard = self
+                    .local_metadata_rmw_lock
+                    .as_ref()
+                    .expect("local decision store has a namespace RMW lock")
+                    .lock()
+                    .await;
                 let Some(current) = self.read_outcome_gc_floor(&floor.deployment_id).await? else {
                     return Ok(false);
                 };
@@ -1271,20 +2342,6 @@ impl CheckpointDecisionStore {
         Err(DecisionError::InventoryChanged(
             "outcome GC floor kept advancing during exact lookup".into(),
         ))
-    }
-
-    /// Whether the durable outcome for `epoch` is commit.
-    ///
-    /// `false` can mean either abort or unresolved. Call [`Self::outcome`] when that distinction
-    /// matters.
-    ///
-    /// # Errors
-    /// Object-store I/O or a malformed/conflicting outcome body.
-    pub async fn outcome_is_committed(&self, epoch: u64) -> Result<bool, DecisionError> {
-        Ok(self
-            .outcome(epoch)
-            .await?
-            .is_some_and(|outcome| outcome.is_commit()))
     }
 
     async fn list_outcome_epochs(&self) -> Result<Vec<u64>, DecisionError> {
@@ -1413,21 +2470,6 @@ impl CheckpointDecisionStore {
         Ok(outcomes)
     }
 
-    /// Greatest committed terminal outcome, ignoring durable aborts.
-    ///
-    /// # Errors
-    /// Object-store I/O or malformed/conflicting outcome inventory.
-    pub async fn highest_committed_outcome(
-        &self,
-    ) -> Result<Option<CheckpointOutcome>, DecisionError> {
-        Ok(self
-            .outcomes()
-            .await?
-            .into_iter()
-            .rev()
-            .find(CheckpointOutcome::is_commit))
-    }
-
     /// Greatest terminal outcome, including the continuity anchor when it is the newest closed
     /// epoch retained by the store.
     ///
@@ -1453,8 +2495,7 @@ impl CheckpointDecisionStore {
     /// Read scalar continuity metadata for compacted terminal outcomes.
     ///
     /// The returned boundary can fence external cursor rollback, but it cannot be used to recover
-    /// a checkpoint. Recovery must use a live commit from [`Self::outcomes`] or
-    /// [`Self::highest_committed_outcome`].
+    /// a checkpoint. Recovery must select a live commit from [`Self::outcomes`].
     ///
     /// # Errors
     /// Object-store I/O or malformed/conflicting floor metadata.
@@ -1555,13 +2596,6 @@ impl CheckpointDecisionStore {
             .collect::<Vec<_>>();
         let examined = entries.len();
 
-        enum ObjectWork {
-            Retained,
-            Deleted,
-            Quarantined,
-            Failed,
-        }
-
         let work = futures::stream::iter(entries.iter().cloned())
             .map(|entry| async move {
                 let Some((epoch, checkpoint_id, digest)) =
@@ -1571,15 +2605,15 @@ impl CheckpointDecisionStore {
                         .quarantine_recovery_capsule_object(&entry.location)
                         .await
                     {
-                        Ok(()) => ObjectWork::Quarantined,
+                        Ok(()) => RecoveryCapsuleObjectWork::Quarantined,
                         Err(error) => {
                             tracing::warn!(path = %entry.location, %error, "recovery capsule quarantine failed; retrying on the next scan pass");
-                            ObjectWork::Failed
+                            RecoveryCapsuleObjectWork::Failed
                         }
                     };
                 };
                 if epoch >= before_epoch {
-                    return ObjectWork::Retained;
+                    return RecoveryCapsuleObjectWork::Retained;
                 }
                 let reference = RecoveryCapsuleRef {
                     epoch,
@@ -1592,22 +2626,24 @@ impl CheckpointDecisionStore {
                         .quarantine_recovery_capsule_object(&entry.location)
                         .await
                     {
-                        Ok(()) => ObjectWork::Quarantined,
+                        Ok(()) => RecoveryCapsuleObjectWork::Quarantined,
                         Err(error) => {
                             tracing::warn!(path = %entry.location, %error, "recovery capsule quarantine failed; retrying on the next scan pass");
-                            ObjectWork::Failed
+                            RecoveryCapsuleObjectWork::Failed
                         }
                     };
                 }
                 if known_live_digests.contains(&reference.sha256) {
-                    return ObjectWork::Retained;
+                    return RecoveryCapsuleObjectWork::Retained;
                 }
                 match self.load_recovery_capsule(&reference).await {
                     Ok(_) => match self.store.delete(&entry.location).await {
-                        Ok(()) | Err(object_store::Error::NotFound { .. }) => ObjectWork::Deleted,
+                        Ok(()) | Err(object_store::Error::NotFound { .. }) => {
+                            RecoveryCapsuleObjectWork::Deleted
+                        }
                         Err(error) => {
                             tracing::warn!(epoch, checkpoint_id, %error, "recovery capsule delete failed; retrying on the next scan pass");
-                            ObjectWork::Failed
+                            RecoveryCapsuleObjectWork::Failed
                         }
                     },
                     Err(DecisionError::Conflict(error)) => {
@@ -1615,7 +2651,7 @@ impl CheckpointDecisionStore {
                             self.store.head(&entry.location).await,
                             Err(object_store::Error::NotFound { .. })
                         ) {
-                            return ObjectWork::Deleted;
+                            return RecoveryCapsuleObjectWork::Deleted;
                         }
                         match self
                             .quarantine_recovery_capsule_object(&entry.location)
@@ -1623,17 +2659,17 @@ impl CheckpointDecisionStore {
                         {
                             Ok(()) => {
                                 tracing::warn!(path = %entry.location, %error, "corrupt recovery capsule quarantined");
-                                ObjectWork::Quarantined
+                                RecoveryCapsuleObjectWork::Quarantined
                             }
                             Err(quarantine_error) => {
                                 tracing::warn!(path = %entry.location, %error, %quarantine_error, "corrupt recovery capsule quarantine failed; retrying on the next scan pass");
-                                ObjectWork::Failed
+                                RecoveryCapsuleObjectWork::Failed
                             }
                         }
                     }
                     Err(error) => {
                         tracing::warn!(path = %entry.location, %error, "recovery capsule read failed; retrying on the next scan pass");
-                        ObjectWork::Failed
+                        RecoveryCapsuleObjectWork::Failed
                     }
                 }
             })
@@ -1643,11 +2679,11 @@ impl CheckpointDecisionStore {
 
         let deleted = work
             .iter()
-            .filter(|result| matches!(result, ObjectWork::Deleted))
+            .filter(|result| matches!(result, RecoveryCapsuleObjectWork::Deleted))
             .count();
         let quarantined = work
             .iter()
-            .filter(|result| matches!(result, ObjectWork::Quarantined))
+            .filter(|result| matches!(result, RecoveryCapsuleObjectWork::Quarantined))
             .count();
 
         let mut updated = cursor.clone();
@@ -1804,13 +2840,13 @@ impl CheckpointDecisionStore {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use futures::TryStreamExt;
     use object_store::local::LocalFileSystem;
     use object_store::memory::InMemory;
     use tempfile::tempdir;
 
     fn store_in(dir: &std::path::Path) -> CheckpointDecisionStore {
-        let fs: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(dir).unwrap());
-        CheckpointDecisionStore::local_single_writer(fs)
+        CheckpointDecisionStore::local_filesystem(dir).unwrap()
     }
 
     async fn record_local_commits(store: &CheckpointDecisionStore, last_epoch: u64) {
@@ -1818,7 +2854,7 @@ mod tests {
             store
                 .record_outcome(
                     epoch,
-                    epoch * 10,
+                    epoch,
                     CheckpointScope::Local,
                     None,
                     None,
@@ -1830,12 +2866,35 @@ mod tests {
         }
     }
 
+    fn highest_commit_epoch(outcomes: &[CheckpointOutcome]) -> Option<u64> {
+        outcomes
+            .iter()
+            .rev()
+            .find(|outcome| outcome.is_commit())
+            .map(|outcome| outcome.epoch)
+    }
+
     struct DeferredPutStore {
         inner: Arc<dyn ObjectStore>,
         target: std::sync::Mutex<Option<OsPath>>,
         intercepted: std::sync::atomic::AtomicBool,
+        apply_before_error: std::sync::atomic::AtomicBool,
         pending: std::sync::Mutex<Option<(OsPath, PutPayload, PutOptions)>>,
         reverse_lists: bool,
+        reject_updates: std::sync::atomic::AtomicBool,
+        blocked_overwrite: std::sync::Mutex<Option<OsPath>>,
+        overwrite_entered: tokio::sync::Semaphore,
+        overwrite_release: tokio::sync::Semaphore,
+        strip_cas_tokens: std::sync::atomic::AtomicBool,
+        forged_get: std::sync::Mutex<Option<(OsPath, ForgedGet)>>,
+        requested_range_end: std::sync::atomic::AtomicU64,
+        get_count: std::sync::atomic::AtomicU64,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ForgedGet {
+        InconsistentRange,
+        OversizedStream,
     }
 
     impl DeferredPutStore {
@@ -1844,8 +2903,17 @@ mod tests {
                 inner,
                 target: std::sync::Mutex::new(None),
                 intercepted: std::sync::atomic::AtomicBool::new(false),
+                apply_before_error: std::sync::atomic::AtomicBool::new(false),
                 pending: std::sync::Mutex::new(None),
                 reverse_lists: false,
+                reject_updates: std::sync::atomic::AtomicBool::new(false),
+                blocked_overwrite: std::sync::Mutex::new(None),
+                overwrite_entered: tokio::sync::Semaphore::new(0),
+                overwrite_release: tokio::sync::Semaphore::new(0),
+                strip_cas_tokens: std::sync::atomic::AtomicBool::new(false),
+                forged_get: std::sync::Mutex::new(None),
+                requested_range_end: std::sync::atomic::AtomicU64::new(0),
+                get_count: std::sync::atomic::AtomicU64::new(0),
             }
         }
 
@@ -1855,8 +2923,17 @@ mod tests {
                 inner,
                 target: std::sync::Mutex::new(None),
                 intercepted: std::sync::atomic::AtomicBool::new(false),
+                apply_before_error: std::sync::atomic::AtomicBool::new(false),
                 pending: std::sync::Mutex::new(None),
                 reverse_lists: true,
+                reject_updates: std::sync::atomic::AtomicBool::new(false),
+                blocked_overwrite: std::sync::Mutex::new(None),
+                overwrite_entered: tokio::sync::Semaphore::new(0),
+                overwrite_release: tokio::sync::Semaphore::new(0),
+                strip_cas_tokens: std::sync::atomic::AtomicBool::new(false),
+                forged_get: std::sync::Mutex::new(None),
+                requested_range_end: std::sync::atomic::AtomicU64::new(0),
+                get_count: std::sync::atomic::AtomicU64::new(0),
             }
         }
 
@@ -1864,13 +2941,67 @@ mod tests {
             *self.target.lock().unwrap() = Some(target);
             self.intercepted
                 .store(false, std::sync::atomic::Ordering::Release);
+            self.apply_before_error
+                .store(false, std::sync::atomic::Ordering::Release);
             *self.pending.lock().unwrap() = None;
+        }
+
+        fn intercept_after_apply(&self, target: OsPath) {
+            self.intercept(target);
+            self.apply_before_error
+                .store(true, std::sync::atomic::Ordering::Release);
         }
 
         async fn apply_pending(&self) -> object_store::Result<object_store::PutResult> {
             let (location, payload, options) =
                 self.pending.lock().unwrap().take().expect("deferred put");
             self.inner.put_opts(&location, payload, options).await
+        }
+
+        fn reject_conditional_updates(&self) {
+            self.reject_updates
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+
+        fn block_next_overwrite(&self, target: OsPath) {
+            *self.blocked_overwrite.lock().unwrap() = Some(target);
+        }
+
+        async fn wait_for_blocked_overwrite(&self) {
+            self.overwrite_entered
+                .acquire()
+                .await
+                .expect("overwrite gate is open")
+                .forget();
+        }
+
+        fn release_blocked_overwrite(&self) {
+            self.overwrite_release.add_permits(1);
+        }
+
+        fn strip_cas_tokens(&self) {
+            self.strip_cas_tokens
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+
+        fn forge_get(&self, target: OsPath, forged: ForgedGet) {
+            *self.forged_get.lock().unwrap() = Some((target, forged));
+            self.requested_range_end
+                .store(0, std::sync::atomic::Ordering::Release);
+        }
+
+        fn requested_range_end(&self) -> u64 {
+            self.requested_range_end
+                .load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        fn reset_get_count(&self) {
+            self.get_count
+                .store(0, std::sync::atomic::Ordering::Release);
+        }
+
+        fn get_count(&self) -> u64 {
+            self.get_count.load(std::sync::atomic::Ordering::Acquire)
         }
     }
 
@@ -1896,12 +3027,45 @@ mod tests {
             payload: PutPayload,
             options: PutOptions,
         ) -> object_store::Result<object_store::PutResult> {
+            if self
+                .reject_updates
+                .load(std::sync::atomic::Ordering::Acquire)
+                && matches!(&options.mode, PutMode::Update(_))
+            {
+                return Err(object_store::Error::NotImplemented {
+                    operation: "put_opts with Update".into(),
+                    implementer: "DeferredPutStore".into(),
+                });
+            }
+            let block_overwrite = matches!(&options.mode, PutMode::Overwrite)
+                && self.blocked_overwrite.lock().unwrap().as_ref() == Some(location);
+            if block_overwrite {
+                *self.blocked_overwrite.lock().unwrap() = None;
+                self.overwrite_entered.add_permits(1);
+                self.overwrite_release
+                    .acquire()
+                    .await
+                    .expect("overwrite release gate is open")
+                    .forget();
+            }
             let target = self.target.lock().unwrap().clone();
             if target.as_ref() == Some(location)
                 && !self
                     .intercepted
                     .swap(true, std::sync::atomic::Ordering::AcqRel)
             {
+                if self
+                    .apply_before_error
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    self.inner.put_opts(location, payload, options).await?;
+                    return Err(object_store::Error::Generic {
+                        store: "DeferredPutStore",
+                        source: Box::new(std::io::Error::other(
+                            "injected response loss after remote visibility",
+                        )),
+                    });
+                }
                 *self.pending.lock().unwrap() =
                     Some((location.clone(), payload.clone(), options.clone()));
                 return Err(object_store::Error::Generic {
@@ -1927,7 +3091,46 @@ mod tests {
             location: &OsPath,
             options: object_store::GetOptions,
         ) -> object_store::Result<object_store::GetResult> {
-            self.inner.get_opts(location, options).await
+            self.get_count
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            if let Some(GetRange::Bounded(range)) = options.range.as_ref() {
+                self.requested_range_end
+                    .store(range.end, std::sync::atomic::Ordering::Release);
+            }
+            let mut result = self.inner.get_opts(location, options).await?;
+            if self
+                .strip_cas_tokens
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                result.meta.e_tag = None;
+                result.meta.version = None;
+            }
+            let forged = self
+                .forged_get
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|(target, _)| target == location)
+                .map(|(_, forged)| *forged);
+            match forged {
+                Some(ForgedGet::InconsistentRange) => {
+                    result.meta.size = 1;
+                    result.range = 0..2;
+                }
+                Some(ForgedGet::OversizedStream) => {
+                    result.meta.size = 1;
+                    result.range = 0..1;
+                    result.payload = object_store::GetResultPayload::Stream(
+                        futures::stream::iter([
+                            Ok::<Bytes, object_store::Error>(Bytes::from_static(b"x")),
+                            Ok::<Bytes, object_store::Error>(Bytes::from_static(b"y")),
+                        ])
+                        .boxed(),
+                    );
+                }
+                None => {}
+            }
+            Ok(result)
         }
 
         fn delete_stream(
@@ -2012,6 +3215,22 @@ mod tests {
         format!("{byte:02x}").repeat(32)
     }
 
+    fn test_sink_open_witness(
+        deployment_id: String,
+        checkpoint_id: u64,
+        create_token: u128,
+    ) -> CheckpointSinkOpenWitness {
+        CheckpointSinkOpenWitness {
+            version: CHECKPOINT_SINK_OPEN_WITNESS_VERSION,
+            deployment_id,
+            pipeline_identity: PipelineIdentity::empty(),
+            participant_id: 0,
+            attempt: CheckpointAttempt::canonical(checkpoint_id),
+            committable_sinks: vec!["sink-a".into(), "sink-b".into()],
+            create_token: uuid::Uuid::from_u128(create_token).to_string(),
+        }
+    }
+
     async fn test_capsule(
         store: &CheckpointDecisionStore,
         epoch: u64,
@@ -2068,19 +3287,235 @@ mod tests {
             CheckpointDecisionStore::outcome_epoch_segment("checkpoint-outcomes/epoch=5/other"),
             None
         );
+        for malformed in [
+            "checkpoint-outcomes/epoch=0/outcome",
+            "checkpoint-outcomes/epoch=05/outcome",
+            "checkpoint-outcomes/epoch=+5/outcome",
+            "checkpoint-outcomes/epoch=5//outcome",
+        ] {
+            assert_eq!(
+                CheckpointDecisionStore::outcome_epoch_segment(malformed),
+                None,
+                "accepted noncanonical outcome path {malformed}"
+            );
+        }
+    }
+
+    async fn put_oversized_control_record(
+        store: &Arc<dyn ObjectStore>,
+        path: &OsPath,
+        maximum: u64,
+    ) {
+        let size = usize::try_from(maximum + 1).unwrap();
+        store
+            .put(path, PutPayload::from(Bytes::from(vec![b'x'; size])))
+            .await
+            .unwrap();
+    }
+
+    fn assert_oversized_control_record(error: &DecisionError, record: &str, maximum: u64) {
+        let message = error.to_string();
+        assert!(message.contains(record), "{message}");
+        assert!(
+            message.contains(&format!("maximum is {maximum}")),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_record_reads_reject_oversized_objects() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = CheckpointDecisionStore::new(Arc::clone(&object_store));
+
+        put_oversized_control_record(
+            &object_store,
+            &CheckpointDecisionStore::deployment_identity_path(),
+            DEPLOYMENT_IDENTITY_MAX_BYTES,
+        )
+        .await;
+        let error = store.read_deployment_identity().await.unwrap_err();
+        assert_oversized_control_record(
+            &error,
+            "deployment identity",
+            DEPLOYMENT_IDENTITY_MAX_BYTES,
+        );
+
+        put_oversized_control_record(
+            &object_store,
+            &CheckpointDecisionStore::sink_open_witness_path(),
+            CHECKPOINT_SINK_OPEN_WITNESS_MAX_BYTES,
+        )
+        .await;
+        let error = store.read_sink_open_witness_record().await.unwrap_err();
+        assert_oversized_control_record(
+            &error,
+            "sink-open witness",
+            CHECKPOINT_SINK_OPEN_WITNESS_MAX_BYTES,
+        );
+
+        let outcome_path = CheckpointDecisionStore::outcome_path(1);
+        put_oversized_control_record(&object_store, &outcome_path, CHECKPOINT_OUTCOME_MAX_BYTES)
+            .await;
+        let error = store
+            .read_outcome_record(&outcome_path, 1)
+            .await
+            .unwrap_err();
+        assert_oversized_control_record(&error, "checkpoint outcome", CHECKPOINT_OUTCOME_MAX_BYTES);
+
+        let deployment_id = uuid::Uuid::from_u128(1).to_string();
+        let floor_path = CheckpointDecisionStore::outcome_gc_floor_path(&deployment_id);
+        put_oversized_control_record(&object_store, &floor_path, OUTCOME_GC_FLOOR_MAX_BYTES).await;
+        let error = store
+            .read_outcome_gc_floor(&deployment_id)
+            .await
+            .unwrap_err();
+        assert_oversized_control_record(&error, "outcome GC floor", OUTCOME_GC_FLOOR_MAX_BYTES);
+
+        let reference = RecoveryCapsuleRef {
+            epoch: 1,
+            checkpoint_id: 1,
+            sha256: digest(1),
+            len: 1,
+        };
+        let capsule_path = CheckpointDecisionStore::recovery_capsule_path(&reference);
+        let capsule_maximum = u64::try_from(crate::checkpoint::MAX_RECOVERY_CAPSULE_BYTES).unwrap();
+        put_oversized_control_record(&object_store, &capsule_path, capsule_maximum).await;
+        let error = store.load_recovery_capsule(&reference).await.unwrap_err();
+        assert_oversized_control_record(&error, "recovery capsule", capsule_maximum);
+    }
+
+    #[tokio::test]
+    async fn control_record_reads_bound_the_requested_range_and_streamed_body() {
+        for (forged, expected_error) in [
+            (ForgedGet::InconsistentRange, "inconsistent with advertised"),
+            (ForgedGet::OversizedStream, "exceeded its advertised"),
+        ] {
+            let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+            let path = CheckpointDecisionStore::deployment_identity_path();
+            inner
+                .put(&path, PutPayload::from_static(b"x"))
+                .await
+                .unwrap();
+            let fault = Arc::new(DeferredPutStore::new(inner));
+            fault.forge_get(path, forged);
+            let object_store: Arc<dyn ObjectStore> = fault.clone();
+            let store = CheckpointDecisionStore::new(object_store);
+
+            let error = store.read_deployment_identity().await.unwrap_err();
+            assert!(error.to_string().contains(expected_error), "{error}");
+            assert_eq!(
+                fault.requested_range_end(),
+                DEPLOYMENT_IDENTITY_MAX_BYTES + 1,
+                "control metadata must never request an unbounded body"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_cas_metadata_requires_an_update_authority() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let deployment_id = uuid::Uuid::from_u128(1).to_string();
+        let floor = OutcomeGcFloor {
+            version: OUTCOME_GC_FLOOR_VERSION,
+            deployment_id: deployment_id.clone(),
+            before_epoch: 1,
+            terminal_anchor: None,
+            committed_anchor: None,
+        };
+        inner
+            .put(
+                &CheckpointDecisionStore::outcome_gc_floor_path(&deployment_id),
+                PutPayload::from(Bytes::from(serde_json::to_vec(&floor).unwrap())),
+            )
+            .await
+            .unwrap();
+        let fault = Arc::new(DeferredPutStore::new(Arc::clone(&inner)));
+        fault.strip_cas_tokens();
+        let object_store: Arc<dyn ObjectStore> = fault.clone();
+        let store = CheckpointDecisionStore::new(object_store);
+
+        let error = store
+            .read_outcome_gc_floor(&deployment_id)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("outcome GC floor"), "{error}");
+        assert!(error.to_string().contains("neither an ETag"), "{error}");
+
+        #[cfg(feature = "cluster")]
+        {
+            let cursor = RecoveryCapsuleGcCursor {
+                version: RECOVERY_CAPSULE_GC_CURSOR_VERSION,
+                deployment_id: deployment_id.clone(),
+                offset: None,
+            };
+            inner
+                .put(
+                    &CheckpointDecisionStore::recovery_capsule_gc_cursor_path(&deployment_id),
+                    PutPayload::from(Bytes::from(serde_json::to_vec(&cursor).unwrap())),
+                )
+                .await
+                .unwrap();
+            let error = store
+                .read_recovery_capsule_gc_cursor(&deployment_id)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("recovery capsule GC cursor"),
+                "{error}"
+            );
+            assert!(error.to_string().contains("neither an ETag"), "{error}");
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    #[tokio::test]
+    async fn recovery_capsule_cursor_read_rejects_oversized_object() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = CheckpointDecisionStore::new(Arc::clone(&object_store));
+        let deployment_id = uuid::Uuid::from_u128(1).to_string();
+        put_oversized_control_record(
+            &object_store,
+            &CheckpointDecisionStore::recovery_capsule_gc_cursor_path(&deployment_id),
+            RECOVERY_CAPSULE_GC_CURSOR_MAX_BYTES,
+        )
+        .await;
+
+        let error = store
+            .read_recovery_capsule_gc_cursor(&deployment_id)
+            .await
+            .unwrap_err();
+        assert_oversized_control_record(
+            &error,
+            "recovery capsule GC cursor",
+            RECOVERY_CAPSULE_GC_CURSOR_MAX_BYTES,
+        );
     }
 
     #[tokio::test]
     async fn recovery_capsule_create_is_idempotent_and_load_verifies_reference() {
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let store = CheckpointDecisionStore::new(Arc::clone(&object_store));
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let fault = Arc::new(DeferredPutStore::new(inner));
+        let object_store: Arc<dyn ObjectStore> = fault.clone();
+        let store = CheckpointDecisionStore::new(object_store);
         let fence = assignment_fence(12, &[2, 7]);
-        let capsule = test_capsule(&store, 4, 40, &fence).await;
+        let capsule = test_capsule(&store, 4, 4, &fence).await;
 
+        fault.reset_get_count();
         let reference = store.create_recovery_capsule(&capsule).await.unwrap();
+        assert_eq!(
+            fault.get_count(),
+            0,
+            "a confirmed immutable create must not read back its body"
+        );
+
+        fault.reset_get_count();
         assert_eq!(
             store.create_recovery_capsule(&capsule).await.unwrap(),
             reference
+        );
+        assert!(
+            fault.get_count() > 0,
+            "an existing immutable body must be reconciled after create conflict"
         );
         assert_eq!(
             store.load_recovery_capsule(&reference).await.unwrap(),
@@ -2096,6 +3531,31 @@ mod tests {
         assert!(store.load_recovery_capsule(&wrong_digest).await.is_err());
     }
 
+    #[tokio::test]
+    async fn recovery_capsule_create_reconciles_a_lost_success_response() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let fault = Arc::new(DeferredPutStore::new(Arc::clone(&inner)));
+        let object_store: Arc<dyn ObjectStore> = fault.clone();
+        let store = CheckpointDecisionStore::new(object_store);
+        let fence = assignment_fence(12, &[2, 7]);
+        let capsule = test_capsule(&store, 4, 4, &fence).await;
+        let (_, expected) = capsule.encode_and_reference().unwrap();
+        fault.intercept_after_apply(CheckpointDecisionStore::recovery_capsule_path(&expected));
+
+        fault.reset_get_count();
+        let observed = store.create_recovery_capsule(&capsule).await.unwrap();
+
+        assert_eq!(observed, expected);
+        assert!(
+            fault.get_count() > 0,
+            "an ambiguous create response must reconcile the remote body"
+        );
+        inner
+            .head(&CheckpointDecisionStore::recovery_capsule_path(&observed))
+            .await
+            .expect("the lost response followed a remotely visible create");
+    }
+
     #[cfg(feature = "cluster")]
     #[tokio::test]
     async fn cyclic_capsule_cleanup_finds_a_create_visible_after_client_failure() {
@@ -2104,16 +3564,21 @@ mod tests {
         let object_store: Arc<dyn ObjectStore> = fault.clone();
         let store = CheckpointDecisionStore::new(object_store);
         let fence = assignment_fence(12, &[2, 7]);
-        let capsule = test_capsule(&store, 1, 40, &fence).await;
+        let capsule = test_capsule(&store, 1, 1, &fence).await;
         let (_, reference) = capsule.encode_and_reference().unwrap();
         let path = CheckpointDecisionStore::recovery_capsule_path(&reference);
         fault.intercept(path.clone());
 
+        fault.reset_get_count();
         let error = store
             .create_recovery_capsule(&capsule)
             .await
             .expect_err("the client must observe the injected ambiguous failure");
         assert!(matches!(error, DecisionError::Io(_)));
+        assert!(
+            fault.get_count() > 0,
+            "an ambiguous failed create must reconcile before returning"
+        );
         assert!(matches!(
             inner.head(&path).await,
             Err(object_store::Error::NotFound { .. })
@@ -2150,13 +3615,13 @@ mod tests {
             Arc::new(DeferredPutStore::with_reversed_lists(Arc::clone(&inner)));
         let store = CheckpointDecisionStore::new(reversed);
         let fence = assignment_fence(12, &[2, 7]);
-        let oldest = create_capsule_ref(&store, 1, 10, &fence).await;
+        let oldest = create_capsule_ref(&store, 1, 1, &fence).await;
         let oldest_path = CheckpointDecisionStore::recovery_capsule_path(&oldest);
         let mut newest_path = None;
         for epoch in 2..=70u64 {
             let reference = RecoveryCapsuleRef {
                 epoch,
-                checkpoint_id: epoch * 10,
+                checkpoint_id: epoch,
                 sha256: digest(u8::try_from(epoch).unwrap()),
                 len: 1,
             };
@@ -2189,7 +3654,7 @@ mod tests {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let store = CheckpointDecisionStore::new(Arc::clone(&object_store));
         let fence = assignment_fence(12, &[2, 7]);
-        let capsule = test_capsule(&store, 4, 40, &fence).await;
+        let capsule = test_capsule(&store, 4, 4, &fence).await;
         let reference = store.create_recovery_capsule(&capsule).await.unwrap();
         let path = CheckpointDecisionStore::recovery_capsule_path(&reference);
         let mut encoded = crate::checkpoint::canonical_json_bytes(&capsule).unwrap();
@@ -2212,12 +3677,12 @@ mod tests {
         let store = CheckpointDecisionStore::new(Arc::new(InMemory::new()));
         let fence = assignment_fence(12, &[2, 7]);
         let proof = leader_proof(&fence, 2, 3, 4);
-        let reference = create_capsule_ref(&store, 4, 40, &fence).await;
+        let reference = create_capsule_ref(&store, 4, 4, &fence).await;
 
         let missing = store
             .canonical_outcome(
                 4,
-                40,
+                4,
                 CheckpointScope::Cluster,
                 Some(fence.clone()),
                 Some(proof.clone()),
@@ -2231,7 +3696,7 @@ mod tests {
         let abort_with_capsule = store
             .canonical_outcome(
                 4,
-                40,
+                4,
                 CheckpointScope::Cluster,
                 Some(fence.clone()),
                 Some(proof),
@@ -2247,7 +3712,7 @@ mod tests {
         let local_with_capsule = store
             .canonical_outcome(
                 4,
-                40,
+                4,
                 CheckpointScope::Local,
                 None,
                 None,
@@ -2266,12 +3731,12 @@ mod tests {
         let store = CheckpointDecisionStore::new(Arc::new(InMemory::new()));
         let fence = assignment_fence(12, &[2, 7]);
         let proof = leader_proof(&fence, 2, 3, 4);
-        let reference = create_capsule_ref(&store, 4, 40, &fence).await;
+        let reference = create_capsule_ref(&store, 4, 4, &fence).await;
 
         let error = store
             .canonical_outcome(
                 5,
-                50,
+                5,
                 CheckpointScope::Cluster,
                 Some(fence),
                 Some(proof),
@@ -2294,7 +3759,7 @@ mod tests {
         let error = store
             .record_outcome(
                 4,
-                40,
+                4,
                 CheckpointScope::Cluster,
                 Some(fence.clone()),
                 Some(proof.clone()),
@@ -2308,7 +3773,7 @@ mod tests {
         let forged = store
             .canonical_outcome(
                 4,
-                40,
+                4,
                 CheckpointScope::Cluster,
                 Some(fence),
                 Some(proof),
@@ -2339,7 +3804,7 @@ mod tests {
         let created = store
             .record_outcome(
                 7,
-                70,
+                7,
                 CheckpointScope::Local,
                 None,
                 None,
@@ -2354,7 +3819,7 @@ mod tests {
 
         assert_eq!(
             store
-                .record_outcome(7, 70, CheckpointScope::Local, None, None, commit, None)
+                .record_outcome(7, 7, CheckpointScope::Local, None, None, commit, None)
                 .await
                 .unwrap(),
             RecordOutcomeResult::Unchanged(winner.clone())
@@ -2363,7 +3828,7 @@ mod tests {
             store
                 .record_outcome(
                     7,
-                    71,
+                    7,
                     CheckpointScope::Local,
                     None,
                     None,
@@ -2390,7 +3855,7 @@ mod tests {
         let error = store
             .record_outcome(
                 2,
-                20,
+                2,
                 CheckpointScope::Local,
                 None,
                 None,
@@ -2404,7 +3869,7 @@ mod tests {
         let RecordOutcomeResult::Created(abort) = store
             .record_outcome(
                 2,
-                20,
+                2,
                 CheckpointScope::Local,
                 None,
                 None,
@@ -2435,7 +3900,7 @@ mod tests {
         let error = store
             .record_outcome(
                 2,
-                20,
+                2,
                 CheckpointScope::Local,
                 None,
                 None,
@@ -2450,7 +3915,7 @@ mod tests {
         let RecordOutcomeResult::Conflict { winner } = store
             .record_outcome(
                 2,
-                20,
+                2,
                 CheckpointScope::Local,
                 None,
                 None,
@@ -2475,7 +3940,7 @@ mod tests {
             commit_store
                 .record_outcome(
                     8,
-                    80,
+                    8,
                     CheckpointScope::Local,
                     None,
                     None,
@@ -2491,7 +3956,7 @@ mod tests {
             abort_store
                 .record_outcome(
                     8,
-                    80,
+                    8,
                     CheckpointScope::Local,
                     None,
                     None,
@@ -2530,7 +3995,7 @@ mod tests {
         store
             .record_outcome(
                 4,
-                40,
+                4,
                 CheckpointScope::Local,
                 None,
                 None,
@@ -2542,7 +4007,7 @@ mod tests {
         store
             .record_outcome(
                 5,
-                50,
+                5,
                 CheckpointScope::Local,
                 None,
                 None,
@@ -2559,17 +4024,8 @@ mod tests {
             CheckpointVerdict::Abort
         ));
         assert_eq!(restarted.outcome(6).await.unwrap(), None);
-        assert!(!restarted.outcome_is_committed(5).await.unwrap());
-        assert!(!restarted.outcome_is_committed(6).await.unwrap());
-        assert_eq!(
-            restarted
-                .highest_committed_outcome()
-                .await
-                .unwrap()
-                .unwrap()
-                .epoch,
-            4
-        );
+        let outcomes = restarted.outcomes().await.unwrap();
+        assert_eq!(highest_commit_epoch(&outcomes), Some(4));
     }
 
     #[tokio::test]
@@ -2578,7 +4034,7 @@ mod tests {
         store
             .record_outcome(
                 4,
-                40,
+                4,
                 CheckpointScope::Local,
                 None,
                 None,
@@ -2590,7 +4046,7 @@ mod tests {
         store
             .record_outcome(
                 5,
-                50,
+                5,
                 CheckpointScope::Local,
                 None,
                 None,
@@ -2609,15 +4065,8 @@ mod tests {
                 .epoch,
             5
         );
-        assert_eq!(
-            store
-                .highest_committed_outcome()
-                .await
-                .unwrap()
-                .unwrap()
-                .epoch,
-            4
-        );
+        let outcomes = store.outcomes().await.unwrap();
+        assert_eq!(highest_commit_epoch(&outcomes), Some(4));
     }
 
     #[tokio::test]
@@ -2625,9 +4074,9 @@ mod tests {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let store = CheckpointDecisionStore::new(Arc::clone(&object_store));
         for (epoch, checkpoint_id, verdict) in [
-            (1, 10, CheckpointVerdict::Commit),
-            (2, 20, CheckpointVerdict::Abort),
-            (5, 50, CheckpointVerdict::Commit),
+            (1, 1, CheckpointVerdict::Commit),
+            (2, 2, CheckpointVerdict::Abort),
+            (5, 5, CheckpointVerdict::Commit),
         ] {
             store
                 .record_outcome(
@@ -2647,7 +4096,7 @@ mod tests {
         let error = store
             .record_outcome(
                 3,
-                30,
+                3,
                 CheckpointScope::Local,
                 None,
                 None,
@@ -2670,7 +4119,7 @@ mod tests {
             live.iter()
                 .map(|outcome| (outcome.epoch, outcome.checkpoint_id))
                 .collect::<Vec<_>>(),
-            vec![(5, 50)]
+            vec![(5, 5)]
         );
         let continuity = restarted.audited_outcomes().await.unwrap();
         assert_eq!(
@@ -2678,18 +4127,10 @@ mod tests {
                 .iter()
                 .map(|outcome| (outcome.epoch, outcome.checkpoint_id))
                 .collect::<Vec<_>>(),
-            vec![(1, 10), (2, 20), (5, 50)]
+            vec![(1, 1), (2, 2), (5, 5)]
         );
         assert!(matches!(&continuity[1].verdict, CheckpointVerdict::Abort));
-        assert_eq!(
-            restarted
-                .highest_committed_outcome()
-                .await
-                .unwrap()
-                .unwrap()
-                .epoch,
-            5
-        );
+        assert_eq!(highest_commit_epoch(&live), Some(5));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2702,7 +4143,7 @@ mod tests {
             writer
                 .record_outcome(
                     epoch,
-                    epoch * 10,
+                    epoch,
                     CheckpointScope::Local,
                     None,
                     None,
@@ -2738,7 +4179,7 @@ mod tests {
             restarted.outcome_retention_boundary().await.unwrap(),
             OutcomeRetentionBoundary {
                 before_epoch: LAST_EPOCH,
-                committed_checkpoint_id: Some((LAST_EPOCH - 1) * 10),
+                committed_checkpoint_id: Some(LAST_EPOCH - 1),
                 highest_closed_epoch: Some(LAST_EPOCH - 1),
             }
         );
@@ -2798,15 +4239,20 @@ mod tests {
             restarted.outcome_gc_floor_horizon().await.unwrap(),
             LAST_EPOCH
         );
-        assert_eq!(
-            restarted
-                .highest_committed_outcome()
-                .await
-                .unwrap()
-                .unwrap()
-                .epoch,
-            LAST_EPOCH
-        );
+        let outcomes = restarted.outcomes().await.unwrap();
+        assert_eq!(highest_commit_epoch(&outcomes), Some(LAST_EPOCH));
+    }
+
+    #[test]
+    fn independently_opened_local_filesystem_stores_share_the_namespace_rmw_lock() {
+        let dir = tempdir().unwrap();
+        let first = CheckpointDecisionStore::local_filesystem(dir.path()).unwrap();
+        let second = CheckpointDecisionStore::local_filesystem(dir.path()).unwrap();
+
+        assert!(Arc::ptr_eq(
+            first.local_metadata_rmw_lock.as_ref().unwrap(),
+            second.local_metadata_rmw_lock.as_ref().unwrap()
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2845,6 +4291,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_floor_rmw_is_ordered_across_store_instances() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let fault = Arc::new(DeferredPutStore::new(inner));
+        let object_store: Arc<dyn ObjectStore> = fault.clone();
+        let first_store = Arc::new(CheckpointDecisionStore::local_single_writer(Arc::clone(
+            &object_store,
+        )));
+        let second_store = Arc::new(CheckpointDecisionStore::local_single_writer(object_store));
+        assert!(Arc::ptr_eq(
+            first_store.local_metadata_rmw_lock.as_ref().unwrap(),
+            second_store.local_metadata_rmw_lock.as_ref().unwrap()
+        ));
+        record_local_commits(first_store.as_ref(), 5).await;
+        assert_eq!(first_store.prune_outcomes_before(2).await.unwrap(), 2);
+
+        fault.reject_conditional_updates();
+        let deployment_id = first_store.load_or_create_deployment_id().await.unwrap();
+        fault.block_next_overwrite(CheckpointDecisionStore::outcome_gc_floor_path(
+            &deployment_id,
+        ));
+        let advancing_store = Arc::clone(&first_store);
+        let advance = tokio::spawn(async move { advancing_store.prune_outcomes_before(3).await });
+        fault.wait_for_blocked_overwrite().await;
+        assert!(
+            second_store
+                .local_metadata_rmw_lock
+                .as_ref()
+                .unwrap()
+                .try_lock()
+                .is_err(),
+            "a second store instance entered a local floor RMW transition"
+        );
+        fault.release_blocked_overwrite();
+        assert!(advance.await.unwrap().unwrap() >= 3);
+
+        assert_eq!(second_store.prune_outcomes_before(4).await.unwrap(), 4);
+        assert_eq!(first_store.outcome_gc_floor_horizon().await.unwrap(), 4);
+    }
+
+    #[tokio::test]
     async fn shared_local_filesystem_requires_native_conditional_floor_updates() {
         let dir = tempdir().unwrap();
         let object_store: Arc<dyn ObjectStore> =
@@ -2880,7 +4366,7 @@ mod tests {
             store
                 .record_outcome(
                     epoch,
-                    epoch * 10,
+                    epoch,
                     CheckpointScope::Local,
                     None,
                     None,
@@ -2913,9 +4399,9 @@ mod tests {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let store = CheckpointDecisionStore::new(Arc::clone(&object_store));
         for (epoch, checkpoint_id, verdict) in [
-            (1, 10, CheckpointVerdict::Commit),
-            (2, 20, CheckpointVerdict::Abort),
-            (3, 30, CheckpointVerdict::Commit),
+            (1, 1, CheckpointVerdict::Commit),
+            (2, 2, CheckpointVerdict::Abort),
+            (3, 3, CheckpointVerdict::Commit),
         ] {
             store
                 .record_outcome(
@@ -2938,7 +4424,7 @@ mod tests {
             restarted.outcome_retention_boundary().await.unwrap(),
             OutcomeRetentionBoundary {
                 before_epoch: 3,
-                committed_checkpoint_id: Some(10),
+                committed_checkpoint_id: Some(1),
                 highest_closed_epoch: Some(2),
             }
         );
@@ -2950,57 +4436,36 @@ mod tests {
                 .into_iter()
                 .map(|outcome| (outcome.epoch, outcome.checkpoint_id))
                 .collect::<Vec<_>>(),
-            vec![(3, 30)]
+            vec![(3, 3)]
         );
     }
 
     #[tokio::test]
-    async fn outcome_inventory_rejects_checkpoint_order_regression() {
-        let store = CheckpointDecisionStore::new(Arc::new(InMemory::new()));
-        store
-            .record_outcome(
-                8,
-                80,
-                CheckpointScope::Local,
-                None,
-                None,
-                CheckpointVerdict::Abort,
-                None,
+    async fn outcome_inventory_rejects_noncanonical_attempt_identity() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = CheckpointDecisionStore::new(Arc::clone(&object_store));
+        let forged = CheckpointOutcome {
+            version: CHECKPOINT_OUTCOME_VERSION,
+            scope: CheckpointScope::Local,
+            epoch: 9,
+            checkpoint_id: 79,
+            deployment_id: store.load_or_create_deployment_id().await.unwrap(),
+            assignment_fence: None,
+            leader_proof: None,
+            recovery_capsule: None,
+            verdict: CheckpointVerdict::Abort,
+        };
+        object_store
+            .put(
+                &CheckpointDecisionStore::outcome_path(9),
+                PutPayload::from(Bytes::from(serde_json::to_vec(&forged).unwrap())),
             )
             .await
             .unwrap();
-        store
-            .record_outcome(
-                10,
-                100,
-                CheckpointScope::Local,
-                None,
-                None,
-                CheckpointVerdict::Commit,
-                None,
-            )
-            .await
-            .unwrap();
-        store.prune_outcomes_before(9).await.unwrap();
-        store
-            .record_outcome(
-                9,
-                79,
-                CheckpointScope::Local,
-                None,
-                None,
-                CheckpointVerdict::Abort,
-                None,
-            )
-            .await
-            .unwrap();
-        let error = store
-            .outcomes()
-            .await
-            .expect_err("the audited inventory must reject checkpoint-order regression");
+
+        let error = store.outcomes().await.unwrap_err();
         assert!(matches!(error, DecisionError::Conflict(_)));
-        assert!(error.to_string().contains("epoch 8 checkpoint 80"));
-        assert!(error.to_string().contains("epoch 9 checkpoint 79"));
+        assert!(error.to_string().contains("non-canonical checkpoint ID 79"));
     }
 
     #[tokio::test]
@@ -3009,7 +4474,7 @@ mod tests {
         store
             .record_outcome(
                 4,
-                40,
+                4,
                 CheckpointScope::Local,
                 None,
                 None,
@@ -3021,7 +4486,7 @@ mod tests {
         store
             .record_outcome(
                 5,
-                50,
+                5,
                 CheckpointScope::Local,
                 None,
                 None,
@@ -3035,15 +4500,8 @@ mod tests {
         assert!(matches!(error, DecisionError::Conflict(_)));
         assert!(error.to_string().contains("no live commit recovery cut"));
         assert_eq!(store.outcome_gc_floor_horizon().await.unwrap(), 0);
-        assert_eq!(
-            store
-                .highest_committed_outcome()
-                .await
-                .unwrap()
-                .unwrap()
-                .epoch,
-            4
-        );
+        let outcomes = store.outcomes().await.unwrap();
+        assert_eq!(highest_commit_epoch(&outcomes), Some(4));
     }
 
     #[tokio::test]
@@ -3071,16 +4529,635 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sink_open_witness_roundtrips_across_restart_and_clears_exactly() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = CheckpointDecisionStore::new(Arc::clone(&object_store));
+        let witness = store
+            .create_sink_open_witness(
+                PipelineIdentity::empty(),
+                0,
+                CheckpointAttempt::canonical(7),
+                vec!["sink-a".into(), "sink-b".into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.sink_open_witness().await.unwrap(),
+            Some(witness.clone())
+        );
+        drop(store);
+
+        let restarted = CheckpointDecisionStore::new(object_store);
+        assert_eq!(
+            restarted.sink_open_witness().await.unwrap(),
+            Some(witness.clone())
+        );
+        restarted.clear_sink_open_witness(&witness).await.unwrap();
+        assert_eq!(restarted.sink_open_witness().await.unwrap(), None);
+        let tombstone = restarted
+            .read_sink_open_witness_record()
+            .await
+            .unwrap()
+            .expect("closed slot remains durable");
+        assert!(matches!(
+            tombstone.slot.state,
+            CheckpointSinkOpenWitnessSlotState::Closed {
+                witness: ref closed,
+                ..
+            } if closed == &witness
+        ));
+        restarted.clear_sink_open_witness(&witness).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sink_open_witness_rejects_malformed_body_and_input() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = CheckpointDecisionStore::new(Arc::clone(&object_store));
+        let deployment_id = store.load_or_create_deployment_id().await.unwrap();
+        let witness = test_sink_open_witness(deployment_id, 8, 8);
+        let mut body = serde_json::to_value(CheckpointSinkOpenWitnessSlot::open(witness)).unwrap();
+        body.as_object_mut()
+            .unwrap()
+            .insert("unexpected".into(), serde_json::Value::Bool(true));
+        object_store
+            .put(
+                &CheckpointDecisionStore::sink_open_witness_path(),
+                PutPayload::from(Bytes::from(serde_json::to_vec(&body).unwrap())),
+            )
+            .await
+            .unwrap();
+
+        let error = store.sink_open_witness().await.unwrap_err();
+        assert!(error.to_string().contains("unknown field"), "{error}");
+
+        let store = CheckpointDecisionStore::new(Arc::new(InMemory::new()));
+        let error = store
+            .create_sink_open_witness(
+                PipelineIdentity::empty(),
+                0,
+                CheckpointAttempt::canonical(9),
+                vec!["sink-b".into(), "sink-a".into()],
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("strictly sorted"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn sink_open_witness_rejects_oversized_body_before_create() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = CheckpointDecisionStore::new(Arc::clone(&object_store));
+        let error = store
+            .create_sink_open_witness(
+                PipelineIdentity::empty(),
+                0,
+                CheckpointAttempt::canonical(10),
+                vec!["x".repeat(CHECKPOINT_SINK_OPEN_WITNESS_MAX_BYTES as usize)],
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("maximum is"), "{error}");
+        assert!(object_store
+            .head(&CheckpointDecisionStore::sink_open_witness_path())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn sink_open_witness_rejects_foreign_deployment() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = CheckpointDecisionStore::new(Arc::clone(&object_store));
+        let current = store.load_or_create_deployment_id().await.unwrap();
+        let foreign = test_sink_open_witness(uuid::Uuid::from_u128(0x1234).to_string(), 11, 0x5678);
+        let foreign_slot = CheckpointSinkOpenWitnessSlot::closed(foreign.clone());
+        object_store
+            .put(
+                &CheckpointDecisionStore::sink_open_witness_path(),
+                PutPayload::from(Bytes::from(serde_json::to_vec(&foreign_slot).unwrap())),
+            )
+            .await
+            .unwrap();
+
+        let error = store.sink_open_witness().await.unwrap_err();
+        assert!(
+            error.to_string().contains(&foreign.deployment_id),
+            "{error}"
+        );
+        assert!(error.to_string().contains(&current), "{error}");
+    }
+
+    #[tokio::test]
+    async fn sink_open_witness_singleton_linearizes_concurrent_attempts() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let first = CheckpointDecisionStore::new(Arc::clone(&object_store));
+        let second = CheckpointDecisionStore::new(object_store);
+        let (left, right) = tokio::join!(
+            first.create_sink_open_witness(
+                PipelineIdentity::empty(),
+                0,
+                CheckpointAttempt::canonical(12),
+                vec!["sink-a".into()],
+            ),
+            second.create_sink_open_witness(
+                PipelineIdentity::empty(),
+                0,
+                CheckpointAttempt::canonical(13),
+                vec!["sink-a".into()],
+            )
+        );
+        assert_ne!(left.is_ok(), right.is_ok());
+        let winner = left.or(right).unwrap();
+        assert_eq!(first.sink_open_witness().await.unwrap(), Some(winner));
+    }
+
+    #[tokio::test]
+    async fn sink_open_witness_does_not_adopt_another_proposals_token() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let first = CheckpointDecisionStore::new(Arc::clone(&object_store));
+        let second = CheckpointDecisionStore::new(object_store);
+        let winner = first
+            .create_sink_open_witness(
+                PipelineIdentity::empty(),
+                0,
+                CheckpointAttempt::canonical(14),
+                vec!["sink-a".into()],
+            )
+            .await
+            .unwrap();
+
+        let error = second
+            .create_sink_open_witness(
+                PipelineIdentity::empty(),
+                0,
+                CheckpointAttempt::canonical(14),
+                vec!["sink-a".into()],
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("conflicting checkpoint 14"),
+            "{error}"
+        );
+        assert_eq!(first.sink_open_witness().await.unwrap(), Some(winner));
+    }
+
+    #[tokio::test]
+    async fn sink_open_witness_reconciles_lost_create_response_by_token() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let fault = Arc::new(DeferredPutStore::new(Arc::clone(&inner)));
+        let object_store: Arc<dyn ObjectStore> = fault.clone();
+        let store = CheckpointDecisionStore::new(object_store);
+        store.load_or_create_deployment_id().await.unwrap();
+        let attempt = CheckpointAttempt::canonical(14);
+        fault.intercept_after_apply(CheckpointDecisionStore::sink_open_witness_path());
+
+        let witness = store
+            .create_sink_open_witness(
+                PipelineIdentity::empty(),
+                0,
+                attempt,
+                vec!["sink-a".into(), "sink-b".into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(witness.attempt, attempt);
+        assert_eq!(store.sink_open_witness().await.unwrap(), Some(witness));
+    }
+
+    #[tokio::test]
+    async fn sink_open_witness_reconciles_lost_close_response_by_tombstone() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let attempt = CheckpointAttempt::canonical(15);
+        let fault = Arc::new(DeferredPutStore::new(Arc::clone(&inner)));
+        let object_store: Arc<dyn ObjectStore> = fault.clone();
+        let store = CheckpointDecisionStore::new(object_store);
+        let witness = store
+            .create_sink_open_witness(
+                PipelineIdentity::empty(),
+                0,
+                attempt,
+                vec!["sink-a".into(), "sink-b".into()],
+            )
+            .await
+            .unwrap();
+
+        fault.intercept_after_apply(CheckpointDecisionStore::sink_open_witness_path());
+        store.clear_sink_open_witness(&witness).await.unwrap();
+        assert_eq!(store.sink_open_witness().await.unwrap(), None);
+        assert!(inner
+            .head(&CheckpointDecisionStore::sink_open_witness_path())
+            .await
+            .is_ok());
+        let tombstone = store
+            .read_sink_open_witness_record()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            tombstone.slot.state,
+            CheckpointSinkOpenWitnessSlotState::Closed {
+                witness: ref closed,
+                ..
+            } if closed == &witness
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_sink_open_witness_close_cannot_erase_a_successor() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let fault = Arc::new(DeferredPutStore::new(Arc::clone(&inner)));
+        let object_store: Arc<dyn ObjectStore> = fault.clone();
+        let stale = CheckpointDecisionStore::new(object_store);
+        let first = stale
+            .create_sink_open_witness(
+                PipelineIdentity::empty(),
+                0,
+                CheckpointAttempt::canonical(16),
+                vec!["sink-a".into()],
+            )
+            .await
+            .unwrap();
+
+        fault.intercept(CheckpointDecisionStore::sink_open_witness_path());
+        let error = stale.clear_sink_open_witness(&first).await.unwrap_err();
+        assert!(matches!(&error, DecisionError::Io(_)), "{error}");
+
+        let current = CheckpointDecisionStore::new(Arc::clone(&inner));
+        current.clear_sink_open_witness(&first).await.unwrap();
+        let successor = current
+            .create_sink_open_witness(
+                PipelineIdentity::empty(),
+                0,
+                CheckpointAttempt::canonical(17),
+                vec!["sink-a".into()],
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            fault.apply_pending().await.is_err(),
+            "the stale close must fail its old object-version precondition"
+        );
+        assert_eq!(current.sink_open_witness().await.unwrap(), Some(successor));
+    }
+
+    #[tokio::test]
+    async fn closed_sink_open_witness_slot_linearizes_successor_open() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let owner = CheckpointDecisionStore::new(Arc::clone(&object_store));
+        let first = owner
+            .create_sink_open_witness(
+                PipelineIdentity::empty(),
+                0,
+                CheckpointAttempt::canonical(18),
+                vec!["sink-a".into()],
+            )
+            .await
+            .unwrap();
+        owner.clear_sink_open_witness(&first).await.unwrap();
+
+        let left_store = CheckpointDecisionStore::new(Arc::clone(&object_store));
+        let right_store = CheckpointDecisionStore::new(object_store);
+        let (left, right) = tokio::join!(
+            left_store.create_sink_open_witness(
+                PipelineIdentity::empty(),
+                0,
+                CheckpointAttempt::canonical(19),
+                vec!["sink-a".into()],
+            ),
+            right_store.create_sink_open_witness(
+                PipelineIdentity::empty(),
+                0,
+                CheckpointAttempt::canonical(20),
+                vec!["sink-a".into()],
+            )
+        );
+        assert_ne!(left.is_ok(), right.is_ok());
+        let winner = left.or(right).unwrap();
+        assert_eq!(owner.sink_open_witness().await.unwrap(), Some(winner));
+    }
+
+    #[tokio::test]
+    async fn local_single_writer_reuses_closed_sink_open_witness_slot() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = CheckpointDecisionStore::local_single_writer(object_store);
+        let first = store
+            .create_sink_open_witness(
+                PipelineIdentity::empty(),
+                0,
+                CheckpointAttempt::canonical(21),
+                vec!["sink-a".into()],
+            )
+            .await
+            .unwrap();
+        store.clear_sink_open_witness(&first).await.unwrap();
+        let error = store
+            .create_sink_open_witness(
+                PipelineIdentity::empty(),
+                0,
+                CheckpointAttempt::canonical(21),
+                vec!["sink-a".into()],
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("does not advance"), "{error}");
+        let successor = store
+            .create_sink_open_witness(
+                PipelineIdentity::empty(),
+                0,
+                CheckpointAttempt::canonical(22),
+                vec!["sink-a".into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.sink_open_witness().await.unwrap(), Some(successor));
+    }
+
+    #[tokio::test]
+    async fn local_sink_witness_rmw_is_ordered_across_store_instances() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let fault = Arc::new(DeferredPutStore::new(inner));
+        let object_store: Arc<dyn ObjectStore> = fault.clone();
+        let first_store = Arc::new(CheckpointDecisionStore::local_single_writer(Arc::clone(
+            &object_store,
+        )));
+        let second_store = Arc::new(CheckpointDecisionStore::local_single_writer(object_store));
+        assert!(Arc::ptr_eq(
+            first_store.local_metadata_rmw_lock.as_ref().unwrap(),
+            second_store.local_metadata_rmw_lock.as_ref().unwrap()
+        ));
+
+        let first = first_store
+            .create_sink_open_witness(
+                PipelineIdentity::empty(),
+                0,
+                CheckpointAttempt::canonical(23),
+                vec!["sink-a".into()],
+            )
+            .await
+            .unwrap();
+        fault.block_next_overwrite(CheckpointDecisionStore::sink_open_witness_path());
+        let closing_store = Arc::clone(&first_store);
+        let closing_witness = first.clone();
+        let close = tokio::spawn(async move {
+            closing_store
+                .clear_sink_open_witness(&closing_witness)
+                .await
+        });
+        fault.wait_for_blocked_overwrite().await;
+        assert!(
+            second_store
+                .local_metadata_rmw_lock
+                .as_ref()
+                .unwrap()
+                .try_lock()
+                .is_err(),
+            "a second store instance entered a local witness RMW transition"
+        );
+        fault.release_blocked_overwrite();
+        close.await.unwrap().unwrap();
+
+        second_store.clear_sink_open_witness(&first).await.unwrap();
+        let successor = second_store
+            .create_sink_open_witness(
+                PipelineIdentity::empty(),
+                0,
+                CheckpointAttempt::canonical(24),
+                vec!["sink-a".into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first_store.sink_open_witness().await.unwrap(),
+            Some(successor)
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_deployment_identity_is_rejected() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        object_store
+            .put(
+                &CheckpointDecisionStore::deployment_identity_path(),
+                PutPayload::from_bytes(Bytes::from_static(
+                    br#"{"version":1,"id":"018f0000-0000-7000-8000-000000000001","allocator_mode":"native_cas","checkpoint_id":0,"allocation_id":"018f0000-0000-7000-8000-000000000002"}"#,
+                )),
+            )
+            .await
+            .unwrap();
+
+        let store = CheckpointDecisionStore::new(object_store);
+        let error = store.load_or_create_deployment_id().await.unwrap_err();
+        assert!(
+            error.to_string().contains("version 1 is unsupported"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn allocator_protocol_cannot_change_inside_a_deployment_namespace() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let shared = CheckpointDecisionStore::new(Arc::clone(&object_store));
+        assert_eq!(shared.allocate_checkpoint_id().await.unwrap(), 1);
+        drop(shared);
+
+        let local = CheckpointDecisionStore::local_single_writer(object_store);
+        let error = local.allocate_checkpoint_id().await.unwrap_err();
+        assert!(error.to_string().contains("allocator mode"), "{error}");
+        assert!(error.to_string().contains("NativeCas"), "{error}");
+        assert!(error.to_string().contains("LocalSingleWriter"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn local_allocator_protocol_cannot_be_reopened_as_shared_cas() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let local = CheckpointDecisionStore::local_single_writer(Arc::clone(&object_store));
+        assert_eq!(local.allocate_checkpoint_id().await.unwrap(), 1);
+        drop(local);
+
+        let shared = CheckpointDecisionStore::new(object_store);
+        let error = shared.allocate_checkpoint_id().await.unwrap_err();
+        assert!(error.to_string().contains("allocator mode"), "{error}");
+        assert!(error.to_string().contains("LocalSingleWriter"), "{error}");
+        assert!(error.to_string().contains("NativeCas"), "{error}");
+    }
+
+    #[tokio::test]
     async fn checkpoint_ids_start_at_one_and_increase() {
         let dir = tempdir().unwrap();
         let s = store_in(dir.path());
 
         assert_eq!(s.allocate_checkpoint_id().await.unwrap(), 1);
         assert_eq!(s.allocate_checkpoint_id().await.unwrap(), 2);
+        assert_eq!(s.allocate_checkpoint_id_at_least(10).await.unwrap(), 10);
+        assert_eq!(s.allocate_checkpoint_id().await.unwrap(), 11);
         drop(s);
 
         let restarted = store_in(dir.path());
-        assert_eq!(restarted.allocate_checkpoint_id().await.unwrap(), 3);
+        assert_eq!(
+            restarted.allocate_checkpoint_id().await.unwrap(),
+            LOCAL_RESERVATION_BLOCK_SIZE + 1,
+            "restart must burn the unconsumed tail of the prior durable block"
+        );
+        assert!(restarted.allocate_checkpoint_id_at_least(0).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn local_checkpoint_allocation_uses_one_durable_object_per_large_block() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = CheckpointDecisionStore::local_single_writer(Arc::clone(&object_store));
+
+        for expected in 1..=4_096 {
+            assert_eq!(store.allocate_checkpoint_id().await.unwrap(), expected);
+        }
+
+        let mut locations = object_store
+            .list(None)
+            .map_ok(|meta| meta.location.to_string())
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        locations.sort_unstable();
+        assert_eq!(
+            locations,
+            vec![
+                "checkpoint-deployment/identity.json".to_owned(),
+                "checkpoint-id-blocks/block=00000000000000000000".to_owned(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn local_checkpoint_floor_jump_claims_a_nonoverlapping_block() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = CheckpointDecisionStore::local_single_writer(object_store);
+
+        assert_eq!(store.allocate_checkpoint_id().await.unwrap(), 1);
+        let minimum = LOCAL_RESERVATION_BLOCK_SIZE * 3 + 17;
+        assert_eq!(
+            store
+                .allocate_checkpoint_id_at_least(minimum)
+                .await
+                .unwrap(),
+            minimum
+        );
+        assert_eq!(store.allocate_checkpoint_id().await.unwrap(), minimum + 1);
+    }
+
+    #[tokio::test]
+    async fn stale_shared_counter_cache_cannot_allocate_below_a_floor_jump() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let stale = CheckpointDecisionStore::new(Arc::clone(&object_store));
+        let jumper = CheckpointDecisionStore::new(object_store);
+
+        assert_eq!(stale.allocate_checkpoint_id().await.unwrap(), 1);
+        assert_eq!(
+            jumper.allocate_checkpoint_id_at_least(100).await.unwrap(),
+            100
+        );
+        assert_eq!(
+            stale.allocate_checkpoint_id().await.unwrap(),
+            101,
+            "a stale cached ETag must reload the durable winner before returning"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_counter_object_count_is_bounded() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = CheckpointDecisionStore::new(Arc::clone(&object_store));
+
+        for expected in 1..=256 {
+            assert_eq!(store.allocate_checkpoint_id().await.unwrap(), expected);
+        }
+
+        let mut locations = object_store
+            .list(None)
+            .map_ok(|meta| meta.location.to_string())
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        locations.sort_unstable();
+        assert_eq!(
+            locations,
+            vec!["checkpoint-deployment/identity.json".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_counter_authority_deletion_changes_deployment_before_id_reuse() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = CheckpointDecisionStore::new(Arc::clone(&object_store));
+        let old_deployment = store.load_or_create_deployment_id().await.unwrap();
+        assert_eq!(store.allocate_checkpoint_id().await.unwrap(), 1);
+
+        object_store
+            .delete(&CheckpointDecisionStore::deployment_identity_path())
+            .await
+            .unwrap();
+        let error = store.allocate_checkpoint_id().await.unwrap_err();
+        assert!(error.to_string().contains("head disappeared"), "{error}");
+        drop(store);
+
+        let restarted = CheckpointDecisionStore::new(object_store);
+        let new_deployment = restarted.load_or_create_deployment_id().await.unwrap();
+        assert_ne!(new_deployment, old_deployment);
+        assert_eq!(restarted.allocate_checkpoint_id().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_shared_authority_is_not_recreated_from_a_cached_deployment_id() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let store = CheckpointDecisionStore::new(Arc::clone(&object_store));
+        let deployment = store.load_or_create_deployment_id().await.unwrap();
+        store.cache_checkpoint_id_head(None);
+        object_store
+            .delete(&CheckpointDecisionStore::deployment_identity_path())
+            .await
+            .unwrap();
+
+        let error = store.allocate_checkpoint_id().await.unwrap_err();
+        assert!(error.to_string().contains(&deployment), "{error}");
+        assert!(error.to_string().contains("disappeared"), "{error}");
+        assert!(object_store
+            .head(&CheckpointDecisionStore::deployment_identity_path())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn shared_counter_reconciles_a_lost_success_response_by_token() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let fault = Arc::new(DeferredPutStore::new(Arc::clone(&inner)));
+        let object_store: Arc<dyn ObjectStore> = fault.clone();
+        let store = CheckpointDecisionStore::new(object_store);
+        store.load_or_create_deployment_id().await.unwrap();
+        fault.intercept_after_apply(CheckpointDecisionStore::deployment_identity_path());
+
+        assert_eq!(store.allocate_checkpoint_id().await.unwrap(), 1);
+        assert_eq!(store.allocate_checkpoint_id().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn uncertain_shared_counter_write_is_burned_after_late_visibility() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let fault = Arc::new(DeferredPutStore::new(Arc::clone(&inner)));
+        let object_store: Arc<dyn ObjectStore> = fault.clone();
+        let store = CheckpointDecisionStore::new(object_store);
+        store.load_or_create_deployment_id().await.unwrap();
+        fault.intercept(CheckpointDecisionStore::deployment_identity_path());
+
+        let error = store.allocate_checkpoint_id().await.unwrap_err();
+        assert!(matches!(error, DecisionError::Io(_)));
+        fault.apply_pending().await.unwrap();
+        drop(store);
+
+        let restarted = CheckpointDecisionStore::new(inner);
+        assert_eq!(
+            restarted.allocate_checkpoint_id().await.unwrap(),
+            2,
+            "the uncertain ID must never be returned again after it becomes visible"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

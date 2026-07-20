@@ -123,7 +123,7 @@ impl SourceConnector for MockSourceConnector {
         &mut self,
         request: crate::connector::SourceStart,
     ) -> Result<(), ConnectorError> {
-        let records = match request.position {
+        let records = match request.into_parts().1 {
             crate::connector::SourcePosition::Initial => 0,
             crate::connector::SourcePosition::Resume { checkpoint, .. } => checkpoint
                 .get_offset("records")
@@ -340,11 +340,14 @@ mod tests {
     async fn test_mock_source_connector() {
         let mut source = MockSourceConnector::with_batches(3, 5);
         source
-            .start(crate::connector::SourceStart {
-                config: ConnectorConfig::new("mock"),
-                position: crate::connector::SourcePosition::Initial,
-                delivery: crate::connector::DeliveryGuarantee::BestEffort,
-            })
+            .start(
+                crate::connector::SourceStart::new(
+                    ConnectorConfig::new("mock"),
+                    crate::connector::SourcePosition::Initial,
+                    crate::connector::DeliveryGuarantee::BestEffort,
+                )
+                .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -401,14 +404,17 @@ mod tests {
         let mut checkpoint = SourceCheckpoint::new();
         checkpoint.set_offset("records", "10");
         source
-            .start(crate::connector::SourceStart {
-                config: ConnectorConfig::new("mock"),
-                position: crate::connector::SourcePosition::Resume {
-                    attempt: laminar_core::state::CheckpointAttempt::new(5, 5),
-                    checkpoint,
-                },
-                delivery: crate::connector::DeliveryGuarantee::AtLeastOnce,
-            })
+            .start(
+                crate::connector::SourceStart::new(
+                    ConnectorConfig::new("mock"),
+                    crate::connector::SourcePosition::Resume {
+                        attempt: laminar_core::state::CheckpointAttempt::new(5, 5),
+                        checkpoint,
+                    },
+                    crate::connector::DeliveryGuarantee::AtLeastOnce,
+                )
+                .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(source.records_produced(), 10);

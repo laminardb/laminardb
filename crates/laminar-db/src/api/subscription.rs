@@ -176,7 +176,7 @@ mod tests {
         let frame = convert_frame(
             PortalFrame::Barrier {
                 sequence: 6,
-                epoch: 7,
+                epoch: 11,
                 checkpoint_id: 11,
                 through_sequence: 5,
             },
@@ -187,7 +187,7 @@ mod tests {
             frame,
             ArrowSubscriptionFrame::Barrier {
                 sequence: 6,
-                epoch: 7,
+                epoch: 11,
                 checkpoint_id: 11,
                 through_sequence: 5,
             }

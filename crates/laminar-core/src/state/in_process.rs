@@ -64,6 +64,20 @@ impl InProcessBackend {
         }
     }
 
+    fn ensure_canonical_attempt(attempt: CheckpointAttempt) -> Result<(), StateBackendError> {
+        if attempt.is_canonical() {
+            Ok(())
+        } else {
+            Err(StateBackendError::Conflict {
+                resource: format!(
+                    "state-v2/epoch={}/checkpoint={}",
+                    attempt.epoch, attempt.checkpoint_id
+                ),
+                message: "state attempt must use one nonzero canonical checkpoint ID".into(),
+            })
+        }
+    }
+
     fn store_partial(
         &self,
         attempt: CheckpointAttempt,
@@ -72,6 +86,7 @@ impl InProcessBackend {
         writer: Option<SealedVnodeWriter>,
         bytes: Bytes,
     ) -> Result<(), StateBackendError> {
+        Self::ensure_canonical_attempt(attempt)?;
         self.check_vnode(vnode)?;
         let stored = StoredPartial {
             attestation: SealedVnodePartial::new(vnode, assignment_version, writer, &bytes),
@@ -102,6 +117,7 @@ impl InProcessBackend {
         writer: Option<SealedCommitDescriptorWriter>,
         bytes: Bytes,
     ) -> Result<(), StateBackendError> {
+        Self::ensure_canonical_attempt(attempt)?;
         if key.is_empty() {
             return Err(StateBackendError::Conflict {
                 resource: format!(
@@ -223,6 +239,7 @@ impl StateBackend for InProcessBackend {
         attempt: CheckpointAttempt,
         vnode: u32,
     ) -> Result<Option<Bytes>, StateBackendError> {
+        Self::ensure_canonical_attempt(attempt)?;
         self.check_vnode(vnode)?;
         Ok(self
             .partials
@@ -276,6 +293,7 @@ impl StateBackend for InProcessBackend {
         attempt: CheckpointAttempt,
         key: &str,
     ) -> Result<Option<Bytes>, StateBackendError> {
+        Self::ensure_canonical_attempt(attempt)?;
         Ok(self
             .descriptors
             .read()
@@ -290,6 +308,7 @@ impl StateBackend for InProcessBackend {
         sealed: &SealedCommitDescriptor,
         max_bytes: u64,
     ) -> Result<Option<Bytes>, StateBackendError> {
+        Self::ensure_canonical_attempt(attempt)?;
         let resource = format!(
             "state-v2/epoch={}/checkpoint={}/commit/{}",
             attempt.epoch, attempt.checkpoint_id, sealed.key
@@ -335,6 +354,7 @@ impl StateBackend for InProcessBackend {
         vnodes: &[u32],
         required_descriptors: &[String],
     ) -> Result<bool, StateBackendError> {
+        Self::ensure_canonical_attempt(attempt)?;
         if assignment_fence.is_some_and(|fence| !fence.is_canonical()) {
             return Err(StateBackendError::Conflict {
                 resource: format!(
@@ -426,6 +446,7 @@ impl StateBackend for InProcessBackend {
         &self,
         attempt: CheckpointAttempt,
     ) -> Result<Option<CheckpointSealInventory>, StateBackendError> {
+        Self::ensure_canonical_attempt(attempt)?;
         Ok(self
             .sealed
             .read()
@@ -438,6 +459,7 @@ impl StateBackend for InProcessBackend {
         inventory: &CheckpointSealInventory,
     ) -> Result<(), StateBackendError> {
         let attempt = inventory.attempt;
+        Self::ensure_canonical_attempt(attempt)?;
         let resource = format!(
             "state-v2/epoch={}/checkpoint={}",
             attempt.epoch, attempt.checkpoint_id
@@ -531,8 +553,8 @@ mod tests {
     use super::*;
     use crate::state::StateBackendDurability;
 
-    fn attempt(epoch: u64) -> CheckpointAttempt {
-        CheckpointAttempt::new(epoch, epoch * 10)
+    fn attempt(checkpoint_id: u64) -> CheckpointAttempt {
+        CheckpointAttempt::canonical(checkpoint_id)
     }
 
     #[tokio::test]
@@ -578,6 +600,20 @@ mod tests {
         let got = b.read_partial(checkpoint, 2).await.unwrap().unwrap();
         assert_eq!(got, payload);
         assert!(b.read_partial(attempt(8), 2).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn noncanonical_attempt_is_rejected_before_state_mutation() {
+        let backend = InProcessBackend::new(1);
+        let invalid = CheckpointAttempt::new(1, 2);
+
+        let error = backend
+            .write_partial(invalid, 0, 0, Bytes::from_static(b"invalid"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("canonical checkpoint ID"));
+        assert!(backend.partials.read().is_empty());
+        assert!(backend.read_partial(invalid, 0).await.is_err());
     }
 
     #[tokio::test]
@@ -715,10 +751,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reused_epoch_isolated_by_checkpoint_id() {
+    async fn checkpoint_attempts_are_isolated() {
         let b = InProcessBackend::new(2);
-        let old = CheckpointAttempt::new(5, 50);
-        let new = CheckpointAttempt::new(5, 99);
+        let old = CheckpointAttempt::canonical(5);
+        let new = CheckpointAttempt::canonical(99);
         b.write_partial(old, 0, 0, Bytes::from_static(b"old"))
             .await
             .unwrap();

@@ -93,10 +93,21 @@ impl<'a> VnodeRehydrator<'a> {
         }
     }
 
+    fn require_canonical_attempt(attempt: CheckpointAttempt) -> Result<(), DbError> {
+        if attempt.is_canonical() {
+            return Ok(());
+        }
+        Err(DbError::Checkpoint(format!(
+            "[LDB-6050] vnode rehydration requires one nonzero canonical checkpoint ID; received epoch {} checkpoint {}",
+            attempt.epoch, attempt.checkpoint_id
+        )))
+    }
+
     async fn sealed_inventory(
         &self,
         attempt: CheckpointAttempt,
     ) -> Result<Arc<CheckpointSealInventory>, DbError> {
+        Self::require_canonical_attempt(attempt)?;
         if let Some(inventory) = self.seal_cache.lock().await.get(&attempt).cloned() {
             return Ok(inventory);
         }
@@ -204,6 +215,7 @@ impl<'a> VnodeRehydrator<'a> {
         vnodes: &[u32],
         attempt: CheckpointAttempt,
     ) -> Result<VnodeRehydration, DbError> {
+        Self::require_canonical_attempt(attempt)?;
         let mut report = VnodeRehydration::default();
         if vnodes.is_empty() {
             return Ok(report);
@@ -769,11 +781,15 @@ impl<'a> RecoveryManager<'a> {
                 );
                 continue;
             }
-            let validation = artifacts.validate(
-                outcome.checkpoint_id,
-                storage_participant,
-                self.store.key_group_count(),
-            );
+            let (artifacts, validation) = artifacts
+                .validate(
+                    outcome.checkpoint_id,
+                    storage_participant,
+                    self.store.key_group_count(),
+                    self.store.max_state_data_bytes(),
+                )
+                .await
+                .map_err(DbError::from)?;
             if !validation.valid {
                 reject_candidate(format!(
                     "participant {storage_participant} artifact integrity failed: {:?}",
@@ -1647,40 +1663,6 @@ impl<'a> RecoveryManager<'a> {
         })
     }
 
-    /// Returns `true` if the checkpoint fails integrity validation.
-    ///
-    /// Operational validation failures propagate instead of being mislabeled as deterministic
-    /// corruption and silently falling back while durable storage is unavailable.
-    fn is_checkpoint_corrupt(
-        &self,
-        storage_id: u64,
-        artifacts: &CheckpointArtifacts,
-        storage_participant: u64,
-    ) -> bool {
-        let manifest = &artifacts.manifest;
-        if manifest.checkpoint_id != storage_id {
-            error!(
-                storage_id,
-                manifest_id = manifest.checkpoint_id,
-                "[LDB-6010] checkpoint identity mismatch"
-            );
-            return true;
-        }
-        let validation = artifacts.validate(
-            storage_id,
-            storage_participant,
-            self.store.key_group_count(),
-        );
-        if !validation.valid {
-            error!(
-                checkpoint_id = manifest.checkpoint_id,
-                issues = ?validation.issues,
-                "[LDB-6010] checkpoint integrity check failed"
-            );
-        }
-        !validation.valid
-    }
-
     fn validate_outcome_manifest_binding(
         &self,
         outcome: &CheckpointOutcome,
@@ -1832,7 +1814,21 @@ impl<'a> RecoveryManager<'a> {
             return Ok(None);
         }
 
-        if self.is_checkpoint_corrupt(storage_id, &artifacts, storage_participant) {
+        let (artifacts, validation) = artifacts
+            .validate(
+                storage_id,
+                storage_participant,
+                self.store.key_group_count(),
+                self.store.max_state_data_bytes(),
+            )
+            .await
+            .map_err(DbError::from)?;
+        if !validation.valid {
+            error!(
+                checkpoint_id,
+                issues = ?validation.issues,
+                "[LDB-6010] checkpoint integrity check failed"
+            );
             warn!(
                 checkpoint_id,
                 epoch, "[LDB-6010] checkpoint corrupt, trying older"
@@ -1913,10 +1909,26 @@ mod tests {
         FileSystemCheckpointStore::new(dir)
     }
 
-    fn finalized_manifest(id: u64, epoch: u64) -> CheckpointManifest {
-        let mut manifest = CheckpointManifest::new(id, epoch);
+    fn finalized_manifest(checkpoint_id: u64) -> CheckpointManifest {
+        let mut manifest = CheckpointManifest::new(checkpoint_id, checkpoint_id);
         manifest.durable_phase = DurableCheckpointPhase::Finalized;
         manifest
+    }
+
+    fn write_raw_filesystem_manifest(
+        root: &std::path::Path,
+        storage_id: u64,
+        manifest: &CheckpointManifest,
+    ) {
+        let checkpoint_dir = root
+            .join("checkpoints")
+            .join(format!("checkpoint_{storage_id:06}"));
+        std::fs::create_dir_all(&checkpoint_dir).unwrap();
+        std::fs::write(
+            checkpoint_dir.join("manifest.json"),
+            serde_json::to_vec_pretty(manifest).unwrap(),
+        )
+        .unwrap();
     }
 
     fn pipeline_identity(byte: u8) -> PipelineIdentity {
@@ -1999,12 +2011,11 @@ mod tests {
 
     async fn record_local_commit(
         store: &laminar_core::checkpoint_decision::CheckpointDecisionStore,
-        epoch: u64,
         checkpoint_id: u64,
     ) {
         store
             .record_outcome(
-                epoch,
+                checkpoint_id,
                 checkpoint_id,
                 CheckpointScope::Local,
                 None,
@@ -2018,12 +2029,11 @@ mod tests {
 
     async fn record_local_abort(
         store: &laminar_core::checkpoint_decision::CheckpointDecisionStore,
-        epoch: u64,
         checkpoint_id: u64,
     ) {
         store
             .record_outcome(
-                epoch,
+                checkpoint_id,
                 checkpoint_id,
                 CheckpointScope::Local,
                 None,
@@ -2059,14 +2069,13 @@ mod tests {
     #[cfg(feature = "cluster")]
     async fn record_cluster_commit(
         store: &ClusterDecisions,
-        epoch: u64,
         checkpoint_id: u64,
         fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
         manifest_participant_id: u64,
         manifest: Option<&CheckpointManifest>,
     ) {
         let deployment_id = store.load_or_create_deployment_id().await.unwrap();
-        let mut synthetic_manifest = CheckpointManifest::new(checkpoint_id, epoch);
+        let mut synthetic_manifest = CheckpointManifest::new(checkpoint_id, checkpoint_id);
         synthetic_manifest.participant_id = manifest_participant_id;
         synthetic_manifest.deployment_id.clone_from(&deployment_id);
         let manifest = manifest.unwrap_or(&synthetic_manifest);
@@ -2124,7 +2133,7 @@ mod tests {
             .collect();
         let capsule = laminar_core::checkpoint::ClusterRecoveryCapsule {
             version: laminar_core::checkpoint::CLUSTER_RECOVERY_CAPSULE_VERSION,
-            attempt: CheckpointAttempt::new(epoch, checkpoint_id),
+            attempt: CheckpointAttempt::canonical(checkpoint_id),
             deployment_id,
             pipeline_identity: manifest.pipeline_identity.clone(),
             assignment_fence: fence.clone(),
@@ -2147,7 +2156,6 @@ mod tests {
     #[cfg(feature = "cluster")]
     async fn record_cluster_abort(
         store: &ClusterDecisions,
-        epoch: u64,
         checkpoint_id: u64,
         fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
     ) {
@@ -2155,7 +2163,7 @@ mod tests {
             .authority
             .record_cluster_outcome(
                 &store.proof,
-                epoch,
+                checkpoint_id,
                 checkpoint_id,
                 fence.clone(),
                 CheckpointVerdict::Abort,
@@ -2168,7 +2176,6 @@ mod tests {
     #[cfg(feature = "cluster")]
     async fn record_cluster_commit_for_manifests(
         store: &ClusterDecisions,
-        epoch: u64,
         checkpoint_id: u64,
         fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
         manifests: &[(u64, &CheckpointManifest)],
@@ -2183,7 +2190,7 @@ mod tests {
             .iter()
             .map(|(participant_id, manifest)| {
                 assert_eq!(manifest.participant_id, *participant_id);
-                assert_eq!(manifest.epoch, epoch);
+                assert_eq!(manifest.epoch, checkpoint_id);
                 assert_eq!(manifest.checkpoint_id, checkpoint_id);
                 let (manifest_sha256, portable) =
                     crate::cluster_recovery_capsule::manifest_digests(manifest).unwrap();
@@ -2237,7 +2244,7 @@ mod tests {
             .collect();
         let capsule = laminar_core::checkpoint::ClusterRecoveryCapsule {
             version: laminar_core::checkpoint::CLUSTER_RECOVERY_CAPSULE_VERSION,
-            attempt: CheckpointAttempt::new(epoch, checkpoint_id),
+            attempt: CheckpointAttempt::canonical(checkpoint_id),
             deployment_id: source_manifest.deployment_id.clone(),
             pipeline_identity: source_manifest.pipeline_identity.clone(),
             assignment_fence: fence.clone(),
@@ -2273,7 +2280,7 @@ mod tests {
         let store = make_store(dir.path());
 
         // Save a basic checkpoint
-        let manifest = finalized_manifest(1, 5);
+        let manifest = finalized_manifest(5);
         store.save_with_state(&manifest, None).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
@@ -2286,8 +2293,11 @@ mod tests {
     async fn recover_to_epoch_picks_newest_at_or_below_target() {
         let dir = tempfile::tempdir().unwrap();
         let store = make_store(dir.path());
-        for (id, epoch) in [(1u64, 3u64), (2, 5), (3, 7)] {
-            store.save(&finalized_manifest(id, epoch)).await.unwrap();
+        for checkpoint_id in [3_u64, 5, 7] {
+            store
+                .save(&finalized_manifest(checkpoint_id))
+                .await
+                .unwrap();
         }
         let mgr = RecoveryManager::new(&store);
 
@@ -2328,8 +2338,8 @@ mod tests {
         let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
             std::sync::Arc::new(object_store::memory::InMemory::new()),
         );
-        record_local_commit(&decisions, 5, 1).await;
-        record_local_commit(&decisions, 7, 2).await;
+        record_local_commit(&decisions, 5).await;
+        record_local_commit(&decisions, 7).await;
 
         let error = RecoveryManager::new(&store)
             .recover_to_epoch(5, Some(&decisions))
@@ -2338,7 +2348,7 @@ mod tests {
 
         assert!(
             error.to_string().contains(
-                "recovery target epoch 5 is not the highest durable Commit outcome: epoch 7 checkpoint 2 is authoritative"
+                "recovery target epoch 5 is not the highest durable Commit outcome: epoch 7 checkpoint 7 is authoritative"
             ),
             "{error}"
         );
@@ -2348,7 +2358,7 @@ mod tests {
     async fn recover_to_genesis_rejects_finalized_inventory_without_latest_pointer() {
         let dir = tempfile::tempdir().unwrap();
         let store = make_store(dir.path());
-        store.save(&finalized_manifest(1, 1)).await.unwrap();
+        store.save(&finalized_manifest(1)).await.unwrap();
         std::fs::remove_file(dir.path().join("checkpoints/latest.txt")).unwrap();
         let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
             std::sync::Arc::new(object_store::memory::InMemory::new()),
@@ -2420,7 +2430,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = make_store(dir.path());
 
-        let mut manifest = finalized_manifest(1, 3);
+        let mut manifest = finalized_manifest(3);
         manifest.watermark = Some(42_000);
         store.save(&manifest).await.unwrap();
 
@@ -2435,7 +2445,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = make_store(dir.path());
 
-        let mut manifest = finalized_manifest(1, 7);
+        let mut manifest = finalized_manifest(7);
         manifest
             .operator_states
             .insert("0".to_string(), OperatorCheckpoint::inline(b"window-state"));
@@ -2457,7 +2467,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = make_store(dir.path());
 
-        let mut manifest = finalized_manifest(1, 1);
+        let mut manifest = finalized_manifest(1);
         manifest.table_store_checkpoint_path = Some("/data/table_store_cp_001".into());
         store.save(&manifest).await.unwrap();
 
@@ -2476,11 +2486,11 @@ mod tests {
         let store = FileSystemCheckpointStore::new(dir.path());
 
         // Save two valid checkpoints
-        let mut m1 = finalized_manifest(1, 10);
+        let mut m1 = finalized_manifest(10);
         m1.watermark = Some(1000);
         store.save(&m1).await.unwrap();
 
-        let mut m2 = finalized_manifest(2, 20);
+        let mut m2 = finalized_manifest(20);
         m2.watermark = Some(2000);
         store.save(&m2).await.unwrap();
 
@@ -2488,16 +2498,16 @@ mod tests {
         let latest_manifest_path = dir
             .path()
             .join("checkpoints")
-            .join("checkpoint_000002")
+            .join("checkpoint_000020")
             .join("manifest.json");
         std::fs::write(&latest_manifest_path, "not valid json!!!").unwrap();
 
         let mgr = RecoveryManager::new(&store);
         let result = mgr.recover(None).await.unwrap();
 
-        // Should fall back to checkpoint 1
+        // Should fall back to checkpoint 10.
         let recovered = result.expect("should recover from fallback checkpoint");
-        assert_eq!(recovered.manifest.checkpoint_id, 1);
+        assert_eq!(recovered.manifest.checkpoint_id, 10);
         assert_eq!(recovered.epoch(), 10);
         assert_eq!(recovered.manifest.watermark, Some(1000));
     }
@@ -2510,17 +2520,17 @@ mod tests {
             std::sync::Arc::new(object_store::memory::InMemory::new()),
         );
         let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
-        let mut older = finalized_manifest(1, 10);
+        let mut older = finalized_manifest(10);
         older.deployment_id.clone_from(&deployment_id);
         store.save(&older).await.unwrap();
-        let mut committed = finalized_manifest(2, 20);
+        let mut committed = finalized_manifest(20);
         committed.deployment_id.clone_from(&deployment_id);
         store.save(&committed).await.unwrap();
-        record_local_commit(&decisions, 20, 2).await;
+        record_local_commit(&decisions, 20).await;
         let committed_manifest = dir
             .path()
             .join("checkpoints")
-            .join("checkpoint_000002")
+            .join("checkpoint_000020")
             .join("manifest.json");
         std::fs::write(committed_manifest, "corrupt").unwrap();
 
@@ -2528,10 +2538,10 @@ mod tests {
             .with_deployment_id(&deployment_id)
             .recover(Some(&decisions))
             .await
-            .expect_err("a committed checkpoint cannot rewind to checkpoint 1");
+            .expect_err("a committed checkpoint cannot rewind to checkpoint 10");
         assert!(
             error.to_string().contains(
-                "[LDB-6041] committed epoch 20 checkpoint 2 participant 0 artifacts are unreadable"
+                "[LDB-6041] committed epoch 20 checkpoint 20 participant 0 artifacts are unreadable"
             ),
             "{error}"
         );
@@ -2543,12 +2553,12 @@ mod tests {
         let store = FileSystemCheckpointStore::new(dir.path());
 
         // Save a checkpoint then corrupt it
-        store.save(&finalized_manifest(1, 5)).await.unwrap();
+        store.save(&finalized_manifest(5)).await.unwrap();
 
         let manifest_path = dir
             .path()
             .join("checkpoints")
-            .join("checkpoint_000001")
+            .join("checkpoint_000005")
             .join("manifest.json");
         std::fs::write(&manifest_path, "corrupt").unwrap();
 
@@ -2562,14 +2572,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = FileSystemCheckpointStore::new(dir.path());
 
-        store.save(&finalized_manifest(1, 10)).await.unwrap();
-        store.save(&finalized_manifest(2, 20)).await.unwrap();
+        store.save(&finalized_manifest(10)).await.unwrap();
+        store.save(&finalized_manifest(20)).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
         let result = mgr.recover(None).await.unwrap().unwrap();
 
         // Should use the latest (no fallback needed)
-        assert_eq!(result.manifest.checkpoint_id, 2);
+        assert_eq!(result.manifest.checkpoint_id, 20);
         assert_eq!(result.epoch(), 20);
     }
 
@@ -2579,7 +2589,7 @@ mod tests {
         let store = make_store(dir.path());
 
         // Build a manifest with an external operator state
-        let mut manifest = finalized_manifest(1, 5);
+        let mut manifest = finalized_manifest(5);
         let large_data = vec![0xAB; 2048];
         manifest
             .operator_states
@@ -2607,7 +2617,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = make_store(dir.path());
 
-        let mut manifest = finalized_manifest(1, 3);
+        let mut manifest = finalized_manifest(3);
         // Small inline state
         manifest
             .operator_states
@@ -2642,7 +2652,7 @@ mod tests {
         let store = make_store(dir.path());
 
         // Manifest references external state but sidecar is missing
-        let mut manifest = finalized_manifest(1, 1);
+        let mut manifest = finalized_manifest(1);
         manifest
             .operator_states
             .insert("orphan".into(), OperatorCheckpoint::external(0, 100));
@@ -2700,13 +2710,13 @@ mod tests {
             std::sync::Arc::new(object_store::memory::InMemory::new()),
         );
         let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
-        let mut committed = CheckpointManifest::new(1, 5);
+        let mut committed = CheckpointManifest::new(5, 5);
         committed.deployment_id.clone_from(&deployment_id);
         store.save(&committed).await.unwrap();
-        let mut unresolved = CheckpointManifest::new(2, 7);
+        let mut unresolved = CheckpointManifest::new(7, 7);
         unresolved.deployment_id.clone_from(&deployment_id);
         store.save(&unresolved).await.unwrap();
-        record_local_commit(&decisions, 5, 1).await;
+        record_local_commit(&decisions, 5).await;
 
         let recovered = RecoveryManager::new(&store)
             .with_deployment_id(&deployment_id)
@@ -2717,10 +2727,10 @@ mod tests {
 
         assert_eq!(
             (recovered.epoch(), recovered.manifest.checkpoint_id),
-            (5, 1)
+            (5, 5)
         );
         let settled = decisions.outcome(7).await.unwrap().unwrap();
-        assert_eq!(settled.checkpoint_id, 2);
+        assert_eq!(settled.checkpoint_id, 7);
         assert_eq!(settled.verdict, CheckpointVerdict::Abort);
     }
 
@@ -2732,17 +2742,17 @@ mod tests {
             std::sync::Arc::new(object_store::memory::InMemory::new()),
         );
         let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
-        let mut committed = CheckpointManifest::new(1, 5);
+        let mut committed = CheckpointManifest::new(5, 5);
         committed.deployment_id.clone_from(&deployment_id);
         store.save(&committed).await.unwrap();
-        let mut unresolved = CheckpointManifest::new(2, 6);
+        let mut unresolved = CheckpointManifest::new(6, 6);
         unresolved.deployment_id.clone_from(&deployment_id);
         store.save(&unresolved).await.unwrap();
-        let mut later_aborted = CheckpointManifest::new(3, 7);
+        let mut later_aborted = CheckpointManifest::new(7, 7);
         later_aborted.deployment_id.clone_from(&deployment_id);
         store.save(&later_aborted).await.unwrap();
-        record_local_commit(&decisions, 5, 1).await;
-        record_local_abort(&decisions, 7, 3).await;
+        record_local_commit(&decisions, 5).await;
+        record_local_abort(&decisions, 7).await;
 
         let recovered = RecoveryManager::new(&store)
             .with_deployment_id(&deployment_id)
@@ -2751,9 +2761,9 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(recovered.manifest.checkpoint_id, 1);
+        assert_eq!(recovered.manifest.checkpoint_id, 5);
         let settled = decisions.outcome(6).await.unwrap().unwrap();
-        assert_eq!(settled.checkpoint_id, 2);
+        assert_eq!(settled.checkpoint_id, 6);
         assert_eq!(settled.verdict, CheckpointVerdict::Abort);
     }
 
@@ -2765,10 +2775,10 @@ mod tests {
             std::sync::Arc::new(object_store::memory::InMemory::new()),
         );
         let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
-        let mut prepared = CheckpointManifest::new(1, 7);
+        let mut prepared = CheckpointManifest::new(7, 7);
         prepared.deployment_id.clone_from(&deployment_id);
         store.save(&prepared).await.unwrap();
-        record_local_commit(&decisions, 7, 1).await;
+        record_local_commit(&decisions, 7).await;
 
         let manager = RecoveryManager::new(&store).with_deployment_id(&deployment_id);
         manager
@@ -2777,7 +2787,7 @@ mod tests {
             .expect("the exact Commit winner must defeat the stale Abort attempt");
         let recovered = manager.recover(Some(&decisions)).await.unwrap().unwrap();
 
-        assert_eq!(recovered.manifest.checkpoint_id, 1);
+        assert_eq!(recovered.manifest.checkpoint_id, 7);
         assert_eq!(
             recovered.manifest.durable_phase,
             DurableCheckpointPhase::Finalized
@@ -2793,10 +2803,10 @@ mod tests {
             std::sync::Arc::new(object_store::memory::InMemory::new()),
         );
         let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
-        let mut invalid = CheckpointManifest::new(1, 7);
+        let mut invalid = CheckpointManifest::new(7, 7);
         invalid.deployment_id.clone_from(&deployment_id);
         invalid.timestamp_ms = 0;
-        store.save(&invalid).await.unwrap();
+        write_raw_filesystem_manifest(dir.path(), 7, &invalid);
 
         let error = RecoveryManager::new(&store)
             .with_deployment_id(&deployment_id)
@@ -2804,9 +2814,12 @@ mod tests {
             .await
             .expect_err("invalid Prepared inventory cannot authorize an Abort");
 
-        assert!(error
-            .to_string()
-            .contains("cannot be used to mint an Abort"));
+        let message = error.to_string();
+        assert!(
+            message.contains("recovery inventory is unreadable while settling Prepared witnesses"),
+            "{error}"
+        );
+        assert!(message.contains("timestamp_ms is 0"), "{error}");
         assert!(decisions.outcome(7).await.unwrap().is_none());
     }
 
@@ -2821,7 +2834,7 @@ mod tests {
         let foreign_authority = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
             std::sync::Arc::new(object_store::memory::InMemory::new()),
         );
-        let mut foreign = CheckpointManifest::new(1, 7);
+        let mut foreign = CheckpointManifest::new(7, 7);
         foreign.deployment_id = foreign_authority
             .load_or_create_deployment_id()
             .await
@@ -2848,13 +2861,13 @@ mod tests {
             std::sync::Arc::new(object_store::memory::InMemory::new()),
         );
         let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
-        let mut committed = CheckpointManifest::new(1, 5);
+        let mut committed = CheckpointManifest::new(5, 5);
         committed.deployment_id.clone_from(&deployment_id);
         store.save(&committed).await.unwrap();
-        let mut newer = finalized_manifest(2, 7);
+        let mut newer = finalized_manifest(7);
         newer.deployment_id.clone_from(&deployment_id);
         store.save(&newer).await.unwrap();
-        record_local_commit(&decisions, 5, 1).await;
+        record_local_commit(&decisions, 5).await;
 
         let error = RecoveryManager::new(&store)
             .with_deployment_id(&deployment_id)
@@ -2865,7 +2878,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("newer Finalized checkpoint 2 epoch 7 is not settled"),
+                .contains("newer Finalized checkpoint 7 epoch 7 is not settled"),
             "{error}"
         );
     }
@@ -2879,14 +2892,14 @@ mod tests {
         );
         let deployment_id = outcomes.load_or_create_deployment_id().await.unwrap();
 
-        let mut committed = CheckpointManifest::new(1, 5);
+        let mut committed = CheckpointManifest::new(5, 5);
         committed.deployment_id.clone_from(&deployment_id);
         store.save(&committed).await.unwrap();
-        let mut aborted = CheckpointManifest::new(2, 7);
+        let mut aborted = CheckpointManifest::new(7, 7);
         aborted.deployment_id.clone_from(&deployment_id);
         store.save(&aborted).await.unwrap();
-        record_local_commit(&outcomes, 5, 1).await;
-        record_local_abort(&outcomes, 7, 2).await;
+        record_local_commit(&outcomes, 5).await;
+        record_local_abort(&outcomes, 7).await;
 
         let recovered = RecoveryManager::new(&store)
             .with_deployment_id(&deployment_id)
@@ -2910,10 +2923,10 @@ mod tests {
             std::sync::Arc::new(object_store::memory::InMemory::new()),
         );
         let deployment_id = outcomes.load_or_create_deployment_id().await.unwrap();
-        let mut aborted = CheckpointManifest::new(1, 5);
+        let mut aborted = CheckpointManifest::new(5, 5);
         aborted.deployment_id.clone_from(&deployment_id);
         store.save(&aborted).await.unwrap();
-        record_local_abort(&outcomes, 5, 1).await;
+        record_local_abort(&outcomes, 5).await;
 
         let recovered = RecoveryManager::new(&store)
             .with_deployment_id(&deployment_id)
@@ -2923,7 +2936,7 @@ mod tests {
 
         assert!(recovered.is_none());
         assert_eq!(
-            store.load_by_id(1).await.unwrap().unwrap().durable_phase,
+            store.load_by_id(5).await.unwrap().unwrap().durable_phase,
             DurableCheckpointPhase::Prepared
         );
     }
@@ -2939,11 +2952,11 @@ mod tests {
         let fence = assignment_fence(4, &[1]);
         let outcomes = cluster_decisions(backing, &fence, 1).await;
         let deployment_id = outcomes.load_or_create_deployment_id().await.unwrap();
-        let mut manifest = CheckpointManifest::new(7, 6);
+        let mut manifest = CheckpointManifest::new(7, 7);
         manifest.participant_id = 1;
         manifest.deployment_id.clone_from(&deployment_id);
         store.save(&manifest).await.unwrap();
-        record_cluster_commit(&outcomes, 6, 7, &fence, 1, Some(&manifest)).await;
+        record_cluster_commit(&outcomes, 7, &fence, 1, Some(&manifest)).await;
 
         let recovered = RecoveryManager::new(&store)
             .with_deployment_id(&deployment_id)
@@ -2953,7 +2966,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(recovered.epoch(), 6);
+        assert_eq!(recovered.epoch(), 7);
         assert_eq!(
             recovered
                 .outcome()
@@ -2968,7 +2981,7 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[tokio::test]
-    async fn outcome_floor_does_not_dominate_a_newer_prepared_checkpoint_id() {
+    async fn outcome_floor_does_not_dominate_a_newer_prepared_attempt() {
         let backing: std::sync::Arc<dyn object_store::ObjectStore> =
             std::sync::Arc::new(object_store::memory::InMemory::new());
         let offline =
@@ -2981,12 +2994,12 @@ mod tests {
         let decisions = cluster_decisions(std::sync::Arc::clone(&backing), &fence, 2).await;
         let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
 
-        record_cluster_commit(&decisions, 5, 1, &fence, 2, None).await;
-        let mut retained = CheckpointManifest::new(3, 7);
+        record_cluster_commit(&decisions, 5, &fence, 2, None).await;
+        let mut retained = CheckpointManifest::new(7, 7);
         retained.participant_id = 2;
         retained.deployment_id.clone_from(&deployment_id);
         donor.save(&retained).await.unwrap();
-        record_cluster_commit(&decisions, 7, 3, &fence, 2, Some(&retained)).await;
+        record_cluster_commit(&decisions, 7, &fence, 2, Some(&retained)).await;
         decisions
             .authority
             .prune_cluster_outcomes_before(&decisions.proof, 7, |_| async { Ok(()) })
@@ -3008,7 +3021,7 @@ mod tests {
             .unwrap()
             .is_none());
 
-        let mut stale = CheckpointManifest::new(99, 6);
+        let mut stale = CheckpointManifest::new(8, 8);
         stale.participant_id = 1;
         stale.deployment_id.clone_from(&deployment_id);
         offline.save(&stale).await.unwrap();
@@ -3018,15 +3031,15 @@ mod tests {
             .with_outcome_scope(CheckpointScope::Cluster)
             .recover_cluster(&decisions.authority, &decisions.capsules)
             .await
-            .expect_err("an outcome floor cannot settle an incomparable Prepared attempt");
+            .expect_err("an outcome floor cannot settle a newer Prepared attempt");
         assert!(
             error
                 .to_string()
-                .contains("checkpoint 99 epoch 6 is not settled by an exact terminal outcome"),
+                .contains("checkpoint 8 epoch 8 is not settled by an exact terminal outcome"),
             "{error}"
         );
         assert_eq!(
-            offline.load_by_id(99).await.unwrap().unwrap().durable_phase,
+            offline.load_by_id(8).await.unwrap().unwrap().durable_phase,
             DurableCheckpointPhase::Prepared
         );
     }
@@ -3047,12 +3060,12 @@ mod tests {
         committed.participant_id = 1;
         committed.deployment_id.clone_from(&deployment_id);
         store.save(&committed).await.unwrap();
-        record_cluster_commit(&decisions, 5, 5, &fence, 1, Some(&committed)).await;
+        record_cluster_commit(&decisions, 5, &fence, 1, Some(&committed)).await;
         let mut prepared = CheckpointManifest::new(6, 6);
         prepared.participant_id = 1;
         prepared.deployment_id.clone_from(&deployment_id);
         store.save(&prepared).await.unwrap();
-        record_cluster_abort(&decisions, 7, 7, &fence).await;
+        record_cluster_abort(&decisions, 7, &fence).await;
 
         let recovered = RecoveryManager::new(&store)
             .with_deployment_id(&deployment_id)
@@ -3074,7 +3087,7 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[tokio::test]
-    async fn incomparable_missing_prepared_attempt_remains_fatal() {
+    async fn newer_missing_prepared_attempt_remains_fatal() {
         let backing: std::sync::Arc<dyn object_store::ObjectStore> =
             std::sync::Arc::new(object_store::memory::InMemory::new());
         let store =
@@ -3088,24 +3101,24 @@ mod tests {
         committed.participant_id = 1;
         committed.deployment_id.clone_from(&deployment_id);
         store.save(&committed).await.unwrap();
-        record_cluster_commit(&decisions, 5, 5, &fence, 1, Some(&committed)).await;
-        let mut incomparable = CheckpointManifest::new(8, 6);
-        incomparable.participant_id = 1;
-        incomparable.deployment_id.clone_from(&deployment_id);
-        store.save(&incomparable).await.unwrap();
-        record_cluster_abort(&decisions, 7, 7, &fence).await;
+        record_cluster_commit(&decisions, 5, &fence, 1, Some(&committed)).await;
+        let mut newer = CheckpointManifest::new(8, 8);
+        newer.participant_id = 1;
+        newer.deployment_id.clone_from(&deployment_id);
+        store.save(&newer).await.unwrap();
+        record_cluster_abort(&decisions, 7, &fence).await;
 
         let error = RecoveryManager::new(&store)
             .with_deployment_id(&deployment_id)
             .with_outcome_scope(CheckpointScope::Cluster)
             .recover_cluster(&decisions.authority, &decisions.capsules)
             .await
-            .expect_err("incomparable dimensions cannot be inferred closed");
+            .expect_err("a newer Prepared attempt cannot be inferred closed");
 
         assert!(
             error
                 .to_string()
-                .contains("checkpoint 8 epoch 6 is not settled by an exact terminal outcome"),
+                .contains("checkpoint 8 epoch 8 is not settled by an exact terminal outcome"),
             "{error}"
         );
     }
@@ -3126,12 +3139,12 @@ mod tests {
         committed.participant_id = 1;
         committed.deployment_id.clone_from(&deployment_id);
         store.save(&committed).await.unwrap();
-        record_cluster_commit(&decisions, 5, 5, &fence, 1, Some(&committed)).await;
+        record_cluster_commit(&decisions, 5, &fence, 1, Some(&committed)).await;
         let mut foreign = CheckpointManifest::new(6, 6);
         foreign.participant_id = 1;
         foreign.deployment_id = uuid::Uuid::new_v4().to_string();
         store.save(&foreign).await.unwrap();
-        record_cluster_abort(&decisions, 7, 7, &fence).await;
+        record_cluster_abort(&decisions, 7, &fence).await;
 
         let error = RecoveryManager::new(&store)
             .with_deployment_id(&deployment_id)
@@ -3161,15 +3174,15 @@ mod tests {
         let fence = assignment_fence(4, &[1]);
         let decisions = cluster_decisions(std::sync::Arc::clone(&backing), &fence, 1).await;
         let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
-        let mut manifest = CheckpointManifest::new(7, 6);
+        let mut manifest = CheckpointManifest::new(7, 7);
         manifest.participant_id = 1;
         manifest.deployment_id.clone_from(&deployment_id);
         store.save(&manifest).await.unwrap();
-        record_cluster_commit(&decisions, 6, 7, &fence, 1, Some(&manifest)).await;
+        record_cluster_commit(&decisions, 7, &fence, 1, Some(&manifest)).await;
 
         let mut forged = decisions
             .authority
-            .cluster_outcome(6)
+            .cluster_outcome(7)
             .await
             .unwrap()
             .unwrap();
@@ -3192,7 +3205,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             (recovered.epoch(), recovered.manifest.checkpoint_id),
-            (6, 7)
+            (7, 7)
         );
     }
 
@@ -3200,7 +3213,7 @@ mod tests {
     async fn published_finalized_manifest_fails_without_commit_outcome() {
         let dir = tempfile::tempdir().unwrap();
         let store = make_store(dir.path());
-        store.save(&finalized_manifest(1, 1)).await.unwrap();
+        store.save(&finalized_manifest(1)).await.unwrap();
         let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
             std::sync::Arc::new(object_store::memory::InMemory::new()),
         );
@@ -3222,7 +3235,7 @@ mod tests {
     async fn finalized_manifest_without_latest_pointer_fails_without_commit_outcome() {
         let dir = tempfile::tempdir().unwrap();
         let store = make_store(dir.path());
-        store.save(&finalized_manifest(1, 1)).await.unwrap();
+        store.save(&finalized_manifest(1)).await.unwrap();
         std::fs::remove_file(dir.path().join("checkpoints/latest.txt")).unwrap();
         let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
             std::sync::Arc::new(object_store::memory::InMemory::new()),
@@ -3304,10 +3317,10 @@ mod tests {
             std::sync::Arc::new(object_store::memory::InMemory::new()),
         );
         let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
-        let mut prepared = CheckpointManifest::new(1, 7);
+        let mut prepared = CheckpointManifest::new(7, 7);
         prepared.deployment_id.clone_from(&deployment_id);
         store.save(&prepared).await.unwrap();
-        record_local_commit(&decisions, 7, 1).await;
+        record_local_commit(&decisions, 7).await;
 
         let recovered = RecoveryManager::new(&store)
             .with_deployment_id(&deployment_id)
@@ -3321,7 +3334,7 @@ mod tests {
         );
         assert_eq!(recovered.epoch(), 7);
         assert_eq!(
-            store.load_by_id(1).await.unwrap().unwrap().durable_phase,
+            store.load_by_id(7).await.unwrap().unwrap().durable_phase,
             DurableCheckpointPhase::Finalized
         );
     }
@@ -3334,7 +3347,7 @@ mod tests {
             std::sync::Arc::new(object_store::memory::InMemory::new()),
         );
         let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
-        let mut manifest = finalized_manifest(1, 1);
+        let mut manifest = finalized_manifest(1);
         manifest.deployment_id.clone_from(&deployment_id);
         store.save(&manifest).await.unwrap();
 
@@ -3365,10 +3378,10 @@ mod tests {
             .unwrap();
         assert_ne!(decision_deployment, manifest_deployment);
 
-        let mut manifest = finalized_manifest(1, 1);
+        let mut manifest = finalized_manifest(1);
         manifest.deployment_id.clone_from(&manifest_deployment);
         store.save(&manifest).await.unwrap();
-        record_local_commit(&decisions, 1, 1).await;
+        record_local_commit(&decisions, 1).await;
 
         let error = RecoveryManager::new(&store)
             .with_deployment_id(&manifest_deployment)
@@ -3389,11 +3402,11 @@ mod tests {
         let store = make_store(dir.path());
         let expected = pipeline_identity(0x11);
 
-        let mut older = finalized_manifest(1, 1);
+        let mut older = finalized_manifest(1);
         older.pipeline_identity = expected.clone();
         store.save(&older).await.unwrap();
 
-        let mut latest = finalized_manifest(2, 2);
+        let mut latest = finalized_manifest(2);
         latest.pipeline_identity = pipeline_identity(0x22);
         store.save(&latest).await.unwrap();
 
@@ -3414,12 +3427,12 @@ mod tests {
             std::sync::Arc::new(object_store::memory::InMemory::new()),
         );
         let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
-        let mut prepared = CheckpointManifest::new(1, 7);
+        let mut prepared = CheckpointManifest::new(7, 7);
         prepared.deployment_id.clone_from(&deployment_id);
         prepared.pipeline_identity = pipeline_identity(0x33);
         store.save(&prepared).await.unwrap();
 
-        record_local_commit(&decisions, 7, 1).await;
+        record_local_commit(&decisions, 7).await;
 
         let error = RecoveryManager::new(&store)
             .with_deployment_id(&deployment_id)
@@ -3428,7 +3441,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("[LDB-6043]"));
-        let persisted = store.load_by_id(1).await.unwrap().unwrap();
+        let persisted = store.load_by_id(7).await.unwrap().unwrap();
         assert_eq!(persisted.durable_phase, DurableCheckpointPhase::Prepared);
     }
 
@@ -3436,13 +3449,13 @@ mod tests {
     async fn outcome_scope_mismatch_does_not_finalize_prepared_checkpoint() {
         let dir = tempfile::tempdir().unwrap();
         let store = make_store(dir.path());
-        let prepared = CheckpointManifest::new(1, 7);
+        let prepared = CheckpointManifest::new(7, 7);
         store.save(&prepared).await.unwrap();
 
         let decisions = laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
             std::sync::Arc::new(object_store::memory::InMemory::new()),
         );
-        record_local_commit(&decisions, 7, 1).await;
+        record_local_commit(&decisions, 7).await;
 
         let error = RecoveryManager::new(&store)
             .with_outcome_scope(CheckpointScope::Cluster)
@@ -3450,7 +3463,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("recovery authority scope Local"));
-        let persisted = store.load_by_id(1).await.unwrap().unwrap();
+        let persisted = store.load_by_id(7).await.unwrap().unwrap();
         assert_eq!(persisted.durable_phase, DurableCheckpointPhase::Prepared);
     }
 
@@ -3466,7 +3479,7 @@ mod tests {
             1,
         )
         .await;
-        record_cluster_commit(&decisions, 7, 1, &fence, 1, None).await;
+        record_cluster_commit(&decisions, 7, &fence, 1, None).await;
 
         let error = RecoveryManager::new(&store)
             .recover_cluster(&decisions.authority, &decisions.capsules)
@@ -3493,7 +3506,7 @@ mod tests {
         let decisions = cluster_decisions(std::sync::Arc::clone(&backing), &fence, 1).await;
         let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
 
-        let mut manifest = CheckpointManifest::new(7, 6);
+        let mut manifest = CheckpointManifest::new(7, 7);
         manifest.participant_id = 1;
         manifest.deployment_id.clone_from(&deployment_id);
         manifest.source_offsets.insert(
@@ -3514,13 +3527,13 @@ mod tests {
             .save_with_state(&manifest, Some(&[Bytes::from_static(b"state")]))
             .await
             .unwrap();
-        record_cluster_commit(&decisions, 6, 7, &fence, 1, Some(&manifest)).await;
+        record_cluster_commit(&decisions, 7, &fence, 1, Some(&manifest)).await;
 
         let manager = RecoveryManager::new(&local)
             .with_deployment_id(&deployment_id)
             .with_outcome_scope(CheckpointScope::Cluster);
         let recovered = manager
-            .recover_cluster_to_epoch(6, &decisions.authority, &decisions.capsules)
+            .recover_cluster_to_epoch(7, &decisions.authority, &decisions.capsules)
             .await
             .unwrap()
             .unwrap();
@@ -3574,7 +3587,7 @@ mod tests {
         let decisions = cluster_decisions(backing, &fence, 1).await;
         let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
 
-        let mut participant_1 = CheckpointManifest::new(7, 6);
+        let mut participant_1 = CheckpointManifest::new(7, 7);
         participant_1.participant_id = 1;
         participant_1.deployment_id.clone_from(&deployment_id);
         let mut participant_2 = participant_1.clone();
@@ -3584,7 +3597,6 @@ mod tests {
 
         record_cluster_commit_for_manifests(
             &decisions,
-            6,
             7,
             &fence,
             &[(1, &participant_1), (2, &participant_2)],
@@ -3623,7 +3635,7 @@ mod tests {
         let decisions = cluster_decisions(std::sync::Arc::clone(&backing), &fence, 1).await;
         let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
 
-        let mut participant_1 = CheckpointManifest::new(7, 6);
+        let mut participant_1 = CheckpointManifest::new(7, 7);
         participant_1.participant_id = 1;
         participant_1.deployment_id.clone_from(&deployment_id);
         participant_1
@@ -3642,7 +3654,6 @@ mod tests {
 
         record_cluster_commit_for_manifests(
             &decisions,
-            6,
             7,
             &fence,
             &[(1, &participant_1), (2, &participant_2)],
@@ -3696,7 +3707,7 @@ mod tests {
         let decisions = cluster_decisions(std::sync::Arc::clone(&backing), &fence, 1).await;
         let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
 
-        let mut participant_1 = CheckpointManifest::new(7, 6);
+        let mut participant_1 = CheckpointManifest::new(7, 7);
         participant_1.participant_id = 1;
         participant_1.deployment_id.clone_from(&deployment_id);
         participant_1
@@ -3714,7 +3725,6 @@ mod tests {
             .unwrap();
         record_cluster_commit_for_manifests(
             &decisions,
-            6,
             7,
             &fence,
             &[(1, &participant_1), (2, &participant_2)],
@@ -3722,7 +3732,7 @@ mod tests {
         .await;
         let outcome = decisions
             .authority
-            .cluster_outcome(6)
+            .cluster_outcome(7)
             .await
             .unwrap()
             .expect("cluster Commit outcome");
@@ -3781,7 +3791,7 @@ mod tests {
         let decisions = cluster_decisions(std::sync::Arc::clone(&backing), &fence, 1).await;
         let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
 
-        let mut participant_1 = CheckpointManifest::new(7, 6);
+        let mut participant_1 = CheckpointManifest::new(7, 7);
         participant_1.participant_id = 1;
         participant_1.deployment_id.clone_from(&deployment_id);
         participant_1
@@ -3800,7 +3810,6 @@ mod tests {
 
         record_cluster_commit_for_manifests(
             &decisions,
-            6,
             7,
             &fence,
             &[(1, &participant_1), (2, &participant_2)],
@@ -3862,11 +3871,11 @@ mod tests {
         let fence = assignment_fence(4, &[1, 3]);
         let decisions = cluster_decisions(std::sync::Arc::clone(&backing), &fence, 1).await;
         let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
-        let mut manifest = CheckpointManifest::new(7, 6);
+        let mut manifest = CheckpointManifest::new(7, 7);
         manifest.participant_id = 1;
         manifest.deployment_id.clone_from(&deployment_id);
         donor.save(&manifest).await.unwrap();
-        record_cluster_commit(&decisions, 6, 7, &fence, 1, Some(&manifest)).await;
+        record_cluster_commit(&decisions, 7, &fence, 1, Some(&manifest)).await;
         manifest.source_watermarks.insert("events".into(), 42_000);
         backing
             .put_opts(
@@ -3896,35 +3905,42 @@ mod tests {
 
     #[cfg(feature = "cluster")]
     #[tokio::test]
-    async fn committed_peer_manifest_must_match_the_exact_epoch() {
+    async fn committed_peer_manifest_must_match_the_exact_attempt() {
+        use object_store::{ObjectStoreExt, PutPayload};
+
         let backing: std::sync::Arc<dyn object_store::ObjectStore> =
             std::sync::Arc::new(object_store::memory::InMemory::new());
-        let donor =
-            ObjectStoreCheckpointStore::new(std::sync::Arc::clone(&backing), "nodes/1/".into())
-                .with_participant_id(1);
         let local =
             ObjectStoreCheckpointStore::new(std::sync::Arc::clone(&backing), "nodes/2/".into())
                 .with_participant_id(2);
         let fence = assignment_fence(4, &[1, 3]);
         let decisions = cluster_decisions(std::sync::Arc::clone(&backing), &fence, 1).await;
         let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
-        let mut wrong_epoch = CheckpointManifest::new(7, 5);
-        wrong_epoch.participant_id = 1;
-        wrong_epoch.deployment_id.clone_from(&deployment_id);
-        donor.save(&wrong_epoch).await.unwrap();
-        record_cluster_commit(&decisions, 6, 7, &fence, 1, Some(&wrong_epoch)).await;
+        let mut wrong_attempt = CheckpointManifest::new(8, 8);
+        wrong_attempt.participant_id = 1;
+        wrong_attempt.deployment_id.clone_from(&deployment_id);
+        backing
+            .put(
+                &object_store::path::Path::from("nodes/1/manifests/manifest-000007.json"),
+                PutPayload::from_bytes(bytes::Bytes::from(
+                    serde_json::to_vec_pretty(&wrong_attempt).unwrap(),
+                )),
+            )
+            .await
+            .unwrap();
+        record_cluster_commit(&decisions, 7, &fence, 1, Some(&wrong_attempt)).await;
 
         let error = RecoveryManager::new(&local)
             .with_deployment_id(&deployment_id)
             .with_outcome_scope(CheckpointScope::Cluster)
-            .recover_cluster_to_epoch(6, &decisions.authority, &decisions.capsules)
+            .recover_cluster_to_epoch(7, &decisions.authority, &decisions.capsules)
             .await
             .expect_err("outcome and donor manifest must identify one exact attempt");
 
         assert!(
             error
                 .to_string()
-                .contains("participant 1 manifest does not identify the committed runtime cut"),
+                .contains("storage checkpoint 7 contains manifest checkpoint 8"),
             "{error}"
         );
     }
@@ -3940,7 +3956,7 @@ mod tests {
         let fence = assignment_fence(4, &[1, 2]);
         let decisions = cluster_decisions(backing, &fence, 1).await;
         let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
-        record_cluster_commit(&decisions, 6, 7, &fence, 1, None).await;
+        record_cluster_commit(&decisions, 7, &fence, 1, None).await;
 
         let error = RecoveryManager::new(&local)
             .with_deployment_id(&deployment_id)
@@ -4074,7 +4090,7 @@ mod rehydration_tests {
     }
 
     async fn seal_epoch(backend: &dyn StateBackend, epoch: u64, vnodes: &[u32], tag: &[u8]) {
-        let attempt = CheckpointAttempt::new(epoch, epoch);
+        let attempt = CheckpointAttempt::canonical(epoch);
         for &v in vnodes {
             let partial = crate::vnode_partial::VnodePartial {
                 operators: vec![("agg".into(), tag.to_vec())],
@@ -4115,22 +4131,34 @@ mod rehydration_tests {
     }
 
     #[tokio::test]
+    async fn rehydrate_rejects_noncanonical_attempt_for_empty_vnode_set() {
+        let backend = InProcessBackend::new(1);
+
+        let error = VnodeRehydrator::new(&backend)
+            .rehydrate_at(&[], CheckpointAttempt::new(7, 8))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("canonical checkpoint ID"));
+    }
+
+    #[tokio::test]
     async fn rehydrate_reads_committed_partials_and_rejects_missing_vnodes() {
         let backend = InProcessBackend::new(4);
         seal_epoch(&backend, 7, &[0, 1, 2], b"v7").await;
 
         let report = VnodeRehydrator::new(&backend)
-            .rehydrate_at(&[0, 1], CheckpointAttempt::new(7, 7))
+            .rehydrate_at(&[0, 1], CheckpointAttempt::canonical(7))
             .await
             .unwrap();
 
-        assert_eq!(report.attempt, Some(CheckpointAttempt::new(7, 7)));
+        assert_eq!(report.attempt, Some(CheckpointAttempt::canonical(7)));
         assert_eq!(report.restored_count(), 2);
         assert_eq!(operator_payload(&report, 0), b"v7");
         assert_eq!(operator_payload(&report, 1), b"v7");
 
         let error = VnodeRehydrator::new(&backend)
-            .rehydrate_at(&[3], CheckpointAttempt::new(7, 7))
+            .rehydrate_at(&[3], CheckpointAttempt::canonical(7))
             .await
             .unwrap_err();
         assert!(error
@@ -4140,7 +4168,7 @@ mod rehydration_tests {
 
     #[tokio::test]
     async fn rehydrate_rejects_payload_that_no_longer_matches_seal_digest() {
-        let attempt = CheckpointAttempt::new(7, 7);
+        let attempt = CheckpointAttempt::canonical(7);
         let backend = CorruptReadBackend {
             inner: InProcessBackend::new(4),
             corrupt_attempt: attempt,
@@ -4165,11 +4193,11 @@ mod rehydration_tests {
         seal_epoch(&backend, 9, &[0, 1], b"new").await;
 
         let report = VnodeRehydrator::new(&backend)
-            .rehydrate_at(&[0, 1], CheckpointAttempt::new(3, 3))
+            .rehydrate_at(&[0, 1], CheckpointAttempt::canonical(3))
             .await
             .unwrap();
 
-        assert_eq!(report.attempt, Some(CheckpointAttempt::new(3, 3)));
+        assert_eq!(report.attempt, Some(CheckpointAttempt::canonical(3)));
         assert_eq!(operator_payload(&report, 0), b"old");
     }
 
@@ -4184,7 +4212,7 @@ mod rehydration_tests {
             base: None,
             deltas: Vec::new(),
         };
-        let full_attempt = CheckpointAttempt::new(5, 1);
+        let full_attempt = CheckpointAttempt::canonical(5);
         backend
             .write_partial(full_attempt, 0, 0, Bytes::from(full.encode().unwrap()))
             .await
@@ -4199,7 +4227,7 @@ mod rehydration_tests {
             base: Some(full_attempt),
             deltas: Vec::new(),
         };
-        let reference_attempt = CheckpointAttempt::new(6, 2);
+        let reference_attempt = CheckpointAttempt::canonical(6);
         backend
             .write_partial(
                 reference_attempt,
@@ -4233,9 +4261,9 @@ mod rehydration_tests {
     #[tokio::test]
     async fn rehydrate_resolves_sealed_full_delta_delta_chain() {
         let backend = InProcessBackend::new(1);
-        let full_attempt = CheckpointAttempt::new(1, 11);
-        let delta_one_attempt = CheckpointAttempt::new(2, 12);
-        let delta_two_attempt = CheckpointAttempt::new(3, 13);
+        let full_attempt = CheckpointAttempt::canonical(1);
+        let delta_one_attempt = CheckpointAttempt::canonical(2);
+        let delta_two_attempt = CheckpointAttempt::canonical(3);
 
         write_and_seal_partial(
             &backend,
@@ -4287,11 +4315,11 @@ mod rehydration_tests {
     async fn retention_keeps_fallback_delta_ancestors_until_rebase() {
         let backend = InProcessBackend::new(1);
         let attempts = [
-            CheckpointAttempt::new(1, 11),
-            CheckpointAttempt::new(2, 12),
-            CheckpointAttempt::new(3, 13),
-            CheckpointAttempt::new(4, 14),
-            CheckpointAttempt::new(5, 15),
+            CheckpointAttempt::canonical(1),
+            CheckpointAttempt::canonical(2),
+            CheckpointAttempt::canonical(3),
+            CheckpointAttempt::canonical(4),
+            CheckpointAttempt::canonical(5),
         ];
 
         write_and_seal_partial(
@@ -4372,7 +4400,7 @@ mod rehydration_tests {
     #[tokio::test]
     async fn large_epoch_gap_rebase_keeps_the_earliest_fallback_chain() {
         let backend = InProcessBackend::new(1);
-        let obsolete = CheckpointAttempt::new(1, 11);
+        let obsolete = CheckpointAttempt::canonical(1);
         write_and_seal_partial(
             &backend,
             obsolete,
@@ -4386,9 +4414,7 @@ mod rehydration_tests {
 
         // An allocator high-watermark jump must re-base at E100. With R=3/C=2 and a current E105,
         // E102 is the earliest retained manifest and state GC may advance only to E100.
-        let attempts: Vec<_> = (100..=105)
-            .map(|epoch| CheckpointAttempt::new(epoch, epoch + 1_000))
-            .collect();
+        let attempts: Vec<_> = (100..=105).map(CheckpointAttempt::canonical).collect();
         for index in [0_usize, 3] {
             write_and_seal_partial(
                 &backend,
@@ -4439,10 +4465,10 @@ mod rehydration_tests {
     #[tokio::test]
     async fn retention_keeps_reference_then_delta_ancestry() {
         let backend = InProcessBackend::new(1);
-        let full = CheckpointAttempt::new(100, 1_100);
-        let reference = CheckpointAttempt::new(102, 1_102);
-        let delta_one = CheckpointAttempt::new(103, 1_103);
-        let delta_two = CheckpointAttempt::new(104, 1_104);
+        let full = CheckpointAttempt::canonical(100);
+        let reference = CheckpointAttempt::canonical(102);
+        let delta_one = CheckpointAttempt::canonical(103);
+        let delta_two = CheckpointAttempt::canonical(104);
 
         write_and_seal_partial(
             &backend,
@@ -4509,7 +4535,7 @@ mod rehydration_tests {
     #[tokio::test]
     async fn rehydrate_rejects_reference_parent_without_its_own_seal() {
         let backend = InProcessBackend::new(4);
-        let base_attempt = CheckpointAttempt::new(5, 1);
+        let base_attempt = CheckpointAttempt::canonical(5);
         let base = crate::vnode_partial::VnodePartial {
             operators: vec![("agg".into(), vec![1, 2, 3])],
             base: None,
@@ -4520,7 +4546,7 @@ mod rehydration_tests {
             .await
             .unwrap();
 
-        let head_attempt = CheckpointAttempt::new(6, 2);
+        let head_attempt = CheckpointAttempt::canonical(6);
         let reference = crate::vnode_partial::VnodePartial {
             operators: Vec::new(),
             base: Some(base_attempt),
@@ -4547,7 +4573,7 @@ mod rehydration_tests {
     async fn rehydrate_at_rejects_an_unsealed_attempt() {
         let backend = InProcessBackend::new(4);
         let error = VnodeRehydrator::new(&backend)
-            .rehydrate_at(&[0, 1], CheckpointAttempt::new(1, 1))
+            .rehydrate_at(&[0, 1], CheckpointAttempt::canonical(1))
             .await
             .unwrap_err();
         assert!(error.to_string().contains("has no exact state seal"));
@@ -4558,7 +4584,7 @@ mod rehydration_tests {
         let backend = InProcessBackend::new(4);
         seal_epoch(&backend, 1, &[0], b"x").await;
         let report = VnodeRehydrator::new(&backend)
-            .rehydrate_at(&[], CheckpointAttempt::new(1, 1))
+            .rehydrate_at(&[], CheckpointAttempt::canonical(1))
             .await
             .unwrap();
         assert_eq!(report.attempt, None);
@@ -4577,11 +4603,11 @@ mod rehydration_tests {
         seal_epoch(&backend, 5, &[0, 1], b"durable").await;
 
         let report = VnodeRehydrator::new(&backend)
-            .rehydrate_at(&[0, 1], CheckpointAttempt::new(5, 5))
+            .rehydrate_at(&[0, 1], CheckpointAttempt::canonical(5))
             .await
             .unwrap();
 
-        assert_eq!(report.attempt, Some(CheckpointAttempt::new(5, 5)));
+        assert_eq!(report.attempt, Some(CheckpointAttempt::canonical(5)));
         assert_eq!(report.restored_count(), 2);
         assert_eq!(operator_payload(&report, 1), b"durable");
     }

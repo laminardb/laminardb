@@ -28,11 +28,12 @@ use laminar_connectors::nats::{NatsSink, NatsSource};
 const NATS_URL: &str = "nats://127.0.0.1:4222";
 
 fn initial_source_start(config: ConnectorConfig) -> SourceStart {
-    SourceStart {
+    SourceStart::new(
         config,
-        position: SourcePosition::Initial,
-        delivery: DeliveryGuarantee::BestEffort,
-    }
+        SourcePosition::Initial,
+        DeliveryGuarantee::BestEffort,
+    )
+    .unwrap()
 }
 
 fn payload_schema() -> SchemaRef {

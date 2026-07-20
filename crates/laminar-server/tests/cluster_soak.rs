@@ -201,6 +201,29 @@ struct DurableCheckpointStatus {
     epoch: u64,
 }
 
+impl DurableCheckpointStatus {
+    const fn is_canonical(self) -> bool {
+        self.checkpoint_id != 0 && self.epoch != 0 && self.epoch == self.checkpoint_id
+    }
+
+    #[cfg(feature = "kafka")]
+    fn require_canonical(self, context: &str) -> Result<Self, String> {
+        if !self.is_canonical() {
+            return Err(format!(
+                "{context} carried a non-canonical identity: checkpoint_id={}, epoch={}; both fields must contain the same nonzero checkpoint ID",
+                self.checkpoint_id, self.epoch
+            ));
+        }
+        Ok(self)
+    }
+
+    #[cfg(feature = "kafka")]
+    fn try_attempt(self, context: &str) -> Result<CheckpointAttempt, String> {
+        self.require_canonical(context)?;
+        Ok(CheckpointAttempt::canonical(self.checkpoint_id))
+    }
+}
+
 fn checkpoint_epoch_advanced(previous: u64, current: u64) -> bool {
     current > previous
 }
@@ -256,14 +279,16 @@ fn log_line_u64_field(line: &str, name: &str) -> Option<u64> {
 }
 
 fn log_line_reports_recovery(line: &str, checkpoint: DurableCheckpointStatus) -> bool {
-    line.contains("Recovered from unified checkpoint")
+    checkpoint.is_canonical()
+        && line.contains("Recovered from unified checkpoint")
         && log_line_has_u64_field(line, "checkpoint_id", checkpoint.checkpoint_id)
         && log_line_has_u64_field(line, "epoch", checkpoint.epoch)
 }
 
 #[cfg(feature = "kafka")]
 fn log_line_reports_checkpoint_completion(line: &str, checkpoint: DurableCheckpointStatus) -> bool {
-    line.contains("checkpoint completed")
+    checkpoint.is_canonical()
+        && line.contains("checkpoint completed")
         && log_line_has_u64_field(line, "checkpoint_id", checkpoint.checkpoint_id)
         && log_line_has_u64_field(line, "epoch", checkpoint.epoch)
 }
@@ -279,15 +304,13 @@ fn checkpoint_reservation_from_log_line(
         .ok_or_else(|| "checkpoint reservation log omitted checkpoint_id".to_string())?;
     let epoch = log_line_u64_field(line, "epoch")
         .ok_or_else(|| "checkpoint reservation log omitted epoch".to_string())?;
-    if checkpoint_id == 0 || epoch == 0 {
-        return Err(format!(
-            "checkpoint reservation log carried a non-canonical identity: checkpoint_id={checkpoint_id}, epoch={epoch}"
-        ));
-    }
-    Ok(Some(DurableCheckpointStatus {
+    let checkpoint = DurableCheckpointStatus {
         checkpoint_id,
         epoch,
-    }))
+    };
+    Ok(Some(
+        checkpoint.require_canonical("checkpoint reservation log")?,
+    ))
 }
 
 #[cfg(feature = "kafka")]
@@ -301,15 +324,13 @@ fn checkpoint_failure_metric_from_log_line(
         .ok_or_else(|| "checkpoint failure metric log omitted checkpoint_id".to_string())?;
     let epoch = log_line_u64_field(line, "epoch")
         .ok_or_else(|| "checkpoint failure metric log omitted epoch".to_string())?;
-    if checkpoint_id == 0 || epoch == 0 {
-        return Err(format!(
-            "checkpoint failure metric log carried a non-canonical identity: checkpoint_id={checkpoint_id}, epoch={epoch}"
-        ));
-    }
-    Ok(Some(DurableCheckpointStatus {
+    let checkpoint = DurableCheckpointStatus {
         checkpoint_id,
         epoch,
-    }))
+    };
+    Ok(Some(
+        checkpoint.require_canonical("checkpoint failure metric log")?,
+    ))
 }
 
 #[cfg(feature = "kafka")]
@@ -317,6 +338,7 @@ fn validate_post_release_checkpoint_lifecycle(
     logs: &[String],
     resumed_checkpoint: DurableCheckpointStatus,
 ) -> Result<DurableCheckpointStatus, String> {
+    let resumed_attempt = resumed_checkpoint.try_attempt("resumed checkpoint")?;
     let mut post_release = Vec::with_capacity(logs.len());
     for (node_id, log) in logs.iter().enumerate() {
         let releases = log.matches(RECOVERY_RELEASE_LOG).count();
@@ -353,9 +375,9 @@ fn validate_post_release_checkpoint_lifecycle(
         return Err("no checkpoint attempt was reserved after recovery Release".into());
     };
     for (index, left) in reservations.iter().enumerate() {
-        let left_attempt = CheckpointAttempt::new(left.0.epoch, left.0.checkpoint_id);
+        let left_attempt = left.0.try_attempt("checkpoint reservation log")?;
         for right in &reservations[index + 1..] {
-            let right_attempt = CheckpointAttempt::new(right.0.epoch, right.0.checkpoint_id);
+            let right_attempt = right.0.try_attempt("checkpoint reservation log")?;
             match left_attempt.relation_to(right_attempt) {
                 CheckpointAttemptRelation::Older | CheckpointAttemptRelation::Newer => {}
                 CheckpointAttemptRelation::Exact => {
@@ -375,18 +397,20 @@ fn validate_post_release_checkpoint_lifecycle(
                 }
             }
         }
-        if left_attempt.relation_to(CheckpointAttempt::new(
-            first_reservation.0.epoch,
-            first_reservation.0.checkpoint_id,
-        )) == CheckpointAttemptRelation::Older
+        if left_attempt.relation_to(
+            first_reservation
+                .0
+                .try_attempt("checkpoint reservation log")?,
+        ) == CheckpointAttemptRelation::Older
         {
             first_reservation = *left;
         }
     }
     let first_attempt = first_reservation.0;
-    match CheckpointAttempt::new(first_attempt.epoch, first_attempt.checkpoint_id).relation_to(
-        CheckpointAttempt::new(resumed_checkpoint.epoch, resumed_checkpoint.checkpoint_id),
-    ) {
+    match first_attempt
+        .try_attempt("checkpoint reservation log")?
+        .relation_to(resumed_attempt)
+    {
         CheckpointAttemptRelation::Exact | CheckpointAttemptRelation::Older => {}
         CheckpointAttemptRelation::Newer | CheckpointAttemptRelation::Conflict => {
             return Err(format!(
@@ -770,7 +794,7 @@ impl Node {
             checkpoint_id: json_u64(row.get("checkpoint_id")?)?,
             epoch: json_u64(row.get("epoch")?)?,
         };
-        (checkpoint.checkpoint_id > 0 && checkpoint.epoch > 0).then_some(checkpoint)
+        checkpoint.is_canonical().then_some(checkpoint)
     }
 
     fn log_len(&self) -> u64 {
@@ -1903,6 +1927,7 @@ fn validate_recovery_checkpoint_failure_evidence(
     leader_log: &str,
     resumed_checkpoint: DurableCheckpointStatus,
 ) -> Result<Option<DurableCheckpointStatus>, String> {
+    let resumed_attempt = resumed_checkpoint.try_attempt("resumed checkpoint")?;
     validate_recovery_checkpoint_failure_totals(baselines, totals, leader)?;
     if fault_logs.len() != totals.len() {
         return Err(format!(
@@ -2025,9 +2050,7 @@ fn validate_recovery_checkpoint_failure_evidence(
             failed.checkpoint_id, failed.epoch
         ));
     }
-    let failed_attempt = CheckpointAttempt::new(failed.epoch, failed.checkpoint_id);
-    let resumed_attempt =
-        CheckpointAttempt::new(resumed_checkpoint.epoch, resumed_checkpoint.checkpoint_id);
+    let failed_attempt = failed.try_attempt("checkpoint failure metric log")?;
     if failed_attempt.relation_to(resumed_attempt) != CheckpointAttemptRelation::Older {
         return Err(format!(
             "resumed checkpoint {} epoch {} is not strictly newer than interrupted checkpoint {} epoch {}",
@@ -3842,31 +3865,42 @@ fn recovery_checkpoint_failure_evidence_binds_the_interrupted_attempt() {
 fn recovery_log_match_binds_checkpoint_and_epoch() {
     let expected = DurableCheckpointStatus {
         checkpoint_id: 41,
-        epoch: 43,
+        epoch: 41,
     };
     assert!(log_line_reports_recovery(
+        "Recovered from unified checkpoint checkpoint_id=41 epoch=41",
+        expected
+    ));
+    assert!(log_line_reports_recovery(
+        "Recovered from unified checkpoint checkpoint_id: 41 epoch: 41",
+        expected
+    ));
+    assert!(!log_line_reports_recovery(
+        "Recovered from unified checkpoint checkpoint_id=40 epoch=40",
+        expected
+    ));
+    assert!(!log_line_reports_recovery(
+        "Recovered from unified checkpoint checkpoint_id=42 epoch=42",
+        expected
+    ));
+    assert!(!log_line_reports_recovery(
+        "Recovered from unified checkpoint checkpoint_id=410 epoch=410",
+        expected
+    ));
+    assert!(!log_line_reports_recovery(
+        "Recovered from unified checkpoint previous_checkpoint_id=41 epoch=41",
+        expected
+    ));
+    assert!(!log_line_reports_recovery(
         "Recovered from unified checkpoint checkpoint_id=41 epoch=43",
         expected
     ));
-    assert!(log_line_reports_recovery(
-        "Recovered from unified checkpoint checkpoint_id: 41 epoch: 43",
-        expected
-    ));
     assert!(!log_line_reports_recovery(
-        "Recovered from unified checkpoint checkpoint_id=40 epoch=43",
-        expected
-    ));
-    assert!(!log_line_reports_recovery(
-        "Recovered from unified checkpoint checkpoint_id=41 epoch=42",
-        expected
-    ));
-    assert!(!log_line_reports_recovery(
-        "Recovered from unified checkpoint checkpoint_id=410 epoch=43",
-        expected
-    ));
-    assert!(!log_line_reports_recovery(
-        "Recovered from unified checkpoint previous_checkpoint_id=41 epoch=43",
-        expected
+        "Recovered from unified checkpoint checkpoint_id=41 epoch=41",
+        DurableCheckpointStatus {
+            checkpoint_id: 41,
+            epoch: 43,
+        }
     ));
 }
 
@@ -3875,24 +3909,45 @@ fn recovery_log_match_binds_checkpoint_and_epoch() {
 fn checkpoint_completion_log_match_binds_checkpoint_and_epoch() {
     let expected = DurableCheckpointStatus {
         checkpoint_id: 41,
-        epoch: 43,
+        epoch: 41,
     };
     assert!(log_line_reports_checkpoint_completion(
+        "checkpoint completed checkpoint_id=41 epoch=41",
+        expected
+    ));
+    assert!(!log_line_reports_checkpoint_completion(
+        "checkpoint completed checkpoint_id=40 epoch=40",
+        expected
+    ));
+    assert!(!log_line_reports_checkpoint_completion(
+        "checkpoint completed checkpoint_id=42 epoch=42",
+        expected
+    ));
+    assert!(!log_line_reports_checkpoint_completion(
         "checkpoint completed checkpoint_id=41 epoch=43",
         expected
     ));
     assert!(!log_line_reports_checkpoint_completion(
-        "checkpoint completed checkpoint_id=40 epoch=43",
+        "checkpoint failed checkpoint_id=41 epoch=41",
         expected
     ));
-    assert!(!log_line_reports_checkpoint_completion(
-        "checkpoint completed checkpoint_id=41 epoch=42",
-        expected
-    ));
-    assert!(!log_line_reports_checkpoint_completion(
-        "checkpoint failed checkpoint_id=41 epoch=43",
-        expected
-    ));
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn checkpoint_log_parsers_reject_zero_and_split_identities() {
+    for (checkpoint_id, epoch) in [(0, 0), (41, 43)] {
+        let reservation = format!(
+            "checkpoint_id={checkpoint_id} epoch={epoch} {CHECKPOINT_ATTEMPT_RESERVED_LOG}"
+        );
+        let error = checkpoint_reservation_from_log_line(&reservation).unwrap_err();
+        assert!(error.contains("non-canonical identity"), "{error}");
+
+        let failure =
+            format!("checkpoint_id={checkpoint_id} epoch={epoch} {CHECKPOINT_FAILURE_METRIC_LOG}");
+        let error = checkpoint_failure_metric_from_log_line(&failure).unwrap_err();
+        assert!(error.contains("non-canonical identity"), "{error}");
+    }
 }
 
 #[cfg(feature = "kafka")]
@@ -3900,7 +3955,7 @@ fn checkpoint_completion_log_match_binds_checkpoint_and_epoch() {
 fn post_release_lifecycle_requires_first_reserved_attempt_to_complete() {
     let logs = vec![
         format!(
-            "{RECOVERY_RELEASE_LOG}\ncheckpoint_id=41 epoch=43 {CHECKPOINT_ATTEMPT_RESERVED_LOG}\ncheckpoint_id=41 epoch=43 checkpoint completed\ncheckpoint_id=42 epoch=44 {CHECKPOINT_ATTEMPT_RESERVED_LOG}\ncheckpoint_id=42 epoch=44 checkpoint completed"
+            "{RECOVERY_RELEASE_LOG}\ncheckpoint_id=41 epoch=41 {CHECKPOINT_ATTEMPT_RESERVED_LOG}\ncheckpoint_id=41 epoch=41 checkpoint completed\ncheckpoint_id=42 epoch=42 {CHECKPOINT_ATTEMPT_RESERVED_LOG}\ncheckpoint_id=42 epoch=42 checkpoint completed"
         ),
         RECOVERY_RELEASE_LOG.to_string(),
         RECOVERY_RELEASE_LOG.to_string(),
@@ -3910,19 +3965,19 @@ fn post_release_lifecycle_requires_first_reserved_attempt_to_complete() {
             &logs,
             DurableCheckpointStatus {
                 checkpoint_id: 42,
-                epoch: 44,
+                epoch: 42,
             },
         )
         .unwrap(),
         DurableCheckpointStatus {
             checkpoint_id: 41,
-            epoch: 43,
+            epoch: 41,
         }
     );
 
     let skipped = vec![
         format!(
-            "{RECOVERY_RELEASE_LOG}\ncheckpoint_id=41 epoch=43 {CHECKPOINT_ATTEMPT_RESERVED_LOG}\nunrecognized failure text\ncheckpoint_id=42 epoch=44 {CHECKPOINT_ATTEMPT_RESERVED_LOG}\ncheckpoint_id=42 epoch=44 checkpoint completed"
+            "{RECOVERY_RELEASE_LOG}\ncheckpoint_id=41 epoch=41 {CHECKPOINT_ATTEMPT_RESERVED_LOG}\nunrecognized failure text\ncheckpoint_id=42 epoch=42 {CHECKPOINT_ATTEMPT_RESERVED_LOG}\ncheckpoint_id=42 epoch=42 checkpoint completed"
         ),
         RECOVERY_RELEASE_LOG.to_string(),
         RECOVERY_RELEASE_LOG.to_string(),
@@ -3931,11 +3986,11 @@ fn post_release_lifecycle_requires_first_reserved_attempt_to_complete() {
         &skipped,
         DurableCheckpointStatus {
             checkpoint_id: 42,
-            epoch: 44,
+            epoch: 42,
         },
     )
     .unwrap_err();
-    assert!(error.contains("checkpoint 41 epoch 43"), "{error}");
+    assert!(error.contains("checkpoint 41 epoch 41"), "{error}");
 }
 
 #[cfg(feature = "kafka")]
@@ -3943,10 +3998,10 @@ fn post_release_lifecycle_requires_first_reserved_attempt_to_complete() {
 fn post_release_lifecycle_rejects_missing_or_pre_release_evidence() {
     let resumed = DurableCheckpointStatus {
         checkpoint_id: 41,
-        epoch: 43,
+        epoch: 41,
     };
     let no_reservation = vec![
-        format!("{RECOVERY_RELEASE_LOG}\ncheckpoint_id=41 epoch=43 checkpoint completed"),
+        format!("{RECOVERY_RELEASE_LOG}\ncheckpoint_id=41 epoch=41 checkpoint completed"),
         RECOVERY_RELEASE_LOG.to_string(),
         RECOVERY_RELEASE_LOG.to_string(),
     ];
@@ -3958,7 +4013,7 @@ fn post_release_lifecycle_rejects_missing_or_pre_release_evidence() {
 
     let completion_before_release = vec![
         format!(
-            "checkpoint_id=41 epoch=43 checkpoint completed\n{RECOVERY_RELEASE_LOG}\ncheckpoint_id=41 epoch=43 {CHECKPOINT_ATTEMPT_RESERVED_LOG}"
+            "checkpoint_id=41 epoch=41 checkpoint completed\n{RECOVERY_RELEASE_LOG}\ncheckpoint_id=41 epoch=41 {CHECKPOINT_ATTEMPT_RESERVED_LOG}"
         ),
         RECOVERY_RELEASE_LOG.to_string(),
         RECOVERY_RELEASE_LOG.to_string(),
@@ -3971,7 +4026,7 @@ fn post_release_lifecycle_rejects_missing_or_pre_release_evidence() {
 
     let completion_before_reservation = vec![
         format!(
-            "{RECOVERY_RELEASE_LOG}\ncheckpoint_id=41 epoch=43 checkpoint completed\ncheckpoint_id=41 epoch=43 {CHECKPOINT_ATTEMPT_RESERVED_LOG}"
+            "{RECOVERY_RELEASE_LOG}\ncheckpoint_id=41 epoch=41 checkpoint completed\ncheckpoint_id=41 epoch=41 {CHECKPOINT_ATTEMPT_RESERVED_LOG}"
         ),
         RECOVERY_RELEASE_LOG.to_string(),
         RECOVERY_RELEASE_LOG.to_string(),
@@ -3984,9 +4039,9 @@ fn post_release_lifecycle_rejects_missing_or_pre_release_evidence() {
 
     let completion_on_another_node = vec![
         format!(
-            "{RECOVERY_RELEASE_LOG}\ncheckpoint_id=41 epoch=43 {CHECKPOINT_ATTEMPT_RESERVED_LOG}"
+            "{RECOVERY_RELEASE_LOG}\ncheckpoint_id=41 epoch=41 {CHECKPOINT_ATTEMPT_RESERVED_LOG}"
         ),
-        format!("{RECOVERY_RELEASE_LOG}\ncheckpoint_id=41 epoch=43 checkpoint completed"),
+        format!("{RECOVERY_RELEASE_LOG}\ncheckpoint_id=41 epoch=41 checkpoint completed"),
         RECOVERY_RELEASE_LOG.to_string(),
     ];
     assert!(
@@ -3997,7 +4052,7 @@ fn post_release_lifecycle_rejects_missing_or_pre_release_evidence() {
 
     let resumed_without_reservation = vec![
         format!(
-            "{RECOVERY_RELEASE_LOG}\ncheckpoint_id=41 epoch=43 {CHECKPOINT_ATTEMPT_RESERVED_LOG}\ncheckpoint_id=41 epoch=43 checkpoint completed\ncheckpoint_id=42 epoch=44 checkpoint completed"
+            "{RECOVERY_RELEASE_LOG}\ncheckpoint_id=41 epoch=41 {CHECKPOINT_ATTEMPT_RESERVED_LOG}\ncheckpoint_id=41 epoch=41 checkpoint completed\ncheckpoint_id=42 epoch=42 checkpoint completed"
         ),
         RECOVERY_RELEASE_LOG.to_string(),
         RECOVERY_RELEASE_LOG.to_string(),
@@ -4006,7 +4061,7 @@ fn post_release_lifecycle_rejects_missing_or_pre_release_evidence() {
         &resumed_without_reservation,
         DurableCheckpointStatus {
             checkpoint_id: 42,
-            epoch: 44,
+            epoch: 42,
         },
     )
     .unwrap_err()
@@ -4034,7 +4089,7 @@ fn post_release_lifecycle_rejects_missing_or_pre_release_evidence() {
             .contains("lifecycle failure")
     );
 
-    let conflicting = vec![
+    let split_identity = vec![
         format!(
             "{RECOVERY_RELEASE_LOG}\ncheckpoint_id=42 epoch=42 {CHECKPOINT_ATTEMPT_RESERVED_LOG}\ncheckpoint_id=42 epoch=42 checkpoint completed"
         ),
@@ -4044,18 +4099,18 @@ fn post_release_lifecycle_rejects_missing_or_pre_release_evidence() {
         RECOVERY_RELEASE_LOG.to_string(),
     ];
     assert!(validate_post_release_checkpoint_lifecycle(
-        &conflicting,
+        &split_identity,
         DurableCheckpointStatus {
-            checkpoint_id: 41,
-            epoch: 43,
+            checkpoint_id: 42,
+            epoch: 42,
         },
     )
     .unwrap_err()
-    .contains("conflicting checkpoint reservations"));
+    .contains("non-canonical identity"));
 
     let duplicate = vec![
         format!(
-            "{RECOVERY_RELEASE_LOG}\ncheckpoint_id=41 epoch=43 {CHECKPOINT_ATTEMPT_RESERVED_LOG}\ncheckpoint_id=41 epoch=43 {CHECKPOINT_ATTEMPT_RESERVED_LOG}\ncheckpoint_id=41 epoch=43 checkpoint completed"
+            "{RECOVERY_RELEASE_LOG}\ncheckpoint_id=41 epoch=41 {CHECKPOINT_ATTEMPT_RESERVED_LOG}\ncheckpoint_id=41 epoch=41 {CHECKPOINT_ATTEMPT_RESERVED_LOG}\ncheckpoint_id=41 epoch=41 checkpoint completed"
         ),
         RECOVERY_RELEASE_LOG.to_string(),
         RECOVERY_RELEASE_LOG.to_string(),

@@ -4,11 +4,21 @@
 //! Validates the full checkpoint → kill → restart → verify cycle
 //! with aggregate state continuity (running totals survive restart).
 
+use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::array::{Float64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use laminar_core::streaming::StreamCheckpointConfig;
 use laminar_db::{LaminarConfig, LaminarDB};
+
+const CRASH_CHILD_STORAGE_ENV: &str = "LAMINARDB_RECOVERY_CRASH_CHILD_STORAGE";
+const RECOVERY_SOURCE_DDL: &str =
+    "CREATE SOURCE trades (symbol VARCHAR, price DOUBLE, ts TIMESTAMP, \
+     WATERMARK FOR ts AS ts - INTERVAL '1' SECOND)";
+const RECOVERY_STREAM_DDL: &str = "CREATE STREAM trade_summary AS \
+                                   SELECT symbol, SUM(price) AS total_price, COUNT(*) AS cnt \
+                                   FROM trades GROUP BY symbol";
 
 fn config_for(dir: &std::path::Path) -> LaminarConfig {
     LaminarConfig {
@@ -33,9 +43,72 @@ fn make_batch(symbols: &[&str], prices: &[f64], timestamps_ms: &[i64]) -> Record
     .unwrap()
 }
 
+async fn run_checkpoint_crash_child(storage: &std::path::Path) {
+    let executable = std::env::current_exe().expect("current recovery test executable");
+    let mut child = Command::new(executable)
+        .args(["--exact", "checkpoint_crash_child", "--nocapture"])
+        .env(CRASH_CHILD_STORAGE_ENV, storage)
+        .spawn()
+        .expect("spawn checkpoint crash child");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                assert!(status.success(), "checkpoint crash child exited {status}");
+                return;
+            }
+            Ok(None) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("checkpoint crash child exceeded {deadline:?}");
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("poll checkpoint crash child: {error}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn checkpoint_crash_child() {
+    let Some(storage) = std::env::var_os(CRASH_CHILD_STORAGE_ENV) else {
+        return;
+    };
+    let storage = std::path::PathBuf::from(storage);
+    let db = LaminarDB::open_with_config(config_for(&storage)).unwrap();
+    db.execute(RECOVERY_SOURCE_DDL).await.unwrap();
+    db.execute(RECOVERY_STREAM_DDL).await.unwrap();
+    db.start().await.unwrap();
+
+    let source = db.source_untyped("trades").unwrap();
+    for i in 0..100 {
+        source
+            .push_arrow(make_batch(
+                &["AAPL"],
+                &[100.0 + f64::from(i)],
+                &[i64::from(i) * 1000],
+            ))
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let checkpoint = db.checkpoint().await.unwrap();
+    assert!(checkpoint.success, "checkpoint must succeed");
+
+    // Exit without LaminarDB teardown. The OS releases the namespace lock, matching a process
+    // crash; an in-process drop must retain that lock because old tasks may still publish.
+    std::process::exit(0);
+}
+
 /// Test: checkpoint → kill → restart → verify aggregate state survives.
 ///
-/// Pushes 100 events, checkpoints, drops the DB, reopens from checkpoint,
+/// Pushes 100 events, checkpoints, terminates the writer process without teardown, reopens,
 /// pushes 10 more events, and verifies the pipeline processes all data
 /// without resetting aggregate state.
 #[tokio::test]
@@ -43,46 +116,14 @@ async fn test_checkpoint_kill_restart_recovery() {
     let dir = tempfile::tempdir().unwrap();
     let storage = dir.path().to_path_buf();
 
-    let ddl_source = "CREATE SOURCE trades (symbol VARCHAR, price DOUBLE, ts TIMESTAMP, \
-                       WATERMARK FOR ts AS ts - INTERVAL '1' SECOND)";
-    let ddl_stream = "CREATE STREAM trade_summary AS \
-                      SELECT symbol, SUM(price) AS total_price, COUNT(*) AS cnt \
-                      FROM trades GROUP BY symbol";
+    // Phase 1 runs in another process so abrupt termination releases its OS-owned namespace lock.
+    run_checkpoint_crash_child(&storage).await;
 
-    // ── Phase 1: Ingest 100 events and checkpoint ──
+    // Phase 2: Reopen and verify state survived.
     {
         let db = LaminarDB::open_with_config(config_for(&storage)).unwrap();
-        db.execute(ddl_source).await.unwrap();
-        db.execute(ddl_stream).await.unwrap();
-        db.start().await.unwrap();
-
-        let source = db.source_untyped("trades").unwrap();
-        for i in 0..100 {
-            source
-                .push_arrow(make_batch(
-                    &["AAPL"],
-                    &[100.0 + f64::from(i)],
-                    &[i64::from(i) * 1000],
-                ))
-                .unwrap();
-        }
-
-        // Let the pipeline process all events
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
-        // Take checkpoint
-        let cp = db.checkpoint().await.unwrap();
-        assert!(cp.success, "checkpoint must succeed");
-
-        // Drop the DB (simulates kill)
-        db.close();
-    }
-
-    // ── Phase 2: Reopen and verify state survived ──
-    {
-        let db = LaminarDB::open_with_config(config_for(&storage)).unwrap();
-        db.execute(ddl_source).await.unwrap();
-        db.execute(ddl_stream).await.unwrap();
+        db.execute(RECOVERY_SOURCE_DDL).await.unwrap();
+        db.execute(RECOVERY_STREAM_DDL).await.unwrap();
         db.start().await.unwrap();
 
         // Push 10 more events

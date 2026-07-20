@@ -851,6 +851,16 @@ struct ReservedCut {
     reserved_bytes: usize,
 }
 
+fn require_canonical_checkpoint_attempt(attempt: CheckpointAttempt) -> Result<(), String> {
+    if attempt.is_canonical() {
+        return Ok(());
+    }
+    Err(format!(
+        "subscription checkpoint cut requires one nonzero canonical checkpoint ID; received epoch={} checkpoint_id={}",
+        attempt.epoch, attempt.checkpoint_id
+    ))
+}
+
 #[derive(Default)]
 struct RegistryLifecycle {
     latest_committed_epoch: Option<u64>,
@@ -923,6 +933,7 @@ impl SubscriptionRegistry {
 
     /// Snapshot every live object's exact cursor at the aligned checkpoint cut.
     pub(crate) fn reserve_cut(&self, attempt: CheckpointAttempt) -> Result<(), String> {
+        require_canonical_checkpoint_attempt(attempt)?;
         let mut lifecycle = self.lifecycle.lock();
         if let Some(existing) = &lifecycle.pending_cut {
             return Err(format!(
@@ -984,6 +995,7 @@ impl SubscriptionRegistry {
 
     /// Resolve a previously reserved cut after the checkpoint is durable.
     pub(crate) fn commit_cut(&self, attempt: CheckpointAttempt) -> Result<(), String> {
+        require_canonical_checkpoint_attempt(attempt)?;
         let mut lifecycle = self.lifecycle.lock();
         let Some(pending) = &lifecycle.pending_cut else {
             return Err(format!(
@@ -1054,6 +1066,9 @@ impl SubscriptionRegistry {
     }
 
     pub(crate) fn abort_cut(&self, attempt: CheckpointAttempt) {
+        if !attempt.is_canonical() {
+            return;
+        }
         let mut lifecycle = self.lifecycle.lock();
         if lifecycle
             .pending_cut
@@ -1271,9 +1286,9 @@ mod tests {
     async fn as_of_starts_strictly_after_exact_retained_barrier() {
         let registry = SubscriptionRegistry::new();
         registry.configure("mv", 1 << 20);
-        registry.broadcast_barrier(1, 10);
+        registry.broadcast_barrier(1, 1);
         registry.send_batch("mv", batch(vec![10])).unwrap();
-        registry.broadcast_barrier(2, 20);
+        registry.broadcast_barrier(2, 2);
 
         let mut reader = registry
             .subscribe("mv", SubscribeStart::AsOfEpoch(1))
@@ -1286,7 +1301,7 @@ mod tests {
             next_update(&mut reader).await.as_ref(),
             MvUpdate::Barrier {
                 epoch: 2,
-                checkpoint_id: 20,
+                checkpoint_id: 2,
                 ..
             }
         ));
@@ -1299,7 +1314,7 @@ mod tests {
         registry.send_batch("mv", batch(vec![10])).unwrap();
         let mut live = registry.subscribe("mv", SubscribeStart::Tail).unwrap();
 
-        let attempt = CheckpointAttempt::new(1, 10);
+        let attempt = CheckpointAttempt::canonical(1);
         registry.reserve_cut(attempt).unwrap();
         registry.send_batch("mv", batch(vec![20])).unwrap();
         registry.commit_cut(attempt).unwrap();
@@ -1313,7 +1328,7 @@ mod tests {
             next_update(&mut live).await.as_ref(),
             MvUpdate::Barrier {
                 epoch: 1,
-                checkpoint_id: 10,
+                checkpoint_id: 1,
                 through_sequence: 1,
             }
         ));
@@ -1335,7 +1350,7 @@ mod tests {
         let registry = SubscriptionRegistry::with_storage_budget(entry_bytes);
         registry.configure("mv", 1 << 20);
         registry.send_batch("mv", sample).unwrap();
-        let attempt = CheckpointAttempt::new(1, 10);
+        let attempt = CheckpointAttempt::canonical(1);
 
         let error = registry.reserve_cut(attempt).unwrap_err();
 
@@ -1350,14 +1365,14 @@ mod tests {
     fn abort_releases_marker_headroom_for_the_next_attempt() {
         let registry = SubscriptionRegistry::with_storage_budget(BARRIER_ENTRY_BYTES);
         registry.configure("mv", BARRIER_ENTRY_BYTES);
-        let first = CheckpointAttempt::new(1, 10);
+        let first = CheckpointAttempt::canonical(1);
         registry.reserve_cut(first).unwrap();
         assert_eq!(registry.charged_bytes(), BARRIER_ENTRY_BYTES);
 
         registry.abort_cut(first);
         assert_eq!(registry.charged_bytes(), 0);
 
-        let second = CheckpointAttempt::new(2, 20);
+        let second = CheckpointAttempt::canonical(2);
         registry.reserve_cut(second).unwrap();
         assert_eq!(registry.charged_bytes(), BARRIER_ENTRY_BYTES);
         registry.abort_cut(second);
@@ -1368,8 +1383,8 @@ mod tests {
     fn conflicting_attempt_cannot_steal_the_reserved_cut() {
         let registry = SubscriptionRegistry::with_storage_budget(BARRIER_ENTRY_BYTES);
         registry.configure("mv", BARRIER_ENTRY_BYTES);
-        let reserved = CheckpointAttempt::new(1, 10);
-        let conflicting = CheckpointAttempt::new(2, 20);
+        let reserved = CheckpointAttempt::canonical(1);
+        let conflicting = CheckpointAttempt::canonical(2);
         registry.reserve_cut(reserved).unwrap();
 
         assert!(registry.reserve_cut(conflicting).is_err());
@@ -1391,6 +1406,43 @@ mod tests {
     }
 
     #[test]
+    fn noncanonical_cut_attempts_cannot_mutate_registry_state() {
+        let registry = SubscriptionRegistry::with_storage_budget(BARRIER_ENTRY_BYTES);
+        registry.configure("mv", BARRIER_ENTRY_BYTES);
+        let invalid = CheckpointAttempt::new(1, 2);
+        let log = registry.streams.read().get("mv").cloned().unwrap();
+
+        let error = registry.reserve_cut(invalid).unwrap_err();
+
+        assert!(error.contains("canonical checkpoint ID"));
+        assert!(registry.lifecycle.lock().pending_cut.is_none());
+        assert_eq!(log.inner.lock().reserved_marker, None);
+        assert_eq!(registry.charged_bytes(), 0);
+
+        let canonical = CheckpointAttempt::canonical(1);
+        registry.reserve_cut(canonical).unwrap();
+        assert!(registry.commit_cut(invalid).is_err());
+        registry.abort_cut(invalid);
+
+        assert_eq!(
+            registry
+                .lifecycle
+                .lock()
+                .pending_cut
+                .as_ref()
+                .map(|cut| cut.attempt),
+            Some(canonical)
+        );
+        assert_eq!(log.inner.lock().reserved_marker, Some(canonical));
+        assert_eq!(registry.charged_bytes(), BARRIER_ENTRY_BYTES);
+
+        registry.abort_cut(canonical);
+        assert!(registry.lifecycle.lock().pending_cut.is_none());
+        assert_eq!(log.inner.lock().reserved_marker, None);
+        assert_eq!(registry.charged_bytes(), 0);
+    }
+
+    #[test]
     fn sequence_exhaustion_rejects_cut_reservation_without_claiming_budget() {
         let registry = SubscriptionRegistry::with_storage_budget(BARRIER_ENTRY_BYTES);
         registry.configure("mv", BARRIER_ENTRY_BYTES);
@@ -1402,7 +1454,7 @@ mod tests {
         }
 
         let error = registry
-            .reserve_cut(CheckpointAttempt::new(1, 10))
+            .reserve_cut(CheckpointAttempt::canonical(1))
             .unwrap_err();
 
         assert!(error.contains("sequence space"));
@@ -1416,7 +1468,7 @@ mod tests {
         registry.configure("mv", BARRIER_ENTRY_BYTES);
         let log = registry.streams.read().get("mv").cloned().unwrap();
         log.terminate("injected terminal state");
-        let attempt = CheckpointAttempt::new(1, 10);
+        let attempt = CheckpointAttempt::canonical(1);
 
         registry.reserve_cut(attempt).unwrap();
 
@@ -1447,7 +1499,7 @@ mod tests {
             inner.next_sequence = u64::MAX - 1;
             inner.retention_floor = u64::MAX - 1;
         }
-        let attempt = CheckpointAttempt::new(1, 10);
+        let attempt = CheckpointAttempt::canonical(1);
         registry.reserve_cut(attempt).unwrap();
 
         let error = registry.send_batch("mv", sample).unwrap_err();
@@ -1470,7 +1522,7 @@ mod tests {
         let registry = SubscriptionRegistry::with_storage_budget(BARRIER_ENTRY_BYTES);
         registry.configure("mv", BARRIER_ENTRY_BYTES);
         let log = registry.streams.read().get("mv").cloned().unwrap();
-        let attempt = CheckpointAttempt::new(1, 10);
+        let attempt = CheckpointAttempt::canonical(1);
         registry.reserve_cut(attempt).unwrap();
 
         let error = registry.send_batch("mv", batch(vec![1])).unwrap_err();
@@ -1491,7 +1543,7 @@ mod tests {
     fn unobserved_commit_releases_reserved_marker_bytes() {
         let registry = SubscriptionRegistry::with_storage_budget(BARRIER_ENTRY_BYTES);
         let reader = registry.subscribe("mv", SubscribeStart::Tail).unwrap();
-        let attempt = CheckpointAttempt::new(1, 10);
+        let attempt = CheckpointAttempt::canonical(1);
         registry.reserve_cut(attempt).unwrap();
         assert_eq!(registry.charged_bytes(), BARRIER_ENTRY_BYTES);
 
@@ -1507,7 +1559,7 @@ mod tests {
         let registry = SubscriptionRegistry::with_storage_budget(BARRIER_ENTRY_BYTES);
         registry.configure("mv", BARRIER_ENTRY_BYTES);
         let log = registry.streams.read().get("mv").cloned().unwrap();
-        let attempt = CheckpointAttempt::new(1, 10);
+        let attempt = CheckpointAttempt::canonical(1);
         registry.reserve_cut(attempt).unwrap();
         log.inner.lock().terminal_error = Some("injected terminal state".into());
 
@@ -1523,14 +1575,14 @@ mod tests {
         let budget = StdArc::new(SubscriptionMemoryBudget::new(BARRIER_ENTRY_BYTES));
         let registry = SubscriptionRegistry::with_budget(StdArc::clone(&budget));
         registry.configure("mv", BARRIER_ENTRY_BYTES);
-        let first = CheckpointAttempt::new(1, 10);
+        let first = CheckpointAttempt::canonical(1);
         registry.reserve_cut(first).unwrap();
 
         registry.invalidate_all("injected recovery");
         assert_eq!(budget.used(), 0);
         assert!(registry.lifecycle.lock().pending_cut.is_none());
 
-        let second = CheckpointAttempt::new(2, 20);
+        let second = CheckpointAttempt::canonical(2);
         registry.reserve_cut(second).unwrap();
         assert!(registry.drop_name("mv"));
         assert_eq!(budget.used(), 0);
@@ -1542,7 +1594,7 @@ mod tests {
         let registry = SubscriptionRegistry::with_storage_budget(1 << 20);
         registry.configure("mv", 1 << 20);
         let mut dropped_reader = registry.subscribe("mv", SubscribeStart::Tail).unwrap();
-        let attempt = CheckpointAttempt::new(1, 10);
+        let attempt = CheckpointAttempt::canonical(1);
         registry.reserve_cut(attempt).unwrap();
 
         assert!(registry.drop_name("mv"));
@@ -1573,7 +1625,9 @@ mod tests {
         {
             let registry = SubscriptionRegistry::with_budget(StdArc::clone(&budget));
             registry.configure("mv", BARRIER_ENTRY_BYTES);
-            registry.reserve_cut(CheckpointAttempt::new(1, 10)).unwrap();
+            registry
+                .reserve_cut(CheckpointAttempt::canonical(1))
+                .unwrap();
             assert_eq!(budget.used(), BARRIER_ENTRY_BYTES);
         }
         assert_eq!(budget.used(), 0);
@@ -1593,7 +1647,7 @@ mod tests {
                 update,
             } if matches!(update.as_ref(), MvUpdate::Batch(_))
         ));
-        let abandoned = CheckpointAttempt::new(1, 10);
+        let abandoned = CheckpointAttempt::canonical(1);
         registry.reserve_cut(abandoned).unwrap();
 
         registry.invalidate_all("injected recovery");
@@ -1613,7 +1667,7 @@ mod tests {
             } if matches!(update.as_ref(), MvUpdate::Batch(_))
         ));
 
-        let committed = CheckpointAttempt::new(2, 20);
+        let committed = CheckpointAttempt::canonical(2);
         registry.reserve_cut(committed).unwrap();
         registry.commit_cut(committed).unwrap();
         assert!(matches!(
@@ -1625,7 +1679,7 @@ mod tests {
                 update.as_ref(),
                 MvUpdate::Barrier {
                     epoch: 2,
-                    checkpoint_id: 20,
+                    checkpoint_id: 2,
                     through_sequence: 2,
                 }
             )
@@ -1636,8 +1690,8 @@ mod tests {
     fn as_of_classifies_future_missing_and_pruned_epochs() {
         let registry = SubscriptionRegistry::with_storage_budget(1 << 20);
         registry.configure("mv", 1 << 20);
-        registry.broadcast_barrier(5, 50);
-        registry.broadcast_barrier(7, 70);
+        registry.broadcast_barrier(5, 5);
+        registry.broadcast_barrier(7, 7);
 
         assert!(matches!(
             registry
@@ -1679,7 +1733,7 @@ mod tests {
     #[test]
     fn as_of_knows_latest_epoch_without_a_stored_log_entry() {
         let registry = SubscriptionRegistry::with_storage_budget(1 << 20);
-        registry.broadcast_barrier(11, 110);
+        registry.broadcast_barrier(11, 11);
 
         assert!(matches!(
             registry

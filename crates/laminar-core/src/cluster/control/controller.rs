@@ -21,7 +21,9 @@ use crate::checkpoint::{
     MAX_CHECKPOINT_PARTICIPANTS, MAX_PREPARED_CHECKPOINT_WITNESSES,
 };
 use crate::cluster::discovery::{assignable_node_ids, NodeId, NodeInfo, NodeState};
-use crate::state::{CheckpointAttempt, Locality};
+#[cfg(test)]
+use crate::state::CheckpointAttempt;
+use crate::state::Locality;
 
 const RECOVERY_INCARNATION_KEY: &str = "control:recovery-incarnation";
 const DRAIN_ACK_KEY: &str = "control:drain-ack";
@@ -3321,15 +3323,6 @@ impl ClusterController {
         self.barrier.announce_prepare(ann, quorum_window).await
     }
 
-    /// Highest valid attempt announced anywhere in the cluster — used by a node reclaiming
-    /// leadership to advance its allocator past the in-flight epoch.
-    ///
-    /// # Errors
-    /// Fails when announcement history is malformed or conflicts across attempt dimensions.
-    pub async fn max_announced_epoch(&self) -> Result<Option<CheckpointAttempt>, String> {
-        self.barrier.max_announced().await
-    }
-
     /// Observe the merged barrier history, validating durable authority only when `predicate`
     /// selects the announcement. Malformed or conflicting histories fail before filtering.
     ///
@@ -5962,7 +5955,7 @@ mod tests {
         let c = ctl(1, vec![]);
         c.announce_barrier(&BarrierAnnouncement {
             epoch: 5,
-            checkpoint_id: 1,
+            checkpoint_id: 5,
             assignment_fence: None,
             leader_proof: None,
             phase: crate::cluster::control::Phase::Prepare,
@@ -6019,7 +6012,7 @@ mod tests {
         .unwrap();
         let mut announcement = BarrierAnnouncement {
             epoch: 9,
-            checkpoint_id: 90,
+            checkpoint_id: 9,
             assignment_fence: Some(fence),
             leader_proof: Some(proof),
             phase: Phase::Prepare,
@@ -6071,7 +6064,7 @@ mod tests {
             ANNOUNCEMENT_KEY,
             serde_json::to_string(&BarrierAnnouncement {
                 epoch: 9,
-                checkpoint_id: 90,
+                checkpoint_id: 9,
                 assignment_fence: None,
                 leader_proof: Some(test_leader_proof(1, Uuid::from_u128(11), 1)),
                 phase: Phase::Prepare,
@@ -6126,7 +6119,7 @@ mod tests {
         follower.publish_checkpoint_assignment_fence(Some(announced.clone()));
         let announcement = BarrierAnnouncement {
             epoch: 9,
-            checkpoint_id: 90,
+            checkpoint_id: 9,
             assignment_fence: Some(announced.clone()),
             leader_proof: Some(lease.proof()),
             phase: Phase::Prepare,
@@ -6179,77 +6172,6 @@ mod tests {
             .expect_err("a stale leader token must fail before assignment disposition");
         assert!(
             error.contains("does not match the latest durable leader lease"),
-            "{error}"
-        );
-    }
-
-    #[cfg(feature = "cluster")]
-    #[tokio::test]
-    async fn wait_for_barrier_propagates_mixed_attempt_conflict_immediately() {
-        let leader_kv = Arc::new(InMemoryKv::new(NodeId(1)));
-        let follower_kv = Arc::new(InMemoryKv::new(NodeId(2)));
-        let (_leader_members_tx, leader_members_rx) = watch::channel(vec![info(2)]);
-        let (_follower_members_tx, follower_members_rx) = watch::channel(vec![info(1)]);
-        let leader = ClusterController::new(NodeId(1), leader_kv.clone(), None, leader_members_rx);
-        let follower =
-            ClusterController::new(NodeId(2), follower_kv.clone(), None, follower_members_rx);
-        let leader_addr = leader
-            .start_barrier_server("127.0.0.1:0".parse().unwrap(), None)
-            .await
-            .unwrap();
-        let follower_addr = follower
-            .start_barrier_server("127.0.0.1:0".parse().unwrap(), None)
-            .await
-            .unwrap();
-        leader_kv.seed(NodeId(2), BARRIER_ADDR_KEY, follower_addr.to_string());
-        follower_kv.seed(NodeId(1), BARRIER_ADDR_KEY, leader_addr.to_string());
-
-        leader
-            .announce_barrier(&BarrierAnnouncement {
-                epoch: 10,
-                checkpoint_id: 100,
-                assignment_fence: None,
-                leader_proof: None,
-                phase: Phase::Abort,
-                flags: 0,
-            })
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let delivered = follower
-                    .barrier
-                    .announcement_watch()
-                    .is_some_and(|watch| watch.borrow().is_some());
-                if delivered {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("direct announcement must reach the follower before conflict injection");
-
-        follower_kv.seed(
-            NodeId(1),
-            ANNOUNCEMENT_KEY,
-            serde_json::to_string(&BarrierAnnouncement {
-                epoch: 11,
-                checkpoint_id: 99,
-                assignment_fence: None,
-                leader_proof: None,
-                phase: Phase::Abort,
-                flags: 0,
-            })
-            .unwrap(),
-        );
-        let error = follower
-            .wait_for_barrier(|_| false, Duration::from_secs(10))
-            .await
-            .expect_err("mixed attempt dimensions must fail instead of timing out");
-
-        assert!(
-            error.contains("conflicting direct and durable barrier attempts"),
             "{error}"
         );
     }
@@ -6739,13 +6661,9 @@ mod tests {
         successor
     }
 
-    fn prepared_witness(
-        epoch: u64,
-        checkpoint_id: u64,
-        participant_id: u64,
-    ) -> PreparedCheckpointWitness {
+    fn prepared_witness(checkpoint_id: u64, participant_id: u64) -> PreparedCheckpointWitness {
         PreparedCheckpointWitness::new(
-            CheckpointAttempt::new(epoch, checkpoint_id),
+            CheckpointAttempt::canonical(checkpoint_id),
             participant_id,
             Uuid::from_u128(500).to_string(),
             crate::checkpoint::PipelineIdentity::empty(),
@@ -7991,7 +7909,7 @@ mod tests {
         };
         let round = recovery_round_with_evidence(&controller, 41, &proof, &[1], vec![evidence]);
         controller
-            .announce_stopped(&round, vec![prepared_witness(7, 42, evidence_node.0)])
+            .announce_stopped(&round, vec![prepared_witness(42, evidence_node.0)])
             .await
             .unwrap();
         kv.seed(
@@ -8035,7 +7953,7 @@ mod tests {
         controller.publish_recovery_incarnation().await.unwrap();
         let proof = test_leader_proof(1, controller.recovery_incarnation(), 1);
         let round = recovery_round(&controller, 41, &proof, &[1]);
-        let witnesses = vec![prepared_witness(7, 42, 1)];
+        let witnesses = vec![prepared_witness(42, 1)];
 
         controller
             .announce_stopped(&round, witnesses.clone())
@@ -8122,7 +8040,7 @@ mod tests {
         assert!(error.contains("exact frozen round"), "{error}");
 
         let witnesses = (1..=MAX_PREPARED_CHECKPOINT_WITNESSES as u64)
-            .map(|attempt| prepared_witness(attempt, attempt, 1))
+            .map(|attempt| prepared_witness(attempt, 1))
             .collect();
         let full = stopped_report(&controller, &round, witnesses);
         let raw = encode_recovery_stopped_report(&full, &round).unwrap();
@@ -8166,7 +8084,7 @@ mod tests {
                 node_id: 1,
                 boot_incarnation: controller.recovery_incarnation(),
             },
-            vec![prepared_witness(1, 1, 2)],
+            vec![prepared_witness(1, 2)],
         )
         .unwrap_err();
         assert!(error.contains("does not match report publisher"), "{error}");
@@ -8177,12 +8095,12 @@ mod tests {
                 node_id: 1,
                 boot_incarnation: controller.recovery_incarnation(),
             },
-            vec![prepared_witness(2, 2, 1), prepared_witness(1, 1, 1)],
+            vec![prepared_witness(2, 1), prepared_witness(1, 1)],
         )
         .unwrap_err();
         assert!(error.contains("uniquely sorted"), "{error}");
 
-        let duplicate = prepared_witness(1, 1, 1);
+        let duplicate = prepared_witness(1, 1);
         let error = RecoveryStoppedReport::new(
             &round,
             CheckpointParticipant {
@@ -8195,7 +8113,7 @@ mod tests {
         assert!(error.contains("uniquely sorted"), "{error}");
 
         let witnesses = (1..=(MAX_PREPARED_CHECKPOINT_WITNESSES + 1) as u64)
-            .map(|attempt| prepared_witness(attempt, attempt, 1))
+            .map(|attempt| prepared_witness(attempt, 1))
             .collect();
         let error = RecoveryStoppedReport::new(
             &round,

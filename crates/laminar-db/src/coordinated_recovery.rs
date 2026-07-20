@@ -4833,126 +4833,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outcome_floor_cannot_settle_an_incomparable_prepared_witness() {
-        use crate::checkpoint_coordinator::{CheckpointConfig, CheckpointCoordinator};
-        use laminar_core::checkpoint::{
-            CheckpointWatermark, ClusterRecoveryCapsule, ParticipantRecoveryRef, PipelineIdentity,
-            PreparedCheckpointWitness, CLUSTER_RECOVERY_CAPSULE_VERSION,
-        };
-        use laminar_core::checkpoint_decision::{CheckpointDecisionStore, CheckpointVerdict};
-        use laminar_core::storage::checkpoint_store::FileSystemCheckpointStore;
-
-        let backing: Arc<dyn object_store::ObjectStore> =
-            Arc::new(object_store::memory::InMemory::new());
-        let decisions = CheckpointDecisionStore::new(Arc::clone(&backing));
-        let deployment_id = decisions.load_or_create_deployment_id().await.unwrap();
-        let (controller, _members_tx, kv) = controller_on(Vec::new(), backing).await;
-        report_test_fault(&controller).await;
-        let round = round_for_current_faults(&controller, 8, &[1]).await;
-        publish_round_roster(&controller, &kv, &round).await;
-        controller.announce_recover_prepare(&round).await.unwrap();
-        let authority = controller.checkpoint_authority().unwrap();
-        authority
-            .record_cluster_outcome(
-                &round.leader_proof,
-                5,
-                1,
-                round.assignment_fence.clone(),
-                CheckpointVerdict::Abort,
-                None,
-            )
-            .await
-            .unwrap();
-        let digest = "11".repeat(32);
-        let capsule = decisions
-            .create_recovery_capsule(&ClusterRecoveryCapsule {
-                version: CLUSTER_RECOVERY_CAPSULE_VERSION,
-                attempt: laminar_core::state::CheckpointAttempt::new(7, 3),
-                deployment_id: deployment_id.clone(),
-                pipeline_identity: PipelineIdentity::empty(),
-                assignment_fence: round.assignment_fence.clone(),
-                seal_inventory_sha256: digest.clone(),
-                participants: vec![ParticipantRecoveryRef {
-                    participant_id: 1,
-                    readiness_sha256: digest.clone(),
-                    manifest_sha256: digest.clone(),
-                    portable_state_sha256: digest.clone(),
-                }],
-                source_offsets: std::collections::BTreeMap::new(),
-                source_metadata: std::collections::BTreeMap::new(),
-                source_assignment_versions: std::collections::BTreeMap::new(),
-                source_watermarks: std::collections::BTreeMap::new(),
-                cluster_watermark: CheckpointWatermark::Uninitialized,
-                recovery_watermark_frontier: None,
-                portable_state_sha256: digest,
-            })
-            .await
-            .unwrap();
-        authority
-            .record_cluster_outcome(
-                &round.leader_proof,
-                7,
-                3,
-                round.assignment_fence.clone(),
-                CheckpointVerdict::Commit,
-                Some(capsule),
-            )
-            .await
-            .unwrap();
-        authority
-            .prune_cluster_outcomes_before(&round.leader_proof, 7, |_| async {
-                Ok::<(), String>(())
-            })
-            .await
-            .unwrap();
-
-        let checkpoint_dir = tempfile::tempdir().unwrap();
-        let store =
-            Box::new(FileSystemCheckpointStore::new(checkpoint_dir.path()).with_participant_id(1));
-        let mut coordinator = CheckpointCoordinator::new(CheckpointConfig::default(), store)
-            .await
-            .unwrap();
-        coordinator
-            .bind_deployment_id(deployment_id.clone())
-            .unwrap();
-        coordinator
-            .bind_pipeline_identity(PipelineIdentity::empty())
-            .unwrap();
-        let db = Arc::new(LaminarDB::open().unwrap());
-        *db.coordinator.lock().await = Some(coordinator);
-
-        let witness = PreparedCheckpointWitness::new(
-            laminar_core::state::CheckpointAttempt::new(6, 99),
-            1,
-            deployment_id,
-            PipelineIdentity::empty(),
-        )
-        .unwrap();
-        let report = RecoveryStoppedReport::new(
-            &round,
-            CheckpointParticipant {
-                node_id: 1,
-                boot_incarnation: controller.recovery_incarnation(),
-            },
-            vec![witness],
-        )
-        .unwrap();
-
-        let error = settle_stopped_prepared_witnesses(&db, &controller, &round, &[report])
-            .await
-            .expect_err("the outcome floor cannot settle an incomparable Prepared witness");
-        assert!(error.contains("not strictly dominated"), "{error}");
-        assert!(authority.cluster_outcome(6).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
     async fn ambiguity_audit_finds_an_outcome_that_becomes_visible_after_the_write_returns() {
         let (controller, _members_tx, kv) = controller(Vec::new()).await;
         report_test_fault(&controller).await;
         let round = round_for_current_faults(&controller, 8, &[1]).await;
         publish_round_roster(&controller, &kv, &round).await;
         let authority = controller.checkpoint_authority().unwrap();
-        let attempt = CheckpointAttempt::new(6, 60);
+        let attempt = CheckpointAttempt::new(60, 60);
         let writer = {
             let authority = Arc::clone(&authority);
             let proof = round.leader_proof.clone();
@@ -4960,7 +4847,7 @@ mod tests {
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(25)).await;
                 authority
-                    .record_cluster_outcome(&proof, 6, 60, fence, CheckpointVerdict::Abort, None)
+                    .record_cluster_outcome(&proof, 60, 60, fence, CheckpointVerdict::Abort, None)
                     .await
                     .unwrap()
             })
@@ -5007,7 +4894,7 @@ mod tests {
 
         let error = audit_cluster_outcome_until(
             authority.as_ref(),
-            CheckpointAttempt::new(99, 990),
+            CheckpointAttempt::new(990, 990),
             tokio::time::Instant::now() + Duration::from_millis(25),
         )
         .await
@@ -5022,7 +4909,7 @@ mod tests {
         let round = round_for_current_faults(&controller, 8, &[1]).await;
         publish_round_roster(&controller, &kv, &round).await;
         let authority = controller.checkpoint_authority().unwrap();
-        let attempt = CheckpointAttempt::new(1, 10);
+        let attempt = CheckpointAttempt::new(10, 10);
 
         // Model a create-once Abort whose successful write response was lost. Enough newer
         // terminals then arrive to compact its exact record before reconciliation begins.
@@ -5043,12 +4930,13 @@ mod tests {
             }
             RecordOutcomeResult::Conflict { winner } => winner,
         };
-        for epoch in 2..=80 {
+        for sequence in 2..=80 {
+            let checkpoint_id = sequence * 10;
             authority
                 .record_cluster_outcome(
                     &round.leader_proof,
-                    epoch,
-                    epoch * 10,
+                    checkpoint_id,
+                    checkpoint_id,
                     round.assignment_fence.clone(),
                     CheckpointVerdict::Abort,
                     None,
@@ -5251,7 +5139,7 @@ mod tests {
         )
         .unwrap();
         let witness = PreparedCheckpointWitness::new(
-            laminar_core::state::CheckpointAttempt::new(6, 60),
+            laminar_core::state::CheckpointAttempt::new(60, 60),
             2,
             deployment_id,
             PipelineIdentity::empty(),
@@ -5271,7 +5159,7 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome = authority.cluster_outcome(6).await.unwrap().unwrap();
+        let outcome = authority.cluster_outcome(60).await.unwrap().unwrap();
         assert_eq!(outcome.checkpoint_id, 60);
         assert_eq!(outcome.verdict, CheckpointVerdict::Abort);
         assert_eq!(
@@ -5282,7 +5170,7 @@ mod tests {
         let delayed = authority
             .record_cluster_outcome(
                 &predecessor_lease.proof(),
-                6,
+                60,
                 60,
                 fence,
                 CheckpointVerdict::Commit,
@@ -5297,7 +5185,7 @@ mod tests {
             authority
                 .record_cluster_outcome(
                     &successor_lease.proof(),
-                    6,
+                    60,
                     60,
                     round.assignment_fence,
                     CheckpointVerdict::Abort,

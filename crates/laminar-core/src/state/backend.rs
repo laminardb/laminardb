@@ -2,8 +2,11 @@
 //! and exposes an exact-attempt durability seal. It is not the hot keyed-state
 //! implementation used while operators process records.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use bytes::Bytes;
+use object_store::ObjectStore;
 use sha2::{Digest, Sha256};
 
 use crate::checkpoint::{
@@ -56,8 +59,9 @@ impl StateNamespaceBinding {
 
 /// Exact identity of one checkpoint attempt.
 ///
-/// `epoch` is logical pipeline progress and `checkpoint_id` is the never-reused attempt identity.
-/// Neither dimension alone orders attempts: valid progress requires both to move together.
+/// Runtime-generated and persisted attempts use one durable order: `epoch == checkpoint_id`.
+/// The duplicated fields remain in the current wire/storage layout and are validated at every
+/// boundary.
 #[derive(
     Debug,
     Clone,
@@ -99,6 +103,18 @@ impl CheckpointAttempt {
             epoch,
             checkpoint_id,
         }
+    }
+
+    /// Construct a runtime attempt from the single durable checkpoint order.
+    #[must_use]
+    pub const fn canonical(checkpoint_id: u64) -> Self {
+        Self::new(checkpoint_id, checkpoint_id)
+    }
+
+    /// Whether both persisted fields represent the same durable checkpoint identity.
+    #[must_use]
+    pub const fn is_canonical(self) -> bool {
+        self.epoch != 0 && self.epoch == self.checkpoint_id
     }
 
     /// Relate this attempt to `other` without inventing a lexicographic order.
@@ -361,6 +377,11 @@ impl CheckpointSealInventory {
     /// An empty descriptor inventory has no descriptor authority. Local descriptors return
     /// `None`; a mixed, incomplete, or assignment-mismatched inventory is rejected.
     pub fn descriptor_leader_proof(&self) -> Result<Option<&LeaderProof>, String> {
+        if !self.attempt.is_canonical() {
+            return Err(
+                "checkpoint seal inventory must use one nonzero canonical checkpoint ID".into(),
+            );
+        }
         if self.sealed_descriptors.len() != self.required_descriptors.len() {
             return Err(
                 "checkpoint seal descriptor attestations do not exactly cover its keys".into(),
@@ -497,6 +518,9 @@ impl CheckpointSeal {
         if self.instance_id.is_empty() || self.execution_id.is_nil() {
             return Err("checkpoint seal has an empty writer identity".into());
         }
+        if !self.attempt.is_canonical() {
+            return Err("checkpoint seal must use one nonzero canonical checkpoint ID".into());
+        }
         if self
             .assignment_fence
             .as_ref()
@@ -596,7 +620,11 @@ impl StateBackendDurability {
     #[must_use]
     pub fn for_storage_url(url: &str) -> Self {
         match url.split_once("://").map(|(scheme, _)| scheme) {
-            Some("file") => Self::NodeDurable,
+            Some("file")
+                if crate::checkpoint::object_store_builder::is_absolute_local_file_url(url) =>
+            {
+                Self::NodeDurable
+            }
             Some("s3" | "gs" | "az" | "abfs" | "abfss") => Self::ClusterShared,
             _ => Self::Volatile,
         }
@@ -915,6 +943,14 @@ pub trait StateBackend: Send + Sync + 'static {
         StateBackendDurability::Volatile
     }
 
+    /// Whether this backend uses the exact object-store handle admitted by cluster startup.
+    ///
+    /// The default fails closed. Object-store-backed cluster implementations override this with
+    /// handle identity, not URL or namespace-string equivalence.
+    fn uses_exact_object_store(&self, _expected: &Arc<dyn ObjectStore>) -> bool {
+        false
+    }
+
     /// Raise the backend's authoritative assignment version — the
     /// exact [`VnodeRegistry::assignment_version`] it will accept on
     /// partial and descriptor writes. Hosts call this on boot
@@ -957,7 +993,7 @@ mod tests {
 
     #[test]
     fn checkpoint_attempt_supports_serde_rkyv_hash_and_explicit_relation() {
-        let attempt = CheckpointAttempt::new(7, 42);
+        let attempt = CheckpointAttempt::canonical(42);
         let json = serde_json::to_vec(&attempt).unwrap();
         assert_eq!(
             serde_json::from_slice::<CheckpointAttempt>(&json).unwrap(),
@@ -976,11 +1012,11 @@ mod tests {
 
         use CheckpointAttemptRelation::{Conflict, Exact, Newer, Older};
         assert_eq!(attempt.relation_to(attempt), Exact);
-        assert_eq!(CheckpointAttempt::new(6, 41).relation_to(attempt), Older);
-        assert_eq!(CheckpointAttempt::new(8, 43).relation_to(attempt), Newer);
-        assert_eq!(CheckpointAttempt::new(6, 43).relation_to(attempt), Conflict);
-        assert_eq!(CheckpointAttempt::new(8, 41).relation_to(attempt), Conflict);
-        assert_eq!(CheckpointAttempt::new(7, 41).relation_to(attempt), Conflict);
-        assert_eq!(CheckpointAttempt::new(7, 43).relation_to(attempt), Conflict);
+        assert_eq!(CheckpointAttempt::canonical(41).relation_to(attempt), Older);
+        assert_eq!(CheckpointAttempt::canonical(43).relation_to(attempt), Newer);
+
+        let malformed = CheckpointAttempt::new(41, 43);
+        assert!(!malformed.is_canonical());
+        assert_eq!(malformed.relation_to(attempt), Conflict);
     }
 }

@@ -36,11 +36,12 @@ use laminar_connectors::mongodb::{
 use testcontainers::ImageExt;
 
 fn initial_source_start(config: &ConnectorConfig) -> SourceStart {
-    SourceStart {
-        config: config.clone(),
-        position: SourcePosition::Initial,
-        delivery: DeliveryGuarantee::BestEffort,
-    }
+    SourceStart::new(
+        config.clone(),
+        SourcePosition::Initial,
+        DeliveryGuarantee::BestEffort,
+    )
+    .unwrap()
 }
 
 async fn collection_uuid(db: &mongodb::Database, collection: &str) -> String {
@@ -475,14 +476,17 @@ async fn checkpoint_resume_covers_empty_anchor_and_exact_emitted_token() {
     let config = MongoDbSourceConfig::new(&uri, "test_resume", "docs");
     let mut source = MongoDbCdcSource::new(config, None);
     source
-        .start(SourceStart {
-            config: connector_config.clone(),
-            position: SourcePosition::Resume {
-                attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
-                checkpoint: empty_checkpoint,
-            },
-            delivery: DeliveryGuarantee::AtLeastOnce,
-        })
+        .start(
+            SourceStart::new(
+                connector_config.clone(),
+                SourcePosition::Resume {
+                    attempt: laminar_core::state::CheckpointAttempt::new(1, 1),
+                    checkpoint: empty_checkpoint,
+                },
+                DeliveryGuarantee::AtLeastOnce,
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
 
@@ -511,14 +515,17 @@ async fn checkpoint_resume_covers_empty_anchor_and_exact_emitted_token() {
     let config2 = MongoDbSourceConfig::new(&uri, "test_resume", "docs");
     let mut source2 = MongoDbCdcSource::new(config2, None);
     source2
-        .start(SourceStart {
-            config: connector_config,
-            position: SourcePosition::Resume {
-                attempt: laminar_core::state::CheckpointAttempt::new(2, 1),
-                checkpoint,
-            },
-            delivery: DeliveryGuarantee::AtLeastOnce,
-        })
+        .start(
+            SourceStart::new(
+                connector_config,
+                SourcePosition::Resume {
+                    attempt: laminar_core::state::CheckpointAttempt::canonical(2),
+                    checkpoint,
+                },
+                DeliveryGuarantee::AtLeastOnce,
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
 
@@ -566,14 +573,17 @@ async fn checkpoint_resume_rejects_a_tampered_deployment_identity() {
     let config = MongoDbSourceConfig::new(&uri, "test_deployment_identity", "docs");
     let mut resumed = MongoDbCdcSource::new(config, None);
     let error = resumed
-        .start(SourceStart {
-            config: connector_config,
-            position: SourcePosition::Resume {
-                attempt: laminar_core::state::CheckpointAttempt::new(2, 1),
-                checkpoint,
-            },
-            delivery: DeliveryGuarantee::AtLeastOnce,
-        })
+        .start(
+            SourceStart::new(
+                connector_config,
+                SourcePosition::Resume {
+                    attempt: laminar_core::state::CheckpointAttempt::canonical(2),
+                    checkpoint,
+                },
+                DeliveryGuarantee::AtLeastOnce,
+            )
+            .unwrap(),
+        )
         .await
         .unwrap_err();
     assert!(!error.is_transient());
@@ -649,14 +659,17 @@ async fn invalidate_checkpoint_rejects_recreated_collection() {
     let config = MongoDbSourceConfig::new(&uri, "test_invalidate_resume", "docs");
     let mut resumed = MongoDbCdcSource::new(config, None);
     let error = resumed
-        .start(SourceStart {
-            config: connector_config,
-            position: SourcePosition::Resume {
-                attempt: laminar_core::state::CheckpointAttempt::new(3, 1),
-                checkpoint: invalidate_checkpoint,
-            },
-            delivery: DeliveryGuarantee::AtLeastOnce,
-        })
+        .start(
+            SourceStart::new(
+                connector_config,
+                SourcePosition::Resume {
+                    attempt: laminar_core::state::CheckpointAttempt::canonical(3),
+                    checkpoint: invalidate_checkpoint,
+                },
+                DeliveryGuarantee::AtLeastOnce,
+            )
+            .unwrap(),
+        )
         .await
         .unwrap_err();
     assert!(
@@ -718,14 +731,17 @@ async fn resume_token_can_cut_between_events_from_one_mongodb_transaction() {
     let config = MongoDbSourceConfig::new(&uri, "test_transaction_resume", "docs");
     let mut resumed = MongoDbCdcSource::new(config, None);
     resumed
-        .start(SourceStart {
-            config: connector_config,
-            position: SourcePosition::Resume {
-                attempt: laminar_core::state::CheckpointAttempt::new(4, 1),
-                checkpoint: first_checkpoint,
-            },
-            delivery: DeliveryGuarantee::AtLeastOnce,
-        })
+        .start(
+            SourceStart::new(
+                connector_config,
+                SourcePosition::Resume {
+                    attempt: laminar_core::state::CheckpointAttempt::canonical(4),
+                    checkpoint: first_checkpoint,
+                },
+                DeliveryGuarantee::AtLeastOnce,
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
 

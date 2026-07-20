@@ -89,21 +89,21 @@ mod tests {
     fn reference_round_trips() {
         let p = VnodePartial {
             operators: Vec::new(),
-            base: Some(laminar_core::state::CheckpointAttempt::new(4, 9)),
+            base: Some(laminar_core::state::CheckpointAttempt::canonical(9)),
             deltas: Vec::new(),
         };
         let bytes = p.encode().unwrap();
         let back = VnodePartial::decode(&bytes).unwrap();
         assert_eq!(
             back.base,
-            Some(laminar_core::state::CheckpointAttempt::new(4, 9))
+            Some(laminar_core::state::CheckpointAttempt::canonical(9))
         );
         assert!(back.operators.is_empty());
     }
 
     #[test]
     fn delta_round_trips_changed_state() {
-        let parent = laminar_core::state::CheckpointAttempt::new(4, 9);
+        let parent = laminar_core::state::CheckpointAttempt::canonical(9);
         let p = VnodePartial {
             operators: Vec::new(),
             base: Some(parent),

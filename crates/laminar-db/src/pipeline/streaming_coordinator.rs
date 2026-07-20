@@ -1062,9 +1062,6 @@ pub struct StreamingCoordinator {
     /// Last durable completion published to sources/subscribers in this runtime. This is a
     /// defense-in-depth monotonic fence in addition to serialized tail admission.
     last_published_checkpoint: Option<CheckpointAttempt>,
-    /// Captured-state bytes held by in-flight epochs; shared with callback.
-    staged_bytes: Arc<AtomicU64>,
-    max_staged_bytes: u64,
     /// Shared exact external-commit bound, checked before ID reservation/barrier injection.
     coordinated_commit_admission: Option<crate::checkpoint_coordinator::CoordinatedCommitAdmission>,
     #[cfg(feature = "cluster")]
@@ -1233,20 +1230,6 @@ const SHUTDOWN_CHECKPOINT_TAIL_TIMEOUT: Duration = Duration::from_secs(8);
 /// Graceful stop gives already-sealed checkpoints one bounded opportunity to
 /// reach coordinated external sinks. Timeout leaves durable markers for replay.
 const COORDINATED_COMMIT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// Throttled WARN while barrier admission is paused at the staged-state cap; this
-/// runs every coordinator tick, so an unthrottled warn would spam under a backlog.
-fn warn_staged_cap_throttled(staged_bytes: u64, cap: u64) {
-    static THROTTLE: crate::log_throttle::LogThrottle =
-        crate::log_throttle::LogThrottle::every(Duration::from_secs(10));
-    if THROTTLE.allow() {
-        tracing::warn!(
-            staged_bytes,
-            cap,
-            "checkpoint admission paused: staged-state cap reached"
-        );
-    }
-}
 
 fn warn_external_commit_cap_throttled(known: bool, pending: u64, cap: u64) {
     static THROTTLE: crate::log_throttle::LogThrottle =
@@ -2734,7 +2717,26 @@ impl StreamingCoordinator {
         #[cfg(feature = "cluster")]
         let source_process_authority = source_process_authority.map(SourceProcessAuthority::new);
 
-        let source_count = sources.len();
+        let mut source_starts = Vec::with_capacity(sources.len());
+        for src in sources {
+            let start = SourceStart::new(
+                src.config.clone(),
+                src.position.clone(),
+                config.delivery_guarantee,
+            )
+            .map_err(|error| match &src.position {
+                SourcePosition::Initial => DbError::Config(format!(
+                    "source '{}' has an invalid initial startup request: {error}",
+                    src.name
+                )),
+                SourcePosition::Resume { attempt, .. } => DbError::Checkpoint(format!(
+                    "[LDB-6003] source '{}' has an invalid resume request for checkpoint epoch={} id={}: {error}",
+                    src.name, attempt.epoch, attempt.checkpoint_id
+                )),
+            })?;
+            source_starts.push((src, start));
+        }
+        let source_count = source_starts.len();
         let mut prepared_sources = Vec::with_capacity(source_count);
         let mut committed_offsets = Vec::with_capacity(source_count);
         let source_start_timeout = config.checkpoint_timeout;
@@ -2743,7 +2745,7 @@ impl StreamingCoordinator {
         // Do not spawn a polling task until every source has atomically installed its startup
         // position. Otherwise a later startup failure detaches the earlier tasks and they keep
         // polling without an owner capable of shutting them down.
-        for mut src in sources {
+        for (mut src, start) in source_starts {
             let src_name = src.name.clone();
             let start_position = src.position.clone();
             if tokio::time::Instant::now() >= source_start_deadline {
@@ -2782,11 +2784,6 @@ impl StreamingCoordinator {
             let committed_offset = match &src.position {
                 SourcePosition::Initial => None,
                 SourcePosition::Resume { checkpoint, .. } => Some(checkpoint.clone()),
-            };
-            let start = SourceStart {
-                config: src.config.clone(),
-                position: start_position.clone(),
-                delivery: config.delivery_guarantee,
             };
             let cancellation_policy = src.connector.cancellation_policy();
             let source_start_authorized = {
@@ -4009,8 +4006,6 @@ impl StreamingCoordinator {
             manual_active: None,
             checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
             last_published_checkpoint: None,
-            staged_bytes: Arc::new(AtomicU64::new(0)),
-            max_staged_bytes: u64::MAX,
             coordinated_commit_admission: None,
             public_generation: None,
             #[cfg(feature = "cluster")]
@@ -4018,16 +4013,9 @@ impl StreamingCoordinator {
         })
     }
 
-    /// Wire in the callback's admission counters so the coordinator gates new barriers.
-    pub(crate) fn with_checkpoint_admission(
-        mut self,
-        in_flight: Arc<AtomicU64>,
-        staged_bytes: Arc<AtomicU64>,
-        max_staged_bytes: u64,
-    ) -> Self {
+    /// Wire in the callback's admission counter so the coordinator gates new barriers.
+    pub(crate) fn with_checkpoint_admission(mut self, in_flight: Arc<AtomicU64>) -> Self {
         self.checkpoint_in_flight = in_flight;
-        self.staged_bytes = staged_bytes;
-        self.max_staged_bytes = max_staged_bytes;
         self
     }
 
@@ -5159,25 +5147,43 @@ impl StreamingCoordinator {
             }
         }
 
-        // No final snapshot is synthesized: open-epoch rows deliberately replay from the last
-        // committed cut. Sink close must confirm queued writes and abort any uncommitted
-        // transactional epoch. A replay guarantee turns every close failure into a recovery fault;
-        // best-effort reports it but may still stop normally.
-        if let Err(close_error) = callback.close_sinks().await {
-            if callback.fault_on_cycle_error() {
+        // Resolve the durable open-epoch witness before close terminates the actor that owns its
+        // rollback. On failure, keep actors live: lifecycle teardown retains their stable handles
+        // and retries settlement before issuing close.
+        let sink_epoch_settled = match callback.settle_sink_epoch_for_shutdown().await {
+            Ok(()) => true,
+            Err(error) => {
                 match fault.as_mut() {
                     Some(existing) => {
-                        existing.push_str("; sink shutdown also failed: ");
-                        existing.push_str(&close_error);
+                        existing.push_str("; sink epoch settlement also failed: ");
+                        existing.push_str(&error);
                     }
-                    None => fault = Some(format!("sink shutdown failed: {close_error}")),
+                    None => fault = Some(format!("sink epoch settlement failed: {error}")),
                 }
-            } else {
-                callback.note_cycle_error();
-                tracing::warn!(
-                    error = %close_error,
-                    "sink shutdown failed under best-effort delivery"
-                );
+                false
+            }
+        };
+
+        // No final snapshot is synthesized: open-epoch rows deliberately replay from the last
+        // committed cut. Sink close confirms queued writes and releases connector resources only
+        // after durable epoch ownership is settled.
+        if sink_epoch_settled {
+            if let Err(close_error) = callback.close_sinks().await {
+                if callback.fault_on_cycle_error() {
+                    match fault.as_mut() {
+                        Some(existing) => {
+                            existing.push_str("; sink shutdown also failed: ");
+                            existing.push_str(&close_error);
+                        }
+                        None => fault = Some(format!("sink shutdown failed: {close_error}")),
+                    }
+                } else {
+                    callback.note_cycle_error();
+                    tracing::warn!(
+                        error = %close_error,
+                        "sink shutdown failed under best-effort delivery"
+                    );
+                }
             }
         }
 
@@ -5773,15 +5779,7 @@ impl StreamingCoordinator {
     }
 
     fn checkpoint_capacity_available(&self) -> bool {
-        if self.pending_barrier.active || self.checkpoint_in_flight.load(Ordering::Acquire) >= 1 {
-            return false;
-        }
-        let staged_bytes = self.staged_bytes.load(Ordering::Acquire);
-        if staged_bytes >= self.max_staged_bytes {
-            warn_staged_cap_throttled(staged_bytes, self.max_staged_bytes);
-            return false;
-        }
-        true
+        !self.pending_barrier.active && self.checkpoint_in_flight.load(Ordering::Acquire) < 1
     }
 
     fn advance_checkpoint_cadence(&mut self) {
@@ -6415,8 +6413,8 @@ mod tests {
         let injector = CheckpointBarrierInjector::new();
         let (release_tx, release_rx) = tokio::sync::watch::channel(None);
         let control = SourceBarrierControl::new(injector, release_tx);
-        let old = CheckpointAttempt::new(7, 70);
-        let newer = CheckpointAttempt::new(8, 80);
+        let old = CheckpointAttempt::new(7, 7);
+        let newer = CheckpointAttempt::new(8, 8);
 
         control.release_exact(old);
         control.release_exact(newer);
@@ -6431,8 +6429,8 @@ mod tests {
 
         let (equivocal_tx, equivocal_rx) = tokio::sync::watch::channel(None);
         let equivocal = SourceBarrierControl::new(CheckpointBarrierInjector::new(), equivocal_tx);
-        let first = CheckpointAttempt::new(9, 90);
-        let conflicting = CheckpointAttempt::new(9, 91);
+        let first = CheckpointAttempt::new(9, 9);
+        let conflicting = CheckpointAttempt::new(9, 10);
         equivocal.release_exact(first);
         equivocal.release_exact(conflicting);
         assert_eq!(
@@ -6442,9 +6440,9 @@ mod tests {
         assert!(!source_barrier_release_covers(first, conflicting));
 
         for conflicting in [
-            CheckpointAttempt::new(10, 90),
-            CheckpointAttempt::new(10, 89),
-            CheckpointAttempt::new(8, 91),
+            CheckpointAttempt::new(10, 8),
+            CheckpointAttempt::new(10, 9),
+            CheckpointAttempt::new(8, 10),
         ] {
             equivocal.release_exact(conflicting);
             assert_eq!(
@@ -6470,7 +6468,7 @@ mod tests {
         );
         coordinator
             .pending_barrier
-            .reset(CheckpointAttempt::new(8, 80), 1);
+            .reset(CheckpointAttempt::new(8, 8), 1);
         let mut callback = MockCallback::new();
         let mut barriers = Vec::new();
         let mut events = 0;
@@ -6479,7 +6477,7 @@ mod tests {
             .process_msg(
                 SourceMsg::Barrier {
                     source_idx: 0,
-                    barrier: CheckpointBarrier::new(70, 7),
+                    barrier: CheckpointBarrier::new(7, 7),
                     checkpoint: checkpoint_at(7),
                 },
                 &mut callback,
@@ -6517,7 +6515,7 @@ mod tests {
         let (source_tx, rx) = mpsc::bounded_async::<SourceMsg>(4);
         let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
         let (completion_tx, completion_rx) = mpsc::bounded_async::<CheckpointCompletion>(4);
-        let attempt = CheckpointAttempt::new(7, 70);
+        let attempt = CheckpointAttempt::new(7, 7);
         let mut coordinator = test_coordinator(
             rx,
             control_rx,
@@ -6545,7 +6543,7 @@ mod tests {
             while observed_rows.load(Ordering::SeqCst) == 0 {
                 tokio::task::yield_now().await;
             }
-            assert_eq!(observed_published.lock().as_slice(), &[(7, 70)]);
+            assert_eq!(observed_published.lock().as_slice(), &[(7, 7)]);
             shutdown.notify_one();
         });
 
@@ -6667,6 +6665,8 @@ mod tests {
         written_rows: Arc<AtomicU64>,
         published_barriers_observed_at_close: Arc<AtomicU64>,
         invalidated_subscriptions: Arc<Mutex<Vec<String>>>,
+        shutdown_sink_order: Arc<Mutex<Vec<&'static str>>>,
+        settle_sink_epoch_error: Option<String>,
         close_error: Option<String>,
         barrier_control_installed: Arc<AtomicBool>,
         intake_gate: Arc<AtomicBool>,
@@ -6736,6 +6736,8 @@ mod tests {
                 written_rows: Arc::new(AtomicU64::new(0)),
                 published_barriers_observed_at_close: Arc::new(AtomicU64::new(0)),
                 invalidated_subscriptions: Arc::new(Mutex::new(Vec::new())),
+                shutdown_sink_order: Arc::new(Mutex::new(Vec::new())),
+                settle_sink_epoch_error: None,
                 close_error: None,
                 barrier_control_installed: Arc::new(AtomicBool::new(false)),
                 intake_gate: Arc::new(AtomicBool::new(false)),
@@ -7074,7 +7076,16 @@ mod tests {
         fn record_cycle(&self, _events: u64, _batches: u64, _elapsed_ns: u64) {}
         fn apply_control(&mut self, _msg: crate::pipeline::ControlMsg) {}
 
+        async fn settle_sink_epoch_for_shutdown(&mut self) -> Result<(), String> {
+            self.shutdown_sink_order.lock().push("settle");
+            match self.settle_sink_epoch_error.take() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+
         async fn close_sinks(&mut self) -> Result<(), String> {
+            self.shutdown_sink_order.lock().push("close");
             let published = self.published_barriers.lock().len();
             self.published_barriers_observed_at_close
                 .store(u64::try_from(published).unwrap(), Ordering::SeqCst);
@@ -7162,7 +7173,7 @@ mod tests {
         announcement_tx
             .send(Some(laminar_core::cluster::control::BarrierAnnouncement {
                 epoch: 7,
-                checkpoint_id: 70,
+                checkpoint_id: 7,
                 assignment_fence: None,
                 leader_proof: None,
                 phase: laminar_core::cluster::control::Phase::Commit,
@@ -7212,13 +7223,13 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 
-        let completed = CheckpointAttempt::new(6, 60);
+        let completed = CheckpointAttempt::new(6, 6);
         completion_tx
             .send(CheckpointCompletion::new(completed, FxHashMap::default()))
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_millis(10), async {
-            while published.lock().as_slice() != [(6, 60)] {
+            while published.lock().as_slice() != [(6, 6)] {
                 tokio::task::yield_now().await;
             }
         })
@@ -7438,8 +7449,6 @@ mod tests {
             manual_active: None,
             checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
             last_published_checkpoint: None,
-            staged_bytes: Arc::new(AtomicU64::new(0)),
-            max_staged_bytes: u64::MAX,
             coordinated_commit_admission: None,
             public_generation: None,
             #[cfg(feature = "cluster")]
@@ -7932,7 +7941,7 @@ mod tests {
     async fn process_lease_loss_after_prepare_abandons_the_exact_attempt() {
         let mut coordinator = admission_coordinator(Vec::new());
         let controller = install_test_process_authority(&mut coordinator, 41);
-        let attempt = CheckpointAttempt::new(41, 4_041);
+        let attempt = CheckpointAttempt::new(41, 41);
         let admission = CheckpointAdmission {
             manual: false,
             assignment_fence: None,
@@ -7975,7 +7984,7 @@ mod tests {
         ] {
             let mut coordinator = admission_coordinator(Vec::new());
             let controller = install_test_process_authority(&mut coordinator, node);
-            let attempt = CheckpointAttempt::new(node, 4_000 + node);
+            let attempt = CheckpointAttempt::new(node, node);
             let admission = CheckpointAdmission {
                 manual: false,
                 assignment_fence: None,
@@ -8028,7 +8037,7 @@ mod tests {
             let mut release_rx = source.barrier_release_tx.subscribe();
             let mut coordinator = admission_coordinator(vec![source]);
             let controller = install_test_process_authority(&mut coordinator, node);
-            let attempt = CheckpointAttempt::new(node, 4_000 + node);
+            let attempt = CheckpointAttempt::new(node, node);
             coordinator.pending_barrier.reset(attempt, 1);
             let barrier = CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch);
             let mut callback = MockCallback::new();
@@ -8069,7 +8078,7 @@ mod tests {
     async fn follower_control_outcome_is_not_applied_after_process_lease_loss() {
         let mut coordinator = admission_coordinator(Vec::new());
         let controller = install_test_process_authority(&mut coordinator, 46);
-        let attempt = CheckpointAttempt::new(46, 4_046);
+        let attempt = CheckpointAttempt::new(46, 46);
         let mut callback = MockCallback::new();
         callback.runtime.leader = false;
         callback.control_checkpoint_outcome = Some(CheckpointControlOutcome::Started {
@@ -8133,7 +8142,7 @@ mod tests {
     async fn authoritative_follower_control_abort_is_not_recorded_as_a_failure() {
         let mut coordinator = admission_coordinator(Vec::new());
         install_test_process_authority(&mut coordinator, 52);
-        let attempt = CheckpointAttempt::new(52, 4_052);
+        let attempt = CheckpointAttempt::new(52, 52);
         let mut callback = MockCallback::new();
         callback.runtime.leader = false;
         callback.control_checkpoint_outcome = Some(CheckpointControlOutcome::Aborted { attempt });
@@ -8153,7 +8162,7 @@ mod tests {
     async fn follower_scope_cancellation_is_not_recorded_as_a_failure() {
         let mut coordinator = admission_coordinator(Vec::new());
         install_test_process_authority(&mut coordinator, 53);
-        let attempt = CheckpointAttempt::new(53, 4_053);
+        let attempt = CheckpointAttempt::new(53, 53);
         let mut callback = MockCallback::new();
         callback.runtime.leader = false;
         callback.control_checkpoint_outcome = Some(CheckpointControlOutcome::Cancelled { attempt });
@@ -8172,7 +8181,7 @@ mod tests {
         let (source, poll) = checkpoint_source_handle("source");
         let mut coordinator = admission_coordinator(vec![source]);
         let controller = install_test_process_authority(&mut coordinator, 47);
-        let attempt = CheckpointAttempt::new(47, 4_047);
+        let attempt = CheckpointAttempt::new(47, 47);
         let (reply_tx, reply_rx) = crossfire::oneshot::oneshot();
         coordinator.manual_waiting.push(reply_tx);
         let admission = CheckpointAdmission {
@@ -8207,7 +8216,7 @@ mod tests {
     fn durable_completion_publication_requires_strict_identity_progress() {
         let mut coordinator = admission_coordinator(Vec::new());
         let mut callback = MockCallback::new();
-        let newer = CheckpointAttempt::new(12, 120);
+        let newer = CheckpointAttempt::new(12, 12);
 
         let completion = CheckpointCompletion::validated(
             newer,
@@ -8221,12 +8230,12 @@ mod tests {
         let accepted_cadence = coordinator.last_checkpoint;
 
         for invalid in [
-            CheckpointAttempt::new(13, 119),
-            CheckpointAttempt::new(11, 121),
-            CheckpointAttempt::new(12, 121),
-            CheckpointAttempt::new(13, 120),
-            CheckpointAttempt::new(12, 120),
-            CheckpointAttempt::new(11, 119),
+            CheckpointAttempt::new(13, 11),
+            CheckpointAttempt::new(11, 13),
+            CheckpointAttempt::new(12, 13),
+            CheckpointAttempt::new(13, 12),
+            CheckpointAttempt::new(12, 12),
+            CheckpointAttempt::new(11, 11),
         ] {
             let completion = CheckpointCompletion::validated(
                 invalid,
@@ -8240,7 +8249,7 @@ mod tests {
             assert!(error.contains("not strictly newer"), "{error}");
             assert_eq!(coordinator.last_checkpoint, accepted_cadence);
         }
-        assert_eq!(*callback.published_barriers.lock(), vec![(12, 120)]);
+        assert_eq!(*callback.published_barriers.lock(), vec![(12, 12)]);
         assert_eq!(coordinator.last_published_checkpoint, Some(newer));
     }
 
@@ -8252,7 +8261,7 @@ mod tests {
         let mut callback = MockCallback::new();
         *callback.publish_barrier_error.lock() = Some("injected publication failure".into());
 
-        let attempt = CheckpointAttempt::new(13, 130);
+        let attempt = CheckpointAttempt::new(13, 13);
         let mut checkpoint = checkpoint_at(attempt.epoch);
         checkpoint.set_offset("partition-0", "offset-13");
         let mut source_checkpoints = FxHashMap::default();
@@ -8285,7 +8294,7 @@ mod tests {
     fn durable_completion_reports_successor_epoch_continuation_failure() {
         let mut coordinator = admission_coordinator(Vec::new());
         let mut callback = MockCallback::new();
-        let attempt = CheckpointAttempt::new(131, 1_301);
+        let attempt = CheckpointAttempt::new(131, 131);
         let mut result = successful_checkpoint_result(attempt);
         result.error = Some("injected successor epoch failure".into());
         let completion =
@@ -8327,9 +8336,9 @@ mod tests {
         let published = Arc::clone(&callback.published_barriers);
         let aborted = Arc::clone(&callback.aborted_subscription_cuts);
         let previous_cadence = coordinator.last_checkpoint;
-        let attempt = CheckpointAttempt::new(14, 140);
+        let attempt = CheckpointAttempt::new(14, 14);
         let mut source_checkpoints = FxHashMap::default();
-        source_checkpoints.insert("source".to_owned(), checkpoint_at(140));
+        source_checkpoints.insert("source".to_owned(), checkpoint_at(attempt.epoch));
         let completion = CheckpointCompletion::validated(
             attempt,
             successful_checkpoint_result(attempt),
@@ -8375,7 +8384,7 @@ mod tests {
         coordinator.checkpoint_retry_backoff = Duration::from_millis(400);
         let previous_cadence = coordinator.last_checkpoint;
         let previous_retry = coordinator.checkpoint_retry_not_before;
-        let attempt = CheckpointAttempt::new(15, 150);
+        let attempt = CheckpointAttempt::canonical(150);
         let mut callback = MockCallback::new();
         callback.attempt_to_reserve = attempt;
         callback.barrier_outcome = Some(BarrierOutcome::Async);
@@ -8407,7 +8416,7 @@ mod tests {
         coordinator.checkpoint_retry_backoff = Duration::from_millis(400);
         let previous_cadence = coordinator.last_checkpoint;
         let previous_retry = coordinator.checkpoint_retry_not_before;
-        let attempt = CheckpointAttempt::new(16, 160);
+        let attempt = CheckpointAttempt::new(16, 16);
         let mut callback = MockCallback::new();
         callback.attempt_to_reserve = attempt;
         callback.barrier_outcome = Some(BarrierOutcome::Async);
@@ -8424,8 +8433,8 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_completions_start_the_next_periodic_delay() {
-        let committed = CheckpointAttempt::new(17, 170);
-        let failed = CheckpointAttempt::new(18, 180);
+        let committed = CheckpointAttempt::new(17, 17);
+        let failed = CheckpointAttempt::new(18, 18);
         let completions = [
             (
                 committed,
@@ -8469,8 +8478,7 @@ mod tests {
             assert_eq!(callback.reserve_calls, 0);
 
             coordinator.last_checkpoint = Instant::now() - interval;
-            let successor =
-                CheckpointAttempt::new(attempt.epoch + 100, attempt.checkpoint_id + 1_000);
+            let successor = CheckpointAttempt::canonical(attempt.epoch + 100);
             callback.attempt_to_reserve = successor;
             callback.barrier_outcome = Some(BarrierOutcome::Committed(successor.epoch));
             coordinator.maybe_checkpoint(&mut callback).await;
@@ -8487,7 +8495,7 @@ mod tests {
         coordinator.checkpoint_retry_not_before = Some(Instant::now() - Duration::from_millis(1));
         coordinator.checkpoint_retry_backoff = Duration::from_millis(400);
         let previous_cadence = coordinator.last_checkpoint;
-        let attempt = CheckpointAttempt::new(19, 190);
+        let attempt = CheckpointAttempt::new(19, 19);
         let mut callback = MockCallback::new();
         callback.attempt_to_reserve = attempt;
         callback.barrier_outcome = Some(BarrierOutcome::Committed(attempt.epoch));
@@ -8506,7 +8514,7 @@ mod tests {
         let (source, poll) = checkpoint_source_handle("input-only");
         let mut coordinator = admission_coordinator(vec![source]);
         let mut callback = MockCallback::new();
-        let reserved = CheckpointAttempt::new(101, 10_001);
+        let reserved = CheckpointAttempt::canonical(10_001);
         callback.attempt_to_reserve = reserved;
 
         coordinator.maybe_checkpoint(&mut callback).await;
@@ -8537,7 +8545,7 @@ mod tests {
             ),
         );
         let mut callback = MockCallback::new();
-        let reserved = CheckpointAttempt::new(101, 10_001);
+        let reserved = CheckpointAttempt::canonical(10_001);
         callback.attempt_to_reserve = reserved;
 
         coordinator.maybe_checkpoint(&mut callback).await;
@@ -8606,7 +8614,7 @@ mod tests {
         let mut coordinator = admission_coordinator(vec![source]);
         coordinator.config.checkpoint_schedule = CheckpointSchedule::Periodic(Duration::ZERO);
         let assignment_fence = assignment_fence(9, &[1, 2]);
-        let attempt = CheckpointAttempt::new(107, 10_007);
+        let attempt = CheckpointAttempt::new(107, 107);
         let mut callback = MockCallback::new();
         callback.attempt_to_reserve = attempt;
         callback.assignment_fence = Some(assignment_fence.clone());
@@ -8675,7 +8683,7 @@ mod tests {
     async fn source_less_local_periodic_checkpoint_uses_exact_attempt_capture() {
         let mut coordinator = admission_coordinator(Vec::new());
         let mut callback = MockCallback::new();
-        let reserved = CheckpointAttempt::new(102, 10_002);
+        let reserved = CheckpointAttempt::new(102, 102);
         callback.attempt_to_reserve = reserved;
 
         coordinator.maybe_checkpoint(&mut callback).await;
@@ -8731,12 +8739,12 @@ mod tests {
     async fn busy_source_injector_preflight_does_not_reserve_an_attempt() {
         let (busy_source, busy_poll) = checkpoint_source_handle("busy");
         let (idle_source, idle_poll) = checkpoint_source_handle("idle");
-        let already_pending = CheckpointBarrier::new(71, 7);
+        let already_pending = CheckpointBarrier::new(71, 71);
         assert!(busy_source.barrier_injector.trigger(already_pending));
 
         let mut coordinator = admission_coordinator(vec![busy_source, idle_source]);
         let mut callback = MockCallback::new();
-        callback.attempt_to_reserve = CheckpointAttempt::new(42, 9_001);
+        callback.attempt_to_reserve = CheckpointAttempt::canonical(9_001);
 
         coordinator.maybe_checkpoint(&mut callback).await;
 
@@ -8755,7 +8763,7 @@ mod tests {
         let (source_1, poll_1) = checkpoint_source_handle("source-1");
         let mut coordinator = admission_coordinator(vec![source_0, source_1]);
         let mut callback = MockCallback::new();
-        let reserved = CheckpointAttempt::new(37, u64::from(u32::MAX) + 8_192);
+        let reserved = CheckpointAttempt::canonical(u64::from(u32::MAX) + 8_192);
         callback.attempt_to_reserve = reserved;
 
         coordinator.maybe_checkpoint(&mut callback).await;
@@ -8784,7 +8792,7 @@ mod tests {
             "follower readiness must not publish non-replayable local progress"
         );
 
-        let attempt = CheckpointAttempt::new(42, 9_042);
+        let attempt = CheckpointAttempt::new(42, 42);
         coordinator.pending_barrier.reset(attempt, 1);
         let barrier = CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch);
         let mut callback = MockCallback::new();
@@ -8805,7 +8813,7 @@ mod tests {
         let (source, _poll) = checkpoint_source_handle("source");
         let release = source.barrier_release_tx.subscribe();
         let mut coordinator = admission_coordinator(vec![source]);
-        let attempt = CheckpointAttempt::new(61, 9_061);
+        let attempt = CheckpointAttempt::new(61, 61);
         coordinator.pending_barrier.reset(attempt, 1);
         let barrier = CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch);
         let mut callback = MockCallback::new();
@@ -8828,7 +8836,7 @@ mod tests {
         let (source, _poll) = checkpoint_source_handle("source");
         let release = source.barrier_release_tx.subscribe();
         let mut coordinator = admission_coordinator(vec![source]);
-        let attempt = CheckpointAttempt::new(62, 9_062);
+        let attempt = CheckpointAttempt::new(62, 62);
         coordinator.pending_barrier.reset(attempt, 1);
         let barrier = CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch);
         let mut callback = MockCallback::new();
@@ -8858,7 +8866,7 @@ mod tests {
             DeliveryGuarantee::AtLeastOnce,
             Some(Duration::from_secs(60)),
         );
-        let attempt = CheckpointAttempt::new(64, 9_064);
+        let attempt = CheckpointAttempt::new(64, 64);
         coordinator.pending_barrier.reset(attempt, 1);
         let mut callback = MockCallback::new();
         callback.checkpoint_drain_error = Some(CycleError::Halt(
@@ -8888,7 +8896,7 @@ mod tests {
         let (source, _poll) = checkpoint_source_handle("source");
         let release = source.barrier_release_tx.subscribe();
         let mut coordinator = admission_coordinator(vec![source]);
-        let attempt = CheckpointAttempt::new(63, 9_063);
+        let attempt = CheckpointAttempt::new(63, 63);
         coordinator.pending_barrier.reset(attempt, 1);
         let barrier = CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch);
         let mut callback = MockCallback::new();
@@ -8911,7 +8919,7 @@ mod tests {
         let (source, _poll) = checkpoint_source_handle("source");
         let release = source.barrier_release_tx.subscribe();
         let mut coordinator = admission_coordinator(vec![source]);
-        let attempt = CheckpointAttempt::new(64, 9_064);
+        let attempt = CheckpointAttempt::new(64, 64);
         coordinator.pending_barrier.reset(attempt, 1);
         let barrier = CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch);
         let mut callback = MockCallback::new();
@@ -8947,7 +8955,7 @@ mod tests {
         force_tx.send(first_sender).await.unwrap();
         force_tx.send(second_sender).await.unwrap();
 
-        let attempt = CheckpointAttempt::new(80, 8_080);
+        let attempt = CheckpointAttempt::canonical(8_080);
         let mut callback = MockCallback::new();
         callback.attempt_to_reserve = attempt;
         callback.barrier_outcome = Some(BarrierOutcome::Async);
@@ -8966,7 +8974,10 @@ mod tests {
         let barrier = poll
             .poll()
             .expect("manual attempt must inject a source barrier");
-        assert_eq!(barrier, CheckpointBarrier::new(8_080, 80));
+        assert_eq!(
+            barrier,
+            CheckpointBarrier::new(attempt.checkpoint_id, attempt.epoch)
+        );
         coordinator
             .handle_barrier(0, &barrier, &checkpoint_at(attempt.epoch), &mut callback)
             .await
@@ -9015,8 +9026,8 @@ mod tests {
         let (force_tx, force_rx) = mpsc::bounded_async::<ForceCheckpointReply>(8);
         coordinator = coordinator.with_force_checkpoint_rx(force_rx);
 
-        let first = CheckpointAttempt::new(81, 8_081);
-        let second = CheckpointAttempt::new(82, 8_099);
+        let first = CheckpointAttempt::canonical(8_081);
+        let second = CheckpointAttempt::canonical(8_099);
         let (first_tx, first_rx) = crossfire::oneshot::oneshot();
         force_tx.send(first_tx).await.unwrap();
         let mut callback = MockCallback::new();
@@ -9061,7 +9072,10 @@ mod tests {
         coordinator.maybe_checkpoint(&mut callback).await;
         assert_eq!(coordinator.manual_active.as_ref().unwrap().attempt, second);
         let second_barrier = poll.poll().unwrap();
-        assert_eq!(second_barrier, CheckpointBarrier::new(8_099, 82));
+        assert_eq!(
+            second_barrier,
+            CheckpointBarrier::new(second.checkpoint_id, second.epoch)
+        );
         callback.barrier_outcome = Some(BarrierOutcome::Async);
         coordinator
             .handle_barrier(
@@ -9126,7 +9140,7 @@ mod tests {
             );
             coordinator.last_checkpoint = Instant::now() - Duration::from_secs(60);
             let previous_cadence = coordinator.last_checkpoint;
-            let attempt = CheckpointAttempt::new(53, 90_053);
+            let attempt = CheckpointAttempt::new(53, 53);
             coordinator.pending_barrier.reset(attempt, 1);
             let mut callback = MockCallback::new();
             callback.barrier_outcome = Some(outcome);
@@ -9165,7 +9179,7 @@ mod tests {
         coordinator.config.checkpoint_schedule =
             CheckpointSchedule::Periodic(Duration::from_secs(60));
         coordinator.last_checkpoint = Instant::now() - Duration::from_secs(60);
-        let cancelled = CheckpointAttempt::new(53, 90_053);
+        let cancelled = CheckpointAttempt::canonical(90_053);
         coordinator.pending_barrier.reset(cancelled, 1);
         let mut callback = MockCallback::new();
         callback.barrier_outcome = Some(BarrierOutcome::CancelledBeforeCapture);
@@ -9191,7 +9205,7 @@ mod tests {
         assert_eq!(callback.reserve_calls, 0);
         assert!(callback.checkpoint_admission_failures.is_empty());
 
-        let successor = CheckpointAttempt::new(54, 90_054);
+        let successor = CheckpointAttempt::canonical(90_054);
         coordinator.checkpoint_retry_not_before = Some(Instant::now() - Duration::from_millis(1));
         callback.runtime.assignment_ready = true;
         callback.attempt_to_reserve = successor;
@@ -9213,7 +9227,7 @@ mod tests {
             CheckpointSchedule::Periodic(Duration::from_secs(60));
         coordinator.last_checkpoint = Instant::now() - Duration::from_secs(60);
         let previous_cadence = coordinator.last_checkpoint;
-        let cancelled = CheckpointAttempt::new(55, 90_055);
+        let cancelled = CheckpointAttempt::new(55, 55);
         let mut callback = MockCallback::new();
         callback.attempt_to_reserve = cancelled;
         callback.barrier_outcome = Some(BarrierOutcome::CancelledBeforeCapture);
@@ -9255,7 +9269,7 @@ mod tests {
         let (source, _poll) = checkpoint_source_handle("source");
         let mut release = source.barrier_release_tx.subscribe();
         let mut coordinator = admission_coordinator(vec![source]);
-        let attempt = CheckpointAttempt::new(54, 90_054);
+        let attempt = CheckpointAttempt::new(54, 54);
         coordinator.pending_barrier.reset(attempt, 1);
         let mut callback = MockCallback::new();
         callback.runtime.leader = false;
@@ -9292,7 +9306,7 @@ mod tests {
         let mut release = source.barrier_release_tx.subscribe();
         let mut coordinator = admission_coordinator(vec![source]);
         install_test_process_authority(&mut coordinator, 56);
-        let attempt = CheckpointAttempt::new(56, 90_056);
+        let attempt = CheckpointAttempt::new(56, 56);
         coordinator.pending_barrier.reset_follower(attempt, 1);
         let mut callback = MockCallback::new();
         callback.runtime.leader = true;
@@ -9327,7 +9341,7 @@ mod tests {
         install_test_process_authority(&mut coordinator, 56);
         coordinator.last_checkpoint = Instant::now() - Duration::from_secs(60);
         let previous_cadence = coordinator.last_checkpoint;
-        let attempt = CheckpointAttempt::new(56, 91_056);
+        let attempt = CheckpointAttempt::new(56, 56);
         coordinator.pending_barrier.reset_follower(attempt, 1);
         let mut callback = MockCallback::new();
         callback.runtime.leader = true;
@@ -9358,7 +9372,7 @@ mod tests {
         let mut release = source.barrier_release_tx.subscribe();
         let mut coordinator = admission_coordinator(vec![source]);
         install_test_process_authority(&mut coordinator, 57);
-        let attempt = CheckpointAttempt::new(57, 90_057);
+        let attempt = CheckpointAttempt::new(57, 57);
         coordinator.pending_barrier.reset_follower(attempt, 1);
         let mut callback = MockCallback::new();
         callback.barrier_outcome = Some(BarrierOutcome::Aborted);
@@ -9391,7 +9405,7 @@ mod tests {
             manual: false,
             assignment_fence: None,
         };
-        let attempt = CheckpointAttempt::new(55, 90_055);
+        let attempt = CheckpointAttempt::new(55, 55);
         let mut callback = MockCallback::new();
         let abandoned = Arc::clone(&callback.abandoned_attempts);
         let aborted_cuts = Arc::clone(&callback.aborted_subscription_cuts);
@@ -9427,7 +9441,7 @@ mod tests {
             None,
         );
         coordinator.config.checkpoint_timeout = Duration::ZERO;
-        let attempt = CheckpointAttempt::new(61, 600_061);
+        let attempt = CheckpointAttempt::new(61, 61);
         coordinator.pending_barrier.reset(attempt, 2);
         coordinator.pending_barrier.sources_aligned.insert(0);
 
@@ -10590,7 +10604,7 @@ mod tests {
             "held source stopped servicing its control plane"
         );
 
-        let barrier = CheckpointBarrier::new(80, 8);
+        let barrier = CheckpointBarrier::new(8, 8);
         assert!(barrier_injector.trigger(barrier));
         drain.wake.notify_one();
         let received = tokio::time::timeout(Duration::from_secs(2), coordinator.rx.recv())
@@ -10600,7 +10614,7 @@ mod tests {
         assert!(matches!(received, SourceMsg::Barrier { barrier: seen, .. } if seen == barrier));
         assert_eq!(state.polls.load(Ordering::SeqCst), polls_at_cut);
 
-        barrier_control.release_exact(CheckpointAttempt::new(8, 80));
+        barrier_control.release_exact(CheckpointAttempt::new(8, 8));
         drain
             .command_tx
             .send(Some(SourceDrainCommand::Resolve {
@@ -11020,7 +11034,7 @@ mod tests {
 
             self.state.start_completions.fetch_add(1, Ordering::SeqCst);
 
-            if matches!(request.position, SourcePosition::Resume { .. }) {
+            if matches!(request.into_parts().1, SourcePosition::Resume { .. }) {
                 self.state.restore_calls.fetch_add(1, Ordering::SeqCst);
                 if self.fail_restore {
                     return Err(ConnectorError::Internal(
@@ -11733,7 +11747,7 @@ mod tests {
         let run = tokio::spawn(async move { coordinator.run_with_ready(callback, ready_tx).await });
         ready_rx.await.unwrap().unwrap();
 
-        assert!(injector.trigger(CheckpointBarrier::new(77, 7)));
+        assert!(injector.trigger(CheckpointBarrier::new(77, 77)));
         tokio::time::timeout(Duration::from_secs(2), async {
             while state.capture_attempts.load(Ordering::SeqCst) == 0 {
                 tokio::task::yield_now().await;
@@ -11821,7 +11835,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let barrier = CheckpointBarrier::new(70, 7);
+        let barrier = CheckpointBarrier::new(70, 70);
         let control = coordinator.source_handles[0].barrier_control();
         assert!(coordinator.source_handles[0]
             .barrier_injector
@@ -11841,7 +11855,7 @@ mod tests {
         let polls_at_barrier = state.polls.load(Ordering::SeqCst);
         let control_before_stale = state.control_drives.load(Ordering::SeqCst);
 
-        control.release_exact(CheckpointAttempt::new(6, 60));
+        control.release_exact(CheckpointAttempt::canonical(60));
         tokio::time::timeout(Duration::from_secs(2), async {
             while state.control_drives.load(Ordering::SeqCst) <= control_before_stale {
                 tokio::task::yield_now().await;
@@ -11855,7 +11869,7 @@ mod tests {
             "a stale release resumed source polling"
         );
 
-        control.release_exact(CheckpointAttempt::new(7, 70));
+        control.release_exact(CheckpointAttempt::canonical(70));
         tokio::time::timeout(Duration::from_secs(2), async {
             while state.polls.load(Ordering::SeqCst) == polls_at_barrier {
                 tokio::task::yield_now().await;
@@ -12432,7 +12446,7 @@ mod tests {
     #[tokio::test]
     async fn expired_source_start_budget_never_polls_resume_start() {
         let state = Arc::new(StartupSourceState::default());
-        let attempt = CheckpointAttempt::new(9, 901);
+        let attempt = CheckpointAttempt::new(9, 9);
         let result = startup_result_with_config(
             vec![startup_source(
                 "unattempted-resume",
@@ -12455,7 +12469,7 @@ mod tests {
             matches!(result, Err(DbError::Checkpoint(ref message))
                 if message.contains("[LDB-6003]")
                     && message.contains("source 'unattempted-resume' start was not attempted")
-                    && message.contains("epoch=9 id=901")),
+                    && message.contains("epoch=9 id=9")),
             "an unattempted resume must retain checkpoint-error classification"
         );
         assert_eq!(state.open_calls.load(Ordering::SeqCst), 0);
@@ -12516,11 +12530,12 @@ mod tests {
             fail_restore: false,
             cancellation_policy: ConnectorCancellationPolicy::RetireConnector,
         };
-        let request = SourceStart {
-            config: laminar_connectors::config::ConnectorConfig::new("deadline-tie"),
-            position: SourcePosition::Initial,
-            delivery: DeliveryGuarantee::AtLeastOnce,
-        };
+        let request = SourceStart::new(
+            laminar_connectors::config::ConnectorConfig::new("deadline-tie"),
+            SourcePosition::Initial,
+            DeliveryGuarantee::AtLeastOnce,
+        )
+        .unwrap();
 
         let outcome = start_source_once(
             &mut connector,
@@ -13424,8 +13439,6 @@ mod tests {
             manual_active: None,
             checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
             last_published_checkpoint: None,
-            staged_bytes: Arc::new(AtomicU64::new(0)),
-            max_staged_bytes: u64::MAX,
             coordinated_commit_admission: None,
             public_generation: None,
             #[cfg(feature = "cluster")]
@@ -13632,7 +13645,7 @@ mod tests {
 
     #[test]
     fn completion_rejects_result_for_a_different_attempt() {
-        let admitted = CheckpointAttempt::new(7, 42);
+        let admitted = CheckpointAttempt::new(7, 7);
         let error = CheckpointCompletion::validated(
             admitted,
             crate::checkpoint_coordinator::CheckpointResult {
@@ -13647,14 +13660,12 @@ mod tests {
         )
         .expect_err("a different durable checkpoint ID must be rejected");
         assert!(error.contains("identity mismatch"));
-        assert!(error.contains("id=42"));
+        assert!(error.contains("id=7"));
         assert!(error.contains("id=43"));
     }
 
-    /// A burned durable ID makes checkpoint ID diverge from epoch. The async completion path
-    /// must preserve that exact identity rather than reconstructing `checkpoint_id = epoch`.
     #[tokio::test]
-    async fn async_completion_publishes_exact_burned_gap_id() {
+    async fn async_completion_publishes_exact_attempt() {
         let shutdown = Arc::new(tokio::sync::Notify::new());
         let (source_tx, rx) = mpsc::bounded_async::<SourceMsg>(4);
         let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
@@ -13672,7 +13683,7 @@ mod tests {
         let published = Arc::clone(&callback.published_barriers);
         let join = tokio::spawn(async move { coordinator.run(callback).await });
 
-        let attempt = CheckpointAttempt::new(7, 42);
+        let attempt = CheckpointAttempt::new(7, 7);
         completion_tx
             .send(CheckpointCompletion::new(attempt, FxHashMap::default()))
             .await
@@ -13775,11 +13786,10 @@ mod tests {
         let published = Arc::clone(&callback.published_barriers);
         let published_at_close = Arc::clone(&callback.published_barriers_observed_at_close);
         let written_rows = Arc::clone(&callback.written_rows);
-        let attempt = CheckpointAttempt::new(11, 8_111);
+        let attempt = CheckpointAttempt::new(11, 11);
         let mut result = successful_checkpoint_result(attempt);
         result.error = Some(
-            "checkpoint 8111 epoch 11 committed, but successor sink epoch 12 failed to begin"
-                .into(),
+            "checkpoint 11 epoch 11 committed, but successor sink epoch 12 failed to begin".into(),
         );
         let mut source_checkpoints = FxHashMap::default();
         let mut source_checkpoint = checkpoint_at(attempt.epoch);
@@ -13887,8 +13897,6 @@ mod tests {
             manual_active: None,
             checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
             last_published_checkpoint: None,
-            staged_bytes: Arc::new(AtomicU64::new(0)),
-            max_staged_bytes: u64::MAX,
             coordinated_commit_admission: None,
             public_generation: None,
             #[cfg(feature = "cluster")]
@@ -13936,7 +13944,7 @@ mod tests {
             DeliveryGuarantee::AtLeastOnce,
             Some(Duration::from_secs(60)),
         );
-        let attempt = CheckpointAttempt::new(31, 9_031);
+        let attempt = CheckpointAttempt::new(31, 31);
         coordinator.pending_barrier.reset(attempt, 1);
         let (reply_tx, reply_rx) = crossfire::oneshot::oneshot();
         coordinator.manual_active = Some(ManualCheckpointAttempt {
@@ -13975,7 +13983,7 @@ mod tests {
             None,
         );
 
-        let attempt = CheckpointAttempt::new(41, 9_041);
+        let attempt = CheckpointAttempt::new(41, 41);
         source_tx
             .send(SourceMsg::Barrier {
                 source_idx: 0,
@@ -14011,7 +14019,6 @@ mod tests {
         let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
         let (completion_tx, completion_rx) = mpsc::bounded_async::<CheckpointCompletion>(8);
         let in_flight = Arc::new(AtomicU64::new(1));
-        let staged_bytes = Arc::new(AtomicU64::new(0));
         let coordinator = test_coordinator(
             rx,
             control_rx,
@@ -14019,13 +14026,14 @@ mod tests {
             DeliveryGuarantee::AtLeastOnce,
             None,
         )
-        .with_checkpoint_admission(Arc::clone(&in_flight), staged_bytes, u64::MAX)
+        .with_checkpoint_admission(Arc::clone(&in_flight))
         .with_checkpoint_complete_rx(completion_rx);
 
         let callback = MockCallback::new();
         let published = Arc::clone(&callback.published_barriers);
         let published_at_close = Arc::clone(&callback.published_barriers_observed_at_close);
-        let attempt = CheckpointAttempt::new(51, 9_051);
+        let shutdown_sink_order = Arc::clone(&callback.shutdown_sink_order);
+        let attempt = CheckpointAttempt::new(51, 51);
         let tail_in_flight = Arc::clone(&in_flight);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -14051,6 +14059,32 @@ mod tests {
             1,
             "sink close raced the terminal completion"
         );
+        assert_eq!(shutdown_sink_order.lock().as_slice(), &["settle", "close"]);
+    }
+
+    #[tokio::test]
+    async fn shutdown_keeps_sink_actor_open_when_epoch_settlement_fails() {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let (_source_tx, rx) = mpsc::bounded_async::<SourceMsg>(4);
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(4);
+        let coordinator = test_coordinator(
+            rx,
+            control_rx,
+            Arc::clone(&shutdown),
+            DeliveryGuarantee::ExactlyOnce,
+            None,
+        );
+        let mut callback = MockCallback::new();
+        callback.settle_sink_epoch_error = Some("durable witness is unresolved".into());
+        let shutdown_sink_order = Arc::clone(&callback.shutdown_sink_order);
+
+        shutdown.notify_one();
+        let exit = coordinator.run(callback).await;
+        let ExitReason::Fault(reason) = exit else {
+            panic!("unresolved durable sink ownership did not fault shutdown");
+        };
+        assert!(reason.contains("durable witness is unresolved"), "{reason}");
+        assert_eq!(shutdown_sink_order.lock().as_slice(), &["settle"]);
     }
 
     #[tokio::test]
@@ -14151,8 +14185,6 @@ mod tests {
             manual_active: None,
             checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
             last_published_checkpoint: None,
-            staged_bytes: Arc::new(AtomicU64::new(0)),
-            max_staged_bytes: u64::MAX,
             coordinated_commit_admission: None,
             public_generation: None,
             #[cfg(feature = "cluster")]
@@ -14344,8 +14376,6 @@ mod tests {
             manual_active: None,
             checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
             last_published_checkpoint: None,
-            staged_bytes: Arc::new(AtomicU64::new(0)),
-            max_staged_bytes: u64::MAX,
             coordinated_commit_admission: None,
             public_generation: None,
             #[cfg(feature = "cluster")]
@@ -14634,8 +14664,6 @@ mod tests {
             manual_active: None,
             checkpoint_in_flight: Arc::new(AtomicU64::new(0)),
             last_published_checkpoint: None,
-            staged_bytes: Arc::new(AtomicU64::new(0)),
-            max_staged_bytes: u64::MAX,
             coordinated_commit_admission: None,
             public_generation: None,
             #[cfg(feature = "cluster")]

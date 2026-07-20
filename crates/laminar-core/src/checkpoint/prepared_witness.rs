@@ -16,7 +16,7 @@ pub const MAX_PREPARED_CHECKPOINT_WITNESSES: usize = 64;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreparedCheckpointWitness {
-    /// Exact epoch and globally unique checkpoint-attempt identifier.
+    /// One nonzero canonical checkpoint ID, mirrored in both retained fields.
     pub attempt: CheckpointAttempt,
     /// Stable logical participant recorded by the prepared manifest.
     pub participant_id: u64,
@@ -52,9 +52,9 @@ impl PreparedCheckpointWitness {
     /// # Errors
     /// Returns an error describing the first non-canonical field.
     pub(crate) fn validate(&self) -> Result<(), String> {
-        if self.attempt.epoch == 0 || self.attempt.checkpoint_id == 0 {
+        if !self.attempt.is_canonical() {
             return Err(
-                "prepared checkpoint attempt must have nonzero epoch and checkpoint ID".into(),
+                "prepared checkpoint attempt must use one nonzero canonical checkpoint ID".into(),
             );
         }
         if self.participant_id == 0 {
@@ -82,12 +82,8 @@ impl PreparedCheckpointWitness {
     }
 
     #[cfg(feature = "cluster")]
-    pub(crate) const fn ordering_key(&self) -> (u64, u64, u64) {
-        (
-            self.attempt.epoch,
-            self.attempt.checkpoint_id,
-            self.participant_id,
-        )
+    pub(crate) const fn ordering_key(&self) -> (u64, u64) {
+        (self.attempt.checkpoint_id, self.participant_id)
     }
 }
 
@@ -97,7 +93,7 @@ mod tests {
 
     fn witness() -> PreparedCheckpointWitness {
         PreparedCheckpointWitness::new(
-            CheckpointAttempt::new(7, 42),
+            CheckpointAttempt::canonical(7),
             3,
             uuid::Uuid::from_u128(9).to_string(),
             PipelineIdentity::empty(),
@@ -116,6 +112,10 @@ mod tests {
 
         let mut invalid = valid.clone();
         invalid.attempt.checkpoint_id = 0;
+        assert!(!invalid.is_canonical());
+
+        let mut invalid = valid.clone();
+        invalid.attempt.checkpoint_id = invalid.attempt.epoch + 1;
         assert!(!invalid.is_canonical());
 
         let mut invalid = valid.clone();

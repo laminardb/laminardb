@@ -7,12 +7,14 @@ use tokio::signal;
 use tracing::{info, warn};
 
 use laminar_core::streaming::checkpoint::StreamCheckpointConfig;
-use laminar_db::{DbError, EngineMetrics, LaminarDB, Profile};
+use laminar_db::{DbError, EngineMetrics, LaminarDB};
 
 #[cfg(feature = "cluster")]
 use crate::cluster_config::{ClusterConfig, ClusterConfigError};
+#[cfg(not(feature = "cluster"))]
+use crate::config::ServerMode;
 use crate::config::{
-    ConfigError, LookupConfig, PipelineConfig, ServerConfig, ServerMode, SinkConfig, SourceConfig,
+    ConfigError, LookupConfig, PipelineConfig, ServerConfig, SinkConfig, SourceConfig,
 };
 use crate::http;
 #[cfg(feature = "cluster")]
@@ -21,7 +23,6 @@ use crate::metrics::ServerMetrics;
 use crate::reload::ReloadGuard;
 #[cfg(test)]
 use laminar_core::state::StateBackendConfig;
-use laminar_core::state::StateBackendDurability;
 
 /// Handle to a running LaminarDB server. Call `wait_for_shutdown` to block until Ctrl-C.
 pub struct ServerHandle {
@@ -176,6 +177,12 @@ pub async fn run_server(
     config: ServerConfig,
     config_path: PathBuf,
 ) -> Result<ServerHandle, ServerError> {
+    // Validate independently of config-file loading: cluster startup acquires durable leases and
+    // starts discovery before constructing LaminarDB, and programmatic callers can bypass the
+    // TOML validator entirely.
+    resolved_checkpoint_state_bytes(&config.checkpoint)
+        .map_err(|error| ServerError::Build(format!("checkpoint.max_staged_bytes: {error}")))?;
+
     // Cluster mode: gated behind the `cluster` feature flag.
     #[cfg(feature = "cluster")]
     {
@@ -206,23 +213,14 @@ pub async fn run_server(
         builder = builder.http_auth_token(token.expose());
     }
     let storage_dir = config.state.local_storage_dir();
-    let has_storage = config
-        .state
-        .durability_scope()
-        .satisfies(StateBackendDurability::NodeDurable);
     if let Some(path) = storage_dir {
         builder = builder.storage_dir(path);
     }
 
-    let profile = match config.server.mode {
-        ServerMode::Single if has_storage => Profile::Embedded,
-        ServerMode::Single => Profile::BareMetal,
-        ServerMode::Cluster => Profile::Cluster,
-    };
-    builder = builder.profile(profile);
     builder = builder.restart_policy(config.supervision.to_policy());
     builder = builder.incremental_emit(config.server.incremental_emit);
-    builder = apply_checkpoint_config(builder, &config.checkpoint.url, &config.checkpoint, false);
+    builder = apply_local_checkpoint_config(builder, &config.checkpoint.url, &config.checkpoint)
+        .map_err(|error| ServerError::Build(format!("checkpoint storage: {error}")))?;
 
     // Build the state backend + single-owner vnode registry from config so
     // the checkpoint coordinator's durability gate runs with real markers.
@@ -362,35 +360,78 @@ pub async fn run_server(
 // Shared helpers (used by both single-node and cluster startup)
 // ---------------------------------------------------------------------------
 
-/// Apply checkpoint settings to a `LaminarDB` builder.
-///
-/// Cluster configuration validation admits only shared cloud URLs. Single-node
-/// mode keeps `file://` on the local `FileSystemCheckpointStore` (stable on-disk
-/// layout); remote schemes (`s3://`, …) use the object-store implementation.
-pub(crate) fn apply_checkpoint_config(
+/// Invalid checkpoint storage or state-budget configuration.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CheckpointConfigurationError {
+    #[error(transparent)]
+    Storage(#[from] laminar_core::storage::object_store_builder::ObjectStoreBuilderError),
+    #[error("checkpoint.max_staged_bytes: {0}")]
+    StateBudget(laminar_core::storage::checkpoint_store::CheckpointStoreError),
+}
+
+/// Apply local-runtime checkpoint settings to a `LaminarDB` builder.
+pub(crate) fn apply_local_checkpoint_config(
     mut builder: laminar_db::LaminarDbBuilder,
     checkpoint_url: &str,
     checkpoint: &crate::config::CheckpointSection,
-    cluster: bool,
-) -> laminar_db::LaminarDbBuilder {
-    let cfg = StreamCheckpointConfig {
-        interval_ms: Some(u64::try_from(checkpoint.interval.as_millis()).unwrap_or(u64::MAX)),
-        timeout_ms: Some(u64::try_from(checkpoint.timeout.as_millis()).unwrap_or(u64::MAX)),
-        data_dir: file_url_to_path(checkpoint_url),
-        max_retained: Some(checkpoint.max_retained),
-        max_staged_bytes: checkpoint.max_staged_bytes,
+) -> Result<laminar_db::LaminarDbBuilder, CheckpointConfigurationError> {
+    let data_dir = if checkpoint_url.starts_with("file://") {
+        Some(laminar_core::storage::object_store_builder::file_url_path(
+            checkpoint_url,
+        )?)
+    } else {
+        None
     };
-    builder = builder.checkpoint(cfg);
+    builder = apply_checkpoint_settings(builder, checkpoint, data_dir)?;
 
     let is_file = checkpoint_url.starts_with("file://");
-    if !checkpoint_url.is_empty() && (cluster || !is_file) {
+    if !checkpoint_url.is_empty() && !is_file {
         builder = builder.object_store_url(checkpoint_url.to_string());
         if !checkpoint.storage.is_empty() {
             builder = builder.object_store_options(checkpoint.storage.clone());
         }
     }
 
-    builder
+    Ok(builder)
+}
+
+#[cfg(feature = "cluster")]
+pub(crate) fn apply_verified_cluster_checkpoint_config(
+    builder: laminar_db::LaminarDbBuilder,
+    checkpoint: &crate::config::CheckpointSection,
+    namespaces: laminar_core::cluster::control::VerifiedClusterNamespaces,
+) -> Result<laminar_db::LaminarDbBuilder, CheckpointConfigurationError> {
+    Ok(apply_checkpoint_settings(builder, checkpoint, None)?
+        .verified_cluster_namespaces(namespaces))
+}
+
+fn apply_checkpoint_settings(
+    builder: laminar_db::LaminarDbBuilder,
+    checkpoint: &crate::config::CheckpointSection,
+    data_dir: Option<PathBuf>,
+) -> Result<laminar_db::LaminarDbBuilder, CheckpointConfigurationError> {
+    let max_state_data_bytes = resolved_checkpoint_state_bytes(checkpoint)
+        .map_err(CheckpointConfigurationError::StateBudget)?;
+    Ok(builder.checkpoint(StreamCheckpointConfig {
+        interval_ms: Some(u64::try_from(checkpoint.interval.as_millis()).unwrap_or(u64::MAX)),
+        timeout_ms: Some(u64::try_from(checkpoint.timeout.as_millis()).unwrap_or(u64::MAX)),
+        data_dir,
+        max_retained: Some(checkpoint.max_retained),
+        max_staged_bytes: Some(max_state_data_bytes),
+    }))
+}
+
+/// Resolve the one capture and recovery admission budget used by every server checkpoint store.
+pub(crate) fn resolved_checkpoint_state_bytes(
+    checkpoint: &crate::config::CheckpointSection,
+) -> Result<u64, laminar_core::storage::checkpoint_store::CheckpointStoreError> {
+    let max_state_data_bytes = checkpoint
+        .max_staged_bytes
+        .unwrap_or(laminar_core::checkpoint::checkpoint_store::DEFAULT_MAX_CHECKPOINT_STATE_BYTES);
+    laminar_core::storage::checkpoint_store::validate_max_checkpoint_state_bytes(
+        max_state_data_bytes,
+    )?;
+    Ok(max_state_data_bytes)
 }
 
 /// Execute DDL for all config sections (sources, lookups, pipelines, sinks, raw SQL).
@@ -613,27 +654,6 @@ pub(crate) fn spawn_config_watcher(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Extract a local filesystem path from a `file://` URL, or `None` for cloud URLs.
-fn file_url_to_path(url: &str) -> Option<PathBuf> {
-    let raw = url.strip_prefix("file://")?;
-    // Accept both absolute file URLs and the explicitly relative form used by
-    // portable examples (`file://./state`). A host-style URL remains rejected;
-    // local checkpoint storage must not silently reinterpret a hostname.
-    if !raw.starts_with('/') && !raw.starts_with("./") && !raw.starts_with("../") {
-        return None;
-    }
-    #[cfg(windows)]
-    let raw = {
-        let b = raw.as_bytes();
-        if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
-            &raw[1..]
-        } else {
-            raw
-        }
-    };
-    Some(PathBuf::from(raw))
-}
-
 // ---------------------------------------------------------------------------
 // DDL generation
 // ---------------------------------------------------------------------------
@@ -827,15 +847,66 @@ pub enum ServerError {
 mod tests {
     use super::*;
 
-    #[test]
-    fn file_checkpoint_url_preserves_explicit_relative_path() {
-        assert_eq!(
-            file_url_to_path("file://./.laminardb/checkpoints"),
-            Some(PathBuf::from("./.laminardb/checkpoints"))
-        );
-        assert!(file_url_to_path("file://checkpoint-host/path").is_none());
-    }
     use crate::config::*;
+
+    #[test]
+    fn checkpoint_config_rejects_relative_file_urls() {
+        let result = apply_local_checkpoint_config(
+            LaminarDB::builder(),
+            "file://./relative",
+            &CheckpointSection::default(),
+        );
+        let Err(error) = result else {
+            panic!("relative checkpoint URL was admitted");
+        };
+        assert!(error.to_string().contains("remote host"), "{error}");
+    }
+
+    #[test]
+    fn checkpoint_state_budget_has_one_default_and_honours_an_override() {
+        let mut checkpoint = CheckpointSection::default();
+        assert_eq!(
+            resolved_checkpoint_state_bytes(&checkpoint).unwrap(),
+            laminar_core::checkpoint::checkpoint_store::DEFAULT_MAX_CHECKPOINT_STATE_BYTES
+        );
+
+        checkpoint.max_staged_bytes = Some(8 * 1024 * 1024);
+        assert_eq!(
+            resolved_checkpoint_state_bytes(&checkpoint).unwrap(),
+            8 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn checkpoint_state_budget_rejects_zero_and_unaddressable_limits() {
+        let mut checkpoint = CheckpointSection::default();
+        checkpoint.max_staged_bytes = Some(0);
+        assert!(resolved_checkpoint_state_bytes(&checkpoint).is_err());
+
+        checkpoint.max_staged_bytes = Some((isize::MAX as u64) + 1);
+        let error = resolved_checkpoint_state_bytes(&checkpoint).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("exceeds this process address space"));
+    }
+
+    #[tokio::test]
+    async fn server_entry_rejects_invalid_budget_before_runtime_mode_routing() {
+        for mode in [ServerMode::Single, ServerMode::Cluster] {
+            let mut config: ServerConfig = toml::from_str("").unwrap();
+            config.server.mode = mode;
+            config.checkpoint.max_staged_bytes = Some(0);
+
+            let result = run_server(config, PathBuf::from("unused.toml")).await;
+            let Err(error) = result else {
+                panic!("invalid checkpoint state budget was admitted in {mode:?} mode");
+            };
+            assert!(
+                error.to_string().contains("checkpoint.max_staged_bytes"),
+                "{error}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn cancelling_http_start_does_not_detach_the_listener() {
@@ -996,7 +1067,7 @@ mod tests {
         let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
             node,
             Arc::clone(&kv),
-            kv,
+            Arc::clone(&kv),
             None,
             members_rx,
             boot,
@@ -1017,9 +1088,33 @@ mod tests {
             .unwrap();
         controller.set_leader_lease_store(Arc::clone(&authority));
         let manifest_store = Arc::new(CatalogManifestStore::new(authority));
+        let participant = laminar_core::checkpoint::CheckpointParticipant {
+            node_id: node.0,
+            boot_incarnation: boot,
+        };
+        let verified_namespaces =
+            laminar_core::cluster::control::prove_shared_object_store_namespaces(
+                participant,
+                &[participant],
+                kv,
+                Arc::clone(&object_store),
+                Arc::clone(&object_store),
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        let state_backend: Arc<dyn laminar_core::state::StateBackend> =
+            Arc::new(laminar_core::state::ObjectStoreBackend::cluster_shared(
+                verified_namespaces.state_store(),
+                node.to_string(),
+                1,
+            ));
+        let vnode_registry = Arc::new(laminar_core::state::VnodeRegistry::new(1));
         let db = LaminarDB::builder()
             .cluster_controller(controller)
-            .cluster_checkpoint_object_store(object_store)
+            .verified_cluster_namespaces(verified_namespaces)
+            .state_backend(state_backend)
+            .vnode_registry(vnode_registry)
             .catalog_manifest_store(Arc::clone(&manifest_store))
             .build()
             .await

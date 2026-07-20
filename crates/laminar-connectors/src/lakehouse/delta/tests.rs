@@ -1024,7 +1024,7 @@ async fn coordinated_epoch_over_four_times_buffer_cap_commits_once() {
         "delta_out",
     )
     .unwrap();
-    let attempt = CheckpointAttempt::new(1, 101);
+    let attempt = CheckpointAttempt::canonical(101);
     sink.commit_aggregated(
         CoordinatedCommitBatch {
             namespace: namespace.clone(),
@@ -1056,8 +1056,8 @@ async fn coordinated_epoch_over_four_times_buffer_cap_commits_once() {
     sink.close().await.unwrap();
 }
 
-/// The designated cursor is scoped by pipeline + sink and stores the globally
-/// unique checkpoint id, independently of the local staging epoch.
+/// The designated cursor stores the canonical engine checkpoint identity;
+/// Delta's local staging epoch remains connector-local.
 #[cfg(feature = "delta-lake")]
 #[tokio::test]
 async fn coordinated_recovery_reads_namespaced_checkpoint_id() {
@@ -1096,7 +1096,7 @@ async fn coordinated_recovery_reads_namespaced_checkpoint_id() {
             .await
             .unwrap()
             .expect("coordinated pre_commit returns a descriptor");
-        let attempt = CheckpointAttempt::new(epoch, 100 + epoch);
+        let attempt = CheckpointAttempt::canonical(100 + epoch);
         writer
             .commit_aggregated(
                 CoordinatedCommitBatch {
@@ -1162,8 +1162,8 @@ async fn coordinated_failover_overlap_does_not_duplicate_committed_attempt() {
         "delta_out",
     )
     .unwrap();
-    let first_attempt = CheckpointAttempt::new(1, 101);
-    let second_attempt = CheckpointAttempt::new(2, 102);
+    let first_attempt = CheckpointAttempt::canonical(101);
+    let second_attempt = CheckpointAttempt::canonical(102);
 
     let mut writer = DeltaLakeSink::with_schema(coordinated_config(&path), test_schema());
     writer
@@ -1322,7 +1322,7 @@ async fn coordinated_unresolved_publication_allows_only_the_exact_batch_retry() 
         "delta_out",
     )
     .unwrap();
-    let attempt = CheckpointAttempt::new(1, 101);
+    let attempt = CheckpointAttempt::canonical(101);
     let committed = CoordinatedCommitCursor {
         checkpoint_id: 101,
         fencing_token: 1,
@@ -1347,8 +1347,8 @@ async fn coordinated_unresolved_publication_allows_only_the_exact_batch_retry() 
     .await
     .unwrap();
 
-    let second = CheckpointAttempt::new(2, 102);
-    let third = CheckpointAttempt::new(3, 103);
+    let second = CheckpointAttempt::canonical(102);
+    let third = CheckpointAttempt::canonical(103);
     let second_batch = CoordinatedCommitBatch {
         namespace: namespace.clone(),
         expected_predecessor: committed,
@@ -1464,7 +1464,7 @@ async fn coordinated_catalog_commit_timeout_fences_later_work_until_cursor_read(
         "delta_timeout",
     )
     .unwrap();
-    let attempt = CheckpointAttempt::new(1, 101);
+    let attempt = CheckpointAttempt::canonical(101);
     let batch = CoordinatedCommitBatch {
         namespace: namespace.clone(),
         expected_predecessor: CoordinatedCommitCursor {

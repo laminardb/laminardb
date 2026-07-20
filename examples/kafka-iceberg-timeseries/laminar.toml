@@ -63,5 +63,4 @@ backend      = "local"
 path         = "./.laminardb/state"
 
 [checkpoint]
-url      = "file://./.laminardb/checkpoints"
 interval = "10s"

@@ -39,10 +39,12 @@ async fn config_roundtrip_in_process_local_object_store() {
     );
 
     let dir = tempdir().unwrap();
-    let url = format!(
-        "file://{}",
-        dir.path().display().to_string().replace('\\', "/")
-    );
+    let normalized = dir.path().display().to_string().replace('\\', "/");
+    let url = if normalized.starts_with('/') {
+        format!("file://{normalized}")
+    } else {
+        format!("file:///{normalized}")
+    };
     let c = StateBackendConfig::object_store(url);
     let b = c.build(LOCAL_KEY_GROUP_COUNT).unwrap();
     assert_eq!(b.durability_scope(), StateBackendDurability::NodeDurable);
@@ -73,7 +75,7 @@ async fn cluster_shared_two_instances_share_state_and_fence_seals() {
         node_a.durability_scope(),
         StateBackendDurability::ClusterShared
     );
-    let attempt = CheckpointAttempt::new(1, 100);
+    let attempt = CheckpointAttempt::new(1, 1);
 
     node_a
         .write_partial(attempt, 0, 0, Bytes::from_static(b"A0"))
@@ -117,7 +119,7 @@ async fn cluster_shared_two_instances_share_state_and_fence_seals() {
         .unwrap_err();
     assert!(matches!(err, StateBackendError::Conflict { .. }));
 
-    let next = CheckpointAttempt::new(2, 101);
+    let next = CheckpointAttempt::new(2, 2);
     node_a
         .write_partial(next, 0, 0, Bytes::from_static(b"A0@2"))
         .await

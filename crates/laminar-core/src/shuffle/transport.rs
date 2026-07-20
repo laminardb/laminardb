@@ -6,7 +6,7 @@
 
 use super::message::ShuffleMessage;
 #[cfg(feature = "cluster")]
-use crate::state::{CheckpointAttempt, CheckpointAttemptRelation};
+use crate::state::CheckpointAttempt;
 
 /// Secondary queue and holdover item bound; byte semaphores are the primary
 /// admission control in cluster mode.
@@ -16,6 +16,21 @@ const SHUFFLE_RECV_QUEUE: usize = 256;
 pub type ShufflePeerId = u64;
 
 const SCOPE_CANCELLED: &str = "shuffle assignment or recovery scope was cancelled";
+const NONCANONICAL_BARRIER: &str =
+    "shuffle checkpoint barrier must use one nonzero canonical checkpoint ID";
+
+fn validate_checkpoint_barrier(
+    barrier: crate::checkpoint::CheckpointBarrier,
+) -> std::io::Result<()> {
+    if barrier.is_canonical() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            NONCANONICAL_BARRIER,
+        ))
+    }
+}
 
 #[derive(Debug)]
 struct ScopeCancelled;
@@ -89,15 +104,29 @@ struct RetiredCheckpoint {
 
 impl BarrierHoldover {
     #[cfg(feature = "cluster")]
-    fn is_retired(&self, attempt: CheckpointAttempt, assignment_digest: Option<[u8; 32]>) -> bool {
-        self.retired_through
-            .is_some_and(|retired| match attempt.relation_to(retired.attempt) {
-                CheckpointAttemptRelation::Older => true,
-                CheckpointAttemptRelation::Exact => {
-                    assignment_digest == Some(retired.assignment_digest)
-                }
-                CheckpointAttemptRelation::Newer | CheckpointAttemptRelation::Conflict => false,
-            })
+    fn is_retired(
+        &self,
+        attempt: CheckpointAttempt,
+        assignment_digest: Option<[u8; 32]>,
+    ) -> std::io::Result<bool> {
+        let Some(retired) = self.retired_through else {
+            return Ok(false);
+        };
+        match attempt.checkpoint_id.cmp(&retired.attempt.checkpoint_id) {
+            std::cmp::Ordering::Less => Ok(true),
+            std::cmp::Ordering::Greater => Ok(false),
+            std::cmp::Ordering::Equal
+                if assignment_digest == Some(retired.assignment_digest) =>
+            {
+                Ok(true)
+            }
+            std::cmp::Ordering::Equal => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "retired checkpoint barrier {attempt:?} has a different assignment digest from its durable terminal outcome"
+                ),
+            )),
+        }
     }
 }
 
@@ -141,37 +170,61 @@ impl Holdover {
         let ShuffleMessage::Barrier(barrier) = received.message() else {
             return None;
         };
-        Some(CheckpointAttempt::new(barrier.epoch, barrier.checkpoint_id))
+        let attempt = CheckpointAttempt::new(barrier.epoch, barrier.checkpoint_id);
+        attempt.is_canonical().then_some(attempt)
     }
 
     #[cfg(feature = "cluster")]
-    fn is_retired_barrier(&self, received: &ReceivedShuffle) -> bool {
+    fn is_retired_barrier(&self, received: &ReceivedShuffle) -> std::io::Result<bool> {
         let Some(attempt) = Self::barrier_attempt(received) else {
-            return false;
+            return Ok(false);
         };
         self.barriers
             .lock()
             .is_retired(attempt, received.assignment_digest)
     }
 
+    #[cfg(feature = "cluster")]
+    fn is_retired_checkpoint_barrier(
+        &self,
+        barrier: crate::checkpoint::CheckpointBarrier,
+        assignment_digest: [u8; 32],
+    ) -> std::io::Result<bool> {
+        let attempt = CheckpointAttempt::new(barrier.epoch, barrier.checkpoint_id);
+        if !attempt.is_canonical() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                NONCANONICAL_BARRIER,
+            ));
+        }
+        self.barriers
+            .lock()
+            .is_retired(attempt, Some(assignment_digest))
+    }
+
     fn has_staged_barriers(&self) -> bool {
         !self.barriers.lock().staged.is_empty()
     }
 
-    fn stage_barrier(&self, barrier: ReceivedShuffle) -> bool {
+    fn stage_barrier(&self, barrier: ReceivedShuffle) -> std::io::Result<bool> {
+        let ShuffleMessage::Barrier(value) = barrier.message() else {
+            return Ok(false);
+        };
+        if !value.is_canonical() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                NONCANONICAL_BARRIER,
+            ));
+        }
         let mut holdover = self.barriers.lock();
         #[cfg(feature = "cluster")]
-        {
-            debug_assert!(Self::barrier_attempt(&barrier).is_some());
-        }
-        #[cfg(feature = "cluster")]
-        if Self::barrier_attempt(&barrier)
-            .is_some_and(|attempt| holdover.is_retired(attempt, barrier.assignment_digest))
-        {
-            return false;
+        if let Some(attempt) = Self::barrier_attempt(&barrier) {
+            if holdover.is_retired(attempt, barrier.assignment_digest)? {
+                return Ok(false);
+            }
         }
         holdover.staged.push(barrier);
-        true
+        Ok(true)
     }
 
     fn take_staged_barriers(&self) -> Vec<ReceivedShuffle> {
@@ -184,10 +237,10 @@ impl Holdover {
         attempt: CheckpointAttempt,
         assignment_digest: [u8; 32],
     ) -> std::io::Result<()> {
-        if attempt.epoch == 0 || attempt.checkpoint_id == 0 {
+        if !attempt.is_canonical() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "retired checkpoint attempt dimensions must be nonzero",
+                "retired checkpoint attempt must use one nonzero canonical checkpoint ID",
             ));
         }
 
@@ -198,71 +251,45 @@ impl Holdover {
                     attempt,
                     assignment_digest,
                 },
-                Some(retired) => match attempt.relation_to(retired.attempt) {
-                    CheckpointAttemptRelation::Newer => RetiredCheckpoint {
+                Some(retired) if attempt.checkpoint_id > retired.attempt.checkpoint_id => {
+                    RetiredCheckpoint {
                         attempt,
                         assignment_digest,
-                    },
-                    CheckpointAttemptRelation::Exact => {
-                        if assignment_digest != retired.assignment_digest {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                format!(
-                                    "checkpoint retirement {attempt:?} has a different assignment digest from its high-water"
-                                ),
-                            ));
-                        }
-                        retired
                     }
-                    CheckpointAttemptRelation::Older => retired,
-                    CheckpointAttemptRelation::Conflict => {
+                }
+                Some(retired) if attempt.checkpoint_id == retired.attempt.checkpoint_id => {
+                    if assignment_digest != retired.assignment_digest {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             format!(
-                                "checkpoint retirement {attempt:?} conflicts with high-water {:?}",
-                                retired.attempt
+                                "checkpoint retirement {attempt:?} has a different assignment digest from its high-water"
                             ),
                         ));
                     }
-                },
+                    retired
+                }
+                Some(retired) => retired,
             };
             for barrier in &holdover.staged {
                 let Some(candidate) = Self::barrier_attempt(barrier) else {
                     continue;
                 };
-                match candidate.relation_to(retired.attempt) {
-                    CheckpointAttemptRelation::Conflict => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!(
-                                "staged checkpoint barrier {candidate:?} conflicts with retirement {:?}",
-                                retired.attempt
-                            ),
-                        ));
-                    }
-                    CheckpointAttemptRelation::Exact
-                        if barrier.assignment_digest != Some(retired.assignment_digest) =>
-                    {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!(
-                                "staged checkpoint barrier {candidate:?} has a different assignment digest from its durable terminal outcome"
-                            ),
-                        ));
-                    }
-                    CheckpointAttemptRelation::Exact
-                    | CheckpointAttemptRelation::Older
-                    | CheckpointAttemptRelation::Newer => {}
+                if candidate.checkpoint_id == retired.attempt.checkpoint_id
+                    && barrier.assignment_digest != Some(retired.assignment_digest)
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "staged checkpoint barrier {candidate:?} has a different assignment digest from its durable terminal outcome"
+                        ),
+                    ));
                 }
             }
             holdover.retired_through = Some(retired);
             let staged_before = holdover.staged.len();
             holdover.staged.retain(|barrier| {
                 !Self::barrier_attempt(barrier).is_some_and(|candidate| {
-                    matches!(
-                        candidate.relation_to(retired.attempt),
-                        CheckpointAttemptRelation::Exact | CheckpointAttemptRelation::Older
-                    )
+                    candidate.checkpoint_id <= retired.attempt.checkpoint_id
                 })
             });
             staged_before - holdover.staged.len()
@@ -514,9 +541,9 @@ mod grpc {
         ShuffleSummary,
     };
     use super::{
-        is_scope_cancelled, scope_cancelled_io, CheckpointAttempt, Holdover, InboundReservation,
-        ReceivedBatch, ReceivedShuffle, ShuffleMessage, ShufflePeerId, SCOPE_CANCELLED,
-        SHUFFLE_ADDR_KEY, SHUFFLE_RECV_QUEUE,
+        is_scope_cancelled, scope_cancelled_io, validate_checkpoint_barrier, CheckpointAttempt,
+        Holdover, InboundReservation, ReceivedBatch, ReceivedShuffle, ShuffleMessage,
+        ShufflePeerId, NONCANONICAL_BARRIER, SCOPE_CANCELLED, SHUFFLE_ADDR_KEY, SHUFFLE_RECV_QUEUE,
     };
     use crate::checkpoint::{CheckpointAssignmentFence, CheckpointBarrier};
     use crate::cluster::control::{ClusterKv, LeaseDeadline};
@@ -1086,7 +1113,10 @@ mod grpc {
 
     fn outbound_workspace_bytes(msg: &ShuffleMessage) -> io::Result<usize> {
         match msg {
-            ShuffleMessage::Barrier(_) => Ok(1024),
+            ShuffleMessage::Barrier(barrier) => {
+                validate_checkpoint_barrier(*barrier)?;
+                Ok(1024)
+            }
             ShuffleMessage::Data {
                 stage,
                 routed_vnodes,
@@ -1707,6 +1737,8 @@ mod grpc {
         } = out;
         let frames = match msg {
             PreparedMessage::Barrier(b) => {
+                validate_checkpoint_barrier(b)
+                    .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
                 let assignment_digest = assignment_digest.ok_or_else(|| {
                     tonic::Status::failed_precondition(
                         "shuffle checkpoint barrier has no assignment certificate",
@@ -2201,6 +2233,7 @@ mod grpc {
                     "shuffle peer must be a different assigned node",
                 ));
             }
+            let admission_bytes = outbound_workspace_bytes(msg)?;
             if matches!(msg, ShuffleMessage::Barrier(_)) && assignment_fence.is_none() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -2208,7 +2241,6 @@ mod grpc {
                 ));
             }
             let scope = self.current_scope(expected_assignment_version)?;
-            let admission_bytes = outbound_workspace_bytes(msg)?;
             let conn = self.connection_for(peer, &scope).await?;
             let _send_guard = tokio::select! {
                 biased;
@@ -2509,6 +2541,7 @@ mod grpc {
             barrier: CheckpointBarrier,
             assignment_fence: &CheckpointAssignmentFence,
         ) -> io::Result<()> {
+            validate_checkpoint_barrier(barrier)?;
             let installed = self.current_assignment()?;
             let expected_peers: Vec<_> = assignment_fence
                 .participants
@@ -3001,6 +3034,7 @@ mod grpc {
             let pending_handshakes = Arc::new(PendingHandshakes::default());
             let delivery = Arc::new(DeliveryTracker::default());
             let barrier_arrivals = Arc::new(AtomicU64::new(0));
+            let holdover = Arc::new(Holdover::new(SHUFFLE_RECV_QUEUE));
             let inbound_budget = Arc::new(InboundBudget::new(INBOUND_NODE_BUDGET_BYTES));
             let active_streams = Arc::new(Semaphore::new(MAX_ACTIVE_STREAMS));
             let active_stream_registry = Arc::new(ActiveStreamRegistry::default());
@@ -3016,6 +3050,7 @@ mod grpc {
                 recovery_gen: Arc::clone(&recovery_gen),
                 delivery: Arc::clone(&delivery),
                 barrier_arrivals: Arc::clone(&barrier_arrivals),
+                holdover: Arc::clone(&holdover),
                 inbound_budget,
                 active_streams: Arc::clone(&active_streams),
                 active_stream_registry,
@@ -3061,7 +3096,7 @@ mod grpc {
                 #[cfg(test)]
                 assignment_wait_pause: Mutex::new(None),
                 server,
-                holdover: Arc::new(Holdover::new(SHUFFLE_RECV_QUEUE)),
+                holdover,
                 barrier_arrivals,
                 barrier_reconciled: AtomicU64::new(0),
                 recovery_gen,
@@ -3484,14 +3519,21 @@ mod grpc {
         }
 
         fn retain_received(&self, received: &ReceivedShuffle) -> bool {
-            !self.holdover.is_retired_barrier(received)
-                && self.retain_queued_scope(
+            match self.holdover.is_retired_barrier(received) {
+                Ok(true) => false,
+                Err(_) => {
+                    self.delivery
+                        .note_loss(received.peer, 1, "retired-barrier-assignment-digest");
+                    false
+                }
+                Ok(false) => self.retain_queued_scope(
                     received.peer,
                     received.sender_incarnation,
                     received.receiver_incarnation,
                     received.assignment_version,
                     received.recovery_gen,
-                )
+                ),
+            }
         }
 
         fn retain_batch(&self, received: &ReceivedBatch) -> bool {
@@ -3663,8 +3705,12 @@ mod grpc {
                             recovery_gen,
                             checkpoint_sequence,
                         };
-                        if self.holdover.stage_barrier(barrier) {
-                            return false;
+                        match self.holdover.stage_barrier(barrier) {
+                            Ok(true) => return false,
+                            Err(_) => self
+                                .delivery
+                                .note_loss(peer, 1, "barrier-holdover-protocol"),
+                            Ok(false) => {}
                         }
                         self.holdover.release_items(1);
                     }
@@ -3721,8 +3767,8 @@ mod grpc {
 
         /// Retire barrier markers through a certified terminal checkpoint without dropping data.
         /// # Errors
-        /// Rejects zero attempt dimensions, conflicting attempts, and exact markers whose
-        /// assignment digest differs from the durable terminal outcome.
+        /// Rejects a noncanonical attempt and exact markers whose assignment digest differs from
+        /// the durable terminal outcome.
         pub fn retire_checkpoint_barriers(
             &self,
             attempt: CheckpointAttempt,
@@ -3744,8 +3790,15 @@ mod grpc {
                     .note_loss(barrier.peer, 1, "barrier-holdover-capacity");
                 return;
             }
-            if !self.holdover.stage_barrier(barrier) {
-                self.holdover.release_items(1);
+            let peer = barrier.peer;
+            match self.holdover.stage_barrier(barrier) {
+                Ok(true) => {}
+                Err(_) => {
+                    self.holdover.release_items(1);
+                    self.delivery
+                        .note_loss(peer, 1, "barrier-holdover-protocol");
+                }
+                Ok(false) => self.holdover.release_items(1),
             }
         }
 
@@ -4255,6 +4308,7 @@ mod grpc {
         recovery_gen: Arc<AtomicU64>,
         delivery: Arc<DeliveryTracker>,
         barrier_arrivals: Arc<AtomicU64>,
+        holdover: Arc<Holdover>,
         inbound_budget: Arc<InboundBudget>,
         active_streams: Arc<Semaphore>,
         active_stream_registry: Arc<ActiveStreamRegistry>,
@@ -4528,11 +4582,12 @@ mod grpc {
     async fn publish_barrier(
         tx: &InboundTx,
         barrier_arrivals: &AtomicU64,
+        holdover: &Holdover,
         assignment_version: &AtomicU64,
         recovery_gen: &AtomicU64,
         delivery: &DeliveryTracker,
         fence: StreamFence,
-        msg: ShuffleMessage,
+        barrier: CheckpointBarrier,
         assignment_digest: [u8; 32],
         last_seq: u64,
         cancel: &CancellationToken,
@@ -4546,6 +4601,9 @@ mod grpc {
             cancel,
             process_lease,
         )?;
+        let retired = holdover
+            .is_retired_checkpoint_barrier(barrier, assignment_digest)
+            .map_err(|error| reject_stream_protocol(delivery, &fence, &error.to_string()))?;
         let reservation = delivery.prepare_barrier(&fence, last_seq)?;
         validate_active_stream_scope(
             assignment_version,
@@ -4556,12 +4614,15 @@ mod grpc {
             process_lease,
         )?;
         delivery.commit_barrier(reservation)?;
+        if retired {
+            return Ok(true);
+        }
         tokio::select! {
             biased;
             () = cancel.cancelled() => Err(scope_cancelled_status()),
             result = tx.send(Inbound {
                 peer: fence.sender_node_id,
-                msg,
+                msg: ShuffleMessage::Barrier(barrier),
                 budget: None,
                 fence,
                 assignment_digest: Some(assignment_digest),
@@ -4591,6 +4652,7 @@ mod grpc {
             pending_handshakes,
             tx,
             barrier_arrivals,
+            holdover,
             recovery_gen,
             delivery,
             inbound_budget,
@@ -4666,6 +4728,18 @@ mod grpc {
                             "shuffle barrier arrived before its preceding batch completed",
                         ));
                     }
+                    let barrier = CheckpointBarrier {
+                        checkpoint_id: b.checkpoint_id,
+                        epoch: b.epoch,
+                        flags: b.flags,
+                    };
+                    if !barrier.is_canonical() {
+                        return Err(reject_stream_protocol(
+                            delivery,
+                            &fence,
+                            NONCANONICAL_BARRIER,
+                        ));
+                    }
                     let assignment_digest: [u8; 32] =
                         b.assignment_digest.as_slice().try_into().map_err(|_| {
                             reject_stream_protocol(
@@ -4689,19 +4763,15 @@ mod grpc {
                         () = stream_cancel.cancelled() => return Err(scope_cancelled_status()),
                         guard = ingress.lock() => guard,
                     };
-                    let msg = ShuffleMessage::Barrier(CheckpointBarrier {
-                        checkpoint_id: b.checkpoint_id,
-                        epoch: b.epoch,
-                        flags: b.flags,
-                    });
                     if !publish_barrier(
                         tx,
                         barrier_arrivals,
+                        holdover,
                         assignment_version,
                         recovery_gen,
                         delivery,
                         fence,
-                        msg,
+                        barrier,
                         assignment_digest,
                         b.last_seq,
                         stream_cancel,
@@ -5184,14 +5254,16 @@ mod grpc {
             let cancel = CancellationToken::new();
             let process_lease = live_process_lease();
             let (tx, rx) = mpsc::bounded_async::<Inbound>(1);
+            let holdover = Holdover::new(1);
             let publish = publish_barrier(
                 &tx,
                 &barrier_arrivals,
+                &holdover,
                 &assignment,
                 &recovery,
                 &d,
                 stream,
-                ShuffleMessage::Barrier(CheckpointBarrier::new(1, 1)),
+                CheckpointBarrier::new(1, 1),
                 [1; 32],
                 1,
                 &cancel,
@@ -5208,6 +5280,47 @@ mod grpc {
             assert!(published.unwrap());
             assert_eq!(loss_at_visibility, 1);
             assert_eq!(barrier_arrivals.load(ACQUIRE), 1);
+        }
+
+        #[tokio::test]
+        async fn transport_rejects_retired_checkpoint_id_with_a_different_assignment() {
+            let d = DeliveryTracker::default();
+            let mut stream = fence(1, 10, 100, 2);
+            stream.assignment_certificate_digest = [2; 32];
+            d.observe_hello(stream).unwrap();
+            let assignment = AtomicU64::new(stream.assignment_version);
+            let recovery = AtomicU64::new(stream.recovery_gen);
+            let barrier_arrivals = AtomicU64::new(0);
+            let cancel = CancellationToken::new();
+            let process_lease = live_process_lease();
+            let (tx, rx) = mpsc::bounded_async::<Inbound>(1);
+            let holdover = Holdover::new(1);
+            holdover
+                .retire_checkpoint_attempt(CheckpointAttempt::canonical(7), [1; 32])
+                .unwrap();
+
+            let error = publish_barrier(
+                &tx,
+                &barrier_arrivals,
+                &holdover,
+                &assignment,
+                &recovery,
+                &d,
+                stream,
+                CheckpointBarrier::new(7, 7),
+                [2; 32],
+                0,
+                &cancel,
+                &process_lease,
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            assert!(error.message().contains("different assignment digest"));
+            assert_eq!(d.delivery_loss_incidents.load(ACQUIRE), 1);
+            assert_eq!(barrier_arrivals.load(ACQUIRE), 0);
+            assert!(rx.try_recv().is_err());
         }
 
         #[test]
@@ -6333,7 +6446,8 @@ mod shim {
     use rustc_hash::FxHashMap;
 
     use super::{
-        Holdover, ReceivedBatch, ReceivedShuffle, ShuffleMessage, ShufflePeerId, SHUFFLE_RECV_QUEUE,
+        validate_checkpoint_barrier, Holdover, ReceivedBatch, ReceivedShuffle, ShuffleMessage,
+        ShufflePeerId, SHUFFLE_RECV_QUEUE,
     };
     use crate::checkpoint::{CheckpointAssignmentFence, CheckpointBarrier};
 
@@ -6417,7 +6531,10 @@ mod shim {
         /// # Errors
         /// Always errors because the no-cluster build has no shuffle transport.
         #[allow(clippy::unused_async)] // async to match the cluster build's API.
-        pub async fn send_to(&self, peer: ShufflePeerId, _msg: &ShuffleMessage) -> io::Result<()> {
+        pub async fn send_to(&self, peer: ShufflePeerId, msg: &ShuffleMessage) -> io::Result<()> {
+            if let ShuffleMessage::Barrier(barrier) = msg {
+                validate_checkpoint_barrier(*barrier)?;
+            }
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!(
@@ -6461,6 +6578,7 @@ mod shim {
             barrier: CheckpointBarrier,
             _assignment_fence: &CheckpointAssignmentFence,
         ) -> io::Result<()> {
+            validate_checkpoint_barrier(barrier)?;
             let msg = ShuffleMessage::Barrier(barrier);
             let mut first_err = None;
             let results =
@@ -6684,10 +6802,10 @@ mod shim {
                                 recovery_gen,
                                 checkpoint_sequence,
                             };
-                            if self.holdover.stage_barrier(barrier) {
-                                break;
+                            match self.holdover.stage_barrier(barrier) {
+                                Ok(true) => break,
+                                Ok(false) | Err(_) => self.holdover.release_items(1),
                             }
-                            self.holdover.release_items(1);
                         }
                     }
                 }
@@ -6771,6 +6889,18 @@ mod shim_tests {
             .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[tokio::test]
+    async fn noncanonical_barrier_is_rejected_in_embedded_mode() {
+        let sender = ShuffleSender::new(1, uuid::Uuid::from_u128(2));
+        let error = sender
+            .send_to(2, &ShuffleMessage::Barrier(CheckpointBarrier::new(7, 8)))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), NONCANONICAL_BARRIER);
     }
 }
 
@@ -7295,7 +7425,7 @@ mod tests {
             )
             .await
             .unwrap();
-        send_barrier(&sender, &[2], CheckpointBarrier::new(70, 7))
+        send_barrier(&sender, &[2], CheckpointBarrier::new(70, 70))
             .await
             .unwrap();
         wait_until(|| receiver.committed_sequence_for_test(1) == Some(1)).await;
@@ -7537,7 +7667,7 @@ mod tests {
 
         let sender = sender(1);
         sender.register_peer(2, recv_addr).await;
-        send_barrier(&sender, &[2], CheckpointBarrier::new(1234, 1))
+        send_barrier(&sender, &[2], CheckpointBarrier::new(1234, 1234))
             .await
             .unwrap();
 
@@ -7546,7 +7676,81 @@ mod tests {
         assert_eq!(from, 1, "receiver attributes frame to sender id");
         assert_eq!(
             received.message(),
-            &ShuffleMessage::Barrier(CheckpointBarrier::new(1234, 1))
+            &ShuffleMessage::Barrier(CheckpointBarrier::new(1234, 1234))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inbound_wire_rejects_noncanonical_barrier_before_publication() {
+        use super::shuffle_v1::shuffle_transport_client::ShuffleTransportClient;
+        use super::shuffle_v1::{
+            shuffle_frame, Barrier as WireBarrier, HandshakeRequest, Hello, ShuffleFrame,
+        };
+
+        let receiver = bind_on_loopback(2).await;
+        let fence = assignment_fence(1, &[1, 2]);
+        let endpoint =
+            crate::cluster::control::tls::client_endpoint(&receiver.local_addr().to_string())
+                .unwrap();
+        let channel = endpoint.connect().await.unwrap();
+        let mut client = ShuffleTransportClient::new(channel);
+        let sender_incarnation = Uuid::from_u128(2);
+        let stream_id = Uuid::new_v4();
+        let handshake = client
+            .handshake(tonic::Request::new(HandshakeRequest {
+                sender_node_id: 1,
+                sender_incarnation: sender_incarnation.as_bytes().to_vec(),
+                stream_id: stream_id.as_bytes().to_vec(),
+                assignment_version: fence.assignment_version,
+                recovery_gen: 0,
+                assignment_certificate_digest: fence.digest().to_vec(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let hello = ShuffleFrame {
+            kind: Some(shuffle_frame::Kind::Hello(Hello {
+                node_id: 1,
+                sender_incarnation: sender_incarnation.as_bytes().to_vec(),
+                receiver_incarnation: handshake.receiver_incarnation,
+                stream_id: stream_id.as_bytes().to_vec(),
+                assignment_version: fence.assignment_version,
+                recovery_gen: 0,
+                assignment_certificate_digest: fence.digest().to_vec(),
+            })),
+        };
+        let malformed = ShuffleFrame {
+            kind: Some(shuffle_frame::Kind::Barrier(WireBarrier {
+                checkpoint_id: 7,
+                epoch: 8,
+                flags: 0,
+                last_seq: 0,
+                assignment_version: fence.assignment_version,
+                assignment_digest: fence.digest().to_vec(),
+                recovery_gen: 0,
+            })),
+        };
+
+        let error = client
+            .shuffle(tonic::Request::new(futures::stream::iter([
+                hello, malformed,
+            ])))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(error.message(), NONCANONICAL_BARRIER);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), receiver.recv())
+                .await
+                .is_err(),
+            "a noncanonical wire barrier reached the receive queue"
+        );
+        assert_eq!(
+            receiver
+                .delivery_loss_incidents()
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
         );
     }
 
@@ -7941,9 +8145,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let terminal = CheckpointBarrier::new(70, 7);
+        let terminal = CheckpointBarrier::new(70, 70);
         send_barrier(&sender, &[2], terminal).await.unwrap();
-        let older = CheckpointBarrier::new(60, 6);
+        let older = CheckpointBarrier::new(60, 60);
         send_barrier(&sender, &[2], older).await.unwrap();
         sender
             .send_to(
@@ -7965,7 +8169,7 @@ mod tests {
 
         receiver
             .retire_checkpoint_barriers(
-                CheckpointAttempt::new(7, 70),
+                CheckpointAttempt::canonical(70),
                 receiver.assignment_fence_for_test().digest(),
             )
             .unwrap();
@@ -7999,14 +8203,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn barrier_retirement_rejects_staged_conflict_and_exact_digest_mismatch() {
+    async fn barrier_retirement_rejects_exact_digest_mismatch_and_noncanonical_attempt() {
         let receiver = bind_on_loopback(2).await;
         let sender = sender(1);
         sender.register_peer(2, receiver.local_addr()).await;
-        let terminal = CheckpointAttempt::new(7, 70);
+        let terminal = CheckpointAttempt::canonical(70);
         let assignment_digest = receiver.assignment_fence_for_test().digest();
 
-        send_barrier(&sender, &[2], CheckpointBarrier::new(70, 7))
+        send_barrier(&sender, &[2], CheckpointBarrier::new(70, 70))
             .await
             .unwrap();
         let mut wrong_digest = receiver.recv().await.unwrap();
@@ -8019,16 +8223,12 @@ mod tests {
         assert!(error.to_string().contains("different assignment digest"));
         assert_eq!(receiver.drain_staged_barriers().len(), 1);
 
-        send_barrier(&sender, &[2], CheckpointBarrier::new(69, 8))
-            .await
-            .unwrap();
-        receiver.stash_barrier(receiver.recv().await.unwrap());
         let error = receiver
-            .retire_checkpoint_barriers(terminal, assignment_digest)
+            .retire_checkpoint_barriers(CheckpointAttempt::new(8, 69), assignment_digest)
             .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("conflicts with retirement"));
-        assert!(receiver.has_staged_checkpoint_barriers());
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("canonical checkpoint ID"));
+        assert!(!receiver.has_staged_checkpoint_barriers());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8037,23 +8237,23 @@ mod tests {
         let sender = sender(1);
         sender.register_peer(2, receiver.local_addr()).await;
 
-        let terminal = CheckpointAttempt::new(7, 70);
+        let terminal = CheckpointAttempt::canonical(70);
         let assignment_digest = receiver.assignment_fence_for_test().digest();
         receiver
             .retire_checkpoint_barriers(terminal, assignment_digest)
             .unwrap();
         receiver
-            .retire_checkpoint_barriers(CheckpointAttempt::new(6, 60), assignment_digest)
+            .retire_checkpoint_barriers(CheckpointAttempt::canonical(60), assignment_digest)
             .unwrap();
         assert_eq!(
             receiver
                 .retire_checkpoint_barriers(CheckpointAttempt::new(8, 69), assignment_digest,)
                 .unwrap_err()
                 .kind(),
-            io::ErrorKind::InvalidData
+            io::ErrorKind::InvalidInput
         );
 
-        send_barrier(&sender, &[2], CheckpointBarrier::new(70, 7))
+        send_barrier(&sender, &[2], CheckpointBarrier::new(70, 70))
             .await
             .unwrap();
         sender
@@ -8081,15 +8281,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn retired_barrier_crossing_assignment_rotation_is_not_delivery_loss() {
+    async fn pre_rotation_retired_barrier_is_discarded_after_rotation_without_loss() {
         use std::sync::atomic::Ordering as O;
 
         let receiver = bind_on_loopback(2).await;
         let sender = sender(1);
         sender.register_peer(2, receiver.local_addr()).await;
 
-        let terminal = CheckpointAttempt::new(7, 70);
-        send_barrier(&sender, &[2], CheckpointBarrier::new(70, 7))
+        let terminal = CheckpointAttempt::canonical(70);
+        send_barrier(&sender, &[2], CheckpointBarrier::new(70, 70))
             .await
             .unwrap();
         wait_until(|| receiver.committed_sequence_for_test(1) == Some(0)).await;
@@ -8131,6 +8331,43 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retired_checkpoint_id_reuse_after_assignment_rotation_faults_the_cut() {
+        use std::sync::atomic::Ordering as O;
+
+        let receiver = bind_on_loopback(2).await;
+        let sender = sender(1);
+        sender.register_peer(2, receiver.local_addr()).await;
+
+        let terminal = CheckpointAttempt::canonical(70);
+        let retired_digest = receiver.assignment_fence_for_test().digest();
+        receiver
+            .retire_checkpoint_barriers(terminal, retired_digest)
+            .unwrap();
+
+        let successor = assignment_fence(2, &[1, 2]);
+        assert_ne!(successor.digest(), retired_digest);
+        let owners = assignment_owners(&[1, 2]);
+        assert!(receiver
+            .install_assignment_fence(&successor, &owners)
+            .unwrap());
+        assert!(sender
+            .install_assignment_fence(&successor, &owners)
+            .unwrap());
+
+        send_barrier(&sender, &[2], CheckpointBarrier::new(70, 70))
+            .await
+            .unwrap();
+        wait_until(|| {
+            let _ = receiver.stage_checkpointed_inbound();
+            receiver.delivery_loss_incidents().load(O::Acquire) == 1
+        })
+        .await;
+
+        assert!(!receiver.has_staged_checkpoint_barriers());
+        assert!(receiver.drain_staged_barriers().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn barrier_holdover_is_bounded_faults_the_cut_and_reopens_after_drain() {
         use std::sync::atomic::Ordering as O;
 
@@ -8142,7 +8379,10 @@ mod tests {
             send_barrier(
                 &sender,
                 &[2],
-                CheckpointBarrier::new(u64::try_from(checkpoint_id + 1).unwrap(), 1),
+                CheckpointBarrier::new(
+                    u64::try_from(checkpoint_id + 1).unwrap(),
+                    u64::try_from(checkpoint_id + 1).unwrap(),
+                ),
             )
             .await
             .unwrap();
@@ -8160,7 +8400,10 @@ mod tests {
         send_barrier(
             &sender,
             &[2],
-            CheckpointBarrier::new(u64::try_from(SHUFFLE_RECV_QUEUE + 2).unwrap(), 1),
+            CheckpointBarrier::new(
+                u64::try_from(SHUFFLE_RECV_QUEUE + 2).unwrap(),
+                u64::try_from(SHUFFLE_RECV_QUEUE + 2).unwrap(),
+            ),
         )
         .await
         .unwrap();
@@ -8472,7 +8715,7 @@ mod tests {
 
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            send_barrier(&sender, &[2], CheckpointBarrier::new(8, 4)),
+            send_barrier(&sender, &[2], CheckpointBarrier::new(8, 8)),
         )
         .await
         .expect("checkpoint barrier waited on the data byte semaphore")
@@ -8531,7 +8774,7 @@ mod tests {
         sender.register_peer(2, recv.local_addr()).await;
 
         for delta in [10u64, 20, 30, 40] {
-            send_barrier(&sender, &[2], CheckpointBarrier::new(delta, 1))
+            send_barrier(&sender, &[2], CheckpointBarrier::new(delta, delta))
                 .await
                 .unwrap();
         }
@@ -8544,10 +8787,10 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                ShuffleMessage::Barrier(CheckpointBarrier::new(10, 1)),
-                ShuffleMessage::Barrier(CheckpointBarrier::new(20, 1)),
-                ShuffleMessage::Barrier(CheckpointBarrier::new(30, 1)),
-                ShuffleMessage::Barrier(CheckpointBarrier::new(40, 1)),
+                ShuffleMessage::Barrier(CheckpointBarrier::new(10, 10)),
+                ShuffleMessage::Barrier(CheckpointBarrier::new(20, 20)),
+                ShuffleMessage::Barrier(CheckpointBarrier::new(30, 30)),
+                ShuffleMessage::Barrier(CheckpointBarrier::new(40, 40)),
             ]
         );
     }
@@ -8570,7 +8813,7 @@ mod tests {
         let receiver = bind_on_loopback(10).await;
         let sender = sender(1);
         sender.register_peer(10, receiver.local_addr()).await;
-        let barrier = CheckpointBarrier::new(5, 1);
+        let barrier = CheckpointBarrier::new(5, 5);
 
         let fence = assignment_fence(2, &[1, 10, 99]);
         receiver
@@ -8615,7 +8858,7 @@ mod tests {
                 std::future::pending::<()>().await;
             })
         };
-        let fanout = sender.fan_out_barrier(&[2, 99], CheckpointBarrier::new(5, 1), &fence);
+        let fanout = sender.fan_out_barrier(&[2, 99], CheckpointBarrier::new(5, 5), &fence);
         tokio::pin!(fanout);
         tokio::select! {
             () = accepted.notified() => {}
@@ -8676,7 +8919,7 @@ mod tests {
             })
         };
 
-        let barrier = CheckpointBarrier::new(5, 1);
+        let barrier = CheckpointBarrier::new(5, 5);
         let fanout = sender.fan_out_barrier(&[2, 3], barrier, &fence);
         tokio::pin!(fanout);
         tokio::select! {
@@ -8740,7 +8983,7 @@ mod tests {
     async fn barrier_fan_out_rejects_an_incomplete_or_duplicate_roster() {
         let sender = sender(1);
         let fence = assignment_fence(1, &[1, 2]);
-        let barrier = CheckpointBarrier::new(5, 1);
+        let barrier = CheckpointBarrier::new(5, 5);
 
         for peers in [&[][..], &[2, 2][..]] {
             let error = sender
@@ -8749,6 +8992,20 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         }
+    }
+
+    #[tokio::test]
+    async fn barrier_fan_out_rejects_noncanonical_identity_before_peer_work() {
+        let sender = sender(1);
+        let fence = assignment_fence(1, &[1, 2]);
+
+        let error = sender
+            .fan_out_barrier(&[2], CheckpointBarrier::new(7, 8), &fence)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), NONCANONICAL_BARRIER);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8769,14 +9026,14 @@ mod tests {
             .install_assignment_fence(&fence, &assignment_owners(&[1, 2]))
             .unwrap();
 
-        send_barrier(&sender, &[2], CheckpointBarrier::new(7, 1))
+        send_barrier(&sender, &[2], CheckpointBarrier::new(7, 7))
             .await
             .unwrap();
         let received = recv.recv().await.unwrap();
         assert_eq!(received.peer(), 1);
         assert_eq!(
             received.message(),
-            &ShuffleMessage::Barrier(CheckpointBarrier::new(7, 1))
+            &ShuffleMessage::Barrier(CheckpointBarrier::new(7, 7))
         );
     }
 }

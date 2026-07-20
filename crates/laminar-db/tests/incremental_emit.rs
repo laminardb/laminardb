@@ -182,7 +182,7 @@ async fn incremental_emit_survives_checkpoint_restart() {
 
         let cp = db.checkpoint().await.unwrap();
         assert!(cp.success, "checkpoint must succeed");
-        db.close();
+        db.shutdown().await.unwrap();
     }
 
     // Reopen from checkpoint — the upsert snapshot recovers from the manifest.
@@ -600,7 +600,7 @@ async fn incremental_join_survives_checkpoint_restart() {
         );
         let cp = db.checkpoint().await.unwrap();
         assert!(cp.success, "checkpoint must succeed");
-        db.close();
+        db.shutdown().await.unwrap();
     }
 
     {

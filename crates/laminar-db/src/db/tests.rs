@@ -7886,7 +7886,8 @@ async fn cluster_secret_reference_is_resolved_per_node_but_manifest_stays_logica
         }
 
         async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
-            *self.observed.lock() = request.config.get("password").map(str::to_owned);
+            let (config, _, _) = request.into_parts();
+            *self.observed.lock() = config.get("password").map(str::to_owned);
             Ok(())
         }
 
@@ -9788,7 +9789,7 @@ async fn create_stream_with_retain_history_enables_as_of_replay() {
     // not testing the pipeline; we're testing that DDL plumbed the cap so
     // the buffer actually retains.
     let reg = &db.subscription_registry;
-    reg.broadcast_barrier(1, 100);
+    reg.broadcast_barrier(1, 1);
 
     let schema = db.source_untyped("trades").unwrap().schema().clone();
     let batch = arrow_array::RecordBatch::try_new(
@@ -9800,7 +9801,7 @@ async fn create_stream_with_retain_history_enables_as_of_replay() {
     )
     .unwrap();
     reg.send_batch("all_trades", batch).unwrap();
-    reg.broadcast_barrier(2, 200);
+    reg.broadcast_barrier(2, 2);
 
     // Subscribe AS OF EPOCH 1 — should replay batch + barrier(2).
     let mut portal = db

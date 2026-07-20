@@ -14,8 +14,9 @@ pub struct StreamCheckpointConfig {
     /// Number of predecessor checkpoints retained alongside the current recovery cut.
     /// `None` = default (3); predecessors keep reference/delta chains resolvable.
     pub max_retained: Option<usize>,
-    /// Cap on captured-state bytes held by in-flight epochs; admission
-    /// pauses at the cap. `None` = default (512 MiB).
+    /// Maximum bytes admitted for one checkpoint across in-flight capture and
+    /// persisted/restored external state. `None` uses
+    /// `DEFAULT_MAX_CHECKPOINT_STATE_BYTES`.
     pub max_staged_bytes: Option<u64>,
 }
 

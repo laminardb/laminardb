@@ -67,6 +67,12 @@ impl CheckpointBarrier {
         }
     }
 
+    /// Whether the duplicated wire fields represent one nonzero durable checkpoint identity.
+    #[must_use]
+    pub const fn is_canonical(self) -> bool {
+        self.checkpoint_id != 0 && self.epoch == self.checkpoint_id
+    }
+
     /// Check whether this barrier requests a full (non-incremental) snapshot.
     #[must_use]
     pub const fn is_full_snapshot(&self) -> bool {
@@ -197,17 +203,16 @@ impl CheckpointBarrierInjector {
     ///
     /// The next [`BarrierPollHandle::poll`] call on any source will
     /// observe this barrier and return it. Returns `false` without
-    /// modifying the pending command if either identity component is zero, or
+    /// modifying the pending command if the identity is zero or noncanonical, or
     /// if another trigger is being published, is pending, or is being consumed.
     ///
     /// # Arguments
     ///
-    /// * `barrier` - Exact barrier command to publish. Both `checkpoint_id` and
-    ///   `epoch` must be nonzero.
+    /// * `barrier` - Exact barrier command to publish. `checkpoint_id` and `epoch`
+    ///   must name the same nonzero durable checkpoint.
     #[must_use = "a rejected trigger leaves the existing barrier pending"]
     pub fn trigger(&self, barrier: CheckpointBarrier) -> bool {
-        if barrier.checkpoint_id == 0
-            || barrier.epoch == 0
+        if !barrier.is_canonical()
             || self
                 .state
                 .compare_exchange(
@@ -239,8 +244,7 @@ impl CheckpointBarrierInjector {
     /// Mismatched pending commands remain available to pollers unchanged.
     #[must_use = "a false result means the exact pending barrier was not cancelled"]
     pub fn cancel_exact(&self, barrier: CheckpointBarrier) -> bool {
-        if barrier.checkpoint_id == 0
-            || barrier.epoch == 0
+        if !barrier.is_canonical()
             || self.state.load(Ordering::Acquire) != STATE_PENDING
             || self.checkpoint_id.load(Ordering::Relaxed) != barrier.checkpoint_id
             || self.epoch.load(Ordering::Relaxed) != barrier.epoch
@@ -363,6 +367,7 @@ mod tests {
     #[test]
     fn test_barrier_flags() {
         let barrier = CheckpointBarrier::new(1, 1);
+        assert!(barrier.is_canonical());
         assert!(!barrier.is_full_snapshot());
         assert!(!barrier.is_drain());
         assert!(!barrier.is_cancel());
@@ -377,6 +382,8 @@ mod tests {
             flags: flags::DRAIN,
         };
         assert!(drain.is_drain());
+        assert!(!CheckpointBarrier::new(0, 0).is_canonical());
+        assert!(!CheckpointBarrier::new(1, 2).is_canonical());
     }
 
     #[test]
@@ -385,7 +392,7 @@ mod tests {
         let handle = injector.handle();
         let expected = CheckpointBarrier {
             checkpoint_id: 42,
-            epoch: 7,
+            epoch: 42,
             flags: flags::DRAIN,
         };
 
@@ -424,7 +431,7 @@ mod tests {
         let handle = injector.handle();
 
         // Trigger barrier
-        let expected = CheckpointBarrier::full_snapshot(42, 11);
+        let expected = CheckpointBarrier::full_snapshot(42, 42);
         assert!(injector.trigger(expected));
 
         // Poll should return the barrier
@@ -442,7 +449,7 @@ mod tests {
         let handle1 = injector.handle();
         let handle2 = injector.handle();
 
-        assert!(injector.trigger(CheckpointBarrier::new(1, 9)));
+        assert!(injector.trigger(CheckpointBarrier::new(1, 1)));
 
         // Only one handle should claim it
         let r1 = handle1.poll();
@@ -460,7 +467,7 @@ mod tests {
         let injector = CheckpointBarrierInjector::new();
         let handle = injector.handle();
         let checkpoint_id = u64::from(u32::MAX) + 17;
-        let epoch = u64::MAX - 7;
+        let epoch = checkpoint_id;
         let barrier_flags = 1_u64 << 63;
         let expected = CheckpointBarrier {
             checkpoint_id,
@@ -478,10 +485,10 @@ mod tests {
         let handle = injector.handle();
         let first = CheckpointBarrier {
             checkpoint_id: u64::MAX,
-            epoch: u64::MAX - 1,
+            epoch: u64::MAX,
             flags: flags::DRAIN,
         };
-        let second = CheckpointBarrier::full_snapshot(7, 8);
+        let second = CheckpointBarrier::full_snapshot(7, 7);
 
         assert!(injector.trigger(first));
         assert!(!injector.trigger(second));
@@ -494,7 +501,7 @@ mod tests {
     fn test_cancel_exact_removes_matching_pending_barrier() {
         let injector = CheckpointBarrierInjector::new();
         let handle = injector.handle();
-        let pending = CheckpointBarrier::full_snapshot(41, 17);
+        let pending = CheckpointBarrier::full_snapshot(41, 41);
 
         assert!(injector.trigger(pending));
         assert!(injector.cancel_exact(pending));
@@ -506,7 +513,7 @@ mod tests {
     fn test_cancel_exact_preserves_mismatched_pending_barrier() {
         let injector = CheckpointBarrierInjector::new();
         let handle = injector.handle();
-        let pending = CheckpointBarrier::full_snapshot(41, 17);
+        let pending = CheckpointBarrier::full_snapshot(41, 41);
 
         assert!(injector.trigger(pending));
         assert!(!injector.cancel_exact(CheckpointBarrier {
@@ -524,7 +531,7 @@ mod tests {
     fn test_cancel_exact_after_poll_does_not_claim_completed_barrier() {
         let injector = CheckpointBarrierInjector::new();
         let handle = injector.handle();
-        let pending = CheckpointBarrier::new(41, 17);
+        let pending = CheckpointBarrier::new(41, 41);
 
         assert!(injector.trigger(pending));
         assert_eq!(handle.poll(), Some(pending));
@@ -536,7 +543,7 @@ mod tests {
     fn test_cancel_exact_and_poll_have_exactly_one_winner() {
         let injector = Arc::new(CheckpointBarrierInjector::new());
         let handle = injector.handle();
-        let pending = CheckpointBarrier::new(41, 17);
+        let pending = CheckpointBarrier::new(41, 41);
         assert!(injector.trigger(pending));
 
         let start = Arc::new(std::sync::Barrier::new(3));
@@ -567,19 +574,21 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_identity_components_are_rejected_without_mutation() {
+    fn test_noncanonical_identity_is_rejected_without_mutation() {
         let injector = CheckpointBarrierInjector::new();
         let handle = injector.handle();
 
         assert!(!injector.trigger(CheckpointBarrier::new(0, 1)));
         assert!(!injector.trigger(CheckpointBarrier::new(1, 0)));
+        assert!(!injector.trigger(CheckpointBarrier::new(1, 2)));
         assert!(injector.can_trigger());
         assert!(handle.poll().is_none());
 
-        let expected = CheckpointBarrier::new(9, 10);
+        let expected = CheckpointBarrier::new(9, 9);
         assert!(injector.trigger(expected));
         assert!(!injector.trigger(CheckpointBarrier::new(0, 11)));
         assert!(!injector.trigger(CheckpointBarrier::new(11, 0)));
+        assert!(!injector.trigger(CheckpointBarrier::new(11, 12)));
         assert_eq!(handle.poll(), Some(expected));
     }
 
@@ -594,7 +603,7 @@ mod tests {
             threads.push(std::thread::spawn(move || {
                 let barrier = CheckpointBarrier {
                     checkpoint_id,
-                    epoch: checkpoint_id + 100,
+                    epoch: checkpoint_id,
                     flags: checkpoint_id << 40,
                 };
                 (barrier, injector.trigger(barrier))

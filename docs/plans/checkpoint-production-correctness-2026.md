@@ -12,8 +12,9 @@ decision and is not part of the pipeline pause.
 
 1. Connector contracts and runtime durability are admitted before connector I/O. Unsupported
    delivery, placement, state, or sink combinations fail closed.
-2. Every attempt has a never-reused pair of epoch and checkpoint ID, bound to deployment and
-   pipeline identity. Failed attempts are abandoned rather than reused.
+2. Every attempt represents one never-reused nonzero checkpoint identity, bound to deployment and
+   pipeline identity. The current duplicated epoch and checkpoint-ID fields must be equal at every
+   runtime, wire, and storage boundary; failed attempts are abandoned rather than reused.
 3. Barriers align source and shuffle input before capturing source cursors with operator state.
    A source cursor never bisects its upstream replay unit; PostgreSQL emits a committed transaction
    whole even when it exceeds the normal batch target.
@@ -21,7 +22,7 @@ decision and is not part of the pipeline pause.
    manifest, and a final readiness record under the exact attempt. Cluster artifacts bind the
    assignment, writer process, leader proof, length, and digest.
 5. A canonical seal is created only after exact vnode, descriptor, and participant coverage is
-   verified. Zero-vnode and idle participants remain part of the certified roster.
+   verified. Zero-vnode workers stay fenced and do not join the assignment or checkpoint quorum.
 6. A valid Prepared manifest is the local write-ahead witness. Its epoch has one create-once
    terminal key, so a delayed Commit and startup Abort race to one immutable winner without an
    extra normal-path registry write. Startup validates provenance and settles every live Prepared
@@ -201,8 +202,9 @@ checkpoint surface.
   sharded replay/history loss, Kafka, and object-store lakehouse commits.
 - Integration commands must assert the expected selected-test count and fail when Docker, Kafka,
   MinIO, PostgreSQL, or MongoDB is unreachable; a zero-test or dependency-skip exit is not evidence.
-- Fault injection before and after capture, seal, Prepared publication, decision, source feedback, external cursor
-  commit, rebalance, and shutdown. Recovery assertions use exact checkpoint ID and epoch.
+- Fault injection before and after capture, seal, Prepared publication, decision, source feedback,
+  external cursor commit, rebalance, and shutdown. Recovery assertions use the exact canonical
+  checkpoint identity and reject split epoch/checkpoint-ID encodings.
 - Local exactly-once soak uses the finite hard-kill source/state/output oracle, not a clean-close
   recovery smoke test. Cluster
   at-least-once soak checks no gaps or coherent state rollback while treating duplicates according

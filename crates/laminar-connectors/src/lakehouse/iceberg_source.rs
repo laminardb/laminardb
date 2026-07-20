@@ -152,9 +152,7 @@ impl IcebergSource {
 #[async_trait]
 impl SourceConnector for IcebergSource {
     async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
-        let SourceStart {
-            config, position, ..
-        } = request;
+        let (config, position, _) = request.into_parts();
         if let SourcePosition::Resume { attempt, .. } = position {
             return Err(ConnectorError::ConfigurationError(format!(
                 "Iceberg is an ephemeral source and cannot resume checkpoint attempt {attempt:?}"
@@ -293,14 +291,17 @@ mod tests {
     async fn resume_fails_before_opening_the_ephemeral_source() {
         let mut source = IcebergSource::new(test_source_config(), None);
         let error = source
-            .start(SourceStart {
-                config: ConnectorConfig::new("iceberg"),
-                position: SourcePosition::Resume {
-                    attempt: laminar_core::state::CheckpointAttempt::new(7, 11),
-                    checkpoint: SourceCheckpoint::new(),
-                },
-                delivery: crate::connector::DeliveryGuarantee::BestEffort,
-            })
+            .start(
+                SourceStart::new(
+                    ConnectorConfig::new("iceberg"),
+                    SourcePosition::Resume {
+                        attempt: laminar_core::state::CheckpointAttempt::canonical(11),
+                        checkpoint: SourceCheckpoint::new(),
+                    },
+                    crate::connector::DeliveryGuarantee::BestEffort,
+                )
+                .unwrap(),
+            )
             .await
             .expect_err("ephemeral Iceberg source must reject recovery");
         assert!(error.to_string().contains("ephemeral"));
