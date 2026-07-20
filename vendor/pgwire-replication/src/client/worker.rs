@@ -820,10 +820,6 @@ impl WorkerState {
     }
 }
 
-fn quote_identifier(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\"\""))
-}
-
 fn escape_string_literal(value: &str) -> String {
     format!("E'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
 }
@@ -958,13 +954,10 @@ fn validate_slot_cursor(config: &ReplicationConfig, row: &[Option<String>]) -> R
 }
 
 fn start_replication_query(config: &ReplicationConfig) -> String {
-    let slot = quote_identifier(&config.slot);
-    let publication_list = quote_identifier(&config.publication);
-    let publication_option = escape_string_literal(&publication_list);
     format!(
-        "START_REPLICATION SLOT {slot} LOGICAL {} \
-         (proto_version '1', publication_names {publication_option}, messages 'false')",
-        config.start_lsn
+        "START_REPLICATION SLOT {} LOGICAL {} \
+         (proto_version '1', publication_names '{}', messages 'false')",
+        config.slot, config.start_lsn, config.publication
     )
 }
 
@@ -1438,7 +1431,14 @@ mod tests {
         message.extend_from_slice(b"prefix\0");
         message.extend_from_slice(&3_i32.to_be_bytes());
         message.extend_from_slice(b"abc");
-        assert!(parse_pgoutput_boundary(&Bytes::from(message.clone()), None).is_ok());
+        let permit = Arc::new(Semaphore::new(message.len()))
+            .try_acquire_many_owned(message.len() as u32)
+            .unwrap();
+        let parsed = parse_pgoutput_boundary(
+            &Bytes::from(message.clone()),
+            Some(WireBytesGuard::new(permit)),
+        );
+        assert!(parsed.is_ok(), "{parsed:?}");
         message.push(0);
         assert!(parse_pgoutput_boundary(&Bytes::from(message.clone()), None).is_err());
         message[1] = 2;
@@ -1463,18 +1463,15 @@ mod tests {
     }
 
     #[test]
-    fn replication_query_quotes_slot_and_exact_publication_identity() {
-        let mut config = ReplicationConfig::default();
-        config.slot = "slot\"name".into();
-        config.publication = "Mixed,Pub'\\name".into();
-
+    fn replication_query_uses_validated_replication_identifiers() {
+        let config = ReplicationConfig::default();
         let query = start_replication_query(&config);
 
-        assert!(query.contains("SLOT \"slot\"\"name\" LOGICAL"), "{query}");
         assert!(
-            query.contains("publication_names E'\"Mixed,Pub''\\\\name\"'"),
+            query.contains("SLOT slot LOGICAL"),
             "{query}"
         );
+        assert!(query.contains("publication_names 'pub'"), "{query}");
         assert!(query.contains("messages 'false'"), "{query}");
     }
 

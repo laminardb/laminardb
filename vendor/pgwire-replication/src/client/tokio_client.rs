@@ -135,7 +135,7 @@ impl ReplicationClient {
     where
         G: Send + 'static,
     {
-        validate_buffer_limits(&cfg)?;
+        validate_config(&cfg)?;
         let (tx, rx) = mpsc::channel(cfg.buffer_events);
         let wire_byte_budget = Arc::new(Semaphore::new(cfg.max_in_flight_bytes));
 
@@ -300,7 +300,32 @@ impl ReplicationClient {
     }
 }
 
-fn validate_buffer_limits(cfg: &ReplicationConfig) -> Result<()> {
+fn validate_config(cfg: &ReplicationConfig) -> Result<()> {
+    if cfg.slot.is_empty()
+        || cfg.slot.len() > 63
+        || !cfg
+            .slot
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return Err(PgWireError::Configuration(
+            "slot must be at most 63 bytes and contain only lower-case ASCII letters, digits, or underscore"
+                .into(),
+        ));
+    }
+    if cfg.publication.is_empty()
+        || cfg.publication.len() > 63
+        || !cfg
+            .publication
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        || cfg.publication.as_bytes()[0].is_ascii_digit()
+    {
+        return Err(PgWireError::Configuration(
+            "publication must start with a lower-case ASCII letter or underscore and contain only lower-case ASCII letters, digits, or underscore (63 bytes maximum)"
+                .into(),
+        ));
+    }
     if cfg.buffer_events == 0 {
         return Err(PgWireError::Configuration(
             "buffer_events must be greater than zero".into(),
@@ -419,7 +444,7 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::{mpsc, oneshot, watch};
 
-    use super::{validate_buffer_limits, ReplicationClient, DROP_SHUTDOWN_GRACE};
+    use super::{validate_config, ReplicationClient, DROP_SHUTDOWN_GRACE};
     use crate::client::worker::{ReplicationEvent, SharedProgress};
     use crate::config::ReplicationConfig;
     use crate::error::PgWireError;
@@ -429,16 +454,35 @@ mod tests {
     fn buffering_config_requires_a_fittable_frame_and_nonzero_channel() {
         let mut config = ReplicationConfig::default();
         config.buffer_events = 0;
-        assert!(validate_buffer_limits(&config).is_err());
+        assert!(validate_config(&config).is_err());
 
         config.buffer_events = 1;
         config.max_message_bytes = 9;
         config.max_in_flight_bytes = 8;
-        let error = validate_buffer_limits(&config).unwrap_err();
+        let error = validate_config(&config).unwrap_err();
         assert!(error.to_string().contains("must not exceed"), "{error}");
 
         config.max_message_bytes = 8;
-        assert!(validate_buffer_limits(&config).is_ok());
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn replication_identifiers_use_the_server_wire_grammar() {
+        for (field, value) in [
+            ("slot", "Mixed-Case"),
+            ("publication", "quoted publication"),
+            ("publication", "pub'option"),
+            ("publication", "9publication"),
+        ] {
+            let mut config = ReplicationConfig::default();
+            if field == "slot" {
+                config.slot = value.into();
+            } else {
+                config.publication = value.into();
+            }
+            let error = validate_config(&config).unwrap_err();
+            assert!(error.to_string().contains(field), "{error}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

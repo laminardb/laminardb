@@ -755,14 +755,16 @@ async fn source_start_rejects_bad_authentication_before_running() {
 }
 
 #[tokio::test]
-async fn source_start_reports_the_cluster_identity_privilege_requirement() {
+async fn source_start_reports_revoked_cluster_identity_privileges() {
     let (_container, host, port) = start_postgres().await;
     let admin = connect(&host, port).await;
     admin
         .batch_execute(&format!(
             "CREATE TABLE cdc_events (id BIGINT PRIMARY KEY); \
              CREATE PUBLICATION {PUBLICATION} FOR TABLE cdc_events WITH (publish = 'insert, update, delete'); \
-             CREATE ROLE cdc_reader LOGIN REPLICATION PASSWORD 'cdc-password';"
+             CREATE ROLE cdc_reader LOGIN REPLICATION PASSWORD 'cdc-password'; \
+             REVOKE EXECUTE ON FUNCTION pg_catalog.pg_control_system() FROM PUBLIC; \
+             REVOKE EXECUTE ON FUNCTION pg_catalog.pg_control_checkpoint() FROM PUBLIC;"
         ))
         .await
         .expect("create restricted replication role");
@@ -818,7 +820,7 @@ async fn resume_rejects_filter_publication_membership_and_recreation_drift() {
     let before = slot_state(&admin).await;
 
     let mut filtered_config = config.clone();
-    filtered_config.set("table.include", "cdc_events");
+    filtered_config.set("table.include", "public.cdc_events");
     let mut filtered_source = PostgresCdcSource::new(PostgresCdcConfig::default(), None);
     let error = filtered_source
         .start(resume_start(&filtered_config, checkpoint.clone()))

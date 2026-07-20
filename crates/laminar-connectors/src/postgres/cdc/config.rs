@@ -276,9 +276,16 @@ impl PostgresCdcConfig {
                     .into(),
             ));
         }
-        if self.publication.len() > 63 {
+        if self.publication.len() > 63
+            || !self
+                .publication
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+            || self.publication.as_bytes()[0].is_ascii_digit()
+        {
             return Err(ConnectorError::ConfigurationError(
-                "publication must be at most 63 bytes".into(),
+                "publication must start with a lower-case ASCII letter or underscore and contain only lower-case ASCII letters, digits, or underscore (63 bytes maximum)"
+                    .into(),
             ));
         }
         if self
@@ -403,6 +410,13 @@ mod tests {
         cfg.slot_name = "valid_slot".into();
         cfg.publication = "bad\0publication".into();
         assert!(cfg.validate().unwrap_err().to_string().contains("NUL"));
+
+        cfg.publication = "Mixed-Publication".into();
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("publication"));
     }
 
     #[test]
