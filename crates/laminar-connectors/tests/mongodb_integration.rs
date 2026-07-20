@@ -106,10 +106,10 @@ async fn disable_fail_command(admin: &mongodb::Database) -> i64 {
 /// Creates a testcontainers MongoDB 8.0 instance and returns the connection URI.
 async fn start_mongo() -> (testcontainers::ContainerAsync<GenericImage>, String) {
     let container = GenericImage::new("mongo", "8.0")
-        .with_exposed_port(27017.into())
         .with_wait_for(testcontainers::core::WaitFor::message_on_stdout(
             "Waiting for connections",
         ))
+        .with_exposed_port(27017.into())
         // Replica set required for change streams.
         .with_cmd([
             "mongod",

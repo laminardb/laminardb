@@ -98,8 +98,8 @@ async fn upsert_against_minio_s3_object_store() {
     // override the entrypoint to pre-create the bucket before the server starts
     // (the official image has no auto-create env).
     let container = GenericImage::new("minio/minio", "latest")
-        .with_exposed_port(9000.tcp())
         .with_wait_for(WaitFor::message_on_stderr("API:"))
+        .with_exposed_port(9000.tcp())
         .with_entrypoint("sh")
         .with_cmd(["-c", "mkdir -p /data/warehouse && minio server /data"])
         .with_env_var("MINIO_ROOT_USER", "minioadmin")

@@ -56,11 +56,11 @@ fn postgres_major() -> &'static str {
 async fn start_postgres() -> (testcontainers::ContainerAsync<GenericImage>, String, u16) {
     let major = postgres_major();
     let container = GenericImage::new("postgres", major)
-        .with_exposed_port(5432.into())
-        .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",
         ))
+        .with_exposed_port(5432.into())
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_cmd([
             "postgres",
             "-c",
