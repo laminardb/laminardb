@@ -40,6 +40,7 @@ const COMMIT_DESCRIPTOR_HEADER_LEN: usize = 204;
 const DESCRIPTOR_ATTESTATION_READ_CONCURRENCY: usize = 32;
 const STATE_PRUNE_FLOOR_VERSION: u32 = 1;
 const STATE_PRUNE_FLOOR_MAX_BYTES: u64 = 512;
+const STATE_PRUNE_DELETE_BATCH_SIZE: usize = 256;
 const STATE_NAMESPACE_VERSION: u32 = 1;
 const STATE_NAMESPACE_MAX_BYTES: u64 = 512;
 // MAX_KEY_GROUP_COUNT (65,535) at a conservative 768 encoded bytes of provenance per
@@ -75,6 +76,7 @@ struct VersionedStatePruneFloor {
 /// Object-store-backed [`StateBackend`].
 pub struct ObjectStoreBackend {
     store: Arc<dyn ObjectStore>,
+    empty_prefix_cleanup: Option<Arc<dyn crate::durable_local_store::EmptyPrefixCleanup>>,
     durability_scope: StateBackendDurability,
     instance_id: String,
     /// Fresh for each backend construction, even when `instance_id` is stable across restarts.
@@ -136,6 +138,21 @@ impl ObjectStoreBackend {
         )
     }
 
+    pub(crate) fn node_durable_with_empty_prefix_cleanup<T>(
+        store: Arc<T>,
+        instance_id: impl Into<String>,
+        vnode_capacity: u32,
+    ) -> Self
+    where
+        T: ObjectStore + crate::durable_local_store::EmptyPrefixCleanup + 'static,
+    {
+        let object_store: Arc<dyn ObjectStore> = store.clone();
+        let cleanup: Arc<dyn crate::durable_local_store::EmptyPrefixCleanup> = store;
+        let mut backend = Self::node_durable(object_store, instance_id, vnode_capacity);
+        backend.empty_prefix_cleanup = Some(cleanup);
+        backend
+    }
+
     /// Wrap durable storage whose namespace is reachable by every cluster node.
     #[must_use]
     pub fn cluster_shared(
@@ -160,6 +177,7 @@ impl ObjectStoreBackend {
         let instance_id = instance_id.into();
         Self {
             store,
+            empty_prefix_cleanup: None,
             durability_scope,
             instance_id,
             execution_id: uuid::Uuid::new_v4(),
@@ -982,6 +1000,63 @@ impl ObjectStoreBackend {
             },
         }
     }
+
+    async fn delete_retired_prefix(&self, prefix: &OsPath) -> Result<(), StateBackendError> {
+        use futures::StreamExt;
+
+        loop {
+            // Materialize one bounded batch before mutating the prefix. LocalFileSystem resumes
+            // WalkDir in chunks, and deleting from that live iterator can skip entries. Re-listing
+            // from the prefix root also bounds memory for the maximum key-group topology.
+            let mut entries = self.store.list(Some(prefix));
+            let mut locations = Vec::with_capacity(STATE_PRUNE_DELETE_BATCH_SIZE);
+            while locations.len() < STATE_PRUNE_DELETE_BATCH_SIZE {
+                let Some(entry) = entries.next().await else {
+                    break;
+                };
+                locations.push(
+                    entry
+                        .map_err(|error| StateBackendError::Io(error.to_string()))?
+                        .location,
+                );
+            }
+            drop(entries);
+            if locations.is_empty() {
+                if let Some(cleanup) = &self.empty_prefix_cleanup {
+                    cleanup
+                        .cleanup_empty_prefix(prefix)
+                        .await
+                        .map_err(|error| StateBackendError::Io(error.to_string()))?;
+                }
+                return Ok(());
+            }
+
+            let expected = locations.len();
+            let input =
+                futures::stream::iter(locations.into_iter().map(Ok::<_, object_store::Error>))
+                    .boxed();
+            let mut deletes = self.store.delete_stream(input);
+            let mut completed = 0_usize;
+            while let Some(result) = deletes.next().await {
+                match result {
+                    Ok(_) | Err(object_store::Error::NotFound { .. }) => {
+                        completed += 1;
+                    }
+                    Err(error) => {
+                        return Err(StateBackendError::Io(format!(
+                            "state backend prune failed to delete an artifact: {error}"
+                        )));
+                    }
+                }
+            }
+            if completed != expected {
+                return Err(StateBackendError::Io(format!(
+                    "state backend prune delete stream ended after {completed} of {expected} artifacts"
+                )));
+            }
+            tokio::task::yield_now().await;
+        }
+    }
 }
 
 #[async_trait]
@@ -1542,8 +1617,6 @@ impl StateBackend for ObjectStoreBackend {
     }
 
     async fn prune_before(&self, before: u64) -> Result<(), StateBackendError> {
-        use futures::StreamExt;
-
         if before == 0 {
             return Ok(());
         }
@@ -1606,24 +1679,7 @@ impl StateBackend for ObjectStoreBackend {
             retired_prefixes.sort_unstable_by_key(|(epoch, _)| *epoch);
 
             for (epoch, prefix) in retired_prefixes {
-                // Feed one prefix directly into bounded object-store deletion. Never retain every
-                // artifact location for the whole sweep in memory.
-                let locations = self
-                    .store
-                    .list(Some(&prefix))
-                    .map(|entry| entry.map(|metadata| metadata.location))
-                    .boxed();
-                let mut deletes = self.store.delete_stream(locations);
-                while let Some(result) = deletes.next().await {
-                    match result {
-                        Ok(_) | Err(object_store::Error::NotFound { .. }) => {}
-                        Err(error) => {
-                            return Err(StateBackendError::Io(format!(
-                                "state backend prune failed to delete an artifact: {error}"
-                            )));
-                        }
-                    }
-                }
+                self.delete_retired_prefix(&prefix).await?;
 
                 // The numeric cursor can represent completion of a sparse materialized prefix:
                 // every lower prefix was absent from the same delimiter snapshot or was already
@@ -2158,6 +2214,10 @@ mod tests {
 
     fn make_store(dir: &std::path::Path) -> Arc<dyn ObjectStore> {
         Arc::new(LocalFileSystem::new_with_prefix(dir).unwrap())
+    }
+
+    fn make_durable_store(dir: &std::path::Path) -> Arc<dyn ObjectStore> {
+        Arc::new(crate::durable_local_store::DurableLocalObjectStore::new(dir).unwrap())
     }
 
     fn pipeline_identity(byte: u8) -> PipelineIdentity {
@@ -3417,6 +3477,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prune_before_completes_on_durable_local_store() {
+        let dir = tempdir().unwrap();
+        let backend = ObjectStoreBackend::node_durable(make_durable_store(dir.path()), "node-0", 4);
+        for epoch in 1..=3_u64 {
+            for vnode in 0..4 {
+                backend
+                    .write_partial(attempt(epoch), vnode, 0, Bytes::from_static(b"state"))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), backend.prune_before(3))
+            .await
+            .expect("durable-local state retention deadlocked")
+            .unwrap();
+
+        for epoch in 1..=2_u64 {
+            for vnode in 0..4 {
+                assert!(backend
+                    .read_partial(attempt(epoch), vnode)
+                    .await
+                    .unwrap()
+                    .is_none());
+            }
+        }
+        for vnode in 0..4 {
+            assert!(backend
+                .read_partial(attempt(3), vnode)
+                .await
+                .unwrap()
+                .is_some());
+        }
+        let floor = backend.read_prune_floor().await.unwrap().unwrap().floor;
+        assert_eq!(floor.before_epoch, 3);
+        assert_eq!(floor.swept_before_epoch, 3);
+    }
+
+    #[tokio::test]
+    async fn prune_before_repairs_empty_durable_local_prefixes() {
+        let directory = tempdir().unwrap();
+        let store = Arc::new(
+            crate::durable_local_store::DurableLocalObjectStore::new(directory.path()).unwrap(),
+        );
+        let backend = ObjectStoreBackend::node_durable_with_empty_prefix_cleanup(
+            Arc::clone(&store),
+            "node-0",
+            1,
+        );
+        let empty_leaf = directory
+            .path()
+            .join("state-v2/epoch=1/checkpoint=1/vnode=0");
+        std::fs::create_dir_all(&empty_leaf).unwrap();
+        std::fs::write(empty_leaf.join(".laminardb-object#123"), b"orphan").unwrap();
+        assert!(store
+            .list(Some(&OsPath::from("state-v2/epoch=1")))
+            .next()
+            .await
+            .is_none());
+
+        backend.prune_before(2).await.unwrap();
+
+        assert!(!directory.path().join("state-v2/epoch=1").exists());
+        let floor = backend.read_prune_floor().await.unwrap().unwrap().floor;
+        assert_eq!(floor.before_epoch, 2);
+        assert_eq!(floor.swept_before_epoch, 2);
+    }
+
+    #[tokio::test]
+    async fn prune_before_repeats_bounded_deletes_until_large_prefix_is_empty() {
+        let directory = tempdir().unwrap();
+        let store = make_durable_store(directory.path());
+        let backend = ObjectStoreBackend::new(Arc::clone(&store), "node-0", 1);
+        let retired = attempt(1);
+        let prefix = ObjectStoreBackend::attempt_prefix(retired);
+        let physical_prefix = directory.path().join(prefix.trim_end_matches('/'));
+        std::fs::create_dir_all(&physical_prefix).unwrap();
+
+        // Seed without 1,025 durable puts: this test targets the local filesystem's lazy 1,024
+        // entry listing boundary and the prune sweep, not publication durability.
+        for artifact in 0..1_025 {
+            std::fs::write(
+                physical_prefix.join(format!("artifact={artifact:04}.bin")),
+                b"state",
+            )
+            .unwrap();
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), backend.prune_before(2))
+            .await
+            .expect("large durable-local prune exceeded its latency bound")
+            .unwrap();
+
+        let retired_prefix = OsPath::from(prefix);
+        assert!(store.list(Some(&retired_prefix)).next().await.is_none());
+        assert!(!directory.path().join("state-v2/epoch=1").exists());
+        let floor = backend.read_prune_floor().await.unwrap().unwrap().floor;
+        assert_eq!(floor.before_epoch, 2);
+        assert_eq!(floor.swept_before_epoch, 2);
+    }
+
+    #[tokio::test]
     async fn prune_before_discovers_sparse_epochs_without_scanning_the_id_gap() {
         let dir = tempdir().unwrap();
         let operations = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -3467,8 +3629,9 @@ mod tests {
             vec![
                 "delimiter:state-v2".to_string(),
                 "list:state-v2/epoch=1".to_string(),
+                "list:state-v2/epoch=1".to_string(),
             ],
-            "retention must list only materialized retired epoch prefixes"
+            "retention must collect and then verify only materialized retired epoch prefixes"
         );
     }
 

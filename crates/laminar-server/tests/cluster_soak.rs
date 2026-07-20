@@ -2355,6 +2355,56 @@ properties = {{ "rows.per.second" = "{rows_per_second}", "batch.max.size" = "256
     path
 }
 
+fn local_exact_checkpoint_source_sequence(
+    checkpoint_dir: &Path,
+    checkpoint: DurableCheckpointStatus,
+) -> Result<u64, String> {
+    let path = checkpoint_dir.join(format!(
+        "checkpoints/checkpoint_{:06}/manifest.json",
+        checkpoint.checkpoint_id
+    ));
+    let bytes = std::fs::read(&path)
+        .map_err(|error| format!("read checkpoint manifest '{}': {error}", path.display()))?;
+    let manifest: laminar_core::checkpoint::CheckpointManifest = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("decode checkpoint manifest '{}': {error}", path.display()))?;
+    if manifest.checkpoint_id != checkpoint.checkpoint_id || manifest.epoch != checkpoint.epoch {
+        return Err(format!(
+            "checkpoint status {checkpoint:?} resolved to manifest identity checkpoint={} epoch={}",
+            manifest.checkpoint_id, manifest.epoch
+        ));
+    }
+    if manifest.durable_phase
+        != laminar_core::checkpoint::checkpoint_manifest::DurableCheckpointPhase::Finalized
+    {
+        return Err(format!(
+            "checkpoint {checkpoint:?} source cursor was read from a non-finalized manifest"
+        ));
+    }
+    let sequence = manifest
+        .source_offsets
+        .get("gen")
+        .and_then(|checkpoint| checkpoint.offsets.get("seq"))
+        .ok_or_else(|| format!("checkpoint {checkpoint:?} has no generator sequence offset"))?;
+    sequence.parse::<u64>().map_err(|error| {
+        format!("checkpoint {checkpoint:?} has invalid generator sequence {sequence:?}: {error}")
+    })
+}
+
+fn assert_no_local_checkpoint_consistency_fault(node: &Node) {
+    let log = std::fs::read_to_string(&node.log_path)
+        .unwrap_or_else(|error| panic!("read local exact soak log: {error}"));
+    for marker in [
+        "[LDB-6024]",
+        "[LDB-6026]",
+        "auto-restarting faulted pipeline",
+    ] {
+        assert!(
+            !log.contains(marker),
+            "local exact soak observed an internal checkpoint consistency fault: {marker}"
+        );
+    }
+}
+
 /// Wait until `pred` holds, polling, or panic with `what` at deadline.
 fn wait_for(what: &str, deadline: Duration, mut pred: impl FnMut() -> bool) {
     let expires_at = Instant::now() + deadline;
@@ -2825,6 +2875,7 @@ fn local_exact_source_state_kill9_soak() {
     validate_local_source_liveness(prefix_rows, rows_per_second, interval_ms, recovery_ceiling);
 
     let dir = tempfile::tempdir().expect("local exact soak tempdir");
+    let checkpoint_dir = dir.path().join("checkpoints");
     let log_dir =
         Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("soak-local-exact-{}", soak_run_id()));
     std::fs::create_dir(&log_dir).expect("create exclusive local exact soak log directory");
@@ -2881,10 +2932,17 @@ fn local_exact_source_state_kill9_soak() {
     let moving_checkpoint = node
         .durable_checkpoint_status()
         .expect("moving local checkpoint has no preceding durable recovery cut");
+    let moving_checkpoint_sequence =
+        local_exact_checkpoint_source_sequence(&checkpoint_dir, moving_checkpoint)
+            .unwrap_or_else(|error| panic!("moving-source recovery cut is invalid: {error}"));
     assert!(
         moving_checkpoint.checkpoint_id >= initial_checkpoint.checkpoint_id
             && moving_checkpoint.epoch >= initial_checkpoint.epoch,
         "moving-source durable cut regressed from {initial_checkpoint:?} to {moving_checkpoint:?}"
+    );
+    assert!(
+        moving_checkpoint_sequence < prefix_rows,
+        "moving-source fault selected an already exhausted durable cut: sequence={moving_checkpoint_sequence}, prefix={prefix_rows}"
     );
     let moving_ingested = node
         .metric("laminardb_events_ingested_total")
@@ -2943,6 +3001,7 @@ fn local_exact_source_state_kill9_soak() {
     );
 
     for round in 2..=max_kills {
+        assert_no_local_checkpoint_consistency_fault(&node);
         node.arm_checkpoint_kill("leader");
         wait_for(
             "local exact node to enter its armed checkpoint phase",
@@ -2966,6 +3025,13 @@ fn local_exact_source_state_kill9_soak() {
             durable_checkpoint.checkpoint_id > latest_checkpoint_id,
             "local checkpoint id reused or regressed: previous={latest_checkpoint_id}, current={}",
             durable_checkpoint.checkpoint_id
+        );
+        let durable_source_sequence =
+            local_exact_checkpoint_source_sequence(&checkpoint_dir, durable_checkpoint)
+                .unwrap_or_else(|error| panic!("frozen-prefix recovery cut is invalid: {error}"));
+        assert_eq!(
+            durable_source_sequence, prefix_rows,
+            "checkpoint {durable_checkpoint:?} does not contain the exhausted finite source cut"
         );
         latest_checkpoint_id = durable_checkpoint.checkpoint_id;
 
@@ -3033,6 +3099,7 @@ fn local_exact_source_state_kill9_soak() {
             latest_epoch,
         );
     }
+    assert_no_local_checkpoint_consistency_fault(&node);
     node.kill9();
 }
 
@@ -4402,6 +4469,34 @@ fn aggregate_prefix_formula_matches_sequential_source() {
             }
         }
     }
+}
+
+#[test]
+fn local_exact_source_cursor_oracle_reads_filesystem_checkpoint_layout() {
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = DurableCheckpointStatus {
+        checkpoint_id: 7,
+        epoch: 7,
+    };
+    let mut manifest = laminar_core::checkpoint::CheckpointManifest::new(7, 7);
+    manifest.durable_phase =
+        laminar_core::checkpoint::checkpoint_manifest::DurableCheckpointPhase::Finalized;
+    manifest.source_offsets.insert(
+        "gen".into(),
+        laminar_core::checkpoint::ConnectorCheckpoint::with_offsets(
+            std::collections::HashMap::from([("seq".into(), "4096".into())]),
+        ),
+    );
+    let path = directory
+        .path()
+        .join("checkpoints/checkpoint_000007/manifest.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+    assert_eq!(
+        local_exact_checkpoint_source_sequence(directory.path(), checkpoint).unwrap(),
+        4096
+    );
 }
 
 #[test]

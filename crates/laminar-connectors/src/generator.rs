@@ -309,4 +309,29 @@ mod tests {
         assert!(error.to_string().contains("bad generator offset"));
         assert!(source.anchor.is_none());
     }
+
+    #[tokio::test]
+    async fn resume_at_finite_end_remains_exhausted() {
+        let mut config = ConnectorConfig::new("generator");
+        config.set("rows.per.second", "1000000");
+        config.set("max.rows", "8");
+        let mut checkpoint = SourceCheckpoint::new();
+        checkpoint.set_offset("seq", "8");
+        let mut source = GeneratorSource::default();
+        source
+            .start(start_request(
+                config,
+                SourcePosition::Resume {
+                    attempt: CheckpointAttempt::new(7, 7),
+                    checkpoint,
+                },
+            ))
+            .await
+            .unwrap();
+
+        assert!(source.poll_batch(8).await.unwrap().is_none());
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert!(source.poll_batch(8).await.unwrap().is_none());
+        assert_eq!(source.checkpoint().get_offset("seq"), Some("8"));
+    }
 }

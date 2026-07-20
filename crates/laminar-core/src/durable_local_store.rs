@@ -70,6 +70,8 @@ struct RootDomain {
     publication_gate: Mutex<Option<Arc<TestPublicationGate>>>,
     #[cfg(test)]
     deletion_gate: Mutex<Option<Arc<TestPublicationGate>>>,
+    #[cfg(test)]
+    directory_prepare_gate: Mutex<Option<Arc<TestPublicationGate>>>,
 }
 
 impl RootDomain {
@@ -85,6 +87,8 @@ impl RootDomain {
             publication_gate: Mutex::new(None),
             #[cfg(test)]
             deletion_gate: Mutex::new(None),
+            #[cfg(test)]
+            directory_prepare_gate: Mutex::new(None),
         }
     }
 
@@ -92,12 +96,6 @@ impl RootDomain {
         self.directory_publication_failed.load(Ordering::Acquire)
             || !self.poisoned_paths.lock().is_empty()
     }
-}
-
-struct DeleteOperationLease {
-    _operation_order: tokio::sync::OwnedMutexGuard<()>,
-    _ownership_lock: Option<Arc<File>>,
-    domain: Arc<RootDomain>,
 }
 
 fn shared_root_domain(root: &FsPath) -> io::Result<Arc<RootDomain>> {
@@ -126,6 +124,11 @@ pub(crate) struct DurableLocalObjectStore {
     inner: LocalFileSystem,
     domain: Arc<RootDomain>,
     ownership_lock: Option<Arc<File>>,
+}
+
+#[async_trait]
+pub(crate) trait EmptyPrefixCleanup: Send + Sync {
+    async fn cleanup_empty_prefix(&self, prefix: &Path) -> object_store::Result<()>;
 }
 
 impl DurableLocalObjectStore {
@@ -281,38 +284,51 @@ impl ObjectStore for DurableLocalObjectStore {
             };
             let (results_tx, results_rx) = tokio::sync::mpsc::channel(10);
             drop(runtime.spawn(async move {
-                let operation_order = Arc::clone(&domain.operation_order).lock_owned().await;
-                let lease = Arc::new(DeleteOperationLease {
-                    _operation_order: operation_order,
-                    _ownership_lock: ownership_lock,
-                    domain,
-                });
                 let jobs = locations
                     .map(move |location| {
                         let inner = inner.clone();
                         let root = Arc::clone(&root);
-                        let lease = Arc::clone(&lease);
+                        let domain = Arc::clone(&domain);
+                        let ownership_lock = ownership_lock.clone();
                         async move {
                             let location = location?;
                             let destination = inner.path_to_filesystem(&location)?;
                             let object_path = location.to_string();
+                            // Serialize only this durable namespace mutation. Holding the root
+                            // order across an entire retention stream can starve foreground
+                            // checkpoint publication behind an arbitrarily large GC sweep.
+                            let operation_order =
+                                Arc::clone(&domain.operation_order).lock_owned().await;
                             tokio::task::spawn_blocking(move || {
                                 #[cfg(test)]
-                                block_test_deletion(lease.domain.as_ref());
+                                block_test_deletion(domain.as_ref());
                                 let result = delete_local_object(
                                     root.as_ref(),
-                                    lease.domain.as_ref(),
+                                    domain.as_ref(),
                                     &destination,
                                     &object_path,
-                                )
-                                .map(|()| location);
-                                drop(lease);
-                                result
+                                );
+                                // The logical deletion is durable before this guard is released.
+                                // Empty-directory cleanup is hygiene and must not extend the
+                                // foreground read/overwrite exclusion window.
+                                drop(operation_order);
+                                if let Ok(deleted_path) = &result {
+                                    remove_empty_ancestor_directories(
+                                        root.as_ref(),
+                                        domain.as_ref(),
+                                        deleted_path,
+                                    );
+                                }
+                                drop(ownership_lock);
+                                result.map(|_| location)
                             })
                             .await?
                         }
                     })
-                    .buffered(10);
+                    // The root order serializes durable object mutations. Polling one job at a
+                    // time avoids queueing a batch of GC lock waiters ahead of a live checkpoint
+                    // overwrite.
+                    .buffered(1);
                 futures::pin_mut!(jobs);
 
                 loop {
@@ -345,30 +361,30 @@ impl ObjectStore for DurableLocalObjectStore {
         let root = Arc::clone(&self.root);
         let domain = Arc::clone(&self.domain);
         let ownership_lock = self.ownership_lock.clone();
-        stream::once(async move {
-            let guard = Arc::clone(&domain.operation_order).lock_owned().await;
-            inner
-                .list(prefix.as_ref())
-                .map(move |result| {
-                    let _keep_alive = (&guard, &ownership_lock);
-                    let metadata = result?;
-                    let path = path_resolver.path_to_filesystem(&metadata.location)?;
-                    if let Some(path) =
-                        canonical_object_path(root.as_ref(), &path).map_err(generic_io_error)?
-                    {
-                        ensure_not_poisoned(&domain.poisoned_paths, &path)
-                            .map_err(generic_io_error)?;
-                    }
-                    Ok(metadata)
-                })
-                .boxed()
-        })
-        .flatten()
-        .boxed()
+        // Local publication, replacement, and deletion change the visible namespace atomically;
+        // object-store LIST does not promise a point-in-time snapshot. Do not hold the mutation
+        // order while streaming results: delete_stream is allowed to consume a LIST from this
+        // same store and takes that order before polling its input.
+        inner
+            .list(prefix.as_ref())
+            .map(move |result| {
+                let _keep_alive = &ownership_lock;
+                let metadata = result?;
+                let path = path_resolver.path_to_filesystem(&metadata.location)?;
+                if let Some(path) =
+                    canonical_object_path(root.as_ref(), &path).map_err(generic_io_error)?
+                {
+                    ensure_not_poisoned(&domain.poisoned_paths, &path).map_err(generic_io_error)?;
+                }
+                Ok(metadata)
+            })
+            .boxed()
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
-        let _operation_order = Arc::clone(&self.domain.operation_order).lock_owned().await;
+        // Like streaming LIST, delimiter inventory observes an atomic but not point-in-time
+        // namespace. A large directory walk must not retain the mutation order needed by live
+        // checkpoint publication.
         self.inner.list_with_delimiter(prefix).await
     }
 
@@ -391,13 +407,29 @@ impl ObjectStore for DurableLocalObjectStore {
     }
 }
 
+#[async_trait]
+impl EmptyPrefixCleanup for DurableLocalObjectStore {
+    async fn cleanup_empty_prefix(&self, prefix: &Path) -> object_store::Result<()> {
+        let prefix = self.filesystem_path(prefix)?;
+        let root = Arc::clone(&self.root);
+        let domain = Arc::clone(&self.domain);
+        let ownership_lock = self.ownership_lock.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ownership_lock = ownership_lock;
+            cleanup_empty_directory_tree(root.as_ref(), domain.as_ref(), &prefix)
+                .map_err(generic_io_error)
+        })
+        .await?
+    }
+}
+
 #[cfg(unix)]
 fn delete_local_object(
     root: &FsPath,
     domain: &RootDomain,
     destination: &FsPath,
     object_path: &str,
-) -> object_store::Result<()> {
+) -> object_store::Result<PathBuf> {
     let destination = canonical_object_path(root, destination)
         .map_err(generic_io_error)?
         .ok_or_else(|| object_not_found(object_path, destination))?;
@@ -416,8 +448,7 @@ fn delete_local_object(
         domain.poisoned_paths.lock().insert(destination);
         return Err(generic_io_error(error));
     }
-
-    Ok(())
+    Ok(destination)
 }
 
 #[cfg(unix)]
@@ -434,7 +465,7 @@ fn delete_local_object(
     _domain: &RootDomain,
     destination: &FsPath,
     object_path: &str,
-) -> object_store::Result<()> {
+) -> object_store::Result<PathBuf> {
     let destination = canonical_object_path(root, destination)
         .map_err(generic_io_error)?
         .ok_or_else(|| object_not_found(object_path, destination))?;
@@ -466,7 +497,7 @@ fn delete_local_object(
             tracing::warn!(path = %tombstone.display(), %error, "local object tombstone cleanup failed");
         }
     }
-    Ok(())
+    Ok(destination)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -475,7 +506,7 @@ fn delete_local_object(
     _domain: &RootDomain,
     destination: &FsPath,
     _object_path: &str,
-) -> object_store::Result<()> {
+) -> object_store::Result<PathBuf> {
     Err(generic_io_error(io::Error::new(
         io::ErrorKind::Unsupported,
         format!(
@@ -483,6 +514,106 @@ fn delete_local_object(
             destination.display()
         ),
     )))
+}
+
+fn remove_empty_ancestor_directories(root: &FsPath, domain: &RootDomain, object: &FsPath) {
+    let Some(mut directory) = object.parent().map(FsPath::to_path_buf) else {
+        return;
+    };
+    while directory != root && directory.starts_with(root) {
+        let Some(parent) = directory.parent().map(FsPath::to_path_buf) else {
+            break;
+        };
+        if !try_remove_empty_directory(root, domain, &directory) {
+            break;
+        }
+        // Directory removal is best-effort metadata hygiene. The file unlink/rename was already
+        // synchronized; a crash may only resurrect an empty directory for prefix maintenance.
+        directory = parent;
+    }
+}
+
+fn cleanup_empty_directory_tree(
+    root: &FsPath,
+    domain: &RootDomain,
+    prefix: &FsPath,
+) -> io::Result<()> {
+    let prefix = match std::fs::canonicalize(prefix) {
+        Ok(prefix) => prefix,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if prefix == root || !prefix.starts_with(root) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "empty-prefix cleanup resolves outside its store root",
+        ));
+    }
+
+    let mut pending = vec![prefix];
+    let mut directories = Vec::new();
+    while let Some(directory) = pending.pop() {
+        directories.push(directory.clone());
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            } else if file_type.is_file() && is_internal_artifact_name(&entry.file_name()) {
+                match std::fs::remove_file(entry.path()) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+
+    for directory in directories.into_iter().rev() {
+        try_remove_empty_directory(root, domain, &directory);
+    }
+    Ok(())
+}
+
+fn is_internal_artifact_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .and_then(|name| name.strip_prefix(TEMP_PREFIX))
+        .is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+fn try_remove_empty_directory(root: &FsPath, domain: &RootDomain, directory: &FsPath) -> bool {
+    if directory == root || !directory.starts_with(root) {
+        return false;
+    }
+    // Immutable creates hold this same short critical section until their temporary file exists.
+    // Cleanup therefore cannot invalidate a directory prepared by a live writer.
+    let mut established = domain.established_directories.lock();
+    match std::fs::remove_dir(directory) {
+        Ok(()) => {
+            established.remove(directory);
+            true
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            established.remove(directory);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 fn object_not_found(object_path: &str, filesystem_path: &FsPath) -> object_store::Error {
@@ -517,13 +648,9 @@ fn write_durable(
             "local object has no parent",
         ))
     })?;
-    let canonical_parent = establish_parent(
-        root,
-        &domain.established_directories,
-        &domain.directory_publication_failed,
-        parent,
-    )
-    .map_err(generic_io_error)?;
+    let (canonical_parent, mut temporary, temporary_path) =
+        establish_parent_and_create_temporary(root, domain, parent).map_err(generic_io_error)?;
+    let cleanup = TemporaryFile(temporary_path.clone());
     let file_name = destination.file_name().ok_or_else(|| {
         generic_io_error(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -532,9 +659,6 @@ fn write_durable(
     })?;
     let destination = canonical_parent.join(file_name);
     ensure_not_poisoned(&domain.poisoned_paths, &destination).map_err(generic_io_error)?;
-    let (mut temporary, temporary_path) =
-        create_temporary(&canonical_parent).map_err(generic_io_error)?;
-    let cleanup = TemporaryFile(temporary_path.clone());
     for chunk in payload {
         temporary.write_all(&chunk).map_err(generic_io_error)?;
     }
@@ -561,49 +685,59 @@ fn write_durable(
     Ok(())
 }
 
-fn establish_parent(
+fn establish_parent_and_create_temporary(
     root: &FsPath,
-    established_directories: &Mutex<FxHashSet<PathBuf>>,
-    directory_publication_failed: &AtomicBool,
+    domain: &RootDomain,
     parent: &FsPath,
-) -> io::Result<PathBuf> {
-    if directory_publication_failed.load(Ordering::Acquire) {
+) -> io::Result<(PathBuf, File, PathBuf)> {
+    if domain.directory_publication_failed.load(Ordering::Acquire) {
         return Err(io::Error::other(
             "local object directory durability is unresolved; restart after storage recovery",
         ));
     }
-    let result = (|| {
-        let mut established = established_directories.lock();
-        if directory_publication_failed.load(Ordering::Acquire) {
-            return Err(io::Error::other(
-                "local object directory durability is unresolved; restart after storage recovery",
-            ));
-        }
 
-        let canonical = match std::fs::canonicalize(parent).ok() {
-            Some(path) if established.contains(&path) => path,
-            _ => {
-                ensure_durable_directory(parent)?;
-                std::fs::canonicalize(parent)?
-            }
-        };
-        if !canonical.starts_with(root) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "local object resolves outside its store root",
-            ));
-        }
-        if established.len() >= MAX_CACHED_DIRECTORIES {
-            established.clear();
-            established.insert(root.to_path_buf());
-        }
-        established.insert(canonical.clone());
-        Ok(canonical)
-    })();
-    if result.is_err() {
-        directory_publication_failed.store(true, Ordering::Release);
+    let mut established = domain.established_directories.lock();
+    if domain.directory_publication_failed.load(Ordering::Acquire) {
+        return Err(io::Error::other(
+            "local object directory durability is unresolved; restart after storage recovery",
+        ));
     }
-    result
+
+    let canonical = match std::fs::canonicalize(parent).ok() {
+        Some(path) if established.contains(&path) => path,
+        _ => match ensure_durable_directory(parent).and_then(|()| std::fs::canonicalize(parent)) {
+            Ok(path) => path,
+            Err(error) => {
+                domain
+                    .directory_publication_failed
+                    .store(true, Ordering::Release);
+                return Err(error);
+            }
+        },
+    };
+    if !canonical.starts_with(root) {
+        domain
+            .directory_publication_failed
+            .store(true, Ordering::Release);
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "local object resolves outside its store root",
+        ));
+    }
+    if established.len() >= MAX_CACHED_DIRECTORIES {
+        established.clear();
+        established.insert(root.to_path_buf());
+    }
+    established.insert(canonical.clone());
+    #[cfg(test)]
+    {
+        let gate = domain.directory_prepare_gate.lock().take();
+        if let Some(gate) = gate {
+            gate.block();
+        }
+    }
+    let (temporary, temporary_path) = create_temporary(&canonical)?;
+    Ok((canonical, temporary, temporary_path))
 }
 
 fn ensure_not_poisoned(
@@ -731,6 +865,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn namespace_inventory_does_not_wait_for_mutable_operation_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DurableLocalObjectStore::new(directory.path()).unwrap();
+        store
+            .put_opts(
+                &Path::from("state/epoch=1/object"),
+                PutPayload::from_static(b"state"),
+                PutMode::Create.into(),
+            )
+            .await
+            .unwrap();
+        let guard = Arc::clone(&store.domain.operation_order).lock_owned().await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let listed = store
+                .list(Some(&Path::from("state")))
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(listed.len(), 1);
+            let delimited = store
+                .list_with_delimiter(Some(&Path::from("state")))
+                .await
+                .unwrap();
+            assert_eq!(delimited.common_prefixes, vec![Path::from("state/epoch=1")]);
+        })
+        .await
+        .expect("namespace inventory was serialized behind a mutation");
+
+        drop(guard);
+    }
+
+    #[tokio::test]
     async fn overwrite_read_list_and_delete_roundtrip() {
         let directory = tempfile::tempdir().unwrap();
         let store = DurableLocalObjectStore::new(directory.path()).unwrap();
@@ -757,6 +924,192 @@ mod tests {
             store.get(&path).await.unwrap_err(),
             object_store::Error::NotFound { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn delete_cleans_empty_ancestors_preserves_siblings_and_allows_recreate() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DurableLocalObjectStore::new(directory.path()).unwrap();
+        let retired = Path::from("state/epoch=1/checkpoint=1/vnode=0/partial.bin");
+        let retained = Path::from("state/epoch=2/checkpoint=2/vnode=0/partial.bin");
+        for path in [&retired, &retained] {
+            store
+                .put_opts(
+                    path,
+                    PutPayload::from_static(b"state"),
+                    PutMode::Create.into(),
+                )
+                .await
+                .unwrap();
+        }
+
+        store.delete(&retired).await.unwrap();
+
+        assert!(!directory.path().join("state/epoch=1").exists());
+        assert!(directory
+            .path()
+            .join("state/epoch=2/checkpoint=2/vnode=0/partial.bin")
+            .is_file());
+        store
+            .put_opts(
+                &retired,
+                PutPayload::from_static(b"recreated"),
+                PutMode::Create.into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get(&retired).await.unwrap().bytes().await.unwrap(),
+            bytes::Bytes::from_static(b"recreated")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn immutable_create_survives_concurrent_empty_ancestor_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DurableLocalObjectStore::new(directory.path()).unwrap();
+        let retired = Path::from("state/epoch=1/retired.bin");
+        let live = Path::from("state/epoch=1/live.bin");
+        store
+            .put_opts(
+                &retired,
+                PutPayload::from_static(b"retired"),
+                PutMode::Create.into(),
+            )
+            .await
+            .unwrap();
+
+        let gate = Arc::new(TestPublicationGate::default());
+        *store.domain.directory_prepare_gate.lock() = Some(Arc::clone(&gate));
+        let creating_store = store.clone();
+        let creating_path = live.clone();
+        let creating = tokio::spawn(async move {
+            creating_store
+                .put_opts(
+                    &creating_path,
+                    PutPayload::from_static(b"live"),
+                    PutMode::Create.into(),
+                )
+                .await
+        });
+        let wait_gate = Arc::clone(&gate);
+        assert!(
+            tokio::task::spawn_blocking(move || {
+                wait_gate.wait_until_entered(std::time::Duration::from_secs(5))
+            })
+            .await
+            .unwrap(),
+            "create did not reach the prepared-directory boundary"
+        );
+
+        let deleting_store = store.clone();
+        let deleting_path = retired.clone();
+        let deleting = tokio::spawn(async move { deleting_store.delete(&deleting_path).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while directory.path().join("state/epoch=1/retired.bin").exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("delete did not reach empty-directory cleanup");
+
+        gate.release();
+        creating.await.unwrap().unwrap();
+        deleting.await.unwrap().unwrap();
+        assert_eq!(
+            store.get(&live).await.unwrap().bytes().await.unwrap(),
+            bytes::Bytes::from_static(b"live")
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_stream_can_consume_a_listing_from_the_same_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DurableLocalObjectStore::new(directory.path()).unwrap();
+        let prefix = Path::from("state/epoch=1");
+        for vnode in 0..3 {
+            store
+                .put_opts(
+                    &Path::from(format!("state/epoch=1/vnode={vnode}")),
+                    PutPayload::from_static(b"retired"),
+                    PutMode::Create.into(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let locations = store
+            .list(Some(&prefix))
+            .map(|result| result.map(|metadata| metadata.location))
+            .boxed();
+        let deleted = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            store.delete_stream(locations).try_collect::<Vec<_>>(),
+        )
+        .await
+        .expect("list-to-delete deadlocked")
+        .unwrap();
+
+        assert_eq!(deleted.len(), 3);
+        assert!(store
+            .list(Some(&prefix))
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_stream_releases_mutation_order_between_objects() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DurableLocalObjectStore::new(directory.path()).unwrap();
+        let retired_a = Path::from("state/epoch=1/a");
+        let retired_b = Path::from("state/epoch=1/b");
+        let live = Path::from("state/prune-floor");
+        for path in [&retired_a, &retired_b, &live] {
+            store
+                .put_opts(
+                    path,
+                    PutPayload::from_static(b"old"),
+                    PutMode::Create.into(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let (locations_tx, locations_rx) =
+            futures::channel::mpsc::unbounded::<object_store::Result<Path>>();
+        locations_tx.unbounded_send(Ok(retired_a.clone())).unwrap();
+        let mut deletes = store.delete_stream(locations_rx.boxed());
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), deletes.next())
+                .await
+                .expect("first delete stalled")
+                .expect("delete stream ended early")
+                .unwrap(),
+            retired_a
+        );
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            store.put_opts(
+                &live,
+                PutPayload::from_static(b"new"),
+                PutMode::Overwrite.into(),
+            ),
+        )
+        .await
+        .expect("idle delete stream retained the mutation order")
+        .unwrap();
+
+        locations_tx.unbounded_send(Ok(retired_b.clone())).unwrap();
+        drop(locations_tx);
+        assert_eq!(deletes.next().await.unwrap().unwrap(), retired_b);
+        assert!(deletes.next().await.is_none());
+        assert_eq!(
+            store.get(&live).await.unwrap().bytes().await.unwrap(),
+            bytes::Bytes::from_static(b"new")
+        );
     }
 
     #[cfg(unix)]
@@ -797,8 +1150,7 @@ mod tests {
         store.delete(&path).await.unwrap();
 
         let parent = directory.path().join("retention");
-        assert!(!parent.join("obsolete").exists());
-        assert_eq!(std::fs::read_dir(parent).unwrap().count(), 0);
+        assert!(!parent.exists());
     }
 
     #[tokio::test]
@@ -1147,6 +1499,9 @@ mod tests {
             store.put(&path, PutPayload::from_static(b"value")).await,
             Err(object_store::Error::Generic { .. })
         ));
+        assert!(std::fs::read_dir(directory.path())
+            .unwrap()
+            .all(|entry| { !is_internal_artifact_name(&entry.unwrap().file_name()) }));
         drop(store);
         let reopened = DurableLocalObjectStore::new(directory.path()).unwrap();
         assert!(matches!(

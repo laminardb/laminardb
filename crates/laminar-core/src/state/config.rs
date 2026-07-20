@@ -147,14 +147,27 @@ impl StateBackendConfig {
             Self::InProcess => Ok(Arc::new(InProcessBackend::new(key_group_count))),
             Self::Local { path } => {
                 let fs = durable_local_store(path)?;
-                Ok(Arc::new(ObjectStoreBackend::node_durable(
-                    fs,
-                    LOCAL_STATE_WRITER_ID,
-                    key_group_count,
-                )))
+                Ok(Arc::new(
+                    ObjectStoreBackend::node_durable_with_empty_prefix_cleanup(
+                        fs,
+                        LOCAL_STATE_WRITER_ID,
+                        key_group_count,
+                    ),
+                ))
+            }
+            Self::ObjectStore { url, .. } if url.starts_with("file://") => {
+                let path = crate::checkpoint::object_store_builder::file_url_path(url)?;
+                let fs = durable_local_store(&path)?;
+                Ok(Arc::new(
+                    ObjectStoreBackend::node_durable_with_empty_prefix_cleanup(
+                        fs,
+                        LOCAL_STATE_WRITER_ID,
+                        key_group_count,
+                    ),
+                ))
             }
             Self::ObjectStore { url, storage } => {
-                let store = state_store(url, storage)?;
+                let store = cloud_store(url, storage)?;
                 let backend = match self.durability_scope() {
                     StateBackendDurability::Volatile => {
                         ObjectStoreBackend::new(store, LOCAL_STATE_WRITER_ID, key_group_count)
@@ -219,9 +232,9 @@ impl StateBackendConfig {
 
 fn durable_local_store(
     path: &std::path::Path,
-) -> Result<Arc<dyn ::object_store::ObjectStore>, StateBackendBuildError> {
+) -> Result<Arc<crate::durable_local_store::DurableLocalObjectStore>, StateBackendBuildError> {
     crate::durable_local_store::DurableLocalObjectStore::new_exclusive(path, LOCAL_STATE_LOCK)
-        .map(|store| Arc::new(store) as Arc<dyn ::object_store::ObjectStore>)
+        .map(Arc::new)
         .map_err(|error| StateBackendBuildError::Io(error.to_string()))
 }
 
@@ -231,7 +244,7 @@ fn state_store(
 ) -> Result<Arc<dyn ::object_store::ObjectStore>, StateBackendBuildError> {
     if url.starts_with("file://") {
         let path = crate::checkpoint::object_store_builder::file_url_path(url)?;
-        durable_local_store(&path)
+        durable_local_store(&path).map(|store| store as Arc<dyn ::object_store::ObjectStore>)
     } else {
         cloud_store(url, storage)
     }
