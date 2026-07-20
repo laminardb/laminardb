@@ -17,7 +17,7 @@ mod tls;
 pub mod types;
 
 pub(crate) use tls::make_rustls_connector;
-/// PostgreSQL connection security policy.
+/// `PostgreSQL` connection security policy.
 pub use tls::SslMode;
 
 #[cfg(feature = "postgres-cdc")]
@@ -63,6 +63,10 @@ where
 }
 
 /// Registers the `PostgreSQL` sink connector with the given registry.
+///
+/// # Errors
+///
+/// Returns an error if the connector name is already registered or the registry is frozen.
 #[cfg(feature = "postgres-sink")]
 pub fn register_postgres_sink(
     registry: &ConnectorRegistry,

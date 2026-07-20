@@ -1259,7 +1259,7 @@ mod rebalance {
         assert_eq!(stored.version, seed.version + 1);
         for outcome in &outcomes {
             if let RotateOutcome::Conflict(current) = outcome {
-                assert_eq!(current, &stored);
+                assert_eq!(current.as_ref(), &stored);
             }
         }
 
@@ -1303,7 +1303,7 @@ mod rebalance {
         }
         let stale = canonical_successor(&seed, stale_map);
         match store.save_if_version(&stale, seed.version).await.unwrap() {
-            RotateOutcome::Conflict(current) => assert_eq!(current, next),
+            RotateOutcome::Conflict(current) => assert_eq!(*current, next),
             RotateOutcome::Rotated => panic!("stale rotation must not succeed"),
         }
         assert_eq!(store.load().await.unwrap().unwrap(), next);
@@ -2209,7 +2209,7 @@ mod minio {
         let follower_owned = owned_vnodes(&registry, NodeId(follower_node.instance_id.0));
         assert_eq!(leader_owned.len() + follower_owned.len(), 4);
         let full = (0..4).collect::<Vec<_>>();
-        let fence = super::test_assignment_fence(&cluster, &registry);
+        let fence = super::test_assignment_fence(cluster, &registry);
 
         let leader_dir = tempfile::tempdir().unwrap();
         let follower_dir = tempfile::tempdir().unwrap();

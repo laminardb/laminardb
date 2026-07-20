@@ -297,7 +297,11 @@ impl PostgresSinkConfig {
                 "statement.timeout.ms must be <= {MAX_POSTGRES_STATEMENT_TIMEOUT_MS}"
             )));
         }
-        if self.statement_timeout.subsec_nanos() % 1_000_000 != 0 {
+        if !self
+            .statement_timeout
+            .subsec_nanos()
+            .is_multiple_of(1_000_000)
+        {
             return Err(ConnectorError::ConfigurationError(
                 "statement timeout must be an integer number of milliseconds".into(),
             ));
@@ -305,7 +309,7 @@ impl PostgresSinkConfig {
         Ok(())
     }
 
-    /// PostgreSQL startup option applied to every connection created by the pool.
+    /// `PostgreSQL` startup option applied to every connection created by the pool.
     #[must_use]
     pub(super) fn statement_timeout_startup_option(&self) -> String {
         format!(
@@ -325,7 +329,7 @@ impl PostgresSinkConfig {
     }
 }
 
-/// Validates one PostgreSQL identifier segment before it can reach generated SQL.
+/// Validates one `PostgreSQL` identifier segment before it can reach generated SQL.
 pub(super) fn validate_sql_identifier(identifier: &str, label: &str) -> Result<(), ConnectorError> {
     if identifier.is_empty() {
         return Err(ConnectorError::ConfigurationError(format!(
@@ -345,7 +349,7 @@ pub(super) fn validate_sql_identifier(identifier: &str, label: &str) -> Result<(
     Ok(())
 }
 
-/// Quotes one already-validated identifier segment. PostgreSQL escapes embedded quotes by
+/// Quotes one already-validated identifier segment. `PostgreSQL` escapes embedded quotes by
 /// doubling them; dots remain literal characters within the segment.
 pub(super) fn quote_sql_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))

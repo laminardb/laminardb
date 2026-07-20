@@ -4,6 +4,20 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::duration_suboptimal_units)] // MSRV 1.85; from_mins/from_hours are 1.91+
 #![allow(clippy::module_name_repetitions)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::cast_possible_truncation,
+        clippy::default_trait_access,
+        clippy::disallowed_types,
+        clippy::field_reassign_with_default,
+        clippy::items_after_statements,
+        clippy::large_futures,
+        clippy::similar_names,
+        clippy::struct_excessive_bools,
+        clippy::too_many_lines
+    )
+)]
 
 /// Feature-neutral catalog identity types.
 pub mod catalog;

@@ -215,6 +215,7 @@ impl SqlQueryOperator {
         newly
     }
 
+    #[allow(clippy::unnecessary_wraps)] // Cluster builds can fail while merging vnode slices.
     fn staged_pending_restore(&self) -> Result<Option<AggStateCheckpoint>, DbError> {
         #[cfg(feature = "cluster")]
         {
@@ -224,7 +225,7 @@ impl SqlQueryOperator {
             let mut slices = Vec::with_capacity(
                 self.pending_restore_slices
                     .len()
-                    .saturating_add(if self.pending_restore.is_some() { 1 } else { 0 }),
+                    .saturating_add(usize::from(self.pending_restore.is_some())),
             );
             if let Some(checkpoint) = &self.pending_restore {
                 slices.push(Bytes::from(serialize_agg_cp(checkpoint, &self.op_name)?));
@@ -236,14 +237,14 @@ impl SqlQueryOperator {
                     self.op_name
                 ))
             })?;
-            return rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(&merged)
+            rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(&merged)
                 .map(Some)
                 .map_err(|error| {
                     DbError::Checkpoint(format!(
                         "aggregate '{}' merged vnode baseline decode failed: {error}",
                         self.op_name
                     ))
-                });
+                })
         }
         #[cfg(not(feature = "cluster"))]
         {
@@ -669,7 +670,7 @@ impl SqlQueryOperator {
                 laminar_core::shuffle::row_vnodes(&batch, &cols, vnode_count).map_err(|error| {
                     crate::operator::shuffle_routing_error(
                         &format!("aggregate [{}] restore filter", self.op_name),
-                        error,
+                        &error,
                     )
                 })?
             };
@@ -749,14 +750,14 @@ async fn shuffle_pre_agg_batches(
         }
         let context = format!("aggregate [{op_name}] routing");
         let row_vn = hash_rows_to_vnodes(&batch, num_group_cols, vnode_count)
-            .map_err(|error| crate::operator::shuffle_routing_error(&context, error))?;
+            .map_err(|error| crate::operator::shuffle_routing_error(&context, &error))?;
         let plan = laminar_core::shuffle::route_checkpointed_batch(
             &batch,
             &row_vn,
             &assignment,
             cfg.self_id,
         )
-        .map_err(|error| crate::operator::shuffle_routing_error(&context, error))?;
+        .map_err(|error| crate::operator::shuffle_routing_error(&context, &error))?;
 
         for route in plan.local {
             local.push(route.batch);

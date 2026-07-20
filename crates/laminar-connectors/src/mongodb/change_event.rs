@@ -86,7 +86,7 @@ pub struct UpdateDescription {
 
     /// Ambiguous update paths mapped to their exact path components.
     ///
-    /// Replay must not treat these keys as ordinary dotted paths. The MongoDB sink rejects a
+    /// Replay must not treat these keys as ordinary dotted paths. The `MongoDB` sink rejects a
     /// non-empty map until it can express the update faithfully with `$setField` semantics.
     #[serde(default)]
     pub disambiguated_paths: HashMap<String, serde_json::Value>,

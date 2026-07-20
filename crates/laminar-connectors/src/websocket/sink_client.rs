@@ -660,9 +660,10 @@ mod tests {
                 .await
                 .unwrap();
             loop {
-                match websocket.next().await.unwrap().unwrap() {
-                    tungstenite::Message::Pong(payload) => return payload,
-                    _ => continue,
+                if let tungstenite::Message::Pong(payload) =
+                    websocket.next().await.unwrap().unwrap()
+                {
+                    return payload;
                 }
             }
         });

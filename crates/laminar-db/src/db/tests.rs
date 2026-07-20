@@ -5144,13 +5144,15 @@ async fn custom_on_demand_lookup_uses_lookup_factory_without_table_source() {
         Some(laminar_sql::datafusion::RegisteredLookup::Partial(ref state))
             if state.source.is_some()
     ));
-    let observed_config = observed_config.lock();
-    let observed_config = observed_config
-        .as_ref()
-        .expect("lookup factory was invoked");
-    assert_eq!(observed_config.connector_type(), "mock-direct");
-    assert_eq!(observed_config.get("connection"), Some("endpoint=test"));
-    assert_eq!(observed_config.get("provider.fetch.mode"), Some("fast"));
+    {
+        let observed_config = observed_config.lock();
+        let observed_config = observed_config
+            .as_ref()
+            .expect("lookup factory was invoked");
+        assert_eq!(observed_config.connector_type(), "mock-direct");
+        assert_eq!(observed_config.get("connection"), Some("endpoint=test"));
+        assert_eq!(observed_config.get("provider.fetch.mode"), Some("fast"));
+    }
     db.shutdown().await.unwrap();
 }
 

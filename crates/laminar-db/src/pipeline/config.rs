@@ -24,11 +24,13 @@ pub enum CheckpointSchedule {
 
 impl CheckpointSchedule {
     /// Whether the durable checkpoint service is configured.
+    #[must_use]
     pub const fn is_enabled(self) -> bool {
         !matches!(self, Self::Disabled)
     }
 
     /// The periodic cadence, if automatic checkpoints are configured.
+    #[must_use]
     pub const fn periodic_interval(self) -> Option<Duration> {
         match self {
             Self::Periodic(interval) => Some(interval),

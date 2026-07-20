@@ -33,9 +33,10 @@ impl std::fmt::Debug for StorageOptions {
 }
 
 /// Tagged-union config that selects checkpoint-artifact storage.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum StateBackendConfig {
     /// Non-durable in-process backend. The default.
+    #[default]
     InProcess,
 
     /// Durable single-node backend on a local filesystem path. Shorthand
@@ -85,12 +86,6 @@ impl<'de> Deserialize<'de> for StateBackendConfig {
                 Self::ObjectStore { url, storage }
             }
         })
-    }
-}
-
-impl Default for StateBackendConfig {
-    fn default() -> Self {
-        Self::InProcess
     }
 }
 

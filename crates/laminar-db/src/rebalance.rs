@@ -200,6 +200,11 @@ async fn hold_terminal_source_resolution(
 }
 
 /// Spawn the per-node snapshot watcher. Exits on `shutdown`.
+///
+/// # Panics
+///
+/// The spawned watcher panics if an already-validated draining snapshot lacks its transition.
+#[allow(clippy::too_many_lines)]
 pub fn spawn_snapshot_watcher(
     db: Arc<LaminarDB>,
     store: Arc<AssignmentSnapshotStore>,
@@ -271,10 +276,10 @@ pub fn spawn_snapshot_watcher(
                             .await;
                             match failed {
                                 Ok(Err(error)) => {
-                                    warn!(%error, version = snapshot.version, "snapshot watcher: drain finalization audit failed; assignment authority suspended")
+                                    warn!(%error, version = snapshot.version, "snapshot watcher: drain finalization audit failed; assignment authority suspended");
                                 }
                                 Err(_) => {
-                                    warn!(version = snapshot.version, timeout = ?config.checkpoint_timeout, "snapshot watcher: drain finalization audit timed out; assignment authority suspended")
+                                    warn!(version = snapshot.version, timeout = ?config.checkpoint_timeout, "snapshot watcher: drain finalization audit timed out; assignment authority suspended");
                                 }
                                 Ok(Ok(_)) => unreachable!(),
                             }
@@ -671,7 +676,7 @@ pub fn spawn_snapshot_watcher(
                                 .to_vnode_vec(registry.vnode_count())
                                 .is_ok_and(|owners| owners.as_slice() == assignment.owners()) =>
                     {
-                        match tokio::time::timeout_at(
+                        if let Ok(fence) = tokio::time::timeout_at(
                             head_deadline,
                             compute_checkpoint_assignment_fence(
                                 c,
@@ -681,16 +686,13 @@ pub fn spawn_snapshot_watcher(
                         )
                         .await
                         {
-                            Ok(fence) => {
-                                fence.filter(|fence| fence.participants == snapshot.participants)
-                            }
-                            Err(_) => {
-                                warn!(
-                                    version,
-                                    "assignment fence computation exceeded the head deadline"
-                                );
-                                None
-                            }
+                            fence.filter(|fence| fence.participants == snapshot.participants)
+                        } else {
+                            warn!(
+                                version,
+                                "assignment fence computation exceeded the head deadline"
+                            );
+                            None
                         }
                     }
                     _ => None,
@@ -1193,6 +1195,7 @@ impl SourceDrainResolutionDeadline {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn settle_observed_local_drain(
     db: &Arc<LaminarDB>,
     store: &AssignmentSnapshotStore,
@@ -1296,8 +1299,7 @@ async fn settle_observed_local_drain(
         .map_err(|error| error.to_string())?;
     if registry.snapshot().as_ref() != expected.as_slice() {
         return Err(format!(
-            "local assignment {} does not match the durable drain outcome",
-            target_version
+            "local assignment {target_version} does not match the durable drain outcome"
         ));
     }
     db.resolve_local_source_drain(transition.id(), outcome, drain_deadline.resolve())
@@ -1530,6 +1532,7 @@ async fn audit_exact_drain_head(
     .map_err(|_| "durable drain predecessor audit timed out".to_string())?
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prepare_and_announce_local_drain(
     db: &LaminarDB,
     store: &AssignmentSnapshotStore,
@@ -1701,7 +1704,7 @@ pub async fn wait_until_drained(
                         Ok(owners) if !snap.draining && !owners.contains(&me) => return true,
                         Ok(_) => {}
                         Err(error) => {
-                            warn!(%error, "wait_until_drained: snapshot cardinality mismatch")
+                            warn!(%error, "wait_until_drained: snapshot cardinality mismatch");
                         }
                     },
                     Err(error) => {
@@ -1759,7 +1762,7 @@ async fn materialize_recovery_decision(
     .map_err(|error| error.to_string())?
     {
         RotateOutcome::Rotated => proposal.clone(),
-        RotateOutcome::Conflict(winner) => winner,
+        RotateOutcome::Conflict(winner) => *winner,
     };
     if durable != proposal {
         return Err(format!(
@@ -1934,7 +1937,7 @@ async fn authorize_recovery_successor(
     )
     .await
     .map_err(|_| "recovery authority admission exceeded the fencing deadline".to_string())?
-    .map_err(|error| error.to_string())?
+    .map_err(|error| error.clone())?
     {
         RecordAssignmentRecoveryDecisionResult::Created(decision)
         | RecordAssignmentRecoveryDecisionResult::Unchanged(decision) => decision,
@@ -1949,6 +1952,7 @@ async fn authorize_recovery_successor(
     materialize_recovery_decision(db, store, controller, decision, operation_timeout).await
 }
 
+#[allow(clippy::too_many_lines)]
 fn try_rebalance_owned(
     db: Arc<LaminarDB>,
     controller: Arc<ClusterController>,
@@ -2308,11 +2312,11 @@ fn try_rebalance_owned(
                         &db,
                         &store,
                         &controller,
-                        winner,
+                        *winner,
                         tokio::time::Instant::now() + config.checkpoint_timeout,
                     )
                     .await?;
-                    return Ok(Some(v));
+                    Ok(Some(v))
                 }
             }
         }
@@ -2559,6 +2563,7 @@ async fn await_drain_quorum(
 /// Settle a draining generation without changing the target version certified by source receipts.
 /// The terminal verdict first enters the shared leader/checkpoint authority sequence; the snapshot
 /// store then publishes that immutable verdict as the assignment materialization.
+#[allow(clippy::too_many_lines)]
 async fn finalize_drain_snapshot(
     db: &Arc<LaminarDB>,
     store: &Arc<AssignmentSnapshotStore>,
@@ -2626,7 +2631,7 @@ async fn finalize_drain_snapshot(
         .map_err(|error| error.to_string())?
     {
         RotateOutcome::Rotated => proposal,
-        RotateOutcome::Conflict(winner) => winner,
+        RotateOutcome::Conflict(winner) => *winner,
     };
     let source_outcome = finalized_drain_outcome(transition, &durable)?;
     let authority_outcome = match decision.verdict {

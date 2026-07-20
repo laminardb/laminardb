@@ -56,6 +56,7 @@ impl ReferenceTableCheckpointCapture {
         self.estimated_bytes
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn encode(self, max_encoded_bytes: u64) -> Result<bytes::Bytes, DbError> {
         let max_encoded_bytes = max_encoded_bytes.min(MAX_REFERENCE_TABLE_CHECKPOINT_BYTES as u64);
         let mut entries = Vec::with_capacity(self.tables.len());
@@ -582,6 +583,7 @@ impl TableStore {
     /// Restore an exact table inventory atomically. Every archive entry is
     /// decoded into a replacement backend before any live table is changed.
     /// `Ok(true)` means the checkpoint covered the complete non-empty catalog.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn restore_checkpoint(&mut self, encoded: &[u8]) -> Result<bool, DbError> {
         if encoded.is_empty() || encoded.len() > MAX_REFERENCE_TABLE_CHECKPOINT_BYTES {
             return Err(DbError::Checkpoint(format!(

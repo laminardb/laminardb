@@ -1688,10 +1688,10 @@ impl ClusterController {
         let authority = self
             .checkpoint_authority()
             .map_err(|error| error.to_string())?;
-        tokio::time::timeout_at(
+        Box::pin(tokio::time::timeout_at(
             deadline,
             authority.record_assignment_recovery_decision(proof, decision),
-        )
+        ))
         .await
         .map_err(|_| "assignment recovery authority admission exceeded its deadline".to_string())?
         .map_err(|error| error.to_string())
@@ -2417,8 +2417,7 @@ impl ClusterController {
         let authority = self
             .checkpoint_authority()
             .map_err(|error| error.to_string())?;
-        let result = authority
-            .record_recovery_fault(publisher, seq)
+        let result = Box::pin(authority.record_recovery_fault(publisher, seq))
             .await
             .map_err(|error| RecoveryControlError::from_authority(error).to_string())?;
         if !self
@@ -3666,6 +3665,7 @@ impl ClusterController {
     /// # Errors
     /// Returns a classified uncertain, conflict, or superseded outcome. Missing readiness remains
     /// a normal pending status.
+    #[allow(clippy::too_many_lines)]
     pub async fn try_commit_recover_release(
         &self,
         release: &RecoveryAnnouncement,
@@ -3742,8 +3742,7 @@ impl ClusterController {
         }
         self.require_recovery_driver_proof_control(round, "Release commit publication")
             .await?;
-        match authority
-            .record_recovery_release_commit(&round.leader_proof, reference)
+        match Box::pin(authority.record_recovery_release_commit(&round.leader_proof, reference))
             .await
             .map_err(RecoveryControlError::from_authority)?
         {
@@ -7276,7 +7275,12 @@ mod tests {
             ReleaseCommitStatus::Pending { .. }
         ));
 
-        tokio::time::advance(PENDING_RELEASE_FAULT_AUDIT_INTERVAL - Duration::from_nanos(1)).await;
+        tokio::time::advance(
+            PENDING_RELEASE_FAULT_AUDIT_INTERVAL
+                .checked_sub(Duration::from_nanos(1))
+                .unwrap(),
+        )
+        .await;
         assert!(matches!(
             controller
                 .try_commit_recover_release(&release)

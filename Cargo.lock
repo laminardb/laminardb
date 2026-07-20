@@ -4947,6 +4947,7 @@ dependencies = [
 name = "laminar-core"
 version = "0.28.0"
 dependencies = [
+ "ahash 0.8.12",
  "anyhow",
  "arrow",
  "arrow-array",

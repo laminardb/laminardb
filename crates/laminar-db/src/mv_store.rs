@@ -191,7 +191,7 @@ fn upsert_checkpoint_batch(
 fn multiset_counted_checkpoint_batch(
     schema: &SchemaRef,
     row_converter: &RowConverter,
-    counts: &mut Vec<(OwnedRow, i64)>,
+    counts: &mut [(OwnedRow, i64)],
 ) -> Result<RecordBatch, DbError> {
     let checkpoint_schema = multiset_checkpoint_schema(schema);
     if counts.is_empty() {

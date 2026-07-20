@@ -80,6 +80,7 @@ impl CheckpointControlWake {
     }
 
     #[must_use]
+    #[allow(clippy::unused_self)] // Maintains the feature-independent callback surface.
     pub(crate) const fn capacity_retry(&self) -> Duration {
         CHECKPOINT_CONTROL_POLL_FALLBACK
     }
@@ -87,16 +88,19 @@ impl CheckpointControlWake {
 
 #[cfg(not(feature = "cluster"))]
 impl CheckpointControlWake {
+    #[allow(clippy::unused_self)] // Maintains the feature-independent callback surface.
     pub(crate) async fn wait_until(&mut self, fallback_at: tokio::time::Instant) {
         tokio::time::sleep_until(fallback_at).await;
     }
 
     #[must_use]
+    #[allow(clippy::unused_self)] // Maintains the feature-independent callback surface.
     pub(crate) const fn fallback(&self) -> Duration {
         CHECKPOINT_CONTROL_POLL_FALLBACK
     }
 
     #[must_use]
+    #[allow(clippy::unused_self)] // Maintains the feature-independent callback surface.
     pub(crate) const fn capacity_retry(&self) -> Duration {
         CHECKPOINT_CONTROL_POLL_FALLBACK
     }
@@ -436,6 +440,10 @@ pub trait PipelineCallback: Send + 'static {
     /// Install any newly published recovery cut before the coordinator removes
     /// another source message from its FIFO. The default is a no-op outside a
     /// clustered source-handoff runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a pending recovery cut cannot be installed.
     fn prepare_source_intake(&mut self) -> Result<(), String> {
         Ok(())
     }
@@ -460,6 +468,10 @@ pub trait PipelineCallback: Send + 'static {
     ) -> Result<(), CycleError>;
 
     /// Push cycle results to stream subscriptions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if subscription delivery rejects the cycle output.
     fn push_to_streams(
         &self,
         results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
@@ -469,6 +481,10 @@ pub trait PipelineCallback: Send + 'static {
     }
 
     /// Update materialized view stores with cycle results.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if materialized state cannot apply the cycle output.
     fn update_mv_stores(
         &self,
         results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
@@ -584,6 +600,10 @@ pub trait PipelineCallback: Send + 'static {
     /// Resolve exact local follower state after an authoritative pre-capture
     /// [`BarrierOutcome::Aborted`]. This operation must not publish control traffic or wait on the
     /// network because cluster authority has already terminated the attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if local follower state cannot be resolved exactly.
     fn resolve_authoritative_follower_abort(
         &mut self,
         _attempt: CheckpointAttempt,
@@ -652,6 +672,10 @@ pub trait PipelineCallback: Send + 'static {
     }
 
     /// Reserve each subscription log's cursor at the aligned checkpoint cut.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription cut cannot be reserved atomically.
     fn reserve_subscription_cut(&self, _attempt: CheckpointAttempt) -> Result<(), String> {
         Ok(())
     }
@@ -660,6 +684,10 @@ pub trait PipelineCallback: Send + 'static {
     fn abort_subscription_cut(&self, _attempt: CheckpointAttempt) {}
 
     /// Resolve the exact cut for external SUBSCRIBE consumers after durable commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the committed cut cannot be published atomically.
     fn publish_barrier(&self, _attempt: CheckpointAttempt) -> Result<(), String> {
         Ok(())
     }

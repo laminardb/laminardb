@@ -155,6 +155,7 @@ fn validate_lookup_command(
 }
 
 #[cfg(feature = "mongodb-cdc")]
+#[allow(clippy::float_cmp)] // MongoDB index direction is the exact BSON value 1 or -1.
 fn has_usable_unique_lookup_index(index: &IndexModel, pk_field: &str) -> bool {
     if index.keys.len() != 1 {
         return false;
@@ -459,6 +460,7 @@ impl MongoLookupSource {
 
 #[cfg(feature = "mongodb-cdc")]
 impl LookupSource for MongoLookupSource {
+    #[allow(clippy::too_many_lines)]
     async fn query(
         &self,
         keys: &[&[u8]],

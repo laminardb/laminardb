@@ -33,6 +33,10 @@ use self::schema::traces_schema;
 ///
 /// After registration, the runtime can instantiate `OtelSource` by
 /// name when processing `CREATE SOURCE ... FROM OTEL (...)`.
+///
+/// # Errors
+///
+/// Returns an error if the connector name is already registered or the registry is frozen.
 pub fn register_otel_source(
     registry: &ConnectorRegistry,
 ) -> Result<(), crate::error::ConnectorError> {

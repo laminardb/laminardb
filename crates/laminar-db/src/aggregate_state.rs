@@ -308,8 +308,7 @@ struct StagedAggMutation {
 
 #[cfg(feature = "cluster")]
 fn validate_unique_decoded_group_keys(groups: &[DecodedGroupState]) -> Result<(), DbError> {
-    let mut keys: std::collections::HashSet<&[u8]> =
-        std::collections::HashSet::with_capacity(groups.len());
+    let mut keys: AHashSet<&[u8]> = AHashSet::with_capacity(groups.len());
     if groups.iter().any(|(key, _, _)| !keys.insert(key.as_ref())) {
         return Err(DbError::Pipeline(
             "aggregate checkpoint contains a duplicate group key".into(),
@@ -581,13 +580,13 @@ fn validate_checkpoint_layout_and_keys(
         }
     }
 
-    let mut unique = std::collections::HashSet::with_capacity(keys.len());
+    let mut unique = AHashSet::with_capacity(keys.len());
     if keys.iter().any(|key| !unique.insert(key.as_slice())) {
         return Err(DbError::Pipeline(format!(
             "{operation}: aggregate checkpoint contains a duplicate group key"
         )));
     }
-    let mut emitted = std::collections::HashSet::with_capacity(checkpoint.last_emitted.len());
+    let mut emitted = AHashSet::with_capacity(checkpoint.last_emitted.len());
     if checkpoint
         .last_emitted
         .iter()
@@ -614,6 +613,7 @@ pub(crate) fn validate_agg_checkpoint_slice(
 
 /// Merge serialized aggregate slices over disjoint keys into one checkpoint.
 #[cfg(feature = "cluster")]
+#[allow(clippy::too_many_lines)]
 pub(crate) fn merge_serialized_agg_cps(slices: &[bytes::Bytes]) -> Result<Vec<u8>, DbError> {
     let checkpoints = slices
         .iter()
@@ -643,7 +643,7 @@ pub(crate) fn merge_serialized_agg_cps(slices: &[bytes::Bytes]) -> Result<Vec<u8
             .checked_add(keys.len())
             .ok_or_else(|| DbError::Pipeline("merge agg row count overflow".into()))
     })?;
-    let mut unique = std::collections::HashSet::with_capacity(logical_rows);
+    let mut unique = AHashSet::with_capacity(logical_rows);
     if layouts
         .iter()
         .flatten()

@@ -543,6 +543,7 @@ impl StaticDiscovery {
     ///
     /// Sends heartbeats concurrently to all seeds and uses the responses
     /// to track failure state.
+    #[allow(clippy::too_many_lines)]
     async fn run_heartbeater(config: StaticDiscoveryConfig, ctx: HeartbeatContext) {
         let mut interval = tokio::time::interval(config.heartbeat_interval);
         // Don't burst missed ticks — skip them to avoid thundering herd (W5 fix)

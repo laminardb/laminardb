@@ -1,4 +1,4 @@
-//! Verified TLS policy and client construction shared by PostgreSQL connectors.
+//! Verified TLS policy and client construction shared by `PostgreSQL` connectors.
 
 use std::path::Path;
 use std::str::FromStr;
@@ -9,7 +9,7 @@ use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
 use crate::error::ConnectorError;
 
-/// Connection security for PostgreSQL connectors.
+/// Connection security for `PostgreSQL` connectors.
 ///
 /// Production connections either verify both the certificate chain and server
 /// hostname, or explicitly opt into plaintext for trusted test networks.

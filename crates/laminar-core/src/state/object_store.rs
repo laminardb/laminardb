@@ -360,7 +360,7 @@ impl ObjectStoreBackend {
 
         let prefix = OsPath::from("state-v2");
         let mut objects = self.store.list(Some(&prefix));
-        while let Some(result) = objects.next().await {
+        if let Some(result) = objects.next().await {
             let object = result.map_err(|error| StateBackendError::Io(error.to_string()))?;
             if object.location == *namespace_path {
                 let existing = self.read_namespace_binding(namespace_path).await?;
@@ -437,7 +437,6 @@ impl ObjectStoreBackend {
     /// durability gate validate hundreds of vnode generations with small concurrent range GETs
     /// instead of downloading every state blob again.
     fn encode_partial(
-        &self,
         attempt: CheckpointAttempt,
         vnode: u32,
         assignment_version: u64,
@@ -1060,6 +1059,7 @@ impl ObjectStoreBackend {
 }
 
 #[async_trait]
+#[allow(clippy::too_many_lines)]
 impl StateBackend for ObjectStoreBackend {
     fn key_group_capacity(&self) -> u32 {
         self.vnode_capacity
@@ -1129,7 +1129,7 @@ impl StateBackend for ObjectStoreBackend {
         self.check_vnode(vnode)?;
         self.check_assignment_version(assignment_version)?;
         let path = Self::partial_path(attempt, vnode);
-        let bytes = self.encode_partial(attempt, vnode, assignment_version, None, &bytes);
+        let bytes = Self::encode_partial(attempt, vnode, assignment_version, None, &bytes);
         self.put_live_immutable(attempt, &path, bytes).await
     }
 
@@ -1157,7 +1157,7 @@ impl StateBackend for ObjectStoreBackend {
                         .into(),
                 }
             })?;
-        let encoded = self.encode_partial(
+        let encoded = Self::encode_partial(
             attempt,
             vnode,
             assignment_fence.assignment_version,
@@ -1275,9 +1275,8 @@ impl StateBackend for ObjectStoreBackend {
         let path = Self::descriptor_path(attempt, key);
         match self.store.get(&path).await {
             Ok(result) => {
-                let max_object_bytes = (COMMIT_DESCRIPTOR_HEADER_LEN as u64)
-                    .checked_add(max_bytes)
-                    .unwrap_or(u64::MAX);
+                let max_object_bytes =
+                    (COMMIT_DESCRIPTOR_HEADER_LEN as u64).saturating_add(max_bytes);
                 if result.meta.size > max_object_bytes {
                     return Err(StateBackendError::Conflict {
                         resource: path.to_string(),
@@ -2393,11 +2392,9 @@ mod tests {
     fn decode_partial_realigns_an_unaligned_transport_buffer() {
         const ARCHIVE_ALIGNMENT: usize = rkyv::util::AlignedVec::<16>::ALIGNMENT;
 
-        let backend =
-            ObjectStoreBackend::new(Arc::new(object_store::memory::InMemory::new()), "node-0", 4);
         let checkpoint = attempt(1);
         let payload = Bytes::from_static(b"archived vnode state");
-        let encoded = backend.encode_partial(checkpoint, 0, 0, None, &payload);
+        let encoded = ObjectStoreBackend::encode_partial(checkpoint, 0, 0, None, &payload);
 
         let mut transport = bytes::BytesMut::zeroed(encoded.len() + ARCHIVE_ALIGNMENT);
         let offset = (0..ARCHIVE_ALIGNMENT)

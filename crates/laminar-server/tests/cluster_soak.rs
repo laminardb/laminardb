@@ -1,3 +1,9 @@
+#![allow(
+    clippy::assertions_on_constants,
+    clippy::disallowed_types,
+    clippy::too_many_arguments
+)]
+
 //! Real-binary checkpoint soaks with `kill -9` fault injection.
 //!
 //! Spawns three `laminardb` processes in cluster mode (real gRPC control plane) against a shared

@@ -5,7 +5,7 @@
 //! from a generic [`ConnectorConfig`] key-value map and programmatic builders.
 //!
 //! User-supplied change-stream pipelines are limited to `$match` stages so they
-//! cannot alter MongoDB's resume token.
+//! cannot alter `MongoDB`'s resume token.
 
 use std::time::Duration;
 
@@ -189,6 +189,7 @@ impl MongoDbSourceConfig {
     /// # Errors
     ///
     /// Returns `ConnectorError` if required keys are missing or invalid.
+    #[allow(clippy::too_many_lines)]
     pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
         if let Some(key) = REMOVED_SOURCE_CONFIG_KEYS
             .iter()
@@ -466,6 +467,7 @@ impl MongoDbSinkConfig {
     /// # Errors
     ///
     /// Returns `ConnectorError` if required keys are missing or invalid.
+    #[allow(clippy::too_many_lines)]
     pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
         if let Some(key) = REMOVED_SINK_CONFIG_KEYS
             .iter()
@@ -932,7 +934,7 @@ mod tests {
     fn sink_upsert_keys_must_be_non_empty_and_unique() {
         for keys in [
             vec![],
-            vec!["".to_string()],
+            vec![String::new()],
             vec!["id".to_string(), "id".to_string()],
             vec!["_op".to_string()],
             vec!["$expr".to_string()],

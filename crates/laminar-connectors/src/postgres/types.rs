@@ -25,7 +25,7 @@ impl PostgresType {
 
 /// Returns the single supported type mapping used by admission, DDL, COPY, and UNNEST.
 ///
-/// The surface is intentionally the intersection of the COPY encoder and the Rust PostgreSQL
+/// The surface is intentionally the intersection of the COPY encoder and the Rust `PostgreSQL`
 /// parameter encoder. Types are added only when both write paths have the same lossless contract.
 pub(super) fn postgres_type(data_type: &DataType) -> Result<PostgresType, ConnectorError> {
     let mapping = match data_type {
@@ -91,17 +91,17 @@ pub(super) fn postgres_type(data_type: &DataType) -> Result<PostgresType, Connec
     Ok(mapping)
 }
 
-/// PostgreSQL type used in an UNNEST cast.
+/// `PostgreSQL` type used in an UNNEST cast.
 pub(super) fn arrow_type_to_pg_sql(data_type: &DataType) -> Result<&'static str, ConnectorError> {
     postgres_type(data_type).map(PostgresType::sql)
 }
 
-/// PostgreSQL type used in generated CREATE TABLE DDL.
+/// `PostgreSQL` type used in generated CREATE TABLE DDL.
 pub(super) fn arrow_to_pg_ddl_type(data_type: &DataType) -> Result<&'static str, ConnectorError> {
     postgres_type(data_type).map(PostgresType::ddl)
 }
 
-/// Typed PostgreSQL array parameter used by an UNNEST statement.
+/// Typed `PostgreSQL` array parameter used by an UNNEST statement.
 pub(super) fn arrow_type_to_pg_array_cast(
     data_type: &DataType,
     parameter: usize,
@@ -164,7 +164,7 @@ pub(super) fn validate_postgres_array_values(
                 }
             }
         }
-        DataType::Timestamp(unit, _) => validate_timestamp_values(array, unit)?,
+        DataType::Timestamp(unit, _) => validate_timestamp_values(array, *unit)?,
         _ => {}
     }
     Ok(())
@@ -172,7 +172,7 @@ pub(super) fn validate_postgres_array_values(
 
 /// Produces the batch schema expected by COPY BINARY.
 ///
-/// `pgpq` encodes Arrow UInt64 as PostgreSQL NUMERIC. The sink deliberately exposes UInt64 as a
+/// `pgpq` encodes Arrow `UInt64` as `PostgreSQL` NUMERIC. The sink deliberately exposes `UInt64` as a
 /// range-checked BIGINT so COPY and UNNEST have identical table types; values are therefore widened
 /// to an Int64 Arrow column after validation and before the COPY encoder is constructed.
 #[cfg(feature = "postgres-sink")]
@@ -226,7 +226,7 @@ pub(super) fn postgres_copy_batch(
 #[cfg(feature = "postgres-sink")]
 fn validate_timestamp_values(
     array: &dyn arrow_array::Array,
-    unit: &TimeUnit,
+    unit: TimeUnit,
 ) -> Result<(), ConnectorError> {
     use arrow_array::{
         Array as _, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampSecondArray,
@@ -262,7 +262,7 @@ fn validate_timestamp_values(
     Ok(())
 }
 
-/// Converts an Arrow column to a PostgreSQL array parameter for UNNEST.
+/// Converts an Arrow column to a `PostgreSQL` array parameter for UNNEST.
 #[cfg(feature = "postgres-sink")]
 #[allow(clippy::too_many_lines)]
 pub(super) fn arrow_column_to_pg_array(
@@ -414,7 +414,7 @@ pub(super) fn arrow_column_to_pg_array(
                             if values.is_null(row) {
                                 Ok(None)
                             } else {
-                                to_naive_datetime(values.value(row), unit)
+                                to_naive_datetime(values.value(row), *unit)
                                     .map(Some)
                                     .ok_or_else(|| {
                                         ConnectorError::SchemaMismatch(format!(
@@ -455,7 +455,7 @@ pub(super) fn arrow_column_to_pg_array(
 /// Converts a Unix timestamp using Euclidean division so negative fractional values retain their
 /// correct instant (for example, -1 ms is 1969-12-31 23:59:59.999, not one second late).
 #[cfg(feature = "postgres-sink")]
-fn to_naive_datetime(value: i64, unit: &TimeUnit) -> Option<chrono::NaiveDateTime> {
+fn to_naive_datetime(value: i64, unit: TimeUnit) -> Option<chrono::NaiveDateTime> {
     let (units_per_second, nanos_per_unit) = match unit {
         TimeUnit::Second => (1_i64, 1_000_000_000_u32),
         TimeUnit::Millisecond => (1_000, 1_000_000),
@@ -543,11 +543,11 @@ mod tests {
     #[cfg(feature = "postgres-sink")]
     #[test]
     fn negative_fractional_timestamps_use_euclidean_division() {
-        let millis = to_naive_datetime(-1, &TimeUnit::Millisecond).unwrap();
+        let millis = to_naive_datetime(-1, TimeUnit::Millisecond).unwrap();
         assert_eq!(millis.and_utc().timestamp(), -1);
         assert_eq!(millis.and_utc().timestamp_subsec_nanos(), 999_000_000);
 
-        let micros = to_naive_datetime(-1, &TimeUnit::Microsecond).unwrap();
+        let micros = to_naive_datetime(-1, TimeUnit::Microsecond).unwrap();
         assert_eq!(micros.and_utc().timestamp(), -1);
         assert_eq!(micros.and_utc().timestamp_subsec_nanos(), 999_999_000);
     }

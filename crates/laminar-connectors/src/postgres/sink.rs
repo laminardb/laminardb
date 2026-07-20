@@ -39,9 +39,9 @@ use super::sink_metrics::PostgresSinkMetrics;
 #[cfg(feature = "postgres-sink")]
 fn postgres_dispatched_write_error(
     operation: &str,
-    error: tokio_postgres::Error,
+    error: &tokio_postgres::Error,
 ) -> ConnectorError {
-    classify_postgres_write_failure(operation, &error, error.as_db_error().is_some())
+    classify_postgres_write_failure(operation, error, error.as_db_error().is_some())
 }
 
 #[cfg(any(feature = "postgres-sink", test))]
@@ -277,6 +277,10 @@ impl PostgresSink {
     /// ```sql
     /// COPY "public"."events" ("id", "value", "ts") FROM STDIN BINARY
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the schema or sink configuration cannot produce a valid COPY.
     pub fn build_copy_sql(
         schema: &SchemaRef,
         config: &PostgresSinkConfig,
@@ -299,6 +303,10 @@ impl PostgresSink {
     ///     value = EXCLUDED.value,
     ///     updated_at = EXCLUDED.updated_at
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the schema or sink configuration cannot produce a valid upsert.
     pub fn build_upsert_sql(
         schema: &SchemaRef,
         config: &PostgresSinkConfig,
@@ -378,6 +386,10 @@ impl PostgresSink {
     /// DELETE FROM "public"."events" AS "target"
     ///   USING UNNEST($1::int8[], $2::text[]) AS "keys"("id", "name")
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured primary key cannot produce a valid delete.
     pub fn build_delete_sql(
         schema: &SchemaRef,
         config: &PostgresSinkConfig,
@@ -444,6 +456,10 @@ impl PostgresSink {
     ///     PRIMARY KEY ("id")
     /// )
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an Arrow field or identifier cannot be represented in `PostgreSQL`.
     pub fn build_create_table_sql(
         schema: &SchemaRef,
         config: &PostgresSinkConfig,
@@ -479,7 +495,7 @@ impl PostgresSink {
                 .map(|column| quote_sql_identifier(column))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let _ = write!(ddl, ",\n    PRIMARY KEY ({})\n", primary_keys);
+            let _ = write!(ddl, ",\n    PRIMARY KEY ({primary_keys})\n");
         }
 
         ddl.push(')');
@@ -632,17 +648,17 @@ impl PostgresSink {
         let sink = client
             .copy_in(copy_sql)
             .await
-            .map_err(|error| postgres_dispatched_write_error("COPY start", error))?;
+            .map_err(|error| postgres_dispatched_write_error("COPY start", &error))?;
 
         {
             use futures_util::SinkExt;
             futures_util::pin_mut!(sink);
             sink.send(bytes_to_send)
                 .await
-                .map_err(|error| postgres_dispatched_write_error("COPY send", error))?;
+                .map_err(|error| postgres_dispatched_write_error("COPY send", &error))?;
             sink.close()
                 .await
-                .map_err(|error| postgres_dispatched_write_error("COPY finish", error))?;
+                .map_err(|error| postgres_dispatched_write_error("COPY finish", &error))?;
         }
 
         let rows = user_batch.num_rows();
@@ -773,7 +789,7 @@ impl PostgresSink {
         let (upserted, deleted, total_bytes) = match mutation {
             Ok(result) => {
                 transaction.commit().await.map_err(|error| {
-                    postgres_dispatched_write_error("transaction COMMIT", error)
+                    postgres_dispatched_write_error("transaction COMMIT", &error)
                 })?;
                 result
             }
@@ -844,7 +860,7 @@ impl PostgresSink {
         let rows = client
             .execute(delete_sql, &pk_refs)
             .await
-            .map_err(|error| postgres_dispatched_write_error("DELETE", error))?;
+            .map_err(|error| postgres_dispatched_write_error("DELETE", &error))?;
 
         Ok(rows as usize)
     }
@@ -962,12 +978,12 @@ impl SinkConnector for PostgresSink {
     }
 
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
-        if !config.properties().is_empty() {
-            self.apply_connector_config(config)?;
-        } else {
+        if config.properties().is_empty() {
             // Direct programmatic construction supplies the schema to `new`.
             self.config.validate()?;
             validate_sink_schema(&self.schema, &self.config)?;
+        } else {
+            self.apply_connector_config(config)?;
         }
 
         // Complete all deterministic admission before touching the network.
@@ -1385,7 +1401,7 @@ fn strip_metadata_columns(batch: &RecordBatch) -> Result<RecordBatch, ConnectorE
 
 /// Collapse one ordinary upsert flush to the last-arriving row per configured
 /// key, then remove the normalized changelog marker before binding UNNEST
-/// parameters. PostgreSQL rejects duplicate conflict keys in one statement.
+/// parameters. `PostgreSQL` rejects duplicate conflict keys in one statement.
 fn collapse_upsert_batch(
     batch: &RecordBatch,
     primary_key_columns: &[String],
@@ -1416,7 +1432,7 @@ where
     client
         .execute(sql, &param_refs)
         .await
-        .map_err(|error| postgres_dispatched_write_error("UNNEST execute", error))
+        .map_err(|error| postgres_dispatched_write_error("UNNEST execute", &error))
 }
 
 #[cfg(any(feature = "postgres-sink", test))]

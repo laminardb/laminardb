@@ -1246,9 +1246,7 @@ impl OperatorGraph {
         }
 
         if let Some(plan) = crate::sql_analysis::plan_frame_query(&sql) {
-            if let Err(error) = self.build_frame_operator_node(&name, &plan) {
-                self.build_errors.push(error);
-            }
+            self.build_frame_operator_node(&name, &plan);
             return;
         }
 
@@ -1591,7 +1589,7 @@ impl OperatorGraph {
         &mut self,
         name: &str,
         plan: &crate::sql_analysis::FrameQueryPlan,
-    ) -> Result<(), DbError> {
+    ) {
         let operator: Box<dyn GraphOperator> =
             Box::new(crate::operator::window_frame::WindowFrameOperator::new(
                 name,
@@ -1616,7 +1614,6 @@ impl OperatorGraph {
         }
         self.output_map.insert(Arc::from(name), node_id);
         self.topo_dirty = true;
-        Ok(())
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -2223,6 +2220,7 @@ impl OperatorGraph {
         .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn execute_cycle_with_mode(
         &mut self,
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,

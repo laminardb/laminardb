@@ -322,7 +322,7 @@ pub(crate) fn plan_record_batch<'a>(
 
 pub(crate) fn events_to_record_batch<I>(
     events: I,
-    plan: ArrowBatchPlan,
+    plan: &ArrowBatchPlan,
 ) -> Result<RecordBatch, ConnectorError>
 where
     I: IntoIterator<Item = ChangeEvent>,
@@ -549,7 +549,7 @@ mod tests {
         }];
 
         let plan = plan_record_batch(&events).unwrap();
-        let batch = events_to_record_batch(events, plan).unwrap();
+        let batch = events_to_record_batch(events, &plan).unwrap();
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(batch.num_columns(), 6);
     }
@@ -584,7 +584,7 @@ mod tests {
         ];
 
         let plan = plan_record_batch(&events).unwrap();
-        let batch = events_to_record_batch(events, plan).unwrap();
+        let batch = events_to_record_batch(events, &plan).unwrap();
         assert_eq!(batch.num_rows(), 3);
     }
 
@@ -592,7 +592,7 @@ mod tests {
     fn test_events_to_record_batch_empty() {
         let events: Vec<ChangeEvent> = vec![];
         let plan = plan_record_batch(&events).unwrap();
-        let batch = events_to_record_batch(events, plan).unwrap();
+        let batch = events_to_record_batch(events, &plan).unwrap();
         assert_eq!(batch.num_rows(), 0);
         assert_eq!(batch.num_columns(), 6);
     }
@@ -671,7 +671,7 @@ mod tests {
         ];
         let plan = plan_record_batch(&events).unwrap();
         let planned = plan.retained_bytes;
-        let batch = events_to_record_batch(events, plan).unwrap();
+        let batch = events_to_record_batch(events, &plan).unwrap();
         let actual = batch
             .columns()
             .iter()

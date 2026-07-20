@@ -1596,6 +1596,7 @@ impl CheckpointCoordinator {
     /// # Errors
     /// Returns a store read failure rather than silently starting at epoch 1 and clobbering
     /// on-disk state.
+    #[allow(clippy::too_many_lines)]
     pub async fn new(
         config: CheckpointConfig,
         store: Box<dyn CheckpointStore>,
@@ -4752,6 +4753,7 @@ impl CheckpointCoordinator {
     }
 
     /// Abandon a failed epoch only after its immutable Abort outcome is durable.
+    #[allow(clippy::too_many_lines)]
     async fn fail_epoch(
         &mut self,
         checkpoint_id: u64,
@@ -5265,6 +5267,7 @@ impl CheckpointCoordinator {
         self.reconcile_sink_open_witness_until(deadline).await
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn reconcile_sink_open_witness_until(
         &mut self,
         deadline: tokio::time::Instant,
@@ -5343,90 +5346,86 @@ impl CheckpointCoordinator {
                 ))
             })?;
 
-        let rollback_required = match outcome {
-            Some(outcome) => {
-                if outcome.epoch != attempt.epoch
-                    || outcome.checkpoint_id != attempt.checkpoint_id
-                    || outcome.deployment_id != witness.deployment_id
-                    || outcome.scope != laminar_core::checkpoint_decision::CheckpointScope::Local
-                {
-                    return Err(DbError::Checkpoint(format!(
-                        "[LDB-6043] terminal outcome does not match sink-open checkpoint {}",
-                        attempt.checkpoint_id
-                    )));
-                }
-                !outcome.is_commit()
+        let rollback_required = if let Some(outcome) = outcome {
+            if outcome.epoch != attempt.epoch
+                || outcome.checkpoint_id != attempt.checkpoint_id
+                || outcome.deployment_id != witness.deployment_id
+                || outcome.scope != laminar_core::checkpoint_decision::CheckpointScope::Local
+            {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6043] terminal outcome does not match sink-open checkpoint {}",
+                    attempt.checkpoint_id
+                )));
             }
-            None => {
-                let floor = tokio::time::timeout_at(deadline, store.outcome_gc_floor_horizon())
-                    .await
-                    .map_err(|_| {
-                        DbError::Checkpoint(
-                            "[LDB-6050] outcome-retention lookup timed out during sink recovery"
-                                .into(),
-                        )
-                    })?
-                    .map_err(|error| {
-                        DbError::Checkpoint(format!(
+            !outcome.is_commit()
+        } else {
+            let floor = tokio::time::timeout_at(deadline, store.outcome_gc_floor_horizon())
+                .await
+                .map_err(|_| {
+                    DbError::Checkpoint(
+                        "[LDB-6050] outcome-retention lookup timed out during sink recovery".into(),
+                    )
+                })?
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
                         "[LDB-6050] outcome-retention lookup failed during sink recovery: {error}"
                     ))
-                    })?;
-                if attempt.epoch < floor {
-                    return Err(DbError::Checkpoint(format!(
-                        "[LDB-6040] sink-open checkpoint {} is below retained outcome history at {floor}; refusing to guess rollback",
-                        attempt.checkpoint_id
-                    )));
-                }
-                let highest = tokio::time::timeout_at(deadline, store.highest_terminal_outcome())
-                    .await
-                    .map_err(|_| {
-                        DbError::Checkpoint(
-                            "[LDB-6050] terminal outcome inventory timed out during sink recovery"
-                                .into(),
-                        )
-                    })?
-                    .map_err(|error| {
-                        DbError::Checkpoint(format!(
-                        "[LDB-6050] terminal outcome inventory failed during sink recovery: {error}"
-                    ))
-                    })?;
-                if highest.is_some_and(|terminal| terminal.epoch > attempt.epoch) {
-                    return Err(DbError::Checkpoint(format!(
-                        "[LDB-6041] sink-open checkpoint {} was bypassed by a newer terminal outcome",
-                        attempt.checkpoint_id
-                    )));
-                }
-                let result = self
-                    .record_terminal_outcome_until(
-                        attempt,
-                        laminar_core::checkpoint_decision::CheckpointVerdict::Abort,
-                        None,
-                        deadline,
-                    )
-                    .await
-                    .map_err(|error| {
-                        DbError::Checkpoint(format!(
-                            "[LDB-6050] could not durably resolve sink-open checkpoint {} before rollback: {error}",
-                            attempt.checkpoint_id
-                        ))
-                    })?;
-                let winner = match result {
-                    laminar_core::checkpoint_decision::RecordOutcomeResult::Created(outcome)
-                    | laminar_core::checkpoint_decision::RecordOutcomeResult::Unchanged(outcome) => {
-                        outcome
-                    }
-                    laminar_core::checkpoint_decision::RecordOutcomeResult::Conflict { winner } => {
-                        winner
-                    }
-                };
-                if !self.outcome_matches_active_authority(&winner, attempt) {
-                    return Err(DbError::Checkpoint(format!(
-                        "[LDB-6043] durable winner does not match sink-open checkpoint {}",
-                        attempt.checkpoint_id
-                    )));
-                }
-                !winner.is_commit()
+                })?;
+            if attempt.epoch < floor {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6040] sink-open checkpoint {} is below retained outcome history at {floor}; refusing to guess rollback",
+                    attempt.checkpoint_id
+                )));
             }
+            let highest = tokio::time::timeout_at(deadline, store.highest_terminal_outcome())
+                .await
+                .map_err(|_| {
+                    DbError::Checkpoint(
+                        "[LDB-6050] terminal outcome inventory timed out during sink recovery"
+                            .into(),
+                    )
+                })?
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                    "[LDB-6050] terminal outcome inventory failed during sink recovery: {error}"
+                ))
+                })?;
+            if highest.is_some_and(|terminal| terminal.epoch > attempt.epoch) {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6041] sink-open checkpoint {} was bypassed by a newer terminal outcome",
+                    attempt.checkpoint_id
+                )));
+            }
+            let result = self
+                .record_terminal_outcome_until(
+                    attempt,
+                    laminar_core::checkpoint_decision::CheckpointVerdict::Abort,
+                    None,
+                    deadline,
+                )
+                .await
+                .map_err(|error| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6050] could not durably resolve sink-open checkpoint {} before rollback: {error}",
+                        attempt.checkpoint_id
+                    ))
+                })?;
+            let winner = match result {
+                laminar_core::checkpoint_decision::RecordOutcomeResult::Created(outcome)
+                | laminar_core::checkpoint_decision::RecordOutcomeResult::Unchanged(outcome) => {
+                    outcome
+                }
+                laminar_core::checkpoint_decision::RecordOutcomeResult::Conflict { winner } => {
+                    winner
+                }
+            };
+            if !self.outcome_matches_active_authority(&winner, attempt) {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6043] durable winner does not match sink-open checkpoint {}",
+                    attempt.checkpoint_id
+                )));
+            }
+            !winner.is_commit()
         };
         // Any decision issued above now has an exact, validated immutable winner.
         self.decision_write_started = false;
@@ -5655,6 +5654,7 @@ impl CheckpointCoordinator {
     /// Announces `Prepare`, waits for live-follower acks, returns the merged cluster-min
     /// watermark. Caller announces `Aligned` on success or `Abort` on failure.
     #[cfg(feature = "cluster")]
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn run_prepare_quorum(
         cc: &Arc<laminar_core::cluster::control::ClusterController>,
         quorum_timeout: Duration,
@@ -6604,7 +6604,7 @@ impl CheckpointCoordinator {
     ) {
         match (controller.cluster_min_watermark(), frontier) {
             (Some(current), Some(committed)) if current >= committed => {}
-            (Some(_), None) | (None, None) => {}
+            (Some(_) | None, None) => {}
             (_, Some(committed)) => controller.publish_cluster_min_watermark(committed),
         }
     }

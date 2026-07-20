@@ -184,10 +184,12 @@ pub async fn commit_data_files_append(
             .apply(tx)
             .map_err(|e| ConnectorError::TransactionError(format!("apply fast_append: {e}")))?
     };
-    tx.commit(catalog).await.map_err(iceberg_commit_error)
+    tx.commit(catalog)
+        .await
+        .map_err(|error| iceberg_commit_error(&error))
 }
 
-fn iceberg_commit_error(error: iceberg::Error) -> ConnectorError {
+fn iceberg_commit_error(error: &iceberg::Error) -> ConnectorError {
     use iceberg::ErrorKind;
 
     let kind = error.kind();
@@ -284,10 +286,9 @@ mod tests {
 
     #[test]
     fn catalog_commit_failure_has_unknown_outcome() {
-        let error = iceberg_commit_error(
-            iceberg::Error::new(iceberg::ErrorKind::Unexpected, "response lost")
-                .with_retryable(true),
-        );
+        let source = iceberg::Error::new(iceberg::ErrorKind::Unexpected, "response lost")
+            .with_retryable(true);
+        let error = iceberg_commit_error(&source);
         assert!(error.is_outcome_unknown());
         assert!(error.is_transient());
         assert!(error.to_string().contains("may have applied"));
@@ -295,10 +296,11 @@ mod tests {
 
     #[test]
     fn catalog_commit_conflict_is_a_definite_retryable_rejection() {
-        let error = iceberg_commit_error(iceberg::Error::new(
+        let source = iceberg::Error::new(
             iceberg::ErrorKind::CatalogCommitConflicts,
             "base metadata changed",
-        ));
+        );
+        let error = iceberg_commit_error(&source);
         assert!(!error.is_outcome_unknown());
         assert!(error.is_transient());
     }

@@ -124,8 +124,7 @@ fn restore_raw(cp: &RawCheckpoint) -> Result<(Vec<RecordBatch>, usize), DbError>
         .map_err(|e| DbError::Checkpoint(format!("EOWC raw restore accounting: {e}")))?;
     if bytes > MAX_EOWC_ACCUMULATED_BYTES {
         return Err(DbError::Checkpoint(format!(
-            "EOWC raw checkpoint expands to {bytes} bytes, exceeding the {}-byte state limit",
-            MAX_EOWC_ACCUMULATED_BYTES
+            "EOWC raw checkpoint expands to {bytes} bytes, exceeding the {MAX_EOWC_ACCUMULATED_BYTES}-byte state limit"
         )));
     }
     Ok((batches, bytes))

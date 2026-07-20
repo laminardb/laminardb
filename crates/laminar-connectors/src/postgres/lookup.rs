@@ -35,7 +35,7 @@ const MAX_POOL_SIZE: usize = 64;
 const POOL_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
-const UNIQUE_LOOKUP_KEY_QUERY: &str = r#"
+const UNIQUE_LOOKUP_KEY_QUERY: &str = r"
 WITH target AS (
     SELECT pg_catalog.to_regclass($1)::oid AS table_oid
 )
@@ -60,7 +60,7 @@ SELECT
           AND NOT attr.attisdropped
     ) AS has_unique_key
 FROM target
-"#;
+";
 
 async fn await_lookup_driver<T>(
     operation: &'static str,
@@ -174,7 +174,7 @@ impl PostgresLookupSource {
                 .get()
                 .await
                 .map_err(|e| LookupError::Connection(format!("postgres pool: {e}")))?;
-            let identity = match tokio::time::timeout(
+            let identity = if let Ok(result) = tokio::time::timeout(
                 QUERY_TIMEOUT,
                 client.query_one(
                     UNIQUE_LOOKUP_KEY_QUERY,
@@ -183,13 +183,12 @@ impl PostgresLookupSource {
             )
             .await
             {
-                Ok(result) => result.map_err(|e| {
+                result.map_err(|e| {
                     LookupError::Connection(format!("inspect postgres lookup key index: {e}"))
-                })?,
-                Err(_) => {
-                    discard_pool_client(client);
-                    return Err(LookupError::Timeout(QUERY_TIMEOUT));
-                }
+                })?
+            } else {
+                discard_pool_client(client);
+                return Err(LookupError::Timeout(QUERY_TIMEOUT));
             };
             let table_oid = identity
                 .try_get::<_, Option<u32>>("table_oid")
@@ -198,13 +197,13 @@ impl PostgresLookupSource {
                 .try_get::<_, bool>("has_unique_key")
                 .map_err(|e| LookupError::Connection(format!("decode lookup index check: {e}")))?;
             validate_unique_lookup_key(&probe_table, &probe_key, table_oid, has_unique_key)?;
-            match tokio::time::timeout(QUERY_TIMEOUT, client.prepare(&schema_probe)).await {
-                Ok(result) => result
-                    .map_err(|e| LookupError::Connection(format!("prepare schema probe: {e}"))),
-                Err(_) => {
-                    discard_pool_client(client);
-                    Err(LookupError::Timeout(QUERY_TIMEOUT))
-                }
+            if let Ok(result) =
+                tokio::time::timeout(QUERY_TIMEOUT, client.prepare(&schema_probe)).await
+            {
+                result.map_err(|e| LookupError::Connection(format!("prepare schema probe: {e}")))
+            } else {
+                discard_pool_client(client);
+                Err(LookupError::Timeout(QUERY_TIMEOUT))
             }
         })
         .await?;
@@ -349,6 +348,7 @@ fn enforce_lookup_result_bytes(batch: &RecordBatch) -> Result<(), LookupError> {
 }
 
 impl LookupSource for PostgresLookupSource {
+    #[allow(clippy::too_many_lines)]
     async fn query(
         &self,
         keys: &[&[u8]],
@@ -435,14 +435,13 @@ impl LookupSource for PostgresLookupSource {
                 .get()
                 .await
                 .map_err(|e| LookupError::Connection(format!("postgres pool: {e}")))?;
-            match tokio::time::timeout(QUERY_TIMEOUT, client.query(&sql, &[&*param])).await {
-                Ok(result) => {
-                    result.map_err(|e| LookupError::Query(format!("postgres lookup query: {e}")))
-                }
-                Err(_) => {
-                    discard_pool_client(client);
-                    Err(LookupError::Timeout(QUERY_TIMEOUT))
-                }
+            if let Ok(result) =
+                tokio::time::timeout(QUERY_TIMEOUT, client.query(&sql, &[&*param])).await
+            {
+                result.map_err(|e| LookupError::Query(format!("postgres lookup query: {e}")))
+            } else {
+                discard_pool_client(client);
+                Err(LookupError::Timeout(QUERY_TIMEOUT))
             }
         })
         .await?;
@@ -516,14 +515,15 @@ impl LookupSource for PostgresLookupSource {
                 .get()
                 .await
                 .map_err(|e| LookupError::Connection(format!("health check pool: {e}")))?;
-            match tokio::time::timeout(QUERY_TIMEOUT, client.query_one("SELECT 1", &[])).await {
-                Ok(result) => result
+            if let Ok(result) =
+                tokio::time::timeout(QUERY_TIMEOUT, client.query_one("SELECT 1", &[])).await
+            {
+                result
                     .map(|_| ())
-                    .map_err(|e| LookupError::Connection(format!("health check: {e}"))),
-                Err(_) => {
-                    discard_pool_client(client);
-                    Err(LookupError::Timeout(QUERY_TIMEOUT))
-                }
+                    .map_err(|e| LookupError::Connection(format!("health check: {e}")))
+            } else {
+                discard_pool_client(client);
+                Err(LookupError::Timeout(QUERY_TIMEOUT))
             }
         })
         .await
@@ -536,6 +536,7 @@ fn discard_pool_client(client: deadpool_postgres::Client) {
 
 /// Build a `deadpool` pool from libpq-style properties (individual keys or a
 /// pre-formed `connection`/`connection_string` parsed via `tokio_postgres`).
+#[allow(clippy::too_many_lines)]
 fn build_pool(props: &HashMap<String, String>, pool_size: usize) -> Result<Pool, LookupError> {
     if pool_size == 0 || pool_size > MAX_POOL_SIZE {
         return Err(LookupError::Connection(format!(
@@ -818,7 +819,7 @@ where
 }
 
 /// Map a `tokio_postgres` type to an Arrow `DataType`. Types without a native
-/// mapping are explicitly projected as PostgreSQL text.
+/// mapping are explicitly projected as `PostgreSQL` text.
 fn pg_type_to_arrow(pg_type: &Type) -> DataType {
     native_pg_type_to_arrow(pg_type).unwrap_or(DataType::Utf8)
 }

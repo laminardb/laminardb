@@ -678,7 +678,7 @@ impl ClusterEngineHarness {
         let mut control_leases = Vec::with_capacity(n);
         let mut leader_managers = Vec::with_capacity(n);
         for (node, (process_store, process_lease, acquisition_started_at)) in
-            cluster.nodes.iter().zip(process_leases.into_iter())
+            cluster.nodes.iter().zip(process_leases)
         {
             assert_eq!(process_lease.node, node.instance_id);
             assert_eq!(

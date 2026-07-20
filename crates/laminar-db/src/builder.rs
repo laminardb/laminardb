@@ -430,6 +430,7 @@ impl LaminarDbBuilder {
     ///
     /// Returns `DbError` if database creation fails.
     #[allow(clippy::unused_async)]
+    #[allow(clippy::too_many_lines)]
     pub async fn build(mut self) -> Result<Arc<LaminarDB>, DbError> {
         let has_checkpoint_data_dir = self
             .config
@@ -787,7 +788,7 @@ impl LaminarDbBuilder {
                         .into(),
                 ));
             }
-            return Ok(RuntimeMode::Local);
+            Ok(RuntimeMode::Local)
         }
 
         #[cfg(feature = "cluster")]

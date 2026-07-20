@@ -24,6 +24,10 @@ pub use text_decoder::TextLineDecoder;
 /// This is called by `LaminarDB::register_builtin_connectors()` when the
 /// `files` feature is enabled, and makes `connector = 'files'` available
 /// in `CREATE SOURCE` statements.
+///
+/// # Errors
+///
+/// Returns an error if the connector name is already registered or the registry is frozen.
 pub fn register_file_source(
     registry: &ConnectorRegistry,
 ) -> Result<(), crate::error::ConnectorError> {
@@ -62,6 +66,10 @@ pub fn register_file_source(
 /// Registers the file sink connector in the registry.
 ///
 /// Makes `connector = 'files'` available in `CREATE SINK` statements.
+///
+/// # Errors
+///
+/// Returns an error if the connector name is already registered or the registry is frozen.
 pub fn register_file_sink(
     registry: &ConnectorRegistry,
 ) -> Result<(), crate::error::ConnectorError> {

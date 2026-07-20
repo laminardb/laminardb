@@ -965,9 +965,8 @@ impl PostgresCdcSource {
                     )
                 })
             })
-            .map_err(|error| {
+            .inspect_err(|_error| {
                 self.state = ConnectorState::Failed;
-                error
             })?;
         let max_bytes = self.config.decoded_event_bytes();
         if retained_bytes > max_bytes {
@@ -1082,9 +1081,8 @@ impl PostgresCdcSource {
             .get(info.relation_id)
             .map(RelationInfo::variable_retained_bytes)
             .transpose()
-            .map_err(|error| {
+            .inspect_err(|_error| {
                 self.state = ConnectorState::Failed;
-                error
             })?;
         let new_relation = usize::from(existing_bytes.is_none());
         let existing_bytes = existing_bytes.unwrap_or(0);
@@ -1095,17 +1093,15 @@ impl PostgresCdcSource {
                 self.state = ConnectorState::Failed;
                 ConnectorError::ReadError("PostgreSQL CDC relation-cache count overflow".into())
             })?;
-        let incoming_bytes = info.variable_retained_bytes().map_err(|error| {
+        let incoming_bytes = info.variable_retained_bytes().inspect_err(|_error| {
             self.state = ConnectorState::Failed;
-            error
         })?;
         let retained_growth = incoming_bytes.saturating_sub(existing_bytes);
         let growth_bytes = self
             .relation_cache
             .reservation_growth_bytes(info.relation_id)
-            .map_err(|error| {
+            .inspect_err(|_error| {
                 self.state = ConnectorState::Failed;
-                error
             })?;
         let admission_bytes = retained_growth.checked_add(growth_bytes).ok_or_else(|| {
             self.state = ConnectorState::Failed;
@@ -1117,9 +1113,8 @@ impl PostgresCdcSource {
         let old_cache_bytes = self.relation_cache.retained_bytes()?;
         self.relation_cache
             .try_reserve_for(info.relation_id)
-            .map_err(|error| {
+            .inspect_err(|_error| {
                 self.state = ConnectorState::Failed;
-                error
             })?;
         let actual_growth = self
             .relation_cache
@@ -1138,9 +1133,8 @@ impl PostgresCdcSource {
             )));
         }
         self.ensure_decoded_byte_limit(retained_growth, "relation-cache admission")?;
-        self.relation_cache.insert(info).map_err(|error| {
+        self.relation_cache.insert(info).inspect_err(|_error| {
             self.state = ConnectorState::Failed;
-            error
         })?;
         self.ensure_decoded_byte_limit(0, "relation-cache retention")?;
         Ok(())
@@ -1290,11 +1284,12 @@ impl PostgresCdcSource {
 
     /// Drains committed transactions without exposing a cursor inside a transaction.
     ///
-    /// `max` is a batching target, not permission to split a PostgreSQL transaction. Logical
+    /// `max` is a batching target, not permission to split a `PostgreSQL` transaction. Logical
     /// replication can resume only at a WAL position, so a checkpoint between two fragments of
     /// one transaction would restore before rows already included in the checkpoint. When the
     /// first queued transaction is larger than `max`, emit it whole; the configured hard event
     /// and byte limits remain the memory bound.
+    #[allow(clippy::too_many_lines)]
     fn drain_events(&mut self, max: usize) -> Result<Option<RecordBatch>, ConnectorError> {
         if self.committed_transactions.is_empty() || max == 0 {
             return Ok(None);
@@ -1400,8 +1395,7 @@ impl PostgresCdcSource {
         if minimum_arrow_bytes > arrow_byte_limit {
             self.state = ConnectorState::Failed;
             return Err(ConnectorError::ReadError(format!(
-                "PostgreSQL CDC Arrow batch exceeds the hard build-buffer limit (retained bytes: {}/{arrow_byte_limit})",
-                minimum_arrow_bytes
+                "PostgreSQL CDC Arrow batch exceeds the hard build-buffer limit (retained bytes: {minimum_arrow_bytes}/{arrow_byte_limit})"
             )));
         }
 
@@ -1471,7 +1465,7 @@ impl PostgresCdcSource {
             self.committed_transactions = VecDeque::new();
         }
 
-        let batch = match events_to_record_batch(event_groups.into_iter().flatten(), plan) {
+        let batch = match events_to_record_batch(event_groups.into_iter().flatten(), &plan) {
             Ok(batch) => batch,
             Err(error) => {
                 self.buffered_event_count -= drained_count;
@@ -1844,9 +1838,8 @@ impl SourceConnector for PostgresCdcSource {
         {
             self.fail_on_terminal_wal_error()?;
             let high_watermark = self.config.decoded_high_watermark_bytes();
-            let decoded_retained_bytes = self.decoded_retained_bytes().map_err(|error| {
+            let decoded_retained_bytes = self.decoded_retained_bytes().inspect_err(|_error| {
                 self.state = ConnectorState::Failed;
-                error
             })?;
             let mut reader_closed = false;
             let must_finish_transaction = self.current_txn.is_some();
@@ -1896,9 +1889,8 @@ impl SourceConnector for PostgresCdcSource {
             // open-transaction busy loop while the server is genuinely idle.
             let reached_payload_budget = processed_payloads == payload_budget;
             let may_drain_more = if reached_payload_budget && self.current_txn.is_none() {
-                self.decoded_retained_bytes().map_err(|error| {
+                self.decoded_retained_bytes().inspect_err(|_error| {
                     self.state = ConnectorState::Failed;
-                    error
                 })? < high_watermark
             } else {
                 reached_payload_budget

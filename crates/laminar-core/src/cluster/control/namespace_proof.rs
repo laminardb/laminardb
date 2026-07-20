@@ -70,7 +70,7 @@ impl NamespaceProofError {
         }
     }
 
-    fn verification(message: String) -> Self {
+    fn verification(message: &str) -> Self {
         Self {
             message: format!("shared checkpoint/state namespace proof failed: {message}"),
         }
@@ -130,6 +130,8 @@ impl NamespaceProofStore {
 }
 
 fn namespace_proof_roster_sha256(participants: &[CheckpointParticipant]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
     let mut hash = Sha256::new();
     hash.update(b"LAMINAR_SHARED_NAMESPACE_ROSTER_V1\0");
     hash.update(
@@ -143,7 +145,6 @@ fn namespace_proof_roster_sha256(participants: &[CheckpointParticipant]) -> Stri
     }
     let digest = hash.finalize();
     let mut encoded = String::with_capacity(digest.len() * 2);
-    const HEX: &[u8; 16] = b"0123456789abcdef";
     for byte in digest {
         encoded.push(HEX[(byte >> 4) as usize] as char);
         encoded.push(HEX[(byte & 0x0f) as usize] as char);
@@ -409,7 +410,7 @@ pub async fn prove_shared_object_store_namespaces(
             state: state_store,
             local,
         }),
-        Ok(Err(error)) => Err(NamespaceProofError::verification(error)),
+        Ok(Err(error)) => Err(NamespaceProofError::verification(&error)),
         Err(_) => Err(NamespaceProofError::timeout(timeout)),
     }
 }

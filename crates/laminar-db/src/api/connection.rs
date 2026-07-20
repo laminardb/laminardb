@@ -209,6 +209,11 @@ impl Connection {
     ///
     /// # Errors
     ///
+    /// Returns an error if shutdown or creation of the temporary runtime fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the scoped shutdown thread panics.
     pub fn close(self) -> Result<(), ApiError> {
         let shutdown = if let Ok(handle) = tokio::runtime::Handle::try_current() {
             std::thread::scope(|scope| {

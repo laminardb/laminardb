@@ -1068,6 +1068,7 @@ impl LeaderAuthorityRecord {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn validate(&self) -> Result<(), LeaseError> {
         if self.version != AUTHORITY_RECORD_VERSION {
             return Err(LeaseError::Invalid(format!(
@@ -1136,96 +1137,91 @@ impl LeaderAuthorityRecord {
                 "one authority sequence cannot admit two terminal domains".into(),
             ));
         }
-        match self.checkpoint_outcome.as_ref() {
-            Some(outcome) => {
-                outcome
-                    .validate_shape(outcome.epoch)
-                    .map_err(|error| LeaseError::Invalid(error.to_string()))?;
-                if outcome.scope != CheckpointScope::Cluster {
+        if let Some(outcome) = self.checkpoint_outcome.as_ref() {
+            outcome
+                .validate_shape(outcome.epoch)
+                .map_err(|error| LeaseError::Invalid(error.to_string()))?;
+            if outcome.scope != CheckpointScope::Cluster {
+                return Err(LeaseError::Invalid(
+                    "leader authority can only admit cluster checkpoint outcomes".into(),
+                ));
+            }
+            let proof = outcome
+                .leader_proof
+                .as_ref()
+                .ok_or_else(|| LeaseError::Invalid("cluster outcome has no leader proof".into()))?;
+            let current_link = OutcomeLink {
+                sequence: self.lease.seq,
+                epoch: outcome.epoch,
+                checkpoint_id: outcome.checkpoint_id,
+            };
+            if !self.lease.matches_proof(proof) || self.outcome_head != Some(current_link) {
+                return Err(LeaseError::Invalid(
+                    "cluster outcome is not bound to its exact authority sequence and term".into(),
+                ));
+            }
+            if let Some(previous) = self.previous_outcome {
+                if previous.sequence >= self.lease.seq
+                    || previous.epoch >= outcome.epoch
+                    || previous.checkpoint_id >= outcome.checkpoint_id
+                {
                     return Err(LeaseError::Invalid(
-                        "leader authority can only admit cluster checkpoint outcomes".into(),
+                        "cluster outcome link does not move backward in sequence and epoch".into(),
                     ));
                 }
-                let proof = outcome.leader_proof.as_ref().ok_or_else(|| {
-                    LeaseError::Invalid("cluster outcome has no leader proof".into())
-                })?;
-                let current_link = OutcomeLink {
-                    sequence: self.lease.seq,
-                    epoch: outcome.epoch,
-                    checkpoint_id: outcome.checkpoint_id,
-                };
-                if !self.lease.matches_proof(proof) || self.outcome_head != Some(current_link) {
+            }
+            if outcome.is_commit() {
+                if self.commit_head != Some(current_link) {
                     return Err(LeaseError::Invalid(
-                        "cluster outcome is not bound to its exact authority sequence and term"
-                            .into(),
+                        "cluster Commit is not bound to its exact Commit-chain head".into(),
                     ));
                 }
-                if let Some(previous) = self.previous_outcome {
+                if let Some(previous) = self.previous_commit {
                     if previous.sequence >= self.lease.seq
                         || previous.epoch >= outcome.epoch
                         || previous.checkpoint_id >= outcome.checkpoint_id
                     {
                         return Err(LeaseError::Invalid(
-                            "cluster outcome link does not move backward in sequence and epoch"
+                            "cluster Commit link does not move backward in sequence and epoch"
+                                .into(),
+                        ));
+                    }
+                    if self.outcome_floor.as_ref().is_some_and(|floor| {
+                        previous.epoch < floor.artifact_before_epoch
+                            && Some(previous) != floor.committed_anchor_link
+                    }) {
+                        return Err(LeaseError::Invalid(
+                            "cluster Commit link crosses the artifact floor without its exact anchor"
                                 .into(),
                         ));
                     }
                 }
-                if outcome.is_commit() {
-                    if self.commit_head != Some(current_link) {
-                        return Err(LeaseError::Invalid(
-                            "cluster Commit is not bound to its exact Commit-chain head".into(),
-                        ));
-                    }
-                    if let Some(previous) = self.previous_commit {
-                        if previous.sequence >= self.lease.seq
-                            || previous.epoch >= outcome.epoch
-                            || previous.checkpoint_id >= outcome.checkpoint_id
-                        {
-                            return Err(LeaseError::Invalid(
-                                "cluster Commit link does not move backward in sequence and epoch"
-                                    .into(),
-                            ));
-                        }
-                        if self.outcome_floor.as_ref().is_some_and(|floor| {
-                            previous.epoch < floor.artifact_before_epoch
-                                && Some(previous) != floor.committed_anchor_link
-                        }) {
-                            return Err(LeaseError::Invalid(
-                                "cluster Commit link crosses the artifact floor without its exact anchor"
-                                    .into(),
-                            ));
-                        }
-                    }
-                } else if self.previous_commit.is_some() {
+            } else if self.previous_commit.is_some() {
+                return Err(LeaseError::Invalid(
+                    "cluster Abort carries a previous-Commit link".into(),
+                ));
+            }
+            if let Some(floor) = &self.outcome_floor {
+                if outcome.deployment_id != floor.deployment_id
+                    || outcome.epoch < floor.authority_before_epoch
+                {
                     return Err(LeaseError::Invalid(
-                        "cluster Abort carries a previous-Commit link".into(),
+                        "cluster outcome is below or outside its durable authority floor".into(),
                     ));
-                }
-                if let Some(floor) = &self.outcome_floor {
-                    if outcome.deployment_id != floor.deployment_id
-                        || outcome.epoch < floor.authority_before_epoch
-                    {
-                        return Err(LeaseError::Invalid(
-                            "cluster outcome is below or outside its durable authority floor"
-                                .into(),
-                        ));
-                    }
                 }
             }
-            None => {
-                if self.previous_outcome.is_some() || self.previous_commit.is_some() {
-                    return Err(LeaseError::Invalid(
-                        "non-outcome authority record carries an outcome-chain link".into(),
-                    ));
-                }
-                if self.outcome_head.is_some_and(|head| {
-                    head.sequence > self.lease.seq || head.epoch == 0 || head.checkpoint_id == 0
-                }) {
-                    return Err(LeaseError::Invalid(
-                        "authority outcome head is outside the durable sequence".into(),
-                    ));
-                }
+        } else {
+            if self.previous_outcome.is_some() || self.previous_commit.is_some() {
+                return Err(LeaseError::Invalid(
+                    "non-outcome authority record carries an outcome-chain link".into(),
+                ));
+            }
+            if self.outcome_head.is_some_and(|head| {
+                head.sequence > self.lease.seq || head.epoch == 0 || head.checkpoint_id == 0
+            }) {
+                return Err(LeaseError::Invalid(
+                    "authority outcome head is outside the durable sequence".into(),
+                ));
             }
         }
         if self.commit_head.is_some_and(|head| {
@@ -1308,55 +1304,52 @@ impl LeaderAuthorityRecord {
                 ));
             }
         }
-        match self.assignment_decision.as_ref() {
-            Some(decision) => {
-                decision.validate()?;
-                if self
-                    .assignment_decision_floor
-                    .as_ref()
-                    .is_some_and(|floor| decision.target_version() < floor.before_target_version)
+        if let Some(decision) = self.assignment_decision.as_ref() {
+            decision.validate()?;
+            if self
+                .assignment_decision_floor
+                .as_ref()
+                .is_some_and(|floor| decision.target_version() < floor.before_target_version)
+            {
+                return Err(LeaseError::Invalid(
+                    "assignment decision is below its durable authority floor".into(),
+                ));
+            }
+            if !self.lease.matches_proof(decision.leader_proof())
+                || self.assignment_decision_head
+                    != Some(AssignmentDecisionLink {
+                        sequence: self.lease.seq,
+                        target_version: decision.target_version(),
+                    })
+            {
+                return Err(LeaseError::Invalid(
+                    "assignment decision is not bound to its exact authority sequence and term"
+                        .into(),
+                ));
+            }
+            if let Some(previous) = self.previous_assignment_decision {
+                if previous.sequence >= self.lease.seq
+                    || previous.target_version >= decision.target_version()
                 {
                     return Err(LeaseError::Invalid(
-                        "assignment decision is below its durable authority floor".into(),
+                        "assignment decision link does not move backward".into(),
                     ));
-                }
-                if !self.lease.matches_proof(decision.leader_proof())
-                    || self.assignment_decision_head
-                        != Some(AssignmentDecisionLink {
-                            sequence: self.lease.seq,
-                            target_version: decision.target_version(),
-                        })
-                {
-                    return Err(LeaseError::Invalid(
-                        "assignment decision is not bound to its exact authority sequence and term"
-                            .into(),
-                    ));
-                }
-                if let Some(previous) = self.previous_assignment_decision {
-                    if previous.sequence >= self.lease.seq
-                        || previous.target_version >= decision.target_version()
-                    {
-                        return Err(LeaseError::Invalid(
-                            "assignment decision link does not move backward".into(),
-                        ));
-                    }
                 }
             }
-            None => {
-                if self.previous_assignment_decision.is_some() {
-                    return Err(LeaseError::Invalid(
-                        "non-decision authority record carries a previous assignment-decision link"
-                            .into(),
-                    ));
-                }
-                if self
-                    .assignment_decision_head
-                    .is_some_and(|head| head.sequence > self.lease.seq || head.target_version == 0)
-                {
-                    return Err(LeaseError::Invalid(
-                        "authority assignment-decision head is outside the durable sequence".into(),
-                    ));
-                }
+        } else {
+            if self.previous_assignment_decision.is_some() {
+                return Err(LeaseError::Invalid(
+                    "non-decision authority record carries a previous assignment-decision link"
+                        .into(),
+                ));
+            }
+            if self
+                .assignment_decision_head
+                .is_some_and(|head| head.sequence > self.lease.seq || head.target_version == 0)
+            {
+                return Err(LeaseError::Invalid(
+                    "authority assignment-decision head is outside the durable sequence".into(),
+                ));
             }
         }
         if let Some(floor) = self.assignment_decision_floor.as_ref() {
@@ -1437,7 +1430,7 @@ pub enum LeaseOutcome {
 enum AuthorityCreateOutcome {
     Created,
     ExistingIdentical,
-    Contended(LeaderAuthorityRecord),
+    Contended(Box<LeaderAuthorityRecord>),
 }
 
 #[derive(Clone, Copy)]
@@ -1626,7 +1619,7 @@ impl std::fmt::Debug for LeaderLeaseStore {
 impl LeaderLeaseStore {
     /// Create a leader lease authority.
     ///
-    /// The store must provide linearizable `PutMode::Create`/`Update` and GET ETag or version
+    /// The store must provide linearizable `PutMode::Create`/`Update` and GET `ETag` or version
     /// metadata; unsupported conditional updates fail closed.
     #[must_use]
     pub fn new(store: Arc<dyn ObjectStore>, ttl_ms: i64) -> Self {
@@ -1894,11 +1887,11 @@ impl LeaderLeaseStore {
         }
 
         loop {
-            let published = self
+            let head = self
                 .load_published_authority_head()
                 .await?
                 .ok_or(ClusterCheckpointAuthorityError::Fenced)?;
-            let current = &published.record;
+            let current = &head.record;
             let node_id = publisher.participant.node_id;
             let slot_index = current
                 .recovery_fault_slots
@@ -1961,7 +1954,7 @@ impl LeaderLeaseStore {
             candidate.validate()?;
 
             match self
-                .create_authority_record(Some(&published), &candidate)
+                .create_authority_record(Some(&head), &candidate)
                 .await?
             {
                 AuthorityCreateOutcome::Created | AuthorityCreateOutcome::ExistingIdentical => {
@@ -2112,6 +2105,7 @@ impl LeaderLeaseStore {
         Ok(terminal)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn record_recovery_release_commit(
         &self,
         proof: &LeaderProof,
@@ -2147,7 +2141,7 @@ impl LeaderLeaseStore {
             if !current.lease.matches_proof(proof) {
                 return Err(ClusterCheckpointAuthorityError::Fenced);
             }
-            let fault_inventory = Self::recovery_fault_inventory_from(&current);
+            let fault_inventory = Self::recovery_fault_inventory_from(current);
             if fault_inventory.revision != terminal.round.fault_revision()
                 || fault_inventory.faults != terminal.round.faults
             {
@@ -2422,6 +2416,7 @@ impl LeaderLeaseStore {
         });
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn prune_history(store: &Arc<dyn ObjectStore>, grace_ms: i64) -> Result<(), LeaseError> {
         let authority = Self::new(Arc::clone(store), 1);
         let Some(head) = authority.load_record().await? else {
@@ -2816,6 +2811,7 @@ impl LeaderLeaseStore {
             .map(|head| head.record))
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn load_published_authority_head(
         &self,
     ) -> Result<Option<PublishedAuthorityHead>, LeaseError> {
@@ -3153,11 +3149,15 @@ impl LeaderLeaseStore {
                 return if head.record == *candidate {
                     Ok(AuthorityCreateOutcome::ExistingIdentical)
                 } else {
-                    Ok(AuthorityCreateOutcome::Contended(head.record.clone()))
+                    Ok(AuthorityCreateOutcome::Contended(Box::new(
+                        head.record.clone(),
+                    )))
                 };
             }
             Some(head) if head.record.lease.seq > candidate.lease.seq => {
-                return Ok(AuthorityCreateOutcome::Contended(head.record.clone()));
+                return Ok(AuthorityCreateOutcome::Contended(Box::new(
+                    head.record.clone(),
+                )));
             }
             Some(head) if head.record.lease.seq.checked_add(1) == Some(candidate.lease.seq) => {
                 Some(&head.pointer)
@@ -3195,7 +3195,7 @@ impl LeaderLeaseStore {
                 let winner = self.load_record().await?.ok_or_else(|| {
                     LeaseError::Io("authority contender was not published or readable".into())
                 })?;
-                return Ok(AuthorityCreateOutcome::Contended(winner));
+                return Ok(AuthorityCreateOutcome::Contended(Box::new(winner)));
             }
         }
 
@@ -3210,7 +3210,7 @@ impl LeaderLeaseStore {
                 .load_record()
                 .await?
                 .ok_or_else(|| LeaseError::Io("newer published authority head vanished".into()))?;
-            return Ok(AuthorityCreateOutcome::Contended(winner));
+            return Ok(AuthorityCreateOutcome::Contended(Box::new(winner)));
         }
         self.schedule_history_prune();
         if created {
@@ -3319,6 +3319,7 @@ impl LeaderLeaseStore {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn audited_cluster_outcomes_from(
         &self,
         head: &LeaderAuthorityRecord,
@@ -4079,6 +4080,7 @@ impl LeaderLeaseStore {
     /// # Errors
     /// Fails closed for a stale proof, non-monotonic or conflicting outcome, malformed recovery
     /// capsule, or object-store failure.
+    #[allow(clippy::too_many_lines)]
     pub async fn record_cluster_outcome(
         &self,
         proof: &LeaderProof,
@@ -4126,7 +4128,7 @@ impl LeaderLeaseStore {
             if !current.lease.matches_proof(proof) {
                 return Err(ClusterCheckpointAuthorityError::Fenced);
             }
-            let snapshot = self.cached_audited_cluster_outcomes_from(&current).await?;
+            let snapshot = self.cached_audited_cluster_outcomes_from(current).await?;
             let outcomes = &snapshot.outcomes;
             if let Some(winner) = outcomes
                 .iter()
@@ -4166,9 +4168,10 @@ impl LeaderLeaseStore {
                     .into());
                 }
             }
-            if self
-                .compact_cluster_outcome_history_before_append(proof, &current, &snapshot)
-                .await?
+            if Box::pin(
+                self.compact_cluster_outcome_history_before_append(proof, current, &snapshot),
+            )
+            .await?
             {
                 tokio::task::yield_now().await;
                 continue;
@@ -4306,6 +4309,7 @@ impl LeaderLeaseStore {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn record_assignment_decision(
         &self,
         proof: &LeaderProof,
@@ -4335,7 +4339,7 @@ impl LeaderLeaseStore {
                     .into());
                 }
             }
-            let decisions = self.audited_assignment_decisions_from(&current).await?;
+            let decisions = self.audited_assignment_decisions_from(current).await?;
             if let Some(winner) = decisions
                 .iter()
                 .find(|winner| winner.target_version() == decision.target_version())
@@ -4438,9 +4442,10 @@ impl LeaderLeaseStore {
         proof: &LeaderProof,
         decision: AssignmentDrainDecision,
     ) -> Result<RecordAssignmentDrainDecisionResult, ClusterCheckpointAuthorityError> {
-        match self
-            .record_assignment_decision(proof, AuthorityAssignmentDecision::Drain(decision))
-            .await?
+        match Box::pin(
+            self.record_assignment_decision(proof, AuthorityAssignmentDecision::Drain(decision)),
+        )
+        .await?
         {
             RecordAuthorityAssignmentDecisionResult::Created(
                 AuthorityAssignmentDecision::Drain(decision),
@@ -4518,9 +4523,10 @@ impl LeaderLeaseStore {
                 }
             };
         }
-        match self
-            .record_assignment_decision(proof, AuthorityAssignmentDecision::Recovery(decision))
-            .await?
+        match Box::pin(
+            self.record_assignment_decision(proof, AuthorityAssignmentDecision::Recovery(decision)),
+        )
+        .await?
         {
             RecordAuthorityAssignmentDecisionResult::Created(
                 AuthorityAssignmentDecision::Recovery(decision),
@@ -4664,6 +4670,10 @@ impl LeaderLeaseStore {
     /// target-version horizon. Decision-bearing authority records below the durable floor then
     /// become eligible for best-effort deletion while the exact terminal anchor preserves chain
     /// continuity.
+    ///
+    /// # Errors
+    ///
+    /// Fails for a stale proof, invalid horizon, corrupt history, or storage failure.
     pub async fn prune_assignment_drain_decisions_before(
         &self,
         proof: &LeaderProof,
@@ -4695,7 +4705,7 @@ impl LeaderLeaseStore {
                 }
             }
 
-            let decisions = self.audited_assignment_decisions_from(&current).await?;
+            let decisions = self.audited_assignment_decisions_from(current).await?;
             let terminal_anchor = decisions
                 .iter()
                 .rev()
@@ -4708,10 +4718,7 @@ impl LeaderLeaseStore {
                         .and_then(|floor| floor.terminal_anchor.clone())
                 });
             let terminal_anchor_link = match terminal_anchor.as_ref() {
-                Some(anchor) => Some(
-                    self.exact_assignment_decision_link(&current, anchor)
-                        .await?,
-                ),
+                Some(anchor) => Some(self.exact_assignment_decision_link(current, anchor).await?),
                 None => None,
             };
             let floor = AuthorityAssignmentDecisionFloor {
@@ -4766,6 +4773,7 @@ impl LeaderLeaseStore {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn cluster_outcome_from_snapshot(
         &self,
         head: &LeaderAuthorityRecord,
@@ -4958,6 +4966,10 @@ impl LeaderLeaseStore {
     }
 
     /// Read one live cluster outcome from the shared authority.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the durable authority history is unavailable or invalid.
     pub async fn cluster_outcome(
         &self,
         epoch: u64,
@@ -4967,6 +4979,10 @@ impl LeaderLeaseStore {
 
     /// Read one live cluster outcome together with its content-addressed recovery capsule.
     /// Commit always returns a validated capsule; Abort returns `None` for the capsule.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the authority history or selected recovery capsule is unavailable or invalid.
     pub async fn cluster_outcome_with_recovery_capsule(
         &self,
         epoch: u64,
@@ -5005,6 +5021,10 @@ impl LeaderLeaseStore {
     }
 
     /// Audit and return every live cluster outcome in ascending epoch order.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the durable authority history is unavailable or invalid.
     pub async fn cluster_outcome_inventory(
         &self,
     ) -> Result<ClusterOutcomeInventory, ClusterCheckpointAuthorityError> {
@@ -5032,6 +5052,10 @@ impl LeaderLeaseStore {
     }
 
     /// Audit and return every live cluster outcome in ascending epoch order.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the durable authority history is unavailable or invalid.
     pub async fn cluster_outcomes(
         &self,
     ) -> Result<Vec<CheckpointOutcome>, ClusterCheckpointAuthorityError> {
@@ -5039,6 +5063,10 @@ impl LeaderLeaseStore {
     }
 
     /// Greatest live cluster commit recovery cut.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the durable authority history is unavailable or invalid.
     pub async fn highest_cluster_committed_outcome(
         &self,
     ) -> Result<Option<CheckpointOutcome>, ClusterCheckpointAuthorityError> {
@@ -5051,6 +5079,10 @@ impl LeaderLeaseStore {
     }
 
     /// Greatest terminal cluster outcome, including the compacted continuity anchor.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the durable authority history is unavailable or invalid.
     pub async fn highest_cluster_terminal_outcome(
         &self,
     ) -> Result<Option<CheckpointOutcome>, ClusterCheckpointAuthorityError> {
@@ -5139,6 +5171,10 @@ impl LeaderLeaseStore {
     }
 
     /// Exact continuity boundary for cluster outcomes compacted from the authority history.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the durable authority history is unavailable or invalid.
     pub async fn cluster_outcome_retention_boundary(
         &self,
     ) -> Result<ClusterOutcomeRetentionBoundary, ClusterCheckpointAuthorityError> {
@@ -5166,6 +5202,10 @@ impl LeaderLeaseStore {
     /// Read live outcomes and their retention boundary only after the selected live Commit passes
     /// the caller's durable recovery metadata preflight and both outcome heads and the floor remain
     /// unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Fails when authority history is invalid or artifact validation fails.
     pub async fn validated_cluster_outcome_inventory<V, Fut>(
         &self,
         validate_artifacts: V,
@@ -5205,6 +5245,10 @@ impl LeaderLeaseStore {
     ///
     /// This is deliberately independent of floor publication: cleanup failure cannot revoke an
     /// already-authorized manifest/state retention horizon.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the authority history is invalid or cleanup storage operations fail.
     pub async fn maintain_cluster_recovery_capsules(
         &self,
     ) -> Result<crate::checkpoint_decision::RecoveryCapsuleGcStep, ClusterCheckpointAuthorityError>
@@ -5250,6 +5294,11 @@ impl LeaderLeaseStore {
     /// At least one live commit remains at or above the requested horizon. Outcome-bearing
     /// records below the floor and unreferenced old recovery capsules become eligible for
     /// best-effort deletion only after the floor is durable.
+    ///
+    /// # Errors
+    ///
+    /// Fails for a stale proof, invalid horizon, failed artifact validation, or storage failure.
+    #[allow(clippy::too_many_lines)]
     pub async fn prune_cluster_outcomes_before<V, Fut>(
         &self,
         proof: &LeaderProof,
@@ -5413,8 +5462,12 @@ impl LeaderLeaseStore {
         owner: &LeaderLeaseOwner,
         now_ms: i64,
     ) -> Result<LeaseOutcome, LeaseError> {
-        self.acquire_or_renew_current_term_for_test_inner(owner, now_ms, SameOwnerToken::Rotate)
-            .await
+        Box::pin(self.acquire_or_renew_current_term_for_test_inner(
+            owner,
+            now_ms,
+            SameOwnerToken::Rotate,
+        ))
+        .await
     }
 
     /// Renew only the exact durable authority term identified by `token`.
@@ -5428,11 +5481,11 @@ impl LeaderLeaseStore {
         token: u64,
         now_ms: i64,
     ) -> Result<LeaseOutcome, LeaseError> {
-        self.acquire_or_renew_current_term_for_test_inner(
+        Box::pin(self.acquire_or_renew_current_term_for_test_inner(
             owner,
             now_ms,
             SameOwnerToken::Exact(token),
-        )
+        ))
         .await
     }
 
@@ -5804,15 +5857,15 @@ impl LeaderLeaseManager {
         });
         let operation = async {
             if let Some(observation) = observation {
-                self.store
-                    .try_takeover(&self.owner, observation, now_millis())
-                    .await
+                Box::pin(
+                    self.store
+                        .try_takeover(&self.owner, observation, now_millis()),
+                )
+                .await
             } else if let Some(token) = held_token {
-                self.store
-                    .renew_exact(&self.owner, token, now_millis())
-                    .await
+                Box::pin(self.store.renew_exact(&self.owner, token, now_millis())).await
             } else {
-                self.store.begin_new_term(&self.owner, now_millis()).await
+                Box::pin(self.store.begin_new_term(&self.owner, now_millis())).await
             }
         };
         tokio::select! {
@@ -5850,6 +5903,7 @@ impl LeaderLeaseManager {
     }
 
     #[cfg(feature = "cluster")]
+    #[allow(clippy::too_many_lines)]
     async fn run(
         self,
         shutdown: tokio_util::sync::CancellationToken,
@@ -5907,15 +5961,14 @@ impl LeaderLeaseManager {
                 _ = ticker.tick() => {}
             }
 
-            let (result, attempt_valid_until) = match self
-                .attempt_lease(
-                    &shutdown,
-                    &mut candidate,
-                    valid_until,
-                    observation.as_ref(),
-                    held_token,
-                )
-                .await
+            let (result, attempt_valid_until) = match Box::pin(self.attempt_lease(
+                &shutdown,
+                &mut candidate,
+                valid_until,
+                observation.as_ref(),
+                held_token,
+            ))
+            .await
             {
                 LeaseOperationEvent::Shutdown | LeaseOperationEvent::Deadline => {
                     self.fence();
@@ -12141,14 +12194,15 @@ mod tests {
         raw.release.add_permits(1);
         let old = old_audit.await.unwrap().unwrap().unwrap();
         assert_eq!((old.epoch, old.checkpoint_id), (1, 1));
-        let cache = store.outcome_audit_cache.lock();
-        let cached = cache.as_ref().expect("newer audit must remain cached");
-        assert_eq!(cached.authority_sequence, 4);
-        assert_eq!(
-            cached.snapshot.outcomes.last().map(|outcome| outcome.epoch),
-            Some(3)
-        );
-        drop(cache);
+        {
+            let cache = store.outcome_audit_cache.lock();
+            let cached = cache.as_ref().expect("newer audit must remain cached");
+            assert_eq!(cached.authority_sequence, 4);
+            assert_eq!(
+                cached.snapshot.outcomes.last().map(|outcome| outcome.epoch),
+                Some(3)
+            );
+        }
 
         raw.clear_get_counts();
         assert_eq!(

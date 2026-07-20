@@ -98,6 +98,7 @@ impl<'a> PreAggBuilder<'a> {
 
     /// `false` if `expr` is not an aggregate function (caller bails to the
     /// interpreted path).
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn push_aggregate(
         &mut self,
         expr: &datafusion_expr::Expr,

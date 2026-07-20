@@ -171,6 +171,7 @@ fn merge_source_assignment_versions(
 }
 
 /// Assemble one compact global image from the readiness records admitted by an exact seal.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn assemble_capsule(
     inventory: &CheckpointSealInventory,
     readiness: Vec<(String, ParticipantReady)>,
@@ -365,9 +366,10 @@ pub(crate) fn assemble_capsule(
     }
 
     if observed_participants != expected_participants || observed_vnodes != sealed_vnodes {
-        return Err(DbError::Checkpoint(format!(
+        return Err(DbError::Checkpoint(
             "[LDB-6041] participant readiness inventory does not cover the exact sealed assignment"
-        )));
+                .to_string(),
+        ));
     }
     let owners: Vec<u64> = (0..fence.vnode_count)
         .map(|vnode| {

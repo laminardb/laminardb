@@ -41,15 +41,13 @@ const RECOVERY_PROPOSAL_GC_MAX_BATCHES: usize = 4;
 fn snapshot_path(version: u64) -> OsPath {
     // Fixed-width so lexicographic list order matches numeric order.
     OsPath::from(format!(
-        "{SNAPSHOT_PREFIX}v{version:0width$}.json",
-        width = SNAPSHOT_VERSION_WIDTH
+        "{SNAPSHOT_PREFIX}v{version:0SNAPSHOT_VERSION_WIDTH$}.json"
     ))
 }
 
 fn drain_finalization_path(version: u64) -> OsPath {
     OsPath::from(format!(
-        "{DRAIN_FINALIZATION_PREFIX}v{version:0width$}.json",
-        width = SNAPSHOT_VERSION_WIDTH
+        "{DRAIN_FINALIZATION_PREFIX}v{version:0SNAPSHOT_VERSION_WIDTH$}.json"
     ))
 }
 
@@ -64,15 +62,13 @@ fn recovery_proposal_path(reference: &AssignmentSnapshotRef) -> OsPath {
 
 fn recovery_proposal_version_prefix(version: u64) -> OsPath {
     OsPath::from(format!(
-        "{RECOVERY_PROPOSAL_PREFIX}v{version:0width$}/",
-        width = SNAPSHOT_VERSION_WIDTH
+        "{RECOVERY_PROPOSAL_PREFIX}v{version:0SNAPSHOT_VERSION_WIDTH$}/"
     ))
 }
 
 fn recovery_materialization_path(version: u64) -> OsPath {
     OsPath::from(format!(
-        "{RECOVERY_MATERIALIZATION_PREFIX}v{version:0width$}.json",
-        width = SNAPSHOT_VERSION_WIDTH
+        "{RECOVERY_MATERIALIZATION_PREFIX}v{version:0SNAPSHOT_VERSION_WIDTH$}.json"
     ))
 }
 
@@ -215,11 +211,10 @@ impl AssignmentSnapshotRef {
                 "recovery proposal SHA-256 must be 64 lowercase hexadecimal characters".into(),
             ));
         }
-        if self.encoded_len == 0
-            || self.encoded_len
-                > u64::try_from(MAX_RECOVERY_PROPOSAL_BYTES)
-                    .expect("recovery proposal byte limit fits u64")
-        {
+        let encoded_len = usize::try_from(self.encoded_len).map_err(|_| {
+            SnapshotError::Invalid("recovery proposal encoded length exceeds usize".into())
+        })?;
+        if encoded_len == 0 || encoded_len > MAX_RECOVERY_PROPOSAL_BYTES {
             return Err(SnapshotError::Invalid(format!(
                 "recovery proposal encoded length {} is outside 1..={MAX_RECOVERY_PROPOSAL_BYTES}",
                 self.encoded_len
@@ -307,12 +302,19 @@ impl AssignmentSnapshot {
     }
 
     /// Next snapshot with bumped version and current wall-clock time.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the version overflows or the successor is noncanonical.
     pub fn next(&self, vnodes: BTreeMap<u32, NodeId>) -> Result<Self, SnapshotError> {
         self.next_for_participants(vnodes, self.participants.clone())
     }
 
     /// Next snapshot bound to the supplied canonical process roster.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the version overflows or the successor is noncanonical.
     pub fn next_for_participants(
         &self,
         vnodes: BTreeMap<u32, NodeId>,
@@ -389,6 +391,10 @@ impl AssignmentSnapshot {
     }
 
     /// Validate the durable owner map, process roster, and optional drain transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the snapshot or drain transition is noncanonical.
     pub fn validate(&self) -> Result<(), SnapshotError> {
         self.validate_assignment()?;
         match (self.draining, self.drain_transition.as_ref()) {
@@ -440,6 +446,10 @@ impl AssignmentSnapshot {
     }
 
     /// Exact checkpoint certificate represented by this snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the assignment map or process roster is noncanonical.
     pub fn assignment_fence(&self) -> Result<CheckpointAssignmentFence, SnapshotError> {
         self.validate_assignment()?;
         self.assignment_fence_unchecked()
@@ -475,6 +485,10 @@ impl AssignmentSnapshot {
     }
 
     /// Convert a draining generation into its committed target without changing identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless this is a valid draining snapshot.
     pub fn committed_target(&self) -> Result<Self, SnapshotError> {
         self.validate()?;
         if !self.draining {
@@ -491,6 +505,10 @@ impl AssignmentSnapshot {
     }
 
     /// Convert a draining generation into a committed rollback of its predecessor map.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either snapshot is invalid or the predecessor does not match.
     pub fn aborted_target(&self, predecessor: &Self) -> Result<Self, SnapshotError> {
         self.validate()?;
         predecessor.validate()?;
@@ -534,6 +552,10 @@ impl AssignmentSnapshot {
     }
 
     /// Convert the canonical owner map to a dense vector of exactly `vnode_count` entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the snapshot is invalid or its vnode map is not exactly dense.
     pub fn to_vnode_vec(&self, vnode_count: u32) -> Result<Vec<NodeId>, SnapshotError> {
         self.validate()?;
         if usize::try_from(vnode_count).ok() != Some(self.vnodes.len()) {
@@ -798,7 +820,7 @@ impl AssignmentSnapshotStore {
             }
             return Ok(RotateOutcome::Rotated);
         }
-        Ok(RotateOutcome::Conflict(winner_snapshot))
+        Ok(RotateOutcome::Conflict(Box::new(winner_snapshot)))
     }
 
     /// Enumerate raw snapshots and recovery materializations with one object-store LIST.
@@ -1164,7 +1186,7 @@ impl AssignmentSnapshotStore {
             let winner = self.load_version(expected).await?.ok_or_else(|| {
                 SnapshotError::Io("durable head disappeared while loading CAS winner".into())
             })?;
-            return Ok(RotateOutcome::Conflict(winner));
+            return Ok(RotateOutcome::Conflict(Box::new(winner)));
         }
         if head != Some(prior_version) {
             return Err(SnapshotError::Invalid(format!(
@@ -1177,7 +1199,7 @@ impl AssignmentSnapshotStore {
         let winner = self.load_version(snapshot.version).await?.ok_or_else(|| {
             SnapshotError::Io("CAS conflict but load of winner returned None".into())
         })?;
-        Ok(RotateOutcome::Conflict(winner))
+        Ok(RotateOutcome::Conflict(Box::new(winner)))
     }
 
     /// Append exactly one immutable winner for a draining object: its target or a rollback.
@@ -1213,11 +1235,11 @@ impl AssignmentSnapshotStore {
                 .load_version(draining.version)
                 .await?
                 .ok_or_else(|| SnapshotError::Io("drain conflict winner disappeared".into()))?;
-            return Ok(RotateOutcome::Conflict(winner));
+            return Ok(RotateOutcome::Conflict(Box::new(winner)));
         }
         if let Some(winner) = self.load_drain_finalization(draining.version).await? {
             winner.validate_against(draining)?;
-            return Ok(RotateOutcome::Conflict(winner.proposal));
+            return Ok(RotateOutcome::Conflict(Box::new(winner.proposal)));
         }
 
         let path = drain_finalization_path(draining.version);
@@ -1231,7 +1253,7 @@ impl AssignmentSnapshotStore {
             Err(error) => match self.load_drain_finalization(draining.version).await {
                 Ok(Some(winner)) => {
                     winner.validate_against(draining)?;
-                    Ok(RotateOutcome::Conflict(winner.proposal))
+                    Ok(RotateOutcome::Conflict(Box::new(winner.proposal)))
                 }
                 Ok(None) | Err(_) => Err(SnapshotError::Io(error.to_string())),
             },
@@ -1295,7 +1317,7 @@ pub enum RotateOutcome {
     /// Another writer (a racing leader) won the CAS. The attached
     /// snapshot is what's currently durable; the caller must adopt it
     /// rather than retry with a stale view.
-    Conflict(AssignmentSnapshot),
+    Conflict(Box<AssignmentSnapshot>),
 }
 
 #[cfg(test)]
@@ -1760,7 +1782,7 @@ mod tests {
         match s.save_if_version(&loser, v1.version).await.unwrap() {
             RotateOutcome::Conflict(current) => {
                 assert_eq!(
-                    current, winner,
+                    *current, winner,
                     "conflict must surface the winner's snapshot",
                 );
             }
@@ -1886,7 +1908,7 @@ mod tests {
         ));
         assert!(matches!(
             store.materialize_recovery(&first_reference).await.unwrap(),
-            RotateOutcome::Conflict(existing) if existing == proposal
+            RotateOutcome::Conflict(existing) if *existing == proposal
         ));
     }
 
@@ -1907,7 +1929,7 @@ mod tests {
         ));
         assert!(matches!(
             store.materialize_recovery(&loser_reference).await.unwrap(),
-            RotateOutcome::Conflict(existing) if existing == winner
+            RotateOutcome::Conflict(existing) if *existing == winner
         ));
     }
 

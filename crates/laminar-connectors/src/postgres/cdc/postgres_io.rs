@@ -163,7 +163,7 @@ pub(super) async fn connect(
 ///
 /// This operation never creates, replaces, advances, or drops a slot. Recovery
 /// owns an exact engine checkpoint and must fail closed when the corresponding
-/// PostgreSQL slot is absent.
+/// `PostgreSQL` slot is absent.
 ///
 /// # Errors
 ///
@@ -214,7 +214,7 @@ pub(super) async fn inspect_replication_slot(
             "query PostgreSQL system identifier and timeline timed out after 10 seconds".into(),
         )
     })?
-    .map_err(map_control_system_query_error)?;
+    .map_err(|error| map_control_system_query_error(&error))?;
     let system_identifier = parse_decimal_identity::<u64>(control_row.get(0), "system identifier")?;
     let timeline_id = parse_decimal_identity::<u32>(control_row.get(1), "timeline ID")?;
 
@@ -365,7 +365,7 @@ where
 }
 
 #[cfg(not(test))]
-fn map_control_system_query_error(error: tokio_postgres::Error) -> ConnectorError {
+fn map_control_system_query_error(error: &tokio_postgres::Error) -> ConnectorError {
     if error.code() == Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE) {
         return ConnectorError::ConfigurationError(
             "PostgreSQL CDC must call pg_catalog.pg_control_system() and pg_catalog.pg_control_checkpoint() to bind checkpoints to a physical cluster and WAL timeline; grant the replication role pg_monitor or EXECUTE on both functions"

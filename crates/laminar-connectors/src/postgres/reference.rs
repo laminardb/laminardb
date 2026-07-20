@@ -1,4 +1,4 @@
-//! PostgreSQL startup snapshot source for reference tables.
+//! `PostgreSQL` startup snapshot source for reference tables.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -138,6 +138,7 @@ impl PostgresReferenceTableSource {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn postgres_config(&self) -> Result<tokio_postgres::Config, ConnectorError> {
         let properties = self.config.properties();
         for (left, right) in [
@@ -327,7 +328,7 @@ impl PostgresReferenceTableSource {
                     "invalid postgres reference ssl.mode: {error}"
                 ))
             })
-            .map(|mode| mode.unwrap_or_default())
+            .map(std::option::Option::unwrap_or_default)
     }
 
     async fn start_snapshot(&mut self) -> Result<(), ConnectorError> {

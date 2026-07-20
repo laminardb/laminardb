@@ -22,6 +22,10 @@ use crate::config::{ConfigKeySpec, ConnectorInfo};
 use crate::registry::ConnectorRegistry;
 
 /// Registers the `PostgreSQL` CDC source connector with the given registry.
+///
+/// # Errors
+///
+/// Returns an error if the connector name is already registered or the registry is frozen.
 pub fn register_postgres_cdc_source(
     registry: &ConnectorRegistry,
 ) -> Result<(), crate::error::ConnectorError> {

@@ -276,7 +276,7 @@ impl StreamLog {
         retain_appended_entry(&mut inner, sequence, entry_bytes);
         reclaim_consumed_prefix(&mut inner);
         drop(inner);
-        self.wake.send_modify(|_| {});
+        self.wake.send_modify(|()| {});
         AppendOutcome::Stored
     }
 
@@ -288,9 +288,9 @@ impl StreamLog {
         if inner.reserved_marker.is_some() {
             return AppendOutcome::Rejected(message);
         }
-        self.terminate_locked(&mut inner, message.clone());
+        Self::terminate_locked(&mut inner, message.clone());
         drop(inner);
-        self.wake.send_modify(|_| {});
+        self.wake.send_modify(|()| {});
         AppendOutcome::Rejected(message)
     }
 
@@ -390,7 +390,7 @@ impl StreamLog {
         retain_appended_entry(&mut inner, sequence, BARRIER_ENTRY_BYTES);
         reclaim_consumed_prefix(&mut inner);
         drop(inner);
-        self.wake.send_modify(|_| {});
+        self.wake.send_modify(|()| {});
         ReservedAppendOutcome::Stored
     }
 
@@ -443,15 +443,15 @@ impl StreamLog {
         let head_changed = head_sequence(&inner) != previous_head;
         drop(inner);
         if head_changed {
-            self.wake.send_modify(|_| {});
+            self.wake.send_modify(|()| {});
         }
     }
 
     fn terminate(&self, message: &str) {
         let mut inner = self.inner.lock();
-        self.terminate_locked(&mut inner, message.to_owned());
+        Self::terminate_locked(&mut inner, message.to_owned());
         drop(inner);
-        self.wake.send_modify(|_| {});
+        self.wake.send_modify(|()| {});
     }
 
     fn terminate_and_replace(&self, message: &str, latest_committed_epoch: Option<u64>) -> Self {
@@ -462,9 +462,9 @@ impl StreamLog {
         );
         let retention_cap = inner.retention_cap;
         let next_sequence = inner.next_sequence;
-        self.terminate_locked(&mut inner, message.to_owned());
+        Self::terminate_locked(&mut inner, message.to_owned());
         drop(inner);
-        self.wake.send_modify(|_| {});
+        self.wake.send_modify(|()| {});
         Self::new_at(
             retention_cap,
             Arc::clone(&self.budget),
@@ -486,7 +486,7 @@ impl StreamLog {
         );
     }
 
-    fn terminate_locked(&self, inner: &mut StreamLogInner, message: String) {
+    fn terminate_locked(inner: &mut StreamLogInner, message: String) {
         if inner.terminal_error.is_none() {
             inner.terminal_error = Some(message);
         }
@@ -1079,7 +1079,7 @@ impl SubscriptionRegistry {
                 .pending_cut
                 .take()
                 .expect("exact pending subscription cut was checked");
-            release_reserved_cut(cut, &self.budget);
+            release_reserved_cut(&cut, &self.budget);
         }
     }
 
@@ -1089,7 +1089,7 @@ impl SubscriptionRegistry {
     pub(crate) fn invalidate_all(&self, reason: &str) {
         let mut lifecycle = self.lifecycle.lock();
         if let Some(cut) = lifecycle.pending_cut.take() {
-            release_reserved_cut(cut, &self.budget);
+            release_reserved_cut(&cut, &self.budget);
         }
         let mut streams = self.streams.write();
         let latest_committed_epoch = lifecycle.latest_committed_epoch;
@@ -1206,7 +1206,7 @@ impl SubscriptionRegistry {
     }
 }
 
-fn release_reserved_cut(cut: ReservedCut, budget: &SubscriptionMemoryBudget) {
+fn release_reserved_cut(cut: &ReservedCut, budget: &SubscriptionMemoryBudget) {
     debug_assert_eq!(
         cut.reserved_bytes,
         cut.markers
@@ -1225,7 +1225,7 @@ fn release_reserved_cut(cut: ReservedCut, budget: &SubscriptionMemoryBudget) {
 impl Drop for SubscriptionRegistry {
     fn drop(&mut self) {
         if let Some(cut) = self.lifecycle.get_mut().pending_cut.take() {
-            release_reserved_cut(cut, &self.budget);
+            release_reserved_cut(&cut, &self.budget);
         }
     }
 }

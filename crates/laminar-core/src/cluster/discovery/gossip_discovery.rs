@@ -279,16 +279,14 @@ impl GossipDiscovery {
             .unwrap_or(0);
         let failure_domain = kvs.get(keys::FAILURE_DOMAIN).cloned();
         let version = kvs.get(keys::NODE_VERSION).cloned().unwrap_or_default();
-        let tags: HashMap<String, String> = match kvs.get(keys::METADATA_TAGS) {
-            Some(encoded) => {
-                if encoded.len() > MAX_METADATA_TAGS_ENCODED_BYTES {
-                    return None;
-                }
-                let tags = serde_json::from_str(encoded).ok()?;
-                Self::validate_metadata_tags(&tags, encoded.len()).ok()?;
-                tags
+        let tags: HashMap<String, String> = {
+            let encoded = kvs.get(keys::METADATA_TAGS)?;
+            if encoded.len() > MAX_METADATA_TAGS_ENCODED_BYTES {
+                return None;
             }
-            None => return None,
+            let tags = serde_json::from_str(encoded).ok()?;
+            Self::validate_metadata_tags(&tags, encoded.len()).ok()?;
+            tags
         };
         Self::validate_process_incarnation(&tags).ok()?;
 

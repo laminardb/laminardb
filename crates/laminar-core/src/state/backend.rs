@@ -376,6 +376,10 @@ impl CheckpointSealInventory {
     ///
     /// An empty descriptor inventory has no descriptor authority. Local descriptors return
     /// `None`; a mixed, incomplete, or assignment-mismatched inventory is rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the inventory is noncanonical, incomplete, or mixes authorities.
     pub fn descriptor_leader_proof(&self) -> Result<Option<&LeaderProof>, String> {
         if !self.attempt.is_canonical() {
             return Err(

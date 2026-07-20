@@ -1377,7 +1377,7 @@ fn test_source_to_connector_checkpoint() {
     assert_eq!(cc.offsets.get("events:0"), Some(&"1234".into()));
     assert_eq!(cc.metadata.get("topic"), Some(&"events".into()));
     assert_eq!(
-        cc.source_assignment_version.map(|version| version.get()),
+        cc.source_assignment_version.map(std::num::NonZeroU64::get),
         Some(7)
     );
 }
@@ -1409,7 +1409,7 @@ fn test_connector_to_source_checkpoint() {
     assert_eq!(cp.get_offset("lsn"), Some("0/ABCD"));
     assert_eq!(cp.get_metadata("type"), Some("postgres"));
     assert_eq!(
-        cp.assignment_version().map(|version| version.get()),
+        cp.assignment_version().map(std::num::NonZeroU64::get),
         Some(11)
     );
 }
@@ -4316,7 +4316,7 @@ async fn source_offset_handoff_round_trip() {
         partitioned
             .checkpoint()
             .source_assignment_version
-            .map(|version| version.get()),
+            .map(std::num::NonZeroU64::get),
         Some(1)
     );
     assert_eq!(partitioned.watermark(), Some(1_000));

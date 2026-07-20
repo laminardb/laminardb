@@ -5,7 +5,7 @@
 //!
 //! # Cancellation Safety
 //!
-//! Connector lifecycle futures never directly poll the MongoDB driver. Driver
+//! Connector lifecycle futures never directly poll the `MongoDB` driver. Driver
 //! I/O lives in an owned reader task; cancellation aborts that task so no
 //! connection or cursor outlives its connector.
 
@@ -230,7 +230,7 @@ fn parse_mongodb_checkpoint(
 }
 
 enum BufferedMongoPayload {
-    Event(MongoDbChangeEvent),
+    Event(Box<MongoDbChangeEvent>),
     HighWatermark {
         token: String,
         requires_start_after: bool,
@@ -245,7 +245,7 @@ struct BufferedMongoEvent {
 impl BufferedMongoEvent {
     fn new(event: MongoDbChangeEvent, byte_permit: OwnedSemaphorePermit) -> Self {
         Self {
-            payload: BufferedMongoPayload::Event(event),
+            payload: BufferedMongoPayload::Event(Box::new(event)),
             _byte_permit: byte_permit,
         }
     }
@@ -1179,22 +1179,18 @@ async fn await_mongo_reader_ready(
             ),
             Err(_) => (
                 ConnectorError::ReadError(format!(
-                    "MongoDB CDC did not open a change stream within the {:?} startup deadline",
-                    READER_STARTUP_TIMEOUT
+                    "MongoDB CDC did not open a change stream within the {READER_STARTUP_TIMEOUT:?} startup deadline"
                 )),
                 false,
             ),
         };
 
     shutdown_tx.send_replace(true);
-    let join_result = match tokio::time::timeout(READER_SHUTDOWN_TIMEOUT, &mut *handle).await {
-        Ok(result) => result,
-        Err(_) => {
-            tracing::warn!(
-                "MongoDB CDC admission reader exceeded its shutdown deadline; the retired generation remains tracked until it exits"
-            );
-            return Err(error);
-        }
+    let Ok(join_result) = tokio::time::timeout(READER_SHUTDOWN_TIMEOUT, &mut *handle).await else {
+        tracing::warn!(
+            "MongoDB CDC admission reader exceeded its shutdown deadline; the retired generation remains tracked until it exits"
+        );
+        return Err(error);
     };
     let error = if include_join_error {
         match join_result {
@@ -1613,6 +1609,7 @@ fn bootstrap_change_stream_options(
 }
 
 #[cfg(feature = "mongodb-cdc")]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn forward_change_stream(
     cursor: &mut mongodb::change_stream::ChangeStream<
         mongodb::change_stream::event::ChangeStreamEvent<mongodb::bson::Document>,
@@ -1887,7 +1884,7 @@ fn verify_mongodb_collection_uuid(
 fn verify_mongodb_collection(
     config: &MongoDbSourceConfig,
     expected_uuid: Uuid,
-    observation: MongoCollectionObservation,
+    observation: &MongoCollectionObservation,
 ) -> Result<(), ConnectorError> {
     verify_mongodb_collection_uuid(
         expected_uuid,
@@ -1928,10 +1925,10 @@ fn verify_mongodb_admission(
     config: &MongoDbSourceConfig,
     expected_deployment: &MongoDeploymentIdentity,
     expected_uuid: Uuid,
-    observation: MongoAdmissionObservation,
+    observation: &MongoAdmissionObservation,
 ) -> Result<(), ConnectorError> {
     verify_mongodb_deployment_identity(expected_deployment, &observation.deployment_identity)?;
-    verify_mongodb_collection(config, expected_uuid, observation.collection)
+    verify_mongodb_collection(config, expected_uuid, &observation.collection)
 }
 
 #[cfg(feature = "mongodb-cdc")]
@@ -1979,6 +1976,7 @@ fn report_mongo_reader_admission_error(
 /// Uses a `'reconnect` / `'recv` double-loop pattern (mirroring the
 /// Postgres CDC source) with exponential backoff capped at 30 seconds.
 #[cfg(feature = "mongodb-cdc")]
+#[allow(clippy::too_many_arguments)]
 async fn run_change_stream_reader(
     db: mongodb::Database,
     config: MongoDbSourceConfig,
@@ -2017,7 +2015,7 @@ async fn run_change_stream_reader(
 }
 
 #[cfg(feature = "mongodb-cdc")]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_change_stream_reader_loop(
     db: mongodb::Database,
     config: MongoDbSourceConfig,
@@ -2083,7 +2081,7 @@ async fn run_change_stream_reader_loop(
         &config,
         &deployment_identity,
         collection_uuid,
-        initial_observation,
+        &initial_observation,
     ) {
         report_mongo_reader_admission_error(&mut ready_tx, &error);
         return Err(error);
@@ -2100,7 +2098,7 @@ async fn run_change_stream_reader_loop(
                         &config,
                         &deployment_identity,
                         collection_uuid,
-                        observation,
+                        &observation,
                     ) {
                         report_mongo_reader_admission_error(&mut ready_tx, &error);
                         return Err(error);
@@ -2183,7 +2181,7 @@ async fn run_change_stream_reader_loop(
                     &config,
                     &deployment_identity,
                     collection_uuid,
-                    observation,
+                    &observation,
                 ) {
                     report_mongo_reader_admission_error(&mut ready_tx, &error);
                     return Err(error);
@@ -2300,6 +2298,7 @@ async fn run_change_stream_reader_loop(
 
 /// Parses a `ChangeStreamEvent<Document>` into a [`MongoDbChangeEvent`].
 #[cfg(feature = "mongodb-cdc")]
+#[allow(clippy::too_many_lines)]
 fn parse_change_stream_event(
     event: &mongodb::change_stream::event::ChangeStreamEvent<mongodb::bson::Document>,
 ) -> Result<MongoDbChangeEvent, ConnectorError> {
@@ -3278,7 +3277,7 @@ mod tests {
         let error = verify_mongodb_collection(
             &config,
             expected,
-            MongoCollectionObservation {
+            &MongoCollectionObservation {
                 collection_uuid: expected,
                 post_images_enabled: false,
             },
@@ -3289,7 +3288,7 @@ mod tests {
         verify_mongodb_collection(
             &config,
             expected,
-            MongoCollectionObservation {
+            &MongoCollectionObservation {
                 collection_uuid: expected,
                 post_images_enabled: true,
             },

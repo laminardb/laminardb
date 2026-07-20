@@ -1791,8 +1791,8 @@ mod tests {
         release.add_permits(1);
         assert!(matches!(
             delayed_server_put.await.unwrap(),
-            Err(object_store::Error::AlreadyExists { .. })
-                | Err(object_store::Error::Precondition { .. })
+            Err(object_store::Error::AlreadyExists { .. }
+                | object_store::Error::Precondition { .. })
         ));
         assert_eq!(authority.load().await.unwrap(), Some(takeover));
     }

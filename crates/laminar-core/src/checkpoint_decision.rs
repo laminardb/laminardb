@@ -177,6 +177,7 @@ const RECOVERY_CAPSULE_GC_BATCH_SIZE: usize = 64;
 const RECOVERY_CAPSULE_GC_CURSOR_MAX_BYTES: u64 = 1_024;
 
 impl CheckpointOutcome {
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn validate_shape(&self, path_epoch: u64) -> Result<(), DecisionError> {
         if self.version != CHECKPOINT_OUTCOME_VERSION {
             return Err(DecisionError::Conflict(format!(
@@ -655,7 +656,7 @@ impl CheckpointDecisionStore {
 
     #[cfg(test)]
     fn local_single_writer(store: Arc<dyn ObjectStore>) -> Self {
-        let authority = Arc::as_ptr(&store) as *const () as usize;
+        let authority = Arc::as_ptr(&store).cast::<()>() as usize;
         let lock =
             shared_local_metadata_rmw_lock(LocalMetadataNamespace::StoreAuthority(authority));
         Self::with_update_mode(
@@ -1224,9 +1225,7 @@ impl CheckpointDecisionStore {
 
     fn consume_local_reservation(&self, minimum: u64) -> Option<u64> {
         let mut state = self.local_reservation.lock();
-        let Some(next_id) = state.next_id else {
-            return None;
-        };
+        let next_id = state.next_id?;
         let checkpoint_id = next_id.max(minimum);
         if checkpoint_id > state.block_end {
             state.next_id = None;
@@ -1497,6 +1496,10 @@ impl CheckpointDecisionStore {
 
     #[cfg(test)]
     /// Allocate from the default floor in unit tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the durable allocator is unavailable or invalid.
     pub async fn allocate_checkpoint_id(&self) -> Result<u64, DecisionError> {
         self.allocate_checkpoint_id_at_least(1).await
     }
@@ -1953,6 +1956,7 @@ impl CheckpointDecisionStore {
         (epoch != 0 && Self::outcome_path(epoch).as_ref() == loc).then_some(segment)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn canonical_outcome(
         &self,
         epoch: u64,
@@ -2270,6 +2274,7 @@ impl CheckpointDecisionStore {
     ///
     /// # Errors
     /// Object-store I/O, malformed/non-canonical metadata, or any cluster-scoped proposal.
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_outcome(
         &self,
         epoch: u64,
@@ -2542,6 +2547,7 @@ impl CheckpointDecisionStore {
     /// Each step full-scans the unordered listing and processes the lexically oldest bounded batch
     /// after the cursor. The cursor wraps so delayed creates and failed paths are retried.
     #[cfg(feature = "cluster")]
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn sweep_recovery_capsules_step(
         &self,
         before_epoch: u64,
@@ -3883,8 +3889,8 @@ mod tests {
         };
         assert!(matches!(
             fault.apply_pending().await,
-            Err(object_store::Error::Precondition { .. })
-                | Err(object_store::Error::AlreadyExists { .. })
+            Err(object_store::Error::Precondition { .. }
+                | object_store::Error::AlreadyExists { .. })
         ));
         assert_eq!(store.outcome(2).await.unwrap(), Some(abort));
     }

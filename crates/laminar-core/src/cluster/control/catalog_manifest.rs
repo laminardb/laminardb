@@ -1,9 +1,9 @@
 //! Catalog inventory sealed in the append-only leader authority.
 
-use std::collections::HashSet;
 use std::fmt::Write;
 use std::sync::Arc;
 
+use ahash::AHashSet;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -26,7 +26,7 @@ fn validate_entries(entries: &[CatalogManifestEntry]) -> Result<(), CatalogManif
             entries.len()
         )));
     }
-    let mut names = HashSet::with_capacity(entries.len());
+    let mut names = AHashSet::with_capacity(entries.len());
     for entry in entries {
         if entry.canonical_name.is_empty() || entry.canonical_name.trim() != entry.canonical_name {
             return Err(CatalogManifestError::Invalid(format!(
@@ -258,7 +258,7 @@ impl CatalogManifestStore {
         manifest: &CatalogManifest,
         proof: &LeaderProof,
     ) -> Result<CatalogSealOutcome, CatalogManifestError> {
-        self.authority.seal_catalog(proof, manifest).await
+        Box::pin(self.authority.seal_catalog(proof, manifest)).await
     }
 }
 

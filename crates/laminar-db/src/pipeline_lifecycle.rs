@@ -1257,6 +1257,7 @@ impl LaminarDB {
         }
     }
 
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)] // Cluster builds enforce the fence.
     fn ensure_pipeline_lifecycle_authorized(
         &self,
         authority: PipelineLifecycleAuthority,
@@ -8038,6 +8039,7 @@ mod cluster_fault_watcher_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // Deliberately stalls startup on the table-store lock.
     async fn pipeline_startup_holds_generation_fence_until_graph_publication() {
         let (db, _controller, _kv, _members, _round, manifest_store, proof) = startup_db().await;
         let state_store: Arc<dyn object_store::ObjectStore> =

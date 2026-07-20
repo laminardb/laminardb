@@ -31,6 +31,10 @@ use crate::config::{ConfigKeySpec, ConnectorInfo};
 use crate::registry::ConnectorRegistry;
 
 /// Registers the `MongoDB` CDC source connector with the given registry.
+///
+/// # Errors
+///
+/// Returns an error if the connector name is already registered or the registry is frozen.
 pub fn register_mongodb_cdc_source(
     registry: &ConnectorRegistry,
 ) -> Result<(), crate::error::ConnectorError> {
@@ -115,6 +119,10 @@ impl crate::registry::LookupSourceFactory for MongoLookupFactory {
 }
 
 /// Registers the `MongoDB` sink connector with the given registry.
+///
+/// # Errors
+///
+/// Returns an error if the connector name is already registered or the registry is frozen.
 pub fn register_mongodb_sink(
     registry: &ConnectorRegistry,
 ) -> Result<(), crate::error::ConnectorError> {

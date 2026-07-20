@@ -5504,6 +5504,7 @@ impl StreamingCoordinator {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn handle_aligned_checkpoint_outcome(
         &mut self,
         callback: &mut impl PipelineCallback,
@@ -5766,13 +5767,10 @@ impl StreamingCoordinator {
             // Capture or exact cleanup has completed. A cleanup failure or sticky replay fault
             // returns above and deliberately leaves the sources held for coordinated recovery.
             self.release_source_barrier_attempt(attempt);
-            match (topology_cancelled, cleanup_owner) {
-                (true, CheckpointCleanupOwner::Originator) => {
-                    self.defer_checkpoint_until_topology_ready();
-                }
-                (true, CheckpointCleanupOwner::Follower) => {}
-                (false, _) if !durable_tail_pending => self.advance_checkpoint_cadence(),
-                (false, _) => {}
+            if topology_cancelled && cleanup_owner == CheckpointCleanupOwner::Originator {
+                self.defer_checkpoint_until_topology_ready();
+            } else if !topology_cancelled && !durable_tail_pending {
+                self.advance_checkpoint_cadence();
             }
         }
         Ok(())
@@ -6289,6 +6287,7 @@ impl StreamingCoordinator {
     }
 
     /// Service periodic, manual, or leader-announced checkpoint admission.
+    #[allow(clippy::too_many_lines)]
     async fn maybe_checkpoint(&mut self, callback: &mut impl PipelineCallback) -> bool {
         self.drain_manual_requests();
         #[cfg(feature = "cluster")]
@@ -11795,7 +11794,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .assignment_version()
-                .map(|version| version.get()),
+                .map(std::num::NonZeroU64::get),
             Some(7)
         );
         let error = try_source_checkpoint(&source, false).unwrap_err();

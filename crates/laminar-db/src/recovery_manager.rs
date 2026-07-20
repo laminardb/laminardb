@@ -665,6 +665,7 @@ impl<'a> RecoveryManager<'a> {
     }
 
     #[cfg(feature = "cluster")]
+    #[allow(clippy::too_many_lines)]
     async fn load_cluster_committed_outcome(
         &self,
         outcome: &CheckpointOutcome,
@@ -804,7 +805,7 @@ impl<'a> RecoveryManager<'a> {
                 continue;
             }
 
-            let mut recovered = match self.restore_from(artifacts) {
+            let mut recovered = match Self::restore_from(artifacts) {
                 Ok(recovered) => recovered,
                 Err(error) => {
                     reject_candidate(format!(
@@ -1019,6 +1020,7 @@ impl<'a> RecoveryManager<'a> {
         Ok(inventory.outcomes)
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn settle_local_prepared_attempts(
         &self,
         decision_store: &laminar_core::checkpoint_decision::CheckpointDecisionStore,
@@ -1592,15 +1594,12 @@ impl<'a> RecoveryManager<'a> {
             return Ok(());
         }
 
-        let state_data = match state_data {
-            Some(data) => data,
-            None => {
-                return Err(DbError::Checkpoint(format!(
-                    "[LDB-6010] checkpoint {} sidecar is missing for external operators \
-                     {external_ops:?}",
-                    manifest.checkpoint_id
-                )));
-            }
+        let Some(state_data) = state_data else {
+            return Err(DbError::Checkpoint(format!(
+                "[LDB-6010] checkpoint {} sidecar is missing for external operators \
+                 {external_ops:?}",
+                manifest.checkpoint_id
+            )));
         };
 
         for (name, op) in &mut manifest.operator_states {
@@ -1643,7 +1642,7 @@ impl<'a> RecoveryManager<'a> {
     }
 
     /// Inner restore logic shared by the fast path and the fallback loop.
-    fn restore_from(&self, artifacts: CheckpointArtifacts) -> Result<RecoveredState, DbError> {
+    fn restore_from(artifacts: CheckpointArtifacts) -> Result<RecoveredState, DbError> {
         let CheckpointArtifacts {
             mut manifest,
             state_data,
@@ -1840,7 +1839,7 @@ impl<'a> RecoveryManager<'a> {
             }
             return Ok(None);
         }
-        let state = self.restore_from(artifacts)?;
+        let state = Self::restore_from(artifacts)?;
         Ok(Some(
             self.complete_restore(state, outcome, storage_id, storage_participant)
                 .await?,

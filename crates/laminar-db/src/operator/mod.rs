@@ -75,7 +75,7 @@ impl std::ops::Deref for RetainedBatch {
 #[cfg(feature = "cluster")]
 pub(crate) fn shuffle_routing_error(
     context: &str,
-    error: laminar_core::shuffle::ShuffleRoutingError,
+    error: &laminar_core::shuffle::ShuffleRoutingError,
 ) -> DbError {
     if error.is_not_ready() {
         DbError::ShuffleNotReady(format!("{context}: {error}"))
@@ -88,7 +88,7 @@ pub(crate) fn shuffle_routing_error(
 pub(crate) fn shuffle_send_error(
     context: &str,
     peer: u64,
-    error: std::io::Error,
+    error: &std::io::Error,
     sent_any: bool,
 ) -> DbError {
     if sent_any {
@@ -122,7 +122,7 @@ pub(crate) async fn send_shuffle_plan(
             .await
         {
             Ok(()) => sent_any = true,
-            Err(error) => return Err(shuffle_send_error(context, peer, error, sent_any)),
+            Err(error) => return Err(shuffle_send_error(context, peer, &error, sent_any)),
         }
     }
     Ok(())

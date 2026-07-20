@@ -580,6 +580,8 @@ impl ClusterKv for InMemoryKv {
     clippy::default_trait_access,
     clippy::missing_const_for_fn,
     clippy::must_use_candidate,
+    clippy::enum_variant_names,
+    clippy::trivially_copy_pass_by_ref,
     clippy::too_many_lines,
     missing_docs
 )]
@@ -2733,6 +2735,7 @@ impl BarrierCoordinator {
         discovered
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn announce_inner(
         &self,
         ann: &BarrierAnnouncement,
@@ -2939,7 +2942,7 @@ impl BarrierCoordinator {
                 .write_checked(ANNOUNCEMENT_KEY, json)
                 .await
                 .map_err(|error| format!("publish barrier announcement: {error}"))?;
-            return Ok(());
+            Ok(())
         }
 
         #[cfg(not(feature = "cluster"))]

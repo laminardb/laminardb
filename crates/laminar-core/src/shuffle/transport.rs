@@ -1898,6 +1898,10 @@ mod grpc {
 
     impl ShuffleSender {
         /// Empty sender; peers arrive via [`Self::register_peer`] or KV discovery.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the node ID is zero or the process incarnation is nil.
         #[must_use]
         pub fn new(local_id: ShufflePeerId, incarnation: Uuid) -> Self {
             assert!(local_id != 0, "shuffle sender node id must be nonzero");
@@ -2220,6 +2224,7 @@ mod grpc {
                 .await
         }
 
+        #[allow(clippy::too_many_lines)]
         async fn send_to_inner(
             &self,
             peer: ShufflePeerId,
@@ -2628,6 +2633,7 @@ mod grpc {
             Some(addr)
         }
 
+        #[allow(clippy::too_many_lines)]
         async fn connection_for(
             &self,
             peer: ShufflePeerId,
@@ -2811,6 +2817,7 @@ mod grpc {
     }
 
     /// Open a client-streaming call after the identity handshake completes.
+    #[allow(clippy::too_many_lines)]
     async fn open_call(call: OpenCall) -> io::Result<PeerConn> {
         let endpoint = crate::cluster::control::tls::client_endpoint(&call.addr.to_string())
             .map_err(io_err)?
@@ -4456,6 +4463,7 @@ mod grpc {
     }
 
     /// Consume the short-lived one-time handshake token and validate the leading `Hello`.
+    #[allow(clippy::too_many_arguments)]
     async fn admit_stream(
         stream: &mut tonic::Streaming<ShuffleFrame>,
         receiver_incarnation: Uuid,
@@ -4579,6 +4587,7 @@ mod grpc {
     /// Publish preceding-data completeness before making the barrier observable. A failed
     /// barrier enqueue cannot seal a checkpoint, while delaying this commit until after enqueue
     /// would let the consumer observe the barrier before its loss fence.
+    #[allow(clippy::too_many_arguments)]
     async fn publish_barrier(
         tx: &InboundTx,
         barrier_arrivals: &AtomicU64,
@@ -4922,6 +4931,7 @@ mod grpc {
 
     /// Forward one logical batch after validating certified vnode ownership. `Ok(false)` when the
     /// queue has closed.
+    #[allow(clippy::too_many_arguments)]
     async fn forward_routed_batch(
         tx: &InboundTx,
         fence: StreamFence,
@@ -5065,7 +5075,7 @@ mod grpc {
                 stream.sender_node_id,
                 PendingHandshake {
                     fence: stream,
-                    issued_at: now - HANDSHAKE_TOKEN_TTL,
+                    issued_at: now.checked_sub(HANDSHAKE_TOKEN_TTL).unwrap(),
                 },
             );
 
@@ -6134,7 +6144,7 @@ mod grpc {
             let decoded_bytes =
                 InboundBudget::validate_decoded(std::slice::from_ref(&batch)).unwrap();
             let metadata_bytes =
-                retained_batch_metadata_bytes(&"stage".to_string(), &vec![1], &batch).unwrap();
+                retained_batch_metadata_bytes(&"stage".to_string(), &[1], &batch).unwrap();
             reservation
                 .retain_decoded(decoded_bytes, metadata_bytes)
                 .unwrap();
@@ -6222,7 +6232,11 @@ mod grpc {
 
         fn fragment(index: u32, count: u32, total: u32, payload: Vec<u8>) -> RoutedData {
             RoutedData {
-                stage: (index == 0).then(|| "stage".into()).unwrap_or_default(),
+                stage: if index == 0 {
+                    "stage".into()
+                } else {
+                    Default::default()
+                },
                 routed_vnodes: (index == 0).then_some(vec![3]).unwrap_or_default(),
                 arrow_ipc: payload.into(),
                 recovery_gen: 4,

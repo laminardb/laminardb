@@ -1102,13 +1102,13 @@ fn observe_unrecovered_delivery_loss_incidents(
 }
 
 impl ConnectorPipelineCallback {
+    #[allow(clippy::unused_self)] // Cluster builds consult the installed controller.
     fn checkpoint_recovery_active(&self) -> bool {
         #[cfg(feature = "cluster")]
         {
-            return self
-                .cluster_controller
+            self.cluster_controller
                 .as_ref()
-                .is_some_and(|controller| controller.is_recovering());
+                .is_some_and(|controller| controller.is_recovering())
         }
         #[cfg(not(feature = "cluster"))]
         {
@@ -1445,6 +1445,7 @@ impl ConnectorPipelineCallback {
     }
 
     #[cfg(feature = "cluster")]
+    #[allow(clippy::too_many_lines)]
     async fn prepare_leader_quorum(
         tail: &LeaderTail,
         deadline: tokio::time::Instant,
@@ -2168,6 +2169,7 @@ impl ConnectorPipelineCallback {
     }
 
     #[cfg(feature = "cluster")]
+    #[allow(clippy::too_many_lines)]
     async fn await_rejected_follower_settlement(
         controller: &laminar_core::cluster::control::ClusterController,
         attempt: CheckpointAttempt,
@@ -2362,6 +2364,7 @@ impl ConnectorPipelineCallback {
     }
 
     #[cfg(feature = "cluster")]
+    #[allow(clippy::too_many_lines)]
     async fn wait_for_aligned_resume(
         has_cluster_shuffle: bool,
         controller: &laminar_core::cluster::control::ClusterController,
@@ -5081,11 +5084,11 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     fn checkpoint_control_wake(&self) -> Option<crate::pipeline::callback::CheckpointControlWake> {
         #[cfg(feature = "cluster")]
         {
-            return self.cluster_controller.as_ref().map(|controller| {
+            self.cluster_controller.as_ref().map(|controller| {
                 crate::pipeline::callback::CheckpointControlWake::new(
                     controller.checkpoint_announcement_watch(),
                 )
-            });
+            })
         }
         #[cfg(not(feature = "cluster"))]
         {

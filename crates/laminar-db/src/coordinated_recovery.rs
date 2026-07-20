@@ -341,14 +341,15 @@ impl RecoveryMonitor {
                             RecoverPhase::Prepare | RecoverPhase::Start { .. } => continue,
                         }
                     }
-                    Err(RecoveryControlError::Uncertain(_)) => continue,
+                    Err(
+                        RecoveryControlError::Uncertain(_) | RecoveryControlError::Superseded(_),
+                    ) => continue,
                     Ok(_) => {}
                     Err(RecoveryControlError::Conflict(error)) => {
                         tracing::error!(%error, "invalid active recovery intent");
                         self.hold_for_unknown_fault_audit(&db, &controller).await;
                         continue;
                     }
-                    Err(RecoveryControlError::Superseded(_)) => continue,
                 },
             }
             if !pending.is_empty() {
@@ -424,6 +425,7 @@ impl RecoveryMonitor {
     }
 
     /// Act on the leader's announcement: stop on `Prepare`, restore on `Start`.
+    #[allow(clippy::too_many_lines)]
     async fn observe(
         &mut self,
         db: &Arc<LaminarDB>,
@@ -845,6 +847,7 @@ impl RecoveryMonitor {
     /// It never joins the frozen restore quorum, acknowledges recovery, or opens its
     /// assignment-closed source gate. It may rebuild a gated local runtime to settle connector
     /// evidence before consuming the terminal.
+    #[allow(clippy::too_many_lines)]
     async fn observe_nonparticipant_release(
         &mut self,
         db: &Arc<LaminarDB>,
@@ -977,12 +980,16 @@ impl RecoveryMonitor {
                     }
                     return false;
                 }
-                Ok(Ok(None)) | Ok(Err(RecoveryControlError::Superseded(_))) => return false,
                 Ok(Err(RecoveryControlError::Uncertain(_)))
                     if tokio::time::Instant::now() < deadline =>
                 {
                     release_retry_delay(deadline, &mut backoff).await;
                 }
+                Ok(
+                    Ok(None)
+                    | Err(RecoveryControlError::Superseded(_) | RecoveryControlError::Uncertain(_)),
+                )
+                | Err(_) => return false,
                 Ok(Err(RecoveryControlError::Conflict(error))) => {
                     tracing::error!(
                         gen = release.round.id.generation,
@@ -994,7 +1001,6 @@ impl RecoveryMonitor {
                     }
                     return false;
                 }
-                Ok(Err(RecoveryControlError::Uncertain(_))) | Err(_) => return false,
             }
         };
         if !self.clear_authorized_pending_request(db) {
@@ -1590,20 +1596,16 @@ impl RecoveryMonitor {
         if self.published_local_request != Some(pending) {
             return false;
         }
-        match db.pending_recovery_fault.compare_exchange(
-            pending,
-            0,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => {
-                self.published_local_request = None;
-                true
-            }
-            Err(_) => {
-                self.published_local_request = None;
-                false
-            }
+        if db
+            .pending_recovery_fault
+            .compare_exchange(pending, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.published_local_request = None;
+            true
+        } else {
+            self.published_local_request = None;
+            false
         }
     }
 
@@ -1622,6 +1624,7 @@ impl RecoveryMonitor {
     /// leader-fenced committed terminal. Compact readiness is the durable prepare promise; the
     /// driver alone reads the exact roster and fault set before committing. Assignment/execution
     /// fences are retained across the whole prepare/commit barrier.
+    #[allow(clippy::too_many_lines)]
     async fn release_after_readiness_quorum(
         &mut self,
         db: &Arc<LaminarDB>,
@@ -1729,33 +1732,26 @@ impl RecoveryMonitor {
             }
         }
 
-        let _adoption =
-            match tokio::time::timeout_at(release_deadline, db.assignment_adoption_lock.lock())
-                .await
-            {
-                Ok(guard) => guard,
-                Err(_) => {
-                    tracing::error!(
-                        gen = release.round.id.generation,
-                        "release readiness could not retain assignment authority"
-                    );
-                    return false;
-                }
-            };
-        let _execution = match tokio::time::timeout_at(
+        let Ok(_adoption) =
+            tokio::time::timeout_at(release_deadline, db.assignment_adoption_lock.lock()).await
+        else {
+            tracing::error!(
+                gen = release.round.id.generation,
+                "release readiness could not retain assignment authority"
+            );
+            return false;
+        };
+        let Ok(_execution) = tokio::time::timeout_at(
             release_deadline,
             Arc::clone(&db.rotation_execution_fence).write_owned(),
         )
         .await
-        {
-            Ok(guard) => guard,
-            Err(_) => {
-                tracing::error!(
-                    gen = release.round.id.generation,
-                    "release readiness could not retain the execution fence"
-                );
-                return false;
-            }
+        else {
+            tracing::error!(
+                gen = release.round.id.generation,
+                "release readiness could not retain the execution fence"
+            );
+            return false;
         };
         if db.assignment_authority_revision.load(Ordering::Acquire) != authority_revision
             || !local_release_round_is_current(db, controller, &release.round)
@@ -1823,7 +1819,9 @@ impl RecoveryMonitor {
                         Ok(Ok(observed))
                             if observed
                                 == pending.round.fault_sequence(controller.instance_id()) => {}
-                        Ok(Ok(_)) | Ok(Err(RecoveryControlError::Superseded(_))) => return false,
+                        Ok(Ok(_) | Err(RecoveryControlError::Superseded(_))) | Err(_) => {
+                            return false;
+                        }
                         Ok(Err(RecoveryControlError::Uncertain(_))) => {
                             release_retry_delay(release_deadline, &mut backoff).await;
                             continue;
@@ -1842,7 +1840,6 @@ impl RecoveryMonitor {
                             );
                             return false;
                         }
-                        Err(_) => return false,
                     }
                     match tokio::time::timeout_at(
                         release_deadline,
@@ -1869,9 +1866,7 @@ impl RecoveryMonitor {
                             );
                             return false;
                         }
-                        Ok(Err(RecoveryControlError::Superseded(_)))
-                        | Ok(Ok(Some(_)))
-                        | Ok(Ok(None))
+                        Ok(Err(RecoveryControlError::Superseded(_)) | Ok(Some(_) | None))
                         | Err(_) => return false,
                     }
                     match tokio::time::timeout_at(
@@ -1916,9 +1911,11 @@ impl RecoveryMonitor {
                     )
                     .await
                     {
-                        Ok(Ok(ReleaseCommitStatus::Pending { .. })) => {}
+                        Ok(
+                            Ok(ReleaseCommitStatus::Pending { .. })
+                            | Err(RecoveryControlError::Uncertain(_)),
+                        ) => {}
                         Ok(Ok(ReleaseCommitStatus::Committed { terminal })) => break terminal,
-                        Ok(Err(RecoveryControlError::Uncertain(_))) => {}
                         Ok(Err(RecoveryControlError::Conflict(error))) => {
                             tracing::error!(
                                 gen = pending.round.id.generation,
@@ -1958,11 +1955,12 @@ impl RecoveryMonitor {
                 {
                     release_retry_delay(release_deadline, &mut terminal_backoff).await;
                 }
-                Ok(Some(_))
-                | Ok(None)
-                | Err(RecoveryControlError::Conflict(_))
-                | Err(RecoveryControlError::Superseded(_))
-                | Err(RecoveryControlError::Uncertain(_)) => {
+                Ok(Some(_) | None)
+                | Err(
+                    RecoveryControlError::Conflict(_)
+                    | RecoveryControlError::Superseded(_)
+                    | RecoveryControlError::Uncertain(_),
+                ) => {
                     self.defer_release_retry(db, controller, release.round.id.generation, false);
                     return false;
                 }
@@ -1989,7 +1987,7 @@ impl RecoveryMonitor {
                     }
                     return false;
                 }
-                Ok(Ok(None)) | Ok(Err(RecoveryControlError::Superseded(_))) => {
+                Ok(Ok(None) | Err(RecoveryControlError::Superseded(_))) => {
                     return false;
                 }
                 Ok(Err(RecoveryControlError::Uncertain(_))) => {
@@ -2709,6 +2707,7 @@ fn validate_cluster_attempt_settlement(
 /// outcomes always win; genuinely unresolved advancing attempts receive a create-once Abort under
 /// the exact recovery-round leader proof. Older gaps dominated by retained terminal authority do
 /// not need an impossible non-advancing backfill.
+#[allow(clippy::too_many_lines)]
 async fn settle_stopped_prepared_witnesses(
     db: &Arc<LaminarDB>,
     controller: &ClusterController,
@@ -2915,15 +2914,17 @@ async fn wait_stopped_quorum(
     timeout: Duration,
 ) -> StoppedQuorum {
     let deadline = tokio::time::Instant::now() + timeout;
-    match tokio::time::timeout_at(deadline, wait_stopped_quorum_until(controller, round)).await {
-        Ok(outcome) => outcome,
-        Err(_) => {
-            tracing::error!(gen = round.id.generation, "recovery stop quorum timed out");
-            StoppedQuorum::TimedOut
-        }
+    if let Ok(outcome) =
+        tokio::time::timeout_at(deadline, wait_stopped_quorum_until(controller, round)).await
+    {
+        outcome
+    } else {
+        tracing::error!(gen = round.id.generation, "recovery stop quorum timed out");
+        StoppedQuorum::TimedOut
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn wait_stopped_quorum_until(
     controller: &ClusterController,
     round: &RecoveryRound,
@@ -2968,15 +2969,17 @@ async fn wait_stopped_quorum_until(
                 continue;
             }
             Err(RecoveryControlError::Conflict(_)) => return StoppedQuorum::Conflicted,
-            Err(RecoveryControlError::Superseded(_)) => return StoppedQuorum::Superseded,
-            Ok(Some(active)) if active.round.id.generation > round.id.generation => {
+            Err(RecoveryControlError::Superseded(_)) | Ok(None) => {
                 return StoppedQuorum::Superseded;
             }
-            Ok(Some(active)) if active.round != *round || active.phase != RecoverPhase::Prepare => {
-                return StoppedQuorum::Conflicted;
+            Ok(Some(active)) => {
+                if active.round.id.generation > round.id.generation {
+                    return StoppedQuorum::Superseded;
+                }
+                if active.round != *round || active.phase != RecoverPhase::Prepare {
+                    return StoppedQuorum::Conflicted;
+                }
             }
-            Ok(None) => return StoppedQuorum::Superseded,
-            Ok(Some(_)) => {}
         }
         let missing = required
             .iter()
@@ -3047,15 +3050,16 @@ async fn wait_restored_quorum(
 ) -> RecoveryQuorum {
     let round = &start.round;
     let deadline = tokio::time::Instant::now() + timeout;
-    match tokio::time::timeout_at(deadline, wait_restored_quorum_until(controller, start)).await {
-        Ok(outcome) => outcome,
-        Err(_) => {
-            tracing::error!(
-                gen = round.id.generation,
-                "recovery restore quorum timed out"
-            );
-            RecoveryQuorum::TimedOut
-        }
+    if let Ok(outcome) =
+        tokio::time::timeout_at(deadline, wait_restored_quorum_until(controller, start)).await
+    {
+        outcome
+    } else {
+        tracing::error!(
+            gen = round.id.generation,
+            "recovery restore quorum timed out"
+        );
+        RecoveryQuorum::TimedOut
     }
 }
 
@@ -3083,17 +3087,17 @@ async fn wait_restored_quorum_until(
                 continue;
             }
             Err(RecoveryControlError::Conflict(_)) => return RecoveryQuorum::Conflicted,
-            Err(RecoveryControlError::Superseded(_)) => return RecoveryQuorum::Superseded,
-            Ok(Some(active)) if active.round.id.generation > round.id.generation => {
+            Err(RecoveryControlError::Superseded(_)) | Ok(None) => {
                 return RecoveryQuorum::Superseded;
             }
-            Ok(Some(active))
-                if active.round.id.generation == round.id.generation && active != *start =>
-            {
-                return RecoveryQuorum::Conflicted;
+            Ok(Some(active)) => {
+                if active.round.id.generation > round.id.generation {
+                    return RecoveryQuorum::Superseded;
+                }
+                if active.round.id.generation == round.id.generation && active != *start {
+                    return RecoveryQuorum::Conflicted;
+                }
             }
-            Ok(None) => return RecoveryQuorum::Superseded,
-            Ok(Some(_)) => {}
         }
         let Ok(reports) = controller.read_recovered().await else {
             return RecoveryQuorum::Conflicted;

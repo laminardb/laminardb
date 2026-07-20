@@ -24,6 +24,7 @@ azure = ["object_store/azure"]
 [dependencies]
 # Performance critical - no allocations on hot path
 rustc-hash = { workspace = true }
+ahash = { workspace = true }
 parking_lot = { workspace = true }
 bytes = { workspace = true }
 quick_cache = { workspace = true }

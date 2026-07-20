@@ -6,7 +6,7 @@
 //!
 //! Writes are bounded by fixed retained-memory and bulk limits and flushed when
 //! a bound is reached, `flush_interval` elapses, or shutdown begins.
-//! Keyed and CDC flushes use one ordered MongoDB 8+ bulk operation, preserving
+//! Keyed and CDC flushes use one ordered `MongoDB` 8+ bulk operation, preserving
 //! input order without a network round trip per row.
 
 use std::future::Future;
@@ -83,7 +83,7 @@ pub(super) fn harden_mongodb_tls(
                     .into(),
             ));
         }
-        Some(Tls::Enabled(_)) | Some(Tls::Disabled) => {}
+        Some(Tls::Enabled(_) | Tls::Disabled) => {}
         None => options.tls = Some(Tls::Enabled(TlsOptions::default())),
     }
     Ok(())
@@ -104,6 +104,8 @@ fn validate_existing_timeseries_spec(
     spec: &mongodb::results::CollectionSpecification,
     expected: &super::timeseries::TimeSeriesConfig,
 ) -> Result<(), ConnectorError> {
+    use super::timeseries::TimeSeriesGranularity;
+    use mongodb::options::TimeseriesGranularity as DriverGranularity;
     use mongodb::results::CollectionType;
 
     if spec.collection_type != CollectionType::Timeseries {
@@ -132,9 +134,6 @@ fn validate_existing_timeseries_spec(
             spec.name, actual.meta_field, expected.meta_field
         )));
     }
-
-    use super::timeseries::TimeSeriesGranularity;
-    use mongodb::options::TimeseriesGranularity as DriverGranularity;
 
     let granularity_matches = match expected.granularity {
         TimeSeriesGranularity::Seconds => match actual.granularity.as_ref() {
@@ -283,9 +282,10 @@ impl MongoDbSink {
 
     fn driver_timeout(&self) -> Duration {
         let headroom = (self.write_timeout / 5).min(MAX_DRIVER_TIMEOUT_HEADROOM);
-        self.write_timeout - headroom
+        self.write_timeout.checked_sub(headroom).unwrap()
     }
 
+    #[allow(clippy::too_many_lines)]
     fn validate_schema(
         schema: &SchemaRef,
         config: &MongoDbSinkConfig,
@@ -357,7 +357,7 @@ impl MongoDbSink {
                 for field in ["_namespace", "_op", "_document_key"] {
                     if schema
                         .field_with_name(field)
-                        .is_ok_and(|field| field.is_nullable())
+                        .is_ok_and(arrow_schema::Field::is_nullable)
                     {
                         return Err(ConnectorError::ConfigurationError(format!(
                             "MongoDB CDC replay field '{field}' must be non-nullable"
@@ -670,7 +670,7 @@ impl MongoDbSink {
                     .flush_inner()
                     .await
                     .map_err(|error| mongo_partial_batch_error(&result, error))?;
-                accumulate_write_result(&mut result, flushed);
+                accumulate_write_result(&mut result, &flushed);
             }
 
             self.retain_batch(chunk, chunk_retained_bytes);
@@ -680,7 +680,7 @@ impl MongoDbSink {
                     .flush_inner()
                     .await
                     .map_err(|error| mongo_partial_batch_error(&result, error))?;
-                accumulate_write_result(&mut result, flushed);
+                accumulate_write_result(&mut result, &flushed);
             }
         }
 
@@ -875,7 +875,7 @@ fn requires_preflush(
         .is_none_or(|total| total > retained_limit))
 }
 
-fn accumulate_write_result(total: &mut WriteResult, flushed: WriteResult) {
+fn accumulate_write_result(total: &mut WriteResult, flushed: &WriteResult) {
     total.records_written = total
         .records_written
         .saturating_add(flushed.records_written);
@@ -981,7 +981,7 @@ fn account_bson_document(
     Ok(())
 }
 
-/// Convert source-envelope JSON to BSON while interpreting MongoDB Extended JSON.
+/// Convert source-envelope JSON to BSON while interpreting `MongoDB` Extended JSON.
 /// Serde's structural conversion would store `$date` as a literal sub-document.
 fn json_to_bson(value: &serde_json::Value) -> Result<mongodb::bson::Bson, ConnectorError> {
     mongodb::bson::Bson::try_from(value.clone())
@@ -1101,11 +1101,11 @@ impl SinkConnector for MongoDbSink {
                 actual: self.state.to_string(),
             });
         }
-        if !config.properties().is_empty() {
-            self.apply_connector_config(config)?;
-        } else {
+        if config.properties().is_empty() {
             self.config.validate()?;
             Self::validate_schema(&self.schema, &self.config)?;
+        } else {
+            self.apply_connector_config(config)?;
         }
         self.connect().await?;
 
@@ -1547,6 +1547,7 @@ impl MongoDbSink {
     ///
     /// Accepts `serde_json::Value` directly (no intermediate string round-trip).
     /// Insert/upsert from documents already in BSON (no JSON hop).
+    #[allow(clippy::too_many_lines)]
     async fn write_bson_docs(
         &self,
         docs: Vec<mongodb::bson::Document>,
@@ -1719,6 +1720,7 @@ impl MongoDbSink {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn prepare_cdc_writes(
         docs: &[serde_json::Value],
         converted_limit: usize,
@@ -1966,6 +1968,7 @@ impl MongoDbSink {
     }
 }
 
+#[derive(Clone, Copy)]
 enum MongoBulkFailure<'a> {
     Driver(&'a mongodb::error::Error),
     Deadline(Duration),
@@ -2077,11 +2080,10 @@ fn classify_mongo_bulk_facts(facts: MongoBulkFailureFacts) -> MongoBulkDispositi
     // batches are still applied when the driver reports a partial result on the wrapper error.
     if facts.no_writes && !partial_result {
         let retryable = match facts.shape {
-            PreCommandTerminal => false,
-            Bulk {
+            PreCommandTerminal
+            | Bulk {
                 write_errors: true, ..
             } => false,
-            Command | WriteRejected => facts.retryable_signal,
             PreCommandTransient | Transport => true,
             _ => facts.retryable_signal,
         };
@@ -2091,9 +2093,6 @@ fn classify_mongo_bulk_facts(facts: MongoBulkFailureFacts) -> MongoBulkDispositi
     match facts.shape {
         PreCommandTransient => DefinitelyNotApplied { retryable: true },
         PreCommandTerminal => DefinitelyNotApplied { retryable: false },
-        Command => OutcomeUnknown {
-            retryable: facts.retryable_signal,
-        },
         WriteRejected => DefinitelyNotApplied {
             retryable: facts.retryable_signal,
         },
@@ -2109,7 +2108,7 @@ fn classify_mongo_bulk_facts(facts: MongoBulkFailureFacts) -> MongoBulkDispositi
             }
         }
         Transport | Deadline => OutcomeUnknown { retryable: true },
-        Bulk { .. } | WriteConcern | Unknown => OutcomeUnknown {
+        Command | Bulk { .. } | WriteConcern | Unknown => OutcomeUnknown {
             retryable: facts.retryable_signal,
         },
     }

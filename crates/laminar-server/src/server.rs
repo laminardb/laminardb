@@ -118,11 +118,11 @@ impl Drop for SingleServerRuntime {
             self.db.close();
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                 let db = Arc::clone(&self.db);
-                let _ = runtime.spawn(async move {
+                drop(runtime.spawn(async move {
                     if let Err(error) = db.shutdown().await {
                         warn!(%error, "Database cleanup after server handle drop failed");
                     }
-                });
+                }));
             }
         }
         if let Some(handle) = &self.watcher_handle {
@@ -879,8 +879,10 @@ mod tests {
 
     #[test]
     fn checkpoint_state_budget_rejects_zero_and_unaddressable_limits() {
-        let mut checkpoint = CheckpointSection::default();
-        checkpoint.max_staged_bytes = Some(0);
+        let mut checkpoint = CheckpointSection {
+            max_staged_bytes: Some(0),
+            ..CheckpointSection::default()
+        };
         assert!(resolved_checkpoint_state_bytes(&checkpoint).is_err());
 
         checkpoint.max_staged_bytes = Some((isize::MAX as u64) + 1);
@@ -910,8 +912,10 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_http_start_does_not_detach_the_listener() {
-        let mut server = ServerSection::default();
-        server.bind = "127.0.0.1:0".into();
+        let server = ServerSection {
+            bind: "127.0.0.1:0".into(),
+            ..ServerSection::default()
+        };
         let config = ServerConfig {
             server,
             state: StateBackendConfig::default(),

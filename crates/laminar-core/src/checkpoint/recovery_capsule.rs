@@ -273,6 +273,7 @@ impl ClusterRecoveryCapsule {
     ///
     /// # Errors
     /// Returns a description when the capsule cannot name one exact cluster recovery image.
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), String> {
         if self.version != CLUSTER_RECOVERY_CAPSULE_VERSION {
             return Err(format!(

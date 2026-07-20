@@ -83,3 +83,7 @@ agent_rules.md
 
 # Vendored library packages use the workspace lockfile.
 /vendor/*/Cargo.lock
+/examples/binance-ws/target
+/examples/binance-ws/target/debug
+/examples/binance-ws/target
+/examples/binance-ws/target
