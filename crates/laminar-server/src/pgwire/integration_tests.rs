@@ -434,11 +434,13 @@ async fn ddl_returns_pg_error_pointing_at_http() {
 
 fn md5_users() -> HashMap<String, Secret> {
     let mut u = HashMap::new();
-    u.insert("alice".to_string(), Secret::new(TEST_PASSWORD));
+    u.insert("alice".to_string(), Secret::new(test_password("alice")));
     u
 }
 
-const TEST_PASSWORD: &str = "wonderland-key";
+fn test_password(user: &str) -> String {
+    format!("{user}-test-{}", std::process::id())
+}
 
 async fn connect_with_password(
     addr: std::net::SocketAddr,
@@ -460,8 +462,9 @@ async fn connect_with_password(
 #[tokio::test]
 async fn md5_auth_accepts_correct_password() {
     let (addr, handle) = spawn_server_with(md5_users()).await;
+    let password = test_password("alice");
 
-    let client = connect_with_password(addr, "alice", TEST_PASSWORD)
+    let client = connect_with_password(addr, "alice", &password)
         .await
         .expect("auth must succeed");
 
@@ -477,24 +480,28 @@ async fn md5_auth_accepts_correct_password() {
 
 #[tokio::test]
 async fn concurrent_md5_challenges_are_session_isolated() {
+    let alice_password = test_password("alice");
+    let bob_password = test_password("bob");
     let mut users = HashMap::new();
-    users.insert("alice".to_owned(), Secret::new("alice-password"));
-    users.insert("bob".to_owned(), Secret::new("bob-password"));
+    users.insert("alice".to_owned(), Secret::new(alice_password.clone()));
+    users.insert("bob".to_owned(), Secret::new(bob_password.clone()));
     let (addr, handle) = spawn_server_with(users).await;
 
-    let attempts = (0..64).map(|index| async move {
+    let attempts = (0..64).map(|index| {
         let (user, password) = if index % 2 == 0 {
-            ("alice", "alice-password")
+            ("alice", alice_password.as_str())
         } else {
-            ("bob", "bob-password")
+            ("bob", bob_password.as_str())
         };
-        let client = connect_with_password(addr, user, password)
-            .await
-            .expect("concurrent authentication must succeed");
-        client
-            .simple_query("SELECT 1")
-            .await
-            .expect("authenticated session remains usable");
+        async move {
+            let client = connect_with_password(addr, user, password)
+                .await
+                .expect("concurrent authentication must succeed");
+            client
+                .simple_query("SELECT 1")
+                .await
+                .expect("authenticated session remains usable");
+        }
     });
     futures::future::join_all(attempts).await;
 
@@ -504,8 +511,9 @@ async fn concurrent_md5_challenges_are_session_isolated() {
 #[tokio::test]
 async fn md5_auth_rejects_wrong_password() {
     let (addr, handle) = spawn_server_with(md5_users()).await;
+    let wrong_password = test_password("wrong");
 
-    let err = connect_with_password(addr, "alice", "not-the-password")
+    let err = connect_with_password(addr, "alice", &wrong_password)
         .await
         .expect_err("auth must fail");
 
@@ -530,8 +538,9 @@ fn md5_users_prehashed(user: &str, password: &str) -> HashMap<String, Secret> {
 
 #[tokio::test]
 async fn md5_auth_accepts_correct_password_against_prehash() {
-    let (addr, handle) = spawn_server_with(md5_users_prehashed("alice", TEST_PASSWORD)).await;
-    let client = connect_with_password(addr, "alice", TEST_PASSWORD)
+    let password = test_password("alice");
+    let (addr, handle) = spawn_server_with(md5_users_prehashed("alice", &password)).await;
+    let client = connect_with_password(addr, "alice", &password)
         .await
         .expect("auth must succeed against pre-hashed entry");
     let messages = client
@@ -545,8 +554,10 @@ async fn md5_auth_accepts_correct_password_against_prehash() {
 
 #[tokio::test]
 async fn md5_auth_rejects_wrong_password_against_prehash() {
-    let (addr, handle) = spawn_server_with(md5_users_prehashed("alice", TEST_PASSWORD)).await;
-    let err = connect_with_password(addr, "alice", "not-the-password")
+    let password = test_password("alice");
+    let wrong_password = test_password("wrong");
+    let (addr, handle) = spawn_server_with(md5_users_prehashed("alice", &password)).await;
+    let err = connect_with_password(addr, "alice", &wrong_password)
         .await
         .expect_err("auth must fail");
     let db_err = err.as_db_error().expect("typed PG error");
@@ -578,8 +589,9 @@ fn parse_pre_hashed_md5_strict_format() {
 #[tokio::test]
 async fn md5_auth_rejects_unknown_user() {
     let (addr, handle) = spawn_server_with(md5_users()).await;
+    let password = test_password("mallory");
 
-    let err = connect_with_password(addr, "mallory", "anything")
+    let err = connect_with_password(addr, "mallory", &password)
         .await
         .expect_err("auth must fail");
 
@@ -664,7 +676,7 @@ async fn cancel_request_bypasses_full_session_cap() {
         "host=localhost hostaddr=127.0.0.1 port={} user=alice password={} \
          dbname=laminardb sslmode=prefer",
         addr.port(),
-        TEST_PASSWORD,
+        test_password("alice"),
     );
     let tls = make_client_tls(&cert_path, None);
     let (client, connection) = tokio_postgres::connect(&conn_str, tls)
