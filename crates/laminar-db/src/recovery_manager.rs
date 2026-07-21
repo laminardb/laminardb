@@ -484,7 +484,7 @@ impl ClusterPreparedDominance {
     }
 }
 
-impl<'a> RecoveryOutcomeAuthority<'a> {
+impl RecoveryOutcomeAuthority<'_> {
     const fn scope(self) -> CheckpointScope {
         match self {
             Self::Local(_) => CheckpointScope::Local,
@@ -521,8 +521,10 @@ impl<'a> RecoveryOutcomeAuthority<'a> {
                 .map_err(|error| DbError::Checkpoint(error.to_string())),
         }
     }
+}
 
-    #[cfg(feature = "cluster")]
+#[cfg(feature = "cluster")]
+impl<'a> RecoveryOutcomeAuthority<'a> {
     const fn capsule_store(
         self,
     ) -> Option<&'a laminar_core::checkpoint_decision::CheckpointDecisionStore> {
@@ -665,7 +667,6 @@ impl<'a> RecoveryManager<'a> {
     }
 
     #[cfg(feature = "cluster")]
-    #[allow(clippy::too_many_lines)]
     async fn load_cluster_committed_outcome(
         &self,
         outcome: &CheckpointOutcome,
@@ -1020,7 +1021,6 @@ impl<'a> RecoveryManager<'a> {
         Ok(inventory.outcomes)
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn settle_local_prepared_attempts(
         &self,
         decision_store: &laminar_core::checkpoint_decision::CheckpointDecisionStore,
@@ -2587,7 +2587,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = make_store(dir.path());
 
-        // Build a manifest with an external operator state
         let mut manifest = finalized_manifest(5);
         let large_data = vec![0xAB; 2048];
         manifest

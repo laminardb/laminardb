@@ -1289,7 +1289,6 @@ impl PostgresCdcSource {
     /// one transaction would restore before rows already included in the checkpoint. When the
     /// first queued transaction is larger than `max`, emit it whole; the configured hard event
     /// and byte limits remain the memory bound.
-    #[allow(clippy::too_many_lines)]
     fn drain_events(&mut self, max: usize) -> Result<Option<RecordBatch>, ConnectorError> {
         if self.committed_transactions.is_empty() || max == 0 {
             return Ok(None);
@@ -1484,7 +1483,6 @@ impl PostgresCdcSource {
 }
 
 #[async_trait]
-#[allow(clippy::too_many_lines)]
 impl SourceConnector for PostgresCdcSource {
     fn terminal_task_tracker(&self) -> Option<ConnectorTaskTracker> {
         Some(self.task_tracker.clone())
@@ -3308,7 +3306,6 @@ mod tests {
         let result = src.poll_batch(100).await.unwrap();
         assert!(result.is_none());
 
-        // Now commit
         src.enqueue_wal_data(PostgresCdcSource::build_commit_message(0x100, 0x200, 0));
 
         let batch = src.poll_batch(100).await.unwrap().unwrap();

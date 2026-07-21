@@ -4,8 +4,6 @@
 //! sequence cursor and a wake-up receiver. Arrow allocations are charged once
 //! and shared by the byte-bounded log and any frame currently in transit.
 
-#![allow(clippy::disallowed_types)] // subscription setup is a cold path
-
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};

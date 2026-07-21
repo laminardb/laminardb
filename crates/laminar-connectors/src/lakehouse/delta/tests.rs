@@ -836,7 +836,6 @@ async fn upsert_collapses_aggregating_mv_to_current_state() {
         .await
         .unwrap();
 
-    // First cut: two brand-new groups.
     flush_batch(
         &mut sink,
         &zset_changelog(&[("east", 10, 1), ("west", 5, 1)]),
@@ -1143,7 +1142,6 @@ async fn coordinated_recovery_reads_namespaced_checkpoint_id() {
 /// advancing the cursor to the batch target.
 #[cfg(feature = "delta-lake")]
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn coordinated_failover_overlap_does_not_duplicate_committed_attempt() {
     use crate::connector::{
         CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
@@ -1299,7 +1297,6 @@ async fn coordinated_open_caches_configured_writer_properties() {
 
 #[cfg(feature = "delta-lake")]
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn coordinated_unresolved_publication_allows_only_the_exact_batch_retry() {
     use crate::connector::{
         CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,

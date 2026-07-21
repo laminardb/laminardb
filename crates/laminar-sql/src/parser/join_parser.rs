@@ -1128,7 +1128,6 @@ impl MultiJoinAnalysis {
 ///
 /// Returns `ParseError::StreamingError` if any join constraint is
 /// not supported or key columns cannot be extracted.
-#[allow(clippy::too_many_lines)]
 pub fn analyze_joins(select: &Select) -> Result<Option<MultiJoinAnalysis>, ParseError> {
     let from = &select.from;
     if from.is_empty() {

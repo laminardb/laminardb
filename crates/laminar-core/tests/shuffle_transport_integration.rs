@@ -101,8 +101,8 @@ async fn two_nodes_exchange_data_bidirectionally() {
     send_b
         .install_assignment_fence(&fence, &ASSIGNMENT_OWNERS)
         .unwrap();
-    send_a.register_peer(2, addr_b).await;
-    send_b.register_peer(1, addr_a).await;
+    send_a.register_peer(2, addr_b);
+    send_b.register_peer(1, addr_a);
 
     // A → B: three pre-routed batches.
     send_a
@@ -223,7 +223,7 @@ async fn fragmented_batch_is_delivered_before_its_barrier() {
     sender
         .install_assignment_fence(&fence, &ASSIGNMENT_OWNERS)
         .unwrap();
-    sender.register_peer(2, receiver.local_addr()).await;
+    sender.register_peer(2, receiver.local_addr());
 
     sender
         .send_to(

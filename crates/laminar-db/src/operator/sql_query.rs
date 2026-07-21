@@ -188,11 +188,6 @@ impl SqlQueryOperator {
     fn skip_whole_node_agg(&self) -> bool {
         self.delta_chain_bound.is_some() || self.vnode_partials_authoritative
     }
-    #[cfg(not(feature = "cluster"))]
-    #[allow(clippy::unused_self)] // mirrors the cluster variant's `&self` signature
-    fn skip_whole_node_agg(&self) -> bool {
-        false
-    }
 
     #[cfg(feature = "cluster")]
     pub fn attach_cluster_shuffle(&mut self, config: ClusterShuffleConfig) {
@@ -215,48 +210,49 @@ impl SqlQueryOperator {
         newly
     }
 
-    #[allow(clippy::unnecessary_wraps)] // Cluster builds can fail while merging vnode slices.
+    #[cfg(feature = "cluster")]
     fn staged_pending_restore(&self) -> Result<Option<AggStateCheckpoint>, DbError> {
-        #[cfg(feature = "cluster")]
-        {
-            if self.pending_restore_slices.is_empty() {
-                return Ok(self.pending_restore.clone());
-            }
-            let mut slices = Vec::with_capacity(
-                self.pending_restore_slices
-                    .len()
-                    .saturating_add(usize::from(self.pending_restore.is_some())),
-            );
-            if let Some(checkpoint) = &self.pending_restore {
-                slices.push(Bytes::from(serialize_agg_cp(checkpoint, &self.op_name)?));
-            }
-            slices.extend(self.pending_restore_slices.iter().cloned());
-            let merged = merge_serialized_agg_cps(&slices).map_err(|error| {
+        if self.pending_restore_slices.is_empty() {
+            return Ok(self.pending_restore.clone());
+        }
+        let mut slices = Vec::with_capacity(
+            self.pending_restore_slices
+                .len()
+                .saturating_add(usize::from(self.pending_restore.is_some())),
+        );
+        if let Some(checkpoint) = &self.pending_restore {
+            slices.push(Bytes::from(serialize_agg_cp(checkpoint, &self.op_name)?));
+        }
+        slices.extend(self.pending_restore_slices.iter().cloned());
+        let merged = merge_serialized_agg_cps(&slices).map_err(|error| {
+            DbError::Checkpoint(format!(
+                "aggregate '{}' vnode baseline merge failed: {error}",
+                self.op_name
+            ))
+        })?;
+        rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(&merged)
+            .map(Some)
+            .map_err(|error| {
                 DbError::Checkpoint(format!(
-                    "aggregate '{}' vnode baseline merge failed: {error}",
+                    "aggregate '{}' merged vnode baseline decode failed: {error}",
                     self.op_name
                 ))
-            })?;
-            rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(&merged)
-                .map(Some)
-                .map_err(|error| {
-                    DbError::Checkpoint(format!(
-                        "aggregate '{}' merged vnode baseline decode failed: {error}",
-                        self.op_name
-                    ))
-                })
-        }
-        #[cfg(not(feature = "cluster"))]
-        {
-            Ok(self.pending_restore.clone())
-        }
+            })
+    }
+
+    #[cfg(not(feature = "cluster"))]
+    fn staged_pending_restore(&self) -> Option<AggStateCheckpoint> {
+        self.pending_restore.clone()
     }
 
     #[allow(clippy::too_many_lines)]
     async fn lazy_init(&mut self) -> Result<(), DbError> {
         match IncrementalAggState::try_from_sql(&self.ctx, &self.sql, self.emit_changelog).await {
             Ok(Some(mut agg_state)) => {
+                #[cfg(feature = "cluster")]
                 let staged_pending_restore = self.staged_pending_restore()?;
+                #[cfg(not(feature = "cluster"))]
+                let staged_pending_restore = self.staged_pending_restore();
                 if let Some(ref cp) = staged_pending_restore {
                     let restored = agg_state.restore_groups(cp).map_err(|error| {
                         DbError::Checkpoint(format!(
@@ -916,11 +912,24 @@ impl GraphOperator for SqlQueryOperator {
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
         // When the delta chain is authoritative, aggregate groups are NOT captured into the
         // whole-node manifest blob — they live in (and recover from) per-vnode partials.
-        let agg: Option<AggStateCheckpoint> = if self.skip_whole_node_agg() {
+        #[cfg(feature = "cluster")]
+        let skip_whole_node_agg = self.skip_whole_node_agg();
+        #[cfg(not(feature = "cluster"))]
+        let skip_whole_node_agg = false;
+        let agg: Option<AggStateCheckpoint> = if skip_whole_node_agg {
             None
         } else {
             match self.state {
-                QueryState::Uninit => self.staged_pending_restore()?,
+                QueryState::Uninit => {
+                    #[cfg(feature = "cluster")]
+                    {
+                        self.staged_pending_restore()?
+                    }
+                    #[cfg(not(feature = "cluster"))]
+                    {
+                        self.staged_pending_restore()
+                    }
+                }
                 QueryState::Agg(ref mut agg_state) => Some(agg_state.checkpoint_groups()?),
                 QueryState::Compiled(_)
                 | QueryState::CachedPlan(_)
@@ -1117,8 +1126,6 @@ impl GraphOperator for SqlQueryOperator {
     }
 
     #[cfg(feature = "cluster")]
-    #[allow(clippy::disallowed_types)] // checkpoint path; vnode-keyed map
-    #[allow(clippy::too_many_lines)]
     fn checkpoint_by_vnode(
         &mut self,
         vnode_count: u32,
@@ -2363,8 +2370,7 @@ mod delta_primary_tests {
             Field::new("val", DataType::Int64, false),
         ]));
         let keys: Vec<String> = (0..GROUPS).map(|k| format!("k{k}")).collect();
-        #[allow(clippy::cast_possible_wrap)]
-        let vals: Vec<i64> = (0..GROUPS as i64).collect();
+        let vals: Vec<i64> = (0_i64..500).collect();
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![

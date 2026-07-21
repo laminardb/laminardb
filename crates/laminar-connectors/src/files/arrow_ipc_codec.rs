@@ -74,7 +74,7 @@ impl FormatDecoder for ArrowIpcDecoder {
             .map_err(|e| SchemaError::DecodeError(format!("Arrow IPC concat error: {e}")))
     }
 
-    fn format_name(&self) -> &str {
+    fn format_name(&self) -> &'static str {
         "arrow_ipc"
     }
 }
@@ -118,7 +118,7 @@ impl FormatEncoder for ArrowIpcEncoder {
         Ok(vec![buf])
     }
 
-    fn format_name(&self) -> &str {
+    fn format_name(&self) -> &'static str {
         "arrow_ipc"
     }
 }

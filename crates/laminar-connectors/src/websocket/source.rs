@@ -128,7 +128,6 @@ impl WebSocketSource {
 
     /// Spawns the WebSocket reader task that connects to the server and
     /// feeds messages through the bounded channel.
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn spawn_reader(
         urls: Vec<String>,
         subscribe_message: Option<String>,

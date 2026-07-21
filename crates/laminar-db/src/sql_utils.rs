@@ -287,7 +287,6 @@ fn validate_insert_literal(
 ///
 /// Returns `DbError::InsertError` if the batch cannot be constructed.
 #[allow(clippy::cast_possible_truncation)] // SQL float literals widened to Arrow f32
-#[allow(clippy::too_many_lines)]
 pub fn sql_values_to_record_batch(
     schema: &arrow::datatypes::SchemaRef,
     values: &[Vec<sqlparser::ast::Expr>],

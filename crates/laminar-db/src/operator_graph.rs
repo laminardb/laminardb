@@ -80,7 +80,6 @@ pub(crate) trait GraphOperator: Send {
     /// Per-vnode state snapshot for cross-node rehydration. `None` for operators
     /// that don't key state by vnode (they recover from the whole-node manifest).
     #[cfg(feature = "cluster")]
-    #[allow(clippy::disallowed_types)] // checkpoint path; vnode-keyed map
     fn checkpoint_by_vnode(
         &mut self,
         _vnode_count: u32,
@@ -1762,14 +1761,15 @@ impl OperatorGraph {
         let emit_changelog =
             incremental || emit_clause.is_some_and(|ec| matches!(ec, EmitClause::Changes));
 
-        #[cfg_attr(not(feature = "cluster"), allow(unused_mut))]
-        let mut op = operator::sql_query::SqlQueryOperator::new(
+        let op = operator::sql_query::SqlQueryOperator::new(
             name,
             sql,
             self.ctx.clone(),
             self.prom.clone(),
             emit_changelog,
         );
+        #[cfg(feature = "cluster")]
+        let mut op = op;
         #[cfg(feature = "cluster")]
         if let Some(ref cfg) = self.cluster_shuffle {
             op.attach_cluster_shuffle(cfg.clone());
@@ -2220,7 +2220,6 @@ impl OperatorGraph {
         .await
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn execute_cycle_with_mode(
         &mut self,
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
@@ -3909,7 +3908,6 @@ mod tests {
             receiver,
             self_id,
         });
-        #[allow(clippy::disallowed_types)] // matches the public rehydration-handle shape
         let staged = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::from([
             (0, crate::db::RehydratedVnode { epoch: 7, chain }),
         ])));
@@ -3962,13 +3960,9 @@ mod tests {
                 .unwrap(),
         );
         let local_sender = ShuffleSender::new(1, uuid::Uuid::from_u128(1));
-        local_sender
-            .register_peer(2, remote_receiver.local_addr())
-            .await;
+        local_sender.register_peer(2, remote_receiver.local_addr());
         let remote_sender = ShuffleSender::new(2, uuid::Uuid::from_u128(2));
-        remote_sender
-            .register_peer(1, local_receiver.local_addr())
-            .await;
+        remote_sender.register_peer(1, local_receiver.local_addr());
         let local_process_deadline =
             Arc::new(laminar_core::cluster::control::LeaseDeadline::live_for(
                 std::time::Duration::from_secs(60),
@@ -4103,12 +4097,8 @@ mod tests {
         }
 
         let local_sender = ShuffleSender::new(1, uuid::Uuid::from_u128(1));
-        local_sender
-            .register_peer(2, peer_two_receiver.local_addr())
-            .await;
-        local_sender
-            .register_peer(3, waiting_peer_receiver.local_addr())
-            .await;
+        local_sender.register_peer(2, peer_two_receiver.local_addr());
+        local_sender.register_peer(3, waiting_peer_receiver.local_addr());
         local_sender
             .install_process_lease_deadline(local_process_deadline)
             .unwrap();
@@ -4116,12 +4106,8 @@ mod tests {
             .install_assignment_fence(&fence, &[1, 2, 3])
             .unwrap();
         let peer_two_sender = ShuffleSender::new(2, uuid::Uuid::from_u128(2));
-        peer_two_sender
-            .register_peer(1, local_receiver.local_addr())
-            .await;
-        peer_two_sender
-            .register_peer(3, waiting_peer_receiver.local_addr())
-            .await;
+        peer_two_sender.register_peer(1, local_receiver.local_addr());
+        peer_two_sender.register_peer(3, waiting_peer_receiver.local_addr());
         peer_two_sender
             .install_process_lease_deadline(peer_two_process_deadline)
             .unwrap();
@@ -4129,12 +4115,8 @@ mod tests {
             .install_assignment_fence(&fence, &[1, 2, 3])
             .unwrap();
         let peer_three_sender = ShuffleSender::new(3, uuid::Uuid::from_u128(3));
-        peer_three_sender
-            .register_peer(1, local_receiver.local_addr())
-            .await;
-        peer_three_sender
-            .register_peer(2, peer_two_receiver.local_addr())
-            .await;
+        peer_three_sender.register_peer(1, local_receiver.local_addr());
+        peer_three_sender.register_peer(2, peer_two_receiver.local_addr());
         peer_three_sender
             .install_process_lease_deadline(peer_three_process_deadline)
             .unwrap();
@@ -4456,9 +4438,7 @@ mod tests {
         );
         let live_peer_three = harness.waiting_peer_receiver.local_addr();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        sender
-            .register_peer(3, listener.local_addr().unwrap())
-            .await;
+        sender.register_peer(3, listener.local_addr().unwrap());
         let accepted = Arc::new(tokio::sync::Notify::new());
         let stalled_peer = {
             let accepted = Arc::clone(&accepted);
@@ -4501,7 +4481,7 @@ mod tests {
             .local_receiver
             .retire_checkpoint_barriers(cancelled, harness.fence.digest())
             .unwrap();
-        sender.register_peer(3, live_peer_three).await;
+        sender.register_peer(3, live_peer_three);
         assert!(sender
             .install_assignment_fence(&harness.fence, &[1, 2, 3])
             .unwrap());

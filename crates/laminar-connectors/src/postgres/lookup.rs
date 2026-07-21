@@ -348,7 +348,6 @@ fn enforce_lookup_result_bytes(batch: &RecordBatch) -> Result<(), LookupError> {
 }
 
 impl LookupSource for PostgresLookupSource {
-    #[allow(clippy::too_many_lines)]
     async fn query(
         &self,
         keys: &[&[u8]],
@@ -499,8 +498,7 @@ impl LookupSource for PostgresLookupSource {
         }
     }
 
-    #[allow(clippy::unnecessary_literal_bound)]
-    fn source_name(&self) -> &str {
+    fn source_name(&self) -> &'static str {
         "postgres"
     }
 
@@ -536,7 +534,6 @@ fn discard_pool_client(client: deadpool_postgres::Client) {
 
 /// Build a `deadpool` pool from libpq-style properties (individual keys or a
 /// pre-formed `connection`/`connection_string` parsed via `tokio_postgres`).
-#[allow(clippy::too_many_lines)]
 fn build_pool(props: &HashMap<String, String>, pool_size: usize) -> Result<Pool, LookupError> {
     if pool_size == 0 || pool_size > MAX_POOL_SIZE {
         return Err(LookupError::Connection(format!(

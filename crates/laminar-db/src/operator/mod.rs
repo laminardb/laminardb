@@ -320,7 +320,7 @@ mod shuffle_tests {
             )))
             .unwrap();
         sender.install_assignment_fence(&fence, &[1, 2, 3]).unwrap();
-        sender.register_peer(2, receiver.local_addr()).await;
+        sender.register_peer(2, receiver.local_addr());
         (sender, receiver)
     }
 

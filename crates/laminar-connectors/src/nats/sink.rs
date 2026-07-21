@@ -402,7 +402,6 @@ impl Drop for NatsSink {
 }
 
 // `async_trait` reports this cohesive lifecycle implementation as one generated function.
-#[allow(clippy::too_many_lines)]
 #[async_trait]
 impl SinkConnector for NatsSink {
     fn terminal_task_tracker(&self) -> Option<ConnectorTaskTracker> {

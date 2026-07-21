@@ -2735,7 +2735,6 @@ impl BarrierCoordinator {
         discovered
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn announce_inner(
         &self,
         ann: &BarrierAnnouncement,

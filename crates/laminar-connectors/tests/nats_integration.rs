@@ -537,7 +537,6 @@ async fn dedup_survives_broker_restart() {
         .await
         .expect("sink open");
 
-    // First run: publish rows 0..50.
     sink.write_batch(&dedup_batch(0..50))
         .await
         .expect("first batch publish");

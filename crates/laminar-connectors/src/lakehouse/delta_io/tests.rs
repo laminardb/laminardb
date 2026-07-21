@@ -844,7 +844,6 @@ async fn coordinated_cursor_rejects_token_change_stale_fence_and_checkpoint_roll
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn coordinated_race_serializes_cursor_and_permanently_fences_stale_writer() {
     use crate::connector::CoordinatedCommitCursor;
 
@@ -1108,7 +1107,6 @@ async fn coordinated_descriptor_batch_rejects_mixed_table_bindings() {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn coordinated_late_exact_commit_and_higher_batch_cannot_both_win() {
     use crate::connector::{
         CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
@@ -1867,7 +1865,6 @@ async fn test_schema_evolution_adds_column() {
     let temp_dir = TempDir::new().unwrap();
     let table_path = temp_dir.path().to_str().unwrap();
 
-    // Create table with 2-column schema.
     let schema_v1 = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("name", DataType::Utf8, true),

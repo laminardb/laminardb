@@ -168,7 +168,6 @@ pub(super) async fn connect(
 /// # Errors
 ///
 /// Returns an error when slot lookup, identity validation, or LSN parsing fails.
-#[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
 pub(super) async fn inspect_replication_slot(
     client: &tokio_postgres::Client,
@@ -377,7 +376,6 @@ fn map_control_system_query_error(error: &tokio_postgres::Error) -> ConnectorErr
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn validate_replication_slot(
     slot_name: &str,
     expected_plugin: &str,

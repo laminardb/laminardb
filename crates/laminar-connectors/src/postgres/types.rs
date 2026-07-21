@@ -264,7 +264,6 @@ fn validate_timestamp_values(
 
 /// Converts an Arrow column to a `PostgreSQL` array parameter for UNNEST.
 #[cfg(feature = "postgres-sink")]
-#[allow(clippy::too_many_lines)]
 pub(super) fn arrow_column_to_pg_array(
     array: &dyn arrow_array::Array,
 ) -> Result<Box<dyn postgres_types::ToSql + Sync + Send>, ConnectorError> {

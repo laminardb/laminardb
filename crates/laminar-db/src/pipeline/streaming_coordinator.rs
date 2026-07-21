@@ -35,8 +35,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::callback::{
     BarrierOutcome, CheckpointAssignmentAdmission, CheckpointCompletion, CheckpointControlOutcome,
-    CycleError, CycleOutcome, PipelineCallback, SourceBarrierControl, SourceBarrierSignal,
-    SourceRegistration,
+    CheckpointControlWake, CycleError, CycleOutcome, PipelineCallback, SourceBarrierControl,
+    SourceBarrierSignal, SourceRegistration,
 };
 #[cfg(test)]
 use super::config::CheckpointSchedule;
@@ -1266,10 +1266,6 @@ fn try_source_checkpoint(
 /// Apply the newest durable commit notification while no source poll borrows
 /// the connector. Non-best-effort pipelines fault if upstream acknowledgement
 /// fails because silently continuing can exhaust upstream retention or acknowledgement headroom.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "source commit acknowledgement is one fenced connector protocol boundary"
-)]
 async fn acknowledge_latest_source_commit(
     connector: &mut dyn SourceConnector,
     epoch_committed_rx: &mut tokio::sync::watch::Receiver<Option<(u64, SourceCheckpoint)>>,
@@ -1327,11 +1323,6 @@ async fn acknowledge_latest_source_commit(
 }
 
 #[cfg(feature = "cluster")]
-#[allow(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "a source drain command is one fenced provider state-machine transition"
-)]
 async fn apply_latest_source_drain_command_fenced(
     connector: &mut dyn SourceConnector,
     command_rx: &mut tokio::sync::watch::Receiver<Option<SourceDrainCommand>>,
@@ -2101,10 +2092,6 @@ async fn poll_source_once(
 
 /// Backoff between completed polls while still servicing durable commit
 /// notifications immediately. This never races a live `poll_batch` future.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "idle waiting multiplexes the complete source actor protocol boundary"
-)]
 async fn wait_source_idle(
     connector: &mut dyn SourceConnector,
     epoch_committed_rx: &mut tokio::sync::watch::Receiver<Option<(u64, SourceCheckpoint)>>,
@@ -2198,10 +2185,6 @@ async fn wait_source_idle(
 }
 
 #[cfg(feature = "cluster")]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the drain hold must select over explicit connector, lease, commit, and shutdown fences"
-)]
 async fn wait_source_drain_hold(
     connector: &mut dyn SourceConnector,
     epoch_committed_rx: &mut tokio::sync::watch::Receiver<Option<(u64, SourceCheckpoint)>>,
@@ -2280,11 +2263,6 @@ fn source_barrier_release_covers(released: CheckpointAttempt, held: CheckpointAt
 ///
 /// The retained watch value closes the release-before-wait race. While held, the source keeps its
 /// connector control plane and durable upstream acknowledgements live, but never polls data.
-#[allow(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    reason = "barrier hold is one source control-plane state machine"
-)]
 async fn wait_source_barrier_release(
     connector: &mut dyn SourceConnector,
     epoch_committed_rx: &mut tokio::sync::watch::Receiver<Option<(u64, SourceCheckpoint)>>,
@@ -2590,7 +2568,6 @@ impl StreamingCoordinator {
     }
 
     #[cfg(all(test, feature = "cluster"))]
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new_with_source_registry(
         sources: Vec<SourceRegistration>,
         config: PipelineConfig,
@@ -2620,7 +2597,6 @@ impl StreamingCoordinator {
         .await
     }
 
-    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     pub(crate) async fn new_with_tracked_source_registry(
         sources: Vec<TrackedSourceRegistration>,
         config: PipelineConfig,
@@ -2629,8 +2605,8 @@ impl StreamingCoordinator {
         source_gate: Arc<std::sync::atomic::AtomicBool>,
         #[cfg(feature = "cluster")] source_process_authority: Option<Arc<ClusterController>>,
         owned_source_tasks: OwnedSourceTasks,
-        #[cfg_attr(not(feature = "cluster"), allow(unused_variables))]
-        runtime_mode: crate::db::RuntimeMode,
+        #[cfg(feature = "cluster")] runtime_mode: crate::db::RuntimeMode,
+        #[cfg(not(feature = "cluster"))] _runtime_mode: crate::db::RuntimeMode,
     ) -> Result<Self, DbError> {
         if config
             .checkpoint_schedule
@@ -4398,7 +4374,6 @@ impl StreamingCoordinator {
         self.run_inner(callback, Some(ready)).await
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn run_inner<C: PipelineCallback>(
         mut self,
         mut callback: C,
@@ -4479,7 +4454,6 @@ impl StreamingCoordinator {
                 && !external_commit_paused
                 && !intake_paused
                 && self.parked_source_msg.is_some();
-            // Wait for data, shutdown, or idle timeout.
             let mut retrying_replay = false;
             let mut checkpoint_control_due = false;
             let msg = tokio::select! {
@@ -4509,9 +4483,9 @@ impl StreamingCoordinator {
                         continue;
                     }
                     checkpoint_control_due = true;
-                    if let Some(wake) = checkpoint_control_wake.as_ref() {
+                    if checkpoint_control_wake.is_some() {
                         checkpoint_control_poll_at =
-                            tokio::time::Instant::now() + wake.capacity_retry();
+                            tokio::time::Instant::now() + CheckpointControlWake::capacity_retry();
                     }
                     None
                 }
@@ -4533,9 +4507,9 @@ impl StreamingCoordinator {
                 }, if !checkpoint_control_pending && !callback.is_leader() => {
                     checkpoint_control_pending = true;
                     checkpoint_control_due = true;
-                    if let Some(wake) = checkpoint_control_wake.as_ref() {
+                    if checkpoint_control_wake.is_some() {
                         checkpoint_control_poll_at =
-                            tokio::time::Instant::now() + wake.capacity_retry();
+                            tokio::time::Instant::now() + CheckpointControlWake::capacity_retry();
                     }
                     None
                 },
@@ -4543,9 +4517,9 @@ impl StreamingCoordinator {
                     if checkpoint_control_pending && !callback.is_leader() =>
                 {
                     checkpoint_control_due = true;
-                    if let Some(wake) = checkpoint_control_wake.as_ref() {
+                    if checkpoint_control_wake.is_some() {
                         checkpoint_control_poll_at =
-                            tokio::time::Instant::now() + wake.capacity_retry();
+                            tokio::time::Instant::now() + CheckpointControlWake::capacity_retry();
                     }
                     None
                 },
@@ -4650,17 +4624,16 @@ impl StreamingCoordinator {
 
             // Coalesce additional buffered messages; stop at count, time budget, or backpressure.
             let mut drain_count = 0;
-            let drain_budget_ns = self.config.drain_budget_ns;
+            let drain_budget = Duration::from_nanos(self.config.drain_budget_ns);
             // `is_backpressured()` bumps a counter, so call it only on active wakeups rather than
             // idle timeouts.
             let backpressured = had_data && callback.is_backpressured();
             if backpressured {
                 tracing::debug!("operator graph backpressured — skipping drain");
             }
-            #[allow(clippy::cast_possible_truncation)]
             while !backpressured
                 && drain_count < MAX_DRAIN_PER_CYCLE
-                && (cycle_start.elapsed().as_nanos() as u64) < drain_budget_ns
+                && cycle_start.elapsed() < drain_budget
             {
                 match self.rx.try_recv() {
                     Ok(msg) => {
@@ -4781,8 +4754,8 @@ impl StreamingCoordinator {
                         }
                     }
                 }
-                #[allow(clippy::cast_possible_truncation)]
-                let elapsed_ns = cycle_start.elapsed().as_nanos() as u64;
+                let elapsed_ns =
+                    u64::try_from(cycle_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 callback.record_cycle(cycle_events, 0, elapsed_ns);
 
                 if elapsed_ns >= self.config.cycle_budget_ns {
@@ -4853,8 +4826,7 @@ impl StreamingCoordinator {
                 break;
             }
 
-            #[allow(clippy::cast_possible_truncation)]
-            let within_background_budget = (bg_start.elapsed().as_nanos() as u64) < bg_budget;
+            let within_background_budget = bg_start.elapsed() < Duration::from_nanos(bg_budget);
             let follower_control_ready =
                 checkpoint_control_pending && checkpoint_control_due && !callback.is_leader();
             let checkpoint_work_due =
@@ -4865,15 +4837,26 @@ impl StreamingCoordinator {
             {
                 let control_serviced = self.maybe_checkpoint(&mut callback).await;
                 if follower_control_ready {
+                    #[cfg(feature = "cluster")]
                     if let Some(wake) = checkpoint_control_wake.as_ref() {
                         if control_serviced {
                             checkpoint_control_pending = false;
                             checkpoint_control_poll_at =
                                 tokio::time::Instant::now() + wake.fallback();
                         } else {
-                            checkpoint_control_poll_at =
-                                tokio::time::Instant::now() + wake.capacity_retry();
+                            checkpoint_control_poll_at = tokio::time::Instant::now()
+                                + CheckpointControlWake::capacity_retry();
                         }
+                    }
+                    #[cfg(not(feature = "cluster"))]
+                    if checkpoint_control_wake.is_some() {
+                        checkpoint_control_poll_at = tokio::time::Instant::now()
+                            + if control_serviced {
+                                CheckpointControlWake::fallback()
+                            } else {
+                                CheckpointControlWake::capacity_retry()
+                            };
+                        checkpoint_control_pending &= !control_serviced;
                     }
                 }
                 if let Some(reason) = callback.take_pipeline_fault() {
@@ -5128,8 +5111,9 @@ impl StreamingCoordinator {
                         }
                     }
                 }
-                #[allow(clippy::cast_possible_truncation)]
-                callback.record_cycle(drain_events, 0, cycle_start.elapsed().as_nanos() as u64);
+                let elapsed_ns =
+                    u64::try_from(cycle_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                callback.record_cycle(drain_events, 0, elapsed_ns);
             }
         }
 
@@ -5247,7 +5231,6 @@ impl StreamingCoordinator {
         }
 
         if let Some(name) = self.source_names.get(source_idx) {
-            #[allow(clippy::cast_possible_truncation)]
             {
                 *cycle_events += batch.num_rows() as u64;
             }
@@ -5504,7 +5487,6 @@ impl StreamingCoordinator {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn handle_aligned_checkpoint_outcome(
         &mut self,
         callback: &mut impl PipelineCallback,
@@ -5620,10 +5602,6 @@ impl StreamingCoordinator {
     }
 
     /// Handle a barrier from a source.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "barrier alignment and durable cleanup form one checkpoint state transition"
-    )]
     async fn handle_barrier(
         &mut self,
         source_idx: usize,
@@ -6051,10 +6029,6 @@ impl StreamingCoordinator {
         .await;
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "source-less completion owns the full durable checkpoint transition"
-    )]
     async fn complete_prepared_source_less_checkpoint(
         &mut self,
         callback: &mut impl PipelineCallback,
@@ -6287,7 +6261,6 @@ impl StreamingCoordinator {
     }
 
     /// Service periodic, manual, or leader-announced checkpoint admission.
-    #[allow(clippy::too_many_lines)]
     async fn maybe_checkpoint(&mut self, callback: &mut impl PipelineCallback) -> bool {
         self.drain_manual_requests();
         #[cfg(feature = "cluster")]
@@ -6999,9 +6972,10 @@ mod tests {
             #[cfg(feature = "cluster")]
             self.fence_process_authority_at(ProcessAuthorityFencePoint::Watermark);
             // Use row count as a simple watermark proxy.
-            #[allow(clippy::cast_possible_wrap)]
             {
-                self.watermark += batch.num_rows() as i64;
+                self.watermark = self
+                    .watermark
+                    .saturating_add(i64::try_from(batch.num_rows()).unwrap_or(i64::MAX));
             }
         }
 

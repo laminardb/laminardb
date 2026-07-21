@@ -432,8 +432,7 @@ impl FormatDecoder for JsonDecoder {
         self.decode_slices(&values)
     }
 
-    #[allow(clippy::unnecessary_literal_bound)]
-    fn format_name(&self) -> &str {
+    fn format_name(&self) -> &'static str {
         "json"
     }
 }
@@ -456,7 +455,6 @@ impl JsonDecoder {
     /// # Errors
     /// Returns `SchemaError::DecodeError` when parsing, coercion, or
     /// `json.explode` would exceed the row bound.
-    #[allow(clippy::too_many_lines)]
     pub fn decode_slices_bounded(
         &self,
         values: &[&[u8]],
@@ -1313,7 +1311,6 @@ fn extract_timestamp(
     unit: TimeUnit,
     from: EpochUnit,
 ) -> Result<i64, String> {
-    // Numeric values: scale from the configured epoch unit.
     if let Some(n) = value.as_i64() {
         return checked_epoch_to_unit(n, from, unit);
     }
@@ -1334,12 +1331,12 @@ fn extract_timestamp(
                 "fractional timestamp {f} is not supported; provide an integer in {from:?} units"
             ));
         }
-        #[allow(clippy::cast_possible_truncation)] // exact integral f64 in checked range
-        let v = f as i64;
+        let v = format!("{f:.0}")
+            .parse::<i64>()
+            .map_err(|error| format!("invalid integral timestamp {f}: {error}"))?;
         return checked_epoch_to_unit(v, from, unit);
     }
 
-    // String values: try configured timestamp formats.
     if let Some(s) = value.as_str() {
         for fmt in &config.timestamp_formats {
             if fmt == "iso8601" {

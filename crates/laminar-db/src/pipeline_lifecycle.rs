@@ -695,10 +695,6 @@ async fn await_sink_open<T>(
     }
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "sink startup and rollback are one shared-deadline protocol"
-)]
 async fn open_prepared_sinks(
     sinks: &mut [PreparedSink],
     open_timeout: std::time::Duration,
@@ -1257,13 +1253,12 @@ impl LaminarDB {
         }
     }
 
-    #[allow(clippy::unused_self, clippy::unnecessary_wraps)] // Cluster builds enforce the fence.
+    #[cfg(feature = "cluster")]
     fn ensure_pipeline_lifecycle_authorized(
         &self,
         authority: PipelineLifecycleAuthority,
         operation: &str,
     ) -> Result<(), DbError> {
-        #[cfg(feature = "cluster")]
         if self
             .coordinated_recovery_fenced
             .load(std::sync::atomic::Ordering::Acquire)
@@ -1273,9 +1268,15 @@ impl LaminarDB {
                 "pipeline {operation} is fenced by coordinated recovery"
             )));
         }
-        #[cfg(not(feature = "cluster"))]
-        let _ = (authority, operation);
         Ok(())
+    }
+
+    #[cfg(not(feature = "cluster"))]
+    fn ensure_pipeline_lifecycle_authorized(
+        authority: PipelineLifecycleAuthority,
+        operation: &str,
+    ) {
+        let _ = (authority, operation);
     }
 
     #[cfg(feature = "cluster")]
@@ -1344,10 +1345,6 @@ impl LaminarDB {
     /// closed when recovery authority is unavailable so the monitor can retry without admitting
     /// records.
     #[cfg(feature = "cluster")]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "cluster startup is one assignment-certified intake admission transaction"
-    )]
     pub async fn finish_cluster_startup(
         &self,
         deadline: tokio::time::Instant,
@@ -2025,12 +2022,18 @@ impl LaminarDB {
             return Err(DbError::Shutdown);
         }
         self.ensure_catalog_cleanup_unfenced("pipeline start")?;
+        #[cfg(feature = "cluster")]
         self.ensure_pipeline_lifecycle_authorized(authority, "start")?;
+        #[cfg(not(feature = "cluster"))]
+        Self::ensure_pipeline_lifecycle_authorized(authority, "start");
         self.connector_registry.freeze();
         let runtime = self.control_runtime.handle()?;
         let attempt = {
             let mut owned = self.startup_attempt.lock();
+            #[cfg(feature = "cluster")]
             self.ensure_pipeline_lifecycle_authorized(authority, "start")?;
+            #[cfg(not(feature = "cluster"))]
+            Self::ensure_pipeline_lifecycle_authorized(authority, "start");
             loop {
                 // Cleanup may publish Created/Faulted just before the owner publishes its sticky
                 // result. The registered incomplete attempt remains authoritative through that
@@ -2063,7 +2066,10 @@ impl LaminarDB {
                         // A compute fault publishes the cluster recovery fence before Faulted.
                         // Re-read that fence after observing the state so a public restart cannot
                         // slip through the fence-before-state publication window.
+                        #[cfg(feature = "cluster")]
                         self.ensure_pipeline_lifecycle_authorized(authority, "start")?;
+                        #[cfg(not(feature = "cluster"))]
+                        Self::ensure_pipeline_lifecycle_authorized(authority, "start");
                         let attempt = Arc::new(StartupAttempt::new());
                         // Publish ownership before Starting so stop/shutdown can always find the
                         // exact attempt they must await.
@@ -2160,10 +2166,6 @@ impl LaminarDB {
         terminal.finish(result);
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "pipeline startup is one generation-fenced lifecycle transaction"
-    )]
     async fn run_claimed_start(&self, starting_from_fault: bool) -> Result<(), DbError> {
         const FAULT_RESTART_QUIESCE_TIMEOUT: std::time::Duration =
             std::time::Duration::from_secs(10);
@@ -2294,7 +2296,6 @@ impl LaminarDB {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn start_inner(&self) -> Result<(), DbError> {
         let runtime_shutdown = tokio_util::sync::CancellationToken::new();
         *self.runtime_shutdown.write() = runtime_shutdown.clone();
@@ -2817,7 +2818,6 @@ impl LaminarDB {
     }
 
     /// Build and start the unified pipeline with sources, sinks, and streams.
-    #[allow(clippy::too_many_lines)]
     async fn start_connector_pipeline(
         &self,
         source_regs: HashMap<String, crate::connector_manager::SourceRegistration>,
@@ -3138,8 +3138,7 @@ impl LaminarDB {
                 config.set("_arrow_schema".to_string(), schema_str);
             }
 
-            #[cfg_attr(not(feature = "cluster"), allow(unused_mut))]
-            let mut source = self
+            let source = self
                 .connector_registry
                 .create_source(&config, prom_registry.as_ref())
                 .map_err(|e| {
@@ -3149,6 +3148,8 @@ impl LaminarDB {
                         config.connector_type()
                     ))
                 })?;
+            #[cfg(feature = "cluster")]
+            let mut source = source;
             let task_fence = ConnectorTaskFenceRegistration::capture_registered(
                 Arc::<str>::from(format!("source:{name}")),
                 source.terminal_task_tracker(),
@@ -3482,7 +3483,6 @@ impl LaminarDB {
         )
         .await?;
 
-        #[allow(clippy::type_complexity)]
         let mut sinks: Vec<(
             String,
             crate::sink_task::SinkTaskHandle,
@@ -4783,10 +4783,6 @@ impl LaminarDB {
     /// # Errors
     ///
     /// Returns `Err` if the watcher task panicked.
-    #[allow(
-        clippy::too_many_lines,
-        reason = "shutdown owns the complete terminal lifecycle and fence release sequence"
-    )]
     pub async fn shutdown(&self) -> Result<(), DbError> {
         const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
         // Terminal intent takes precedence over a concurrent restartable stop. Publishing it
@@ -4920,10 +4916,6 @@ impl LaminarDB {
             .await
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "restartable stop owns one bounded lifecycle and fence transition"
-    )]
     async fn stop_pipeline_with_lifecycle_authority(
         &self,
         authority: PipelineLifecycleAuthority,
@@ -4933,7 +4925,10 @@ impl LaminarDB {
         let first_stop = loop {
             let startup = {
                 let owned = self.startup_attempt.lock();
+                #[cfg(feature = "cluster")]
                 self.ensure_pipeline_lifecycle_authorized(authority, "stop")?;
+                #[cfg(not(feature = "cluster"))]
+                Self::ensure_pipeline_lifecycle_authorized(authority, "stop");
                 if let Some(in_flight) = owned.as_ref().filter(|attempt| !attempt.is_complete()) {
                     Arc::clone(in_flight)
                 } else {
@@ -8039,7 +8034,6 @@ mod cluster_fault_watcher_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[allow(clippy::await_holding_lock)] // Deliberately stalls startup on the table-store lock.
     async fn pipeline_startup_holds_generation_fence_until_graph_publication() {
         let (db, _controller, _kv, _members, _round, manifest_store, proof) = startup_db().await;
         let state_store: Arc<dyn object_store::ObjectStore> =
@@ -8073,7 +8067,19 @@ mod cluster_fault_watcher_tests {
 
         // Stall startup after its staging reset. This makes the old reset-only fence gap
         // deterministic without adding a production test hook.
-        let table_store = db.table_store.write();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let table_store_blocker = {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || {
+                let _table_store = db.table_store.write();
+                let _ = locked_tx.send(());
+                let _ = release_rx.recv();
+            })
+        };
+        locked_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("table-store blocker did not acquire the write lock");
         let starting = {
             let db = Arc::clone(&db);
             tokio::spawn(async move { db.start().await })
@@ -8096,7 +8102,12 @@ mod cluster_fault_watcher_tests {
             "assignment rotation entered while startup still owned an unpublished graph"
         );
 
-        drop(table_store);
+        release_tx
+            .send(())
+            .expect("table-store blocker stopped before release");
+        table_store_blocker
+            .join()
+            .expect("table-store blocker panicked");
         starting.await.unwrap().unwrap();
         db.shutdown().await.unwrap();
     }

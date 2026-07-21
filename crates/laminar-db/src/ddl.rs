@@ -284,7 +284,6 @@ struct CreateTableWith {
 /// implement. Keep this destructuring exhaustive: a parser upgrade that adds a
 /// field must make this function fail to compile until its semantics are
 /// reviewed.
-#[allow(clippy::too_many_lines)] // exhaustive parser-envelope rejection is one invariant
 fn validate_create_table_envelope(create: &sqlparser::ast::CreateTable) -> Result<(), DbError> {
     let sqlparser::ast::CreateTable {
         or_replace: _,
@@ -436,7 +435,6 @@ fn validate_create_table_envelope(create: &sqlparser::ast::CreateTable) -> Resul
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)] // column and table constraints must be validated together
 fn build_table_fields_and_primary_key(
     create: &sqlparser::ast::CreateTable,
 ) -> Result<(Vec<Field>, String), DbError> {
@@ -831,7 +829,6 @@ impl LaminarDB {
         }
     }
 
-    #[allow(clippy::too_many_lines)] // exhaustive cleanup and residue matrix
     fn cleanup_catalog_object(&self, name: &str, kind: CatalogObjectKind) -> Result<(), DbError> {
         let mut errors = Vec::new();
 
@@ -1682,7 +1679,6 @@ impl LaminarDB {
         }))
     }
 
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     // Parsing, admission, catalog mutation, and live-control acknowledgement form one transaction.
     pub(crate) async fn handle_create_stream(
         &self,
@@ -2284,7 +2280,6 @@ impl LaminarDB {
     /// Cluster admission is based on configured runtime mode, never the current owner count.
     /// Every stateful route admitted here must implement key shuffle plus vnode capture, restore,
     /// and revoke. Joins fail closed until their operator and output state have that lifecycle.
-    #[allow(clippy::too_many_lines)] // fail-closed operator lifecycle admission matrix
     pub(crate) async fn validate_cluster_query_shape(
         &self,
         object_kind: &str,

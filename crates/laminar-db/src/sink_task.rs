@@ -1880,7 +1880,6 @@ fn record_flush_error(
     });
 }
 
-#[allow(clippy::too_many_arguments)] // Copied fields avoid borrowing the actor across sink I/O.
 fn record_write_error(
     sink_name: &str,
     sink_id: &Arc<str>,
@@ -1975,7 +1974,6 @@ async fn handle_write_batch(
     }
 }
 
-#[allow(clippy::too_many_arguments)] // Copied fields avoid borrowing the actor across sink I/O.
 fn record_write_timeout(
     sink_name: &str,
     sink_id: &Arc<str>,
@@ -4445,9 +4443,7 @@ mod tests {
             Arc::clone(&state),
             async move {
                 let _task = task;
-                panic!("injected terminal driver panic");
-                #[allow(unreachable_code)]
-                SinkCloseOutcome::Success
+                panic!("injected terminal driver panic")
             },
             &runtime,
         );

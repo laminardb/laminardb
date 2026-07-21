@@ -873,9 +873,7 @@ impl ClusterEngineHarness {
                 if p_idx == idx {
                     continue;
                 }
-                sender
-                    .register_peer(p_nh.instance_id.0, receivers[p_idx].local_addr())
-                    .await;
+                sender.register_peer(p_nh.instance_id.0, receivers[p_idx].local_addr());
             }
             let sender = Arc::new(sender);
 
@@ -1189,7 +1187,7 @@ impl ClusterEngineHarness {
                             )
                             .expect("startup assignment fence");
                         let owns_vnodes = fence.contains(runtime.instance_id.0);
-                        runtime.db.cluster_intake_fenced() == !owns_vnodes
+                        runtime.db.cluster_intake_fenced() != owns_vnodes
                             && (!recovery_fenced
                                 || !owns_vnodes
                                 || !cluster_node.controller.is_recovering())

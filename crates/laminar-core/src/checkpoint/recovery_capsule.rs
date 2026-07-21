@@ -1,7 +1,5 @@
 //! Canonical, content-addressed recovery image for a committed cluster checkpoint.
 
-#![allow(clippy::disallowed_types)] // Durable JSON uses ordered maps by contract.
-
 use std::{collections::BTreeMap, num::NonZeroU64};
 
 use serde::Serialize;
@@ -273,7 +271,6 @@ impl ClusterRecoveryCapsule {
     ///
     /// # Errors
     /// Returns a description when the capsule cannot name one exact cluster recovery image.
-    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), String> {
         if self.version != CLUSTER_RECOVERY_CAPSULE_VERSION {
             return Err(format!(

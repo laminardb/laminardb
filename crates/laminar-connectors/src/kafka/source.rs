@@ -726,7 +726,6 @@ fn kafka_drain_target_ready(
     Ok(registry_version == target_version && reconciled_version == target_version)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn resolve_kafka_reader_drain(
     consumer: &Arc<StreamConsumer<LaminarConsumerContext>>,
     blocking_tasks: &KafkaBlockingTasks,
@@ -1326,7 +1325,6 @@ impl KafkaSource {
     /// Spawns the background reader task on the first `poll_batch()`.
     /// The startup cursor has already been installed by `start()` before these
     /// tasks can observe the consumer.
-    #[allow(clippy::too_many_lines)]
     fn ensure_reader_started(&mut self) {
         if self.reader_handle.is_some() || self.consumer.is_none() {
             return;
@@ -1353,6 +1351,8 @@ impl KafkaSource {
         let channel_len = Arc::clone(&self.channel_len);
         let capture_headers = self.config.include_headers;
         let reader_channel_capacity = self.config.reader_channel_capacity;
+        let reader_channel_capacity_f64 =
+            u32::try_from(reader_channel_capacity).map_or(f64::from(u32::MAX), f64::from);
         let assign_generation = Arc::clone(&self.assign_generation);
         let rebalance_state = Arc::clone(&self.rebalance_state);
         let pause_threshold = self.config.backpressure_high_watermark;
@@ -2165,9 +2165,10 @@ impl KafkaSource {
                 }
 
                 // Backpressure: pause/resume Kafka partitions based on channel fill.
-                #[allow(clippy::cast_precision_loss)]
                 let fill = if reader_channel_capacity > 0 {
-                    channel_len.load(Ordering::Acquire) as f64 / reader_channel_capacity as f64
+                    let channel_len = u32::try_from(channel_len.load(Ordering::Acquire))
+                        .map_or(f64::from(u32::MAX), f64::from);
+                    channel_len / reader_channel_capacity_f64
                 } else {
                     0.0
                 };
@@ -3179,7 +3180,6 @@ async fn resolve_timestamp_offsets(
 }
 
 #[async_trait]
-#[allow(clippy::too_many_lines)] // poll_batch has legitimate complexity (backpressure + deser + poison pill fallback)
 impl SourceConnector for KafkaSource {
     fn terminal_task_tracker(&self) -> Option<ConnectorTaskTracker> {
         Some(self.task_tracker.clone())
@@ -3636,7 +3636,6 @@ impl SourceConnector for KafkaSource {
             "starting Kafka source connector"
         );
 
-        // Build rdkafka consumer with rebalance-aware context.
         let mut rdkafka_config: ClientConfig = kafka_config.to_rdkafka_config();
         if delivery != DeliveryGuarantee::BestEffort
             || matches!(
@@ -4239,7 +4238,6 @@ impl SourceConnector for KafkaSource {
         }
     }
 
-    #[allow(clippy::cast_possible_truncation)] // Kafka partition/offset values fit in narrower types
     async fn poll_batch(
         &mut self,
         max_records: usize,
@@ -4603,7 +4601,7 @@ impl SourceConnector for KafkaSource {
                 // be filtered to match the reduced row count.
                 let mut good_batches = Vec::with_capacity(refs.len());
                 let mut good_idx = Vec::with_capacity(refs.len());
-                let mut error_count = 0u64;
+                let mut error_count = 0usize;
                 for (i, r) in refs.iter().enumerate() {
                     match self
                         .deserializer
@@ -4624,9 +4622,16 @@ impl SourceConnector for KafkaSource {
                     return Err(ConnectorError::Serde(batch_err));
                 }
                 // Escalate if the error rate exceeds the configured threshold.
-                #[allow(clippy::cast_precision_loss)]
                 if error_count > 0 {
-                    let error_rate = error_count as f64 / refs.len() as f64;
+                    let error_count = u32::try_from(error_count).map_err(|_| {
+                        ConnectorError::Internal(
+                            "Kafka deserialization error count exceeds u32".into(),
+                        )
+                    })?;
+                    let record_count = u32::try_from(refs.len()).map_err(|_| {
+                        ConnectorError::Internal("Kafka batch record count exceeds u32".into())
+                    })?;
+                    let error_rate = f64::from(error_count) / f64::from(record_count);
                     if error_rate > self.config.max_deser_error_rate {
                         return Err(ConnectorError::Serde(batch_err));
                     }

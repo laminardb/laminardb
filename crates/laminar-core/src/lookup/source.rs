@@ -117,7 +117,7 @@ pub trait LookupSource: Send + Sync {
     fn capabilities(&self) -> LookupSourceCapabilities;
 
     /// Source name for logging and metrics.
-    fn source_name(&self) -> &str;
+    fn source_name(&self) -> &'static str;
 
     /// Arrow schema of the data this source returns.
     fn schema(&self) -> SchemaRef;
@@ -340,7 +340,7 @@ impl<S: LookupSource> LookupSource for PushdownAdapter<S> {
         self.inner.capabilities()
     }
 
-    fn source_name(&self) -> &str {
+    fn source_name(&self) -> &'static str {
         self.inner.source_name()
     }
 

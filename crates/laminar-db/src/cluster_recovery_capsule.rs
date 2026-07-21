@@ -1,7 +1,6 @@
 //! Assembly and validation of the global cluster recovery image.
 
 #![cfg(feature = "cluster")]
-#![allow(clippy::disallowed_types)] // Cold-path durable JSON uses ordered maps.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -171,7 +170,6 @@ fn merge_source_assignment_versions(
 }
 
 /// Assemble one compact global image from the readiness records admitted by an exact seal.
-#[allow(clippy::too_many_lines)]
 pub(crate) fn assemble_capsule(
     inventory: &CheckpointSealInventory,
     readiness: Vec<(String, ParticipantReady)>,

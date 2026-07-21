@@ -1086,7 +1086,6 @@ async fn preflight_cluster_retention_cut(
     .await
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // One fail-closed retention authorization protocol keeps its authority inputs explicit.
 async fn authorize_retention_horizon(
     requested: u64,
     trigger_epoch: u64,
@@ -1244,7 +1243,6 @@ async fn run_capsule_gc_step(
     }
 }
 
-#[allow(clippy::too_many_lines)] // One ownership loop serializes every retention transition.
 async fn run_retention_maintenance(
     store: Arc<dyn CheckpointStore>,
     mut requests: tokio::sync::watch::Receiver<Option<RetentionRequest>>,
@@ -1496,7 +1494,6 @@ pub struct CheckpointCoordinator {
     // Self-contained root bases for reference partials. Delta preparation always removes an old
     // entry, and reference preparation retains the original root rather than chaining references.
     // Bytes are refcounted.
-    #[allow(clippy::disallowed_types)]
     last_vnode_uploads: std::collections::HashMap<
         u32,
         (
@@ -1511,11 +1508,8 @@ pub struct CheckpointCoordinator {
     last_partial_delta_depth: std::collections::HashMap<u32, u32>,
     // Candidates above advance after all writes land. Reuse is allowed only after the exact
     // state seal proves that the candidate is durable for this vnode.
-    #[allow(clippy::disallowed_types)]
     last_sealed_partial_attempt: std::collections::HashMap<u32, CheckpointAttempt>,
-    #[allow(clippy::disallowed_types)]
     last_sealed_delta_depth: std::collections::HashMap<u32, u32>,
-    #[allow(clippy::disallowed_types)]
     last_sealed_upload_attempt: std::collections::HashMap<u32, CheckpointAttempt>,
     #[cfg(feature = "cluster")]
     cluster_controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
@@ -1596,7 +1590,6 @@ impl CheckpointCoordinator {
     /// # Errors
     /// Returns a store read failure rather than silently starting at epoch 1 and clobbering
     /// on-disk state.
-    #[allow(clippy::too_many_lines)]
     pub async fn new(
         config: CheckpointConfig,
         store: Box<dyn CheckpointStore>,
@@ -1748,7 +1741,6 @@ impl CheckpointCoordinator {
             && outcome.leader_proof == self.active_leader_proof
     }
 
-    #[allow(clippy::too_many_lines)] // One create-once decision transition owns ambiguity handling.
     async fn record_terminal_outcome_until(
         &mut self,
         attempt: CheckpointAttempt,
@@ -2810,7 +2802,6 @@ impl CheckpointCoordinator {
     /// Stage per-vnode operator-state slices for the next checkpoint.
     ///
     /// Call once per checkpoint (even with an empty map) so prior epoch slices never leak.
-    #[allow(clippy::disallowed_types)]
     pub(crate) fn set_pending_vnode_states(&mut self, states: StagedVnodeStates) {
         self.pending_vnode_states = states;
     }
@@ -2952,7 +2943,6 @@ impl CheckpointCoordinator {
             })
     }
 
-    #[cfg_attr(not(feature = "cluster"), allow(clippy::unused_self))]
     fn is_designated_commit_leader(&self) -> bool {
         #[cfg(feature = "cluster")]
         {
@@ -3008,7 +2998,6 @@ impl CheckpointCoordinator {
     /// proves both manifest completion and a complete vnode-owner offset inventory, including
     /// owners whose connectors have empty offsets.
     #[cfg(feature = "cluster")]
-    #[allow(clippy::too_many_lines)] // Readiness persistence is one fail-closed attestation state machine.
     async fn persist_participant_ready_until(
         &mut self,
         attempt: CheckpointAttempt,
@@ -3631,7 +3620,6 @@ impl CheckpointCoordinator {
 
     /// Apply one absolute deadline to the whole durable attempt. A decision write is treated as
     /// irrevocable from the instant it is issued because a timed-out create may still be visible.
-    #[allow(clippy::too_many_lines)] // One durable-attempt state machine owns its absolute deadline.
     async fn run_checkpoint_attempt(
         &mut self,
         request: CheckpointRequest,
@@ -4018,7 +4006,6 @@ impl CheckpointCoordinator {
     }
 
     /// This coordinator's node id for namespacing commit descriptors (0 without the cluster feature).
-    #[cfg_attr(not(feature = "cluster"), allow(clippy::unused_self))]
     fn self_node_id(&self) -> u64 {
         #[cfg(feature = "cluster")]
         if let Some(cc) = self.cluster_controller.as_ref() {
@@ -4027,7 +4014,6 @@ impl CheckpointCoordinator {
         0
     }
 
-    #[cfg_attr(not(feature = "cluster"), allow(clippy::unused_self))]
     fn active_outcome_scope(&self) -> laminar_core::checkpoint_decision::CheckpointScope {
         #[cfg(feature = "cluster")]
         if self.cluster_controller.is_some() {
@@ -4280,7 +4266,6 @@ impl CheckpointCoordinator {
         })?
     }
 
-    #[allow(clippy::too_many_lines)] // One fenced persistence transaction seals descriptors and state.
     async fn write_vnode_partials_inner(
         &mut self,
         epoch: u64,
@@ -4753,7 +4738,6 @@ impl CheckpointCoordinator {
     }
 
     /// Abandon a failed epoch only after its immutable Abort outcome is durable.
-    #[allow(clippy::too_many_lines)]
     async fn fail_epoch(
         &mut self,
         checkpoint_id: u64,
@@ -5267,7 +5251,6 @@ impl CheckpointCoordinator {
         self.reconcile_sink_open_witness_until(deadline).await
     }
 
-    #[allow(clippy::too_many_lines)]
     pub(crate) async fn reconcile_sink_open_witness_until(
         &mut self,
         deadline: tokio::time::Instant,
@@ -5654,7 +5637,6 @@ impl CheckpointCoordinator {
     /// Announces `Prepare`, waits for live-follower acks, returns the merged cluster-min
     /// watermark. Caller announces `Aligned` on success or `Abort` on failure.
     #[cfg(feature = "cluster")]
-    #[allow(clippy::too_many_lines)]
     pub(crate) async fn run_prepare_quorum(
         cc: &Arc<laminar_core::cluster::control::ClusterController>,
         quorum_timeout: Duration,

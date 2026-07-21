@@ -169,13 +169,11 @@ impl FileDiscoveryEngine {
         let result = match tokio::time::timeout_at(deadline, handle).await {
             Ok(result) => result,
             Err(_) => {
-                #[allow(clippy::cast_possible_truncation)]
                 return Err(ConnectorError::Timeout(wait.as_millis() as u64));
             }
         };
         self.handle.take();
         if tokio::time::Instant::now() >= deadline {
-            #[allow(clippy::cast_possible_truncation)]
             return Err(ConnectorError::Timeout(wait.as_millis() as u64));
         }
 
@@ -206,13 +204,11 @@ impl FileDiscoveryEngine {
         let result = match tokio::time::timeout_at(deadline, handle).await {
             Ok(result) => result,
             Err(_) => {
-                #[allow(clippy::cast_possible_truncation)]
                 return Err(ConnectorError::Timeout(wait.as_millis() as u64));
             }
         };
         self.initial_scan_handle.take();
         if tokio::time::Instant::now() >= deadline {
-            #[allow(clippy::cast_possible_truncation)]
             return Err(ConnectorError::Timeout(wait.as_millis() as u64));
         }
 

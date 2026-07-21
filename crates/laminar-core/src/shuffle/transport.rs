@@ -2184,8 +2184,7 @@ mod grpc {
         }
 
         /// Register (or update) a peer's shuffle address.
-        #[allow(clippy::unused_async)]
-        pub async fn register_peer(&self, peer: ShufflePeerId, addr: SocketAddr) {
+        pub fn register_peer(&self, peer: ShufflePeerId, addr: SocketAddr) {
             if peer == 0 || peer == self.local_id {
                 return;
             }
@@ -2224,7 +2223,6 @@ mod grpc {
                 .await
         }
 
-        #[allow(clippy::too_many_lines)]
         async fn send_to_inner(
             &self,
             peer: ShufflePeerId,
@@ -2633,7 +2631,6 @@ mod grpc {
             Some(addr)
         }
 
-        #[allow(clippy::too_many_lines)]
         async fn connection_for(
             &self,
             peer: ShufflePeerId,
@@ -2817,7 +2814,6 @@ mod grpc {
     }
 
     /// Open a client-streaming call after the identity handshake completes.
-    #[allow(clippy::too_many_lines)]
     async fn open_call(call: OpenCall) -> io::Result<PeerConn> {
         let endpoint = crate::cluster::control::tls::client_endpoint(&call.addr.to_string())
             .map_err(io_err)?
@@ -3062,7 +3058,6 @@ mod grpc {
                 active_streams: Arc::clone(&active_streams),
                 active_stream_registry,
             };
-            // Set TCP_NODELAY on each accepted connection.
             let incoming = futures::stream::unfold(listener, |listener| async move {
                 let item = match listener.accept().await {
                     Ok((stream, _)) => {
@@ -4463,7 +4458,6 @@ mod grpc {
     }
 
     /// Consume the short-lived one-time handshake token and validate the leading `Hello`.
-    #[allow(clippy::too_many_arguments)]
     async fn admit_stream(
         stream: &mut tonic::Streaming<ShuffleFrame>,
         receiver_incarnation: Uuid,
@@ -4587,7 +4581,6 @@ mod grpc {
     /// Publish preceding-data completeness before making the barrier observable. A failed
     /// barrier enqueue cannot seal a checkpoint, while delaying this commit until after enqueue
     /// would let the consumer observe the barrier before its loss fence.
-    #[allow(clippy::too_many_arguments)]
     async fn publish_barrier(
         tx: &InboundTx,
         barrier_arrivals: &AtomicU64,
@@ -4647,7 +4640,6 @@ mod grpc {
     }
 
     /// Forward decoded frames onto the inbound queue and summarize on half-close.
-    #[allow(clippy::too_many_lines)]
     async fn run_stream(
         service: &ShuffleService,
         mut stream: tonic::Streaming<ShuffleFrame>,
@@ -4931,7 +4923,6 @@ mod grpc {
 
     /// Forward one logical batch after validating certified vnode ownership. `Ok(false)` when the
     /// queue has closed.
-    #[allow(clippy::too_many_arguments)]
     async fn forward_routed_batch(
         tx: &InboundTx,
         fence: StreamFence,
@@ -6495,14 +6486,12 @@ mod shim {
         }
 
         /// No peer fabric without the cluster feature; matches the cluster build's API.
-        #[allow(clippy::unused_self)]
         pub fn set_recovery_gen(&self, _gen: u64) {}
 
         /// No peer fabric without the cluster feature; retain the clustered installation API.
         ///
         /// # Errors
         /// This networking-free implementation never errors.
-        #[allow(clippy::unused_self)]
         pub fn install_assignment_fence(
             &self,
             _fence: &CheckpointAssignmentFence,
@@ -6512,11 +6501,9 @@ mod shim {
         }
 
         /// No cluster fabric exists, so there is no assignment authority to invalidate.
-        #[allow(clippy::unused_self)]
         pub fn invalidate_assignment_fence(&self) {}
 
         /// No cluster fabric exists, so there is no assignment authority to suspend.
-        #[allow(clippy::unused_self)]
         pub fn suspend_assignment_fence(&self) {}
 
         /// No cluster fabric exists, so no assignment scope is active.
@@ -6538,36 +6525,38 @@ mod shim {
         }
 
         /// Preserve the cluster build's API; no address can create a transport in this build.
-        #[allow(clippy::unused_async)] // async to match the cluster build's API.
-        #[allow(clippy::unused_self)]
-        pub async fn register_peer(&self, _peer: ShufflePeerId, _addr: SocketAddr) {}
+        pub fn register_peer(&self, _peer: ShufflePeerId, _addr: SocketAddr) {}
 
         /// # Errors
         /// Always errors because the no-cluster build has no shuffle transport.
-        #[allow(clippy::unused_async)] // async to match the cluster build's API.
-        pub async fn send_to(&self, peer: ShufflePeerId, msg: &ShuffleMessage) -> io::Result<()> {
+        pub fn send_to(
+            &self,
+            peer: ShufflePeerId,
+            msg: &ShuffleMessage,
+        ) -> std::future::Ready<io::Result<()>> {
             if let ShuffleMessage::Barrier(barrier) = msg {
-                validate_checkpoint_barrier(*barrier)?;
+                if let Err(error) = validate_checkpoint_barrier(*barrier) {
+                    return std::future::ready(Err(error));
+                }
             }
-            Err(io::Error::new(
+            std::future::ready(Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!(
                     "node {} cannot send shuffle to peer {peer}: cluster transport is disabled",
                     self.local_id
                 ),
-            ))
+            )))
         }
 
         /// No cluster fabric exists, so only a local-only assignment has a complete mesh.
         ///
         /// # Errors
         /// Returns an unsupported error when the assignment names a remote participant.
-        #[allow(clippy::unused_async)]
-        pub async fn establish_assignment_mesh(
+        pub fn establish_assignment_mesh(
             &self,
             assignment_fence: &CheckpointAssignmentFence,
-        ) -> io::Result<()> {
-            if assignment_fence
+        ) -> std::future::Ready<io::Result<()>> {
+            let result = if assignment_fence
                 .participants
                 .iter()
                 .all(|participant| participant.node_id == self.local_id)
@@ -6578,7 +6567,8 @@ mod shim {
                     io::ErrorKind::Unsupported,
                     "cluster shuffle mesh is disabled",
                 ))
-            }
+            };
+            std::future::ready(result)
         }
 
         /// Fan out to every required peer, reporting any missing peer after all
@@ -6645,14 +6635,12 @@ mod shim {
 
     impl ShuffleReceiver {
         /// No peer fabric without the cluster feature; matches the cluster build's API.
-        #[allow(clippy::unused_self)]
         pub fn set_recovery_gen(&self, _gen: u64) {}
 
         /// No peer fabric without the cluster feature; retain the clustered installation API.
         ///
         /// # Errors
         /// This networking-free implementation never errors.
-        #[allow(clippy::unused_self)]
         pub fn install_assignment_fence(
             &self,
             _fence: &CheckpointAssignmentFence,
@@ -6662,11 +6650,9 @@ mod shim {
         }
 
         /// No cluster fabric exists, so there is no assignment authority to invalidate.
-        #[allow(clippy::unused_self)]
         pub fn invalidate_assignment_fence(&self) {}
 
         /// No cluster fabric exists, so there is no assignment authority to suspend.
-        #[allow(clippy::unused_self)]
         pub fn suspend_assignment_fence(&self) {}
 
         /// No cluster fabric exists, so no assignment scope is active.
@@ -6689,21 +6675,18 @@ mod shim {
 
         /// No peer fabric without the cluster feature; nothing can be lost in transit.
         #[must_use]
-        #[allow(clippy::unused_self)]
         pub fn delivery_loss_incidents(&self) -> Arc<std::sync::atomic::AtomicU64> {
             Arc::new(std::sync::atomic::AtomicU64::new(0))
         }
 
         /// No peer fabric exists, so no delivery-loss incident has required recovery.
         #[must_use]
-        #[allow(clippy::unused_self)]
         pub fn recovered_delivery_loss_incidents(&self) -> Arc<std::sync::atomic::AtomicU64> {
             Arc::new(std::sync::atomic::AtomicU64::new(0))
         }
 
         /// No peer fabric exists, so no delivery loss can require recovery.
         #[must_use]
-        #[allow(clippy::unused_self)]
         pub const fn has_unrecovered_delivery_loss(&self) -> bool {
             false
         }
@@ -6893,9 +6876,7 @@ mod shim_tests {
     #[tokio::test]
     async fn registered_peer_still_fails_when_transport_is_disabled() {
         let sender = ShuffleSender::new(1, uuid::Uuid::from_u128(2));
-        sender
-            .register_peer(2, "127.0.0.1:9000".parse().unwrap())
-            .await;
+        sender.register_peer(2, "127.0.0.1:9000".parse().unwrap());
 
         let error = sender
             .send_to(2, &ShuffleMessage::Barrier(CheckpointBarrier::new(1, 1)))
@@ -7052,7 +7033,7 @@ mod tests {
         sender
             .install_assignment_fence(&fence, &assignment_owners(&[1, 2]))
             .unwrap();
-        sender.register_peer(2, receiver.local_addr()).await;
+        sender.register_peer(2, receiver.local_addr());
         let held_budget = sender.hold_outbound_budget_for_test(2).await.unwrap();
         let message = ShuffleMessage::checkpointed("stage".into(), 0, one_row(1));
         let mut blocked = Box::pin(sender.send_to(2, &message));
@@ -7127,7 +7108,7 @@ mod tests {
             .install_assignment_fence(&fence, &assignment_owners(&[1, 2]))
             .unwrap();
         let sender = sender(1);
-        sender.register_peer(2, receiver.local_addr()).await;
+        sender.register_peer(2, receiver.local_addr());
         sender
             .send_to(
                 2,
@@ -7244,7 +7225,7 @@ mod tests {
             )))
             .unwrap();
         let sender = sender(1);
-        sender.register_peer(2, receiver.local_addr()).await;
+        sender.register_peer(2, receiver.local_addr());
 
         let error = sender
             .establish_assignment_mesh(&fence)
@@ -7389,7 +7370,7 @@ mod tests {
         let fence = assignment_fence(1, &[1, 2]);
         let receiver = bind_on_loopback(2).await;
         let sender = sender(1);
-        sender.register_peer(2, receiver.local_addr()).await;
+        sender.register_peer(2, receiver.local_addr());
 
         sender
             .send_to(
@@ -7430,7 +7411,7 @@ mod tests {
         let owners = assignment_owners(&[1, 2]);
         let receiver = bind_on_loopback(2).await;
         let sender = sender(1);
-        sender.register_peer(2, receiver.local_addr()).await;
+        sender.register_peer(2, receiver.local_addr());
 
         sender
             .send_to(
@@ -7504,7 +7485,7 @@ mod tests {
         let receiver = bind_on_loopback(2).await;
         let sender = sender(1);
         for peer in 2..=64 {
-            sender.register_peer(peer, receiver.local_addr()).await;
+            sender.register_peer(peer, receiver.local_addr());
         }
         sender
             .send_to(
@@ -7520,7 +7501,7 @@ mod tests {
 
         for version in 2..=64 {
             let peer = version + 100;
-            sender.register_peer(peer, receiver.local_addr()).await;
+            sender.register_peer(peer, receiver.local_addr());
             let fence = assignment_fence(version, &[1, peer]);
             assert!(sender
                 .install_assignment_fence(&fence, &assignment_owners(&[1, peer]))
@@ -7537,7 +7518,7 @@ mod tests {
         let owners = assignment_owners(&[1, 2]);
         let receiver = bind_on_loopback(2).await;
         let sender = sender(1);
-        sender.register_peer(2, receiver.local_addr()).await;
+        sender.register_peer(2, receiver.local_addr());
         sender
             .send_to(
                 2,
@@ -7611,7 +7592,7 @@ mod tests {
     async fn superseded_scope_cancels_blocked_outbound_budget_without_switching_scope() {
         let receiver = bind_on_loopback(2).await;
         let sender = sender(1);
-        sender.register_peer(2, receiver.local_addr()).await;
+        sender.register_peer(2, receiver.local_addr());
         let held_budget = sender.hold_outbound_budget_for_test(2).await.unwrap();
         let message = ShuffleMessage::checkpointed("stage".into(), 0, one_row(1));
         let mut blocked = Box::pin(sender.send_to_for_assignment(2, 1, &message));
@@ -7657,7 +7638,7 @@ mod tests {
 
         let receiver = bind_on_loopback(2).await;
         let sender = sender(1);
-        sender.register_peer(2, receiver.local_addr()).await;
+        sender.register_peer(2, receiver.local_addr());
         sender
             .send_to(
                 2,
@@ -7680,7 +7661,7 @@ mod tests {
         let recv_addr = recv.local_addr();
 
         let sender = sender(1);
-        sender.register_peer(2, recv_addr).await;
+        sender.register_peer(2, recv_addr);
         send_barrier(&sender, &[2], CheckpointBarrier::new(1234, 1234))
             .await
             .unwrap();
@@ -7821,7 +7802,7 @@ mod tests {
         let receiver_v1 = bind_on_loopback(2).await;
         let receiver_v1_incarnation = receiver_v1.incarnation();
         let sender = sender(1);
-        sender.register_peer(2, receiver_v1.local_addr()).await;
+        sender.register_peer(2, receiver_v1.local_addr());
 
         for value in [10, 20] {
             sender
@@ -7853,7 +7834,7 @@ mod tests {
         sender.disconnect_peer_for_test(2);
         drop(receiver_v1);
         let receiver_v2 = bind_on_loopback_with_incarnation(2, Uuid::from_u128(300)).await;
-        sender.register_peer(2, receiver_v2.local_addr()).await;
+        sender.register_peer(2, receiver_v2.local_addr());
         let error = sender
             .send_to(
                 2,
@@ -7957,7 +7938,7 @@ mod tests {
     async fn concurrent_senders_preserve_sequence_and_every_record() {
         let receiver = bind_on_loopback(2).await;
         let sender = Arc::new(sender(1));
-        sender.register_peer(2, receiver.local_addr()).await;
+        sender.register_peer(2, receiver.local_addr());
 
         let mut tasks = Vec::new();
         for value in 0..128i64 {
@@ -8011,7 +7992,7 @@ mod tests {
     async fn stale_assignment_stream_is_rejected_before_folding() {
         let receiver = bind_on_loopback(2).await;
         let sender = sender(1);
-        sender.register_peer(2, receiver.local_addr()).await;
+        sender.register_peer(2, receiver.local_addr());
         sender
             .send_to(
                 2,
@@ -8083,7 +8064,7 @@ mod tests {
         sender
             .install_assignment_fence(&next_assignment, &assignment_owners(&[1, 2]))
             .unwrap();
-        sender.register_peer(2, receiver.local_addr()).await;
+        sender.register_peer(2, receiver.local_addr());
 
         let error = sender
             .send_to_for_assignment(
@@ -8107,7 +8088,7 @@ mod tests {
     async fn self_shuffle_is_rejected_before_connection_or_enqueue() {
         let receiver = bind_on_loopback(1).await;
         let sender = sender(1);
-        sender.register_peer(1, receiver.local_addr()).await;
+        sender.register_peer(1, receiver.local_addr());
 
         let error = sender
             .send_to(
@@ -8129,7 +8110,7 @@ mod tests {
     async fn terminal_reconciliation_does_not_scan_ordinary_shuffle_traffic() {
         let receiver = bind_on_loopback(2).await;
         let sender = sender(1);
-        sender.register_peer(2, receiver.local_addr()).await;
+        sender.register_peer(2, receiver.local_addr());
         sender
             .send_to(
                 2,
@@ -8150,7 +8131,7 @@ mod tests {
     async fn terminal_barrier_retirement_unblocks_data_and_preserves_data_holdover() {
         let receiver = bind_on_loopback(2).await;
         let sender = sender(1);
-        sender.register_peer(2, receiver.local_addr()).await;
+        sender.register_peer(2, receiver.local_addr());
 
         sender
             .send_to(
@@ -8220,7 +8201,7 @@ mod tests {
     async fn barrier_retirement_rejects_exact_digest_mismatch_and_noncanonical_attempt() {
         let receiver = bind_on_loopback(2).await;
         let sender = sender(1);
-        sender.register_peer(2, receiver.local_addr()).await;
+        sender.register_peer(2, receiver.local_addr());
         let terminal = CheckpointAttempt::canonical(70);
         let assignment_digest = receiver.assignment_fence_for_test().digest();
 
@@ -8249,7 +8230,7 @@ mod tests {
     async fn late_retired_barrier_does_not_block_normal_drain() {
         let receiver = bind_on_loopback(2).await;
         let sender = sender(1);
-        sender.register_peer(2, receiver.local_addr()).await;
+        sender.register_peer(2, receiver.local_addr());
 
         let terminal = CheckpointAttempt::canonical(70);
         let assignment_digest = receiver.assignment_fence_for_test().digest();
@@ -8300,7 +8281,7 @@ mod tests {
 
         let receiver = bind_on_loopback(2).await;
         let sender = sender(1);
-        sender.register_peer(2, receiver.local_addr()).await;
+        sender.register_peer(2, receiver.local_addr());
 
         let terminal = CheckpointAttempt::canonical(70);
         send_barrier(&sender, &[2], CheckpointBarrier::new(70, 70))
@@ -8350,7 +8331,7 @@ mod tests {
 
         let receiver = bind_on_loopback(2).await;
         let sender = sender(1);
-        sender.register_peer(2, receiver.local_addr()).await;
+        sender.register_peer(2, receiver.local_addr());
 
         let terminal = CheckpointAttempt::canonical(70);
         let retired_digest = receiver.assignment_fence_for_test().digest();
@@ -8387,7 +8368,7 @@ mod tests {
 
         let receiver = bind_on_loopback(2).await;
         let sender = sender(1);
-        sender.register_peer(2, receiver.local_addr()).await;
+        sender.register_peer(2, receiver.local_addr());
 
         for checkpoint_id in 0..=SHUFFLE_RECV_QUEUE {
             send_barrier(
@@ -8432,7 +8413,7 @@ mod tests {
 
         let receiver = bind_on_loopback(2).await;
         let sender = sender(1);
-        sender.register_peer(2, receiver.local_addr()).await;
+        sender.register_peer(2, receiver.local_addr());
 
         for value in 0..=SHUFFLE_RECV_QUEUE {
             sender
@@ -8471,7 +8452,7 @@ mod tests {
 
         let receiver = bind_on_loopback(2).await;
         let sender = sender(1);
-        sender.register_peer(2, receiver.local_addr()).await;
+        sender.register_peer(2, receiver.local_addr());
         sender
             .send_to(
                 2,
@@ -8494,7 +8475,7 @@ mod tests {
 
         let receiver = bind_on_loopback(2).await;
         let sender = sender(1);
-        sender.register_peer(2, receiver.local_addr()).await;
+        sender.register_peer(2, receiver.local_addr());
         sender
             .send_to(
                 2,
@@ -8523,7 +8504,7 @@ mod tests {
 
         let recv = bind_on_loopback(2).await;
         let sender = sender(1);
-        sender.register_peer(2, recv.local_addr()).await;
+        sender.register_peer(2, recv.local_addr());
 
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         let batch = arrow_array::RecordBatch::try_new(
@@ -8575,7 +8556,7 @@ mod tests {
 
         let recv = bind_on_loopback(2).await;
         let sender = sender(1);
-        sender.register_peer(2, recv.local_addr()).await;
+        sender.register_peer(2, recv.local_addr());
         let incidents = recv.delivery_loss_incidents();
 
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
@@ -8638,7 +8619,7 @@ mod tests {
 
         let recv = bind_on_loopback(2).await;
         let sender = sender(1);
-        sender.register_peer(2, recv.local_addr()).await;
+        sender.register_peer(2, recv.local_addr());
         let incidents = recv.delivery_loss_incidents();
 
         recv.set_recovery_gen(5);
@@ -8674,7 +8655,7 @@ mod tests {
 
         let recv = bind_on_loopback(2).await;
         let sender = sender(1);
-        sender.register_peer(2, recv.local_addr()).await;
+        sender.register_peer(2, recv.local_addr());
         let incidents = recv.delivery_loss_incidents();
 
         // Two data frames enqueued, both dropped in transit; then the epoch's barrier.
@@ -8700,7 +8681,7 @@ mod tests {
         let sender = sender(1);
         recv.set_recovery_gen(1);
         sender.set_recovery_gen(1);
-        sender.register_peer(2, recv.local_addr()).await;
+        sender.register_peer(2, recv.local_addr());
 
         // Sequence zero is allocated but never reaches the receiver. A new recovery Hello must
         // not rebaseline at the barrier's high-water mark.
@@ -8724,7 +8705,7 @@ mod tests {
     async fn saturated_checkpointed_data_budget_does_not_block_barrier_control_admission() {
         let recv = bind_on_loopback(2).await;
         let sender = sender(1);
-        sender.register_peer(2, recv.local_addr()).await;
+        sender.register_peer(2, recv.local_addr());
         let _held = sender.hold_outbound_budget_for_test(2).await.unwrap();
 
         tokio::time::timeout(
@@ -8752,7 +8733,7 @@ mod tests {
 
         let recv = bind_on_loopback(2).await;
         let sender = sender(1);
-        sender.register_peer(2, recv.local_addr()).await;
+        sender.register_peer(2, recv.local_addr());
         let incidents = recv.delivery_loss_incidents();
 
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
@@ -8785,7 +8766,7 @@ mod tests {
     async fn sender_reuses_stream_across_sends() {
         let recv = bind_on_loopback(2).await;
         let sender = sender(1);
-        sender.register_peer(2, recv.local_addr()).await;
+        sender.register_peer(2, recv.local_addr());
 
         for delta in [10u64, 20, 30, 40] {
             send_barrier(&sender, &[2], CheckpointBarrier::new(delta, delta))
@@ -8826,7 +8807,7 @@ mod tests {
     async fn barrier_fan_out_attempts_all_peers_but_rejects_a_partial_cut() {
         let receiver = bind_on_loopback(10).await;
         let sender = sender(1);
-        sender.register_peer(10, receiver.local_addr()).await;
+        sender.register_peer(10, receiver.local_addr());
         let barrier = CheckpointBarrier::new(5, 5);
 
         let fence = assignment_fence(2, &[1, 10, 99]);
@@ -8856,9 +8837,7 @@ mod tests {
     async fn barrier_fan_out_does_not_mask_peer_failure_with_scope_cancellation() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let sender = sender(1);
-        sender
-            .register_peer(2, listener.local_addr().unwrap())
-            .await;
+        sender.register_peer(2, listener.local_addr().unwrap());
         let fence = assignment_fence(2, &[1, 2, 99]);
         sender
             .install_assignment_fence(&fence, &assignment_owners(&[1, 2, 99]))
@@ -8909,7 +8888,7 @@ mod tests {
         let owners = assignment_owners(&[1, 2, 3]);
         receiver.install_assignment_fence(&fence, &owners).unwrap();
         sender.install_assignment_fence(&fence, &owners).unwrap();
-        sender.register_peer(2, receiver.local_addr()).await;
+        sender.register_peer(2, receiver.local_addr());
 
         sender
             .send_to(
@@ -8920,9 +8899,7 @@ mod tests {
             .unwrap();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        sender
-            .register_peer(3, listener.local_addr().unwrap())
-            .await;
+        sender.register_peer(3, listener.local_addr().unwrap());
         let accepted = Arc::new(tokio::sync::Notify::new());
         let stalled_peer = {
             let accepted = Arc::clone(&accepted);

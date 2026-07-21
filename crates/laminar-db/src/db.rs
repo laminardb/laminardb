@@ -1187,7 +1187,6 @@ impl LaminarDB {
     }
 
     #[cfg(feature = "cluster")]
-    #[allow(clippy::too_many_lines)] // One fail-closed shuffle authority installation transaction.
     pub(crate) fn install_shuffle_assignment_fence(
         &self,
         fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
@@ -1407,7 +1406,6 @@ impl LaminarDB {
     /// force. The controller certificate is deliberately published only after both endpoints are
     /// installed.
     #[cfg(feature = "cluster")]
-    #[allow(clippy::too_many_lines)] // One serialized assignment-authority activation transaction.
     pub(crate) async fn activate_assignment_authority(
         &self,
         fence: &laminar_core::checkpoint::CheckpointAssignmentFence,
@@ -1930,7 +1928,6 @@ impl LaminarDB {
     /// Fails closed when the manifest cannot be loaded, a local definition conflicts with it, or
     /// any entry cannot be recreated. A node must never start with a partial cluster topology.
     #[cfg(feature = "cluster")]
-    #[allow(clippy::too_many_lines)] // Replay, validation, rollback, and sealing form one transaction.
     pub(crate) async fn restore_catalog_from_manifest(
         &self,
     ) -> Result<Option<laminar_core::cluster::control::CatalogManifest>, DbError> {
@@ -2106,7 +2103,6 @@ impl LaminarDB {
     }
 
     #[cfg(feature = "cluster")]
-    #[allow(clippy::too_many_lines)] // sequential rotation steps read better inline
     async fn adopt_assignment_snapshot_locked(
         &self,
         snapshot: laminar_core::cluster::control::AssignmentSnapshot,
@@ -2988,7 +2984,6 @@ impl LaminarDB {
     /// Returns an error for a partial or divergent bootstrap, unsafe catalog mutation, lost leader
     /// authority, or manifest sealing failure. Local creates are rolled back on every error.
     #[cfg(feature = "cluster")]
-    #[allow(clippy::too_many_lines)] // Parse, validate, apply, rollback, and seal one catalog batch.
     pub async fn execute_cluster_bootstrap_batch(
         &self,
         sql: &[String],
@@ -3204,7 +3199,6 @@ impl LaminarDB {
         self.execute_parsed_single(sql, &statements[0]).await
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn execute_parsed_single(
         &self,
         sql: &str,

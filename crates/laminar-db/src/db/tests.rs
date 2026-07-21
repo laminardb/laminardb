@@ -1436,9 +1436,7 @@ async fn assignment_activation_revalidates_recovery_admission_after_mesh_wait() 
             .unwrap(),
     );
     let local_sender = Arc::new(ShuffleSender::new(local_id.0, local_boot));
-    local_sender
-        .register_peer(peer_id.0, peer_receiver.local_addr())
-        .await;
+    local_sender.register_peer(peer_id.0, peer_receiver.local_addr());
     let db = LaminarDB::builder()
         .cluster_controller(Arc::clone(&controller))
         .cluster_checkpoint_object_store(authority_store)
@@ -2193,7 +2191,6 @@ async fn test_multi_statement_error_stops() {
         .execute("CREATE SOURCE a (id INT); CREATE SOURCE a (id INT)")
         .await;
     assert!(result.is_err());
-    // First statement should have succeeded
     assert_eq!(db.source_count(), 1);
 }
 
@@ -3112,7 +3109,6 @@ async fn test_insert_negative_values() {
 #[tokio::test]
 async fn test_create_source_unknown_connector() {
     let db = LaminarDB::open().unwrap();
-    // Use correct SQL syntax: FROM <type> (...) SCHEMA (...)
     let result = db
         .execute(
             "CREATE SOURCE events FROM NONEXISTENT \
@@ -3128,7 +3124,6 @@ async fn test_create_source_unknown_connector() {
 async fn test_create_sink_unknown_connector() {
     let db = LaminarDB::open().unwrap();
     db.execute("CREATE SOURCE events (id INT)").await.unwrap();
-    // Use correct SQL syntax: INTO <type> (...)
     let result = db
         .execute(
             "CREATE SINK output FROM events \
@@ -3286,61 +3281,24 @@ async fn test_connector_registry_accessor() {
     let db = LaminarDB::open().unwrap();
     let registry = db.connector_registry();
 
-    // With feature flags enabled, built-in connectors are auto-registered.
-    // Without any features, registry should be empty.
-    #[allow(unused_mut)]
-    // The generator source is unconditional (no feature gate).
-    let mut expected_sources = 1;
-    #[allow(unused_mut)]
-    let mut expected_sinks = 0;
-
-    #[cfg(feature = "kafka")]
-    {
-        expected_sources += 1; // kafka source
-        expected_sinks += 1; // kafka sink
-    }
-    #[cfg(feature = "postgres-cdc")]
-    {
-        expected_sources += 1; // postgres CDC source
-    }
-    #[cfg(feature = "postgres-sink")]
-    {
-        expected_sinks += 1; // postgres sink
-    }
-    #[cfg(feature = "delta-lake")]
-    {
-        expected_sources += 1; // delta-lake source
-        expected_sinks += 1; // delta-lake sink
-    }
-    #[cfg(feature = "iceberg")]
-    {
-        expected_sources += 1; // iceberg source
-        expected_sinks += 1; // iceberg sink
-    }
-    #[cfg(feature = "websocket")]
-    {
-        expected_sources += 1; // websocket source
-        expected_sinks += 1; // websocket sink
-    }
-    #[cfg(feature = "mongodb-cdc")]
-    {
-        expected_sources += 1; // mongodb CDC source
-        expected_sinks += 1; // mongodb sink
-    }
-    #[cfg(feature = "files")]
-    {
-        expected_sources += 1; // file source
-        expected_sinks += 1; // file sink
-    }
-    #[cfg(feature = "otel")]
-    {
-        expected_sources += 1; // otel source
-    }
-    #[cfg(feature = "nats")]
-    {
-        expected_sources += 1; // nats source
-        expected_sinks += 1; // nats sink
-    }
+    let expected_sources = 1
+        + usize::from(cfg!(feature = "kafka"))
+        + usize::from(cfg!(feature = "postgres-cdc"))
+        + usize::from(cfg!(feature = "delta-lake"))
+        + usize::from(cfg!(feature = "iceberg"))
+        + usize::from(cfg!(feature = "websocket"))
+        + usize::from(cfg!(feature = "mongodb-cdc"))
+        + usize::from(cfg!(feature = "files"))
+        + usize::from(cfg!(feature = "otel"))
+        + usize::from(cfg!(feature = "nats"));
+    let expected_sinks = usize::from(cfg!(feature = "kafka"))
+        + usize::from(cfg!(feature = "postgres-sink"))
+        + usize::from(cfg!(feature = "delta-lake"))
+        + usize::from(cfg!(feature = "iceberg"))
+        + usize::from(cfg!(feature = "websocket"))
+        + usize::from(cfg!(feature = "mongodb-cdc"))
+        + usize::from(cfg!(feature = "files"))
+        + usize::from(cfg!(feature = "nats"));
 
     assert_eq!(registry.list_sources().len(), expected_sources);
     assert_eq!(registry.list_sinks().len(), expected_sinks);
@@ -5273,7 +5231,6 @@ async fn test_drop_table_if_exists() {
 async fn test_having_filters_grouped_results() {
     let db = LaminarDB::open().unwrap();
 
-    // Create table and query via DataFusion directly
     db.ctx
         .sql(
             "CREATE TABLE hv_trades AS SELECT * FROM (VALUES \
@@ -5386,7 +5343,6 @@ async fn test_having_compound_predicate() {
 async fn test_multi_join_two_way_lookup() {
     let db = LaminarDB::open().unwrap();
 
-    // Create tables via DataFusion
     db.ctx
         .sql(
             "CREATE TABLE orders AS SELECT * FROM (VALUES \
@@ -5905,7 +5861,6 @@ async fn test_all_source_metrics() {
 
     let all = db.all_source_metrics();
     assert_eq!(all.len(), 2);
-    #[allow(clippy::disallowed_types)] // test code
     let names: std::collections::HashSet<_> = all.iter().map(|m| m.name.clone()).collect();
     assert!(names.contains("a"));
     assert!(names.contains("b"));
@@ -6094,7 +6049,6 @@ async fn test_watermark_advances_on_push() {
     let batch = make_ts_batch(&schema, &[1000, 2000, 3000]);
     handle.push_arrow(batch).unwrap();
 
-    // Wait for pipeline loop to process
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // With 0s delay, watermark should be max timestamp = 3000
@@ -6198,7 +6152,6 @@ async fn test_watermark_with_arrow_timestamp_column() {
     let handle = db.source_untyped("events").unwrap();
     let schema = handle.schema().clone();
 
-    // Build a batch with Arrow Timestamp(us) column matching the schema
     let batch = RecordBatch::try_new(
         schema,
         vec![
@@ -6340,7 +6293,6 @@ async fn test_late_data_dropped_after_external_watermark() {
     let handle = db.source_untyped("events").unwrap();
     let schema = handle.schema().clone();
 
-    // Step 1: Push on-time data
     let batch1 = make_ts_batch(&schema, &[1000, 2000, 3000]);
     handle.push_arrow(batch1).unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -6355,17 +6307,14 @@ async fn test_late_data_dropped_after_external_watermark() {
     }
     assert!(on_time_rows > 0, "should have on-time rows");
 
-    // Step 2: Advance watermark to 200_000 (external signal)
     handle.watermark(200_000);
     // Give the pipeline loop a cycle to pick up the external watermark
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-    // Step 3: Push late data (all timestamps < 200_000)
     let late_batch = make_ts_batch(&schema, &[100, 200, 300]);
     handle.push_arrow(late_batch).unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    // Step 4: Check that late data was filtered out
     let mut late_rows = 0;
     for _ in 0..256 {
         match poll_subscription_batch(&mut sub) {
@@ -6476,7 +6425,6 @@ async fn test_programmatic_watermark_filters_late_rows() {
 
     let schema = handle.schema().clone();
 
-    // Step 1: Push on-time data
     let batch1 = make_ts_batch(&schema, &[1000, 2000, 3000]);
     handle.push_arrow(batch1).unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -6491,16 +6439,13 @@ async fn test_programmatic_watermark_filters_late_rows() {
     }
     assert!(on_time_rows > 0, "should have on-time rows");
 
-    // Step 2: Advance watermark to 200_000 (external signal)
     handle.watermark(200_000);
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-    // Step 3: Push late data (all timestamps < 200_000)
     let late_batch = make_ts_batch(&schema, &[100, 200, 300]);
     handle.push_arrow(late_batch).unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    // Step 4: Check that late data was filtered out
     let mut late_rows = 0;
     for _ in 0..256 {
         match poll_subscription_batch(&mut sub) {

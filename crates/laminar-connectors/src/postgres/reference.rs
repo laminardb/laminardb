@@ -138,7 +138,6 @@ impl PostgresReferenceTableSource {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     fn postgres_config(&self) -> Result<tokio_postgres::Config, ConnectorError> {
         let properties = self.config.properties();
         for (left, right) in [

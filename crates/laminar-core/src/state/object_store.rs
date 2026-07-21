@@ -1059,7 +1059,6 @@ impl ObjectStoreBackend {
 }
 
 #[async_trait]
-#[allow(clippy::too_many_lines)]
 impl StateBackend for ObjectStoreBackend {
     fn key_group_capacity(&self) -> u32 {
         self.vnode_capacity

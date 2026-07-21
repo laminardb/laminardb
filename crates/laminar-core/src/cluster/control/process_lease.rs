@@ -80,11 +80,12 @@ fn sequence_from_path(node: NodeId, path: &OsPath) -> Result<u64, ProcessLeaseEr
     Ok(sequence)
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis() as i64)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        })
 }
 
 /// Durable owner of one stable node identity.

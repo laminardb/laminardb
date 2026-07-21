@@ -4218,7 +4218,6 @@ async fn gate_checks_full_registry_not_just_owned() {
 /// seals, a node acquiring a partition reads the sealed union and resumes from the committed cut.
 #[cfg(feature = "cluster")]
 #[tokio::test]
-#[allow(clippy::disallowed_types)]
 async fn source_offset_handoff_round_trip() {
     use bytes::Bytes;
     use laminar_core::state::{InProcessBackend, StateBackend};
@@ -5957,7 +5956,6 @@ async fn vnode_partial_write_fanout_is_bounded() {
 ///   a reference base (a successor with identical state must
 ///   re-upload full, or reference an older *successful* epoch).
 #[tokio::test]
-#[allow(clippy::too_many_lines)] // four-epoch fault sequence reads better unsplit
 async fn overlapping_epoch_failure_is_isolated() {
     let dir = tempfile::tempdir().unwrap();
     let mut coord = make_coordinator_with_key_groups(dir.path(), 2).await;

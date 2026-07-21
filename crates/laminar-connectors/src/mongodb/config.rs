@@ -189,7 +189,6 @@ impl MongoDbSourceConfig {
     /// # Errors
     ///
     /// Returns `ConnectorError` if required keys are missing or invalid.
-    #[allow(clippy::too_many_lines)]
     pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
         if let Some(key) = REMOVED_SOURCE_CONFIG_KEYS
             .iter()
@@ -467,7 +466,6 @@ impl MongoDbSinkConfig {
     /// # Errors
     ///
     /// Returns `ConnectorError` if required keys are missing or invalid.
-    #[allow(clippy::too_many_lines)]
     pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
         if let Some(key) = REMOVED_SINK_CONFIG_KEYS
             .iter()

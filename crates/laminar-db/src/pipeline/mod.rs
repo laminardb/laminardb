@@ -102,7 +102,6 @@ pub(crate) enum ControlMsgKind {
 }
 
 impl ControlMsg {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn add_stream(
         name: String,
         sql: String,

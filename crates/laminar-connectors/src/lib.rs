@@ -4,6 +4,8 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::duration_suboptimal_units)] // MSRV 1.85; from_mins/from_hours are 1.91+
 #![allow(clippy::module_name_repetitions)]
+#![allow(clippy::too_many_arguments, clippy::too_many_lines)]
+// Connector protocols keep explicit inputs and contiguous state transitions.
 // Connectors are Ring 1 (cold path): std HashMap/HashSet are acceptable
 // throughout config, registry, schema, checkpoint, and CDC modules.
 #![allow(clippy::disallowed_types)]

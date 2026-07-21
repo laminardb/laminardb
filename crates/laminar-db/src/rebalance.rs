@@ -204,7 +204,6 @@ async fn hold_terminal_source_resolution(
 /// # Panics
 ///
 /// The spawned watcher panics if an already-validated draining snapshot lacks its transition.
-#[allow(clippy::too_many_lines)]
 pub fn spawn_snapshot_watcher(
     db: Arc<LaminarDB>,
     store: Arc<AssignmentSnapshotStore>,
@@ -1195,7 +1194,6 @@ impl SourceDrainResolutionDeadline {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn settle_observed_local_drain(
     db: &Arc<LaminarDB>,
     store: &AssignmentSnapshotStore,
@@ -1532,7 +1530,6 @@ async fn audit_exact_drain_head(
     .map_err(|_| "durable drain predecessor audit timed out".to_string())?
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn prepare_and_announce_local_drain(
     db: &LaminarDB,
     store: &AssignmentSnapshotStore,
@@ -1557,7 +1554,6 @@ async fn prepare_and_announce_local_drain(
 }
 
 /// Publish per-domain owner counts. Resets the gauge so disappeared domains don't leave stale series.
-#[allow(clippy::cast_precision_loss)]
 fn publish_placement_metrics(
     metrics: &EngineMetrics,
     registry: &VnodeRegistry,
@@ -1565,7 +1561,7 @@ fn publish_placement_metrics(
     isolation_tier: usize,
 ) {
     let owners = registry.snapshot();
-    let total = owners.len().max(1);
+    let total = u32::try_from(owners.len().max(1)).unwrap_or(u32::MAX);
     let counts = owners_per_domain(&owners, nodes, isolation_tier);
 
     metrics.placement_vnodes_per_domain.reset();
@@ -1584,7 +1580,7 @@ fn publish_placement_metrics(
     }
     metrics
         .placement_blast_radius_ratio
-        .set(f64::from(max) / total as f64);
+        .set(f64::from(max) / f64::from(total));
 }
 
 /// Spawn the leader-gated rebalance controller. Runs on every node;
@@ -1952,7 +1948,6 @@ async fn authorize_recovery_successor(
     materialize_recovery_decision(db, store, controller, decision, operation_timeout).await
 }
 
-#[allow(clippy::too_many_lines)]
 fn try_rebalance_owned(
     db: Arc<LaminarDB>,
     controller: Arc<ClusterController>,
@@ -2563,7 +2558,6 @@ async fn await_drain_quorum(
 /// Settle a draining generation without changing the target version certified by source receipts.
 /// The terminal verdict first enters the shared leader/checkpoint authority sequence; the snapshot
 /// store then publishes that immutable verdict as the assignment materialization.
-#[allow(clippy::too_many_lines)]
 async fn finalize_drain_snapshot(
     db: &Arc<LaminarDB>,
     store: &Arc<AssignmentSnapshotStore>,
@@ -3863,9 +3857,7 @@ mod tests {
             .unwrap();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        sender
-            .register_peer(2, listener.local_addr().unwrap())
-            .await;
+        sender.register_peer(2, listener.local_addr().unwrap());
         let accepted = Arc::new(Notify::new());
         let peer = {
             let accepted = Arc::clone(&accepted);

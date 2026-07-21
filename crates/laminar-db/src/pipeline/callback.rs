@@ -80,28 +80,24 @@ impl CheckpointControlWake {
     }
 
     #[must_use]
-    #[allow(clippy::unused_self)] // Maintains the feature-independent callback surface.
-    pub(crate) const fn capacity_retry(&self) -> Duration {
+    pub(crate) const fn capacity_retry() -> Duration {
         CHECKPOINT_CONTROL_POLL_FALLBACK
     }
 }
 
 #[cfg(not(feature = "cluster"))]
 impl CheckpointControlWake {
-    #[allow(clippy::unused_self)] // Maintains the feature-independent callback surface.
     pub(crate) async fn wait_until(&mut self, fallback_at: tokio::time::Instant) {
         tokio::time::sleep_until(fallback_at).await;
     }
 
     #[must_use]
-    #[allow(clippy::unused_self)] // Maintains the feature-independent callback surface.
-    pub(crate) const fn fallback(&self) -> Duration {
+    pub(crate) const fn fallback() -> Duration {
         CHECKPOINT_CONTROL_POLL_FALLBACK
     }
 
     #[must_use]
-    #[allow(clippy::unused_self)] // Maintains the feature-independent callback surface.
-    pub(crate) const fn capacity_retry(&self) -> Duration {
+    pub(crate) const fn capacity_retry() -> Duration {
         CHECKPOINT_CONTROL_POLL_FALLBACK
     }
 }

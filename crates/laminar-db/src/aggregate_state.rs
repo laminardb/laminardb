@@ -613,7 +613,6 @@ pub(crate) fn validate_agg_checkpoint_slice(
 
 /// Merge serialized aggregate slices over disjoint keys into one checkpoint.
 #[cfg(feature = "cluster")]
-#[allow(clippy::too_many_lines)]
 pub(crate) fn merge_serialized_agg_cps(slices: &[bytes::Bytes]) -> Result<Vec<u8>, DbError> {
     let checkpoints = slices
         .iter()
@@ -1483,7 +1482,6 @@ impl IncrementalAggState {
         Ok(vec![batch])
     }
 
-    #[allow(clippy::too_many_lines)]
     fn emit_changelog_delta(&mut self) -> Result<Vec<RecordBatch>, DbError> {
         let mut retract_keys: Vec<arrow::row::OwnedRow> = Vec::new();
         let mut retract_vals: Vec<Vec<ScalarValue>> = Vec::new();
@@ -1779,7 +1777,6 @@ impl IncrementalAggState {
 
     /// Partition state into one [`AggStateCheckpoint`] per vnode using the same hash as the shuffle.
     #[cfg(feature = "cluster")]
-    #[allow(clippy::disallowed_types)] // checkpoint path; vnode-keyed map
     pub(crate) fn checkpoint_groups_by_vnode(
         &mut self,
         vnode_count: u32,
@@ -1880,20 +1877,17 @@ impl IncrementalAggState {
         retractable: bool,
     ) -> Result<VnodeCapture, DbError> {
         let global = self.num_group_cols == 0;
-        let vnode_of = |key: &arrow::row::OwnedRow| -> u32 {
+        let vnode_of = |key: &arrow::row::OwnedRow| -> u64 {
             if global {
                 0
             } else {
-                #[allow(clippy::cast_possible_truncation)]
-                {
-                    (laminar_core::state::key_hash(key.as_ref()) % u64::from(vnode_count)) as u32
-                }
+                laminar_core::state::key_hash(key.as_ref()) % u64::from(vnode_count)
             }
         };
         let mut entries: Vec<(arrow::row::OwnedRow, &mut GroupEntry)> = self
             .groups
             .iter_mut()
-            .filter(|(key, _)| vnode_of(key) == vnode)
+            .filter(|(key, _)| vnode_of(key) == u64::from(vnode))
             .map(|(key, entry)| (key.clone(), entry))
             .collect();
         let encoded = encode_groups_columnar(
@@ -1922,7 +1916,6 @@ impl IncrementalAggState {
     /// groups, so the dedup map survives chain replay. Clears the per-vnode dirty sets; the next
     /// delta measures against the state captured here.
     #[cfg(feature = "cluster")]
-    #[allow(clippy::disallowed_types)] // checkpoint path; vnode-keyed map
     pub(crate) fn checkpoint_delta_by_vnode(
         &mut self,
         vnode_count: u32,
@@ -2393,91 +2386,6 @@ impl IncrementalAggState {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Profiler: isolates the per-cycle cost of a non-windowed running-state aggregate at high
-    // group cardinality — #1 full re-emit (`emit_running_state`) vs #2 checkpoint capture
-    // (`checkpoint_groups`) vs the incremental baseline (folding ONE changed row). Run release:
-    //   cargo test -p laminar-db --lib --release profile_agg_emit_vs_capture -- --ignored --nocapture
-    #[tokio::test]
-    #[ignore = "profiler — run with --release --ignored --nocapture"]
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-    async fn profile_agg_emit_vs_capture() {
-        use std::time::Instant;
-
-        fn pre_agg_batch(n: usize) -> RecordBatch {
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("name", DataType::Utf8, true),
-                Field::new("__agg_input_1", DataType::Float64, true),
-            ]));
-            let names: Vec<String> = (0..n).map(|i| format!("g{i}")).collect();
-            let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
-            let vals: Vec<f64> = (0..n).map(|i| i as f64).collect();
-            RecordBatch::try_new(
-                schema,
-                vec![
-                    Arc::new(arrow::array::StringArray::from(name_refs)),
-                    Arc::new(arrow::array::Float64Array::from(vals)),
-                ],
-            )
-            .unwrap()
-        }
-
-        println!("\n--- non-windowed running-state aggregate, per-cycle cost ---");
-        for &n in &[10_000usize, 100_000, 1_000_000] {
-            let ctx = laminar_sql::create_session_context();
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("name", DataType::Utf8, true),
-                Field::new("value", DataType::Float64, true),
-            ]));
-            let dummy = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(arrow::array::StringArray::from(vec!["x"])),
-                    Arc::new(arrow::array::Float64Array::from(vec![1.0])),
-                ],
-            )
-            .unwrap();
-            let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![dummy]]).unwrap();
-            ctx.register_table("events", Arc::new(mem)).unwrap();
-            let mut state = IncrementalAggState::try_from_sql(
-                &ctx,
-                "SELECT name, SUM(value) AS total FROM events GROUP BY name",
-                false, // non-windowed running-state → the full re-emit path
-            )
-            .await
-            .unwrap()
-            .expect("agg state");
-
-            state.process_batch(&pre_agg_batch(n), i64::MIN).unwrap();
-            assert_eq!(state.groups.len(), n);
-
-            // #1 — full re-emit of all N groups (what a non-windowed running-state MV does
-            // every cycle, regardless of how many groups actually changed).
-            let t = Instant::now();
-            let out = state.emit_running_state().unwrap();
-            let emit_us = t.elapsed().as_micros();
-            let emitted: usize = out.iter().map(arrow_array::RecordBatch::num_rows).sum();
-
-            // #2 — O(groups) checkpoint capture (inline on the pipeline task).
-            let t = Instant::now();
-            let _cp = state.checkpoint_groups().unwrap();
-            let capture_us = t.elapsed().as_micros();
-
-            // Baseline — the real incremental work for a cycle touching ONE group.
-            let t = Instant::now();
-            state.process_batch(&pre_agg_batch(1), i64::MIN).unwrap();
-            let process_one_us = t.elapsed().as_micros().max(1);
-
-            println!(
-                "N={n:>9}  emit={emit_us:>8}us ({:>4}ns/grp, {emitted} rows)  \
-                 capture={capture_us:>8}us ({:>4}ns/grp)  process_1row={process_one_us:>4}us  \
-                 emit/process1={:>6.0}x",
-                (emit_us * 1000) / n as u128,
-                (capture_us * 1000) / n as u128,
-                emit_us as f64 / process_one_us as f64,
-            );
-        }
-    }
 
     #[tokio::test]
     async fn test_try_from_sql_rejects_post_aggregate_projection() {
@@ -3616,7 +3524,6 @@ mod tests {
             .unwrap()
             .unwrap()
         }
-        #[allow(clippy::disallowed_types)] // matches checkpoint_delta_by_vnode's return type
         fn delta_for_vnode0(cap: std::collections::HashMap<u32, VnodeCapture>) -> AggVnodeDelta {
             match cap.into_iter().find(|(v, _)| *v == 0).map(|(_, c)| c) {
                 Some(VnodeCapture::Delta(d)) => d,

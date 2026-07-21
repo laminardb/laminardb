@@ -285,7 +285,6 @@ impl MongoDbSink {
         self.write_timeout.checked_sub(headroom).unwrap()
     }
 
-    #[allow(clippy::too_many_lines)]
     fn validate_schema(
         schema: &SchemaRef,
         config: &MongoDbSinkConfig,
@@ -1547,7 +1546,6 @@ impl MongoDbSink {
     ///
     /// Accepts `serde_json::Value` directly (no intermediate string round-trip).
     /// Insert/upsert from documents already in BSON (no JSON hop).
-    #[allow(clippy::too_many_lines)]
     async fn write_bson_docs(
         &self,
         docs: Vec<mongodb::bson::Document>,

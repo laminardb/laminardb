@@ -73,7 +73,7 @@ async fn harness() -> Harness {
     .unwrap();
     recv.install_assignment_fence(&fence, &[1, 2]).unwrap();
     sender.install_assignment_fence(&fence, &[1, 2]).unwrap();
-    sender.register_peer(2, recv.local_addr()).await;
+    sender.register_peer(2, recv.local_addr());
     let received = Arc::new(AtomicU64::new(0));
     let counter = Arc::clone(&received);
     tokio::spawn(async move {

@@ -3665,7 +3665,6 @@ impl ClusterController {
     /// # Errors
     /// Returns a classified uncertain, conflict, or superseded outcome. Missing readiness remains
     /// a normal pending status.
-    #[allow(clippy::too_many_lines)]
     pub async fn try_commit_recover_release(
         &self,
         release: &RecoveryAnnouncement,

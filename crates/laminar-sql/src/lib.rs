@@ -4,6 +4,7 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::duration_suboptimal_units)] // MSRV 1.85; from_mins/from_hours are 1.91+
 #![allow(clippy::module_name_repetitions)]
+#![allow(clippy::too_many_arguments, clippy::too_many_lines)] // Parser and planner entry points keep grammar state and operands explicit.
 #![allow(clippy::disallowed_types)] // cold path: SQL parsing and query planning only
 #![allow(clippy::doc_markdown)]
 #![allow(clippy::uninlined_format_args)]

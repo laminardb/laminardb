@@ -349,7 +349,6 @@ impl SourceConnector for FileSource {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)] // One state machine keeps the post-I/O cursor transition await-free.
     async fn poll_batch(
         &mut self,
         max_records: usize,

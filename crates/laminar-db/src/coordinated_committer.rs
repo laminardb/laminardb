@@ -493,7 +493,6 @@ impl CoordinatedCommitter {
         first_err.map_or(Ok(()), Err)
     }
 
-    #[allow(clippy::too_many_lines)] // One snapshot audit establishes a single commit frontier.
     async fn load_commit_inventory(&self) -> Result<CommitInventory, DbError> {
         let decision_store = self.decision_store.as_ref().ok_or_else(|| {
             DbError::Checkpoint(
@@ -891,7 +890,6 @@ impl CoordinatedCommitter {
     }
 
     #[cfg(feature = "cluster")]
-    #[allow(clippy::too_many_lines)] // Capsule validation is one cohesive fail-closed recovery protocol.
     async fn validate_cluster_recovery_capsules(
         &self,
         committed_attempts: &[CheckpointAttempt],
@@ -1041,7 +1039,6 @@ impl CoordinatedCommitter {
         .await
     }
 
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // One bounded commit transaction keeps its frontier and batching limits explicit.
     async fn commit_sealed_with_limits(
         &self,
         handle: &SinkTaskHandle,

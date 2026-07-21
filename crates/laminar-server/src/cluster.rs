@@ -856,7 +856,6 @@ impl Drop for ClusterHandle {
 const PROCESS_LEASE_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const PROCESS_LEASE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn unix_time_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3150,7 +3149,7 @@ async fn build_shuffle_sender(
                             .get(SHUFFLE_ADDR_KEY)
                             .and_then(|a| a.parse::<std::net::SocketAddr>().ok())
                         {
-                            sender_clone.register_peer(node.id.0, addr).await;
+                            sender_clone.register_peer(node.id.0, addr);
                         }
                     }
                 }

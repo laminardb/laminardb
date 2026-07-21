@@ -4,6 +4,9 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::duration_suboptimal_units)] // MSRV 1.85; from_mins/from_hours are 1.91+
 #![allow(clippy::module_name_repetitions)]
+#![allow(clippy::too_many_arguments, clippy::too_many_lines)]
+// Protocol state machines remain contiguous and keep authority inputs explicit.
+// Protocol fixtures use explicit boundary values and full state construction.
 #![cfg_attr(
     test,
     allow(
@@ -14,8 +17,7 @@
         clippy::items_after_statements,
         clippy::large_futures,
         clippy::similar_names,
-        clippy::struct_excessive_bools,
-        clippy::too_many_lines
+        clippy::struct_excessive_bools
     )
 )]
 

@@ -230,8 +230,7 @@ impl FormatDecoder for CsvDecoder {
         self.decode_slices(&values)
     }
 
-    #[allow(clippy::unnecessary_literal_bound)]
-    fn format_name(&self) -> &str {
+    fn format_name(&self) -> &'static str {
         "csv"
     }
 }
@@ -581,8 +580,7 @@ impl FormatEncoder for CsvEncoder {
         Ok(output)
     }
 
-    #[allow(clippy::unnecessary_literal_bound)]
-    fn format_name(&self) -> &str {
+    fn format_name(&self) -> &'static str {
         "csv"
     }
 }

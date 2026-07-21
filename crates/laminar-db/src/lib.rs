@@ -24,12 +24,16 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::duration_suboptimal_units)] // MSRV 1.85; from_mins/from_hours are 1.91+
 #![allow(clippy::module_name_repetitions)]
+#![allow(clippy::too_many_arguments, clippy::too_many_lines)] // Lifecycle protocols remain contiguous and keep fencing inputs explicit.
+#![allow(clippy::disallowed_types)] // Control-plane maps mirror persisted and cross-crate checkpoint types.
+#![allow(clippy::unused_self)]
+// Feature stubs preserve shared protocol call sites.
+// Lifecycle fixtures favor explicit protocol setup and boundary assertions.
 #![cfg_attr(
     test,
     allow(
         clippy::assertions_on_constants,
         clippy::default_trait_access,
-        clippy::disallowed_types,
         clippy::field_reassign_with_default,
         clippy::filter_map_bool_then,
         clippy::float_cmp,
@@ -42,8 +46,6 @@
         clippy::redundant_closure,
         clippy::similar_names,
         clippy::single_char_pattern,
-        clippy::too_many_arguments,
-        clippy::too_many_lines,
         clippy::type_complexity,
         clippy::unchecked_time_subtraction,
         clippy::unnecessary_to_owned,

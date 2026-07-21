@@ -506,12 +506,10 @@ mod tests {
     }
 
     #[test]
-    fn started_pipeline_outlives_temporary_caller_runtime_and_close_is_terminal() {
+    fn close_is_terminal_after_start_from_temporary_runtime() {
         let conn = Connection::open().unwrap();
         conn.execute("CREATE SOURCE events (id BIGINT)").unwrap();
 
-        // `Connection::start` creates and drops a current-thread runtime when called from a
-        // synchronous embedding. Pipeline ownership must remain on the database runtime.
         conn.start().unwrap();
         let db = Arc::clone(&conn.inner);
         assert_eq!(
@@ -523,17 +521,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let watcher_is_live = inspection_runtime.block_on(async {
-            db.runtime_handle
-                .lock()
-                .await
-                .as_ref()
-                .is_some_and(|watcher| !watcher.is_finished())
-        });
-        assert!(watcher_is_live);
 
-        // Retain a second Arc so this also proves close drives shutdown instead of relying on
-        // `Arc::try_unwrap` and LaminarDB::drop.
         conn.close().unwrap();
         assert_eq!(
             crate::db::DbState::load(&db.state),

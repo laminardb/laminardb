@@ -2,7 +2,7 @@
     clippy::assertions_on_constants,
     clippy::disallowed_types,
     clippy::too_many_arguments
-)]
+)] // Fault-soak setup keeps explicit process inputs and platform-gated assertions.
 
 //! Real-binary checkpoint soaks with `kill -9` fault injection.
 //!

@@ -1609,7 +1609,6 @@ fn bootstrap_change_stream_options(
 }
 
 #[cfg(feature = "mongodb-cdc")]
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn forward_change_stream(
     cursor: &mut mongodb::change_stream::ChangeStream<
         mongodb::change_stream::event::ChangeStreamEvent<mongodb::bson::Document>,
@@ -1976,7 +1975,6 @@ fn report_mongo_reader_admission_error(
 /// Uses a `'reconnect` / `'recv` double-loop pattern (mirroring the
 /// Postgres CDC source) with exponential backoff capped at 30 seconds.
 #[cfg(feature = "mongodb-cdc")]
-#[allow(clippy::too_many_arguments)]
 async fn run_change_stream_reader(
     db: mongodb::Database,
     config: MongoDbSourceConfig,
@@ -2015,7 +2013,6 @@ async fn run_change_stream_reader(
 }
 
 #[cfg(feature = "mongodb-cdc")]
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_change_stream_reader_loop(
     db: mongodb::Database,
     config: MongoDbSourceConfig,
@@ -2298,7 +2295,6 @@ async fn run_change_stream_reader_loop(
 
 /// Parses a `ChangeStreamEvent<Document>` into a [`MongoDbChangeEvent`].
 #[cfg(feature = "mongodb-cdc")]
-#[allow(clippy::too_many_lines)]
 fn parse_change_stream_event(
     event: &mongodb::change_stream::event::ChangeStreamEvent<mongodb::bson::Document>,
 ) -> Result<MongoDbChangeEvent, ConnectorError> {

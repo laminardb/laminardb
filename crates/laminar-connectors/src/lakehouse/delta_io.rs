@@ -1093,7 +1093,6 @@ fn bounded_map_bytes<'a>(
 }
 
 #[cfg(feature = "delta-lake")]
-#[allow(clippy::too_many_lines)] // A descriptor is validated in one fail-closed pass.
 fn validate_coordinated_descriptors(
     adds: &[deltalake::kernel::Add],
     partition_columns: &[String],
@@ -1369,7 +1368,6 @@ struct CoordinatedPublicationOutcome {
 }
 
 #[cfg(feature = "delta-lake")]
-#[allow(clippy::too_many_lines)] // Keep the ordered prepare/admit/reconcile protocol contiguous.
 async fn publish_coordinated<F>(
     table: &DeltaTable,
     external_key: &str,

@@ -1068,7 +1068,6 @@ impl LeaderAuthorityRecord {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     fn validate(&self) -> Result<(), LeaseError> {
         if self.version != AUTHORITY_RECORD_VERSION {
             return Err(LeaseError::Invalid(format!(
@@ -2105,7 +2104,6 @@ impl LeaderLeaseStore {
         Ok(terminal)
     }
 
-    #[allow(clippy::too_many_lines)]
     pub(crate) async fn record_recovery_release_commit(
         &self,
         proof: &LeaderProof,
@@ -2416,7 +2414,6 @@ impl LeaderLeaseStore {
         });
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn prune_history(store: &Arc<dyn ObjectStore>, grace_ms: i64) -> Result<(), LeaseError> {
         let authority = Self::new(Arc::clone(store), 1);
         let Some(head) = authority.load_record().await? else {
@@ -2811,7 +2808,6 @@ impl LeaderLeaseStore {
             .map(|head| head.record))
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn load_published_authority_head(
         &self,
     ) -> Result<Option<PublishedAuthorityHead>, LeaseError> {
@@ -3319,7 +3315,6 @@ impl LeaderLeaseStore {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn audited_cluster_outcomes_from(
         &self,
         head: &LeaderAuthorityRecord,
@@ -4080,7 +4075,6 @@ impl LeaderLeaseStore {
     /// # Errors
     /// Fails closed for a stale proof, non-monotonic or conflicting outcome, malformed recovery
     /// capsule, or object-store failure.
-    #[allow(clippy::too_many_lines)]
     pub async fn record_cluster_outcome(
         &self,
         proof: &LeaderProof,
@@ -4309,7 +4303,6 @@ impl LeaderLeaseStore {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn record_assignment_decision(
         &self,
         proof: &LeaderProof,
@@ -4773,7 +4766,6 @@ impl LeaderLeaseStore {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn cluster_outcome_from_snapshot(
         &self,
         head: &LeaderAuthorityRecord,
@@ -5298,7 +5290,6 @@ impl LeaderLeaseStore {
     /// # Errors
     ///
     /// Fails for a stale proof, invalid horizon, failed artifact validation, or storage failure.
-    #[allow(clippy::too_many_lines)]
     pub async fn prune_cluster_outcomes_before<V, Fut>(
         &self,
         proof: &LeaderProof,
@@ -5903,7 +5894,6 @@ impl LeaderLeaseManager {
     }
 
     #[cfg(feature = "cluster")]
-    #[allow(clippy::too_many_lines)]
     async fn run(
         self,
         shutdown: tokio_util::sync::CancellationToken,

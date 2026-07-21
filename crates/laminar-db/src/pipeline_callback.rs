@@ -459,7 +459,6 @@ async fn fail_reserved_leader_attempt(
     }
 }
 
-#[allow(clippy::disallowed_types)]
 fn combine_operator_checkpoint_states<I>(
     graph_state: Option<bytes::Bytes>,
     mv_states: I,
@@ -678,7 +677,6 @@ fn staged_request_bytes(
     ops.saturating_add(vnodes)
 }
 
-#[allow(clippy::disallowed_types)]
 fn staged_vnode_bytes(vnode_states: &crate::checkpoint_coordinator::StagedVnodeStates) -> u64 {
     staged_request_bytes(
         &crate::checkpoint_coordinator::CheckpointRequest::default(),
@@ -1102,18 +1100,11 @@ fn observe_unrecovered_delivery_loss_incidents(
 }
 
 impl ConnectorPipelineCallback {
-    #[allow(clippy::unused_self)] // Cluster builds consult the installed controller.
+    #[cfg(feature = "cluster")]
     fn checkpoint_recovery_active(&self) -> bool {
-        #[cfg(feature = "cluster")]
-        {
-            self.cluster_controller
-                .as_ref()
-                .is_some_and(|controller| controller.is_recovering())
-        }
-        #[cfg(not(feature = "cluster"))]
-        {
-            false
-        }
+        self.cluster_controller
+            .as_ref()
+            .is_some_and(|controller| controller.is_recovering())
     }
 
     fn mark_checkpoint_admission_failure(&mut self, reason: &str) -> bool {
@@ -1147,10 +1138,6 @@ impl ConnectorPipelineCallback {
     }
 
     #[cfg(feature = "cluster")]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "source handoff validation and watermark installation form one atomic reconciliation"
-    )]
     fn reconcile_source_handoff_watermarks(&mut self) -> Result<(), String> {
         let Some(registry) = self.vnode_registry.as_ref() else {
             return Ok(());
@@ -1445,7 +1432,6 @@ impl ConnectorPipelineCallback {
     }
 
     #[cfg(feature = "cluster")]
-    #[allow(clippy::too_many_lines)]
     async fn prepare_leader_quorum(
         tail: &LeaderTail,
         deadline: tokio::time::Instant,
@@ -2169,7 +2155,6 @@ impl ConnectorPipelineCallback {
     }
 
     #[cfg(feature = "cluster")]
-    #[allow(clippy::too_many_lines)]
     async fn await_rejected_follower_settlement(
         controller: &laminar_core::cluster::control::ClusterController,
         attempt: CheckpointAttempt,
@@ -2364,7 +2349,6 @@ impl ConnectorPipelineCallback {
     }
 
     #[cfg(feature = "cluster")]
-    #[allow(clippy::too_many_lines)]
     async fn wait_for_aligned_resume(
         has_cluster_shuffle: bool,
         controller: &laminar_core::cluster::control::ClusterController,
@@ -2917,10 +2901,6 @@ impl ConnectorPipelineCallback {
     }
 
     #[cfg(feature = "cluster")]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "follower checkpoint admission is one fail-closed control-state transition"
-    )]
     async fn maybe_follower_checkpoint(
         &mut self,
         controller: Arc<laminar_core::cluster::control::ClusterController>,
@@ -3119,10 +3099,6 @@ impl ConnectorPipelineCallback {
     }
 
     #[cfg(feature = "cluster")]
-    #[allow(
-        clippy::too_many_lines,
-        reason = "the deferred follower checkpoint keeps alignment, capture, and publication fences contiguous"
-    )]
     async fn run_follower_checkpoint_deferred(
         &mut self,
         ann: laminar_core::cluster::control::BarrierAnnouncement,
@@ -3715,45 +3691,33 @@ impl ConnectorPipelineCallback {
     ///
     /// Empty outside cluster mode. A cluster capture failure faults the runtime because an empty
     /// map is a valid stateless snapshot and cannot encode partially consumed live state.
-    #[allow(clippy::unused_self, clippy::disallowed_types)] // matches the coordinator/graph map shape
-    #[cfg_attr(
-        not(feature = "cluster"),
-        allow(clippy::unnecessary_wraps) // one cross-feature API; cluster capture is fallible
-    )]
+    #[cfg(feature = "cluster")]
     fn capture_vnode_states(
         &mut self,
         epoch: u64,
     ) -> Result<crate::checkpoint_coordinator::StagedVnodeStates, String> {
-        #[cfg(feature = "cluster")]
+        // This proactive re-base avoids sacrificing an attempt after an allocator jump. The
+        // coordinator separately requires a sealed, immediately preceding parent before it
+        // persists any delta manifest or marker.
+        let failed_capture = self
+            .delta_rebase_needed
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        if failed_capture
+            || vnode_capture_requires_full_rebase(self.last_vnode_capture_epoch, epoch)
         {
-            // This proactive re-base avoids sacrificing an attempt after an allocator jump. The
-            // coordinator separately requires a sealed, immediately preceding parent before it
-            // persists any delta manifest or marker.
-            let failed_capture = self
-                .delta_rebase_needed
-                .swap(false, std::sync::atomic::Ordering::SeqCst);
-            if failed_capture
-                || vnode_capture_requires_full_rebase(self.last_vnode_capture_epoch, epoch)
-            {
-                self.graph.force_full_rebase();
-            }
-            match self.graph.snapshot_state_by_vnode() {
-                Ok(states) => {
-                    self.last_vnode_capture_epoch = Some(epoch);
-                    Ok(states)
-                }
-                Err(error) => {
-                    self.delta_rebase_needed
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                    let error = format!("per-vnode state snapshot failed: {error}");
-                    Err(self.fault_mutable_checkpoint_capture("per-vnode state", &error))
-                }
-            }
+            self.graph.force_full_rebase();
         }
-        #[cfg(not(feature = "cluster"))]
-        {
-            let _ = epoch;
-            Ok(std::collections::HashMap::new())
+        match self.graph.snapshot_state_by_vnode() {
+            Ok(states) => {
+                self.last_vnode_capture_epoch = Some(epoch);
+                Ok(states)
+            }
+            Err(error) => {
+                self.delta_rebase_needed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                let error = format!("per-vnode state snapshot failed: {error}");
+                Err(self.fault_mutable_checkpoint_capture("per-vnode state", &error))
+            }
         }
     }
 
@@ -3788,7 +3752,6 @@ impl ConnectorPipelineCallback {
 
     /// Cluster pipelines always fault (rather than drop) on fatal errors: coordinated
     /// recovery replays them, and a swallowed fault would desync the cross-node cut.
-    #[cfg_attr(not(feature = "cluster"), allow(clippy::unused_self))]
     fn in_cluster(&self) -> bool {
         #[cfg(feature = "cluster")]
         {
@@ -3841,10 +3804,6 @@ impl ConnectorPipelineCallback {
         }
     }
 
-    #[cfg(not(feature = "cluster"))]
-    #[allow(clippy::unused_self)]
-    fn check_shuffle_delivery_loss(&mut self) {}
-
     fn sink_publication_requires_replay(&self) -> bool {
         self.checkpoint_committable_sinks
             || self.delivery_guarantee
@@ -3861,6 +3820,7 @@ impl ConnectorPipelineCallback {
     }
 
     fn drain_sink_events(&mut self) {
+        #[cfg(feature = "cluster")]
         self.check_shuffle_delivery_loss();
         while let Ok(event) = self.sink_event_rx.try_recv() {
             tracing::debug!(?event, "sink event");
@@ -3993,10 +3953,6 @@ impl ConnectorPipelineCallback {
         }
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "checkpoint graph drain is one deadline-fenced quiescence protocol"
-    )]
     async fn drain_checkpoint_edges_until_inner(
         &mut self,
         deadline: tokio::time::Instant,
@@ -4089,12 +4045,11 @@ impl ConnectorPipelineCallback {
             }
             #[cfg(feature = "cluster")]
             self.require_process_authority("checkpoint graph drain continuation")?;
-            #[allow(clippy::cast_possible_truncation)]
             <Self as crate::pipeline::PipelineCallback>::record_cycle(
                 self,
                 0,
                 0,
-                pass_started.elapsed().as_nanos() as u64,
+                u64::try_from(pass_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
             );
 
             if tokio::time::Instant::now() >= deadline {
@@ -4121,7 +4076,6 @@ impl ConnectorPipelineCallback {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn admit_control_stream(
     graph: &mut crate::operator_graph::OperatorGraph,
     name: String,
@@ -4219,7 +4173,6 @@ pub(crate) fn apply_control_to_graph(
     }
 }
 
-#[allow(clippy::too_many_lines)]
 impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     fn prepare_source_intake(&mut self) -> Result<(), String> {
         #[cfg(feature = "cluster")]
@@ -4332,7 +4285,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             if let Some(batches) = results.get(entry.name.as_str()) {
                 for batch in batches {
                     if batch.num_rows() > 0 {
-                        #[allow(clippy::cast_possible_truncation)]
                         let row_count = batch.num_rows() as u64;
                         self.subscription_registry
                             .send_batch(&entry.name, batch.clone())
@@ -4421,7 +4373,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             // Apply the whole cycle's output in one call: an Aggregate-mode MV replaces its
             // result set per cycle, so a per-batch update would keep only the last chunk of a
             // multi-batch (>8192-row) output (EX-1).
-            #[allow(clippy::cast_possible_truncation)]
             let row_batches = batches.iter().filter(|b| b.num_rows() > 0).count() as u64;
             if row_batches > 0 {
                 store.update_cycle(stream_name, batches).map_err(|error| {
@@ -4454,10 +4405,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
         if updates > 0 {
             self.prom.mv_updates.inc_by(updates);
-            #[allow(clippy::cast_possible_truncation)]
-            let bytes = store.total_bytes() as u64;
-            #[allow(clippy::cast_possible_wrap)]
-            self.prom.mv_bytes_stored.set(bytes as i64);
+            let bytes = i64::try_from(store.total_bytes()).unwrap_or(i64::MAX);
+            self.prom.mv_bytes_stored.set(bytes);
         }
         drop(store);
 
@@ -4608,7 +4557,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                                         Ok(Some(fb)) => Cow::Owned(fb),
                                         Ok(None) => continue,
                                         Err(e) => {
-                                            #[allow(clippy::cast_possible_truncation)]
                                             let dropped = batch.num_rows() as u64;
                                             prom.sink_filter_rejected_rows
                                                 .with_label_values(&[sink_name.as_str()])
@@ -4628,7 +4576,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                                     }
                                 }
                                 SinkFilterDispatch::Rejected => {
-                                    #[allow(clippy::cast_possible_truncation)]
                                     let dropped = batch.num_rows() as u64;
                                     prom.sink_filter_rejected_rows
                                         .with_label_values(&[sink_name.as_str()])
@@ -4757,7 +4704,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             }
         }
 
-        #[allow(clippy::cast_possible_truncation)]
         let row_count = batch.num_rows() as u64;
         self.prom.events_ingested.inc_by(row_count);
         self.prom.batches.inc();
@@ -4835,7 +4781,10 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     fn is_recovering(&mut self) -> bool {
+        #[cfg(feature = "cluster")]
         let recovering = self.checkpoint_recovery_active();
+        #[cfg(not(feature = "cluster"))]
+        let recovering = false;
         self.observe_checkpoint_recovery_state(recovering)
     }
 
@@ -4906,7 +4855,10 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     fn record_checkpoint_admission_failure(&mut self, reason: &str) {
+        #[cfg(feature = "cluster")]
         let recovering = self.checkpoint_recovery_active();
+        #[cfg(not(feature = "cluster"))]
+        let recovering = false;
         self.observe_checkpoint_recovery_state(recovering);
         if self.mark_checkpoint_admission_failure(reason) {
             tracing::error!(reason = %reason, "checkpoint admission failed");
@@ -5384,6 +5336,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             return BarrierOutcome::Failed;
         }
 
+        #[cfg(feature = "cluster")]
         let vnode_states = match self.capture_vnode_states(attempt.epoch) {
             Ok(states) => states,
             Err(error) => {
@@ -5396,6 +5349,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 return BarrierOutcome::Failed;
             }
         };
+        #[cfg(not(feature = "cluster"))]
+        let vnode_states = std::collections::HashMap::new();
         let operator_state_encoded_budget = match encoded_operator_state_budget(
             self.checkpoint_state_cap_bytes,
             operator_state.estimated_bytes(),
@@ -5509,10 +5464,9 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     fn record_cycle(&self, events_ingested: u64, _batches: u64, elapsed_ns: u64) {
         let _ = events_ingested; // counted in extract_watermark
         self.prom.cycles.inc();
-        #[allow(clippy::cast_precision_loss)]
         self.prom
             .cycle_duration
-            .observe(elapsed_ns as f64 / 1_000_000_000.0);
+            .observe(Duration::from_nanos(elapsed_ns).as_secs_f64());
     }
 
     fn note_cycle_error(&self) {
@@ -8393,7 +8347,7 @@ mod tests {
             .unwrap();
         receiver.install_assignment_fence(fence, &[1, 7]).unwrap();
         sender.install_assignment_fence(fence, &[1, 7]).unwrap();
-        sender.register_peer(7, receiver.local_addr()).await;
+        sender.register_peer(7, receiver.local_addr());
         callback
             .graph
             .set_cluster_shuffle(crate::operator::sql_query::ClusterShuffleConfig {

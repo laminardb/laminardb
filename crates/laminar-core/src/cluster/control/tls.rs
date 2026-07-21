@@ -24,6 +24,7 @@ impl ClusterTls {
     /// every peer cert, and the `server_name` SAN peers are verified against.
     #[must_use]
     pub fn from_pem(cert: &[u8], key: &[u8], ca: &[u8], server_name: &str) -> Self {
+        let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
         let fingerprint = tls_material_fingerprint(cert, key, ca, server_name);
         let identity = Identity::from_pem(cert, key);
         let ca = Certificate::from_pem(ca);

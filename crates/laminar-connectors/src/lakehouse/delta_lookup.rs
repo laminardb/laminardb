@@ -275,8 +275,7 @@ impl LookupSource for DeltaLookupSource {
         }
     }
 
-    #[allow(clippy::unnecessary_literal_bound)]
-    fn source_name(&self) -> &str {
+    fn source_name(&self) -> &'static str {
         "delta-lake"
     }
 

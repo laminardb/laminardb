@@ -41,7 +41,7 @@ pub trait FormatDecoder: Send + Sync {
     }
 
     /// Returns the name of the format this decoder handles (e.g., `"json"`).
-    fn format_name(&self) -> &str;
+    fn format_name(&self) -> &'static str;
 }
 
 // ── FormatEncoder ──────────────────────────────────────────────────
@@ -61,7 +61,7 @@ pub trait FormatEncoder: Send + Sync {
     fn encode_batch(&self, batch: &RecordBatch) -> SchemaResult<Vec<Vec<u8>>>;
 
     /// Returns the name of the format this encoder produces (e.g., `"json"`).
-    fn format_name(&self) -> &str;
+    fn format_name(&self) -> &'static str;
 }
 
 // ── Inference types ────────────────────────────────────────────────

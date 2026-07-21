@@ -87,8 +87,7 @@ impl NatsSourceMetrics {
         self.fetch_errors_total.inc();
     }
 
-    #[allow(missing_docs)]
-    pub fn record_ack_enqueued(&self) {
+    pub(crate) fn record_ack_enqueued(&self) {
         self.pending_acks.inc();
     }
 
@@ -104,8 +103,7 @@ impl NatsSourceMetrics {
         self.pending_acks.dec();
     }
 
-    #[allow(missing_docs)]
-    pub fn record_ack_enqueue_errors(&self, n: usize) {
+    pub(crate) fn record_ack_enqueue_errors(&self, n: usize) {
         self.ack_errors_total
             .inc_by(u64::try_from(n).unwrap_or(u64::MAX));
     }
@@ -117,8 +115,7 @@ impl NatsSourceMetrics {
         self.pending_acks.sub(n as i64);
     }
 
-    #[allow(missing_docs)]
-    pub fn record_abandoned_acks(&self) {
+    pub(crate) fn record_abandoned_acks(&self) {
         let pending = self.pending_acks.get();
         if pending > 0 {
             self.ack_errors_total

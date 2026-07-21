@@ -73,10 +73,11 @@ fn recovery_materialization_path(version: u64) -> OsPath {
 }
 
 fn current_time_millis() -> i64 {
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis() as i64)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        })
 }
 
 fn version_from_file(name: &str, kind: &str, minimum: u64) -> Result<u64, SnapshotError> {

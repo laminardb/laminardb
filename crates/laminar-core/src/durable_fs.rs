@@ -35,7 +35,13 @@ pub fn ensure_durable_directory(path: &Path) -> io::Result<()> {
 
     match std::fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_dir() => {
+            #[cfg(unix)]
             return establish_existing_directory(&path);
+            #[cfg(not(unix))]
+            {
+                establish_existing_directory(&path);
+                return Ok(());
+            }
         }
         Ok(_) => {
             return Err(io::Error::new(
@@ -98,16 +104,8 @@ fn establish_existing_directory(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
-#[allow(clippy::unnecessary_wraps)] // Shared caller is fallible on Unix.
-fn establish_existing_directory(_path: &Path) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn establish_existing_directory(_path: &Path) -> io::Result<()> {
-    Ok(())
-}
+#[cfg(not(unix))]
+fn establish_existing_directory(_path: &Path) {}
 
 /// Whether publication may replace an existing destination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

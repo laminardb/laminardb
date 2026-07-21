@@ -765,7 +765,6 @@ pub(crate) struct ChangelogEnrichConfig {
 
 /// Detect a single equi-join of an incremental MV (changelog) left and a static table right; returns
 /// the changelog table and a `__weight`-preserving temp-rewritten join SQL, else `None`.
-#[allow(clippy::too_many_lines)] // detection and certificate extraction must share one parsed AST
 pub(crate) fn detect_changelog_enrich_query(
     sql: &str,
     incremental_mvs: &FxHashSet<String>,

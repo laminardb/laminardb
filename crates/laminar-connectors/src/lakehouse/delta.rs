@@ -198,7 +198,7 @@ async fn publish_coordinated_delta_batch(
 /// are reclaimed later by retention-safe vacuum.
 pub struct DeltaLakeSink {
     /// Sole admission authority for Delta tasks that may outlive a cancelled caller.
-    #[cfg_attr(not(feature = "delta-lake"), allow(dead_code))]
+    #[cfg(feature = "delta-lake")]
     task_owner: ConnectorTaskOwner,
     /// Stable terminal observer retained by the runtime after this sink is retired.
     task_tracker: ConnectorTaskTracker,
@@ -290,7 +290,10 @@ impl DeltaLakeSink {
     #[must_use]
     pub fn new(config: DeltaLakeSinkConfig, registry: Option<&prometheus::Registry>) -> Self {
         let (task_owner, task_tracker) = ConnectorTaskOwner::new();
+        #[cfg(not(feature = "delta-lake"))]
+        let _ = task_owner;
         Self {
+            #[cfg(feature = "delta-lake")]
             task_owner,
             task_tracker,
             config,
@@ -439,11 +442,10 @@ impl DeltaLakeSink {
             }
         }
 
-        // Store the Delta version.
-        #[allow(clippy::cast_sign_loss)]
-        {
-            self.delta_version = table.version().unwrap_or(0) as u64;
-        }
+        self.delta_version = table
+            .version()
+            .and_then(|version| u64::try_from(version).ok())
+            .unwrap_or(0);
         self.table = Some(table);
 
         // Pre-build caches used on every commit. Rebuilding WriterProperties
@@ -594,17 +596,16 @@ impl DeltaLakeSink {
         )
         .await?;
 
-        #[allow(clippy::cast_sign_loss)]
-        {
-            self.delta_version = table.version().unwrap_or(0) as u64;
-        }
+        self.delta_version = table
+            .version()
+            .and_then(|version| u64::try_from(version).ok())
+            .unwrap_or(0);
         self.table = Some(table);
         Ok(())
     }
 
     /// Attempts a single Delta write/merge and returns the updated table on success.
     #[cfg(feature = "delta-lake")]
-    #[allow(clippy::too_many_arguments)]
     async fn attempt_delta_write(
         table: DeltaTable,
         batches: Vec<RecordBatch>,
@@ -743,7 +744,6 @@ impl DeltaLakeSink {
     /// bounded Delta metadata. The Parquet objects remain invisible until
     /// `commit_aggregated` publishes these Adds with the checkpoint cursor.
     #[cfg(feature = "delta-lake")]
-    #[allow(clippy::too_many_lines)] // One atomic staging-state transition is easier to audit whole.
     async fn materialize_coordinated_staged(
         &mut self,
         deadline: tokio::time::Instant,
@@ -1001,10 +1001,10 @@ impl DeltaLakeSink {
             }
         }
 
-        #[allow(clippy::cast_sign_loss)]
-        {
-            self.delta_version = table.version().unwrap_or(0) as u64;
-        }
+        self.delta_version = table
+            .version()
+            .and_then(|version| u64::try_from(version).ok())
+            .unwrap_or(0);
         self.table = Some(table);
         self.staged_batches.clear();
         self.staged_rows = 0;

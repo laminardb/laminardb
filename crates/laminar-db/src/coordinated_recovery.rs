@@ -425,7 +425,6 @@ impl RecoveryMonitor {
     }
 
     /// Act on the leader's announcement: stop on `Prepare`, restore on `Start`.
-    #[allow(clippy::too_many_lines)]
     async fn observe(
         &mut self,
         db: &Arc<LaminarDB>,
@@ -847,7 +846,6 @@ impl RecoveryMonitor {
     /// It never joins the frozen restore quorum, acknowledges recovery, or opens its
     /// assignment-closed source gate. It may rebuild a gated local runtime to settle connector
     /// evidence before consuming the terminal.
-    #[allow(clippy::too_many_lines)]
     async fn observe_nonparticipant_release(
         &mut self,
         db: &Arc<LaminarDB>,
@@ -1194,7 +1192,6 @@ impl RecoveryMonitor {
     /// Leader: stop the world, fix the target against the quiesced decision store, then restart
     /// the world. An incomplete round retains the intake fence, bumps
     /// `coordinated_recovery_failures_total`, and leaves its fault pending for a complete retry.
-    #[allow(clippy::too_many_lines)]
     async fn drive_round(
         &mut self,
         db: &Arc<LaminarDB>,
@@ -1624,7 +1621,6 @@ impl RecoveryMonitor {
     /// leader-fenced committed terminal. Compact readiness is the durable prepare promise; the
     /// driver alone reads the exact roster and fault set before committing. Assignment/execution
     /// fences are retained across the whole prepare/commit barrier.
-    #[allow(clippy::too_many_lines)]
     async fn release_after_readiness_quorum(
         &mut self,
         db: &Arc<LaminarDB>,
@@ -2707,7 +2703,6 @@ fn validate_cluster_attempt_settlement(
 /// outcomes always win; genuinely unresolved advancing attempts receive a create-once Abort under
 /// the exact recovery-round leader proof. Older gaps dominated by retained terminal authority do
 /// not need an impossible non-advancing backfill.
-#[allow(clippy::too_many_lines)]
 async fn settle_stopped_prepared_witnesses(
     db: &Arc<LaminarDB>,
     controller: &ClusterController,
@@ -2924,7 +2919,6 @@ async fn wait_stopped_quorum(
     }
 }
 
-#[allow(clippy::too_many_lines)]
 async fn wait_stopped_quorum_until(
     controller: &ClusterController,
     round: &RecoveryRound,

@@ -177,7 +177,6 @@ const RECOVERY_CAPSULE_GC_BATCH_SIZE: usize = 64;
 const RECOVERY_CAPSULE_GC_CURSOR_MAX_BYTES: u64 = 1_024;
 
 impl CheckpointOutcome {
-    #[allow(clippy::too_many_lines)]
     pub(crate) fn validate_shape(&self, path_epoch: u64) -> Result<(), DecisionError> {
         if self.version != CHECKPOINT_OUTCOME_VERSION {
             return Err(DecisionError::Conflict(format!(
@@ -1956,7 +1955,6 @@ impl CheckpointDecisionStore {
         (epoch != 0 && Self::outcome_path(epoch).as_ref() == loc).then_some(segment)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn canonical_outcome(
         &self,
         epoch: u64,
@@ -2274,7 +2272,6 @@ impl CheckpointDecisionStore {
     ///
     /// # Errors
     /// Object-store I/O, malformed/non-canonical metadata, or any cluster-scoped proposal.
-    #[allow(clippy::too_many_arguments)]
     pub async fn record_outcome(
         &self,
         epoch: u64,
@@ -2547,7 +2544,6 @@ impl CheckpointDecisionStore {
     /// Each step full-scans the unordered listing and processes the lexically oldest bounded batch
     /// after the cursor. The cursor wraps so delayed creates and failed paths are retried.
     #[cfg(feature = "cluster")]
-    #[allow(clippy::too_many_lines)]
     pub(crate) async fn sweep_recovery_capsules_step(
         &self,
         before_epoch: u64,
