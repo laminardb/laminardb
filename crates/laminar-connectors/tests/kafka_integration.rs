@@ -40,6 +40,7 @@ fn test_schema() -> SchemaRef {
 }
 
 const REDPANDA_HOST_PORT: u16 = 19092;
+const KAFKA_STARTUP_TIMEOUT: Duration = Duration::from_secs(90);
 
 fn initial_source_start(config: &ConnectorConfig) -> SourceStart {
     SourceStart::new(
@@ -150,7 +151,7 @@ async fn wait_for_kafka(brokers: &str) {
         .set("socket.timeout.ms", "1000")
         .create()
         .expect("Kafka readiness observer creation");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + KAFKA_STARTUP_TIMEOUT;
 
     loop {
         if observer
@@ -161,7 +162,7 @@ async fn wait_for_kafka(brokers: &str) {
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "Kafka metadata protocol was not ready within 30 seconds"
+            "Kafka metadata protocol was not ready within {KAFKA_STARTUP_TIMEOUT:?}"
         );
         sleep(Duration::from_millis(100)).await;
     }

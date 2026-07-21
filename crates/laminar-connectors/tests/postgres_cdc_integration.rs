@@ -6,7 +6,6 @@
 #![cfg(feature = "postgres-cdc")]
 #![cfg(not(target_os = "windows"))]
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use arrow_array::{Array, StringArray, UInt64Array};
@@ -117,14 +116,16 @@ fn lookup_config(host: &str, port: u16, table: &str) -> PostgresLookupSourceConf
     PostgresLookupSourceConfig {
         table: table.into(),
         primary_key_columns: vec!["id".into()],
-        properties: HashMap::from([
+        properties: [
             ("host".into(), host.into()),
             ("port".into(), port.to_string()),
             ("database".into(), "postgres".into()),
             ("user".into(), "postgres".into()),
             ("password".into(), "postgres".into()),
             ("ssl.mode".into(), "disable".into()),
-        ]),
+        ]
+        .into_iter()
+        .collect(),
         pool_size: 2,
     }
 }

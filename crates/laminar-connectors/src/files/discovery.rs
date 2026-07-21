@@ -50,8 +50,8 @@ pub struct DiscoveryConfig {
 /// Handle to a running discovery engine.
 ///
 /// Drop aborts async discovery. An already-running blocking inventory scan
-/// finishes under its task guard; [`FileDiscoveryEngine::abort_and_join_until`]
-/// is the bounded shutdown path.
+/// finishes under its task guard; `abort_and_join_until` is the bounded
+/// shutdown path.
 pub struct FileDiscoveryEngine {
     /// Channel receiver for discovered files.
     rx: AsyncRx<mpsc::Array<DiscoveredFile>>,

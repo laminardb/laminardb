@@ -2,7 +2,7 @@
 //!
 //! A `deadpool`-pooled client issues one parameterized `WHERE pk = ANY($1)`
 //! per fetch, so all missed keys of a probe fold into one index-served round
-//! trip. [`KeyAligner`](laminar_core::lookup::KeyAligner) handles key decode and result realignment.
+//! trip. [`KeyAligner`] handles key decode and result realignment.
 //!
 //! TLS is server-auth via `rustls`: verified chain and hostname is the default,
 //! using `ssl.ca.cert.path` when set and Mozilla roots otherwise. Plaintext is
