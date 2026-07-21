@@ -30,6 +30,7 @@ use laminar_connectors::config::ConnectorConfig;
 use laminar_connectors::connector::{
     DeliveryGuarantee, SourceConnector, SourcePosition, SourceStart,
 };
+use laminar_connectors::error::ConnectorError;
 use laminar_connectors::kafka::{KafkaSource, KafkaSourceConfig, TopicSubscription};
 
 fn test_schema() -> SchemaRef {
@@ -380,8 +381,11 @@ async fn checkpoint_restore(brokers: &str) {
             .unwrap(),
         )
         .await
-        .expect_err("partition expansion must fail a guaranteed resume closed");
-    assert!(error.to_string().contains("partition inventory changed"));
+        .expect_err("partition expansion must fail a guaranteed resume");
+    assert!(
+        matches!(error, ConnectorError::ConfigurationError(_)),
+        "expected a configuration error after partition expansion, got {error}"
+    );
     changed.close().await.unwrap();
 }
 
