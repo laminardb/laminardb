@@ -142,6 +142,11 @@ fn parse_absolute_local_file_url(url: &str) -> Result<url::Url, ObjectStoreBuild
             "file URL scheme must be lowercase 'file://'".to_string(),
         ));
     }
+    if url == "file://" {
+        return Err(ObjectStoreBuilderError::InvalidUrl(
+            "file URL path must not be empty".to_string(),
+        ));
+    }
     let parsed = url::Url::parse(url)
         .map_err(|error| ObjectStoreBuilderError::InvalidUrl(error.to_string()))?;
     if parsed.scheme() != "file" {

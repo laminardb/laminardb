@@ -204,8 +204,11 @@ fn make_config(brokers: &str, group_id: &str, topic: &str) -> KafkaSourceConfig 
 /// scenarios sequentially to avoid fixed-port conflicts.
 #[tokio::test]
 async fn kafka_source_integration() {
-    let _container = GenericImage::new("docker.redpanda.com/redpandadata/redpanda", "v26.1.13")
+    let _container = GenericImage::new("redpandadata/redpanda", "v24.3.1")
         .with_exposed_port(9092.into())
+        .with_wait_for(testcontainers::core::WaitFor::message_on_stderr(
+            "Successfully started Redpanda",
+        ))
         .with_mapped_port(REDPANDA_HOST_PORT, 9092.tcp())
         .with_cmd([
             "redpanda",
