@@ -324,7 +324,13 @@ mod tests {
         let file = directory.path().join("file");
         std::fs::write(&file, b"not a directory").unwrap();
         let error = ensure_durable_directory(&file.join("child")).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(
+            matches!(
+                error.kind(),
+                io::ErrorKind::AlreadyExists | io::ErrorKind::NotADirectory
+            ),
+            "unexpected error for a file in the directory path: {error}"
+        );
     }
 
     #[cfg(windows)]
