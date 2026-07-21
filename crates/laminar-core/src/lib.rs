@@ -6,6 +6,8 @@
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::too_many_arguments, clippy::too_many_lines)]
 // Protocol state machines remain contiguous and keep authority inputs explicit.
+#![allow(clippy::enum_variant_names, clippy::trivially_copy_pass_by_ref)]
+// Generated protobuf APIs retain schema-defined names and callback signatures.
 // Protocol fixtures use explicit boundary values and full state construction.
 #![cfg_attr(
     test,

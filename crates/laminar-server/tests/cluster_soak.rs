@@ -1,3 +1,4 @@
+// The real-binary soak fixture keeps its process-control scaffolding explicit.
 #![allow(
     clippy::assertions_on_constants,
     clippy::disallowed_types,

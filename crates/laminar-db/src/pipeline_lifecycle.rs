@@ -369,6 +369,65 @@ struct PreparedSink {
     task_fence: ConnectorTaskFenceRegistration,
 }
 
+type PipelineSink = (
+    String,
+    crate::sink_task::SinkTaskHandle,
+    Option<String>,
+    String,
+    SinkContract,
+);
+
+struct PipelineSinkSetup {
+    sinks: Vec<PipelineSink>,
+    sink_event_rx: laminar_core::streaming::AsyncConsumer<crate::sink_task::SinkEvent>,
+    coordinated_committer: Option<crate::coordinated_committer::CoordinatedCommitter>,
+    committer_poll: std::time::Duration,
+    committer_notify: Arc<tokio::sync::Notify>,
+    #[cfg(feature = "cluster")]
+    callback_controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
+}
+
+struct PipelineRecoveryState {
+    graph: crate::operator_graph::OperatorGraph,
+    recovered_mv_store: crate::mv_store::MvStore,
+    recovered_source_wms: rustc_hash::FxHashMap<String, i64>,
+    recovered_watermark_frontier: Option<i64>,
+    recovered_all_sources_idle: bool,
+    source_watermark_recovery_selected: bool,
+    #[cfg(feature = "cluster")]
+    reconciled_source_handoff_version: Option<u64>,
+    restored_reference_tables: bool,
+}
+
+struct PipelineWatermarks {
+    stream_entries: Vec<Arc<crate::catalog::StreamEntry>>,
+    watermark_states: FxHashMap<String, SourceWatermarkState>,
+    source_entries: FxHashMap<String, Arc<crate::catalog::SourceEntry>>,
+    source_ids: FxHashMap<String, usize>,
+    tracker: Option<laminar_core::time::WatermarkTracker>,
+}
+
+struct PipelineRuntimeSetup {
+    sources: Vec<TrackedSourceRegistration>,
+    config: crate::pipeline::PipelineConfig,
+    callback: crate::pipeline_callback::ConnectorPipelineCallback,
+    force_checkpoint_rx: crate::db::ForceCheckpointRx,
+    checkpoint_complete_rx:
+        crossfire::AsyncRx<crossfire::mpsc::Array<crate::pipeline::CheckpointCompletion>>,
+    checkpoint_in_flight: Arc<std::sync::atomic::AtomicU64>,
+    coordinated_commit_admission: Option<crate::checkpoint_coordinator::CoordinatedCommitAdmission>,
+    #[cfg(feature = "cluster")]
+    source_process_authority: Option<Arc<laminar_core::cluster::control::ClusterController>>,
+    runtime_mode: RuntimeMode,
+}
+
+struct PreparedPipelineRuntime {
+    runtime: PipelineRuntimeSetup,
+    coordinated_committer: Option<crate::coordinated_committer::CoordinatedCommitter>,
+    committer_poll: std::time::Duration,
+    committer_notify: Arc<tokio::sync::Notify>,
+}
+
 type ReferenceTableRuntimeSource = (
     String,
     Box<dyn laminar_connectors::reference::ReferenceTableSource>,
@@ -2296,34 +2355,16 @@ impl LaminarDB {
         }
     }
 
-    async fn start_inner(&self) -> Result<(), DbError> {
-        let runtime_shutdown = tokio_util::sync::CancellationToken::new();
-        *self.runtime_shutdown.write() = runtime_shutdown.clone();
-        if self.is_closed() {
-            runtime_shutdown.cancel();
-            return Err(DbError::Shutdown);
-        }
-
-        let (source_regs, sink_regs, stream_regs, table_regs, has_external) = {
-            let mgr = self.connector_manager.lock();
-            (
-                mgr.sources().clone(),
-                mgr.sinks().clone(),
-                mgr.streams().clone(),
-                mgr.tables().clone(),
-                mgr.has_external_connectors(),
-            )
-        };
-
-        for (name, reg) in &source_regs {
-            tracing::debug!(source = %name, connector_type = ?reg.connector_type, "Registered source");
-        }
-        for (name, reg) in &sink_regs {
-            tracing::debug!(sink = %name, connector_type = ?reg.connector_type, "Registered sink");
-        }
-
-        let startup_runtime = self.runtime_mode();
-
+    fn validate_startup_durability(
+        &self,
+        startup_runtime: RuntimeMode,
+    ) -> Result<
+        (
+            Option<Arc<dyn object_store::ObjectStore>>,
+            StateBackendDurability,
+        ),
+        DbError,
+    > {
         #[cfg(feature = "cluster")]
         if startup_runtime == RuntimeMode::Cluster
             && (!self.mv_registry.lock().is_empty() || !self.mv_store.read().is_empty())
@@ -2438,6 +2479,21 @@ impl LaminarDB {
             }
             _ => {}
         }
+        Ok((injected_cluster_checkpoint_store, state_backend_scope))
+    }
+
+    async fn initialize_checkpointing(
+        &self,
+        source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
+        sink_regs: &HashMap<String, crate::connector_manager::SinkRegistration>,
+        stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
+        table_regs: &HashMap<String, crate::connector_manager::TableRegistration>,
+        startup_runtime: RuntimeMode,
+        injected_cluster_checkpoint_store: Option<Arc<dyn object_store::ObjectStore>>,
+        state_backend_scope: StateBackendDurability,
+    ) -> Result<(), DbError> {
+        #[cfg(not(feature = "cluster"))]
+        let _ = state_backend_scope;
 
         if let Some(ref cp_config) = self.config.checkpoint {
             use crate::checkpoint_coordinator::{
@@ -2724,6 +2780,49 @@ impl LaminarDB {
 
             *self.coordinator.lock().await = Some(coord);
         }
+        Ok(())
+    }
+    async fn start_inner(&self) -> Result<(), DbError> {
+        let runtime_shutdown = tokio_util::sync::CancellationToken::new();
+        *self.runtime_shutdown.write() = runtime_shutdown.clone();
+        if self.is_closed() {
+            runtime_shutdown.cancel();
+            return Err(DbError::Shutdown);
+        }
+
+        let (source_regs, sink_regs, stream_regs, table_regs, has_external) = {
+            let mgr = self.connector_manager.lock();
+            (
+                mgr.sources().clone(),
+                mgr.sinks().clone(),
+                mgr.streams().clone(),
+                mgr.tables().clone(),
+                mgr.has_external_connectors(),
+            )
+        };
+
+        for (name, reg) in &source_regs {
+            tracing::debug!(source = %name, connector_type = ?reg.connector_type, "Registered source");
+        }
+        for (name, reg) in &sink_regs {
+            tracing::debug!(sink = %name, connector_type = ?reg.connector_type, "Registered sink");
+        }
+
+        let startup_runtime = self.runtime_mode();
+
+        let (injected_cluster_checkpoint_store, state_backend_scope) =
+            self.validate_startup_durability(startup_runtime)?;
+
+        self.initialize_checkpointing(
+            &source_regs,
+            &sink_regs,
+            &stream_regs,
+            &table_regs,
+            startup_runtime,
+            injected_cluster_checkpoint_store,
+            state_backend_scope,
+        )
+        .await?;
 
         #[cfg(feature = "cluster")]
         if startup_runtime == RuntimeMode::Cluster {
@@ -2817,64 +2916,13 @@ impl LaminarDB {
         Ok(has_ownership_partitioned_state)
     }
 
-    /// Build and start the unified pipeline with sources, sinks, and streams.
-    async fn start_connector_pipeline(
+    fn build_connector_operator_graph(
         &self,
-        source_regs: HashMap<String, crate::connector_manager::SourceRegistration>,
-        sink_regs: HashMap<String, crate::connector_manager::SinkRegistration>,
-        stream_regs: HashMap<String, crate::connector_manager::StreamRegistration>,
-        table_regs: HashMap<String, crate::connector_manager::TableRegistration>,
-        has_external: bool,
-        runtime_shutdown: tokio_util::sync::CancellationToken,
-    ) -> Result<(), DbError> {
-        use crate::connector_manager::{
-            build_sink_config, build_source_config, build_table_config,
-        };
+        source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
+        stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
+        table_regs: &HashMap<String, crate::connector_manager::TableRegistration>,
+    ) -> Result<crate::operator_graph::OperatorGraph, DbError> {
         use crate::operator_graph::OperatorGraph;
-        use crate::pipeline::{CheckpointSchedule, PipelineConfig, SourceRegistration};
-        use laminar_connectors::connector::SourceConnector as _;
-
-        let runtime_mode = self.runtime_mode();
-
-        #[cfg(feature = "cluster")]
-        let startup_generation_fence = if runtime_mode == RuntimeMode::Cluster {
-            let generation_fence = Arc::clone(&self.rotation_execution_fence)
-                .write_owned()
-                .await;
-            self.rehydrated_vnode_state.lock().clear();
-            self.pending_revoke_vnodes.lock().clear();
-            Some(generation_fence)
-        } else {
-            None
-        };
-
-        self.revalidate_persisted_cluster_query_shapes(&stream_regs)
-            .await?;
-
-        let checkpoint_schedule =
-            self.config
-                .checkpoint
-                .as_ref()
-                .map_or(CheckpointSchedule::Disabled, |config| {
-                    config
-                        .interval_ms
-                        .map_or(CheckpointSchedule::Manual, |interval_ms| {
-                            CheckpointSchedule::Periodic(std::time::Duration::from_millis(
-                                interval_ms,
-                            ))
-                        })
-                });
-        let checkpointing_enabled = checkpoint_schedule.is_enabled();
-        let pipeline_checkpoint_timeout = self
-            .config
-            .checkpoint
-            .as_ref()
-            .and_then(|config| config.timeout_ms)
-            .map_or(
-                crate::checkpoint_coordinator::CheckpointConfig::default().checkpoint_timeout,
-                std::time::Duration::from_millis,
-            );
-
         let ctx = {
             use datafusion::execution::SessionStateBuilder;
             let mut session_config = laminar_sql::datafusion::base_session_config();
@@ -3123,11 +3171,22 @@ impl LaminarDB {
                 );
             }
         }
+        Ok(graph)
+    }
 
-        let prom_registry = self.prometheus_registry.lock().clone();
-
+    fn build_pipeline_sources(
+        &self,
+        graph: &mut crate::operator_graph::OperatorGraph,
+        source_regs: &HashMap<String, crate::connector_manager::SourceRegistration>,
+        checkpointing_enabled: bool,
+        runtime_mode: RuntimeMode,
+        prom_registry: Option<&Arc<prometheus::Registry>>,
+    ) -> Result<Vec<TrackedSourceRegistration>, DbError> {
+        use crate::connector_manager::build_source_config;
+        use crate::pipeline::SourceRegistration;
+        use laminar_connectors::connector::SourceConnector as _;
         let mut sources: Vec<TrackedSourceRegistration> = Vec::new();
-        for (name, reg) in &source_regs {
+        for (name, reg) in source_regs {
             if reg.connector_type.is_none() {
                 continue;
             }
@@ -3140,7 +3199,7 @@ impl LaminarDB {
 
             let source = self
                 .connector_registry
-                .create_source(&config, prom_registry.as_ref())
+                .create_source(&config, prom_registry)
                 .map_err(|e| {
                     DbError::Connector(format!(
                         "Cannot create source '{}' (type '{}'): {e}",
@@ -3215,7 +3274,7 @@ impl LaminarDB {
 
         let bridged_names: rustc_hash::FxHashSet<String> =
             sources.iter().map(|s| s.name.clone()).collect();
-        for (name, reg) in &source_regs {
+        for (name, reg) in source_regs {
             if reg.connector_type.is_some() {
                 continue;
             }
@@ -3308,8 +3367,20 @@ impl LaminarDB {
                 ));
             }
         }
-
-        let stream_output_schemas = resolve_stream_output_schemas(&self.ctx, &stream_regs).await?;
+        Ok(sources)
+    }
+    async fn prepare_pipeline_sinks(
+        &self,
+        sources: &[TrackedSourceRegistration],
+        sink_regs: &HashMap<String, crate::connector_manager::SinkRegistration>,
+        stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
+        runtime_mode: RuntimeMode,
+        checkpointing_enabled: bool,
+        pipeline_checkpoint_timeout: std::time::Duration,
+        prom_registry: Option<&Arc<prometheus::Registry>>,
+    ) -> Result<PipelineSinkSetup, DbError> {
+        use crate::connector_manager::build_sink_config;
+        let stream_output_schemas = resolve_stream_output_schemas(&self.ctx, stream_regs).await?;
         {
             let mut schemas = self.stream_schemas.write();
             schemas.clear();
@@ -3335,7 +3406,7 @@ impl LaminarDB {
                 .collect();
             loop {
                 let mut added = false;
-                for (name, reg) in &stream_regs {
+                for (name, reg) in stream_regs {
                     if !set.contains(name)
                         && crate::sql_analysis::extract_table_references(&reg.query_sql)
                             .iter()
@@ -3353,7 +3424,7 @@ impl LaminarDB {
         };
 
         let mut prepared_sinks = Vec::new();
-        for (name, reg) in &sink_regs {
+        for (name, reg) in sink_regs {
             if reg.connector_type.is_none() {
                 continue;
             }
@@ -3369,7 +3440,7 @@ impl LaminarDB {
             }
             let sink = self
                 .connector_registry
-                .create_sink(&config, prom_registry.as_ref())
+                .create_sink(&config, prom_registry)
                 .map_err(|e| {
                     DbError::Connector(format!(
                         "Cannot create sink '{}' (type '{}'): {e}",
@@ -3568,6 +3639,59 @@ impl LaminarDB {
             }
         }
 
+        Ok(PipelineSinkSetup {
+            sinks,
+            sink_event_rx,
+            coordinated_committer,
+            committer_poll,
+            committer_notify,
+            #[cfg(feature = "cluster")]
+            callback_controller,
+        })
+    }
+    fn restore_reference_table_checkpoint(
+        &self,
+        recovered: &crate::recovery_manager::RecoveredState,
+    ) -> Result<bool, DbError> {
+        let checkpoint = recovered
+            .manifest
+            .operator_states
+            .get(crate::table_store::REFERENCE_TABLE_CHECKPOINT_KEY);
+        let has_reference_tables = !self.table_store.read().table_names().is_empty();
+
+        match (has_reference_tables, checkpoint) {
+            (true, Some(state)) => {
+                let bytes = state.decode_inline().ok_or_else(|| {
+                    DbError::Checkpoint(
+                        "reference-table checkpoint is not inline after sidecar resolution".into(),
+                    )
+                })?;
+                let restored = self.table_store.write().restore_checkpoint(&bytes)?;
+                if !restored {
+                    return Err(DbError::Checkpoint(
+                        "reference-table checkpoint did not cover the complete catalog".into(),
+                    ));
+                }
+                Ok(true)
+            }
+            (true, None) => Err(DbError::Checkpoint(format!(
+                "recovered checkpoint {} has no atomic reference-table state",
+                recovered.manifest.checkpoint_id
+            ))),
+            (false, Some(_)) => Err(DbError::Checkpoint(
+                "recovered checkpoint contains reference-table state but the catalog has no tables"
+                    .into(),
+            )),
+            (false, None) => Ok(false),
+        }
+    }
+
+    async fn recover_pipeline_state(
+        &self,
+        mut graph: crate::operator_graph::OperatorGraph,
+        sources: &mut [TrackedSourceRegistration],
+        runtime_mode: RuntimeMode,
+    ) -> Result<PipelineRecoveryState, DbError> {
         // Must run BEFORE begin_initial_epoch so the epoch reflects the recovered state.
         // Hoist watermarks now so generators are seeded before watermark-state construction;
         // without this, generators restart at i64::MIN while offsets resume mid-stream.
@@ -3615,7 +3739,7 @@ impl LaminarDB {
                     // startup request at Initial; the connector applies its configured initial
                     // policy as part of start rather than becoming active and then rewinding.
                     if recover_target == Some(0) && matches!(&recovery, Ok(None)) {
-                        for src in &mut sources {
+                        for src in sources.iter_mut() {
                             src.position = laminar_connectors::connector::SourcePosition::Initial;
                         }
                         tracing::info!("genesis rewind: sources will start at initial position");
@@ -3647,7 +3771,7 @@ impl LaminarDB {
                         };
                         #[cfg(not(feature = "cluster"))]
                         let recovered_assignment = None;
-                        for source in &sources {
+                        for source in sources.iter() {
                             validate_source_recovery_assignment(
                                 &source.name,
                                 source.assignment_scoped,
@@ -3677,7 +3801,7 @@ impl LaminarDB {
                             recovered.manifest.epoch,
                             recovered.manifest.checkpoint_id,
                         );
-                        for src in &mut sources {
+                        for src in sources.iter_mut() {
                             if !src.contract.supports_replay() {
                                 continue;
                             }
@@ -3723,43 +3847,8 @@ impl LaminarDB {
                             keys = ?op_keys,
                             "manifest operator_states summary"
                         );
-                        let table_checkpoint = recovered
-                            .manifest
-                            .operator_states
-                            .get(crate::table_store::REFERENCE_TABLE_CHECKPOINT_KEY);
-                        let has_reference_tables =
-                            !self.table_store.read().table_names().is_empty();
-                        match (has_reference_tables, table_checkpoint) {
-                            (true, Some(state)) => {
-                                let bytes = state.decode_inline().ok_or_else(|| {
-                                    DbError::Checkpoint(
-                                        "reference-table checkpoint is not inline after sidecar resolution"
-                                            .into(),
-                                    )
-                                })?;
-                                restored_reference_tables =
-                                    self.table_store.write().restore_checkpoint(&bytes)?;
-                                if !restored_reference_tables {
-                                    return Err(DbError::Checkpoint(
-                                        "reference-table checkpoint did not cover the complete catalog"
-                                            .into(),
-                                    ));
-                                }
-                            }
-                            (true, None) => {
-                                return Err(DbError::Checkpoint(format!(
-                                    "recovered checkpoint {} has no atomic reference-table state",
-                                    recovered.manifest.checkpoint_id
-                                )));
-                            }
-                            (false, Some(_)) => {
-                                return Err(DbError::Checkpoint(
-                                    "recovered checkpoint contains reference-table state but the catalog has no tables"
-                                        .into(),
-                                ));
-                            }
-                            (false, None) => {}
-                        }
+                        restored_reference_tables =
+                            self.restore_reference_table_checkpoint(&recovered)?;
                         if let Some(op) = recovered.manifest.operator_states.get("operator_graph") {
                             if let Some(bytes) = op.decode_inline() {
                                 match graph.restore_from_bytes(&bytes) {
@@ -3865,29 +3954,28 @@ impl LaminarDB {
             }
         }
 
-        let previous_mv_store = {
-            let mut live = self.mv_store.write();
-            std::mem::replace(&mut *live, recovered_mv_store)
-        };
-        drop(previous_mv_store);
-
-        if source_watermark_recovery_selected {
-            for source_name in self.catalog.list_sources() {
-                if let Some(entry) = self.catalog.get_source(&source_name) {
-                    entry.source.restore_watermark_for_recovery(
-                        recovered_source_wms
-                            .get(&source_name)
-                            .copied()
-                            .or(recovered_watermark_frontier)
-                            .unwrap_or(i64::MIN),
-                    );
-                }
-            }
-        }
-
+        Ok(PipelineRecoveryState {
+            graph,
+            recovered_mv_store,
+            recovered_source_wms,
+            recovered_watermark_frontier,
+            recovered_all_sources_idle,
+            source_watermark_recovery_selected,
+            #[cfg(feature = "cluster")]
+            reconciled_source_handoff_version: startup_reconciled_source_handoff_version,
+            restored_reference_tables,
+        })
+    }
+    async fn initialize_reference_tables(
+        &self,
+        table_regs: &HashMap<String, crate::connector_manager::TableRegistration>,
+        stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
+        restored_reference_tables: bool,
+    ) -> Result<(), DbError> {
+        use crate::connector_manager::build_table_config;
         let table_sources = create_reference_table_sources(
             &self.connector_registry,
-            &table_regs,
+            table_regs,
             &self.table_store,
             restored_reference_tables,
         )
@@ -3928,7 +4016,7 @@ impl LaminarDB {
             }
         }
 
-        for (name, reg) in &table_regs {
+        for (name, reg) in table_regs {
             if !reg.on_demand {
                 continue;
             }
@@ -4014,6 +4102,16 @@ impl LaminarDB {
             );
         }
 
+        Ok(())
+    }
+    fn prepare_pipeline_watermarks(
+        &self,
+        stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
+        recovered_source_wms: &FxHashMap<String, i64>,
+        recovered_watermark_frontier: Option<i64>,
+        recovered_all_sources_idle: bool,
+        source_watermark_recovery_selected: bool,
+    ) -> Result<PipelineWatermarks, DbError> {
         let stream_entries: Vec<_> = self
             .catalog
             .list_streams()
@@ -4213,12 +4311,672 @@ impl LaminarDB {
             );
         }
 
+        Ok(PipelineWatermarks {
+            stream_entries,
+            watermark_states,
+            source_entries: source_entries_for_wm,
+            source_ids,
+            tracker,
+        })
+    }
+
+    async fn prepare_pipeline_runtime(
+        &self,
+        sources: Vec<TrackedSourceRegistration>,
+        mut graph: crate::operator_graph::OperatorGraph,
+        sink_setup: PipelineSinkSetup,
+        watermarks: PipelineWatermarks,
+        config: crate::pipeline::PipelineConfig,
+        runtime_mode: RuntimeMode,
+        #[cfg(feature = "cluster")] reconciled_source_handoff_version: Option<u64>,
+    ) -> Result<PreparedPipelineRuntime, DbError> {
+        let PipelineSinkSetup {
+            sinks,
+            sink_event_rx,
+            coordinated_committer,
+            committer_poll,
+            committer_notify,
+            #[cfg(feature = "cluster")]
+            callback_controller,
+        } = sink_setup;
+        let PipelineWatermarks {
+            stream_entries,
+            watermark_states,
+            source_entries,
+            source_ids,
+            tracker,
+        } = watermarks;
+
+        graph.set_query_budget_ns(config.query_budget_ns);
+        graph.set_max_input_buf_batches(config.max_input_buf_batches);
+        graph.set_max_input_buf_bytes(config.max_input_buf_bytes);
+        graph.set_backpressure_policy(config.backpressure_policy);
+        graph.set_shared_source_isolation(
+            config.shared_source_isolation,
+            config.max_replay_buffer_bytes,
+        );
+
+        let pending_sink_filter_compiles = sinks
+            .iter()
+            .filter(|(_, _, filter_sql, _, _)| filter_sql.is_some())
+            .count();
+        let source_name_arcs: rustc_hash::FxHashMap<usize, Arc<str>> = source_ids
+            .iter()
+            .map(|(name, &source_id)| (source_id, Arc::<str>::from(name.as_str())))
+            .collect();
+        let source_wms_buf = rustc_hash::FxHashMap::with_capacity_and_hasher(
+            source_name_arcs.len(),
+            rustc_hash::FxBuildHasher,
+        );
+        let prom = self
+            .engine_metrics
+            .lock()
+            .clone()
+            .expect("EngineMetrics must be set before start()");
+
+        let (force_checkpoint_tx, force_checkpoint_rx) =
+            crossfire::mpsc::bounded_async::<crate::db::ForceCheckpointReply>(
+                crate::db::FORCE_CHECKPOINT_CHANNEL_CAPACITY,
+            );
+        *self.force_ckpt_tx.lock() = Some(force_checkpoint_tx);
+        let (checkpoint_complete_tx, checkpoint_complete_rx) =
+            crossfire::mpsc::bounded_async::<crate::pipeline::CheckpointCompletion>(16);
+
+        let checkpoint_committable_sinks = sinks
+            .iter()
+            .any(|(_, handle, _, _, _)| handle.checkpoint_committable());
+        let checkpoint_in_flight = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (
+            epoch_allocator,
+            quorum_timeout,
+            checkpoint_timeout,
+            checkpoint_cleanup_timeout,
+            max_staged_bytes,
+            coordinated_commit_admission,
+        ) = {
+            let coordinator = self.coordinator.lock().await;
+            match coordinator.as_ref() {
+                Some(coordinator) => {
+                    let checkpoint = coordinator.config();
+                    (
+                        Some(coordinator.epoch_allocator()),
+                        checkpoint.quorum_timeout,
+                        checkpoint.checkpoint_timeout,
+                        checkpoint.cleanup_timeout,
+                        checkpoint.max_staged_bytes,
+                        coordinator.coordinated_commit_admission(),
+                    )
+                }
+                None => (
+                    None,
+                    std::time::Duration::from_secs(3),
+                    std::time::Duration::from_secs(120),
+                    crate::checkpoint_coordinator::CheckpointConfig::default().cleanup_timeout,
+                    u64::MAX,
+                    None,
+                ),
+            }
+        };
+        #[cfg(not(feature = "cluster"))]
+        let _ = quorum_timeout;
+
+        let named_stream_names = stream_entries
+            .iter()
+            .map(|entry| Arc::from(entry.name.as_str()))
+            .collect();
+        #[cfg(feature = "cluster")]
+        let source_process_authority = (runtime_mode == RuntimeMode::Cluster)
+            .then(|| callback_controller.clone())
+            .flatten();
+        #[cfg(feature = "cluster")]
+        let vnode_registry = self.vnode_registry.lock().clone();
+        #[cfg(feature = "cluster")]
+        let (shuffle_delivery_loss_incidents, shuffle_recovered_delivery_loss_incidents) = self
+            .shuffle_receiver
+            .lock()
+            .as_ref()
+            .map_or((None, None), |receiver| {
+                (
+                    Some(receiver.delivery_loss_incidents()),
+                    Some(receiver.recovered_delivery_loss_incidents()),
+                )
+            });
+
+        let callback = crate::pipeline_callback::ConnectorPipelineCallback {
+            graph,
+            stream_entries,
+            sinks,
+            owned_sink_handles: Arc::clone(&self.owned_sink_handles),
+            watermark_states,
+            source_entries_for_wm: source_entries,
+            source_ids,
+            source_name_arcs,
+            source_wms_buf,
+            tracker,
+            prom,
+            pipeline_watermark: Arc::clone(&self.pipeline_watermark),
+            coordinator: Arc::clone(&self.coordinator),
+            table_store: self.table_store.clone(),
+            mv_store_has_any: self.mv_store.read().has_any_handle(),
+            mv_store: self.mv_store.clone(),
+            filter_ctx: laminar_sql::create_session_context(),
+            compiled_sink_filters: Vec::new(),
+            pending_sink_filter_compiles,
+            delivery_guarantee: config.delivery_guarantee,
+            serialization_timeout: checkpoint_timeout,
+            checkpoint_state_cap_bytes: max_staged_bytes,
+            checkpoint_serialization_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            checkpoint_timeout,
+            checkpoint_cleanup_timeout,
+            sink_event_rx,
+            sink_timed_out: false,
+            sink_fault: None,
+            checkpoint_fault: Arc::new(parking_lot::Mutex::new(None)),
+            last_checkpoint_admission_failure: None,
+            checkpoint_admission_recovering: false,
+            shutdown_signal: Arc::clone(&self.shutdown_signal),
+            #[cfg(feature = "cluster")]
+            vnode_registry,
+            #[cfg(feature = "cluster")]
+            reconciled_source_handoff_version,
+            #[cfg(feature = "cluster")]
+            cluster_controller: callback_controller,
+            #[cfg(feature = "cluster")]
+            follower_tail: Arc::default(),
+            #[cfg(feature = "cluster")]
+            barrier_injectors: Vec::new(),
+            #[cfg(feature = "cluster")]
+            shuffle_delivery_loss_incidents,
+            #[cfg(feature = "cluster")]
+            shuffle_recovered_delivery_loss_incidents,
+            #[cfg(feature = "cluster")]
+            shuffle_delivery_loss_incidents_seen: 0,
+            #[cfg(feature = "cluster")]
+            pending_follower_checkpoint: None,
+            #[cfg(feature = "cluster")]
+            checkpoint_leader_proofs: rustc_hash::FxHashMap::default(),
+            subscription_registry: Arc::clone(&self.subscription_registry),
+            named_stream_names,
+            checkpoint_complete_tx,
+            checkpoint_tail_tasks: tokio::task::JoinSet::new(),
+            checkpoint_in_flight: Arc::clone(&checkpoint_in_flight),
+            #[cfg(feature = "cluster")]
+            delta_rebase_needed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "cluster")]
+            last_vnode_capture_epoch: None,
+            epoch_allocator,
+            #[cfg(feature = "cluster")]
+            quorum_timeout,
+            checkpoint_committable_sinks,
+            #[cfg(feature = "cluster")]
+            intake_gate: Arc::clone(&self.source_gate),
+            #[cfg(not(feature = "cluster"))]
+            intake_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        Ok(PreparedPipelineRuntime {
+            runtime: PipelineRuntimeSetup {
+                sources,
+                config,
+                callback,
+                force_checkpoint_rx,
+                checkpoint_complete_rx,
+                checkpoint_in_flight,
+                coordinated_commit_admission,
+                #[cfg(feature = "cluster")]
+                source_process_authority,
+                runtime_mode,
+            },
+            coordinated_committer,
+            committer_poll,
+            committer_notify,
+        })
+    }
+
+    async fn launch_pipeline_runtime(
+        &self,
+        setup: PipelineRuntimeSetup,
+        shutdown: Arc<tokio::sync::Notify>,
+        runtime_shutdown: tokio_util::sync::CancellationToken,
+        #[cfg(feature = "cluster")] startup_generation_fence: Option<
+            tokio::sync::OwnedRwLockWriteGuard<()>,
+        >,
+    ) -> Result<(), DbError> {
+        let PipelineRuntimeSetup {
+            sources,
+            config: pipeline_config,
+            callback,
+            force_checkpoint_rx: force_ckpt_rx,
+            checkpoint_complete_rx,
+            checkpoint_in_flight,
+            coordinated_commit_admission,
+            #[cfg(feature = "cluster")]
+            source_process_authority,
+            runtime_mode,
+        } = setup;
+        let (control_tx, control_rx) =
+            crossfire::mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
+        *self.control_tx.lock() = Some(control_tx);
+
+        #[cfg(feature = "cluster")]
+        let source_gate = Arc::clone(&self.source_gate);
+        #[cfg(not(feature = "cluster"))]
+        let source_gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let coordinator = crate::pipeline::StreamingCoordinator::new_with_tracked_source_registry(
+            sources,
+            pipeline_config,
+            Arc::clone(&shutdown),
+            control_rx,
+            source_gate,
+            #[cfg(feature = "cluster")]
+            source_process_authority,
+            Arc::clone(&self.owned_source_tasks),
+            runtime_mode,
+        )
+        .await?
+        .with_terminal_shutdown(runtime_shutdown.clone())
+        .with_force_checkpoint_rx(force_ckpt_rx)
+        .with_checkpoint_complete_rx(checkpoint_complete_rx)
+        .with_checkpoint_admission(checkpoint_in_flight)
+        .with_coordinated_commit_admission(coordinated_commit_admission);
+
+        let (done_tx, done_rx) = crossfire::oneshot::oneshot::<crate::pipeline::ExitReason>();
+        let (startup_tx, startup_rx) = crossfire::oneshot::oneshot::<Result<(), String>>();
+        // Captured by the compute thread so an operator panic is recorded
+        // (surfaced via pipeline status) rather than only logged.
+        let fault_slot = Arc::clone(&self.last_fault);
+        let fault_state = Arc::clone(&self.state);
+        let fault_metrics = self.engine_metrics.lock().clone();
+        #[cfg(feature = "cluster")]
+        let compute_fault_source_gate = Arc::clone(&self.source_gate);
+        #[cfg(feature = "cluster")]
+        let compute_fault_recovery_fence = Arc::clone(&self.coordinated_recovery_fenced);
+        #[cfg(feature = "cluster")]
+        let compute_fault_is_cluster = runtime_mode == RuntimeMode::Cluster;
+        #[cfg(feature = "cluster")]
+        let compute_fault_controller = self.cluster_controller.lock().clone();
+        #[cfg(feature = "cluster")]
+        let compute_fault_pending = Arc::clone(&self.pending_recovery_fault);
+        #[cfg(feature = "cluster")]
+        let compute_fault_runtime_shutdown = runtime_shutdown.clone();
+        match std::thread::Builder::new()
+            .name("laminar-compute".into())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        startup_tx.send(Err(format!("compute runtime: {e}")));
+                        return;
+                    }
+                };
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    rt.block_on(async move {
+                        Box::pin(coordinator.run_with_ready(callback, startup_tx)).await
+                    })
+                }));
+                // Runtime shutdown waits for non-abortable `spawn_blocking` filesystem work.
+                // Publish neither clean completion nor a fault until those workers are gone;
+                // otherwise lifecycle teardown could release the exact namespace lock while
+                // an old local decision hard-link was still able to appear.
+                drop(rt);
+                let exit = match result {
+                    Ok(exit) => exit,
+                    Err(panic) => {
+                        let msg = panic
+                            .downcast_ref::<String>()
+                            .map(String::as_str)
+                            .or_else(|| panic.downcast_ref::<&str>().copied())
+                            .unwrap_or("unknown");
+                        tracing::error!(panic = msg, "laminar-compute thread panicked");
+                        crate::pipeline::ExitReason::Fault(msg.to_string())
+                    }
+                };
+                let exit = match exit {
+                    crate::pipeline::ExitReason::Shutdown => {
+                        crate::pipeline::ExitReason::Shutdown
+                    }
+                    crate::pipeline::ExitReason::Fault(reason) => {
+                        #[cfg(feature = "cluster")]
+                        if compute_fault_is_cluster {
+                            // Fence public restarts before publishing Faulted. The state CAS
+                            // then orders this fault against a concurrent coordinated stop.
+                            compute_fault_source_gate
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            compute_fault_recovery_fence
+                                .store(true, std::sync::atomic::Ordering::Release);
+                        }
+
+                        // Publish before notifying the watcher. This closes the ready-send ->
+                        // watcher-scheduled window in which start() could otherwise report
+                        // Running after the compute loop had already exited.
+                        #[cfg(feature = "cluster")]
+                        let owns_fault_state = publish_runtime_fault_state(&fault_state);
+                        #[cfg(not(feature = "cluster"))]
+                        publish_runtime_fault_state(&fault_state);
+                        #[cfg(feature = "cluster")]
+                        let covered_by_terminal_stop = compute_fault_is_cluster
+                            && !owns_fault_state
+                            && compute_fault_runtime_shutdown.is_cancelled()
+                            && DbState::load(&fault_state) == DbState::ShuttingDown;
+                        #[cfg(not(feature = "cluster"))]
+                        let covered_by_terminal_stop = false;
+
+                        if covered_by_terminal_stop {
+                            crate::pipeline::ExitReason::Shutdown
+                        } else {
+                            tracing::error!(
+                                reason = %reason,
+                                "pipeline faulted on a fatal cycle error; recovering from last checkpoint"
+                            );
+                            *fault_slot.lock() = Some(reason.clone());
+                            #[cfg(feature = "cluster")]
+                            if compute_fault_is_cluster {
+                                if let Some(controller) = compute_fault_controller.as_deref() {
+                                    if let Err(error) = queue_owned_cluster_compute_fault(
+                                        controller,
+                                        &compute_fault_pending,
+                                        owns_fault_state,
+                                        &compute_fault_runtime_shutdown,
+                                    ) {
+                                        tracing::error!(
+                                            %error,
+                                            "could not allocate a recovery fault request"
+                                        );
+                                    }
+                                }
+                                // A Release may have raced the close-before-queue edge.
+                                compute_fault_source_gate
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                                compute_fault_recovery_fence
+                                    .store(true, std::sync::atomic::Ordering::Release);
+                            }
+                            if let Some(ref metrics) = fault_metrics {
+                                metrics.pipeline_faults_total.inc();
+                            }
+                            crate::pipeline::ExitReason::Fault(reason)
+                        }
+                    }
+                };
+                done_tx.send(exit);
+            }) {
+            Ok(_) => {}
+            Err(e) => {
+                return Err(DbError::Config(format!(
+                    "failed to spawn compute thread: {e}"
+                )));
+            }
+        }
+
+        match startup_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) if runtime_shutdown.is_cancelled() || self.is_closed() => {
+                let _ = done_rx.await;
+                return Err(DbError::Shutdown);
+            }
+            Ok(Err(e)) => {
+                let _ = done_rx.await;
+                return Err(DbError::Config(e));
+            }
+            Err(_) => {
+                let _ = done_rx.await;
+                return Err(DbError::Config(
+                    "compute thread exited before entering the runtime control loop".into(),
+                ));
+            }
+        }
+
+        // Readiness transfers the recovered MV image and fully wired graph to the live loop.
+        // Release only now: a subsequent assignment may safely stage into the graph's shared
+        // handles, and a first cycle already waiting on the read fence can then proceed.
+        #[cfg(feature = "cluster")]
+        drop(startup_generation_fence);
+
+        let watcher_state = Arc::clone(&self.state);
+        let watcher_shutdown = Arc::clone(&self.shutdown_signal);
+        let watcher_fault = Arc::clone(&self.last_fault);
+        let watcher_supervisor = Arc::clone(&self.supervisor_self);
+        let watcher_restart_history = Arc::clone(&self.restart_history);
+        let watcher_metrics = self.engine_metrics.lock().clone();
+        #[cfg(feature = "cluster")]
+        let watcher_controller = self.cluster_controller.lock().clone();
+        #[cfg(feature = "cluster")]
+        let watcher_source_gate = Arc::clone(&self.source_gate);
+        #[cfg(feature = "cluster")]
+        let watcher_recovery_fence = Arc::clone(&self.coordinated_recovery_fenced);
+        #[cfg(feature = "cluster")]
+        let watcher_is_cluster = runtime_mode == RuntimeMode::Cluster;
+        #[cfg(feature = "cluster")]
+        let watcher_pending_compute_fault = Arc::clone(&self.pending_recovery_fault);
+        #[cfg(feature = "cluster")]
+        let watcher_runtime_shutdown = runtime_shutdown.clone();
+        let handle = tokio::spawn(async move {
+            let exit = done_rx.await.unwrap_or_else(|_| {
+                crate::pipeline::ExitReason::Fault(
+                    "compute thread exited without a terminal result".to_string(),
+                )
+            });
+            match exit {
+                crate::pipeline::ExitReason::Shutdown => {
+                    // Lifecycle ownership finalizes the state only after every remote decision
+                    // writer has settled. The watcher cannot prove that merely because the
+                    // compute thread exited, so a timed-out stop remains ShuttingDown until retry.
+                }
+                crate::pipeline::ExitReason::Fault(reason) => {
+                    tracing::error!(%reason, "laminar-compute thread exited with a recoverable fault");
+                    watcher_fault.lock().get_or_insert(reason);
+                    #[cfg(feature = "cluster")]
+                    if watcher_is_cluster {
+                        // Also cover a lost terminal channel or a compute-thread exit before
+                        // its normal fault publication reached this watcher.
+                        watcher_source_gate.store(true, std::sync::atomic::Ordering::SeqCst);
+                        watcher_recovery_fence.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    publish_runtime_fault_state(&watcher_state);
+                    watcher_shutdown.notify_one();
+                    // Cluster mode: report the fault and let the leader drive a global
+                    // restart; the monitor restores this node. A local restart would rewind
+                    // only this node while peers advanced — an inconsistent cut.
+                    #[cfg(feature = "cluster")]
+                    if watcher_is_cluster {
+                        tokio::select! {
+                            biased;
+                            () = watcher_runtime_shutdown.cancelled() => {}
+                            () = report_cluster_compute_fault(
+                                watcher_controller,
+                                watcher_pending_compute_fault,
+                            ) => {}
+                        }
+                        return;
+                    }
+                    // Auto-restart if supervised; otherwise the pipeline stays Faulted.
+                    let supervised = watcher_supervisor.lock().upgrade();
+                    if let Some(db) = supervised {
+                        let _ =
+                            spawn_supervised_restart(db, watcher_restart_history, watcher_metrics);
+                    }
+                }
+            }
+        });
+
+        *self.runtime_handle.lock().await = Some(handle);
+        Ok(())
+    }
+
+    async fn start_coordinated_committer(
+        &self,
+        committer: Option<crate::coordinated_committer::CoordinatedCommitter>,
+        poll_interval: std::time::Duration,
+        notify: Arc<tokio::sync::Notify>,
+    ) -> Result<(), DbError> {
+        let Some(mut committer) = committer else {
+            return Ok(());
+        };
+
+        let state = Arc::clone(&self.state);
+        let handle = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(poll_interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            tick.tick().await;
+
+            if let Err(error) = committer.commit_ready().await {
+                tracing::warn!(%error, "initial coordinated committer pass failed; will retry");
+            }
+            loop {
+                tokio::select! {
+                    () = notify.notified() => {}
+                    _ = tick.tick() => {}
+                }
+                if matches!(
+                    DbState::load(&state),
+                    DbState::Stopped | DbState::Faulted | DbState::Created
+                ) {
+                    break;
+                }
+                if let Err(error) = committer.commit_ready().await {
+                    tracing::warn!(%error, "coordinated committer pass failed; will retry");
+                }
+            }
+        });
+
+        let mut owned_handle = self.committer_handle.lock().await;
+        if owned_handle.is_some() {
+            handle.abort();
+            let _ = handle.await;
+            return Err(DbError::Checkpoint(
+                "cannot start a coordinated committer while a prior generation is still owned"
+                    .into(),
+            ));
+        }
+        *owned_handle = Some(handle);
+        Ok(())
+    }
+
+    async fn start_connector_pipeline(
+        &self,
+        source_regs: HashMap<String, crate::connector_manager::SourceRegistration>,
+        sink_regs: HashMap<String, crate::connector_manager::SinkRegistration>,
+        stream_regs: HashMap<String, crate::connector_manager::StreamRegistration>,
+        table_regs: HashMap<String, crate::connector_manager::TableRegistration>,
+        has_external: bool,
+        runtime_shutdown: tokio_util::sync::CancellationToken,
+    ) -> Result<(), DbError> {
+        use crate::pipeline::{CheckpointSchedule, PipelineConfig};
+
+        let runtime_mode = self.runtime_mode();
+
+        #[cfg(feature = "cluster")]
+        let startup_generation_fence = if runtime_mode == RuntimeMode::Cluster {
+            let generation_fence = Arc::clone(&self.rotation_execution_fence)
+                .write_owned()
+                .await;
+            self.rehydrated_vnode_state.lock().clear();
+            self.pending_revoke_vnodes.lock().clear();
+            Some(generation_fence)
+        } else {
+            None
+        };
+
+        self.revalidate_persisted_cluster_query_shapes(&stream_regs)
+            .await?;
+
+        let checkpoint_schedule =
+            self.config
+                .checkpoint
+                .as_ref()
+                .map_or(CheckpointSchedule::Disabled, |config| {
+                    config
+                        .interval_ms
+                        .map_or(CheckpointSchedule::Manual, |interval_ms| {
+                            CheckpointSchedule::Periodic(std::time::Duration::from_millis(
+                                interval_ms,
+                            ))
+                        })
+                });
+        let checkpointing_enabled = checkpoint_schedule.is_enabled();
+        let pipeline_checkpoint_timeout = self
+            .config
+            .checkpoint
+            .as_ref()
+            .and_then(|config| config.timeout_ms)
+            .map_or(
+                crate::checkpoint_coordinator::CheckpointConfig::default().checkpoint_timeout,
+                std::time::Duration::from_millis,
+            );
+
+        let mut graph =
+            self.build_connector_operator_graph(&source_regs, &stream_regs, &table_regs)?;
+
+        let prom_registry = self.prometheus_registry.lock().clone();
+        let mut sources = self.build_pipeline_sources(
+            &mut graph,
+            &source_regs,
+            checkpointing_enabled,
+            runtime_mode,
+            prom_registry.as_ref(),
+        )?;
+
+        let sink_setup = self
+            .prepare_pipeline_sinks(
+                &sources,
+                &sink_regs,
+                &stream_regs,
+                runtime_mode,
+                checkpointing_enabled,
+                pipeline_checkpoint_timeout,
+                prom_registry.as_ref(),
+            )
+            .await?;
+        let PipelineRecoveryState {
+            graph,
+            recovered_mv_store,
+            recovered_source_wms,
+            recovered_watermark_frontier,
+            recovered_all_sources_idle,
+            source_watermark_recovery_selected,
+            #[cfg(feature = "cluster")]
+                reconciled_source_handoff_version: startup_reconciled_source_handoff_version,
+            restored_reference_tables,
+        } = self
+            .recover_pipeline_state(graph, &mut sources, runtime_mode)
+            .await?;
+        let previous_mv_store = {
+            let mut live = self.mv_store.write();
+            std::mem::replace(&mut *live, recovered_mv_store)
+        };
+        drop(previous_mv_store);
+
+        if source_watermark_recovery_selected {
+            for source_name in self.catalog.list_sources() {
+                if let Some(entry) = self.catalog.get_source(&source_name) {
+                    entry.source.restore_watermark_for_recovery(
+                        recovered_source_wms
+                            .get(&source_name)
+                            .copied()
+                            .or(recovered_watermark_frontier)
+                            .unwrap_or(i64::MIN),
+                    );
+                }
+            }
+        }
+
+        self.initialize_reference_tables(&table_regs, &stream_regs, restored_reference_tables)
+            .await?;
+        let watermarks = self.prepare_pipeline_watermarks(
+            &stream_regs,
+            &recovered_source_wms,
+            recovered_watermark_frontier,
+            recovered_all_sources_idle,
+            source_watermark_recovery_selected,
+        )?;
         let max_poll = self.config.default_buffer_size.min(1024);
         tracing::info!(
             sources = sources.len(),
-            sinks = sinks.len(),
+            sinks = sink_setup.sinks.len(),
             streams = stream_regs.len(),
-            watermark_sources = source_ids.len(),
+            watermark_sources = watermarks.source_ids.len(),
             "Starting event-driven connector pipeline"
         );
 
@@ -4254,490 +5012,36 @@ impl LaminarDB {
             max_replay_buffer_bytes: 256 * 1024 * 1024,
         };
 
-        let shutdown = self.shutdown_signal.clone();
+        let PreparedPipelineRuntime {
+            runtime,
+            coordinated_committer,
+            committer_poll,
+            committer_notify,
+        } = self
+            .prepare_pipeline_runtime(
+                sources,
+                graph,
+                sink_setup,
+                watermarks,
+                pipeline_config,
+                runtime_mode,
+                #[cfg(feature = "cluster")]
+                startup_reconciled_source_handoff_version,
+            )
+            .await?;
 
-        let pipeline_watermark = Arc::clone(&self.pipeline_watermark);
-        let coordinator = Arc::clone(&self.coordinator);
-        let table_store_for_loop = self.table_store.clone();
-        graph.set_query_budget_ns(pipeline_config.query_budget_ns);
-        graph.set_max_input_buf_batches(pipeline_config.max_input_buf_batches);
-        graph.set_max_input_buf_bytes(pipeline_config.max_input_buf_bytes);
-        graph.set_backpressure_policy(pipeline_config.backpressure_policy);
-        graph.set_shared_source_isolation(
-            pipeline_config.shared_source_isolation,
-            pipeline_config.max_replay_buffer_bytes,
-        );
+        self.launch_pipeline_runtime(
+            runtime,
+            Arc::clone(&self.shutdown_signal),
+            runtime_shutdown,
+            #[cfg(feature = "cluster")]
+            startup_generation_fence,
+        )
+        .await?;
 
-        let sinks_pending_filter_count = sinks
-            .iter()
-            .filter(|(_, _, filter_sql, _, _)| filter_sql.is_some())
-            .count();
-
-        let source_name_arcs: rustc_hash::FxHashMap<usize, Arc<str>> = source_ids
-            .iter()
-            .map(|(name, &sid)| (sid, Arc::<str>::from(name.as_str())))
-            .collect();
-        let source_wms_buf = rustc_hash::FxHashMap::with_capacity_and_hasher(
-            source_name_arcs.len(),
-            rustc_hash::FxBuildHasher,
-        );
-
-        let prom = self
-            .engine_metrics
-            .lock()
-            .clone()
-            .expect("EngineMetrics must be set before start()");
-
-        let (force_ckpt_tx, force_ckpt_rx) = crossfire::mpsc::bounded_async::<
-            crate::db::ForceCheckpointReply,
-        >(crate::db::FORCE_CHECKPOINT_CHANNEL_CAPACITY);
-        *self.force_ckpt_tx.lock() = Some(force_ckpt_tx);
-
-        let (checkpoint_complete_tx, checkpoint_complete_rx) =
-            crossfire::mpsc::bounded_async::<crate::pipeline::CheckpointCompletion>(16);
-        // Checkpoint tails are serialized. Completion currently has no admission-ordered
-        // sequencer, so allowing multiple durable tails could acknowledge epoch N+1 before N and
-        // move a source cursor backwards when N finishes later.
-        let has_checkpoint_committable_sink = sinks
-            .iter()
-            .any(|(_, handle, _, _, _)| handle.checkpoint_committable());
-        let checkpoint_in_flight = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let (
-            epoch_allocator,
-            ckpt_quorum_timeout,
-            checkpoint_timeout,
-            checkpoint_cleanup_timeout,
-            max_staged_bytes,
-            coordinated_commit_admission,
-        ) = {
-            let guard = coordinator.lock().await;
-            match guard.as_ref() {
-                Some(coord) => {
-                    let cfg = coord.config();
-                    (
-                        Some(coord.epoch_allocator()),
-                        cfg.quorum_timeout,
-                        cfg.checkpoint_timeout,
-                        cfg.cleanup_timeout,
-                        cfg.max_staged_bytes,
-                        coord.coordinated_commit_admission(),
-                    )
-                }
-                None => (
-                    None,
-                    std::time::Duration::from_secs(3),
-                    std::time::Duration::from_secs(120),
-                    crate::checkpoint_coordinator::CheckpointConfig::default().cleanup_timeout,
-                    u64::MAX,
-                    None,
-                ),
-            }
-        };
-        #[cfg(not(feature = "cluster"))]
-        let _ = ckpt_quorum_timeout;
-
-        let named_stream_names: rustc_hash::FxHashSet<Arc<str>> = stream_entries
-            .iter()
-            .map(|entry| Arc::from(entry.name.as_str()))
-            .collect();
-
-        // Snapshot the controller once: locking the same `parking_lot::Mutex` twice
-        // within the struct literal below would deadlock (the first guard lives until
-        // the statement ends).
-        #[cfg(feature = "cluster")]
-        let source_process_authority = (runtime_mode == RuntimeMode::Cluster)
-            .then(|| callback_controller.clone())
-            .flatten();
-        #[cfg(feature = "cluster")]
-        let callback_vnode_registry = self.vnode_registry.lock().clone();
-        #[cfg(feature = "cluster")]
-        let (
-            callback_shuffle_delivery_loss_incidents,
-            callback_shuffle_recovered_delivery_loss_incidents,
-        ) = self
-            .shuffle_receiver
-            .lock()
-            .as_ref()
-            .map_or((None, None), |receiver| {
-                (
-                    Some(receiver.delivery_loss_incidents()),
-                    Some(receiver.recovered_delivery_loss_incidents()),
-                )
-            });
-
-        let callback = crate::pipeline_callback::ConnectorPipelineCallback {
-            graph,
-            stream_entries,
-            sinks,
-            owned_sink_handles: Arc::clone(&self.owned_sink_handles),
-            watermark_states,
-            source_entries_for_wm,
-            source_ids,
-            source_name_arcs,
-            source_wms_buf,
-            tracker,
-            prom,
-            pipeline_watermark,
-            coordinator,
-            table_store: table_store_for_loop,
-            mv_store_has_any: self.mv_store.read().has_any_handle(),
-            mv_store: self.mv_store.clone(),
-            filter_ctx: laminar_sql::create_session_context(),
-            compiled_sink_filters: Vec::new(),
-            pending_sink_filter_compiles: sinks_pending_filter_count,
-            delivery_guarantee: pipeline_config.delivery_guarantee,
-            serialization_timeout: checkpoint_timeout,
-            checkpoint_state_cap_bytes: max_staged_bytes,
-            checkpoint_serialization_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-            checkpoint_timeout,
-            checkpoint_cleanup_timeout,
-            sink_event_rx,
-            sink_timed_out: false,
-            sink_fault: None,
-            checkpoint_fault: Arc::new(parking_lot::Mutex::new(None)),
-            last_checkpoint_admission_failure: None,
-            checkpoint_admission_recovering: false,
-            shutdown_signal: Arc::clone(&self.shutdown_signal),
-            #[cfg(feature = "cluster")]
-            vnode_registry: callback_vnode_registry,
-            #[cfg(feature = "cluster")]
-            reconciled_source_handoff_version: startup_reconciled_source_handoff_version,
-            #[cfg(feature = "cluster")]
-            cluster_controller: callback_controller,
-            #[cfg(feature = "cluster")]
-            follower_tail: Arc::default(),
-            #[cfg(feature = "cluster")]
-            barrier_injectors: Vec::new(),
-            #[cfg(feature = "cluster")]
-            shuffle_delivery_loss_incidents: callback_shuffle_delivery_loss_incidents,
-            #[cfg(feature = "cluster")]
-            shuffle_recovered_delivery_loss_incidents:
-                callback_shuffle_recovered_delivery_loss_incidents,
-            #[cfg(feature = "cluster")]
-            shuffle_delivery_loss_incidents_seen: 0,
-            #[cfg(feature = "cluster")]
-            pending_follower_checkpoint: None,
-            #[cfg(feature = "cluster")]
-            checkpoint_leader_proofs: rustc_hash::FxHashMap::default(),
-            subscription_registry: Arc::clone(&self.subscription_registry),
-            named_stream_names,
-            checkpoint_complete_tx,
-            checkpoint_tail_tasks: tokio::task::JoinSet::new(),
-            checkpoint_in_flight: Arc::clone(&checkpoint_in_flight),
-            #[cfg(feature = "cluster")]
-            delta_rebase_needed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            #[cfg(feature = "cluster")]
-            last_vnode_capture_epoch: None,
-            epoch_allocator,
-            #[cfg(feature = "cluster")]
-            quorum_timeout: ckpt_quorum_timeout,
-            checkpoint_committable_sinks: has_checkpoint_committable_sink,
-            #[cfg(feature = "cluster")]
-            intake_gate: Arc::clone(&self.source_gate),
-            #[cfg(not(feature = "cluster"))]
-            intake_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        };
-
-        {
-            let (control_tx, control_rx) =
-                crossfire::mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
-            *self.control_tx.lock() = Some(control_tx);
-
-            #[cfg(feature = "cluster")]
-            let source_gate = Arc::clone(&self.source_gate);
-            #[cfg(not(feature = "cluster"))]
-            let source_gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let coordinator =
-                crate::pipeline::StreamingCoordinator::new_with_tracked_source_registry(
-                    sources,
-                    pipeline_config,
-                    Arc::clone(&shutdown),
-                    control_rx,
-                    source_gate,
-                    #[cfg(feature = "cluster")]
-                    source_process_authority,
-                    Arc::clone(&self.owned_source_tasks),
-                    runtime_mode,
-                )
-                .await?
-                .with_terminal_shutdown(runtime_shutdown.clone())
-                .with_force_checkpoint_rx(force_ckpt_rx)
-                .with_checkpoint_complete_rx(checkpoint_complete_rx)
-                .with_checkpoint_admission(checkpoint_in_flight)
-                .with_coordinated_commit_admission(coordinated_commit_admission);
-
-            let (done_tx, done_rx) = crossfire::oneshot::oneshot::<crate::pipeline::ExitReason>();
-            let (startup_tx, startup_rx) = crossfire::oneshot::oneshot::<Result<(), String>>();
-            // Captured by the compute thread so an operator panic is recorded
-            // (surfaced via pipeline status) rather than only logged.
-            let fault_slot = Arc::clone(&self.last_fault);
-            let fault_state = Arc::clone(&self.state);
-            let fault_metrics = self.engine_metrics.lock().clone();
-            #[cfg(feature = "cluster")]
-            let compute_fault_source_gate = Arc::clone(&self.source_gate);
-            #[cfg(feature = "cluster")]
-            let compute_fault_recovery_fence = Arc::clone(&self.coordinated_recovery_fenced);
-            #[cfg(feature = "cluster")]
-            let compute_fault_is_cluster = runtime_mode == RuntimeMode::Cluster;
-            #[cfg(feature = "cluster")]
-            let compute_fault_controller = self.cluster_controller.lock().clone();
-            #[cfg(feature = "cluster")]
-            let compute_fault_pending = Arc::clone(&self.pending_recovery_fault);
-            #[cfg(feature = "cluster")]
-            let compute_fault_runtime_shutdown = runtime_shutdown.clone();
-            match std::thread::Builder::new()
-                .name("laminar-compute".into())
-                .spawn(move || {
-                    let rt = match tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                    {
-                        Ok(rt) => rt,
-                        Err(e) => {
-                            startup_tx.send(Err(format!("compute runtime: {e}")));
-                            return;
-                        }
-                    };
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        rt.block_on(async move {
-                            Box::pin(coordinator.run_with_ready(callback, startup_tx)).await
-                        })
-                    }));
-                    // Runtime shutdown waits for non-abortable `spawn_blocking` filesystem work.
-                    // Publish neither clean completion nor a fault until those workers are gone;
-                    // otherwise lifecycle teardown could release the exact namespace lock while
-                    // an old local decision hard-link was still able to appear.
-                    drop(rt);
-                    let exit = match result {
-                        Ok(exit) => exit,
-                        Err(panic) => {
-                            let msg = panic
-                                .downcast_ref::<String>()
-                                .map(String::as_str)
-                                .or_else(|| panic.downcast_ref::<&str>().copied())
-                                .unwrap_or("unknown");
-                            tracing::error!(panic = msg, "laminar-compute thread panicked");
-                            crate::pipeline::ExitReason::Fault(msg.to_string())
-                        }
-                    };
-                    let exit = match exit {
-                        crate::pipeline::ExitReason::Shutdown => {
-                            crate::pipeline::ExitReason::Shutdown
-                        }
-                        crate::pipeline::ExitReason::Fault(reason) => {
-                            #[cfg(feature = "cluster")]
-                            if compute_fault_is_cluster {
-                                // Fence public restarts before publishing Faulted. The state CAS
-                                // then orders this fault against a concurrent coordinated stop.
-                                compute_fault_source_gate
-                                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                                compute_fault_recovery_fence
-                                    .store(true, std::sync::atomic::Ordering::Release);
-                            }
-
-                            // Publish before notifying the watcher. This closes the ready-send ->
-                            // watcher-scheduled window in which start() could otherwise report
-                            // Running after the compute loop had already exited.
-                            #[cfg(feature = "cluster")]
-                            let owns_fault_state = publish_runtime_fault_state(&fault_state);
-                            #[cfg(not(feature = "cluster"))]
-                            publish_runtime_fault_state(&fault_state);
-                            #[cfg(feature = "cluster")]
-                            let covered_by_terminal_stop = compute_fault_is_cluster
-                                && !owns_fault_state
-                                && compute_fault_runtime_shutdown.is_cancelled()
-                                && DbState::load(&fault_state) == DbState::ShuttingDown;
-                            #[cfg(not(feature = "cluster"))]
-                            let covered_by_terminal_stop = false;
-
-                            if covered_by_terminal_stop {
-                                crate::pipeline::ExitReason::Shutdown
-                            } else {
-                                tracing::error!(
-                                    reason = %reason,
-                                    "pipeline faulted on a fatal cycle error; recovering from last checkpoint"
-                                );
-                                *fault_slot.lock() = Some(reason.clone());
-                                #[cfg(feature = "cluster")]
-                                if compute_fault_is_cluster {
-                                    if let Some(controller) = compute_fault_controller.as_deref() {
-                                        if let Err(error) = queue_owned_cluster_compute_fault(
-                                            controller,
-                                            &compute_fault_pending,
-                                            owns_fault_state,
-                                            &compute_fault_runtime_shutdown,
-                                        ) {
-                                            tracing::error!(
-                                                %error,
-                                                "could not allocate a recovery fault request"
-                                            );
-                                        }
-                                    }
-                                    // A Release may have raced the close-before-queue edge.
-                                    compute_fault_source_gate
-                                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                                    compute_fault_recovery_fence
-                                        .store(true, std::sync::atomic::Ordering::Release);
-                                }
-                                if let Some(ref metrics) = fault_metrics {
-                                    metrics.pipeline_faults_total.inc();
-                                }
-                                crate::pipeline::ExitReason::Fault(reason)
-                            }
-                        }
-                    };
-                    done_tx.send(exit);
-                }) {
-                Ok(_) => {}
-                Err(e) => {
-                    return Err(DbError::Config(format!(
-                        "failed to spawn compute thread: {e}"
-                    )));
-                }
-            }
-
-            match startup_rx.await {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) if runtime_shutdown.is_cancelled() || self.is_closed() => {
-                    let _ = done_rx.await;
-                    return Err(DbError::Shutdown);
-                }
-                Ok(Err(e)) => {
-                    let _ = done_rx.await;
-                    return Err(DbError::Config(e));
-                }
-                Err(_) => {
-                    let _ = done_rx.await;
-                    return Err(DbError::Config(
-                        "compute thread exited before entering the runtime control loop".into(),
-                    ));
-                }
-            }
-
-            // Readiness transfers the recovered MV image and fully wired graph to the live loop.
-            // Release only now: a subsequent assignment may safely stage into the graph's shared
-            // handles, and a first cycle already waiting on the read fence can then proceed.
-            #[cfg(feature = "cluster")]
-            drop(startup_generation_fence);
-
-            let watcher_state = Arc::clone(&self.state);
-            let watcher_shutdown = Arc::clone(&self.shutdown_signal);
-            let watcher_fault = Arc::clone(&self.last_fault);
-            let watcher_supervisor = Arc::clone(&self.supervisor_self);
-            let watcher_restart_history = Arc::clone(&self.restart_history);
-            let watcher_metrics = self.engine_metrics.lock().clone();
-            #[cfg(feature = "cluster")]
-            let watcher_controller = self.cluster_controller.lock().clone();
-            #[cfg(feature = "cluster")]
-            let watcher_source_gate = Arc::clone(&self.source_gate);
-            #[cfg(feature = "cluster")]
-            let watcher_recovery_fence = Arc::clone(&self.coordinated_recovery_fenced);
-            #[cfg(feature = "cluster")]
-            let watcher_is_cluster = runtime_mode == RuntimeMode::Cluster;
-            #[cfg(feature = "cluster")]
-            let watcher_pending_compute_fault = Arc::clone(&self.pending_recovery_fault);
-            #[cfg(feature = "cluster")]
-            let watcher_runtime_shutdown = runtime_shutdown.clone();
-            let handle = tokio::spawn(async move {
-                let exit = done_rx.await.unwrap_or_else(|_| {
-                    crate::pipeline::ExitReason::Fault(
-                        "compute thread exited without a terminal result".to_string(),
-                    )
-                });
-                match exit {
-                    crate::pipeline::ExitReason::Shutdown => {
-                        // Lifecycle ownership finalizes the state only after every remote decision
-                        // writer has settled. The watcher cannot prove that merely because the
-                        // compute thread exited, so a timed-out stop remains ShuttingDown until retry.
-                    }
-                    crate::pipeline::ExitReason::Fault(reason) => {
-                        tracing::error!(%reason, "laminar-compute thread exited with a recoverable fault");
-                        watcher_fault.lock().get_or_insert(reason);
-                        #[cfg(feature = "cluster")]
-                        if watcher_is_cluster {
-                            // Also cover a lost terminal channel or a compute-thread exit before
-                            // its normal fault publication reached this watcher.
-                            watcher_source_gate.store(true, std::sync::atomic::Ordering::SeqCst);
-                            watcher_recovery_fence
-                                .store(true, std::sync::atomic::Ordering::Release);
-                        }
-                        publish_runtime_fault_state(&watcher_state);
-                        watcher_shutdown.notify_one();
-                        // Cluster mode: report the fault and let the leader drive a global
-                        // restart; the monitor restores this node. A local restart would rewind
-                        // only this node while peers advanced — an inconsistent cut.
-                        #[cfg(feature = "cluster")]
-                        if watcher_is_cluster {
-                            tokio::select! {
-                                biased;
-                                () = watcher_runtime_shutdown.cancelled() => {}
-                                () = report_cluster_compute_fault(
-                                    watcher_controller,
-                                    watcher_pending_compute_fault,
-                                ) => {}
-                            }
-                            return;
-                        }
-                        // Auto-restart if supervised; otherwise the pipeline stays Faulted.
-                        let supervised = watcher_supervisor.lock().upgrade();
-                        if let Some(db) = supervised {
-                            let _ = spawn_supervised_restart(
-                                db,
-                                watcher_restart_history,
-                                watcher_metrics,
-                            );
-                        }
-                    }
-                }
-            });
-
-            *self.runtime_handle.lock().await = Some(handle);
-        }
-
-        // Start the designated committer only after recovery, reconciliation,
-        // source restoration, and the compute runtime all succeeded. Its first
-        // pass runs immediately to close any recovery/external-commit crash window. New
-        // checkpoints wake it directly; the interval is only a safety net.
-        if let Some(mut committer) = coordinated_committer {
-            let state = Arc::clone(&self.state);
-            let handle = tokio::spawn(async move {
-                let mut tick = tokio::time::interval(committer_poll);
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                tick.tick().await;
-
-                if let Err(e) = committer.commit_ready().await {
-                    tracing::warn!(error = %e, "initial coordinated committer pass failed; will retry");
-                }
-                loop {
-                    tokio::select! {
-                        () = committer_notify.notified() => {}
-                        _ = tick.tick() => {}
-                    }
-                    if matches!(
-                        DbState::load(&state),
-                        DbState::Stopped | DbState::Faulted | DbState::Created
-                    ) {
-                        break;
-                    }
-                    if let Err(e) = committer.commit_ready().await {
-                        tracing::warn!(error = %e, "coordinated committer pass failed; will retry");
-                    }
-                }
-            });
-            let mut guard = self.committer_handle.lock().await;
-            if guard.is_some() {
-                handle.abort();
-                let _ = handle.await;
-                return Err(DbError::Checkpoint(
-                    "cannot start a coordinated committer while a prior generation is still owned"
-                        .into(),
-                ));
-            }
-            *guard = Some(handle);
-        }
-        Ok(())
+        self.start_coordinated_committer(coordinated_committer, committer_poll, committer_notify)
+            .await
     }
-
     async fn quiesce_checkpoint_decision_until(
         &self,
         deadline: tokio::time::Instant,
@@ -5050,3735 +5354,22 @@ impl LaminarDB {
 }
 
 #[cfg(test)]
-mod connector_admission_tests {
-    #[cfg(feature = "cluster")]
-    use super::cluster_delta_chain_bound;
-    use super::LaminarDB;
-    use super::{
-        admit_sink, admit_sink_contract, admit_source_contract, close_opened_sinks,
-        open_prepared_sinks, resolve_stream_output_schemas, validate_source_recovery_assignment,
-        ConnectorTaskFenceRegistration, DbError, PreparedSink, RuntimeMode, SinkAdmissionContext,
-        TrackedSourceRegistration, CLUSTER_BEST_EFFORT, EXACT_SINK_PROTOCOL,
-    };
-    use crate::db::DbState;
-    use crate::pipeline::PipelineConfig;
-    use crate::sink_task::{SinkTaskConfig, DEFAULT_CHANNEL_CAPACITY, SINK_EVENT_CHANNEL_CAPACITY};
-    use arrow_array::RecordBatch;
-    use arrow_schema::{Schema, SchemaRef};
-    use async_trait::async_trait;
-    use laminar_connectors::checkpoint::SourceCheckpoint;
-    use laminar_connectors::config::ConnectorConfig;
-    use laminar_connectors::connector::{
-        ConnectorCancellationPolicy, ConnectorTaskOwner, ConnectorTaskTracker, DeliveryGuarantee,
-        SinkConnector, SinkConsistency, SinkContract, SinkInputMode, SinkTopology, SourceBatch,
-        SourceConnector, SourceConsistency, SourceContract, SourceStart, SourceTopology,
-        WriteResult,
-    };
-    use laminar_connectors::error::ConnectorError;
-    use laminar_core::state::StateBackendDurability;
-    use laminar_core::storage::checkpoint_manifest::ConnectorCheckpoint;
-    use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    #[cfg(feature = "cluster")]
-    #[test]
-    fn cluster_delta_chain_bound_is_derived_from_retention() {
-        assert_eq!(cluster_delta_chain_bound(0), None);
-        assert_eq!(cluster_delta_chain_bound(1), None);
-        assert_eq!(cluster_delta_chain_bound(2), Some(1));
-        assert_eq!(cluster_delta_chain_bound(3), Some(2));
-        assert_eq!(cluster_delta_chain_bound(4), Some(3));
-        assert_eq!(cluster_delta_chain_bound(5), Some(4));
-        assert_eq!(cluster_delta_chain_bound(usize::MAX), Some(4));
-    }
-
-    struct RetiringQuiesceSink {
-        schema: SchemaRef,
-    }
-
-    #[async_trait]
-    impl SinkConnector for RetiringQuiesceSink {
-        async fn open(&mut self, _config: &ConnectorConfig) -> Result<(), ConnectorError> {
-            Ok(())
-        }
-
-        async fn write_batch(
-            &mut self,
-            _batch: &RecordBatch,
-        ) -> Result<WriteResult, ConnectorError> {
-            Err(ConnectorError::outcome_unknown(
-                "injected unknown write outcome",
-                true,
-            ))
-        }
-
-        async fn close(&mut self) -> Result<(), ConnectorError> {
-            Ok(())
-        }
-
-        fn schema(&self) -> SchemaRef {
-            Arc::clone(&self.schema)
-        }
-
-        fn suggested_write_timeout(&self) -> Duration {
-            Duration::from_secs(1)
-        }
-    }
-
-    #[tokio::test]
-    async fn sink_quiesce_waits_for_terminal_proof_after_sticky_close_error() {
-        let db = LaminarDB::open().unwrap();
-        let (owner, tracker) = ConnectorTaskOwner::new();
-        let guard = owner.track().expect("live connector child");
-        drop(owner);
-        let schema = Arc::new(Schema::empty());
-        let (event_tx, mut events) =
-            laminar_core::streaming::channel::channel(SINK_EVENT_CHANNEL_CAPACITY);
-        let handle = crate::sink_task::SinkTaskHandle::spawn(SinkTaskConfig {
-            name: "retired-quiesce".into(),
-            sink_id: Arc::from("retired-quiesce"),
-            connector: Box::new(RetiringQuiesceSink {
-                schema: Arc::clone(&schema),
-            }),
-            contract: SinkContract::new(
-                SinkConsistency::DurableAtLeastOnce,
-                SinkTopology::MultiWriter,
-                laminar_connectors::connector::SinkInputMode::AppendOnly,
-            ),
-            requires_recovery_on_error: true,
-            channel_capacity: DEFAULT_CHANNEL_CAPACITY,
-            flush_interval: Duration::from_secs(60),
-            write_timeout: Duration::from_secs(1),
-            event_tx,
-            terminal_tasks: Some(tracker),
-            #[cfg(feature = "cluster")]
-            process_authority: None,
-        });
-        handle
-            .write_batch(RecordBatch::new_empty(schema))
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), events.recv())
-            .await
-            .expect("retiring write did not report its error")
-            .expect("sink event channel closed unexpectedly");
-        handle
-            .sync()
-            .await
-            .expect_err("retired actor must reject later commands");
-        db.owned_sink_handles.lock().push(handle.clone());
-
-        let quiesce_db = Arc::clone(&db);
-        let quiesce = tokio::spawn(async move {
-            quiesce_db
-                .quiesce_owned_sink_handles_until(
-                    tokio::time::Instant::now() + Duration::from_secs(1),
-                )
-                .await
-        });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !handle.close_outcome_published() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("retired sink did not publish its sticky close error");
-        assert!(
-            !quiesce.is_finished(),
-            "a sticky close error must not bypass the terminal connector proof"
-        );
-
-        drop(guard);
-        quiesce
-            .await
-            .expect("sink quiesce task panicked")
-            .expect("terminal sink generation should permit replacement");
-        assert!(db.owned_sink_handles.lock().is_empty());
-    }
-
-    #[tokio::test]
-    async fn expired_sink_quiesce_budget_prunes_an_already_terminal_actor() {
-        let db = LaminarDB::open().unwrap();
-        let schema = Arc::new(Schema::empty());
-        let (event_tx, _events) =
-            laminar_core::streaming::channel::channel(SINK_EVENT_CHANNEL_CAPACITY);
-        let handle = crate::sink_task::SinkTaskHandle::spawn(SinkTaskConfig {
-            name: "terminal-before-quiesce".into(),
-            sink_id: Arc::from("terminal-before-quiesce"),
-            connector: Box::new(RetiringQuiesceSink { schema }),
-            contract: SinkContract::new(
-                SinkConsistency::DurableAtLeastOnce,
-                SinkTopology::MultiWriter,
-                SinkInputMode::AppendOnly,
-            ),
-            requires_recovery_on_error: true,
-            channel_capacity: DEFAULT_CHANNEL_CAPACITY,
-            flush_interval: Duration::from_secs(60),
-            write_timeout: Duration::from_secs(1),
-            event_tx,
-            terminal_tasks: None,
-            #[cfg(feature = "cluster")]
-            process_authority: None,
-        });
-        handle.close().await.unwrap();
-        assert!(
-            handle
-                .wait_terminal_until(tokio::time::Instant::now() + Duration::from_secs(1))
-                .await
-        );
-        db.owned_sink_handles.lock().push(handle);
-
-        db.quiesce_owned_sink_handles_until(tokio::time::Instant::now())
-            .await
-            .expect("terminal actors need no remaining cleanup budget");
-        assert!(db.owned_sink_handles.lock().is_empty());
-    }
-
-    #[test]
-    fn recovered_source_assignment_scope_fails_closed() {
-        let expected = std::num::NonZeroU64::new(7).unwrap();
-        let mut checkpoint = ConnectorCheckpoint::new();
-
-        let error =
-            validate_source_recovery_assignment("events", true, Some(&checkpoint), Some(expected))
-                .unwrap_err();
-        assert!(error.to_string().contains("missing its assignment version"));
-
-        checkpoint.source_assignment_version = std::num::NonZeroU64::new(6);
-        let error =
-            validate_source_recovery_assignment("events", true, Some(&checkpoint), Some(expected))
-                .unwrap_err();
-        assert!(error.to_string().contains("committed fence is 7"));
-
-        checkpoint.source_assignment_version = Some(expected);
-        validate_source_recovery_assignment("events", true, Some(&checkpoint), Some(expected))
-            .unwrap();
-
-        let error = validate_source_recovery_assignment("events", true, Some(&checkpoint), None)
-            .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("no authoritative assignment fence"));
-
-        let error = validate_source_recovery_assignment("local", false, Some(&checkpoint), None)
-            .unwrap_err();
-        assert!(error.to_string().contains("non-assigned source 'local'"));
-
-        checkpoint.source_assignment_version = None;
-        validate_source_recovery_assignment("local", false, Some(&checkpoint), None).unwrap();
-        validate_source_recovery_assignment("local", false, Some(&checkpoint), Some(expected))
-            .unwrap();
-    }
-
-    #[test]
-    fn startup_transition_publishes_running_from_starting() {
-        let db = LaminarDB::open().unwrap();
-        DbState::Starting.store(&db.state);
-
-        db.finish_start_transition().unwrap();
-
-        assert_eq!(DbState::load(&db.state), DbState::Running);
-    }
-
-    #[test]
-    fn startup_transition_fails_closed_when_compute_loop_faulted() {
-        let db = LaminarDB::open().unwrap();
-        DbState::Faulted.store(&db.state);
-        *db.last_fault.lock() = Some("injected startup fault".into());
-
-        let error = db.finish_start_transition().unwrap_err();
-
-        assert!(
-            error.to_string().contains("injected startup fault"),
-            "unexpected startup error: {error}"
-        );
-        assert_eq!(DbState::load(&db.state), DbState::Faulted);
-    }
-
-    #[test]
-    fn cancelled_runtime_generation_cannot_publish_running() {
-        let db = LaminarDB::open().unwrap();
-        DbState::Starting.store(&db.state);
-        db.runtime_shutdown.read().cancel();
-
-        let error = db.finish_start_transition().unwrap_err();
-
-        assert!(matches!(error, crate::error::DbError::Shutdown));
-        assert_eq!(DbState::load(&db.state), DbState::Created);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelled_and_concurrent_start_wait_for_one_owned_attempt() {
-        let db = LaminarDB::open().unwrap();
-        let topology = db.topology_ddl_lock.write().await;
-
-        let first_db = Arc::clone(&db);
-        let first = tokio::spawn(async move { first_db.start().await });
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while DbState::load(&db.state) != DbState::Starting {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("startup attempt was not registered");
-        let owned = db
-            .startup_attempt
-            .lock()
-            .clone()
-            .expect("Starting must publish its attempt first");
-
-        first.abort();
-        let _ = first.await;
-        assert_eq!(DbState::load(&db.state), DbState::Starting);
-
-        let second_db = Arc::clone(&db);
-        let second = tokio::spawn(async move { second_db.start().await });
-        tokio::task::yield_now().await;
-        assert!(!second.is_finished());
-        assert!(Arc::ptr_eq(
-            &owned,
-            db.startup_attempt.lock().as_ref().unwrap()
-        ));
-
-        drop(topology);
-        tokio::time::timeout(Duration::from_secs(5), second)
-            .await
-            .expect("owned startup did not finish")
-            .expect("concurrent start task panicked")
-            .expect("owned startup failed");
-        assert_eq!(DbState::load(&db.state), DbState::Running);
-        db.shutdown().await.unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn synchronous_close_wakes_the_running_pipeline() {
-        let db = LaminarDB::open().unwrap();
-        db.execute("CREATE SOURCE input (id BIGINT)").await.unwrap();
-        db.execute("CREATE STREAM output AS SELECT id FROM input")
-            .await
-            .unwrap();
-        db.start().await.unwrap();
-        assert!(db.runtime_handle.lock().await.is_some());
-
-        db.close();
-
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let finished = db
-                    .runtime_handle
-                    .lock()
-                    .await
-                    .as_ref()
-                    .is_some_and(tokio::task::JoinHandle::is_finished);
-                if finished {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("synchronous shutdown request did not wake the pipeline runtime");
-        db.shutdown().await.unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn concurrent_stop_cannot_downgrade_completed_shutdown() {
-        let db = LaminarDB::open().unwrap();
-        db.start().await.unwrap();
-
-        // Hold the second lifecycle fence so shutdown owns ShuttingDown and the topology lock,
-        // while the trailing stop deterministically records that it observed the same teardown.
-        let lifecycle = db.lifecycle_lock.lock().await;
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        *db.stop_after_claim_gate.lock() = Some((Arc::clone(&entered), Arc::clone(&release)));
-
-        let shutdown_db = Arc::clone(&db);
-        let shutdown = tokio::spawn(async move { shutdown_db.shutdown().await });
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while DbState::load(&db.state) != DbState::ShuttingDown {
-                tokio::task::yield_now().await;
-            }
-            while db.topology_ddl_lock.try_read().is_ok() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("shutdown did not acquire lifecycle ownership");
-
-        let stop_db = Arc::clone(&db);
-        let stop = tokio::spawn(async move { stop_db.stop_pipeline().await });
-        tokio::time::timeout(Duration::from_secs(2), entered.notified())
-            .await
-            .expect("stop did not observe the in-progress shutdown");
-
-        drop(lifecycle);
-        tokio::time::timeout(Duration::from_secs(5), shutdown)
-            .await
-            .expect("shutdown remained blocked")
-            .expect("shutdown task panicked")
-            .expect("shutdown failed");
-        assert_eq!(DbState::load(&db.state), DbState::Stopped);
-
-        release.notify_one();
-        tokio::time::timeout(Duration::from_secs(5), stop)
-            .await
-            .expect("trailing stop remained blocked")
-            .expect("stop task panicked")
-            .expect("trailing stop failed");
-        assert_eq!(DbState::load(&db.state), DbState::Stopped);
-        *db.stop_after_claim_gate.lock() = None;
-    }
-
-    #[test]
-    fn runtime_fault_publication_preserves_lifecycle_ownership() {
-        let state = std::sync::atomic::AtomicU8::new(0);
-        for initial in [DbState::Starting, DbState::Running] {
-            initial.store(&state);
-            assert!(super::publish_runtime_fault_state(&state));
-            assert_eq!(DbState::load(&state), DbState::Faulted);
-        }
-        for preserved in [
-            DbState::Faulted,
-            DbState::Created,
-            DbState::ShuttingDown,
-            DbState::Stopped,
-        ] {
-            preserved.store(&state);
-            assert!(!super::publish_runtime_fault_state(&state));
-            assert_eq!(DbState::load(&state), preserved);
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn runtime_fault_cannot_steal_a_stop_transition() {
-        let db = LaminarDB::open().unwrap();
-        db.start().await.unwrap();
-
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        *db.stop_after_claim_gate.lock() = Some((Arc::clone(&entered), Arc::clone(&release)));
-        let stopping_db = Arc::clone(&db);
-        let stopping = tokio::spawn(async move { stopping_db.stop_pipeline().await });
-        tokio::time::timeout(Duration::from_secs(2), entered.notified())
-            .await
-            .expect("stop did not claim lifecycle ownership");
-
-        assert_eq!(DbState::load(&db.state), DbState::ShuttingDown);
-        assert!(!super::publish_runtime_fault_state(&db.state));
-        assert!(!super::publish_runtime_fault_state(&db.state));
-        assert_eq!(DbState::load(&db.state), DbState::ShuttingDown);
-
-        release.notify_one();
-        tokio::time::timeout(Duration::from_secs(5), stopping)
-            .await
-            .expect("stop remained blocked")
-            .expect("stop task panicked")
-            .expect("stop failed after racing runtime fault");
-        assert_eq!(DbState::load(&db.state), DbState::Created);
-        *db.stop_after_claim_gate.lock() = None;
-
-        db.start().await.unwrap();
-        assert_eq!(DbState::load(&db.state), DbState::Running);
-        db.shutdown().await.unwrap();
-    }
-
-    #[cfg(feature = "cluster")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn recovery_fence_linearizes_before_a_public_start_claim() {
-        let db = LaminarDB::open().unwrap();
-        let lifecycle_claim = db.startup_attempt.lock();
-        let starting_db = Arc::clone(&db);
-        let starting = tokio::spawn(async move { starting_db.start().await });
-
-        db.set_source_gate(true);
-        db.coordinated_recovery_fenced
-            .store(true, Ordering::Release);
-        drop(lifecycle_claim);
-
-        let error = tokio::time::timeout(Duration::from_secs(2), starting)
-            .await
-            .expect("public start remained blocked behind the recovery fence")
-            .expect("public start task panicked")
-            .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("pipeline start is fenced by coordinated recovery"));
-        assert_eq!(DbState::load(&db.state), DbState::Created);
-
-        db.release_coordinated_recovery_lifecycle();
-        db.shutdown().await.unwrap();
-    }
-
-    #[cfg(feature = "cluster")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn only_recovery_authority_can_stop_or_start_while_fenced() {
-        let db = LaminarDB::open().unwrap();
-        db.start().await.unwrap();
-        db.fence_coordinated_recovery_lifecycle();
-
-        let stop_error = db.stop_pipeline().await.unwrap_err();
-        assert!(stop_error
-            .to_string()
-            .contains("pipeline stop is fenced by coordinated recovery"));
-        assert_eq!(DbState::load(&db.state), DbState::Running);
-
-        db.stop_pipeline_for_coordinated_recovery().await.unwrap();
-        assert_eq!(DbState::load(&db.state), DbState::Created);
-
-        let start_error = db.start().await.unwrap_err();
-        assert!(start_error
-            .to_string()
-            .contains("pipeline start is fenced by coordinated recovery"));
-        db.start_for_coordinated_recovery().await.unwrap();
-        assert_eq!(DbState::load(&db.state), DbState::Running);
-
-        db.release_coordinated_recovery_lifecycle();
-        db.shutdown().await.unwrap();
-    }
-
-    #[cfg(feature = "cluster")]
-    #[tokio::test]
-    async fn topology_ddl_is_rejected_while_recovery_owns_lifecycle() {
-        let db = LaminarDB::open().unwrap();
-        db.fence_coordinated_recovery_lifecycle();
-
-        let error = db
-            .execute("CREATE SOURCE blocked_source (id BIGINT)")
-            .await
-            .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("pipeline database mutation is fenced by coordinated recovery"));
-
-        db.release_coordinated_recovery_lifecycle();
-        db.execute("CREATE SOURCE blocked_source (id BIGINT)")
-            .await
-            .unwrap();
-        db.shutdown().await.unwrap();
-    }
-
-    #[cfg(feature = "cluster")]
-    #[tokio::test]
-    async fn all_public_database_mutations_are_rejected_while_recovery_owns_lifecycle() {
-        let db = LaminarDB::open().unwrap();
-        db.execute("CREATE TABLE retained (id BIGINT PRIMARY KEY)")
-            .await
-            .unwrap();
-        db.fence_coordinated_recovery_lifecycle();
-
-        for sql in [
-            "INSERT INTO retained VALUES (1)",
-            "SET application_name = 'blocked'",
-            "CHECKPOINT",
-        ] {
-            let error = db.execute(sql).await.unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("pipeline database mutation is fenced by coordinated recovery"),
-                "{sql}: {error}"
-            );
-        }
-        let error = db.checkpoint().await.unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("pipeline manual checkpoint is fenced by coordinated recovery"));
-
-        db.release_coordinated_recovery_lifecycle();
-        db.execute("INSERT INTO retained VALUES (1)").await.unwrap();
-        db.shutdown().await.unwrap();
-    }
-
-    #[cfg(feature = "cluster")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn coordinated_recovery_supervisor_is_owned_and_replaces_a_terminated_task() {
-        let controller = sink_open_authority(1);
-        let db = LaminarDB::builder()
-            .cluster_controller(controller)
-            .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
-            .build()
-            .await
-            .unwrap();
-        let runtime = db.control_runtime.handle().unwrap();
-        let finished = runtime.spawn(async {});
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !finished.is_finished() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("injected recovery task did not terminate");
-        *db.recovery_monitor.lock() = Some(finished);
-
-        db.enable_coordinated_recovery().unwrap();
-        assert!(db
-            .recovery_monitor
-            .lock()
-            .as_ref()
-            .is_some_and(|monitor| !monitor.is_finished()));
-
-        db.shutdown().await.unwrap();
-        assert!(db.recovery_monitor.lock().is_none());
-    }
-
-    #[cfg(feature = "cluster")]
-    #[tokio::test]
-    async fn coordinated_recovery_supervisor_rejects_local_runtime() {
-        let db = LaminarDB::open().unwrap();
-
-        let error = db.enable_coordinated_recovery().unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("coordinated recovery requires a cluster runtime"));
-        assert!(db.recovery_monitor.lock().is_none());
-        db.shutdown().await.unwrap();
-    }
-
-    #[test]
-    fn source_contract_admission_matrix_is_fail_closed() {
-        let consistencies = [
-            SourceConsistency::Ephemeral,
-            SourceConsistency::Replayable,
-            SourceConsistency::CommitCoupled,
-        ];
-        let topologies = [
-            SourceTopology::Singleton,
-            SourceTopology::Splittable,
-            SourceTopology::NodeLocalIngress,
-        ];
-        let deliveries = [
-            DeliveryGuarantee::BestEffort,
-            DeliveryGuarantee::AtLeastOnce,
-            DeliveryGuarantee::ExactlyOnce,
-        ];
-        let runtimes = [RuntimeMode::Local, RuntimeMode::Cluster];
-        let certifications = [false, true];
-
-        for consistency in consistencies {
-            for topology in topologies {
-                for delivery in deliveries {
-                    for runtime in runtimes {
-                        for checkpointing_enabled in [false, true] {
-                            for certified in certifications {
-                                let mut contract = if certified {
-                                    laminar_connectors::generator::GeneratorSource::default()
-                                        .contract(&ConnectorConfig::new("generator"))
-                                        .expect("static generator contract")
-                                } else {
-                                    SourceContract::new(consistency, topology)
-                                };
-                                contract.consistency = consistency;
-                                contract.topology = topology;
-                                let expected = match consistency {
-                                    SourceConsistency::Ephemeral => {
-                                        delivery == DeliveryGuarantee::BestEffort
-                                    }
-                                    SourceConsistency::Replayable => true,
-                                    SourceConsistency::CommitCoupled => {
-                                        delivery == DeliveryGuarantee::AtLeastOnce
-                                            && checkpointing_enabled
-                                    }
-                                };
-                                let expected = expected
-                                    && (delivery != DeliveryGuarantee::ExactlyOnce || certified)
-                                    && !(runtime == RuntimeMode::Cluster
-                                        && delivery != DeliveryGuarantee::AtLeastOnce)
-                                    && (runtime != RuntimeMode::Cluster
-                                        || topology == SourceTopology::Splittable);
-
-                                assert_eq!(
-                                    admit_source_contract(
-                                        contract,
-                                        delivery,
-                                        checkpointing_enabled,
-                                        runtime,
-                                    )
-                                    .is_ok(),
-                                    expected,
-                                    "contract={contract:?}, delivery={delivery:?}, \
-                                     checkpointing_enabled={checkpointing_enabled}, \
-                                     runtime={runtime:?}"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn cluster_best_effort_is_rejected_before_source_topology() {
-        let contract =
-            SourceContract::new(SourceConsistency::Replayable, SourceTopology::Singleton);
-        let error = admit_source_contract(
-            contract,
-            DeliveryGuarantee::BestEffort,
-            true,
-            RuntimeMode::Cluster,
-        )
-        .unwrap_err();
-        assert_eq!(error, CLUSTER_BEST_EFFORT);
-    }
-
-    #[test]
-    fn commit_coupled_exactly_once_requires_a_certified_barrier_cut() {
-        let mut contract = laminar_connectors::generator::GeneratorSource::default()
-            .contract(&ConnectorConfig::new("generator"))
-            .expect("static generator contract");
-        contract.consistency = SourceConsistency::CommitCoupled;
-        let error = admit_source_contract(
-            contract,
-            DeliveryGuarantee::ExactlyOnce,
-            true,
-            RuntimeMode::Local,
-        )
-        .unwrap_err();
-
-        assert!(error.contains("certified in-flight transaction/barrier checkpoint cut"));
-    }
-
-    #[test]
-    fn deterministic_generator_is_admitted_for_local_exact_delivery() {
-        let source = laminar_connectors::generator::GeneratorSource::default();
-        let contract = source
-            .contract(&ConnectorConfig::new("generator"))
-            .expect("static generator contract");
-
-        assert!(contract.is_exact_delivery_certified());
-        admit_source_contract(
-            contract,
-            DeliveryGuarantee::ExactlyOnce,
-            true,
-            RuntimeMode::Local,
-        )
-        .expect("the certified deterministic generator must remain locally admissible");
-    }
-
-    #[test]
-    fn uncertified_replayable_source_is_rejected_for_exact_delivery() {
-        let contract =
-            SourceContract::new(SourceConsistency::Replayable, SourceTopology::Splittable);
-        assert!(!contract.is_exact_delivery_certified());
-        let error = admit_source_contract(
-            contract,
-            DeliveryGuarantee::ExactlyOnce,
-            true,
-            RuntimeMode::Local,
-        )
-        .expect_err("uncertified source recovery must fail closed for exact delivery");
-        assert!(error.contains(laminar_core::error_codes::EXACTLY_ONCE_SOURCE_UNCERTIFIED));
-    }
-
-    #[test]
-    fn sink_contract_admission_matrix_is_fail_closed() {
-        let consistencies = [
-            SinkConsistency::Ephemeral,
-            SinkConsistency::DurableAtLeastOnce,
-            SinkConsistency::CheckpointCommittable,
-        ];
-        let topologies = [
-            SinkTopology::Singleton,
-            SinkTopology::MultiWriter,
-            SinkTopology::NodeLocalEgress,
-        ];
-        let input_modes = [
-            SinkInputMode::AppendOnly,
-            SinkInputMode::KeyedUpsert,
-            SinkInputMode::FullChangelog,
-        ];
-        let deliveries = [
-            DeliveryGuarantee::BestEffort,
-            DeliveryGuarantee::AtLeastOnce,
-            DeliveryGuarantee::ExactlyOnce,
-        ];
-        let runtimes = [RuntimeMode::Local, RuntimeMode::Cluster];
-
-        for consistency in consistencies {
-            for topology in topologies {
-                for input_mode in input_modes {
-                    for delivery in deliveries {
-                        for runtime in runtimes {
-                            for carries_changelog in [false, true] {
-                                let contract = SinkContract::new(consistency, topology, input_mode);
-                                let durable = delivery != DeliveryGuarantee::AtLeastOnce
-                                    || consistency != SinkConsistency::Ephemeral;
-                                let placed = runtime != RuntimeMode::Cluster
-                                    || topology == SinkTopology::MultiWriter;
-                                let input_compatible =
-                                    !carries_changelog || input_mode.accepts_full_changelog();
-                                let protocol_compatible =
-                                    if delivery == DeliveryGuarantee::ExactlyOnce {
-                                        consistency == SinkConsistency::CheckpointCommittable
-                                    } else {
-                                        consistency != SinkConsistency::CheckpointCommittable
-                                    };
-                                let expected = protocol_compatible
-                                    && durable
-                                    && placed
-                                    && input_compatible
-                                    && !(runtime == RuntimeMode::Cluster
-                                        && delivery != DeliveryGuarantee::AtLeastOnce);
-
-                                assert_eq!(
-                                    admit_sink_contract(
-                                        contract,
-                                        delivery,
-                                        runtime,
-                                        carries_changelog,
-                                    )
-                                    .is_ok(),
-                                    expected,
-                                    "contract={contract:?}, delivery={delivery:?}, \
-                                     runtime={runtime:?}, carries_changelog={carries_changelog}"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    struct OpenProbeSink {
-        contract: SinkContract,
-        opened: Arc<AtomicBool>,
-        schema: SchemaRef,
-        exact_protocol: bool,
-    }
-
-    struct StartupProbeSink {
-        open_delay: Duration,
-        open_error: Option<ConnectorError>,
-        close_delay: Duration,
-        open_calls: Arc<AtomicU64>,
-        close_calls: Arc<AtomicU64>,
-        schema: SchemaRef,
-        cancellation_policy: ConnectorCancellationPolicy,
-    }
-
-    struct TrackedAdmissionSink {
-        _owner: ConnectorTaskOwner,
-        tracker: ConnectorTaskTracker,
-        schema: SchemaRef,
-    }
-
-    struct TrackedPlanningSource {
-        _owner: ConnectorTaskOwner,
-        tracker: ConnectorTaskTracker,
-        schema: SchemaRef,
-    }
-
-    #[async_trait]
-    impl SinkConnector for TrackedAdmissionSink {
-        fn terminal_task_tracker(&self) -> Option<ConnectorTaskTracker> {
-            Some(self.tracker.clone())
-        }
-
-        fn contract(&self, _config: &ConnectorConfig) -> Result<SinkContract, ConnectorError> {
-            Ok(SinkContract::new(
-                SinkConsistency::DurableAtLeastOnce,
-                SinkTopology::MultiWriter,
-                SinkInputMode::AppendOnly,
-            ))
-        }
-
-        async fn open(&mut self, _config: &ConnectorConfig) -> Result<(), ConnectorError> {
-            Ok(())
-        }
-
-        async fn write_batch(
-            &mut self,
-            _batch: &RecordBatch,
-        ) -> Result<WriteResult, ConnectorError> {
-            Ok(WriteResult::new(0, 0))
-        }
-
-        fn suggested_write_timeout(&self) -> Duration {
-            Duration::from_secs(1)
-        }
-
-        fn schema(&self) -> SchemaRef {
-            Arc::clone(&self.schema)
-        }
-
-        async fn close(&mut self) -> Result<(), ConnectorError> {
-            Ok(())
-        }
-    }
-
-    #[async_trait]
-    impl SourceConnector for TrackedPlanningSource {
-        fn terminal_task_tracker(&self) -> Option<ConnectorTaskTracker> {
-            Some(self.tracker.clone())
-        }
-
-        async fn start(&mut self, _request: SourceStart) -> Result<(), ConnectorError> {
-            Ok(())
-        }
-
-        async fn poll_batch(
-            &mut self,
-            _max_records: usize,
-        ) -> Result<Option<SourceBatch>, ConnectorError> {
-            Ok(None)
-        }
-
-        fn schema(&self) -> SchemaRef {
-            Arc::clone(&self.schema)
-        }
-
-        fn checkpoint(&self) -> SourceCheckpoint {
-            SourceCheckpoint::new()
-        }
-
-        async fn close(&mut self) -> Result<(), ConnectorError> {
-            Ok(())
-        }
-    }
-
-    #[async_trait]
-    impl SinkConnector for StartupProbeSink {
-        fn cancellation_policy(&self) -> ConnectorCancellationPolicy {
-            self.cancellation_policy
-        }
-
-        fn contract(&self, _config: &ConnectorConfig) -> Result<SinkContract, ConnectorError> {
-            Ok(SinkContract::new(
-                SinkConsistency::DurableAtLeastOnce,
-                SinkTopology::MultiWriter,
-                SinkInputMode::AppendOnly,
-            ))
-        }
-
-        async fn open(&mut self, _config: &ConnectorConfig) -> Result<(), ConnectorError> {
-            self.open_calls.fetch_add(1, Ordering::SeqCst);
-            tokio::time::sleep(self.open_delay).await;
-            self.open_error.take().map_or(Ok(()), Err)
-        }
-
-        async fn write_batch(
-            &mut self,
-            _batch: &RecordBatch,
-        ) -> Result<WriteResult, ConnectorError> {
-            Ok(WriteResult::new(0, 0))
-        }
-
-        fn schema(&self) -> SchemaRef {
-            Arc::clone(&self.schema)
-        }
-
-        fn suggested_write_timeout(&self) -> Duration {
-            Duration::from_secs(5)
-        }
-
-        async fn close(&mut self) -> Result<(), ConnectorError> {
-            self.close_calls.fetch_add(1, Ordering::SeqCst);
-            tokio::time::sleep(self.close_delay).await;
-            Ok(())
-        }
-    }
-
-    fn prepared_startup_probe(
-        name: &str,
-        delay: Duration,
-        open_calls: Arc<AtomicU64>,
-        close_calls: Arc<AtomicU64>,
-    ) -> PreparedSink {
-        prepared_lifecycle_probe(name, delay, Duration::ZERO, open_calls, close_calls)
-    }
-
-    fn prepared_lifecycle_probe(
-        name: &str,
-        open_delay: Duration,
-        close_delay: Duration,
-        open_calls: Arc<AtomicU64>,
-        close_calls: Arc<AtomicU64>,
-    ) -> PreparedSink {
-        prepared_lifecycle_probe_with_policy(
-            name,
-            open_delay,
-            close_delay,
-            open_calls,
-            close_calls,
-            ConnectorCancellationPolicy::CancelSafe,
-        )
-    }
-
-    fn prepared_lifecycle_probe_with_policy(
-        name: &str,
-        open_delay: Duration,
-        close_delay: Duration,
-        open_calls: Arc<AtomicU64>,
-        close_calls: Arc<AtomicU64>,
-        cancellation_policy: ConnectorCancellationPolicy,
-    ) -> PreparedSink {
-        prepared_lifecycle_probe_with_error(
-            name,
-            open_delay,
-            close_delay,
-            open_calls,
-            close_calls,
-            cancellation_policy,
-            None,
-        )
-    }
-
-    fn prepared_lifecycle_probe_with_error(
-        name: &str,
-        open_delay: Duration,
-        close_delay: Duration,
-        open_calls: Arc<AtomicU64>,
-        close_calls: Arc<AtomicU64>,
-        cancellation_policy: ConnectorCancellationPolicy,
-        open_error: Option<ConnectorError>,
-    ) -> PreparedSink {
-        PreparedSink {
-            name: name.into(),
-            connector: Box::new(StartupProbeSink {
-                open_delay,
-                open_error,
-                close_delay,
-                open_calls,
-                close_calls,
-                schema: Arc::new(Schema::empty()),
-                cancellation_policy,
-            }),
-            config: ConnectorConfig::new("startup-probe"),
-            filter_expr: None,
-            input: "input".into(),
-            contract: SinkContract::new(
-                SinkConsistency::DurableAtLeastOnce,
-                SinkTopology::MultiWriter,
-                SinkInputMode::AppendOnly,
-            ),
-            write_timeout: Duration::from_secs(1),
-            flush_interval: Duration::from_secs(5),
-            requires_recovery_on_error: true,
-            task_fence: ConnectorTaskFenceRegistration::capture(
-                Arc::<str>::from(format!("sink:{name}")),
-                None,
-            ),
-        }
-    }
-
-    #[tokio::test]
-    async fn source_preplanning_failure_retains_captured_generation_fence() {
-        let (owner, tracker) = ConnectorTaskOwner::new();
-        let guard = owner.track().expect("live source child");
-        let owned = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let source: Box<dyn SourceConnector> = Box::new(TrackedPlanningSource {
-            _owner: owner,
-            tracker,
-            schema: Arc::new(Schema::empty()),
-        });
-        let task_fence = ConnectorTaskFenceRegistration::capture_registered(
-            "source:planning-failure",
-            source.terminal_task_tracker(),
-            &owned,
-        );
-        let source = TrackedSourceRegistration::from_captured(
-            crate::pipeline::SourceRegistration {
-                name: "planning-failure".into(),
-                connector: source,
-                config: ConnectorConfig::new("planning-probe"),
-                contract: SourceContract::new(
-                    SourceConsistency::Replayable,
-                    SourceTopology::Singleton,
-                ),
-                assignment_scoped: false,
-                position: laminar_connectors::connector::SourcePosition::Initial,
-            },
-            task_fence,
-        );
-
-        let result: Result<(), DbError> = async move {
-            let _source = source;
-            let context = datafusion::prelude::SessionContext::new();
-            let mut streams = HashMap::new();
-            streams.insert(
-                "unresolved".into(),
-                crate::connector_manager::StreamRegistration {
-                    name: "unresolved".into(),
-                    query_sql: "SELECT * FROM missing_source".into(),
-                    emit_clause: None,
-                    window_config: None,
-                    order_config: None,
-                    join_config: None,
-                    has_analytic: false,
-                    has_frame: false,
-                    incremental: false,
-                },
-            );
-            resolve_stream_output_schemas(&context, &streams).await?;
-            Ok(())
-        }
-        .await;
-
-        assert!(matches!(result, Err(DbError::Pipeline(_))));
-        assert_eq!(owned.lock().len(), 1);
-        assert!(!owned.lock()[0].is_finished());
-        drop(guard);
-        assert!(owned.lock()[0].is_finished());
-    }
-
-    #[test]
-    fn sink_admission_failure_retains_captured_generation_fence() {
-        let (owner, tracker) = ConnectorTaskOwner::new();
-        let guard = owner.track().expect("live sink child");
-        let owned = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let result: Result<(), DbError> = (|| {
-            let sink: Box<dyn SinkConnector> = Box::new(TrackedAdmissionSink {
-                _owner: owner,
-                tracker,
-                schema: Arc::new(Schema::empty()),
-            });
-            let _task_fence = ConnectorTaskFenceRegistration::capture_registered(
-                "sink:admission-failure",
-                sink.terminal_task_tracker(),
-                &owned,
-            );
-            let config = ConnectorConfig::new("admission-probe");
-            admit_sink(
-                sink.as_ref(),
-                SinkAdmissionContext {
-                    config: &config,
-                    name: "admission-failure",
-                    input: "input",
-                    delivery: DeliveryGuarantee::ExactlyOnce,
-                    runtime: RuntimeMode::Local,
-                    carries_changelog: false,
-                    checkpointing_enabled: true,
-                    state_backend_scope: StateBackendDurability::NodeDurable,
-                },
-            )?;
-            Ok(())
-        })();
-
-        assert!(matches!(result, Err(DbError::Config(_))));
-        assert_eq!(owned.lock().len(), 1);
-        assert!(!owned.lock()[0].is_finished());
-        drop(guard);
-        assert!(owned.lock()[0].is_finished());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn sink_open_stage_uses_one_deadline_and_rolls_back_current_and_prior() {
-        let prior_open = Arc::new(AtomicU64::new(0));
-        let prior_close = Arc::new(AtomicU64::new(0));
-        let current_open = Arc::new(AtomicU64::new(0));
-        let current_close = Arc::new(AtomicU64::new(0));
-        let mut sinks = vec![
-            prepared_startup_probe(
-                "prior",
-                Duration::from_secs(6),
-                Arc::clone(&prior_open),
-                Arc::clone(&prior_close),
-            ),
-            prepared_startup_probe(
-                "current",
-                Duration::from_secs(6),
-                Arc::clone(&current_open),
-                Arc::clone(&current_close),
-            ),
-        ];
-
-        let error = open_prepared_sinks(
-            &mut sinks,
-            Duration::from_secs(10),
-            #[cfg(feature = "cluster")]
-            None,
-        )
-        .await
-        .expect_err("the second sink must consume the remaining shared startup budget");
-
-        let message = error.to_string();
-        assert!(
-            message.contains("Failed to open sink 'current'")
-                && message.contains("shared 10s sink-open stage deadline"),
-            "unexpected error: {error}"
-        );
-        assert_eq!(prior_open.load(Ordering::SeqCst), 1);
-        assert_eq!(current_open.load(Ordering::SeqCst), 1);
-        assert_eq!(prior_close.load(Ordering::SeqCst), 1);
-        assert_eq!(current_close.load(Ordering::SeqCst), 1);
-    }
-
-    #[cfg(feature = "cluster")]
-    #[tokio::test(start_paused = true)]
-    async fn live_cluster_authority_rolls_back_timed_out_sink_startup() {
-        let prior_open = Arc::new(AtomicU64::new(0));
-        let prior_close = Arc::new(AtomicU64::new(0));
-        let current_open = Arc::new(AtomicU64::new(0));
-        let current_close = Arc::new(AtomicU64::new(0));
-        let mut sinks = vec![
-            prepared_startup_probe(
-                "prior",
-                Duration::from_secs(6),
-                Arc::clone(&prior_open),
-                Arc::clone(&prior_close),
-            ),
-            prepared_startup_probe(
-                "current",
-                Duration::from_secs(6),
-                Arc::clone(&current_open),
-                Arc::clone(&current_close),
-            ),
-        ];
-        let controller = sink_open_authority(40);
-
-        let error = open_prepared_sinks(
-            &mut sinks,
-            Duration::from_secs(10),
-            Some(controller.as_ref()),
-        )
-        .await
-        .expect_err("the second sink must consume the remaining shared startup budget");
-
-        assert!(
-            error
-                .to_string()
-                .contains("shared 10s sink-open stage deadline"),
-            "{error}"
-        );
-        assert!(controller.process_lease_is_live());
-        assert_eq!(prior_open.load(Ordering::SeqCst), 1);
-        assert_eq!(current_open.load(Ordering::SeqCst), 1);
-        assert_eq!(prior_close.load(Ordering::SeqCst), 1);
-        assert_eq!(current_close.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn expired_sink_open_budget_never_polls_connector() {
-        let open_calls = Arc::new(AtomicU64::new(0));
-        let close_calls = Arc::new(AtomicU64::new(0));
-        let mut sinks = vec![prepared_startup_probe(
-            "unattempted",
-            Duration::ZERO,
-            Arc::clone(&open_calls),
-            Arc::clone(&close_calls),
-        )];
-
-        let error = open_prepared_sinks(
-            &mut sinks,
-            Duration::ZERO,
-            #[cfg(feature = "cluster")]
-            None,
-        )
-        .await
-        .expect_err("an expired shared budget must reject before polling open");
-
-        assert!(
-            error
-                .to_string()
-                .contains("deadline was exhausted before open began"),
-            "unexpected error: {error}"
-        );
-        assert_eq!(open_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(close_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn timed_out_sink_open_retires_candidate_at_the_shared_deadline() {
-        let open_calls = Arc::new(AtomicU64::new(0));
-        let close_calls = Arc::new(AtomicU64::new(0));
-        let mut sinks = vec![prepared_lifecycle_probe_with_policy(
-            "retired-open",
-            Duration::from_secs(12),
-            Duration::ZERO,
-            Arc::clone(&open_calls),
-            Arc::clone(&close_calls),
-            ConnectorCancellationPolicy::RetireConnector,
-        )];
-        let started = tokio::time::Instant::now();
-
-        let error = open_prepared_sinks(
-            &mut sinks,
-            Duration::from_secs(10),
-            #[cfg(feature = "cluster")]
-            None,
-        )
-        .await
-        .expect_err("late open must still fail the startup stage");
-
-        assert!(error
-            .to_string()
-            .contains("shared 10s sink-open stage deadline"));
-        assert_eq!(
-            tokio::time::Instant::now() - started,
-            Duration::from_secs(10)
-        );
-        assert_eq!(open_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            close_calls.load(Ordering::SeqCst),
-            0,
-            "a retired startup candidate must not receive a later connector call"
-        );
-    }
-
-    #[cfg(feature = "cluster")]
-    fn sink_open_authority(node: u64) -> Arc<laminar_core::cluster::control::ClusterController> {
-        use laminar_core::cluster::control::{ClusterKv, InMemoryKv, LeaseDeadline};
-        use laminar_core::state::NodeId;
-
-        let node = NodeId(node);
-        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(node));
-        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
-        let controller = Arc::new(laminar_core::cluster::control::ClusterController::new(
-            node, kv, None, members_rx,
-        ));
-        controller
-            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
-            .unwrap();
-        controller
-    }
-
-    #[cfg(feature = "cluster")]
-    #[tokio::test(start_paused = true)]
-    async fn cluster_process_lease_loss_cancels_cancel_safe_sink_open() {
-        let open_calls = Arc::new(AtomicU64::new(0));
-        let close_calls = Arc::new(AtomicU64::new(0));
-        let mut sinks = vec![prepared_startup_probe(
-            "fenced-open",
-            Duration::from_secs(60),
-            Arc::clone(&open_calls),
-            Arc::clone(&close_calls),
-        )];
-        let controller = sink_open_authority(41);
-        let fencer = Arc::clone(&controller);
-        tokio::spawn(async move {
-            tokio::task::yield_now().await;
-            fencer.fence_process_lease();
-        });
-        let started = tokio::time::Instant::now();
-
-        let error = open_prepared_sinks(
-            &mut sinks,
-            Duration::from_secs(60),
-            Some(controller.as_ref()),
-        )
-        .await
-        .expect_err("process lease loss must reject sink startup");
-
-        assert!(
-            error.to_string().contains("process lease expired"),
-            "{error}"
-        );
-        assert!(tokio::time::Instant::now() - started < Duration::from_secs(60));
-        assert_eq!(open_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            close_calls.load(Ordering::SeqCst),
-            0,
-            "a fenced process must not invoke generic close because close may publish"
-        );
-    }
-
-    #[cfg(feature = "cluster")]
-    #[tokio::test(start_paused = true)]
-    async fn cluster_process_lease_loss_retires_sink_open_without_cleanup() {
-        let open_calls = Arc::new(AtomicU64::new(0));
-        let close_calls = Arc::new(AtomicU64::new(0));
-        let mut sinks = vec![prepared_lifecycle_probe_with_policy(
-            "retired-authority-open",
-            Duration::from_secs(12),
-            Duration::ZERO,
-            Arc::clone(&open_calls),
-            Arc::clone(&close_calls),
-            ConnectorCancellationPolicy::RetireConnector,
-        )];
-        let controller = sink_open_authority(42);
-        let fencer = Arc::clone(&controller);
-        tokio::spawn(async move {
-            tokio::task::yield_now().await;
-            fencer.fence_process_lease();
-        });
-        let started = tokio::time::Instant::now();
-
-        let error = open_prepared_sinks(
-            &mut sinks,
-            Duration::from_secs(60),
-            Some(controller.as_ref()),
-        )
-        .await
-        .expect_err("lease loss must retire the in-flight open");
-
-        assert!(
-            error.to_string().contains("process lease expired"),
-            "{error}"
-        );
-        assert!(tokio::time::Instant::now() - started < Duration::from_secs(12));
-        assert_eq!(open_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(close_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn outcome_unknown_sink_open_retires_candidate_without_close() {
-        let open_calls = Arc::new(AtomicU64::new(0));
-        let close_calls = Arc::new(AtomicU64::new(0));
-        let mut sinks = vec![prepared_lifecycle_probe_with_error(
-            "unknown-open",
-            Duration::ZERO,
-            Duration::ZERO,
-            Arc::clone(&open_calls),
-            Arc::clone(&close_calls),
-            ConnectorCancellationPolicy::CancelSafe,
-            Some(ConnectorError::outcome_unknown(
-                "remote admission acknowledgement was lost",
-                true,
-            )),
-        )];
-
-        let error = open_prepared_sinks(
-            &mut sinks,
-            Duration::from_secs(1),
-            #[cfg(feature = "cluster")]
-            None,
-        )
-        .await
-        .unwrap_err();
-
-        assert!(error.to_string().contains("outcome unknown"), "{error}");
-        assert_eq!(open_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            close_calls.load(Ordering::SeqCst),
-            0,
-            "a generation with unknown startup outcome must not receive another connector call"
-        );
-    }
-
-    #[cfg(feature = "cluster")]
-    #[tokio::test]
-    async fn expired_cluster_process_lease_never_polls_sink_open() {
-        let open_calls = Arc::new(AtomicU64::new(0));
-        let close_calls = Arc::new(AtomicU64::new(0));
-        let mut sinks = vec![prepared_startup_probe(
-            "expired-authority",
-            Duration::ZERO,
-            Arc::clone(&open_calls),
-            Arc::clone(&close_calls),
-        )];
-        let controller = sink_open_authority(43);
-        controller.fence_process_lease();
-
-        let error = open_prepared_sinks(
-            &mut sinks,
-            Duration::from_secs(10),
-            Some(controller.as_ref()),
-        )
-        .await
-        .expect_err("expired authority must reject before polling sink open");
-
-        assert!(
-            error.to_string().contains("process lease expired"),
-            "{error}"
-        );
-        assert_eq!(open_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(close_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn sink_startup_cleanup_attempts_every_connector_with_one_shared_deadline() {
-        let first_close = Arc::new(AtomicU64::new(0));
-        let second_close = Arc::new(AtomicU64::new(0));
-        let mut sinks = vec![
-            prepared_lifecycle_probe(
-                "first",
-                Duration::ZERO,
-                PipelineConfig::CONNECTOR_STARTUP_CLEANUP_TIMEOUT + Duration::from_secs(1),
-                Arc::new(AtomicU64::new(0)),
-                Arc::clone(&first_close),
-            ),
-            prepared_lifecycle_probe(
-                "second",
-                Duration::ZERO,
-                PipelineConfig::CONNECTOR_STARTUP_CLEANUP_TIMEOUT + Duration::from_secs(1),
-                Arc::new(AtomicU64::new(0)),
-                Arc::clone(&second_close),
-            ),
-        ];
-        let started = tokio::time::Instant::now();
-        close_opened_sinks(
-            &mut sinks,
-            PipelineConfig::CONNECTOR_STARTUP_CLEANUP_TIMEOUT,
-            #[cfg(feature = "cluster")]
-            None,
-        )
-        .await;
-
-        assert_eq!(
-            tokio::time::Instant::now().duration_since(started),
-            PipelineConfig::CONNECTOR_STARTUP_CLEANUP_TIMEOUT,
-            "startup rollback must not multiply latency by the connector count"
-        );
-        assert_eq!(first_close.load(Ordering::SeqCst), 1);
-        assert_eq!(second_close.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn coordinated_commit_is_rejected_under_at_least_once_before_open() {
-        let opened = Arc::new(AtomicBool::new(false));
-        let sink = OpenProbeSink {
-            contract: SinkContract::new(
-                SinkConsistency::CheckpointCommittable,
-                SinkTopology::MultiWriter,
-                SinkInputMode::AppendOnly,
-            ),
-            opened: Arc::clone(&opened),
-            schema: Arc::new(Schema::empty()),
-            exact_protocol: true,
-        };
-        let config = ConnectorConfig::new("checkpoint-committable-probe");
-
-        let error = admit_sink(
-            &sink,
-            SinkAdmissionContext {
-                config: &config,
-                name: "exact_out",
-                input: "input",
-                delivery: DeliveryGuarantee::AtLeastOnce,
-                runtime: RuntimeMode::Local,
-                carries_changelog: false,
-                checkpointing_enabled: true,
-                state_backend_scope: StateBackendDurability::Volatile,
-            },
-        )
-        .expect_err("the exact descriptor/cursor path must not activate under ALO");
-
-        assert!(error.to_string().contains("require global exactly-once"));
-        assert!(!opened.load(Ordering::SeqCst));
-    }
-
-    #[async_trait]
-    impl SinkConnector for OpenProbeSink {
-        fn contract(&self, _config: &ConnectorConfig) -> Result<SinkContract, ConnectorError> {
-            Ok(self.contract)
-        }
-
-        async fn open(&mut self, _config: &ConnectorConfig) -> Result<(), ConnectorError> {
-            self.opened.store(true, Ordering::SeqCst);
-            Ok(())
-        }
-
-        async fn write_batch(
-            &mut self,
-            _batch: &RecordBatch,
-        ) -> Result<WriteResult, ConnectorError> {
-            Ok(WriteResult::new(0, 0))
-        }
-
-        fn schema(&self) -> SchemaRef {
-            Arc::clone(&self.schema)
-        }
-
-        fn suggested_write_timeout(&self) -> Duration {
-            Duration::from_secs(1)
-        }
-
-        fn as_coordinated_committer(
-            &self,
-        ) -> Option<&dyn laminar_connectors::connector::CoordinatedCommitter> {
-            self.exact_protocol.then_some(self)
-        }
-
-        async fn close(&mut self) -> Result<(), ConnectorError> {
-            Ok(())
-        }
-    }
-
-    #[async_trait]
-    impl laminar_connectors::connector::CoordinatedCommitter for OpenProbeSink {
-        async fn commit_aggregated(
-            &self,
-            _batch: laminar_connectors::connector::CoordinatedCommitBatch,
-            _context: laminar_connectors::connector::CoordinatedCommitContext,
-        ) -> Result<(), ConnectorError> {
-            Ok(())
-        }
-
-        async fn committed_cursor(
-            &self,
-            _namespace: &laminar_connectors::connector::CoordinatedCommitNamespace,
-        ) -> Result<Option<laminar_connectors::connector::CoordinatedCommitCursor>, ConnectorError>
-        {
-            Ok(None)
-        }
-    }
-
-    #[test]
-    fn complete_exact_protocol_is_admitted_without_opening() {
-        let opened = Arc::new(AtomicBool::new(false));
-        let sink = OpenProbeSink {
-            contract: SinkContract::new(
-                SinkConsistency::CheckpointCommittable,
-                SinkTopology::MultiWriter,
-                SinkInputMode::AppendOnly,
-            ),
-            opened: Arc::clone(&opened),
-            schema: Arc::new(Schema::empty()),
-            exact_protocol: true,
-        };
-
-        let config = ConnectorConfig::new("exact-probe");
-        admit_sink(
-            &sink,
-            SinkAdmissionContext {
-                config: &config,
-                name: "exact_out",
-                input: "input",
-                delivery: DeliveryGuarantee::ExactlyOnce,
-                runtime: RuntimeMode::Local,
-                carries_changelog: false,
-                checkpointing_enabled: true,
-                state_backend_scope: StateBackendDurability::NodeDurable,
-            },
-        )
-        .unwrap();
-        assert!(!opened.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn checkpoint_committable_contract_without_committer_is_rejected_before_open() {
-        let opened = Arc::new(AtomicBool::new(false));
-        let sink = OpenProbeSink {
-            contract: SinkContract::new(
-                SinkConsistency::CheckpointCommittable,
-                SinkTopology::MultiWriter,
-                SinkInputMode::AppendOnly,
-            ),
-            opened: Arc::clone(&opened),
-            schema: Arc::new(Schema::empty()),
-            exact_protocol: false,
-        };
-
-        let config = ConnectorConfig::new("incomplete-exact-probe");
-        let error = admit_sink(
-            &sink,
-            SinkAdmissionContext {
-                config: &config,
-                name: "exact_out",
-                input: "input",
-                delivery: DeliveryGuarantee::ExactlyOnce,
-                runtime: RuntimeMode::Local,
-                carries_changelog: false,
-                checkpointing_enabled: true,
-                state_backend_scope: StateBackendDurability::NodeDurable,
-            },
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("does not implement"));
-        assert!(!opened.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn exact_state_scope_is_runtime_aware_and_checked_before_open() {
-        let cases = [
-            (RuntimeMode::Local, StateBackendDurability::Volatile, false),
-            (
-                RuntimeMode::Local,
-                StateBackendDurability::NodeDurable,
-                true,
-            ),
-            (
-                RuntimeMode::Cluster,
-                StateBackendDurability::NodeDurable,
-                false,
-            ),
-            (
-                RuntimeMode::Cluster,
-                StateBackendDurability::ClusterShared,
-                false,
-            ),
-        ];
-
-        for (runtime, scope, expected_admission) in cases {
-            let opened = Arc::new(AtomicBool::new(false));
-            let sink = OpenProbeSink {
-                contract: SinkContract::new(
-                    SinkConsistency::CheckpointCommittable,
-                    SinkTopology::MultiWriter,
-                    SinkInputMode::AppendOnly,
-                ),
-                opened: Arc::clone(&opened),
-                schema: Arc::new(Schema::empty()),
-                exact_protocol: true,
-            };
-
-            let config = ConnectorConfig::new("exact-probe");
-            let result = admit_sink(
-                &sink,
-                SinkAdmissionContext {
-                    config: &config,
-                    name: "exact_out",
-                    input: "input",
-                    delivery: DeliveryGuarantee::ExactlyOnce,
-                    runtime,
-                    carries_changelog: false,
-                    checkpointing_enabled: true,
-                    state_backend_scope: scope,
-                },
-            );
-
-            assert_eq!(
-                result.is_ok(),
-                expected_admission,
-                "runtime={runtime:?}, scope={scope:?}, result={result:?}"
-            );
-            assert!(!opened.load(Ordering::SeqCst));
-        }
-    }
-
-    #[test]
-    fn exact_rejection_precedes_open_for_non_committable_contract() {
-        let opened = Arc::new(AtomicBool::new(false));
-        let sink = OpenProbeSink {
-            contract: SinkContract::new(
-                SinkConsistency::DurableAtLeastOnce,
-                SinkTopology::Singleton,
-                SinkInputMode::AppendOnly,
-            ),
-            opened: Arc::clone(&opened),
-            schema: Arc::new(Schema::empty()),
-            exact_protocol: false,
-        };
-        let config = ConnectorConfig::new("durable-probe");
-        let error = admit_sink(
-            &sink,
-            SinkAdmissionContext {
-                config: &config,
-                name: "durable_out",
-                input: "input",
-                delivery: DeliveryGuarantee::ExactlyOnce,
-                runtime: RuntimeMode::Local,
-                carries_changelog: false,
-                checkpointing_enabled: true,
-                state_backend_scope: StateBackendDurability::NodeDurable,
-            },
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains(EXACT_SINK_PROTOCOL));
-        assert!(!opened.load(Ordering::SeqCst));
-    }
-}
+mod connector_admission_tests;
 
 #[cfg(test)]
-mod resolver_tests {
-    use super::resolve_stream_output_schemas;
-    use crate::connector_manager::StreamRegistration;
-    use arrow_schema::{DataType, Field, Schema};
-    use datafusion::datasource::empty::EmptyTable;
-    use datafusion::prelude::SessionContext;
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    fn ctx_with_payments() -> SessionContext {
-        let ctx = SessionContext::new_with_config(laminar_sql::datafusion::base_session_config());
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("region", DataType::Utf8, false),
-            Field::new("method", DataType::Utf8, false),
-            Field::new("amount_usd", DataType::Float64, false),
-            Field::new("status", DataType::Utf8, false),
-            Field::new(
-                "event_time",
-                DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
-                false,
-            ),
-        ]));
-        ctx.register_table("payments", Arc::new(EmptyTable::new(schema)))
-            .unwrap();
-        ctx.register_udf(datafusion_expr::ScalarUDF::from(
-            laminar_sql::datafusion::TumbleWindowStart::new(),
-        ));
-        ctx
-    }
-
-    fn reg(name: &str, sql: &str, windowed: bool) -> StreamRegistration {
-        StreamRegistration {
-            name: name.to_string(),
-            query_sql: sql.to_string(),
-            emit_clause: None,
-            // Resolver only checks `is_some()`; the size doesn't matter.
-            window_config: windowed.then(|| {
-                laminar_sql::translator::WindowOperatorConfig::tumbling(
-                    "event_time".into(),
-                    Duration::ZERO,
-                )
-            }),
-            order_config: None,
-            join_config: None,
-            has_analytic: false,
-            has_frame: false,
-            incremental: false,
-        }
-    }
-
-    #[tokio::test]
-    async fn windowed_stream_schema_matches_user_select() {
-        let ctx = ctx_with_payments();
-        let mut regs = std::collections::HashMap::new();
-        regs.insert(
-            "agg".to_string(),
-            reg(
-                "agg",
-                "SELECT region, COUNT(*) AS n FROM payments \
-                 GROUP BY tumble(event_time, INTERVAL '1' MINUTE), region",
-                true,
-            ),
-        );
-
-        let out = resolve_stream_output_schemas(&ctx, &regs).await.unwrap();
-        let names: Vec<&str> = out["agg"]
-            .fields()
-            .iter()
-            .map(|f| f.name().as_str())
-            .collect();
-        assert_eq!(names, vec!["region", "n"]);
-    }
-
-    #[tokio::test]
-    async fn windowed_stream_with_explicit_window_columns() {
-        let ctx = ctx_with_payments();
-        ctx.register_udf(datafusion_expr::ScalarUDF::from(
-            laminar_sql::datafusion::TumbleWindowEnd::new(),
-        ));
-        let mut regs = std::collections::HashMap::new();
-        regs.insert(
-            "agg".to_string(),
-            reg(
-                "agg",
-                "SELECT \
-                    tumble(event_time, INTERVAL '1' MINUTE)     AS window_start, \
-                    tumble_end(event_time, INTERVAL '1' MINUTE) AS window_end, \
-                    region, \
-                    COUNT(*) AS n \
-                 FROM payments \
-                 GROUP BY \
-                    tumble(event_time, INTERVAL '1' MINUTE), \
-                    tumble_end(event_time, INTERVAL '1' MINUTE), \
-                    region",
-                true,
-            ),
-        );
-
-        let out = resolve_stream_output_schemas(&ctx, &regs).await.unwrap();
-        let names: Vec<&str> = out["agg"]
-            .fields()
-            .iter()
-            .map(|f| f.name().as_str())
-            .collect();
-        assert_eq!(names, vec!["window_start", "window_end", "region", "n"]);
-        assert_eq!(
-            out["agg"].field(0).data_type(),
-            &DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
-        );
-        assert_eq!(
-            out["agg"].field(1).data_type(),
-            &DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
-        );
-    }
-
-    #[tokio::test]
-    async fn non_windowed_stream_has_no_prefix() {
-        let ctx = ctx_with_payments();
-        let mut regs = std::collections::HashMap::new();
-        regs.insert(
-            "passthrough".to_string(),
-            reg(
-                "passthrough",
-                "SELECT region, amount_usd FROM payments",
-                false,
-            ),
-        );
-
-        let out = resolve_stream_output_schemas(&ctx, &regs).await.unwrap();
-        let names: Vec<&str> = out["passthrough"]
-            .fields()
-            .iter()
-            .map(|f| f.name().as_str())
-            .collect();
-        assert_eq!(names, vec!["region", "amount_usd"]);
-    }
-
-    #[tokio::test]
-    async fn chained_streams_resolve_via_iterative_planning() {
-        // `b` reads from `a`; iteration order doesn't matter — the loop
-        // re-tries `b` after `a` is registered.
-        let ctx = ctx_with_payments();
-        let mut regs = std::collections::HashMap::new();
-        regs.insert(
-            "b".to_string(),
-            reg("b", "SELECT region, n + 1 AS n_plus_one FROM a", false),
-        );
-        regs.insert(
-            "a".to_string(),
-            reg(
-                "a",
-                "SELECT region, COUNT(*) AS n FROM payments GROUP BY region",
-                false,
-            ),
-        );
-
-        let out = resolve_stream_output_schemas(&ctx, &regs).await.unwrap();
-        let b_names: Vec<&str> = out["b"]
-            .fields()
-            .iter()
-            .map(|f| f.name().as_str())
-            .collect();
-        assert_eq!(b_names, vec!["region", "n_plus_one"]);
-
-        // Placeholders must not leak into the public ctx — `subscribe()`
-        // is the data path for streams; `SELECT * FROM <stream>` should
-        // not silently return zero rows from a left-over EmptyTable.
-        assert!(!ctx.table_exist("a").unwrap_or(false));
-        assert!(!ctx.table_exist("b").unwrap_or(false));
-    }
-
-    #[tokio::test]
-    async fn case_distinct_chained_streams_resolve_exactly() {
-        let ctx = ctx_with_payments();
-        let mut regs = std::collections::HashMap::new();
-        regs.insert(
-            "foo".to_string(),
-            reg("foo", "SELECT region, n FROM Foo", false),
-        );
-        regs.insert(
-            "Foo".to_string(),
-            reg(
-                "Foo",
-                "SELECT region, COUNT(*) AS n FROM payments GROUP BY region",
-                false,
-            ),
-        );
-
-        let out = resolve_stream_output_schemas(&ctx, &regs).await.unwrap();
-        assert!(out.contains_key("Foo"));
-        assert!(out.contains_key("foo"));
-    }
-
-    #[tokio::test]
-    async fn unresolvable_streams_surface_planner_error() {
-        let ctx = ctx_with_payments();
-        let mut regs = std::collections::HashMap::new();
-        // Cycle: a→b, b→a. Planning stalls; we report the unresolved set.
-        regs.insert("a".to_string(), reg("a", "SELECT * FROM b", false));
-        regs.insert("b".to_string(), reg("b", "SELECT * FROM a", false));
-
-        let err = resolve_stream_output_schemas(&ctx, &regs)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("unresolvable stream dependency"), "got: {err}");
-        assert!(err.contains('a') && err.contains('b'), "got: {err}");
-    }
-}
+mod resolver_tests;
 
 #[cfg(test)]
-mod checkpoint_namespace_lock_tests {
-    use std::sync::atomic::Ordering;
-    use std::sync::Arc;
-
-    use laminar_connectors::connector::DeliveryGuarantee;
-    use laminar_core::state::{NodeId, ObjectStoreBackend, VnodeRegistry};
-    use laminar_core::storage::checkpoint_manifest::DurableCheckpointPhase;
-    use laminar_core::storage::checkpoint_store::{CheckpointStore, FileSystemCheckpointStore};
-
-    fn exact_builder_with_roots(
-        state_dir: &std::path::Path,
-        checkpoint_dir: &std::path::Path,
-    ) -> crate::builder::LaminarDbBuilder {
-        std::fs::create_dir_all(state_dir).unwrap();
-        let store: Arc<dyn object_store::ObjectStore> =
-            Arc::new(object_store::local::LocalFileSystem::new_with_prefix(state_dir).unwrap());
-        let backend = Arc::new(ObjectStoreBackend::node_durable(store, "node-0", 1));
-        crate::db::LaminarDB::builder()
-            .storage_dir(checkpoint_dir)
-            .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
-                interval_ms: Some(1_000),
-                ..Default::default()
-            })
-            .delivery_guarantee(DeliveryGuarantee::ExactlyOnce)
-            .state_backend(backend)
-            .vnode_registry(Arc::new(VnodeRegistry::single_owner(1, NodeId(0))))
-    }
-
-    fn exact_builder(root: &std::path::Path) -> crate::builder::LaminarDbBuilder {
-        exact_builder_with_roots(&root.join("state"), &root.join("checkpoints"))
-    }
-
-    async fn exact_db(root: &std::path::Path) -> Arc<crate::db::LaminarDB> {
-        exact_builder(root).build().await.unwrap()
-    }
-
-    async fn install_generator_pipeline(db: &Arc<crate::db::LaminarDB>) {
-        db.execute(
-            "CREATE SOURCE generated_source (seq BIGINT, ts_ms BIGINT, value VARCHAR) WITH \
-             ('connector' = 'generator', 'rows.per.second' = '1000', 'max.rows' = '1')",
-        )
-        .await
-        .unwrap();
-        db.execute("CREATE STREAM generated_stream AS SELECT seq FROM generated_source")
-            .await
-            .unwrap();
-    }
-
-    async fn wait_for_processing_cycle(db: &Arc<crate::db::LaminarDB>) {
-        let metrics = db.engine_metrics.lock().clone().unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while metrics.cycles.get() == 0 || metrics.events_ingested.get() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the generator processing cycle must complete");
-    }
-
-    #[tokio::test]
-    async fn second_local_exact_process_cannot_share_checkpoint_namespace() {
-        let root = tempfile::tempdir().unwrap();
-        let first = exact_db(root.path()).await;
-        let second = exact_db(root.path()).await;
-
-        first.start().await.unwrap();
-        let error = second
-            .start()
-            .await
-            .expect_err("the deployment lock must reject a second live writer");
-        assert!(error.to_string().contains("[LDB-0014]"), "{error}");
-
-        first.shutdown().await.unwrap();
-        second
-            .start()
-            .await
-            .expect("OS lock must be released by clean shutdown");
-        second.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn startup_uses_one_checkpoint_state_budget_for_admission_and_storage() {
-        let root = tempfile::tempdir().unwrap();
-        let max_staged_bytes = 29;
-        let db = crate::db::LaminarDB::builder()
-            .storage_dir(root.path())
-            .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
-                max_staged_bytes: Some(max_staged_bytes),
-                ..Default::default()
-            })
-            .build()
-            .await
-            .unwrap();
-
-        db.start().await.unwrap();
-        {
-            let coordinator = db.coordinator.lock().await;
-            let coordinator = coordinator
-                .as_ref()
-                .expect("checkpoint configuration must install a coordinator");
-            assert_eq!(coordinator.config().max_staged_bytes, max_staged_bytes);
-            assert_eq!(coordinator.store().max_state_data_bytes(), max_staged_bytes);
-        }
-        db.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn local_startup_settles_prepared_witness_before_reconciliation() {
-        let root = tempfile::tempdir().unwrap();
-        let checkpoint_dir = root.path().join("checkpoints");
-        let first = exact_db(root.path()).await;
-        install_generator_pipeline(&first).await;
-        first.start().await.unwrap();
-        wait_for_processing_cycle(&first).await;
-        let committed = first.checkpoint().await.unwrap();
-        assert!(committed.success, "{:?}", committed.error);
-        first.shutdown().await.unwrap();
-
-        // Retain committed N and model a crash after a distinct N+1 Prepared manifest became
-        // durable but before its create-once terminal outcome became visible.
-        let manifest_store = FileSystemCheckpointStore::new(&checkpoint_dir);
-        let committed_manifest = manifest_store
-            .load_by_id(committed.checkpoint_id)
-            .await
-            .unwrap()
-            .unwrap();
-        let prepared_id = committed.checkpoint_id + 1;
-        let prepared_epoch = committed.epoch + 1;
-        let mut prepared = committed_manifest.clone();
-        prepared.checkpoint_id = prepared_id;
-        prepared.epoch = prepared_epoch;
-        prepared.durable_phase = DurableCheckpointPhase::Prepared;
-        manifest_store.save(&prepared).await.unwrap();
-
-        let restarted = exact_db(root.path()).await;
-        install_generator_pipeline(&restarted).await;
-        restarted
-            .start()
-            .await
-            .expect("startup recovery must settle the Prepared witness before reconciliation");
-
-        let decisions =
-            laminar_core::checkpoint_decision::CheckpointDecisionStore::local_filesystem(
-                &checkpoint_dir,
-            )
-            .unwrap();
-        let winner = decisions
-            .outcome(prepared_epoch)
-            .await
-            .unwrap()
-            .expect("recovery must publish a terminal winner");
-        assert_eq!(winner.checkpoint_id, prepared_id);
-        assert_eq!(
-            winner.verdict,
-            laminar_core::checkpoint_decision::CheckpointVerdict::Abort
-        );
-        restarted.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn startup_rejects_a_state_root_from_another_deployment_before_installing_coordinator() {
-        let root = tempfile::tempdir().unwrap();
-        let state_dir = root.path().join("state");
-        let first = exact_builder_with_roots(&state_dir, &root.path().join("checkpoint-a"))
-            .build()
-            .await
-            .unwrap();
-        first.start().await.unwrap();
-        first.shutdown().await.unwrap();
-
-        let second = exact_builder_with_roots(&state_dir, &root.path().join("checkpoint-b"))
-            .build()
-            .await
-            .unwrap();
-        let error = second.start().await.unwrap_err();
-        assert!(
-            error.to_string().contains("belongs to deployment"),
-            "{error}"
-        );
-        assert!(second.coordinator.lock().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn recovered_global_watermark_floors_a_source_without_a_source_watermark() {
-        let root = tempfile::tempdir().unwrap();
-        let db = exact_builder(root.path())
-            .delivery_guarantee(DeliveryGuarantee::BestEffort)
-            .build()
-            .await
-            .unwrap();
-        db.execute(
-            "CREATE SOURCE trades (id BIGINT, ts TIMESTAMP, \
-             WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
-        )
-        .await
-        .unwrap();
-        db.execute("CREATE STREAM out AS SELECT id FROM trades")
-            .await
-            .unwrap();
-        db.start().await.unwrap();
-
-        let metrics = db.engine_metrics.lock().clone().unwrap();
-        let cycles_before = metrics.cycles.get();
-        let events_before = metrics.events_ingested.get();
-        let input = db.source_untyped("trades").unwrap();
-        let schema = input.schema();
-        input
-            .push_arrow(
-                arrow_array::RecordBatch::try_new(
-                    Arc::clone(&schema),
-                    vec![
-                        Arc::new(arrow_array::Int64Array::from(vec![1])),
-                        arrow_array::new_null_array(schema.field(1).data_type(), 1),
-                    ],
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while metrics.cycles.get() == cycles_before
-                || metrics.events_ingested.get() == events_before
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the null-event-time input cycle must complete");
-
-        let source = db.catalog.get_source("trades").unwrap();
-        assert_eq!(source.source.current_watermark(), i64::MIN);
-        db.pipeline_watermark.store(1_500, Ordering::Release);
-        let checkpoint = db.checkpoint().await.unwrap();
-        assert!(checkpoint.success, "{:?}", checkpoint.error);
-        assert_eq!(source.source.current_watermark(), i64::MIN);
-
-        db.stop_pipeline().await.unwrap();
-        db.pipeline_watermark.store(i64::MIN, Ordering::Release);
-        source.source.restore_watermark_for_recovery(i64::MIN);
-        db.start().await.unwrap();
-
-        assert_eq!(
-            db.pipeline_watermark.load(Ordering::Acquire),
-            1_500,
-            "the durable global frontier must seed the rebuilt tracker",
-        );
-        assert_eq!(
-            source.source.current_watermark(),
-            1_500,
-            "a source missing a per-source value must inherit the durable frontier",
-        );
-        db.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn local_exact_file_url_uses_the_durable_locked_namespace() {
-        let root = tempfile::tempdir().unwrap();
-        let object_root = root.path().join("remote-shaped-checkpoints");
-        std::fs::create_dir_all(&object_root).unwrap();
-        let normalized = object_root.display().to_string().replace('\\', "/");
-        let checkpoint_url = if normalized.starts_with('/') {
-            format!("file://{normalized}")
-        } else {
-            format!("file:///{normalized}")
-        };
-        let first = exact_builder(root.path())
-            .object_store_url(checkpoint_url.clone())
-            .build()
-            .await
-            .unwrap();
-        let second = exact_builder(root.path())
-            .object_store_url(checkpoint_url)
-            .build()
-            .await
-            .unwrap();
-        install_generator_pipeline(&first).await;
-        install_generator_pipeline(&second).await;
-
-        first.start().await.unwrap();
-        assert!(first.checkpoint_namespace_lock.lock().is_some());
-        wait_for_processing_cycle(&first).await;
-        let checkpoint = first.checkpoint().await.unwrap();
-        assert!(checkpoint.success, "{:?}", checkpoint.error);
-        assert!(object_root
-            .join("checkpoints")
-            .join(format!("checkpoint_{:06}", checkpoint.checkpoint_id))
-            .join("manifest.json")
-            .is_file());
-        let error = second
-            .start()
-            .await
-            .expect_err("a second process must not share the file:// checkpoint root");
-        assert!(error.to_string().contains("[LDB-0014]"), "{error}");
-
-        let decisions =
-            laminar_core::checkpoint_decision::CheckpointDecisionStore::local_filesystem(
-                &object_root,
-            )
-            .unwrap();
-        assert!(decisions.load_or_create_deployment_id().await.is_ok());
-
-        first.shutdown().await.unwrap();
-        second.start().await.unwrap();
-        second.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn local_at_least_once_file_url_is_node_durable_and_exclusive() {
-        let root = tempfile::tempdir().unwrap();
-        let object_root = root.path().join("remote-shaped-checkpoints");
-        std::fs::create_dir_all(&object_root).unwrap();
-        let normalized = object_root.display().to_string().replace('\\', "/");
-        let checkpoint_url = if normalized.starts_with('/') {
-            format!("file://{normalized}")
-        } else {
-            format!("file:///{normalized}")
-        };
-        let first = exact_builder(root.path())
-            .delivery_guarantee(DeliveryGuarantee::AtLeastOnce)
-            .object_store_url(checkpoint_url.clone())
-            .build()
-            .await
-            .unwrap();
-        let second = exact_builder(root.path())
-            .delivery_guarantee(DeliveryGuarantee::AtLeastOnce)
-            .object_store_url(checkpoint_url)
-            .build()
-            .await
-            .unwrap();
-
-        first.start().await.unwrap();
-        assert!(first.checkpoint_namespace_lock.lock().is_some());
-        let error = second
-            .start()
-            .await
-            .expect_err("a second process must not share the file:// checkpoint root");
-        assert!(error.to_string().contains("[LDB-0014]"), "{error}");
-
-        first.shutdown().await.unwrap();
-        second.start().await.unwrap();
-        second.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn local_at_least_once_rejects_an_unfenced_shared_checkpoint_namespace() {
-        let root = tempfile::tempdir().unwrap();
-        let error = exact_builder(root.path())
-            .delivery_guarantee(DeliveryGuarantee::AtLeastOnce)
-            .object_store_url("s3://shared-checkpoints/deployment")
-            .build()
-            .await
-            .expect_err("a shared replay writer requires a remote fencing lease");
-        assert!(error.to_string().contains("[LDB-0014]"), "{error}");
-    }
-
-    #[tokio::test]
-    async fn local_best_effort_cannot_bypass_a_replay_namespace_lock() {
-        let root = tempfile::tempdir().unwrap();
-        let checkpoint_dir = root.path().join("checkpoints");
-        let best_effort =
-            exact_builder_with_roots(&root.path().join("best-effort-state"), &checkpoint_dir)
-                .delivery_guarantee(DeliveryGuarantee::BestEffort)
-                .build()
-                .await
-                .unwrap();
-        let replay = exact_builder_with_roots(&root.path().join("replay-state"), &checkpoint_dir)
-            .delivery_guarantee(DeliveryGuarantee::AtLeastOnce)
-            .build()
-            .await
-            .unwrap();
-
-        best_effort.start().await.unwrap();
-        assert!(best_effort.checkpoint_namespace_lock.lock().is_some());
-        let error = replay
-            .start()
-            .await
-            .expect_err("best-effort must not bypass the checkpoint namespace lease");
-        assert!(error.to_string().contains("[LDB-0014]"), "{error}");
-
-        best_effort.shutdown().await.unwrap();
-        replay.start().await.unwrap();
-        replay.shutdown().await.unwrap();
-    }
-
-    #[cfg(feature = "cluster")]
-    #[tokio::test]
-    async fn local_exact_builder_rejects_an_injected_cluster_decision_store() {
-        let root = tempfile::tempdir().unwrap();
-        let decision_store = Arc::new(
-            laminar_core::checkpoint_decision::CheckpointDecisionStore::new(Arc::new(
-                object_store::memory::InMemory::new(),
-            )),
-        );
-        let result = exact_builder(root.path())
-            .decision_store(decision_store)
-            .build()
-            .await;
-        let Err(error) = result else {
-            panic!("a cluster decision store without a controller must fail at admission");
-        };
-        assert!(error.to_string().contains("cluster-only stores"), "{error}");
-    }
-}
+mod checkpoint_namespace_lock_tests;
 
 #[cfg(test)]
-mod mv_recovery_lifecycle_tests {
-    use std::sync::atomic::Ordering;
-    use std::sync::Arc;
-
-    use arrow::array::Int64Array;
-    use arrow::record_batch::RecordBatch;
-    use laminar_core::streaming::StreamCheckpointConfig;
-
-    use crate::config::LaminarConfig;
-    use crate::db::LaminarDB;
-
-    async fn install_generator_mvs(db: &Arc<LaminarDB>, max_rows: u64) {
-        db.execute(&format!(
-            "CREATE SOURCE generated (seq BIGINT, ts_ms BIGINT, value VARCHAR) WITH \
-             ('connector' = 'generator', 'rows.per.second' = '1000', 'max.rows' = '{max_rows}')"
-        ))
-        .await
-        .unwrap();
-        db.execute("CREATE MATERIALIZED VIEW committed AS SELECT seq FROM generated")
-            .await
-            .unwrap();
-        db.execute("CREATE MATERIALIZED VIEW empty_at_cut AS SELECT seq FROM generated")
-            .await
-            .unwrap();
-    }
-
-    fn update_mv(db: &LaminarDB, name: &str, values: Vec<i64>) {
-        let schema = db
-            .mv_store
-            .read()
-            .to_record_batch(name)
-            .unwrap()
-            .unwrap()
-            .schema();
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))])
-            .expect("test MV batch");
-        db.mv_store
-            .write()
-            .update_cycle(name, &[batch])
-            .expect("test MV update");
-    }
-
-    fn mv_values(db: &LaminarDB, name: &str) -> Vec<i64> {
-        let batch = db.mv_store.read().to_record_batch(name).unwrap().unwrap();
-        batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap()
-            .values()
-            .to_vec()
-    }
-
-    fn checkpoint_config(dir: &std::path::Path) -> LaminarConfig {
-        LaminarConfig {
-            storage_dir: Some(dir.to_path_buf()),
-            checkpoint: Some(StreamCheckpointConfig {
-                interval_ms: None,
-                data_dir: Some(dir.to_path_buf()),
-                ..StreamCheckpointConfig::default()
-            }),
-            ..LaminarConfig::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn restart_installs_the_exact_committed_mv_image() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = LaminarDB::open_with_config(checkpoint_config(dir.path())).unwrap();
-        install_generator_mvs(&db, 1).await;
-        db.start().await.unwrap();
-
-        let metrics = db.engine_metrics.lock().clone().unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while metrics.cycles.get() == 0 || metrics.events_ingested.get() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("bounded generator cycle");
-        let empty_image = db.mv_store.read().fresh_image().unwrap();
-        let previous = {
-            let mut live = db.mv_store.write();
-            std::mem::replace(&mut *live, empty_image)
-        };
-        drop(previous);
-
-        update_mv(&db, "committed", vec![1]);
-        let checkpoint = db.checkpoint().await.unwrap();
-        assert!(checkpoint.success, "{:?}", checkpoint.error);
-        update_mv(&db, "committed", vec![2]);
-        update_mv(&db, "empty_at_cut", vec![9]);
-
-        db.stop_pipeline().await.unwrap();
-        db.start().await.unwrap();
-
-        assert_eq!(mv_values(&db, "committed"), [1]);
-        assert!(mv_values(&db, "empty_at_cut").is_empty());
-        db.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn restart_with_no_checkpoint_installs_an_empty_mv_image() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = LaminarDB::open_with_config(checkpoint_config(dir.path())).unwrap();
-        install_generator_mvs(&db, 0).await;
-        db.start().await.unwrap();
-        update_mv(&db, "committed", vec![1]);
-
-        db.stop_pipeline().await.unwrap();
-        db.start().await.unwrap();
-
-        assert!(mv_values(&db, "committed").is_empty());
-        db.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn restart_without_a_coordinator_installs_an_empty_mv_image() {
-        let db = LaminarDB::open().unwrap();
-        install_generator_mvs(&db, 0).await;
-        db.start().await.unwrap();
-        update_mv(&db, "committed", vec![1]);
-        db.pipeline_watermark.store(42, Ordering::Release);
-        let source = db.catalog.get_source("generated").unwrap();
-        source.source.restore_watermark_for_recovery(42);
-
-        db.stop_pipeline().await.unwrap();
-        db.start().await.unwrap();
-
-        assert!(mv_values(&db, "committed").is_empty());
-        assert_eq!(db.pipeline_watermark.load(Ordering::Acquire), i64::MIN);
-        assert_eq!(source.source.current_watermark(), i64::MIN);
-        db.shutdown().await.unwrap();
-    }
-}
+mod mv_recovery_lifecycle_tests;
 
 #[cfg(all(test, feature = "cluster"))]
-mod cluster_fault_watcher_tests {
-    use super::{
-        publish_runtime_fault_state, queue_owned_cluster_compute_fault,
-        report_cluster_compute_fault,
-    };
-    use crate::db::DbState;
-    use crate::{ClusterStartupDisposition, LaminarDB};
-    use async_trait::async_trait;
-    use laminar_connectors::checkpoint::SourceCheckpoint;
-    use laminar_connectors::config::{ConnectorConfig, ConnectorInfo};
-    use laminar_connectors::connector::{
-        SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceStart,
-        SourceTopology,
-    };
-    use laminar_connectors::error::ConnectorError;
-    use laminar_core::checkpoint::CheckpointAssignmentFence;
-    use laminar_core::checkpoint_decision::{CheckpointVerdict, RecordOutcomeResult};
-    use laminar_core::cluster::control::controller::{
-        RecoveryAnnouncement, RecoveryFault, RecoveryRound,
-    };
-    use laminar_core::cluster::control::{
-        CatalogManifest, CatalogManifestEntry, CatalogManifestStore, CatalogObjectKind,
-        CheckpointParticipant, ClusterController, ClusterKv, InMemoryKv, LeaderLeaseOwner,
-        LeaderLeaseStore, LeaseDeadline, LeaseOutcome, ProcessLeaseAuthority, ProcessLeaseOutcome,
-        RecoverPhase,
-    };
-    use laminar_core::cluster::discovery::{NodeId, NodeInfo, NodeMetadata, NodeState};
-    use laminar_core::state::{
-        InProcessBackend, KeyGroupCount, NodeId as StateNodeId, ObjectStoreBackend, VnodeRegistry,
-    };
-    use laminar_core::storage::checkpoint_manifest::DurableCheckpointPhase;
-    use laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore;
-    use laminar_core::storage::CheckpointStore;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    #[derive(Default)]
-    struct IdleClusterTestSource {
-        assignment_version: Option<std::num::NonZeroU64>,
-    }
-
-    static REJECTING_SPLITTABLE_STARTED: AtomicBool = AtomicBool::new(false);
-
-    struct RejectingSplittableSource;
-
-    #[async_trait]
-    impl SourceConnector for IdleClusterTestSource {
-        async fn start(&mut self, _request: SourceStart) -> Result<(), ConnectorError> {
-            Ok(())
-        }
-
-        async fn poll_batch(
-            &mut self,
-            _max_records: usize,
-        ) -> Result<Option<SourceBatch>, ConnectorError> {
-            Ok(None)
-        }
-
-        fn schema(&self) -> arrow::datatypes::SchemaRef {
-            Arc::new(arrow::datatypes::Schema::new(vec![
-                arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, true),
-            ]))
-        }
-
-        fn checkpoint(&self) -> SourceCheckpoint {
-            let mut checkpoint = SourceCheckpoint::new();
-            if let Some(version) = self.assignment_version {
-                checkpoint.bind_assignment_version(version);
-            }
-            checkpoint
-        }
-
-        fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
-            Ok(SourceContract::new(
-                SourceConsistency::Replayable,
-                SourceTopology::Splittable,
-            ))
-        }
-
-        fn set_vnode_assignment(
-            &mut self,
-            _source_identity: &str,
-            registry: Arc<VnodeRegistry>,
-            _self_id: StateNodeId,
-        ) -> Result<(), ConnectorError> {
-            self.assignment_version = std::num::NonZeroU64::new(registry.assignment_version());
-            Ok(())
-        }
-
-        async fn close(&mut self) -> Result<(), ConnectorError> {
-            Ok(())
-        }
-    }
-
-    #[async_trait]
-    impl SourceConnector for RejectingSplittableSource {
-        async fn start(&mut self, _request: SourceStart) -> Result<(), ConnectorError> {
-            REJECTING_SPLITTABLE_STARTED.store(true, Ordering::Release);
-            Ok(())
-        }
-
-        async fn poll_batch(
-            &mut self,
-            _max_records: usize,
-        ) -> Result<Option<SourceBatch>, ConnectorError> {
-            Ok(None)
-        }
-
-        fn schema(&self) -> arrow::datatypes::SchemaRef {
-            Arc::new(arrow::datatypes::Schema::new(vec![
-                arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, true),
-            ]))
-        }
-
-        fn checkpoint(&self) -> SourceCheckpoint {
-            SourceCheckpoint::new()
-        }
-
-        fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
-            Ok(SourceContract::new(
-                SourceConsistency::Replayable,
-                SourceTopology::Splittable,
-            ))
-        }
-
-        async fn close(&mut self) -> Result<(), ConnectorError> {
-            Ok(())
-        }
-    }
-
-    async fn startup_db() -> (
-        Arc<LaminarDB>,
-        Arc<ClusterController>,
-        Arc<InMemoryKv>,
-        tokio::sync::watch::Sender<Vec<NodeInfo>>,
-        RecoveryRound,
-        Arc<CatalogManifestStore>,
-        laminar_core::checkpoint::LeaderProof,
-    ) {
-        let node_id = NodeId(7);
-        let kv = Arc::new(InMemoryKv::new(node_id));
-        let controller_kv: Arc<dyn ClusterKv> = kv.clone();
-        let (members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
-        let controller = Arc::new(ClusterController::new(
-            node_id,
-            controller_kv,
-            None,
-            members_rx,
-        ));
-        let checkpoint_store: Arc<dyn object_store::ObjectStore> =
-            Arc::new(object_store::memory::InMemory::new());
-        let process_authority = Arc::new(
-            ProcessLeaseAuthority::new(Arc::clone(&checkpoint_store), Duration::from_secs(60))
-                .unwrap(),
-        );
-        let ProcessLeaseOutcome::Acquired(process_lease) = process_authority
-            .store_for(node_id)
-            .try_acquire(controller.recovery_incarnation(), 0)
-            .await
-            .unwrap()
-        else {
-            panic!("empty test authority must grant the local process lease");
-        };
-        controller
-            .set_process_lease_authority(process_authority)
-            .unwrap();
-        controller
-            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
-            .unwrap();
-        controller
-            .publish_leased_recovery_incarnation(&process_lease)
-            .await
-            .unwrap();
-        controller.install_local_leader_proof_provider();
-        controller
-            .start_leased_barrier_server("127.0.0.1:0".parse().unwrap(), None, &process_lease)
-            .await
-            .unwrap();
-        let authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&checkpoint_store), 10_000));
-        let owner = LeaderLeaseOwner {
-            node: node_id,
-            boot: controller.recovery_incarnation(),
-            process_term: process_lease.term,
-        };
-        let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap()
-        else {
-            panic!("empty test authority must grant leadership");
-        };
-        let (_lease_tx, lease_rx) = tokio::sync::watch::channel(Some(lease.clone()));
-        controller
-            .set_leader_lease_watch(
-                lease_rx,
-                owner,
-                Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))),
-            )
-            .unwrap();
-        controller.set_leader_lease_store(Arc::clone(&authority));
-        controller.set_active(true);
-        let manifest_store = Arc::new(CatalogManifestStore::new(authority));
-        let registry = Arc::new(VnodeRegistry::single_owner(1, StateNodeId(node_id.0)));
-        let round = RecoveryRound::new(
-            1,
-            lease.proof(),
-            CheckpointAssignmentFence::from_owner_map(
-                1,
-                &[node_id.0],
-                vec![CheckpointParticipant {
-                    node_id: node_id.0,
-                    boot_incarnation: controller.recovery_incarnation(),
-                }],
-            )
-            .unwrap(),
-            Vec::new(),
-            1,
-            vec![RecoveryFault {
-                reporter: node_id,
-                sequence: 1,
-            }],
-        )
-        .unwrap();
-        controller.publish_checkpoint_assignment_fence(Some(round.assignment_fence.clone()));
-        let db = LaminarDB::builder()
-            .cluster_controller(Arc::clone(&controller))
-            .cluster_checkpoint_object_store(checkpoint_store)
-            .catalog_manifest_store(Arc::clone(&manifest_store))
-            .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
-                interval_ms: Some(3_600_000),
-                ..laminar_core::streaming::StreamCheckpointConfig::default()
-            })
-            .state_backend(Arc::new(InProcessBackend::new(1)))
-            .vnode_registry(registry)
-            .register_connector(|registry| {
-                registry.register_source(
-                    "idle-cluster-test",
-                    ConnectorInfo {
-                        name: "idle-cluster-test".into(),
-                        display_name: "Idle cluster test source".into(),
-                        version: "1".into(),
-                        is_source: true,
-                        is_sink: false,
-                        config_keys: vec![],
-                    },
-                    Arc::new(|_| Ok(Box::<IdleClusterTestSource>::default())),
-                )?;
-                registry.register_source(
-                    "rejecting-splittable-test",
-                    ConnectorInfo {
-                        name: "rejecting-splittable-test".into(),
-                        display_name: "Rejecting splittable test source".into(),
-                        version: "1".into(),
-                        is_source: true,
-                        is_sink: false,
-                        config_keys: vec![],
-                    },
-                    Arc::new(|_| Ok(Box::new(RejectingSplittableSource))),
-                )
-            })
-            .build()
-            .await
-            .unwrap();
-        db.fence_cluster_startup();
-        (
-            db,
-            controller,
-            kv,
-            members_tx,
-            round,
-            manifest_store,
-            lease.proof(),
-        )
-    }
-
-    #[tokio::test]
-    async fn fresh_certified_cluster_startup_opens_intake() {
-        let (db, controller, _kv, _members, _round, _manifest_store, _proof) = startup_db().await;
-
-        assert_eq!(
-            db.finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(1))
-                .await
-                .unwrap(),
-            ClusterStartupDisposition::Serving
-        );
-        assert!(!db.source_gate.load(std::sync::atomic::Ordering::Acquire));
-        assert!(!controller.is_recovering());
-    }
-
-    #[tokio::test]
-    async fn durable_fault_before_startup_audit_keeps_intake_closed() {
-        let (db, controller, _kv, _members, _round, _manifest_store, _proof) = startup_db().await;
-        let request = controller.next_recovery_fault_request().unwrap();
-        controller.report_fault(request).await.unwrap();
-
-        assert_eq!(
-            db.finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(1))
-                .await
-                .unwrap(),
-            ClusterStartupDisposition::RecoveryFenced
-        );
-        assert!(db.cluster_intake_fenced());
-        assert!(controller.is_recovering());
-    }
-
-    #[tokio::test]
-    async fn zero_vnode_worker_finishes_startup_idle_and_data_plane_fenced() {
-        let local = StateNodeId(7);
-        let owner = StateNodeId(8);
-        let owner_boot = uuid::Uuid::from_u128(88);
-        let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(local));
-        let owner_member = NodeInfo {
-            id: NodeId(owner.0),
-            name: "owner".into(),
-            rpc_address: String::new(),
-            raft_address: String::new(),
-            state: NodeState::Active,
-            metadata: NodeMetadata::default(),
-            last_heartbeat_ms: 0,
-        };
-        let (_members_tx, members_rx) = tokio::sync::watch::channel(vec![owner_member]);
-        let controller = Arc::new(ClusterController::new(local, kv, None, members_rx));
-        controller
-            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
-            .unwrap();
-        controller.publish_recovery_incarnation().await.unwrap();
-        controller.set_active(true);
-        let fence = CheckpointAssignmentFence::from_owner_map(
-            1,
-            &[owner.0],
-            vec![CheckpointParticipant {
-                node_id: owner.0,
-                boot_incarnation: owner_boot,
-            }],
-        )
-        .unwrap();
-        controller.publish_checkpoint_assignment_fence(Some(fence.clone()));
-        let sender = Arc::new(laminar_core::shuffle::ShuffleSender::new(
-            local.0,
-            controller.recovery_incarnation(),
-        ));
-        let receiver = Arc::new(
-            laminar_core::shuffle::ShuffleReceiver::bind(
-                local.0,
-                "127.0.0.1:0".parse().unwrap(),
-                controller.recovery_incarnation(),
-            )
-            .await
-            .unwrap(),
-        );
-        let db = LaminarDB::builder()
-            .cluster_controller(Arc::clone(&controller))
-            .cluster_checkpoint_object_store(Arc::new(object_store::memory::InMemory::new()))
-            .state_backend(Arc::new(InProcessBackend::new(1)))
-            .vnode_registry(Arc::new(VnodeRegistry::single_owner(1, owner)))
-            .shuffle_sender(Arc::clone(&sender))
-            .shuffle_receiver(receiver)
-            .build()
-            .await
-            .unwrap();
-        db.fence_cluster_startup();
-
-        assert_eq!(
-            db.finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(1))
-                .await
-                .unwrap(),
-            ClusterStartupDisposition::Idle
-        );
-        assert!(db.cluster_intake_fenced());
-        assert_eq!(sender.assignment_version(), 0);
-        assert!(sender.active_assignment_digest().is_none());
-        assert_eq!(controller.checkpoint_assignment_fence(1), Some(fence));
-        assert!(!controller.is_recovering());
-        assert_eq!(
-            db.pending_recovery_fault
-                .load(std::sync::atomic::Ordering::Acquire),
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn splittable_source_without_assignment_hook_fails_before_start() {
-        REJECTING_SPLITTABLE_STARTED.store(false, Ordering::Release);
-        let (db, _controller, _kv, _members, _round, manifest_store, proof) = startup_db().await;
-        let state_store: Arc<dyn object_store::ObjectStore> =
-            Arc::new(object_store::memory::InMemory::new());
-        *db.state_backend.lock() = Some(Arc::new(ObjectStoreBackend::cluster_shared(
-            state_store,
-            "node-7",
-            1,
-        )));
-        manifest_store
-            .seal(
-                &CatalogManifest::new(vec![
-                    CatalogManifestEntry {
-                        canonical_name: "unsafe_input".into(),
-                        kind: CatalogObjectKind::Source,
-                        ddl: "CREATE SOURCE unsafe_input (id BIGINT) WITH ('connector' = \
-                              'rejecting-splittable-test')"
-                            .into(),
-                    },
-                    CatalogManifestEntry {
-                        canonical_name: "unsafe_output".into(),
-                        kind: CatalogObjectKind::Stream,
-                        ddl: "CREATE STREAM unsafe_output AS SELECT id FROM unsafe_input".into(),
-                    },
-                ])
-                .unwrap(),
-                &proof,
-            )
-            .await
-            .unwrap();
-
-        let error = db.start().await.unwrap_err().to_string();
-        assert!(
-            error.contains("rejected cluster vnode assignment"),
-            "{error}"
-        );
-        assert!(
-            error.contains("does not implement vnode assignment"),
-            "{error}"
-        );
-        assert!(
-            !REJECTING_SPLITTABLE_STARTED.load(Ordering::Acquire),
-            "source I/O must not start before assignment admission succeeds"
-        );
-    }
-
-    #[tokio::test]
-    async fn manifest_replay_cleanup_fault_remains_terminal_after_start_returns() {
-        let (db, _controller, _kv, _members, _round, manifest_store, proof) = startup_db().await;
-        manifest_store
-            .seal(
-                &CatalogManifest::new(vec![
-                    CatalogManifestEntry {
-                        canonical_name: "fenced".into(),
-                        kind: CatalogObjectKind::Source,
-                        ddl: "CREATE SOURCE fenced (id BIGINT)".into(),
-                    },
-                    CatalogManifestEntry {
-                        canonical_name: "broken".into(),
-                        kind: CatalogObjectKind::Stream,
-                        ddl: "CREATE STREAM broken AS SELECT id FROM missing_source".into(),
-                    },
-                ])
-                .unwrap(),
-                &proof,
-            )
-            .await
-            .unwrap();
-        *db.catalog_cleanup_deregister_fault.lock() = Some("fenced".into());
-
-        let start_error = db.start().await.unwrap_err();
-        let start_error = start_error.to_string();
-        assert!(
-            start_error.contains("catalog manifest replay failed for 'broken'"),
-            "{start_error}"
-        );
-        assert!(start_error.contains("[LDB-6044]"), "{start_error}");
-        assert!(
-            start_error.contains("catalog bootstrap rollback remains terminally fenced"),
-            "{start_error}"
-        );
-        assert_eq!(DbState::load(&db.state), DbState::Faulted);
-        assert!(db
-            .catalog_cleanup_fenced
-            .load(std::sync::atomic::Ordering::Acquire));
-        assert!(db.ctx.table_exist("fenced").unwrap());
-        assert_eq!(
-            db.catalog_namespace.lock().get("fenced"),
-            Some(&CatalogObjectKind::Source)
-        );
-        let terminal_reason = db.last_fault().expect("terminal cleanup reason");
-        assert!(terminal_reason.contains("[LDB-6044]"));
-
-        let retry_error = db.start().await.unwrap_err();
-        assert!(retry_error.to_string().contains("[LDB-6044]"));
-        assert_eq!(DbState::load(&db.state), DbState::Faulted);
-        assert_eq!(db.last_fault().as_deref(), Some(terminal_reason.as_str()));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn assignment_closure_wins_while_startup_waits_to_open_intake() {
-        let (db, controller, _kv, _members, _round, _manifest_store, _proof) = startup_db().await;
-        let execution = Arc::clone(&db.rotation_execution_fence).read_owned().await;
-        let starting = {
-            let db = Arc::clone(&db);
-            tokio::spawn(async move {
-                db.finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(2))
-                    .await
-            })
-        };
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if db.assignment_adoption_lock.try_lock().is_err() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("startup must reach the serialized activation boundary");
-
-        db.set_source_gate(true);
-        controller.publish_checkpoint_assignment_fence(None);
-        db.suspend_shuffle_assignment_fence();
-        drop(execution);
-
-        assert_eq!(
-            starting.await.unwrap().unwrap(),
-            ClusterStartupDisposition::RecoveryFenced
-        );
-        assert!(db.cluster_intake_fenced());
-        assert_eq!(controller.checkpoint_assignment_fence(1), None);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn pipeline_startup_holds_generation_fence_until_graph_publication() {
-        let (db, _controller, _kv, _members, _round, manifest_store, proof) = startup_db().await;
-        let state_store: Arc<dyn object_store::ObjectStore> =
-            Arc::new(object_store::memory::InMemory::new());
-        *db.state_backend.lock() = Some(Arc::new(ObjectStoreBackend::cluster_shared(
-            state_store,
-            "node-7",
-            1,
-        )));
-        manifest_store
-            .seal(
-                &CatalogManifest::new(vec![
-                    CatalogManifestEntry {
-                        canonical_name: "trades".into(),
-                        kind: CatalogObjectKind::Source,
-                        ddl: "CREATE SOURCE trades (id BIGINT) WITH ('connector' = 'idle-cluster-test')"
-                            .into(),
-                    },
-                    CatalogManifestEntry {
-                        canonical_name: "out".into(),
-                        kind: CatalogObjectKind::Stream,
-                        ddl: "CREATE STREAM out AS SELECT id FROM trades".into(),
-                    },
-                ])
-                .unwrap(),
-                &proof,
-            )
-            .await
-            .unwrap();
-        db.pending_revoke_vnodes.lock().insert(0);
-
-        // Stall startup after its staging reset. This makes the old reset-only fence gap
-        // deterministic without adding a production test hook.
-        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let table_store_blocker = {
-            let db = Arc::clone(&db);
-            std::thread::spawn(move || {
-                let _table_store = db.table_store.write();
-                let _ = locked_tx.send(());
-                let _ = release_rx.recv();
-            })
-        };
-        locked_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("table-store blocker did not acquire the write lock");
-        let starting = {
-            let db = Arc::clone(&db);
-            tokio::spawn(async move { db.start().await })
-        };
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !db.pending_revoke_vnodes.lock().is_empty() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("startup must reset prior-generation vnode staging");
-
-        let competing_generation = tokio::time::timeout(
-            Duration::from_millis(100),
-            Arc::clone(&db.rotation_execution_fence).write_owned(),
-        )
-        .await;
-        assert!(
-            competing_generation.is_err(),
-            "assignment rotation entered while startup still owned an unpublished graph"
-        );
-
-        release_tx
-            .send(())
-            .expect("table-store blocker stopped before release");
-        table_store_blocker
-            .join()
-            .expect("table-store blocker panicked");
-        starting.await.unwrap().unwrap();
-        db.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn cluster_startup_defers_source_actor_until_prepared_outcome_is_terminal() {
-        let (db, controller, _kv, _members, round, manifest_store, proof) = startup_db().await;
-        let state_store: Arc<dyn object_store::ObjectStore> =
-            Arc::new(object_store::memory::InMemory::new());
-        *db.state_backend.lock() = Some(Arc::new(ObjectStoreBackend::cluster_shared(
-            state_store,
-            "node-7",
-            1,
-        )));
-        manifest_store
-            .seal(
-                &CatalogManifest::new(vec![
-                    CatalogManifestEntry {
-                        canonical_name: "trades".into(),
-                        kind: CatalogObjectKind::Source,
-                        ddl: "CREATE SOURCE trades (id BIGINT) WITH ('connector' = 'idle-cluster-test')"
-                            .into(),
-                    },
-                    CatalogManifestEntry {
-                        canonical_name: "out".into(),
-                        kind: CatalogObjectKind::Stream,
-                        ddl: "CREATE STREAM out AS SELECT id FROM trades".into(),
-                    },
-                ])
-                .unwrap(),
-                &proof,
-            )
-            .await
-            .unwrap();
-
-        db.start().await.unwrap();
-        assert_eq!(
-            db.finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(2))
-                .await
-                .unwrap(),
-            ClusterStartupDisposition::Serving
-        );
-        let committed = db.checkpoint().await.unwrap_or_else(|error| {
-            panic!(
-                "initial cluster checkpoint failed: {error}; runtime fault: {:?}",
-                db.last_fault()
-            )
-        });
-        assert!(committed.success, "{:?}", committed.error);
-        db.stop_pipeline().await.unwrap();
-        assert!(db.owned_source_tasks.lock().is_empty());
-
-        let participant_store = ObjectStoreCheckpointStore::new(
-            db.cluster_checkpoint_object_store().unwrap(),
-            "nodes/7/".into(),
-        )
-        .with_key_group_count(KeyGroupCount::try_from(1_u16).unwrap())
-        .with_participant_id(7);
-        let mut prepared = participant_store
-            .load_by_id(committed.checkpoint_id)
-            .await
-            .unwrap()
-            .unwrap();
-        prepared.checkpoint_id = committed.checkpoint_id + 1;
-        prepared.epoch = committed.epoch + 1;
-        prepared.durable_phase = DurableCheckpointPhase::Prepared;
-        participant_store.save(&prepared).await.unwrap();
-
-        db.start().await.unwrap();
-        assert_eq!(DbState::load(&db.state), DbState::Running);
-        assert!(db.owned_source_tasks.lock().is_empty());
-        assert!(db.runtime_handle.lock().await.is_none());
-        assert!(db.coordinated_recovery_in_progress());
-        assert!(db.cluster_intake_fenced());
-        assert!(controller.is_recovering());
-        assert!(controller
-            .read_local_fault_report()
-            .await
-            .unwrap()
-            .is_some());
-
-        let authority = controller.checkpoint_authority().unwrap();
-        assert!(authority
-            .cluster_outcome(prepared.epoch)
-            .await
-            .unwrap()
-            .is_none());
-        assert!(matches!(
-            authority
-                .record_cluster_outcome(
-                    &proof,
-                    prepared.epoch,
-                    prepared.checkpoint_id,
-                    round.assignment_fence,
-                    CheckpointVerdict::Abort,
-                    None,
-                )
-                .await
-                .unwrap(),
-            RecordOutcomeResult::Created(_)
-        ));
-
-        db.stop_pipeline_for_coordinated_recovery().await.unwrap();
-        db.start_for_coordinated_recovery().await.unwrap();
-        assert!(!db.owned_source_tasks.lock().is_empty());
-        assert!(db.runtime_handle.lock().await.is_some());
-        assert!(db.cluster_intake_fenced());
-
-        db.release_coordinated_recovery_lifecycle();
-        controller.set_recovering(false);
-        db.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn restored_or_active_recovery_startup_stays_fenced_and_reports() {
-        let (restored, controller, _kv, _members, _round, _manifest_store, _proof) =
-            startup_db().await;
-        *restored.last_recovery_epoch.lock() = Some(9);
-        assert_eq!(
-            restored
-                .finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(1))
-                .await
-                .unwrap(),
-            ClusterStartupDisposition::RecoveryFenced
-        );
-        assert!(restored
-            .source_gate
-            .load(std::sync::atomic::Ordering::Acquire));
-        assert!(!controller.read_fault_reports().await.unwrap().is_empty());
-
-        let (active, controller, _kv, _members, round, _manifest_store, _proof) =
-            startup_db().await;
-        controller.announce_recover_prepare(&round).await.unwrap();
-        assert_eq!(
-            active
-                .finish_cluster_startup(tokio::time::Instant::now() + Duration::from_secs(1))
-                .await
-                .unwrap(),
-            ClusterStartupDisposition::RecoveryFenced
-        );
-        assert!(active
-            .source_gate
-            .load(std::sync::atomic::Ordering::Acquire));
-        assert!(controller.is_recovering());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn active_recovery_does_not_block_compute_fault_handoff() {
-        let (_db, controller, _kv, _members, round, _manifest_store, _proof) = startup_db().await;
-        controller.announce_recover_prepare(&round).await.unwrap();
-        assert_eq!(
-            controller.observe_recover().await.unwrap(),
-            Some(RecoveryAnnouncement {
-                round: round.clone(),
-                phase: RecoverPhase::Prepare,
-            })
-        );
-
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            report_cluster_compute_fault(
-                Some(Arc::clone(&controller)),
-                Arc::new(AtomicU64::new(0)),
-            ),
-        )
-        .await
-        .expect("fault handoff waited for the active recovery round to clear");
-
-        assert!(controller
-            .read_fault_reports()
-            .await
-            .unwrap()
-            .into_iter()
-            .any(|(node, sequence)| node == controller.instance_id() && sequence > 0));
-        assert_eq!(
-            controller.observe_recover().await.unwrap(),
-            Some(RecoveryAnnouncement {
-                round,
-                phase: RecoverPhase::Prepare,
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn lifecycle_arbitration_queues_only_a_live_generation_that_won_faulted() {
-        let (_db, controller, _kv, _members, _round, _manifest_store, _proof) = startup_db().await;
-        let pending = AtomicU64::new(0);
-        let stopped_state = std::sync::atomic::AtomicU8::new(DbState::ShuttingDown as u8);
-        let stopped_generation = tokio_util::sync::CancellationToken::new();
-        stopped_generation.cancel();
-        let stopped_owned = publish_runtime_fault_state(&stopped_state);
-        assert!(!stopped_owned);
-        assert!(!queue_owned_cluster_compute_fault(
-            &controller,
-            &pending,
-            stopped_owned,
-            &stopped_generation,
-        )
-        .unwrap());
-        assert_eq!(pending.load(Ordering::Acquire), 0);
-
-        let running_state = std::sync::atomic::AtomicU8::new(DbState::Running as u8);
-        let running_generation = tokio_util::sync::CancellationToken::new();
-        let running_owned = publish_runtime_fault_state(&running_state);
-        assert!(running_owned);
-        assert_eq!(DbState::load(&running_state), DbState::Faulted);
-        assert!(queue_owned_cluster_compute_fault(
-            &controller,
-            &pending,
-            running_owned,
-            &running_generation,
-        )
-        .unwrap());
-        assert_ne!(pending.load(Ordering::Acquire), 0);
-    }
-}
+mod cluster_fault_watcher_tests;
 
 #[cfg(test)]
-mod reference_table_recovery_tests {
-    use std::collections::{HashMap, VecDeque};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-
-    use arrow::array::{Int32Array, RecordBatch, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use laminar_connectors::config::ConnectorInfo;
-    use laminar_connectors::error::ConnectorError;
-    use laminar_connectors::reference::ReferenceTableSource;
-    use laminar_connectors::registry::ConnectorRegistry;
-
-    use super::{
-        create_reference_table_sources, hydrate_reference_table_sources,
-        ReferenceTableRuntimeSource,
-    };
-    use crate::connector_manager::TableRegistration;
-    use crate::table_store::TableStore;
-
-    struct CountingSnapshotSource {
-        polls: Arc<AtomicUsize>,
-        closes: Arc<AtomicUsize>,
-        batches: VecDeque<RecordBatch>,
-        fail_poll: bool,
-        fail_close: bool,
-    }
-
-    #[async_trait::async_trait]
-    impl ReferenceTableSource for CountingSnapshotSource {
-        async fn poll_snapshot(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
-            self.polls.fetch_add(1, Ordering::SeqCst);
-            if self.fail_poll {
-                self.fail_poll = false;
-                return Err(ConnectorError::ReadError(
-                    "injected snapshot failure".into(),
-                ));
-            }
-            Ok(self.batches.pop_front())
-        }
-
-        async fn close(&mut self) -> Result<(), ConnectorError> {
-            self.closes.fetch_add(1, Ordering::SeqCst);
-            if self.fail_close {
-                Err(ConnectorError::ReadError("injected close failure".into()))
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    fn schema() -> Arc<Schema> {
-        Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("value", DataType::Utf8, false),
-        ]))
-    }
-
-    fn batch(id: i32, value: &str) -> RecordBatch {
-        RecordBatch::try_new(
-            schema(),
-            vec![
-                Arc::new(Int32Array::from(vec![id])),
-                Arc::new(StringArray::from(vec![value])),
-            ],
-        )
-        .unwrap()
-    }
-
-    fn runtime_source(
-        name: &str,
-        polls: Arc<AtomicUsize>,
-        closes: Arc<AtomicUsize>,
-        batches: Vec<RecordBatch>,
-        fail_poll: bool,
-        fail_close: bool,
-    ) -> ReferenceTableRuntimeSource {
-        (
-            name.into(),
-            Box::new(CountingSnapshotSource {
-                polls,
-                closes,
-                batches: batches.into(),
-                fail_poll,
-                fail_close,
-            }),
-        )
-    }
-
-    fn registration(name: &str) -> TableRegistration {
-        TableRegistration {
-            name: name.into(),
-            primary_key: "id".into(),
-            connector_type: Some("mock".into()),
-            connector_options: HashMap::new(),
-            format: None,
-            format_options: HashMap::new(),
-            on_demand: false,
-            cache_max_bytes: None,
-            cache_ttl: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn complete_table_restore_skips_source_construction() {
-        let mut table_store = TableStore::new();
-        table_store.create_table("t", schema(), "id").unwrap();
-        table_store.upsert("t", &batch(1, "checkpoint")).unwrap();
-        table_store.set_ready("t", true);
-        let table_store = parking_lot::RwLock::new(table_store);
-
-        let factory_calls = Arc::new(AtomicUsize::new(0));
-        let calls = Arc::clone(&factory_calls);
-        let registry = ConnectorRegistry::new();
-        registry
-            .register_table_source(
-                "mock",
-                ConnectorInfo {
-                    name: "mock".into(),
-                    display_name: "Mock".into(),
-                    version: "1".into(),
-                    is_source: true,
-                    is_sink: false,
-                    config_keys: Vec::new(),
-                },
-                Arc::new(move |_, _| {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    Ok(Box::new(CountingSnapshotSource {
-                        polls: Arc::new(AtomicUsize::new(0)),
-                        closes: Arc::new(AtomicUsize::new(0)),
-                        batches: VecDeque::new(),
-                        fail_poll: false,
-                        fail_close: false,
-                    }))
-                }),
-            )
-            .unwrap();
-        let registrations = HashMap::from([("t".into(), registration("t"))]);
-        let sources = create_reference_table_sources(&registry, &registrations, &table_store, true)
-            .await
-            .unwrap();
-
-        assert!(sources.is_empty());
-        assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
-        let restored = table_store.read().to_record_batch("t").unwrap().unwrap();
-        assert_eq!(restored.num_rows(), 1);
-        assert_eq!(
-            restored
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .unwrap()
-                .value(0),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn later_source_construction_failure_closes_prior_sources() {
-        let mut table_store = TableStore::new();
-        table_store.create_table("a", schema(), "id").unwrap();
-        table_store.create_table("b", schema(), "id").unwrap();
-        let table_store = parking_lot::RwLock::new(table_store);
-
-        let factory_calls = Arc::new(AtomicUsize::new(0));
-        let calls = Arc::clone(&factory_calls);
-        let closes = Arc::new(AtomicUsize::new(0));
-        let source_closes = Arc::clone(&closes);
-        let registry = ConnectorRegistry::new();
-        registry
-            .register_table_source(
-                "mock",
-                ConnectorInfo {
-                    name: "mock".into(),
-                    display_name: "Mock".into(),
-                    version: "1".into(),
-                    is_source: true,
-                    is_sink: false,
-                    config_keys: Vec::new(),
-                },
-                Arc::new(move |_, _| {
-                    if calls.fetch_add(1, Ordering::SeqCst) == 1 {
-                        return Err(ConnectorError::ConfigurationError(
-                            "injected factory failure".into(),
-                        ));
-                    }
-                    Ok(Box::new(CountingSnapshotSource {
-                        polls: Arc::new(AtomicUsize::new(0)),
-                        closes: Arc::clone(&source_closes),
-                        batches: VecDeque::new(),
-                        fail_poll: false,
-                        fail_close: false,
-                    }))
-                }),
-            )
-            .unwrap();
-        let registrations = HashMap::from([
-            ("b".into(), registration("b")),
-            ("a".into(), registration("a")),
-        ]);
-
-        let result =
-            create_reference_table_sources(&registry, &registrations, &table_store, false).await;
-        let error = match result {
-            Ok(_) => panic!("the second table-source factory must fail"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("injected factory failure"));
-        assert_eq!(factory_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(closes.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn fresh_start_exhausts_upstream_snapshot_and_marks_table_ready() {
-        let mut table_store = TableStore::new();
-        table_store.create_table("t", schema(), "id").unwrap();
-        let table_store = parking_lot::RwLock::new(table_store);
-
-        let polls = Arc::new(AtomicUsize::new(0));
-        let closes = Arc::new(AtomicUsize::new(0));
-        let sources = vec![runtime_source(
-            "t",
-            Arc::clone(&polls),
-            Arc::clone(&closes),
-            vec![batch(2, "upstream")],
-            false,
-            false,
-        )];
-        let names = hydrate_reference_table_sources(sources, &table_store)
-            .await
-            .unwrap();
-
-        assert_eq!(names, ["t"]);
-        assert_eq!(polls.load(Ordering::SeqCst), 2);
-        assert_eq!(closes.load(Ordering::SeqCst), 1);
-        assert!(table_store.read().is_ready("t"));
-        assert_eq!(table_store.read().table_row_count("t"), 1);
-    }
-
-    #[tokio::test]
-    async fn snapshot_poll_failure_closes_every_source_without_mutation() {
-        let mut table_store = TableStore::new();
-        table_store.create_table("a", schema(), "id").unwrap();
-        table_store.create_table("b", schema(), "id").unwrap();
-        let table_store = parking_lot::RwLock::new(table_store);
-
-        let a_polls = Arc::new(AtomicUsize::new(0));
-        let b_polls = Arc::new(AtomicUsize::new(0));
-        let a_closes = Arc::new(AtomicUsize::new(0));
-        let b_closes = Arc::new(AtomicUsize::new(0));
-        let sources = vec![
-            runtime_source(
-                "a",
-                Arc::clone(&a_polls),
-                Arc::clone(&a_closes),
-                Vec::new(),
-                true,
-                false,
-            ),
-            runtime_source(
-                "b",
-                Arc::clone(&b_polls),
-                Arc::clone(&b_closes),
-                vec![batch(2, "upstream")],
-                false,
-                false,
-            ),
-        ];
-
-        let error = hydrate_reference_table_sources(sources, &table_store)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("injected snapshot failure"));
-        assert_eq!(a_polls.load(Ordering::SeqCst), 1);
-        assert_eq!(b_polls.load(Ordering::SeqCst), 0);
-        assert_eq!(a_closes.load(Ordering::SeqCst), 1);
-        assert_eq!(b_closes.load(Ordering::SeqCst), 1);
-        assert_eq!(table_store.read().table_row_count("a"), 0);
-        assert_eq!(table_store.read().table_row_count("b"), 0);
-        assert!(!table_store.read().is_ready("a"));
-        assert!(!table_store.read().is_ready("b"));
-    }
-
-    #[tokio::test]
-    async fn snapshot_close_failure_prevents_install() {
-        let mut table_store = TableStore::new();
-        table_store.create_table("t", schema(), "id").unwrap();
-        let table_store = parking_lot::RwLock::new(table_store);
-
-        let polls = Arc::new(AtomicUsize::new(0));
-        let closes = Arc::new(AtomicUsize::new(0));
-        let sources = vec![runtime_source(
-            "t",
-            Arc::clone(&polls),
-            Arc::clone(&closes),
-            vec![batch(2, "upstream")],
-            false,
-            true,
-        )];
-
-        let error = hydrate_reference_table_sources(sources, &table_store)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("injected close failure"));
-        assert_eq!(polls.load(Ordering::SeqCst), 2);
-        assert_eq!(closes.load(Ordering::SeqCst), 1);
-        assert_eq!(table_store.read().table_row_count("t"), 0);
-        assert!(!table_store.read().is_ready("t"));
-    }
-}
+mod reference_table_recovery_tests;
 
 #[cfg(test)]
-mod supervisor_tests {
-    use super::{backoff_for_attempt, claim_restart_slot, spawn_supervised_restart};
-    use crate::config::RestartPolicy;
-    use crate::db::{DbState, LaminarDB};
-    use laminar_core::catalog::CatalogObjectKind;
-    use std::sync::Arc;
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn restart_budget_caps_within_window_and_prunes_stale() {
-        let p = RestartPolicy::default();
-        let mut hist = Vec::new();
-        let now = Instant::now();
-        for i in 0..p.max_restarts {
-            assert_eq!(
-                claim_restart_slot(&mut hist, now, p.max_restarts, p.window),
-                Some(i)
-            );
-        }
-        assert_eq!(
-            claim_restart_slot(&mut hist, now, p.max_restarts, p.window),
-            None
-        );
-        // A window later the stale entries are pruned, freeing the budget again.
-        let later = now + p.window * 2;
-        assert_eq!(
-            claim_restart_slot(&mut hist, later, p.max_restarts, p.window),
-            Some(0)
-        );
-        assert_eq!(hist.len(), 1);
-    }
-
-    #[test]
-    fn backoff_grows_exponentially_capped() {
-        let init = Duration::from_millis(100);
-        let max = Duration::from_secs(1);
-        assert_eq!(
-            backoff_for_attempt(init, max, 0),
-            Duration::from_millis(100)
-        );
-        assert_eq!(
-            backoff_for_attempt(init, max, 1),
-            Duration::from_millis(200)
-        );
-        assert_eq!(
-            backoff_for_attempt(init, max, 3),
-            Duration::from_millis(800)
-        );
-        assert_eq!(
-            backoff_for_attempt(init, max, 4),
-            max,
-            "1600ms capped at 1s"
-        );
-        assert_eq!(
-            backoff_for_attempt(init, max, 1000),
-            max,
-            "huge attempt must not overflow"
-        );
-    }
-
-    // Drives the real watcher path and transfers startup to its owned driver.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn supervised_restart_recovers_faulted_pipeline() {
-        let db = LaminarDB::open().unwrap();
-        db.enable_supervision();
-        db.execute(
-            "CREATE SOURCE trades (id BIGINT, ts TIMESTAMP, \
-             WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
-        )
-        .await
-        .unwrap();
-        db.execute("CREATE STREAM out AS SELECT id FROM trades")
-            .await
-            .unwrap();
-
-        DbState::Faulted.store(&db.state);
-        *db.last_fault.lock() = Some("operator boom".to_string());
-        db.shutdown_signal.notify_one();
-
-        let metrics = Arc::new(crate::engine_metrics::EngineMetrics::new(
-            &prometheus::Registry::new(),
-        ));
-        let join = spawn_supervised_restart(
-            Arc::clone(&db),
-            Arc::clone(&db.restart_history),
-            Some(Arc::clone(&metrics)),
-        )
-        .expect("spawn restart thread");
-        join.await.expect("restart task");
-
-        assert_eq!(db.pipeline_state(), "Running");
-        assert!(db.last_fault().is_none());
-        assert_eq!(metrics.pipeline_restarts_total.get(), 1);
-        db.shutdown().await.unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn incomplete_catalog_cleanup_is_terminal_across_stop_and_supervision() {
-        let db = LaminarDB::open().unwrap();
-        db.execute("CREATE TABLE fenced (id BIGINT PRIMARY KEY)")
-            .await
-            .unwrap();
-        *db.catalog_cleanup_deregister_fault.lock() = Some("fenced".into());
-
-        let drop_error = db.execute("DROP TABLE fenced").await.unwrap_err();
-        assert!(drop_error.to_string().contains("[LDB-6044]"));
-        assert_eq!(DbState::load(&db.state), DbState::Faulted);
-        assert!(db.ctx.table_exist("fenced").unwrap());
-        assert_eq!(
-            db.catalog_namespace.lock().get("fenced"),
-            Some(&CatalogObjectKind::Table)
-        );
-        let terminal_reason = db.last_fault().expect("terminal reason");
-
-        db.stop_pipeline().await.unwrap();
-        let start_error = db.start().await.unwrap_err();
-        assert!(start_error.to_string().contains("[LDB-6044]"));
-        assert_eq!(db.last_fault().as_deref(), Some(terminal_reason.as_str()));
-
-        let create_error = db
-            .execute("CREATE TABLE fenced (id BIGINT PRIMARY KEY)")
-            .await
-            .unwrap_err();
-        assert!(create_error.to_string().contains("[LDB-6044]"));
-        assert_eq!(
-            db.catalog_namespace.lock().get("fenced"),
-            Some(&CatalogObjectKind::Table)
-        );
-
-        let metrics = Arc::new(crate::engine_metrics::EngineMetrics::new(
-            &prometheus::Registry::new(),
-        ));
-        let join = spawn_supervised_restart(
-            Arc::clone(&db),
-            Arc::clone(&db.restart_history),
-            Some(Arc::clone(&metrics)),
-        )
-        .expect("spawn restart thread");
-        join.await.expect("restart task");
-
-        assert!(db.restart_history.lock().is_empty());
-        assert_eq!(metrics.pipeline_restarts_total.get(), 0);
-        assert_eq!(db.last_fault().as_deref(), Some(terminal_reason.as_str()));
-    }
-}
+mod supervisor_tests;

@@ -41,14 +41,15 @@ impl Lsn {
     /// Returns the upper 32 bits (segment number).
     #[must_use]
     pub const fn segment(self) -> u32 {
-        (self.0 >> 32) as u32
+        let bytes = self.0.to_be_bytes();
+        u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
     }
 
     /// Returns the lower 32 bits (offset within segment).
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)] // Intentional: extracts lower 32 bits of u64 LSN
     pub const fn offset(self) -> u32 {
-        self.0 as u32
+        let bytes = self.0.to_be_bytes();
+        u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]])
     }
 
     /// Returns the byte difference between two LSNs.

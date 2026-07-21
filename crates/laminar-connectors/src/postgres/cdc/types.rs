@@ -121,7 +121,6 @@ impl PgColumn {
 /// Covers the most common `PostgreSQL` types. Unknown OIDs map to
 /// `DataType::Utf8` as a safe fallback (text representation).
 #[must_use]
-#[allow(clippy::match_same_arms)] // Arms kept separate to document type categories
 pub fn pg_type_to_arrow(oid: u32) -> DataType {
     match oid {
         // Boolean
@@ -136,12 +135,6 @@ pub fn pg_type_to_arrow(oid: u32) -> DataType {
         FLOAT4_OID => DataType::Float32,
         FLOAT8_OID => DataType::Float64,
 
-        // Numeric (arbitrary precision → string to preserve precision)
-        NUMERIC_OID => DataType::Utf8,
-
-        // Character types
-        CHAR_OID | BPCHAR_OID | VARCHAR_OID | TEXT_OID | NAME_OID => DataType::Utf8,
-
         // Binary
         BYTEA_OID => DataType::Binary,
 
@@ -152,25 +145,7 @@ pub fn pg_type_to_arrow(oid: u32) -> DataType {
         TIMESTAMPTZ_OID => {
             DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into()))
         }
-        INTERVAL_OID => DataType::Utf8,
-
-        // UUID
-        UUID_OID => DataType::Utf8,
-
-        // JSON
-        JSON_OID | JSONB_OID => DataType::Utf8,
-
-        // Network types
-        INET_OID | CIDR_OID | MACADDR_OID => DataType::Utf8,
-
-        // XML
-        XML_OID => DataType::Utf8,
-
-        // Array types (represented as JSON strings)
-        BOOL_ARRAY_OID | INT2_ARRAY_OID | INT4_ARRAY_OID | INT8_ARRAY_OID | FLOAT4_ARRAY_OID
-        | FLOAT8_ARRAY_OID | TEXT_ARRAY_OID | VARCHAR_ARRAY_OID => DataType::Utf8,
-
-        // Unknown types → text fallback
+        // Types without a lossless Arrow scalar mapping use their text representation.
         _ => DataType::Utf8,
     }
 }

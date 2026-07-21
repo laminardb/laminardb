@@ -42,8 +42,11 @@ pub struct PostgresCdcMetrics {
 
 impl PostgresCdcMetrics {
     /// Creates a new metrics instance with all counters at zero.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a built-in metric descriptor is invalid.
     #[must_use]
-    #[allow(clippy::missing_panics_doc)]
     pub fn new(registry: Option<&Registry>) -> Self {
         let mut local = None;
         let reg = reg_or_local(registry, &mut local);
@@ -113,15 +116,15 @@ impl PostgresCdcMetrics {
     }
 
     /// Updates the confirmed flush LSN.
-    #[allow(clippy::cast_possible_wrap)]
     pub fn set_confirmed_flush_lsn(&self, lsn: u64) {
-        self.confirmed_flush_lsn.set(lsn as i64);
+        self.confirmed_flush_lsn
+            .set(i64::from_ne_bytes(lsn.to_ne_bytes()));
     }
 
     /// Updates the replication lag in bytes.
-    #[allow(clippy::cast_possible_wrap)]
     pub fn set_replication_lag_bytes(&self, lag: u64) {
-        self.replication_lag_bytes.set(lag as i64);
+        self.replication_lag_bytes
+            .set(i64::from_ne_bytes(lag.to_ne_bytes()));
     }
 }
 

@@ -204,38 +204,396 @@ async fn hold_terminal_source_resolution(
 /// # Panics
 ///
 /// The spawned watcher panics if an already-validated draining snapshot lacks its transition.
-pub fn spawn_snapshot_watcher(
+struct SnapshotWatcher {
     db: Arc<LaminarDB>,
     store: Arc<AssignmentSnapshotStore>,
     registry: Arc<VnodeRegistry>,
     shutdown: CancellationToken,
     config: RebalanceConfig,
     controller: Option<Arc<ClusterController>>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    ticker: tokio::time::Interval,
+    published_adoption: Option<CheckpointAssignmentAdoption>,
+    metrics_version: u64,
+    last_drained: u64,
+    durable_snapshot: Option<AssignmentSnapshot>,
+    durable_drain_transition: Option<AssignmentDrainTransition>,
+    active_local_drain: Option<AssignmentDrainTransition>,
+    terminal_resolution_hold: Option<(AssignmentDrainId, u64)>,
+    installed_fence: Option<(u64, [u8; 32])>,
+    installed_authority_revision: u64,
+    assignment_authority_dirty: bool,
+}
+
+impl SnapshotWatcher {
+    fn new(
+        db: Arc<LaminarDB>,
+        store: Arc<AssignmentSnapshotStore>,
+        registry: Arc<VnodeRegistry>,
+        shutdown: CancellationToken,
+        config: RebalanceConfig,
+        controller: Option<Arc<ClusterController>>,
+    ) -> Self {
         let mut ticker = tokio::time::interval(config.watcher_poll);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut published_adoption: Option<CheckpointAssignmentAdoption> = None;
-        let mut metrics_version = 0;
-        // Highest draining snapshot already adopted; a draining snapshot doesn't
-        // bump the registry version, so this prevents re-adopting it every tick.
-        let mut last_drained = 0u64;
-        let mut durable_snapshot: Option<AssignmentSnapshot>;
-        let mut durable_drain_transition: Option<AssignmentDrainTransition>;
-        let mut active_local_drain: Option<AssignmentDrainTransition> = None;
-        let mut terminal_resolution_hold: Option<(AssignmentDrainId, u64)> = None;
-        let mut installed_fence: Option<(u64, [u8; 32])> = None;
-        let mut installed_authority_revision = 0u64;
-        let mut assignment_authority_dirty = false;
+        Self {
+            db,
+            store,
+            registry,
+            shutdown,
+            config,
+            controller,
+            ticker,
+            published_adoption: None,
+            metrics_version: 0,
+            last_drained: 0,
+            durable_snapshot: None,
+            durable_drain_transition: None,
+            active_local_drain: None,
+            terminal_resolution_hold: None,
+            installed_fence: None,
+            installed_authority_revision: 0,
+            assignment_authority_dirty: false,
+        }
+    }
+
+    async fn publish_authority(
+        &mut self,
+        mut authority_revision: u64,
+        head_deadline: tokio::time::Instant,
+    ) {
+        let current_authority_revision = self
+            .db
+            .assignment_authority_revision
+            .load(std::sync::atomic::Ordering::Acquire);
+        if authority_revision != current_authority_revision {
+            // The durable head used above predates an authority closure by another adoption.
+            // Keep that closure in force and re-read the head on the next tick.
+            self.db.set_source_gate(true);
+            if let Some(ref c) = self.controller {
+                c.publish_checkpoint_drain_transition(None);
+                c.publish_checkpoint_assignment_fence(None);
+            }
+            self.assignment_authority_dirty = true;
+            return;
+        }
+        if self.installed_fence.is_some()
+            && self.installed_authority_revision != current_authority_revision
+        {
+            self.assignment_authority_dirty = true;
+        }
+
+        let assignment = self.registry.versioned_snapshot();
+        let version = assignment.version();
+        if let Some(ref c) = self.controller {
+            let participant = CheckpointParticipant {
+                node_id: c.instance_id().0,
+                boot_incarnation: c.recovery_incarnation(),
+            };
+            let local_is_participant = self.durable_snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.version == version
+                    && snapshot
+                        .participants
+                        .binary_search_by_key(&participant.node_id, |entry| entry.node_id)
+                        .ok()
+                        .and_then(|index| snapshot.participants.get(index))
+                        == Some(&participant)
+            });
+            if local_is_participant {
+                let owner_ids: Vec<u64> = assignment.owners().iter().map(|owner| owner.0).collect();
+                let adoption = CheckpointAssignmentAdoption {
+                    participant,
+                    assignment_version: version,
+                    vnode_count: self.registry.vnode_count(),
+                    partitioning_abi_version: laminar_core::state::PARTITIONING_ABI_VERSION,
+                    assignment_digest: CheckpointAssignmentFence::owner_map_digest(
+                        self.registry.vnode_count(),
+                        &owner_ids,
+                    ),
+                };
+                if self.published_adoption.as_ref() != Some(&adoption) {
+                    match tokio::time::timeout_at(
+                        head_deadline,
+                        c.announce_adopted_assignment(&adoption),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => self.published_adoption = Some(adoption),
+                        Ok(Err(error)) => {
+                            warn!(%error, version, "adopted assignment publication failed; retrying");
+                        }
+                        Err(_) => {
+                            warn!(
+                                version,
+                                "adopted assignment publication exceeded the head deadline"
+                            );
+                        }
+                    }
+                }
+            } else {
+                self.published_adoption = None;
+            }
+        }
+        if version != self.metrics_version {
+            self.metrics_version = version;
+            if let (Some(c), Some(metrics)) = (self.controller.as_ref(), self.db.engine_metrics()) {
+                let nodes = c.assignable_with_locality();
+                publish_placement_metrics(
+                    &metrics,
+                    &self.registry,
+                    &nodes,
+                    self.config.placement_isolation_tier,
+                );
+            }
+        }
+
+        // Publish a version-bound, owner-complete fence off the hot path on every node.
+        // The adoption lock and authority revision reject a proof computed from a head that
+        // another task fenced while this watcher was awaiting durable I/O.
+        if let Some(ref c) = self.controller {
+            let fence = match self.durable_snapshot.as_ref() {
+                Some(snapshot)
+                    if !snapshot.draining
+                        && snapshot.version == version
+                        && snapshot.has_canonical_participants()
+                        && snapshot
+                            .to_vnode_vec(self.registry.vnode_count())
+                            .is_ok_and(|owners| owners.as_slice() == assignment.owners()) =>
+                {
+                    if let Ok(fence) = tokio::time::timeout_at(
+                        head_deadline,
+                        compute_checkpoint_assignment_fence(
+                            c,
+                            &self.registry,
+                            &snapshot.participants,
+                        ),
+                    )
+                    .await
+                    {
+                        fence.filter(|fence| fence.participants == snapshot.participants)
+                    } else {
+                        warn!(
+                            version,
+                            "assignment fence computation exceeded the head deadline"
+                        );
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if authority_revision
+                != self
+                    .db
+                    .assignment_authority_revision
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                self.db.set_source_gate(true);
+                c.publish_checkpoint_drain_transition(None);
+                c.publish_checkpoint_assignment_fence(None);
+                self.assignment_authority_dirty = true;
+                return;
+            }
+            let drain_transition = self
+                .durable_drain_transition
+                .as_ref()
+                .filter(|transition| fence.as_ref() == Some(&transition.predecessor))
+                .cloned();
+            match fence {
+                Some(fence) => {
+                    let identity = (fence.assignment_version, fence.digest());
+                    let local_has_authority = fence.participant_incarnation(c.instance_id().0)
+                        == Some(c.recovery_incarnation());
+                    let published_fence = c.checkpoint_assignment_fence(fence.assignment_version);
+                    let needs_activation = self.assignment_authority_dirty
+                        || self.installed_fence != Some(identity)
+                        || published_fence.as_ref() != Some(&fence)
+                        || c.checkpoint_drain_transition() != drain_transition
+                        || (local_has_authority
+                            && !c.is_recovering()
+                            && drain_transition.is_none()
+                            && self.db.cluster_intake_fenced());
+                    if needs_activation {
+                        if self.installed_fence.is_some() && self.installed_fence != Some(identity)
+                        {
+                            // Cancel the cached lifetime before waiting for compute cycles that
+                            // may be blocked in send. Suspension is safe if another authority
+                            // path already installed this exact successor; a genuinely higher
+                            // certificate resets the delivery domain during installation.
+                            self.db.set_source_gate(true);
+                            c.publish_checkpoint_drain_transition(None);
+                            c.publish_checkpoint_assignment_fence(None);
+                            self.db.suspend_shuffle_assignment_fence();
+                            authority_revision = self
+                                .db
+                                .assignment_authority_revision
+                                .load(std::sync::atomic::Ordering::Acquire);
+                            self.installed_fence = None;
+                        }
+                        match self
+                            .db
+                            .activate_assignment_authority(
+                                &fence,
+                                drain_transition,
+                                authority_revision,
+                                head_deadline,
+                            )
+                            .await
+                        {
+                            Ok(activation) if activation.installed => {
+                                self.installed_fence = Some(identity);
+                                self.installed_authority_revision = activation.revision;
+                                self.assignment_authority_dirty = false;
+                            }
+                            Ok(_) => self.assignment_authority_dirty = true,
+                            Err(error) => {
+                                c.publish_checkpoint_drain_transition(None);
+                                c.publish_checkpoint_assignment_fence(None);
+                                self.installed_fence = None;
+                                self.assignment_authority_dirty = true;
+                                warn!(%error, version, "shuffle assignment certificate install failed");
+                            }
+                        }
+                    }
+                }
+                None if !self.assignment_authority_dirty => {
+                    // An incomplete adoption or process-roster read is not proof that the
+                    // installed certificate was superseded. Close admission while retaining
+                    // its delivery sequence; installing a later concrete successor resets the
+                    // delivery domain from that certified boundary.
+                    self.assignment_authority_dirty = true;
+                    match suspend_local_assignment_authority(
+                        &self.db,
+                        Some(c.as_ref()),
+                        head_deadline,
+                    )
+                    .await
+                    {
+                        Ok(()) => warn!(
+                            version,
+                            "owner-complete assignment certificate unavailable; authority suspended"
+                        ),
+                        Err(error) => warn!(
+                            %error,
+                            version,
+                            "assignment suspension could not drain the prior execution scope"
+                        ),
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    async fn settle_terminal_drain(
+        &mut self,
+        snapshot: &AssignmentSnapshot,
+        audited_terminal: Option<&AuditedDrainOutcome>,
+        head_deadline: tokio::time::Instant,
+        authority_revision: &mut u64,
+    ) -> bool {
+        let transition = self.active_local_drain.clone().or_else(|| {
+            audited_terminal.and_then(|audited| {
+                self.controller
+                    .as_deref()
+                    .and_then(|controller| local_drain_participant(controller, &audited.transition))
+                    .map(|_| audited.transition.clone())
+            })
+        });
+        let Some(transition) = transition else {
+            self.terminal_resolution_hold = None;
+            return true;
+        };
+
+        let audited = audited_terminal.filter(|audited| audited.transition == transition);
+        let already_resolved = match audited {
+            Some(audited) => {
+                let resolution = SourceDrainResolution {
+                    round: transition.id(),
+                    outcome: audited.outcome,
+                };
+                match crate::pipeline::streaming_coordinator::owned_source_drain_resolved(
+                    &self.db.owned_source_tasks,
+                    resolution,
+                ) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        self.assignment_authority_dirty = true;
+                        let _ = hold_terminal_source_resolution(
+                            &self.db,
+                            self.controller.as_deref(),
+                            transition.id(),
+                            head_deadline,
+                            &mut self.terminal_resolution_hold,
+                        )
+                        .await;
+                        warn!(%error, version = snapshot.version, "snapshot watcher: source drain status audit failed; assignment authority suspended");
+                        return false;
+                    }
+                }
+            }
+            None => false,
+        };
+        if already_resolved {
+            self.active_local_drain = None;
+            self.terminal_resolution_hold = None;
+            return true;
+        }
+
+        self.assignment_authority_dirty = true;
+        match hold_terminal_source_resolution(
+            &self.db,
+            self.controller.as_deref(),
+            transition.id(),
+            head_deadline,
+            &mut self.terminal_resolution_hold,
+        )
+        .await
+        {
+            Ok(revision) => *authority_revision = revision,
+            Err(error) => {
+                warn!(%error, version = snapshot.version, "snapshot watcher: could not suspend authority for source drain resolution");
+                return false;
+            }
+        }
+        match settle_observed_local_drain(
+            &self.db,
+            &self.store,
+            &self.registry,
+            self.controller.as_deref(),
+            &transition,
+            snapshot,
+            audited,
+            head_deadline,
+            SourceDrainResolutionDeadline::Fresh(self.config.drain_ack_timeout),
+        )
+        .await
+        {
+            Ok(true) => {
+                self.active_local_drain = None;
+                self.terminal_resolution_hold = None;
+                *authority_revision = self
+                    .db
+                    .assignment_authority_revision
+                    .load(std::sync::atomic::Ordering::Acquire);
+                true
+            }
+            Ok(false) => false,
+            Err(error) => {
+                warn!(%error, version = snapshot.version, "snapshot watcher: local source drain resolution failed; assignment authority suspended");
+                false
+            }
+        }
+    }
+
+    async fn run(mut self) {
         loop {
             tokio::select! {
                 biased;
-                () = shutdown.cancelled() => return,
-                _ = ticker.tick() => {}
+                () = self.shutdown.cancelled() => return,
+                _ = self.ticker.tick() => {}
             }
-            let local = registry.assignment_version();
-            let head_deadline = tokio::time::Instant::now() + config.checkpoint_timeout;
-            let mut authority_revision = db
+            let local = self.registry.assignment_version();
+            let head_deadline = tokio::time::Instant::now() + self.config.checkpoint_timeout;
+            let mut authority_revision = self
+                .db
                 .assignment_authority_revision
                 .load(std::sync::atomic::Ordering::Acquire);
 
@@ -244,8 +602,8 @@ pub fn spawn_snapshot_watcher(
             // before local adoption.
             let audit = tokio::select! {
                 biased;
-                () = shutdown.cancelled() => return,
-                result = tokio::time::timeout_at(head_deadline, store.load()) => result,
+                () = self.shutdown.cancelled() => return,
+                result = tokio::time::timeout_at(head_deadline, self.store.load()) => result,
             };
             let mut audited_terminal = None;
             let mut audited_recovery = false;
@@ -254,8 +612,8 @@ pub fn spawn_snapshot_watcher(
                     let materialization_audit = tokio::time::timeout_at(
                         head_deadline,
                         audit_assignment_snapshot_authority_outcome(
-                            &store,
-                            controller.as_deref(),
+                            &self.store,
+                            self.controller.as_deref(),
                             snapshot,
                         ),
                     )
@@ -266,10 +624,10 @@ pub fn spawn_snapshot_watcher(
                             audited_terminal = outcome;
                         }
                         failed => {
-                            assignment_authority_dirty = true;
+                            self.assignment_authority_dirty = true;
                             let _ = suspend_local_assignment_authority(
-                                &db,
-                                controller.as_deref(),
+                                &self.db,
+                                self.controller.as_deref(),
                                 head_deadline,
                             )
                             .await;
@@ -278,7 +636,7 @@ pub fn spawn_snapshot_watcher(
                                     warn!(%error, version = snapshot.version, "snapshot watcher: drain finalization audit failed; assignment authority suspended");
                                 }
                                 Err(_) => {
-                                    warn!(version = snapshot.version, timeout = ?config.checkpoint_timeout, "snapshot watcher: drain finalization audit timed out; assignment authority suspended");
+                                    warn!(version = snapshot.version, timeout = ?self.config.checkpoint_timeout, "snapshot watcher: drain finalization audit timed out; assignment authority suspended");
                                 }
                                 Ok(Ok(_)) => unreachable!(),
                             }
@@ -288,99 +646,17 @@ pub fn spawn_snapshot_watcher(
                 }
             }
             if let Ok(Ok(Some(snapshot))) = &audit {
-                if !snapshot.draining {
-                    let transition = active_local_drain.clone().or_else(|| {
-                        audited_terminal.as_ref().and_then(|audited| {
-                            controller
-                                .as_deref()
-                                .and_then(|controller| {
-                                    local_drain_participant(controller, &audited.transition)
-                                })
-                                .map(|_| audited.transition.clone())
-                        })
-                    });
-                    if let Some(transition) = transition {
-                        let audited_for_transition = audited_terminal
-                            .as_ref()
-                            .filter(|audited| audited.transition == transition);
-                        let already_resolved = match audited_for_transition {
-                            Some(audited) => {
-                                let resolution = SourceDrainResolution {
-                                    round: transition.id(),
-                                    outcome: audited.outcome,
-                                };
-                                match crate::pipeline::streaming_coordinator::owned_source_drain_resolved(
-                                    &db.owned_source_tasks,
-                                    resolution,
-                                ) {
-                                    Ok(resolved) => resolved,
-                                    Err(error) => {
-                                        assignment_authority_dirty = true;
-                                        let _ = hold_terminal_source_resolution(
-                                            &db,
-                                            controller.as_deref(),
-                                            transition.id(),
-                                            head_deadline,
-                                            &mut terminal_resolution_hold,
-                                        )
-                                        .await;
-                                        warn!(%error, version = snapshot.version, "snapshot watcher: source drain status audit failed; assignment authority suspended");
-                                        continue;
-                                    }
-                                }
-                            }
-                            None => false,
-                        };
-                        if already_resolved {
-                            active_local_drain = None;
-                            terminal_resolution_hold = None;
-                        } else {
-                            assignment_authority_dirty = true;
-                            match hold_terminal_source_resolution(
-                                &db,
-                                controller.as_deref(),
-                                transition.id(),
-                                head_deadline,
-                                &mut terminal_resolution_hold,
-                            )
-                            .await
-                            {
-                                Ok(revision) => authority_revision = revision,
-                                Err(error) => {
-                                    warn!(%error, version = snapshot.version, "snapshot watcher: could not suspend authority for source drain resolution");
-                                    continue;
-                                }
-                            }
-                            match settle_observed_local_drain(
-                                &db,
-                                &store,
-                                &registry,
-                                controller.as_deref(),
-                                &transition,
-                                snapshot,
-                                audited_for_transition,
-                                head_deadline,
-                                SourceDrainResolutionDeadline::Fresh(config.drain_ack_timeout),
-                            )
-                            .await
-                            {
-                                Ok(true) => {
-                                    active_local_drain = None;
-                                    terminal_resolution_hold = None;
-                                    authority_revision = db
-                                        .assignment_authority_revision
-                                        .load(std::sync::atomic::Ordering::Acquire);
-                                }
-                                Ok(false) => continue,
-                                Err(error) => {
-                                    warn!(%error, version = snapshot.version, "snapshot watcher: local source drain resolution failed; assignment authority suspended");
-                                    continue;
-                                }
-                            }
-                        }
-                    } else {
-                        terminal_resolution_hold = None;
-                    }
+                if !snapshot.draining
+                    && !self
+                        .settle_terminal_drain(
+                            snapshot,
+                            audited_terminal.as_ref(),
+                            head_deadline,
+                            &mut authority_revision,
+                        )
+                        .await
+                {
+                    continue;
                 }
             }
             match audit {
@@ -395,7 +671,12 @@ pub fn spawn_snapshot_watcher(
                     // predecessor of the observed head.
                     let predecessor = tokio::time::timeout_at(
                         head_deadline,
-                        audit_drain_predecessor(&store, &registry, &snap, controller.as_deref()),
+                        audit_drain_predecessor(
+                            &self.store,
+                            &self.registry,
+                            &snap,
+                            self.controller.as_deref(),
+                        ),
                     )
                     .await;
                     match predecessor {
@@ -405,16 +686,16 @@ pub fn spawn_snapshot_watcher(
                                 .as_ref()
                                 .expect("validated draining snapshot has a transition")
                                 .clone();
-                            durable_drain_transition = Some(transition.clone());
-                            durable_snapshot = Some(predecessor);
-                            if let Some(ref c) = controller {
+                            self.durable_drain_transition = Some(transition.clone());
+                            self.durable_snapshot = Some(predecessor);
+                            if let Some(ref c) = self.controller {
                                 c.publish_checkpoint_drain_transition(Some(transition.clone()));
                             }
-                            if snap.version != last_drained {
-                                match db.validate_source_drain_snapshot(&snap) {
+                            if snap.version != self.last_drained {
+                                match self.db.validate_source_drain_snapshot(&snap) {
                                     Ok(()) => {
                                         let acknowledgement = async {
-                                            let c = controller.as_ref().ok_or_else(|| {
+                                            let c = self.controller.as_ref().ok_or_else(|| {
                                                 "assignment drain has no cluster controller"
                                                     .to_string()
                                             })?;
@@ -426,11 +707,11 @@ pub fn spawn_snapshot_watcher(
                                                 // the receipt quorum.
                                                 return Ok(());
                                             };
-                                            active_local_drain = Some(transition.clone());
+                                            self.active_local_drain = Some(transition.clone());
                                             prepare_and_announce_local_drain(
-                                                &db,
-                                                &store,
-                                                &registry,
+                                                &self.db,
+                                                &self.store,
+                                                &self.registry,
                                                 c,
                                                 &snap,
                                                 &transition,
@@ -438,7 +719,7 @@ pub fn spawn_snapshot_watcher(
                                                 std::cmp::min(
                                                     head_deadline,
                                                     tokio::time::Instant::now()
-                                                        + config.drain_ack_timeout,
+                                                        + self.config.drain_ack_timeout,
                                                 ),
                                             )
                                             .await
@@ -446,7 +727,7 @@ pub fn spawn_snapshot_watcher(
                                         .await;
                                         match acknowledgement {
                                             Ok(()) => {
-                                                last_drained = snap.version;
+                                                self.last_drained = snap.version;
                                                 // Receipt production may consume the entire head
                                                 // budget. Re-read and recertify from a fresh
                                                 // durable head on the next tick.
@@ -465,73 +746,80 @@ pub fn spawn_snapshot_watcher(
                             }
                         }
                         Ok(Err(error)) => {
-                            durable_snapshot = None;
-                            durable_drain_transition = None;
-                            assignment_authority_dirty = true;
+                            self.durable_snapshot = None;
+                            self.durable_drain_transition = None;
+                            self.assignment_authority_dirty = true;
                             let _ = suspend_local_assignment_authority(
-                                &db,
-                                controller.as_deref(),
+                                &self.db,
+                                self.controller.as_deref(),
                                 head_deadline,
                             )
                             .await;
                             warn!(%error, version = snap.version, "snapshot watcher: draining predecessor audit failed; assignment authority suspended");
                         }
                         Err(_) => {
-                            durable_snapshot = None;
-                            durable_drain_transition = None;
-                            assignment_authority_dirty = true;
+                            self.durable_snapshot = None;
+                            self.durable_drain_transition = None;
+                            self.assignment_authority_dirty = true;
                             let _ = suspend_local_assignment_authority(
-                                &db,
-                                controller.as_deref(),
+                                &self.db,
+                                self.controller.as_deref(),
                                 head_deadline,
                             )
                             .await;
-                            warn!(version = snap.version, timeout = ?config.checkpoint_timeout, "snapshot watcher: draining predecessor audit timed out; assignment authority suspended");
+                            warn!(version = snap.version, timeout = ?self.config.checkpoint_timeout, "snapshot watcher: draining predecessor audit timed out; assignment authority suspended");
                         }
                     }
                 }
                 Ok(Ok(Some(snap))) if !snap.draining && snap.version > local => {
                     if audited_recovery {
-                        let Some(controller) = controller.as_deref() else {
-                            assignment_authority_dirty = true;
+                        let Some(controller) = self.controller.as_deref() else {
+                            self.assignment_authority_dirty = true;
                             let _ =
-                                suspend_local_assignment_authority(&db, None, head_deadline).await;
+                                suspend_local_assignment_authority(&self.db, None, head_deadline)
+                                    .await;
                             warn!(
                                 version = snap.version,
                                 "snapshot watcher: recovery assignment has no cluster controller"
                             );
                             continue;
                         };
-                        if let Err(error) =
-                            suspend_local_assignment_authority(&db, Some(controller), head_deadline)
-                                .await
+                        if let Err(error) = suspend_local_assignment_authority(
+                            &self.db,
+                            Some(controller),
+                            head_deadline,
+                        )
+                        .await
                         {
-                            assignment_authority_dirty = true;
+                            self.assignment_authority_dirty = true;
                             warn!(%error, version = snap.version, "snapshot watcher: could not suspend recovery assignment");
                             continue;
                         }
-                        if let Err(error) = ensure_local_recovery_fault(&db, controller).await {
-                            assignment_authority_dirty = true;
+                        if let Err(error) = ensure_local_recovery_fault(&self.db, controller).await
+                        {
+                            self.assignment_authority_dirty = true;
                             warn!(%error, version = snap.version, "snapshot watcher: could not publish recovery fault");
                             continue;
                         }
-                        authority_revision = db
+                        authority_revision = self
+                            .db
                             .assignment_authority_revision
                             .load(std::sync::atomic::Ordering::Acquire);
-                        assignment_authority_dirty = true;
+                        self.assignment_authority_dirty = true;
                     }
-                    durable_drain_transition = None;
-                    durable_snapshot = Some(snap.clone());
-                    let resolved_local = registry.assignment_version();
+                    self.durable_drain_transition = None;
+                    self.durable_snapshot = Some(snap.clone());
+                    let resolved_local = self.registry.assignment_version();
                     if snap.version > resolved_local {
                         debug!(
                             local = resolved_local,
                             remote = snap.version,
                             "adopting newer assignment"
                         );
-                        match db.adopt_assignment_snapshot(snap, head_deadline).await {
+                        match self.db.adopt_assignment_snapshot(snap, head_deadline).await {
                             Ok(adoption) => {
-                                authority_revision = db
+                                authority_revision = self
+                                    .db
                                     .assignment_authority_revision
                                     .load(std::sync::atomic::Ordering::Acquire);
                                 log_adoption("watcher", &adoption);
@@ -541,262 +829,64 @@ pub fn spawn_snapshot_watcher(
                     }
                 }
                 Ok(Ok(Some(snap))) => {
-                    durable_drain_transition = snap.drain_transition.clone();
-                    durable_snapshot = Some(snap);
+                    self.durable_drain_transition
+                        .clone_from(&snap.drain_transition);
+                    self.durable_snapshot = Some(snap);
                 }
                 Ok(Ok(None)) => {
-                    durable_drain_transition = None;
-                    durable_snapshot = None;
+                    self.durable_drain_transition = None;
+                    self.durable_snapshot = None;
                 }
                 Ok(Err(error)) => {
-                    durable_snapshot = None;
-                    durable_drain_transition = None;
-                    assignment_authority_dirty = true;
+                    self.durable_snapshot = None;
+                    self.durable_drain_transition = None;
+                    self.assignment_authority_dirty = true;
                     let _ = suspend_local_assignment_authority(
-                        &db,
-                        controller.as_deref(),
+                        &self.db,
+                        self.controller.as_deref(),
                         head_deadline,
                     )
                     .await;
                     warn!(%error, "snapshot watcher: durable audit failed; assignment authority suspended");
                 }
                 Err(_) => {
-                    durable_snapshot = None;
-                    durable_drain_transition = None;
-                    assignment_authority_dirty = true;
+                    self.durable_snapshot = None;
+                    self.durable_drain_transition = None;
+                    self.assignment_authority_dirty = true;
                     let _ = suspend_local_assignment_authority(
-                        &db,
-                        controller.as_deref(),
+                        &self.db,
+                        self.controller.as_deref(),
                         head_deadline,
                     )
                     .await;
                     warn!(
-                        timeout = ?config.checkpoint_timeout,
+                        timeout = ?self.config.checkpoint_timeout,
                         "snapshot watcher: durable audit timed out; assignment authority suspended"
                     );
                 }
             }
 
-            let current_authority_revision = db
-                .assignment_authority_revision
-                .load(std::sync::atomic::Ordering::Acquire);
-            if authority_revision != current_authority_revision {
-                // The durable head used above predates an authority closure by another adoption.
-                // Keep that closure in force and re-read the head on the next tick.
-                db.set_source_gate(true);
-                if let Some(ref c) = controller {
-                    c.publish_checkpoint_drain_transition(None);
-                    c.publish_checkpoint_assignment_fence(None);
-                }
-                assignment_authority_dirty = true;
-                continue;
-            }
-            if installed_fence.is_some()
-                && installed_authority_revision != current_authority_revision
-            {
-                assignment_authority_dirty = true;
-            }
-
-            let assignment = registry.versioned_snapshot();
-            let version = assignment.version();
-            if let Some(ref c) = controller {
-                let participant = CheckpointParticipant {
-                    node_id: c.instance_id().0,
-                    boot_incarnation: c.recovery_incarnation(),
-                };
-                let local_is_participant = durable_snapshot.as_ref().is_some_and(|snapshot| {
-                    snapshot.version == version
-                        && snapshot
-                            .participants
-                            .binary_search_by_key(&participant.node_id, |entry| entry.node_id)
-                            .ok()
-                            .and_then(|index| snapshot.participants.get(index))
-                            == Some(&participant)
-                });
-                if local_is_participant {
-                    let owner_ids: Vec<u64> =
-                        assignment.owners().iter().map(|owner| owner.0).collect();
-                    let adoption = CheckpointAssignmentAdoption {
-                        participant,
-                        assignment_version: version,
-                        vnode_count: registry.vnode_count(),
-                        partitioning_abi_version: laminar_core::state::PARTITIONING_ABI_VERSION,
-                        assignment_digest: CheckpointAssignmentFence::owner_map_digest(
-                            registry.vnode_count(),
-                            &owner_ids,
-                        ),
-                    };
-                    if published_adoption.as_ref() != Some(&adoption) {
-                        match tokio::time::timeout_at(
-                            head_deadline,
-                            c.announce_adopted_assignment(&adoption),
-                        )
-                        .await
-                        {
-                            Ok(Ok(())) => published_adoption = Some(adoption),
-                            Ok(Err(error)) => {
-                                warn!(%error, version, "adopted assignment publication failed; retrying");
-                            }
-                            Err(_) => {
-                                warn!(
-                                    version,
-                                    "adopted assignment publication exceeded the head deadline"
-                                );
-                            }
-                        }
-                    }
-                } else {
-                    published_adoption = None;
-                }
-            }
-            if version != metrics_version {
-                metrics_version = version;
-                if let (Some(c), Some(metrics)) = (controller.as_ref(), db.engine_metrics()) {
-                    let nodes = c.assignable_with_locality();
-                    publish_placement_metrics(
-                        &metrics,
-                        &registry,
-                        &nodes,
-                        config.placement_isolation_tier,
-                    );
-                }
-            }
-
-            // Publish a version-bound, owner-complete fence off the hot path on every node.
-            // The adoption lock and authority revision reject a proof computed from a head that
-            // another task fenced while this watcher was awaiting durable I/O.
-            if let Some(ref c) = controller {
-                let fence = match durable_snapshot.as_ref() {
-                    Some(snapshot)
-                        if !snapshot.draining
-                            && snapshot.version == version
-                            && snapshot.has_canonical_participants()
-                            && snapshot
-                                .to_vnode_vec(registry.vnode_count())
-                                .is_ok_and(|owners| owners.as_slice() == assignment.owners()) =>
-                    {
-                        if let Ok(fence) = tokio::time::timeout_at(
-                            head_deadline,
-                            compute_checkpoint_assignment_fence(
-                                c,
-                                &registry,
-                                &snapshot.participants,
-                            ),
-                        )
-                        .await
-                        {
-                            fence.filter(|fence| fence.participants == snapshot.participants)
-                        } else {
-                            warn!(
-                                version,
-                                "assignment fence computation exceeded the head deadline"
-                            );
-                            None
-                        }
-                    }
-                    _ => None,
-                };
-                if authority_revision
-                    != db
-                        .assignment_authority_revision
-                        .load(std::sync::atomic::Ordering::Acquire)
-                {
-                    db.set_source_gate(true);
-                    c.publish_checkpoint_drain_transition(None);
-                    c.publish_checkpoint_assignment_fence(None);
-                    assignment_authority_dirty = true;
-                    continue;
-                }
-                let drain_transition = durable_drain_transition
-                    .as_ref()
-                    .filter(|transition| fence.as_ref() == Some(&transition.predecessor))
-                    .cloned();
-                match fence {
-                    Some(fence) => {
-                        let identity = (fence.assignment_version, fence.digest());
-                        let local_has_authority = fence.participant_incarnation(c.instance_id().0)
-                            == Some(c.recovery_incarnation());
-                        let published_fence =
-                            c.checkpoint_assignment_fence(fence.assignment_version);
-                        let needs_activation = assignment_authority_dirty
-                            || installed_fence != Some(identity)
-                            || published_fence.as_ref() != Some(&fence)
-                            || c.checkpoint_drain_transition() != drain_transition
-                            || (local_has_authority
-                                && !c.is_recovering()
-                                && drain_transition.is_none()
-                                && db.cluster_intake_fenced());
-                        if needs_activation {
-                            if installed_fence.is_some() && installed_fence != Some(identity) {
-                                // Cancel the cached lifetime before waiting for compute cycles that
-                                // may be blocked in send. Suspension is safe if another authority
-                                // path already installed this exact successor; a genuinely higher
-                                // certificate resets the delivery domain during installation.
-                                db.set_source_gate(true);
-                                c.publish_checkpoint_drain_transition(None);
-                                c.publish_checkpoint_assignment_fence(None);
-                                db.suspend_shuffle_assignment_fence();
-                                authority_revision = db
-                                    .assignment_authority_revision
-                                    .load(std::sync::atomic::Ordering::Acquire);
-                                installed_fence = None;
-                            }
-                            match db
-                                .activate_assignment_authority(
-                                    &fence,
-                                    drain_transition,
-                                    authority_revision,
-                                    head_deadline,
-                                )
-                                .await
-                            {
-                                Ok(activation) if activation.installed => {
-                                    installed_fence = Some(identity);
-                                    installed_authority_revision = activation.revision;
-                                    assignment_authority_dirty = false;
-                                }
-                                Ok(_) => assignment_authority_dirty = true,
-                                Err(error) => {
-                                    c.publish_checkpoint_drain_transition(None);
-                                    c.publish_checkpoint_assignment_fence(None);
-                                    installed_fence = None;
-                                    assignment_authority_dirty = true;
-                                    warn!(%error, version, "shuffle assignment certificate install failed");
-                                }
-                            }
-                        }
-                    }
-                    None if !assignment_authority_dirty => {
-                        // An incomplete adoption or process-roster read is not proof that the
-                        // installed certificate was superseded. Close admission while retaining
-                        // its delivery sequence; installing a later concrete successor resets the
-                        // delivery domain from that certified boundary.
-                        assignment_authority_dirty = true;
-                        match suspend_local_assignment_authority(
-                            &db,
-                            Some(c.as_ref()),
-                            head_deadline,
-                        )
-                        .await
-                        {
-                            Ok(()) => warn!(
-                                version,
-                                "owner-complete assignment certificate unavailable; authority suspended"
-                            ),
-                            Err(error) => warn!(
-                                %error,
-                                version,
-                                "assignment suspension could not drain the prior execution scope"
-                            ),
-                        }
-                    }
-                    None => {}
-                }
-            }
+            self.publish_authority(authority_revision, head_deadline)
+                .await;
         }
-    })
+    }
 }
 
+/// Spawn the per-node snapshot watcher. Exits on shutdown.
+///
+/// # Panics
+///
+/// The spawned watcher panics if an already-validated draining snapshot lacks its transition.
+pub fn spawn_snapshot_watcher(
+    db: Arc<LaminarDB>,
+    store: Arc<AssignmentSnapshotStore>,
+    registry: Arc<VnodeRegistry>,
+    shutdown: CancellationToken,
+    config: RebalanceConfig,
+    controller: Option<Arc<ClusterController>>,
+) -> JoinHandle<()> {
+    tokio::spawn(SnapshotWatcher::new(db, store, registry, shutdown, config, controller).run())
+}
 /// Per-node checkpoint fence. A reported version is insufficient: the exact current
 /// assignment must be owner-complete over the same canonical participant set.
 async fn compute_checkpoint_assignment_fence(
@@ -1948,6 +2038,175 @@ async fn authorize_recovery_successor(
     materialize_recovery_decision(db, store, controller, decision, operation_timeout).await
 }
 
+fn execute_graceful_rotation_owned(
+    db: Arc<LaminarDB>,
+    controller: Arc<ClusterController>,
+    store: Arc<AssignmentSnapshotStore>,
+    registry: Arc<VnodeRegistry>,
+    current: AssignmentSnapshot,
+    new_vnodes: std::collections::BTreeMap<u32, NodeId>,
+    participants: Vec<CheckpointParticipant>,
+    config: RebalanceConfig,
+) -> futures::future::BoxFuture<'static, Result<Option<u64>, String>> {
+    Box::pin(async move {
+        let leader = controller.capture_leader_proof().ok_or_else(|| {
+            "assignment drain requires the current durable leader proof".to_string()
+        })?;
+        let drain = current
+            .next_draining(new_vnodes.clone(), participants.clone(), leader)
+            .map_err(|error| error.to_string())?;
+        let transition = drain
+            .drain_transition
+            .as_ref()
+            .expect("validated draining snapshot has a transition")
+            .clone();
+        match store
+            .save_if_version(&drain, current.version)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            RotateOutcome::Rotated => {
+                let drain_deadline = tokio::time::Instant::now() + config.drain_ack_timeout;
+                db.validate_source_drain_snapshot(&drain)
+                    .map_err(|error| error.to_string())?;
+                controller.publish_checkpoint_drain_transition(Some(transition.clone()));
+                // Wait for every process in the snapshot's frozen boot roster to durably ack the
+                // exact source cut. Target-only joiners intentionally do not acknowledge inputs
+                // they never owned under the predecessor.
+                let local_receipt = match local_drain_participant(&controller, &transition) {
+                    Some(participant) => {
+                        prepare_and_announce_local_drain(
+                            &db,
+                            &store,
+                            &registry,
+                            &controller,
+                            &drain,
+                            &transition,
+                            participant,
+                            drain_deadline,
+                        )
+                        .await
+                    }
+                    None => Ok(()),
+                };
+                let acked = match local_receipt {
+                    Ok(()) => await_drain_quorum(&controller, &transition, drain_deadline).await,
+                    Err(error) => {
+                        warn!(%error, version = drain.version, "leader durable drain acknowledgement failed");
+                        false
+                    }
+                };
+                if !acked {
+                    let failure = "drain ack quorum not reached before timeout";
+                    if let Err(error) = audit_exact_drain_head(
+                        &store,
+                        &registry,
+                        &drain,
+                        &controller,
+                        tokio::time::Instant::now() + config.checkpoint_timeout,
+                    )
+                    .await
+                    {
+                        return Err(format!(
+                            "{failure}; drain is no longer authoritative: {error}"
+                        ));
+                    }
+                    if let Err(abort_error) = finalize_drain_snapshot(
+                        &db,
+                        &store,
+                        &controller,
+                        &drain,
+                        &current,
+                        AssignmentDrainVerdict::Abort,
+                        config,
+                    )
+                    .await
+                    {
+                        return Err(format!(
+                            "{failure}; assignment drain abort failed: {abort_error}"
+                        ));
+                    }
+                    return Err(failure.into());
+                }
+                audit_exact_drain_head(
+                    &store,
+                    &registry,
+                    &drain,
+                    &controller,
+                    tokio::time::Instant::now() + config.checkpoint_timeout,
+                )
+                .await?;
+                // Abort the drain on failure OR timeout (not just Ok(false)) — a bare
+                // `?` here would leave nodes stuck draining.
+                let checkpointed = pre_rotation_checkpoint(&db, config).await;
+                if !matches!(checkpointed, Ok(true)) {
+                    let failure = checkpointed
+                        .err()
+                        .unwrap_or_else(|| "pre-rotation checkpoint failed during drain".into());
+                    if let Err(error) = audit_exact_drain_head(
+                        &store,
+                        &registry,
+                        &drain,
+                        &controller,
+                        tokio::time::Instant::now() + config.checkpoint_timeout,
+                    )
+                    .await
+                    {
+                        return Err(format!(
+                            "{failure}; drain is no longer authoritative: {error}"
+                        ));
+                    }
+                    if let Err(abort_error) = finalize_drain_snapshot(
+                        &db,
+                        &store,
+                        &controller,
+                        &drain,
+                        &current,
+                        AssignmentDrainVerdict::Abort,
+                        config,
+                    )
+                    .await
+                    {
+                        return Err(format!(
+                            "{failure}; assignment drain abort failed: {abort_error}"
+                        ));
+                    }
+                    return Err(failure);
+                }
+                audit_exact_drain_head(
+                    &store,
+                    &registry,
+                    &drain,
+                    &controller,
+                    tokio::time::Instant::now() + config.checkpoint_timeout,
+                )
+                .await?;
+                return finalize_drain_snapshot(
+                    &db,
+                    &store,
+                    &controller,
+                    &drain,
+                    &current,
+                    AssignmentDrainVerdict::Commit,
+                    config,
+                )
+                .await;
+            }
+            RotateOutcome::Conflict(winner) => {
+                let v = winner.version;
+                adopt_any(
+                    &db,
+                    &store,
+                    &controller,
+                    *winner,
+                    tokio::time::Instant::now() + config.checkpoint_timeout,
+                )
+                .await?;
+                Ok(Some(v))
+            }
+        }
+    })
+}
 fn try_rebalance_owned(
     db: Arc<LaminarDB>,
     controller: Arc<ClusterController>,
@@ -2152,169 +2411,17 @@ fn try_rebalance_owned(
             .await;
         }
 
-        // Every graceful rotation uses one global predecessor source frontier. This is required for
-        // at-least-once as well as exactly-once: replay can recover a failed cut, but it cannot repair
-        // a successful handoff assembled from unrelated source and state frontiers.
-        {
-            let leader = controller.capture_leader_proof().ok_or_else(|| {
-                "assignment drain requires the current durable leader proof".to_string()
-            })?;
-            let drain = current
-                .next_draining(new_vnodes.clone(), participants.clone(), leader)
-                .map_err(|error| error.to_string())?;
-            let transition = drain
-                .drain_transition
-                .as_ref()
-                .expect("validated draining snapshot has a transition")
-                .clone();
-            match store
-                .save_if_version(&drain, current.version)
-                .await
-                .map_err(|e| e.to_string())?
-            {
-                RotateOutcome::Rotated => {
-                    let drain_deadline = tokio::time::Instant::now() + config.drain_ack_timeout;
-                    db.validate_source_drain_snapshot(&drain)
-                        .map_err(|error| error.to_string())?;
-                    controller.publish_checkpoint_drain_transition(Some(transition.clone()));
-                    // Wait for every process in the snapshot's frozen boot roster to durably ack the
-                    // exact source cut. Target-only joiners intentionally do not acknowledge inputs
-                    // they never owned under the predecessor.
-                    let local_receipt = match local_drain_participant(&controller, &transition) {
-                        Some(participant) => {
-                            prepare_and_announce_local_drain(
-                                &db,
-                                &store,
-                                &registry,
-                                &controller,
-                                &drain,
-                                &transition,
-                                participant,
-                                drain_deadline,
-                            )
-                            .await
-                        }
-                        None => Ok(()),
-                    };
-                    let acked = match local_receipt {
-                        Ok(()) => {
-                            await_drain_quorum(&controller, &transition, drain_deadline).await
-                        }
-                        Err(error) => {
-                            warn!(%error, version = drain.version, "leader durable drain acknowledgement failed");
-                            false
-                        }
-                    };
-                    if !acked {
-                        let failure = "drain ack quorum not reached before timeout";
-                        if let Err(error) = audit_exact_drain_head(
-                            &store,
-                            &registry,
-                            &drain,
-                            &controller,
-                            tokio::time::Instant::now() + config.checkpoint_timeout,
-                        )
-                        .await
-                        {
-                            return Err(format!(
-                                "{failure}; drain is no longer authoritative: {error}"
-                            ));
-                        }
-                        if let Err(abort_error) = finalize_drain_snapshot(
-                            &db,
-                            &store,
-                            &controller,
-                            &drain,
-                            &current,
-                            AssignmentDrainVerdict::Abort,
-                            config,
-                        )
-                        .await
-                        {
-                            return Err(format!(
-                                "{failure}; assignment drain abort failed: {abort_error}"
-                            ));
-                        }
-                        return Err(failure.into());
-                    }
-                    audit_exact_drain_head(
-                        &store,
-                        &registry,
-                        &drain,
-                        &controller,
-                        tokio::time::Instant::now() + config.checkpoint_timeout,
-                    )
-                    .await?;
-                    // Abort the drain on failure OR timeout (not just Ok(false)) — a bare
-                    // `?` here would leave nodes stuck draining.
-                    let checkpointed = pre_rotation_checkpoint(&db, config).await;
-                    if !matches!(checkpointed, Ok(true)) {
-                        let failure = checkpointed.err().unwrap_or_else(|| {
-                            "pre-rotation checkpoint failed during drain".into()
-                        });
-                        if let Err(error) = audit_exact_drain_head(
-                            &store,
-                            &registry,
-                            &drain,
-                            &controller,
-                            tokio::time::Instant::now() + config.checkpoint_timeout,
-                        )
-                        .await
-                        {
-                            return Err(format!(
-                                "{failure}; drain is no longer authoritative: {error}"
-                            ));
-                        }
-                        if let Err(abort_error) = finalize_drain_snapshot(
-                            &db,
-                            &store,
-                            &controller,
-                            &drain,
-                            &current,
-                            AssignmentDrainVerdict::Abort,
-                            config,
-                        )
-                        .await
-                        {
-                            return Err(format!(
-                                "{failure}; assignment drain abort failed: {abort_error}"
-                            ));
-                        }
-                        return Err(failure);
-                    }
-                    audit_exact_drain_head(
-                        &store,
-                        &registry,
-                        &drain,
-                        &controller,
-                        tokio::time::Instant::now() + config.checkpoint_timeout,
-                    )
-                    .await?;
-                    return finalize_drain_snapshot(
-                        &db,
-                        &store,
-                        &controller,
-                        &drain,
-                        &current,
-                        AssignmentDrainVerdict::Commit,
-                        config,
-                    )
-                    .await;
-                }
-                RotateOutcome::Conflict(winner) => {
-                    let v = winner.version;
-                    adopt_any(
-                        &db,
-                        &store,
-                        &controller,
-                        *winner,
-                        tokio::time::Instant::now() + config.checkpoint_timeout,
-                    )
-                    .await?;
-                    Ok(Some(v))
-                }
-            }
-        }
+        execute_graceful_rotation_owned(
+            db,
+            controller,
+            store,
+            registry,
+            current,
+            new_vnodes,
+            participants,
+            config,
+        )
+        .await
     })
 }
 
@@ -2755,2484 +2862,4 @@ async fn adopt_any(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::BTreeMap;
-
-    use laminar_core::state::InProcessBackend;
-    use object_store::memory::InMemory;
-    use object_store::{ObjectStore, ObjectStoreExt};
-
-    struct PendingListStore {
-        inner: Arc<dyn ObjectStore>,
-    }
-
-    impl std::fmt::Debug for PendingListStore {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_struct("PendingListStore").finish_non_exhaustive()
-        }
-    }
-
-    impl std::fmt::Display for PendingListStore {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("PendingListStore")
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ObjectStore for PendingListStore {
-        async fn put_opts(
-            &self,
-            location: &object_store::path::Path,
-            payload: object_store::PutPayload,
-            opts: object_store::PutOptions,
-        ) -> object_store::Result<object_store::PutResult> {
-            self.inner.put_opts(location, payload, opts).await
-        }
-
-        async fn put_multipart_opts(
-            &self,
-            location: &object_store::path::Path,
-            opts: object_store::PutMultipartOptions,
-        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-            self.inner.put_multipart_opts(location, opts).await
-        }
-
-        async fn get_opts(
-            &self,
-            location: &object_store::path::Path,
-            options: object_store::GetOptions,
-        ) -> object_store::Result<object_store::GetResult> {
-            self.inner.get_opts(location, options).await
-        }
-
-        fn delete_stream(
-            &self,
-            locations: futures::stream::BoxStream<
-                'static,
-                object_store::Result<object_store::path::Path>,
-            >,
-        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
-        {
-            self.inner.delete_stream(locations)
-        }
-
-        fn list(
-            &self,
-            _prefix: Option<&object_store::path::Path>,
-        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
-        {
-            Box::pin(futures::stream::pending())
-        }
-
-        async fn list_with_delimiter(
-            &self,
-            prefix: Option<&object_store::path::Path>,
-        ) -> object_store::Result<object_store::ListResult> {
-            self.inner.list_with_delimiter(prefix).await
-        }
-
-        async fn copy_opts(
-            &self,
-            from: &object_store::path::Path,
-            to: &object_store::path::Path,
-            options: object_store::CopyOptions,
-        ) -> object_store::Result<()> {
-            self.inner.copy_opts(from, to, options).await
-        }
-    }
-
-    fn store() -> AssignmentSnapshotStore {
-        let mem: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        AssignmentSnapshotStore::new(mem)
-    }
-
-    fn test_cluster_checkpoint_store() -> Arc<dyn ObjectStore> {
-        Arc::new(InMemory::new())
-    }
-
-    fn test_cluster_controller(
-        node: NodeId,
-        boot: uuid::Uuid,
-        assignment_store: Option<Arc<AssignmentSnapshotStore>>,
-    ) -> Arc<ClusterController> {
-        use laminar_core::cluster::control::{ClusterKv, InMemoryKv};
-        use laminar_core::cluster::discovery::NodeInfo;
-
-        let kv = Arc::new(InMemoryKv::new(node));
-        let control: Arc<dyn ClusterKv> = kv.clone();
-        let recovery: Arc<dyn ClusterKv> = kv;
-        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
-        let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
-            node,
-            control,
-            recovery,
-            assignment_store,
-            members_rx,
-            boot,
-        ));
-        controller
-            .set_process_lease_deadline(Arc::new(
-                laminar_core::cluster::control::LeaseDeadline::live_for(Duration::from_secs(60)),
-            ))
-            .unwrap();
-        controller
-    }
-
-    async fn grant_test_leadership(
-        controller: &Arc<ClusterController>,
-    ) -> tokio::sync::watch::Sender<Option<laminar_core::cluster::control::LeaderLease>> {
-        use laminar_core::cluster::control::{LeaderLeaseOwner, LeaseOutcome};
-
-        let authority = Arc::new(LeaderLeaseStore::new(Arc::new(InMemory::new()), 10_000));
-        let owner = LeaderLeaseOwner {
-            node: controller.instance_id(),
-            boot: controller.recovery_incarnation(),
-            process_term: 1,
-        };
-        let LeaseOutcome::Acquired(lease) = authority.begin_new_term(&owner, 0).await.unwrap()
-        else {
-            panic!("empty test authority must grant leadership");
-        };
-        install_test_leadership(controller, authority, owner, lease)
-    }
-
-    async fn install_test_process_authority(
-        controller: &Arc<ClusterController>,
-        participants: &[CheckpointParticipant],
-    ) -> Arc<laminar_core::cluster::control::ProcessLeaseAuthority> {
-        let authority = Arc::new(
-            laminar_core::cluster::control::ProcessLeaseAuthority::new(
-                Arc::new(InMemory::new()),
-                Duration::from_millis(5),
-            )
-            .unwrap(),
-        );
-        let mut local_lease = None;
-        for participant in participants {
-            let outcome = authority
-                .store_for(NodeId(participant.node_id))
-                .try_acquire(participant.boot_incarnation, 0)
-                .await
-                .unwrap();
-            if participant.node_id == controller.instance_id().0 {
-                let laminar_core::cluster::control::ProcessLeaseOutcome::Acquired(lease) = outcome
-                else {
-                    panic!("local test process lease must be acquired");
-                };
-                local_lease = Some(lease);
-            }
-        }
-        if controller.process_lease_deadline().is_none() {
-            controller
-                .set_process_lease_deadline(Arc::new(
-                    laminar_core::cluster::control::LeaseDeadline::live_for(Duration::from_secs(
-                        60,
-                    )),
-                ))
-                .unwrap();
-        }
-        controller
-            .set_process_lease_authority(Arc::clone(&authority))
-            .unwrap();
-        if let Some(lease) = local_lease {
-            controller
-                .publish_leased_recovery_incarnation(&lease)
-                .await
-                .unwrap();
-        }
-        authority
-    }
-
-    fn install_test_leadership(
-        controller: &Arc<ClusterController>,
-        authority: Arc<LeaderLeaseStore>,
-        owner: laminar_core::cluster::control::LeaderLeaseOwner,
-        lease: laminar_core::cluster::control::LeaderLease,
-    ) -> tokio::sync::watch::Sender<Option<laminar_core::cluster::control::LeaderLease>> {
-        use laminar_core::cluster::control::LeaseDeadline;
-
-        let (lease_tx, lease_rx) = tokio::sync::watch::channel(Some(lease));
-        if controller.process_lease_deadline().is_none() {
-            controller
-                .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(
-                    60,
-                ))))
-                .unwrap();
-        }
-        controller
-            .set_leader_lease_watch(
-                lease_rx,
-                owner,
-                Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))),
-            )
-            .unwrap();
-        controller.set_leader_lease_store(authority);
-        assert!(controller.capture_leader_proof().is_some());
-        lease_tx
-    }
-
-    fn snapshot(vnodes: BTreeMap<u32, NodeId>) -> AssignmentSnapshot {
-        let mut node_ids: Vec<u64> = vnodes.values().map(|node| node.0).collect();
-        node_ids.sort_unstable();
-        node_ids.dedup();
-        let participants = node_ids
-            .into_iter()
-            .map(|node_id| CheckpointParticipant {
-                node_id,
-                boot_incarnation: uuid::Uuid::from_u128(u128::from(node_id)),
-            })
-            .collect();
-        AssignmentSnapshot::empty()
-            .next_for_participants(vnodes, participants)
-            .unwrap()
-    }
-
-    fn draining_snapshot(
-        committed: &AssignmentSnapshot,
-        vnodes: BTreeMap<u32, NodeId>,
-        participants: Vec<CheckpointParticipant>,
-    ) -> AssignmentSnapshot {
-        let leader = committed.participants[0];
-        committed
-            .next_draining(
-                vnodes,
-                participants,
-                laminar_core::checkpoint::LeaderProof {
-                    owner: laminar_core::checkpoint::LeaderProofOwner {
-                        node_id: leader.node_id,
-                        boot_id: leader.boot_incarnation,
-                        process_term: 1,
-                    },
-                    fencing_token: 1,
-                },
-            )
-            .unwrap()
-    }
-
-    fn member(
-        id: NodeId,
-        state: laminar_core::cluster::discovery::NodeState,
-    ) -> laminar_core::cluster::discovery::NodeInfo {
-        laminar_core::cluster::discovery::NodeInfo {
-            id,
-            name: format!("node-{}", id.0),
-            rpc_address: String::new(),
-            raft_address: String::new(),
-            state,
-            metadata: laminar_core::cluster::discovery::NodeMetadata::default(),
-            last_heartbeat_ms: 0,
-        }
-    }
-
-    async fn predecessor_failure_fixture(
-        self_process: CheckpointParticipant,
-        failed_process: CheckpointParticipant,
-        owners: Vec<NodeId>,
-        additional_successors: Vec<CheckpointParticipant>,
-    ) -> (
-        Arc<LaminarDB>,
-        Arc<ClusterController>,
-        Arc<AssignmentSnapshotStore>,
-        Arc<VnodeRegistry>,
-        AssignmentSnapshot,
-        Arc<laminar_core::cluster::control::ProcessLeaseAuthority>,
-    ) {
-        use laminar_core::cluster::control::{ClusterKv, InMemoryKv};
-        use laminar_core::cluster::discovery::NodeState;
-
-        let self_id = NodeId(self_process.node_id);
-        let failed_id = NodeId(failed_process.node_id);
-        let mut current_processes = vec![self_process, failed_process];
-        current_processes.sort_unstable_by_key(|participant| participant.node_id);
-        let current = AssignmentSnapshot::empty()
-            .next_for_participants(
-                AssignmentSnapshot::vnodes_from_vec(&owners),
-                current_processes,
-            )
-            .unwrap();
-        let shared_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let durable = Arc::new(AssignmentSnapshotStore::new(Arc::clone(&shared_store)));
-        durable.save_if_absent(&current).await.unwrap();
-
-        let kv = Arc::new(InMemoryKv::new(self_id));
-        let mut successor_processes = current.participants.clone();
-        successor_processes.extend(additional_successors);
-        successor_processes.sort_unstable_by_key(|participant| participant.node_id);
-        successor_processes.dedup_by_key(|participant| participant.node_id);
-        for participant in &successor_processes {
-            if participant.node_id != self_id.0 {
-                kv.seed(
-                    NodeId(participant.node_id),
-                    "control:recovery-incarnation",
-                    participant.boot_incarnation.to_string(),
-                );
-            }
-        }
-        let control: Arc<dyn ClusterKv> = kv.clone();
-        let recovery: Arc<dyn ClusterKv> = kv;
-        let members = successor_processes
-            .iter()
-            .filter(|participant| participant.node_id != self_id.0)
-            .map(|participant| {
-                let id = NodeId(participant.node_id);
-                member(
-                    id,
-                    if id == failed_id {
-                        NodeState::Left
-                    } else {
-                        NodeState::Active
-                    },
-                )
-            })
-            .collect();
-        let (_members_tx, members_rx) = tokio::sync::watch::channel(members);
-        let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
-            self_id,
-            control,
-            recovery,
-            Some(Arc::clone(&durable)),
-            members_rx,
-            self_process.boot_incarnation,
-        ));
-        let process_authority = Arc::new(
-            laminar_core::cluster::control::ProcessLeaseAuthority::new(
-                Arc::clone(&shared_store),
-                Duration::from_millis(50),
-            )
-            .unwrap(),
-        );
-        for participant in &successor_processes {
-            assert!(matches!(
-                process_authority
-                    .store_for(NodeId(participant.node_id))
-                    .try_acquire(participant.boot_incarnation, 0)
-                    .await
-                    .unwrap(),
-                laminar_core::cluster::control::ProcessLeaseOutcome::Acquired(_)
-            ));
-        }
-        let local_process_lease = process_authority
-            .store_for(self_id)
-            .load()
-            .await
-            .unwrap()
-            .expect("local test process lease must be durable");
-        controller
-            .set_process_lease_authority(Arc::clone(&process_authority))
-            .unwrap();
-        let leader_authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&shared_store), 10_000));
-        let leader_owner = laminar_core::cluster::control::LeaderLeaseOwner {
-            node: self_id,
-            boot: self_process.boot_incarnation,
-            process_term: 1,
-        };
-        let laminar_core::cluster::control::LeaseOutcome::Acquired(leader_lease) = leader_authority
-            .begin_new_term(&leader_owner, 0)
-            .await
-            .unwrap()
-        else {
-            panic!("test leader must acquire the empty authority");
-        };
-        let _leader_lease =
-            install_test_leadership(&controller, leader_authority, leader_owner, leader_lease);
-        controller
-            .publish_leased_recovery_incarnation(&local_process_lease)
-            .await
-            .unwrap();
-
-        let vnode_count = u32::try_from(owners.len()).unwrap();
-        let registry = Arc::new(VnodeRegistry::new_unassigned(vnode_count));
-        registry.set_assignment_and_version(owners.into(), current.version);
-        let shuffle_receiver = Arc::new(
-            laminar_core::shuffle::ShuffleReceiver::bind(
-                self_id.0,
-                "127.0.0.1:0".parse().unwrap(),
-                self_process.boot_incarnation,
-            )
-            .await
-            .unwrap(),
-        );
-        let db = LaminarDB::builder()
-            .cluster_controller(Arc::clone(&controller))
-            .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-            .shuffle_sender(Arc::new(laminar_core::shuffle::ShuffleSender::new(
-                self_id.0,
-                self_process.boot_incarnation,
-            )))
-            .shuffle_receiver(shuffle_receiver)
-            .state_backend(Arc::new(InProcessBackend::new(vnode_count)))
-            .vnode_registry(Arc::clone(&registry))
-            .assignment_snapshot_store(Arc::clone(&durable))
-            .build()
-            .await
-            .unwrap();
-        (
-            db,
-            controller,
-            durable,
-            registry,
-            current,
-            process_authority,
-        )
-    }
-
-    async fn dead_predecessor_fixture() -> (
-        Arc<LaminarDB>,
-        Arc<ClusterController>,
-        Arc<AssignmentSnapshotStore>,
-        Arc<VnodeRegistry>,
-        AssignmentSnapshot,
-        Arc<laminar_core::cluster::control::ProcessLeaseAuthority>,
-    ) {
-        predecessor_failure_fixture(
-            CheckpointParticipant {
-                node_id: 1,
-                boot_incarnation: uuid::Uuid::from_u128(11),
-            },
-            CheckpointParticipant {
-                node_id: 2,
-                boot_incarnation: uuid::Uuid::from_u128(22),
-            },
-            vec![NodeId(1), NodeId(2)],
-            Vec::new(),
-        )
-        .await
-    }
-
-    #[test]
-    fn successor_checkpoint_roster_contains_only_successor_owners() {
-        let owners = [NodeId(3), NodeId(1), NodeId(3), NodeId(1)];
-        assert_eq!(successor_participant_ids(&owners), [1, 3]);
-        assert!(!successor_participant_ids(&owners).contains(&2));
-    }
-
-    #[tokio::test]
-    async fn failure_recovery_retains_a_healthy_predecessor_with_no_rendezvous_share() {
-        let healthy = CheckpointParticipant {
-            node_id: 3,
-            boot_incarnation: uuid::Uuid::from_u128(33),
-        };
-        let failed = CheckpointParticipant {
-            node_id: 9,
-            boot_incarnation: uuid::Uuid::from_u128(99),
-        };
-        let successor_five = CheckpointParticipant {
-            node_id: 5,
-            boot_incarnation: uuid::Uuid::from_u128(55),
-        };
-        let successor_seven = CheckpointParticipant {
-            node_id: 7,
-            boot_incarnation: uuid::Uuid::from_u128(77),
-        };
-        assert_eq!(
-            rendezvous_assignment(2, &[NodeId(3), NodeId(5), NodeId(7)]).as_ref(),
-            &[NodeId(5), NodeId(7)]
-        );
-        let (db, controller, durable, registry, current, _process_authority) =
-            predecessor_failure_fixture(
-                healthy,
-                failed,
-                vec![NodeId(3), NodeId(9)],
-                vec![successor_five, successor_seven],
-            )
-            .await;
-        controller.note_unresponsive(&[NodeId(9)]);
-
-        let version = try_rebalance(
-            &db,
-            &controller,
-            &durable,
-            &registry,
-            &[NodeId(3), NodeId(5), NodeId(7), NodeId(9)],
-            RebalanceConfig::test_defaults(),
-        )
-        .await
-        .expect("recovery must retain the healthy predecessor without restoring local state");
-        assert_eq!(version, Some(current.version + 1));
-        let recovery = durable.load().await.unwrap().unwrap();
-        assert_eq!(recovery.to_vnode_vec(2).unwrap(), [NodeId(3), NodeId(7)]);
-        assert_eq!(
-            recovery
-                .assignment_fence()
-                .unwrap()
-                .participant_incarnation(healthy.node_id),
-            Some(healthy.boot_incarnation)
-        );
-        let decision = controller
-            .checkpoint_authority()
-            .unwrap()
-            .assignment_recovery_decision(recovery.version)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(decision.removed_process_fences.len(), 1);
-        assert_eq!(
-            decision.removed_process_fences[0].predecessor.node,
-            NodeId(failed.node_id)
-        );
-        assert!(controller
-            .verify_current_process_incarnation(
-                healthy,
-                tokio::time::Instant::now() + Duration::from_secs(1),
-            )
-            .await
-            .unwrap());
-        assert_eq!(registry.assignment_version(), recovery.version);
-    }
-
-    #[tokio::test]
-    async fn recent_quorum_miss_bypasses_stale_active_membership() {
-        use laminar_core::cluster::control::{ClusterKv, InMemoryKv};
-        use laminar_core::cluster::discovery::NodeState;
-        use uuid::Uuid;
-
-        let self_id = NodeId(1);
-        let peer_id = NodeId(2);
-        let self_boot = Uuid::from_u128(11);
-        let peer_boot = Uuid::from_u128(22);
-        let owners = [self_id, peer_id];
-        let current = AssignmentSnapshot::empty()
-            .next_for_participants(
-                AssignmentSnapshot::vnodes_from_vec(&owners),
-                vec![
-                    CheckpointParticipant {
-                        node_id: self_id.0,
-                        boot_incarnation: self_boot,
-                    },
-                    CheckpointParticipant {
-                        node_id: peer_id.0,
-                        boot_incarnation: peer_boot,
-                    },
-                ],
-            )
-            .unwrap();
-        let kv = Arc::new(InMemoryKv::new(self_id));
-        kv.seed(
-            peer_id,
-            "control:recovery-incarnation",
-            peer_boot.to_string(),
-        );
-        let control: Arc<dyn ClusterKv> = kv.clone();
-        let recovery: Arc<dyn ClusterKv> = kv;
-        let (_members_tx, members_rx) =
-            tokio::sync::watch::channel(vec![member(peer_id, NodeState::Active)]);
-        let controller = ClusterController::new_with_recovery_incarnation(
-            self_id, control, recovery, None, members_rx, self_boot,
-        );
-        controller.publish_recovery_incarnation().await.unwrap();
-        controller.set_active(true);
-        controller.note_unresponsive(&[peer_id]);
-
-        let reason = predecessor_cut_unavailability(&controller, &current, &owners, &owners).await;
-
-        assert_eq!(
-            reason.as_deref(),
-            Some("predecessor owner node-2 cannot certify the source cut")
-        );
-    }
-
-    #[tokio::test]
-    async fn at_least_once_live_rotation_uses_the_global_drain_protocol() {
-        use laminar_connectors::connector::DeliveryGuarantee;
-        use laminar_core::cluster::control::{ClusterKv, InMemoryKv};
-        use laminar_core::cluster::discovery::NodeState;
-        use uuid::Uuid;
-
-        let self_id = NodeId(1);
-        let peer_id = NodeId(2);
-        let self_boot = Uuid::from_u128(11);
-        let peer_boot = Uuid::from_u128(22);
-        let vnode_count = 32;
-        let durable = Arc::new(store());
-        let current = AssignmentSnapshot::empty()
-            .next_for_participants(
-                AssignmentSnapshot::vnodes_from_vec(&vec![self_id; vnode_count as usize]),
-                vec![CheckpointParticipant {
-                    node_id: self_id.0,
-                    boot_incarnation: self_boot,
-                }],
-            )
-            .unwrap();
-        durable.save_if_absent(&current).await.unwrap();
-
-        let kv = Arc::new(InMemoryKv::new(self_id));
-        kv.seed(
-            peer_id,
-            "control:recovery-incarnation",
-            peer_boot.to_string(),
-        );
-        let control: Arc<dyn ClusterKv> = kv.clone();
-        let recovery: Arc<dyn ClusterKv> = kv;
-        let (_members_tx, members_rx) =
-            tokio::sync::watch::channel(vec![member(peer_id, NodeState::Active)]);
-        let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
-            self_id,
-            control,
-            recovery,
-            Some(Arc::clone(&durable)),
-            members_rx,
-            self_boot,
-        ));
-        controller.publish_recovery_incarnation().await.unwrap();
-        controller.set_active(true);
-        let _leader_lease = grant_test_leadership(&controller).await;
-        install_test_process_authority(
-            &controller,
-            &[
-                current.participants[0],
-                CheckpointParticipant {
-                    node_id: peer_id.0,
-                    boot_incarnation: peer_boot,
-                },
-            ],
-        )
-        .await;
-
-        let desired = rendezvous_assignment(vnode_count, &[self_id, peer_id]);
-        assert!(desired.contains(&peer_id));
-        let registry = Arc::new(VnodeRegistry::single_owner(vnode_count, self_id));
-        let db = LaminarDB::builder()
-            .delivery_guarantee(DeliveryGuarantee::AtLeastOnce)
-            .cluster_controller(Arc::clone(&controller))
-            .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-            .state_backend(Arc::new(InProcessBackend::new(vnode_count)))
-            .vnode_registry(Arc::clone(&registry))
-            .assignment_snapshot_store(Arc::clone(&durable))
-            .build()
-            .await
-            .unwrap();
-        let mut config = RebalanceConfig::test_defaults();
-        config.checkpoint_timeout = Duration::from_secs(2);
-        config.drain_ack_timeout = Duration::from_secs(1);
-
-        let error = try_rebalance(
-            &db,
-            &controller,
-            &durable,
-            &registry,
-            &[self_id, peer_id],
-            config,
-        )
-        .await
-        .expect_err("the unstarted test pipeline cannot seal the forced checkpoint");
-        assert!(error.contains("checkpoint"), "{error}");
-
-        let transition = durable
-            .load_drain_transition(current.version + 1)
-            .await
-            .unwrap()
-            .expect("live at-least-once rotation must publish a drain transition");
-        assert!(transition
-            .target
-            .matches_owner_map(&desired.iter().map(|owner| owner.0).collect::<Vec<_>>()));
-        let materialized = durable.load().await.unwrap().unwrap();
-        assert_eq!(materialized.version, current.version + 1);
-        assert_eq!(materialized.vnodes, current.vnodes);
-        assert!(!materialized.draining);
-        let decision = controller
-            .checkpoint_authority()
-            .unwrap()
-            .assignment_drain_decision(materialized.version)
-            .await
-            .unwrap()
-            .expect("failed checkpoint must durably abort the source drain");
-        assert_eq!(decision.verdict, AssignmentDrainVerdict::Abort);
-    }
-
-    #[tokio::test]
-    async fn dead_predecessor_publishes_an_authorized_recovery_generation() {
-        let self_id = NodeId(1);
-        let (db, controller, durable, registry, current, _process_authority) =
-            dead_predecessor_fixture().await;
-        controller.note_unresponsive(&[NodeId(2)]);
-
-        let error = try_rebalance(
-            &db,
-            &controller,
-            &durable,
-            &registry,
-            &[self_id, NodeId(2)],
-            RebalanceConfig::test_defaults(),
-        )
-        .await
-        .expect_err("the unstarted successor cannot restore the acquired state");
-        assert!(error.contains("cannot acquire 1 vnodes"), "{error}");
-        let successor = durable.load().await.unwrap().unwrap();
-        assert_eq!(successor.version, current.version + 1);
-        assert!(!successor.draining);
-        assert_eq!(successor.participants.len(), 1);
-        assert_eq!(successor.participants[0].node_id, self_id.0);
-        assert!(successor
-            .to_vnode_vec(2)
-            .unwrap()
-            .iter()
-            .all(|owner| *owner == self_id));
-        let decision = controller
-            .checkpoint_authority()
-            .unwrap()
-            .assignment_recovery_decision(successor.version)
-            .await
-            .unwrap()
-            .expect("successor must have one immutable recovery decision");
-        assert_eq!(decision.predecessor, current.assignment_fence().unwrap());
-        assert_eq!(decision.target, successor.assignment_fence().unwrap());
-        assert_eq!(decision.removed_process_fences.len(), 1);
-        assert_eq!(
-            decision.removed_process_fences[0].predecessor.node,
-            NodeId(2)
-        );
-        assert_eq!(
-            durable
-                .load_recovery_proposal(&decision.proposal)
-                .await
-                .unwrap(),
-            successor
-        );
-        assert!(controller
-            .verify_process_lease_fence(
-                &decision.removed_process_fences[0],
-                tokio::time::Instant::now() + Duration::from_secs(1),
-            )
-            .await
-            .unwrap());
-        assert_eq!(registry.assignment_version(), current.version);
-        assert!(db.cluster_intake_fenced());
-        assert!(controller.is_recovering());
-        assert!(controller
-            .read_fault_reports()
-            .await
-            .unwrap()
-            .iter()
-            .any(|(node, sequence)| *node == controller.instance_id() && *sequence != 0));
-    }
-
-    #[tokio::test]
-    async fn renewing_predecessor_cannot_be_removed_by_failure_recovery() {
-        let self_id = NodeId(1);
-        let (db, controller, durable, registry, current, process_authority) =
-            dead_predecessor_fixture().await;
-        let predecessor = current.participants[1];
-        let predecessor_store = process_authority.store_for(NodeId(predecessor.node_id));
-        let keep_renewing = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let renewal_flag = Arc::clone(&keep_renewing);
-        let first_renewal = Arc::new(Notify::new());
-        let renewal_started = Arc::clone(&first_renewal);
-        let renewals = tokio::spawn(async move {
-            let mut timestamp = 1;
-            while renewal_flag.load(std::sync::atomic::Ordering::Acquire) {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-                predecessor_store
-                    .try_acquire(predecessor.boot_incarnation, timestamp)
-                    .await
-                    .unwrap();
-                renewal_started.notify_one();
-                timestamp += 1;
-            }
-        });
-        tokio::time::timeout(Duration::from_secs(1), first_renewal.notified())
-            .await
-            .expect("predecessor renewal task did not start");
-
-        let error = try_rebalance(
-            &db,
-            &controller,
-            &durable,
-            &registry,
-            &[self_id],
-            RebalanceConfig::test_defaults(),
-        )
-        .await
-        .expect_err("a renewing process term must win against recovery fencing");
-        keep_renewing.store(false, std::sync::atomic::Ordering::Release);
-        renewals.await.unwrap();
-        assert!(error.contains("renewed"), "{error}");
-        assert_eq!(durable.load().await.unwrap().unwrap(), current);
-        assert!(controller
-            .checkpoint_authority()
-            .unwrap()
-            .assignment_recovery_decision(current.version + 1)
-            .await
-            .unwrap()
-            .is_none());
-        assert!(controller
-            .read_local_fault_report()
-            .await
-            .unwrap()
-            .is_none());
-    }
-
-    #[test]
-    fn drain_abort_restores_committed_process_roster() {
-        let committed = snapshot(BTreeMap::from([(0, NodeId(1))]));
-        let replacement = CheckpointParticipant {
-            node_id: 2,
-            boot_incarnation: uuid::Uuid::from_u128(2),
-        };
-        let draining = draining_snapshot(
-            &committed,
-            BTreeMap::from([(0, NodeId(2))]),
-            vec![replacement],
-        );
-
-        let aborted = draining.aborted_target(&committed).unwrap();
-        assert!(!aborted.draining);
-        assert_eq!(aborted.vnodes, committed.vnodes);
-        assert_eq!(aborted.participants, committed.participants);
-    }
-
-    #[test]
-    fn drain_certificate_binds_the_durable_target_map_and_boot_roster() {
-        let committed = snapshot(BTreeMap::from([(0, NodeId(1)), (1, NodeId(1))]));
-        assert!(committed.drain_transition.is_none());
-        let replacement = CheckpointParticipant {
-            node_id: 2,
-            boot_incarnation: uuid::Uuid::from_u128(22),
-        };
-        let draining = draining_snapshot(
-            &committed,
-            BTreeMap::from([(0, NodeId(1)), (1, NodeId(2))]),
-            vec![committed.participants[0], replacement],
-        );
-        draining.to_vnode_vec(2).unwrap();
-        let fence = draining.drain_transition.as_ref().unwrap().target.clone();
-        assert_eq!(fence.assignment_version, draining.version);
-        assert_eq!(fence.participants, draining.participants);
-        assert!(fence.matches_owner_map(&[1, 2]));
-        assert!(draining.to_vnode_vec(1).is_err());
-    }
-
-    #[test]
-    fn publish_placement_metrics_labels_by_domain() {
-        let prom = prometheus::Registry::new();
-        let metrics = EngineMetrics::new(&prom);
-
-        // 4 vnodes: node 1 owns two, node 2 owns one, one is unassigned.
-        let vreg = VnodeRegistry::new(4);
-        vreg.set_assignment(vec![NodeId(1), NodeId(1), NodeId(2), NodeId::UNASSIGNED].into());
-        let nodes = vec![
-            (NodeId(1), Locality::parse("region=r;zone=z1")),
-            (NodeId(2), Locality::parse("region=r;zone=z2")),
-        ];
-
-        publish_placement_metrics(&metrics, &vreg, &nodes, 1); // isolation_tier 1 = zone
-
-        let g = &metrics.placement_vnodes_per_domain;
-        assert_eq!(g.with_label_values(&["r;z1"]).get(), 2);
-        assert_eq!(g.with_label_values(&["r;z2"]).get(), 1);
-        assert_eq!(g.with_label_values(&["unknown"]).get(), 1); // the unassigned vnode
-                                                                // Blast radius = largest domain (2) / total vnodes (4).
-        assert!((metrics.placement_blast_radius_ratio.get() - 0.5).abs() < 1e-9);
-    }
-
-    #[test]
-    fn checkpoint_fence_requires_exact_reports_and_complete_live_owners() {
-        fn participant(node_id: u64, boot: u64) -> CheckpointParticipant {
-            CheckpointParticipant {
-                node_id,
-                boot_incarnation: format!("00000000-0000-0000-0000-{boot:012x}")
-                    .parse()
-                    .unwrap(),
-            }
-        }
-
-        fn adoption(
-            participant: CheckpointParticipant,
-            version: u64,
-            owners: &[u64],
-        ) -> CheckpointAssignmentAdoption {
-            let vnode_count = u32::try_from(owners.len()).unwrap();
-            CheckpointAssignmentAdoption {
-                participant,
-                assignment_version: version,
-                vnode_count,
-                partitioning_abi_version: laminar_core::state::PARTITIONING_ABI_VERSION,
-                assignment_digest: CheckpointAssignmentFence::owner_map_digest(vnode_count, owners),
-            }
-        }
-
-        let p1 = participant(1, 11);
-        let p2 = participant(2, 22);
-        let owners = [1, 2, 1];
-        let reported = rustc_hash::FxHashMap::from_iter([
-            (1, adoption(p1, 7, &owners)),
-            (2, adoption(p2, 7, &owners)),
-        ]);
-        let fence = checkpoint_assignment_fence(
-            7,
-            &[NodeId(1), NodeId(2), NodeId(1)],
-            vec![p1, p2],
-            &reported,
-        )
-        .expect("exact assignment should be checkpoint-ready");
-        assert_eq!(fence.assignment_version, 7);
-        assert_eq!(fence.participant_ids(), [1, 2]);
-        assert!(fence.matches_owner_map(&owners));
-
-        assert!(
-            checkpoint_assignment_fence(7, &[NodeId(1), NodeId(9)], vec![p1, p2], &reported,)
-                .is_none(),
-            "an owner outside current checkpoint membership must close the fence"
-        );
-        assert!(
-            checkpoint_assignment_fence(
-                7,
-                &[NodeId(1), NodeId::UNASSIGNED],
-                vec![p1, p2],
-                &reported,
-            )
-            .is_none(),
-            "unassigned vnodes are never restorable"
-        );
-
-        let missing_report = rustc_hash::FxHashMap::from_iter([(1, adoption(p1, 7, &[1, 2]))]);
-        assert!(checkpoint_assignment_fence(
-            7,
-            &[NodeId(1), NodeId(2)],
-            vec![p1, p2],
-            &missing_report,
-        )
-        .is_none());
-        let stale_report = rustc_hash::FxHashMap::from_iter([
-            (1, adoption(p1, 7, &[1, 2])),
-            (2, adoption(p2, 6, &[1, 2])),
-        ]);
-        assert!(checkpoint_assignment_fence(
-            7,
-            &[NodeId(1), NodeId(2)],
-            vec![p1, p2],
-            &stale_report,
-        )
-        .is_none());
-
-        let divergent_same_version = rustc_hash::FxHashMap::from_iter([
-            (1, adoption(p1, 7, &[1, 2])),
-            (2, adoption(p2, 7, &[2, 1])),
-        ]);
-        assert!(checkpoint_assignment_fence(
-            7,
-            &[NodeId(1), NodeId(2)],
-            vec![p1, p2],
-            &divergent_same_version,
-        )
-        .is_none());
-
-        let restarted_p2 = participant(2, 222);
-        assert!(checkpoint_assignment_fence(
-            7,
-            &[NodeId(1), NodeId(2)],
-            vec![p1, restarted_p2],
-            &rustc_hash::FxHashMap::from_iter([
-                (1, adoption(p1, 7, &[1, 2])),
-                (2, adoption(p2, 7, &[1, 2])),
-            ]),
-        )
-        .is_none());
-    }
-
-    #[tokio::test]
-    async fn wait_until_drained_false_while_owning_vnodes() {
-        let s = store();
-        let me = NodeId(1);
-        let mut vnodes = BTreeMap::new();
-        vnodes.insert(0, me);
-        vnodes.insert(1, NodeId(2));
-        let snap = snapshot(vnodes);
-        s.save_if_absent(&snap).await.unwrap();
-
-        let drained = wait_until_drained(
-            &s,
-            None,
-            me,
-            2,
-            Duration::from_millis(20),
-            Duration::from_millis(120),
-        )
-        .await;
-        assert!(!drained, "still owns vnode 0 → not drained");
-    }
-
-    #[tokio::test]
-    async fn wait_until_drained_true_when_owning_none() {
-        let s = store();
-        let me = NodeId(1);
-        let mut vnodes = BTreeMap::new();
-        vnodes.insert(0, NodeId(2));
-        vnodes.insert(1, NodeId(3));
-        let snap = snapshot(vnodes);
-        s.save_if_absent(&snap).await.unwrap();
-
-        let drained = wait_until_drained(
-            &s,
-            None,
-            me,
-            2,
-            Duration::from_millis(20),
-            Duration::from_secs(5),
-        )
-        .await;
-        assert!(drained, "owns no vnode → drained quickly");
-    }
-
-    #[tokio::test]
-    async fn wait_until_drained_fails_closed_when_no_snapshot() {
-        let s = store();
-        let drained = wait_until_drained(
-            &s,
-            None,
-            NodeId(1),
-            1,
-            Duration::from_millis(10),
-            Duration::from_millis(60),
-        )
-        .await;
-        assert!(
-            !drained,
-            "missing ownership authority cannot certify a safe exit"
-        );
-    }
-
-    #[tokio::test]
-    async fn wait_until_drained_bounds_a_stalled_snapshot_read() {
-        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let blocked: Arc<dyn ObjectStore> = Arc::new(PendingListStore { inner });
-        let store = AssignmentSnapshotStore::new(blocked);
-
-        let drained = tokio::time::timeout(
-            Duration::from_millis(250),
-            wait_until_drained(
-                &store,
-                None,
-                NodeId(1),
-                1,
-                Duration::from_millis(5),
-                Duration::from_millis(40),
-            ),
-        )
-        .await
-        .expect("the shutdown deadline must cancel a stalled object-store read");
-        assert!(!drained, "an unreadable durable head cannot certify drain");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn assignment_closure_cancels_shuffle_before_waiting_for_execution_drain() {
-        use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointBarrier};
-        use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
-        use uuid::Uuid;
-
-        let local_boot = Uuid::from_u128(11);
-        let participants = vec![
-            CheckpointParticipant {
-                node_id: 1,
-                boot_incarnation: local_boot,
-            },
-            CheckpointParticipant {
-                node_id: 2,
-                boot_incarnation: Uuid::from_u128(22),
-            },
-        ];
-        let assignment =
-            CheckpointAssignmentFence::from_owner_map(1, &[1, 2], participants).unwrap();
-        let controller = test_cluster_controller(NodeId(1), local_boot, None);
-        let process_deadline = controller
-            .process_lease_deadline()
-            .expect("test controller process lease deadline");
-        let receiver = Arc::new(
-            ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap(), local_boot)
-                .await
-                .unwrap(),
-        );
-        let sender = Arc::new(ShuffleSender::new(1, local_boot));
-        receiver
-            .install_process_lease_deadline(Arc::clone(&process_deadline))
-            .unwrap();
-        sender
-            .install_process_lease_deadline(process_deadline)
-            .unwrap();
-        receiver
-            .install_assignment_fence(&assignment, &[1, 2])
-            .unwrap();
-        sender
-            .install_assignment_fence(&assignment, &[1, 2])
-            .unwrap();
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        sender.register_peer(2, listener.local_addr().unwrap());
-        let accepted = Arc::new(Notify::new());
-        let peer = {
-            let accepted = Arc::clone(&accepted);
-            tokio::spawn(async move {
-                let (_socket, _) = listener.accept().await.unwrap();
-                accepted.notify_one();
-                std::future::pending::<()>().await;
-            })
-        };
-
-        let registry = Arc::new(VnodeRegistry::single_owner(1, NodeId(1)));
-        let db = LaminarDB::builder()
-            .cluster_controller(controller)
-            .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-            .state_backend(Arc::new(InProcessBackend::new(1)))
-            .vnode_registry(registry)
-            .shuffle_sender(Arc::clone(&sender))
-            .shuffle_receiver(receiver)
-            .build()
-            .await
-            .unwrap();
-        let blocked_cycle = {
-            let execution_fence = Arc::clone(&db.rotation_execution_fence);
-            let sender = Arc::clone(&sender);
-            let assignment = assignment.clone();
-            tokio::spawn(async move {
-                let _cycle = execution_fence.read_owned().await;
-                sender
-                    .fan_out_barrier(&[2], CheckpointBarrier::new(7, 7), &assignment)
-                    .await
-            })
-        };
-        tokio::time::timeout(Duration::from_secs(1), accepted.notified())
-            .await
-            .expect("shuffle send did not reach the peer handshake");
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        let closing = {
-            let db = Arc::clone(&db);
-            tokio::spawn(async move { close_local_assignment_authority(&db, None, deadline).await })
-        };
-        tokio::time::timeout_at(deadline, async {
-            while sender.assignment_version() != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("authority closure did not cancel shuffle admission");
-        let error = tokio::time::timeout_at(deadline, blocked_cycle)
-            .await
-            .expect("cancelled shuffle cycle did not exit")
-            .unwrap()
-            .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
-        tokio::time::timeout_at(deadline, closing)
-            .await
-            .expect("authority closure deadlocked behind a shuffle-held read fence")
-            .unwrap()
-            .expect("authority closure exceeded its deadline");
-        assert!(db.cluster_intake_fenced());
-        peer.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn assignment_suspension_reasserts_closure_after_serialization_race() {
-        use laminar_core::checkpoint::CheckpointAssignmentFence;
-        use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
-        use uuid::Uuid;
-
-        let local_boot = Uuid::from_u128(11);
-        let participants = vec![CheckpointParticipant {
-            node_id: 1,
-            boot_incarnation: local_boot,
-        }];
-        let assignment = CheckpointAssignmentFence::from_owner_map(1, &[1], participants).unwrap();
-        let controller = test_cluster_controller(NodeId(1), local_boot, None);
-        let process_deadline = controller
-            .process_lease_deadline()
-            .expect("test controller process lease deadline");
-        let receiver = Arc::new(
-            ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap(), local_boot)
-                .await
-                .unwrap(),
-        );
-        let sender = Arc::new(ShuffleSender::new(1, local_boot));
-        receiver
-            .install_process_lease_deadline(Arc::clone(&process_deadline))
-            .unwrap();
-        sender
-            .install_process_lease_deadline(process_deadline)
-            .unwrap();
-        receiver
-            .install_assignment_fence(&assignment, &[1])
-            .unwrap();
-        sender.install_assignment_fence(&assignment, &[1]).unwrap();
-
-        let registry = Arc::new(VnodeRegistry::single_owner(1, NodeId(1)));
-        let db = LaminarDB::builder()
-            .cluster_controller(controller)
-            .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-            .state_backend(Arc::new(InProcessBackend::new(1)))
-            .vnode_registry(registry)
-            .shuffle_sender(Arc::clone(&sender))
-            .shuffle_receiver(receiver)
-            .build()
-            .await
-            .unwrap();
-        let adoption = db.assignment_adoption_lock.lock().await;
-        let suspension = {
-            let db = Arc::clone(&db);
-            tokio::spawn(async move {
-                suspend_local_assignment_authority(
-                    &db,
-                    None,
-                    tokio::time::Instant::now() + Duration::from_secs(1),
-                )
-                .await
-            })
-        };
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while sender.assignment_version() != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("suspension did not close shuffle before waiting for serialization");
-
-        assert!(sender
-            .install_assignment_fence(&assignment, &[1])
-            .expect("the retained same-version certificate must be resumable"));
-        db.set_source_gate(false);
-        drop(adoption);
-
-        suspension
-            .await
-            .unwrap()
-            .expect("serialized suspension exceeded its deadline");
-        assert_eq!(sender.assignment_version(), 0);
-        assert_eq!(sender.active_assignment_digest(), None);
-        assert!(db.cluster_intake_fenced());
-        assert!(sender
-            .install_assignment_fence(&assignment, &[1])
-            .expect("suspension must preserve the same-version certificate"));
-    }
-
-    #[tokio::test]
-    async fn wait_until_drained_fails_closed_on_wrong_vnode_cardinality() {
-        let store = store();
-        let snapshot = snapshot(BTreeMap::from([(0, NodeId(2))]));
-        store.save_if_absent(&snapshot).await.unwrap();
-
-        let drained = wait_until_drained(
-            &store,
-            None,
-            NodeId(1),
-            2,
-            Duration::from_millis(10),
-            Duration::from_millis(60),
-        )
-        .await;
-        assert!(
-            !drained,
-            "wrong-cardinality history cannot certify a safe exit"
-        );
-    }
-
-    #[tokio::test]
-    async fn wait_until_drained_does_not_treat_draining_target_as_committed() {
-        let store = store();
-        let me = NodeId(1);
-        let replacement = NodeId(2);
-        let committed = snapshot(BTreeMap::from([(0, me)]));
-        store.save_if_absent(&committed).await.unwrap();
-
-        let replacement_process = CheckpointParticipant {
-            node_id: replacement.0,
-            boot_incarnation: uuid::Uuid::from_u128(2),
-        };
-        let draining = draining_snapshot(
-            &committed,
-            BTreeMap::from([(0, replacement)]),
-            vec![replacement_process],
-        );
-        store
-            .save_if_version(&draining, committed.version)
-            .await
-            .unwrap();
-
-        assert!(
-            !wait_until_drained(
-                &store,
-                None,
-                me,
-                1,
-                Duration::from_millis(10),
-                Duration::from_millis(60),
-            )
-            .await,
-            "a drain target has not transferred durable ownership"
-        );
-
-        let replacement_committed = draining.committed_target().unwrap();
-        store
-            .finalize_drain(&draining, &replacement_committed)
-            .await
-            .unwrap();
-        assert!(
-            !wait_until_drained(
-                &store,
-                None,
-                me,
-                1,
-                Duration::from_millis(10),
-                Duration::from_millis(40),
-            )
-            .await,
-            "a standalone materialization cannot certify shutdown"
-        );
-
-        let authority = LeaderLeaseStore::new(Arc::new(InMemory::new()), 1_000);
-        let owner = laminar_core::cluster::control::LeaderLeaseOwner {
-            node: me,
-            boot: committed.participants[0].boot_incarnation,
-            process_term: 1,
-        };
-        let laminar_core::cluster::control::LeaseOutcome::Acquired(lease) =
-            authority.begin_new_term(&owner, 0).await.unwrap()
-        else {
-            panic!("test authority acquisition must succeed");
-        };
-        let transition = draining.drain_transition.as_ref().unwrap();
-        assert_eq!(lease.proof(), transition.leader);
-        let decision =
-            AssignmentDrainDecision::new(transition, lease.proof(), AssignmentDrainVerdict::Commit)
-                .unwrap();
-        authority
-            .record_assignment_drain_decision(&lease.proof(), decision)
-            .await
-            .unwrap();
-        assert!(
-            wait_until_drained(
-                &store,
-                Some(&authority),
-                me,
-                1,
-                Duration::from_millis(10),
-                Duration::from_millis(60),
-            )
-            .await,
-            "only the committed successor can certify shutdown"
-        );
-    }
-
-    #[tokio::test]
-    async fn bare_recovery_successor_without_an_authority_decision_is_rejected() {
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let durable = Arc::new(AssignmentSnapshotStore::new(Arc::clone(&object_store)));
-        let first = AssignmentSnapshot::empty()
-            .next_for_participants(
-                BTreeMap::from([(0, NodeId(1))]),
-                vec![CheckpointParticipant {
-                    node_id: 1,
-                    boot_incarnation: uuid::Uuid::from_u128(11),
-                }],
-            )
-            .unwrap();
-        let unauthorized = first
-            .next_for_participants(
-                BTreeMap::from([(0, NodeId(2))]),
-                vec![CheckpointParticipant {
-                    node_id: 2,
-                    boot_incarnation: uuid::Uuid::from_u128(22),
-                }],
-            )
-            .unwrap();
-        durable.save_if_absent(&first).await.unwrap();
-        assert!(matches!(
-            durable
-                .save_if_version(&unauthorized, first.version)
-                .await
-                .unwrap(),
-            RotateOutcome::Rotated
-        ));
-        let controller = test_cluster_controller(
-            NodeId(1),
-            uuid::Uuid::from_u128(11),
-            Some(Arc::clone(&durable)),
-        );
-        controller.set_leader_lease_store(Arc::new(LeaderLeaseStore::new(object_store, 10_000)));
-        let error = audit_assignment_snapshot_authority(&durable, Some(&controller), &unauthorized)
-            .await
-            .expect_err("a bare stable successor must never pass authority audit");
-        assert!(
-            error.contains("no drain transition or recovery authority decision"),
-            "{error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn startup_rejects_drain_that_does_not_bind_retained_predecessor() {
-        let durable = Arc::new(store());
-        let retained = snapshot(BTreeMap::from([(0, NodeId(1))]));
-        durable.save_if_absent(&retained).await.unwrap();
-
-        let different_predecessor = snapshot(BTreeMap::from([(0, NodeId(2))]));
-        let forged_head = draining_snapshot(
-            &different_predecessor,
-            BTreeMap::from([(0, NodeId(3))]),
-            vec![CheckpointParticipant {
-                node_id: 3,
-                boot_incarnation: uuid::Uuid::from_u128(3),
-            }],
-        );
-        assert!(matches!(
-            durable
-                .save_if_version(&forged_head, retained.version)
-                .await
-                .unwrap(),
-            RotateOutcome::Rotated
-        ));
-
-        let head = durable.load().await.unwrap().unwrap();
-        let error = startup_committed_assignment(&durable, None, head)
-            .await
-            .expect_err("startup must reject a transition over another predecessor");
-        assert!(
-            error.contains("does not bind retained predecessor"),
-            "{error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn watcher_resumes_exact_authority_after_transient_audit_gaps() {
-        use laminar_core::cluster::control::{ClusterKv, InMemoryKv};
-        use laminar_core::cluster::discovery::NodeInfo;
-        use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
-        use uuid::Uuid;
-
-        let self_id = NodeId(1);
-        let boot = Uuid::from_u128(11);
-        let process = CheckpointParticipant {
-            node_id: self_id.0,
-            boot_incarnation: boot,
-        };
-        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let durable = Arc::new(AssignmentSnapshotStore::new(Arc::clone(&object_store)));
-        let committed = AssignmentSnapshot::empty()
-            .next_for_participants(BTreeMap::from([(0, self_id)]), vec![process])
-            .unwrap();
-        durable.save_if_absent(&committed).await.unwrap();
-
-        let kv = Arc::new(InMemoryKv::new(self_id));
-        let control: Arc<dyn ClusterKv> = kv.clone();
-        let recovery: Arc<dyn ClusterKv> = kv.clone();
-        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
-        let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
-            self_id,
-            control,
-            recovery,
-            Some(Arc::clone(&durable)),
-            members_rx,
-            boot,
-        ));
-        controller
-            .set_process_lease_deadline(Arc::new(
-                laminar_core::cluster::control::LeaseDeadline::live_for(Duration::from_secs(60)),
-            ))
-            .unwrap();
-        controller.publish_recovery_incarnation().await.unwrap();
-        controller.set_active(true);
-        let _process_authority = install_test_process_authority(&controller, &[process]).await;
-        let _leader_lease = grant_test_leadership(&controller).await;
-
-        let registry = Arc::new(VnodeRegistry::single_owner(1, self_id));
-        let receiver = Arc::new(
-            ShuffleReceiver::bind(self_id.0, "127.0.0.1:0".parse().unwrap(), boot)
-                .await
-                .unwrap(),
-        );
-        let sender = Arc::new(ShuffleSender::new(self_id.0, boot));
-        let db = LaminarDB::builder()
-            .cluster_controller(Arc::clone(&controller))
-            .cluster_checkpoint_object_store(Arc::clone(&object_store))
-            .state_backend(Arc::new(InProcessBackend::new(1)))
-            .vnode_registry(Arc::clone(&registry))
-            .assignment_snapshot_store(Arc::clone(&durable))
-            .shuffle_sender(Arc::clone(&sender))
-            .shuffle_receiver(Arc::clone(&receiver))
-            .build()
-            .await
-            .unwrap();
-        db.set_source_gate(true);
-        let shutdown = CancellationToken::new();
-        let mut config = RebalanceConfig::test_defaults();
-        config.watcher_poll = Duration::from_millis(10);
-        config.checkpoint_timeout = Duration::from_millis(100);
-        let watcher = spawn_snapshot_watcher(
-            Arc::clone(&db),
-            Arc::clone(&durable),
-            Arc::clone(&registry),
-            shutdown.clone(),
-            config,
-            Some(Arc::clone(&controller)),
-        );
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while db.cluster_intake_fenced() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("valid durable authority should open intake");
-        assert!(controller
-            .checkpoint_assignment_fence(committed.version)
-            .is_some());
-        assert_eq!(sender.assignment_version(), committed.version);
-        assert_eq!(receiver.assignment_version(), committed.version);
-
-        let corrupt_path = object_store::path::Path::from(
-            "control/assignment-snapshots/v00000000000000000002.json",
-        );
-        object_store
-            .put(
-                &corrupt_path,
-                object_store::PutPayload::from(bytes::Bytes::from_static(b"{not-json")),
-            )
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !db.cluster_intake_fenced() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("a corrupt durable head must close intake");
-        assert_eq!(
-            controller.checkpoint_assignment_fence(committed.version),
-            None
-        );
-        assert_eq!(sender.assignment_version(), 0);
-        assert_eq!(receiver.assignment_version(), 0);
-
-        object_store.delete(&corrupt_path).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while db.cluster_intake_fenced() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("the exact durable head should resume after the transient read fault clears");
-        assert_eq!(sender.assignment_version(), committed.version);
-        assert_eq!(receiver.assignment_version(), committed.version);
-
-        let exact_adoption = controller
-            .read_adopted_assignments()
-            .await
-            .unwrap()
-            .into_iter()
-            .find_map(|(node, adoption)| (node == self_id).then_some(adoption))
-            .expect("watcher must publish its exact adoption report");
-        let expected_digest = committed.assignment_fence().unwrap().digest();
-        let mut incomplete_adoption = exact_adoption.clone();
-        incomplete_adoption.assignment_version += 1;
-        kv.seed(
-            self_id,
-            "control:adopted-assignment",
-            serde_json::to_string(&incomplete_adoption).unwrap(),
-        );
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !db.cluster_intake_fenced()
-                || sender.assignment_version() != 0
-                || receiver.assignment_version() != 0
-            {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("an incomplete adoption cut must suspend assignment authority");
-        assert_eq!(
-            controller.checkpoint_assignment_fence(committed.version),
-            None
-        );
-
-        kv.seed(
-            self_id,
-            "control:adopted-assignment",
-            serde_json::to_string(&exact_adoption).unwrap(),
-        );
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while db.cluster_intake_fenced() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("the exact adoption cut should resume its retained certificate");
-        assert_eq!(registry.assignment_version(), committed.version);
-        assert_eq!(sender.assignment_version(), committed.version);
-        assert_eq!(receiver.assignment_version(), committed.version);
-        assert_eq!(sender.active_assignment_digest(), Some(expected_digest));
-        assert_eq!(receiver.active_assignment_digest(), Some(expected_digest));
-
-        object_store
-            .put(
-                &corrupt_path,
-                object_store::PutPayload::from(bytes::Bytes::from_static(b"{not-json")),
-            )
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !db.cluster_intake_fenced() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("the second corrupt head must suspend authority");
-        let execution = Arc::clone(&db.rotation_execution_fence).read_owned().await;
-        object_store.delete(&corrupt_path).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if db.assignment_adoption_lock.try_lock().is_err() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("watcher must reach the serialized activation boundary");
-        db.set_source_gate(true);
-        controller.publish_checkpoint_drain_transition(None);
-        controller.publish_checkpoint_assignment_fence(None);
-        db.suspend_shuffle_assignment_fence();
-        shutdown.cancel();
-        drop(execution);
-        tokio::time::timeout(Duration::from_secs(1), watcher)
-            .await
-            .expect("watcher should observe shutdown")
-            .unwrap();
-        assert!(db.cluster_intake_fenced());
-        assert_eq!(
-            controller.checkpoint_assignment_fence(committed.version),
-            None
-        );
-        assert_eq!(sender.assignment_version(), 0);
-        assert_eq!(receiver.assignment_version(), 0);
-    }
-
-    #[tokio::test]
-    async fn restarted_process_publishes_an_authorized_recovery_generation() {
-        use laminar_core::cluster::control::{ClusterKv, InMemoryKv};
-        use laminar_core::cluster::discovery::NodeInfo;
-        use uuid::Uuid;
-
-        let self_id = NodeId(1);
-        let old_process = CheckpointParticipant {
-            node_id: self_id.0,
-            boot_incarnation: Uuid::from_u128(11),
-        };
-        let new_boot = Uuid::from_u128(111);
-        let vnodes = BTreeMap::from([(0, self_id), (1, self_id)]);
-        let shared_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let durable = Arc::new(AssignmentSnapshotStore::new(Arc::clone(&shared_store)));
-        let first = AssignmentSnapshot::empty()
-            .next_for_participants(vnodes.clone(), vec![old_process])
-            .unwrap();
-        durable.save_if_absent(&first).await.unwrap();
-
-        let control = Arc::new(InMemoryKv::new(self_id));
-        let control_kv: Arc<dyn ClusterKv> = control.clone();
-        let recovery_kv: Arc<dyn ClusterKv> = control;
-        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
-        let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
-            self_id,
-            control_kv,
-            recovery_kv,
-            Some(Arc::clone(&durable)),
-            members_rx,
-            new_boot,
-        ));
-        controller.publish_recovery_incarnation().await.unwrap();
-        controller.set_active(true);
-        let process_authority = Arc::new(
-            laminar_core::cluster::control::ProcessLeaseAuthority::new(
-                Arc::clone(&shared_store),
-                Duration::from_millis(1),
-            )
-            .unwrap(),
-        );
-        let process_store = process_authority.store_for(self_id);
-        let laminar_core::cluster::control::ProcessLeaseOutcome::Acquired(old_lease) =
-            process_store
-                .try_acquire(old_process.boot_incarnation, 0)
-                .await
-                .unwrap()
-        else {
-            panic!("old process must seed its lease");
-        };
-        let observation = process_store.observe_rival(&old_lease).unwrap();
-        tokio::time::sleep(Duration::from_millis(2)).await;
-        let laminar_core::cluster::control::ProcessLeaseOutcome::Acquired(new_lease) =
-            process_store
-                .try_takeover(new_boot, &observation, 1)
-                .await
-                .unwrap()
-        else {
-            panic!("replacement process must take over");
-        };
-        controller
-            .set_process_lease_authority(process_authority)
-            .unwrap();
-        controller
-            .set_process_lease_deadline(Arc::new(
-                laminar_core::cluster::control::LeaseDeadline::live_for(Duration::from_secs(60)),
-            ))
-            .unwrap();
-        controller
-            .publish_leased_recovery_incarnation(&new_lease)
-            .await
-            .unwrap();
-        controller.set_active(true);
-        let leader_authority = Arc::new(LeaderLeaseStore::new(Arc::clone(&shared_store), 10_000));
-        let leader_owner = laminar_core::cluster::control::LeaderLeaseOwner {
-            node: self_id,
-            boot: new_boot,
-            process_term: new_lease.term,
-        };
-        let laminar_core::cluster::control::LeaseOutcome::Acquired(leader_lease) = leader_authority
-            .begin_new_term(&leader_owner, 0)
-            .await
-            .unwrap()
-        else {
-            panic!("replacement process must acquire leadership");
-        };
-        let _leader_lease =
-            install_test_leadership(&controller, leader_authority, leader_owner, leader_lease);
-
-        let registry = Arc::new(VnodeRegistry::single_owner(2, self_id));
-        let db = LaminarDB::builder()
-            .cluster_controller(Arc::clone(&controller))
-            .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-            .state_backend(Arc::new(InProcessBackend::new(2)))
-            .vnode_registry(Arc::clone(&registry))
-            .assignment_snapshot_store(Arc::clone(&durable))
-            .build()
-            .await
-            .unwrap();
-        let error = try_rebalance(
-            &db,
-            &controller,
-            &durable,
-            &registry,
-            &[self_id],
-            RebalanceConfig::test_defaults(),
-        )
-        .await
-        .expect_err("a new process incarnation must restore before adopting its old vnodes");
-
-        assert!(error.contains("cannot acquire 2 vnodes"), "{error}");
-        let advanced = durable.load().await.unwrap().unwrap();
-        assert_eq!(advanced.version, first.version + 1);
-        assert_eq!(advanced.vnodes, vnodes);
-        assert_eq!(
-            advanced.participants,
-            vec![CheckpointParticipant {
-                node_id: self_id.0,
-                boot_incarnation: new_boot,
-            }]
-        );
-        assert!(db.cluster_intake_fenced());
-        assert_eq!(registry.assignment_version(), first.version);
-    }
-
-    #[tokio::test]
-    async fn restart_after_durable_drain_retains_abort_until_recovery() {
-        use laminar_core::cluster::control::{ClusterKv, InMemoryKv};
-        use laminar_core::cluster::discovery::NodeInfo;
-        use uuid::Uuid;
-
-        let self_id = NodeId(1);
-        let boot = Uuid::from_u128(11);
-        let restart_boot = Uuid::from_u128(111);
-        let participant = CheckpointParticipant {
-            node_id: self_id.0,
-            boot_incarnation: boot,
-        };
-        let committed_vnodes = BTreeMap::from([(0, self_id)]);
-        let durable = Arc::new(store());
-        let committed = AssignmentSnapshot::empty()
-            .next_for_participants(committed_vnodes.clone(), vec![participant])
-            .unwrap();
-        durable.save_if_absent(&committed).await.unwrap();
-        let drain = draining_snapshot(
-            &committed,
-            BTreeMap::from([(0, NodeId(2))]),
-            vec![CheckpointParticipant {
-                node_id: 2,
-                boot_incarnation: Uuid::from_u128(22),
-            }],
-        );
-        assert!(matches!(
-            durable
-                .save_if_version(&drain, committed.version)
-                .await
-                .unwrap(),
-            RotateOutcome::Rotated
-        ));
-
-        let kv = Arc::new(InMemoryKv::new(self_id));
-        let control: Arc<dyn ClusterKv> = kv.clone();
-        let recovery: Arc<dyn ClusterKv> = kv;
-        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
-        let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
-            self_id,
-            control,
-            recovery,
-            Some(Arc::clone(&durable)),
-            members_rx,
-            restart_boot,
-        ));
-        controller.publish_recovery_incarnation().await.unwrap();
-        let _leader_lease = grant_test_leadership(&controller).await;
-        let registry = Arc::new(VnodeRegistry::single_owner(1, self_id));
-        let db = LaminarDB::builder()
-            .cluster_controller(Arc::clone(&controller))
-            .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-            .state_backend(Arc::new(InProcessBackend::new(1)))
-            .vnode_registry(Arc::clone(&registry))
-            .assignment_snapshot_store(Arc::clone(&durable))
-            .build()
-            .await
-            .unwrap();
-        db.validate_source_drain_snapshot(&drain).unwrap();
-
-        let error = try_rebalance(
-            &db,
-            &controller,
-            &durable,
-            &registry,
-            &[self_id],
-            RebalanceConfig::test_defaults(),
-        )
-        .await
-        .expect_err("a skipped assignment generation must restore before local adoption");
-        assert!(error.contains("cannot acquire 1 vnodes"), "{error}");
-        let aborted = durable.load().await.unwrap().unwrap();
-        assert!(!aborted.draining);
-        assert_eq!(aborted.version, drain.version);
-        assert_eq!(aborted.vnodes, committed_vnodes);
-        assert_eq!(aborted.participants, vec![participant]);
-        assert_eq!(registry.assignment_version(), committed.version);
-        assert!(db.cluster_intake_fenced());
-    }
-
-    #[tokio::test]
-    async fn recovery_settles_drain_before_reusing_process_local_source_cuts() {
-        use laminar_core::cluster::control::{ClusterKv, InMemoryKv};
-        use laminar_core::cluster::discovery::NodeInfo;
-        use uuid::Uuid;
-
-        let self_id = NodeId(1);
-        let boot = Uuid::from_u128(11);
-        let participant = CheckpointParticipant {
-            node_id: self_id.0,
-            boot_incarnation: boot,
-        };
-        let committed = AssignmentSnapshot::empty()
-            .next_for_participants(BTreeMap::from([(0, self_id)]), vec![participant])
-            .unwrap();
-        let durable = Arc::new(store());
-        durable.save_if_absent(&committed).await.unwrap();
-
-        let kv = Arc::new(InMemoryKv::new(self_id));
-        let control: Arc<dyn ClusterKv> = kv.clone();
-        let recovery: Arc<dyn ClusterKv> = kv;
-        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
-        let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
-            self_id,
-            control,
-            recovery,
-            Some(Arc::clone(&durable)),
-            members_rx,
-            boot,
-        ));
-        controller.publish_recovery_incarnation().await.unwrap();
-        let _leader_lease = grant_test_leadership(&controller).await;
-        let drain = committed
-            .next_draining(
-                BTreeMap::from([(0, NodeId(2))]),
-                vec![CheckpointParticipant {
-                    node_id: 2,
-                    boot_incarnation: Uuid::from_u128(22),
-                }],
-                controller.capture_leader_proof().unwrap(),
-            )
-            .unwrap();
-        assert!(matches!(
-            durable
-                .save_if_version(&drain, committed.version)
-                .await
-                .unwrap(),
-            RotateOutcome::Rotated
-        ));
-        controller.publish_checkpoint_drain_transition(drain.drain_transition.clone());
-
-        let registry = Arc::new(VnodeRegistry::single_owner(1, self_id));
-        let db = LaminarDB::builder()
-            .cluster_controller(Arc::clone(&controller))
-            .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-            .state_backend(Arc::new(InProcessBackend::new(1)))
-            .vnode_registry(Arc::clone(&registry))
-            .assignment_snapshot_store(Arc::clone(&durable))
-            .build()
-            .await
-            .unwrap();
-
-        assert_eq!(
-            settle_source_drain_before_recovery(
-                &db,
-                &controller,
-                RebalanceConfig::test_defaults(),
-            )
-            .await
-            .unwrap(),
-            Some(drain.version)
-        );
-        let settled = durable.load().await.unwrap().unwrap();
-        assert!(!settled.draining);
-        assert_eq!(settled.version, drain.version);
-        assert_eq!(settled.vnodes, committed.vnodes);
-        assert_eq!(registry.assignment_version(), drain.version);
-        assert!(controller.checkpoint_drain_transition().is_none());
-        let decision = controller
-            .checkpoint_authority()
-            .unwrap()
-            .assignment_drain_decision(drain.version)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(decision.verdict, AssignmentDrainVerdict::Abort);
-    }
-
-    #[tokio::test]
-    async fn recovery_release_reapplies_a_committed_drain_to_replacement_sources() {
-        use laminar_core::cluster::control::{ClusterKv, InMemoryKv};
-        use laminar_core::cluster::discovery::NodeInfo;
-        use uuid::Uuid;
-
-        let self_id = NodeId(1);
-        let boot = Uuid::from_u128(11);
-        let participant = CheckpointParticipant {
-            node_id: self_id.0,
-            boot_incarnation: boot,
-        };
-        let owners = BTreeMap::from([(0, self_id)]);
-        let durable = Arc::new(store());
-        let committed = AssignmentSnapshot::empty()
-            .next_for_participants(owners.clone(), vec![participant])
-            .unwrap();
-        durable.save_if_absent(&committed).await.unwrap();
-
-        let kv = Arc::new(InMemoryKv::new(self_id));
-        let control: Arc<dyn ClusterKv> = kv.clone();
-        let recovery: Arc<dyn ClusterKv> = kv;
-        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
-        let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
-            self_id,
-            control,
-            recovery,
-            Some(Arc::clone(&durable)),
-            members_rx,
-            boot,
-        ));
-        controller.publish_recovery_incarnation().await.unwrap();
-        let _leader_lease = grant_test_leadership(&controller).await;
-        let draining = committed
-            .next_draining(
-                owners,
-                vec![participant],
-                controller.capture_leader_proof().unwrap(),
-            )
-            .unwrap();
-        assert!(matches!(
-            durable
-                .save_if_version(&draining, committed.version)
-                .await
-                .unwrap(),
-            RotateOutcome::Rotated
-        ));
-
-        let registry = Arc::new(VnodeRegistry::single_owner(1, self_id));
-        let db = LaminarDB::builder()
-            .cluster_controller(Arc::clone(&controller))
-            .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-            .state_backend(Arc::new(InProcessBackend::new(1)))
-            .vnode_registry(Arc::clone(&registry))
-            .assignment_snapshot_store(Arc::clone(&durable))
-            .build()
-            .await
-            .unwrap();
-        assert_eq!(
-            finalize_drain_snapshot(
-                &db,
-                &durable,
-                &controller,
-                &draining,
-                &committed,
-                AssignmentDrainVerdict::Commit,
-                RebalanceConfig::test_defaults(),
-            )
-            .await
-            .unwrap(),
-            Some(draining.version)
-        );
-        let terminal = durable.load().await.unwrap().unwrap();
-        let terminal_fence = terminal.assignment_fence().unwrap();
-        let transition = draining.drain_transition.clone().unwrap();
-        let task =
-            crate::pipeline::streaming_coordinator::install_replacement_source_drain_task_for_test(
-                &db.owned_source_tasks,
-                "replacement-source",
-            );
-
-        controller.publish_checkpoint_drain_transition(Some(transition.clone()));
-        controller.set_recovering(true);
-        db.set_source_gate(true);
-        let resolution = SourceDrainResolution {
-            round: transition.id(),
-            outcome: SourceDrainOutcome::Commit,
-        };
-        let error = settle_source_drain_before_recovery_release(
-            &db,
-            &controller,
-            &committed.assignment_fence().unwrap(),
-            tokio::time::Instant::now() + Duration::from_secs(2),
-        )
-        .await
-        .expect_err("a predecessor assignment must not authorize terminal source resolution");
-        assert!(error.contains("assignment 2 changed"), "{error}");
-        assert_eq!(
-            controller.checkpoint_drain_transition(),
-            Some(transition.clone())
-        );
-        assert!(
-            !crate::pipeline::streaming_coordinator::owned_source_drain_resolved(
-                &db.owned_source_tasks,
-                resolution,
-            )
-            .unwrap()
-        );
-        assert_eq!(
-            settle_source_drain_before_recovery_release(
-                &db,
-                &controller,
-                &terminal_fence,
-                tokio::time::Instant::now() + Duration::from_secs(2),
-            )
-            .await
-            .unwrap(),
-            Some(terminal.version)
-        );
-        assert!(
-            crate::pipeline::streaming_coordinator::owned_source_drain_resolved(
-                &db.owned_source_tasks,
-                resolution,
-            )
-            .unwrap()
-        );
-        assert!(controller.checkpoint_drain_transition().is_none());
-
-        task.request_shutdown();
-        assert!(
-            task.wait_until(tokio::time::Instant::now() + Duration::from_secs(1))
-                .await
-        );
-        db.owned_source_tasks
-            .lock()
-            .retain(|source| !source.is_finished());
-        let replacement =
-            crate::pipeline::streaming_coordinator::install_replacement_source_drain_task_for_test(
-                &db.owned_source_tasks,
-                "next-replacement-source",
-            );
-        assert!(
-            !crate::pipeline::streaming_coordinator::owned_source_drain_resolved(
-                &db.owned_source_tasks,
-                resolution,
-            )
-            .unwrap()
-        );
-        assert!(controller.checkpoint_drain_transition().is_none());
-        assert_eq!(
-            settle_source_drain_before_recovery_release(
-                &db,
-                &controller,
-                &terminal_fence,
-                tokio::time::Instant::now() + Duration::from_secs(2),
-            )
-            .await
-            .unwrap(),
-            Some(terminal.version),
-            "a replacement generation must reconcile retained terminal authority even after the process-local marker was cleared"
-        );
-        assert!(
-            crate::pipeline::streaming_coordinator::owned_source_drain_resolved(
-                &db.owned_source_tasks,
-                resolution,
-            )
-            .unwrap()
-        );
-
-        replacement.request_shutdown();
-        assert!(
-            replacement
-                .wait_until(tokio::time::Instant::now() + Duration::from_secs(1))
-                .await
-        );
-        controller.publish_checkpoint_drain_transition(Some(transition.clone()));
-        let error = settle_source_drain_before_recovery_release(
-            &db,
-            &controller,
-            &terminal_fence,
-            tokio::time::Instant::now() + Duration::from_secs(2),
-        )
-        .await
-        .expect_err("a finished replacement source must block recovery Release");
-        assert!(error.contains("exited before committing drain"), "{error}");
-        assert_eq!(controller.checkpoint_drain_transition(), Some(transition));
-    }
-
-    #[tokio::test]
-    async fn draining_head_with_dead_predecessor_owner_uses_retained_roster() {
-        use laminar_core::cluster::control::{ClusterKv, InMemoryKv};
-        use laminar_core::cluster::discovery::NodeInfo;
-        use uuid::Uuid;
-
-        let self_id = NodeId(1);
-        let dead_owner = NodeId(2);
-        let self_process = CheckpointParticipant {
-            node_id: self_id.0,
-            boot_incarnation: Uuid::from_u128(11),
-        };
-        let dead_process = CheckpointParticipant {
-            node_id: dead_owner.0,
-            boot_incarnation: Uuid::from_u128(22),
-        };
-        let durable = Arc::new(store());
-        let committed = AssignmentSnapshot::empty()
-            .next_for_participants(BTreeMap::from([(0, dead_owner)]), vec![dead_process])
-            .unwrap();
-        durable.save_if_absent(&committed).await.unwrap();
-        let draining = draining_snapshot(
-            &committed,
-            BTreeMap::from([(0, self_id)]),
-            vec![self_process],
-        );
-        durable
-            .save_if_version(&draining, committed.version)
-            .await
-            .unwrap();
-
-        let kv = Arc::new(InMemoryKv::new(self_id));
-        let control: Arc<dyn ClusterKv> = kv.clone();
-        let recovery: Arc<dyn ClusterKv> = kv;
-        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
-        let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
-            self_id,
-            control,
-            recovery,
-            Some(Arc::clone(&durable)),
-            members_rx,
-            self_process.boot_incarnation,
-        ));
-        controller.publish_recovery_incarnation().await.unwrap();
-        controller.set_active(true);
-        let _leader_lease = grant_test_leadership(&controller).await;
-
-        let registry = Arc::new(VnodeRegistry::single_owner(1, dead_owner));
-        let db = LaminarDB::builder()
-            .cluster_controller(Arc::clone(&controller))
-            .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-            .state_backend(Arc::new(InProcessBackend::new(1)))
-            .vnode_registry(Arc::clone(&registry))
-            .assignment_snapshot_store(Arc::clone(&durable))
-            .build()
-            .await
-            .unwrap();
-
-        let version = try_rebalance(
-            &db,
-            &controller,
-            &durable,
-            &registry,
-            &[self_id],
-            RebalanceConfig::test_defaults(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(version, Some(draining.version));
-
-        let rollback = durable.load().await.unwrap().unwrap();
-        assert!(!rollback.draining);
-        assert_eq!(rollback.vnodes, committed.vnodes);
-        assert_eq!(rollback.participants, committed.participants);
-        assert_eq!(registry.assignment_version(), rollback.version);
-        assert!(
-            db.cluster_intake_fenced(),
-            "the dead predecessor process cannot certify the rollback generation"
-        );
-        assert_eq!(
-            controller.checkpoint_assignment_fence(rollback.version),
-            None
-        );
-    }
-
-    #[tokio::test]
-    async fn replacement_process_aborts_drain_through_the_same_authority_sequence() {
-        use laminar_core::cluster::control::{
-            ClusterCheckpointAuthorityError, ClusterKv, InMemoryKv, LeaderLeaseOwner, LeaseOutcome,
-        };
-        use laminar_core::cluster::discovery::NodeInfo;
-        use uuid::Uuid;
-
-        let self_id = NodeId(1);
-        let old_boot = Uuid::from_u128(11);
-        let new_boot = Uuid::from_u128(111);
-        let authority = Arc::new(LeaderLeaseStore::new(Arc::new(InMemory::new()), 10));
-        let old_owner = LeaderLeaseOwner {
-            node: self_id,
-            boot: old_boot,
-            process_term: 1,
-        };
-        let LeaseOutcome::Acquired(old_lease) =
-            authority.begin_new_term(&old_owner, 0).await.unwrap()
-        else {
-            panic!("empty authority must grant the predecessor term");
-        };
-        let old_proof = old_lease.proof();
-
-        let durable = Arc::new(store());
-        let committed = AssignmentSnapshot::empty()
-            .next_for_participants(
-                BTreeMap::from([(0, self_id)]),
-                vec![CheckpointParticipant {
-                    node_id: self_id.0,
-                    boot_incarnation: old_boot,
-                }],
-            )
-            .unwrap();
-        durable.save_if_absent(&committed).await.unwrap();
-        let draining = committed
-            .next_draining(
-                BTreeMap::from([(0, NodeId(2))]),
-                vec![CheckpointParticipant {
-                    node_id: 2,
-                    boot_incarnation: Uuid::from_u128(22),
-                }],
-                old_proof.clone(),
-            )
-            .unwrap();
-        durable
-            .save_if_version(&draining, committed.version)
-            .await
-            .unwrap();
-
-        let new_owner = LeaderLeaseOwner {
-            node: self_id,
-            boot: new_boot,
-            process_term: 2,
-        };
-        let observation = authority.observe_rival(&new_owner, &old_lease).unwrap();
-        tokio::time::sleep(Duration::from_millis(15)).await;
-        let LeaseOutcome::Acquired(takeover) = authority
-            .try_takeover(&new_owner, &observation, 20)
-            .await
-            .unwrap()
-        else {
-            panic!("replacement process must take over the observed durable term");
-        };
-        assert!(takeover.token > old_lease.token);
-
-        let kv = Arc::new(InMemoryKv::new(self_id));
-        let control: Arc<dyn ClusterKv> = kv.clone();
-        let recovery: Arc<dyn ClusterKv> = kv;
-        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
-        let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
-            self_id,
-            control,
-            recovery,
-            Some(Arc::clone(&durable)),
-            members_rx,
-            new_boot,
-        ));
-        controller.publish_recovery_incarnation().await.unwrap();
-        let _lease_watch = install_test_leadership(
-            &controller,
-            Arc::clone(&authority),
-            new_owner,
-            takeover.clone(),
-        );
-        let registry = Arc::new(VnodeRegistry::single_owner(1, self_id));
-        let db = LaminarDB::builder()
-            .cluster_controller(Arc::clone(&controller))
-            .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-            .state_backend(Arc::new(InProcessBackend::new(1)))
-            .vnode_registry(Arc::clone(&registry))
-            .assignment_snapshot_store(Arc::clone(&durable))
-            .build()
-            .await
-            .unwrap();
-
-        let error = try_rebalance(
-            &db,
-            &controller,
-            &durable,
-            &registry,
-            &[self_id],
-            RebalanceConfig::test_defaults(),
-        )
-        .await
-        .expect_err("replacement must restore before adopting the predecessor rollback");
-        assert!(error.contains("cannot acquire 1 vnodes"), "{error}");
-        let materialized = durable.load().await.unwrap().unwrap();
-        assert!(!materialized.draining);
-        assert_eq!(materialized.version, draining.version);
-        assert_eq!(materialized.vnodes, committed.vnodes);
-        let winner = authority
-            .assignment_drain_decision(draining.version)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(winner.verdict, AssignmentDrainVerdict::Abort);
-        assert_eq!(winner.leader_proof, takeover.proof());
-
-        let stale = AssignmentDrainDecision::new(
-            draining.drain_transition.as_ref().unwrap(),
-            old_proof.clone(),
-            AssignmentDrainVerdict::Abort,
-        )
-        .unwrap();
-        assert!(matches!(
-            authority
-                .record_assignment_drain_decision(&old_proof, stale)
-                .await,
-            Err(ClusterCheckpointAuthorityError::Fenced)
-        ));
-    }
-
-    #[tokio::test]
-    async fn takeover_materializes_decision_written_before_snapshot_cas() {
-        use laminar_core::cluster::control::{
-            ClusterKv, InMemoryKv, LeaderLeaseOwner, LeaseOutcome,
-        };
-        use laminar_core::cluster::discovery::NodeInfo;
-        use uuid::Uuid;
-
-        let self_id = NodeId(1);
-        let old_boot = Uuid::from_u128(11);
-        let new_boot = Uuid::from_u128(111);
-        let authority = Arc::new(LeaderLeaseStore::new(Arc::new(InMemory::new()), 10));
-        let old_owner = LeaderLeaseOwner {
-            node: self_id,
-            boot: old_boot,
-            process_term: 1,
-        };
-        let LeaseOutcome::Acquired(old_lease) =
-            authority.begin_new_term(&old_owner, 0).await.unwrap()
-        else {
-            panic!("empty authority must grant the predecessor term");
-        };
-        let old_proof = old_lease.proof();
-        let durable = Arc::new(store());
-        let committed = AssignmentSnapshot::empty()
-            .next_for_participants(
-                BTreeMap::from([(0, self_id)]),
-                vec![CheckpointParticipant {
-                    node_id: self_id.0,
-                    boot_incarnation: old_boot,
-                }],
-            )
-            .unwrap();
-        durable.save_if_absent(&committed).await.unwrap();
-        let draining = committed
-            .next_draining(
-                BTreeMap::from([(0, NodeId(2))]),
-                vec![CheckpointParticipant {
-                    node_id: 2,
-                    boot_incarnation: Uuid::from_u128(22),
-                }],
-                old_proof.clone(),
-            )
-            .unwrap();
-        durable
-            .save_if_version(&draining, committed.version)
-            .await
-            .unwrap();
-        let committed_decision = AssignmentDrainDecision::new(
-            draining.drain_transition.as_ref().unwrap(),
-            old_proof.clone(),
-            AssignmentDrainVerdict::Commit,
-        )
-        .unwrap();
-        assert!(matches!(
-            authority
-                .record_assignment_drain_decision(&old_proof, committed_decision)
-                .await
-                .unwrap(),
-            RecordAssignmentDrainDecisionResult::Created(_)
-        ));
-
-        let current_old_lease = authority.load().await.unwrap().unwrap();
-        let new_owner = LeaderLeaseOwner {
-            node: self_id,
-            boot: new_boot,
-            process_term: 2,
-        };
-        let observation = authority
-            .observe_rival(&new_owner, &current_old_lease)
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(15)).await;
-        let LeaseOutcome::Acquired(takeover) = authority
-            .try_takeover(&new_owner, &observation, 20)
-            .await
-            .unwrap()
-        else {
-            panic!("replacement process must take over the decision-bearing term");
-        };
-
-        let kv = Arc::new(InMemoryKv::new(self_id));
-        let control: Arc<dyn ClusterKv> = kv.clone();
-        let recovery: Arc<dyn ClusterKv> = kv;
-        let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::<NodeInfo>::new());
-        let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
-            self_id,
-            control,
-            recovery,
-            Some(Arc::clone(&durable)),
-            members_rx,
-            new_boot,
-        ));
-        controller.publish_recovery_incarnation().await.unwrap();
-        let _lease_watch =
-            install_test_leadership(&controller, Arc::clone(&authority), new_owner, takeover);
-        let registry = Arc::new(VnodeRegistry::single_owner(1, self_id));
-        let db = LaminarDB::builder()
-            .cluster_controller(Arc::clone(&controller))
-            .cluster_checkpoint_object_store(test_cluster_checkpoint_store())
-            .state_backend(Arc::new(InProcessBackend::new(1)))
-            .vnode_registry(Arc::clone(&registry))
-            .assignment_snapshot_store(Arc::clone(&durable))
-            .build()
-            .await
-            .unwrap();
-
-        assert_eq!(
-            try_rebalance(
-                &db,
-                &controller,
-                &durable,
-                &registry,
-                &[self_id],
-                RebalanceConfig::test_defaults(),
-            )
-            .await
-            .unwrap(),
-            Some(draining.version)
-        );
-        let materialized = durable.load().await.unwrap().unwrap();
-        assert!(!materialized.draining);
-        assert_eq!(materialized.vnodes, draining.vnodes);
-        assert_eq!(registry.assignment_version(), draining.version);
-        assert_eq!(registry.owner(0), NodeId(2));
-        let winner = authority
-            .assignment_drain_decision(draining.version)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(winner.verdict, AssignmentDrainVerdict::Commit);
-        assert_eq!(winner.leader_proof, old_proof);
-    }
-}
+mod tests;
