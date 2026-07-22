@@ -222,9 +222,9 @@ fn write_data_type(
         | DataType::Struct(_)
         | DataType::Union(_, _)
         | DataType::Map(_, _)
-        | DataType::RunEndEncoded(_, _) => Err(PartitionKeyCodecError::UnsupportedKeyType {
+        | DataType::RunEndEncoded(_, _) => Err(PartitionKeyCodecError::UnsupportedKeyTypeFamily {
             index,
-            data_type: data_type.clone(),
+            family: "non-scalar",
         }),
     }
 }

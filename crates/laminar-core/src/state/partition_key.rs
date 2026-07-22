@@ -78,6 +78,14 @@ pub enum PartitionKeyCodecError {
         /// Rejected Arrow type.
         data_type: DataType,
     },
+    /// A recursive Arrow family is rejected without cloning attacker-shaped schema trees.
+    #[error("partition key column {index} has unsupported ABI-v1 type family {family}")]
+    UnsupportedKeyTypeFamily {
+        /// Zero-based position in the composite key.
+        index: usize,
+        /// Stable rejected family label.
+        family: &'static str,
+    },
     /// Arrow rejected the otherwise admitted row layout.
     #[error("partition key Arrow row encoding: {0}")]
     Arrow(#[from] arrow_schema::ArrowError),
@@ -298,38 +306,34 @@ pub(crate) fn validate_key_type(
                     | DataType::UInt64
             ) =>
         {
-            match validate_key_type(values, index, depth + 1) {
-                Err(PartitionKeyCodecError::UnsupportedKeyType { .. }) => {
-                    Err(PartitionKeyCodecError::UnsupportedKeyType {
-                        index,
-                        data_type: data_type.clone(),
-                    })
-                }
-                result => result,
-            }
+            validate_key_type(values, index, depth + 1)
         }
         DataType::Float16
         | DataType::Float32
         | DataType::Float64
-        | DataType::List(_)
-        | DataType::ListView(_)
-        | DataType::FixedSizeList(_, _)
-        | DataType::LargeList(_)
-        | DataType::LargeListView(_)
-        | DataType::Struct(_)
-        | DataType::Union(_, _)
-        | DataType::Map(_, _)
-        | DataType::RunEndEncoded(_, _)
         | DataType::FixedSizeBinary(_)
         | DataType::Decimal32(_, _)
         | DataType::Decimal64(_, _)
         | DataType::Decimal128(_, _)
-        | DataType::Decimal256(_, _)
-        | DataType::Dictionary(_, _) => Err(PartitionKeyCodecError::UnsupportedKeyType {
+        | DataType::Decimal256(_, _) => Err(PartitionKeyCodecError::UnsupportedKeyType {
             index,
             data_type: data_type.clone(),
         }),
+        DataType::List(_) => unsupported_family(index, "list"),
+        DataType::ListView(_) => unsupported_family(index, "list-view"),
+        DataType::FixedSizeList(_, _) => unsupported_family(index, "fixed-size-list"),
+        DataType::LargeList(_) => unsupported_family(index, "large-list"),
+        DataType::LargeListView(_) => unsupported_family(index, "large-list-view"),
+        DataType::Struct(_) => unsupported_family(index, "struct"),
+        DataType::Union(_, _) => unsupported_family(index, "union"),
+        DataType::Map(_, _) => unsupported_family(index, "map"),
+        DataType::RunEndEncoded(_, _) => unsupported_family(index, "run-end-encoded"),
+        DataType::Dictionary(_, _) => unsupported_family(index, "dictionary-index"),
     }
+}
+
+fn unsupported_family(index: usize, family: &'static str) -> Result<(), PartitionKeyCodecError> {
+    Err(PartitionKeyCodecError::UnsupportedKeyTypeFamily { index, family })
 }
 
 fn valid_decimal<T: DecimalType>(precision: u8, scale: i8) -> bool {
@@ -962,12 +966,11 @@ mod tests {
         ];
 
         for data_type in rejected {
+            let error = PartitionKeyCodecV1::try_new([data_type]).unwrap_err();
             assert!(matches!(
-                PartitionKeyCodecV1::try_new([data_type.clone()]),
-                Err(PartitionKeyCodecError::UnsupportedKeyType {
-                    index: 0,
-                    data_type: rejected,
-                }) if rejected == data_type
+                error,
+                PartitionKeyCodecError::UnsupportedKeyType { index: 0, .. }
+                    | PartitionKeyCodecError::UnsupportedKeyTypeFamily { index: 0, .. }
             ));
         }
 
@@ -1246,6 +1249,19 @@ mod tests {
         assert!(matches!(
             PartitionKeyCodecV1::try_new([nested]),
             Err(PartitionKeyCodecError::KeyTypeNestingTooDeep { index: 0, .. })
+        ));
+
+        let mut rejected_list = DataType::Int64;
+        for depth in 0..512 {
+            rejected_list =
+                DataType::List(Arc::new(Field::new(depth.to_string(), rejected_list, true)));
+        }
+        assert!(matches!(
+            PartitionKeyCodecV1::try_new([rejected_list]),
+            Err(PartitionKeyCodecError::UnsupportedKeyTypeFamily {
+                index: 0,
+                family: "list"
+            })
         ));
     }
 }
