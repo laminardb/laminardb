@@ -130,8 +130,17 @@ pub(crate) struct QueryEntry {
 
 pub(crate) struct StreamEntry {
     pub(crate) name: String,
-    pub(crate) source: streaming::Source<ArrowRecord>,
-    pub(crate) sink: streaming::Sink<ArrowRecord>,
+    emitted_rows: AtomicU64,
+}
+
+impl StreamEntry {
+    pub(crate) fn record_emitted_rows(&self, rows: u64) {
+        self.emitted_rows.fetch_add(rows, Ordering::Relaxed);
+    }
+
+    pub(crate) fn emitted_rows(&self) -> u64 {
+        self.emitted_rows.load(Ordering::Relaxed)
+    }
 }
 
 /// Central registry of sources, sinks, streams, and queries.
@@ -208,6 +217,7 @@ impl SourceCatalog {
         Ok(entry)
     }
 
+    #[cfg(test)]
     pub(crate) fn register_source_or_replace(
         &self,
         name: &str,
@@ -266,48 +276,18 @@ impl SourceCatalog {
             return Err(crate::DbError::StreamAlreadyExists(name.to_string()));
         }
 
-        let config = SourceConfig {
-            channel: streaming::ChannelConfig {
-                buffer_size: self.default_buffer_size,
-                backpressure: self.default_backpressure,
-                wait_strategy: WaitStrategy::SpinYield,
-                track_stats: false,
-            },
-            name: Some(name.to_string()),
-        };
-
-        let (source, sink) = streaming::create_with_config::<ArrowRecord>(config);
-
         streams.insert(
             name.to_string(),
             Arc::new(StreamEntry {
                 name: name.to_string(),
-                source,
-                sink,
+                emitted_rows: AtomicU64::new(0),
             }),
         );
         Ok(())
     }
 
-    pub(crate) fn get_stream_subscription(
-        &self,
-        name: &str,
-    ) -> Option<streaming::Subscription<ArrowRecord>> {
-        self.streams
-            .read()
-            .get(name)
-            .map(|entry| entry.sink.subscribe())
-    }
-
     pub(crate) fn get_stream_entry(&self, name: &str) -> Option<Arc<StreamEntry>> {
         self.streams.read().get(name).cloned()
-    }
-
-    pub(crate) fn get_stream_source(&self, name: &str) -> Option<streaming::Source<ArrowRecord>> {
-        self.streams
-            .read()
-            .get(name)
-            .map(|entry| entry.source.clone())
     }
 
     /// Returns `true` if the stream existed.

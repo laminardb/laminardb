@@ -51,7 +51,7 @@ impl Profile {
     /// | Signal | Detected Profile |
     /// |--------|-----------------|
     /// | `has_discovery` = true | `Cluster` |
-    /// | `object_store_url` is `s3://`/`gs://`/`az://` | `Durable` |
+    /// | `object_store_url` uses a supported cloud scheme | `Durable` |
     /// | `object_store_url` is `file://` or `storage_dir` set | `Embedded` |
     /// | None of the above | `BareMetal` |
     #[must_use]
@@ -64,6 +64,7 @@ impl Profile {
                 || url.starts_with("gs://")
                 || url.starts_with("az://")
                 || url.starts_with("abfs://")
+                || url.starts_with("abfss://")
             {
                 return Self::Durable;
             }
@@ -71,7 +72,13 @@ impl Profile {
                 return Self::Embedded;
             }
         }
-        if config.storage_dir.is_some() {
+        if config.storage_dir.is_some()
+            || config
+                .checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.data_dir.as_ref())
+                .is_some()
+        {
             return Self::Embedded;
         }
         Self::BareMetal
@@ -87,7 +94,7 @@ impl Profile {
     /// feature is missing.
     pub fn validate_features(self) -> Result<(), ProfileError> {
         // Feature gates for durable/cluster were removed — all profiles are
-        // always available. Heavy distributed deps (tonic, openraft, chitchat)
+        // always available. Heavy distributed deps (tonic, chitchat)
         // are gated on laminar-core's `cluster` feature, which the
         // server binary enables unconditionally. Library users of laminar-db
         // get lightweight builds without distributed infrastructure.
@@ -112,12 +119,24 @@ impl Profile {
         match self {
             Self::BareMetal => Ok(()),
             Self::Embedded => {
-                if config.storage_dir.is_none() {
-                    return Err(ProfileError::RequirementNotMet(
-                        "Embedded profile requires a storage_dir".into(),
-                    ));
+                if let Some(url) = object_store_url.filter(|url| url.starts_with("file://")) {
+                    laminar_core::storage::object_store_builder::file_url_path(url)
+                        .map_err(|error| ProfileError::RequirementNotMet(error.to_string()))?;
+                    return Ok(());
                 }
-                Ok(())
+                if config.storage_dir.is_some()
+                    || config
+                        .checkpoint
+                        .as_ref()
+                        .and_then(|checkpoint| checkpoint.data_dir.as_ref())
+                        .is_some()
+                {
+                    return Ok(());
+                }
+                Err(ProfileError::RequirementNotMet(
+                    "Embedded profile requires an absolute file:// checkpoint URL or local storage directory"
+                        .into(),
+                ))
             }
             Self::Durable | Self::Cluster => {
                 if object_store_url.is_none() {
@@ -226,6 +245,31 @@ mod tests {
             result.unwrap_err(),
             ProfileError::RequirementNotMet(_)
         ));
+    }
+
+    #[test]
+    fn embedded_accepts_an_absolute_file_checkpoint_url() {
+        let config = LaminarConfig::default();
+        let directory = tempfile::tempdir().unwrap();
+        let normalized = directory.path().display().to_string().replace('\\', "/");
+        let url = if normalized.starts_with('/') {
+            format!("file://{normalized}")
+        } else {
+            format!("file:///{normalized}")
+        };
+        assert!(Profile::Embedded
+            .validate_config(&config, Some(&url))
+            .is_ok());
+        assert!(Profile::Embedded
+            .validate_config(&config, Some("file://./relative"))
+            .is_err());
+        let config_with_fallback = LaminarConfig {
+            storage_dir: Some(directory.path().to_path_buf()),
+            ..LaminarConfig::default()
+        };
+        assert!(Profile::Embedded
+            .validate_config(&config_with_fallback, Some("file://./relative"))
+            .is_err());
     }
 
     #[test]
@@ -353,6 +397,15 @@ mod tests {
     fn test_from_config_durable_abfs() {
         let config = LaminarConfig {
             object_store_url: Some("abfs://container/prefix".to_string()),
+            ..LaminarConfig::default()
+        };
+        assert_eq!(Profile::from_config(&config, false), Profile::Durable);
+    }
+
+    #[test]
+    fn test_from_config_durable_abfss() {
+        let config = LaminarConfig {
+            object_store_url: Some("abfss://container/prefix".to_string()),
             ..LaminarConfig::default()
         };
         assert_eq!(Profile::from_config(&config, false), Profile::Durable);

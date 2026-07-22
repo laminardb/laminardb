@@ -1,30 +1,362 @@
 //! Kafka checkpoint scenarios against `tests/docker/compose.yml`'s
-//! Redpanda. Skips when the broker is unreachable.
+//! Redpanda. Skips when the broker is unreachable unless release validation requires it.
 
 #![cfg(feature = "kafka")]
 
-use std::time::Duration;
-
-use laminar_db::LaminarDB;
-
-mod common;
-use common::{
-    compose, consume_json, consume_keyed, create_topic, delete_topic, json_i64, kafka_brokers,
-    produce_json_seq, wait_for_broker,
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    process::Command,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        OnceLock,
+    },
+    time::{Duration, SystemTime},
 };
 
+use laminar_db::{DeliveryGuarantee, LaminarConfig, LaminarDB};
+use rdkafka::{
+    config::ClientConfig,
+    consumer::{BaseConsumer, Consumer, StreamConsumer},
+    producer::{FutureProducer, FutureRecord},
+    Message, Offset, TopicPartitionList,
+};
+
+#[path = "common/kafka.rs"]
+mod common;
+use common::{
+    consume_keyed, create_topic, delete_topic, json_i64, kafka_brokers, produce_json_seq,
+    wait_for_broker, wait_for_broker_unavailable,
+};
+
+const REQUIRE_REDPANDA_ENV: &str = "LAMINAR_REQUIRE_REDPANDA";
+const STOPPED_WRITER_STABILITY: Duration = Duration::from_millis(500);
+static NEXT_UNIQUE_ID: AtomicU64 = AtomicU64::new(0);
+static RUN_NONCE: OnceLock<String> = OnceLock::new();
+
 fn unique(name: &str) -> String {
-    let t = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
-    format!("{name}_{t}")
+    let nonce = RUN_NONCE.get_or_init(|| {
+        let started_at = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock must be after the Unix epoch")
+            .as_nanos();
+        format!("{started_at:032x}{:08x}", std::process::id())
+    });
+    format!(
+        "{name}_{nonce}_{}",
+        NEXT_UNIQUE_ID.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn redpanda_required() -> bool {
+    std::env::var(REQUIRE_REDPANDA_ENV)
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+fn kafka_test_brokers() -> Option<&'static str> {
+    match kafka_brokers() {
+        Some(brokers) => Some(brokers),
+        None if redpanda_required() => {
+            panic!("Redpanda is required by {REQUIRE_REDPANDA_ENV} but is not reachable")
+        }
+        None => {
+            eprintln!("skipping: Redpanda not reachable");
+            None
+        }
+    }
+}
+
+fn at_least_once_config(storage: &Path) -> LaminarConfig {
+    LaminarConfig {
+        storage_dir: Some(storage.to_path_buf()),
+        checkpoint: Some(laminar_core::streaming::StreamCheckpointConfig {
+            interval_ms: None,
+            ..Default::default()
+        }),
+        delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
+        ..LaminarConfig::default()
+    }
+}
+
+fn compose_checked(args: &[&str]) {
+    let compose_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("tests")
+        .join("docker")
+        .join("compose.yml");
+    let status = Command::new("docker")
+        .arg("compose")
+        .arg("-f")
+        .arg(&compose_path)
+        .args(args)
+        .status()
+        .unwrap_or_else(|error| panic!("failed to run docker compose {args:?}: {error}"));
+    assert!(
+        status.success(),
+        "docker compose {args:?} failed with status {status}"
+    );
+}
+
+async fn produce_json_range(brokers: &str, topic: &str, range: std::ops::Range<usize>) {
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("message.timeout.ms", "5000")
+        .create()
+        .expect("producer");
+    for id in range {
+        let payload = format!(r#"{{"id": {id}, "value": {}}}"#, id * 10);
+        let key = id.to_string();
+        producer
+            .send(
+                FutureRecord::to(topic).payload(&payload).key(&key),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("produce");
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PartitionWatermarkCut {
+    low: i64,
+    high_exclusive: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct KafkaHighWatermarkCut {
+    partitions: BTreeMap<i32, PartitionWatermarkCut>,
+}
+
+fn capture_high_watermark_cut(brokers: &str, topic: &str) -> KafkaHighWatermarkCut {
+    let consumer: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("socket.timeout.ms", "5000")
+        .create()
+        .expect("Kafka watermark consumer");
+    let metadata = consumer
+        .fetch_metadata(Some(topic), Duration::from_secs(5))
+        .unwrap_or_else(|error| panic!("fetch metadata for {topic}: {error}"));
+    let topic_metadata = metadata
+        .topics()
+        .iter()
+        .find(|candidate| candidate.name() == topic)
+        .unwrap_or_else(|| panic!("Kafka metadata omitted topic {topic}"));
+    assert_eq!(
+        topic_metadata.error(),
+        None,
+        "Kafka metadata reported an error for {topic}"
+    );
+    assert!(
+        !topic_metadata.partitions().is_empty(),
+        "Kafka topic {topic} has no partitions"
+    );
+
+    let partitions = topic_metadata
+        .partitions()
+        .iter()
+        .map(|partition| {
+            assert_eq!(
+                partition.error(),
+                None,
+                "Kafka metadata reported an error for {topic}/{}",
+                partition.id()
+            );
+            let (low, high_exclusive) = consumer
+                .fetch_watermarks(topic, partition.id(), Duration::from_secs(5))
+                .unwrap_or_else(|error| {
+                    panic!("fetch watermarks for {topic}/{}: {error}", partition.id())
+                });
+            assert!(
+                low >= 0 && high_exclusive >= low,
+                "invalid Kafka watermarks for {topic}/{}: {low}..{high_exclusive}",
+                partition.id()
+            );
+            (
+                partition.id(),
+                PartitionWatermarkCut {
+                    low,
+                    high_exclusive,
+                },
+            )
+        })
+        .collect();
+    KafkaHighWatermarkCut { partitions }
+}
+
+async fn capture_stopped_writer_cut(brokers: &str, topic: &str) -> KafkaHighWatermarkCut {
+    let cut = capture_high_watermark_cut(brokers, topic);
+    tokio::time::sleep(STOPPED_WRITER_STABILITY).await;
+    let later = capture_high_watermark_cut(brokers, topic);
+    assert_eq!(
+        later, cut,
+        "Kafka high watermarks for {topic} changed after its writer stopped"
+    );
+    cut
+}
+
+fn update_consumer_positions(
+    consumer: &StreamConsumer,
+    topic: &str,
+    next_offsets: &mut BTreeMap<i32, i64>,
+) {
+    let positions = consumer
+        .position()
+        .unwrap_or_else(|error| panic!("read consumer positions for {topic}: {error}"));
+    for position in positions.elements_for_topic(topic) {
+        if let Offset::Offset(offset) = position.offset() {
+            let next = next_offsets
+                .get_mut(&position.partition())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "consumer position contains unexpected partition {topic}/{}",
+                        position.partition()
+                    )
+                });
+            *next = (*next).max(offset);
+        }
+    }
+}
+
+async fn consume_through_cut(
+    brokers: &str,
+    topic: &str,
+    group: &str,
+    cut: &KafkaHighWatermarkCut,
+    deadline: Duration,
+) -> Vec<String> {
+    let consumer: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("group.id", group)
+        .set("enable.auto.commit", "false")
+        .create()
+        .expect("cut consumer");
+    let mut assignment = TopicPartitionList::with_capacity(cut.partitions.len());
+    let mut next_offsets = BTreeMap::new();
+    for (&partition, watermark) in &cut.partitions {
+        assignment
+            .add_partition_offset(topic, partition, Offset::Offset(watermark.low))
+            .unwrap_or_else(|error| panic!("assign {topic}/{partition}: {error}"));
+        next_offsets.insert(partition, watermark.low);
+    }
+    consumer
+        .assign(&assignment)
+        .unwrap_or_else(|error| panic!("assign Kafka cut for {topic}: {error}"));
+
+    let covered = |positions: &BTreeMap<i32, i64>| {
+        cut.partitions.iter().all(|(partition, watermark)| {
+            positions
+                .get(partition)
+                .is_some_and(|offset| *offset >= watermark.high_exclusive)
+        })
+    };
+    let deadline = tokio::time::Instant::now() + deadline;
+    let mut seen_offsets = BTreeSet::new();
+    let mut payloads = Vec::new();
+    while !covered(&next_offsets) && tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), consumer.recv()).await {
+            Ok(Ok(message)) => {
+                assert_eq!(message.topic(), topic, "cut consumer read another topic");
+                let partition = message.partition();
+                let watermark = cut.partitions.get(&partition).unwrap_or_else(|| {
+                    panic!("cut consumer read unexpected partition {topic}/{partition}")
+                });
+                let offset = message.offset();
+                if offset >= watermark.low && offset < watermark.high_exclusive {
+                    assert!(
+                        seen_offsets.insert((partition, offset)),
+                        "cut consumer read {topic}/{partition}@{offset} more than once"
+                    );
+                    payloads.push(
+                        message
+                            .payload_view::<str>()
+                            .and_then(Result::ok)
+                            .expect("Kafka output must be UTF-8 JSON")
+                            .to_owned(),
+                    );
+                }
+                update_consumer_positions(&consumer, topic, &mut next_offsets);
+            }
+            Ok(Err(error)) => panic!("consume Kafka cut for {topic}: {error}"),
+            Err(_) => update_consumer_positions(&consumer, topic, &mut next_offsets),
+        }
+    }
+
+    assert!(
+        covered(&next_offsets),
+        "did not consume through Kafka cut for {topic} before {deadline:?}; cut={cut:?}, positions={next_offsets:?}"
+    );
+    payloads
+}
+
+async fn wait_for_required_ids(
+    brokers: &str,
+    topic: &str,
+    group: &str,
+    required_ids: std::ops::Range<i64>,
+    deadline: Duration,
+) {
+    let required: BTreeSet<_> = required_ids.collect();
+    let consumer: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("group.id", group)
+        .set("auto.offset.reset", "earliest")
+        .set("enable.auto.commit", "false")
+        .create()
+        .expect("consumer");
+    consumer.subscribe(&[topic]).expect("subscribe");
+
+    let deadline = tokio::time::Instant::now() + deadline;
+    let mut observed = BTreeSet::new();
+    while !required.is_subset(&observed) && tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(250), consumer.recv()).await {
+            Ok(Ok(message)) => {
+                let payload = message
+                    .payload_view::<str>()
+                    .and_then(Result::ok)
+                    .expect("Kafka output must be UTF-8 JSON")
+                    .to_owned();
+                observed.insert(json_i64(&payload, "id"));
+            }
+            Ok(Err(error)) => eprintln!("consumer error: {error}"),
+            Err(_) => {}
+        }
+    }
+
+    let missing: Vec<_> = required.difference(&observed).copied().collect();
+    assert!(
+        missing.is_empty(),
+        "missing required IDs from {topic}: {missing:?}; observed {observed:?}"
+    );
+}
+
+fn validated_id_counts(
+    payloads: &[String],
+    expected_ids: std::ops::Range<i64>,
+) -> BTreeMap<i64, usize> {
+    let expected: BTreeSet<_> = expected_ids.collect();
+    let mut counts = BTreeMap::new();
+    for payload in payloads {
+        let id = json_i64(payload, "id");
+        assert!(expected.contains(&id), "unexpected ID {id}: {payload}");
+        assert_eq!(
+            json_i64(payload, "value"),
+            id * 10,
+            "incorrect value for ID {id}: {payload}"
+        );
+        *counts.entry(id).or_insert(0) += 1;
+    }
+    assert_eq!(
+        counts.keys().copied().collect::<BTreeSet<_>>(),
+        expected,
+        "captured Kafka cut has missing or unexpected IDs"
+    );
+    counts
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scenario_1_kafka_roundtrip() {
-    let Some(brokers) = kafka_brokers() else {
-        eprintln!("skipping: Redpanda not reachable");
+    let Some(brokers) = kafka_test_brokers() else {
         return;
     };
     let in_topic = unique("s1_in");
@@ -60,37 +392,37 @@ async fn scenario_1_kafka_roundtrip() {
     db.execute(&ddl_sink).await.expect("create sink");
     db.start().await.expect("start");
 
-    let results = consume_json(
+    wait_for_required_ids(
         brokers,
         &out_topic,
         &unique("s1_verify"),
-        n,
+        0..n as i64,
         Duration::from_secs(30),
     )
     .await;
-    db.shutdown().await.ok();
+    db.shutdown().await.expect("shutdown");
+    let cut = capture_stopped_writer_cut(brokers, &out_topic).await;
+    let results = consume_through_cut(
+        brokers,
+        &out_topic,
+        &unique("s1_cut"),
+        &cut,
+        Duration::from_secs(30),
+    )
+    .await;
+    let counts = validated_id_counts(&results, 0..n as i64);
+    assert!(
+        counts.values().all(|count| *count == 1),
+        "roundtrip output must contain each exact ID/value record once at the captured cut: {counts:?}"
+    );
     delete_topic(brokers, &in_topic).await;
     delete_topic(brokers, &out_topic).await;
-
-    assert_eq!(
-        results.len(),
-        n,
-        "expected {n} records in output, got {}",
-        results.len(),
-    );
-    // Spot-check: every output carries both id and value fields.
-    for payload in &results {
-        assert!(payload.contains("\"id\""));
-        assert!(payload.contains("\"value\""));
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore] // enabled via `cargo test -- --ignored`; killing the broker
-          // disturbs other concurrent tests against the same compose.
-async fn scenario_2_broker_kill_midstream() {
-    let Some(brokers) = kafka_brokers() else {
-        eprintln!("skipping: Redpanda not reachable");
+#[ignore] // Reconnect smoke test. Killing the shared broker disturbs concurrent Docker tests.
+async fn scenario_2_broker_outage_between_batches_reconnect_smoke() {
+    let Some(brokers) = kafka_test_brokers() else {
         return;
     };
     let in_topic = unique("s2_in");
@@ -100,9 +432,10 @@ async fn scenario_2_broker_kill_midstream() {
 
     // Produce in two halves so we can kill the broker between them.
     let half = 20;
-    produce_json_seq(brokers, &in_topic, half).await;
+    produce_json_range(brokers, &in_topic, 0..half).await;
 
-    let db = LaminarDB::open().expect("open db");
+    let storage = tempfile::tempdir().expect("tempdir");
+    let db = LaminarDB::open_with_config(at_least_once_config(storage.path())).expect("open db");
     let ddl_src = format!(
         "CREATE SOURCE input (id BIGINT, value BIGINT) WITH (\
              'connector' = 'kafka', \
@@ -110,7 +443,7 @@ async fn scenario_2_broker_kill_midstream() {
              'topic' = '{in_topic}', \
              'group.id' = 'laminar_s2', \
              'format' = 'json', \
-             'auto.offset.reset' = 'earliest')"
+             'startup.mode' = 'earliest')"
     );
     db.execute(&ddl_src).await.expect("create source");
     db.execute("CREATE STREAM projected AS SELECT id, value FROM input")
@@ -126,43 +459,58 @@ async fn scenario_2_broker_kill_midstream() {
     db.execute(&ddl_sink).await.expect("create sink");
     db.start().await.expect("start");
 
-    // Let the first half flow through, then kill and restart the broker.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    compose(&["kill", "redpanda"]);
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    compose(&["start", "redpanda"]);
+    // Prove the first input batch is visible before interrupting the broker.
+    wait_for_required_ids(
+        brokers,
+        &out_topic,
+        &unique("s2_ready"),
+        0..half as i64,
+        Duration::from_secs(20),
+    )
+    .await;
+    compose_checked(&["kill", "redpanda"]);
+    let broker_became_unavailable = wait_for_broker_unavailable(Duration::from_secs(10)).await;
+    compose_checked(&["start", "redpanda"]);
+    assert!(
+        broker_became_unavailable,
+        "broker still served Kafka metadata after docker compose kill",
+    );
     assert!(
         wait_for_broker(Duration::from_secs(30)).await,
         "broker did not come back online",
     );
 
-    // Produce the remaining half; pipeline should resume and emit.
-    produce_json_seq(brokers, &in_topic, half).await;
-    let results = consume_json(
+    // This is a reconnect smoke test: the later batch must become visible after recovery.
+    let total = half * 2;
+    produce_json_range(brokers, &in_topic, half..total).await;
+    wait_for_required_ids(
         brokers,
         &out_topic,
         &unique("s2_verify"),
-        half * 2,
+        0..total as i64,
         Duration::from_secs(60),
     )
     .await;
-    db.shutdown().await.ok();
+    db.shutdown().await.expect("shutdown after broker recovery");
+    let cut = capture_stopped_writer_cut(brokers, &out_topic).await;
+    let results = consume_through_cut(
+        brokers,
+        &out_topic,
+        &unique("s2_cut"),
+        &cut,
+        Duration::from_secs(30),
+    )
+    .await;
+
+    // At-least-once permits duplicates; the captured broker cut must contain both batches.
+    validated_id_counts(&results, 0..total as i64);
     delete_topic(brokers, &in_topic).await;
     delete_topic(brokers, &out_topic).await;
-
-    // At-least-once: every record arrives, duplicates acceptable.
-    assert!(
-        results.len() >= half * 2,
-        "expected at least {} records, got {}",
-        half * 2,
-        results.len(),
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn scenario_3_exactly_once_survives_db_restart() {
-    let Some(brokers) = kafka_brokers() else {
-        eprintln!("skipping: Redpanda not reachable");
+async fn scenario_3_at_least_once_has_no_loss_after_db_restart() {
+    let Some(brokers) = kafka_test_brokers() else {
         return;
     };
     let in_topic = unique("s3_in");
@@ -173,14 +521,12 @@ async fn scenario_3_exactly_once_survives_db_restart() {
     let storage = tempfile::tempdir().expect("tempdir");
 
     let n = 30;
-    produce_json_seq(brokers, &in_topic, n).await;
+    let first_batch = n / 2;
+    produce_json_seq(brokers, &in_topic, first_batch).await;
 
-    // First run: process, checkpoint, shut down cleanly.
-    {
-        let config = laminar_db::LaminarConfig {
-            storage_dir: Some(storage.path().to_path_buf()),
-            ..laminar_db::LaminarConfig::default()
-        };
+    // Stop every writer before taking the baseline used to detect replay on restart.
+    let (first_cut, first_counts) = {
+        let config = at_least_once_config(storage.path());
         let db = LaminarDB::open_with_config(config).expect("open");
         let ddl = format!(
             "CREATE SOURCE input (id BIGINT, value BIGINT) WITH (\
@@ -189,7 +535,7 @@ async fn scenario_3_exactly_once_survives_db_restart() {
                  'topic' = '{in_topic}', \
                  'group.id' = 'laminar_s3', \
                  'format' = 'json', \
-                 'auto.offset.reset' = 'earliest')"
+                 'startup.mode' = 'earliest')"
         );
         db.execute(&ddl).await.expect("src");
         db.execute("CREATE STREAM out_stream AS SELECT id, value FROM input")
@@ -205,20 +551,40 @@ async fn scenario_3_exactly_once_survives_db_restart() {
         db.execute(&ddl_sink).await.expect("sink");
         db.start().await.expect("start");
 
-        // Wait for the first n to flow through, then force a checkpoint
-        // and shut down cleanly.
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        db.checkpoint().await.ok();
-        db.shutdown().await.ok();
-    }
+        wait_for_required_ids(
+            brokers,
+            &out_topic,
+            &unique("s3_ready"),
+            0..first_batch as i64,
+            Duration::from_secs(20),
+        )
+        .await;
+        let checkpoint = db.checkpoint().await.expect("checkpoint");
+        assert!(
+            checkpoint.success && checkpoint.error.is_none(),
+            "checkpoint did not commit cleanly: {checkpoint:?}"
+        );
+        db.shutdown().await.expect("shutdown");
 
-    // Second run against the same storage dir: should resume at the
-    // committed offset and NOT re-emit.
+        let first_cut = capture_stopped_writer_cut(brokers, &out_topic).await;
+        let first_results = consume_through_cut(
+            brokers,
+            &out_topic,
+            &unique("s3_baseline"),
+            &first_cut,
+            Duration::from_secs(20),
+        )
+        .await;
+        (
+            first_cut,
+            validated_id_counts(&first_results, 0..first_batch as i64),
+        )
+    };
+
+    produce_json_range(brokers, &in_topic, first_batch..n).await;
+
     {
-        let config = laminar_db::LaminarConfig {
-            storage_dir: Some(storage.path().to_path_buf()),
-            ..laminar_db::LaminarConfig::default()
-        };
+        let config = at_least_once_config(storage.path());
         let db = LaminarDB::open_with_config(config).expect("reopen");
         let ddl = format!(
             "CREATE SOURCE input (id BIGINT, value BIGINT) WITH (\
@@ -227,7 +593,7 @@ async fn scenario_3_exactly_once_survives_db_restart() {
                  'topic' = '{in_topic}', \
                  'group.id' = 'laminar_s3', \
                  'format' = 'json', \
-                 'auto.offset.reset' = 'earliest')"
+                 'startup.mode' = 'earliest')"
         );
         db.execute(&ddl).await.expect("src");
         db.execute("CREATE STREAM out_stream AS SELECT id, value FROM input")
@@ -242,97 +608,55 @@ async fn scenario_3_exactly_once_survives_db_restart() {
         );
         db.execute(&ddl_sink).await.expect("sink");
         db.start().await.expect("restart");
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        db.shutdown().await.ok();
+        wait_for_required_ids(
+            brokers,
+            &out_topic,
+            &unique("s3_verify"),
+            first_batch as i64..n as i64,
+            Duration::from_secs(20),
+        )
+        .await;
+        db.shutdown().await.expect("shutdown after restart");
     }
 
-    let results = consume_json(
-        brokers,
-        &out_topic,
-        &unique("s3_verify"),
-        n * 2, // upper bound
-        Duration::from_secs(10),
-    )
-    .await;
-    delete_topic(brokers, &in_topic).await;
-    delete_topic(brokers, &out_topic).await;
-
-    // Exactly-once target: exactly `n` records in output.
-    // At-least-once acceptable fallback: `n` to `2n`. Fail only if under n.
-    assert!(
-        results.len() >= n,
-        "expected ≥{n} records after restart, got {}",
-        results.len(),
+    let final_cut = capture_stopped_writer_cut(brokers, &out_topic).await;
+    assert_eq!(
+        final_cut.partitions.keys().collect::<Vec<_>>(),
+        first_cut.partitions.keys().collect::<Vec<_>>(),
+        "Kafka output partition set changed across restart"
     );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore] // rebalance is timing-sensitive; run explicitly.
-async fn scenario_4_consumer_rebalance_midstream() {
-    let Some(brokers) = kafka_brokers() else {
-        eprintln!("skipping: Redpanda not reachable");
-        return;
-    };
-    let in_topic = unique("s4_in");
-    let out_topic = unique("s4_out");
-    create_topic(brokers, &in_topic, 2).await; // 2 partitions so rebalance does something
-    create_topic(brokers, &out_topic, 1).await;
-
-    let n = 80;
-    produce_json_seq(brokers, &in_topic, n).await;
-
-    let group = unique("laminar_s4_grp");
-    let make_db = || async {
-        let db = LaminarDB::open().expect("open");
-        let ddl = format!(
-            "CREATE SOURCE input (id BIGINT, value BIGINT) WITH (\
-                 'connector' = 'kafka', \
-                 'bootstrap.servers' = '{brokers}', \
-                 'topic' = '{in_topic}', \
-                 'group.id' = '{group}', \
-                 'format' = 'json', \
-                 'auto.offset.reset' = 'earliest')"
+    for (partition, first) in &first_cut.partitions {
+        let final_watermark = &final_cut.partitions[partition];
+        assert_eq!(
+            final_watermark.low, first.low,
+            "Kafka output low watermark changed for partition {partition}"
         );
-        db.execute(&ddl).await.expect("src");
-        db.execute("CREATE STREAM out_stream AS SELECT id, value FROM input")
-            .await
-            .expect("stream");
-        let ddl_sink = format!(
-            "CREATE SINK sink_a FROM out_stream WITH (\
-                 'connector' = 'kafka', \
-                 'bootstrap.servers' = '{brokers}', \
-                 'topic' = '{out_topic}', \
-                 'format' = 'json')"
+        assert!(
+            final_watermark.high_exclusive >= first.high_exclusive,
+            "Kafka output high watermark regressed for partition {partition}: {} -> {}",
+            first.high_exclusive,
+            final_watermark.high_exclusive
         );
-        db.execute(&ddl_sink).await.expect("sink");
-        db.start().await.expect("start");
-        db
-    };
-
-    let db_a = make_db().await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let db_b = make_db().await; // joining the group triggers rebalance
-    tokio::time::sleep(Duration::from_secs(6)).await;
-
-    let results = consume_json(
+    }
+    let final_results = consume_through_cut(
         brokers,
         &out_topic,
-        &unique("s4_verify"),
-        n,
+        &unique("s3_final"),
+        &final_cut,
         Duration::from_secs(20),
     )
     .await;
-    db_a.shutdown().await.ok();
-    db_b.shutdown().await.ok();
+    let final_counts = validated_id_counts(&final_results, 0..n as i64);
+    for id in 0..first_batch as i64 {
+        assert_eq!(
+            final_counts.get(&id),
+            first_counts.get(&id),
+            "pre-checkpoint ID {id} was emitted again after a clean restore"
+        );
+    }
+
     delete_topic(brokers, &in_topic).await;
     delete_topic(brokers, &out_topic).await;
-
-    // At-least-once: every record visible, duplicates acceptable.
-    assert!(
-        results.len() >= n,
-        "expected ≥{n} records after rebalance, got {}",
-        results.len(),
-    );
 }
 
 fn kv_batch(ks: &[i64], vs: &[i64]) -> arrow::array::RecordBatch {
@@ -351,15 +675,14 @@ fn kv_batch(ks: &[i64], vs: &[i64]) -> arrow::array::RecordBatch {
 }
 
 /// Broker for this test: honor `LAMINAR_TEST_KAFKA_BROKERS` (a functional broker on this host,
-/// e.g. the 29092 cluster) before the shared 19092 helper, since TCP-reachability alone doesn't
-/// prove the broker serves admin/produce.
+/// e.g. the 29092 cluster) before the shared 19092 metadata probe.
 fn upsert_test_brokers() -> Option<String> {
     if let Ok(b) = std::env::var("LAMINAR_TEST_KAFKA_BROKERS") {
         if !b.is_empty() {
             return Some(b);
         }
     }
-    kafka_brokers().map(String::from)
+    kafka_test_brokers().map(String::from)
 }
 
 /// Shared ENVELOPE UPSERT scenario: build an incremental agg MV, optionally project it through
@@ -377,9 +700,9 @@ async fn run_upsert_scenario(
     let dir = tempfile::tempdir().unwrap();
     let cfg = laminar_db::LaminarConfig {
         storage_dir: Some(dir.path().to_path_buf()),
+        incremental_emit: true,
         checkpoint: Some(laminar_core::streaming::StreamCheckpointConfig {
             interval_ms: None,
-            incremental_emit: true,
             ..Default::default()
         }),
         ..Default::default()
@@ -421,7 +744,7 @@ async fn run_upsert_scenario(
         Duration::from_secs(10),
     )
     .await;
-    db.shutdown().await.ok();
+    db.shutdown().await.expect("shutdown");
     delete_topic(brokers, &out_topic).await;
 
     let mut latest: std::collections::BTreeMap<String, Option<String>> =
@@ -451,7 +774,6 @@ async fn run_upsert_scenario(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scenario_incremental_agg_kafka_upsert() {
     let Some(brokers) = upsert_test_brokers() else {
-        eprintln!("skipping: Redpanda not reachable");
         return;
     };
     run_upsert_scenario(brokers.as_str(), "p1b_upsert", None, "agg").await;
@@ -462,7 +784,6 @@ async fn scenario_incremental_agg_kafka_upsert() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scenario_stream_over_incremental_mv_to_kafka_upsert() {
     let Some(brokers) = upsert_test_brokers() else {
-        eprintln!("skipping: Redpanda not reachable");
         return;
     };
     run_upsert_scenario(

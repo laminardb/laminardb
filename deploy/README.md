@@ -95,7 +95,7 @@ helm package deploy/helm/laminardb
 helm install my-laminardb laminardb-*.tgz
 ```
 
-### Quick start (standalone embedded mode)
+### Quick start (standalone single-node mode)
 
 ```bash
 helm install my-laminardb deploy/helm/laminardb \
@@ -123,7 +123,7 @@ All values are documented in [`helm/laminardb/values.yaml`](helm/laminardb/value
 
 | Section | Description |
 |---------|-------------|
-| `laminardb.mode` | `embedded` (single node) or `cluster` (multi-node) |
+| `laminardb.mode` | `single` (standalone) or `cluster` (multi-node) |
 | `laminardb.checkpoint` | Checkpoint interval, storage URL, strategy |
 | `sources` / `sinks` / `pipelines` | Streaming pipeline definitions (rendered to TOML) |
 | `persistence` | PVC sizes for state and checkpoints |

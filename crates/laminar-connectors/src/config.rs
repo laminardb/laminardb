@@ -190,6 +190,34 @@ impl ConnectorConfig {
         }
         Ok(())
     }
+
+    /// Rejects properties outside `allowed`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConnectorError::ConfigurationError`] for unknown properties.
+    pub fn reject_unknown_properties(
+        &self,
+        allowed: &[&str],
+        connector: &str,
+    ) -> Result<(), ConnectorError> {
+        let mut unknown: Vec<&str> = self
+            .properties
+            .keys()
+            .map(String::as_str)
+            .filter(|key| !allowed.contains(key))
+            .collect();
+        if unknown.is_empty() {
+            return Ok(());
+        }
+
+        unknown.sort_unstable();
+        Err(ConnectorError::ConfigurationError(format!(
+            "unknown {connector} propert{}: {}",
+            if unknown.len() == 1 { "y" } else { "ies" },
+            unknown.join(", ")
+        )))
+    }
 }
 
 /// Validates that a string field is non-empty.

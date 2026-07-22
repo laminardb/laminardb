@@ -75,7 +75,26 @@ impl IcebergCatalogConfig {
 
         let catalog_uri = config.require("catalog.uri")?.to_string();
         let warehouse = config.require("warehouse")?.to_string();
-        let storage_type = config.get("storage.type").map(str::to_string);
+        let storage_type = config
+            .get("storage.type")
+            .map(str::trim)
+            .filter(|storage| !storage.is_empty())
+            .map(str::to_ascii_lowercase);
+        if let Some(storage) = storage_type.as_deref() {
+            if !matches!(storage, "s3" | "s3a" | "fs") {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "unsupported Iceberg storage.type '{storage}'; expected s3 | s3a | fs"
+                )));
+            }
+        }
+        if let Some((scheme, _)) = warehouse.split_once("://") {
+            let scheme = scheme.to_ascii_lowercase();
+            if !matches!(scheme.as_str(), "s3" | "s3a" | "file") {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "unsupported Iceberg warehouse scheme '{scheme}'; expected s3 | s3a | file"
+                )));
+            }
+        }
         let namespace = config.require("namespace")?.to_string();
         let table_name = config.require("table.name")?.to_string();
 
@@ -104,8 +123,6 @@ pub struct IcebergSinkConfig {
     pub compression: String,
     /// Auto-create table if it doesn't exist.
     pub auto_create: bool,
-    /// Writer ID for exactly-once deduplication (auto UUID if not set).
-    pub writer_id: String,
 }
 
 impl IcebergSinkConfig {
@@ -123,16 +140,10 @@ impl IcebergSinkConfig {
             .get("auto.create")
             .is_some_and(|v| v.eq_ignore_ascii_case("true"));
 
-        let writer_id = config
-            .get("writer.id")
-            .filter(|v| !v.is_empty())
-            .map_or_else(|| uuid::Uuid::now_v7().to_string(), ToString::to_string);
-
         Ok(Self {
             catalog,
             compression,
             auto_create,
-            writer_id,
         })
     }
 }
@@ -267,7 +278,6 @@ mod tests {
         assert_eq!(cfg.catalog.namespace, "prod");
         assert_eq!(cfg.catalog.table_name, "events");
         assert_eq!(cfg.compression, "snappy");
-        assert!(!cfg.writer_id.is_empty());
     }
 
     #[test]
@@ -302,6 +312,21 @@ mod tests {
         let cfg = IcebergSinkConfig::from_config(&config).unwrap();
         assert_eq!(cfg.compression, "zstd");
         assert!(!cfg.auto_create);
+    }
+
+    #[test]
+    fn test_unwired_storage_backends_are_rejected() {
+        let mut config = ConnectorConfig::new("iceberg");
+        config.set("catalog.uri", "http://localhost:8181");
+        config.set("warehouse", "demo");
+        config.set("storage.type", "gcs");
+        config.set("namespace", "prod");
+        config.set("table.name", "events");
+        assert!(IcebergSinkConfig::from_config(&config).is_err());
+
+        config.set("storage.type", "s3");
+        config.set("warehouse", "abfs://container/warehouse");
+        assert!(IcebergSinkConfig::from_config(&config).is_err());
     }
 
     // ── Schema validation tests ──

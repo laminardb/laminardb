@@ -24,14 +24,11 @@ pub use json::{
 };
 #[cfg(any(feature = "parquet-lookup", feature = "files"))]
 pub use parquet::{
-    ParquetDecoder, ParquetDecoderConfig, ParquetEncoder, ParquetEncoderConfig,
-    ParquetSchemaProvider, RowGroupPredicate,
+    ParquetDecoder, ParquetDecoderConfig, ParquetEncoder, ParquetEncoderConfig, RowGroupPredicate,
 };
 pub use traits::{
-    ArrayInference, ColumnProjection, CompatibilityMode, ConfigOption, ConfigValueType,
-    ConnectorConfigSchema, EvolutionVerdict, FieldInferenceDetail, FormatDecoder, FormatEncoder,
-    InferenceConfig, InferenceWarning, InferredSchema, NumberInference, RegisteredSchema,
-    RegistryConfig, RegistryCredentials, RegistrySchemaType, SchemaChange, SchemaProvider,
-    SchemaRegistryAware, WarningSeverity,
+    ArrayInference, ColumnProjection, CompatibilityMode, EvolutionVerdict, FieldInferenceDetail,
+    FormatDecoder, FormatEncoder, InferenceConfig, InferenceWarning, InferredSchema,
+    NumberInference, SchemaChange, WarningSeverity,
 };
-pub use types::{FieldMeta, RawRecord, SinkConfig, SourceConfig, SourceMetadata};
+pub use types::{FieldMeta, RawRecord, SourceMetadata};

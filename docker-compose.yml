@@ -16,7 +16,7 @@ services:
       - KAFKA_BROKERS=redpanda:9092
 
   redpanda:
-    image: docker.redpanda.com/redpandadata/redpanda:v24.2.5
+    image: docker.redpanda.com/redpandadata/redpanda:v26.1.13
     command:
       - redpanda
       - start
@@ -35,7 +35,7 @@ services:
       - "18082:18082"
       - "18081:18081"
     healthcheck:
-      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true'"]
+      test: ["CMD", "rpk", "cluster", "health", "-e", "-X", "brokers=127.0.0.1:9092"]
       interval: 10s
       timeout: 5s
       retries: 5

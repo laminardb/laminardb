@@ -11,7 +11,7 @@ pub use connection::{Connection, ExecuteResult};
 pub use error::{codes, ApiError};
 pub use ingestion::Writer;
 pub use query::{QueryResult, QueryStream};
-pub use subscription::ArrowSubscription;
+pub use subscription::{ArrowSubscription, ArrowSubscriptionFrame};
 
 pub use crate::LaminarConfig;
 

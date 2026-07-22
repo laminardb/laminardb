@@ -77,6 +77,9 @@ pub struct LaminarConfig {
     pub storage_dir: Option<PathBuf>,
     /// Checkpoint config. `None` = disabled.
     pub checkpoint: Option<StreamCheckpointConfig>,
+    /// Emit dirty-only changelogs for keyed non-windowed aggregate materialized views instead of
+    /// re-materializing every group each cycle. This is query execution policy, not checkpointing.
+    pub incremental_emit: bool,
     /// Cloud checkpoint URL, e.g. `s3://bucket/prefix`.
     pub object_store_url: Option<String>,
     /// Credential/config overrides for the object store.
@@ -86,19 +89,6 @@ pub struct LaminarConfig {
     pub http_auth_token: Option<SecretString>,
     /// Delivery guarantee.
     pub delivery_guarantee: DeliveryGuarantee,
-    /// Per-operator state limit. At 80% warns, at 100% errors. `None` = unlimited.
-    pub max_state_bytes_per_operator: Option<usize>,
-    /// Node-level cap on in-memory operator state; crossing it backpressures
-    /// source intake until state drains below it. `None` = unlimited.
-    pub state_memory_budget_bytes: Option<usize>,
-    /// Local directory for the disk cold tier. With `state_memory_budget_bytes`,
-    /// state near the budget is demoted here instead of backpressuring. `None` = no tier.
-    /// Requires the `state-tier` build feature; ignored otherwise.
-    pub state_tier_dir: Option<PathBuf>,
-    /// Demote at GROUP granularity: shed individual idle aggregate groups to the tier instead of
-    /// only whole idle vnodes. Requires the `state-tier` feature and delta checkpoints; else a no-op.
-    pub state_tier_group_demotion: bool,
-
     /// Source-to-coordinator channel capacity. `None` = 64.
     pub pipeline_channel_capacity: Option<usize>,
     /// Micro-batch coalescing window. `None` = 5ms connectors / 0 embedded.
@@ -115,9 +105,6 @@ pub struct LaminarConfig {
     pub pipeline_backpressure_policy: BackpressurePolicy,
     /// Auto-restart policy applied when supervision is enabled.
     pub restart_policy: RestartPolicy,
-    /// Cluster mode: on a fatal fault, the leader rewinds every node to the highest
-    /// cluster-wide committed epoch instead of a local-only restart. Default off.
-    pub coordinated_recovery: bool,
     /// Isolate queries that share a source into independent failure domains.
     /// Default off; when off, shared-source queries fault and recover together.
     pub shared_source_isolation: bool,
@@ -130,14 +117,11 @@ impl Default for LaminarConfig {
             default_backpressure: BackpressureStrategy::Block,
             storage_dir: None,
             checkpoint: None,
+            incremental_emit: true,
             object_store_url: None,
             object_store_options: HashMap::new(),
             http_auth_token: None,
             delivery_guarantee: DeliveryGuarantee::default(),
-            max_state_bytes_per_operator: None,
-            state_memory_budget_bytes: None,
-            state_tier_dir: None,
-            state_tier_group_demotion: false,
             pipeline_channel_capacity: None,
             pipeline_batch_window: None,
             pipeline_drain_budget_ns: None,
@@ -146,7 +130,6 @@ impl Default for LaminarConfig {
             pipeline_max_input_buf_bytes: None,
             pipeline_backpressure_policy: BackpressurePolicy::default(),
             restart_policy: RestartPolicy::default(),
-            coordinated_recovery: false,
             shared_source_isolation: false,
         }
     }

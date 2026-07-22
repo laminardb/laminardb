@@ -11,7 +11,7 @@ Unified database facade for LaminarDB. The main entry point that wires the SQL p
 - **`SourceHandle<T>`** / **`UntypedSourceHandle`** -- Typed and untyped handles for pushing data into sources.
 - **`TypedSubscription<T>`** -- Subscription to a named stream with automatic RecordBatch-to-struct conversion.
 - **`SubscriptionRegistry`** / **`SubscriptionPortal`** -- Broadcast fan-out and per-consumer pump.
-- **`CheckpointCoordinator`** -- Orchestrates two-phase commit checkpoints across all operators and sinks.
+- **`CheckpointCoordinator`** -- Seals source/operator state, records the exact durable decision, and hands coordinated external publication to the designated committer.
 - **`RecoveryManager`** -- Restores operator state, connector offsets, and watermarks from the latest checkpoint.
 - **`Profile`** -- Deployment profile (`BareMetal`, `Embedded`, `Durable`, `Delta`).
 - **`PipelineMetrics`** / **`PipelineCounters`** -- Real-time pipeline observability.
@@ -35,9 +35,8 @@ laminar-db
 | `api` | FFI-friendly API module with `Connection`, `Writer`, `QueryStream` |
 | `ffi` | C FFI layer with `extern "C"` functions and Arrow C Data Interface (implies `api`) |
 | `kafka` | Kafka source/sink connector |
-| `postgres-cdc` | PostgreSQL CDC source (also enables Postgres lookup) |
+| `postgres-cdc` | PostgreSQL CDC source (also builds the standalone `postgres` lookup connector) |
 | `postgres-sink` | PostgreSQL sink |
-| `mysql-cdc` | MySQL CDC source via binlog |
 | `mongodb-cdc` | MongoDB CDC source and sink |
 | `delta-lake` | Delta Lake sink and source |
 | `delta-lake-s3` / `delta-lake-azure` / `delta-lake-gcs` | Cloud storage backends for Delta Lake |
@@ -46,9 +45,9 @@ laminar-db
 | `iceberg` | Apache Iceberg source and sink |
 | `websocket` | WebSocket source and sink connectors |
 | `files` | File source (AutoLoader) and sink (rolling files) |
-| `parquet-lookup` | Parquet lookup source for reference tables |
+| `parquet-lookup` | Parquet schema and codec helpers; no standalone connector |
 | `otel` | OpenTelemetry OTLP/gRPC source |
-| `cluster` | Full distributed mode scaffolding (gRPC, gossip, Raft). Not production-ready. |
+| `cluster` | Pre-production distributed mode (gRPC control plane and gossip/static discovery; at-least-once only). |
 | `aws` / `gcs` / `azure` | Object-store checkpoint backends (forwards to laminar-core) |
 
 ## Internal Architecture

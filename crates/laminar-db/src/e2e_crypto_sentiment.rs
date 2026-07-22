@@ -149,7 +149,6 @@ fn build_scoring_graph(runtime: Arc<AiRuntime>) -> OperatorGraph {
         None,
         None,
         None,
-        None,
         false,
     );
     graph
@@ -232,7 +231,6 @@ async fn ai_degrades_to_null_on_provider_500() {
         None,
         None,
         None,
-        None,
         false,
     );
     graph
@@ -281,82 +279,4 @@ async fn ai_degrades_to_null_on_provider_500() {
             .any(|c| matches!(c.outcome, CallOutcome::Failure(_))),
         "the failure is recorded in laminar.ai_calls"
     );
-}
-
-// A plain INNER equi-join is a stateful processing-time join: it buffers each
-// side and matches when the second side arrives, so two windowed views that
-// close the same bucket in DIFFERENT cycles (e.g. when an upstream AI operator's
-// watermark-hold delays one side) still join — with no watermark.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn join_matches_buckets_closing_in_different_cycles() {
-    // Two hand-built bucketed streams (the shape price_1m / sentiment_1m emit):
-    // one row per closed minute, arriving on the bucket key at different times.
-    let ctx = laminar_sql::create_session_context();
-    laminar_sql::register_streaming_functions(&ctx);
-    let mut graph = OperatorGraph::new(ctx);
-
-    let price_schema = Arc::new(Schema::new(vec![
-        Field::new("bucket", DataType::Int64, false),
-        Field::new("price", DataType::Float64, false),
-    ]));
-    let sent_schema = Arc::new(Schema::new(vec![
-        Field::new("bucket", DataType::Int64, false),
-        Field::new("ms", DataType::Float64, false),
-    ]));
-    graph.register_source_schema("price_b".to_string(), Arc::clone(&price_schema));
-    graph.register_source_schema("sent_b".to_string(), Arc::clone(&sent_schema));
-    graph.add_query(
-        "joined".to_string(),
-        "SELECT p.bucket AS bucket, p.price AS price, s.ms AS ms \
-         FROM price_b p JOIN sent_b s ON p.bucket = s.bucket"
-            .to_string(),
-        None,
-        None,
-        None,
-        None,
-        None,
-        false,
-    );
-    graph
-        .take_build_errors()
-        .expect("equi-join routes as a per-cycle batch join");
-
-    let price_row = |b: i64, p: f64| {
-        RecordBatch::try_new(
-            Arc::clone(&price_schema),
-            vec![
-                Arc::new(Int64Array::from(vec![b])),
-                Arc::new(Float64Array::from(vec![p])),
-            ],
-        )
-        .unwrap()
-    };
-    let sent_row = |b: i64, m: f64| {
-        RecordBatch::try_new(
-            Arc::clone(&sent_schema),
-            vec![
-                Arc::new(Int64Array::from(vec![b])),
-                Arc::new(Float64Array::from(vec![m])),
-            ],
-        )
-        .unwrap()
-    };
-
-    let count = |r: &FxHashMap<Arc<str>, Vec<RecordBatch>>| {
-        r.get(&(Arc::from("joined") as Arc<str>))
-            .map_or(0, |v| v.iter().map(RecordBatch::num_rows).sum::<usize>())
-    };
-
-    // Cycle 1: only the price side closes bucket 1 (the sentiment side is still
-    // being scored). The join buffers it and emits nothing yet.
-    let mut c1 = FxHashMap::default();
-    c1.insert(Arc::from("price_b"), vec![price_row(1, 100.0)]);
-    let r1 = graph.execute_cycle(&c1, i64::MAX, None).await.unwrap();
-    assert_eq!(count(&r1), 0, "no match until the second side closes");
-
-    // Cycle 2: the sentiment side closes bucket 1 — the buffered price matches.
-    let mut c2 = FxHashMap::default();
-    c2.insert(Arc::from("sent_b"), vec![sent_row(1, 0.5)]);
-    let r2 = graph.execute_cycle(&c2, i64::MAX, None).await.unwrap();
-    assert_eq!(count(&r2), 1, "bucket 1 joins across cycles");
 }

@@ -385,7 +385,7 @@ mod tests {
             laminar_open(&mut conn);
 
             // Create table (not source) for point-in-time queries
-            let create_sql = b"CREATE TABLE query_test (id BIGINT, val DOUBLE)\0";
+            let create_sql = b"CREATE TABLE query_test (id BIGINT PRIMARY KEY, val DOUBLE)\0";
             crate::ffi::connection::laminar_execute(
                 conn,
                 create_sql.as_ptr().cast(),
@@ -417,7 +417,7 @@ mod tests {
             laminar_open(&mut conn);
 
             // Create table (not source) for point-in-time queries
-            let create_sql = b"CREATE TABLE count_test (id BIGINT)\0";
+            let create_sql = b"CREATE TABLE count_test (id BIGINT PRIMARY KEY)\0";
             crate::ffi::connection::laminar_execute(
                 conn,
                 create_sql.as_ptr().cast(),

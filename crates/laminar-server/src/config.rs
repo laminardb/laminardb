@@ -7,7 +7,11 @@ use std::path::Path;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use laminar_core::state::StateBackendConfig;
+use laminar_core::state::{
+    KeyGroupCount, StateBackendConfig, StateBackendDurability, DEFAULT_CLUSTER_KEY_GROUP_COUNT,
+    LOCAL_KEY_GROUP_COUNT,
+};
+use laminar_db::DeliveryGuarantee;
 use regex::Regex;
 use serde::Deserialize;
 
@@ -41,9 +45,12 @@ pub fn load_config(path: &Path) -> Result<ServerConfig, ConfigError> {
 }
 
 /// Substitute `${VAR}` and `${VAR:-default}` patterns with environment values.
+/// `$${VAR}` escapes substitution and becomes the literal `${VAR}` used by cluster DDL.
 fn substitute_env_vars(input: &str) -> Result<String, ConfigError> {
+    const ESCAPED_OPEN: &str = "\0LAMINAR_ENV_OPEN\0";
+    let escaped = input.replace("$${", ESCAPED_OPEN);
     let mut errors = Vec::new();
-    let result = ENV_VAR_RE.replace_all(input, |caps: &regex::Captures| {
+    let result = ENV_VAR_RE.replace_all(&escaped, |caps: &regex::Captures| {
         let var_name = &caps[1];
         match std::env::var(var_name) {
             Ok(val) => val,
@@ -62,7 +69,7 @@ fn substitute_env_vars(input: &str) -> Result<String, ConfigError> {
         return Err(ConfigError::MissingEnvVars { vars: errors });
     }
 
-    Ok(result.into_owned())
+    Ok(result.replace(ESCAPED_OPEN, "${"))
 }
 
 fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
@@ -114,8 +121,15 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         ));
     }
     if let Some(addr) = &config.server.pgwire_bind {
-        if addr.parse::<std::net::SocketAddr>().is_err() {
-            errors.push(format!("invalid server pgwire_bind address: '{}'", addr));
+        match addr.parse::<std::net::SocketAddr>() {
+            Ok(addr) if !addr.ip().is_loopback() && config.server.pgwire_tls_cert.is_none() => {
+                errors.push(
+                    "non-loopback pgwire_bind requires pgwire_tls_cert + pgwire_tls_key"
+                        .to_string(),
+                );
+            }
+            Ok(_) => {}
+            Err(_) => errors.push(format!("invalid server pgwire_bind address: '{}'", addr)),
         }
     }
     for (user, password) in &config.server.pgwire_users {
@@ -201,12 +215,31 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         }
     }
 
-    if config.server.mode == "cluster" {
+    if config.server.mode == ServerMode::Single && config.server.key_groups.is_some() {
+        errors.push(
+            "server.key_groups is cluster-only; single mode always uses exactly 1 key group"
+                .to_string(),
+        );
+    }
+
+    if config.server.mode == ServerMode::Cluster {
+        match config.server.delivery {
+            DeliveryGuarantee::BestEffort => errors.push(
+                "cluster mode requires at_least_once delivery; best_effort has no defined \
+                 rebalance/state-loss contract"
+                    .to_string(),
+            ),
+            DeliveryGuarantee::AtLeastOnce => {}
+            DeliveryGuarantee::ExactlyOnce => errors.push(
+                "[LDB-0013] cluster exactly-once is not admitted: checkpoint decisions are \
+                 term-fenced, but supported connectors do not yet provide a certified \
+                 term-fenced source handoff and external sink cursor commit. Use cluster \
+                 at_least_once, or exactly_once in embedded/single-node mode"
+                    .to_string(),
+            ),
+        }
         if config.discovery.is_none() {
             errors.push("mode = \"cluster\" requires a [discovery] section".to_string());
-        }
-        if config.coordination.is_none() {
-            errors.push("mode = \"cluster\" requires a [coordination] section".to_string());
         }
         if config.node_id.is_none() {
             errors.push("mode = \"cluster\" requires node_id to be set".to_string());
@@ -218,13 +251,67 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
                 config.checkpoint.interval,
             ));
         }
+        let scope = config.state.durability_scope();
+        if !scope.satisfies(StateBackendDurability::ClusterShared) {
+            errors.push(format!(
+                "mode = \"cluster\" requires ClusterShared [state] storage; configured scope is \
+                 {scope:?}. Use s3://, gs://, or az:// storage; local paths and file:// are \
+                 node-local"
+            ));
+        }
+        let checkpoint_scope = StateBackendDurability::for_storage_url(&config.checkpoint.url);
+        if !checkpoint_scope.satisfies(StateBackendDurability::ClusterShared) {
+            errors.push(format!(
+                "mode = \"cluster\" requires ClusterShared [checkpoint] storage for manifests \
+                 and decisions; configured scope is {checkpoint_scope:?}. Use s3://, gs://, or \
+                 az:// storage"
+            ));
+        }
+    } else if config.server.delivery == DeliveryGuarantee::ExactlyOnce {
+        if !config.checkpoint.url.starts_with("file://") {
+            errors.push(
+                "[LDB-0014] embedded/single-node exactly-once currently requires a local \
+                 file:// checkpoint namespace protected by an exclusive process lock; shared \
+                 object-store checkpoints require a term-fenced deployment lease"
+                    .to_string(),
+            );
+        }
+        let scope = config.state.durability_scope();
+        if !scope.satisfies(StateBackendDurability::NodeDurable) {
+            errors.push(format!(
+                "exactly-once delivery requires at least NodeDurable [state] storage; configured \
+                 scope is {scope:?}"
+            ));
+        }
+        let checkpoint_scope = StateBackendDurability::for_storage_url(&config.checkpoint.url);
+        if !checkpoint_scope.satisfies(StateBackendDurability::NodeDurable) {
+            errors.push(format!(
+                "exactly-once delivery requires at least NodeDurable [checkpoint] storage; \
+                 configured scope is {checkpoint_scope:?}"
+            ));
+        }
+    } else if config.server.delivery == DeliveryGuarantee::AtLeastOnce {
+        let checkpoint_scope = StateBackendDurability::for_storage_url(&config.checkpoint.url);
+        if !checkpoint_scope.satisfies(StateBackendDurability::NodeDurable) {
+            errors.push(format!(
+                "at-least-once delivery requires at least NodeDurable [checkpoint] storage \
+                 before source acknowledgements can advance; configured scope is \
+                 {checkpoint_scope:?}"
+            ));
+        }
     }
     // 0 would pause barrier admission permanently, silently wedging checkpointing.
+    if config.checkpoint.interval.is_zero() {
+        errors.push("checkpoint.interval must be > 0".to_string());
+    }
+    if config.checkpoint.timeout.is_zero() {
+        errors.push("checkpoint.timeout must be > 0".to_string());
+    }
     if config.checkpoint.max_staged_bytes == Some(0) {
         errors.push("checkpoint.max_staged_bytes must be > 0".to_string());
     }
-    if config.checkpoint.max_in_flight_epochs == Some(0) {
-        errors.push("checkpoint.max_in_flight_epochs must be > 0".to_string());
+    if config.checkpoint.max_retained == 0 {
+        errors.push("checkpoint.max_retained must be > 0".to_string());
     }
     // 0 prunes every prior timestamp, so the restart-rate budget never trips (unbounded restart loop).
     if config.supervision.window_secs == Some(0) {
@@ -233,8 +320,6 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
 
     validate_ai(config, &mut errors);
     validate_cluster_tls(config, &mut errors);
-    validate_state_tier(config, &mut errors);
-
     if !errors.is_empty() {
         return Err(ConfigError::ValidationErrors { errors });
     }
@@ -242,51 +327,9 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// Validate the `state_tier_dir` contract once, shared by embedded and cluster startup.
-fn validate_state_tier(config: &ServerConfig, errors: &mut Vec<String>) {
-    // Group demotion needs the cold tier; enabling it without a tier dir demotes nothing.
-    if config.server.state_tier_group_demotion == Some(true)
-        && config.server.state_tier_dir.is_none()
-    {
-        errors.push(
-            "state_tier_group_demotion is set but state_tier_dir is not — group demotion needs a \
-             cold tier to shed groups to, so without state_tier_dir it does nothing; set \
-             state_tier_dir (with state_memory_budget_bytes) or remove state_tier_group_demotion"
-                .to_string(),
-        );
-    }
-    if config.server.state_tier_dir.is_none() {
-        return;
-    }
-    #[cfg(feature = "state-tier")]
-    {
-        // Cold tier needs a durable backend (survives restart) and a memory budget (drives demotion).
-        if !config.state.is_durable() {
-            errors.push(
-                "state_tier_dir requires a durable [state] backend (a local path or \
-                 object store); an in-process backend would lose demoted state on restart"
-                    .to_string(),
-            );
-        }
-        if config.server.state_memory_budget_bytes.is_none() {
-            errors.push(
-                "state_tier_dir requires state_memory_budget_bytes — demotion to the cold \
-                 tier is triggered by the memory budget, so a tier dir without a budget \
-                 would never demote"
-                    .to_string(),
-            );
-        }
-    }
-    #[cfg(not(feature = "state-tier"))]
-    errors.push(
-        "state_tier_dir is set but this binary was built without the 'state-tier' \
-         feature; rebuild with --features state-tier or remove state_tier_dir"
-            .to_string(),
-    );
-}
-
 /// Top-level server configuration deserialized from `laminardb.toml`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     #[serde(default)]
     pub server: ServerSection,
@@ -309,7 +352,6 @@ pub struct ServerConfig {
     #[serde(default)]
     pub sql: Option<String>,
     pub discovery: Option<DiscoverySection>,
-    pub coordination: Option<CoordinationSection>,
     pub node_id: Option<String>,
     /// `[ai]` — AI provider wiring and per-task default models.
     #[serde(default)]
@@ -319,20 +361,41 @@ pub struct ServerConfig {
     pub models: std::collections::HashMap<String, ModelConfig>,
 }
 
+/// Runtime protocol boundary selected by `[server].mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerMode {
+    /// Standalone single-node server.
+    #[default]
+    Single,
+    /// Multi-node runtime with discovery, durable leases, and shared state.
+    Cluster,
+}
+
 /// `[server]` section.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerSection {
-    #[serde(default = "default_mode")]
-    pub mode: String,
+    #[serde(default)]
+    pub mode: ServerMode,
+    /// Stable hash partitions. Configurable only in cluster mode.
+    #[serde(default)]
+    pub key_groups: Option<KeyGroupCount>,
     #[serde(default = "default_bind")]
     pub bind: String,
+    /// End-to-end pipeline delivery contract. Connector protocols are derived from this value.
+    #[serde(default = "default_delivery")]
+    pub delivery: DeliveryGuarantee,
+    /// Query execution policy for keyed running aggregates; independent of checkpoint storage.
+    #[serde(default = "default_incremental_emit")]
+    pub incremental_emit: bool,
     /// Postgres wire bind address; `None` disables it.
     #[serde(default)]
     pub pgwire_bind: Option<String>,
     /// MD5 auth users. Empty → trust auth (loopback only).
     #[serde(default)]
     pub pgwire_users: std::collections::HashMap<String, Secret>,
-    /// Required true to bind pgwire on a non-loopback address.
+    /// Required true to bind pgwire on a non-loopback address; remote binds also require TLS.
     #[serde(default)]
     pub pgwire_allow_remote: bool,
     /// PEM cert; pair with `pgwire_tls_key` to enable TLS.
@@ -359,17 +422,6 @@ pub struct ServerSection {
     /// CORS allow-list of console origins; `None` falls back to a permissive policy (dev only).
     #[serde(default)]
     pub console_cors_allowed_origins: Option<Vec<String>>,
-    /// Cap on in-memory operator state (bytes); crossing it backpressures intake. `None` = unlimited.
-    #[serde(default)]
-    pub state_memory_budget_bytes: Option<usize>,
-    /// Local directory for the disk cold tier; state near the memory budget demotes here
-    /// instead of backpressuring. Requires a `state-tier` build. `None` = no tier.
-    #[serde(default)]
-    pub state_tier_dir: Option<std::path::PathBuf>,
-    /// Demote at GROUP (not vnode) granularity. Requires the cold tier. Unset defaults ON for
-    /// embedded, OFF for cluster (its group path has open correctness gaps); `Some(b)` forces either.
-    #[serde(default)]
-    pub state_tier_group_demotion: Option<bool>,
 }
 
 fn default_pgwire_max_connections() -> usize {
@@ -384,20 +436,14 @@ fn default_pgwire_tls_min_version() -> String {
     "1.2".to_string()
 }
 
-impl ServerSection {
-    /// Effective group-demotion setting; unset defaults ON for embedded, OFF for cluster.
-    /// Explicit config wins.
-    #[cfg(feature = "state-tier")]
-    pub(crate) fn group_demotion(&self, embedded: bool) -> bool {
-        self.state_tier_group_demotion.unwrap_or(embedded)
-    }
-}
-
 impl Default for ServerSection {
     fn default() -> Self {
         Self {
-            mode: default_mode(),
+            mode: ServerMode::default(),
+            key_groups: None,
             bind: default_bind(),
+            delivery: default_delivery(),
+            incremental_emit: default_incremental_emit(),
             pgwire_bind: None,
             pgwire_users: std::collections::HashMap::new(),
             pgwire_allow_remote: false,
@@ -409,9 +455,17 @@ impl Default for ServerSection {
             pgwire_tls_min_version: default_pgwire_tls_min_version(),
             console_token: None,
             console_cors_allowed_origins: None,
-            state_memory_budget_bytes: None,
-            state_tier_dir: None,
-            state_tier_group_demotion: None,
+        }
+    }
+}
+
+impl ServerSection {
+    /// Key-group topology selected by the runtime mode.
+    #[must_use]
+    pub(crate) fn resolved_key_groups(&self) -> KeyGroupCount {
+        match self.mode {
+            ServerMode::Single => LOCAL_KEY_GROUP_COUNT,
+            ServerMode::Cluster => self.key_groups.unwrap_or(DEFAULT_CLUSTER_KEY_GROUP_COUNT),
         }
     }
 }
@@ -423,10 +477,6 @@ pub struct SupervisionSection {
     pub window_secs: Option<u64>,
     pub initial_backoff_ms: Option<u64>,
     pub max_backoff_secs: Option<u64>,
-    /// Cluster: on a fatal fault, rewind every node to the highest committed epoch instead of a
-    /// local restart. Default off.
-    #[serde(default)]
-    pub coordinated_recovery: bool,
 }
 
 impl SupervisionSection {
@@ -477,50 +527,27 @@ impl std::fmt::Debug for Secret {
 
 /// `[checkpoint]` section.
 #[derive(Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CheckpointSection {
     /// Storage URL: file:///path, s3://bucket/prefix, gs://bucket/prefix.
     #[serde(default = "default_checkpoint_url")]
     pub url: String,
     #[serde(default = "default_checkpoint_interval", with = "humantime_serde")]
     pub interval: Duration,
-    /// Number of recent checkpoints to retain before pruning.
+    /// One end-to-end checkpoint-attempt deadline.
+    #[serde(default = "default_checkpoint_timeout", with = "humantime_serde")]
+    pub timeout: Duration,
+    /// Number of predecessor checkpoints retained alongside the current recovery cut.
+    /// Predecessors keep reference/delta chains resolvable.
     #[serde(default = "default_max_retained")]
     pub max_retained: usize,
     /// Cloud storage credentials/config (e.g., `aws_access_key_id`).
     #[serde(default)]
     pub storage: std::collections::HashMap<String, String>,
-    /// Max epochs between capture and restorable (the upload backlog).
-    /// Default 4; exactly-once pipelines are capped at 1 regardless.
-    #[serde(default)]
-    pub max_in_flight_epochs: Option<u64>,
     /// Cap on captured-state bytes held by in-flight epochs awaiting
     /// upload; admission pauses at the cap. Default 512 MiB.
     #[serde(default)]
     pub max_staged_bytes: Option<u64>,
-    /// Coordinated-committer lag (sealed-but-uncommitted epochs) past which the
-    /// committer warns; the hard cap when `uncommitted_epochs_backpressure` is
-    /// on. Default 1024.
-    #[serde(default)]
-    pub max_uncommitted_epochs: Option<u64>,
-    /// Fail checkpoints once the coordinated committer lag exceeds
-    /// `max_uncommitted_epochs`, bounding object-storage growth. Default false.
-    #[serde(default)]
-    pub uncommitted_epochs_backpressure: bool,
-    /// Durability-gate poll first interval in ms (default 100). Tighten on a
-    /// low-latency object store to cut poll quantization.
-    #[serde(default)]
-    pub restorable_gate_poll_initial_ms: Option<u64>,
-    /// Durability-gate poll backoff cap in ms (default 1000).
-    #[serde(default)]
-    pub restorable_gate_poll_max_ms: Option<u64>,
-    /// Enable incremental delta checkpoints (cluster-only) with this re-base chain bound.
-    /// Default off; clamped `< max_retained` so a chain base never ages out of the prune window.
-    #[serde(default)]
-    pub delta_chain_max: Option<u32>,
-    /// Incremental emit for non-windowed running-state aggregate MVs: a dirty-only changelog into
-    /// a keyed upsert store instead of re-materializing every group each cycle. Default ON.
-    #[serde(default = "default_incremental_emit")]
-    pub incremental_emit: bool,
 }
 
 impl Default for CheckpointSection {
@@ -528,16 +555,10 @@ impl Default for CheckpointSection {
         Self {
             url: default_checkpoint_url(),
             interval: default_checkpoint_interval(),
+            timeout: default_checkpoint_timeout(),
             max_retained: default_max_retained(),
             storage: std::collections::HashMap::new(),
-            max_in_flight_epochs: None,
             max_staged_bytes: None,
-            max_uncommitted_epochs: None,
-            uncommitted_epochs_backpressure: false,
-            restorable_gate_poll_initial_ms: None,
-            restorable_gate_poll_max_ms: None,
-            delta_chain_max: None,
-            incremental_emit: default_incremental_emit(),
         }
     }
 }
@@ -548,6 +569,7 @@ impl std::fmt::Debug for CheckpointSection {
         f.debug_struct("CheckpointSection")
             .field("url", &self.url)
             .field("interval", &self.interval)
+            .field("timeout", &self.timeout)
             .field("max_retained", &self.max_retained)
             .field(
                 "storage",
@@ -557,7 +579,6 @@ impl std::fmt::Debug for CheckpointSection {
                     .map(|k| (k, "[REDACTED]"))
                     .collect::<Vec<_>>(),
             )
-            .field("max_in_flight_epochs", &self.max_in_flight_epochs)
             .field("max_staged_bytes", &self.max_staged_bytes)
             .finish()
     }
@@ -645,22 +666,26 @@ impl TaskSpec {
 /// Control-plane mTLS is all-or-nothing: cert, key, client_ca, and server_name
 /// must be set together, and each path must exist.
 fn validate_cluster_tls(config: &ServerConfig, errors: &mut Vec<String>) {
+    if config.server.mode != ServerMode::Cluster {
+        return;
+    }
     let Some(d) = &config.discovery else {
         return;
     };
-    let set = [
+    let configured = [
         d.cluster_tls_cert.is_some(),
         d.cluster_tls_key.is_some(),
         d.cluster_tls_client_ca.is_some(),
-        // A whitespace-only server name is no name.
-        d.cluster_tls_server_name
-            .as_ref()
-            .is_some_and(|s| !s.trim().is_empty()),
+        d.cluster_tls_server_name.is_some(),
     ];
-    if !set.iter().any(|s| *s) {
-        return; // TLS disabled
+    if !configured.iter().any(|is_set| *is_set) {
+        return;
     }
-    if !set.iter().all(|s| *s) {
+    let complete = configured.iter().all(|is_set| *is_set)
+        && d.cluster_tls_server_name
+            .as_ref()
+            .is_some_and(|name| cluster_tls_server_name_is_valid(name));
+    if !complete {
         errors.push(
             "cluster_tls requires cluster_tls_cert, cluster_tls_key, \
              cluster_tls_client_ca, and cluster_tls_server_name together"
@@ -679,6 +704,12 @@ fn validate_cluster_tls(config: &ServerConfig, errors: &mut Vec<String>) {
             }
         }
     }
+}
+
+pub(crate) fn cluster_tls_server_name_is_valid(name: &str) -> bool {
+    !name.is_empty()
+        && name.trim() == name
+        && tokio_rustls::rustls::pki_types::ServerName::try_from(name.to_string()).is_ok()
 }
 
 /// Structural validation of `[ai]`/`[models]`; semantic checks happen when the registry is built.
@@ -746,7 +777,7 @@ fn validate_ai(config: &ServerConfig, errors: &mut Vec<String>) {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SourceConfig {
     pub name: String,
-    /// Connector type: "kafka", "postgres_cdc", "mysql_cdc", "generator".
+    /// Connector type: "kafka", "postgres-cdc", "mongodb-cdc", "generator".
     pub connector: String,
     #[serde(default = "default_format")]
     pub format: String,
@@ -779,7 +810,7 @@ pub struct WatermarkConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct LookupConfig {
     pub name: String,
-    /// Connector type: "postgres", "mysql", "redis", "csv".
+    /// Connector type: "postgres", "redis", "csv".
     pub connector: String,
     #[serde(default = "default_lookup_strategy")]
     pub strategy: String,
@@ -820,13 +851,12 @@ pub struct PipelineConfig {
 
 /// `[[sink]]` section.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SinkConfig {
     pub name: String,
     pub pipeline: String,
     /// Connector type: "kafka", "postgres", "delta-lake", "iceberg", "stdout".
     pub connector: String,
-    #[serde(default = "default_delivery")]
-    pub delivery: String,
     #[serde(default)]
     pub properties: toml::Table,
 }
@@ -848,8 +878,8 @@ pub struct DiscoverySection {
     /// Locality tier the placement/blast-radius metrics group by (0 = coarsest).
     #[serde(default)]
     pub placement_isolation_tier: usize,
-    /// PEM cert for control-plane (barrier/query/shuffle) mTLS; enable by
-    /// setting cert + key + client_ca + server_name together.
+    /// Optional PEM cert for control-plane (barrier/shuffle) mTLS; when set,
+    /// key + client_ca + server_name must also be set.
     #[serde(default)]
     pub cluster_tls_cert: Option<std::path::PathBuf>,
     /// PEM private key paired with `cluster_tls_cert`.
@@ -861,19 +891,6 @@ pub struct DiscoverySection {
     /// DNS SAN present in every node cert, verified on connect (peers dial by IP).
     #[serde(default)]
     pub cluster_tls_server_name: Option<String>,
-}
-
-/// `[coordination]` section: cluster coordination.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct CoordinationSection {
-    #[serde(default = "default_coordination_strategy")]
-    pub strategy: String,
-    #[serde(default = "default_raft_port")]
-    pub raft_port: u16,
-    #[serde(default = "default_election_timeout", with = "humantime_serde")]
-    pub election_timeout: Duration,
-    #[serde(default = "default_heartbeat_interval", with = "humantime_serde")]
-    pub heartbeat_interval: Duration,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -894,9 +911,6 @@ pub enum ConfigError {
     ValidationErrors { errors: Vec<String> },
 }
 
-fn default_mode() -> String {
-    "embedded".to_string()
-}
 fn default_bind() -> String {
     "127.0.0.1:8080".to_string()
 }
@@ -919,6 +933,9 @@ fn default_incremental_emit() -> bool {
 fn default_checkpoint_interval() -> Duration {
     Duration::from_secs(10)
 }
+fn default_checkpoint_timeout() -> Duration {
+    Duration::from_secs(120)
+}
 fn default_format() -> String {
     "json".to_string()
 }
@@ -937,25 +954,12 @@ fn default_cache_size() -> u64 {
 fn default_cache_ttl() -> Duration {
     Duration::from_secs(300)
 }
-fn default_delivery() -> String {
-    "at_least_once".to_string()
+fn default_delivery() -> DeliveryGuarantee {
+    DeliveryGuarantee::AtLeastOnce
 }
 fn default_gossip_port() -> u16 {
     7946
 }
-fn default_coordination_strategy() -> String {
-    "raft".to_string()
-}
-fn default_raft_port() -> u16 {
-    7947
-}
-fn default_election_timeout() -> Duration {
-    Duration::from_millis(1500)
-}
-fn default_heartbeat_interval() -> Duration {
-    Duration::from_millis(300)
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -963,20 +967,6 @@ fn default_heartbeat_interval() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(feature = "state-tier")]
-    #[test]
-    fn group_demotion_defaults_by_topology() {
-        let mut s = ServerSection::default();
-        assert_eq!(s.state_tier_group_demotion, None, "unset by default");
-        assert!(s.group_demotion(true), "unset defaults ON for embedded");
-        assert!(!s.group_demotion(false), "unset defaults OFF for cluster");
-
-        s.state_tier_group_demotion = Some(false);
-        assert!(!s.group_demotion(true), "explicit OFF overrides embedded");
-        s.state_tier_group_demotion = Some(true);
-        assert!(s.group_demotion(false), "explicit ON overrides cluster");
-    }
 
     const AI_TOML: &str = r#"
 [server]
@@ -1100,18 +1090,55 @@ task = "classify"
     fn test_parse_minimal_config() {
         let toml = "[server]\n";
         let config: ServerConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.server.mode, "embedded");
+        assert_eq!(config.server.mode, ServerMode::Single);
         assert_eq!(config.server.bind, "127.0.0.1:8080");
+        assert!(config.server.incremental_emit);
+        assert_eq!(config.server.delivery, DeliveryGuarantee::AtLeastOnce);
         assert!(config.sources.is_empty());
         assert!(config.pipelines.is_empty());
         assert!(config.sinks.is_empty());
     }
 
     #[test]
-    fn test_parse_full_embedded_config() {
+    fn test_server_mode_rejects_unknown_values() {
+        let error = toml::from_str::<ServerConfig>("[server]\nmode = \"cluser\"\n")
+            .expect_err("a mistyped runtime mode must not fall back to single-node mode");
+        let message = error.to_string();
+        assert!(message.contains("unknown variant"), "{message}");
+        assert!(
+            message.contains("single") && message.contains("cluster"),
+            "{message}"
+        );
+        assert!(!message.contains("embedded"), "{message}");
+    }
+
+    #[test]
+    fn test_server_mode_rejects_retired_embedded_value() {
+        let error = toml::from_str::<ServerConfig>("[server]\nmode = \"embedded\"\n")
+            .expect_err("the standalone server mode is named single");
+        let message = error.to_string();
+        assert!(message.contains("unknown variant"), "{message}");
+        assert!(
+            message.contains("single") && message.contains("cluster"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn test_removed_coordination_section_is_rejected() {
+        let error = toml::from_str::<ServerConfig>(
+            "[server]\nmode = \"cluster\"\n[coordination]\nstrategy = \"raft\"\n",
+        )
+        .expect_err("removed coordination settings must not be silently ignored");
+        assert!(error.to_string().contains("unknown field"), "{error}");
+        assert!(error.to_string().contains("coordination"), "{error}");
+    }
+
+    #[test]
+    fn test_parse_full_single_config() {
         let toml = r#"
 [server]
-mode = "embedded"
+mode = "single"
 bind = "127.0.0.1:8080"
 
 [state]
@@ -1120,14 +1147,14 @@ backend = "in_process"
 [checkpoint]
 url = "file:///tmp/checkpoints"
 interval = "10s"
-mode = "aligned"
 
 [[source]]
 name = "trades"
 connector = "kafka"
 format = "json"
 [source.properties]
-brokers = "localhost:9092"
+"bootstrap.servers" = "localhost:9092"
+"group.id" = "laminardb-trades"
 topic = "trades"
 [[source.schema]]
 name = "symbol"
@@ -1149,12 +1176,27 @@ name = "output"
 pipeline = "vwap"
 connector = "kafka"
 [sink.properties]
+"bootstrap.servers" = "localhost:9092"
 topic = "vwap_output"
 "#;
 
         let config: ServerConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.sources.len(), 1);
         assert_eq!(config.sources[0].name, "trades");
+        assert_eq!(
+            config.sources[0]
+                .properties
+                .get("bootstrap.servers")
+                .and_then(toml::Value::as_str),
+            Some("localhost:9092")
+        );
+        assert_eq!(
+            config.sources[0]
+                .properties
+                .get("group.id")
+                .and_then(toml::Value::as_str),
+            Some("laminardb-trades")
+        );
         assert_eq!(config.sources[0].schema.len(), 2);
         assert!(!config.sources[0].schema[0].nullable);
         assert!(config.sources[0].schema[1].nullable); // default true
@@ -1162,6 +1204,13 @@ topic = "vwap_output"
         assert_eq!(config.pipelines.len(), 1);
         assert_eq!(config.sinks.len(), 1);
         assert_eq!(config.sinks[0].pipeline, "vwap");
+        assert_eq!(
+            config.sinks[0]
+                .properties
+                .get("bootstrap.servers")
+                .and_then(toml::Value::as_str),
+            Some("localhost:9092")
+        );
 
         validate_config(&config).unwrap();
     }
@@ -1174,16 +1223,16 @@ node_id = "star-1"
 [server]
 mode = "cluster"
 bind = "0.0.0.0:8080"
+delivery = "at_least_once"
+key_groups = 256
 
 [state]
-backend = "local"
-path = "/data/state"
-vnode_capacity = 256
+backend = "object_store"
+url = "s3://bucket/state"
 
 [checkpoint]
 url = "s3://bucket/checkpoints"
 interval = "30s"
-snapshot_strategy = "fork_cow"
 
 [discovery]
 strategy = "static"
@@ -1191,12 +1240,6 @@ seeds = ["node-1:7946", "node-2:7946"]
 gossip_port = 7946
 failure_domain = "region=us-east-1;zone=us-east-1a;rack=r17"
 placement_isolation_tier = 1
-
-[coordination]
-strategy = "raft"
-raft_port = 7947
-election_timeout = "1500ms"
-heartbeat_interval = "300ms"
 
 [[source]]
 name = "orders"
@@ -1212,15 +1255,22 @@ parallelism = 8
 name = "output"
 pipeline = "enrichment"
 connector = "kafka"
-delivery = "exactly_once"
 "#;
 
         let config: ServerConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.node_id.as_deref(), Some("star-1"));
-        assert_eq!(config.server.mode, "cluster");
-        assert!(matches!(config.state, StateBackendConfig::Local { .. }));
+        assert_eq!(config.server.mode, ServerMode::Cluster);
+        assert_eq!(config.server.delivery, DeliveryGuarantee::AtLeastOnce);
+        assert_eq!(config.server.resolved_key_groups().get(), 256);
+        assert!(matches!(
+            &config.state,
+            StateBackendConfig::ObjectStore { .. }
+        ));
+        assert_eq!(
+            config.state.durability_scope(),
+            StateBackendDurability::ClusterShared
+        );
         assert!(config.discovery.is_some());
-        assert!(config.coordination.is_some());
 
         let disc = config.discovery.as_ref().unwrap();
         assert_eq!(
@@ -1229,36 +1279,163 @@ delivery = "exactly_once"
         );
         assert_eq!(disc.placement_isolation_tier, 1);
 
-        let coord = config.coordination.as_ref().unwrap();
-        assert_eq!(coord.election_timeout, Duration::from_millis(1500));
-        assert_eq!(coord.heartbeat_interval, Duration::from_millis(300));
-
         validate_config(&config).unwrap();
     }
 
     #[test]
-    fn test_state_memory_budget_parses_and_defaults_off() {
-        let toml = r#"
+    fn test_runtime_durability_scope_is_fail_closed() {
+        let local_exact: ServerConfig = toml::from_str(
+            r#"
 [server]
-mode = "embedded"
-state_memory_budget_bytes = 1073741824
-"#;
-        let config: ServerConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.server.state_memory_budget_bytes, Some(1_073_741_824));
+delivery = "exactly_once"
 
-        let config: ServerConfig = toml::from_str("[server]\nmode = \"embedded\"\n").unwrap();
-        assert_eq!(config.server.state_memory_budget_bytes, None);
-        assert_eq!(config.server.state_tier_dir, None);
+[state]
+backend = "in_process"
+"#,
+        )
+        .unwrap();
+        let ConfigError::ValidationErrors { errors } = validate_config(&local_exact).unwrap_err()
+        else {
+            panic!("expected validation errors");
+        };
+        assert!(errors.iter().any(|error| error.contains("NodeDurable")));
+
+        let local_cluster: ServerConfig = toml::from_str(
+            r#"
+node_id = "node-1"
+
+[server]
+mode = "cluster"
+
+[state]
+backend = "local"
+path = "/tmp/laminar-state"
+
+[discovery]
+strategy = "static"
+seeds = ["node-1:7946"]
+
+"#,
+        )
+        .unwrap();
+        let ConfigError::ValidationErrors { errors } = validate_config(&local_cluster).unwrap_err()
+        else {
+            panic!("expected validation errors");
+        };
+        assert!(errors.iter().any(|error| error.contains("ClusterShared")));
+
+        let cluster_exact: ServerConfig = toml::from_str(
+            r#"
+node_id = "node-1"
+
+[server]
+mode = "cluster"
+delivery = "exactly_once"
+
+[state]
+backend = "object_store"
+url = "s3://bucket/state"
+
+[discovery]
+strategy = "static"
+seeds = ["node-1:7946"]
+
+"#,
+        )
+        .unwrap();
+        let ConfigError::ValidationErrors { errors } = validate_config(&cluster_exact).unwrap_err()
+        else {
+            panic!("expected validation errors");
+        };
+        assert!(errors.iter().any(|error| error.contains("[LDB-0013]")));
+        assert!(errors
+            .iter()
+            .any(|error| { error.contains("ClusterShared [checkpoint]") }));
+
+        let cluster_best_effort: ServerConfig = toml::from_str(
+            r#"
+node_id = "node-1"
+
+[server]
+mode = "cluster"
+delivery = "best_effort"
+
+[state]
+backend = "object_store"
+url = "s3://bucket/state"
+
+[checkpoint]
+url = "s3://bucket/checkpoints"
+
+[discovery]
+strategy = "static"
+seeds = ["node-1:7946"]
+
+"#,
+        )
+        .unwrap();
+        let ConfigError::ValidationErrors { errors } =
+            validate_config(&cluster_best_effort).unwrap_err()
+        else {
+            panic!("expected validation errors");
+        };
+        assert!(errors.iter().any(|error| {
+            error.contains("cluster mode requires at_least_once") && error.contains("best_effort")
+        }));
+
+        let volatile_checkpoint: ServerConfig = toml::from_str(
+            r#"
+[server]
+delivery = "at_least_once"
+
+[checkpoint]
+url = "memory://checkpoint"
+"#,
+        )
+        .unwrap();
+        let ConfigError::ValidationErrors { errors } =
+            validate_config(&volatile_checkpoint).unwrap_err()
+        else {
+            panic!("expected validation errors");
+        };
+        assert!(errors.iter().any(|error| {
+            error.contains("NodeDurable [checkpoint]") && error.contains("source acknowledgements")
+        }));
+
+        let shared_local_exact: ServerConfig = toml::from_str(
+            r#"
+[server]
+delivery = "exactly_once"
+
+[state]
+backend = "local"
+path = "/tmp/laminar-state"
+
+[checkpoint]
+url = "s3://bucket/checkpoints"
+"#,
+        )
+        .unwrap();
+        let ConfigError::ValidationErrors { errors } =
+            validate_config(&shared_local_exact).unwrap_err()
+        else {
+            panic!("expected validation errors");
+        };
+        assert!(errors.iter().any(|error| error.contains("[LDB-0014]")));
     }
 
     #[test]
-    fn test_state_tier_dir_parses() {
-        let toml = "[server]\nmode = \"embedded\"\nstate_tier_dir = \"/data/tier\"\n";
-        let config: ServerConfig = toml::from_str(toml).unwrap();
-        assert_eq!(
-            config.server.state_tier_dir,
-            Some(std::path::PathBuf::from("/data/tier"))
-        );
+    fn removed_managed_state_options_are_rejected() {
+        for option in [
+            "state_memory_budget_bytes = 1073741824",
+            "state_tier_dir = \"/data/tier\"",
+            "state_tier_group_demotion = true",
+        ] {
+            let input = format!("[server]\nmode = \"single\"\n{option}\n");
+            let error = toml::from_str::<ServerConfig>(&input)
+                .expect_err("removed managed-state options must not be ignored");
+            assert!(error.to_string().contains("unknown field"), "{error}");
+        }
     }
 
     #[test]
@@ -1276,6 +1453,14 @@ state_memory_budget_bytes = 1073741824
         let input = "brokers = \"${LAMINAR_TEST_UNSET_VAR:-localhost:9092}\"";
         let result = substitute_env_vars(input).unwrap();
         assert_eq!(result, "brokers = \"localhost:9092\"");
+    }
+
+    #[test]
+    fn escaped_env_var_is_preserved_for_per_node_connector_resolution() {
+        std::env::remove_var("LAMINAR_TEST_CONNECTOR_PASSWORD");
+        let input = "password = \"$${LAMINAR_TEST_CONNECTOR_PASSWORD}\"";
+        let result = substitute_env_vars(input).unwrap();
+        assert_eq!(result, "password = \"${LAMINAR_TEST_CONNECTOR_PASSWORD}\"");
     }
 
     #[test]
@@ -1381,8 +1566,6 @@ interval = "50ms"
 strategy = "static"
 seeds = ["x:1"]
 
-[coordination]
-strategy = "raft"
 "#;
         let config: ServerConfig = toml::from_str(toml).unwrap();
         let err = validate_config(&config).unwrap_err();
@@ -1415,6 +1598,115 @@ bind = "not-a-socket-addr"
     }
 
     #[test]
+    fn remote_cluster_plaintext_is_accepted() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+node_id = "node-1"
+
+[server]
+mode = "cluster"
+bind = "0.0.0.0:8080"
+delivery = "at_least_once"
+
+[state]
+backend = "object_store"
+url = "s3://bucket/state"
+
+[checkpoint]
+url = "s3://bucket/checkpoints"
+
+[discovery]
+strategy = "static"
+seeds = ["node-1:7946"]
+"#,
+        )
+        .unwrap();
+        validate_config(&config).expect("remote cluster may explicitly run without TLS");
+    }
+
+    #[test]
+    fn cluster_plaintext_and_complete_mtls_are_accepted() {
+        let mut config: ServerConfig = toml::from_str(
+            r#"
+node_id = "node-1"
+
+[server]
+mode = "cluster"
+bind = "127.0.0.1:8080"
+delivery = "at_least_once"
+
+[state]
+backend = "object_store"
+url = "s3://bucket/state"
+
+[checkpoint]
+url = "s3://bucket/checkpoints"
+
+[discovery]
+strategy = "static"
+seeds = ["127.0.0.1:7946"]
+"#,
+        )
+        .unwrap();
+        validate_config(&config).expect("cluster control may remain plaintext");
+
+        let directory = tempfile::tempdir().unwrap();
+        let cert = directory.path().join("node.crt");
+        let key = directory.path().join("node.key");
+        let ca = directory.path().join("cluster-ca.crt");
+        for path in [&cert, &key, &ca] {
+            std::fs::write(path, b"test material").unwrap();
+        }
+        config.server.bind = "0.0.0.0:8080".into();
+        let discovery = config.discovery.as_mut().unwrap();
+        discovery.seeds = vec!["10.0.0.2:7946".into()];
+        discovery.cluster_tls_cert = Some(cert);
+        discovery.cluster_tls_key = Some(key);
+        discovery.cluster_tls_client_ca = Some(ca);
+        discovery.cluster_tls_server_name = Some("laminardb-cluster.internal".into());
+        validate_config(&config).expect("complete remote cluster mTLS should be admitted");
+    }
+
+    #[test]
+    fn invalid_cluster_tls_server_name_is_not_treated_as_absent() {
+        let mut config: ServerConfig = toml::from_str(
+            r#"
+node_id = "node-1"
+
+[server]
+mode = "cluster"
+bind = "127.0.0.1:8080"
+delivery = "at_least_once"
+
+[state]
+backend = "object_store"
+url = "s3://bucket/state"
+
+[checkpoint]
+url = "s3://bucket/checkpoints"
+
+[discovery]
+strategy = "static"
+seeds = ["127.0.0.1:7946"]
+cluster_tls_server_name = "bad name"
+"#,
+        )
+        .unwrap();
+        let ConfigError::ValidationErrors { errors } = validate_config(&config).unwrap_err() else {
+            panic!("expected validation errors");
+        };
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("cluster_tls requires")),
+            "errors: {errors:?}"
+        );
+
+        config.server.mode = ServerMode::Single;
+        validate_config(&config).expect("cluster TLS settings do not affect single-node mode");
+    }
+
+    #[test]
     fn test_validate_zero_max_connections() {
         let toml = r#"
 [server]
@@ -1426,6 +1718,29 @@ pgwire_max_connections = 0
             ConfigError::ValidationErrors { errors } => {
                 assert!(
                     errors.iter().any(|e| e.contains("must be > 0")),
+                    "errors: {errors:?}"
+                );
+            }
+            _ => panic!("expected ValidationErrors"),
+        }
+    }
+
+    #[test]
+    fn test_validate_remote_pgwire_requires_tls() {
+        let toml = r#"
+[server]
+pgwire_bind = "0.0.0.0:5432"
+pgwire_allow_remote = true
+pgwire_users = { alice = "wonderland-key" }
+"#;
+        let config: ServerConfig = toml::from_str(toml).unwrap();
+        let err = validate_config(&config).unwrap_err();
+        match err {
+            ConfigError::ValidationErrors { errors } => {
+                assert!(
+                    errors
+                        .iter()
+                        .any(|e| e.contains("non-loopback pgwire_bind requires")),
                     "errors: {errors:?}"
                 );
             }
@@ -1644,17 +1959,57 @@ alice = "wonderland-key"
             pipelines: vec![],
             sinks: vec![],
             discovery: None,
-            coordination: None,
             node_id: None,
             sql: None,
             ai: Default::default(),
             models: Default::default(),
         };
 
-        assert_eq!(config.server.mode, "embedded");
+        assert_eq!(config.server.mode, ServerMode::Single);
         assert_eq!(config.server.bind, "127.0.0.1:8080");
-        assert!(matches!(config.state, StateBackendConfig::InProcess { .. }));
+        assert!(matches!(config.state, StateBackendConfig::InProcess));
         assert_eq!(config.checkpoint.interval, Duration::from_secs(10));
+        assert_eq!(config.checkpoint.timeout, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn key_groups_are_mode_scoped_and_typed() {
+        let single: ServerConfig = toml::from_str("[server]\n").unwrap();
+        assert_eq!(single.server.resolved_key_groups(), LOCAL_KEY_GROUP_COUNT);
+
+        for explicit in [1, 256] {
+            let input = format!("[server]\nmode = \"single\"\nkey_groups = {explicit}\n");
+            let config: ServerConfig = toml::from_str(&input).unwrap();
+            let ConfigError::ValidationErrors { errors } = validate_config(&config).unwrap_err()
+            else {
+                panic!("expected a cluster-only key_groups validation error");
+            };
+            assert!(errors.iter().any(|error| error.contains("cluster-only")));
+        }
+
+        let cluster: ServerConfig = toml::from_str("[server]\nmode = \"cluster\"\n").unwrap();
+        assert_eq!(
+            cluster.server.resolved_key_groups(),
+            DEFAULT_CLUSTER_KEY_GROUP_COUNT
+        );
+
+        let configured: ServerConfig =
+            toml::from_str("[server]\nmode = \"cluster\"\nkey_groups = 1024\n").unwrap();
+        assert_eq!(configured.server.resolved_key_groups().get(), 1024);
+
+        for invalid in [0_u32, u32::from(u16::MAX) + 1] {
+            let input = format!("[server]\nmode = \"cluster\"\nkey_groups = {invalid}\n");
+            assert!(toml::from_str::<ServerConfig>(&input).is_err());
+        }
+    }
+
+    #[test]
+    fn state_rejects_retired_vnode_capacity() {
+        let error = toml::from_str::<ServerConfig>(
+            "[state]\nbackend = \"in_process\"\nvnode_capacity = 256\n",
+        )
+        .expect_err("key-group topology must not be configured per state backend");
+        assert!(error.to_string().contains("vnode_capacity"), "{error}");
     }
 
     #[test]
@@ -1662,9 +2017,11 @@ alice = "wonderland-key"
         let toml = r#"
 [checkpoint]
 interval = "30s"
+timeout = "2m"
 "#;
         let config: ServerConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.checkpoint.interval, Duration::from_secs(30));
+        assert_eq!(config.checkpoint.timeout, Duration::from_secs(120));
 
         let toml2 = r#"
 [checkpoint]
@@ -1679,6 +2036,52 @@ interval = "500ms"
 "#;
         let config3: ServerConfig = toml::from_str(toml3).unwrap();
         assert_eq!(config3.checkpoint.interval, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn incremental_emit_is_server_execution_policy() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+[server]
+incremental_emit = false
+"#,
+        )
+        .unwrap();
+
+        assert!(!config.server.incremental_emit);
+    }
+
+    #[test]
+    fn checkpoint_rejects_removed_mechanism_knobs() {
+        for option in [
+            r#"snapshot_strategy = "incremental""#,
+            "delta_chain_max = 2",
+        ] {
+            let input = format!(
+                r#"
+[checkpoint]
+{option}
+"#,
+            );
+            let error = toml::from_str::<ServerConfig>(&input)
+                .expect_err("removed checkpoint knobs must not be silently ignored");
+            assert!(error.to_string().contains("unknown field"), "{error}");
+        }
+    }
+
+    #[test]
+    fn sink_rejects_per_connector_delivery_dimension() {
+        let error = toml::from_str::<ServerConfig>(
+            r#"
+[[sink]]
+name = "out"
+pipeline = "p"
+connector = "kafka"
+delivery = "exactly_once"
+"#,
+        )
+        .expect_err("delivery is a pipeline-wide server contract");
+        assert!(error.to_string().contains("unknown field"), "{error}");
     }
 
     #[test]
@@ -1718,7 +2121,6 @@ interval = "10s"
         match err {
             ConfigError::ValidationErrors { errors } => {
                 assert!(errors.iter().any(|e| e.contains("[discovery]")));
-                assert!(errors.iter().any(|e| e.contains("[coordination]")));
                 assert!(errors.iter().any(|e| e.contains("node_id")));
             }
             _ => panic!("expected ValidationErrors"),

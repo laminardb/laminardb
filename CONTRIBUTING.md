@@ -35,7 +35,7 @@ LaminarDB is a Rust workspace with 6 crates. Here's what each one does:
 |-------|-------------|
 | **laminar-core** | The engine. Operators, window assigners, streaming channels (crossfire), checkpoint barrier protocol, lookup tables, time/watermarks, structured error codes, checkpoint manifests, and object-store checkpoint persistence. |
 | **laminar-sql** | SQL parser with streaming extensions (EMIT, watermarks, windows, ASOF, temporal probe joins), query planner, DataFusion integration, custom UDFs, streaming physical optimizer. |
-| **laminar-connectors** | All external connectors: Kafka, PostgreSQL CDC, MySQL CDC, MongoDB CDC, Delta Lake, Iceberg, WebSocket, OpenTelemetry (OTLP/gRPC), files, Postgres/Parquet lookup. Also the schema framework and serde layer. |
+| **laminar-connectors** | All external connectors: Kafka, PostgreSQL CDC, MongoDB CDC, Delta Lake, Iceberg, WebSocket, OpenTelemetry (OTLP/gRPC), files, Postgres/Parquet lookup. Also the schema framework and serde layer. |
 | **laminar-db** | The main entry point. Ties everything together -- `StreamingCoordinator` pipeline, checkpoint coordination, recovery, FFI API. |
 | **laminar-derive** | Proc macros: `Record`, `FromRecordBatch`, `FromRow`, `ConnectorConfig`. |
 | **laminar-server** | Standalone server binary with TOML config, Axum HTTP API, hot reload, Prometheus metrics. |
@@ -68,7 +68,6 @@ Most connectors are behind feature flags so the default build stays fast. Here a
 | `kafka` | Kafka source/sink with Avro serde |
 | `postgres-cdc` | PostgreSQL CDC (logical replication) source |
 | `postgres-sink` | PostgreSQL sink |
-| `mysql-cdc` | MySQL CDC (binlog) source |
 | `mongodb-cdc` | MongoDB change stream source and sink |
 | `delta-lake` | Delta Lake source and sink |
 | `iceberg` | Apache Iceberg source and sink |
@@ -77,7 +76,7 @@ Most connectors are behind feature flags so the default build stays fast. Here a
 | `parquet-lookup` | Parquet file lookup table source |
 | `otel` | OpenTelemetry OTLP/gRPC source (traces, metrics, logs) |
 | `ffi` | C FFI layer and Arrow C Data Interface |
-| `delta` | Distributed delta mode (Raft, gossip, gRPC) |
+| `delta` | Delta Lake connector bundle (local, S3, Azure, GCS, Unity, and Glue) |
 
 To run tests with a specific connector:
 
@@ -119,7 +118,7 @@ cargo test -p laminar-core
 cargo test -p laminar-sql test_parse_tumbling_window
 
 # With connector features
-cargo test --all --features kafka,postgres-cdc,mysql-cdc
+cargo test --all --features kafka,postgres-cdc,mongodb-cdc
 
 # Benchmarks
 cargo bench --bench streaming_bench

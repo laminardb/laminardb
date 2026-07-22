@@ -8,8 +8,9 @@ members = [
     "crates/laminar-db",
 ]
 exclude = [
-    "examples/*",
     "tools/*",
+    "vendor/pgwire",
+    "vendor/pgwire-replication",
 ]
 resolver = "2"
 
@@ -41,6 +42,7 @@ anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = "0.4"
+url = "2"
 
 # Allocators
 tikv-jemallocator = { version = "0.6", features = [
@@ -66,15 +68,17 @@ humantime-serde = "1.1"
 notify = "8"
 globset = "0.4"
 
-# DataFusion and Arrow - using latest versions
-arrow = { version = "57.2", default-features = true }
-arrow-array = "57.2"
-arrow-schema = "57.2"
-arrow-cast = "57.2"
-arrow-csv = "57.2"
-arrow-ipc = "57.2"
-arrow-json = "57.2"
-arrow-select = "57.2"
+# Arrow row encoding participates in the partitioning ABI. Upgrade these exact
+# pins only with an ABI version bump and updated golden vectors.
+arrow = { version = "=57.2.0", default-features = true }
+arrow-array = "=57.2.0"
+arrow-schema = "=57.2.0"
+arrow-cast = "=57.2.0"
+arrow-csv = "=57.2.0"
+arrow-ipc = "=57.2.0"
+arrow-json = "=57.2.0"
+arrow-row = "=57.2.0"
+arrow-select = "=57.2.0"
 datafusion = "52.3"
 datafusion-common = "52.0"
 datafusion-expr = "52.0"
@@ -95,9 +99,7 @@ arrayvec = "0.7"
 
 # Platform-specific
 libc = "0.2"
-
-# Probabilistic data structures
-xorf = "0.12"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 # Encoding
 base64 = "0.22"
@@ -122,12 +124,18 @@ iceberg-storage-opendal = "0.9.1"
 # Cluster (distributed mode)
 chitchat = "0.10"
 tokio-util = { version = "0.7", features = ["rt"] }
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
+# xxh3 output is part of the partitioning ABI; upgrade only with an ABI version
+# bump and updated golden vectors.
+xxhash-rust = { version = "=0.8.15", features = ["xxh3"] }
 
 # Testing
 criterion = { version = "0.8", features = ["html_reports"] }
 proptest = "1.11"
 tempfile = "3.27"
+
+[patch.crates-io]
+pgwire = { path = "vendor/pgwire" }
+pgwire-replication = { path = "vendor/pgwire-replication" }
 
 [profile.release]
 lto = "thin"
@@ -140,3 +148,9 @@ strip = "debuginfo"
 inherits = "release"
 debug = false
 strip = "debuginfo"
+
+# Optimized real-process fault tests retain the test-only checkpoint gate.
+[profile.soak]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true

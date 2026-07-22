@@ -69,14 +69,14 @@ impl KeyAligner {
     }
 
     /// Realign fetched rows to the input key order. Each fetched row is matched
-    /// to its key by re-encoding its PK columns; the first row wins per key,
-    /// duplicate input keys each resolve to their own single-row slice, and
-    /// misses are `None`.
+    /// to its key by re-encoding its PK columns. Duplicate input keys each
+    /// resolve to their own single-row slice; duplicate fetched keys are
+    /// rejected, and misses are `None`.
     ///
     /// # Errors
     ///
     /// Returns `LookupError::Internal` if a PK column is absent from a fetched
-    /// batch or cannot be re-encoded.
+    /// batch, cannot be re-encoded, or occurs more than once in the fetched rows.
     pub fn align(
         &self,
         keys: &[&[u8]],
@@ -102,9 +102,14 @@ impl KeyAligner {
                 .convert_columns(&pk_cols)
                 .map_err(|e| LookupError::Internal(format!("encode result keys: {e}")))?;
             for row in 0..batch.num_rows() {
-                index
-                    .entry(rows.row(row).as_ref().to_vec())
-                    .or_insert((batch_idx, row));
+                if index
+                    .insert(rows.row(row).as_ref().to_vec(), (batch_idx, row))
+                    .is_some()
+                {
+                    return Err(LookupError::Internal(
+                        "lookup source returned multiple rows for one key".into(),
+                    ));
+                }
             }
         }
         Ok(keys
@@ -172,5 +177,15 @@ mod tests {
         let cols = aligner.decode_keys(&key_refs).unwrap();
         let ids = cols[0].as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(ids.values(), &[7, 8]);
+    }
+
+    #[test]
+    fn rejects_duplicate_fetched_keys_instead_of_choosing_a_row() {
+        let aligner = aligner();
+        let keys = encode(&[2]);
+        let error = aligner
+            .align(&[keys[0].as_slice()], &[batch(&[2, 2])])
+            .unwrap_err();
+        assert!(error.to_string().contains("multiple rows"), "{error}");
     }
 }

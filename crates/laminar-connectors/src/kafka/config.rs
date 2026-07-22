@@ -175,8 +175,6 @@ pub enum StartupMode {
     Timestamp(i64),
 }
 
-impl StartupMode {}
-
 impl std::str::FromStr for StartupMode {
     type Err = ConnectorError;
 
@@ -528,8 +526,6 @@ pub struct KafkaSourceConfig {
     /// Deadline for Schema Registry lookups performed during schema
     /// auto-discovery at DDL time. Default: 10s.
     pub schema_registry_discovery_timeout: Duration,
-    /// Column name containing the event timestamp.
-    pub event_time_column: Option<String>,
     /// Whether to include Kafka metadata columns (_partition, _offset, _timestamp).
     pub include_metadata: bool,
     /// Whether to include Kafka headers as a map column (_headers).
@@ -555,13 +551,6 @@ pub struct KafkaSourceConfig {
     /// Maximum bytes per partition to return from broker.
     pub max_partition_fetch_bytes: Option<i32>,
 
-    // -- Watermark --
-    /// Maximum expected out-of-orderness for watermark generation.
-    pub max_out_of_orderness: Duration,
-    /// Timeout before marking a partition as idle.
-    pub idle_timeout: Duration,
-    /// Enable per-partition watermark tracking (integrates with watermark tracking).
-    pub enable_watermark_tracking: bool,
     // -- Consumer group timing --
     /// Consumer session timeout (default: 45s — production-safe; rdkafka's
     /// aggressive 10s default causes rebalance storms under GC pauses).
@@ -585,10 +574,10 @@ pub struct KafkaSourceConfig {
     /// `LaminarDB` checkpoint completes. Default: `true`.
     ///
     /// Advisory — `LaminarDB` recovery uses its own manifest, not broker-stored
-    /// offsets. This exists so external tooling (`kafka-consumer-groups`,
-    /// kafka-exporter, Burrow) sees progress, and so `StartupMode::GroupOffsets`
-    /// can act as a "lost-checkpoint" fallback that resumes from the last
-    /// durable epoch (no skip-ahead window).
+    /// offsets. This exists only so external tooling (`kafka-consumer-groups`,
+    /// kafka-exporter, Burrow) can observe progress. Guaranteed delivery always
+    /// derives an unrecorded partition's start from engine configuration and
+    /// deliberately ignores broker-stored group offsets from abandoned timelines.
     pub broker_commit_on_checkpoint: bool,
 
     // -- Backpressure --
@@ -601,12 +590,12 @@ pub struct KafkaSourceConfig {
     pub backpressure_low_watermark: f64,
 
     // -- Error handling --
-    /// Maximum tolerated deserialization error rate per batch (0.0-1.0).
+    /// Maximum tolerated deserialization error rate per `BestEffort` batch (0.0-1.0).
     ///
     /// When the poison pill fallback is active and the error rate exceeds
     /// this threshold, the batch is rejected instead of returning partial
-    /// results. Prevents silent data loss when a schema change makes most
-    /// records unparseable. Default: 0.5 (50%).
+    /// results. Guaranteed-delivery modes reject any deserialization failure;
+    /// they never use this threshold. Default: 0.5 (50%).
     pub max_deser_error_rate: f64,
 
     // -- Pass-through --
@@ -659,7 +648,6 @@ impl Default for KafkaSourceConfig {
             schema_registry_subject_strategy: SubjectNameStrategy::default(),
             schema_registry_record_name: None,
             schema_registry_discovery_timeout: Duration::from_secs(10),
-            event_time_column: None,
             include_metadata: false,
             include_headers: false,
             startup_mode: StartupMode::default(),
@@ -671,9 +659,6 @@ impl Default for KafkaSourceConfig {
             fetch_max_bytes: None,
             fetch_max_wait_ms: None,
             max_partition_fetch_bytes: None,
-            max_out_of_orderness: Duration::from_secs(5),
-            idle_timeout: Duration::from_secs(30),
-            enable_watermark_tracking: false,
             session_timeout: Duration::from_secs(45),
             heartbeat_interval: Duration::from_secs(10),
             max_poll_interval: Duration::from_secs(600),
@@ -797,8 +782,6 @@ impl KafkaSourceConfig {
             .get_parsed::<u64>("schema.registry.discovery.timeout.ms")?
             .map_or(Duration::from_secs(10), Duration::from_millis);
 
-        let event_time_column = config.get("event.time.column").map(String::from);
-
         let include_metadata = config
             .get_parsed::<bool>("include.metadata")?
             .unwrap_or(false);
@@ -855,18 +838,6 @@ impl KafkaSourceConfig {
         let fetch_max_bytes = config.get_parsed::<i32>("fetch.max.bytes")?;
         let fetch_max_wait_ms = config.get_parsed::<i32>("fetch.max.wait.ms")?;
         let max_partition_fetch_bytes = config.get_parsed::<i32>("max.partition.fetch.bytes")?;
-
-        let max_out_of_orderness_ms = config
-            .get_parsed::<u64>("max.out.of.orderness.ms")?
-            .unwrap_or(5000);
-
-        let idle_timeout_ms = config
-            .get_parsed::<u64>("idle.timeout.ms")?
-            .unwrap_or(30_000);
-
-        let enable_watermark_tracking = config
-            .get_parsed::<bool>("enable.watermark.tracking")?
-            .unwrap_or(false);
 
         let session_timeout_ms = config
             .get_parsed::<u64>("session.timeout.ms")?
@@ -941,7 +912,6 @@ impl KafkaSourceConfig {
             schema_registry_subject_strategy,
             schema_registry_record_name,
             schema_registry_discovery_timeout,
-            event_time_column,
             include_metadata,
             include_headers,
             startup_mode,
@@ -953,9 +923,6 @@ impl KafkaSourceConfig {
             fetch_max_bytes,
             fetch_max_wait_ms,
             max_partition_fetch_bytes,
-            max_out_of_orderness: Duration::from_millis(max_out_of_orderness_ms),
-            idle_timeout: Duration::from_millis(idle_timeout_ms),
-            enable_watermark_tracking,
             session_timeout: Duration::from_millis(session_timeout_ms),
             heartbeat_interval: Duration::from_millis(heartbeat_interval_ms),
             max_poll_interval: Duration::from_millis(max_poll_interval_ms),
@@ -1361,7 +1328,6 @@ mod tests {
             ("max.poll.records", "500"),
             ("include.metadata", "true"),
             ("include.headers", "true"),
-            ("event.time.column", "ts"),
             ("partition.assignment.strategy", "roundrobin"),
             ("isolation.level", "read_uncommitted"),
         ]))
@@ -1373,7 +1339,6 @@ mod tests {
         assert_eq!(cfg.max_poll_records, 500);
         assert!(cfg.include_metadata);
         assert!(cfg.include_headers);
-        assert_eq!(cfg.event_time_column, Some("ts".to_string()));
         assert_eq!(
             cfg.partition_assignment_strategy,
             AssignmentStrategy::RoundRobin
@@ -1906,28 +1871,6 @@ mod tests {
             cfg.schema_registry_ssl_key_location,
             Some("/key.pem".to_string())
         );
-    }
-
-    #[test]
-    fn test_parse_watermark_defaults() {
-        let cfg = KafkaSourceConfig::from_config(&make_config(&[])).unwrap();
-        assert_eq!(cfg.max_out_of_orderness, Duration::from_secs(5));
-        assert_eq!(cfg.idle_timeout, Duration::from_secs(30));
-        assert!(!cfg.enable_watermark_tracking);
-    }
-
-    #[test]
-    fn test_parse_watermark_tracking_enabled() {
-        let cfg = KafkaSourceConfig::from_config(&make_config(&[
-            ("enable.watermark.tracking", "true"),
-            ("max.out.of.orderness.ms", "10000"),
-            ("idle.timeout.ms", "60000"),
-        ]))
-        .unwrap();
-
-        assert!(cfg.enable_watermark_tracking);
-        assert_eq!(cfg.max_out_of_orderness, Duration::from_secs(10));
-        assert_eq!(cfg.idle_timeout, Duration::from_secs(60));
     }
 
     // -- startup.mode = timestamp error --

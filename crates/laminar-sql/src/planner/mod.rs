@@ -19,13 +19,13 @@ use std::sync::Arc;
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
-use sqlparser::ast::{ObjectName, SetExpr, Statement};
+use sqlparser::ast::{ObjectName, Select, SetExpr, Statement, TableFactor};
 
 use crate::parser::aggregation_parser::analyze_aggregates;
 use crate::parser::analytic_parser::{
     analyze_analytic_functions, analyze_window_frames, FrameBound,
 };
-use crate::parser::join_parser::{analyze_joins, MultiJoinAnalysis};
+use crate::parser::join_parser::{analyze_joins, JoinAnalysis, JoinType, MultiJoinAnalysis};
 use crate::parser::lookup_table::{validate_properties, LookupTableProperties};
 use crate::parser::order_analyzer::analyze_order_by;
 use crate::parser::{
@@ -62,9 +62,7 @@ pub struct StreamingPlanner {
     sinks: HashMap<String, SinkInfo>,
     /// Registered lookup tables
     lookup_tables: HashMap<String, LookupTableInfo>,
-    /// Names of windowed views/streams (created with a windowed aggregation).
-    /// Their output is bounded per window close, so an equi-join between two of
-    /// them is a processing-time batch join, not an unbounded stream-stream join.
+    /// Names of views/streams for which planning retains window classification.
     windowed_views: std::collections::HashSet<String>,
 }
 
@@ -88,6 +86,30 @@ pub struct SinkInfo {
     pub from: String,
     /// Connector options
     pub options: HashMap<String, String>,
+}
+
+fn is_inline_unnest(factor: &TableFactor) -> bool {
+    match factor {
+        TableFactor::UNNEST { .. } => true,
+        TableFactor::Table {
+            name,
+            args: Some(_),
+            ..
+        }
+        | TableFactor::Function { name, .. } => {
+            name.0.len() == 1 && name.to_string().eq_ignore_ascii_case("unnest")
+        }
+        _ => false,
+    }
+}
+
+fn has_implicit_multi_source(select: &Select) -> bool {
+    select
+        .from
+        .iter()
+        .filter(|from| !is_inline_unnest(&from.relation))
+        .count()
+        > 1
 }
 
 /// Result of planning a streaming statement
@@ -139,6 +161,75 @@ pub struct QueryPlan {
     pub statement: Box<Statement>,
 }
 
+/// Exact one-call admission for a database-certified state-backed join.
+///
+/// The certificate is matched against the planner's independent parse, so it
+/// cannot authorize another relation pair, key mapping, or join type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateBackedJoinAdmission {
+    left_table: String,
+    right_table: String,
+    left_keys: Vec<String>,
+    right_keys: Vec<String>,
+    join_type: JoinType,
+}
+
+impl StateBackedJoinAdmission {
+    /// Construct an exact INNER or LEFT state-backed join admission.
+    ///
+    /// # Errors
+    /// Returns an error for empty relations/keys or a mismatched key arity.
+    pub fn try_new(
+        left_table: impl Into<String>,
+        right_table: impl Into<String>,
+        left_keys: Vec<String>,
+        right_keys: Vec<String>,
+        left_outer: bool,
+    ) -> Result<Self, String> {
+        let left_table = left_table.into();
+        let right_table = right_table.into();
+        if left_table.is_empty() || right_table.is_empty() {
+            return Err("state-backed join relations cannot be empty".into());
+        }
+        if left_keys.is_empty()
+            || left_keys.len() != right_keys.len()
+            || left_keys.iter().chain(&right_keys).any(String::is_empty)
+        {
+            return Err("state-backed join keys must be non-empty with matching arity".into());
+        }
+        Ok(Self {
+            left_table,
+            right_table,
+            left_keys,
+            right_keys,
+            join_type: if left_outer {
+                JoinType::Left
+            } else {
+                JoinType::Inner
+            },
+        })
+    }
+
+    fn matches(&self, step: &JoinAnalysis) -> bool {
+        let mut left_keys = Vec::with_capacity(1 + step.additional_key_columns.len());
+        let mut right_keys = Vec::with_capacity(1 + step.additional_key_columns.len());
+        left_keys.push(step.left_key_column.as_str());
+        right_keys.push(step.right_key_column.as_str());
+        for (left, right) in &step.additional_key_columns {
+            left_keys.push(left);
+            right_keys.push(right);
+        }
+        self.left_table == step.left_table
+            && self.right_table == step.right_table
+            && self.join_type == step.join_type
+            && self.left_keys.iter().map(String::as_str).eq(left_keys)
+            && self.right_keys.iter().map(String::as_str).eq(right_keys)
+            && !step.is_asof_join
+            && !step.is_temporal_join
+            && step.time_bound.is_none()
+    }
+}
+
 impl StreamingPlanner {
     /// Creates a new streaming planner
     #[must_use]
@@ -157,6 +248,39 @@ impl StreamingPlanner {
     ///
     /// Returns `PlanningError` if the statement cannot be planned.
     pub fn plan(&mut self, statement: &StreamingStatement) -> Result<StreamingPlan, PlanningError> {
+        self.plan_internal(statement, None)
+    }
+
+    /// Plan one query whose unbounded join shape has already been certified by
+    /// the database as a durable state-backed incremental join.
+    ///
+    /// This does not relax multi-way, join-type, temporal, or implicit-join
+    /// validation. Raw stream callers must use [`Self::plan`].
+    ///
+    /// # Errors
+    /// Returns `PlanningError` if the statement fails the remaining streaming checks.
+    pub fn plan_state_backed_join(
+        &mut self,
+        statement: &StreamingStatement,
+        admission: &StateBackedJoinAdmission,
+    ) -> Result<StreamingPlan, PlanningError> {
+        if !matches!(
+            statement,
+            StreamingStatement::CreateContinuousQuery { .. }
+                | StreamingStatement::CreateStream { .. }
+        ) {
+            return Err(PlanningError::InvalidQuery(
+                "state-backed join admission is valid only for a named streaming query".into(),
+            ));
+        }
+        self.plan_internal(statement, Some(admission))
+    }
+
+    fn plan_internal(
+        &mut self,
+        statement: &StreamingStatement,
+        state_backed_join: Option<&StateBackedJoinAdmission>,
+    ) -> Result<StreamingPlan, PlanningError> {
         match statement {
             StreamingStatement::CreateSource(source) => self.plan_create_source(source),
             StreamingStatement::CreateSink(sink) => self.plan_create_sink(sink),
@@ -171,7 +295,7 @@ impl StreamingPlanner {
                 query,
                 emit_clause,
                 ..
-            } => self.plan_continuous_query(name, query, emit_clause.as_ref()),
+            } => self.plan_continuous_query(name, query, emit_clause.as_ref(), state_backed_join),
             StreamingStatement::Standard(stmt) => self.plan_standard_statement(stmt),
             StreamingStatement::CreateLookupTable(lt) => self.plan_create_lookup_table(lt),
             StreamingStatement::DropLookupTable { name, if_exists } => {
@@ -199,6 +323,33 @@ impl StreamingPlanner {
                 )))
             }
         }
+    }
+
+    /// Remove query classification installed by a successful plan when the surrounding catalog
+    /// transaction is rolled back or the query is dropped.
+    pub fn unregister_query(&mut self, name: &str) {
+        self.windowed_views.remove(name);
+    }
+
+    /// Whether query classification state remains for a catalog object.
+    #[must_use]
+    pub fn has_query(&self, name: &str) -> bool {
+        self.windowed_views.contains(name)
+    }
+
+    /// Remove a source installed by a catalog transaction that was dropped or rolled back.
+    pub fn unregister_source(&mut self, name: &str) {
+        self.sources.remove(name);
+    }
+
+    /// Remove a sink installed by a catalog transaction that was dropped or rolled back.
+    pub fn unregister_sink(&mut self, name: &str) {
+        self.sinks.remove(name);
+    }
+
+    /// Remove a lookup table installed by a catalog transaction that was dropped or rolled back.
+    pub fn unregister_lookup_table(&mut self, name: &str) {
+        self.lookup_tables.remove(name);
     }
 
     /// Plans a CREATE SOURCE statement.
@@ -270,6 +421,7 @@ impl StreamingPlanner {
         name: &ObjectName,
         query: &StreamingStatement,
         emit_clause: Option<&EmitClause>,
+        state_backed_join: Option<&StateBackedJoinAdmission>,
     ) -> Result<StreamingPlan, PlanningError> {
         // The query inside should be a standard SELECT
         let stmt = match query {
@@ -282,11 +434,10 @@ impl StreamingPlanner {
         };
 
         // Analyze the query for streaming features
-        let query_plan = self.analyze_query(&stmt, emit_clause)?;
+        let query_plan = self.analyze_query(&stmt, emit_clause, state_backed_join)?;
 
-        // A windowed aggregation is a bounded input to a processing-time join.
-        // Insert *and* remove so a CREATE OR REPLACE that makes the view
-        // non-windowed clears the stale entry (else a join on it skips the guard).
+        // Keep planner classification in sync with catalog rollback/drop. A windowed query is the
+        // only query shape for which the planner retains classification after planning.
         let view_name = object_name_to_string(name);
         if query_plan.window_config.is_some() {
             self.windowed_views.insert(view_name);
@@ -313,6 +464,12 @@ impl StreamingPlanner {
         // Check if it's a query that might have streaming features
         if let Statement::Query(query) = stmt {
             if let SetExpr::Select(select) = query.body.as_ref() {
+                if has_implicit_multi_source(select) {
+                    return Err(PlanningError::InvalidQuery(
+                        "implicit multi-source joins are unsupported; use one bounded INNER JOIN"
+                            .to_string(),
+                    ));
+                }
                 // Check for window functions in GROUP BY
                 let window_function = Self::extract_window_from_select(select);
 
@@ -322,11 +479,7 @@ impl StreamingPlanner {
                 })?;
 
                 if let Some(ref multi) = join_analysis {
-                    reject_unbounded_streaming_join(
-                        multi,
-                        &self.lookup_tables,
-                        &self.windowed_views,
-                    )?;
+                    validate_streaming_joins(multi, &self.lookup_tables, None)?;
                 }
 
                 // Check for ORDER BY
@@ -377,12 +530,8 @@ impl StreamingPlanner {
                         None => None,
                     };
 
-                    // A windowed-view equi-join carries no join_config: it routes
-                    // to the processing-time join, re-detected in `add_query`.
-                    // (A config here would suppress that detection.)
-                    let join_config = join_analysis
-                        .filter(|m| !is_windowed_view_join(m, &self.windowed_views))
-                        .map(|m| JoinOperatorConfig::from_multi_analysis(&m));
+                    let join_config =
+                        join_analysis.map(|m| JoinOperatorConfig::from_multi_analysis(&m));
 
                     return Ok(StreamingPlan::Query(QueryPlan {
                         name: None,
@@ -408,11 +557,18 @@ impl StreamingPlanner {
         &self,
         stmt: &Statement,
         emit_clause: Option<&EmitClause>,
+        state_backed_join: Option<&StateBackedJoinAdmission>,
     ) -> Result<QueryAnalysis, PlanningError> {
         let mut analysis = QueryAnalysis::default();
 
         if let Statement::Query(query) = stmt {
             if let SetExpr::Select(select) = query.body.as_ref() {
+                if has_implicit_multi_source(select) {
+                    return Err(PlanningError::InvalidQuery(
+                        "implicit multi-source joins are unsupported; use one bounded INNER JOIN"
+                            .to_string(),
+                    ));
+                }
                 // Extract window function
                 if let Some(window) = Self::extract_window_from_select(select) {
                     let mut config = WindowOperatorConfig::from_window_function(&window)
@@ -432,17 +588,8 @@ impl StreamingPlanner {
                 if let Some(multi) = analyze_joins(select).map_err(|e| {
                     PlanningError::InvalidQuery(format!("Join analysis failed: {e}"))
                 })? {
-                    reject_unbounded_streaming_join(
-                        &multi,
-                        &self.lookup_tables,
-                        &self.windowed_views,
-                    )?;
-                    // A windowed-view equi-join routes to the processing-time join
-                    // (re-detected in `add_query`); a config here would suppress it.
-                    if !is_windowed_view_join(&multi, &self.windowed_views) {
-                        analysis.join_config =
-                            Some(JoinOperatorConfig::from_multi_analysis(&multi));
-                    }
+                    validate_streaming_joins(&multi, &self.lookup_tables, state_backed_join)?;
+                    analysis.join_config = Some(JoinOperatorConfig::from_multi_analysis(&multi));
                 }
             }
         }
@@ -658,26 +805,48 @@ struct QueryAnalysis {
 
 /// Helper to convert `ObjectName` to String
 fn object_name_to_string(name: &ObjectName) -> String {
-    name.to_string()
+    match name.0.as_slice() {
+        [sqlparser::ast::ObjectNamePart::Identifier(ident)] => ident.value.clone(),
+        _ => name.to_string(),
+    }
 }
 
-/// Reject unbounded joins between two streaming sources.
-fn reject_unbounded_streaming_join(
+/// Fail closed on stream-join shapes whose state/output semantics are not implemented.
+fn validate_streaming_joins(
     multi: &MultiJoinAnalysis,
     lookup_tables: &HashMap<String, LookupTableInfo>,
-    windowed_views: &std::collections::HashSet<String>,
+    state_backed_join: Option<&StateBackedJoinAdmission>,
 ) -> Result<(), PlanningError> {
+    if multi.joins.len() != 1 {
+        return Err(PlanningError::InvalidQuery(
+            "multi-way streaming joins require explicitly named two-way stages".to_string(),
+        ));
+    }
     for step in &multi.joins {
+        if step.time_bound.is_some_and(|bound| bound.is_zero()) {
+            return Err(PlanningError::InvalidQuery(
+                "streaming interval joins require a positive finite time bound".to_string(),
+            ));
+        }
+        if step.time_bound.is_some()
+            && !step.is_asof_join
+            && !step.is_temporal_join
+            && !matches!(step.join_type, JoinType::Inner)
+        {
+            return Err(PlanningError::InvalidQuery(format!(
+                "streaming interval joins support only INNER joins; {:?} requires durable per-row matched metadata",
+                step.join_type,
+            )));
+        }
         if step.is_bounded() {
             continue;
         }
         let left_lookup = lookup_tables.contains_key(&step.left_table);
         let right_lookup = lookup_tables.contains_key(&step.right_table);
-        // A join between two windowed views is bounded per cycle (each emits
-        // aligned closed windows) — it runs as a processing-time batch join.
-        let both_windowed =
-            windowed_views.contains(&step.left_table) && windowed_views.contains(&step.right_table);
-        if !left_lookup && !right_lookup && !both_windowed {
+        if !left_lookup && !right_lookup {
+            if state_backed_join.is_some_and(|admission| admission.matches(step)) {
+                continue;
+            }
             return Err(PlanningError::InvalidQuery(format!(
                 "unbounded join between streaming sources '{}' and '{}'; \
                  add a temporal predicate or use a lookup table",
@@ -686,21 +855,6 @@ fn reject_unbounded_streaming_join(
         }
     }
     Ok(())
-}
-
-/// A single non-temporal equi-join between two windowed views — the
-/// processing-time batch-join shape (`create_operator` builds it from the
-/// re-detected config, so its `join_config` is left empty here).
-fn is_windowed_view_join(
-    multi: &MultiJoinAnalysis,
-    windowed_views: &std::collections::HashSet<String>,
-) -> bool {
-    multi.joins.len() == 1
-        && multi.joins.iter().all(|j| {
-            !j.is_bounded()
-                && windowed_views.contains(&j.left_table)
-                && windowed_views.contains(&j.right_table)
-        })
 }
 
 /// Planning errors
@@ -920,7 +1074,8 @@ mod tests {
     fn test_plan_rejects_unbounded_streaming_join() {
         let mut planner = StreamingPlanner::new();
         let statements = StreamingParser::parse_sql(
-            "SELECT * FROM orders o JOIN payments p ON o.order_id = p.order_id",
+            "CREATE STREAM joined AS SELECT * FROM orders o JOIN payments p \
+             ON o.order_id = p.order_id",
         )
         .unwrap();
         let err = planner.plan(&statements[0]).unwrap_err();
@@ -930,7 +1085,166 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_allows_join_between_windowed_views() {
+    fn test_plan_rejects_unbounded_standard_select_join() {
+        let statements = StreamingParser::parse_sql(
+            "SELECT * FROM orders o JOIN payments p ON o.order_id = p.order_id",
+        )
+        .unwrap();
+        assert!(matches!(
+            statements.first(),
+            Some(StreamingStatement::Standard(_))
+        ));
+
+        let error = StreamingPlanner::new().plan(&statements[0]).unwrap_err();
+        assert!(error.to_string().contains("unbounded join"));
+    }
+
+    #[test]
+    fn exact_state_backed_certificate_allows_only_its_join() {
+        let statements = StreamingParser::parse_sql(
+            "CREATE STREAM joined AS SELECT * FROM orders o JOIN payments p \
+             ON o.order_id = p.order_id",
+        )
+        .unwrap();
+        let admission = StateBackedJoinAdmission::try_new(
+            "orders",
+            "payments",
+            vec!["order_id".into()],
+            vec!["order_id".into()],
+            false,
+        )
+        .unwrap();
+        StreamingPlanner::new()
+            .plan_state_backed_join(&statements[0], &admission)
+            .unwrap();
+
+        let wrong_key = StateBackedJoinAdmission::try_new(
+            "orders",
+            "payments",
+            vec!["tenant_id".into()],
+            vec!["tenant_id".into()],
+            false,
+        )
+        .unwrap();
+        let error = StreamingPlanner::new()
+            .plan_state_backed_join(&statements[0], &wrong_key)
+            .unwrap_err();
+        assert!(error.to_string().contains("unbounded join"));
+    }
+
+    #[test]
+    fn composite_state_backed_certificate_binds_ordered_key_mapping() {
+        let statements = StreamingParser::parse_sql(
+            "CREATE STREAM joined AS SELECT * FROM orders o JOIN payments p \
+             ON o.tenant_id = p.account_id AND o.order_id = p.payment_order_id",
+        )
+        .unwrap();
+        let exact = StateBackedJoinAdmission::try_new(
+            "orders",
+            "payments",
+            vec!["tenant_id".into(), "order_id".into()],
+            vec!["account_id".into(), "payment_order_id".into()],
+            false,
+        )
+        .unwrap();
+        StreamingPlanner::new()
+            .plan_state_backed_join(&statements[0], &exact)
+            .unwrap();
+
+        for (left_keys, right_keys) in [
+            (
+                vec!["order_id".into(), "tenant_id".into()],
+                vec!["payment_order_id".into(), "account_id".into()],
+            ),
+            (
+                vec!["tenant_id".into(), "order_id".into()],
+                vec!["account_id".into(), "order_id".into()],
+            ),
+        ] {
+            let mismatch = StateBackedJoinAdmission::try_new(
+                "orders", "payments", left_keys, right_keys, false,
+            )
+            .unwrap();
+            let error = StreamingPlanner::new()
+                .plan_state_backed_join(&statements[0], &mismatch)
+                .unwrap_err();
+            assert!(error.to_string().contains("unbounded join"));
+        }
+    }
+
+    #[test]
+    fn state_backed_certificate_binds_inner_vs_left() {
+        let statements = StreamingParser::parse_sql(
+            "CREATE STREAM joined AS SELECT * FROM orders o LEFT JOIN payments p \
+             ON o.order_id = p.order_id",
+        )
+        .unwrap();
+        let left = StateBackedJoinAdmission::try_new(
+            "orders",
+            "payments",
+            vec!["order_id".into()],
+            vec!["order_id".into()],
+            true,
+        )
+        .unwrap();
+        StreamingPlanner::new()
+            .plan_state_backed_join(&statements[0], &left)
+            .unwrap();
+
+        let inner = StateBackedJoinAdmission::try_new(
+            "orders",
+            "payments",
+            vec!["order_id".into()],
+            vec!["order_id".into()],
+            false,
+        )
+        .unwrap();
+        assert!(StreamingPlanner::new()
+            .plan_state_backed_join(&statements[0], &inner)
+            .is_err());
+    }
+
+    #[test]
+    fn state_backed_certificate_does_not_relax_right_or_multiway_joins() {
+        let admission = StateBackedJoinAdmission::try_new(
+            "orders",
+            "payments",
+            vec!["order_id".into()],
+            vec!["order_id".into()],
+            false,
+        )
+        .unwrap();
+        for sql in [
+            "CREATE STREAM joined AS SELECT * FROM orders o RIGHT JOIN payments p \
+             ON o.order_id = p.order_id",
+            "CREATE STREAM joined AS SELECT * FROM orders o JOIN payments p \
+             ON o.order_id = p.order_id JOIN refunds r ON p.order_id = r.order_id",
+        ] {
+            let statements = StreamingParser::parse_sql(sql).unwrap();
+            assert!(StreamingPlanner::new()
+                .plan_state_backed_join(&statements[0], &admission)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn test_plan_rejects_implicit_cross_join() {
+        let statements = StreamingParser::parse_sql("SELECT * FROM orders, payments").unwrap();
+        let error = StreamingPlanner::new().plan(&statements[0]).unwrap_err();
+        assert!(error.to_string().contains("implicit multi-source"));
+    }
+
+    #[test]
+    fn test_plan_allows_unnest_after_one_stream_source() {
+        let statements = StreamingParser::parse_sql(
+            "SELECT event_id, tag FROM events, UNNEST(make_array('a', 'b')) AS tags(tag)",
+        )
+        .unwrap();
+        StreamingPlanner::new().plan(&statements[0]).unwrap();
+    }
+
+    #[test]
+    fn test_plan_rejects_unbounded_join_between_windowed_views() {
         let mut planner = StreamingPlanner::new();
         // Two windowed views register as bounded inputs.
         for sql in [
@@ -942,22 +1256,53 @@ mod tests {
             let st = StreamingParser::parse_sql(sql).unwrap();
             planner.plan(&st[0]).unwrap();
         }
-        // The equi-join between them is accepted (not rejected as unbounded) and
-        // carries no join_config, so add_query routes it to the process-time join.
+        // Closed-window batches are not an ordering/alignment contract between two independent
+        // streams. A per-cycle join can silently miss rows when the batches arrive in different
+        // cycles, so this shape remains unbounded and must fail closed.
         let st = StreamingParser::parse_sql(
             "CREATE STREAM joined AS SELECT a.bucket, a.price, b.ms \
              FROM price_1m a JOIN sent_1m b ON a.bucket = b.bucket",
         )
         .unwrap();
-        match planner.plan(&st[0]).unwrap() {
-            StreamingPlan::Query(qp) => {
-                assert!(
-                    qp.join_config.is_none(),
-                    "windowed-view join carries no join_config"
-                );
-            }
-            other => panic!("expected a Query plan, got {other:?}"),
+        let error = planner.plan(&st[0]).unwrap_err();
+        assert!(error.to_string().contains("unbounded join"));
+    }
+
+    #[test]
+    fn test_plan_rejects_non_inner_interval_joins() {
+        for join_type in [
+            "LEFT",
+            "RIGHT",
+            "FULL",
+            "LEFT SEMI",
+            "LEFT ANTI",
+            "RIGHT SEMI",
+            "RIGHT ANTI",
+        ] {
+            let sql = format!(
+                "SELECT * FROM orders o {join_type} JOIN payments p \
+                 ON o.order_id = p.order_id \
+                 AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' HOUR"
+            );
+            let statements = StreamingParser::parse_sql(&sql).unwrap();
+            let error = StreamingPlanner::new().plan(&statements[0]).unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains("only INNER joins"),
+                "{join_type} interval join was not rejected: {message}"
+            );
         }
+    }
+
+    #[test]
+    fn test_plan_rejects_zero_interval_bound() {
+        let statements = StreamingParser::parse_sql(
+            "SELECT * FROM orders o JOIN payments p ON o.order_id = p.order_id \
+             AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '0' SECOND",
+        )
+        .unwrap();
+        let error = StreamingPlanner::new().plan(&statements[0]).unwrap_err();
+        assert!(error.to_string().contains("positive finite time bound"));
     }
 
     #[test]
@@ -1105,7 +1450,7 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_two_way_join() {
+    fn test_plan_rejects_multi_way_interval_join() {
         let mut planner = StreamingPlanner::new();
         let statements = StreamingParser::parse_sql(
             "SELECT * FROM a JOIN b ON a.id = b.a_id \
@@ -1115,26 +1460,17 @@ mod tests {
         )
         .unwrap();
 
-        let plan = planner.plan(&statements[0]).unwrap();
-        match plan {
-            StreamingPlan::Query(qp) => {
-                let configs = qp.join_config.unwrap();
-                assert_eq!(configs.len(), 2);
-                assert_eq!(configs[0].left_key(), "id");
-                assert_eq!(configs[0].right_key(), "a_id");
-                assert_eq!(configs[1].left_key(), "id");
-                assert_eq!(configs[1].right_key(), "b_id");
-            }
-            _ => panic!("Expected Query plan"),
-        }
+        let error = planner.plan(&statements[0]).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("explicitly named two-way stages"));
     }
 
     #[test]
-    fn test_plan_mixed_join_types() {
+    fn test_plan_rejects_mixed_multi_way_join() {
         let mut planner = StreamingPlanner::new();
-        // The second JOIN here would be unbounded if `customers` were a
-        // streaming source. Register it as a lookup table so the rejection
-        // rule passes.
+        // A lookup-table final step does not make a multi-way operator atomic; users must expose
+        // the interval result as a named stage before enriching it.
         let _ = planner.plan(
             &StreamingParser::parse_sql(
                 "CREATE LOOKUP TABLE customers (id BIGINT NOT NULL, name VARCHAR, \
@@ -1150,16 +1486,10 @@ mod tests {
         )
         .unwrap();
 
-        let plan = planner.plan(&statements[0]).unwrap();
-        match plan {
-            StreamingPlan::Query(qp) => {
-                let configs = qp.join_config.unwrap();
-                assert_eq!(configs.len(), 2);
-                assert!(configs[0].is_stream_stream());
-                assert!(configs[1].is_lookup());
-            }
-            _ => panic!("Expected Query plan"),
-        }
+        let error = planner.plan(&statements[0]).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("explicitly named two-way stages"));
     }
 
     #[test]

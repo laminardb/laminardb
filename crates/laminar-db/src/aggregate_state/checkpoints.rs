@@ -3,9 +3,8 @@
 //! `AggStateCheckpoint` is columnar; `GroupCheckpoint` (window/EOWC) and
 //! `EmittedCheckpoint` hold one-row IPC tuples; join buffers hold multi-row batches.
 
-use std::hash::{Hash, Hasher};
-
 use arrow::datatypes::Schema;
+use xxhash_rust::xxh3::Xxh3;
 
 #[derive(
     Clone, serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
@@ -84,13 +83,31 @@ fn default_evicted_watermark() -> i64 {
     i64::MIN
 }
 
-/// Stable hash of the pre-agg SQL and output schema; invalidates restored state on query change.
-pub(crate) fn query_fingerprint(pre_agg_sql: &str, output_schema: &Schema) -> u64 {
-    let mut hasher = std::hash::DefaultHasher::new();
-    pre_agg_sql.hash(&mut hasher);
+/// Stable hash of the state-producing SQL and output schema; invalidates state on query change.
+pub(crate) fn query_fingerprint(state_sql: &str, output_schema: &Schema) -> u64 {
+    query_fingerprint_with_config(state_sql, output_schema, &[])
+}
+
+/// Query fingerprint with an operator-specific binary configuration suffix.
+pub(crate) fn query_fingerprint_with_config(
+    state_sql: &str,
+    output_schema: &Schema,
+    config: &[u8],
+) -> u64 {
+    let mut hasher = Xxh3::new();
+    hasher.update(b"laminardb.state-query.v2\0");
+    hash_bytes(&mut hasher, state_sql.as_bytes());
+    hasher.update(&(output_schema.fields().len() as u64).to_le_bytes());
     for field in output_schema.fields() {
-        field.name().hash(&mut hasher);
-        field.data_type().to_string().hash(&mut hasher);
+        hash_bytes(&mut hasher, field.name().as_bytes());
+        hash_bytes(&mut hasher, field.data_type().to_string().as_bytes());
+        hasher.update(&[u8::from(field.is_nullable())]);
     }
-    hasher.finish()
+    hash_bytes(&mut hasher, config);
+    hasher.digest()
+}
+
+fn hash_bytes(hasher: &mut Xxh3, value: &[u8]) {
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value);
 }

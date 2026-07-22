@@ -1,9 +1,10 @@
 //! NATS source and sink — `core` (non-durable, at-most-once) or
-//! `jetstream` (default; replayable; at-least-once, or exactly-once
-//! with `Nats-Msg-Id` dedup).
+//! `jetstream` (default; replayable, durable at-least-once with optional
+//! bounded `Nats-Msg-Id` broker deduplication).
 
 pub mod config;
 pub mod metrics;
+mod setup;
 pub mod sink;
 pub mod source;
 
@@ -19,7 +20,13 @@ use crate::config::{ConfigKeySpec, ConnectorInfo};
 use crate::registry::ConnectorRegistry;
 
 /// Registers the NATS source connector.
-pub fn register_nats_source(registry: &ConnectorRegistry) {
+///
+/// # Errors
+///
+/// Returns an error if the source is already registered or the registry is frozen.
+pub fn register_nats_source(
+    registry: &ConnectorRegistry,
+) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
         name: "nats".to_string(),
         display_name: "NATS Source".to_string(),
@@ -31,12 +38,23 @@ pub fn register_nats_source(registry: &ConnectorRegistry) {
     registry.register_source(
         "nats",
         info,
-        Arc::new(|reg| Box::new(NatsSource::new(Arc::new(Schema::empty()), reg))),
-    );
+        Arc::new(|registry| {
+            Ok(Box::new(NatsSource::new(
+                Arc::new(Schema::empty()),
+                registry.map(Arc::as_ref),
+            )))
+        }),
+    )
 }
 
 /// Registers the NATS sink connector.
-pub fn register_nats_sink(registry: &ConnectorRegistry) {
+///
+/// # Errors
+///
+/// Returns an error if the sink is already registered or the registry is frozen.
+pub fn register_nats_sink(
+    registry: &ConnectorRegistry,
+) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
         name: "nats".to_string(),
         display_name: "NATS Sink".to_string(),
@@ -48,8 +66,13 @@ pub fn register_nats_sink(registry: &ConnectorRegistry) {
     registry.register_sink(
         "nats",
         info,
-        Arc::new(|reg| Box::new(NatsSink::new(Arc::new(Schema::empty()), reg))),
-    );
+        Arc::new(|_config, registry| {
+            Ok(Box::new(NatsSink::new(
+                Arc::new(Schema::empty()),
+                registry.map(Arc::as_ref),
+            )))
+        }),
+    )
 }
 
 fn auth_and_tls_keys() -> Vec<ConfigKeySpec> {
@@ -131,11 +154,6 @@ fn source_config_keys() -> Vec<ConfigKeySpec> {
         K::optional("fetch.batch", "Messages per pull fetch", "500"),
         K::optional("fetch.max.wait.ms", "Max wait per fetch", "500"),
         K::optional(
-            "fetch.error.threshold",
-            "Consecutive fetch errors before the source reports Unhealthy",
-            "10",
-        ),
-        K::optional(
             "lag.poll.interval.ms",
             "Interval between consumer.info() polls for the lag gauge (0 disables)",
             "10000",
@@ -156,7 +174,11 @@ fn sink_config_keys() -> Vec<ConfigKeySpec> {
     let mut keys = vec![
         K::required("servers", "NATS server URLs, comma-separated"),
         K::optional("mode", "core | jetstream", "jetstream"),
-        K::optional("stream", "Target stream (used for validation only)", ""),
+        K::optional(
+            "stream",
+            "Required JetStream target; validated and sent as Nats-Expected-Stream",
+            "",
+        ),
         K::optional("subject", "Literal subject for every row", ""),
         K::optional(
             "subject.column",
@@ -164,23 +186,13 @@ fn sink_config_keys() -> Vec<ConfigKeySpec> {
             "",
         ),
         K::optional(
-            "expected.stream",
-            "Nats-Expected-Stream header for fail-fast",
-            "",
-        ),
-        K::optional(
-            "delivery.guarantee",
-            "at_least_once | exactly_once",
-            "at_least_once",
-        ),
-        K::optional(
             "dedup.id.column",
-            "Column used as Nats-Msg-Id (required for exactly-once)",
+            "Unique row column used as Nats-Msg-Id for bounded broker deduplication",
             "",
         ),
         K::optional(
             "min.duplicate.window.ms",
-            "Minimum stream duplicate_window accepted under exactly-once",
+            "Minimum stream duplicate_window accepted when deduplication is enabled",
             "120000",
         ),
         K::optional("max.pending", "Max outstanding PubAck futures", "4096"),
@@ -203,14 +215,14 @@ mod tests {
     #[test]
     fn register_source_appears_in_registry() {
         let registry = ConnectorRegistry::new();
-        register_nats_source(&registry);
+        register_nats_source(&registry).unwrap();
         assert!(registry.list_sources().contains(&"nats".to_string()));
     }
 
     #[test]
     fn register_sink_appears_in_registry() {
         let registry = ConnectorRegistry::new();
-        register_nats_sink(&registry);
+        register_nats_sink(&registry).unwrap();
         assert!(registry.list_sinks().contains(&"nats".to_string()));
     }
 }

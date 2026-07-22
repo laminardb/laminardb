@@ -63,24 +63,6 @@ pub struct PipelineMetrics {
     pub mv_bytes_stored: u64,
 }
 
-/// Cold-tier (demoted operator state) metrics. Embedded mode has no
-/// `/metrics` endpoint, so this is the way to observe demotion/promotion on a
-/// single node.
-#[cfg(feature = "state-tier")]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TierMetrics {
-    /// Effective demotions — slices that actually left memory for the tier.
-    pub demote_total: u64,
-    /// Promotion fetches — cold slices read back into memory.
-    pub fetch_total: u64,
-    /// Logical bytes currently resident in the tier.
-    pub resident_bytes: i64,
-    /// Slices currently resident in the tier.
-    pub resident_slices: i64,
-    /// Groups found resident AND cold at capture (disjoint-set invariant broken). Must be 0.
-    pub overlap_total: u64,
-}
-
 /// Metrics for a single registered source.
 #[derive(Debug, Clone)]
 pub struct SourceMetrics {
@@ -105,16 +87,8 @@ pub struct SourceMetrics {
 pub struct StreamMetrics {
     /// Name.
     pub name: String,
-    /// Total events.
+    /// Total rows emitted by this stream since it started.
     pub total_events: u64,
-    /// Buffered events.
-    pub pending: usize,
-    /// Capacity.
-    pub capacity: usize,
-    /// >80% full.
-    pub is_backpressured: bool,
-    /// Watermark.
-    pub watermark: i64,
     /// Defining SQL query.
     pub sql: Option<String>,
 }
@@ -224,10 +198,6 @@ mod tests {
         let m = StreamMetrics {
             name: "avg_price".to_string(),
             total_events: 500,
-            pending: 0,
-            capacity: 1024,
-            is_backpressured: false,
-            watermark: 0,
             sql: Some("SELECT symbol, AVG(price) FROM trades GROUP BY symbol".to_string()),
         };
         assert_eq!(

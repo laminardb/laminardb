@@ -77,18 +77,20 @@ impl GraphOperator for TemporalProbeJoinOperator {
         let cp: TemporalProbeCheckpoint =
             rkyv::from_bytes::<TemporalProbeCheckpoint, rkyv::rancor::Error>(&checkpoint.data)
                 .map_err(|e| {
-                    DbError::Pipeline(format!(
+                    DbError::Checkpoint(format!(
                         "temporal probe [{}]: checkpoint deserialization: {e}",
                         self.projection.op_name
                     ))
                 })?;
 
-        self.state = TemporalProbeState::from_checkpoint(&cp)?;
+        let state = TemporalProbeState::from_checkpoint(&cp).map_err(|error| {
+            DbError::Checkpoint(format!(
+                "temporal probe [{}]: checkpoint restore: {error}",
+                self.projection.op_name
+            ))
+        })?;
+        self.state = state;
         Ok(())
-    }
-
-    fn estimated_state_bytes(&self) -> usize {
-        self.state.estimated_size_bytes()
     }
 }
 
@@ -203,12 +205,5 @@ mod tests {
 
         let result = op.process(&[], &[0]).await.unwrap();
         assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_estimated_state_bytes() {
-        let ctx = laminar_sql::create_session_context();
-        let op = TemporalProbeJoinOperator::new("test_probe", test_config(), None, ctx);
-        assert_eq!(op.estimated_state_bytes(), 0);
     }
 }

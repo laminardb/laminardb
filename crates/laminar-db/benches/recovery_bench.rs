@@ -1,7 +1,7 @@
 #![allow(clippy::disallowed_types)]
-//! Recovery benchmark: measures checkpoint load + state restore time.
+//! Recovery-storage benchmark: measures checkpoint manifest and sidecar load time.
 //!
-//! Validates the <60s for 10GB recovery target (scaled: <6s for 1GB).
+//! This covers storage I/O and deserialization, not full connector or operator restoration.
 //!
 //! Run with: `cargo bench --bench recovery_bench -p laminar-db`
 
@@ -31,7 +31,7 @@ fn synthetic_state(size_bytes: usize) -> Vec<u8> {
     data
 }
 
-/// Creates a manifest with realistic metadata (source offsets, sink epochs, etc.).
+/// Creates a manifest with realistic source offsets and topology metadata.
 fn realistic_manifest(id: u64, num_sources: usize, num_operators: usize) -> CheckpointManifest {
     let mut m = CheckpointManifest::new(id, id);
     m.watermark = Some(1_000_000);
@@ -40,14 +40,11 @@ fn realistic_manifest(id: u64, num_sources: usize, num_operators: usize) -> Chec
         let name = format!("source_{i}");
         m.source_offsets.insert(
             name.clone(),
-            ConnectorCheckpoint::with_offsets(
-                id,
-                HashMap::from([
-                    ("partition-0".into(), format!("{}", 1000 * id)),
-                    ("partition-1".into(), format!("{}", 2000 * id)),
-                    ("partition-2".into(), format!("{}", 3000 * id)),
-                ]),
-            ),
+            ConnectorCheckpoint::with_offsets(HashMap::from([
+                ("events:0".into(), format!("{}", 1000 * id)),
+                ("events:1".into(), format!("{}", 2000 * id)),
+                ("events:2".into(), format!("{}", 3000 * id)),
+            ])),
         );
         m.source_watermarks.insert(name, 500_000 + i as i64);
         m.source_names.push(format!("source_{i}"));
@@ -61,11 +58,6 @@ fn realistic_manifest(id: u64, num_sources: usize, num_operators: usize) -> Chec
     }
 
     m.sink_names = vec!["pg_sink".into(), "kafka_sink".into()];
-    m.sink_epochs.insert("pg_sink".into(), id.saturating_sub(1));
-    m.sink_epochs
-        .insert("kafka_sink".into(), id.saturating_sub(1));
-    m.pipeline_hash = Some(0xABCD_1234);
-
     m
 }
 
@@ -79,7 +71,7 @@ fn bench_recovery_manifest_only(c: &mut Criterion) {
 
     for &(sources, operators) in &[(2, 2), (10, 10), (50, 20)] {
         let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 5);
+        let store = FileSystemCheckpointStore::new(dir.path());
 
         let manifest = realistic_manifest(1, sources, operators);
         rt.block_on(store.save(&manifest)).unwrap();
@@ -98,18 +90,17 @@ fn bench_recovery_manifest_only(c: &mut Criterion) {
 
 /// Benchmark: load manifest + sidecar state data.
 ///
-/// This measures the full recovery path when operator state is large
-/// enough to be stored in a sidecar file (state.bin).
+/// This measures the storage-read portion of recovery when operator state
+/// is large enough to be stored in a sidecar file (state.bin).
 fn bench_recovery_with_sidecar(c: &mut Criterion) {
     let mut group = c.benchmark_group("recovery_with_sidecar");
     group.sample_size(10); // Fewer samples for large state sizes.
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     // Sizes: 1KB, 1MB, 10MB, 100MB.
-    // 1GB is too slow for default CI runs; test via #[ignore] integration test.
     for &size_bytes in &[1_024, 1_048_576, 10_485_760, 104_857_600] {
         let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 5);
+        let store = FileSystemCheckpointStore::new(dir.path());
 
         let manifest = realistic_manifest(1, 5, 3);
         let state = synthetic_state(size_bytes);
@@ -144,7 +135,7 @@ fn bench_checkpoint_save(c: &mut Criterion) {
 
     for &size_bytes in &[1_024, 1_048_576, 10_485_760] {
         let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 100);
+        let store = FileSystemCheckpointStore::new(dir.path());
 
         let state = synthetic_state(size_bytes);
         // Wrap once; cloning a Bytes is an Arc-bump so reusing this

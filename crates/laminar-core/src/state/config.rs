@@ -1,6 +1,6 @@
-//! [`StateBackendConfig`]: tagged enum selecting the runtime state
-//! backend. Three shapes: `in_process`, `local` (filesystem path),
-//! `object_store` (s3/gcs/file url).
+//! [`StateBackendConfig`]: tagged enum selecting storage for checkpointed
+//! vnode artifacts. Three shapes: `in_process`, `local` (filesystem path),
+//! `object_store` (S3/GCS/Azure/file URL).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -8,32 +8,14 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 use super::{
-    backend::StateBackend, in_process::InProcessBackend, object_store::ObjectStoreBackend,
+    backend::{StateBackend, StateBackendDurability},
+    in_process::InProcessBackend,
+    object_store::ObjectStoreBackend,
+    KeyGroupCount,
 };
 
-/// Default number of vnodes if the user does not override.
-pub const DEFAULT_VNODE_CAPACITY: u32 = 256;
-
-fn default_vnode_capacity() -> u32 {
-    DEFAULT_VNODE_CAPACITY
-}
-
-fn default_instance_id() -> String {
-    "local".to_string()
-}
-
-/// How nodes discover one another in `object_store` mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DiscoveryMode {
-    /// Static vnode assignment. `vnodes` and (optionally) `merger_instance`
-    /// are required in this mode.
-    #[default]
-    Static,
-    /// Dynamic membership — peers gossip via chitchat; vnode assignment
-    /// is chosen by the coordination layer.
-    Dynamic,
-}
+const LOCAL_STATE_WRITER_ID: &str = "local";
+const LOCAL_STATE_LOCK: &str = ".laminardb-state.lock";
 
 /// Cloud credential/config overrides for the state object store.
 /// `Debug` redacts values — they can hold secrets
@@ -50,34 +32,22 @@ impl std::fmt::Debug for StorageOptions {
     }
 }
 
-/// Tagged-union config that selects the runtime [`StateBackend`].
-///
-/// See module docs for the five deployment shapes.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(tag = "backend", rename_all = "snake_case")]
+/// Tagged-union config that selects checkpoint-artifact storage.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum StateBackendConfig {
     /// Non-durable in-process backend. The default.
-    InProcess {
-        /// Number of vnodes the backend should size for.
-        #[serde(default = "default_vnode_capacity")]
-        vnode_capacity: u32,
-    },
+    #[default]
+    InProcess,
 
     /// Durable single-node backend on a local filesystem path. Shorthand
     /// for an `object_store` backend with a `file://` URL.
     Local {
         /// Filesystem root for state.
         path: PathBuf,
-        /// Node identity (written into epoch commit markers for audit).
-        #[serde(default = "default_instance_id")]
-        instance_id: String,
-        /// Number of vnodes the backend should size for.
-        #[serde(default = "default_vnode_capacity")]
-        vnode_capacity: u32,
     },
 
-    /// Durable shared-state backend on S3 / GCS / Azure. Used by all
-    /// distributed-embedded and cluster modes.
+    /// Object-store backend. Cloud URLs (`s3://`, `gs://`, `az://`) are
+    /// cluster-shared; `file://` is node-durable only.
     ObjectStore {
         /// Object store URL: `s3://bucket/prefix`, `gs://bucket/prefix`,
         /// etc.
@@ -86,36 +56,36 @@ pub enum StateBackendConfig {
         /// `aws_access_key_id`), same keys as `[checkpoint.storage]`.
         /// Anything absent falls back to the provider's standard env
         /// vars (`AWS_ACCESS_KEY_ID`, ...).
-        #[serde(default)]
         storage: StorageOptions,
-        /// This node's identity. Written into epoch manifests and used
-        /// by the assignment-version fence to reject stale writes.
-        instance_id: String,
-        /// Number of vnodes the backend should size for.
-        #[serde(default = "default_vnode_capacity")]
-        vnode_capacity: u32,
-        /// Static vnode subset for this instance. `None` means "all
-        /// vnodes" (useful for the merger instance or for dynamic mode).
-        #[serde(default)]
-        vnodes: Option<Vec<u32>>,
-        /// Optional merger instance — the node that fans in partials
-        /// for sink emission. Only meaningful in static mode.
-        #[serde(default)]
-        merger_instance: Option<String>,
-        /// Discovery strategy: static assignment or chitchat gossip.
-        #[serde(default)]
-        discovery: DiscoveryMode,
-        /// Seed peers for dynamic discovery.
-        #[serde(default)]
-        seed_peers: Vec<String>,
     },
 }
 
-impl Default for StateBackendConfig {
-    fn default() -> Self {
-        Self::InProcess {
-            vnode_capacity: DEFAULT_VNODE_CAPACITY,
-        }
+#[derive(Deserialize)]
+#[serde(tag = "backend", rename_all = "snake_case", deny_unknown_fields)]
+enum StrictStateBackendConfig {
+    InProcess {},
+    Local {
+        path: PathBuf,
+    },
+    ObjectStore {
+        url: String,
+        #[serde(default)]
+        storage: StorageOptions,
+    },
+}
+
+impl<'de> Deserialize<'de> for StateBackendConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match StrictStateBackendConfig::deserialize(deserializer)? {
+            StrictStateBackendConfig::InProcess {} => Self::InProcess,
+            StrictStateBackendConfig::Local { path } => Self::Local { path },
+            StrictStateBackendConfig::ObjectStore { url, storage } => {
+                Self::ObjectStore { url, storage }
+            }
+        })
     }
 }
 
@@ -136,84 +106,79 @@ impl StateBackendConfig {
     /// Builder: embedded library, single process.
     #[must_use]
     pub fn in_process() -> Self {
-        Self::InProcess {
-            vnode_capacity: DEFAULT_VNODE_CAPACITY,
-        }
+        Self::InProcess
     }
 
     /// Builder: single-node durable state on the local filesystem.
     #[must_use]
     pub fn local(path: impl Into<PathBuf>) -> Self {
-        Self::Local {
-            path: path.into(),
-            instance_id: default_instance_id(),
-            vnode_capacity: DEFAULT_VNODE_CAPACITY,
-        }
+        Self::Local { path: path.into() }
     }
 
-    /// Builder: distributed-embedded over an object store, static mode.
+    /// Builder: object-store-backed state for an embedded or single-node runtime.
     /// Credentials resolve from the provider's standard env vars; use
     /// the `storage` config field for explicit overrides.
     #[must_use]
-    pub fn object_store(url: impl Into<String>, instance_id: impl Into<String>) -> Self {
+    pub fn object_store(url: impl Into<String>) -> Self {
         Self::ObjectStore {
             url: url.into(),
             storage: StorageOptions::default(),
-            instance_id: instance_id.into(),
-            vnode_capacity: DEFAULT_VNODE_CAPACITY,
-            vnodes: None,
-            merger_instance: None,
-            discovery: DiscoveryMode::Static,
-            seed_peers: Vec::new(),
         }
     }
 
     /// Instantiate the runtime backend.
-    ///
-    /// Declared `async` because backends added in later iterations
-    /// (object store, distributed) need to perform async setup. The
-    /// in-process path completes synchronously today; callers must
-    /// still `.await` for forward-compatibility.
     ///
     /// # Errors
     /// - [`StateBackendBuildError::Store`] for a bad URL, a scheme
     ///   whose feature flag (`aws`/`gcs`/`azure`) is not compiled in,
     ///   or cloud-client construction failure.
     /// - [`StateBackendBuildError::Io`] on filesystem setup.
-    #[allow(clippy::unused_async)]
-    pub async fn build(&self) -> Result<Arc<dyn StateBackend>, StateBackendBuildError> {
+    pub fn build(
+        &self,
+        key_groups: KeyGroupCount,
+    ) -> Result<Arc<dyn StateBackend>, StateBackendBuildError> {
+        let key_group_count = u32::from(key_groups);
         match self {
-            Self::InProcess { vnode_capacity } => {
-                Ok(Arc::new(InProcessBackend::new(*vnode_capacity)))
+            Self::InProcess => Ok(Arc::new(InProcessBackend::new(key_group_count))),
+            Self::Local { path } => {
+                let fs = durable_local_store(path)?;
+                Ok(Arc::new(
+                    ObjectStoreBackend::node_durable_with_empty_prefix_cleanup(
+                        fs,
+                        LOCAL_STATE_WRITER_ID,
+                        key_group_count,
+                    ),
+                ))
             }
-            Self::Local {
-                path,
-                instance_id,
-                vnode_capacity,
-            } => {
-                std::fs::create_dir_all(path)
-                    .map_err(|e| StateBackendBuildError::Io(e.to_string()))?;
-                let fs = ::object_store::local::LocalFileSystem::new_with_prefix(path)
-                    .map_err(|e| StateBackendBuildError::Io(e.to_string()))?;
-                Ok(Arc::new(ObjectStoreBackend::new(
-                    Arc::new(fs),
-                    instance_id,
-                    *vnode_capacity,
-                )))
+            Self::ObjectStore { url, .. } if url.starts_with("file://") => {
+                let path = crate::checkpoint::object_store_builder::file_url_path(url)?;
+                let fs = durable_local_store(&path)?;
+                Ok(Arc::new(
+                    ObjectStoreBackend::node_durable_with_empty_prefix_cleanup(
+                        fs,
+                        LOCAL_STATE_WRITER_ID,
+                        key_group_count,
+                    ),
+                ))
             }
-            Self::ObjectStore {
-                url,
-                storage,
-                instance_id,
-                vnode_capacity,
-                ..
-            } => {
+            Self::ObjectStore { url, storage } => {
                 let store = cloud_store(url, storage)?;
-                Ok(Arc::new(ObjectStoreBackend::new(
-                    store,
-                    instance_id,
-                    *vnode_capacity,
-                )))
+                let backend = match self.durability_scope() {
+                    StateBackendDurability::Volatile => {
+                        ObjectStoreBackend::new(store, LOCAL_STATE_WRITER_ID, key_group_count)
+                    }
+                    StateBackendDurability::NodeDurable => ObjectStoreBackend::node_durable(
+                        store,
+                        LOCAL_STATE_WRITER_ID,
+                        key_group_count,
+                    ),
+                    StateBackendDurability::ClusterShared => ObjectStoreBackend::cluster_shared(
+                        store,
+                        LOCAL_STATE_WRITER_ID,
+                        key_group_count,
+                    ),
+                };
+                Ok(Arc::new(backend))
             }
         }
     }
@@ -239,33 +204,44 @@ impl StateBackendConfig {
         &self,
     ) -> Result<Option<Arc<dyn ::object_store::ObjectStore>>, StateBackendBuildError> {
         match self {
-            Self::InProcess { .. } => Ok(None),
-            Self::Local { path, .. } => {
-                std::fs::create_dir_all(path)
-                    .map_err(|e| StateBackendBuildError::Io(e.to_string()))?;
-                let fs = ::object_store::local::LocalFileSystem::new_with_prefix(path)
-                    .map_err(|e| StateBackendBuildError::Io(e.to_string()))?;
-                Ok(Some(Arc::new(fs)))
-            }
-            Self::ObjectStore { url, storage, .. } => Ok(Some(cloud_store(url, storage)?)),
+            Self::InProcess => Ok(None),
+            Self::Local { path } => Ok(Some(durable_local_store(path)?)),
+            Self::ObjectStore { url, storage, .. } => Ok(Some(state_store(url, storage)?)),
         }
     }
 
-    /// Returns true if this backend persists state across process
-    /// restarts.
+    /// Failure scope survived by the configured backend.
+    ///
+    /// A local path and `file://` survive a same-node process restart but do
+    /// not claim peer visibility. Supported cloud schemes name a shared
+    /// service and therefore satisfy cluster recovery admission.
     #[must_use]
-    pub fn is_durable(&self) -> bool {
-        !matches!(self, Self::InProcess { .. })
-    }
-
-    /// Number of vnodes this backend is sized for.
-    #[must_use]
-    pub fn vnode_capacity(&self) -> u32 {
+    pub fn durability_scope(&self) -> StateBackendDurability {
         match self {
-            Self::InProcess { vnode_capacity }
-            | Self::Local { vnode_capacity, .. }
-            | Self::ObjectStore { vnode_capacity, .. } => *vnode_capacity,
+            Self::InProcess => StateBackendDurability::Volatile,
+            Self::Local { .. } => StateBackendDurability::NodeDurable,
+            Self::ObjectStore { url, .. } => StateBackendDurability::for_storage_url(url),
         }
+    }
+}
+
+fn durable_local_store(
+    path: &std::path::Path,
+) -> Result<Arc<crate::durable_local_store::DurableLocalObjectStore>, StateBackendBuildError> {
+    crate::durable_local_store::DurableLocalObjectStore::new_exclusive(path, LOCAL_STATE_LOCK)
+        .map(Arc::new)
+        .map_err(|error| StateBackendBuildError::Io(error.to_string()))
+}
+
+fn state_store(
+    url: &str,
+    storage: &StorageOptions,
+) -> Result<Arc<dyn ::object_store::ObjectStore>, StateBackendBuildError> {
+    if url.starts_with("file://") {
+        let path = crate::checkpoint::object_store_builder::file_url_path(url)?;
+        durable_local_store(&path).map(|store| store as Arc<dyn ::object_store::ObjectStore>)
+    } else {
+        cloud_store(url, storage)
     }
 }
 
@@ -291,17 +267,26 @@ fn cloud_store(
 mod tests {
     use super::*;
 
+    fn persisted_seal_writer(
+        root: &std::path::Path,
+        attempt: crate::state::CheckpointAttempt,
+    ) -> String {
+        let path = root
+            .join("state-v2")
+            .join(format!("epoch={}", attempt.epoch))
+            .join(format!("checkpoint={}", attempt.checkpoint_id))
+            .join("_SEAL");
+        let bytes = std::fs::read(path).unwrap();
+        let seal: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        seal["instance_id"].as_str().unwrap().to_owned()
+    }
+
     #[test]
     fn parse_in_process_minimal() {
         let toml = r#"backend = "in_process""#;
         let c: StateBackendConfig = toml::from_str(toml).unwrap();
-        assert!(matches!(
-            c,
-            StateBackendConfig::InProcess {
-                vnode_capacity: 256
-            }
-        ));
-        assert!(!c.is_durable());
+        assert!(matches!(c, StateBackendConfig::InProcess));
+        assert_eq!(c.durability_scope(), StateBackendDurability::Volatile);
         assert!(c.local_storage_dir().is_none());
     }
 
@@ -310,129 +295,212 @@ mod tests {
         let toml = r#"
 backend = "local"
 path = "/var/laminar"
-vnode_capacity = 128
 "#;
         let c: StateBackendConfig = toml::from_str(toml).unwrap();
         assert_eq!(
             c.local_storage_dir(),
             Some(std::path::Path::new("/var/laminar"))
         );
-        assert!(c.is_durable());
-        if let StateBackendConfig::Local { vnode_capacity, .. } = c {
-            assert_eq!(vnode_capacity, 128);
-        } else {
-            panic!("expected Local");
-        }
+        assert_eq!(c.durability_scope(), StateBackendDurability::NodeDurable);
+        assert!(matches!(c, StateBackendConfig::Local { .. }));
     }
 
     #[test]
-    fn parse_object_store_static() {
+    fn storage_url_durability_is_fail_closed() {
+        let local_url = url::Url::from_file_path(std::env::temp_dir().join("laminar-state"))
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            StateBackendDurability::for_storage_url(&local_url),
+            StateBackendDurability::NodeDurable
+        );
+        assert_eq!(
+            StateBackendDurability::for_storage_url("file:///tmp/laminar-state"),
+            StateBackendDurability::NodeDurable
+        );
+        assert_eq!(
+            StateBackendDurability::for_storage_url("file://remote-host/state"),
+            StateBackendDurability::Volatile
+        );
+        assert_eq!(
+            StateBackendDurability::for_storage_url("file://./relative"),
+            StateBackendDurability::Volatile
+        );
+        assert_eq!(
+            StateBackendDurability::for_storage_url("s3://bucket/state"),
+            StateBackendDurability::ClusterShared
+        );
+        assert_eq!(
+            StateBackendDurability::for_storage_url("memory://state"),
+            StateBackendDurability::Volatile
+        );
+        assert_eq!(
+            StateBackendDurability::for_storage_url("custom://state"),
+            StateBackendDurability::Volatile
+        );
+    }
+
+    #[test]
+    fn parse_object_store() {
         let toml = r#"
 backend = "object_store"
 url = "s3://bucket/laminar"
-instance_id = "node-0"
-vnodes = [0, 1, 2, 3]
-merger_instance = "node-0"
 "#;
         let c: StateBackendConfig = toml::from_str(toml).unwrap();
+        assert_eq!(c.durability_scope(), StateBackendDurability::ClusterShared);
         match c {
-            StateBackendConfig::ObjectStore {
-                url,
-                instance_id,
-                vnodes,
-                merger_instance,
-                discovery,
-                ..
-            } => {
+            StateBackendConfig::ObjectStore { url, .. } => {
                 assert_eq!(url, "s3://bucket/laminar");
-                assert_eq!(instance_id, "node-0");
-                assert_eq!(vnodes, Some(vec![0, 1, 2, 3]));
-                assert_eq!(merger_instance.as_deref(), Some("node-0"));
-                assert_eq!(discovery, DiscoveryMode::Static);
             }
             _ => panic!("expected ObjectStore"),
         }
     }
 
     #[test]
-    fn parse_object_store_dynamic() {
-        let toml = r#"
-backend = "object_store"
-url = "s3://bucket/laminar"
-instance_id = "node-0"
-discovery = "dynamic"
-seed_peers = ["10.0.0.1:7946", "10.0.0.2:7946"]
-"#;
-        let c: StateBackendConfig = toml::from_str(toml).unwrap();
-        match c {
-            StateBackendConfig::ObjectStore {
-                discovery,
-                seed_peers,
-                ..
-            } => {
-                assert_eq!(discovery, DiscoveryMode::Dynamic);
-                assert_eq!(seed_peers.len(), 2);
-            }
-            _ => panic!("expected ObjectStore dynamic"),
+    fn reject_public_state_writer_identity() {
+        for toml in [
+            "backend = \"local\"\npath = \"/var/laminar\"\ninstance_id = \"node-0\"\n",
+            "backend = \"local\"\npath = \"/var/laminar\"\ninstanceId = \"node-0\"\n",
+            "backend = \"object_store\"\nurl = \"s3://bucket/laminar\"\ninstance_id = \"node-0\"\n",
+            "backend = \"object_store\"\nurl = \"s3://bucket/laminar\"\ninstanceId = \"node-0\"\n",
+        ] {
+            assert!(
+                toml::from_str::<StateBackendConfig>(toml).is_err(),
+                "public writer identity was silently accepted: {toml}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_unwired_object_store_fields() {
+        for retired in [
+            "vnodes = [0, 1]",
+            "merger_instance = \"node-0\"",
+            "discovery = \"dynamic\"",
+            "seed_peers = [\"10.0.0.1:7946\"]",
+        ] {
+            let toml =
+                format!("backend = \"object_store\"\nurl = \"s3://bucket/laminar\"\n{retired}\n");
+            assert!(
+                toml::from_str::<StateBackendConfig>(&toml).is_err(),
+                "retired field was silently accepted: {retired}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_backend_specific_vnode_capacity() {
+        for toml in [
+            "backend = \"in_process\"\nvnode_capacity = 256\n",
+            "backend = \"local\"\npath = \"/var/laminar\"\nvnode_capacity = 256\n",
+            "backend = \"object_store\"\nurl = \"s3://bucket/state\"\nvnode_capacity = 256\n",
+        ] {
+            assert!(toml::from_str::<StateBackendConfig>(toml).is_err());
         }
     }
 
     #[tokio::test]
     async fn build_in_process_returns_backend() {
+        use crate::state::CheckpointAttempt;
         use bytes::Bytes;
         let c = StateBackendConfig::in_process();
-        let backend = c.build().await.unwrap();
+        let backend = c.build(super::super::LOCAL_KEY_GROUP_COUNT).unwrap();
+        assert_eq!(backend.durability_scope(), StateBackendDurability::Volatile);
+        let attempt = CheckpointAttempt::new(1, 1);
         backend
-            .write_partial(0, 1, 0, Bytes::from_static(b"ok"))
+            .write_partial(attempt, 0, 0, Bytes::from_static(b"ok"))
             .await
             .unwrap();
         assert_eq!(
-            &backend.read_partial(0, 1).await.unwrap().unwrap()[..],
+            &backend.read_partial(attempt, 0).await.unwrap().unwrap()[..],
             b"ok",
         );
     }
 
     #[tokio::test]
     async fn build_local_instantiates_backend() {
+        use crate::state::CheckpointAttempt;
         let dir = tempfile::tempdir().unwrap();
         let c = StateBackendConfig::local(dir.path());
-        let backend = c.build().await.unwrap();
+        let backend = c.build(super::super::LOCAL_KEY_GROUP_COUNT).unwrap();
+        assert_eq!(
+            backend.durability_scope(),
+            StateBackendDurability::NodeDurable
+        );
+        let attempt = CheckpointAttempt::new(1, 1);
         backend
-            .write_partial(0, 1, 0, bytes::Bytes::from_static(b"z"))
+            .write_partial(attempt, 0, 0, bytes::Bytes::from_static(b"z"))
             .await
             .unwrap();
+        assert!(backend
+            .seal_checkpoint(attempt, None, &[0], &[])
+            .await
+            .unwrap());
+        assert_eq!(persisted_seal_writer(dir.path(), attempt), "local");
         assert_eq!(
-            &backend.read_partial(0, 1).await.unwrap().unwrap()[..],
+            &backend.read_partial(attempt, 0).await.unwrap().unwrap()[..],
+            b"z",
+        );
+        drop(backend);
+        let restarted = c.build(super::super::LOCAL_KEY_GROUP_COUNT).unwrap();
+        assert_eq!(
+            &restarted.read_partial(attempt, 0).await.unwrap().unwrap()[..],
             b"z",
         );
     }
 
+    #[test]
+    fn local_state_root_has_one_live_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StateBackendConfig::local(dir.path());
+        let first = config.build(super::super::LOCAL_KEY_GROUP_COUNT).unwrap();
+        let Err(error) = config.build(super::super::LOCAL_KEY_GROUP_COUNT) else {
+            panic!("a second local state owner was admitted");
+        };
+        assert!(error.to_string().contains("already owned"));
+        drop(first);
+        config.build(super::super::LOCAL_KEY_GROUP_COUNT).unwrap();
+    }
+
     #[tokio::test]
     async fn build_object_store_file_url_instantiates_backend() {
+        use crate::state::CheckpointAttempt;
         let dir = tempfile::tempdir().unwrap();
-        let url = format!(
-            "file://{}",
-            dir.path().display().to_string().replace('\\', "/")
+        let normalized = dir.path().display().to_string().replace('\\', "/");
+        let url = if normalized.starts_with('/') {
+            format!("file://{normalized}")
+        } else {
+            format!("file:///{normalized}")
+        };
+        let c = StateBackendConfig::object_store(url);
+        let backend = c.build(super::super::LOCAL_KEY_GROUP_COUNT).unwrap();
+        assert_eq!(
+            backend.durability_scope(),
+            StateBackendDurability::NodeDurable
         );
-        let c = StateBackendConfig::object_store(url, "node-0");
-        let backend = c.build().await.unwrap();
+        let attempt = CheckpointAttempt::new(1, 1);
         backend
-            .write_partial(0, 1, 0, bytes::Bytes::from_static(b"z"))
+            .write_partial(attempt, 0, 0, bytes::Bytes::from_static(b"z"))
             .await
             .unwrap();
-        let got = backend.read_partial(0, 1).await.unwrap().unwrap();
+        assert!(backend
+            .seal_checkpoint(attempt, None, &[0], &[])
+            .await
+            .unwrap());
+        assert_eq!(persisted_seal_writer(dir.path(), attempt), "local");
+        let got = backend.read_partial(attempt, 0).await.unwrap().unwrap();
         assert_eq!(&got[..], b"z");
     }
 
     /// Without the `aws` feature an `s3://` URL must fail with the
     /// missing-feature error, not silently fall back to local.
     #[cfg(not(feature = "aws"))]
-    #[tokio::test]
-    async fn build_object_store_s3_requires_aws_feature() {
+    #[test]
+    fn build_object_store_s3_requires_aws_feature() {
         use crate::checkpoint::object_store_builder::ObjectStoreBuilderError;
 
-        let c = StateBackendConfig::object_store("s3://bucket/path", "node-0");
-        let Err(err) = c.build().await else {
+        let c = StateBackendConfig::object_store("s3://bucket/path");
+        let Err(err) = c.build(super::super::LOCAL_KEY_GROUP_COUNT) else {
             panic!("s3 must not build without the aws feature");
         };
         assert!(
@@ -448,12 +516,11 @@ seed_peers = ["10.0.0.1:7946", "10.0.0.2:7946"]
     /// credentials builds a client (construction is offline — no
     /// network until first use).
     #[cfg(feature = "aws")]
-    #[tokio::test]
-    async fn build_object_store_s3_builds_with_storage_options() {
+    #[test]
+    fn build_object_store_s3_builds_with_storage_options() {
         let toml = r#"
 backend = "object_store"
 url = "s3://bucket/laminar"
-instance_id = "node-0"
 
 [storage]
 endpoint = "http://127.0.0.1:9000"
@@ -463,13 +530,14 @@ region = "us-east-1"
 allow_http = "true"
 "#;
         let c: StateBackendConfig = toml::from_str(toml).unwrap();
-        c.build().await.expect("s3 client must build offline");
+        c.build(super::super::LOCAL_KEY_GROUP_COUNT)
+            .expect("s3 client must build offline");
     }
 
     #[test]
     fn default_is_in_process() {
         let c = StateBackendConfig::default();
-        assert!(matches!(c, StateBackendConfig::InProcess { .. }));
+        assert!(matches!(c, StateBackendConfig::InProcess));
     }
 
     #[test]

@@ -19,9 +19,7 @@ CREATE SOURCE crypto_ticks (
     'bootstrap.servers'      = 'localhost:9092',
     'topic'                  = 'crypto.ticks',
     'group.id'               = 'laminar-ohlc-demo',
-    'startup.mode'           = 'earliest',
-    'event.time.column'      = 'ts',
-    'max.out.of.orderness.ms' = '5000'
+    'startup.mode'           = 'earliest'
 ) FORMAT JSON;
 
 -- ──────────────────────────────────────────────────────────────────────
@@ -39,8 +37,8 @@ CREATE SOURCE crypto_ticks (
 --      window.
 --    - SUM(price * qty) drives the tick-weighted hourly VWAP rollup
 --      computed in query.sql.                         (prompt requirement)
---    - EMIT ON WINDOW CLOSE: append-only, exactly the Iceberg sink
---      contract (statements.rs:425-427, EmitClause::OnWindowClose).
+--    - EMIT ON WINDOW CLOSE makes the result append-only for the Iceberg
+--      append sink (statements.rs:425-427, EmitClause::OnWindowClose).
 -- ──────────────────────────────────────────────────────────────────────
 CREATE MATERIALIZED VIEW ohlc_1m AS
 SELECT

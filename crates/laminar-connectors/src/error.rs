@@ -7,6 +7,24 @@ use thiserror::Error;
 /// variants directly — the variant set has changed in the past.
 #[derive(Debug, Error)]
 pub enum ConnectorError {
+    /// A connector factory was registered more than once in the same registry category.
+    #[error("{kind} connector factory '{name}' is already registered")]
+    FactoryAlreadyRegistered {
+        /// Registry category (`source`, `sink`, `table source`, or `lookup source`).
+        kind: &'static str,
+        /// Duplicate connector type name.
+        name: String,
+    },
+
+    /// Connector factory registration was attempted after construction completed.
+    #[error("connector registry is frozen; cannot register {kind} factory '{name}'")]
+    RegistryFrozen {
+        /// Registry category (`source`, `sink`, `table source`, or `lookup source`).
+        kind: &'static str,
+        /// Connector type name that was rejected.
+        name: String,
+    },
+
     /// Failed to connect to the external system (network error, DNS
     /// failure, TLS negotiation failure, auth rejection).
     #[error("connection failed: {0}")]
@@ -23,6 +41,20 @@ pub enum ConnectorError {
     /// Error writing data to a sink.
     #[error("write error: {0}")]
     WriteError(String),
+
+    /// A dispatched operation failed without proving whether its external
+    /// side effects were applied.
+    ///
+    /// Recovery may replay the operation, but the connector generation that
+    /// observed this error must not process later work because its external
+    /// position is no longer known.
+    #[error("operation outcome unknown: {message}")]
+    OutcomeUnknown {
+        /// Failure detail.
+        message: String,
+        /// Whether a fresh connector generation may make progress after reconciliation.
+        retryable: bool,
+    },
 
     /// Serialization or deserialization error.
     #[error("serde error: {0}")]
@@ -88,6 +120,15 @@ impl From<laminar_core::lookup::source::LookupError> for ConnectorError {
 }
 
 impl ConnectorError {
+    /// Construct an error for a dispatched operation whose external outcome is unknown.
+    #[must_use]
+    pub fn outcome_unknown(message: impl Into<String>, retryable: bool) -> Self {
+        Self::OutcomeUnknown {
+            message: message.into(),
+            retryable,
+        }
+    }
+
     /// Construct a "missing required config" error. Thin helper around
     /// [`Self::ConfigurationError`] so every "missing required config:
     /// {key}" message is shaped the same way.
@@ -96,13 +137,17 @@ impl ConnectorError {
         Self::ConfigurationError(format!("missing required config: {}", key.into()))
     }
 
-    /// Returns `true` if this error is likely transient and the operation
-    /// may succeed on retry (e.g., network timeout, throttled request).
+    /// Returns `true` if this error is likely transient and recovery or a
+    /// retry may make progress (e.g., network timeout, throttled request).
+    /// An outcome-unknown error still requires connector retirement before
+    /// replay; inspect [`Self::is_outcome_unknown`] when that distinction
+    /// matters.
     /// Returns `false` for configuration, schema, and state errors that
     /// will not resolve without user intervention.
     #[must_use]
     pub fn is_transient(&self) -> bool {
         match self {
+            Self::OutcomeUnknown { retryable, .. } => *retryable,
             Self::ReadError(_)
             | Self::WriteError(_)
             | Self::Timeout(_)
@@ -110,6 +155,8 @@ impl ConnectorError {
             | Self::ConnectionFailed(_) => true,
 
             Self::ConfigurationError(_)
+            | Self::FactoryAlreadyRegistered { .. }
+            | Self::RegistryFrozen { .. }
             | Self::SchemaMismatch(_)
             | Self::InvalidState { .. }
             | Self::TransactionError(_)
@@ -117,6 +164,16 @@ impl ConnectorError {
             | Self::Closed
             | Self::Internal(_) => false,
         }
+    }
+
+    /// Returns `true` when an external side effect may have completed even
+    /// though the operation returned an error.
+    ///
+    /// This is stronger than [`Self::is_transient`]: callers may recover and
+    /// replay, but must retire the connector generation before doing so.
+    #[must_use]
+    pub fn is_outcome_unknown(&self) -> bool {
+        matches!(self, Self::OutcomeUnknown { .. })
     }
 }
 
@@ -239,6 +296,27 @@ mod tests {
         };
         assert!(err.to_string().contains("Running"));
         assert!(err.to_string().contains("Closed"));
+    }
+
+    #[test]
+    fn outcome_unknown_is_recoverable_but_requires_retirement() {
+        let err = ConnectorError::outcome_unknown("publish acknowledgement timed out", true);
+        assert!(err.is_transient());
+        assert!(err.is_outcome_unknown());
+        assert_eq!(
+            err.to_string(),
+            "operation outcome unknown: publish acknowledgement timed out"
+        );
+
+        assert!(!ConnectorError::Timeout(10).is_outcome_unknown());
+        assert!(
+            !ConnectorError::WriteError("rejected before dispatch".into()).is_outcome_unknown()
+        );
+
+        let terminal =
+            ConnectorError::outcome_unknown("permanent rejection after partial work", false);
+        assert!(terminal.is_outcome_unknown());
+        assert!(!terminal.is_transient());
     }
 
     #[test]

@@ -515,7 +515,6 @@
       <a href="#kafka-source">Kafka Source</a>
       <a href="#kafka-sink">Kafka Sink</a>
       <a href="#postgres-cdc">PostgreSQL CDC</a>
-      <a href="#mysql-cdc">MySQL CDC</a>
       <a href="#mongodb-cdc">MongoDB CDC Source</a>
       <a href="#mongodb-sink">MongoDB Sink</a>
       <a href="#postgres-sink">PostgreSQL Sink</a>
@@ -535,7 +534,6 @@
 
       <h4>Advanced</h4>
       <a href="#env-vars">Environment Variables</a>
-      <a href="#tiering">S3 Tiering</a>
       <a href="#delivery">Delivery Guarantees</a>
     </aside>
 
@@ -604,14 +602,32 @@ docker run -d -p 8080:8080 laminardb/laminardb-server:latest
           <tr>
             <td class="field-name">mode</td>
             <td class="field-type">String</td>
-            <td class="field-default">"embedded"</td>
-            <td>Run mode. <code>"embedded"</code> (standalone single-node) or <code>"cluster"</code> (multi-node deployment).</td>
+            <td class="field-default">"single"</td>
+            <td>Run mode. <code>"single"</code> (standalone) or <code>"cluster"</code> (multi-node deployment).</td>
+          </tr>
+          <tr>
+            <td class="field-name">key_groups</td>
+            <td class="field-type">u16</td>
+            <td class="field-default">256 (cluster)</td>
+            <td>Stable hash partitions for cluster placement and rescaling. Optional in cluster mode; rejected in single mode, which always uses one key group.</td>
           </tr>
           <tr>
             <td class="field-name">bind</td>
             <td class="field-type">String</td>
             <td class="field-default">"127.0.0.1:8080"</td>
             <td>HTTP API and Console UI control-plane bind address.</td>
+          </tr>
+          <tr>
+            <td class="field-name">delivery</td>
+            <td class="field-type">String</td>
+            <td class="field-default">"at_least_once"</td>
+            <td>Pipeline-wide contract: <code>best_effort</code>, <code>at_least_once</code>, or <code>exactly_once</code>. Connector protocols are derived from this value; sinks do not have an independent delivery setting.</td>
+          </tr>
+          <tr>
+            <td class="field-name">incremental_emit</td>
+            <td class="field-type">bool</td>
+            <td class="field-default">true</td>
+            <td>Query execution policy: emit dirty-only changelog updates for keyed non-windowed running aggregates.</td>
           </tr>
           <tr>
             <td class="field-name">console_token</td>
@@ -700,7 +716,7 @@ docker run -d -p 8080:8080 laminardb/laminardb-server:latest
       <div class="toml-block">
         <div class="toml-header">laminardb.toml</div>
         <pre><code class="language-toml">[server]
-mode = "embedded"
+mode = "single"
 bind = "0.0.0.0:8080"
 console_token = "supersecret"
 pgwire_bind = "0.0.0.0:5433"
@@ -716,7 +732,10 @@ log_level = "info"</code></pre>
       <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">crates/laminar-server/src/config.rs:641</a></div>
 
       <p>
-        When <code>mode = "cluster"</code>, the server requires both the <code>[discovery]</code> and <code>[coordination]</code> sections to be defined.
+        When <code>mode = "cluster"</code>, the server requires a unique <code>node_id</code> and a <code>[discovery]</code> section. Cluster coordination uses the configured shared state store; there is no separate <code>[coordination]</code> section or embedded Raft service.
+      </p>
+      <p>
+        Cluster mode requires <code>delivery = "at_least_once"</code> and cluster-shared state on S3, GCS, or Azure. Cluster exactly-once fails closed with <code>[LDB-0013]</code>: checkpoint decisions are term-fenced, but supported connectors do not yet have certified term-fenced source handoff and external sink cursors. Local paths and <code>file://</code> state are rejected because peers cannot recover them.
       </p>
 
       <h3>[discovery]</h3>
@@ -750,52 +769,19 @@ log_level = "info"</code></pre>
         </tbody>
       </table>
 
-      <h3>[coordination]</h3>
-      <table class="config-table">
-        <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
-        <tbody>
-          <tr>
-            <td class="field-name">strategy</td>
-            <td class="field-type">String</td>
-            <td class="field-default">"raft"</td>
-            <td>Consensus coordinator strategy. Currently supports <code>"raft"</code>.</td>
-          </tr>
-          <tr>
-            <td class="field-name">raft_port</td>
-            <td class="field-type">u16</td>
-            <td class="field-default">8888</td>
-            <td>The port used for Raft consensus group communications.</td>
-          </tr>
-          <tr>
-            <td class="field-name">election_timeout</td>
-            <td class="field-type">Duration</td>
-            <td class="field-default">"3s"</td>
-            <td>Raft leader election timeout (supports humantime format).</td>
-          </tr>
-          <tr>
-            <td class="field-name">heartbeat_interval</td>
-            <td class="field-type">Duration</td>
-            <td class="field-default">"500ms"</td>
-            <td>Raft leader heartbeat interval.</td>
-          </tr>
-        </tbody>
-      </table>
-
       <div class="toml-block">
         <div class="toml-header">laminardb.toml (Cluster sections)</div>
         <pre><code class="language-toml">node_id = "node-1"
+
+[server]
+mode = "cluster"
+key_groups = 256
 
 [discovery]
 strategy = "gossip"
 gossip_port = 7946
 advertise_host = "10.0.0.1"
-seeds = ["10.0.0.1:7946", "10.0.0.2:7946"]
-
-[coordination]
-strategy = "raft"
-raft_port = 8888
-election_timeout = "3s"
-heartbeat_interval = "500ms"</code></pre>
+seeds = ["10.0.0.1:7946", "10.0.0.2:7946"]</code></pre>
       </div>
 
       <!-- STATE -->
@@ -803,25 +789,14 @@ heartbeat_interval = "500ms"</code></pre>
       <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/src/state/config.rs" target="_blank" rel="noopener">crates/laminar-core/src/state/config.rs:43</a></div>
 
       <p>
-        The <code>[state]</code> section configures the engine's query state backend (used for aggregates, joins, and windowing). It is a tagged union using the <code>backend</code> key.
+        The <code>[state]</code> section configures storage for per-vnode checkpoint artifacts and exact-attempt durability seals. Hot aggregate, join, and window state remains in the operator runtime; this setting does not provide an incremental disk-backed keyed-state engine. It is a tagged union using the <code>backend</code> key.
       </p>
 
       <h3>In-Process State (Non-durable, in-memory)</h3>
       <p>Configure with <code>backend = "in_process"</code> (the default).</p>
-      <table class="config-table">
-        <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
-        <tbody>
-          <tr>
-            <td class="field-name">vnode_capacity</td>
-            <td class="field-type">u32</td>
-            <td class="field-default">256</td>
-            <td>Number of virtual nodes to divide the hash ring into.</td>
-          </tr>
-        </tbody>
-      </table>
 
-      <h3>Local State (Durable, local filesystem)</h3>
-      <p>Configure with <code>backend = "local"</code>.</p>
+      <h3>Local State (Node-durable filesystem)</h3>
+      <p>Configure with <code>backend = "local"</code>. This survives a same-node process restart and is valid for embedded/single-node exactly-once, but it is not visible to another cluster node.</p>
       <table class="config-table">
         <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
         <tbody>
@@ -831,23 +806,11 @@ heartbeat_interval = "500ms"</code></pre>
             <td class="field-required">required</td>
             <td>Local directory path where state partitions are stored.</td>
           </tr>
-          <tr>
-            <td class="field-name">instance_id</td>
-            <td class="field-type">String</td>
-            <td class="field-default">"local"</td>
-            <td>Auditable instance identity written to checkpoint metadata.</td>
-          </tr>
-          <tr>
-            <td class="field-name">vnode_capacity</td>
-            <td class="field-type">u32</td>
-            <td class="field-default">256</td>
-            <td>Number of virtual nodes.</td>
-          </tr>
         </tbody>
       </table>
 
-      <h3>Object Store State (Durable, shared storage)</h3>
-      <p>Configure with <code>backend = "object_store"</code>. Essential for cluster mode deployments.</p>
+      <h3>Object Store State (Failure scope determined by URL)</h3>
+      <p>Configure with <code>backend = "object_store"</code>. S3, GCS, and Azure URLs are cluster-shared; a <code>file://</code> URL remains node-durable only. Cluster mode requires one of the shared cloud schemes.</p>
       <table class="config-table">
         <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
         <tbody>
@@ -855,43 +818,7 @@ heartbeat_interval = "500ms"</code></pre>
             <td class="field-name">url</td>
             <td class="field-type">String</td>
             <td class="field-required">required</td>
-            <td>Shared storage URL (currently <code>"file://..."</code>; cloud schemes such as <code>"s3://"</code>/<code>"gs://"</code>/<code>"az://"</code> are not yet implemented).</td>
-          </tr>
-          <tr>
-            <td class="field-name">instance_id</td>
-            <td class="field-type">String</td>
-            <td class="field-required">required</td>
-            <td>This node's unique ID, used for writer fencing.</td>
-          </tr>
-          <tr>
-            <td class="field-name">vnode_capacity</td>
-            <td class="field-type">u32</td>
-            <td class="field-default">256</td>
-            <td>Total virtual nodes for the cluster layout.</td>
-          </tr>
-          <tr>
-            <td class="field-name">vnodes</td>
-            <td class="field-type">Array&lt;u32&gt;</td>
-            <td class="field-default">none</td>
-            <td>Static list of vnodes assigned to this node (only used for static/non-cluster layouts).</td>
-          </tr>
-          <tr>
-            <td class="field-name">merger_instance</td>
-            <td class="field-type">String</td>
-            <td class="field-default">none</td>
-            <td>The node that compiles partial sink outputs (only used in static modes).</td>
-          </tr>
-          <tr>
-            <td class="field-name">discovery</td>
-            <td class="field-type">String</td>
-            <td class="field-default">"static"</td>
-            <td>Membership discovery mode: <code>"static"</code> or <code>"dynamic"</code> (gossip).</td>
-          </tr>
-          <tr>
-            <td class="field-name">seed_peers</td>
-            <td class="field-type">Array&lt;String&gt;</td>
-            <td class="field-default">[]</td>
-            <td>Seed peer addresses for dynamic chitchat discovery.</td>
+            <td>State URL: <code>s3://</code>, <code>gs://</code>, <code>az://</code>/<code>abfs://</code>, or node-local <code>file://</code>.</td>
           </tr>
         </tbody>
       </table>
@@ -906,14 +833,26 @@ heartbeat_interval = "500ms"</code></pre>
           <tr>
             <td class="field-name">url</td>
             <td class="field-type">String</td>
-            <td class="field-default">"file:///tmp/laminardb/checkpoints"</td>
-            <td>Storage URL. file:///, s3://, gs://</td>
+            <td class="field-default">OS temp/laminardb</td>
+            <td>Checkpoint storage URL: <code>file://</code>, <code>s3://</code>, <code>gs://</code>, or <code>az://</code>/<code>abfs://</code>. Use an explicit durable location in production.</td>
           </tr>
           <tr>
             <td class="field-name">interval</td>
             <td class="field-type">Duration</td>
             <td class="field-default">"10s"</td>
-            <td>Checkpoint interval. Supports humantime: "10s", "1m", "500ms"</td>
+            <td>Checkpoint interval; must be greater than zero. Supports humantime such as <code>"10s"</code>, <code>"1m"</code>, or <code>"500ms"</code>. Cluster mode has a 100ms minimum.</td>
+          </tr>
+          <tr>
+            <td class="field-name">timeout</td>
+            <td class="field-type">Duration</td>
+            <td class="field-default">"120s"</td>
+            <td>One absolute end-to-end deadline spanning admission, alignment, capture, durable publication, and completion delivery.</td>
+          </tr>
+          <tr>
+            <td class="field-name">max_retained</td>
+            <td class="field-type">usize</td>
+            <td class="field-default">10</td>
+            <td>Number of finalized checkpoints retained for recovery and fallback.</td>
           </tr>
           <tr>
             <td class="field-name">storage</td>
@@ -922,10 +861,10 @@ heartbeat_interval = "500ms"</code></pre>
             <td>Cloud storage credentials. Keys: aws_access_key_id, aws_region, etc.</td>
           </tr>
           <tr>
-            <td class="field-name">tiering</td>
-            <td class="field-type">Section</td>
+            <td class="field-name">max_staged_bytes</td>
+            <td class="field-type">u64</td>
             <td class="field-default">none</td>
-            <td>Optional S3 storage class tiering. See <a href="#tiering">Tiering</a>.</td>
+            <td>Bound on captured state bytes awaiting durable upload (runtime default 512 MiB).</td>
           </tr>
         </tbody>
       </table>
@@ -979,22 +918,6 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
 }</code></pre>
       </div>
 
-      <h3>Ad-hoc Query &amp; Ephemeral Stream Lifecycle</h3>
-      <p>
-        To run an ad-hoc query and tail it in the browser:
-      </p>
-      <ol>
-        <li>Post the SQL query to <code>POST /api/v1/queries</code>:
-          <pre><code class="language-json">POST /api/v1/queries
-{ "sql": "SELECT symbol, price FROM trades WHERE volume > 1000" }</code></pre>
-        </li>
-        <li>The server registers an ephemeral stream named <code>__console_&lt;uuid&gt;</code> and returns:
-          <pre><code class="language-json">{ "stream_id": "__console_&lt;uuid&gt;", "ws_url": "/ws/__console_&lt;uuid&gt;" }</code></pre>
-        </li>
-        <li>The client connects to the WebSocket at <code>ws_url</code> to receive the data stream.</li>
-        <li>When the WebSocket connection closes or times out, the server automatically <code>DROP</code>s the ephemeral stream and releases resources.</li>
-      </ol>
-
       <h3>Realtime Telemetry &amp; WebSocket Protocol</h3>
       <p>
         WebSocket client connects to <code>GET /ws/{name}</code>. Messages are serialized using Arrow JSON format:
@@ -1010,8 +933,8 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
       <h3>Cluster Management Endpoints</h3>
       <ul>
         <li><code>GET /api/v1/cluster/nodes</code> &mdash; Returns list of cluster members, including their node IDs, network addresses, and states (<code>Active</code>, <code>Draining</code>, <code>Suspected</code>, <code>Left</code>).</li>
-        <li><code>GET /api/v1/cluster/vnodes</code> &mdash; Returns the current assignment map mapping the 256 virtual nodes (vnodes) to active cluster nodes.</li>
-        <li><code>GET /api/v1/cluster/leader</code> &mdash; Returns node details for the active Raft leader lease holder.</li>
+        <li><code>GET /api/v1/cluster/vnodes</code> &mdash; Returns the current key-group assignment map for active cluster nodes.</li>
+        <li><code>GET /api/v1/cluster/leader</code> &mdash; Returns node details for the active durable leader-lease holder.</li>
         <li><code>GET /api/v1/cluster/checkpoints</code> &mdash; Returns history and completion metadata of recent coordinator checkpoints.</li>
       </ul>
 
@@ -1069,11 +992,6 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
         </div>
         <div class="endpoint-row">
           <span class="endpoint-method method-post">POST</span>
-          <span class="endpoint-path">/api/v1/queries</span>
-          <span class="endpoint-desc">Create ephemeral query stream for ad-hoc tailing</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="endpoint-method method-post">POST</span>
           <span class="endpoint-path">/api/v1/checkpoint</span>
           <span class="endpoint-desc">Trigger immediate coordinator checkpoint</span>
         </div>
@@ -1105,7 +1023,7 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
         <div class="endpoint-row">
           <span class="endpoint-method method-get">GET</span>
           <span class="endpoint-path">/api/v1/cluster/vnodes</span>
-          <span class="endpoint-desc">Get current vnode instance assignments</span>
+          <span class="endpoint-desc">Get current key-group assignments</span>
         </div>
         <div class="endpoint-row">
           <span class="endpoint-method method-get">GET</span>
@@ -1208,13 +1126,13 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
             <td class="field-name">connector</td>
             <td class="field-type">String</td>
             <td><span class="field-required">required</span></td>
-            <td>"kafka", "postgres_cdc", "mysql_cdc", "mongodb-cdc", "nats", "websocket", "files", "delta-lake", "iceberg", "otel", "parquet-lookup", "postgres-lookup"</td>
+            <td>"kafka", "postgres-cdc", "mongodb-cdc", "nats", "websocket", "files", "delta-lake", "iceberg", "otel"</td>
           </tr>
           <tr>
             <td class="field-name">format</td>
             <td class="field-type">String</td>
             <td class="field-default">"json"</td>
-            <td>"json", "avro", "protobuf", "csv"</td>
+            <td>Connector-specific; see the source connector tables below</td>
           </tr>
           <tr>
             <td class="field-name">properties</td>
@@ -1260,7 +1178,7 @@ type = "DOUBLE"
 
 [[source.schema]]
 name = "ts"
-type = "BIGINT"
+type = "TIMESTAMP"
 
 [source.watermark]
 column = "ts"
@@ -1316,13 +1234,7 @@ max_out_of_orderness = "5s"</code></pre>
             <td class="field-name">connector</td>
             <td class="field-type">String</td>
             <td><span class="field-required">required</span></td>
-            <td>"kafka", "postgres", "mongodb", "nats", "delta-lake", "iceberg", "websocket", "files", "stdout"</td>
-          </tr>
-          <tr>
-            <td class="field-name">delivery</td>
-            <td class="field-type">String</td>
-            <td class="field-default">"at_least_once"</td>
-            <td>"at_least_once" or "exactly_once"</td>
+            <td>"kafka", "postgres-sink", "mongodb-sink", "nats", "delta-lake", "iceberg", "websocket", "files", "stdout"</td>
           </tr>
           <tr>
             <td class="field-name">properties</td>
@@ -1332,6 +1244,8 @@ max_out_of_orderness = "5s"</code></pre>
           </tr>
         </tbody>
       </table>
+
+      <p>Delivery is configured once at <code>[server].delivery</code>. A per-sink <code>delivery</code> field is rejected so a pipeline cannot silently mix checkpoint semantics.</p>
 
       <h2 id="lookups">[[lookup]]</h2>
       <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">config.rs:373</a></div>
@@ -1390,12 +1304,12 @@ max_out_of_orderness = "5s"</code></pre>
 
       <h2 id="connectors" style="font-size: 1.5rem;">Connectors</h2>
       <p>All connectors are feature-gated. Enable via <code>cargo add laminar-db --features kafka,delta-lake</code>.</p>
+      <p>Set delivery once at <code>[server].delivery</code> (or <code>LaminarDbBuilder::delivery_guarantee</code> when embedded). The runtime injects the selected protocol and owns checkpoint/committer identities; connector properties do not require public writer IDs.</p>
 
       <div class="connector-grid">
         <div class="connector-card"><a href="#kafka-source"><h4>Kafka</h4></a><div class="direction">Source + Sink</div><div class="feature">kafka</div></div>
         <div class="connector-card"><a href="#nats-source"><h4>NATS</h4></a><div class="direction">Source + Sink</div><div class="feature">nats</div></div>
         <div class="connector-card"><a href="#postgres-cdc"><h4>PostgreSQL CDC</h4></a><div class="direction">Source</div><div class="feature">postgres-cdc</div></div>
-        <div class="connector-card"><a href="#mysql-cdc"><h4>MySQL CDC</h4></a><div class="direction">Source</div><div class="feature">mysql-cdc</div></div>
         <div class="connector-card"><a href="#mongodb-cdc"><h4>MongoDB CDC</h4></a><div class="direction">Source + Sink</div><div class="feature">mongodb-cdc</div></div>
         <div class="connector-card"><a href="#postgres-sink"><h4>PostgreSQL Sink</h4></a><div class="direction">Sink</div><div class="feature">postgres-sink</div></div>
         <div class="connector-card"><a href="#delta-source"><h4>Delta Lake</h4></a><div class="direction">Source + Sink</div><div class="feature">delta-lake</div></div>
@@ -1423,7 +1337,7 @@ max_out_of_orderness = "5s"</code></pre>
       <table class="config-table">
         <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
         <tbody>
-          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, avro, protobuf</td></tr>
+          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, csv, avro, raw, debezium</td></tr>
           <tr><td class="field-name">schema.registry.url</td><td></td><td>Confluent Schema Registry URL</td></tr>
           <tr><td class="field-name">schema.registry.username</td><td></td><td>Schema Registry auth</td></tr>
           <tr><td class="field-name">schema.registry.password</td><td></td><td>Schema Registry auth</td></tr>
@@ -1446,12 +1360,11 @@ max_out_of_orderness = "5s"</code></pre>
       <table class="config-table">
         <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
         <tbody>
-          <tr><td class="field-name">startup.mode</td><td class="field-default">earliest</td><td>earliest, latest, none</td></tr>
+          <tr><td class="field-name">startup.mode</td><td class="field-default">group-offsets</td><td>group-offsets, earliest, latest</td></tr>
+          <tr><td class="field-name">auto.offset.reset</td><td class="field-default">earliest</td><td>earliest, latest, none (used when group offsets do not exist)</td></tr>
           <tr><td class="field-name">max.poll.records</td><td class="field-default">1000</td><td>Records per poll batch</td></tr>
           <tr><td class="field-name">isolation.level</td><td class="field-default">read_committed</td><td>read_uncommitted, read_committed</td></tr>
-          <tr><td class="field-name">partition.assignment.strategy</td><td class="field-default">range</td><td>range, roundrobin, sticky, cooperative-sticky</td></tr>
-          <tr><td class="field-name">max.out.of.orderness.ms</td><td class="field-default">5000</td><td>Watermark out-of-order tolerance</td></tr>
-          <tr><td class="field-name">idle.timeout.ms</td><td class="field-default">30000</td><td>Idle watermark advancement timeout</td></tr>
+          <tr><td class="field-name">partition.assignment.strategy</td><td class="field-default">range</td><td>range, roundrobin, cooperative-sticky</td></tr>
         </tbody>
       </table>
 
@@ -1466,15 +1379,12 @@ max_out_of_orderness = "5s"</code></pre>
         <tbody>
           <tr><td class="field-name">bootstrap.servers</td><td><span class="field-required">required</span></td><td>Kafka broker addresses</td></tr>
           <tr><td class="field-name">topic</td><td><span class="field-required">required</span></td><td>Target topic</td></tr>
-          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, avro, protobuf</td></tr>
-          <tr><td class="field-name">delivery.guarantee</td><td class="field-default">at-least-once</td><td>at-least-once, exactly-once</td></tr>
+          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, csv, avro, raw</td></tr>
           <tr><td class="field-name">key.column</td><td></td><td>Column for partition key</td></tr>
           <tr><td class="field-name">partitioner</td><td class="field-default">key-hash</td><td>key-hash, round-robin, sticky</td></tr>
           <tr><td class="field-name">compression.type</td><td class="field-default">none</td><td>none, gzip, snappy, lz4, zstd</td></tr>
-          <tr><td class="field-name">acks</td><td class="field-default">all</td><td>all, 1, 0</td></tr>
           <tr><td class="field-name">linger.ms</td><td class="field-default">5</td><td>Batch linger time</td></tr>
           <tr><td class="field-name">batch.size</td><td class="field-default">16384</td><td>Max batch bytes</td></tr>
-          <tr><td class="field-name">transactional.id</td><td></td><td>For exactly-once producer</td></tr>
         </tbody>
       </table>
 
@@ -1487,7 +1397,7 @@ max_out_of_orderness = "5s"</code></pre>
         <tbody>
           <tr><td class="field-name">servers</td><td><span class="field-required">required</span></td><td>NATS server URLs (comma-separated)</td></tr>
           <tr><td class="field-name">mode</td><td class="field-default">jetstream</td><td>jetstream, core</td></tr>
-          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, avro, protobuf</td></tr>
+          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, csv, raw</td></tr>
           <tr><td class="field-name">auth.mode</td><td class="field-default">none</td><td>none, user_pass, token, creds_file</td></tr>
           <tr><td class="field-name">user</td><td></td><td>Auth username (required for user_pass)</td></tr>
           <tr><td class="field-name">password</td><td></td><td>Auth password (required for user_pass)</td></tr>
@@ -1513,6 +1423,10 @@ max_out_of_orderness = "5s"</code></pre>
           <tr><td class="field-name">queue.group</td><td></td><td>Queue group (core mode only)</td></tr>
         </tbody>
       </table>
+      <p>JetStream messages receive confirmed acknowledgements asynchronously after successful deserialization;
+         acknowledgement failures and timeouts leave them eligible for broker redelivery. NATS
+         source progress is not checkpoint-coupled, and both JetStream and Core modes are admitted
+         only as ephemeral/best-effort sources.</p>
 
       <!-- NATS SINK -->
       <h3 id="nats-sink">NATS Sink</h3>
@@ -1523,7 +1437,7 @@ max_out_of_orderness = "5s"</code></pre>
         <tbody>
           <tr><td class="field-name">servers</td><td><span class="field-required">required</span></td><td>NATS server URLs (comma-separated)</td></tr>
           <tr><td class="field-name">mode</td><td class="field-default">jetstream</td><td>jetstream, core</td></tr>
-          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, avro, protobuf</td></tr>
+          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, csv, raw</td></tr>
           <tr><td class="field-name">auth.mode</td><td class="field-default">none</td><td>none, user_pass, token, creds_file</td></tr>
           <tr><td class="field-name">user</td><td></td><td>Auth username (required for user_pass)</td></tr>
           <tr><td class="field-name">password</td><td></td><td>Auth password (required for user_pass)</td></tr>
@@ -1533,12 +1447,10 @@ max_out_of_orderness = "5s"</code></pre>
           <tr><td class="field-name">tls.ca.location</td><td></td><td>CA cert path</td></tr>
           <tr><td class="field-name">tls.cert.location</td><td></td><td>Client certificate path</td></tr>
           <tr><td class="field-name">tls.key.location</td><td></td><td>Client key path</td></tr>
-          <tr><td class="field-name">stream</td><td></td><td>Target JetStream stream (required if delivery.guarantee=exactly_once)</td></tr>
+          <tr><td class="field-name">stream</td><td></td><td>JetStream target, required in JetStream mode and forbidden in Core mode; file storage, three replicas, and publish acknowledgements are validated at startup</td></tr>
           <tr><td class="field-name">subject</td><td></td><td>Literal publishing subject. Mutually exclusive with subject.column.</td></tr>
           <tr><td class="field-name">subject.column</td><td></td><td>Per-row subject column name. Mutually exclusive with subject.</td></tr>
-          <tr><td class="field-name">expected.stream</td><td></td><td>Optional stream name assertion header</td></tr>
-          <tr><td class="field-name">delivery.guarantee</td><td class="field-default">at-least-once</td><td>at-least-once, exactly-once, at-most-once</td></tr>
-          <tr><td class="field-name">dedup.id.column</td><td></td><td>Column to use for message deduplication ID (required if exactly_once)</td></tr>
+          <tr><td class="field-name">dedup.id.column</td><td></td><td>Column to use for JetStream message deduplication IDs</td></tr>
           <tr><td class="field-name">min.duplicate.window.ms</td><td class="field-default">120000</td><td>Minimum duplicate window in milliseconds</td></tr>
           <tr><td class="field-name">max.pending</td><td class="field-default">4096</td><td>Maximum pending publish futures</td></tr>
           <tr><td class="field-name">ack.timeout.ms</td><td class="field-default">30000</td><td>Ack timeout in milliseconds</td></tr>
@@ -1548,7 +1460,9 @@ max_out_of_orderness = "5s"</code></pre>
 
       <!-- POSTGRES CDC -->
       <h3 id="postgres-cdc">PostgreSQL CDC Source</h3>
-      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/cdc/postgres/source.rs" target="_blank" rel="noopener">cdc/postgres/source.rs</a></div>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/postgres/cdc/source.rs" target="_blank" rel="noopener">postgres/cdc/source.rs</a></div>
+
+      <p><strong>Delivery boundary:</strong> the source resumes from the last fully emitted committed transaction and is admitted for at-least-once processing. It does not create an initial snapshot, so fresh startup is rejected before network I/O. Both the control and replication connections use the same verified TLS policy.</p>
 
       <table class="config-table">
         <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
@@ -1560,31 +1474,11 @@ max_out_of_orderness = "5s"</code></pre>
           <tr><td class="field-name">password</td><td></td><td>Auth password</td></tr>
           <tr><td class="field-name">slot.name</td><td><span class="field-required">required</span></td><td>Logical replication slot</td></tr>
           <tr><td class="field-name">publication</td><td><span class="field-required">required</span></td><td>Publication name</td></tr>
-          <tr><td class="field-name">ssl.mode</td><td class="field-default">prefer</td><td>disable, prefer, require, verify-ca, verify-full</td></tr>
-          <tr><td class="field-name">snapshot.mode</td><td class="field-default">initial</td><td>initial, never, always</td></tr>
-          <tr><td class="field-name">table.include</td><td></td><td>Comma-separated table filter</td></tr>
-          <tr><td class="field-name">table.exclude</td><td></td><td>Comma-separated table exclusions</td></tr>
-          <tr><td class="field-name">max.poll.records</td><td class="field-default">1000</td><td>Records per poll</td></tr>
-        </tbody>
-      </table>
-
-      <!-- MYSQL CDC -->
-      <h3 id="mysql-cdc">MySQL CDC Source</h3>
-      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/cdc/mysql/source.rs" target="_blank" rel="noopener">cdc/mysql/source.rs</a></div>
-
-      <table class="config-table">
-        <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
-        <tbody>
-          <tr><td class="field-name">host</td><td><span class="field-required">required</span></td><td>MySQL hostname</td></tr>
-          <tr><td class="field-name">port</td><td class="field-default">3306</td><td>Port</td></tr>
-          <tr><td class="field-name">username</td><td><span class="field-required">required</span></td><td>Auth username</td></tr>
-          <tr><td class="field-name">password</td><td></td><td>Auth password</td></tr>
-          <tr><td class="field-name">database</td><td></td><td>Database filter</td></tr>
-          <tr><td class="field-name">server.id</td><td class="field-default">1001</td><td>Unique replica server ID</td></tr>
-          <tr><td class="field-name">use.gtid</td><td class="field-default">true</td><td>GTID-based replication</td></tr>
-          <tr><td class="field-name">gtid.set</td><td></td><td>Starting GTID set</td></tr>
-          <tr><td class="field-name">snapshot.mode</td><td class="field-default">initial</td><td>initial, never, always</td></tr>
-          <tr><td class="field-name">table.include</td><td></td><td>Comma-separated tables (db.table format)</td></tr>
+          <tr><td class="field-name">ssl.mode</td><td class="field-default">verify-full</td><td><code>verify-full</code> or explicit plaintext <code>disable</code></td></tr>
+          <tr><td class="field-name">ssl.ca.cert.path</td><td></td><td>Optional PEM CA bundle for <code>verify-full</code>; web PKI roots are used by default</td></tr>
+          <tr><td class="field-name">table.include</td><td></td><td>Comma-separated, schema-qualified table filter</td></tr>
+          <tr><td class="field-name">table.exclude</td><td></td><td>Comma-separated, schema-qualified table exclusions</td></tr>
+          <tr><td class="field-name">max.buffered.bytes</td><td class="field-default">268435456</td><td>Total connector-owned payload budget across raw WAL, decoded transactions, and Arrow construction (1 MiB to 4 GiB)</td></tr>
         </tbody>
       </table>
 
@@ -1604,9 +1498,9 @@ max_out_of_orderness = "5s"</code></pre>
           <tr><td class="field-name">schema.name</td><td class="field-default">public</td><td>PostgreSQL schema</td></tr>
           <tr><td class="field-name">write.mode</td><td class="field-default">append</td><td>append (COPY BINARY) or upsert (INSERT ON CONFLICT)</td></tr>
           <tr><td class="field-name">primary.key</td><td></td><td>PK columns for upsert (comma-separated). Required if write.mode=upsert.</td></tr>
-          <tr><td class="field-name">batch.size</td><td class="field-default">4096</td><td>Records per flush</td></tr>
-          <tr><td class="field-name">pool.size</td><td class="field-default">4</td><td>Connection pool size</td></tr>
-          <tr><td class="field-name">delivery.guarantee</td><td class="field-default">at_least_once</td><td>at_least_once, exactly_once (2PC)</td></tr>
+          <tr><td class="field-name">flush.interval.ms</td><td class="field-default">250</td><td>Maximum time to buffer before flushing</td></tr>
+          <tr><td class="field-name">connect.timeout.ms</td><td class="field-default">10000</td><td>Connection deadline</td></tr>
+          <tr><td class="field-name">statement.timeout.ms</td><td class="field-default">30000</td><td>Per-query deadline</td></tr>
           <tr><td class="field-name">auto.create.table</td><td class="field-default">false</td><td>Create table if missing</td></tr>
         </tbody>
       </table>
@@ -1615,36 +1509,31 @@ max_out_of_orderness = "5s"</code></pre>
       <h3 id="mongodb-cdc">MongoDB CDC Source</h3>
       <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/mongodb/source.rs" target="_blank" rel="noopener">mongodb/source.rs</a></div>
 
-      <p>Consumes MongoDB <a href="https://www.mongodb.com/docs/manual/changeStreams/" target="_blank" rel="noopener">change streams</a>.
-         Resume tokens provide at-least-once delivery across restarts. Requires MongoDB 4.0+ (replica set) or 4.2+ (sharded cluster).</p>
+      <p>Consumes fixed-collection MongoDB <a href="https://www.mongodb.com/docs/manual/changeStreams/" target="_blank" rel="noopener">change streams</a> with byte-bounded backpressure, reconnect, and deployment- and collection-bound resume-token checkpoints. Fresh sources establish an exact empty bootstrap cut. Delivery is replayable at-least-once.</p>
 
       <table class="config-table">
         <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
         <tbody>
-          <tr><td class="field-name">connection.uri</td><td class="field-default">mongodb://localhost:27017</td><td>MongoDB connection string</td></tr>
+          <tr><td class="field-name">connection.uri</td><td><span class="field-required">required</span></td><td>MongoDB connection string</td></tr>
           <tr><td class="field-name">database</td><td><span class="field-required">required</span></td><td>Database name</td></tr>
-          <tr><td class="field-name">collection</td><td><span class="field-required">required</span></td><td>Collection name, or <code>*</code> for all collections in database</td></tr>
-          <tr><td class="field-name">full.document.mode</td><td class="field-default">delta</td><td>delta, update_lookup, required, when_available</td></tr>
-          <tr><td class="field-name">max.await.time.ms</td><td class="field-default">1000</td><td><code>getMore</code> await timeout (milliseconds)</td></tr>
-          <tr><td class="field-name">batch.size</td><td class="field-default">1000</td><td>Cursor batch size hint</td></tr>
-          <tr><td class="field-name">max.poll.records</td><td class="field-default">1000</td><td>Max records per poll batch</td></tr>
-          <tr><td class="field-name">max.buffered.events</td><td class="field-default">100000</td><td>Max buffered events before backpressure</td></tr>
+          <tr><td class="field-name">collection</td><td><span class="field-required">required</span></td><td>Fixed collection name; the collection must exist before source startup</td></tr>
+          <tr><td class="field-name">full.document.mode</td><td class="field-default">delta</td><td>delta or required</td></tr>
+          <tr><td class="field-name">pipeline</td><td class="field-default">[]</td><td>JSON array of at most 64 <code>$match</code> stages, bounded to 256 KiB</td></tr>
+          <tr><td class="field-name">max.buffered.bytes</td><td class="field-default">67108864</td><td>Retained decoded-byte limit across the reader queue and poll buffer (1 MiB to 4 GiB)</td></tr>
         </tbody>
       </table>
 
       <p style="font-size: 0.8rem; color: var(--text-dim);">
         <strong>Full document modes:</strong>
         <code>delta</code> sends the update description only (default).
-        <code>update_lookup</code> fetches the current document on updates.
         <code>required</code> needs <code>changeStreamPreAndPostImages</code> enabled on the collection.
-        <code>when_available</code> returns the post-image when present, otherwise null.
       </p>
 
       <p style="font-size: 0.8rem; color: var(--text-dim);">
         <strong>CDC envelope schema:</strong>
         <code>_namespace</code> (Utf8), <code>_op</code> (Utf8: I/U/R/D/DROP),
         <code>_document_key</code> (Utf8), <code>_cluster_time_s</code> (UInt32),
-        <code>_cluster_time_i</code> (UInt32), <code>_wall_time_ms</code> (Int64),
+        <code>_cluster_time_i</code> (UInt32), <code>_wall_time_ms</code> (Timestamp(ms)),
         <code>_full_document</code> (Utf8, nullable), <code>_update_desc</code> (Utf8, nullable),
         <code>_resume_token</code> (Utf8).
       </p>
@@ -1656,25 +1545,22 @@ max_out_of_orderness = "5s"</code></pre>
       <table class="config-table">
         <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
         <tbody>
-          <tr><td class="field-name">connection.uri</td><td class="field-default">mongodb://localhost:27017</td><td>MongoDB connection string</td></tr>
+          <tr><td class="field-name">connection.uri</td><td><span class="field-required">required</span></td><td>MongoDB connection string</td></tr>
           <tr><td class="field-name">database</td><td><span class="field-required">required</span></td><td>Target database name</td></tr>
           <tr><td class="field-name">collection</td><td><span class="field-required">required</span></td><td>Target collection name</td></tr>
-          <tr><td class="field-name">write.mode</td><td class="field-default">insert</td><td>insert, upsert, replace, cdc_replay</td></tr>
-          <tr><td class="field-name">batch.size</td><td class="field-default">500</td><td>Max documents per bulk write</td></tr>
-          <tr><td class="field-name">flush.interval.ms</td><td class="field-default">1000</td><td>Max time between flushes (ms)</td></tr>
-          <tr><td class="field-name">ordered</td><td class="field-default">true</td><td>true = fail-fast ordered writes; false = unordered (higher throughput)</td></tr>
-          <tr><td class="field-name">write.concern.w</td><td class="field-default">majority</td><td>majority or integer node count</td></tr>
-          <tr><td class="field-name">write.concern.journal</td><td class="field-default">true</td><td>Wait for journal commit</td></tr>
+          <tr><td class="field-name">write.mode</td><td class="field-default">insert</td><td>insert, upsert, cdc_replay</td></tr>
+          <tr><td class="field-name">write.mode.key_fields</td><td></td><td>Comma-separated top-level keys; required for upsert</td></tr>
+          <tr><td class="field-name">flush.interval.ms</td><td class="field-default">250</td><td>Max time between flushes (ms)</td></tr>
+          <tr><td class="field-name">sink.write.timeout.ms</td><td class="field-default">30000</td><td>End-to-end write deadline</td></tr>
         </tbody>
       </table>
 
       <p style="font-size: 0.8rem; color: var(--text-dim);">
         <strong>Write modes:</strong>
         <code>insert</code> is append-only.
-        <code>upsert</code> replaces documents by the fields listed in <code>upsert.key.fields</code>.
-        <code>replace</code> rewrites the full document.
+        <code>upsert</code> replaces documents by the fields listed in <code>write.mode.key_fields</code>.
         <code>cdc_replay</code> routes by the <code>_op</code> column (I→insert, U→update, R→replace, D→delete).
-        Time series collections only support <code>insert</code>.
+        Writes are ordered and majority-journaled; these correctness settings are not user-tunable. Time series collections only support <code>insert</code>.
       </p>
 
       <!-- DELTA LAKE SOURCE -->
@@ -1707,35 +1593,31 @@ max_out_of_orderness = "5s"</code></pre>
           <tr><td class="field-name">target.file.size</td><td class="field-default">134217728</td><td>Target Parquet file size (128 MB)</td></tr>
           <tr><td class="field-name">max.buffer.records</td><td class="field-default">100000</td><td>Records before flush</td></tr>
           <tr><td class="field-name">max.buffer.duration.ms</td><td class="field-default">60000</td><td>Time before flush</td></tr>
-          <tr><td class="field-name">delivery.guarantee</td><td class="field-default">at-least-once</td><td>at-least-once, exactly-once</td></tr>
-          <tr><td class="field-name">writer.id</td><td></td><td>Writer ID (required for exactly-once)</td></tr>
           <tr><td class="field-name">schema.evolution</td><td class="field-default">false</td><td>Auto-merge new columns</td></tr>
-          <tr><td class="field-name">compaction.enabled</td><td class="field-default">false</td><td>Enable automatic compaction</td></tr>
-          <tr><td class="field-name">vacuum.retention.hours</td><td class="field-default">168</td><td>Retention hours (7 days)</td></tr>
           <tr><td class="field-name">catalog.type</td><td class="field-default">none</td><td>none, glue, unity</td></tr>
         </tbody>
       </table>
 
-      <p style="font-size: 0.8rem; color: var(--text-dim);">Cloud storage credentials: use <code>storage.aws_access_key_id</code>, <code>storage.aws_secret_access_key</code>, <code>storage.aws_region</code>, etc.</p>
+      <p style="font-size: 0.8rem; color: var(--text-dim);">Cloud storage credentials: use <code>storage.aws_access_key_id</code>, <code>storage.aws_secret_access_key</code>, <code>storage.aws_region</code>, etc. Delivery comes from the pipeline-wide setting. Delta's checkpoint-committable protocol is limited to append mode in embedded/single-node runtime; production exactly-once certification remains a release fault/soak gate. Alternate log stores and custom object-store endpoints fail closed. Its coordinated transaction namespace is internal.</p>
 
       <!-- WEBSOCKET SOURCE -->
       <h3 id="websocket-source">WebSocket Source</h3>
       <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/websocket/source.rs" target="_blank" rel="noopener">websocket/source.rs</a></div>
 
-      <p><strong>Note:</strong> WebSocket is non-replayable. At-most-once delivery on recovery.</p>
+      <p><strong>Note:</strong> WebSocket is non-replayable and therefore requires pipeline-wide <code>best_effort</code>. Reconnects can create gaps or duplicates; stronger guarantees fail admission.</p>
 
       <table class="config-table">
         <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
         <tbody>
-          <tr><td class="field-name">mode</td><td class="field-default">client</td><td>client (connect out) or server (accept connections)</td></tr>
-          <tr><td class="field-name">url</td><td></td><td>WebSocket URL (client mode, comma-separated for multi)</td></tr>
-          <tr><td class="field-name">bind.address</td><td></td><td>Bind address (server mode)</td></tr>
-          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, jsonlines, binary, csv</td></tr>
-          <tr><td class="field-name">subscribe.message</td><td></td><td>Message sent after handshake (client mode)</td></tr>
-          <tr><td class="field-name">reconnect.enabled</td><td class="field-default">true</td><td>Auto-reconnect (client mode)</td></tr>
+          <tr><td class="field-name">url</td><td><span class="field-required">required</span></td><td>WebSocket URL (comma-separated in failover order)</td></tr>
+          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, csv, or binary</td></tr>
+          <tr><td class="field-name">subscribe.message</td><td></td><td>Message sent after each handshake</td></tr>
+          <tr><td class="field-name">reconnect.enabled</td><td class="field-default">true</td><td>Auto-reconnect</td></tr>
+          <tr><td class="field-name">reconnect.initial.delay.ms</td><td class="field-default">100</td><td>Initial reconnect delay</td></tr>
           <tr><td class="field-name">reconnect.max.delay.ms</td><td class="field-default">30000</td><td>Max backoff delay</td></tr>
-          <tr><td class="field-name">ping.interval.ms</td><td class="field-default">30000</td><td>Keepalive ping interval</td></tr>
-          <tr><td class="field-name">auth.type</td><td></td><td>bearer, basic, hmac</td></tr>
+          <tr><td class="field-name">reconnect.max.retries</td><td></td><td>Maximum reconnect attempts; empty means unlimited</td></tr>
+          <tr><td class="field-name">on.backpressure</td><td class="field-default">block</td><td>block or drop_newest</td></tr>
+          <tr><td class="field-name">max.message.size</td><td class="field-default">67108864</td><td>Maximum accepted message size in bytes</td></tr>
         </tbody>
       </table>
 
@@ -1749,12 +1631,13 @@ max_out_of_orderness = "5s"</code></pre>
           <tr><td class="field-name">mode</td><td class="field-default">server</td><td>server (accept clients) or client (push to remote)</td></tr>
           <tr><td class="field-name">bind.address</td><td></td><td>Bind address (server mode)</td></tr>
           <tr><td class="field-name">url</td><td></td><td>Remote URL (client mode)</td></tr>
-          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, jsonlines, arrow_ipc, binary</td></tr>
           <tr><td class="field-name">max.connections</td><td class="field-default">10000</td><td>Max concurrent clients (server mode)</td></tr>
-          <tr><td class="field-name">slow.client.policy</td><td class="field-default">drop_oldest</td><td>drop_oldest, drop_newest, disconnect</td></tr>
-          <tr><td class="field-name">replay.buffer.size</td><td></td><td>Messages replayed to new clients</td></tr>
+          <tr><td class="field-name">ping.interval.ms</td><td class="field-default">30000</td><td>Ping interval (server mode)</td></tr>
+          <tr><td class="field-name">ping.timeout.ms</td><td class="field-default">10000</td><td>Pong timeout (server mode)</td></tr>
         </tbody>
       </table>
+
+      <p>Client mode sends one schema-encoded JSON row per text frame. Server-mode clients must first send <code>{"action":"subscribe"}</code>; the server replies with a subscription ID and then emits <code>{"type":"data","data":[...],"sequence":N}</code> text frames. Server fan-out uses a shared 32-frame ring with 256 KiB frames; an oversized row or burst is rejected before publication, and a lagging subscriber is disconnected so sequence gaps remain visible. The built-in server does not terminate TLS or authenticate clients; expose it only on a trusted network or behind an authenticated TLS reverse proxy.</p>
 
       <!-- FILE SOURCE -->
       <h3 id="file-source">File Source (Auto-Loader)</h3>
@@ -2066,22 +1949,6 @@ aws_access_key_id = "${AWS_ACCESS_KEY_ID}"
 aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
       </div>
 
-      <h2 id="tiering">S3 Storage Class Tiering</h2>
-      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">config.rs:295</a></div>
-
-      <p>Active checkpoints use the hot tier. Older checkpoints automatically tier down via S3 Lifecycle rules.</p>
-
-      <table class="config-table">
-        <thead><tr><th>Field</th><th>Default</th><th>Description</th></tr></thead>
-        <tbody>
-          <tr><td class="field-name">hot_class</td><td class="field-default">"STANDARD"</td><td>Storage class for active checkpoints (e.g. "EXPRESS_ONE_ZONE")</td></tr>
-          <tr><td class="field-name">warm_class</td><td class="field-default">"STANDARD"</td><td>Storage class for older checkpoints</td></tr>
-          <tr><td class="field-name">cold_class</td><td class="field-default">""</td><td>Archive class (e.g. "GLACIER_IR"). Empty = no cold tier.</td></tr>
-          <tr><td class="field-name">hot_retention</td><td class="field-default">"24h"</td><td>Time before hot &rarr; warm</td></tr>
-          <tr><td class="field-name">warm_retention</td><td class="field-default">"7d"</td><td>Time before warm &rarr; cold</td></tr>
-        </tbody>
-      </table>
-
       <h2 id="delivery">Delivery Guarantees</h2>
       <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/connector.rs" target="_blank" rel="noopener">connector.rs:DeliveryGuarantee</a></div>
 
@@ -2089,21 +1956,29 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
         <thead><tr><th>Guarantee</th><th>How it works</th><th>Requirements</th></tr></thead>
         <tbody>
           <tr>
+            <td class="field-name" style="color: var(--text);">best_effort</td>
+            <td>No replay promise. This is the low-latency mode for inputs or outputs that cannot survive a failure.</td>
+            <td>Accepts ephemeral connectors; failure may lose accepted events.</td>
+          </tr>
+          <tr>
             <td class="field-name" style="color: var(--text);">at_least_once</td>
-            <td>Default. On recovery, sources replay from last checkpoint offset. Some records may be reprocessed.</td>
-            <td>Checkpointing enabled. Works with all connectors.</td>
+            <td>Default. Recovery resumes replayable sources from the finalized checkpoint cut, so some records may be processed again.</td>
+            <td>Checkpointing, replayable sources, and durably acknowledged sinks. Cluster mode additionally requires cluster-shared state.</td>
           </tr>
           <tr>
             <td class="field-name" style="color: var(--text);">exactly_once</td>
-            <td>Barrier-aligned checkpoints with two-phase commit to sinks. No duplicates in output.</td>
-            <td>All sources must support replay. Sinks must support 2PC. Currently: Kafka sink and PostgreSQL sink.</td>
+            <td>Barrier-aligned state and source positions are sealed before checkpoint-committable sink output becomes externally visible.</td>
+            <td>Embedded/single-node only, node-durable state, a local checkpoint directory protected by an exclusive OS deployment lock, a certified <code>Replayable</code> source cut, and a coordinated sink. In the standalone server, a <code>file://</code> checkpoint URL selects that locked local store. Append-mode Delta Lake is the only implemented checkpoint-committable external sink and remains release-gated by its integration and fault/soak suite; Apache Iceberg is durable at-least-once. Local Kafka source ownership and recoverable Kafka sink transactions are not yet certified. Shared-object-store local exact deployments and library-injected object or decision stores fail with <code>[LDB-0014]</code> until a term-fenced lease exists. Commit-coupled CDC sources are currently at-least-once only.</td>
           </tr>
         </tbody>
       </table>
 
       <p>
-        WebSocket sources are <strong>non-replayable</strong>. Under exactly-once mode,
-        they degrade to at-most-once delivery with a warning.
+        Delivery is one pipeline-wide setting. Per-connector delivery fields are rejected, and
+        incompatible connectors fail before external I/O. For example, WebSocket, OTLP, and NATS
+        Core sources are non-replayable and therefore require <code>best_effort</code>. Cluster
+        <code>exactly_once</code> fails closed with <code>[LDB-0013]</code> until connector handoff and
+        external sink cursor publication consume the leader term end to end.
       </p>
 
       <!-- Full example -->
@@ -2112,13 +1987,16 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
       <div class="toml-block">
         <div class="toml-header">laminardb.toml</div>
         <pre><code class="language-toml">[server]
-mode = "embedded"
+mode = "single"
 bind = "0.0.0.0:8080"
-workers = 4
-log_level = "info"
+delivery = "at_least_once"
 
 [state]
-backend = "in_process"
+backend = "object_store"
+url = "s3://my-bucket/laminardb/state"
+
+[state.storage]
+aws_region = "us-east-1"
 
 [checkpoint]
 url = "s3://my-bucket/laminardb/checkpoints"
@@ -2156,7 +2034,7 @@ type = "BIGINT"
 
 [[source.schema]]
 name = "ts"
-type = "BIGINT"
+type = "TIMESTAMP"
 
 [source.watermark]
 column = "ts"
@@ -2171,10 +2049,10 @@ strategy = "poll"
 pushdown = true
 
 [lookup.properties]
-hostname = "db.internal"
+host = "db.internal"
 database = "reference_data"
 username = "reader"
-table.name = "instruments"
+table = "instruments"
 
 [lookup.cache]
 size_bytes = 104857600
@@ -2201,7 +2079,6 @@ EMIT ON WINDOW CLOSE
 name = "kafka_output"
 pipeline = "vwap"
 connector = "kafka"
-delivery = "exactly_once"
 
 [sink.properties]
 bootstrap.servers = "${KAFKA_BROKERS}"
@@ -2214,12 +2091,10 @@ compression.type = "lz4"
 name = "lake"
 pipeline = "vwap"
 connector = "delta-lake"
-delivery = "exactly_once"
 
 [sink.properties]
 table.path = "s3://my-bucket/delta/vwap"
-partition.columns = "exchange"
-writer.id = "vwap-writer"</code></pre>
+partition.columns = "exchange"</code></pre>
       </div>
 
       </article>

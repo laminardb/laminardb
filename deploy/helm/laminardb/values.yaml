@@ -1,4 +1,4 @@
-# -- Number of replicas (use 1 for embedded, >1 for cluster mode)
+# -- Number of replicas (use 1 for single-node, >1 for cluster mode)
 replicaCount: 1
 
 # -- StatefulSet pod launch ordering: "Parallel" or "OrderedReady".
@@ -31,8 +31,10 @@ testConnection:
 
 # -- LaminarDB server configuration
 laminardb:
-  # -- Server mode: "embedded" (single-node) or "cluster" (multi-node clustering)
-  mode: embedded
+  # -- Server mode: "single" (standalone) or "cluster" (multi-node clustering)
+  mode: single
+  # -- Pipeline-wide delivery contract. Cluster mode currently requires at_least_once.
+  delivery: at_least_once
   # -- Log level: trace, debug, info, warn, error
   logLevel: info
   # -- HTTP API bind address
@@ -52,36 +54,15 @@ laminardb:
     path: /var/lib/laminardb/state
     # -- URL for shared storage (required when backend=object_store, e.g. "s3://bucket/prefix")
     url: ""
-    # -- Node identity written into state commit markers (defaults to ${HOSTNAME})
-    instanceId: ""
-    # -- Number of vnodes the backend should size for
-    vnodeCapacity: 256
-    # -- Optional static vnode list (only for object_store backend)
-    vnodes: []
-    # -- Node-level memory budget for operator state, in bytes (0 = unlimited).
-    # -- Crossing it backpressures intake, or demotes to the cold tier below.
-    memoryBudgetBytes: 0
-    # -- Disk cold tier for demoted state. Needs memoryBudgetBytes > 0 and a
-    # -- durable backend. Scratch only: wiped on restart, rebuilt from checkpoints.
-    tier:
-      enabled: false
-      path: /var/lib/laminardb/tier
-      # -- emptyDir medium for tier scratch ("Memory" for tmpfs).
-      emptyDirMedium: ""
-
   # -- Checkpoint configuration
   checkpoint:
-    # -- Enable checkpointing
-    enabled: true
     # -- Checkpoint interval (Go/humantime duration)
     interval: "30s"
+    # -- One end-to-end checkpoint attempt deadline
+    timeout: "120s"
     # -- Checkpoint storage URL. Use an object store (s3://, gs://, az://) for durable
     # checkpoints; empty falls back to a local path (non-durable unless checkpoints PVC enabled).
     url: ""
-    # -- Checkpoint mode: "aligned" or "unaligned"
-    mode: aligned
-    # -- Snapshot strategy: "full", "incremental", or "fork_cow"
-    snapshotStrategy: full
 
   # -- PostgreSQL wire protocol (SUBSCRIBE + queries via psql/JDBC/psycopg).
   pgwire:
@@ -130,6 +111,8 @@ laminardb:
   cluster:
     # -- Node ID (auto-generated from pod name if empty)
     nodeId: ""
+    # -- Stable key groups distributed across cluster nodes
+    keyGroups: 256
     discovery:
       # -- Discovery strategy: "gossip" (recommended) or "static"
       strategy: gossip
@@ -141,15 +124,6 @@ laminardb:
       # -- Host peers use to reach this node. Empty = the pod's headless-service
       # -- DNS name (override only for non-standard network setups)
       advertiseHost: ""
-    coordination:
-      # -- Coordination strategy (only "raft" supported)
-      strategy: raft
-      # -- Raft port
-      raftPort: 7947
-      # -- Raft election timeout
-      electionTimeout: "1500ms"
-      # -- Raft heartbeat interval
-      heartbeatInterval: "300ms"
 
 # -- Pipeline definitions (rendered into laminardb.toml [[pipeline]] sections)
 # -- Each entry needs: name, sql, and optionally parallelism
@@ -169,9 +143,9 @@ sources: []
 #   connector: kafka
 #   format: json
 #   properties:
-#     brokers: "kafka:9092"
+#     bootstrap.servers: "kafka:9092"
 #     topic: raw-trades
-#     group_id: laminardb-trades
+#     group.id: laminardb-trades
 #   schema:
 #     - name: symbol
 #       type: VARCHAR
@@ -198,9 +172,8 @@ sinks: []
 # - name: output
 #   pipeline: trade-volumes
 #   connector: kafka
-#   delivery: at_least_once
 #   properties:
-#     brokers: "kafka:9092"
+#     bootstrap.servers: "kafka:9092"
 #     topic: trade-volumes
 
 serviceAccount:
@@ -242,8 +215,6 @@ service:
   pgPort: 5432
   # -- Gossip port for cluster mode discovery
   gossipPort: 7946
-  # -- Raft port for cluster mode coordination
-  raftPort: 7947
   # -- Service annotations
   annotations: {}
 

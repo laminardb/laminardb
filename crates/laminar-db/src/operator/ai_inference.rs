@@ -358,37 +358,18 @@ impl GraphOperator for AiInferenceOperator {
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
         let blobs: Vec<(i64, Vec<u8>)> =
             rkyv::from_bytes::<Vec<(i64, Vec<u8>)>, rkyv::rancor::Error>(&checkpoint.data)
-                .map_err(|e| DbError::Pipeline(format!("ai operator: checkpoint decode: {e}")))?;
-        self.pending.clear();
-        self.unsubmitted.clear();
-        self.replay.clear();
+                .map_err(|e| DbError::Checkpoint(format!("ai operator: checkpoint decode: {e}")))?;
+        let mut replay = VecDeque::with_capacity(blobs.len());
         for (watermark, blob) in &blobs {
             let batch = deserialize_batch_stream(blob).map_err(|e| {
-                DbError::Pipeline(format!("ai operator: checkpoint deserialization: {e}"))
+                DbError::Checkpoint(format!("ai operator: checkpoint deserialization: {e}"))
             })?;
-            self.replay.push_back((*watermark, batch));
+            replay.push_back((*watermark, batch));
         }
+        self.pending.clear();
+        self.unsubmitted.clear();
+        self.replay = replay;
         Ok(())
-    }
-
-    fn estimated_state_bytes(&self) -> usize {
-        let pending: usize = self
-            .pending
-            .values()
-            .map(|pb| pb.batch.get_array_memory_size())
-            .sum();
-        let replay: usize = self
-            .replay
-            .iter()
-            .map(|(_, b)| b.get_array_memory_size())
-            .sum();
-        let unsubmitted: usize = self
-            .unsubmitted
-            .iter()
-            .flat_map(|item| item.rows.iter())
-            .map(|row| row.text.len())
-            .sum();
-        pending + replay + unsubmitted
     }
 
     fn watermark_hold(&self) -> Option<i64> {
@@ -551,6 +532,24 @@ mod tests {
             Arc::new(AiCallLog::with_defaults()),
             &Handle::current(),
         )
+    }
+
+    #[tokio::test]
+    async fn late_checkpoint_decode_failure_preserves_replay_state() {
+        let mut op = operator(Arc::new(Failing));
+        op.replay.push_back((7, text_batch(&["existing"])));
+        let valid = serialize_batch_stream(&text_batch(&["replacement"])).unwrap();
+        let blobs = vec![(8, valid), (9, b"not-arrow-ipc".to_vec())];
+        let data = rkyv::to_bytes::<rkyv::rancor::Error>(&blobs)
+            .unwrap()
+            .to_vec();
+
+        let error = op.restore(OperatorCheckpoint { data }).unwrap_err();
+
+        assert!(matches!(error, DbError::Checkpoint(_)));
+        assert!(error.requires_pipeline_recovery());
+        assert_eq!(op.replay.len(), 1);
+        assert_eq!(op.replay.front().map(|(watermark, _)| *watermark), Some(7));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1,9 +1,11 @@
 //! HTTP API for LaminarDB server.
 
-use std::collections::HashMap;
+use std::io::Write as _;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
+use std::{future::Future as _, future::IntoFuture as _, task::Poll};
 
 use prometheus::Registry;
 
@@ -19,7 +21,7 @@ use tracing::{info, warn};
 
 use laminar_db::{ConnectorInfo, LaminarDB, PipelineNodeType};
 
-use crate::config::ServerConfig;
+use crate::config::{ServerConfig, ServerMode};
 use crate::metrics::ServerMetrics;
 use crate::reload::{self, ReloadGuard};
 use crate::server::ServerError;
@@ -29,10 +31,10 @@ use crate::server::ServerError;
 #[cfg(feature = "cluster")]
 #[derive(Clone)]
 pub struct ClusterComponents {
-    /// Leader-election / membership controller (gossip discovery only).
-    pub controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
+    /// Leader-election / membership controller.
+    pub controller: Arc<laminar_core::cluster::control::ClusterController>,
     /// Durable vnode-assignment snapshot store.
-    pub snapshot_store: Option<Arc<laminar_core::cluster::control::AssignmentSnapshotStore>>,
+    pub snapshot_store: Arc<laminar_core::cluster::control::AssignmentSnapshotStore>,
     /// Live cluster membership feed.
     pub membership_rx:
         tokio::sync::watch::Receiver<Vec<laminar_core::cluster::discovery::NodeInfo>>,
@@ -45,91 +47,159 @@ pub struct AppState {
     pub reload_guard: ReloadGuard,
     pub registry: Arc<Registry>,
     pub server_metrics: ServerMetrics,
-    /// Tracks ephemeral streams created by the console (`POST /api/v1/queries`)
-    /// so abandoned ones can be reaped.
-    pub ephemeral: Arc<EphemeralTracker>,
+    pub(crate) ws_slots: Arc<tokio::sync::Semaphore>,
+    pub(crate) serving_gate: Arc<ServingGate>,
     /// Cluster control-plane handles (cluster mode only). `None` in
     /// single-node mode; the cluster endpoints 404 when absent.
     #[cfg(feature = "cluster")]
     pub cluster: Option<ClusterComponents>,
 }
 
-// ---------------------------------------------------------------------------
-// Ephemeral console streams
-// ---------------------------------------------------------------------------
+const SERVING_STARTING: u8 = 0;
+const SERVING_READY: u8 = 1;
+const SERVING_FENCED: u8 = 2;
 
-/// How long an ephemeral console stream may sit `Pending` (created but never
-/// connected to over WebSocket) before its one-shot reaper task drops it.
-const EPHEMERAL_PENDING_TTL: Duration = Duration::from_secs(30);
-
-/// Cap on concurrent ephemeral console streams (each a real CREATE STREAM
-/// pipeline), so `POST /api/v1/queries` spam can't accumulate live pipelines.
-const MAX_EPHEMERAL_STREAMS: usize = 256;
-
-/// Lifecycle state of a console-managed ephemeral stream.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum EphemeralState {
-    /// Created by `POST /api/v1/queries`, no WebSocket attached yet.
-    Pending,
-    /// A WebSocket client is (or was) attached.
-    Connected,
+/// One-way serving authority shared by startup and the terminal cluster lease fence.
+pub(crate) struct ServingGate {
+    state: AtomicU8,
+    fenced: tokio::sync::Notify,
+    #[cfg(feature = "cluster")]
+    process_deadline: std::sync::OnceLock<Arc<laminar_core::cluster::control::LeaseDeadline>>,
+    #[cfg(feature = "cluster")]
+    deadline_watcher: parking_lot::Mutex<Option<tokio::task::AbortHandle>>,
 }
 
-/// Tracks console-initiated ephemeral streams so abandoned ones (created but
-/// never connected) can be reaped after [`EPHEMERAL_PENDING_TTL`].
-#[derive(Default)]
-pub struct EphemeralTracker {
-    inner: parking_lot::Mutex<HashMap<String, EphemeralState>>,
+impl ServingGate {
+    pub(crate) fn starting() -> Self {
+        Self {
+            state: AtomicU8::new(SERVING_STARTING),
+            fenced: tokio::sync::Notify::new(),
+            #[cfg(feature = "cluster")]
+            process_deadline: std::sync::OnceLock::new(),
+            #[cfg(feature = "cluster")]
+            deadline_watcher: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// Open serving after startup. A terminal fence can never be reopened.
+    pub(crate) fn open(&self) -> bool {
+        match self.state.compare_exchange(
+            SERVING_STARTING,
+            SERVING_READY,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(SERVING_READY) => true,
+            Err(SERVING_FENCED) => false,
+            Err(_) => unreachable!("serving gate contains an invalid state"),
+        }
+    }
+
+    /// Permanently revoke serving authority.
+    pub(crate) fn fence(&self) {
+        self.state.store(SERVING_FENCED, Ordering::Release);
+        self.fenced.notify_waiters();
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) fn install_process_lease_deadline(
+        self: &Arc<Self>,
+        deadline: Arc<laminar_core::cluster::control::LeaseDeadline>,
+    ) -> Result<(), &'static str> {
+        if !deadline.is_live() {
+            self.fence();
+            return Err("HTTP process lease is already expired");
+        }
+        let mut watcher_slot = self.deadline_watcher.lock();
+        if let Some(current) = self.process_deadline.get() {
+            return if Arc::ptr_eq(current, &deadline) {
+                Ok(())
+            } else {
+                Err("HTTP process lease deadline is already installed")
+            };
+        }
+        self.process_deadline
+            .set(Arc::clone(&deadline))
+            .map_err(|_| "HTTP process lease deadline is already installed")?;
+        let gate = Arc::downgrade(self);
+        let watcher = tokio::spawn(async move {
+            deadline.wait_until_expired().await;
+            if let Some(gate) = gate.upgrade() {
+                gate.fence();
+            }
+        });
+        *watcher_slot = Some(watcher.abort_handle());
+        Ok(())
+    }
+
+    async fn wait_fenced(&self) {
+        loop {
+            let fenced = self.fenced.notified();
+            tokio::pin!(fenced);
+            fenced.as_mut().enable();
+            if self.state.load(Ordering::Acquire) == SERVING_FENCED {
+                return;
+            }
+            fenced.await;
+        }
+    }
+
+    pub(crate) fn rejection_message(&self) -> Option<&'static str> {
+        match self.state.load(Ordering::Acquire) {
+            SERVING_STARTING => Some("server startup is not complete"),
+            SERVING_READY => None,
+            SERVING_FENCED => Some("server serving authority is fenced"),
+            _ => unreachable!("serving gate contains an invalid state"),
+        }
+    }
 }
 
-impl EphemeralTracker {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+impl AppState {
+    /// Open the startup gate after the runtime has established serving authority.
+    pub(crate) fn open_startup_gate(&self) -> bool {
+        self.serving_gate.open()
     }
 
-    /// Reserve a `Pending` slot, enforcing [`MAX_EPHEMERAL_STREAMS`] under the
-    /// lock; returns `false` (inserting nothing) when already at capacity.
-    fn try_add_pending(&self, name: String) -> bool {
-        let mut guard = self.inner.lock();
-        if guard.len() >= MAX_EPHEMERAL_STREAMS {
-            return false;
+    fn serving_rejection(&self) -> Option<&'static str> {
+        if let Some(reason) = self.serving_gate.rejection_message() {
+            return Some(reason);
         }
-        guard.insert(name, EphemeralState::Pending);
-        true
+        #[cfg(feature = "cluster")]
+        if let Some(cluster) = self.cluster.as_ref() {
+            if !cluster.controller.process_lease_is_live() {
+                return Some("server process lease is no longer live");
+            }
+            if cluster.controller.is_recovering() || self.db.coordinated_recovery_in_progress() {
+                return Some("server is completing coordinated recovery");
+            }
+        }
+        None
     }
 
-    /// Marks a pending stream `Connected`; returns `false` if it wasn't tracked.
-    fn mark_connected(&self, name: &str) -> bool {
-        let mut guard = self.inner.lock();
-        if let Some(state) = guard.get_mut(name) {
-            *state = EphemeralState::Connected;
-            true
-        } else {
-            false
+    async fn wait_for_serving_fence(&self) {
+        #[cfg(feature = "cluster")]
+        if let Some(cluster) = self.cluster.as_ref() {
+            tokio::select! {
+                biased;
+                () = cluster.controller.wait_for_process_lease_loss() => return,
+                () = self.serving_gate.wait_fenced() => return,
+            }
+        }
+        self.serving_gate.wait_fenced().await;
+    }
+}
+
+impl Drop for ServingGate {
+    fn drop(&mut self) {
+        #[cfg(feature = "cluster")]
+        if let Some(watcher) = self.deadline_watcher.get_mut().take() {
+            watcher.abort();
         }
     }
+}
 
-    fn remove(&self, name: &str) -> bool {
-        self.inner.lock().remove(name).is_some()
-    }
-
-    /// Removes `name` only if still `Pending`, so the reaper leaves a stream
-    /// that connected (or was already torn down) in the meantime untouched.
-    fn remove_if_pending(&self, name: &str) -> bool {
-        let mut guard = self.inner.lock();
-        if matches!(guard.get(name), Some(EphemeralState::Pending)) {
-            guard.remove(name);
-            true
-        } else {
-            false
-        }
-    }
-
-    #[cfg(test)]
-    fn is_tracked(&self, name: &str) -> bool {
-        self.inner.lock().contains_key(name)
-    }
+pub(crate) fn ws_connection_slots() -> Arc<tokio::sync::Semaphore> {
+    Arc::new(tokio::sync::Semaphore::new(MAX_WS_CONNECTIONS))
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -152,7 +222,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/streams/{name}", get(get_stream))
         .route("/api/v1/mvs", get(list_mvs))
         .route("/api/v1/connectors", get(list_connectors))
-        .route("/api/v1/queries", post(create_query))
         .route("/api/v1/checkpoint", post(trigger_checkpoint))
         .route("/api/v1/sql", post(execute_sql))
         .route("/api/v1/reload", post(handle_reload))
@@ -173,9 +242,28 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     public
         .merge(protected)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            startup_gate_middleware,
+        ))
         .layer(cors)
         .layer(axum::middleware::from_fn(request_logging))
         .with_state(state)
+}
+
+async fn startup_gate_middleware(
+    State(state): State<Arc<AppState>>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = req.uri().path();
+    let startup_probe = matches!(path, "/health" | "/ready" | "/metrics");
+    if !startup_probe {
+        if let Some(reason) = state.serving_rejection() {
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, reason).into_response();
+        }
+    }
+    next.run(req).await
 }
 
 /// Build the CORS policy from config. With an explicit allow-list of console
@@ -265,18 +353,39 @@ fn ct_eq(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).unwrap_u8() == 1
 }
 
-pub async fn serve(router: Router, bind: &str) -> Result<tokio::task::JoinHandle<()>, ServerError> {
-    let listener = tokio::net::TcpListener::bind(bind)
+pub async fn bind_listener(bind: &str) -> Result<tokio::net::TcpListener, ServerError> {
+    tokio::net::TcpListener::bind(bind)
         .await
-        .map_err(|e| ServerError::Http(format!("failed to bind to {bind}: {e}")))?;
+        .map_err(|e| ServerError::Http(format!("failed to bind to {bind}: {e}")))
+}
 
+pub fn serve_listener(
+    router: Router,
+    listener: tokio::net::TcpListener,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::oneshot::Receiver<()>,
+) {
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, router).await {
-            tracing::error!("HTTP server error: {e}");
+        let mut server = Box::pin(axum::serve(listener, router).into_future());
+        let stopped = std::future::poll_fn(|context| match server.as_mut().poll(context) {
+            Poll::Pending => Poll::Ready(None),
+            Poll::Ready(result) => Poll::Ready(Some(result)),
+        })
+        .await;
+        if let Some(result) = stopped {
+            if let Err(error) = result {
+                tracing::error!(%error, "HTTP server stopped before its accept loop started");
+            }
+            return;
+        }
+        let _ = started_tx.send(());
+        if let Err(error) = server.await {
+            tracing::error!(%error, "HTTP server error");
         }
     });
-
-    Ok(handle)
+    (handle, started_rx)
 }
 
 /// Health check response.
@@ -314,6 +423,8 @@ struct CheckpointResponse {
     duration_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_disposition: Option<laminar_db::CheckpointFailureDisposition>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -333,13 +444,8 @@ struct SqlResponse {
     /// `true` when the result was capped at `MAX_SQL_RESULT_ROWS` or the
     /// collection timed out, so `data` is a prefix of the full result. Omitted
     /// when the result is complete.
-    #[serde(skip_serializing_if = "is_false")]
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     truncated: bool,
-}
-
-#[allow(clippy::trivially_copy_pass_by_ref)] // serde skip_serializing_if signature
-fn is_false(b: &bool) -> bool {
-    !*b
 }
 
 /// Trim `batches` to at most `cap` rows, returning the trimmed batches and
@@ -417,6 +523,9 @@ async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 async fn readiness_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if let Some(reason) = state.serving_rejection() {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, reason).into_response();
+    }
     let pipeline_state = state.db.pipeline_state();
     if pipeline_state == "Running" {
         (
@@ -537,87 +646,6 @@ async fn list_connectors(State(state): State<Arc<AppState>>) -> impl IntoRespons
     Json(ConnectorsResponse { sources, sinks })
 }
 
-#[derive(Debug, Deserialize)]
-struct CreateQueryRequest {
-    sql: String,
-}
-
-#[derive(Debug, Serialize)]
-struct CreateQueryResponse {
-    stream_id: String,
-    ws_url: String,
-}
-
-/// Generate a unique name for an ephemeral console stream. Combines a
-/// millisecond timestamp with a random suffix so concurrent requests don't
-/// collide. The leading `__console_` marks it as console-managed.
-fn console_stream_name() -> String {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis());
-    let rand: u32 = rand::random();
-    format!("__console_{ts}_{rand:08x}")
-}
-
-/// Register an ad-hoc live query as an ephemeral stream and return the URL the
-/// console connects its WebSocket to. The stream is reaped on WS disconnect, or
-/// by a one-shot reaper task if no client connects within
-/// [`EPHEMERAL_PENDING_TTL`].
-async fn create_query(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<CreateQueryRequest>,
-) -> impl IntoResponse {
-    let name = console_stream_name();
-
-    // Reserve a slot before any DDL so the cap is enforced up front; released
-    // below if CREATE STREAM fails.
-    if !state.ephemeral.try_add_pending(name.clone()) {
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "too many ephemeral console queries in flight; retry shortly",
-        )
-        .into_response();
-    }
-
-    // Register as a physical CREATE STREAM (reaped on WS disconnect / TTL): the
-    // `/ws/{name}` subscription path can only bind to a catalog-registered stream.
-    let ddl = format!("CREATE STREAM {name} AS {}", req.sql);
-
-    match state.db.execute(&ddl).await {
-        Ok(_) => {
-            // Arm a one-shot reaper: if no WebSocket connects within the TTL,
-            // drop the still-`Pending` stream so an abandoned request can't
-            // leak it.
-            let tracker = Arc::clone(&state.ephemeral);
-            let db = Arc::clone(&state.db);
-            let name_clone = name.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(EPHEMERAL_PENDING_TTL).await;
-                if tracker.remove_if_pending(&name_clone) {
-                    let ddl = format!("DROP STREAM IF EXISTS {name_clone}");
-                    if let Err(e) = db.execute(&ddl).await {
-                        warn!(stream = %name_clone, error = %e, "failed to drop abandoned ephemeral stream");
-                    } else {
-                        info!(stream = %name_clone, "reaped abandoned ephemeral console stream");
-                    }
-                }
-            });
-
-            let ws_url = format!("/ws/{name}");
-            Json(CreateQueryResponse {
-                stream_id: name,
-                ws_url,
-            })
-            .into_response()
-        }
-        Err(e) => {
-            // The stream was never created, so free the reserved slot.
-            state.ephemeral.remove(&name);
-            error_response(StatusCode::BAD_REQUEST, e.to_string()).into_response()
-        }
-    }
-}
-
 async fn trigger_checkpoint(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match state.db.checkpoint().await {
         Ok(result) => {
@@ -636,6 +664,7 @@ async fn trigger_checkpoint(State(state): State<Arc<AppState>>) -> impl IntoResp
                     epoch: result.epoch,
                     duration_ms,
                     error: result.error,
+                    failure_disposition: result.failure_disposition,
                 }),
             )
                 .into_response()
@@ -809,7 +838,7 @@ async fn handle_reload(State(state): State<Arc<AppState>>) -> impl IntoResponse 
 
 async fn cluster_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let config = state.current_config.read();
-    if config.server.mode != "cluster" {
+    if config.server.mode != ServerMode::Cluster {
         return error_response(
             StatusCode::NOT_FOUND,
             "cluster endpoint is only available when server.mode = \"cluster\"",
@@ -855,12 +884,12 @@ async fn fan_out_pipeline_control(state: &AppState, local: bool, path: &str) {
         let Some(cluster) = state.cluster.as_ref() else {
             return;
         };
-        let self_id = cluster.controller.as_ref().map(|c| c.instance_id());
+        let self_id = cluster.controller.instance_id();
         let peers: Vec<String> = cluster
             .membership_rx
             .borrow()
             .iter()
-            .filter(|m| self_id != Some(m.id))
+            .filter(|m| self_id != m.id)
             .map(|m| m.rpc_address.clone())
             .collect();
         let token = state.current_config.read().server.console_token.clone();
@@ -1018,29 +1047,29 @@ async fn cluster_nodes(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     }
 }
 
-/// `GET /api/v1/cluster/vnodes` — the latest vnode→instance assignment
-/// snapshot (or an empty snapshot when none has been written yet).
+/// `GET /api/v1/cluster/vnodes` — the latest vnode-to-instance assignment snapshot.
 async fn cluster_vnodes(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     #[cfg(feature = "cluster")]
     {
-        use laminar_core::cluster::control::AssignmentSnapshot;
-
         let Some(cluster) = state.cluster.as_ref() else {
             return error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response();
         };
-        let snapshot = match &cluster.snapshot_store {
-            Some(store) => match store.load().await {
-                Ok(Some(snap)) => snap,
-                Ok(None) => AssignmentSnapshot::empty(),
-                Err(e) => {
-                    return error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("failed to load assignment snapshot: {e}"),
-                    )
-                    .into_response();
-                }
-            },
-            None => AssignmentSnapshot::empty(),
+        let snapshot = match cluster.snapshot_store.load().await {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "durable assignment snapshot is missing",
+                )
+                .into_response();
+            }
+            Err(error) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to load assignment snapshot: {error}"),
+                )
+                .into_response();
+            }
         };
         Json(snapshot).into_response()
     }
@@ -1065,10 +1094,8 @@ async fn cluster_leader(State(state): State<Arc<AppState>>) -> impl IntoResponse
         let Some(cluster) = state.cluster.as_ref() else {
             return error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response();
         };
-        let (leader_id, is_leader) = match &cluster.controller {
-            Some(controller) => (controller.current_leader(), controller.is_leader()),
-            None => (None, false),
-        };
+        let leader_id = cluster.controller.current_leader();
+        let is_leader = cluster.controller.is_leader();
         let leader = leader_id.and_then(|id| {
             cluster
                 .membership_rx
@@ -1106,35 +1133,289 @@ async fn cluster_checkpoints(State(state): State<Arc<AppState>>) -> impl IntoRes
 // WebSocket stream subscriptions
 // ---------------------------------------------------------------------------
 
-const MAX_WS_CONNECTIONS: i64 = 10_000;
+const MAX_WS_CONNECTIONS: usize = 10_000;
+const MAX_WS_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_WS_CONTROL_FIELD_BYTES: usize = 4096;
+const MAX_WS_SUBSCRIPTION_ID_BYTES: usize = 1024;
+const MAX_WS_INBOUND_BYTES: usize = 4096;
 const WS_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+const WS_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const MAX_UNANSWERED_WS_PINGS: u8 = 2;
+
+#[derive(Default)]
+struct WsPongDeadline {
+    unanswered: u8,
+}
+
+impl WsPongDeadline {
+    fn before_ping(&mut self) -> bool {
+        if self.unanswered >= MAX_UNANSWERED_WS_PINGS {
+            return false;
+        }
+        self.unanswered += 1;
+        true
+    }
+
+    fn on_pong(&mut self) {
+        self.unanswered = 0;
+    }
+}
+
+fn try_acquire_ws_slot(
+    slots: &Arc<tokio::sync::Semaphore>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    Arc::clone(slots).try_acquire_owned().ok()
+}
+
+fn ws_error_json(name: &str, code: &str, message: &str, sequence: u64) -> String {
+    let out = serde_json::json!({
+        "type": "error",
+        "subscription_id": name,
+        "code": truncate_utf8(code, MAX_WS_CONTROL_FIELD_BYTES),
+        "message": truncate_utf8(message, MAX_WS_CONTROL_FIELD_BYTES),
+        "sequence": sequence.to_string(),
+    })
+    .to_string();
+    debug_assert!(out.len() <= MAX_WS_FRAME_BYTES);
+    out
+}
+
+fn ws_gap_json(name: &str, skipped: u64, sequence: u64) -> String {
+    let out = serde_json::json!({
+        "type": "gap",
+        "subscription_id": name,
+        "code": "subscription_lagged",
+        "message": format!("subscription lagged: skipped {skipped} messages"),
+        "skipped_messages": skipped.to_string(),
+        "sequence": sequence.to_string(),
+    })
+    .to_string();
+    debug_assert!(out.len() <= MAX_WS_FRAME_BYTES);
+    out
+}
+
+fn ws_progress_json(
+    name: &str,
+    epoch: u64,
+    checkpoint_id: u64,
+    log_sequence: u64,
+    through_sequence: u64,
+    sequence: u64,
+) -> String {
+    let out = serde_json::json!({
+        "type": "progress",
+        "subscription_id": name,
+        "epoch": epoch.to_string(),
+        "checkpoint_id": checkpoint_id.to_string(),
+        "log_sequence": log_sequence.to_string(),
+        "through_log_sequence": through_sequence.to_string(),
+        "sequence": sequence.to_string(),
+    })
+    .to_string();
+    debug_assert!(out.len() <= MAX_WS_FRAME_BYTES);
+    out
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WsFrameBuildError {
+    TooLarge,
+    Serialization(String),
+}
+
+#[derive(Default)]
+struct WsBatchFrameState {
+    /// First row not yet included in a completed frame.
+    offset: usize,
+    /// A row encoded while filling the previous frame that did not fit.
+    pending_row: Option<Vec<u8>>,
+}
+
+const WS_DATA_SUFFIX_FIXED_BYTES: usize =
+    r#"],"sequence":"","log_sequence":"","row_offset":"","row_count":""}"#.len();
+
+fn decimal_digits_u64(value: u64) -> usize {
+    if value == 0 {
+        1
+    } else {
+        value.ilog10() as usize + 1
+    }
+}
+
+fn decimal_digits_usize(value: usize) -> usize {
+    if value == 0 {
+        1
+    } else {
+        value.ilog10() as usize + 1
+    }
+}
+
+fn ws_data_suffix_len(sequence: u64, log_sequence: u64, offset: usize, rows: usize) -> usize {
+    WS_DATA_SUFFIX_FIXED_BYTES
+        + decimal_digits_u64(sequence)
+        + decimal_digits_u64(log_sequence)
+        + decimal_digits_usize(offset)
+        + decimal_digits_usize(rows)
+}
+
+fn ws_data_suffix(sequence: u64, log_sequence: u64, offset: usize, rows: usize) -> String {
+    format!(
+        "],\"sequence\":\"{sequence}\",\"log_sequence\":\"{log_sequence}\",\"row_offset\":\"{offset}\",\"row_count\":\"{rows}\"}}"
+    )
+}
+
+fn next_ws_data_frame(
+    name: &str,
+    batch: &arrow_array::RecordBatch,
+    state: &mut WsBatchFrameState,
+    sequence: u64,
+    log_sequence: u64,
+) -> Result<Option<String>, WsFrameBuildError> {
+    if state.offset >= batch.num_rows() {
+        debug_assert!(state.pending_row.is_none());
+        return Ok(None);
+    }
+
+    let subid = serde_json::to_string(name)
+        .map_err(|error| WsFrameBuildError::Serialization(error.to_string()))?;
+    let prefix = format!("{{\"type\":\"data\",\"subscription_id\":{subid},\"data\":[");
+    let frame_offset = state.offset;
+    if prefix
+        .len()
+        .saturating_add(ws_data_suffix_len(sequence, log_sequence, frame_offset, 1))
+        >= MAX_WS_FRAME_BYTES
+    {
+        return Err(WsFrameBuildError::TooLarge);
+    }
+
+    // Build one root encoder per output frame. It is deliberately local so no
+    // non-Send Arrow encoder is retained across the socket write await.
+    let root = arrow_array::StructArray::from(batch.clone());
+    let root_field = Arc::new(arrow_schema::Field::new_struct(
+        "",
+        batch.schema().fields().clone(),
+        false,
+    ));
+    let options = exact_json_encoder_options();
+    let mut encoder = arrow_json::writer::make_encoder(&root_field, &root, &options)
+        .map_err(|error| WsFrameBuildError::Serialization(error.to_string()))?;
+
+    let mut bytes = Vec::with_capacity(MAX_WS_FRAME_BYTES.min(prefix.len() + 16 * 1024));
+    bytes.extend_from_slice(prefix.as_bytes());
+    let mut rows = 0_usize;
+
+    while state.offset < batch.num_rows() {
+        let row = state.pending_row.take().unwrap_or_else(|| {
+            let mut row = Vec::new();
+            encoder.encode(state.offset, &mut row);
+            row
+        });
+        let separator_bytes = usize::from(rows != 0);
+        let candidate_rows = rows + 1;
+        let candidate_len = bytes
+            .len()
+            .saturating_add(separator_bytes)
+            .saturating_add(row.len())
+            .saturating_add(ws_data_suffix_len(
+                sequence,
+                log_sequence,
+                frame_offset,
+                candidate_rows,
+            ));
+
+        if candidate_len > MAX_WS_FRAME_BYTES {
+            if rows == 0 {
+                return Err(WsFrameBuildError::TooLarge);
+            }
+            state.pending_row = Some(row);
+            break;
+        }
+
+        if separator_bytes != 0 {
+            bytes.push(b',');
+        }
+        bytes.extend_from_slice(&row);
+        state.offset += 1;
+        rows = candidate_rows;
+    }
+
+    debug_assert!(rows > 0);
+    bytes.extend_from_slice(ws_data_suffix(sequence, log_sequence, frame_offset, rows).as_bytes());
+    debug_assert!(bytes.len() <= MAX_WS_FRAME_BYTES);
+    let frame = String::from_utf8(bytes)
+        .map_err(|error| WsFrameBuildError::Serialization(error.to_string()))?;
+    Ok(Some(frame))
+}
+
+async fn ws_send(socket: &mut WebSocket, message: Message, state: &AppState) -> bool {
+    if state.serving_rejection().is_some() {
+        return false;
+    }
+    tokio::select! {
+        biased;
+        () = state.wait_for_serving_fence() => false,
+        result = tokio::time::timeout(WS_WRITE_TIMEOUT, socket.send(message)) => {
+            matches!(result, Ok(Ok(())))
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WsSubscribeParams {
+    as_of_epoch: Option<u64>,
+}
 
 async fn ws_upgrade(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
+    Query(params): Query<WsSubscribeParams>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    if state.server_metrics.ws_connections.get() >= MAX_WS_CONNECTIONS {
+    if name.is_empty() || name.len() > MAX_WS_SUBSCRIPTION_ID_BYTES {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "WebSocket subscription name must contain 1..={MAX_WS_SUBSCRIPTION_ID_BYTES} UTF-8 bytes"
+            ),
+        )
+        .into_response();
+    }
+    let Some(slot) = try_acquire_ws_slot(&state.ws_slots) else {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "too many WebSocket connections".to_string(),
         )
         .into_response();
-    }
+    };
 
-    if !state.db.streams().iter().any(|s| s.name == name) {
-        return error_response(StatusCode::NOT_FOUND, format!("stream '{name}' not found"))
-            .into_response();
-    }
-
-    // Each WS client gets its own broadcast subscription — fan-out is in the Sink.
-    let portal = match state
-        .db
-        .open_subscription(&name, None, laminar_db::subscription::SubscribeStart::Tail)
-        .await
-    {
+    let start = params.as_of_epoch.map_or(
+        laminar_db::subscription::SubscribeStart::Tail,
+        laminar_db::subscription::SubscribeStart::AsOfEpoch,
+    );
+    let portal = match state.db.open_subscription(&name, None, start).await {
         Ok(p) => p,
-        Err(_) => {
+        Err(laminar_db::DbError::StreamNotFound(_)) => {
+            return error_response(StatusCode::NOT_FOUND, format!("stream '{name}' not found"))
+                .into_response();
+        }
+        Err(error @ laminar_db::DbError::SubscriptionReplayPruned { .. }) => {
+            return error_response(StatusCode::GONE, error.to_string()).into_response();
+        }
+        Err(error @ laminar_db::DbError::SubscriptionEpochNotCommitted { .. }) => {
+            return error_response(StatusCode::CONFLICT, error.to_string()).into_response();
+        }
+        Err(error) => {
+            warn!(stream = %name, error = %error, "failed to open WebSocket subscription");
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("failed to subscribe to '{name}'"),
@@ -1142,84 +1423,160 @@ async fn ws_upgrade(
             .into_response();
         }
     };
+    if let Some(reason) = state.serving_rejection() {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, reason).into_response();
+    }
 
     let st = Arc::clone(&state);
-    ws.on_upgrade(move |socket| async move {
-        // If this is a console-initiated ephemeral stream, transition it to
-        // `Connected` so the GC task won't reap it while a client is attached.
-        let is_console = st.ephemeral.mark_connected(&name);
-
-        st.server_metrics.ws_connections.inc();
-        ws_client(socket, portal, name.clone()).await;
-        st.server_metrics.ws_connections.dec();
-
-        // On disconnect, tear down the ephemeral stream so it doesn't linger
-        // after the console tab that owned it goes away.
-        if is_console {
-            let ddl = format!("DROP STREAM IF EXISTS {name}");
-            if let Err(e) = st.db.execute(&ddl).await {
-                warn!(stream = %name, error = %e, "failed to drop ephemeral stream on disconnect");
-            }
-            st.ephemeral.remove(&name);
-            info!(stream = %name, "dropped ephemeral console stream on disconnect");
-        }
-    })
-    .into_response()
+    ws.max_message_size(MAX_WS_INBOUND_BYTES)
+        .max_frame_size(MAX_WS_INBOUND_BYTES)
+        .on_upgrade(move |socket| async move {
+            let _slot = slot;
+            st.server_metrics.ws_connections.inc();
+            ws_client(socket, portal, name, Arc::clone(&st)).await;
+            st.server_metrics.ws_connections.dec();
+        })
+        .into_response()
 }
 
 async fn ws_client(
     mut socket: WebSocket,
     mut portal: laminar_db::subscription::SubscriptionPortal,
     name: String,
+    state: Arc<AppState>,
 ) {
     let mut heartbeat = tokio::time::interval(WS_HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut pong_deadline = WsPongDeadline::default();
     let mut seq: u64 = 0;
 
-    loop {
+    'subscription: loop {
         tokio::select! {
             biased;
+            () = state.wait_for_serving_fence() => break,
             frame = portal.next_frame() => {
                 match frame {
-                    Some(laminar_db::subscription::PortalFrame::Batch(batch)) => {
+                    Some(laminar_db::subscription::PortalFrame::Batch {
+                        batch,
+                        sequence: log_sequence,
+                        lease: _lease,
+                    }) => {
                         if batch.num_rows() == 0 {
                             continue;
                         }
-                        // Embed the already-serialized data array directly in the
-                        // envelope to skip a RawValue parse + reserialize per frame.
-                        let data_json = match batches_to_json_string(&[batch]) {
-                            Ok(j) => j,
-                            Err(e) => {
-                                warn!(stream = %name, error = %e, "serialize error");
-                                continue;
+                        let mut frame_state = WsBatchFrameState::default();
+                        while frame_state.offset < batch.num_rows() {
+                            let out = match next_ws_data_frame(
+                                &name,
+                                &batch,
+                                &mut frame_state,
+                                seq,
+                                log_sequence,
+                            ) {
+                                Ok(Some(frame)) => frame,
+                                Ok(None) => break,
+                                Err(WsFrameBuildError::TooLarge) => {
+                                    let out = ws_error_json(
+                                        &name,
+                                        "row_too_large",
+                                        "one subscription row exceeds the WebSocket frame limit",
+                                        seq,
+                                    );
+                                    let _ = ws_send(
+                                        &mut socket,
+                                        Message::Text(out.into()),
+                                        &state,
+                                    ).await;
+                                    break 'subscription;
+                                }
+                                Err(WsFrameBuildError::Serialization(error)) => {
+                                    warn!(stream = %name, error = %error, "serialize error");
+                                    let message = format!("subscription batch serialization failed: {error}");
+                                    let out = ws_error_json(
+                                        &name,
+                                        "serialization_failed",
+                                        &message,
+                                        seq,
+                                    );
+                                    let _ = ws_send(
+                                        &mut socket,
+                                        Message::Text(out.into()),
+                                        &state,
+                                    ).await;
+                                    break 'subscription;
+                                }
+                            };
+                            if !ws_send(
+                                &mut socket,
+                                Message::Text(out.into()),
+                                &state,
+                            ).await {
+                                break 'subscription;
                             }
-                        };
-                        // serde-escape the URL-derived name; data_json is valid JSON.
-                        let subid =
-                            serde_json::to_string(&name).unwrap_or_else(|_| "\"\"".to_string());
-                        let out = format!(
-                            "{{\"type\":\"data\",\"subscription_id\":{subid},\"data\":{data_json},\"sequence\":{seq}}}"
-                        );
-                        seq += 1;
-                        if socket.send(Message::Text(out.into())).await.is_err() {
-                            break;
+                            let Some(next) = seq.checked_add(1) else {
+                                break 'subscription;
+                            };
+                            seq = next;
                         }
                     }
-                    Some(laminar_db::subscription::PortalFrame::Barrier { .. }) => {
-                        // Checkpoint barriers have no WS wire representation.
-                        continue;
+                    Some(laminar_db::subscription::PortalFrame::Barrier {
+                        sequence: log_sequence,
+                        epoch,
+                        checkpoint_id,
+                        through_sequence,
+                    }) => {
+                        let out = ws_progress_json(
+                            &name,
+                            epoch,
+                            checkpoint_id,
+                            log_sequence,
+                            through_sequence,
+                            seq,
+                        );
+                        if !ws_send(
+                            &mut socket,
+                            Message::Text(out.into()),
+                            &state,
+                        ).await {
+                            break;
+                        }
+                        let Some(next) = seq.checked_add(1) else {
+                            break;
+                        };
+                        seq = next;
                     }
                     Some(laminar_db::subscription::PortalFrame::Lagged(n)) => {
                         warn!(stream = %name, skipped = n, "WS client fell behind, disconnecting");
+                        let out = ws_gap_json(&name, n, seq);
+                        let _ = ws_send(
+                            &mut socket,
+                            Message::Text(out.into()),
+                            &state,
+                        ).await;
+                        break;
+                    }
+                    Some(laminar_db::subscription::PortalFrame::Error { message }) => {
+                        warn!(stream = %name, error = %message, "WS subscription failed, disconnecting");
+                        let out = ws_error_json(&name, "subscription_failed", &message, seq);
+                        let _ = ws_send(
+                            &mut socket,
+                            Message::Text(out.into()),
+                            &state,
+                        ).await;
                         break;
                     }
                     None => break, // disconnected
                 }
             }
             _ = heartbeat.tick() => {
-                // Native WebSocket Ping for liveness (client auto-Pongs); no
-                // app-level heartbeat message needed.
-                if socket.send(Message::Ping(bytes::Bytes::new())).await.is_err() {
+                if !pong_deadline.before_ping() {
+                    break;
+                }
+                if !ws_send(
+                    &mut socket,
+                    Message::Ping(bytes::Bytes::new()),
+                    &state,
+                ).await {
                     break;
                 }
             }
@@ -1229,20 +1586,164 @@ async fn ws_client(
                 match msg {
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(Message::Ping(data))) => {
-                        if socket.send(Message::Pong(data)).await.is_err() { break; }
+                        if !ws_send(&mut socket, Message::Pong(data), &state).await {
+                            break;
+                        }
                     }
-                    _ => {}
+                    Some(Ok(Message::Pong(_))) => pong_deadline.on_pong(),
+                    Some(Ok(Message::Text(_) | Message::Binary(_))) => {
+                        let out = ws_error_json(
+                            &name,
+                            "unsupported_client_message",
+                            "subscription WebSocket accepts control frames only",
+                            seq,
+                        );
+                        let _ = ws_send(
+                            &mut socket,
+                            Message::Text(out.into()),
+                            &state,
+                        ).await;
+                        break;
+                    }
+                    Some(Err(error)) => {
+                        warn!(stream = %name, %error, "WebSocket receive failed");
+                        break;
+                    }
                 }
             }
         }
     }
+    if state.serving_rejection().is_none() {
+        let _ = ws_send(&mut socket, Message::Close(None), &state).await;
+    }
 }
 
-/// Serialize Arrow batches to a JSON array string via `arrow_json::ArrayWriter`.
-/// The single serialization pass shared by `batches_to_json_raw` and the WS path.
+const EXACT_DISPLAY_OPTIONS: arrow_cast::display::FormatOptions<'static> =
+    arrow_cast::display::FormatOptions::new().with_display_error(true);
+
+#[derive(Debug)]
+struct ExactJsonEncoderFactory;
+
+struct QuotedFormatterEncoder<'a> {
+    formatter: arrow_cast::display::ArrayFormatter<'a>,
+}
+
+impl arrow_json::writer::Encoder for QuotedFormatterEncoder<'_> {
+    fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
+        out.push(b'"');
+        write!(out, "{}", self.formatter.value(idx)).expect("writing to Vec cannot fail");
+        out.push(b'"');
+    }
+}
+
+fn encode_non_finite_float(value: f64, out: &mut Vec<u8>) -> bool {
+    let value = if value.is_nan() {
+        "\"NaN\""
+    } else if value == f64::INFINITY {
+        "\"Infinity\""
+    } else if value == f64::NEG_INFINITY {
+        "\"-Infinity\""
+    } else {
+        return false;
+    };
+    out.extend_from_slice(value.as_bytes());
+    true
+}
+
+struct Float16JsonEncoder<'a>(&'a arrow_array::Float16Array);
+
+impl arrow_json::writer::Encoder for Float16JsonEncoder<'_> {
+    fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
+        let value = f32::from(self.0.value(idx));
+        if !encode_non_finite_float(f64::from(value), out) {
+            serde_json::to_writer(out, &value).expect("finite f32 is valid JSON");
+        }
+    }
+}
+
+struct Float32JsonEncoder<'a>(&'a arrow_array::Float32Array);
+
+impl arrow_json::writer::Encoder for Float32JsonEncoder<'_> {
+    fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
+        let value = self.0.value(idx);
+        if !encode_non_finite_float(f64::from(value), out) {
+            serde_json::to_writer(out, &value).expect("finite f32 is valid JSON");
+        }
+    }
+}
+
+struct Float64JsonEncoder<'a>(&'a arrow_array::Float64Array);
+
+impl arrow_json::writer::Encoder for Float64JsonEncoder<'_> {
+    fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
+        let value = self.0.value(idx);
+        if !encode_non_finite_float(value, out) {
+            serde_json::to_writer(out, &value).expect("finite f64 is valid JSON");
+        }
+    }
+}
+
+impl arrow_json::writer::EncoderFactory for ExactJsonEncoderFactory {
+    fn make_default_encoder<'a>(
+        &self,
+        _field: &'a arrow_schema::FieldRef,
+        array: &'a dyn arrow_array::Array,
+        _options: &'a arrow_json::writer::EncoderOptions,
+    ) -> Result<Option<arrow_json::writer::NullableEncoder<'a>>, arrow_schema::ArrowError> {
+        use arrow_schema::DataType;
+
+        let encoder: Option<Box<dyn arrow_json::writer::Encoder + 'a>> = match array.data_type() {
+            // These types cannot be represented exactly by all JSON consumers.
+            DataType::Int64
+            | DataType::UInt64
+            | DataType::Decimal32(_, _)
+            | DataType::Decimal64(_, _)
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _) => {
+                let formatter =
+                    arrow_cast::display::ArrayFormatter::try_new(array, &EXACT_DISPLAY_OPTIONS)?;
+                Some(Box::new(QuotedFormatterEncoder { formatter }))
+            }
+            DataType::Float16 => Some(Box::new(Float16JsonEncoder(
+                array
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float16Array>()
+                    .expect("Float16 data type must use Float16Array"),
+            ))),
+            DataType::Float32 => Some(Box::new(Float32JsonEncoder(
+                array
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float32Array>()
+                    .expect("Float32 data type must use Float32Array"),
+            ))),
+            DataType::Float64 => Some(Box::new(Float64JsonEncoder(
+                array
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float64Array>()
+                    .expect("Float64 data type must use Float64Array"),
+            ))),
+            _ => None,
+        };
+
+        Ok(encoder.map(|encoder| {
+            arrow_json::writer::NullableEncoder::new(encoder, array.nulls().cloned())
+        }))
+    }
+}
+
+fn exact_json_encoder_options() -> arrow_json::writer::EncoderOptions {
+    arrow_json::writer::EncoderOptions::default()
+        .with_explicit_nulls(true)
+        .with_encoder_factory(Arc::new(ExactJsonEncoderFactory))
+}
+
+/// Serialize Arrow batches using the same exact JSON value contract as WS data frames.
 fn batches_to_json_string(batches: &[arrow_array::RecordBatch]) -> Result<String, String> {
     let mut buf = Vec::new();
-    let mut writer = arrow_json::ArrayWriter::new(&mut buf);
+    let mut writer = arrow_json::writer::WriterBuilder::new()
+        .with_explicit_nulls(true)
+        .with_encoder_factory(Arc::new(ExactJsonEncoderFactory))
+        .build::<_, arrow_json::writer::JsonArray>(&mut buf);
     for batch in batches {
         writer.write(batch).map_err(|e| e.to_string())?;
     }
@@ -1258,932 +1759,4 @@ fn batches_to_json_raw(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::body::Body;
-    use axum::http::Request;
-    use tower::ServiceExt;
-
-    #[test]
-    fn cap_result_trims_and_flags() {
-        use arrow_array::{Int32Array, RecordBatch};
-        use arrow_schema::{DataType, Field, Schema};
-        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, false)]));
-        let batch = |n: i32| {
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(Int32Array::from((0..n).collect::<Vec<_>>()))],
-            )
-            .unwrap()
-        };
-        let rows = |bs: &[RecordBatch]| bs.iter().map(RecordBatch::num_rows).sum::<usize>();
-
-        // Under the cap: unchanged, not truncated.
-        let (b, t) = cap_result(vec![batch(3)], 5);
-        assert_eq!((rows(&b), t), (3, false));
-        // Exactly at the cap across batches: complete, not truncated.
-        let (b, t) = cap_result(vec![batch(3), batch(2)], 5);
-        assert_eq!((rows(&b), t), (5, false));
-        // Over the cap: trimmed to the cap, truncated.
-        let (b, t) = cap_result(vec![batch(3), batch(4)], 5);
-        assert_eq!((rows(&b), t), (5, true));
-    }
-
-    fn test_state() -> Arc<AppState> {
-        let registry = Arc::new(crate::metrics::build_registry([
-            ("instance".into(), "test".into()),
-            ("pipeline".into(), "test".into()),
-        ]));
-        let engine_metrics = Arc::new(laminar_db::EngineMetrics::new(&registry));
-        let db = Arc::new(LaminarDB::open().unwrap());
-        db.set_engine_metrics(engine_metrics);
-        let server_metrics = crate::metrics::ServerMetrics::new(&registry);
-        Arc::new(AppState {
-            db,
-            config_path: PathBuf::from("test.toml"),
-            current_config: parking_lot::RwLock::new(crate::config::ServerConfig {
-                server: crate::config::ServerSection::default(),
-                state: laminar_core::state::StateBackendConfig::default(),
-                checkpoint: crate::config::CheckpointSection::default(),
-                supervision: Default::default(),
-                sources: vec![],
-                lookups: vec![],
-                pipelines: vec![],
-                sinks: vec![],
-                discovery: None,
-                coordination: None,
-                node_id: None,
-                sql: None,
-                ai: Default::default(),
-                models: Default::default(),
-            }),
-            reload_guard: ReloadGuard::new(),
-
-            registry,
-            server_metrics,
-            ephemeral: Arc::new(EphemeralTracker::new()),
-            #[cfg(feature = "cluster")]
-            cluster: None,
-        })
-    }
-
-    /// Like [`test_state`] but with a console bearer token configured, so the
-    /// auth middleware is active on protected routes.
-    fn test_state_with_token(token: &str) -> Arc<AppState> {
-        let registry = Arc::new(crate::metrics::build_registry([
-            ("instance".into(), "test".into()),
-            ("pipeline".into(), "test".into()),
-        ]));
-        let engine_metrics = Arc::new(laminar_db::EngineMetrics::new(&registry));
-        let db = Arc::new(LaminarDB::open().unwrap());
-        db.set_engine_metrics(engine_metrics);
-        let server_metrics = crate::metrics::ServerMetrics::new(&registry);
-        let server = crate::config::ServerSection {
-            console_token: Some(crate::config::Secret::new(token)),
-            ..Default::default()
-        };
-        Arc::new(AppState {
-            db,
-            config_path: PathBuf::from("test.toml"),
-            current_config: parking_lot::RwLock::new(crate::config::ServerConfig {
-                server,
-                state: laminar_core::state::StateBackendConfig::default(),
-                checkpoint: crate::config::CheckpointSection::default(),
-                supervision: Default::default(),
-                sources: vec![],
-                lookups: vec![],
-                pipelines: vec![],
-                sinks: vec![],
-                discovery: None,
-                coordination: None,
-                node_id: None,
-                sql: None,
-                ai: Default::default(),
-                models: Default::default(),
-            }),
-            reload_guard: ReloadGuard::new(),
-            registry,
-            server_metrics,
-            ephemeral: Arc::new(EphemeralTracker::new()),
-            #[cfg(feature = "cluster")]
-            cluster: None,
-        })
-    }
-
-    #[tokio::test]
-    async fn test_auth_required_without_token_returns_401() {
-        let state = test_state_with_token("supersecret-token");
-        let app = build_router(state);
-
-        let req = Request::builder()
-            .uri("/api/v1/sources")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn test_auth_with_valid_bearer_returns_200() {
-        let state = test_state_with_token("supersecret-token");
-        let app = build_router(state);
-
-        let req = Request::builder()
-            .uri("/api/v1/sources")
-            .header("authorization", "Bearer supersecret-token")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_auth_with_wrong_bearer_returns_401() {
-        let state = test_state_with_token("supersecret-token");
-        let app = build_router(state);
-
-        let req = Request::builder()
-            .uri("/api/v1/sources")
-            .header("authorization", "Bearer not-the-token")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn test_auth_with_query_token_returns_200() {
-        // WebSocket clients can't set the Authorization header, so the token is
-        // accepted from the query string — but only on `/ws/` routes. A plain
-        // (non-upgrade) GET to a WS route passes auth and is then rejected by
-        // the WebSocket upgrade extractor, so the meaningful assertion is that
-        // auth did not reject it with 401.
-        let state = test_state_with_token("supersecret-token");
-        let app = build_router(state);
-
-        let req = Request::builder()
-            .uri("/ws/events?token=supersecret-token")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn test_auth_query_token_on_http_returns_401() {
-        // The `?token=` query parameter is honored only on WS upgrade routes.
-        // On a normal HTTP control-plane route it is ignored, so a request
-        // without a bearer header is unauthorized.
-        let state = test_state_with_token("supersecret-token");
-        let app = build_router(state);
-
-        let req = Request::builder()
-            .uri("/api/v1/sources?token=supersecret-token")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    #[tokio::test]
-    async fn test_public_health_bypasses_auth() {
-        // /health is public even when a console token is configured.
-        let state = test_state_with_token("supersecret-token");
-        let app = build_router(state);
-
-        let req = Request::builder()
-            .uri("/health")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_health_check() {
-        let state = test_state();
-        let app = build_router(state);
-
-        let req = Request::builder()
-            .uri("/health")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["status"], "healthy");
-        assert!(json["version"].is_string());
-    }
-
-    #[tokio::test]
-    async fn test_readiness_not_running() {
-        let state = test_state();
-        let app = build_router(state);
-
-        let req = Request::builder()
-            .uri("/ready")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        // Pipeline is in Created state, not Running
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-    }
-
-    #[tokio::test]
-    async fn test_metrics() {
-        let state = test_state();
-        let app = build_router(state);
-
-        let req = Request::builder()
-            .uri("/metrics")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let ct = resp
-            .headers()
-            .get("content-type")
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert!(
-            ct.contains("text/plain"),
-            "expected text/plain content-type, got: {ct}"
-        );
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let text = String::from_utf8(body.to_vec()).unwrap();
-        assert!(
-            text.contains("laminardb_events_ingested_total"),
-            "missing events_ingested_total"
-        );
-        assert!(
-            text.contains("laminardb_cycles_total"),
-            "missing cycles_total"
-        );
-        assert!(
-            text.contains("laminardb_checkpoints_completed_total"),
-            "missing checkpoints_completed_total"
-        );
-        // Prometheus text format includes HELP and TYPE annotations.
-        assert!(text.contains("# HELP"), "missing # HELP annotation");
-        assert!(text.contains("# TYPE"), "missing # TYPE annotation");
-    }
-
-    #[tokio::test]
-    async fn test_list_sources_empty() {
-        let state = test_state();
-        let app = build_router(state);
-
-        let req = Request::builder()
-            .uri("/api/v1/sources")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json.as_array().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_get_stream_not_found() {
-        let state = test_state();
-        let app = build_router(state);
-
-        let req = Request::builder()
-            .uri("/api/v1/streams/nonexistent")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn test_execute_sql_create_source() {
-        let state = test_state();
-        let app = build_router(state);
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/sql")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_string(&serde_json::json!({
-                    "sql": "CREATE SOURCE test_src (id BIGINT, name VARCHAR)"
-                }))
-                .unwrap(),
-            ))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["result_type"], "CREATE SOURCE");
-    }
-
-    #[tokio::test]
-    async fn test_execute_sql_metadata_returns_rows() {
-        let state = test_state();
-        let app = build_router(state);
-
-        // Create a source so SHOW SOURCES has a row to return.
-        let create = Request::builder()
-            .method("POST")
-            .uri("/api/v1/sql")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_string(&serde_json::json!({
-                    "sql": "CREATE SOURCE meta_src (id BIGINT, name VARCHAR)"
-                }))
-                .unwrap(),
-            ))
-            .unwrap();
-        let resp = app.clone().oneshot(create).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        // SHOW SOURCES yields an ExecuteResult::Metadata batch — the handler
-        // must serialize it into the `data` field.
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/sql")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_string(&serde_json::json!({ "sql": "SHOW SOURCES" })).unwrap(),
-            ))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["result_type"], "metadata");
-        let data = json["data"]
-            .as_array()
-            .expect("data should be a JSON array");
-        assert_eq!(data.len(), 1, "expected the one created source");
-        assert_eq!(data[0]["source_name"], "meta_src");
-    }
-
-    #[tokio::test]
-    async fn test_execute_sql_invalid() {
-        let state = test_state();
-        let app = build_router(state);
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/sql")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_string(&serde_json::json!({
-                    "sql": "NOT VALID SQL AT ALL BLAH"
-                }))
-                .unwrap(),
-            ))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn test_reload_invalid_config_path() {
-        // test_state has config_path = "test.toml" which doesn't exist → 400
-        let state = test_state();
-        let app = build_router(state);
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/reload")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn test_reload_concurrent_returns_conflict() {
-        let state = test_state();
-        // Hold the guard before making the request
-        let _guard = state.reload_guard.try_acquire().unwrap();
-
-        let app = build_router(state);
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/reload")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
-    }
-
-    #[tokio::test]
-    async fn test_reload_with_valid_config() {
-        use std::io::Write;
-
-        // Create a real temp config file
-        let mut tmpfile = tempfile::NamedTempFile::new().unwrap();
-        writeln!(tmpfile, "[server]").unwrap();
-        let path = tmpfile.path().to_path_buf();
-
-        let registry = Arc::new(crate::metrics::build_registry([
-            ("instance".into(), "test".into()),
-            ("pipeline".into(), "test".into()),
-        ]));
-        let db = Arc::new(LaminarDB::open().unwrap());
-        let engine_metrics = Arc::new(laminar_db::EngineMetrics::new(&registry));
-        db.set_engine_metrics(engine_metrics);
-        let server_metrics = crate::metrics::ServerMetrics::new(&registry);
-        let state = Arc::new(AppState {
-            db,
-            config_path: path,
-            current_config: parking_lot::RwLock::new(crate::config::ServerConfig {
-                server: crate::config::ServerSection::default(),
-                state: laminar_core::state::StateBackendConfig::default(),
-                checkpoint: crate::config::CheckpointSection::default(),
-                supervision: Default::default(),
-                sources: vec![],
-                lookups: vec![],
-                pipelines: vec![],
-                sinks: vec![],
-                discovery: None,
-                coordination: None,
-                node_id: None,
-                sql: None,
-                ai: Default::default(),
-                models: Default::default(),
-            }),
-            reload_guard: ReloadGuard::new(),
-
-            registry,
-            server_metrics,
-            ephemeral: Arc::new(EphemeralTracker::new()),
-            #[cfg(feature = "cluster")]
-            cluster: None,
-        });
-
-        let app = build_router(state.clone());
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/reload")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["success"], true);
-    }
-
-    /// POST a SQL statement to `/api/v1/sql`, asserting it succeeds.
-    async fn exec_sql(app: &Router, sql: &str) {
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/sql")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_string(&serde_json::json!({ "sql": sql })).unwrap(),
-            ))
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "exec failed: {sql}");
-    }
-
-    #[tokio::test]
-    async fn test_list_mvs_empty() {
-        let state = test_state();
-        let app = build_router(state);
-
-        let req = Request::builder()
-            .uri("/api/v1/mvs")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json.as_array().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_list_mvs_after_create() {
-        let state = test_state();
-        let app = build_router(state);
-
-        exec_sql(&app, "CREATE SOURCE events (id INT, value DOUBLE)").await;
-        // Registers the MV in the registry (see ddl.rs); query execution is not
-        // required for it to be listed.
-        exec_sql(
-            &app,
-            "CREATE MATERIALIZED VIEW event_stats AS SELECT * FROM events",
-        )
-        .await;
-
-        let req = Request::builder()
-            .uri("/api/v1/mvs")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let mvs = json.as_array().expect("mvs should be an array");
-        let found = mvs
-            .iter()
-            .find(|m| m["name"] == "event_stats")
-            .expect("event_stats should be listed");
-        assert_eq!(found["state"], "Running");
-        assert!(
-            found["sql"].as_str().unwrap().contains("event_stats"),
-            "sql should be the full CREATE statement: {found:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_list_connectors() {
-        let state = test_state();
-        let app = build_router(state);
-
-        let req = Request::builder()
-            .uri("/api/v1/connectors")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        // Shape is `{sources: [...], sinks: [...]}`; the exact connectors depend
-        // on enabled features, so only assert the structure here.
-        assert!(json["sources"].is_array(), "sources should be an array");
-        assert!(json["sinks"].is_array(), "sinks should be an array");
-    }
-
-    #[tokio::test]
-    async fn test_create_query_returns_stream_id_and_ws_url() {
-        let state = test_state();
-        let app = build_router(state.clone());
-
-        exec_sql(&app, "CREATE SOURCE events (id INT, value DOUBLE)").await;
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/queries")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_string(&serde_json::json!({ "sql": "SELECT * FROM events" }))
-                    .unwrap(),
-            ))
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let stream_id = json["stream_id"].as_str().expect("stream_id present");
-        assert!(
-            stream_id.starts_with("__console_"),
-            "unexpected stream_id: {stream_id}"
-        );
-        assert_eq!(json["ws_url"], format!("/ws/{stream_id}"));
-
-        // The ephemeral stream is registered and tracked as pending.
-        assert!(
-            state.db.streams().iter().any(|s| s.name == stream_id),
-            "ephemeral stream should be registered"
-        );
-        assert!(state.ephemeral.is_tracked(stream_id));
-    }
-
-    #[tokio::test]
-    async fn test_create_query_invalid_sql_returns_400() {
-        let state = test_state();
-        let app = build_router(state);
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/queries")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_string(&serde_json::json!({ "sql": "NOT VALID SQL BLAH" })).unwrap(),
-            ))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    }
-
-    /// Unit test of the ephemeral-stream lifecycle the WS handler and reaper
-    /// task drive: pending → connected, removal, and pending-only reaping.
-    #[test]
-    fn test_ephemeral_tracker_lifecycle() {
-        let tracker = EphemeralTracker::new();
-
-        // Unknown stream: not tracked, can't be marked connected or reaped.
-        assert!(!tracker.is_tracked("__console_x"));
-        assert!(!tracker.mark_connected("__console_x"));
-        assert!(!tracker.remove_if_pending("__console_x"));
-
-        // A pending stream is tracked and reaped by `remove_if_pending`.
-        assert!(tracker.try_add_pending("__console_x".to_string()));
-        assert!(tracker.is_tracked("__console_x"));
-        assert!(
-            tracker.remove_if_pending("__console_x"),
-            "a pending stream is reaped"
-        );
-        assert!(
-            !tracker.is_tracked("__console_x"),
-            "reaping stops tracking the stream"
-        );
-
-        // Once connected, the reaper must never drop it.
-        assert!(tracker.try_add_pending("__console_x".to_string()));
-        assert!(tracker.mark_connected("__console_x"));
-        assert!(
-            !tracker.remove_if_pending("__console_x"),
-            "a connected stream is never reaped"
-        );
-        assert!(
-            tracker.is_tracked("__console_x"),
-            "a connected stream stays tracked"
-        );
-
-        // Removal stops tracking.
-        assert!(tracker.remove("__console_x"));
-        assert!(!tracker.is_tracked("__console_x"));
-        assert!(!tracker.remove("__console_x"));
-    }
-
-    /// The cap rejects reservations past [`MAX_EPHEMERAL_STREAMS`]; a freed slot
-    /// is reusable.
-    #[test]
-    fn test_ephemeral_tracker_caps_concurrent_streams() {
-        let tracker = EphemeralTracker::new();
-
-        for i in 0..MAX_EPHEMERAL_STREAMS {
-            assert!(
-                tracker.try_add_pending(format!("__console_{i}")),
-                "reservations below the cap succeed"
-            );
-        }
-
-        // At capacity the next reservation is rejected and inserts nothing.
-        assert!(
-            !tracker.try_add_pending("__console_overflow".to_string()),
-            "reservation at the cap is rejected"
-        );
-        assert!(!tracker.is_tracked("__console_overflow"));
-
-        // Freeing one slot lets exactly one more reservation through.
-        assert!(tracker.remove("__console_0"));
-        assert!(
-            tracker.try_add_pending("__console_overflow".to_string()),
-            "a freed slot is reusable"
-        );
-    }
-
-    /// Bind a real ephemeral-port server so the WebSocket upgrade runs over a
-    /// genuine hyper connection (the `tower::oneshot` harness can't upgrade —
-    /// the request has no `OnUpgrade` extension, so axum rejects with 426).
-    async fn spawn_test_server(state: Arc<AppState>) -> std::net::SocketAddr {
-        let router = build_router(state);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
-        });
-        addr
-    }
-
-    /// Send a raw WebSocket upgrade request for `path` and return the first
-    /// chunk of the HTTP response (enough to read the status line).
-    async fn ws_handshake(addr: std::net::SocketAddr, path: &str) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let req = format!(
-            "GET {path} HTTP/1.1\r\n\
-             Host: localhost\r\n\
-             Connection: Upgrade\r\n\
-             Upgrade: websocket\r\n\
-             Sec-WebSocket-Version: 13\r\n\
-             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
-             \r\n"
-        );
-        stream.write_all(req.as_bytes()).await.unwrap();
-        let mut buf = [0u8; 1024];
-        let n = stream.read(&mut buf).await.unwrap();
-        String::from_utf8_lossy(&buf[..n]).into_owned()
-    }
-
-    #[tokio::test]
-    async fn test_ws_upgrade_switching_protocols() {
-        let state = test_state();
-        let app = build_router(state.clone());
-        exec_sql(&app, "CREATE SOURCE events (id INT, value DOUBLE)").await;
-
-        // Create an ephemeral console stream to connect to.
-        let create = Request::builder()
-            .method("POST")
-            .uri("/api/v1/queries")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_string(&serde_json::json!({ "sql": "SELECT * FROM events" }))
-                    .unwrap(),
-            ))
-            .unwrap();
-        let resp = app.oneshot(create).await.unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let stream_id = json["stream_id"].as_str().unwrap().to_string();
-
-        let addr = spawn_test_server(state).await;
-        let resp = ws_handshake(addr, &format!("/ws/{stream_id}")).await;
-        assert!(
-            resp.starts_with("HTTP/1.1 101"),
-            "expected 101 Switching Protocols, got: {resp}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_ws_upgrade_unknown_stream_returns_404() {
-        // Over a real connection the upgrade extractor succeeds, so the
-        // handler's stream-existence check runs and returns 404.
-        let state = test_state();
-        let addr = spawn_test_server(state).await;
-        let resp = ws_handshake(addr, "/ws/does_not_exist").await;
-        assert!(
-            resp.starts_with("HTTP/1.1 404"),
-            "expected 404 Not Found for unknown stream, got: {resp}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_get_graph_returns_nodes_and_edges() {
-        let state = test_state();
-        let app = build_router(state);
-
-        exec_sql(&app, "CREATE SOURCE events (id INT, value DOUBLE)").await;
-        exec_sql(&app, "CREATE STREAM s1 AS SELECT * FROM events").await;
-
-        let req = Request::builder()
-            .uri("/api/v1/graph")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-
-        let nodes = json["nodes"].as_array().expect("nodes should be an array");
-        let edges = json["edges"].as_array().expect("edges should be an array");
-
-        let source = nodes
-            .iter()
-            .find(|n| n["name"] == "events")
-            .expect("events source node should be present");
-        assert_eq!(source["node_type"], "Source");
-
-        let stream = nodes
-            .iter()
-            .find(|n| n["name"] == "s1")
-            .expect("s1 stream node should be present");
-        assert_eq!(stream["node_type"], "Stream");
-        assert!(
-            stream["sql"].as_str().unwrap().contains("events"),
-            "stream node should carry its defining SQL: {stream:?}"
-        );
-
-        assert!(
-            edges
-                .iter()
-                .any(|e| e["from"] == "events" && e["to"] == "s1"),
-            "expected an edge events -> s1, got: {edges:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_get_graph_empty() {
-        let state = test_state();
-        let app = build_router(state);
-
-        let req = Request::builder()
-            .uri("/api/v1/graph")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["nodes"].as_array().unwrap().is_empty());
-        assert!(json["edges"].as_array().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_cluster_nodes_404_when_not_cluster() {
-        // test_state() leaves `cluster` as None, so the cluster endpoints 404
-        // even when compiled with the `cluster` feature.
-        let state = test_state();
-        let app = build_router(state);
-
-        let req = Request::builder()
-            .uri("/api/v1/cluster/nodes")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn test_cluster_vnodes_404_when_not_cluster() {
-        let state = test_state();
-        let app = build_router(state);
-
-        let req = Request::builder()
-            .uri("/api/v1/cluster/vnodes")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn test_cluster_leader_404_when_not_cluster() {
-        let state = test_state();
-        let app = build_router(state);
-
-        let req = Request::builder()
-            .uri("/api/v1/cluster/leader")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn test_cluster_checkpoints_returns_metadata() {
-        // Available in both single-node and cluster mode. With no checkpoint
-        // taken yet it still returns a single metadata row of zeros.
-        let state = test_state();
-        let app = build_router(state);
-
-        let req = Request::builder()
-            .uri("/api/v1/cluster/checkpoints")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let rows = json
-            .as_array()
-            .expect("checkpoint status should be an array");
-        assert_eq!(rows.len(), 1, "expected one checkpoint-status row");
-        let row = &rows[0];
-        assert!(
-            row.get("checkpoint_id").is_some(),
-            "row should carry checkpoint_id: {row:?}"
-        );
-        assert!(
-            row.get("total_checkpoints").is_some(),
-            "row should carry total_checkpoints: {row:?}"
-        );
-    }
-}
+mod tests;

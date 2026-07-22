@@ -6,13 +6,73 @@
 /// Canonical JSONB binary format type tag constants.
 pub mod jsonb_tags;
 
-use std::sync::Arc;
-
 use arrow::buffer::Buffer;
 use arrow_array::RecordBatch;
 use arrow_ipc::reader::{StreamDecoder, StreamReader};
 use arrow_ipc::writer::StreamWriter;
-use arrow_schema::{ArrowError, Schema, SchemaRef};
+use arrow_schema::{ArrowError, Schema};
+
+/// A growable byte writer that rejects payloads and retained capacities above a fixed limit.
+/// This is shared by Arrow IPC and archive encoders at checkpoint/shuffle boundaries.
+pub struct BoundedBytesWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl BoundedBytesWriter {
+    /// Create an empty bounded writer.
+    #[must_use]
+    pub fn new(limit: usize) -> Self {
+        Self::with_capacity(limit, 0)
+    }
+
+    fn with_capacity(limit: usize, initial_capacity: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(initial_capacity.min(limit)),
+            limit,
+        }
+    }
+
+    /// Consume the writer and return its retained bytes without copying.
+    #[must_use]
+    pub fn into_vec(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl std::io::Write for BoundedBytesWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let next_len = self
+            .bytes
+            .len()
+            .checked_add(buf.len())
+            .filter(|next_len| *next_len <= self.limit)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::OutOfMemory,
+                    "serialized payload exceeds its configured bound",
+                )
+            })?;
+        if next_len > self.bytes.capacity() {
+            self.bytes
+                .try_reserve_exact(next_len - self.bytes.len())
+                .map_err(std::io::Error::other)?;
+            if self.bytes.capacity() < next_len || self.bytes.capacity() > self.limit {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::OutOfMemory,
+                    "serialized allocation exceeds its configured bound",
+                ));
+            }
+        }
+        self.bytes.extend_from_slice(buf);
+        debug_assert!(self.bytes.capacity() <= self.limit);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Serializes a single [`RecordBatch`] to Arrow IPC stream bytes.
 ///
@@ -42,29 +102,22 @@ pub fn deserialize_batch_stream(bytes: &[u8]) -> Result<RecordBatch, arrow_schem
     })?
 }
 
-/// Incremental Arrow IPC encoder that writes the schema once: concatenating the
-/// per-call blobs in order yields one IPC stream for [`BatchStreamDecoder`].
-pub struct BatchStreamEncoder {
+/// Test encoder for exercising incrementally chunked Arrow IPC streams.
+#[cfg(test)]
+pub(crate) struct BatchStreamEncoder {
     writer: StreamWriter<Vec<u8>>,
-    schema: SchemaRef,
 }
 
+#[cfg(test)]
 impl BatchStreamEncoder {
     /// Encoder for `schema`; the schema message flushes out with the first batch.
     ///
     /// # Errors
     /// [`ArrowError`] if the schema header can't be IPC-encoded.
-    pub fn new(schema: &Schema) -> Result<Self, ArrowError> {
+    pub(crate) fn new(schema: &Schema) -> Result<Self, ArrowError> {
         Ok(Self {
             writer: StreamWriter::try_new(Vec::new(), schema)?,
-            schema: Arc::new(schema.clone()),
         })
-    }
-
-    /// Schema this encoder was created with; every encoded batch must match it.
-    #[must_use]
-    pub fn schema(&self) -> &SchemaRef {
-        &self.schema
     }
 
     /// Encode one batch, returning the bytes written since the last call (the
@@ -72,7 +125,7 @@ impl BatchStreamEncoder {
     ///
     /// # Errors
     /// [`ArrowError`] if IPC encoding fails.
-    pub fn encode(&mut self, batch: &RecordBatch) -> Result<Vec<u8>, ArrowError> {
+    pub(crate) fn encode(&mut self, batch: &RecordBatch) -> Result<Vec<u8>, ArrowError> {
         self.writer.write(batch)?;
         Ok(std::mem::take(self.writer.get_mut()))
     }
@@ -83,14 +136,14 @@ impl BatchStreamEncoder {
     ///
     /// # Errors
     /// [`ArrowError`] if writing the marker fails.
-    pub fn finish(&mut self) -> Result<Vec<u8>, ArrowError> {
+    pub(crate) fn finish(&mut self) -> Result<Vec<u8>, ArrowError> {
         self.writer.finish()?;
         Ok(std::mem::take(self.writer.get_mut()))
     }
 }
 
-/// Decoder for a stream produced by [`BatchStreamEncoder`]: feed each chunk in
-/// order; the first chunk's schema decodes all later schema-less chunks.
+/// Decoder for an incrementally chunked Arrow IPC stream. The first chunk's
+/// schema decodes all later schema-less chunks.
 #[derive(Debug, Default)]
 pub struct BatchStreamDecoder {
     decoder: StreamDecoder,
@@ -120,6 +173,66 @@ impl BatchStreamDecoder {
         }
         Ok(batches)
     }
+
+    /// Verify that the last chunk ended between IPC messages rather than in a
+    /// buffered header, metadata block, or body. This does not finish or reset
+    /// the decoder.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn ensure_message_boundary(&mut self) -> Result<(), ArrowError> {
+        self.decoder.finish()
+    }
+}
+
+/// Serializes batches as one Arrow IPC stream without allowing the writer to allocate beyond
+/// `max_bytes`.
+///
+/// # Errors
+///
+/// Returns [`arrow_schema::ArrowError`] if encoding fails or crosses the byte bound.
+pub fn serialize_batches_stream_bounded<'a, I>(
+    schema: &Schema,
+    batches: I,
+    max_bytes: usize,
+) -> Result<Vec<u8>, arrow_schema::ArrowError>
+where
+    I: IntoIterator<Item = &'a RecordBatch>,
+{
+    serialize_batches_stream_bounded_with_capacity(schema, batches, max_bytes, 0)
+}
+
+fn serialize_batches_stream_bounded_with_capacity<'a, I>(
+    schema: &Schema,
+    batches: I,
+    max_bytes: usize,
+    initial_capacity: usize,
+) -> Result<Vec<u8>, arrow_schema::ArrowError>
+where
+    I: IntoIterator<Item = &'a RecordBatch>,
+{
+    let mut bounded = BoundedBytesWriter::with_capacity(max_bytes, initial_capacity);
+    {
+        let mut writer = StreamWriter::try_new(&mut bounded, schema)?;
+        for batch in batches {
+            writer.write(batch)?;
+        }
+        writer.finish()?;
+    }
+    Ok(bounded.bytes)
+}
+
+#[cfg(feature = "cluster")]
+/// Single-batch adapter that preserves the shuffle path's measured initial-capacity hint.
+pub(crate) fn serialize_batch_stream_bounded(
+    batch: &RecordBatch,
+    max_bytes: usize,
+    initial_capacity: usize,
+) -> Result<Vec<u8>, arrow_schema::ArrowError> {
+    serialize_batches_stream_bounded_with_capacity(
+        batch.schema().as_ref(),
+        std::iter::once(batch),
+        max_bytes,
+        initial_capacity,
+    )
 }
 
 #[cfg(test)]
@@ -127,6 +240,7 @@ mod tests {
     use super::*;
     use arrow_array::Int32Array;
     use arrow_schema::{DataType, Field};
+    use std::io::Write as _;
     use std::sync::Arc;
 
     fn batch(values: &[i32]) -> RecordBatch {
@@ -174,5 +288,41 @@ mod tests {
         }
 
         assert_eq!(out, inputs);
+    }
+
+    #[test]
+    fn bounded_writer_never_grows_past_its_limit() {
+        let mut writer = BoundedBytesWriter::with_capacity(8, 4);
+        writer.write_all(&[1, 2, 3]).unwrap();
+        writer.write_all(&[4, 5, 6, 7, 8]).unwrap();
+        assert_eq!(writer.bytes, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(writer.bytes.capacity() <= 8);
+
+        let error = writer.write_all(&[9]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::OutOfMemory);
+        assert_eq!(writer.bytes.len(), 8);
+        assert!(writer.bytes.capacity() <= 8);
+    }
+
+    #[test]
+    fn bounded_batch_stream_round_trips_multiple_batches_and_fails_at_the_bound() {
+        let inputs = [batch(&[1, 2]), batch(&[3, 4, 5])];
+        let schema = inputs[0].schema();
+        let encoded =
+            serialize_batches_stream_bounded(schema.as_ref(), inputs.iter(), usize::MAX).unwrap();
+        let decoded = StreamReader::try_new(std::io::Cursor::new(&encoded), None)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(decoded, inputs);
+
+        let error =
+            serialize_batches_stream_bounded(schema.as_ref(), inputs.iter(), encoded.len() - 1)
+                .unwrap_err();
+        assert!(error.to_string().contains("configured bound"));
+
+        let tiny_error =
+            serialize_batches_stream_bounded(schema.as_ref(), inputs.iter(), 1).unwrap_err();
+        assert!(tiny_error.to_string().contains("configured bound"));
     }
 }

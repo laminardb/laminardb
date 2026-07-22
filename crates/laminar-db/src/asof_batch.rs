@@ -453,19 +453,6 @@ impl AsofRightBuffer {
         self.ingest_count = 0;
         Ok(())
     }
-
-    pub fn estimated_size_bytes(&self) -> usize {
-        let index_size: usize = self
-            .index
-            .values()
-            .map(|btree| btree.len() * (8 + 8 + 24))
-            .sum();
-        let batch_size = self
-            .right_concat
-            .as_ref()
-            .map_or(0, RecordBatch::get_array_memory_size);
-        index_size + batch_size
-    }
 }
 
 /// ASOF join of left batches against a pre-populated `AsofRightBuffer`.

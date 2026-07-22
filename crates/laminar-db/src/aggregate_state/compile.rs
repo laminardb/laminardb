@@ -129,18 +129,35 @@ impl<'a> PreAggBuilder<'a> {
                 compile,
             );
         } else {
-            for arg_expr in &agg_func.params.args {
+            let raw_types: Vec<DataType> = agg_func
+                .params
+                .args
+                .iter()
+                .map(|arg_expr| {
+                    resolve_expr_type(arg_expr, self.input_schema, agg_field.data_type())
+                })
+                .collect();
+            let input_fields: Vec<Arc<Field>> = raw_types
+                .iter()
+                .enumerate()
+                .map(|(i, data_type)| {
+                    Arc::new(Field::new(format!("arg_{i}"), data_type.clone(), true))
+                })
+                .collect();
+            let Ok(coerced_fields) = datafusion_expr::type_coercion::functions::fields_with_udf(
+                &input_fields,
+                udf.as_ref(),
+            ) else {
+                return false;
+            };
+
+            for (arg_expr, coerced_field) in agg_func.params.args.iter().zip(coerced_fields) {
                 let col_idx = self.next_col_idx;
                 self.next_col_idx += 1;
-                let expr_sql = expr_to_sql(arg_expr);
-                let dt = resolve_expr_type(arg_expr, self.input_schema, agg_field.data_type());
+                let dt = coerced_field.data_type().clone();
 
                 // FILTER: wrap with CASE WHEN so filtered rows become NULL.
-                if let Some(filter_expr) = &agg_func.params.filter {
-                    let filter_sql = expr_to_sql(filter_expr);
-                    self.pre_agg_select_items.push(format!(
-                        "CASE WHEN {filter_sql} THEN {expr_sql} ELSE NULL END AS \"__agg_input_{col_idx}\""
-                    ));
+                let projected_expr = if let Some(filter_expr) = &agg_func.params.filter {
                     let case_expr = datafusion_expr::Expr::Case(datafusion_expr::expr::Case {
                         expr: None,
                         when_then_expr: vec![(
@@ -149,24 +166,31 @@ impl<'a> PreAggBuilder<'a> {
                         )],
                         else_expr: Some(Box::new(datafusion_expr::lit(ScalarValue::Null))),
                     });
-                    self.push_compiled_column(
-                        &format!("__agg_input_{col_idx}"),
-                        &case_expr,
-                        dt.clone(),
-                        false,
-                        compile,
-                    );
+                    case_expr
                 } else {
-                    self.pre_agg_select_items
-                        .push(format!("{expr_sql} AS \"__agg_input_{col_idx}\""));
-                    self.push_compiled_column(
-                        &format!("__agg_input_{col_idx}"),
-                        arg_expr,
-                        dt.clone(),
-                        false,
-                        compile,
-                    );
-                }
+                    arg_expr.clone()
+                };
+                let raw_type =
+                    resolve_expr_type(arg_expr, self.input_schema, agg_field.data_type());
+                let projected_expr = if raw_type == dt {
+                    projected_expr
+                } else {
+                    datafusion_expr::Expr::Cast(datafusion_expr::expr::Cast {
+                        expr: Box::new(projected_expr),
+                        data_type: dt.clone(),
+                    })
+                };
+                self.pre_agg_select_items.push(format!(
+                    "{} AS \"__agg_input_{col_idx}\"",
+                    expr_to_sql(&projected_expr)
+                ));
+                self.push_compiled_column(
+                    &format!("__agg_input_{col_idx}"),
+                    &projected_expr,
+                    dt.clone(),
+                    false,
+                    compile,
+                );
 
                 input_col_indices.push(col_idx);
                 input_types.push(dt);

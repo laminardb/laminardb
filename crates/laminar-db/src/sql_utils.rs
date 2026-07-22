@@ -225,6 +225,60 @@ fn narrow_i64_col<N: TryFrom<i64>>(
         .collect()
 }
 
+fn is_null_literal(expr: &sqlparser::ast::Expr) -> bool {
+    matches!(
+        expr,
+        sqlparser::ast::Expr::Value(sqlparser::ast::ValueWithSpan {
+            value: sqlparser::ast::Value::Null,
+            ..
+        })
+    )
+}
+
+fn validate_insert_literal(
+    expr: &sqlparser::ast::Expr,
+    field: &arrow::datatypes::Field,
+) -> Result<(), DbError> {
+    use arrow::datatypes::DataType;
+
+    if is_null_literal(expr) {
+        return if field.is_nullable() {
+            Ok(())
+        } else {
+            Err(DbError::InsertError(format!(
+                "column '{}' does not accept NULL",
+                field.name()
+            )))
+        };
+    }
+
+    let valid = match field.data_type() {
+        DataType::Boolean => expr_to_bool(Some(expr)).is_some(),
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+            expr_to_i64(Some(expr)).is_some()
+        }
+        DataType::Float32 | DataType::Float64 => {
+            expr_to_f64(Some(expr)).is_some_and(f64::is_finite)
+        }
+        DataType::Utf8 => expr_to_string(Some(expr)).is_some(),
+        unsupported => {
+            return Err(DbError::InsertError(format!(
+                "INSERT VALUES does not support {unsupported} column '{}'",
+                field.name()
+            )));
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(DbError::InsertError(format!(
+            "literal {expr} is invalid for {} column '{}'",
+            field.data_type(),
+            field.name()
+        )))
+    }
+}
+
 /// Convert SQL `VALUES (...)` rows into an Arrow `RecordBatch`.
 ///
 /// Columns are matched positionally against `schema`.
@@ -242,6 +296,20 @@ pub fn sql_values_to_record_batch(
         Int8Array, RecordBatch, StringArray,
     };
     use arrow::datatypes::DataType;
+
+    for (row_index, row) in values.iter().enumerate() {
+        if row.len() != schema.fields().len() {
+            return Err(DbError::InsertError(format!(
+                "VALUES row {} has {} expressions but the target schema has {} columns",
+                row_index + 1,
+                row.len(),
+                schema.fields().len()
+            )));
+        }
+        for (expr, field) in row.iter().zip(schema.fields()) {
+            validate_insert_literal(expr, field)?;
+        }
+    }
 
     let mut columns: Vec<std::sync::Arc<dyn Array>> = Vec::with_capacity(schema.fields().len());
 
@@ -277,10 +345,25 @@ pub fn sql_values_to_record_batch(
                 columns.push(std::sync::Arc::new(arr));
             }
             DataType::Float32 => {
-                let arr: Float32Array = values
+                let vals = values
                     .iter()
-                    .map(|row| expr_to_f64(row.get(col_idx)).map(|v| v as f32))
-                    .collect();
+                    .map(|row| {
+                        expr_to_f64(row.get(col_idx))
+                            .map(|value| {
+                                let narrowed = value as f32;
+                                if narrowed.is_finite() {
+                                    Ok(narrowed)
+                                } else {
+                                    Err(DbError::InsertError(format!(
+                                        "literal {value} out of range for FLOAT column '{}'",
+                                        field.name()
+                                    )))
+                                }
+                            })
+                            .transpose()
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let arr = Float32Array::from(vals);
                 columns.push(std::sync::Arc::new(arr));
             }
             DataType::Float64 => {
@@ -290,7 +373,7 @@ pub fn sql_values_to_record_batch(
                     .collect();
                 columns.push(std::sync::Arc::new(arr));
             }
-            _ => {
+            DataType::Utf8 => {
                 let strs: Vec<Option<String>> = values
                     .iter()
                     .map(|row| expr_to_string(row.get(col_idx)))
@@ -298,11 +381,21 @@ pub fn sql_values_to_record_batch(
                 let arr: StringArray = strs.iter().map(|s| s.as_deref()).collect();
                 columns.push(std::sync::Arc::new(arr));
             }
+            unsupported => unreachable!("validated unsupported INSERT type {unsupported}"),
         }
     }
 
-    RecordBatch::try_new(schema.clone(), columns)
-        .map_err(|e| DbError::InsertError(format!("Failed to create RecordBatch: {e}")))
+    let batch = RecordBatch::try_new(schema.clone(), columns)
+        .map_err(|e| DbError::InsertError(format!("Failed to create RecordBatch: {e}")))?;
+    for (field, column) in schema.fields().iter().zip(batch.columns()) {
+        if !field.is_nullable() && column.null_count() != 0 {
+            return Err(DbError::InsertError(format!(
+                "column '{}' does not accept NULL",
+                field.name()
+            )));
+        }
+    }
+    Ok(batch)
 }
 
 #[cfg(test)]
@@ -403,6 +496,63 @@ mod tests {
         // Out of i8 range → hard error (previously silently wrapped to 159i8).
         let err = sql_values_to_record_batch(&schema, &[vec![lit("99999")]]).unwrap_err();
         assert!(matches!(err, DbError::InsertError(_)));
+    }
+
+    #[test]
+    fn insert_values_require_exact_arity_and_valid_literals() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let lit = |sql: &str| {
+            Parser::new(&GenericDialect {})
+                .try_with_sql(sql)
+                .unwrap()
+                .parse_expr()
+                .unwrap()
+        };
+        let schema = std::sync::Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("label", DataType::Utf8, true),
+        ]));
+
+        for row in [vec![lit("1")], vec![lit("1"), lit("'ok'"), lit("2")]] {
+            let error = sql_values_to_record_batch(&schema, &[row]).unwrap_err();
+            assert!(matches!(error, DbError::InsertError(_)));
+        }
+
+        for row in [
+            vec![lit("NULL"), lit("'ok'")],
+            vec![lit("'not-an-integer'"), lit("'ok'")],
+            vec![lit("1 + 1"), lit("'ok'")],
+        ] {
+            let error = sql_values_to_record_batch(&schema, &[row]).unwrap_err();
+            assert!(matches!(error, DbError::InsertError(_)));
+        }
+
+        let batch = sql_values_to_record_batch(&schema, &[vec![lit("1"), lit("NULL")]]).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(batch.column(1).null_count(), 1);
+    }
+
+    #[test]
+    fn float32_overflow_is_rejected() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let value = Parser::new(&GenericDialect {})
+            .try_with_sql("3.5e38")
+            .unwrap()
+            .parse_expr()
+            .unwrap();
+        let schema = std::sync::Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Float32,
+            false,
+        )]));
+        let error = sql_values_to_record_batch(&schema, &[vec![value]]).unwrap_err();
+        assert!(matches!(error, DbError::InsertError(_)));
     }
 
     #[test]

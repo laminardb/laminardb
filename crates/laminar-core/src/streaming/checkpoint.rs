@@ -1,97 +1,24 @@
 //! Streaming checkpoint configuration.
 
-use std::fmt;
-
 /// Configuration for streaming checkpoints.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct StreamCheckpointConfig {
     /// Checkpoint interval in milliseconds. `None` = manual only.
     pub interval_ms: Option<u64>,
-    /// Directory for persisting checkpoints. `None` = in-memory only.
+    /// One end-to-end attempt deadline in milliseconds, spanning sink fencing, alignment,
+    /// capture, durable publication, and completion delivery. `None` = default (`120_000`).
+    pub timeout_ms: Option<u64>,
+    /// Directory for persisting checkpoints. `None` uses the database storage directory, then
+    /// falls back to `./data`; it never silently selects volatile checkpoint storage.
     pub data_dir: Option<std::path::PathBuf>,
-    /// Maximum number of retained checkpoints. `None` = default (3).
+    /// Number of predecessor checkpoints retained alongside the current recovery cut.
+    /// `None` = default (3); predecessors keep reference/delta chains resolvable.
     pub max_retained: Option<usize>,
-    /// Barrier-alignment timeout in milliseconds at fan-in operators.
-    /// `None` = default (`30_000`).
-    pub alignment_timeout_ms: Option<u64>,
-    /// Max epochs admitted between capture and restorable. `None` = default (4).
-    /// Exactly-once pipelines are capped at 1 regardless.
-    pub max_in_flight_epochs: Option<u64>,
-    /// Cap on captured-state bytes held by in-flight epochs; admission
-    /// pauses at the cap. `None` = default (512 MiB).
+    /// Maximum bytes admitted for one checkpoint across in-flight capture and
+    /// persisted/restored external state. `None` uses
+    /// `DEFAULT_MAX_CHECKPOINT_STATE_BYTES`.
     pub max_staged_bytes: Option<u64>,
-    /// Coordinated-committer lag (sealed-but-uncommitted epochs) past which the
-    /// committer warns, and — with `uncommitted_epochs_backpressure` — the hard
-    /// cap. `None` = default (1024).
-    pub max_uncommitted_epochs: Option<u64>,
-    /// Fail checkpoints once committer lag exceeds `max_uncommitted_epochs`,
-    /// bounding object-storage growth at the cost of pausing progress. Default off.
-    pub uncommitted_epochs_backpressure: bool,
-    /// Durability-gate poll first interval (ms). `None` = engine default (100).
-    pub restorable_gate_poll_initial_ms: Option<u64>,
-    /// Durability-gate poll backoff cap (ms). `None` = engine default (1000).
-    pub restorable_gate_poll_max_ms: Option<u64>,
-    /// Enable incremental delta checkpoints (cluster-only), bounding the re-base chain length.
-    /// `None` = off. When set, the per-vnode delta chain is the primary aggregate checkpoint,
-    /// dropping per-cycle cost to O(dirty). Requires a durable backend; clamped `< max_retained`
-    /// so the chain base never ages out of the prune window.
-    pub delta_chain_max: Option<u32>,
-    /// Incremental emit for non-windowed aggregate MVs: emit a dirty-only changelog into a
-    /// keyed upsert store instead of re-materializing every group each cycle
-    /// (`SELECT * FROM mv` still returns the full snapshot). Default ON.
-    pub incremental_emit: bool,
 }
-
-impl Default for StreamCheckpointConfig {
-    fn default() -> Self {
-        Self {
-            interval_ms: None,
-            data_dir: None,
-            max_retained: None,
-            alignment_timeout_ms: None,
-            max_in_flight_epochs: None,
-            max_staged_bytes: None,
-            max_uncommitted_epochs: None,
-            uncommitted_epochs_backpressure: false,
-            restorable_gate_poll_initial_ms: None,
-            restorable_gate_poll_max_ms: None,
-            delta_chain_max: None,
-            incremental_emit: true,
-        }
-    }
-}
-
-/// Errors from checkpoint operations.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CheckpointError {
-    /// Checkpointing is disabled.
-    Disabled,
-    /// A data directory is required.
-    DataDirRequired,
-    /// No checkpoint available for restore.
-    NoCheckpoint,
-    /// Operation timed out.
-    Timeout,
-    /// Invalid configuration.
-    InvalidConfig(String),
-    /// I/O error (stored as string for Clone/PartialEq).
-    IoError(String),
-}
-
-impl fmt::Display for CheckpointError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Disabled => write!(f, "checkpointing is disabled"),
-            Self::DataDirRequired => write!(f, "data directory is required"),
-            Self::NoCheckpoint => write!(f, "no checkpoint available"),
-            Self::Timeout => write!(f, "checkpoint operation timed out"),
-            Self::InvalidConfig(msg) => write!(f, "invalid checkpoint config: {msg}"),
-            Self::IoError(msg) => write!(f, "checkpoint I/O error: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for CheckpointError {}
 
 #[cfg(test)]
 mod tests {
@@ -101,11 +28,9 @@ mod tests {
     fn test_default_config() {
         let config = StreamCheckpointConfig::default();
         assert!(config.interval_ms.is_none());
+        assert!(config.timeout_ms.is_none());
         assert!(config.data_dir.is_none());
         assert!(config.max_retained.is_none());
-        assert!(config.alignment_timeout_ms.is_none());
-        // Deliberate non-Default-derive values — guard against a silent revert.
-        assert!(config.incremental_emit);
-        assert!(!config.uncommitted_epochs_backpressure);
+        assert!(config.max_staged_bytes.is_none());
     }
 }

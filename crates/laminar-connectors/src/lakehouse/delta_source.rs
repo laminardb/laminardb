@@ -19,7 +19,10 @@ use deltalake::DeltaTable;
 
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
-use crate::connector::{SourceBatch, SourceConnector};
+use crate::connector::{
+    SourceBatch, SourceConnector, SourceConsistency, SourceContract, SourceTopology,
+};
+use crate::connector::{SourcePosition, SourceStart};
 use crate::error::ConnectorError;
 
 use super::delta_source_config::DeltaSourceConfig;
@@ -35,16 +38,16 @@ use super::delta_source_config::{DeltaReadMode, SchemaEvolutionAction};
 /// # Lifecycle
 ///
 /// ```text
-/// new() -> open() -> [poll_batch()]* -> close()
-///                          |
-///                 checkpoint() / restore()
+/// new() -> start() -> [poll_batch()]* -> close()
+///                           |
+///                      checkpoint()
 /// ```
 pub struct DeltaSource {
     /// Source configuration.
     config: DeltaSourceConfig,
     /// Connector lifecycle state.
     state: ConnectorState,
-    /// Arrow schema (set from table metadata on open).
+    /// Arrow schema (set from table metadata on start).
     schema: Option<SchemaRef>,
     /// Current Delta Lake version cursor — the last *fully consumed* version.
     /// Only advanced after all buffered batches for a version are drained.
@@ -139,7 +142,21 @@ impl DeltaSource {
 #[async_trait]
 #[allow(clippy::too_many_lines)]
 impl SourceConnector for DeltaSource {
-    async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
+    fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+        Ok(SourceContract::new(
+            SourceConsistency::Ephemeral,
+            SourceTopology::Singleton,
+        ))
+    }
+
+    async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
+        let (config, position, _) = request.into_parts();
+        if let SourcePosition::Resume { attempt, .. } = position {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "Delta Lake is an ephemeral source and cannot resume checkpoint attempt {attempt:?}"
+            )));
+        }
+        let config = &config;
         self.state = ConnectorState::Initializing;
 
         // Re-parse config if properties provided.
@@ -502,25 +519,10 @@ impl SourceConnector for DeltaSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
-        let mut cp = SourceCheckpoint::new(0);
+        let mut cp = SourceCheckpoint::new();
         cp.set_offset("delta_version", self.current_version.to_string());
         cp.set_offset("read_mode", self.config.read_mode.to_string());
         cp
-    }
-
-    async fn restore(&mut self, checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
-        if let Some(version_str) = checkpoint.get_offset("delta_version") {
-            self.current_version = version_str.parse::<i64>().map_err(|_| {
-                ConnectorError::ConfigurationError(format!(
-                    "invalid delta_version in checkpoint: '{version_str}'"
-                ))
-            })?;
-            info!(
-                restored_version = self.current_version,
-                "Delta Lake source: restored from checkpoint"
-            );
-        }
-        Ok(())
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
@@ -611,15 +613,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_restore_from_checkpoint() {
+    async fn resume_fails_before_opening_the_ephemeral_source() {
         let mut source = DeltaSource::new(test_config(), None);
-        assert_eq!(source.current_version(), -1);
-
-        let mut cp = SourceCheckpoint::new(0);
-        cp.set_offset("delta_version", "10");
-        source.restore(&cp).await.unwrap();
-
-        assert_eq!(source.current_version(), 10);
+        let error = source
+            .start(
+                SourceStart::new(
+                    ConnectorConfig::new("delta-lake"),
+                    SourcePosition::Resume {
+                        attempt: laminar_core::state::CheckpointAttempt::canonical(11),
+                        checkpoint: SourceCheckpoint::new(),
+                    },
+                    crate::connector::DeliveryGuarantee::BestEffort,
+                )
+                .unwrap(),
+            )
+            .await
+            .expect_err("ephemeral Delta source must reject recovery");
+        assert!(error.to_string().contains("ephemeral"));
+        assert_eq!(source.state(), ConnectorState::Created);
     }
 
     #[test]
@@ -744,13 +755,22 @@ mod tests {
         assert!(source.pending_batches.is_empty());
     }
 
-    /// D020: Source `open()` must error without delta-lake feature.
+    /// D020: Source `start()` must error without delta-lake feature.
     #[cfg(not(feature = "delta-lake"))]
     #[tokio::test]
     async fn test_open_requires_feature() {
         let mut source = DeltaSource::new(test_config(), None);
         let connector_config = crate::config::ConnectorConfig::new("delta-lake");
-        let result = source.open(&connector_config).await;
+        let result = source
+            .start(
+                SourceStart::new(
+                    connector_config,
+                    SourcePosition::Initial,
+                    crate::connector::DeliveryGuarantee::BestEffort,
+                )
+                .unwrap(),
+            )
+            .await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("delta-lake"), "error: {err}");

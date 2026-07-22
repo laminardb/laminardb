@@ -77,5 +77,6 @@ crash-durable and per-domain-seekable. Largest; only if shared-source full-EO is
 - Manifest schema for per-domain epochs (no backward-compat constraint).
 - Cluster: per-domain recover targets on `BarrierCoordinator` without per-cycle gossip on the hot
   path (the documented alignment-timeout regression risk).
-- Interaction with the convergence gate (`assignment_ready_for_checkpoint`) and the single
-  `is_recovering` fence — both currently whole-pipeline.
+- Interaction with the exact assignment certificate
+  (`checkpoint_assignment_fence(assignment_version)`) and the single `is_recovering` fence — both
+  currently cover the whole pipeline and its canonical checkpoint participant roster.

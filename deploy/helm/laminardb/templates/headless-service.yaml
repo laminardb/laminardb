@@ -23,10 +23,6 @@ spec:
       targetPort: gossip
       protocol: TCP
       name: gossip
-    - port: {{ .Values.service.raftPort }}
-      targetPort: raft
-      protocol: TCP
-      name: raft
     {{- end }}
   selector:
     {{- include "laminardb.selectorLabels" . | nindent 4 }}

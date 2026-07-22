@@ -1,9 +1,7 @@
-//! NATS source: `JetStream` pull consumer with ack-on-commit, or core
-//! subscribe (at-most-once). A background task forwards messages through
-//! an `mpsc` channel; JS message handles are retained until
-//! `notify_epoch_committed` fires, then acked in bulk.
+//! NATS source: `JetStream` pull consumer with bounded asynchronous acknowledgement, or core
+//! subscribe (at-most-once). Messages are acknowledged only after successful deserialization;
+//! the source remains explicitly ephemeral and does not couple broker acks to checkpoints.
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,33 +11,180 @@ use async_nats::jetstream::{self, consumer::pull};
 use async_trait::async_trait;
 use bytes::Bytes;
 use crossfire::{mpsc, AsyncRx, MAsyncTx, TryRecvError};
+use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
-use rustc_hash::FxHashMap;
-use tokio::sync::Notify;
+use tokio::sync::{mpsc as tokio_mpsc, watch, Notify};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use super::config::{build_connect_options, AckPolicy, DeliverPolicy, Mode, NatsSourceConfig};
 use super::metrics::NatsSourceMetrics;
+use super::setup::{
+    classify_connect_error, classify_create_consumer_error, classify_get_stream_error,
+    classify_subscribe_error, track_connection_tasks,
+};
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::ConnectorConfig;
-use crate::connector::{PartitionInfo, SourceBatch, SourceConnector};
+use crate::connector::{
+    ConnectorTaskGuard, ConnectorTaskOwner, ConnectorTaskTracker, SourceBatch, SourceConnector,
+    SourceConsistency, SourceContract, SourcePosition, SourceStart, SourceTopology,
+};
 use crate::error::ConnectorError;
 use crate::serde::{self, RecordDeserializer};
 
+const ACK_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_ACK_CONCURRENCY: usize = 64;
+const MAX_ACK_BACKLOG: usize = 16_384;
+
 /// `ack` is `Some` only on the `JetStream` path.
 struct Incoming {
-    subject: String,
     payload: Bytes,
-    stream_seq: Option<u64>,
     ack: Option<jetstream::Message>,
+}
+
+struct AckRuntime {
+    tx: Option<tokio_mpsc::Sender<jetstream::Message>>,
+    shutdown: watch::Sender<bool>,
+    task: TrackedTask,
 }
 
 struct Running {
     deserializer: Box<dyn RecordDeserializer>,
-    rx: AsyncRx<mpsc::Array<Incoming>>,
-    shutdown: Arc<Notify>,
-    handle: JoinHandle<()>,
+    rx: Option<AsyncRx<mpsc::Array<Incoming>>>,
+    shutdown: watch::Sender<bool>,
+    reader: TrackedTask,
+    ack_runtime: Option<AckRuntime>,
+}
+
+struct TrackedTask {
+    handle: Option<JoinHandle<()>>,
+    reaper_guard: Option<ConnectorTaskGuard>,
+    name: &'static str,
+}
+
+enum TaskWait {
+    Completed(Result<(), tokio::task::JoinError>),
+    TimedOut,
+}
+
+impl TrackedTask {
+    fn spawn(
+        owner: &ConnectorTaskOwner,
+        name: &'static str,
+        future: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<Self, ConnectorError> {
+        let task_guard = owner.track().ok_or_else(|| {
+            ConnectorError::Internal("NATS source task generation is already retired".into())
+        })?;
+        let reaper_guard = owner.track().ok_or_else(|| {
+            ConnectorError::Internal("NATS source task generation is already retired".into())
+        })?;
+        let handle = tokio::spawn(async move {
+            let _task_guard = task_guard;
+            future.await;
+        });
+        Ok(Self {
+            handle: Some(handle),
+            reaper_guard: Some(reaper_guard),
+            name,
+        })
+    }
+
+    async fn wait_until(&mut self, deadline: tokio::time::Instant) -> TaskWait {
+        let Some(handle) = self.handle.as_mut() else {
+            return TaskWait::Completed(Ok(()));
+        };
+        match tokio::time::timeout_at(deadline, handle).await {
+            Ok(result) => {
+                self.handle.take();
+                self.reaper_guard.take();
+                TaskWait::Completed(result)
+            }
+            Err(_) => TaskWait::TimedOut,
+        }
+    }
+
+    fn retire(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            self.reaper_guard.take();
+            return;
+        };
+        let reaper_guard = self.reaper_guard.take();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            // Runtime destruction drops the task future and its task guard. That guard is the
+            // completion proof; a join task is useful for cleanup but is not itself the proof.
+            drop(handle);
+            drop(reaper_guard);
+            return;
+        };
+        let name = self.name;
+        drop(runtime.spawn(async move {
+            let _reaper_guard = reaper_guard;
+            if let Err(error) = handle.await {
+                debug!(task = name, %error, "retired NATS source task reaped");
+            }
+        }));
+    }
+}
+
+impl Drop for TrackedTask {
+    fn drop(&mut self) {
+        self.retire();
+    }
+}
+
+impl Running {
+    fn request_shutdown(&self) {
+        self.shutdown.send_replace(true);
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        // Drop is the final backstop for a cancelled startup/close future. Tasks retain their
+        // generation guards until they actually exit; the reapers retain the join handles.
+        self.request_shutdown();
+        self.rx.take();
+        if let Some(ack_runtime) = self.ack_runtime.as_mut() {
+            ack_runtime.request_shutdown();
+            ack_runtime.task.retire();
+        }
+        self.reader.retire();
+    }
+}
+
+impl AckRuntime {
+    fn spawn(
+        cfg: &NatsSourceConfig,
+        metrics: NatsSourceMetrics,
+        owner: &ConnectorTaskOwner,
+    ) -> Result<Self, ConnectorError> {
+        let (backlog, concurrency) = ack_runtime_limits(cfg);
+        let (tx, rx) = tokio_mpsc::channel(backlog);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let task = TrackedTask::spawn(
+            owner,
+            "ack-worker",
+            run_ack_worker(rx, shutdown_rx, concurrency, metrics),
+        )?;
+        Ok(Self {
+            tx: Some(tx),
+            shutdown,
+            task,
+        })
+    }
+
+    fn request_shutdown(&mut self) {
+        self.shutdown.send_replace(true);
+        self.tx.take();
+    }
+}
+
+impl Drop for AckRuntime {
+    fn drop(&mut self) {
+        self.request_shutdown();
+    }
 }
 
 /// NATS source — core and `JetStream` modes.
@@ -49,37 +194,27 @@ pub struct NatsSource {
     data_ready: Arc<Notify>,
     metrics: NatsSourceMetrics,
     running: Option<Running>,
-
-    // Interior mutability so `checkpoint()` (takes `&self`) can seal
-    // `pending` into `sealed` atomically with offset capture.
-    pending: parking_lot::Mutex<Vec<jetstream::Message>>,
-    sealed: parking_lot::Mutex<VecDeque<Vec<jetstream::Message>>>,
-    offsets: parking_lot::Mutex<FxHashMap<String, u64>>,
+    task_owner: ConnectorTaskOwner,
+    task_tracker: ConnectorTaskTracker,
 }
 
 impl NatsSource {
     /// Metrics register on `registry` if provided.
     #[must_use]
     pub fn new(schema: SchemaRef, registry: Option<&prometheus::Registry>) -> Self {
+        let (task_owner, task_tracker) = ConnectorTaskOwner::new();
         Self {
             schema,
             config: None,
             data_ready: Arc::new(Notify::new()),
             metrics: NatsSourceMetrics::new(registry),
             running: None,
-            pending: parking_lot::Mutex::new(Vec::new()),
-            sealed: parking_lot::Mutex::new(VecDeque::new()),
-            offsets: parking_lot::Mutex::new(FxHashMap::default()),
+            task_owner,
+            task_tracker,
         }
     }
 
-    fn update_pending_gauge(&self) {
-        let pending_len = self.pending.lock().len();
-        let sealed_total: usize = self.sealed.lock().iter().map(Vec::len).sum();
-        self.metrics.set_pending_acks(pending_len + sealed_total);
-    }
-
-    /// Available after [`SourceConnector::open`].
+    /// Available after [`SourceConnector::start`].
     #[must_use]
     pub fn config(&self) -> Option<&NatsSourceConfig> {
         self.config.as_ref()
@@ -96,7 +231,7 @@ impl NatsSource {
         cfg: &NatsSourceConfig,
         deserializer: Box<dyn RecordDeserializer>,
     ) -> Result<(), ConnectorError> {
-        let client = connect(cfg).await?;
+        let client = connect(cfg, &self.task_owner).await?;
         let js = jetstream::new(client);
 
         let stream_name = cfg
@@ -112,33 +247,45 @@ impl NatsSource {
         let stream = js
             .get_stream(stream_name)
             .await
-            .map_err(|e| err(&format!("get_stream('{stream_name}') failed: {e}")))?;
+            .map_err(|error| classify_get_stream_error(&error, stream_name))?;
         let consumer = stream
             .create_consumer(pull_cfg)
             .await
-            .map_err(|e| classify_create_consumer_error(&e, consumer_name))?;
+            .map_err(|error| classify_create_consumer_error(&error, consumer_name))?;
 
         let (tx, rx) = mpsc::bounded_async::<Incoming>(cfg.fetch_batch * 2);
-        let shutdown = Arc::new(Notify::new());
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let requires_ack = cfg.ack_policy == AckPolicy::Explicit;
+        let ack_runtime = if requires_ack {
+            Some(AckRuntime::spawn(
+                cfg,
+                self.metrics.clone(),
+                &self.task_owner,
+            )?)
+        } else {
+            None
+        };
 
         let reader = JsReader {
             consumer,
             tx,
-            shutdown: Arc::clone(&shutdown),
+            shutdown: shutdown_rx,
             consecutive_errors: Arc::new(AtomicU32::new(0)),
             data_ready: Arc::clone(&self.data_ready),
             metrics: self.metrics.clone(),
             batch_size: cfg.fetch_batch,
             max_wait: cfg.fetch_max_wait,
             lag_poll_interval: cfg.lag_poll_interval,
+            requires_ack,
         };
-        let handle = tokio::spawn(reader.run());
+        let reader = TrackedTask::spawn(&self.task_owner, "jetstream-reader", reader.run())?;
 
         self.running = Some(Running {
             deserializer,
-            rx,
+            rx: Some(rx),
             shutdown,
-            handle,
+            reader,
+            ack_runtime,
         });
         Ok(())
     }
@@ -148,7 +295,7 @@ impl NatsSource {
         cfg: &NatsSourceConfig,
         deserializer: Box<dyn RecordDeserializer>,
     ) -> Result<(), ConnectorError> {
-        let client = connect(cfg).await?;
+        let client = connect(cfg, &self.task_owner).await?;
         let subject = cfg
             .subject
             .clone()
@@ -157,30 +304,31 @@ impl NatsSource {
             client
                 .queue_subscribe(subject, group.to_string())
                 .await
-                .map_err(|e| err(&format!("queue_subscribe: {e}")))?
+                .map_err(|error| classify_subscribe_error(&error, "NATS queue subscribe"))?
         } else {
             client
                 .subscribe(subject)
                 .await
-                .map_err(|e| err(&format!("subscribe: {e}")))?
+                .map_err(|error| classify_subscribe_error(&error, "NATS subscribe"))?
         };
 
         let (tx, rx) = mpsc::bounded_async::<Incoming>(cfg.fetch_batch * 2);
-        let shutdown = Arc::new(Notify::new());
+        let (shutdown, shutdown_rx) = watch::channel(false);
 
         let reader = CoreReader {
             subscriber,
             tx,
-            shutdown: Arc::clone(&shutdown),
+            shutdown: shutdown_rx,
             data_ready: Arc::clone(&self.data_ready),
         };
-        let handle = tokio::spawn(reader.run());
+        let reader = TrackedTask::spawn(&self.task_owner, "core-reader", reader.run())?;
 
         self.running = Some(Running {
             deserializer,
-            rx,
+            rx: Some(rx),
             shutdown,
-            handle,
+            reader,
+            ack_runtime: None,
         });
         Ok(())
     }
@@ -188,17 +336,41 @@ impl NatsSource {
 
 #[async_trait]
 impl SourceConnector for NatsSource {
-    async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
-        let cfg = NatsSourceConfig::from_config(config)?;
-        // SQL DDL schema overrides the registry placeholder.
-        if let Some(schema) = config.arrow_schema() {
-            self.schema = schema;
+    fn terminal_task_tracker(&self) -> Option<ConnectorTaskTracker> {
+        Some(self.task_tracker.clone())
+    }
+
+    fn contract(&self, _config: &ConnectorConfig) -> Result<SourceContract, ConnectorError> {
+        // Neither Core NATS nor the current JetStream implementation can
+        // rewind an abandoned checkpoint attempt deterministically. Durable
+        // consumers alone are insufficient for LaminarDB replay semantics.
+        Ok(SourceContract::new(
+            SourceConsistency::Ephemeral,
+            SourceTopology::Singleton,
+        ))
+    }
+
+    async fn start(&mut self, request: SourceStart) -> Result<(), ConnectorError> {
+        let (config, position, _) = request.into_parts();
+        if let SourcePosition::Resume { attempt, .. } = position {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "NATS is an ephemeral source and cannot resume checkpoint attempt {attempt:?}"
+            )));
         }
+        let config = &config;
+
+        let cfg = NatsSourceConfig::from_config(config)?;
+        // Keep the candidate schema local until network admission succeeds so
+        // cancelling start leaves the existing instance unchanged.
+        let candidate_schema = config.arrow_schema();
         let deserializer = serde::create_deserializer(cfg.format)
             .map_err(|e| err(&format!("deserializer for format {:?}: {e}", cfg.format)))?;
         match cfg.mode {
             Mode::JetStream => self.open_jetstream(&cfg, deserializer).await?,
             Mode::Core => self.open_core(&cfg, deserializer).await?,
+        }
+        if let Some(schema) = candidate_schema {
+            self.schema = schema;
         }
         self.config = Some(cfg);
         Ok(())
@@ -213,21 +385,23 @@ impl SourceConnector for NatsSource {
         };
 
         let mut payloads: Vec<Bytes> = Vec::new();
-        let mut partition: Option<PartitionInfo> = None;
         let mut new_acks: Vec<jetstream::Message> = Vec::new();
-        let mut offset_updates: Vec<(String, u64)> = Vec::new();
+        let mut reader_disconnected = false;
 
         while payloads.len() < max_records {
-            let incoming = match running.rx.try_recv() {
+            let incoming = match running
+                .rx
+                .as_mut()
+                .expect("running NATS source owns its receiver")
+                .try_recv()
+            {
                 Ok(m) => m,
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-            };
-            if let Some(seq) = incoming.stream_seq {
-                offset_updates.push((incoming.subject.clone(), seq));
-                if partition.is_none() {
-                    partition = Some(PartitionInfo::new(&incoming.subject, seq.to_string()));
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    reader_disconnected = true;
+                    break;
                 }
-            }
+            };
             payloads.push(incoming.payload);
             if let Some(msg) = incoming.ack {
                 new_acks.push(msg);
@@ -235,39 +409,29 @@ impl SourceConnector for NatsSource {
         }
 
         if payloads.is_empty() {
+            if reader_disconnected {
+                return Err(ConnectorError::ReadError(
+                    "NATS reader task terminated unexpectedly".into(),
+                ));
+            }
             return Ok(None);
         }
 
         let records: Vec<&[u8]> = payloads.iter().map(Bytes::as_ref).collect();
         let bytes_total: u64 = records.iter().map(|r| r.len() as u64).sum();
-        // Deserialize before parking acks: on failure the handles drop
-        // un-acked and the broker redelivers after ack_wait.
+        // Deserialize before scheduling acks: on failure the handles drop unacked and the broker
+        // redelivers after ack_wait. Ack enqueue is non-blocking to keep this poll path bounded.
         let batch = running
             .deserializer
             .deserialize_batch(&records, &self.schema)
             .map_err(|e| err(&format!("deserialize batch: {e}")))?;
 
-        if !offset_updates.is_empty() {
-            let mut offsets = self.offsets.lock();
-            for (subject, seq) in offset_updates {
-                offsets
-                    .entry(subject)
-                    .and_modify(|s| *s = (*s).max(seq))
-                    .or_insert(seq);
-            }
-        }
-        if !new_acks.is_empty() {
-            self.pending.lock().extend(new_acks);
-        }
+        enqueue_acks(running.ack_runtime.as_ref(), new_acks, &self.metrics);
 
         self.metrics
             .record_poll(batch.num_rows() as u64, bytes_total);
-        self.update_pending_gauge();
 
-        Ok(Some(SourceBatch {
-            records: batch,
-            partition,
-        }))
+        Ok(Some(SourceBatch::new(batch)))
     }
 
     fn schema(&self) -> SchemaRef {
@@ -275,69 +439,50 @@ impl SourceConnector for NatsSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
-        // Seal now-pending acks into this epoch; anything arriving after
-        // goes into a fresh batch committed with a later epoch. Without
-        // this split, an ack could fire before its manifest record lands.
-        {
-            let mut pending = self.pending.lock();
-            if !pending.is_empty() {
-                let batch = std::mem::take(&mut *pending);
-                self.sealed.lock().push_back(batch);
-            }
-        }
-        let mut cp = SourceCheckpoint::default();
-        for (subject, seq) in &*self.offsets.lock() {
-            cp.set_offset(subject.as_str(), seq.to_string());
-        }
-        cp
-    }
-
-    async fn restore(&mut self, _checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
-        // Durable consumer ack floor on the server is authoritative.
-        Ok(())
+        // Ephemeral sources deliberately expose no recovery cursor. JetStream acknowledgements
+        // are delivery progress, not checkpoint-owned state.
+        SourceCheckpoint::new()
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
-        let Some(running) = self.running.take() else {
+        let Some(mut running) = self.running.take() else {
             return Ok(());
         };
-        running.shutdown.notify_one();
-        let _ = tokio::time::timeout(Duration::from_secs(5), running.handle).await;
+        let close_deadline = tokio::time::Instant::now() + CLOSE_DRAIN_TIMEOUT;
+        running.request_shutdown();
+        match running.reader.wait_until(close_deadline).await {
+            TaskWait::Completed(Ok(())) => {}
+            TaskWait::Completed(Err(error)) => {
+                warn!(%error, "NATS reader task failed while closing");
+            }
+            TaskWait::TimedOut => warn!(
+                "NATS reader exceeded its close deadline; its tracked reaper retains shutdown ownership"
+            ),
+        }
+        // Drop unread messages only after the reader has stopped. Their unacked JetStream
+        // handles remain eligible for broker redelivery.
+        running.rx.take();
+
+        if let Some(mut ack_runtime) = running.ack_runtime.take() {
+            ack_runtime.request_shutdown();
+            match ack_runtime.task.wait_until(close_deadline).await {
+                TaskWait::Completed(Ok(())) => {}
+                TaskWait::Completed(Err(error)) => {
+                    warn!(%error, "NATS ack worker failed while closing");
+                    self.metrics.record_abandoned_acks();
+                }
+                TaskWait::TimedOut => {
+                    warn!(
+                        "NATS ack worker exceeded its close deadline; its tracked reaper retains shutdown ownership"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
     fn data_ready_notify(&self) -> Option<Arc<Notify>> {
         Some(Arc::clone(&self.data_ready))
-    }
-
-    fn supports_replay(&self) -> bool {
-        // JetStream is replayable (durable consumer); core NATS is not.
-        !matches!(self.config.as_ref().map(|c| c.mode), Some(Mode::Core))
-    }
-
-    async fn notify_epoch_committed(
-        &mut self,
-        _epoch: u64,
-        _checkpoint: &crate::checkpoint::SourceCheckpoint,
-    ) -> Result<(), ConnectorError> {
-        // Per-msg ack errors don't roll the epoch back; the broker
-        // redelivers on ack_wait.
-        loop {
-            let Some(batch) = self.sealed.lock().pop_front() else {
-                break;
-            };
-            for msg in batch {
-                match msg.ack().await {
-                    Ok(()) => self.metrics.record_ack(),
-                    Err(e) => {
-                        self.metrics.record_ack_error();
-                        warn!(error = %e, "JetStream ack failed; broker will redeliver");
-                    }
-                }
-            }
-        }
-        self.update_pending_gauge();
-        Ok(())
     }
 }
 
@@ -347,11 +492,156 @@ fn err(msg: &str) -> ConnectorError {
     ConnectorError::ConfigurationError(msg.to_string())
 }
 
-async fn connect(cfg: &NatsSourceConfig) -> Result<async_nats::Client, ConnectorError> {
-    build_connect_options(&cfg.auth, &cfg.tls)?
+fn ack_runtime_limits(cfg: &NatsSourceConfig) -> (usize, usize) {
+    let broker_limit = usize::try_from(cfg.max_ack_pending)
+        .ok()
+        .filter(|limit| *limit > 0);
+    let fallback = cfg.fetch_batch.saturating_mul(2);
+    let backlog = broker_limit.unwrap_or(fallback).clamp(1, MAX_ACK_BACKLOG);
+    let concurrency = cfg.fetch_batch.clamp(1, MAX_ACK_CONCURRENCY).min(backlog);
+    (backlog, concurrency)
+}
+
+fn enqueue_acks(
+    runtime: Option<&AckRuntime>,
+    messages: Vec<jetstream::Message>,
+    metrics: &NatsSourceMetrics,
+) {
+    if messages.is_empty() {
+        return;
+    }
+    let Some(runtime) = runtime else {
+        metrics.record_ack_enqueue_errors(messages.len());
+        warn!(
+            rejected = messages.len(),
+            "JetStream ack worker is unavailable; broker will redeliver"
+        );
+        return;
+    };
+
+    let mut rejected = 0usize;
+    for message in messages {
+        // Increment before publication: a fast worker may complete immediately after try_send.
+        metrics.record_ack_enqueued();
+        if runtime
+            .tx
+            .as_ref()
+            .is_none_or(|tx| tx.try_send(message).is_err())
+        {
+            metrics.record_ack_error();
+            rejected += 1;
+        }
+    }
+    if rejected > 0 {
+        warn!(
+            rejected,
+            "JetStream ack backlog is full or closed; broker will redeliver"
+        );
+    }
+}
+
+async fn run_ack_worker(
+    rx: tokio_mpsc::Receiver<jetstream::Message>,
+    shutdown: watch::Receiver<bool>,
+    concurrency: usize,
+    metrics: NatsSourceMetrics,
+) {
+    // Ack calls stay scoped under the worker. Its single generation guard therefore proves that
+    // the receiver and every in-flight acknowledgement have all been dropped or completed.
+    let task_metrics = metrics.clone();
+    let abandoned = run_bounded_queue(rx, shutdown, concurrency, move |message| {
+        let metrics = task_metrics.clone();
+        async move {
+            acknowledge_message(message, &metrics).await;
+        }
+    })
+    .await;
+    if abandoned > 0 {
+        metrics.record_ack_abandoned(abandoned);
+        warn!(
+            abandoned,
+            "discarded queued JetStream acknowledgements during shutdown; broker will redeliver"
+        );
+    }
+}
+
+async fn run_bounded_queue<T, F, Fut>(
+    mut rx: tokio_mpsc::Receiver<T>,
+    mut shutdown: watch::Receiver<bool>,
+    concurrency: usize,
+    process: F,
+) -> usize
+where
+    T: Send + 'static,
+    F: Fn(T) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    debug_assert!(concurrency > 0);
+    let mut in_flight = FuturesUnordered::new();
+    'input: loop {
+        if shutdown_requested(&shutdown) || rx.is_closed() {
+            break;
+        }
+        while in_flight.len() >= concurrency {
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => break 'input,
+                _ = in_flight.next() => {}
+            }
+            if rx.is_closed() {
+                break 'input;
+            }
+        }
+
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => break,
+            _ = in_flight.next(), if !in_flight.is_empty() => {}
+            message = rx.recv() => {
+                let Some(message) = message else {
+                    break;
+                };
+                in_flight.push(process(message));
+            }
+        }
+    }
+
+    // Closing the receiver makes queued-but-unstarted messages immediately eligible for broker
+    // redelivery. Only work already admitted to `in_flight` is allowed to consume the close budget.
+    rx.close();
+    let mut abandoned = 0usize;
+    while rx.try_recv().is_ok() {
+        abandoned = abandoned.saturating_add(1);
+    }
+    while in_flight.next().await.is_some() {}
+    abandoned
+}
+
+async fn acknowledge_message(message: jetstream::Message, metrics: &NatsSourceMetrics) {
+    match tokio::time::timeout(ACK_IO_TIMEOUT, message.double_ack()).await {
+        Ok(Ok(())) => metrics.record_ack(),
+        Ok(Err(error)) => {
+            metrics.record_ack_error();
+            warn!(%error, "JetStream ack failed; broker will redeliver");
+        }
+        Err(_) => {
+            metrics.record_ack_error();
+            warn!(
+                timeout_ms = ACK_IO_TIMEOUT.as_millis(),
+                "JetStream ack timed out; broker will redeliver"
+            );
+        }
+    }
+}
+
+async fn connect(
+    cfg: &NatsSourceConfig,
+    owner: &ConnectorTaskOwner,
+) -> Result<async_nats::Client, ConnectorError> {
+    track_connection_tasks(build_connect_options(&cfg.auth, &cfg.tls)?, owner, "source")?
         .connect(&cfg.servers)
         .await
-        .map_err(|e| err(&format!("nats connect({:?}): {e}", cfg.servers)))
+        .map_err(|error| classify_connect_error(&error))
 }
 
 fn build_pull_config(
@@ -428,33 +718,6 @@ fn fetch_backoff(consecutive_errors: u32, entropy: u64) -> Duration {
     with_jitter(fetch_backoff_base(consecutive_errors), entropy)
 }
 
-/// Server 10148 / 10013 → consumer exists with a conflicting config;
-/// raise LDB-5070 with an operator fix-up.
-fn classify_create_consumer_error(
-    e: &async_nats::jetstream::stream::ConsumerError,
-    consumer_name: &str,
-) -> ConnectorError {
-    use async_nats::jetstream::stream::ConsumerErrorKind;
-    use async_nats::jetstream::ErrorCode;
-
-    let drift_code = match e.kind() {
-        ConsumerErrorKind::JetStream(server_err) => matches!(
-            server_err.error_code(),
-            ErrorCode::CONSUMER_ALREADY_EXISTS | ErrorCode::CONSUMER_NAME_EXIST
-        ),
-        _ => false,
-    };
-    if drift_code {
-        err(&format!(
-            "[LDB-5070] consumer '{consumer_name}' exists with incompatible config; \
-             rotate the durable name or delete the consumer out-of-band. \
-             Server said: {e}"
-        ))
-    } else {
-        err(&format!("create_consumer('{consumer_name}') failed: {e}"))
-    }
-}
-
 /// Wall-clock nanos for `with_jitter`. `Instant::now().elapsed()` is ~0
 /// and produces correlated jitter across tasks.
 #[allow(clippy::cast_possible_truncation)]
@@ -465,10 +728,14 @@ fn entropy_now() -> u64 {
         .as_nanos() as u64
 }
 
+fn shutdown_requested(shutdown: &watch::Receiver<bool>) -> bool {
+    *shutdown.borrow() || shutdown.has_changed().is_err()
+}
+
 struct JsReader {
     consumer: jetstream::consumer::Consumer<pull::Config>,
     tx: MAsyncTx<mpsc::Array<Incoming>>,
-    shutdown: Arc<Notify>,
+    shutdown: watch::Receiver<bool>,
     consecutive_errors: Arc<AtomicU32>,
     data_ready: Arc<Notify>,
     metrics: NatsSourceMetrics,
@@ -476,6 +743,7 @@ struct JsReader {
     max_wait: Duration,
     /// `Duration::ZERO` disables the poll.
     lag_poll_interval: Duration,
+    requires_ack: bool,
 }
 
 impl JsReader {
@@ -483,22 +751,26 @@ impl JsReader {
         let Self {
             mut consumer,
             tx,
-            shutdown,
+            mut shutdown,
             consecutive_errors,
             data_ready,
             metrics,
             batch_size,
             max_wait,
             lag_poll_interval,
+            requires_ack,
         } = self;
 
         let mut last_lag_poll = Instant::now();
         let lag_poll_enabled = !lag_poll_interval.is_zero();
 
         loop {
+            if shutdown_requested(&shutdown) {
+                break;
+            }
             let fetch_result = tokio::select! {
                 biased;
-                () = shutdown.notified() => break,
+                _ = shutdown.changed() => break,
                 r = consumer.fetch().max_messages(batch_size).expires(max_wait).messages() => r,
             };
 
@@ -515,7 +787,7 @@ impl JsReader {
                     let backoff = fetch_backoff(errs, entropy_now());
                     tokio::select! {
                         biased;
-                        () = shutdown.notified() => break,
+                        _ = shutdown.changed() => break,
                         () = tokio::time::sleep(backoff) => {}
                     }
                     continue;
@@ -527,7 +799,7 @@ impl JsReader {
             loop {
                 let msg_result = tokio::select! {
                     biased;
-                    () = shutdown.notified() => return,
+                    _ = shutdown.changed() => return,
                     r = stream.next() => match r {
                         Some(r) => r,
                         None => break,
@@ -542,13 +814,17 @@ impl JsReader {
                         continue;
                     }
                 };
+                let payload = msg.payload.clone();
                 let incoming = Incoming {
-                    subject: msg.subject.to_string(),
-                    payload: msg.payload.clone(),
-                    stream_seq: msg.info().ok().map(|i| i.stream_sequence),
-                    ack: Some(msg),
+                    payload,
+                    ack: requires_ack.then_some(msg),
                 };
-                if tx.send(incoming).await.is_err() {
+                let send_result = tokio::select! {
+                    biased;
+                    _ = shutdown.changed() => return,
+                    result = tx.send(incoming) => result,
+                };
+                if send_result.is_err() {
                     debug!("nats reader: downstream channel closed");
                     return;
                 }
@@ -565,7 +841,7 @@ impl JsReader {
                 let backoff = fetch_backoff(errs, entropy_now());
                 tokio::select! {
                     biased;
-                    () = shutdown.notified() => break,
+                    _ = shutdown.changed() => break,
                     () = tokio::time::sleep(backoff) => {}
                 }
             }
@@ -584,7 +860,7 @@ impl JsReader {
 struct CoreReader {
     subscriber: async_nats::Subscriber,
     tx: MAsyncTx<mpsc::Array<Incoming>>,
-    shutdown: Arc<Notify>,
+    shutdown: watch::Receiver<bool>,
     data_ready: Arc<Notify>,
 }
 
@@ -593,30 +869,39 @@ impl CoreReader {
         let Self {
             mut subscriber,
             tx,
-            shutdown,
+            mut shutdown,
             data_ready,
         } = self;
 
         loop {
+            if shutdown_requested(&shutdown) {
+                break;
+            }
             let msg = tokio::select! {
                 biased;
-                () = shutdown.notified() => break,
+                _ = shutdown.changed() => break,
                 m = subscriber.next() => match m {
                     Some(m) => m,
                     None => break,
                 },
             };
             let incoming = Incoming {
-                subject: msg.subject.to_string(),
                 payload: msg.payload,
-                stream_seq: None,
                 ack: None,
             };
-            if tx.send(incoming).await.is_err() {
-                return;
+            let send_result = tokio::select! {
+                biased;
+                _ = shutdown.changed() => break,
+                result = tx.send(incoming) => result,
+            };
+            if send_result.is_err() {
+                break;
             }
             data_ready.notify_one();
         }
+        // Wake the coordinator so it observes the now-disconnected channel immediately instead
+        // of treating a terminated Core subscription as an indefinitely idle source.
+        data_ready.notify_one();
     }
 }
 
@@ -625,14 +910,318 @@ mod tests {
     use super::*;
     use arrow_schema::Schema;
 
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    async fn pending_task(
+        started: tokio::sync::oneshot::Sender<()>,
+        dropped: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let _drop_signal = DropSignal(Some(dropped));
+        let _ = started.send(());
+        let _ = release.await;
+    }
+
     #[test]
-    fn checkpoint_empty_pending_is_noop() {
-        // `jetstream::Message` can't be constructed without a server,
-        // so we only cover the empty path here; non-empty sealing is
-        // exercised in `tests/nats_integration.rs`.
+    fn source_contract_is_ephemeral_even_for_jetstream_config() {
+        let source = NatsSource::new(Arc::new(Schema::empty()), None);
+        let mut config = ConnectorConfig::new("nats");
+        config.set("mode", "jetstream");
+        let contract = source.contract(&config).expect("static NATS contract");
+        assert_eq!(contract.consistency, SourceConsistency::Ephemeral);
+        assert_eq!(contract.topology, SourceTopology::Singleton);
+    }
+
+    #[test]
+    fn ephemeral_source_checkpoint_has_no_protocol_state() {
         let src = NatsSource::new(Arc::new(Schema::empty()), None);
-        let _ = src.checkpoint();
-        assert!(src.sealed.lock().is_empty());
+        assert!(src.checkpoint().is_empty());
+        assert_eq!(
+            src.cancellation_policy(),
+            crate::connector::ConnectorCancellationPolicy::RetireConnector
+        );
+    }
+
+    #[test]
+    fn task_tracker_notifies_waiters_on_another_runtime() {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (tracker_tx, tracker_rx) = std::sync::mpsc::sync_channel(1);
+        let owner_thread = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let mut source = NatsSource::new(Arc::new(Schema::empty()), None);
+                    let terminal = source.terminal_task_tracker().unwrap();
+                    let owner_waiter = terminal.clone();
+                    let (_, rx) = mpsc::bounded_async::<Incoming>(1);
+                    let (shutdown, _) = watch::channel(false);
+                    let reader = TrackedTask::spawn(
+                        &source.task_owner,
+                        "cross-runtime-reader",
+                        async move {
+                            let _ = release_rx.await;
+                        },
+                    )
+                    .unwrap();
+                    source.running = Some(Running {
+                        deserializer: serde::create_deserializer(serde::Format::Raw).unwrap(),
+                        rx: Some(rx),
+                        shutdown,
+                        reader,
+                        ack_runtime: None,
+                    });
+                    tracker_tx.send(terminal).unwrap();
+                    drop(source);
+                    owner_waiter.wait_terminated().await;
+                });
+        });
+
+        let terminal = tracker_rx.recv().unwrap();
+        assert!(!terminal.is_terminated());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                release_tx.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(1), terminal.wait_terminated())
+                    .await
+                    .expect("cross-runtime tracker waiter was not notified");
+            });
+        owner_thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn disconnected_reader_drains_queued_payload_before_terminal_error() {
+        let mut src = NatsSource::new(Arc::new(Schema::empty()), None);
+        let (tx, rx) = mpsc::bounded_async::<Incoming>(2);
+        assert!(tx
+            .try_send(Incoming {
+                payload: Bytes::from_static(b"one"),
+                ack: None,
+            })
+            .is_ok());
+        drop(tx);
+        let (shutdown, _) = watch::channel(false);
+        let reader = TrackedTask::spawn(&src.task_owner, "test-reader", async {}).unwrap();
+        src.running = Some(Running {
+            deserializer: serde::create_deserializer(serde::Format::Raw).unwrap(),
+            rx: Some(rx),
+            shutdown,
+            reader,
+            ack_runtime: None,
+        });
+
+        let final_batch = src.poll_batch(10).await.unwrap().unwrap();
+        assert_eq!(final_batch.records.num_rows(), 1);
+
+        let error = src.poll_batch(10).await.unwrap_err();
+        assert!(matches!(error, ConnectorError::ReadError(_)));
+        assert!(error.to_string().contains("reader task terminated"));
+    }
+
+    #[tokio::test]
+    async fn dropping_source_signals_and_reaps_the_owned_reader() {
+        let mut source = NatsSource::new(Arc::new(Schema::empty()), None);
+        let terminal = source.terminal_task_tracker().unwrap();
+        let (_, rx) = mpsc::bounded_async::<Incoming>(1);
+        let (shutdown, mut task_shutdown) = watch::channel(false);
+        let shutdown_observer = task_shutdown.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let reader = TrackedTask::spawn(&source.task_owner, "test-reader", async move {
+            let _drop_signal = DropSignal(Some(dropped_tx));
+            let _ = started_tx.send(());
+            let _ = task_shutdown.changed().await;
+        })
+        .unwrap();
+        source.running = Some(Running {
+            deserializer: serde::create_deserializer(serde::Format::Raw).unwrap(),
+            rx: Some(rx),
+            shutdown,
+            reader,
+            ack_runtime: None,
+        });
+        started_rx.await.expect("reader task started");
+
+        drop(source);
+
+        assert!(*shutdown_observer.borrow(), "drop must publish shutdown");
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("reader must observe shutdown on drop")
+            .expect("reader drop signal");
+        tokio::time::timeout(Duration::from_secs(1), terminal.wait_terminated())
+            .await
+            .expect("reader and its tracked reaper must terminate");
+    }
+
+    #[tokio::test]
+    async fn normal_close_joins_reader_and_ack_tasks() {
+        let mut source = NatsSource::new(Arc::new(Schema::empty()), None);
+        let (_, rx) = mpsc::bounded_async::<Incoming>(1);
+        let (shutdown, mut shutdown_rx) = watch::channel(false);
+        let (reader_started_tx, reader_started_rx) = tokio::sync::oneshot::channel();
+        let (reader_dropped_tx, reader_dropped_rx) = tokio::sync::oneshot::channel();
+        let reader = TrackedTask::spawn(&source.task_owner, "test-reader", async move {
+            let _drop_signal = DropSignal(Some(reader_dropped_tx));
+            let _ = reader_started_tx.send(());
+            let _ = shutdown_rx.changed().await;
+        })
+        .unwrap();
+
+        let (ack_tx, mut ack_rx) = tokio_mpsc::channel::<jetstream::Message>(1);
+        let (ack_shutdown, _) = watch::channel(false);
+        let (ack_started_tx, ack_started_rx) = tokio::sync::oneshot::channel();
+        let (ack_dropped_tx, ack_dropped_rx) = tokio::sync::oneshot::channel();
+        let ack_task = TrackedTask::spawn(&source.task_owner, "test-ack", async move {
+            let _drop_signal = DropSignal(Some(ack_dropped_tx));
+            let _ = ack_started_tx.send(());
+            while ack_rx.recv().await.is_some() {}
+        })
+        .unwrap();
+
+        source.running = Some(Running {
+            deserializer: serde::create_deserializer(serde::Format::Raw).unwrap(),
+            rx: Some(rx),
+            shutdown,
+            reader,
+            ack_runtime: Some(AckRuntime {
+                tx: Some(ack_tx),
+                shutdown: ack_shutdown,
+                task: ack_task,
+            }),
+        });
+        reader_started_rx.await.expect("reader task started");
+        ack_started_rx.await.expect("ack task started");
+
+        tokio::time::timeout(Duration::from_secs(1), source.close())
+            .await
+            .expect("normal close must join owned tasks")
+            .unwrap();
+
+        for (name, dropped) in [("reader", reader_dropped_rx), ("ack", ack_dropped_rx)] {
+            tokio::time::timeout(Duration::from_secs(1), dropped)
+                .await
+                .unwrap_or_else(|_| panic!("{name} task was not joined"))
+                .unwrap_or_else(|_| panic!("{name} drop signal closed"));
+        }
+        assert!(source.running.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelling_close_does_not_detach_reader_or_ack_tasks() {
+        let mut source = NatsSource::new(Arc::new(Schema::empty()), None);
+        let terminal = source.terminal_task_tracker().unwrap();
+        let (_, rx) = mpsc::bounded_async::<Incoming>(1);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let (reader_started_tx, reader_started_rx) = tokio::sync::oneshot::channel();
+        let (reader_dropped_tx, reader_dropped_rx) = tokio::sync::oneshot::channel();
+        let (reader_release_tx, reader_release_rx) = tokio::sync::oneshot::channel();
+        let reader = TrackedTask::spawn(
+            &source.task_owner,
+            "test-reader",
+            pending_task(reader_started_tx, reader_dropped_tx, reader_release_rx),
+        )
+        .unwrap();
+
+        let (ack_tx, ack_rx) = tokio_mpsc::channel::<jetstream::Message>(1);
+        let (ack_shutdown, _) = watch::channel(false);
+        let (ack_started_tx, ack_started_rx) = tokio::sync::oneshot::channel();
+        let (ack_dropped_tx, ack_dropped_rx) = tokio::sync::oneshot::channel();
+        let (ack_release_tx, ack_release_rx) = tokio::sync::oneshot::channel();
+        let ack_task = TrackedTask::spawn(&source.task_owner, "test-ack", async move {
+            let _ack_rx = ack_rx;
+            pending_task(ack_started_tx, ack_dropped_tx, ack_release_rx).await;
+        })
+        .unwrap();
+        source.running = Some(Running {
+            deserializer: serde::create_deserializer(serde::Format::Raw).unwrap(),
+            rx: Some(rx),
+            shutdown,
+            reader,
+            ack_runtime: Some(AckRuntime {
+                tx: Some(ack_tx),
+                shutdown: ack_shutdown,
+                task: ack_task,
+            }),
+        });
+        reader_started_rx.await.expect("reader task started");
+        ack_started_rx.await.expect("ack task started");
+
+        let close = tokio::spawn(async move { source.close().await });
+        tokio::task::yield_now().await;
+        assert!(!close.is_finished(), "close must be waiting for the reader");
+        close.abort();
+        assert!(close
+            .await
+            .expect_err("close waiter cancelled")
+            .is_cancelled());
+
+        assert!(
+            *shutdown_rx.borrow(),
+            "cancelling close must publish shutdown"
+        );
+        assert!(
+            !terminal.is_terminated(),
+            "task guards must keep a cancelled generation non-terminal"
+        );
+        reader_release_tx.send(()).expect("release reader");
+        ack_release_tx.send(()).expect("release ack worker");
+
+        for (name, dropped) in [("reader", reader_dropped_rx), ("ack", ack_dropped_rx)] {
+            tokio::time::timeout(Duration::from_secs(1), dropped)
+                .await
+                .unwrap_or_else(|_| panic!("{name} task remained detached"))
+                .unwrap_or_else(|_| panic!("{name} drop signal closed"));
+        }
+        tokio::time::timeout(Duration::from_secs(1), terminal.wait_terminated())
+            .await
+            .expect("generation must become terminal after every owned task exits");
+    }
+
+    #[tokio::test]
+    async fn ack_shutdown_discards_queued_but_unstarted_work() {
+        let (tx, rx) = tokio_mpsc::channel(8);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (admitted_tx, mut admitted_rx) = tokio_mpsc::unbounded_channel();
+        let release = Arc::new(Notify::new());
+        let worker_release = Arc::clone(&release);
+        let worker = tokio::spawn(run_bounded_queue(rx, shutdown_rx, 1, move |message| {
+            let admitted_tx = admitted_tx.clone();
+            let release = Arc::clone(&worker_release);
+            async move {
+                admitted_tx.send(message).unwrap();
+                release.notified().await;
+            }
+        }));
+
+        for message in 1..=3 {
+            tx.send(message).await.unwrap();
+        }
+        assert_eq!(admitted_rx.recv().await, Some(1));
+
+        shutdown_tx.send_replace(true);
+        drop(tx);
+        tokio::task::yield_now().await;
+        release.notify_one();
+
+        let abandoned = tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("worker shutdown must be bounded by admitted work")
+            .unwrap();
+        assert_eq!(abandoned, 2);
+        assert!(admitted_rx.try_recv().is_err());
     }
 
     #[test]

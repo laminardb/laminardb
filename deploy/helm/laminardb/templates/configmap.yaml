@@ -17,7 +17,11 @@ data:
 
     [server]
     mode = "{{ if $isCluster }}cluster{{ else }}{{ .Values.laminardb.mode }}{{ end }}"
+    delivery = "{{ .Values.laminardb.delivery }}"
     bind = "{{ .Values.laminardb.httpBind }}"
+    {{- if $isCluster }}
+    key_groups = {{ $cluster.keyGroups }}
+    {{- end }}
     workers = {{ .Values.laminardb.workers }}
     log_level = "{{ .Values.laminardb.logLevel }}"
     {{- if (.Values.laminardb.consoleToken | default dict).existingSecret }}
@@ -26,12 +30,6 @@ data:
     {{- end }}
     {{- with .Values.laminardb.consoleCorsAllowedOrigins }}
     console_cors_allowed_origins = [{{ range $i, $o := . }}{{ if $i }}, {{ end }}"{{ $o }}"{{ end }}]
-    {{- end }}
-    {{- if gt (.Values.laminardb.state.memoryBudgetBytes | int64) 0 }}
-    state_memory_budget_bytes = {{ .Values.laminardb.state.memoryBudgetBytes }}
-    {{- end }}
-    {{- if .Values.laminardb.state.tier.enabled }}
-    state_tier_dir = "{{ .Values.laminardb.state.tier.path }}"
     {{- end }}
     {{- if .Values.laminardb.pgwire.enabled }}
     {{- $pg := .Values.laminardb.pgwire }}
@@ -58,23 +56,16 @@ data:
 
     [state]
     backend = "{{ .Values.laminardb.state.backend }}"
-    vnode_capacity = {{ .Values.laminardb.state.vnodeCapacity | default 256 }}
     {{- if eq .Values.laminardb.state.backend "local" }}
     path = "{{ .Values.laminardb.state.path }}"
-    instance_id = "{{ default "${HOSTNAME}" .Values.laminardb.state.instanceId }}"
     {{- else if eq .Values.laminardb.state.backend "object_store" }}
     url = "{{ .Values.laminardb.state.url }}"
-    instance_id = "{{ default "${HOSTNAME}" .Values.laminardb.state.instanceId }}"
-    {{- if .Values.laminardb.state.vnodes }}
-    vnodes = [{{ range $i, $v := .Values.laminardb.state.vnodes }}{{ if $i }}, {{ end }}{{ $v }}{{ end }}]
-    {{- end }}
     {{- end }}
 
     [checkpoint]
     url = "{{ .Values.laminardb.checkpoint.url | default "file:///var/lib/laminardb/checkpoints" }}"
     interval = "{{ .Values.laminardb.checkpoint.interval }}"
-    mode = "{{ .Values.laminardb.checkpoint.mode }}"
-    snapshot_strategy = "{{ .Values.laminardb.checkpoint.snapshotStrategy }}"
+    timeout = "{{ .Values.laminardb.checkpoint.timeout }}"
 
     {{- if $isCluster }}
 
@@ -93,13 +84,6 @@ data:
     # Generated from replicaCount: every node lists the full cluster (self included).
     seeds = [{{ range $i := until (int .Values.replicaCount) }}{{ if $i }}, {{ end }}"{{ include "laminardb.fullname" $ }}-{{ $i }}.{{ $podDomain }}:{{ $gossipPort }}"{{ end }}]
     {{- end }}
-
-    [coordination]
-    {{- $coordination := $cluster.coordination | default dict }}
-    strategy = "{{ $coordination.strategy }}"
-    raft_port = {{ $coordination.raftPort }}
-    election_timeout = "{{ $coordination.electionTimeout }}"
-    heartbeat_interval = "{{ $coordination.heartbeatInterval }}"
     {{- end }}
 
     {{- range .Values.sources }}
@@ -113,7 +97,7 @@ data:
     {{- if .properties }}
     [source.properties]
     {{- range $key, $val := .properties }}
-    {{ $key }} = {{ $val | quote }}
+    {{ $key | quote }} = {{ $val | quote }}
     {{- end }}
     {{- end }}
     {{- range .schema }}
@@ -144,7 +128,7 @@ data:
     {{- if .properties }}
     [lookup.properties]
     {{- range $key, $val := .properties }}
-    {{ $key }} = {{ $val | quote }}
+    {{ $key | quote }} = {{ $val | quote }}
     {{- end }}
     {{- end }}
     {{- end }}
@@ -167,13 +151,10 @@ data:
     name = "{{ .name }}"
     pipeline = "{{ .pipeline }}"
     connector = "{{ .connector }}"
-    {{- if .delivery }}
-    delivery = "{{ .delivery }}"
-    {{- end }}
     {{- if .properties }}
     [sink.properties]
     {{- range $key, $val := .properties }}
-    {{ $key }} = {{ $val | quote }}
+    {{ $key | quote }} = {{ $val | quote }}
     {{- end }}
     {{- end }}
     {{- end }}

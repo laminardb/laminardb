@@ -4,7 +4,7 @@ A Helm chart for deploying [LaminarDB](https://laminardb.dev) (Embedded Streamin
 
 ## 🚀 Quick Start (Standalone / Standalone-Durable)
 
-By default, the chart runs in `embedded` (single-node) mode.
+By default, the chart runs in `single` (standalone) mode.
 
 ```bash
 helm repo add laminardb https://laminardb.io/charts
@@ -20,17 +20,17 @@ helm install my-laminardb deploy/helm/laminardb
 
 ---
 
-## 🌐 Production Clustered Setup (`cluster` mode)
+## 🌐 Durable Clustered Setup (`cluster` mode)
 
-LaminarDB supports distributed execution where query processing and subscription routing are coordinated across multiple nodes.
+LaminarDB supports distributed streaming execution across multiple nodes.
 
-To run a production-ready, durable 3-node cluster:
+Cluster mode is still pre-production while the open security and operability work is completed. To run a durable 3-node cluster configuration for evaluation:
 
 1. **Set `laminardb.mode` to `"cluster"`**
 2. **Increase `replicaCount` to `3` (or more)**
 3. **Configure durable state and checkpoints**
 
-Here is an example production values file (`prod-values.yaml`):
+Here is an example cluster values file (`cluster-values.yaml`):
 
 ```yaml
 replicaCount: 3
@@ -41,27 +41,22 @@ laminardb:
   workers: 4
   
   state:
-    backend: local
-    path: "/var/lib/laminardb/state"
+    backend: object_store
+    url: "az://laminardb-checkpoints/cluster-state"
     
   checkpoint:
     interval: "30s"
-    mode: aligned
-    snapshotStrategy: incremental
+    timeout: "120s"
     # Object store so checkpoints are recoverable across nodes (credentials via extraEnv).
     url: "az://laminardb-checkpoints/cluster"
     
   cluster:
+    keyGroups: 256
     discovery:
       strategy: gossip
       gossipPort: 7946
       # seeds are generated from replicaCount (per-pod headless DNS names);
       # set `seeds` explicitly only for non-standard topologies
-    coordination:
-      strategy: raft
-      raftPort: 7947
-      electionTimeout: "1500ms"
-      heartbeatInterval: "300ms"
 
 persistence:
   state:
@@ -102,7 +97,7 @@ topologySpreadConstraints:
 
 Apply this via:
 ```bash
-helm install my-laminardb deploy/helm/laminardb -f prod-values.yaml
+helm install my-laminardb deploy/helm/laminardb -f cluster-values.yaml
 ```
 
 ---
@@ -162,21 +157,21 @@ prometheusRule:
 |--------|-------------|---------|
 | `replicaCount` | Number of pods to run | `1` |
 | `podManagementPolicy` | StatefulSet pod launch ordering: `Parallel` or `OrderedReady` (immutable after creation) | `Parallel` |
-| `laminardb.mode` | Server mode: `embedded` or `cluster` | `embedded` |
+| `laminardb.mode` | Server mode: `single` or `cluster` | `single` |
 | `laminardb.logLevel` | Log level: `trace`, `debug`, `info`, `warn`, `error` | `info` |
 | `laminardb.httpBind` | HTTP API bind address | `0.0.0.0:8080` |
 | `laminardb.workers` | Number of worker threads (0 = auto) | `0` |
 | `laminardb.consoleToken.existingSecret` | Secret holding the console API bearer token (key from `secretKey`, default `token`); empty = unauthenticated | `""` |
 | `laminardb.consoleCorsAllowedOrigins` | CORS allow-list of console origins; empty = permissive legacy policy | `[]` |
 | `laminardb.state.backend` | Storage type: `in_process`, `local`, or `object_store` | `local` |
+| `laminardb.delivery` | Pipeline-wide delivery: `best_effort`, `at_least_once`, or single-node `exactly_once` (cluster currently requires `at_least_once`) | `at_least_once` |
 | `laminardb.state.path` | Path for persistent state (required if backend=local) | `/var/lib/laminardb/state` |
 | `laminardb.state.url` | URL for object storage (required if backend=object_store) | `""` |
-| `laminardb.checkpoint.enabled` | Enable checkpoint coordination | `true` |
 | `laminardb.checkpoint.interval` | Checkpoint frequency | `30s` |
 | `laminardb.checkpoint.url` | Checkpoint storage: object store (`s3://`, `gs://`, `az://`) or local `file://`. Empty = local default. | `""` |
 | `laminardb.configWatch` | Hot-reload config on file change. Off in K8s (config changes roll pods via the checksum annotation); sets `LAMINAR_DISABLE_FILE_WATCH=1`. | `false` |
+| `laminardb.cluster.keyGroups` | Stable hash partitions used for cluster placement and rescaling | `256` |
 | `laminardb.cluster.discovery.strategy` | Discovery method (`gossip`, `static`) | `gossip` |
-| `laminardb.cluster.coordination.strategy` | Clustering controller coordination (`raft`) | `raft` |
 | `persistence.state.enabled` | Keep local state in Persistent Volume | `true` |
 | `persistence.state.storageClass` | K8s storage class for state PVC | `""` (default) |
 | `persistence.checkpoints.enabled` | Provision a dedicated checkpoints PVC. Off by default — prefer an object store via `laminardb.checkpoint.url`. | `false` |

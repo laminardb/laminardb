@@ -5,13 +5,45 @@
 #[path = "common/cluster_harness.rs"]
 mod cluster_harness;
 
-#[path = "common/mod.rs"]
+#[path = "common/minio.rs"]
 mod common;
+
+fn test_assignment_fence(
+    cluster: &laminar_core::cluster::testing::MiniCluster,
+    registry: &laminar_core::state::VnodeRegistry,
+) -> laminar_core::checkpoint::CheckpointAssignmentFence {
+    let snapshot = registry.versioned_snapshot();
+    let owners = snapshot
+        .owners()
+        .iter()
+        .map(|owner| owner.0)
+        .collect::<Vec<_>>();
+    let owner_set = owners
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut participants = cluster
+        .nodes
+        .iter()
+        .filter(|node| owner_set.contains(&node.instance_id.0))
+        .map(|node| laminar_core::checkpoint::CheckpointParticipant {
+            node_id: node.instance_id.0,
+            boot_incarnation: node.controller.recovery_incarnation(),
+        })
+        .collect::<Vec<_>>();
+    participants.sort_unstable_by_key(|participant| participant.node_id);
+    laminar_core::checkpoint::CheckpointAssignmentFence::from_owner_map(
+        snapshot.version(),
+        &owners,
+        participants,
+    )
+    .unwrap()
+}
 
 mod durable_backend_gate {
     use std::sync::Arc;
 
-    use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+    use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv, LeaseDeadline};
     use laminar_core::state::{InProcessBackend, NodeId, VnodeRegistry};
     use laminar_db::LaminarDB;
     use tokio::sync::watch;
@@ -23,20 +55,38 @@ mod durable_backend_gate {
         let self_id = NodeId(1);
         let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(self_id));
         let (_tx, rx) = watch::channel(Vec::new());
-        let controller = Arc::new(ClusterController::new(self_id, kv, None, rx));
+        let controller = Arc::new(ClusterController::new(self_id, Arc::clone(&kv), None, rx));
+        controller
+            .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
+                std::time::Duration::from_secs(30),
+            )))
+            .expect("install the process authority deadline required by cluster construction");
 
-        let db = LaminarDB::builder()
+        let checkpoint_store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let participant = laminar_core::checkpoint::CheckpointParticipant {
+            node_id: self_id.0,
+            boot_incarnation: controller.recovery_incarnation(),
+        };
+        let verified_namespaces =
+            laminar_core::cluster::control::prove_shared_object_store_namespaces(
+                participant,
+                &[participant],
+                kv,
+                Arc::clone(&checkpoint_store),
+                Arc::clone(&checkpoint_store),
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        let err = LaminarDB::builder()
             .cluster_controller(controller)
+            .verified_cluster_namespaces(verified_namespaces)
             .state_backend(Arc::new(InProcessBackend::new(4)))
             .vnode_registry(Arc::new(VnodeRegistry::new(4)))
             .build()
             .await
-            .expect("build succeeds; durability is enforced at start");
-
-        let err = db
-            .start()
-            .await
-            .expect_err("cluster start must reject a non-durable backend");
+            .expect_err("cluster construction must reject a non-durable backend");
         assert!(
             err.to_string().contains("LDB-0011"),
             "expected LDB-0011 durable-backend error, got: {err}"
@@ -44,133 +94,8 @@ mod durable_backend_gate {
     }
 }
 
-mod smoke {
-    use std::collections::HashSet;
-    use std::time::Duration;
-    use tokio::time::sleep;
-
-    use super::cluster_harness::{
-        input_batch, manifest_epoch, pick_keys_per_owner, read_mv_sums, ClusterEngineHarness,
-    };
-
-    const VNODE_COUNT: u32 = 4;
-    const N_NODES: usize = 2;
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn happy_path_eight_keys_correct_sums() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-            )
-            .with_test_writer()
-            .try_init();
-
-        let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
-        let leader_idx = harness.leader_idx();
-        let follower_idx = harness.follower_idxs()[0];
-
-        let key_buckets = {
-            let leader = &harness.nodes[leader_idx];
-            let follower = &harness.nodes[follower_idx];
-            let owners = vec![
-                (leader.instance_id, leader.owned_vnodes()),
-                (follower.instance_id, follower.owned_vnodes()),
-            ];
-            pick_keys_per_owner(VNODE_COUNT, &owners, 4)
-                .expect("pick_keys_per_owner: search range too small")
-        };
-        let all_keys: Vec<i64> = key_buckets
-            .iter()
-            .flat_map(|(_, ks)| ks.iter().copied())
-            .collect();
-        assert_eq!(all_keys.len(), 8, "want 4 keys per owner");
-
-        for node in &harness.nodes {
-            node.db
-                .execute("CREATE SOURCE src (key BIGINT, value BIGINT)")
-                .await
-                .expect("CREATE SOURCE");
-            node.db
-                .execute(
-                    "CREATE MATERIALIZED VIEW sums AS \
-                     SELECT key, SUM(value) AS total FROM src GROUP BY key",
-                )
-                .await
-                .expect("CREATE MATERIALIZED VIEW");
-        }
-        harness.start_all().await;
-
-        let leader_node = &harness.nodes[leader_idx];
-        let follower_node = &harness.nodes[follower_idx];
-        let src = leader_node
-            .db
-            .source_untyped("src")
-            .expect("source_untyped on leader");
-        src.push_arrow(input_batch(&all_keys)).expect("push_arrow");
-
-        let result = leader_node
-            .db
-            .checkpoint()
-            .await
-            .expect("leader checkpoint");
-        assert!(
-            result.success,
-            "leader checkpoint failed: {:?}",
-            result.error,
-        );
-
-        sleep(Duration::from_millis(500)).await;
-
-        let leader_rows = read_mv_sums(&leader_node.db, "sums").await;
-        let follower_rows = read_mv_sums(&follower_node.db, "sums").await;
-
-        assert!(
-            !follower_rows.is_empty(),
-            "follower MV is empty — shuffle didn't deliver any partials. \
-             leader_rows={leader_rows:?}",
-        );
-
-        let leader_keys: HashSet<i64> = leader_rows.iter().map(|(k, _)| *k).collect();
-        let follower_keys: HashSet<i64> = follower_rows.iter().map(|(k, _)| *k).collect();
-        assert!(
-            leader_keys.is_disjoint(&follower_keys),
-            "key appears on both nodes: leader={leader_keys:?} follower={follower_keys:?}",
-        );
-
-        let mut union: Vec<(i64, i64)> = leader_rows
-            .iter()
-            .chain(follower_rows.iter())
-            .copied()
-            .collect();
-        union.sort_by_key(|(k, _)| *k);
-
-        let mut expected: Vec<(i64, i64)> = all_keys.iter().map(|&k| (k, k * 10)).collect();
-        expected.sort_by_key(|(k, _)| *k);
-
-        assert_eq!(
-            union, expected,
-            "union of MVs does not match input:\n got  {union:?}\n want {expected:?}",
-        );
-
-        let leader_epoch = manifest_epoch(&leader_node.db).await;
-        let follower_epoch = manifest_epoch(&follower_node.db).await;
-        assert!(
-            leader_epoch.abs_diff(follower_epoch) <= 1,
-            "manifest epoch drift > 1: leader={leader_epoch} follower={follower_epoch}",
-        );
-
-        harness.shutdown().await;
-    }
-}
-
 mod failures {
-    use std::time::Duration;
-    use tokio::time::sleep;
-
-    use super::cluster_harness::{
-        input_batch, pick_keys_per_owner, read_mv_sums, ClusterEngineHarness,
-    };
+    use super::cluster_harness::ClusterEngineHarness;
 
     const VNODE_COUNT: u32 = 4;
     const N_NODES: usize = 2;
@@ -178,7 +103,9 @@ mod failures {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn split_brain_write_partial_rejected() {
         use bytes::Bytes;
-        use laminar_core::state::{ObjectStoreBackend, StateBackend, StateBackendError};
+        use laminar_core::state::{
+            CheckpointAttempt, ObjectStoreBackend, StateBackend, StateBackendError,
+        };
         use object_store::local::LocalFileSystem;
         use object_store::ObjectStore;
 
@@ -186,18 +113,20 @@ mod failures {
         let store: std::sync::Arc<dyn ObjectStore> =
             std::sync::Arc::new(LocalFileSystem::new_with_prefix(dir.path()).expect("local fs"));
 
-        let fresh = ObjectStoreBackend::new(std::sync::Arc::clone(&store), "leader", 4);
-        let stale = ObjectStoreBackend::new(std::sync::Arc::clone(&store), "ex-leader", 4);
+        let fresh = ObjectStoreBackend::cluster_shared(std::sync::Arc::clone(&store), "leader", 4);
+        let stale =
+            ObjectStoreBackend::cluster_shared(std::sync::Arc::clone(&store), "ex-leader", 4);
 
         fresh.set_authoritative_version(3);
+        let attempt = CheckpointAttempt::new(1, 1);
         fresh
-            .write_partial(0, 1, 3, Bytes::from_static(b"fresh"))
+            .write_partial(attempt, 0, 3, Bytes::from_static(b"fresh"))
             .await
             .expect("fresh write at current version");
 
         stale.set_authoritative_version(3);
         let err = stale
-            .write_partial(0, 1, 2, Bytes::from_static(b"stale"))
+            .write_partial(attempt, 0, 2, Bytes::from_static(b"stale"))
             .await
             .expect_err("stale write must be rejected");
         match err {
@@ -211,31 +140,42 @@ mod failures {
             other => panic!("expected StaleVersion, got {other:?}"),
         }
 
-        let got = fresh.read_partial(0, 1).await.unwrap().unwrap();
+        let got = fresh.read_partial(attempt, 0).await.unwrap().unwrap();
         assert_eq!(&got[..], b"fresh");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn assignment_snapshot_unifies_cluster_view() {
-        let harness_a =
+        let mut harness_a =
             super::cluster_harness::ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
+        setup_stateless_query(&harness_a).await;
+        harness_a.start_all().await;
+        let checkpoint = harness_a.nodes[harness_a.leader_idx()]
+            .db
+            .checkpoint()
+            .await
+            .expect("checkpoint the assignment before restarting its process owners");
+        assert!(
+            checkpoint.success,
+            "assignment checkpoint failed: {:?}",
+            checkpoint.error,
+        );
         let assignment_a: Vec<super::cluster_harness::NodeIdView> = harness_a
             .nodes
             .iter()
             .map(|n| (n.instance_id, n.owned_vnodes()))
             .collect();
-        let (shared_dir, _cp_dirs) = harness_a.shutdown_keep_dirs().await;
+        let (shared_dir, checkpoint_dirs, control_store) = harness_a.shutdown_keep_dirs().await;
 
-        let cp_dirs2: Vec<_> = (0..N_NODES).map(|_| tempfile::tempdir().unwrap()).collect();
-        let harness_b = super::cluster_harness::ClusterEngineHarness::spawn_with_dirs(
+        let mut harness_b = super::cluster_harness::ClusterEngineHarness::spawn_with_dirs(
             N_NODES,
             VNODE_COUNT,
             shared_dir,
-            cp_dirs2,
-            None,
-            None,
+            checkpoint_dirs,
+            control_store,
         )
         .await;
+        harness_b.start_all().await;
         let assignment_b: Vec<super::cluster_harness::NodeIdView> = harness_b
             .nodes
             .iter()
@@ -247,31 +187,136 @@ mod failures {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn zero_vnode_workers_start_idle_without_joining_assignment_quorum() {
+        let mut harness = ClusterEngineHarness::spawn(3, 1).await;
+        setup_stateless_query(&harness).await;
+        tokio::time::timeout(std::time::Duration::from_secs(20), harness.start_all())
+            .await
+            .expect("idle workers must not block cluster startup");
+
+        let snapshot = harness.nodes[0]
+            .assignment_snapshot_store
+            .load()
+            .await
+            .unwrap()
+            .unwrap();
+        let owner = snapshot.to_vnode_vec(1).unwrap()[0];
+        assert_eq!(snapshot.participants.len(), 1);
+        assert_eq!(snapshot.participants[0].node_id, owner.0);
+
+        for node in &harness.nodes {
+            let owns_vnode = node.instance_id == owner;
+            assert_eq!(node.owned_vnodes().len(), if owns_vnode { 1 } else { 0 });
+            assert_eq!(node.db.cluster_intake_fenced(), !owns_vnode);
+            if !owns_vnode {
+                assert_eq!(node.shuffle_sender.assignment_version(), 0);
+                assert_eq!(node.shuffle_receiver.assignment_version(), 0);
+            }
+        }
+
+        harness.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sealed_materialized_view_manifest_is_rejected_by_every_node_after_restart() {
+        use laminar_core::cluster::control::{
+            CatalogManifest, CatalogManifestEntry, CatalogObjectKind,
+        };
+
+        const SOURCE_DDL: &str = "CREATE SOURCE src (key BIGINT, value BIGINT)";
+        const VIEW_DDL: &str =
+            "CREATE MATERIALIZED VIEW totals AS SELECT key, SUM(value) FROM src GROUP BY key";
+
+        let harness = ClusterEngineHarness::spawn(3, VNODE_COUNT).await;
+        let manifest = CatalogManifest::new(vec![
+            CatalogManifestEntry {
+                canonical_name: "src".into(),
+                kind: CatalogObjectKind::Source,
+                ddl: SOURCE_DDL.into(),
+            },
+            CatalogManifestEntry {
+                canonical_name: "totals".into(),
+                kind: CatalogObjectKind::MaterializedView,
+                ddl: VIEW_DDL.into(),
+            },
+        ])
+        .expect("fault manifest is structurally valid");
+        let leader = harness.leader_idx();
+        let proof = harness.cluster.nodes[leader]
+            .controller
+            .capture_catalog_bootstrap_proof()
+            .expect("active durable leader proof");
+        harness
+            .catalog_manifest_store
+            .seal(&manifest, &proof)
+            .await
+            .expect("inject structurally valid but unsupported catalog manifest");
+
+        assert_cluster_nodes_reject_materialized_manifest(&harness).await;
+        let (shared_dir, checkpoint_dirs, control_store) = harness.shutdown_keep_dirs().await;
+
+        let restarted = ClusterEngineHarness::spawn_with_dirs(
+            3,
+            VNODE_COUNT,
+            shared_dir,
+            checkpoint_dirs,
+            control_store,
+        )
+        .await;
+        assert_eq!(
+            restarted
+                .catalog_manifest_store
+                .load()
+                .await
+                .expect("load injected manifest"),
+            Some(manifest),
+        );
+        assert_cluster_nodes_reject_materialized_manifest(&restarted).await;
+        restarted.shutdown().await;
+    }
+
+    async fn assert_cluster_nodes_reject_materialized_manifest(harness: &ClusterEngineHarness) {
+        for node in &harness.nodes {
+            let error = node
+                .db
+                .start()
+                .await
+                .expect_err("cluster materialized-view manifest must fail closed");
+            assert!(error.to_string().contains("LDB-4007"), "{error}");
+            assert!(
+                node.db.sources().is_empty(),
+                "failed replay left source residue on node {}",
+                node.instance_id.0,
+            );
+            assert!(
+                node.db.materialized_views().is_empty(),
+                "failed replay left materialized state on node {}",
+                node.instance_id.0,
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn checkpoint_records_durable_commit_marker() {
         let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
-        for node in &harness.nodes {
-            setup_query(&node.db).await;
-        }
+        setup_stateless_query(&harness).await;
         harness.start_all().await;
 
         let leader = &harness.nodes[harness.leader_idx()];
         let result = leader.db.checkpoint().await.expect("leader checkpoint");
         assert!(result.success, "leader checkpoint: {:?}", result.error);
 
-        assert!(
-            leader
-                .decision_store
-                .is_committed(result.epoch)
+        for node in &harness.cluster.nodes {
+            let outcome = node
+                .controller
+                .checkpoint_authority()
+                .expect("cluster checkpoint authority")
+                .cluster_outcome(result.epoch)
                 .await
-                .expect("marker read"),
-            "commit marker must exist for the just-completed epoch",
-        );
-        for idx in harness.follower_idxs() {
-            assert!(harness.nodes[idx]
-                .decision_store
-                .is_committed(result.epoch)
-                .await
-                .unwrap());
+                .expect("cluster outcome read")
+                .expect("commit outcome must exist before checkpoint success");
+            assert!(outcome.is_commit());
+            assert_eq!(outcome.checkpoint_id, result.checkpoint_id);
         }
 
         harness.shutdown().await;
@@ -285,9 +330,7 @@ mod failures {
             assert_eq!(node.state_backend.authoritative_version(), 0);
         }
 
-        for node in &harness.nodes {
-            setup_query(&node.db).await;
-        }
+        setup_stateless_query(&harness).await;
         harness.start_all().await;
 
         for node in &harness.nodes {
@@ -298,13 +341,18 @@ mod failures {
         }
 
         use bytes::Bytes;
-        use laminar_core::state::StateBackendError;
+        use laminar_core::state::{CheckpointAttempt, StateBackendError};
         let node = &harness.nodes[0];
         let authoritative = node.state_backend.authoritative_version();
         let stale_caller = authoritative - 1;
         let err = node
             .state_backend
-            .write_partial(0, 9_999, stale_caller, Bytes::from_static(b"stale"))
+            .write_partial(
+                CheckpointAttempt::new(9_999, 9_999),
+                0,
+                stale_caller,
+                Bytes::from_static(b"stale"),
+            )
             .await
             .expect_err("stale write must be rejected by the live fence");
         match err {
@@ -321,1130 +369,30 @@ mod failures {
         harness.shutdown().await;
     }
 
-    async fn setup_query(db: &laminar_db::LaminarDB) {
-        db.execute("CREATE SOURCE src (key BIGINT, value BIGINT)")
+    async fn setup_stateless_query(harness: &ClusterEngineHarness) {
+        harness
+            .bootstrap_catalog(&[
+                super::cluster_harness::TEST_SOURCE_DDL,
+                "CREATE STREAM projected AS SELECT key, value FROM src",
+            ])
             .await
-            .expect("CREATE SOURCE");
-        db.execute(
-            "CREATE MATERIALIZED VIEW sums AS \
-             SELECT key, SUM(value) AS total FROM src GROUP BY key",
-        )
-        .await
-        .expect("CREATE MATERIALIZED VIEW");
-    }
-
-    async fn union_sums(harness: &ClusterEngineHarness) -> Vec<(i64, i64)> {
-        let mut out = Vec::new();
-        for node in &harness.nodes {
-            out.extend(read_mv_sums(&node.db, "sums").await);
-        }
-        out
-    }
-
-    /// A hard crash sheds the dead node's vnodes to the survivor, which rehydrates their
-    /// checkpointed state and takes over their keys. Rows in flight at the crash are lost —
-    /// the at-least-once failover window.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn crash_sheds_vnodes_to_survivor() {
-        let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
-        let leader_idx = harness.leader_idx();
-        let follower_idx = harness.follower_idxs()[0];
-
-        for node in &harness.nodes {
-            setup_query(&node.db).await;
-        }
-        harness.start_all().await;
-
-        let owners = vec![
-            (
-                harness.nodes[leader_idx].instance_id,
-                harness.nodes[leader_idx].owned_vnodes(),
-            ),
-            (
-                harness.nodes[follower_idx].instance_id,
-                harness.nodes[follower_idx].owned_vnodes(),
-            ),
-        ];
-        let key_buckets = pick_keys_per_owner(VNODE_COUNT, &owners, 4)
-            .expect("pick_keys_per_owner: search range too small");
-        let follower_keys = key_buckets[1].1.clone();
-
-        let phase_a: Vec<i64> = key_buckets
-            .iter()
-            .flat_map(|(_, ks)| ks.iter().copied())
-            .collect();
-        let src = harness.nodes[leader_idx]
-            .db
-            .source_untyped("src")
-            .expect("source_untyped");
-        src.push_arrow(input_batch(&phase_a)).expect("push phase_a");
-        harness.nodes[leader_idx]
-            .db
-            .checkpoint()
-            .await
-            .expect("leader checkpoint phase_a");
-        sleep(Duration::from_millis(500)).await;
-
-        let pre_crash = union_sums(&harness).await;
-        assert_eq!(
-            pre_crash.len(),
-            8,
-            "want 8 rows total; duplicates here would signal a key on >1 node",
-        );
-
-        let crashed_runtime = harness.nodes.swap_remove(follower_idx);
-        let crashed_node = harness.cluster.nodes.swap_remove(follower_idx);
-        drop(crashed_runtime);
-        crashed_node.crash().await;
-
-        // Wait for rotation to hand every vnode to the survivor.
-        // Detection is time-based (phi-accrual Suspected flip →
-        // debounce → rotation → rehydration), so a fixed sleep flakes
-        // under parallel test load.
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while harness.nodes[0].owned_vnodes().len() < VNODE_COUNT as usize {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "survivor never acquired the crashed node's vnodes",
-            );
-            sleep(Duration::from_millis(200)).await;
-        }
-
-        let phase_c = input_batch(&follower_keys);
-        let src = harness.nodes[0]
-            .db
-            .source_untyped("src")
-            .expect("source_untyped on surviving leader");
-        src.push_arrow(phase_c).expect("push phase_c");
-
-        // Rotation handed the crashed node's vnodes to the survivor,
-        // which rehydrated their phase-A state and processed phase C
-        // for them — so the survivor now serves EVERY key, and the
-        // crashed node's keys total phase A + phase C (`input_batch`
-        // pushes value = key*10). Asserting TOTALS, not just presence:
-        // a lost rehydration would still show the key (phase C creates
-        // the group) but with only phase C's contribution.
-        let mut expected: std::collections::HashMap<i64, i64> =
-            key_buckets[0].1.iter().map(|&k| (k, k * 10)).collect();
-        for &k in &follower_keys {
-            expected.insert(k, k * 10 * 2);
-        }
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            let got: std::collections::HashMap<i64, i64> =
-                read_mv_sums(&harness.nodes[0].db, "sums")
-                    .await
-                    .into_iter()
-                    .collect();
-            if got == expected {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "survivor never served all recovered totals: got {got:?}, want {expected:?}",
-            );
-            sleep(Duration::from_millis(200)).await;
-        }
-
-        harness.shutdown().await;
-    }
-
-    // Delta chain is the PRIMARY aggregate checkpoint; the manifest has none, so the
-    // survivor recovers the crashed node's keys from the per-vnode chain; doubled totals prove it.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn delta_primary_crash_rehydrates_aggregate_from_chain() {
-        let mut harness = ClusterEngineHarness::spawn_delta(N_NODES, VNODE_COUNT, 2).await;
-        let leader_idx = harness.leader_idx();
-        let follower_idx = harness.follower_idxs()[0];
-        for node in &harness.nodes {
-            setup_query(&node.db).await;
-        }
-        harness.start_all().await;
-
-        let owners = vec![
-            (
-                harness.nodes[leader_idx].instance_id,
-                harness.nodes[leader_idx].owned_vnodes(),
-            ),
-            (
-                harness.nodes[follower_idx].instance_id,
-                harness.nodes[follower_idx].owned_vnodes(),
-            ),
-        ];
-        let key_buckets = pick_keys_per_owner(VNODE_COUNT, &owners, 4).expect("pick keys");
-        let follower_keys = key_buckets[1].1.clone();
-        let phase_a: Vec<i64> = key_buckets
-            .iter()
-            .flat_map(|(_, ks)| ks.iter().copied())
-            .collect();
-
-        harness.nodes[leader_idx]
-            .db
-            .source_untyped("src")
-            .expect("src")
-            .push_arrow(input_batch(&phase_a))
-            .expect("push phase_a");
-        harness.nodes[leader_idx]
-            .db
-            .checkpoint()
-            .await
-            .expect("checkpoint phase_a");
-        sleep(Duration::from_millis(500)).await;
-
-        let crashed_runtime = harness.nodes.swap_remove(follower_idx);
-        let crashed_node = harness.cluster.nodes.swap_remove(follower_idx);
-        drop(crashed_runtime);
-        crashed_node.crash().await;
-
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while harness.nodes[0].owned_vnodes().len() < VNODE_COUNT as usize {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "survivor never acquired the crashed node's vnodes",
-            );
-            sleep(Duration::from_millis(200)).await;
-        }
-
-        harness.nodes[0]
-            .db
-            .source_untyped("src")
-            .expect("src on survivor")
-            .push_arrow(input_batch(&follower_keys))
-            .expect("push phase_c");
-
-        let mut expected: std::collections::HashMap<i64, i64> =
-            key_buckets[0].1.iter().map(|&k| (k, k * 10)).collect();
-        for &k in &follower_keys {
-            expected.insert(k, k * 10 * 2);
-        }
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            let got: std::collections::HashMap<i64, i64> =
-                read_mv_sums(&harness.nodes[0].db, "sums")
-                    .await
-                    .into_iter()
-                    .collect();
-            if got == expected {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "delta_primary crash recovery totals wrong: got {got:?}, want {expected:?}",
-            );
-            sleep(Duration::from_millis(200)).await;
-        }
-        harness.shutdown().await;
-    }
-
-    // Graceful full-cluster restart, delta_primary: the manifest holds no aggregate state, so each
-    // node rehydrates its OWN vnodes from the chain (start_inner staging); re-fed keys double.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn delta_primary_aggregate_survives_graceful_restart() {
-        let mut harness = ClusterEngineHarness::spawn_delta(N_NODES, VNODE_COUNT, 2).await;
-        for node in &harness.nodes {
-            setup_query(&node.db).await;
-        }
-        harness.start_all().await;
-
-        let owners: Vec<_> = harness
-            .nodes
-            .iter()
-            .map(|n| (n.instance_id, n.owned_vnodes()))
-            .collect();
-        let key_buckets = pick_keys_per_owner(VNODE_COUNT, &owners, 3).expect("pick keys");
-        let keys: Vec<i64> = key_buckets
-            .iter()
-            .flat_map(|(_, ks)| ks.iter().copied())
-            .collect();
-
-        let leader = harness.leader_idx();
-        harness.nodes[leader]
-            .db
-            .source_untyped("src")
-            .expect("src")
-            .push_arrow(input_batch(&keys))
-            .expect("push batch1");
-        harness.nodes[leader]
-            .db
-            .checkpoint()
-            .await
-            .expect("checkpoint batch1");
-        sleep(Duration::from_millis(500)).await;
-
-        let baseline: std::collections::HashMap<i64, i64> =
-            union_sums(&harness).await.into_iter().collect();
-        for &k in &keys {
-            assert_eq!(
-                baseline.get(&k),
-                Some(&(k * 10)),
-                "baseline total for key {k}"
-            );
-        }
-
-        // Graceful full-cluster restart, delta_primary still on.
-        let (shared, cp_dirs) = harness.shutdown_keep_dirs().await;
-        let mut harness = ClusterEngineHarness::spawn_with_dirs(
-            N_NODES,
-            VNODE_COUNT,
-            shared,
-            cp_dirs,
-            Some(2),
-            None,
-        )
-        .await;
-        for node in &harness.nodes {
-            setup_query(&node.db).await;
-        }
-        harness.start_all().await;
-
-        // Re-feed the same keys: doubled totals iff the accumulators recovered from the chain.
-        let leader = harness.leader_idx();
-        harness.nodes[leader]
-            .db
-            .source_untyped("src")
-            .expect("src")
-            .push_arrow(input_batch(&keys))
-            .expect("push batch2");
-
-        let expected: std::collections::HashMap<i64, i64> =
-            keys.iter().map(|&k| (k, k * 10 * 2)).collect();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            let got: std::collections::HashMap<i64, i64> = union_sums(&harness)
-                .await
-                .into_iter()
-                .filter(|(k, _)| keys.contains(k))
-                .collect();
-            if got == expected {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "delta_primary graceful-restart totals wrong: got {got:?}, want {expected:?}",
-            );
-            sleep(Duration::from_millis(200)).await;
-        }
-        harness.shutdown().await;
-    }
-
-    /// Exact-value correctness under cluster GROUP demotion: a deterministic keyed SUM across a
-    /// 2-node cluster with a tiny per-node budget (idle groups demote to cold, re-touched ones
-    /// promote back) must match the analytic per-key totals — the exact-value guarantee the kill-9
-    /// soaks omit, since they assert only demote/promote counters + EO density. Keys span both
-    /// owners so the demote↔promote path runs under cross-node shuffle + barrier alignment.
-    #[cfg(feature = "state-tier")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn cluster_group_demotion_preserves_aggregate_values() {
-        use std::collections::HashMap;
-        use std::time::Instant;
-
-        // chain_max=2 enables the delta chain (group demotion needs it); 2 KiB/node forces demotion.
-        let mut harness =
-            ClusterEngineHarness::spawn_delta_tier(N_NODES, VNODE_COUNT, 2, 2048).await;
-        for node in &harness.nodes {
-            setup_query(&node.db).await;
-        }
-        harness.start_all().await;
-
-        let owners: Vec<_> = harness
-            .nodes
-            .iter()
-            .map(|n| (n.instance_id, n.owned_vnodes()))
-            .collect();
-        let key_buckets = pick_keys_per_owner(VNODE_COUNT, &owners, 96).expect("pick keys");
-        let all_keys: Vec<i64> = key_buckets
-            .iter()
-            .flat_map(|(_, ks)| ks.iter().copied())
-            .collect();
-        let leader = harness.leader_idx();
-
-        // Three rounds over every key with idle gaps (so clean groups become demotable), then a
-        // checkpoint to mark them clean — the demotion precondition + delta-tracking seed.
-        const ROUNDS: i64 = 3;
-        for _ in 0..ROUNDS {
-            harness.nodes[leader]
-                .db
-                .source_untyped("src")
-                .expect("src")
-                .push_arrow(input_batch(&all_keys))
-                .expect("push round");
-            sleep(Duration::from_millis(150)).await;
-        }
-        harness.nodes[leader]
-            .db
-            .checkpoint()
-            .await
-            .expect("checkpoint");
-
-        let demotes = |h: &ClusterEngineHarness| -> u64 {
-            h.nodes
-                .iter()
-                .map(|n| n.db.tier_metrics().demote_total)
-                .sum()
-        };
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while demotes(&harness) == 0 {
-            assert!(
-                Instant::now() < deadline,
-                "cluster group demotion never fired (tier never shed an idle group)",
-            );
-            sleep(Duration::from_millis(200)).await;
-        }
-
-        // Re-touch the first half once more → demoted groups promote back (fetch-on-access) and bump.
-        let half: Vec<i64> = all_keys.iter().take(all_keys.len() / 2).copied().collect();
-        harness.nodes[leader]
-            .db
-            .source_untyped("src")
-            .expect("src")
-            .push_arrow(input_batch(&half))
-            .expect("push promote round");
-
-        // value = key*10; fed ROUNDS times, plus once more for the re-touched half.
-        let mut expected: HashMap<i64, i64> =
-            all_keys.iter().map(|&k| (k, k * 10 * ROUNDS)).collect();
-        for &k in &half {
-            *expected.get_mut(&k).expect("half ⊆ all_keys") += k * 10;
-        }
-
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let got: HashMap<i64, i64> = union_sums(&harness).await.into_iter().collect();
-            if got == expected {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "cluster group demotion changed aggregate values (demotes={}): {:?}",
-                demotes(&harness),
-                expected
-                    .iter()
-                    .filter(|(k, v)| got.get(k) != Some(v))
-                    .map(|(k, v)| (*k, *v, got.get(k).copied()))
-                    .take(10)
-                    .collect::<Vec<_>>(),
-            );
-            sleep(Duration::from_millis(200)).await;
-        }
-        assert!(
-            demotes(&harness) > 0,
-            "demote/promote path must be exercised"
-        );
-        harness.shutdown().await;
-    }
-
-    /// Non-chain group demotion (no delta chain — the whole-node manifest is authoritative and
-    /// demoted groups fold into cold-only partials) must recover EXACT values across a full cluster
-    /// restart. A resident∩cold overlap at capture would double-count here (additive merge).
-    #[cfg(feature = "state-tier")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn cluster_group_demotion_nonchain_survives_restart() {
-        use std::collections::HashMap;
-        use std::time::Instant;
-        use tempfile::TempDir;
-
-        let shared = tempfile::tempdir().expect("shared state dir");
-        let cp_dirs: Vec<TempDir> = (0..N_NODES)
-            .map(|_| tempfile::tempdir().expect("cp dir"))
-            .collect();
-        let mut harness = ClusterEngineHarness::spawn_with_dirs(
-            N_NODES,
-            VNODE_COUNT,
-            shared,
-            cp_dirs,
-            None,
-            Some(2048),
-        )
-        .await;
-        for node in &harness.nodes {
-            setup_query(&node.db).await;
-        }
-        harness.start_all().await;
-
-        let owners: Vec<_> = harness
-            .nodes
-            .iter()
-            .map(|n| (n.instance_id, n.owned_vnodes()))
-            .collect();
-        let key_buckets = pick_keys_per_owner(VNODE_COUNT, &owners, 96).expect("pick keys");
-        let all_keys: Vec<i64> = key_buckets
-            .iter()
-            .flat_map(|(_, ks)| ks.iter().copied())
-            .collect();
-        let leader = harness.leader_idx();
-        let demotes = |h: &ClusterEngineHarness| -> u64 {
-            h.nodes
-                .iter()
-                .map(|n| n.db.tier_metrics().demote_total)
-                .sum()
-        };
-
-        for _ in 0..3 {
-            harness.nodes[leader]
-                .db
-                .source_untyped("src")
-                .expect("src")
-                .push_arrow(input_batch(&all_keys))
-                .expect("push");
-            sleep(Duration::from_millis(150)).await;
-        }
-        harness.nodes[leader]
-            .db
-            .checkpoint()
-            .await
-            .expect("checkpoint");
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while demotes(&harness) == 0 {
-            assert!(
-                Instant::now() < deadline,
-                "non-chain group demotion never fired"
-            );
-            sleep(Duration::from_millis(200)).await;
-        }
-        // Checkpoint AGAIN so the demoted groups are captured into durable cold-only partials.
-        harness.nodes[leader]
-            .db
-            .checkpoint()
-            .await
-            .expect("checkpoint2");
-        let expected: HashMap<i64, i64> = all_keys.iter().map(|&k| (k, k * 10 * 3)).collect();
-
-        // Graceful full-cluster restart (tier wiped; recover from the durable manifest + partials).
-        let (shared, cp_dirs) = harness.shutdown_keep_dirs().await;
-        let mut harness = ClusterEngineHarness::spawn_with_dirs(
-            N_NODES,
-            VNODE_COUNT,
-            shared,
-            cp_dirs,
-            None,
-            Some(2048),
-        )
-        .await;
-        for node in &harness.nodes {
-            setup_query(&node.db).await;
-        }
-        harness.start_all().await;
-
-        // No re-feed: the recovered values must equal the pre-restart totals — never doubled.
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            let got: HashMap<i64, i64> = union_sums(&harness)
-                .await
-                .into_iter()
-                .filter(|(k, _)| expected.contains_key(k))
-                .collect();
-            let bad: Vec<(i64, i64, i64)> = expected
-                .iter()
-                .filter(|(k, &e)| got.get(k).copied() != Some(e))
-                .map(|(k, &e)| (*k, e, got.get(k).copied().unwrap_or(-1)))
-                .take(10)
-                .collect();
-            if bad.is_empty() && got.len() == expected.len() {
-                break;
-            }
-            if Instant::now() > deadline {
-                let overlap: u64 = harness
-                    .nodes
-                    .iter()
-                    .map(|n| n.db.tier_metrics().overlap_total)
-                    .sum();
-                panic!(
-                    "non-chain cluster demotion recovered wrong values (overlap_total={overlap}) \
-                     [(key, expected, got)]: {bad:?}",
-                );
-            }
-            sleep(Duration::from_millis(200)).await;
-        }
-        harness.shutdown().await;
-    }
-
-    /// A crashed node's DEMOTED groups must survive failover. With the cold tier on, the follower
-    /// demotes idle groups — their durable home is the per-vnode delta chain, NOT the node-local tier
-    /// (which dies with the process). When the follower crashes, the survivor acquires its vnodes and
-    /// must rehydrate those demoted groups from the chain. Re-feeding the dead node's keys doubles
-    /// their totals iff the prior (demoted) counts recovered; a lost demoted group would instead show
-    /// only the re-fed value.
-    #[cfg(feature = "state-tier")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn cluster_demoted_groups_survive_crash_failover() {
-        use std::collections::HashMap;
-        use std::time::Instant;
-
-        let mut harness =
-            ClusterEngineHarness::spawn_delta_tier(N_NODES, VNODE_COUNT, 2, 2048).await;
-        let leader_idx = harness.leader_idx();
-        let follower_idx = harness.follower_idxs()[0];
-        for node in &harness.nodes {
-            setup_query(&node.db).await;
-        }
-        harness.start_all().await;
-
-        let owners = vec![
-            (
-                harness.nodes[leader_idx].instance_id,
-                harness.nodes[leader_idx].owned_vnodes(),
-            ),
-            (
-                harness.nodes[follower_idx].instance_id,
-                harness.nodes[follower_idx].owned_vnodes(),
-            ),
-        ];
-        let key_buckets = pick_keys_per_owner(VNODE_COUNT, &owners, 96).expect("pick keys");
-        let leader_keys = key_buckets[0].1.clone();
-        let follower_keys = key_buckets[1].1.clone();
-        let phase_a: Vec<i64> = leader_keys.iter().chain(&follower_keys).copied().collect();
-
-        // Feed everything, checkpoint (clean baseline + delta seed), then wait for the FOLLOWER to
-        // demote idle groups; checkpoint again so the demoted state is captured in the durable chain.
-        harness.nodes[leader_idx]
-            .db
-            .source_untyped("src")
-            .expect("src")
-            .push_arrow(input_batch(&phase_a))
-            .expect("push phase_a");
-        harness.nodes[leader_idx]
-            .db
-            .checkpoint()
-            .await
-            .expect("checkpoint phase_a");
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while harness.nodes[follower_idx].db.tier_metrics().demote_total == 0 {
-            assert!(
-                Instant::now() < deadline,
-                "follower never demoted a group before the crash",
-            );
-            sleep(Duration::from_millis(200)).await;
-        }
-        harness.nodes[leader_idx]
-            .db
-            .checkpoint()
-            .await
-            .expect("checkpoint post-demote");
-        sleep(Duration::from_millis(300)).await;
-
-        // Crash the follower.
-        let crashed_runtime = harness.nodes.swap_remove(follower_idx);
-        let crashed_node = harness.cluster.nodes.swap_remove(follower_idx);
-        drop(crashed_runtime);
-        crashed_node.crash().await;
-
-        // Survivor acquires the crashed node's vnodes.
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while harness.nodes[0].owned_vnodes().len() < VNODE_COUNT as usize {
-            assert!(
-                Instant::now() < deadline,
-                "survivor never acquired the crashed node's vnodes",
-            );
-            sleep(Duration::from_millis(200)).await;
-        }
-
-        // Re-feed the dead node's keys on the survivor → totals double iff the demoted groups
-        // recovered from the chain (a lost demoted group would show only this re-fed value).
-        harness.nodes[0]
-            .db
-            .source_untyped("src")
-            .expect("src on survivor")
-            .push_arrow(input_batch(&follower_keys))
-            .expect("push phase_c");
-
-        let mut expected: HashMap<i64, i64> = leader_keys.iter().map(|&k| (k, k * 10)).collect();
-        for &k in &follower_keys {
-            expected.insert(k, k * 10 * 2);
-        }
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            let got: HashMap<i64, i64> = read_mv_sums(&harness.nodes[0].db, "sums")
-                .await
-                .into_iter()
-                .collect();
-            if got == expected {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "demoted-group crash-failover totals wrong: {:?}",
-                expected
-                    .iter()
-                    .filter(|(k, v)| got.get(k) != Some(v))
-                    .map(|(k, v)| (*k, *v, got.get(k).copied()))
-                    .take(10)
-                    .collect::<Vec<_>>(),
-            );
-            sleep(Duration::from_millis(200)).await;
-        }
-        harness.shutdown().await;
-    }
-
-    /// Lose-then-REACQUIRE of a vnode whose aggregate group was demoted to the cold tier must not
-    /// double-count on re-acquire and must not lose the group. Node A
-    /// (follower) owns V, demotes idle groups and durably folds them into V's delta chain; V then
-    /// moves to B (leader) and back to A. On revoke, `drop_vnodes` must purge A's resident AND cold
-    /// tracking for V before the additive `merge_groups` rehydrates the chain — otherwise re-acquire
-    /// merges the chain onto A's stale state and doubles its totals. Read-back is on A (the final
-    /// owner) only, isolating the operator-state property from any cross-node MV cleanup concern.
-    #[cfg(feature = "state-tier")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn cluster_demoted_group_survives_lose_then_reacquire() {
-        use std::collections::BTreeMap;
-        use std::sync::Arc;
-        use std::time::Instant;
-
-        use laminar_core::cluster::control::{AssignmentSnapshotStore, RotateOutcome};
-        use laminar_core::state::NodeId;
-
-        let mut harness =
-            ClusterEngineHarness::spawn_delta_tier(N_NODES, VNODE_COUNT, 2, 2048).await;
-        let leader_idx = harness.leader_idx(); // B: temporarily gains V
-        let follower_idx = harness.follower_idxs()[0]; // A: holds V, demotes, loses then reacquires
-        for node in &harness.nodes {
-            setup_query(&node.db).await;
-        }
-        harness.start_all().await;
-
-        let owners = vec![
-            (
-                harness.nodes[leader_idx].instance_id,
-                harness.nodes[leader_idx].owned_vnodes(),
-            ),
-            (
-                harness.nodes[follower_idx].instance_id,
-                harness.nodes[follower_idx].owned_vnodes(),
-            ),
-        ];
-        let key_buckets = pick_keys_per_owner(VNODE_COUNT, &owners, 96).expect("pick keys");
-        let leader_keys = key_buckets[0].1.clone();
-        let follower_keys = key_buckets[1].1.clone();
-        let phase_a: Vec<i64> = leader_keys.iter().chain(&follower_keys).copied().collect();
-
-        // K is a non-zero follower key (so a doubled total is detectable); V is the vnode it hashes to.
-        let k: i64 = *follower_keys
-            .iter()
-            .find(|&&x| x != 0)
-            .expect("a non-zero follower key");
-        let v: u32 = super::cluster_harness::vnode_for_key(k, VNODE_COUNT);
-        assert!(
-            harness.nodes[follower_idx].owned_vnodes().contains(&v),
-            "precondition: follower (A) owns V={v} for K={k}",
-        );
-        let node_a = NodeId(harness.nodes[follower_idx].instance_id.0);
-        let node_b = NodeId(harness.nodes[leader_idx].instance_id.0);
-        let store: Arc<AssignmentSnapshotStore> =
-            Arc::clone(&harness.nodes[0].assignment_snapshot_store);
-
-        // Seed durable demoted state: feed all keys with idle gaps → checkpoint (clean baseline +
-        // delta seed) → wait for A to demote → checkpoint AGAIN so the cold-only partial folds into
-        // V's chain. Without the second checkpoint, re-acquire rehydrates nothing → loss, not a fix.
-        const ROUNDS: i64 = 3;
-        for _ in 0..ROUNDS {
-            harness.nodes[leader_idx]
-                .db
-                .source_untyped("src")
-                .expect("src")
-                .push_arrow(input_batch(&phase_a))
-                .expect("push round");
-            sleep(Duration::from_millis(150)).await;
-        }
-        harness.nodes[leader_idx]
-            .db
-            .checkpoint()
-            .await
-            .expect("checkpoint phase_a");
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while harness.nodes[follower_idx].db.tier_metrics().demote_total == 0 {
-            assert!(
-                Instant::now() < deadline,
-                "follower (A) never demoted a group before the rotation",
-            );
-            sleep(Duration::from_millis(200)).await;
-        }
-        harness.nodes[leader_idx]
-            .db
-            .checkpoint()
-            .await
-            .expect("checkpoint post-demote");
-        sleep(Duration::from_millis(300)).await;
-
-        // (1) LOSE: move ONLY V from A -> B, preserving every other vnode->owner mapping.
-        let seed = store.load().await.unwrap().unwrap();
-        let mut vnodes: BTreeMap<u32, NodeId> = seed
-            .to_vnode_vec(VNODE_COUNT)
-            .into_iter()
-            .enumerate()
-            .map(|(i, owner)| (i as u32, owner))
-            .collect();
-        vnodes.insert(v, node_b);
-        let moved = seed.next(vnodes);
-        let v_moved = moved.version;
-        assert!(matches!(
-            store.save_if_version(&moved, seed.version).await.unwrap(),
-            RotateOutcome::Rotated,
-        ));
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !harness
-            .nodes
-            .iter()
-            .all(|n| n.vnode_registry.assignment_version() >= v_moved)
-        {
-            assert!(
-                Instant::now() < deadline,
-                "nodes never adopted the A->B move"
-            );
-            sleep(Duration::from_millis(100)).await;
-        }
-        assert!(
-            harness.nodes[follower_idx]
-                .owned_vnodes()
-                .iter()
-                .all(|&x| x != v),
-            "A must drop V",
-        );
-        // Poll (don't fixed-sleep) until A's compute thread drains the staged revoke — apply_revoked_vnodes
-        // empties pending_revoke while dropping V's state — so the reacquire exercises drop-then-rehydrate.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while harness.nodes[follower_idx].db.pending_revoke_vnode_count() > 0 {
-            assert!(
-                Instant::now() < deadline,
-                "A never drained the pending revoke of V",
-            );
-            sleep(Duration::from_millis(50)).await;
-        }
-
-        // (2) REACQUIRE: move V back B -> A (exercises the revoked-state-drop-then-rehydrate path).
-        let seed2 = store.load().await.unwrap().unwrap();
-        let mut vnodes2: BTreeMap<u32, NodeId> = seed2
-            .to_vnode_vec(VNODE_COUNT)
-            .into_iter()
-            .enumerate()
-            .map(|(i, owner)| (i as u32, owner))
-            .collect();
-        vnodes2.insert(v, node_a);
-        let back = seed2.next(vnodes2);
-        let v_back = back.version;
-        assert!(matches!(
-            store.save_if_version(&back, seed2.version).await.unwrap(),
-            RotateOutcome::Rotated,
-        ));
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !harness
-            .nodes
-            .iter()
-            .all(|n| n.vnode_registry.assignment_version() >= v_back)
-        {
-            assert!(
-                Instant::now() < deadline,
-                "nodes never adopted the B->A move-back"
-            );
-            sleep(Duration::from_millis(100)).await;
-        }
-        assert!(
-            harness.nodes[follower_idx].owned_vnodes().contains(&v),
-            "A must re-acquire V",
-        );
-        // Let A run cycles so apply_rehydrated_vnodes folds the durable chain onto now-empty V.
-        sleep(Duration::from_millis(600)).await;
-
-        // (3) Re-feed K once → shuffles to V's owner (A); A re-emits its rehydrated changelog.
-        harness.nodes[leader_idx]
-            .db
-            .source_untyped("src")
-            .expect("src")
-            .push_arrow(input_batch(&[k]))
-            .expect("push K re-feed");
-
-        // K fed ROUNDS times pre-rotation + once after re-acquire. A double-count (chain merged onto
-        // un-dropped state) shows ~2x; a lost group shows < expected.
-        let expected_k = k * 10 * (ROUNDS + 1);
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            let got_k: i64 = read_mv_sums(&harness.nodes[follower_idx].db, "sums")
-                .await
-                .into_iter()
-                .filter(|(kk, _)| *kk == k)
-                .map(|(_, t)| t)
-                .sum();
-            if got_k == expected_k {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "K total after lose-then-reacquire wrong: got {got_k}, want {expected_k} \
-                 (double-count or loss across the rotation)",
-            );
-            sleep(Duration::from_millis(200)).await;
-        }
-
-        // A sibling key on a vnode that never moved must be unchanged (single-counted).
-        let sibling: i64 = *leader_keys
-            .iter()
-            .find(|&&x| x != 0)
-            .expect("a non-zero leader key");
-        let sib_total: i64 = read_mv_sums(&harness.nodes[leader_idx].db, "sums")
-            .await
-            .into_iter()
-            .filter(|(kk, _)| *kk == sibling)
-            .map(|(_, t)| t)
-            .sum();
-        assert_eq!(
-            sib_total,
-            sibling * 10 * ROUNDS,
-            "untouched sibling key changed across the rotation",
-        );
-
-        harness.shutdown().await;
-    }
-
-    /// A rebalance MOVE (vnode A->B, no move-back) must RETRACT the moved groups from the
-    /// LOSING node's incremental MV snapshot. Otherwise A keeps materializing K forever while B also
-    /// materializes it, so a distributed (union) read double-counts K. Reads the union across both
-    /// nodes and asserts K appears exactly once at the full total, and that A dropped K locally.
-    #[cfg(feature = "state-tier")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn rebalance_move_retracts_moved_group_from_losing_node() {
-        use std::collections::BTreeMap;
-        use std::sync::Arc;
-        use std::time::Instant;
-
-        use laminar_core::cluster::control::{AssignmentSnapshotStore, RotateOutcome};
-        use laminar_core::state::NodeId;
-
-        let mut harness =
-            ClusterEngineHarness::spawn_delta_tier(N_NODES, VNODE_COUNT, 2, 2048).await;
-        let leader_idx = harness.leader_idx(); // B: gains V
-        let follower_idx = harness.follower_idxs()[0]; // A: holds V, then loses it
-        for node in &harness.nodes {
-            setup_query(&node.db).await;
-        }
-        harness.start_all().await;
-
-        let owners = vec![
-            (
-                harness.nodes[leader_idx].instance_id,
-                harness.nodes[leader_idx].owned_vnodes(),
-            ),
-            (
-                harness.nodes[follower_idx].instance_id,
-                harness.nodes[follower_idx].owned_vnodes(),
-            ),
-        ];
-        let key_buckets = pick_keys_per_owner(VNODE_COUNT, &owners, 96).expect("pick keys");
-        let leader_keys = key_buckets[0].1.clone();
-        let follower_keys = key_buckets[1].1.clone();
-        let phase: Vec<i64> = leader_keys.iter().chain(&follower_keys).copied().collect();
-
-        let k: i64 = *follower_keys
-            .iter()
-            .find(|&&x| x != 0)
-            .expect("a non-zero follower key");
-        let v: u32 = super::cluster_harness::vnode_for_key(k, VNODE_COUNT);
-        assert!(
-            harness.nodes[follower_idx].owned_vnodes().contains(&v),
-            "precondition: A owns V={v} for K={k}",
-        );
-        let node_b = NodeId(harness.nodes[leader_idx].instance_id.0);
-        let store: Arc<AssignmentSnapshotStore> =
-            Arc::clone(&harness.nodes[0].assignment_snapshot_store);
-
-        // Feed K (and siblings) then checkpoint so B can rehydrate V's aggregate state on acquire.
-        const ROUNDS: i64 = 3;
-        for _ in 0..ROUNDS {
-            harness.nodes[leader_idx]
-                .db
-                .source_untyped("src")
-                .expect("src")
-                .push_arrow(input_batch(&phase))
-                .expect("push round");
-            sleep(Duration::from_millis(150)).await;
-        }
-        harness.nodes[leader_idx]
-            .db
-            .checkpoint()
-            .await
-            .expect("checkpoint baseline");
-        sleep(Duration::from_millis(300)).await;
-
-        // Baseline: K materialized exactly once at ROUNDS*k*10 (on A, its owner) across the union.
-        let baseline = k * 10 * ROUNDS;
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            let rows = union_sums(&harness).await;
-            let n = rows.iter().filter(|(kk, _)| *kk == k).count();
-            let tot: i64 = rows.iter().filter(|(kk, _)| *kk == k).map(|(_, t)| t).sum();
-            if n == 1 && tot == baseline {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "baseline K wrong: rows={rows:?} want one row total {baseline}",
-            );
-            sleep(Duration::from_millis(200)).await;
-        }
-
-        // MOVE V: A -> B (one way), preserving every other vnode->owner mapping.
-        let seed = store.load().await.unwrap().unwrap();
-        let mut vnodes: BTreeMap<u32, NodeId> = seed
-            .to_vnode_vec(VNODE_COUNT)
-            .into_iter()
-            .enumerate()
-            .map(|(i, owner)| (i as u32, owner))
-            .collect();
-        vnodes.insert(v, node_b);
-        let moved = seed.next(vnodes);
-        let v_moved = moved.version;
-        assert!(matches!(
-            store.save_if_version(&moved, seed.version).await.unwrap(),
-            RotateOutcome::Rotated,
-        ));
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !harness
-            .nodes
-            .iter()
-            .all(|n| n.vnode_registry.assignment_version() >= v_moved)
-        {
-            assert!(Instant::now() < deadline, "nodes never adopted A->B move");
-            sleep(Duration::from_millis(100)).await;
-        }
-        assert!(
-            harness.nodes[follower_idx]
-                .owned_vnodes()
-                .iter()
-                .all(|&x| x != v),
-            "A must drop V",
-        );
-        // Let A drain apply_revoked_vnodes (stash the retraction) and B stage the rehydrated chain.
-        sleep(Duration::from_millis(600)).await;
-
-        // Push another round: K routes to V's new owner (B), and A's retained vnodes still receive
-        // rows so A's operator advances its watermark and flushes the stashed retraction.
-        harness.nodes[leader_idx]
-            .db
-            .source_untyped("src")
-            .expect("src")
-            .push_arrow(input_batch(&phase))
-            .expect("push post-move round");
-
-        // K2 is a sibling follower key on a DIFFERENT vnode than V — one A keeps. It proves the
-        // retraction is surgical (only V's groups leave A), and since A never rehydrates, its total
-        // settles promptly (unlike a leader key on B, which races B's acquire-rehydrate cycle).
-        let k2: i64 = *follower_keys
-            .iter()
-            .find(|&&x| {
-                x != 0 && x != k && super::cluster_harness::vnode_for_key(x, VNODE_COUNT) != v
-            })
-            .expect("a second follower key on a vnode other than V");
-
-        // Settle everything together on one consistent snapshot: A dropped K (the retraction), the
-        // union carries K once at the full rehydrated+new total, and A still owns K2 at its full
-        // total. Without the retraction, A keeps K and the union double-counts it.
-        let expected_k = k * 10 * (ROUNDS + 1);
-        let expected_k2 = k2 * 10 * (ROUNDS + 1);
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let a_rows = read_mv_sums(&harness.nodes[follower_idx].db, "sums").await;
-            let a_has_k = a_rows.iter().any(|(kk, _)| *kk == k);
-            let a_has_k2 = a_rows.iter().any(|(kk, _)| *kk == k2);
-            let rows = union_sums(&harness).await;
-            let kn = rows.iter().filter(|(kk, _)| *kk == k).count();
-            let kt: i64 = rows.iter().filter(|(kk, _)| *kk == k).map(|(_, t)| t).sum();
-            let k2n = rows.iter().filter(|(kk, _)| *kk == k2).count();
-            let k2t: i64 = rows
-                .iter()
-                .filter(|(kk, _)| *kk == k2)
-                .map(|(_, t)| t)
-                .sum();
-            if !a_has_k && kn == 1 && kt == expected_k && a_has_k2 && k2n == 1 && k2t == expected_k2
-            {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "after A->B move: A_has_K={a_has_k} K(rows={kn},tot={kt},want {expected_k}) \
-                 A_has_K2={a_has_k2} K2(rows={k2n},tot={k2t},want {expected_k2}); rows={rows:?}",
-            );
-            sleep(Duration::from_millis(250)).await;
-        }
-
-        harness.shutdown().await;
-    }
-
-    /// [LDB-3006] An incremental changelog join is single-node only; creating one in a multi-node
-    /// cluster must be rejected at DDL rather than silently producing per-node-partitioned (wrong)
-    /// results. Covers both the two-way form and the single-statement multi-way decomposition.
-    #[cfg(feature = "state-tier")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn incremental_join_rejected_in_multi_node_cluster() {
-        let harness = ClusterEngineHarness::spawn_delta_tier(N_NODES, VNODE_COUNT, 2, 2048).await;
-        let leader = &harness.nodes[harness.leader_idx()].db;
-        leader
-            .execute("CREATE SOURCE ev_a (k BIGINT, v BIGINT)")
-            .await
-            .expect("src a");
-        leader
-            .execute("CREATE SOURCE ev_b (k BIGINT, v BIGINT)")
-            .await
-            .expect("src b");
-        leader
-            .execute(
-                "CREATE MATERIALIZED VIEW agg_a AS SELECT k, SUM(v) AS ta FROM ev_a GROUP BY k",
-            )
-            .await
-            .expect("agg a");
-        leader
-            .execute(
-                "CREATE MATERIALIZED VIEW agg_b AS SELECT k, SUM(v) AS tb FROM ev_b GROUP BY k",
-            )
-            .await
-            .expect("agg b");
-
-        let two_way = leader
-            .execute(
-                "CREATE MATERIALIZED VIEW j AS \
-                 SELECT a.k, a.ta, b.tb FROM agg_a a JOIN agg_b b ON a.k = b.k",
-            )
-            .await;
-        let err = format!(
-            "{:?}",
-            two_way.expect_err("two-way incremental join must be rejected in a cluster")
-        );
-        assert!(err.contains("LDB-3006"), "expected LDB-3006, got: {err}");
-
-        // Single-statement multi-way decomposition is also rejected: each hidden 2-way intermediate
-        // hits the same guard, so the CREATE fails (and the atomic unwind removes any intermediate).
-        leader
-            .execute("CREATE SOURCE ev_c (k BIGINT, v BIGINT)")
-            .await
-            .expect("src c");
-        leader
-            .execute(
-                "CREATE MATERIALIZED VIEW agg_c AS SELECT k, SUM(v) AS tc FROM ev_c GROUP BY k",
-            )
-            .await
-            .expect("agg c");
-        let multi_way = leader
-            .execute(
-                "CREATE MATERIALIZED VIEW jm AS \
-                 SELECT a.k, a.ta, b.tb, c.tc FROM agg_a a \
-                 JOIN agg_b b ON a.k = b.k JOIN agg_c c ON b.k = c.k",
-            )
-            .await;
-        let merr = format!(
-            "{:?}",
-            multi_way.expect_err("multi-way incremental join must be rejected in a cluster")
-        );
-        assert!(merr.contains("LDB-3006"), "expected LDB-3006, got: {merr}");
-
-        harness.shutdown().await;
+            .expect("bootstrap cluster catalog");
     }
 }
 
 mod rebalance {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use laminar_core::cluster::control::{AssignmentSnapshotStore, RotateOutcome};
-    use laminar_core::state::NodeId;
+    use laminar_core::checkpoint::{CheckpointParticipant, LeaderProof};
+    use laminar_core::cluster::control::{
+        AssignmentDrainDecision, AssignmentDrainVerdict, AssignmentSnapshot,
+        AssignmentSnapshotStore, RotateOutcome,
+    };
+    use laminar_core::state::{CheckpointAttempt, NodeId};
 
-    use super::cluster_harness::ClusterEngineHarness;
+    use super::cluster_harness::{AggregateObservation, ClusterEngineHarness};
 
     const VNODE_COUNT: u32 = 4;
     const N_NODES: usize = 2;
@@ -1461,26 +409,504 @@ mod rebalance {
         panic!("timed out waiting for: {what}");
     }
 
+    fn successor_participants(
+        predecessor: &AssignmentSnapshot,
+        vnodes: &BTreeMap<u32, NodeId>,
+    ) -> Vec<CheckpointParticipant> {
+        let owners = vnodes
+            .values()
+            .map(|owner| owner.0)
+            .collect::<BTreeSet<_>>();
+        let participants = predecessor
+            .participants
+            .iter()
+            .copied()
+            .filter(|participant| owners.contains(&participant.node_id))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            participants.len(),
+            owners.len(),
+            "every successor owner must retain its exact live process incarnation",
+        );
+        participants
+    }
+
+    fn canonical_successor(
+        predecessor: &AssignmentSnapshot,
+        vnodes: BTreeMap<u32, NodeId>,
+    ) -> AssignmentSnapshot {
+        let participants = successor_participants(predecessor, &vnodes);
+        predecessor
+            .next_for_participants(vnodes, participants)
+            .expect("canonical participant-aware successor")
+    }
+
+    async fn stop_placement_drivers(harness: &mut ClusterEngineHarness) {
+        for node in &mut harness.nodes {
+            let placement_driver = node
+                .rebalance_tasks
+                .pop()
+                .expect("cluster harness starts one placement driver after each watcher");
+            placement_driver.abort();
+            let _ = placement_driver.await;
+        }
+    }
+
+    async fn begin_planned_rotation(
+        harness: &mut ClusterEngineHarness,
+        vnodes: BTreeMap<u32, NodeId>,
+    ) -> (AssignmentSnapshot, LeaderProof) {
+        stop_placement_drivers(harness).await;
+        let leader_idx = harness.leader_idx();
+        let store = Arc::clone(&harness.nodes[leader_idx].assignment_snapshot_store);
+        let predecessor = store
+            .load()
+            .await
+            .expect("load predecessor assignment")
+            .expect("predecessor assignment");
+        let participants = successor_participants(&predecessor, &vnodes);
+        let leader_proof = harness.cluster.nodes[leader_idx]
+            .controller
+            .capture_leader_proof()
+            .expect("planned rotation requires the exact live leader grant");
+        let draining = predecessor
+            .next_draining(vnodes, participants, leader_proof.clone())
+            .expect("canonical planned rotation");
+        assert!(matches!(
+            store
+                .save_if_version(&draining, predecessor.version)
+                .await
+                .expect("publish draining assignment"),
+            RotateOutcome::Rotated,
+        ));
+
+        let transition = draining
+            .drain_transition
+            .as_ref()
+            .expect("draining assignment carries its exact transition")
+            .clone();
+        tokio::time::timeout(POLL_DEADLINE, async {
+            loop {
+                match harness.cluster.nodes[leader_idx]
+                    .controller
+                    .drain_ack_quorum_reached(&transition)
+                    .await
+                {
+                    Ok(true) => break,
+                    Ok(false) => tokio::time::sleep(Duration::from_millis(50)).await,
+                    Err(error) => panic!("drain acknowledgement audit failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("every predecessor must acknowledge the planned source cut");
+
+        (draining, leader_proof)
+    }
+
+    async fn authorize_planned_rotation(
+        harness: &ClusterEngineHarness,
+        draining: &AssignmentSnapshot,
+        leader_proof: &LeaderProof,
+    ) -> AssignmentSnapshot {
+        let transition = draining
+            .drain_transition
+            .as_ref()
+            .expect("draining assignment carries its exact transition");
+        let decision = AssignmentDrainDecision::new(
+            transition,
+            leader_proof.clone(),
+            AssignmentDrainVerdict::Commit,
+        )
+        .expect("canonical planned-rotation decision");
+        harness.cluster.nodes[harness.leader_idx()]
+            .controller
+            .checkpoint_authority()
+            .expect("cluster checkpoint authority")
+            .record_assignment_drain_decision(leader_proof, decision)
+            .await
+            .expect("record immutable planned-rotation decision");
+        draining
+            .committed_target()
+            .expect("materialize committed planned rotation")
+    }
+
+    async fn finalize_planned_rotation(
+        harness: &ClusterEngineHarness,
+        draining: &AssignmentSnapshot,
+        committed: &AssignmentSnapshot,
+    ) {
+        let store = &harness.nodes[harness.leader_idx()].assignment_snapshot_store;
+        assert!(matches!(
+            store
+                .finalize_drain(draining, committed)
+                .await
+                .expect("finalize planned rotation"),
+            RotateOutcome::Rotated,
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dead_aggregate_owner_advances_to_a_successor_recovery_quorum() {
+        let mut harness = ClusterEngineHarness::spawn(N_NODES, 1).await;
+        harness
+            .bootstrap_catalog(&[
+                super::cluster_harness::TEST_SOURCE_DDL,
+                "CREATE STREAM totals AS SELECT SUM(value) AS total FROM src EMIT CHANGES",
+                super::cluster_harness::TEST_AGGREGATE_SINK_DDL,
+            ])
+            .await
+            .expect("bootstrap stateful cluster catalog");
+        harness.start_all().await;
+
+        let leader = harness.leader_idx();
+        let store = Arc::clone(&harness.nodes[leader].assignment_snapshot_store);
+        let predecessor = store.load().await.unwrap().unwrap();
+        let aggregate_owner = predecessor
+            .vnodes
+            .get(&0)
+            .copied()
+            .expect("global aggregate state is assigned through vnode zero");
+        let failed_index = harness
+            .nodes
+            .iter()
+            .position(|node| node.instance_id == aggregate_owner)
+            .expect("aggregate owner belongs to the running harness");
+
+        harness.source_log.append(&[(1, 10), (2, 20)]);
+        let expected_observation = AggregateObservation {
+            node_id: aggregate_owner,
+            total: 30,
+            weight: 1,
+        };
+        if tokio::time::timeout(POLL_DEADLINE, async {
+            while !harness
+                .sink_state
+                .observations()
+                .contains(&expected_observation)
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            panic!(
+                "aggregate owner did not publish {expected_observation:?}; observations={:?}; nodes={:?}",
+                harness.sink_state.observations(),
+                harness
+                    .nodes
+                    .iter()
+                    .map(|node| (
+                        node.instance_id,
+                        node.owned_vnodes(),
+                        node.source_state.polls(),
+                        node.source_state.last_checkpoint_cursor(),
+                        node.db.cluster_intake_fenced(),
+                        node.db.pipeline_state(),
+                        node.db.last_fault(),
+                    ))
+                    .collect::<Vec<_>>(),
+            );
+        }
+
+        let committed = harness.nodes[leader]
+            .db
+            .checkpoint()
+            .await
+            .expect("seed cluster checkpoint");
+        assert!(
+            committed.success,
+            "seed cluster checkpoint failed: {:?}",
+            committed.error
+        );
+        let committed_attempt = CheckpointAttempt::new(committed.epoch, committed.checkpoint_id);
+        assert_eq!(
+            harness.nodes[failed_index]
+                .source_state
+                .last_checkpoint_cursor(),
+            2,
+            "the committed cut must own both scripted input rows"
+        );
+        let observations_at_commit = harness.sink_state.observations();
+        assert!(
+            observations_at_commit
+                .iter()
+                .all(|observation| observation.node_id == aggregate_owner),
+            "only the vnode owner may consume the scripted split before failover: {observations_at_commit:?}"
+        );
+        let mut baseline_relation = std::collections::BTreeMap::<i64, i64>::new();
+        for observation in &observations_at_commit {
+            *baseline_relation.entry(observation.total).or_default() += observation.weight;
+        }
+        baseline_relation.retain(|_, weight| *weight != 0);
+        assert_eq!(
+            baseline_relation,
+            std::collections::BTreeMap::from([(30, 1)]),
+            "the committed aggregate relation must contain exactly one total 30"
+        );
+        assert!(
+            harness.nodes[failed_index].source_state.polls() > 0,
+            "the vnode-zero owner must be the process that consumed the scripted split"
+        );
+        for (index, node) in harness.nodes.iter().enumerate() {
+            if index != failed_index {
+                assert_eq!(
+                    node.source_state.polls(),
+                    0,
+                    "a non-owner source process must never poll the shared split"
+                );
+            }
+        }
+
+        harness.source_log.block_resumes();
+        let survivor_index = (0..harness.nodes.len())
+            .find(|index| *index != failed_index)
+            .expect("two-node harness has one survivor");
+        let resume_starts_before_failure =
+            harness.nodes[survivor_index].source_state.resume_starts();
+        let stopped = harness.fail_node_runtime(failed_index).await;
+        assert_eq!(stopped, aggregate_owner);
+        assert_eq!(harness.nodes.len(), 1);
+        let survivor_id = harness.nodes[0].instance_id;
+        let survivor_db = Arc::clone(&harness.nodes[0].db);
+        let survivor_registry = Arc::clone(&harness.nodes[0].vnode_registry);
+        let survivor_source_state = Arc::clone(&harness.nodes[0].source_state);
+        let successor_version = predecessor.version + 1;
+
+        tokio::time::timeout(Duration::from_secs(45), async {
+            while survivor_source_state.resume_starts() <= resume_starts_before_failure {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("successor source must install its durable cursor before intake opens");
+        assert_eq!(
+            survivor_source_state.last_resume_cursor(),
+            2,
+            "successor must resume after the committed input, not replay from zero"
+        );
+        assert!(
+            survivor_db.cluster_intake_fenced(),
+            "recovery must retain the source-intake fence while Resume is blocked"
+        );
+        assert!(
+            harness.cluster.nodes[0].controller.is_recovering(),
+            "the controller must remain in recovery while Resume is blocked"
+        );
+        let polls_while_fenced = survivor_source_state.polls();
+        assert_eq!(
+            harness.sink_state.observations(),
+            observations_at_commit,
+            "a fenced successor must not emit aggregate output"
+        );
+
+        harness.source_log.release_resumes();
+        tokio::time::timeout(Duration::from_secs(45), async {
+            loop {
+                let durable = store.load().await.unwrap().unwrap();
+                let recovered = durable.version == successor_version
+                    && !durable.draining
+                    && durable.participants.len() == 1
+                    && durable.participants[0].node_id == survivor_id.0
+                    && durable.vnodes.values().all(|owner| *owner == survivor_id)
+                    && survivor_registry.assignment_version() == successor_version
+                    && harness.cluster.nodes[0]
+                        .controller
+                        .checkpoint_assignment_fence(successor_version)
+                        .is_some_and(|fence| {
+                            fence.participants == durable.participants
+                                && fence.matches_owner_map(
+                                    &durable
+                                        .vnodes
+                                        .values()
+                                        .map(|owner| owner.0)
+                                        .collect::<Vec<_>>(),
+                                )
+                        })
+                    && harness.cluster.nodes[0].controller.is_leader()
+                    && !harness.cluster.nodes[0].controller.is_recovering()
+                    && !survivor_db.cluster_intake_fenced()
+                    && survivor_source_state.polls() > polls_while_fenced;
+                if recovered {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("successor owners must restore and resume serving");
+
+        let durable = store.load().await.unwrap().unwrap();
+        let survivor_controller = &harness.cluster.nodes[0].controller;
+        let decision = survivor_controller
+            .checkpoint_authority()
+            .expect("cluster checkpoint authority")
+            .assignment_recovery_decision(successor_version)
+            .await
+            .expect("recovery decision read")
+            .expect("successor must have a durable recovery decision");
+        assert_eq!(
+            decision.predecessor,
+            predecessor.assignment_fence().unwrap()
+        );
+        assert_eq!(decision.target, durable.assignment_fence().unwrap());
+        assert_eq!(
+            store
+                .load_recovery_proposal(&decision.proposal)
+                .await
+                .expect("staged recovery proposal"),
+            durable
+        );
+        assert_eq!(decision.removed_process_fences.len(), 1);
+        let removed = &decision.removed_process_fences[0];
+        assert_eq!(removed.predecessor.node, aggregate_owner);
+        assert_eq!(
+            removed.predecessor.owner,
+            predecessor
+                .participants
+                .iter()
+                .find(|participant| participant.node_id == aggregate_owner.0)
+                .expect("failed owner belongs to predecessor roster")
+                .boot_incarnation
+        );
+        assert!(
+            survivor_controller
+                .verify_process_lease_fence(
+                    removed,
+                    tokio::time::Instant::now() + Duration::from_secs(2),
+                )
+                .await
+                .expect("failed-owner process fence verification"),
+            "the recovery decision must retain a verifiable takeover certificate"
+        );
+
+        let assignment = survivor_registry.versioned_snapshot();
+        assert_eq!(
+            assignment.source_handoff_attempt(),
+            Some(committed_attempt),
+            "new ownership must be restored from the last committed cluster cut"
+        );
+        harness.source_log.append(&[(3, 7)]);
+        if tokio::time::timeout(POLL_DEADLINE, async {
+            loop {
+                let observations = harness.sink_state.observations();
+                if observations.contains(&AggregateObservation {
+                    node_id: survivor_id,
+                    total: 30,
+                    weight: -1,
+                }) && observations.contains(&AggregateObservation {
+                    node_id: survivor_id,
+                    total: 37,
+                    weight: 1,
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .is_err()
+        {
+            panic!(
+                "successor did not retract restored total 30 and publish continued total 37; observations={:?}; polls={}; cursor={}; restoring={}; intake_fenced={}; state={:?}; fault={:?}",
+                harness.sink_state.observations(),
+                survivor_source_state.polls(),
+                survivor_source_state.last_checkpoint_cursor(),
+                survivor_registry.is_restoring(0),
+                survivor_db.cluster_intake_fenced(),
+                survivor_db.pipeline_state(),
+                survivor_db.last_fault(),
+            );
+        }
+
+        let post_recovery = survivor_db
+            .checkpoint()
+            .await
+            .expect("checkpoint after successor recovery");
+        assert!(
+            post_recovery.success,
+            "post-recovery checkpoint failed: {:?}",
+            post_recovery.error
+        );
+        assert!(post_recovery.epoch > committed.epoch);
+        assert_eq!(
+            survivor_source_state.last_checkpoint_cursor(),
+            3,
+            "post-recovery checkpoint must advance the connector-local cursor once"
+        );
+        let observations = harness.sink_state.observations();
+        assert_eq!(
+            &observations[observations_at_commit.len()..],
+            &[
+                AggregateObservation {
+                    node_id: survivor_id,
+                    total: 30,
+                    weight: -1,
+                },
+                AggregateObservation {
+                    node_id: survivor_id,
+                    total: 37,
+                    weight: 1,
+                },
+            ],
+            "the post-barrier tail must contain no replay or stale-owner write"
+        );
+
+        harness.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn snapshot_watcher_adopts_direct_rotation() {
         let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
+        harness
+            .bootstrap_catalog(&[
+                super::cluster_harness::TEST_SOURCE_DDL,
+                "CREATE STREAM totals AS SELECT SUM(value) AS total FROM src EMIT CHANGES",
+                super::cluster_harness::TEST_AGGREGATE_SINK_DDL,
+            ])
+            .await
+            .expect("bootstrap cluster catalog");
         harness.start_all().await;
 
-        let store: Arc<AssignmentSnapshotStore> =
-            Arc::clone(&harness.nodes[0].assignment_snapshot_store);
-        let seed = store.load().await.unwrap().unwrap();
+        let old_owner = harness.nodes[0].vnode_registry.owner(0);
+        let target_owner = harness
+            .nodes
+            .iter()
+            .map(|node| node.instance_id)
+            .find(|node| *node != old_owner)
+            .expect("two-node harness has a distinct transfer target");
+        harness.source_log.append(&[(1, 10), (2, 20)]);
+        wait_for(
+            || {
+                harness
+                    .sink_state
+                    .observations()
+                    .contains(&AggregateObservation {
+                        node_id: old_owner,
+                        total: 30,
+                        weight: 1,
+                    })
+            },
+            "predecessor aggregate output",
+        )
+        .await;
 
-        let leader = NodeId(harness.nodes[harness.leader_idx()].instance_id.0);
         let mut vnodes = BTreeMap::new();
         for v in 0..VNODE_COUNT {
-            vnodes.insert(v, leader);
+            vnodes.insert(v, target_owner);
         }
-        let next = seed.next(vnodes);
+        let (draining, leader_proof) = begin_planned_rotation(&mut harness, vnodes).await;
+        let cut = harness.nodes[harness.leader_idx()]
+            .db
+            .checkpoint()
+            .await
+            .expect("checkpoint the acknowledged predecessor cut");
+        assert!(cut.success, "pre-rotation checkpoint: {:?}", cut.error);
+        let observations_before_transfer = harness.sink_state.observations();
+        let next = authorize_planned_rotation(&harness, &draining, &leader_proof).await;
         let expected = next.version;
-        assert!(matches!(
-            store.save_if_version(&next, seed.version).await.unwrap(),
-            RotateOutcome::Rotated,
-        ));
+        finalize_planned_rotation(&harness, &draining, &next).await;
 
         wait_for(
             || {
@@ -1492,6 +918,83 @@ mod rebalance {
             "every node to adopt the new version",
         )
         .await;
+        wait_for(
+            || {
+                harness
+                    .nodes
+                    .iter()
+                    .find(|node| node.instance_id == target_owner)
+                    .is_some_and(|node| !node.vnode_registry.is_restoring(0))
+            },
+            "transfer target to apply the restored vnode baseline",
+        )
+        .await;
+        assert_eq!(
+            harness.sink_state.observations(),
+            observations_before_transfer,
+            "physical ownership movement must not change the logical stream"
+        );
+
+        harness.source_log.append(&[(3, 7)]);
+        wait_for(
+            || {
+                let observations = harness.sink_state.observations();
+                observations.contains(&AggregateObservation {
+                    node_id: target_owner,
+                    total: 30,
+                    weight: -1,
+                }) && observations.contains(&AggregateObservation {
+                    node_id: target_owner,
+                    total: 37,
+                    weight: 1,
+                })
+            },
+            "transferred aggregate to continue from its restored baseline",
+        )
+        .await;
+        let post_rotation = harness.nodes[harness.leader_idx()]
+            .db
+            .checkpoint()
+            .await
+            .expect("checkpoint after transferred input");
+        assert!(
+            post_rotation.success,
+            "post-rotation checkpoint: {:?}",
+            post_rotation.error
+        );
+        let committed = harness.cluster.nodes[harness.leader_idx()]
+            .controller
+            .checkpoint_authority()
+            .expect("cluster checkpoint authority")
+            .cluster_outcome(post_rotation.epoch)
+            .await
+            .expect("cluster outcome read")
+            .expect("post-rotation checkpoint outcome");
+        assert!(committed.is_commit());
+        assert_eq!(
+            committed
+                .assignment_fence
+                .as_ref()
+                .map(|fence| fence.assignment_version),
+            Some(expected),
+            "post-rotation checkpoint must certify the adopted assignment generation"
+        );
+        assert_eq!(
+            &harness.sink_state.observations()[observations_before_transfer.len()..],
+            &[
+                AggregateObservation {
+                    node_id: target_owner,
+                    total: 30,
+                    weight: -1,
+                },
+                AggregateObservation {
+                    node_id: target_owner,
+                    total: 37,
+                    weight: 1,
+                },
+            ],
+            "the transfer and committed source handoff must produce one logical continuation"
+        );
 
         for node in &harness.nodes {
             let backend_v = node.state_backend.authoritative_version();
@@ -1500,19 +1003,41 @@ mod rebalance {
             assert_eq!(backend_v, registry_v);
         }
         assert_eq!(
-            harness.nodes[harness.leader_idx()].owned_vnodes().len(),
+            harness
+                .nodes
+                .iter()
+                .find(|node| node.instance_id == target_owner)
+                .expect("transfer target remains live")
+                .owned_vnodes()
+                .len(),
             VNODE_COUNT as usize,
         );
+        let mut relation = BTreeMap::<i64, i64>::new();
+        for observation in harness.sink_state.observations() {
+            *relation.entry(observation.total).or_default() += observation.weight;
+        }
+        relation.retain(|_, weight| *weight != 0);
+        assert_eq!(relation, BTreeMap::from([(37, 1)]));
 
         harness.shutdown().await;
     }
 
-    /// Barrier-aligned handoff: the draining phase marks to-be-lost vnodes draining (source pauses
-    /// them for a clean cut) without changing ownership; the commit phase rotates and clears it.
+    /// Barrier-aligned handoff: the draining phase holds every predecessor source at one frontier
+    /// without changing ownership; the commit phase rotates and releases the cut.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn snapshot_watcher_handles_draining_phase() {
         let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
+        harness
+            .bootstrap_catalog(&[
+                super::cluster_harness::TEST_SOURCE_DDL,
+                "CREATE STREAM projected AS SELECT key, value FROM src",
+            ])
+            .await
+            .expect("bootstrap cluster catalog");
         harness.start_all().await;
+        // This test drives the durable assignment head directly. Retain the watchers under test
+        // and stop the independent placement drivers so they cannot abort the injected drain.
+        stop_placement_drivers(&mut harness).await;
 
         let store: Arc<AssignmentSnapshotStore> =
             Arc::clone(&harness.nodes[0].assignment_snapshot_store);
@@ -1532,25 +1057,61 @@ mod rebalance {
             vnodes.insert(v, leader);
         }
 
-        // Draining snapshot: the follower marks its lost vnodes draining, but ownership
-        // (the registry version) does not change.
+        // Draining snapshot: every predecessor process adopts the global source-cut transition,
+        // but ownership (the registry version) does not change.
         let pre_version = harness.nodes[follower_idx]
             .vnode_registry
             .assignment_version();
-        let mut drain = seed.next(vnodes.clone());
-        drain.draining = true;
+        let leader_proof = harness.cluster.nodes[harness.leader_idx()]
+            .controller
+            .capture_leader_proof()
+            .expect("test leader must hold the durable lease");
+        let leader_participant = seed
+            .participants
+            .iter()
+            .find(|participant| participant.node_id == leader.0)
+            .copied()
+            .expect("leader belongs to the predecessor roster");
+        let drain = seed
+            .next_draining(
+                vnodes.clone(),
+                vec![leader_participant],
+                leader_proof.clone(),
+            )
+            .unwrap();
         assert!(matches!(
             store.save_if_version(&drain, seed.version).await.unwrap(),
             RotateOutcome::Rotated,
         ));
+        let transition = drain.drain_transition.clone();
         wait_for(
             || {
-                lost.iter()
-                    .all(|&v| harness.nodes[follower_idx].vnode_registry.is_draining(v))
+                harness.cluster.nodes[follower_idx]
+                    .controller
+                    .checkpoint_drain_transition()
+                    == transition
             },
-            "follower marks its lost vnodes draining",
+            "follower adopts the global source-cut transition",
         )
         .await;
+        let exact_transition = transition
+            .as_ref()
+            .expect("draining assignment has a transition");
+        tokio::time::timeout(POLL_DEADLINE, async {
+            loop {
+                match harness.cluster.nodes[harness.leader_idx()]
+                    .controller
+                    .drain_ack_quorum_reached(exact_transition)
+                    .await
+                {
+                    Ok(true) => break,
+                    Ok(false) => tokio::time::sleep(Duration::from_millis(50)).await,
+                    Err(error) => panic!("drain acknowledgement audit failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("every predecessor watcher must acknowledge the global source cut");
         assert_eq!(
             harness.nodes[follower_idx]
                 .vnode_registry
@@ -1559,31 +1120,99 @@ mod rebalance {
             "drain phase must not change ownership",
         );
 
+        let checkpoint = harness.nodes[harness.leader_idx()]
+            .db
+            .checkpoint()
+            .await
+            .expect("pre-rotation checkpoint");
+        assert!(
+            checkpoint.success,
+            "pre-rotation checkpoint must consume the held FIFO barriers: {:?}",
+            checkpoint.error
+        );
+        let leader_idx = harness.leader_idx();
+        let held_polls = harness.nodes[leader_idx].source_state.polls();
+        assert_eq!(harness.nodes[leader_idx].source_state.drain_finishes(), 0);
+        let watcher = harness.nodes[leader_idx].rebalance_tasks.remove(0);
+        watcher.abort();
+        let _ = watcher.await;
+
         // Committed snapshot: ownership rotates and the drain clears.
-        let commit = drain.next(vnodes);
+        let commit = drain.committed_target().unwrap();
         let expected = commit.version;
+        let decision = laminar_core::cluster::control::AssignmentDrainDecision::new(
+            drain.drain_transition.as_ref().unwrap(),
+            leader_proof.clone(),
+            laminar_core::cluster::control::AssignmentDrainVerdict::Commit,
+        )
+        .unwrap();
+        harness.cluster.nodes[harness.leader_idx()]
+            .controller
+            .checkpoint_authority()
+            .unwrap()
+            .record_assignment_drain_decision(&leader_proof, decision)
+            .await
+            .unwrap();
         assert!(matches!(
-            store.save_if_version(&commit, drain.version).await.unwrap(),
+            store.finalize_drain(&drain, &commit).await.unwrap(),
             RotateOutcome::Rotated,
         ));
+        let restarted_watcher = laminar_db::rebalance::spawn_snapshot_watcher(
+            Arc::clone(&harness.nodes[leader_idx].db),
+            Arc::clone(&harness.nodes[leader_idx].assignment_snapshot_store),
+            Arc::clone(&harness.nodes[leader_idx].vnode_registry),
+            harness.nodes[leader_idx].rebalance_shutdown.clone(),
+            laminar_db::rebalance::RebalanceConfig::test_defaults(),
+            Some(Arc::clone(&harness.cluster.nodes[leader_idx].controller)),
+        );
+        harness.nodes[leader_idx]
+            .rebalance_tasks
+            .push(restarted_watcher);
+        let adoption_deadline = Instant::now() + POLL_DEADLINE;
+        while Instant::now() < adoption_deadline
+            && !harness
+                .nodes
+                .iter()
+                .all(|node| node.vnode_registry.assignment_version() >= expected)
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let observed_versions: Vec<_> = harness
+            .nodes
+            .iter()
+            .map(|node| node.vnode_registry.assignment_version())
+            .collect();
+        assert!(
+            observed_versions.iter().all(|version| *version >= expected),
+            "every node must adopt committed assignment {expected}; observed {observed_versions:?}"
+        );
         wait_for(
             || {
                 harness
+                    .cluster
                     .nodes
                     .iter()
-                    .all(|n| n.vnode_registry.assignment_version() >= expected)
+                    .all(|node| node.controller.checkpoint_drain_transition().is_none())
             },
-            "every node adopts the committed snapshot",
+            "every watcher resolves the global source cut",
         )
         .await;
-        for node in &harness.nodes {
-            for v in 0..VNODE_COUNT {
-                assert!(
-                    !node.vnode_registry.is_draining(v),
-                    "draining must clear on commit",
-                );
-            }
-        }
+        wait_for(
+            || {
+                harness.nodes[leader_idx].source_state.drain_finishes() == 1
+                    && harness.nodes[leader_idx].source_state.polls() > held_polls
+                    && !harness.nodes[leader_idx].db.cluster_intake_fenced()
+            },
+            "fresh leader watcher to resolve durable source history before reopening intake",
+        )
+        .await;
+        let drain_resolutions = harness.nodes[leader_idx].source_state.drain_resolutions();
+        assert_eq!(drain_resolutions.len(), 1);
+        assert_eq!(
+            drain_resolutions[0].outcome,
+            laminar_connectors::connector::SourceDrainOutcome::Commit,
+            "the connector must observe the durable handoff outcome"
+        );
         assert_eq!(
             harness.nodes[harness.leader_idx()].owned_vnodes().len(),
             VNODE_COUNT as usize,
@@ -1594,8 +1223,7 @@ mod rebalance {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_rotation_picks_single_winner() {
-        let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
-        harness.start_all().await;
+        let harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
 
         let store: Arc<AssignmentSnapshotStore> =
             Arc::clone(&harness.nodes[0].assignment_snapshot_store);
@@ -1609,7 +1237,10 @@ mod rebalance {
             a_map.insert(v, leader);
             b_map.insert(v, follower);
         }
-        let (a, b) = (seed.next(a_map), seed.next(b_map));
+        let (a, b) = (
+            canonical_successor(&seed, a_map),
+            canonical_successor(&seed, b_map),
+        );
 
         let (ra, rb) = tokio::join!(
             store.save_if_version(&a, seed.version),
@@ -1628,39 +1259,39 @@ mod rebalance {
         assert_eq!(stored.version, seed.version + 1);
         for outcome in &outcomes {
             if let RotateOutcome::Conflict(current) = outcome {
-                assert_eq!(current, &stored);
+                assert_eq!(current.as_ref(), &stored);
             }
         }
-
-        wait_for(
-            || {
-                harness
-                    .nodes
-                    .iter()
-                    .all(|n| n.vnode_registry.assignment_version() >= stored.version)
-            },
-            "nodes to adopt the CAS winner",
-        )
-        .await;
 
         harness.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn stale_rotation_attempt_rejected_by_cas() {
-        let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
-        harness.start_all().await;
+        let harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
 
         let store: Arc<AssignmentSnapshotStore> =
             Arc::clone(&harness.nodes[0].assignment_snapshot_store);
         let seed = store.load().await.unwrap().unwrap();
 
-        let leader = NodeId(harness.nodes[harness.leader_idx()].instance_id.0);
+        let winner = NodeId(
+            seed.participants
+                .first()
+                .expect("seed must certify the cluster participants")
+                .node_id,
+        );
+        let stale_owner = NodeId(
+            seed.participants
+                .iter()
+                .find(|participant| participant.node_id != winner.0)
+                .expect("test requires a second certified participant")
+                .node_id,
+        );
         let mut m = BTreeMap::new();
         for v in 0..VNODE_COUNT {
-            m.insert(v, leader);
+            m.insert(v, winner);
         }
-        let next = seed.next(m);
+        let next = canonical_successor(&seed, m);
         assert!(matches!(
             store.save_if_version(&next, seed.version).await.unwrap(),
             RotateOutcome::Rotated,
@@ -1668,40 +1299,32 @@ mod rebalance {
 
         let mut stale_map = BTreeMap::new();
         for v in 0..VNODE_COUNT {
-            stale_map.insert(v, NodeId(99));
+            stale_map.insert(v, stale_owner);
         }
-        let stale = seed.next(stale_map);
+        let stale = canonical_successor(&seed, stale_map);
         match store.save_if_version(&stale, seed.version).await.unwrap() {
-            RotateOutcome::Conflict(current) => assert_eq!(current, next),
+            RotateOutcome::Conflict(current) => assert_eq!(*current, next),
             RotateOutcome::Rotated => panic!("stale rotation must not succeed"),
         }
-
-        wait_for(
-            || {
-                harness
-                    .nodes
-                    .iter()
-                    .all(|n| n.vnode_registry.assignment_version() >= next.version)
-            },
-            "nodes to adopt the legitimate rotation",
-        )
-        .await;
-        for node in &harness.nodes {
-            for v in 0..VNODE_COUNT {
-                assert_ne!(node.vnode_registry.owner(v).0, 99);
-            }
-        }
+        assert_eq!(store.load().await.unwrap().unwrap(), next);
 
         harness.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn rebalance_rehydrates_acquired_vnode_state() {
-        use bytes::Bytes;
-
-        const SEED_EPOCH: u64 = 50;
-
         let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
+
+        // Drive the production checkpoint path so the fixture contains a participant-ready
+        // inventory and durable decision as well as valid encoded vnode partials. A bare seal is
+        // only prepared state and must never be an assignment handoff cut.
+        harness
+            .bootstrap_catalog(&[
+                super::cluster_harness::TEST_SOURCE_DDL,
+                "CREATE STREAM projected AS SELECT key, value FROM src",
+            ])
+            .await
+            .expect("bootstrap cluster catalog");
         harness.start_all().await;
 
         let leader_idx = harness.leader_idx();
@@ -1710,74 +1333,73 @@ mod rebalance {
         let follower_vnodes = harness.nodes[follower_idx].owned_vnodes();
         assert!(!follower_vnodes.is_empty(), "follower must own some vnodes");
 
-        let backend = Arc::clone(&harness.nodes[leader_idx].state_backend);
-        let version = backend.authoritative_version();
-        let all_vnodes: Vec<u32> = (0..VNODE_COUNT).collect();
-        for &v in &all_vnodes {
-            backend
-                .write_partial(v, SEED_EPOCH, version, Bytes::from(format!("vnode-{v}")))
-                .await
-                .expect("seed write_partial");
-        }
-        assert!(
-            backend
-                .epoch_complete(SEED_EPOCH, &all_vnodes, &[])
-                .await
-                .expect("seal seed epoch"),
-            "seed epoch must seal once every vnode partial is present",
-        );
-
-        let store: Arc<AssignmentSnapshotStore> =
-            Arc::clone(&harness.nodes[0].assignment_snapshot_store);
-        let seed = store.load().await.unwrap().unwrap();
         let leader = NodeId(harness.nodes[leader_idx].instance_id.0);
-        let mut m = BTreeMap::new();
-        for v in 0..VNODE_COUNT {
-            m.insert(v, leader);
+        let mut target = BTreeMap::new();
+        for vnode in 0..VNODE_COUNT {
+            target.insert(vnode, leader);
         }
-        let rotated = seed.next(m);
-        assert!(matches!(
-            store.save_if_version(&rotated, seed.version).await.unwrap(),
-            RotateOutcome::Rotated,
-        ));
+        let (draining, leader_proof) = begin_planned_rotation(&mut harness, target).await;
 
-        wait_for(
-            || {
-                harness.nodes[leader_idx]
-                    .vnode_registry
-                    .assignment_version()
-                    >= rotated.version
-            },
-            "leader to adopt the rotation",
-        )
-        .await;
+        let checkpoint = harness.nodes[leader_idx]
+            .db
+            .checkpoint()
+            .await
+            .expect("decision-bound handoff checkpoint");
+        assert!(
+            checkpoint.success,
+            "handoff checkpoint failed: {:?}",
+            checkpoint.error
+        );
+        let outcome = harness.cluster.nodes[leader_idx]
+            .controller
+            .checkpoint_authority()
+            .expect("cluster checkpoint authority")
+            .cluster_outcome(checkpoint.epoch)
+            .await
+            .expect("read handoff outcome")
+            .expect("handoff checkpoint must have a durable outcome");
+        assert_eq!(outcome.checkpoint_id, checkpoint.checkpoint_id);
 
-        wait_for(
-            || {
-                let staged = harness.nodes[leader_idx].db.rehydrated_vnode_state();
-                follower_vnodes.iter().all(|v| staged.contains_key(v))
-            },
-            "leader to stage rehydrated state for acquired vnodes",
-        )
-        .await;
+        let seed_attempt = CheckpointAttempt::new(checkpoint.epoch, checkpoint.checkpoint_id);
+        let inventory = harness.nodes[leader_idx]
+            .state_backend
+            .checkpoint_seal_inventory(seed_attempt)
+            .await
+            .expect("read handoff seal")
+            .expect("decided checkpoint must have an exact seal");
+        let all_vnodes: Vec<u32> = (0..VNODE_COUNT).collect();
+        assert_eq!(inventory.attempt, seed_attempt);
+        assert_eq!(inventory.required_vnodes, all_vnodes);
+        assert_eq!(inventory.assignment_fence, outcome.assignment_fence);
 
-        let staged = harness.nodes[leader_idx].db.rehydrated_vnode_state();
-        let staged_keys: std::collections::BTreeSet<u32> = staged.keys().copied().collect();
+        for node in &mut harness.nodes {
+            for watcher in std::mem::take(&mut node.rebalance_tasks) {
+                watcher.abort();
+                let _ = watcher.await;
+            }
+        }
+        let rotated = authorize_planned_rotation(&harness, &draining, &leader_proof).await;
+        finalize_planned_rotation(&harness, &draining, &rotated).await;
+        let adoption = harness.nodes[leader_idx]
+            .db
+            .adopt_assignment_snapshot(
+                rotated.clone(),
+                tokio::time::Instant::now() + Duration::from_secs(30),
+            )
+            .await
+            .expect("adopt decision-bound assignment handoff");
+
+        assert!(adoption.adopted);
+        assert_eq!(adoption.version, rotated.version);
+        let acquired: std::collections::BTreeSet<u32> =
+            adoption.newly_acquired.iter().copied().collect();
         let expected: std::collections::BTreeSet<u32> = follower_vnodes.iter().copied().collect();
         assert_eq!(
-            staged_keys, expected,
-            "leader must rehydrate exactly its newly-acquired vnodes",
+            acquired, expected,
+            "leader must acquire exactly the follower's prior vnodes",
         );
-        for &v in &follower_vnodes {
-            let entry = staged.get(&v).expect("acquired vnode staged");
-            assert_eq!(entry.epoch, SEED_EPOCH);
-            assert_eq!(
-                entry.chain.len(),
-                1,
-                "simple seed resolves to a single-link chain"
-            );
-            assert_eq!(&entry.chain[0][..], format!("vnode-{v}").as_bytes());
-        }
+        assert_eq!(adoption.rehydrated, follower_vnodes.len());
+        assert_eq!(adoption.rehydration_epoch, Some(checkpoint.epoch));
 
         harness.shutdown().await;
     }
@@ -1786,35 +1408,33 @@ mod rebalance {
     async fn checkpoint_after_rotation_carries_new_version() {
         let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
 
-        for node in &harness.nodes {
-            node.db
-                .execute("CREATE SOURCE src (key BIGINT, value BIGINT)")
-                .await
-                .expect("CREATE SOURCE");
-            node.db
-                .execute(
-                    "CREATE MATERIALIZED VIEW sums AS \
-                     SELECT key, SUM(value) AS total FROM src GROUP BY key",
-                )
-                .await
-                .expect("CREATE MATERIALIZED VIEW");
-        }
+        harness
+            .bootstrap_catalog(&[
+                super::cluster_harness::TEST_SOURCE_DDL,
+                "CREATE STREAM projected AS SELECT key, value FROM src",
+            ])
+            .await
+            .expect("bootstrap cluster catalog");
         harness.start_all().await;
-
-        let store: Arc<AssignmentSnapshotStore> =
-            Arc::clone(&harness.nodes[0].assignment_snapshot_store);
-        let seed = store.load().await.unwrap().unwrap();
 
         let leader = NodeId(harness.nodes[harness.leader_idx()].instance_id.0);
         let mut m = BTreeMap::new();
         for v in 0..VNODE_COUNT {
             m.insert(v, leader);
         }
-        let rotated = seed.next(m);
-        assert!(matches!(
-            store.save_if_version(&rotated, seed.version).await.unwrap(),
-            RotateOutcome::Rotated,
-        ));
+        let (draining, leader_proof) = begin_planned_rotation(&mut harness, m).await;
+        let handoff = harness.nodes[harness.leader_idx()]
+            .db
+            .checkpoint()
+            .await
+            .expect("checkpoint the acknowledged predecessor cut");
+        assert!(
+            handoff.success,
+            "handoff checkpoint failed: {:?}",
+            handoff.error
+        );
+        let rotated = authorize_planned_rotation(&harness, &draining, &leader_proof).await;
+        finalize_planned_rotation(&harness, &draining, &rotated).await;
 
         wait_for(
             || {
@@ -1838,72 +1458,334 @@ mod rebalance {
             result.error
         );
 
-        assert!(harness.nodes[harness.leader_idx()]
-            .decision_store
-            .is_committed(result.epoch)
+        let leader_idx = harness.leader_idx();
+        let outcome = harness.cluster.nodes[leader_idx]
+            .controller
+            .checkpoint_authority()
+            .expect("cluster checkpoint authority")
+            .cluster_outcome(result.epoch)
             .await
-            .unwrap());
+            .expect("cluster outcome read")
+            .expect("post-rotation checkpoint outcome");
+        assert!(outcome.is_commit());
+        assert_eq!(
+            outcome
+                .assignment_fence
+                .as_ref()
+                .map(|fence| fence.assignment_version),
+            Some(rotated.version),
+            "post-rotation checkpoint must certify the adopted assignment generation",
+        );
 
         harness.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn source_assignment_cut_survives_cluster_restart() {
+        let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
+        harness
+            .bootstrap_catalog(&[
+                super::cluster_harness::TEST_SOURCE_DDL,
+                "CREATE STREAM projected AS SELECT key, value FROM src",
+            ])
+            .await
+            .expect("bootstrap cluster catalog");
+        harness.start_all().await;
+
+        let first = harness.nodes[harness.leader_idx()]
+            .db
+            .checkpoint()
+            .await
+            .expect("initial cluster checkpoint");
+        assert!(first.success, "initial checkpoint: {:?}", first.error);
+
+        let predecessor = harness.nodes[0]
+            .assignment_snapshot_store
+            .load()
+            .await
+            .expect("load durable predecessor")
+            .expect("durable predecessor assignment");
+        let predecessor_fence = predecessor
+            .assignment_fence()
+            .expect("canonical predecessor assignment");
+        let first_outcome = harness.cluster.nodes[harness.leader_idx()]
+            .controller
+            .checkpoint_authority()
+            .expect("cluster checkpoint authority")
+            .cluster_outcome(first.epoch)
+            .await
+            .expect("initial cluster outcome read")
+            .expect("initial checkpoint outcome");
+        assert_eq!(
+            first_outcome.assignment_fence,
+            Some(predecessor_fence.clone())
+        );
+
+        let (shared_dir, checkpoint_dirs, control_store) = harness.shutdown_keep_dirs().await;
+        let mut restarted = ClusterEngineHarness::spawn_with_dirs(
+            N_NODES,
+            VNODE_COUNT,
+            shared_dir,
+            checkpoint_dirs,
+            control_store,
+        )
+        .await;
+        assert_eq!(
+            restarted.nodes[0]
+                .assignment_snapshot_store
+                .load()
+                .await
+                .expect("load assignment after process respawn")
+                .expect("durable assignment after process respawn"),
+            predecessor,
+            "process construction must not advance the durable assignment head"
+        );
+        restarted.start_all().await;
+
+        let successor = restarted.nodes[0]
+            .assignment_snapshot_store
+            .load()
+            .await
+            .expect("load durable restart successor")
+            .expect("durable restart successor");
+        assert_eq!(successor.version, predecessor.version + 1);
+        assert_eq!(successor.vnodes, predecessor.vnodes);
+        assert!(!successor.draining);
+
+        let owner_ids = successor
+            .vnodes
+            .values()
+            .map(|owner| owner.0)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut replacement_roster = restarted
+            .cluster
+            .nodes
+            .iter()
+            .filter(|node| owner_ids.contains(&node.instance_id.0))
+            .map(|node| laminar_core::checkpoint::CheckpointParticipant {
+                node_id: node.instance_id.0,
+                boot_incarnation: node.controller.recovery_incarnation(),
+            })
+            .collect::<Vec<_>>();
+        replacement_roster.sort_unstable_by_key(|participant| participant.node_id);
+        assert_eq!(successor.participants, replacement_roster);
+        assert!(
+            successor
+                .participants
+                .iter()
+                .zip(&predecessor.participants)
+                .all(|(replacement, prior)| {
+                    replacement.node_id == prior.node_id
+                        && replacement.boot_incarnation != prior.boot_incarnation
+                }),
+            "every predecessor owner must be replaced by its current process incarnation"
+        );
+
+        let successor_fence = successor
+            .assignment_fence()
+            .expect("canonical restart successor");
+        let leader_idx = restarted.leader_idx();
+        let authority = restarted.cluster.nodes[leader_idx]
+            .controller
+            .checkpoint_authority()
+            .expect("cluster checkpoint authority");
+        let decision = authority
+            .assignment_recovery_decision(successor.version)
+            .await
+            .expect("restart recovery decision read")
+            .expect("authorized restart recovery decision");
+        assert_eq!(decision.predecessor, predecessor_fence);
+        assert_eq!(decision.target, successor_fence);
+        assert_eq!(
+            restarted.nodes[leader_idx]
+                .assignment_snapshot_store
+                .load_recovery_proposal(&decision.proposal)
+                .await
+                .expect("load authorized restart proposal"),
+            successor
+        );
+
+        for (runtime, cluster_node) in restarted.nodes.iter().zip(&restarted.cluster.nodes) {
+            assert_eq!(
+                runtime.vnode_registry.assignment_version(),
+                successor.version
+            );
+            assert_eq!(
+                cluster_node
+                    .controller
+                    .checkpoint_assignment_fence(successor.version),
+                Some(successor_fence.clone())
+            );
+            let active = successor_fence.contains(runtime.instance_id.0);
+            let active_version = if active { successor.version } else { 0 };
+            let active_digest = active.then_some(successor_fence.digest());
+            assert_eq!(runtime.shuffle_sender.assignment_version(), active_version);
+            assert_eq!(
+                runtime.shuffle_receiver.assignment_version(),
+                active_version
+            );
+            assert_eq!(
+                runtime.shuffle_sender.active_assignment_digest(),
+                active_digest
+            );
+            assert_eq!(
+                runtime.shuffle_receiver.active_assignment_digest(),
+                active_digest
+            );
+        }
+
+        let second = restarted.nodes[restarted.leader_idx()]
+            .db
+            .checkpoint()
+            .await
+            .expect("checkpoint after recovery");
+        assert!(second.success, "recovered checkpoint: {:?}", second.error);
+        assert!(second.epoch > first.epoch);
+
+        restarted.shutdown().await;
     }
 }
 
 mod two_pc {
+    use super::cluster_harness::ClusterEngineHarness;
     use std::sync::Arc;
     use std::time::Duration;
 
-    use laminar_core::cluster::control::{BarrierAnnouncement, CheckpointDecisionStore, Phase};
-    use laminar_core::cluster::testing::MiniCluster;
+    use laminar_core::cluster::control::{
+        BarrierAnnouncement, CheckpointAssignmentFence, CheckpointDecisionStore, LeaderLeaseStore,
+        Phase,
+    };
     use laminar_core::state::{
-        owned_vnodes, InProcessBackend, NodeId, StateBackend, VnodeRegistry,
+        owned_vnodes, CheckpointAttempt, InProcessBackend, NodeId, StateBackend, VnodeRegistry,
     };
     use laminar_core::storage::checkpoint_store::FileSystemCheckpointStore;
     use laminar_db::checkpoint_coordinator::{
         CheckpointConfig, CheckpointCoordinator, CheckpointRequest,
     };
-    use object_store::local::LocalFileSystem;
     use object_store::ObjectStore;
-    use tempfile::TempDir;
 
-    const CONVERGENCE: Duration = Duration::from_secs(5);
+    fn certified_request(assignment_fence: &CheckpointAssignmentFence) -> CheckpointRequest {
+        CheckpointRequest {
+            assignment_fence: Some(assignment_fence.clone()),
+            ..CheckpointRequest::default()
+        }
+    }
+
+    fn checkpoint_authority(harness: &ClusterEngineHarness) -> Arc<LeaderLeaseStore> {
+        let authority = harness.cluster.nodes[0]
+            .controller
+            .checkpoint_authority()
+            .expect("cluster checkpoint authority");
+        for node in &harness.cluster.nodes[1..] {
+            let peer_authority = node
+                .controller
+                .checkpoint_authority()
+                .expect("peer checkpoint authority");
+            assert!(
+                Arc::ptr_eq(&authority, &peer_authority),
+                "all participants must use the exact shared checkpoint authority",
+            );
+        }
+        authority
+    }
+
+    fn live_leader_proof(
+        controller: &laminar_core::cluster::control::ClusterController,
+    ) -> laminar_core::checkpoint::LeaderProof {
+        let proof = controller
+            .capture_leader_proof()
+            .expect("durable leader proof must be live");
+        assert!(controller.proof_is_live(&proof));
+        proof
+    }
 
     async fn make_coord(
         dir: &std::path::Path,
         backend: Arc<InProcessBackend>,
         vnodes: Vec<u32>,
+        assignment_fence: &CheckpointAssignmentFence,
         controller: Arc<laminar_core::cluster::control::ClusterController>,
+        decision_store: Arc<CheckpointDecisionStore>,
     ) -> CheckpointCoordinator {
-        let store = Box::new(FileSystemCheckpointStore::new(dir, 3));
+        let key_group_count =
+            laminar_core::state::KeyGroupCount::try_from(backend.key_group_capacity()).unwrap();
+        let store = Box::new(
+            FileSystemCheckpointStore::new(dir)
+                .with_key_group_count(key_group_count)
+                .with_participant_id(controller.instance_id().0),
+        );
         let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
             .await
             .unwrap();
-        coord.set_state_backend(backend);
+        coord.set_state_backend(backend).unwrap();
         coord.set_vnode_set(vnodes);
+        coord.set_assignment_version(assignment_fence.assignment_version);
+        controller.publish_checkpoint_assignment_fence(Some(assignment_fence.clone()));
         coord.set_cluster_controller(controller);
+        coord
+            .bind_durable_decision_store(decision_store)
+            .await
+            .unwrap();
         coord
     }
 
-    fn make_decision_store(dir: &TempDir) -> Arc<CheckpointDecisionStore> {
-        let os: Arc<dyn ObjectStore> = Arc::new(
-            LocalFileSystem::new_with_prefix(dir.path())
-                .expect("LocalFileSystem for decision store"),
-        );
-        Arc::new(CheckpointDecisionStore::new(os))
+    fn make_decision_store(store: Arc<dyn ObjectStore>) -> Arc<CheckpointDecisionStore> {
+        Arc::new(CheckpointDecisionStore::new(store))
+    }
+
+    async fn create_test_recovery_capsule(
+        store: &CheckpointDecisionStore,
+        checkpoint_id: u64,
+        fence: &CheckpointAssignmentFence,
+    ) -> laminar_core::checkpoint::RecoveryCapsuleRef {
+        use laminar_core::checkpoint::{
+            ClusterRecoveryCapsule, ParticipantRecoveryRef, PipelineIdentity,
+            CLUSTER_RECOVERY_CAPSULE_VERSION,
+        };
+
+        fn digest(byte: u8) -> String {
+            format!("{byte:02x}").repeat(32)
+        }
+
+        let deployment_id = store.load_or_create_deployment_id().await.unwrap();
+        let portable_state_sha256 = digest(9);
+        let participants = fence
+            .participant_ids()
+            .into_iter()
+            .map(|participant_id| ParticipantRecoveryRef {
+                participant_id,
+                readiness_sha256: digest(3),
+                manifest_sha256: digest(4),
+                portable_state_sha256: portable_state_sha256.clone(),
+            })
+            .collect();
+        let capsule = ClusterRecoveryCapsule {
+            version: CLUSTER_RECOVERY_CAPSULE_VERSION,
+            attempt: CheckpointAttempt::new(checkpoint_id, checkpoint_id),
+            deployment_id,
+            pipeline_identity: PipelineIdentity::empty(),
+            assignment_fence: fence.clone(),
+            seal_inventory_sha256: digest(2),
+            participants,
+            source_offsets: Default::default(),
+            source_metadata: Default::default(),
+            source_assignment_versions: Default::default(),
+            source_watermarks: Default::default(),
+            cluster_watermark: laminar_core::checkpoint::CheckpointWatermark::Uninitialized,
+            recovery_watermark_frontier: None,
+            portable_state_sha256,
+        };
+        store.create_recovery_capsule(&capsule).await.unwrap()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn two_node_leader_commits_follower_mirrors() {
-        let cluster = MiniCluster::spawn(2).await;
-        cluster
-            .wait_for_convergence(CONVERGENCE)
-            .await
-            .expect("cluster converges");
-
-        let (leader_node, follower_node) = if cluster.nodes[0].controller.is_leader() {
-            (&cluster.nodes[0], &cluster.nodes[1])
-        } else {
-            (&cluster.nodes[1], &cluster.nodes[0])
-        };
+        let harness = ClusterEngineHarness::spawn(2, 4).await;
+        let leader_idx = harness.leader_idx();
+        let follower_idx = harness.follower_idxs()[0];
+        let leader_node = &harness.cluster.nodes[leader_idx];
+        let follower_node = &harness.cluster.nodes[follower_idx];
+        let authority = checkpoint_authority(&harness);
 
         let backend = Arc::new(InProcessBackend::new(4));
         let registry = VnodeRegistry::new(4);
@@ -1919,43 +1801,49 @@ mod two_pc {
 
         let leader_dir = tempfile::tempdir().unwrap();
         let follower_dir = tempfile::tempdir().unwrap();
-        let decision_dir = tempfile::tempdir().unwrap();
-        let decision_store = make_decision_store(&decision_dir);
+        let decision_store = make_decision_store(harness.control_store());
+        let fence = super::test_assignment_fence(&harness.cluster, &registry);
 
         let mut leader_coord = make_coord(
             leader_dir.path(),
             backend.clone(),
             owned_vnodes(&registry, NodeId(leader_node.instance_id.0)),
+            &fence,
             Arc::clone(&leader_node.controller),
+            Arc::clone(&decision_store),
         )
         .await;
-        leader_coord.set_decision_store(Arc::clone(&decision_store));
+        leader_coord.set_gate_vnode_set((0..registry.vnode_count()).collect());
         let mut follower_coord = make_coord(
             follower_dir.path(),
             backend.clone(),
             owned_vnodes(&registry, NodeId(follower_node.instance_id.0)),
+            &fence,
             Arc::clone(&follower_node.controller),
+            Arc::clone(&decision_store),
         )
         .await;
-        follower_coord.set_decision_store(Arc::clone(&decision_store));
 
+        let leader_proof = live_leader_proof(&leader_node.controller);
         let ann = BarrierAnnouncement {
             epoch: 1,
             checkpoint_id: 1,
+            assignment_fence: Some(fence.clone()),
+            leader_proof: Some(leader_proof),
             phase: Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         };
 
+        let follower_request = certified_request(&fence);
         let follower_handle = tokio::spawn(async move {
             follower_coord
-                .follower_checkpoint(CheckpointRequest::default(), ann, Duration::from_secs(15))
+                .follower_checkpoint(follower_request, ann, Duration::from_secs(15))
                 .await
         });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         let leader_result = leader_coord
-            .checkpoint(CheckpointRequest::default())
+            .checkpoint(certified_request(&fence))
             .await
             .expect("leader checkpoint call");
         assert!(
@@ -1970,22 +1858,30 @@ mod two_pc {
             .expect("follower checkpoint Result");
         assert!(committed, "follower must commit on leader's Commit");
 
+        let attempt = CheckpointAttempt::new(leader_result.epoch, leader_result.checkpoint_id);
         for v in 0..4 {
-            assert!(backend.read_partial(v, 1).await.unwrap().is_some());
+            assert!(backend.read_partial(attempt, v).await.unwrap().is_some());
         }
+        let outcome = authority
+            .cluster_outcome(leader_result.epoch)
+            .await
+            .expect("cluster outcome read")
+            .expect("committed cluster outcome");
+        assert!(outcome.is_commit());
+        assert_eq!(outcome.checkpoint_id, leader_result.checkpoint_id);
+        assert_eq!(outcome.assignment_fence.as_ref(), Some(&fence));
 
-        cluster.shutdown().await;
+        harness.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn leader_records_commit_decision_before_announce() {
-        let cluster = MiniCluster::spawn(2).await;
-        cluster.wait_for_convergence(CONVERGENCE).await.unwrap();
-        let (leader_node, follower_node) = if cluster.nodes[0].controller.is_leader() {
-            (&cluster.nodes[0], &cluster.nodes[1])
-        } else {
-            (&cluster.nodes[1], &cluster.nodes[0])
-        };
+        let harness = ClusterEngineHarness::spawn(2, 4).await;
+        let leader_idx = harness.leader_idx();
+        let follower_idx = harness.follower_idxs()[0];
+        let leader_node = &harness.cluster.nodes[leader_idx];
+        let follower_node = &harness.cluster.nodes[follower_idx];
+        let authority = checkpoint_authority(&harness);
 
         let backend = Arc::new(InProcessBackend::new(4));
         let registry = VnodeRegistry::new(4);
@@ -1999,8 +1895,8 @@ mod two_pc {
             .into(),
         );
 
-        let decision_dir = tempfile::tempdir().unwrap();
-        let decision_store = make_decision_store(&decision_dir);
+        let decision_store = make_decision_store(harness.control_store());
+        let fence = super::test_assignment_fence(&harness.cluster, &registry);
 
         let leader_dir = tempfile::tempdir().unwrap();
         let follower_dir = tempfile::tempdir().unwrap();
@@ -2008,34 +1904,40 @@ mod two_pc {
             leader_dir.path(),
             backend.clone(),
             owned_vnodes(&registry, NodeId(leader_node.instance_id.0)),
+            &fence,
             Arc::clone(&leader_node.controller),
+            Arc::clone(&decision_store),
         )
         .await;
-        leader_coord.set_decision_store(Arc::clone(&decision_store));
+        leader_coord.set_gate_vnode_set((0..registry.vnode_count()).collect());
         let mut follower_coord = make_coord(
             follower_dir.path(),
             backend.clone(),
             owned_vnodes(&registry, NodeId(follower_node.instance_id.0)),
+            &fence,
             Arc::clone(&follower_node.controller),
+            Arc::clone(&decision_store),
         )
         .await;
-        follower_coord.set_decision_store(Arc::clone(&decision_store));
 
+        let leader_proof = live_leader_proof(&leader_node.controller);
         let ann = BarrierAnnouncement {
             epoch: 1,
             checkpoint_id: 1,
+            assignment_fence: Some(fence.clone()),
+            leader_proof: Some(leader_proof),
             phase: Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         };
+        let follower_request = certified_request(&fence);
         let follower_handle = tokio::spawn(async move {
             follower_coord
-                .follower_checkpoint(CheckpointRequest::default(), ann, Duration::from_secs(15))
+                .follower_checkpoint(follower_request, ann, Duration::from_secs(15))
                 .await
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
         let leader_result = leader_coord
-            .checkpoint(CheckpointRequest::default())
+            .checkpoint(certified_request(&fence))
             .await
             .unwrap();
         assert!(
@@ -2045,117 +1947,171 @@ mod two_pc {
         );
         let _ = follower_handle.await.unwrap().unwrap();
 
-        assert!(
-            decision_store.is_committed(1).await.unwrap(),
-            "leader must record commit marker before announcing Commit",
-        );
+        let outcome = authority
+            .cluster_outcome(leader_result.epoch)
+            .await
+            .expect("cluster outcome read")
+            .expect("leader must record Commit before the follower can observe it");
+        assert!(outcome.is_commit());
+        assert_eq!(outcome.checkpoint_id, leader_result.checkpoint_id);
+        assert_eq!(outcome.assignment_fence.as_ref(), Some(&fence));
 
-        cluster.shutdown().await;
+        harness.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn follower_timeout_commits_when_decision_recorded() {
-        let cluster = MiniCluster::spawn(2).await;
-        cluster.wait_for_convergence(CONVERGENCE).await.unwrap();
-        let follower_node = if cluster.nodes[0].controller.is_leader() {
-            &cluster.nodes[1]
-        } else {
-            &cluster.nodes[0]
-        };
+        const CHECKPOINT_ID: u64 = 42;
+
+        let harness = ClusterEngineHarness::spawn(2, 4).await;
+        let leader_idx = harness.leader_idx();
+        let follower_idx = harness.follower_idxs()[0];
+        let leader_node = &harness.cluster.nodes[leader_idx];
+        let follower_node = &harness.cluster.nodes[follower_idx];
+        let authority = checkpoint_authority(&harness);
 
         let backend = Arc::new(InProcessBackend::new(4));
         let registry = VnodeRegistry::new(4);
-        registry.set_assignment(vec![NodeId(follower_node.instance_id.0); 4].into());
+        registry.set_assignment(
+            vec![
+                NodeId(leader_node.instance_id.0),
+                NodeId(follower_node.instance_id.0),
+                NodeId(follower_node.instance_id.0),
+                NodeId(follower_node.instance_id.0),
+            ]
+            .into(),
+        );
 
-        let decision_dir = tempfile::tempdir().unwrap();
-        let decision_store = make_decision_store(&decision_dir);
-        decision_store.record_committed(42).await.unwrap();
+        let decision_store = make_decision_store(harness.control_store());
+        let fence = super::test_assignment_fence(&harness.cluster, &registry);
+        let leader_proof = live_leader_proof(&leader_node.controller);
+        let recovery_capsule =
+            create_test_recovery_capsule(decision_store.as_ref(), CHECKPOINT_ID, &fence).await;
+        authority
+            .record_cluster_outcome(
+                &leader_proof,
+                CHECKPOINT_ID,
+                CHECKPOINT_ID,
+                fence.clone(),
+                laminar_core::checkpoint_decision::CheckpointVerdict::Commit,
+                Some(recovery_capsule),
+            )
+            .await
+            .unwrap();
 
         let follower_dir = tempfile::tempdir().unwrap();
         let mut follower_coord = make_coord(
             follower_dir.path(),
             backend.clone(),
             owned_vnodes(&registry, NodeId(follower_node.instance_id.0)),
+            &fence,
             Arc::clone(&follower_node.controller),
+            Arc::clone(&decision_store),
         )
         .await;
-        follower_coord.set_decision_store(Arc::clone(&decision_store));
 
         let ann = BarrierAnnouncement {
-            epoch: 42,
-            checkpoint_id: 100,
+            epoch: CHECKPOINT_ID,
+            checkpoint_id: CHECKPOINT_ID,
+            assignment_fence: Some(fence.clone()),
+            leader_proof: Some(leader_proof),
             phase: Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         };
         let committed = follower_coord
-            .follower_checkpoint(
-                CheckpointRequest::default(),
-                ann,
-                Duration::from_millis(500),
-            )
+            .follower_checkpoint(certified_request(&fence), ann, Duration::from_millis(500))
             .await
             .unwrap();
 
         assert!(committed);
-        cluster.shutdown().await;
+        let outcome = authority
+            .cluster_outcome(CHECKPOINT_ID)
+            .await
+            .expect("cluster outcome read")
+            .expect("pre-recorded cluster outcome");
+        assert!(outcome.is_commit());
+        assert_eq!(outcome.checkpoint_id, CHECKPOINT_ID);
+        assert_eq!(outcome.assignment_fence.as_ref(), Some(&fence));
+        harness.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn follower_timeout_rolls_back_when_no_decision() {
-        let cluster = MiniCluster::spawn(2).await;
-        cluster.wait_for_convergence(CONVERGENCE).await.unwrap();
-        let follower_node = if cluster.nodes[0].controller.is_leader() {
-            &cluster.nodes[1]
-        } else {
-            &cluster.nodes[0]
-        };
+    async fn follower_timeout_stays_in_doubt_when_no_decision() {
+        const CHECKPOINT_ID: u64 = 99;
+
+        let harness = ClusterEngineHarness::spawn(2, 4).await;
+        let leader_idx = harness.leader_idx();
+        let follower_idx = harness.follower_idxs()[0];
+        let leader_node = &harness.cluster.nodes[leader_idx];
+        let follower_node = &harness.cluster.nodes[follower_idx];
+        let authority = checkpoint_authority(&harness);
 
         let backend = Arc::new(InProcessBackend::new(4));
         let registry = VnodeRegistry::new(4);
-        registry.set_assignment(vec![NodeId(follower_node.instance_id.0); 4].into());
+        registry.set_assignment(
+            vec![
+                NodeId(leader_node.instance_id.0),
+                NodeId(follower_node.instance_id.0),
+                NodeId(follower_node.instance_id.0),
+                NodeId(follower_node.instance_id.0),
+            ]
+            .into(),
+        );
 
-        let decision_dir = tempfile::tempdir().unwrap();
-        let decision_store = make_decision_store(&decision_dir);
+        let decision_store = make_decision_store(harness.control_store());
+        let fence = super::test_assignment_fence(&harness.cluster, &registry);
 
         let follower_dir = tempfile::tempdir().unwrap();
         let mut follower_coord = make_coord(
             follower_dir.path(),
             backend.clone(),
             owned_vnodes(&registry, NodeId(follower_node.instance_id.0)),
+            &fence,
             Arc::clone(&follower_node.controller),
+            Arc::clone(&decision_store),
         )
         .await;
-        follower_coord.set_decision_store(Arc::clone(&decision_store));
 
+        let leader_proof = live_leader_proof(&leader_node.controller);
         let ann = BarrierAnnouncement {
-            epoch: 99,
-            checkpoint_id: 200,
+            epoch: CHECKPOINT_ID,
+            checkpoint_id: CHECKPOINT_ID,
+            assignment_fence: Some(fence.clone()),
+            leader_proof: Some(leader_proof),
             phase: Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         };
-        let committed = follower_coord
-            .follower_checkpoint(
-                CheckpointRequest::default(),
-                ann,
-                Duration::from_millis(500),
-            )
+        let error = follower_coord
+            .follower_checkpoint(certified_request(&fence), ann, Duration::from_millis(500))
             .await
-            .unwrap();
-        assert!(!committed);
-        cluster.shutdown().await;
+            .expect_err("a prepared follower must not guess abort without a durable decision");
+        assert!(
+            error.to_string().contains("[LDB-6046]"),
+            "unexpected in-doubt error: {error}"
+        );
+        assert!(
+            authority
+                .cluster_outcome(CHECKPOINT_ID)
+                .await
+                .expect("cluster outcome read")
+                .is_none(),
+            "the follower must not synthesize a terminal cluster outcome",
+        );
+        harness.shutdown().await;
     }
 }
 
 mod minio {
+    use super::cluster_harness::{ClusterEngineHarness, TEST_SOURCE_DDL};
     use std::sync::Arc;
     use std::time::Duration;
 
-    use laminar_core::cluster::control::{BarrierAnnouncement, Phase};
-    use laminar_core::cluster::testing::MiniCluster;
+    use laminar_core::cluster::control::{
+        BarrierAnnouncement, CheckpointAssignmentFence, CheckpointDecisionStore, Phase,
+    };
     use laminar_core::state::{
-        owned_vnodes, rendezvous_assignment, NodeId, ObjectStoreBackend, VnodeRegistry,
+        owned_vnodes, rendezvous_assignment, CheckpointAttempt, NodeId, ObjectStoreBackend,
+        StateBackend, VnodeRegistry,
     };
     use laminar_core::storage::checkpoint_store::FileSystemCheckpointStore;
     use laminar_db::checkpoint_coordinator::{
@@ -2165,23 +2121,49 @@ mod minio {
 
     use super::common::{minio_endpoint, minio_store};
 
-    const CONVERGENCE: Duration = Duration::from_secs(5);
+    fn unique_bucket(prefix: &str) -> String {
+        format!("{prefix}-{}", uuid::Uuid::new_v4())
+    }
+
+    fn certified_request(
+        controller: &laminar_core::cluster::control::ClusterController,
+        assignment_version: u64,
+    ) -> CheckpointRequest {
+        CheckpointRequest {
+            assignment_fence: controller.checkpoint_assignment_fence(assignment_version),
+            ..CheckpointRequest::default()
+        }
+    }
 
     async fn make_coord(
         dir: &std::path::Path,
         backend: Arc<ObjectStoreBackend>,
         vnodes: Vec<u32>,
         gate_vnodes: Vec<u32>,
+        assignment_fence: &CheckpointAssignmentFence,
         controller: Arc<laminar_core::cluster::control::ClusterController>,
+        decision_store: Arc<CheckpointDecisionStore>,
     ) -> CheckpointCoordinator {
-        let store = Box::new(FileSystemCheckpointStore::new(dir, 3));
+        let key_group_count =
+            laminar_core::state::KeyGroupCount::try_from(backend.key_group_capacity()).unwrap();
+        let store = Box::new(
+            FileSystemCheckpointStore::new(dir)
+                .with_key_group_count(key_group_count)
+                .with_participant_id(controller.instance_id().0),
+        );
         let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
             .await
             .unwrap();
-        coord.set_state_backend(backend);
+        coord.set_state_backend(backend).unwrap();
         coord.set_vnode_set(vnodes);
         coord.set_gate_vnode_set(gate_vnodes);
+        coord.set_assignment_version(assignment_fence.assignment_version);
+        controller.publish_checkpoint_assignment_fence(Some(assignment_fence.clone()));
         coord.set_cluster_controller(controller);
+        coord
+            .bind_durable_decision_store(decision_store)
+            .await
+            .unwrap();
         coord
     }
 
@@ -2191,11 +2173,11 @@ mod minio {
             eprintln!("skipping: MinIO not reachable at 127.0.0.1:19000");
             return;
         }
-        let cluster = MiniCluster::spawn(2).await;
-        cluster
-            .wait_for_convergence(CONVERGENCE)
-            .await
-            .expect("cluster converges");
+        let bucket = unique_bucket("laminar-test");
+        let store = minio_store(&bucket).await;
+        let harness =
+            ClusterEngineHarness::spawn_with_control_store(2, 4, Arc::clone(&store)).await;
+        let cluster = &harness.cluster;
 
         let (leader_node, follower_node) = if cluster.nodes[0].controller.is_leader() {
             (&cluster.nodes[0], &cluster.nodes[1])
@@ -2203,21 +2185,14 @@ mod minio {
             (&cluster.nodes[1], &cluster.nodes[0])
         };
 
-        let bucket = format!(
-            "laminar-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
-        );
-        let store = minio_store(&bucket).await;
+        let decision_store = Arc::new(CheckpointDecisionStore::new(Arc::clone(&store)));
 
-        let leader_backend = Arc::new(ObjectStoreBackend::new(
+        let leader_backend = Arc::new(ObjectStoreBackend::cluster_shared(
             Arc::clone(&store),
             leader_node.instance_id.0.to_string(),
             4,
         ));
-        let follower_backend = Arc::new(ObjectStoreBackend::new(
+        let follower_backend = Arc::new(ObjectStoreBackend::cluster_shared(
             Arc::clone(&store),
             follower_node.instance_id.0.to_string(),
             4,
@@ -2234,6 +2209,7 @@ mod minio {
         let follower_owned = owned_vnodes(&registry, NodeId(follower_node.instance_id.0));
         assert_eq!(leader_owned.len() + follower_owned.len(), 4);
         let full = (0..4).collect::<Vec<_>>();
+        let fence = super::test_assignment_fence(cluster, &registry);
 
         let leader_dir = tempfile::tempdir().unwrap();
         let follower_dir = tempfile::tempdir().unwrap();
@@ -2242,7 +2218,9 @@ mod minio {
             leader_backend,
             leader_owned,
             full.clone(),
+            &fence,
             Arc::clone(&leader_node.controller),
+            Arc::clone(&decision_store),
         )
         .await;
         let mut follower_coord = make_coord(
@@ -2250,27 +2228,42 @@ mod minio {
             follower_backend,
             follower_owned,
             full,
+            &fence,
             Arc::clone(&follower_node.controller),
+            decision_store,
         )
         .await;
 
+        let assignment_version = registry.assignment_version();
         let ann = BarrierAnnouncement {
             epoch: 1,
             checkpoint_id: 1,
+            assignment_fence: leader_node
+                .controller
+                .checkpoint_assignment_fence(assignment_version),
+            leader_proof: Some(
+                leader_node
+                    .controller
+                    .capture_leader_proof()
+                    .expect("durable leader proof must be live"),
+            ),
             phase: Phase::Prepare,
             flags: 0,
-            min_watermark_ms: None,
         };
 
+        let follower_request = certified_request(&follower_node.controller, assignment_version);
         let follower_handle = tokio::spawn(async move {
             follower_coord
-                .follower_checkpoint(CheckpointRequest::default(), ann, Duration::from_secs(20))
+                .follower_checkpoint(follower_request, ann, Duration::from_secs(20))
                 .await
         });
 
         tokio::time::sleep(Duration::from_millis(200)).await;
         let leader_result = leader_coord
-            .checkpoint(CheckpointRequest::default())
+            .checkpoint(certified_request(
+                &leader_node.controller,
+                assignment_version,
+            ))
             .await
             .expect("leader checkpoint");
         assert!(
@@ -2282,85 +2275,277 @@ mod minio {
         let committed = follower_handle.await.expect("join").expect("follower");
         assert!(committed, "follower must commit on leader's Commit");
 
+        let attempt = CheckpointAttempt::new(leader_result.epoch, leader_result.checkpoint_id);
         for v in 0..4 {
-            let path = object_store::path::Path::from(format!("epoch=1/vnode={v}/partial.bin"));
+            let path = object_store::path::Path::from(format!(
+                "state-v2/epoch={}/checkpoint={}/vnode={v}/partial.bin",
+                attempt.epoch, attempt.checkpoint_id
+            ));
             let meta = store.head(&path).await;
             assert!(meta.is_ok(), "missing partial for vnode {v}: {meta:?}");
         }
-        let commit_path = object_store::path::Path::from("epoch=1/_COMMIT");
+        let seal_path = object_store::path::Path::from(format!(
+            "state-v2/epoch={}/checkpoint={}/_SEAL",
+            attempt.epoch, attempt.checkpoint_id
+        ));
         assert!(
-            store.head(&commit_path).await.is_ok(),
-            "missing epoch=1/_COMMIT marker on MinIO",
+            store.head(&seal_path).await.is_ok(),
+            "missing exact-attempt _SEAL marker on MinIO",
         );
 
-        cluster.shutdown().await;
+        harness.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cluster_control_state_survives_fresh_minio_client_restart() {
+        if minio_endpoint().is_none() {
+            eprintln!("skipping: MinIO not reachable at 127.0.0.1:19000");
+            return;
+        }
+        let bucket = unique_bucket("laminar-restart");
+        let mut harness =
+            ClusterEngineHarness::spawn_with_control_store(2, 4, minio_store(&bucket).await).await;
+        harness
+            .bootstrap_catalog(&[
+                TEST_SOURCE_DDL,
+                "CREATE STREAM projected AS SELECT key, value FROM src",
+            ])
+            .await
+            .expect("bootstrap cluster catalog");
+        harness.start_all().await;
+
+        let first = harness.nodes[harness.leader_idx()]
+            .db
+            .checkpoint()
+            .await
+            .expect("checkpoint before restart");
+        assert!(
+            first.success,
+            "checkpoint before restart: {:?}",
+            first.error
+        );
+        let predecessor = harness.nodes[0]
+            .assignment_snapshot_store
+            .load()
+            .await
+            .expect("load assignment before restart")
+            .expect("assignment before restart");
+        let predecessor_fence = predecessor
+            .assignment_fence()
+            .expect("canonical assignment before restart");
+        let first_certified = harness.cluster.nodes[harness.leader_idx()]
+            .controller
+            .checkpoint_authority()
+            .expect("checkpoint authority before restart")
+            .cluster_outcome_with_recovery_capsule(first.epoch)
+            .await
+            .expect("load certified checkpoint before restart")
+            .expect("certified checkpoint before restart");
+        assert!(first_certified.0.is_commit());
+        assert!(first_certified.1.is_some());
+
+        let (shared_dir, checkpoint_dirs, old_control_store) = harness.shutdown_keep_dirs().await;
+        drop(old_control_store);
+        let fresh_control_store = minio_store(&bucket).await;
+        let mut restarted = ClusterEngineHarness::spawn_with_dirs(
+            2,
+            4,
+            shared_dir,
+            checkpoint_dirs,
+            fresh_control_store,
+        )
+        .await;
+        assert_eq!(
+            restarted.nodes[0]
+                .assignment_snapshot_store
+                .load()
+                .await
+                .expect("load assignment through fresh MinIO client")
+                .expect("durable assignment after restart"),
+            predecessor,
+            "process construction must recover the persisted assignment head",
+        );
+        let recovered_first = restarted.cluster.nodes[0]
+            .controller
+            .checkpoint_authority()
+            .expect("checkpoint authority through fresh MinIO client")
+            .cluster_outcome_with_recovery_capsule(first.epoch)
+            .await
+            .expect("load certified checkpoint through fresh MinIO client")
+            .expect("certified checkpoint after restart");
+        assert_eq!(recovered_first, first_certified);
+        restarted.start_all().await;
+
+        let leader_idx = restarted.leader_idx();
+        let successor = restarted.nodes[leader_idx]
+            .assignment_snapshot_store
+            .load()
+            .await
+            .expect("load restart successor through fresh MinIO client")
+            .expect("restart successor assignment");
+        assert_eq!(successor.version, predecessor.version + 1);
+        assert_eq!(successor.vnodes, predecessor.vnodes);
+        let successor_fence = successor
+            .assignment_fence()
+            .expect("canonical restart successor");
+        let authority = restarted.cluster.nodes[leader_idx]
+            .controller
+            .checkpoint_authority()
+            .expect("checkpoint authority after restart");
+        let recovery_decision = authority
+            .assignment_recovery_decision(successor.version)
+            .await
+            .expect("load restart recovery decision through fresh MinIO client")
+            .expect("durable restart recovery decision");
+        assert_eq!(recovery_decision.predecessor, predecessor_fence);
+        assert_eq!(recovery_decision.target, successor_fence);
+
+        let second = restarted.nodes[leader_idx]
+            .db
+            .checkpoint()
+            .await
+            .expect("checkpoint after restart");
+        assert!(
+            second.success,
+            "checkpoint after restart: {:?}",
+            second.error
+        );
+        assert!(second.epoch > first.epoch);
+        let (outcome, capsule) = authority
+            .cluster_outcome_with_recovery_capsule(second.epoch)
+            .await
+            .expect("read checkpoint outcome through fresh MinIO client")
+            .expect("durable checkpoint outcome after restart");
+        assert!(outcome.is_commit());
+        assert_eq!(outcome.checkpoint_id, second.checkpoint_id);
+        let capsule = capsule.expect("durable recovery capsule after restart");
+        assert_eq!(capsule.attempt.epoch, second.epoch);
+        assert_eq!(capsule.attempt.checkpoint_id, second.checkpoint_id);
+        assert_eq!(capsule.assignment_fence, successor_fence);
+
+        restarted.shutdown().await;
     }
 
     /// Coordinated-commit descriptors written by two nodes to shared MinIO seal
-    /// the leader's gate only when both are present, and the leader reads both
-    /// back for the designated committer to aggregate.
+    /// the leader's gate only when both are present. The designated committer reads
+    /// the exact keys bound into that seal rather than listing the descriptor prefix.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn two_node_coordinated_descriptors_aggregate_on_leader() {
         use bytes::Bytes;
+        use laminar_core::checkpoint::{
+            CheckpointAssignmentFence, CheckpointParticipant, LeaderProof, LeaderProofOwner,
+        };
         use laminar_core::state::StateBackend as _;
 
         if minio_endpoint().is_none() {
             eprintln!("skipping: MinIO not reachable at 127.0.0.1:19000");
             return;
         }
-        let bucket = format!(
-            "laminar-coord-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
-        );
+        let bucket = unique_bucket("laminar-coord");
         let store = minio_store(&bucket).await;
-        let node1 = ObjectStoreBackend::new(Arc::clone(&store), "1".to_string(), 4);
-        let node2 = ObjectStoreBackend::new(Arc::clone(&store), "2".to_string(), 4);
+        let node1 = ObjectStoreBackend::cluster_shared(Arc::clone(&store), "1".to_string(), 4);
+        let node2 = ObjectStoreBackend::cluster_shared(Arc::clone(&store), "2".to_string(), 4);
 
         let full = [0u32, 1, 2, 3];
         let required = ["node=1/sink=s".to_string(), "node=2/sink=s".to_string()];
+        let attempt = CheckpointAttempt::new(1, 1);
+        let boot1 = uuid::Uuid::from_u128(1);
+        let boot2 = uuid::Uuid::from_u128(2);
+        let fence = CheckpointAssignmentFence::from_owner_map(
+            1,
+            &[1, 1, 2, 2],
+            vec![
+                CheckpointParticipant {
+                    node_id: 1,
+                    boot_incarnation: boot1,
+                },
+                CheckpointParticipant {
+                    node_id: 2,
+                    boot_incarnation: boot2,
+                },
+            ],
+        )
+        .unwrap();
+        let proof = LeaderProof {
+            owner: LeaderProofOwner {
+                node_id: 1,
+                boot_id: boot1,
+                process_term: 1,
+            },
+            fencing_token: 1,
+        };
+        node1.set_authoritative_version(1);
+        node2.set_authoritative_version(1);
 
         // Node 1 writes its vnode slice and its commit descriptor.
         for v in [0u32, 1] {
             node1
-                .write_partial(v, 1, 0, Bytes::from_static(b"a"))
+                .write_certified_partial(attempt, v, &fence, 1, Bytes::from_static(b"a"))
                 .await
                 .unwrap();
         }
         node1
-            .write_commit_descriptor(1, "node=1/sink=s", 0, Bytes::from_static(b"d1"))
+            .write_certified_commit_descriptor(
+                attempt,
+                "node=1/sink=s",
+                &fence,
+                1,
+                &proof,
+                Bytes::from_static(b"d1"),
+            )
             .await
             .unwrap();
 
         // Leader cannot seal yet — node 2's partials and descriptor are missing.
-        assert!(!node1.epoch_complete(1, &full, &required).await.unwrap());
+        assert!(!node1
+            .seal_checkpoint(attempt, Some(&fence), &full, &required)
+            .await
+            .unwrap());
 
         // Node 2 writes its slice and descriptor to the same bucket.
         for v in [2u32, 3] {
             node2
-                .write_partial(v, 1, 0, Bytes::from_static(b"b"))
+                .write_certified_partial(attempt, v, &fence, 2, Bytes::from_static(b"b"))
                 .await
                 .unwrap();
         }
         node2
-            .write_commit_descriptor(1, "node=2/sink=s", 0, Bytes::from_static(b"d2"))
+            .write_certified_commit_descriptor(
+                attempt,
+                "node=2/sink=s",
+                &fence,
+                2,
+                &proof,
+                Bytes::from_static(b"d2"),
+            )
             .await
             .unwrap();
 
         // Now the leader seals: all partials and both descriptors are durable.
-        assert!(node1.epoch_complete(1, &full, &required).await.unwrap());
+        assert!(node1
+            .seal_checkpoint(attempt, Some(&fence), &full, &required)
+            .await
+            .unwrap());
 
-        // The leader reads both nodes' descriptors for the committer to aggregate.
-        let mut descriptors = node1.read_commit_descriptors(1).await.unwrap();
-        descriptors.sort_by(|a, b| a.0.cmp(&b.0));
+        let inventory = node1
+            .checkpoint_seal_inventory(attempt)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(inventory.required_descriptors, required);
+        let descriptor1 = node1
+            .read_commit_descriptor(attempt, "node=1/sink=s")
+            .await
+            .unwrap()
+            .expect("node 1 descriptor named by seal");
+        let descriptor2 = node1
+            .read_commit_descriptor(attempt, "node=2/sink=s")
+            .await
+            .unwrap()
+            .expect("node 2 descriptor named by seal");
         assert_eq!(
-            descriptors,
-            vec![
-                ("node=1/sink=s".to_string(), Bytes::from_static(b"d1")),
-                ("node=2/sink=s".to_string(), Bytes::from_static(b"d2")),
-            ]
+            (descriptor1, descriptor2),
+            (Bytes::from_static(b"d1"), Bytes::from_static(b"d2"))
         );
     }
 }

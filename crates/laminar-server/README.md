@@ -54,30 +54,11 @@ See the [Configuration Reference](https://laminardb.io/docs/) for every field, o
 
 ```toml
 [server]
-mode = "embedded"           # "embedded" (single-node) or "cluster" (multi-node scaffolding, not production-hardened)
+mode = "single"             # "single" (standalone) or "cluster" (multi-node at-least-once)
 bind = "0.0.0.0:8080"       # HTTP API bind address
+delivery = "at_least_once"  # pipeline-wide; exactly_once is single-node only
 pgwire_bind = "127.0.0.1:5433"  # optional; enables Postgres wire protocol for SUBSCRIBE
 log_level = "info"
-# Optional node-level cap on total operator state held in memory, in bytes.
-# Crossing it pauses source intake (backpressure, not failure) until state
-# drains below the budget; watch `state_bytes` / `state_over_budget` in
-# /metrics. Unset = unlimited.
-# state_memory_budget_bytes = 8589934592
-# Optional disk cold tier (experimental; needs a `state-tier` build). With a
-# memory budget set, idle aggregate state approaching the budget is demoted
-# here (local NVMe) and fetched back on demand instead of backpressuring.
-# Watch `state_tier_bytes` / `state_tier_slices` / `state_tier_demote_total`.
-# Works single-node (no cluster) — the server derives the vnode topology from
-# [state]. Requires a durable [state] backend (`local`/`object_store`): the
-# tier's demoted state is replayed from it on restart, so an `in_process`
-# backend is rejected. Set a memory budget too, or nothing is demoted.
-# state_tier_dir = "/var/lib/laminardb/state-tier"
-# Demote at GROUP granularity (shed individual idle aggregate groups) instead of
-# whole idle vnodes. Requires the cold tier. Unset defaults ON for embedded
-# single-node (kill-9-soaked) and OFF for cluster (the cluster group path has
-# open correctness gaps; it stays vnode-granular). Set true to force it on either
-# topology, false to force vnode-granular.
-# state_tier_group_demotion = true
 # Optional MD5 password auth for the pgwire listener. When this map is set,
 # the listener requires MD5 auth and is allowed to bind to non-localhost
 # interfaces. When empty, auth is "trust" and the bind must be localhost.
@@ -90,8 +71,15 @@ log_level = "info"
 backend = "local"           # "in_process", "local", or "object_store"
 path = "./data/state"       # required when backend = "local"
 # When backend = "object_store": url = "s3://bucket/state" (same schemes as
-# [checkpoint]) and instance_id = "node-0" (required, unique per node);
-# credentials from provider env vars or [state.storage].
+# [checkpoint]); credentials from provider env vars or [state.storage].
+# Local state paths are node-durable and valid for embedded/single-node
+# exactly-once. A file:// checkpoint URL selects the built-in local directory
+# protected by its exclusive OS lock. Shared object-store URLs and
+# library-injected object or decision stores fail with LDB-0014 because their
+# writer-fencing provenance cannot be proved. Cluster mode requires cloud
+# object storage shared by every node.
+# Cluster exactly-once currently fails closed with LDB-0013 because supported
+# connectors lack certified term-fenced source handoff and external sink cursors.
 
 [checkpoint]
 # Local file://, or an object store: s3://, gs://, az://, abfs(s):// (the
@@ -99,6 +87,7 @@ path = "./data/state"       # required when backend = "local"
 # standard provider env vars, or set them under [checkpoint.storage].
 url = "file:///tmp/laminardb/checkpoints"
 interval = "30s"
+timeout = "120s" # one deadline across fence, capture, durable decision, and completion
 
 [[source]]
 name = "trades"
@@ -135,7 +124,6 @@ EMIT ON WINDOW CLOSE
 name = "output"
 pipeline = "avg_price"
 connector = "kafka"
-delivery = "at_least_once"
 [sink.properties]
 bootstrap.servers = "localhost:9092"
 topic = "avg-prices"
@@ -284,7 +272,7 @@ placement_isolation_tier = 1     # 0=region, 1=zone, 2=rack — what counts as a
 
 ## Cluster Control-Plane TLS (mTLS)
 
-In `mode = "cluster"`, the inter-node control plane (barrier sync, the distributed-query `RemoteScan` service, and the row shuffle) is plaintext and unauthenticated by default — run it on a trusted/isolated network. To require mutual TLS between nodes, set all four `[discovery]` keys together (omit them for plaintext):
+In `mode = "cluster"`, the inter-node control plane (barrier sync and row shuffle) is plaintext and unauthenticated by default — run it on a trusted/isolated network. To require mutual TLS between nodes, set all four `[discovery]` keys together (omit them for plaintext):
 
 ```toml
 [discovery]

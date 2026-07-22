@@ -17,7 +17,7 @@ impl LaminarDB {
     /// Returns [`DbError::Checkpoint`] if the metadata batch cannot be
     /// assembled from the latest checkpoint.
     pub async fn build_show_checkpoint_status(&self) -> Result<RecordBatch, DbError> {
-        let store = self.checkpoint_store();
+        let store = self.checkpoint_store()?;
         let (latest, list) = match &store {
             Some(s) => {
                 let latest = s.load_latest().await.map_err(|e| {
@@ -76,13 +76,6 @@ impl LaminarDB {
         let mut states = Vec::new();
         for view in registry.views() {
             let info = crate::handle::MaterializedViewInfo::from(view);
-            // Hidden intermediates of a decomposed multi-way join are not part of the user's catalog.
-            if info
-                .name
-                .starts_with(crate::sql_analysis::MULTIWAY_INTERMEDIATE_PREFIX)
-            {
-                continue;
-            }
             names.push(info.name);
             sqls.push(info.sql);
             states.push(info.state);

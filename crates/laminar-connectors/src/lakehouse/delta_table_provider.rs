@@ -78,7 +78,11 @@ pub async fn register_delta_table(
             ConnectorError::Internal(format!("failed to build table provider: {e}"))
         })?;
 
-    ctx.register_table(name, Arc::new(provider)).map_err(|e| {
+    ctx.register_table(
+        datafusion::common::TableReference::bare(name),
+        Arc::new(provider),
+    )
+    .map_err(|e| {
         ConnectorError::Internal(format!("failed to register Delta table '{name}': {e}"))
     })?;
 
@@ -137,13 +141,10 @@ mod tests {
         let (_table, version) = delta_io::write_batches(
             table,
             vec![batch],
-            "test-writer",
-            1,
             SaveMode::Append,
             None,
             false,
             None,
-            false,
             None,
         )
         .await
@@ -152,12 +153,12 @@ mod tests {
 
         // Register as TableProvider and query.
         let ctx = SessionContext::new();
-        register_delta_table(&ctx, "test_delta", table_path, HashMap::new())
+        register_delta_table(&ctx, "MixedDelta", table_path, HashMap::new())
             .await
             .unwrap();
 
         let df = ctx
-            .sql("SELECT COUNT(*) AS cnt FROM test_delta")
+            .sql("SELECT COUNT(*) AS cnt FROM \"MixedDelta\"")
             .await
             .unwrap();
         let results = df.collect().await.unwrap();

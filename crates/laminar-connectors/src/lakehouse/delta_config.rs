@@ -7,6 +7,8 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
 
+use crate::connector::DeliveryGuarantee;
+
 use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
 use crate::storage::{
@@ -34,9 +36,6 @@ pub struct DeltaLakeSinkConfig {
     /// Maximum time to buffer records before flushing.
     pub max_buffer_duration: Duration,
 
-    /// Delta Lake checkpoint interval (create checkpoint every N commits).
-    pub checkpoint_interval: u64,
-
     /// Whether to enable schema evolution (auto-merge new columns).
     pub schema_evolution: bool,
 
@@ -49,17 +48,8 @@ pub struct DeltaLakeSinkConfig {
     /// Storage options (S3 credentials, Azure keys, etc.).
     pub storage_options: HashMap<String, String>,
 
-    /// Compaction configuration.
-    pub compaction: CompactionConfig,
-
-    /// Vacuum retention period for old files.
-    pub vacuum_retention: Duration,
-
     /// Delivery guarantee: `AtLeastOnce` or `ExactlyOnce`.
     pub delivery_guarantee: DeliveryGuarantee,
-
-    /// Writer ID for exactly-once deduplication.
-    pub writer_id: String,
 
     /// Catalog type for table discovery.
     pub catalog_type: DeltaCatalogType,
@@ -78,12 +68,8 @@ pub struct DeltaLakeSinkConfig {
     /// via the Unity Catalog REST API at this storage location.
     pub catalog_storage_location: Option<String>,
 
-    /// Maximum number of retries on optimistic concurrency conflicts
-    /// (default: 3). After exhausting retries, the conflict error is
-    /// propagated as fatal. Uses exponential backoff (100ms, 500ms, 2s).
-    pub max_commit_retries: u32,
-
-    /// Timeout for individual Delta write operations (default: 30s).
+    /// End-to-end timeout for one Delta write, including table reopen and all
+    /// optimistic commit retries (default: 30s).
     pub write_timeout: Duration,
 
     /// Parquet writer properties (compression, bloom filters, statistics, etc.).
@@ -98,21 +84,16 @@ impl Default for DeltaLakeSinkConfig {
             target_file_size: 128 * 1024 * 1024, // 128 MB
             max_buffer_records: 100_000,
             max_buffer_duration: Duration::from_secs(60),
-            checkpoint_interval: 10,
             schema_evolution: false,
             write_mode: DeltaWriteMode::Append,
             merge_key_columns: Vec::new(),
             storage_options: HashMap::new(),
-            compaction: CompactionConfig::default(),
-            vacuum_retention: Duration::from_secs(7 * 24 * 3600),
             delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
-            writer_id: uuid::Uuid::new_v4().to_string(),
             catalog_type: DeltaCatalogType::None,
             catalog_database: None,
             catalog_name: None,
             catalog_schema: None,
             catalog_storage_location: None,
-            max_commit_retries: 3,
             write_timeout: Duration::from_secs(30),
             parquet: ParquetWriteConfig::default(),
         }
@@ -169,11 +150,6 @@ impl DeltaLakeSinkConfig {
             })?;
             cfg.max_buffer_duration = Duration::from_millis(ms);
         }
-        if let Some(v) = config.get("checkpoint.interval") {
-            cfg.checkpoint_interval = v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!("invalid checkpoint.interval: '{v}'"))
-            })?;
-        }
         if let Some(v) = config.get("schema.evolution") {
             cfg.schema_evolution = v.eq_ignore_ascii_case("true");
         }
@@ -199,56 +175,12 @@ impl DeltaLakeSinkConfig {
                 ))
             })?;
         }
-        if let Some(v) = config.get("compaction.enabled") {
-            cfg.compaction.enabled = v.eq_ignore_ascii_case("true");
-        }
-        if let Some(v) = config.get("compaction.z-order.columns") {
-            cfg.compaction.z_order_columns = v
-                .split(',')
-                .map(|c| c.trim().to_string())
-                .filter(|c| !c.is_empty())
-                .collect();
-        }
-        if let Some(v) = config.get("compaction.target-file-size") {
-            cfg.compaction.target_file_size = v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!(
-                    "invalid compaction.target-file-size: '{v}'"
-                ))
-            })?;
-        } else {
-            // Default compaction target file size to the sink's target_file_size.
-            cfg.compaction.target_file_size = cfg.target_file_size;
-        }
-        if let Some(v) = config.get("compaction.min-files") {
-            cfg.compaction.min_files_for_compaction = v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!("invalid compaction.min-files: '{v}'"))
-            })?;
-        }
-        if let Some(v) = config.get("compaction.check-interval.ms") {
-            let ms: u64 = v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!(
-                    "invalid compaction.check-interval.ms: '{v}'"
-                ))
-            })?;
-            if ms == 0 {
-                return Err(ConnectorError::ConfigurationError(
-                    "compaction.check-interval.ms must be > 0".into(),
-                ));
-            }
-            cfg.compaction.check_interval = Duration::from_millis(ms);
-        }
-        if let Some(v) = config.get("vacuum.retention.hours") {
-            let hours: u64 = v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!("invalid vacuum.retention.hours: '{v}'"))
-            })?;
-            cfg.vacuum_retention = Duration::from_secs(hours * 3600);
-        }
-        if let Some(v) = config.get("writer.id") {
-            cfg.writer_id = v.to_string();
-        } else if cfg.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
+        if cfg.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
+            && cfg.write_mode != DeltaWriteMode::Append
+        {
             return Err(ConnectorError::ConfigurationError(
-                "exactly-once delivery requires an explicit 'writer.id' for stable \
-                 recovery across restarts"
+                "Delta exactly-once is supported only for coordinated append mode; \
+                 upsert/overwrite do not expose a certified distributed committable"
                     .into(),
             ));
         }
@@ -286,11 +218,6 @@ impl DeltaLakeSinkConfig {
         if let Some(v) = config.get("catalog.storage.location") {
             cfg.catalog_storage_location = Some(v.to_string());
         }
-        if let Some(v) = config.get("max.commit.retries") {
-            cfg.max_commit_retries = v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!("invalid max.commit.retries: '{v}'"))
-            })?;
-        }
         if let Some(v) = config.get("write.timeout.ms") {
             let ms: u64 = v.parse().map_err(|_| {
                 ConnectorError::ConfigurationError(format!("invalid write.timeout.ms: '{v}'"))
@@ -308,13 +235,6 @@ impl DeltaLakeSinkConfig {
                     "invalid parquet.compression.level: '{v}'"
                 ))
             })?;
-        }
-        if let Some(v) = config.get("parquet.compaction.compression.level") {
-            cfg.parquet.compaction_compression_level = Some(v.parse().map_err(|_| {
-                ConnectorError::ConfigurationError(format!(
-                    "invalid parquet.compaction.compression.level: '{v}'"
-                ))
-            })?);
         }
         if let Some(v) = config.get("parquet.dictionary.enabled") {
             cfg.parquet.dictionary_enabled = v.eq_ignore_ascii_case("true");
@@ -400,24 +320,9 @@ impl DeltaLakeSinkConfig {
                 "target.file.size must be > 0".into(),
             ));
         }
-        if self.checkpoint_interval == 0 {
-            return Err(ConnectorError::ConfigurationError(
-                "checkpoint.interval must be > 0".into(),
-            ));
-        }
         if self.write_timeout < Duration::from_secs(5) {
             return Err(ConnectorError::ConfigurationError(
                 "write.timeout.ms must be >= 5000 (5 seconds)".into(),
-            ));
-        }
-        if self.compaction.check_interval.is_zero() {
-            return Err(ConnectorError::ConfigurationError(
-                "compaction.check-interval.ms must be > 0".into(),
-            ));
-        }
-        if self.vacuum_retention < Duration::from_secs(86400) {
-            return Err(ConnectorError::ConfigurationError(
-                "vacuum.retention.hours must be >= 24 (Delta Lake safety minimum)".into(),
             ));
         }
 
@@ -453,9 +358,7 @@ impl DeltaLakeSinkConfig {
         #[cfg(feature = "delta-lake")]
         {
             self.parquet.to_writer_properties()?;
-            self.parquet.compaction_writer_properties()?;
         }
-
         self.validate_catalog()?;
 
         // Validate cloud storage credentials (skip when catalog resolves the path).
@@ -575,8 +478,6 @@ impl fmt::Display for DeltaWriteMode {
     }
 }
 
-pub use crate::connector::DeliveryGuarantee;
-
 /// Delta Lake catalog type for table discovery.
 ///
 /// Catalogs enable referencing tables by logical names instead of raw paths.
@@ -622,37 +523,6 @@ impl fmt::Display for DeltaCatalogType {
     }
 }
 
-/// Configuration for background compaction.
-#[derive(Debug, Clone)]
-pub struct CompactionConfig {
-    /// Whether to run automatic compaction.
-    pub enabled: bool,
-
-    /// Minimum number of files before triggering compaction.
-    pub min_files_for_compaction: usize,
-
-    /// Target file size after compaction.
-    pub target_file_size: usize,
-
-    /// Columns for Z-ORDER clustering (optional).
-    pub z_order_columns: Vec<String>,
-
-    /// How often to check if compaction is needed.
-    pub check_interval: Duration,
-}
-
-impl Default for CompactionConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            min_files_for_compaction: 10,
-            target_file_size: 128 * 1024 * 1024, // 128 MB
-            z_order_columns: Vec::new(),
-            check_interval: Duration::from_secs(3600), // 60 minutes
-        }
-    }
-}
-
 /// Configuration for Parquet writer properties (compression, dictionary
 /// encoding, statistics, bloom filters, row group sizing).
 #[derive(Debug, Clone)]
@@ -661,8 +531,6 @@ pub struct ParquetWriteConfig {
     pub compression: String,
     /// Compression level (default: 1 — ZSTD L1 for hot writes).
     pub compression_level: i32,
-    /// Optional higher compression level used during compaction (default: 3).
-    pub compaction_compression_level: Option<i32>,
     /// Whether to enable dictionary encoding (default: true).
     pub dictionary_enabled: bool,
     /// Statistics granularity: `"none"`, `"chunk"`, or `"page"` (default: `"page"`).
@@ -682,7 +550,6 @@ impl Default for ParquetWriteConfig {
         Self {
             compression: "zstd".to_string(),
             compression_level: 1,
-            compaction_compression_level: Some(3),
             dictionary_enabled: true,
             statistics: "page".to_string(),
             bloom_filter_columns: Vec::new(),
@@ -704,21 +571,6 @@ impl ParquetWriteConfig {
         &self,
     ) -> Result<deltalake::parquet::file::properties::WriterProperties, ConnectorError> {
         self.build_properties(self.compression_level)
-    }
-
-    /// Builds `WriterProperties` for compaction (uses `compaction_compression_level`
-    /// if set, otherwise falls back to `compression_level`).
-    ///
-    /// # Errors
-    ///
-    /// Returns `ConnectorError::ConfigurationError` on invalid codec/level.
-    pub fn compaction_writer_properties(
-        &self,
-    ) -> Result<deltalake::parquet::file::properties::WriterProperties, ConnectorError> {
-        let level = self
-            .compaction_compression_level
-            .unwrap_or(self.compression_level);
-        self.build_properties(level)
     }
 
     /// Shared builder: maps string codec → `Compression`, sets dictionary,
@@ -821,9 +673,7 @@ mod tests {
         assert!(cfg.merge_key_columns.is_empty());
         assert_eq!(cfg.target_file_size, 128 * 1024 * 1024);
         assert_eq!(cfg.max_buffer_records, 100_000);
-        assert_eq!(cfg.checkpoint_interval, 10);
         assert!(!cfg.schema_evolution);
-        assert!(cfg.compaction.enabled);
     }
 
     #[test]
@@ -840,16 +690,10 @@ mod tests {
             ("target.file.size", "67108864"),
             ("max.buffer.records", "50000"),
             ("max.buffer.duration.ms", "30000"),
-            ("checkpoint.interval", "20"),
             ("schema.evolution", "true"),
             ("write.mode", "upsert"),
             ("merge.key.columns", "customer_id, order_id"),
             ("delivery.guarantee", "at-least-once"),
-            ("compaction.enabled", "true"),
-            ("compaction.z-order.columns", "customer_id, product_id"),
-            ("compaction.min-files", "20"),
-            ("vacuum.retention.hours", "336"),
-            ("writer.id", "my-writer"),
             ("storage.aws_access_key_id", "AKID123"),
             ("storage.aws_region", "us-east-1"),
         ]);
@@ -860,19 +704,10 @@ mod tests {
         assert_eq!(cfg.target_file_size, 67_108_864);
         assert_eq!(cfg.max_buffer_records, 50_000);
         assert_eq!(cfg.max_buffer_duration, Duration::from_secs(30));
-        assert_eq!(cfg.checkpoint_interval, 20);
         assert!(cfg.schema_evolution);
         assert_eq!(cfg.write_mode, DeltaWriteMode::Upsert);
         assert_eq!(cfg.merge_key_columns, vec!["customer_id", "order_id"]);
         assert_eq!(cfg.delivery_guarantee, DeliveryGuarantee::AtLeastOnce);
-        assert!(cfg.compaction.enabled);
-        assert_eq!(
-            cfg.compaction.z_order_columns,
-            vec!["customer_id", "product_id"]
-        );
-        assert_eq!(cfg.compaction.min_files_for_compaction, 20);
-        assert_eq!(cfg.vacuum_retention, Duration::from_secs(1209600));
-        assert_eq!(cfg.writer_id, "my-writer");
         assert_eq!(
             cfg.storage_options.get("aws_access_key_id"),
             Some(&"AKID123".to_string())
@@ -918,70 +753,6 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_checkpoint_interval_rejected() {
-        let mut pairs = required_pairs();
-        pairs.push(("checkpoint.interval", "0"));
-        let config = make_config(&pairs);
-        assert!(DeltaLakeSinkConfig::from_config(&config).is_err());
-    }
-
-    #[test]
-    fn test_vacuum_retention_below_24h_rejected() {
-        let mut pairs = required_pairs();
-        pairs.push(("vacuum.retention.hours", "12"));
-        let config = make_config(&pairs);
-        let result = DeltaLakeSinkConfig::from_config(&config);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("24"), "error: {err}");
-    }
-
-    #[test]
-    fn test_vacuum_retention_24h_accepted() {
-        let mut pairs = required_pairs();
-        pairs.push(("vacuum.retention.hours", "24"));
-        let config = make_config(&pairs);
-        assert!(DeltaLakeSinkConfig::from_config(&config).is_ok());
-    }
-
-    #[test]
-    fn test_compaction_target_file_size_from_config() {
-        let mut pairs = required_pairs();
-        pairs.push(("compaction.target-file-size", "67108864"));
-        let config = make_config(&pairs);
-        let cfg = DeltaLakeSinkConfig::from_config(&config).unwrap();
-        assert_eq!(cfg.compaction.target_file_size, 67_108_864);
-    }
-
-    #[test]
-    fn test_compaction_target_file_size_defaults_to_sink() {
-        let mut pairs = required_pairs();
-        pairs.push(("target.file.size", "33554432"));
-        let config = make_config(&pairs);
-        let cfg = DeltaLakeSinkConfig::from_config(&config).unwrap();
-        assert_eq!(cfg.compaction.target_file_size, 33_554_432);
-    }
-
-    #[test]
-    fn test_exactly_once_requires_writer_id() {
-        let mut pairs = required_pairs();
-        pairs.push(("delivery.guarantee", "exactly-once"));
-        let config = make_config(&pairs);
-        let err = DeltaLakeSinkConfig::from_config(&config).unwrap_err();
-        assert!(err.to_string().contains("writer.id"), "error: {err}");
-    }
-
-    #[test]
-    fn test_exactly_once_with_writer_id_ok() {
-        let mut pairs = required_pairs();
-        pairs.push(("delivery.guarantee", "exactly-once"));
-        pairs.push(("writer.id", "my-stable-writer"));
-        let config = make_config(&pairs);
-        let cfg = DeltaLakeSinkConfig::from_config(&config).unwrap();
-        assert_eq!(cfg.writer_id, "my-stable-writer");
-    }
-
-    #[test]
     fn test_invalid_target_file_size() {
         let mut pairs = required_pairs();
         pairs.push(("target.file.size", "abc"));
@@ -1021,29 +792,9 @@ mod tests {
         assert_eq!(cfg.target_file_size, 128 * 1024 * 1024);
         assert_eq!(cfg.max_buffer_records, 100_000);
         assert_eq!(cfg.max_buffer_duration, Duration::from_secs(60));
-        assert_eq!(cfg.checkpoint_interval, 10);
         assert!(!cfg.schema_evolution);
         assert_eq!(cfg.write_mode, DeltaWriteMode::Append);
         assert_eq!(cfg.delivery_guarantee, DeliveryGuarantee::AtLeastOnce);
-        assert!(!cfg.writer_id.is_empty());
-        assert_eq!(cfg.max_commit_retries, 3);
-    }
-
-    #[test]
-    fn test_max_commit_retries_from_config() {
-        let mut pairs = required_pairs();
-        pairs.push(("max.commit.retries", "5"));
-        let config = make_config(&pairs);
-        let cfg = DeltaLakeSinkConfig::from_config(&config).unwrap();
-        assert_eq!(cfg.max_commit_retries, 5);
-    }
-
-    #[test]
-    fn test_max_commit_retries_invalid() {
-        let mut pairs = required_pairs();
-        pairs.push(("max.commit.retries", "abc"));
-        let config = make_config(&pairs);
-        assert!(DeltaLakeSinkConfig::from_config(&config).is_err());
     }
 
     #[test]
@@ -1108,16 +859,6 @@ mod tests {
     fn test_delivery_guarantee_display() {
         assert_eq!(DeliveryGuarantee::AtLeastOnce.to_string(), "at-least-once");
         assert_eq!(DeliveryGuarantee::ExactlyOnce.to_string(), "exactly-once");
-    }
-
-    #[test]
-    fn test_compaction_config_defaults() {
-        let cfg = CompactionConfig::default();
-        assert!(cfg.enabled);
-        assert_eq!(cfg.min_files_for_compaction, 10);
-        assert_eq!(cfg.target_file_size, 128 * 1024 * 1024);
-        assert!(cfg.z_order_columns.is_empty());
-        assert_eq!(cfg.check_interval, Duration::from_secs(3600));
     }
 
     #[test]
@@ -1386,7 +1127,6 @@ mod tests {
         let cfg = ParquetWriteConfig::default();
         assert_eq!(cfg.compression, "zstd");
         assert_eq!(cfg.compression_level, 1);
-        assert_eq!(cfg.compaction_compression_level, Some(3));
         assert!(cfg.dictionary_enabled);
         assert_eq!(cfg.statistics, "page");
         assert!(cfg.bloom_filter_columns.is_empty());
@@ -1421,15 +1161,6 @@ mod tests {
         pairs.push(("parquet.compression.level", "abc"));
         let config = make_config(&pairs);
         assert!(DeltaLakeSinkConfig::from_config(&config).is_err());
-    }
-
-    #[test]
-    fn test_parquet_compaction_compression_level() {
-        let mut pairs = required_pairs();
-        pairs.push(("parquet.compaction.compression.level", "7"));
-        let config = make_config(&pairs);
-        let cfg = DeltaLakeSinkConfig::from_config(&config).unwrap();
-        assert_eq!(cfg.parquet.compaction_compression_level, Some(7));
     }
 
     #[test]
@@ -1502,14 +1233,6 @@ mod tests {
     fn test_writer_properties_default_zstd() {
         let cfg = ParquetWriteConfig::default();
         assert!(cfg.to_writer_properties().is_ok());
-    }
-
-    #[cfg(feature = "delta-lake")]
-    #[test]
-    fn test_compaction_writer_properties_higher_level() {
-        let cfg = ParquetWriteConfig::default();
-        // Should succeed and use level 3 for compaction.
-        assert!(cfg.compaction_writer_properties().is_ok());
     }
 
     #[cfg(feature = "delta-lake")]

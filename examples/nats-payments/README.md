@@ -1,5 +1,10 @@
 # LaminarDB — payments + fraud-check streaming demo
 
+> **Delivery contract:** this demo runs with pipeline-wide `best_effort` because
+> LaminarDB's NATS sources do not expose a checkpoint-owned replay cursor. The
+> Iceberg sinks durably acknowledge appends, but cannot recover source events
+> lost during a process failure or prevent replay duplicates.
+
 Two correlated payment streams over NATS:
 
 * `payments.initiated`  — a payment is created (someone hits Pay)
@@ -37,7 +42,7 @@ DuckDB can resolve the name from the host:
 The published `9000:9000` Docker port forwards `rustfs:9000` to the
 running container.
 
-## Run it
+## Setup
 
 ```bash
 # 1. NATS + RustFS + Postgres + Lakekeeper.

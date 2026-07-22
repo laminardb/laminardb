@@ -39,6 +39,6 @@ Replicas: {{ .Values.replicaCount }}
 Cluster mode info:
   Nodes: {{ .Values.replicaCount }}
   Discovery: {{ ($cluster.discovery | default dict).strategy }}
-  Coordination: {{ ($cluster.coordination | default dict).strategy }}
+  Control plane: shared-store leader lease and assignment CAS
   Headless service: {{ include "laminardb.headlessServiceName" . }}
 {{- end }}

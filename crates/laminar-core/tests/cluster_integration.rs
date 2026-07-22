@@ -16,7 +16,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use laminar_core::cluster::control::{
-    AssignmentSnapshot, AssignmentSnapshotStore, BarrierAck, BarrierAnnouncement, QuorumOutcome,
+    AssignmentSnapshot, AssignmentSnapshotStore, BarrierAck, BarrierAnnouncement,
+    CheckpointParticipant, QuorumOutcome,
 };
 use laminar_core::cluster::discovery::NodeId;
 use laminar_core::cluster::testing::{FaultyObjectStore, MiniCluster, ObjectStoreFault};
@@ -28,6 +29,26 @@ const CONVERGENCE_DEADLINE: Duration = Duration::from_secs(8);
 /// observe its `Left` announcement via gossip. 5 s covers the
 /// 500 ms gossip_discovery watcher interval plus a margin.
 const FAILOVER_DEADLINE: Duration = Duration::from_secs(5);
+
+fn test_participants(vnodes: &BTreeMap<u32, NodeId>) -> Vec<CheckpointParticipant> {
+    let mut owners = vnodes.values().map(|owner| owner.0).collect::<Vec<_>>();
+    owners.sort_unstable();
+    owners.dedup();
+    owners
+        .into_iter()
+        .map(|node_id| CheckpointParticipant {
+            node_id,
+            boot_incarnation: uuid::Uuid::from_u128(u128::from(node_id)),
+        })
+        .collect()
+}
+
+fn test_snapshot(vnodes: BTreeMap<u32, NodeId>) -> AssignmentSnapshot {
+    let participants = test_participants(&vnodes);
+    AssignmentSnapshot::empty()
+        .next_for_participants(vnodes, participants)
+        .unwrap()
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_node_cluster_converges() {
@@ -99,10 +120,11 @@ async fn barrier_announce_then_follower_observes_and_acks() {
     let follower_ids: Vec<_> = followers.iter().map(|n| n.instance_id).collect();
     let announcement = BarrierAnnouncement {
         epoch: 7,
-        checkpoint_id: 101,
+        checkpoint_id: 7,
+        assignment_fence: None,
+        leader_proof: None,
         phase: laminar_core::cluster::control::Phase::Prepare,
         flags: 0,
-        min_watermark_ms: None,
     };
 
     // Step 1: leader announces.
@@ -118,7 +140,7 @@ async fn barrier_announce_then_follower_observes_and_acks() {
         let mut observed = None;
         let start = std::time::Instant::now();
         while start.elapsed() < Duration::from_secs(4) {
-            match follower.controller.observe_barrier().await {
+            match follower.controller.observe_barrier_matching(|_| true).await {
                 Ok(Some(ann)) if ann.epoch == 7 => {
                     observed = Some(ann);
                     break;
@@ -136,9 +158,11 @@ async fn barrier_announce_then_follower_observes_and_acks() {
             .controller
             .ack_barrier(&BarrierAck {
                 epoch: 7,
+                checkpoint_id: 7,
+                assignment_digest: None,
                 ok: true,
                 error: None,
-                local_watermark_ms: None,
+                watermark: laminar_core::checkpoint::CheckpointWatermark::Uninitialized,
             })
             .await
             .expect("ack");
@@ -150,7 +174,7 @@ async fn barrier_announce_then_follower_observes_and_acks() {
     // doesn't enforce that semantically).
     let outcome = leader
         .controller
-        .wait_for_quorum(7, &follower_ids, Duration::from_secs(6))
+        .wait_for_quorum(&announcement, &follower_ids, Duration::from_secs(6))
         .await;
     match outcome {
         QuorumOutcome::Reached { mut acks, .. } => {
@@ -314,14 +338,16 @@ async fn snapshot_save_fails_under_object_store_fault_and_recovers() {
     // Step 1: save baseline via CAS-create.
     let mut v1_map = BTreeMap::new();
     v1_map.insert(0u32, NodeId(1));
-    let v1 = AssignmentSnapshot::empty().next(v1_map);
+    let v1 = test_snapshot(v1_map);
     store.save_if_absent(&v1).await.expect("baseline save");
 
     // Step 2: turn writes off; the next rotate must fail.
     faulty.set_fault(ObjectStoreFault::FailWrites);
     let mut v2_map = BTreeMap::new();
     v2_map.insert(0u32, NodeId(2));
-    let v2 = v1.next(v2_map);
+    let v2 = v1
+        .next_for_participants(v2_map.clone(), test_participants(&v2_map))
+        .unwrap();
     let write_err = store
         .save_if_version(&v2, v1.version)
         .await
@@ -397,7 +423,7 @@ async fn assignment_snapshot_survives_full_cluster_restart() {
     vnodes.insert(0u32, NodeId(1));
     vnodes.insert(1u32, NodeId(2));
     vnodes.insert(2u32, NodeId(3));
-    let snapshot = AssignmentSnapshot::empty().next(vnodes);
+    let snapshot = test_snapshot(vnodes);
 
     leader
         .controller
@@ -545,15 +571,17 @@ async fn quorum_times_out_when_follower_silent() {
     let acker = &cluster.nodes[2];
     let expected_acks = vec![silent, acker.instance_id];
 
+    let announcement = BarrierAnnouncement {
+        epoch: 42,
+        checkpoint_id: 42,
+        assignment_fence: None,
+        leader_proof: None,
+        phase: laminar_core::cluster::control::Phase::Prepare,
+        flags: 0,
+    };
     leader
         .controller
-        .announce_barrier(&BarrierAnnouncement {
-            epoch: 42,
-            checkpoint_id: 1,
-            phase: laminar_core::cluster::control::Phase::Prepare,
-            flags: 0,
-            min_watermark_ms: None,
-        })
+        .announce_barrier(&announcement)
         .await
         .unwrap();
 
@@ -564,9 +592,11 @@ async fn quorum_times_out_when_follower_silent() {
         .controller
         .ack_barrier(&BarrierAck {
             epoch: 42,
+            checkpoint_id: 42,
+            assignment_digest: None,
             ok: true,
             error: None,
-            local_watermark_ms: None,
+            watermark: laminar_core::checkpoint::CheckpointWatermark::Uninitialized,
         })
         .await
         .unwrap();
@@ -574,7 +604,7 @@ async fn quorum_times_out_when_follower_silent() {
     // Leader should time out waiting for the silent follower.
     let outcome = leader
         .controller
-        .wait_for_quorum(42, &expected_acks, Duration::from_secs(2))
+        .wait_for_quorum(&announcement, &expected_acks, Duration::from_secs(2))
         .await;
     match outcome {
         QuorumOutcome::TimedOut { got, missing } => {

@@ -1,598 +1,344 @@
-//! Per-client fan-out manager for WebSocket sink server mode.
-//!
-//! Manages per-client state, bounded send buffers, and slow client
-//! eviction. Each connected client gets its own ring-buffer channel
-//! so that a slow client cannot block or affect other clients.
-//!
-//! The [`RingSender`]/[`RingReceiver`] pair implements true `DropOldest`
-//! semantics: when the buffer is full, the oldest message is evicted
-//! to make room for the new one.
+//! Bounded shared fan-out for the WebSocket server sink.
 
-use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 use bytes::Bytes;
-use parking_lot::{Mutex, RwLock};
-use tokio::sync::Notify;
-use tracing::{debug, warn};
+use tokio::sync::broadcast;
+use tungstenite::Utf8Bytes;
 
-use super::sink_config::SlowClientPolicy;
+use crate::error::{ConnectorError, SerdeError};
 
-// ── Ring-buffer channel ─────────────────────────────────────────────
+pub(super) const MAX_SERVER_FRAME_BYTES: usize = 256 * 1024;
+pub(super) const SERVER_BROADCAST_CAPACITY: usize = 32;
 
-struct RingInner<T> {
-    buffer: VecDeque<T>,
-    capacity: usize,
-    closed: bool,
-}
+const DATA_PREFIX: &[u8] = b"{\"type\":\"data\",\"data\":[";
+const SEQUENCE_PREFIX: &[u8] = b"],\"sequence\":";
+const MAX_SEQUENCE_DIGITS: usize = 20;
 
-/// Sender half of a bounded ring-buffer channel.
-///
-/// When the buffer is full:
-/// - `DropOldest`: evicts the oldest entry and pushes the new one.
-/// - `DropNewest`: discards the new entry.
-///
-/// Uses `parking_lot::Mutex` for the shared buffer (one writer from
-/// `broadcast()`, one reader from the per-client tokio task).
-pub struct RingSender<T> {
-    inner: Arc<Mutex<RingInner<T>>>,
-    notify: Arc<Notify>,
-}
-
-/// Receiver half of a bounded ring-buffer channel.
-pub struct RingReceiver<T> {
-    inner: Arc<Mutex<RingInner<T>>>,
-    notify: Arc<Notify>,
-}
-
-/// Result of a send attempt on a ring channel.
-pub enum RingSendResult {
-    /// Message was enqueued.
-    Sent,
-    /// Buffer was full; oldest message evicted to make room.
-    Evicted,
-    /// Buffer was full; incoming message dropped (`DropNewest` policy).
-    Dropped,
-    /// Receiver was dropped.
-    Closed,
-}
-
-/// Creates a ring-buffer channel pair with the given capacity.
-#[must_use]
-pub fn ring_channel<T>(capacity: usize) -> (RingSender<T>, RingReceiver<T>) {
-    let cap = capacity.max(1);
-    let inner = Arc::new(Mutex::new(RingInner {
-        buffer: VecDeque::with_capacity(cap),
-        capacity: cap,
-        closed: false,
-    }));
-    let notify = Arc::new(Notify::new());
-    (
-        RingSender {
-            inner: Arc::clone(&inner),
-            notify: Arc::clone(&notify),
-        },
-        RingReceiver { inner, notify },
-    )
-}
-
-impl<T> RingSender<T> {
-    /// Sends a value, applying the given policy when the buffer is full.
-    #[must_use]
-    pub fn send(&self, value: T, drop_oldest: bool) -> RingSendResult {
-        let mut guard = self.inner.lock();
-        if guard.closed {
-            return RingSendResult::Closed;
-        }
-        if guard.buffer.len() >= guard.capacity {
-            if drop_oldest {
-                guard.buffer.pop_front();
-                guard.buffer.push_back(value);
-                self.notify.notify_one();
-                return RingSendResult::Evicted;
-            }
-            return RingSendResult::Dropped;
-        }
-        guard.buffer.push_back(value);
-        self.notify.notify_one();
-        RingSendResult::Sent
-    }
-}
-
-impl<T> Drop for RingSender<T> {
-    fn drop(&mut self) {
-        self.inner.lock().closed = true;
-        self.notify.notify_one();
-    }
-}
-
-impl<T> RingReceiver<T> {
-    /// Receives the next value, waiting asynchronously if the buffer is empty.
-    /// Returns `None` if the sender is dropped and the buffer is empty.
-    pub async fn recv(&self) -> Option<T> {
-        loop {
-            {
-                let mut guard = self.inner.lock();
-                if let Some(item) = guard.buffer.pop_front() {
-                    return Some(item);
-                }
-                if guard.closed {
-                    return None;
-                }
-            }
-            self.notify.notified().await;
-        }
-    }
-}
-
-impl<T> Drop for RingReceiver<T> {
-    fn drop(&mut self) {
-        self.inner.lock().closed = true;
-    }
-}
-
-// ── Fan-out types ───────────────────────────────────────────────────
-
-/// Unique identifier for a connected WebSocket client.
-pub type ClientId = u64;
-
-/// Per-client state within the fan-out manager.
-#[derive(Debug)]
-pub struct ClientState {
-    /// Ring-buffer sender for this client.
-    pub tx: RingSender<Bytes>,
-    /// Client's subscription filter expression (if any).
-    pub filter: Option<String>,
-    /// Subscription ID assigned to this client.
-    pub subscription_id: String,
-    /// Desired output format (reserved for per-client format negotiation).
-    pub format: Option<super::sink_config::SinkFormat>,
-    /// Number of messages dropped for this client.
-    pub messages_dropped: AtomicU64,
-}
-
-impl std::fmt::Debug for RingSender<Bytes> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let guard = self.inner.lock();
-        f.debug_struct("RingSender")
-            .field("buffered", &guard.buffer.len())
-            .field("capacity", &guard.capacity)
-            .finish()
-    }
-}
-
-/// Circular replay buffer for client resume support.
-#[derive(Debug)]
-pub struct ReplayBuffer {
-    /// Ring buffer of `(sequence, serialized_message)`.
-    buffer: VecDeque<(u64, Bytes)>,
-    /// Maximum number of entries.
-    max_size: usize,
-}
-
-impl ReplayBuffer {
-    /// Creates a new replay buffer with the given capacity.
-    #[must_use]
-    pub fn new(max_size: usize) -> Self {
-        Self {
-            buffer: VecDeque::with_capacity(max_size.min(10_000)),
-            max_size,
-        }
-    }
-
-    /// Appends a message to the replay buffer, evicting the oldest if full.
-    pub fn push(&mut self, sequence: u64, data: Bytes) {
-        if self.buffer.len() >= self.max_size {
-            self.buffer.pop_front();
-        }
-        self.buffer.push_back((sequence, data));
-    }
-
-    /// Returns all messages with sequence number > `from_sequence`.
-    #[must_use]
-    pub fn replay_from(&self, from_sequence: u64) -> Vec<(u64, Bytes)> {
-        self.buffer
-            .iter()
-            .filter(|(seq, _)| *seq > from_sequence)
-            .cloned()
-            .collect()
-    }
-
-    /// Returns the lowest sequence number in the buffer, if any.
-    #[must_use]
-    pub fn oldest_sequence(&self) -> Option<u64> {
-        self.buffer.front().map(|(seq, _)| *seq)
-    }
-
-    /// Returns the number of entries in the buffer.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.buffer.len()
-    }
-
-    /// Returns whether the buffer is empty.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.buffer.is_empty()
-    }
-}
-
-/// Fan-out manager that distributes messages to connected WebSocket clients.
-///
-/// Each client gets an independent bounded channel. The fan-out loop
-/// serializes once, then attempts to send to every client. If a client's
-/// channel is full, the configured [`SlowClientPolicy`] is applied.
+/// Shared bounded broadcast ring. Each encoded frame is retained once and
+/// cloned cheaply for every subscribed socket.
 pub struct FanoutManager {
-    /// Connected clients keyed by ID.
-    clients: Arc<RwLock<HashMap<ClientId, ClientState>>>,
-    /// Slow client eviction policy.
-    policy: SlowClientPolicy,
-    /// Per-client send buffer capacity (in messages).
-    buffer_capacity: usize,
-    /// Next client ID.
-    next_id: AtomicU64,
-    /// Global sequence counter for messages.
+    sender: broadcast::Sender<Utf8Bytes>,
+    next_client_id: AtomicU64,
     sequence: AtomicU64,
-    /// Optional replay buffer.
-    replay_buffer: Option<parking_lot::Mutex<ReplayBuffer>>,
+    frame_bytes: usize,
+    capacity: usize,
 }
 
 impl FanoutManager {
-    /// Creates a new fan-out manager.
-    ///
-    /// # Arguments
-    ///
-    /// * `policy` - Slow client eviction policy.
-    /// * `buffer_capacity` - Max queued messages per client.
-    /// * `replay_buffer_size` - If `Some`, enables a replay buffer of this size.
+    /// Creates the production broadcast ring.
     #[must_use]
-    pub fn new(
-        policy: SlowClientPolicy,
-        buffer_capacity: usize,
-        replay_buffer_size: Option<usize>,
-    ) -> Self {
-        let replay_buffer =
-            replay_buffer_size.map(|size| parking_lot::Mutex::new(ReplayBuffer::new(size)));
+    pub fn new() -> Self {
+        Self::with_limits(MAX_SERVER_FRAME_BYTES, SERVER_BROADCAST_CAPACITY)
+    }
+
+    fn with_limits(frame_bytes: usize, capacity: usize) -> Self {
+        let (sender, receiver) = broadcast::channel(capacity);
+        drop(receiver);
         Self {
-            clients: Arc::new(RwLock::new(HashMap::new())),
-            policy,
-            buffer_capacity: buffer_capacity.max(1),
-            next_id: AtomicU64::new(1),
+            sender,
+            next_client_id: AtomicU64::new(1),
             sequence: AtomicU64::new(0),
-            replay_buffer,
+            frame_bytes,
+            capacity,
         }
     }
 
-    /// Registers a new client and returns its ID and receive channel.
-    pub fn add_client(
-        &self,
-        subscription_id: String,
-        filter: Option<String>,
-        format: Option<super::sink_config::SinkFormat>,
-    ) -> (ClientId, RingReceiver<Bytes>) {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = ring_channel(self.buffer_capacity);
-
-        let state = ClientState {
-            tx,
-            filter,
-            subscription_id,
-            format,
-            messages_dropped: AtomicU64::new(0),
-        };
-
-        self.clients.write().insert(id, state);
-        debug!(client_id = id, "client registered");
-        (id, rx)
+    /// Subscribes a client to future frames.
+    pub fn subscribe(&self) -> (u64, broadcast::Receiver<Utf8Bytes>) {
+        let id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
+        (id, self.sender.subscribe())
     }
 
-    /// Removes a client by ID, returning whether it existed.
-    pub fn remove_client(&self, id: ClientId) -> bool {
-        let removed = self.clients.write().remove(&id).is_some();
-        if removed {
-            debug!(client_id = id, "client removed");
-        }
-        removed
-    }
-
-    /// Returns the number of connected clients.
     #[must_use]
     pub fn client_count(&self) -> usize {
-        self.clients.read().len()
+        self.sender.receiver_count()
     }
 
-    /// Returns the current global sequence number.
-    #[must_use]
-    pub fn current_sequence(&self) -> u64 {
-        self.sequence.load(Ordering::Relaxed)
-    }
-
-    /// Returns a clone of the clients map handle for external use.
-    #[must_use]
-    pub fn clients(&self) -> Arc<RwLock<HashMap<ClientId, ClientState>>> {
-        Arc::clone(&self.clients)
-    }
-
-    /// Broadcasts serialized data to all connected clients.
-    ///
-    /// Applies the slow client policy for clients that can't keep up.
-    /// Returns the number of clients that received the message successfully.
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn broadcast(&self, data: Bytes) -> BroadcastResult {
-        let seq = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
-
-        // Store in replay buffer if enabled.
-        if let Some(ref replay) = self.replay_buffer {
-            replay.lock().push(seq, data.clone());
+    /// Preflights, encodes, and publishes one logical batch as ordered frames.
+    /// No frame is published if a row or the complete burst exceeds a bound.
+    pub fn publish_rows(&self, rows: &[Vec<u8>]) -> Result<BroadcastResult, ConnectorError> {
+        if rows.is_empty() {
+            return Ok(BroadcastResult {
+                sequence: self.sequence.load(Ordering::Relaxed),
+                frames: 0,
+                payload_bytes: 0,
+                transport_bytes: 0,
+                receiver_enqueues: 0,
+            });
         }
 
-        let clients = self.clients.read();
-        let mut sent = 0u64;
-        let mut dropped = 0u64;
-        let mut disconnected: Vec<ClientId> = Vec::new();
+        for (index, row) in rows.iter().enumerate() {
+            std::str::from_utf8(row).map_err(|error| {
+                ConnectorError::Serde(SerdeError::MalformedInput(format!(
+                    "WebSocket sink row {index} is not UTF-8: {error}"
+                )))
+            })?;
+        }
 
-        let drop_oldest = matches!(self.policy, SlowClientPolicy::DropOldest);
-
-        for (&id, state) in clients.iter() {
-            match state.tx.send(data.clone(), drop_oldest) {
-                RingSendResult::Sent => {
-                    sent += 1;
-                }
-                RingSendResult::Evicted => {
-                    state.messages_dropped.fetch_add(1, Ordering::Relaxed);
-                    sent += 1; // new message was enqueued after eviction
-                    dropped += 1; // but the old message was lost
-                }
-                RingSendResult::Dropped => match &self.policy {
-                    SlowClientPolicy::DropNewest | SlowClientPolicy::DropOldest => {
-                        state.messages_dropped.fetch_add(1, Ordering::Relaxed);
-                        dropped += 1;
-                    }
-                    SlowClientPolicy::Disconnect { .. } => {
-                        disconnected.push(id);
-                    }
-                    SlowClientPolicy::WarnThenDisconnect { .. } => {
-                        let total_drops =
-                            state.messages_dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                        if total_drops > self.buffer_capacity as u64 {
-                            disconnected.push(id);
-                        } else {
-                            dropped += 1;
-                        }
-                    }
-                },
-                RingSendResult::Closed => {
-                    disconnected.push(id);
-                }
+        let mut boundaries = Vec::new();
+        let mut start = 0;
+        while start < rows.len() {
+            let end = self.next_frame_end(rows, start)?;
+            boundaries.push((start, end));
+            if boundaries.len() > self.capacity {
+                return Err(ConnectorError::WriteError(format!(
+                    "WebSocket server batch requires more than {} frames; split the input batch",
+                    self.capacity
+                )));
             }
+            start = end;
         }
-        drop(clients);
 
-        // Remove disconnected clients outside the read lock.
-        if !disconnected.is_empty() {
-            let mut clients = self.clients.write();
-            for id in &disconnected {
-                clients.remove(id);
-                warn!(client_id = id, "slow/disconnected client removed");
+        let first_sequence = self.reserve_sequences(boundaries.len())?;
+        let mut frames = Vec::with_capacity(boundaries.len());
+        let mut total_bytes = 0usize;
+        for (index, (start, end)) in boundaries.into_iter().enumerate() {
+            let offset = u64::try_from(index).map_err(|_| {
+                ConnectorError::WriteError("WebSocket server sequence range is too large".into())
+            })?;
+            let sequence = first_sequence.checked_add(offset).ok_or_else(|| {
+                ConnectorError::WriteError("WebSocket server sequence exhausted".into())
+            })?;
+            let frame = encode_data_frame(&rows[start..end], sequence)?;
+            total_bytes = total_bytes
+                .checked_add(frame.len())
+                .ok_or_else(wire_size_overflow)?;
+            frames.push(frame);
+        }
+
+        let frame_count = frames.len();
+        let mut receiver_enqueues = 0u64;
+        let mut transport_bytes = 0u64;
+        for frame in frames {
+            let frame_bytes = u64::try_from(frame.len()).unwrap_or(u64::MAX);
+            if let Ok(receivers) = self.sender.send(frame) {
+                let receivers = u64::try_from(receivers).unwrap_or(u64::MAX);
+                receiver_enqueues = receiver_enqueues.saturating_add(receivers);
+                transport_bytes =
+                    transport_bytes.saturating_add(frame_bytes.saturating_mul(receivers));
             }
         }
 
-        BroadcastResult {
-            sequence: seq,
-            sent,
-            dropped,
-            disconnected: disconnected.len() as u64,
-        }
+        let frame_count_u64 = u64::try_from(frame_count).map_err(|_| {
+            ConnectorError::WriteError("WebSocket server frame count is too large".into())
+        })?;
+        Ok(BroadcastResult {
+            sequence: first_sequence + frame_count_u64 - 1,
+            frames: frame_count,
+            payload_bytes: total_bytes,
+            transport_bytes,
+            receiver_enqueues,
+        })
     }
 
-    /// Returns replay messages for a client resuming from a given sequence.
-    #[must_use]
-    pub fn replay_from(&self, from_sequence: u64) -> Vec<(u64, Bytes)> {
-        match &self.replay_buffer {
-            Some(replay) => replay.lock().replay_from(from_sequence),
-            None => Vec::new(),
+    fn next_frame_end(&self, rows: &[Vec<u8>], start: usize) -> Result<usize, ConnectorError> {
+        let envelope_bytes = DATA_PREFIX
+            .len()
+            .checked_add(SEQUENCE_PREFIX.len())
+            .and_then(|bytes| bytes.checked_add(MAX_SEQUENCE_DIGITS + 1))
+            .ok_or_else(wire_size_overflow)?;
+        let mut bytes = envelope_bytes;
+        let mut end = start;
+
+        while end < rows.len() {
+            let separator = usize::from(end > start);
+            let next_bytes = bytes
+                .checked_add(separator)
+                .and_then(|size| size.checked_add(rows[end].len()))
+                .ok_or_else(wire_size_overflow)?;
+            if next_bytes > self.frame_bytes {
+                if end == start {
+                    return Err(ConnectorError::WriteError(format!(
+                        "WebSocket server row {start} requires {next_bytes} bytes, exceeding the {}-byte frame limit",
+                        self.frame_bytes
+                    )));
+                }
+                break;
+            }
+            bytes = next_bytes;
+            end += 1;
         }
+        Ok(end)
     }
+
+    fn reserve_sequences(&self, frame_count: usize) -> Result<u64, ConnectorError> {
+        let amount = u64::try_from(frame_count).map_err(|_| {
+            ConnectorError::WriteError("WebSocket server sequence range is too large".into())
+        })?;
+        let previous = self
+            .sequence
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(amount)
+            })
+            .map_err(|_| {
+                ConnectorError::WriteError("WebSocket server sequence exhausted".into())
+            })?;
+        previous
+            .checked_add(1)
+            .ok_or_else(|| ConnectorError::WriteError("WebSocket server sequence exhausted".into()))
+    }
+}
+
+impl Default for FanoutManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn encode_data_frame(rows: &[Vec<u8>], sequence: u64) -> Result<Utf8Bytes, ConnectorError> {
+    let row_bytes = rows.iter().try_fold(0usize, |total, row| {
+        total.checked_add(row.len()).ok_or_else(wire_size_overflow)
+    })?;
+    let sequence = sequence.to_string();
+    let capacity = DATA_PREFIX
+        .len()
+        .checked_add(row_bytes)
+        .and_then(|size| size.checked_add(rows.len().saturating_sub(1)))
+        .and_then(|size| size.checked_add(SEQUENCE_PREFIX.len()))
+        .and_then(|size| size.checked_add(sequence.len() + 1))
+        .ok_or_else(wire_size_overflow)?;
+    let mut data = Vec::with_capacity(capacity);
+    data.extend_from_slice(DATA_PREFIX);
+    for (index, row) in rows.iter().enumerate() {
+        if index > 0 {
+            data.push(b',');
+        }
+        data.extend_from_slice(row);
+    }
+    data.extend_from_slice(SEQUENCE_PREFIX);
+    data.extend_from_slice(sequence.as_bytes());
+    data.push(b'}');
+    Utf8Bytes::try_from(Bytes::from(data)).map_err(|error| {
+        ConnectorError::Serde(SerdeError::MalformedInput(format!(
+            "WebSocket sink produced invalid UTF-8: {error}"
+        )))
+    })
+}
+
+fn wire_size_overflow() -> ConnectorError {
+    ConnectorError::Serde(SerdeError::MalformedInput(
+        "WebSocket sink wire message size overflow".into(),
+    ))
 }
 
 impl std::fmt::Debug for FanoutManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FanoutManager")
             .field("clients", &self.client_count())
-            .field("sequence", &self.current_sequence())
-            .field("buffer_capacity", &self.buffer_capacity)
+            .field("sequence", &self.sequence.load(Ordering::Relaxed))
+            .field("frame_bytes", &self.frame_bytes)
+            .field("capacity", &self.capacity)
             .finish_non_exhaustive()
     }
 }
 
-/// Result of a broadcast operation.
 #[derive(Debug, Clone)]
 pub struct BroadcastResult {
-    /// Sequence number assigned to this message.
+    /// Sequence assigned to the final frame.
     pub sequence: u64,
-    /// Number of clients that received the message.
-    pub sent: u64,
-    /// Number of clients where the message was dropped.
-    pub dropped: u64,
-    /// Number of clients that were disconnected.
-    pub disconnected: u64,
+    /// Number of frames published for the logical batch.
+    pub frames: usize,
+    /// Encoded payload bytes retained once by the shared ring.
+    pub payload_bytes: usize,
+    /// Estimated transport bytes across subscribed receivers.
+    pub transport_bytes: u64,
+    /// Sum of receiver counts returned by each frame publish.
+    pub receiver_enqueues: u64,
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
-    #[test]
-    fn test_replay_buffer() {
-        let mut buf = ReplayBuffer::new(3);
-        buf.push(1, Bytes::from("a"));
-        buf.push(2, Bytes::from("b"));
-        buf.push(3, Bytes::from("c"));
-
-        assert_eq!(buf.len(), 3);
-        assert_eq!(buf.oldest_sequence(), Some(1));
-
-        let replay = buf.replay_from(1);
-        assert_eq!(replay.len(), 2);
-        assert_eq!(replay[0].0, 2);
-        assert_eq!(replay[1].0, 3);
+    fn row(value: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({ "value": value })).unwrap()
     }
 
-    #[test]
-    fn test_replay_buffer_eviction() {
-        let mut buf = ReplayBuffer::new(2);
-        buf.push(1, Bytes::from("a"));
-        buf.push(2, Bytes::from("b"));
-        buf.push(3, Bytes::from("c")); // evicts seq 1
-
-        assert_eq!(buf.len(), 2);
-        assert_eq!(buf.oldest_sequence(), Some(2));
-
-        let replay = buf.replay_from(0);
-        assert_eq!(replay.len(), 2);
-        assert_eq!(replay[0].0, 2);
-    }
-
-    #[test]
-    fn test_fanout_add_remove_client() {
-        let mgr = FanoutManager::new(SlowClientPolicy::DropOldest, 10, None);
-
-        let (id1, _rx1) = mgr.add_client("sub1".into(), None, None);
-        let (id2, _rx2) = mgr.add_client("sub2".into(), None, None);
-        assert_eq!(mgr.client_count(), 2);
-
-        assert!(mgr.remove_client(id1));
-        assert_eq!(mgr.client_count(), 1);
-
-        assert!(!mgr.remove_client(id1)); // already removed
-        assert!(mgr.remove_client(id2));
-        assert_eq!(mgr.client_count(), 0);
+    fn payload(message: &Utf8Bytes) -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(message.as_ref()).unwrap()
     }
 
     #[tokio::test]
-    async fn test_fanout_broadcast() {
-        let mgr = FanoutManager::new(SlowClientPolicy::DropOldest, 10, None);
-        let (_id1, mut rx1) = mgr.add_client("sub1".into(), None, None);
-        let (_id2, mut rx2) = mgr.add_client("sub2".into(), None, None);
+    async fn one_shared_publish_reaches_every_subscriber() {
+        let manager = FanoutManager::with_limits(1024, 4);
+        let (_first_id, mut first) = manager.subscribe();
+        let (_second_id, mut second) = manager.subscribe();
 
-        let result = mgr.broadcast(Bytes::from("hello"));
-        assert_eq!(result.sent, 2);
-        assert_eq!(result.dropped, 0);
-        assert_eq!(result.sequence, 1);
+        let result = manager.publish_rows(&[row("hello")]).unwrap();
 
-        let msg1 = rx1.recv().await.unwrap();
-        assert_eq!(msg1.as_ref(), b"hello");
-
-        let msg2 = rx2.recv().await.unwrap();
-        assert_eq!(msg2.as_ref(), b"hello");
-    }
-
-    #[test]
-    fn test_fanout_slow_client_drop() {
-        let mgr = FanoutManager::new(SlowClientPolicy::DropNewest, 2, None);
-        let (_id, _rx) = mgr.add_client("sub1".into(), None, None);
-
-        // Fill the buffer.
-        mgr.broadcast(Bytes::from("a"));
-        mgr.broadcast(Bytes::from("b"));
-
-        // This should be dropped (buffer full, DropNewest policy).
-        let result = mgr.broadcast(Bytes::from("c"));
-        assert_eq!(result.dropped, 1);
-    }
-
-    #[test]
-    fn test_fanout_disconnect_policy() {
-        let mgr = FanoutManager::new(SlowClientPolicy::Disconnect { threshold_pct: 80 }, 2, None);
-        let (_id, _rx) = mgr.add_client("sub1".into(), None, None);
-
-        mgr.broadcast(Bytes::from("a"));
-        mgr.broadcast(Bytes::from("b"));
-
-        // Buffer full → client disconnected.
-        let result = mgr.broadcast(Bytes::from("c"));
-        assert_eq!(result.disconnected, 1);
-        assert_eq!(mgr.client_count(), 0);
-    }
-
-    #[test]
-    fn test_fanout_with_replay() {
-        let mgr = FanoutManager::new(SlowClientPolicy::DropOldest, 10, Some(5));
-
-        mgr.broadcast(Bytes::from("a"));
-        mgr.broadcast(Bytes::from("b"));
-        mgr.broadcast(Bytes::from("c"));
-
-        let replay = mgr.replay_from(1);
-        assert_eq!(replay.len(), 2);
-        assert_eq!(replay[0].1.as_ref(), b"b");
-        assert_eq!(replay[1].1.as_ref(), b"c");
+        assert_eq!(result.frames, 1);
+        assert_eq!(result.receiver_enqueues, 2);
+        assert_eq!(
+            payload(&first.recv().await.unwrap())["data"][0]["value"],
+            "hello"
+        );
+        assert_eq!(payload(&second.recv().await.unwrap())["sequence"], 1);
     }
 
     #[tokio::test]
-    async fn test_fanout_closed_client_removed() {
-        let mgr = FanoutManager::new(SlowClientPolicy::DropOldest, 10, None);
-        let (_id, rx) = mgr.add_client("sub1".into(), None, None);
+    async fn multi_frame_batch_does_not_evict_itself() {
+        let rows = [row("a"), row("b"), row("c")];
+        let two_row_bytes = encode_data_frame(&rows[..2], u64::MAX).unwrap().len();
+        let manager = FanoutManager::with_limits(two_row_bytes, 2);
+        let (_id, mut receiver) = manager.subscribe();
 
-        // Drop the receiver to simulate client disconnect.
-        drop(rx);
+        let result = manager.publish_rows(&rows).unwrap();
 
-        let result = mgr.broadcast(Bytes::from("hello"));
-        assert_eq!(result.disconnected, 1);
-        assert_eq!(mgr.client_count(), 0);
+        assert_eq!(result.frames, 2);
+        assert_eq!(payload(&receiver.recv().await.unwrap())["sequence"], 1);
+        assert_eq!(payload(&receiver.recv().await.unwrap())["sequence"], 2);
     }
 
     #[tokio::test]
-    async fn test_fanout_drop_oldest_evicts() {
-        let mgr = FanoutManager::new(SlowClientPolicy::DropOldest, 2, None);
-        let (_id, rx) = mgr.add_client("sub1".into(), None, None);
+    async fn oversized_row_fails_before_delivery_or_sequence_reservation() {
+        let rows = [row("small"), row(&"x".repeat(128))];
+        let first_row_bytes = encode_data_frame(&rows[..1], u64::MAX).unwrap().len();
+        let manager = FanoutManager::with_limits(first_row_bytes, 2);
+        let (_id, mut receiver) = manager.subscribe();
 
-        // Fill the buffer.
-        mgr.broadcast(Bytes::from("a"));
-        mgr.broadcast(Bytes::from("b"));
+        let error = manager.publish_rows(&rows).unwrap_err().to_string();
 
-        // This should evict "a" and enqueue "c".
-        let result = mgr.broadcast(Bytes::from("c"));
-        assert_eq!(result.sent, 1); // new message was enqueued
-        assert_eq!(result.dropped, 1); // old message was evicted
-
-        // Receiver should get "b" then "c" (not "a").
-        let msg1 = rx.recv().await.unwrap();
-        assert_eq!(msg1.as_ref(), b"b");
-        let msg2 = rx.recv().await.unwrap();
-        assert_eq!(msg2.as_ref(), b"c");
+        assert!(error.contains("row 1"), "{error}");
+        assert_eq!(manager.sequence.load(Ordering::Relaxed), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), receiver.recv())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
-    async fn test_ring_channel_basic() {
-        let (tx, rx) = ring_channel::<Bytes>(4);
-        let _ = tx.send(Bytes::from("hello"), false);
-        let msg = rx.recv().await.unwrap();
-        assert_eq!(msg.as_ref(), b"hello");
+    async fn over_capacity_burst_fails_before_delivery() {
+        let rows = [row("a"), row("b"), row("c")];
+        let one_row_bytes = encode_data_frame(&rows[..1], u64::MAX).unwrap().len();
+        let manager = FanoutManager::with_limits(one_row_bytes, 2);
+        let (_id, mut receiver) = manager.subscribe();
+
+        let error = manager.publish_rows(&rows).unwrap_err().to_string();
+
+        assert!(error.contains("more than 2 frames"), "{error}");
+        assert_eq!(manager.sequence.load(Ordering::Relaxed), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), receiver.recv())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
-    async fn test_ring_channel_sender_dropped() {
-        let (tx, rx) = ring_channel::<Bytes>(4);
-        let _ = tx.send(Bytes::from("last"), false);
-        drop(tx);
-        let msg = rx.recv().await.unwrap();
-        assert_eq!(msg.as_ref(), b"last");
-        assert!(rx.recv().await.is_none());
-    }
+    async fn lag_is_reported_by_the_shared_ring() {
+        let manager = FanoutManager::with_limits(1024, 2);
+        let (_id, mut receiver) = manager.subscribe();
+        manager.publish_rows(&[row("a")]).unwrap();
+        manager.publish_rows(&[row("b")]).unwrap();
+        manager.publish_rows(&[row("c")]).unwrap();
 
-    #[test]
-    fn test_fanout_sequence_increments() {
-        let mgr = FanoutManager::new(SlowClientPolicy::DropOldest, 10, None);
-
-        let r1 = mgr.broadcast(Bytes::from("a"));
-        let r2 = mgr.broadcast(Bytes::from("b"));
-        let r3 = mgr.broadcast(Bytes::from("c"));
-
-        assert_eq!(r1.sequence, 1);
-        assert_eq!(r2.sequence, 2);
-        assert_eq!(r3.sequence, 3);
+        assert!(matches!(
+            receiver.recv().await,
+            Err(broadcast::error::RecvError::Lagged(1))
+        ));
     }
 }

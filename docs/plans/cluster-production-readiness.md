@@ -1,26 +1,22 @@
 # Plan: Cluster Mode Production Readiness (Distributed, Partition-Aware, Exactly-Once)
 
-- **Status:** Proposed (not started). Large multi-phase program.
-- **Date:** 2026-05-28
+- **Status:** In progress. Cluster exactly-once remains deliberately rejected with `LDB-0013`.
+- **Last audited:** 2026-07-14
 - **Scope:** Make `cluster` a production-grade distributed streaming runtime:
-  partition-aware sources (Kafka first), end-to-end exactly-once across the distributed
-  dataflow, fault-tolerant state with failover, then elastic rescale and operational
-  hardening.
+  partition-aware sources, fault-tolerant state and elastic operation. Admit cluster
+  exactly-once only after its remaining fences are proven.
 - **Relationship to other plans:** This is a **prerequisite for**
   `docs/plans/lookup-source-production-mpp.md` Track B (distributed joins) — distributed
-  non-aggregation operators (Phase 4 here) and barrier alignment (Phase 2) are shared
-  foundations. The lookup-MPP single-node track (Track A) does **not** depend on this and
-  can proceed in parallel.
+  non-aggregation operators and partitioned state are shared foundations. The lookup-MPP
+  single-node track (Track A) does **not** depend on this and can proceed in parallel.
 - **Targets (grounded in Flink / RisingWave / Arroyo, decided 2026-05-28):**
-  - **Correctness:** end-to-end exactly-once via aligned Chandy-Lamport barriers + the
-    existing cross-node 2PC sink commit. (Unaligned checkpoints noted as a follow-up for
-    backpressure resilience — Flink's lesson.)
+  - **Correctness:** retain the implemented aligned global cut; do not admit cluster
+    exactly-once until the leader term also fences durable decisions and external sink commits.
   - **Sources:** engine-controlled split assignment (not Kafka consumer groups), per-split
     offsets in the checkpoint, dynamic partition discovery, cross-node watermark alignment.
-  - **Elasticity:** vnode (256, fixed logical partitions) + object-store state; **failover
-    first** (reload a dead node's vnodes onto survivors), then **elastic rescale** as the
-    same machinery with a changing node count. This is the RisingWave model on the substrate
-    LaminarDB already has.
+  - **Elasticity:** fixed logical vnodes backed by one local LSM working copy per owner and
+    immutable object-store checkpoint handles. **Failover first**, then elastic rescale at an
+    assignment/checkpoint cut. A thin object-store adapter is not a live-state engine.
   - **Coordination (AD-0, settled):** hybrid — gossip for liveness, object-store CAS for
     fencing, **Postgres** as the authoritative control store (fenced leader lease, assignment,
     commit verdict, recovery epoch). See AD-0 below.
@@ -29,7 +25,7 @@
 
 ## How the reference systems do this (rationale)
 
-All three converge, and LaminarDB is architecturally closest to RisingWave:
+The production systems converge on fixed logical partitions, but not on one storage design:
 
 - **Correctness:** ABS aligned barriers + 2PC sinks (Flink, RW, Arroyo). Flink adds
   *unaligned* checkpoints so alignment can't stall under backpressure.
@@ -38,53 +34,54 @@ All three converge, and LaminarDB is architecturally closest to RisingWave:
   subtasks via the engine's own assignment, using manual `assign()` — **not** Kafka consumer
   groups — so partition→subtask mapping is deterministic and consistent with checkpointed
   per-split offsets. Plus dynamic discovery and watermark alignment (Flink FLIP-182).
-- **Elasticity:** fixed logical partitions (Flink key groups; RW + LaminarDB vnodes)
-  decoupled from physical parallelism, state in DFS/S3, rescale = reassign vnode ranges +
-  reload from shared storage. **Failover and rescale are the same primitive.** RW is most
-  elastic because state is in shared Hummock/S3 and reassignment rides a barrier.
+- **State:** Flink and Kafka Streams keep partitioned working state locally and recover from
+  checkpoints/changelogs. RisingWave's shared Hummock LSM additionally requires a versioned
+  metadata authority, pinned epochs, compaction ownership, garbage collection, and caches.
+  Materialize similarly couples blob storage to transactional consensus. LaminarDB must first
+  implement the local keyed-state path; its current object-store backend persists checkpoint
+  artifacts and exact-attempt seals only.
+- **Other execution models:** [Spark Structured Streaming](https://spark.apache.org/docs/latest/streaming/)
+  binds state to a stable shuffle partitioning and uses RocksDB snapshots or changelog checkpoints;
+  its exactly-once path remains micro-batch, while continuous processing is at-least-once.
+  [ksqlDB](https://docs.confluent.io/platform/current/ksqldb/operate-and-deploy/capacity-planning.html)
+  keeps one local RocksDB store per input partition and rebuilds it from compacted changelog topics;
+  repartition topics are part of the durable dataflow. These validate fixed keyed partitions plus
+  local working state, but do not justify putting Kafka or object-store I/O on LaminarDB's record
+  path.
+- **Control/recovery split:** [Arroyo](https://doc.arroyo.dev/architecture/) uses asynchronous
+  barrier snapshots, remote object storage for production checkpoints, and PostgreSQL for
+  distributed control metadata. Its local storage choices are deployment conveniences, not a
+  reason to weaken cluster checkpoint authority.
+- **Elasticity:** fixed logical partitions (Flink key groups; RisingWave/LaminarDB vnodes)
+  decouple state ownership from physical parallelism. Reassignment and restore happen at a
+  fenced checkpoint cut; gossip is never assignment or state authority.
 
-LaminarDB already has the enabling primitives (vnodes, `object_store` state backend, CAS
-fencing, barrier/2PC machinery); the gaps below are wiring, not missing architecture.
+LaminarDB has useful primitives—vnodes, assignment fences, aligned barriers, immutable checkpoint
+artifacts, and a bounded shuffle—but it does not yet have a common live keyed-state engine. The
+operator-owned maps and synchronous checkpoint scans are an architectural gap, not wiring work.
 
-## Current state (audited 2026-05-28, `cluster`)
+## Current state (audited 2026-07-14, `cluster`)
 
-**Real and tested:** chitchat gossip membership + phi-accrual failure detection
-(`crates/laminar-core/src/cluster/discovery/gossip_discovery.rs:253`); weak-by-design leader
-= lowest live id (`control/leader.rs:8`); **enforced split-brain fencing** via
-`assignment_version` gating object-store writes (`state/object_store.rs:104-123`) and
-committer-id CAS on `_COMMIT` (`:201-211`); CAS'd versioned `AssignmentSnapshot`
-(`control/snapshot.rs:189`) watched + rotated on membership change
-(`crates/laminar-db/src/rebalance.rs:100-153`); **cross-node 2PC commit decision**
-(`checkpoint_coordinator.rs:1066-1077`, `control/barrier.rs:215-278`); **distributed
-aggregation** via a pre-agg row-shuffle bridge (`operator/sql_query.rs:450-538`, wired at
-`pipeline_lifecycle.rs:485`); shuffle transport with reconnect (`shuffle/transport.rs:165`).
+**Implemented:** gossip membership and failure detection; versioned assignment and state-write
+fences; fixed logical vnodes assigned by deterministic rendezvous hashing; checkpoint-bound vnode
+partials and adoption-time rehydration; and a TLS shuffle transport with assignment/recovery
+fencing and bounded per-peer/per-node admission. The earlier distributed aggregate path remains as
+implementation substrate, but keyed cluster DDL now fails closed because its operator-owned maps
+have no live-state byte bound.
 
-**Stubbed / missing (the work):**
-- **Partition-aware source distribution is not implemented.** Source tasks are cluster-blind
-  (`pipeline/streaming_coordinator.rs:317-367`); Kafka uses `subscribe()`/consumer groups
-  (`kafka/source.rs:631-655`), disconnected from membership/vnodes/fencing/checkpoints. No
-  node→partition assignment. `TODO(distributed): embed the lease epoch` (`kafka/sink_config.rs:58`).
-- **No barrier alignment across the shuffle.** `BarrierTracker` exists but is unused in the
-  db checkpoint path (`shuffle/mod.rs:9` only); followers checkpoint on a *gossip
-  announcement* (`pipeline_callback.rs:239-242`), not an aligned data-plane barrier → the
-  cut does not capture in-flight shuffle records. Exactly-once with the shuffle active is not
-  actually correct today.
-- **State is not redistributable.** Per-vnode `partial.bin` is a marker (`"ckpt:{id}"`,
-  `checkpoint_coordinator.rs:587`), not state; `read_partial` is dead in prod; manifests are
-  per-node (no global manifest / `instance_id`). A dead node's vnodes/state are **dropped**
-  (asserted current behavior, `tests/cluster_e2e_failures.rs:205`); MV catalog restore across
-  the cluster is **unimplemented** (`:288-293`).
-- **No rescale.** `round_robin_assignment` reshuffles *all* vnodes on join/leave
-  (`state/vnode.rs:206-231`), and with no state reload, recovers nothing.
-- **Only aggregation distributes**; joins/windows/distinct are single-node.
-  `ClusterRepartitionExec` is **dead/test-only** (`cluster.rs:455-457`).
-- **Transport fragile:** no connect/write timeouts; an unreachable peer **fails the whole
-  cycle** (`sql_query.rs:516`); no cross-node backpressure to sources.
-- **No inter-node security:** plaintext, unauthenticated `Hello(node_id)` (`transport.rs:211`).
-- **No graceful drain / rolling upgrade / scale-down** (`Draining` only logged,
-  `server/cluster.rs:107`); admin API read-only (`http.rs:390-417`).
-- **No Raft:** `raft_port` is config theatre (`cluster_config.rs:150`, `cluster.rs:237-240`);
-  stale `Cargo.toml:14-16` comment claims rebalance "not yet implemented" (it is).
+The checkpoint path now forms one **global aligned cut**. Sources hold at their barriers, the graph
+drains pre-cut work, sinks are fenced, every process fans a shuffle barrier to the same frozen
+participant roster, and state capture starts only after all peer barriers arrive. Roster changes,
+sequence gaps, partial fan-out, and alignment timeout reject the attempt.
+
+**Remaining production gates:**
+- Cluster exactly-once fails closed with `LDB-0013`; checkpoint verdicts are term-fenced, but
+  supported connectors lack certified term-fenced source handoff and external sink cursors.
+- Shuffle `send_to` completion is local queue admission, not a remote-delivery acknowledgement.
+  Sequence gaps and barrier high-water marks fence detected loss, but callers must not interpret a
+  successful send as proof that a peer incorporated the row.
+- Cluster support remains operator-specific. Unsupported stateful paths fail closed;
+  fault, recovery, rescale, and latency coverage must pass for each admitted path.
 
 ## Goals
 
@@ -99,13 +96,14 @@ aggregation** via a pre-agg row-shuffle bridge (`operator/sql_query.rs:450-538`,
 - **No Raft / custom consensus engine** unless the coordination-store decision (below) calls
   for it. The current weak-leader + durable-CAS-fence model is correct *if* the fence is
   airtight; we either keep it or adopt an external store — we do not hand-roll Raft.
-- **No zero-downtime live repartition.** None of Flink/RW/Arroyo do that; rescale is
-  barrier-coordinated reassignment + reload (brief reconfiguration), which is the target.
+- **No record-by-record live state migration.** Rescale is a fenced checkpoint-cut reassignment
+  and reload with a bounded reconfiguration pause.
 - **No multi-region / geo-replication** in this plan.
-- **No bespoke RPC framework** — reuse the existing length-prefixed shuffle transport +
-  object store + gossip; add TLS via the existing rustls stack used by pgwire.
-- **No new state backend** — extend the existing `object_store` backend to carry real
-  per-vnode state; do not introduce complex embedded/external LSM databases.
+- **No bespoke RPC framework** — reuse the existing TLS gRPC shuffle transport, object store,
+  and gossip.
+- **No shared live state implemented as a thin object-store adapter.** Build one local batched
+  keyed-state engine for embedded, single-node, and cluster workers. Shared object-backed live
+  state is deferred until a term-fenced metadata/version/compaction/GC authority exists.
 
 ## AD-0 — Coordination store (SETTLED 2026-05-28: Hybrid + Postgres)
 
@@ -117,8 +115,8 @@ control store. Responsibilities split by what each layer is good at:
 - **Object-store CAS keeps fencing** (`assignment_version` gate + `_COMMIT` committer-id CAS)
   as defense-in-depth — the "even if the control plane has a bug, committed state cannot be
   corrupted" backstop. Retained, not removed.
-- **Postgres becomes authoritative for:** the **fenced leader lease** (advisory lock / lease
-  row → prevents the dual-leader window the current lowest-id model only *tolerates*), the
+- **Postgres becomes authoritative for:** a transactionally incremented **fencing term** plus a
+  database-clock lease row (renewal and every control mutation compare term and owner), the
   **assignment** (vnode→node and partition→node rows), the **checkpoint commit verdict**, and
   **cluster-wide recovery-epoch agreement**.
 
@@ -132,8 +130,8 @@ edges (quorum fsync, defrag, revision compaction) are worse for teams not alread
 degrades to "no new checkpoints / no rebalance" (liveness), never a data-plane outage — same
 as Flink/Arroyo. Run the control Postgres HA (RDS Multi-AZ / Patroni).
 
-**Foundation work (lands with/before Phase 1, since P1 is the first consumer):** introduce the
-control-store client + schema (lease, `assignments`, `checkpoint_epochs`, recovery pointer),
+**Foundation work (lands with/before Phase 0, since authority fencing is the first consumer):**
+introduce the control-store client + schema (lease, `assignments`, `checkpoint_epochs`, recovery pointer),
 a fenced **leader lease** replacing lowest-live-id (`control/leader.rs:8`), and migrate the
 authoritative `AssignmentSnapshot` from object-store CAS to Postgres rows (keep the CAS fence
 as backstop). Make Postgres optional/disabled for single-instance mode.
@@ -142,102 +140,95 @@ as backstop). Make Postgres optional/disabled for single-instance mode.
 
 ## Phases
 
-### Phase 0 — Transport & safety hardening (small, unblocks everything)
-- Add connect/write **timeouts** to the shuffle transport (`shuffle/transport.rs`); today a
-  blocking `send_to` can hang forever.
-- Peer-failure handling: an unreachable peer must **backpressure / trigger reassignment**,
-  not fail the whole cycle (`sql_query.rs:516`). Distinguish transient (retry) from durable
-  (rebalance) peer loss.
-- **Inter-node TLS + authenticated handshake** on shuffle + control (reuse the pgwire rustls
-  work); reject `Hello` from unauthenticated/mismatched ids.
-- **Exit:** a node can crash or a link can blip without killing the cluster; all inter-node
-  traffic is encrypted + authenticated.
+### Phase 0 — Authority and transport safety
+- Term-fence durable per-node recovery-control records, preserve the global recovery generation
+  across all process terms, and fail unknown gossip lifecycle state closed.
+- Retain TLS identity, assignment/recovery fences, bounded byte admission, sequence-gap detection,
+  and barrier high-water checks under link-loss and restart fault injection.
+- Use one certified, sequenced data/barrier FIFO per peer with bounded queue, byte reservation,
+  decode, and holdover admission. Barrier control bytes have separate admission without leaving
+  that FIFO. Cluster subscriptions fail closed; local subscriptions never enter shuffle.
+- Make shuffle slicing reject invalid owner/vnode inputs and prove row-count conservation. Reject
+  reserved protocol field and stage names before execution.
+- **Exit:** delayed writes from an expired process term cannot replace successor state, saturated
+  data saturation cannot starve checkpoint barriers, no local enqueue is treated as remote delivery,
+  and every detected loss rejects the cut before state is sealed.
 
-### Phase 1 — Partition-aware source assignment (Kafka) — the headline
-- Introduce an engine-side **split enumerator + assigner**: enumerate Kafka partitions,
-  assign them to nodes via the **Postgres control store** (AD-0; co-partition with vnode
-  ownership where the key hashes align), and switch the Kafka source from `subscribe()` to
-  manual **`assign()`** of only its owned partitions. (Requires the AD-0 control-store
-  foundation.)
-- Per-split offsets become part of the engine checkpoint (already per-partition,
-  `kafka/offsets.rs:20`); on reassignment the new owner resumes from the checkpointed offset.
-- Reuse the **rebalance controller** (`rebalance.rs`) to reassign splits on membership change
-  (cooperative: only moved partitions pause); handle **dynamic partition discovery** and
-  topic repartitioning.
-- **Cross-node watermark alignment:** extend the leader's cluster-min watermark to gate fast
-  partitions (Flink FLIP-182 style) + idle-partition detection across nodes.
-- **Exit:** N nodes consume disjoint Kafka partitions assigned by the engine; node loss
-  reassigns its partitions to survivors which resume at the correct offsets; watermarks align
-  across the cluster. Covered by a real Kafka cluster integration test (none exists today).
+### Phase 1 — Bounded state capture and async durable tail
+- Add live-state byte accounting and reserve before mutation/capture so the configured bound is
+  enforced before allocation, not after serialization.
+- Replace synchronous full-state scans during the aligned pause with a bounded immutable/COW
+  generation freeze. The stopped phase may drain and pin state but performs no remote I/O,
+  compaction, full-state iteration, or encoding.
+- Encode and upload in bounded cancellable chunks after processing resumes; publish immutable
+  per-vnode handles through the existing exact-attempt seal/decision protocol. Delta/rebase policy
+  is internal, not a public checkpoint dimension.
+- **Exit:** event-loop heartbeat and ingestion p99 remain within target during large captures, RSS
+  stays inside the configured budget, and kill/cancel before and after freeze/upload/seal cannot
+  publish a partial cut.
 
-### Phase 2 — Consistent distributed checkpoint (correctness foundation)
-- Wire `BarrierTracker` into the db checkpoint path so checkpoint barriers **align across the
-  shuffle** (true Chandy-Lamport cut): each shuffle-input operator snapshots only after the
-  barrier arrives on all input channels, buffering post-barrier records.
-- Decide in-flight handling: **aligned** first (buffer); add **unaligned** (snapshot in-flight
-  shuffle data) as a follow-up so alignment can't stall under backpressure.
-- Replace "follower checkpoints on gossip announcement" with barrier-driven snapshotting.
-- **Exit:** exactly-once holds with the shuffle active (distributed agg today, joins later);
-  verified by a fault-injection test that asserts no double-count on failover.
+### Phase 2 — Common keyed state, aggregate vertical slice
+- Add the smallest batched API needed by operators: multi-get, ordered vnode/range scan, atomic
+  write batch, bounded generation freeze, async materialize, restore, and drop-vnodes.
+- Provide an in-memory reference implementation and one local production LSM implementation.
+  Namespace state by deployment, pipeline fingerprint, stable operator/table/schema identity,
+  vnode, and user key. Assignment generation and process incarnation are write fences and
+  checkpoint provenance, not key components. Do one read/write batch per Arrow batch, never one
+  await per row.
+- Move grouped aggregate accumulators and `last_emitted` into one atomic keyed-state batch. Keep
+  the old map path only as a differential oracle during the cycle, then delete it.
+- **Exit:** output/state parity, crash/reopen, corruption, memory-bound, and 1→3→2 ownership tests
+  pass in embedded, single-node, and cluster modes.
 
-### Phase 3 — Durable partitioned state + reload-on-failover (the big one)
-- Write **real per-vnode operator/keyed state** to the `object_store` backend (replace the
-  `partial.bin` marker), keyed by `(checkpoint_id, vnode)`.
-- On failover/rebalance, a node adopting a vnode **loads that vnode's state** from shared
-  storage (resurrect `read_partial` into the adopt/recovery path; today it's dead).
-- Implement **cluster MV catalog restore** across nodes (currently unimplemented,
-  `cluster_e2e_failures.rs:288`).
-- **Cluster-wide recovery epoch agreement** so all nodes recover to a consistent global
-  checkpoint (via the Postgres control store, AD-0).
-- **Exit:** killing a node drops **zero** committed state; a survivor adopts its vnodes and
-  resumes. The `cluster_e2e_failures.rs:205` "rows dropped" assertion flips to "rows
-  recovered."
+### Phase 3 — Partition-aware source ownership
+- Use engine-owned split enumeration and assignment for Kafka and database snapshot/log splits;
+  checkpoint exact per-split cursors and bind handoff to the same assignment/state handle.
+- Add dynamic split discovery and cross-node watermark alignment. Gossip advertises liveness only;
+  the durable control store owns assignment generations.
+- **Exit:** nodes consume disjoint splits, owner death resumes from the decided cursor, and
+  snapshot/log handoff plus watermark frontiers pass process-death integration tests.
 
-### Phase 4 — Distributed non-aggregation operators (converges with lookup-MPP Track B)
-- Extend the shuffle bridge beyond aggregation: hash-partition keyed joins, windows, distinct,
-  topk by key across vnodes, with **co-partition enforcement** (both join sides shuffled by the
-  join key). This is the same machinery as `lookup-source-production-mpp.md` Phase 5
-  (key-shard the lookup probe side).
-- **Exit:** a keyed stream-stream join / windowed aggregation / distinct runs distributed,
-  barrier-consistent (Phase 2), state-durable (Phase 3).
+### Phase 4 — Windows and timers
+- Implement fixed tumbling/hopping windows over keyed tables and timer/range indexes; consolidate
+  duplicated whole-node window state. Add session-window interval merging only after fixed-window
+  range and eviction semantics pass.
+- **Exit:** every admitted window snapshots, restores, and revokes per vnode; all other window
+  shapes remain rejected in cluster mode.
 
-### Phase 5 — Elastic rescale + lifecycle
-- Extend the failover machinery (Phase 3) to **changing node counts (N→M)**: barrier-coordinated
-  vnode reassignment + reload from object store (RW model). Move toward consistent-hash-style
-  vnode mapping so a join/leave moves a bounded fraction (today `round_robin` reshuffles all,
-  `vnode.rs:206`).
-- **Graceful drain** (act on `NodeState::Draining`, not just log it), **rolling upgrade**,
-  scale-down.
-- **Admin API** for cluster ops (drain / trigger rebalance / scale / view assignments),
-  replacing the read-only endpoint (`http.rs:390`).
-- **Exit:** add/remove nodes with state preserved; drain a node for upgrade without data loss.
+### Phase 5 — Bounded joins and other stateful operators
+- Implement bounded interval joins as two vnode-keyed time-indexed tables with watermark eviction,
+  then incremental changelog joins as two atomic keyed multisets. Require co-partitioned shuffle.
+- Process-time/unbounded joins require an explicit finite retention contract or remain rejected.
+  Classify every operator as stateless, rebuildable read-only, vnode-keyed, or unsupported.
+- **Exit:** future operators cannot enter a cluster graph without an explicit state/shuffle
+  capability, and each admitted shape passes rescale/recovery/output-oracle tests.
 
-### Phase 6 — Recovery coordination & observability
-- Per-node + cluster metrics: per-partition lag, assignment map visibility, checkpoint
-  alignment health, shuffle queue depth, barrier latency, fence rejections.
-- Runbooks; correct the misleading `raft` config surface and the stale `Cargo.toml` comment.
-- **Exit:** the cluster is operable and observable under production load.
+### Phase 6 — Elastic lifecycle, authority, and operations
+- Validate changing node counts, graceful drain, rolling upgrade, skew, owner death, and assignment
+  rotation mid-checkpoint. Acquired state must restore before Active; revoked owners stop writes
+  before dropping state.
+- Complete connector handoff and external committer fencing before removing `LDB-0013`. Add per-stage
+  shuffle fairness, drain/in-flight metrics, adaptive buffer targets, and recovery/state-cut SLOs.
+- **Exit:** the cluster is operable under the full fault/soak matrix; shared object-backed live
+  state remains deferred unless a version/compaction/GC metadata authority is proven.
 
 ---
 
 ## Sequencing & risk
 
-- **Critical path:** 0 → 1 (headline) and 0 → 2 → 3 can proceed somewhat in parallel; 4
-  depends on 2+3; 5 depends on 3; 6 throughout.
-- **Phase 1** delivers the user's explicit ask (partition-aware Kafka) early and is buildable
-  on the existing assignment/rebalance substrate without waiting for full distributed-state
-  correctness — sources' "state" is mostly offsets.
-- **Phase 3 is the largest and riskiest** (real partitioned state movement); it gates true
-  fault tolerance and all elasticity. AD-0 must be settled before it.
-- **Phase 2 is correctness-critical**: until it lands, distributed-agg exactly-once is
-  nominal, not real.
-- **Reuse over rebuild:** every phase extends proven substrate (vnodes, AssignmentSnapshot,
-  CAS fence, 2PC, shuffle transport) rather than introducing new infrastructure — this is the
-  RisingWave model on what LaminarDB already has.
+- **Stateful operator path:** AD-0 → 0 → 1 → 2 → 4 → 5. **Clustered source-handoff path:**
+  AD-0 → 0 → 1 → 2 → 3. Phase 6 certifies both under lifecycle faults; work on source ownership may
+  proceed in parallel but cannot bypass the state-handle cut.
+- **Phase 2 is the largest architectural change.** Phase 1 first establishes truthful memory and
+  pause bounds so the new engine cannot inherit an unsafe capture path.
+- **Phase 1's aligned cut is necessary but not sufficient** for cluster exactly-once; the
+  `LDB-0013` leader-term and external-publication fence remains the admission gate.
+- **Reuse the proven control/data-plane substrate**, but do not preserve operator-owned map and
+  synchronous snapshot paths after their replacement passes differential validation.
 
 ## Open questions
 
-- Aligned-only vs aligned+unaligned checkpoints for v1 (backpressure tolerance).
+- Whether measured alignment backpressure justifies unaligned checkpointing.
 - Co-partitioning policy: should source-partition assignment be forced to align with vnode
   ownership (so a node consumes the partitions whose keys it owns), eliminating a reshuffle
   hop for keyed pipelines?

@@ -27,14 +27,8 @@ pub struct MongoDbCdcMetrics {
     pub deletes: IntCounter,
     /// Total lifecycle events (drop/rename/invalidate).
     pub lifecycle_events: IntCounter,
-    /// Total resume token persist operations.
-    pub token_persists: IntCounter,
     /// Total reconnection attempts.
     pub reconnects: IntCounter,
-    /// Total large event fragments received.
-    pub large_event_fragments: IntCounter,
-    /// Total large events reassembled.
-    pub large_events_reassembled: IntCounter,
 }
 
 impl MongoDbCdcMetrics {
@@ -67,21 +61,9 @@ impl MongoDbCdcMetrics {
                 "mongodb_cdc_lifecycle_events_total",
                 "Total lifecycle events",
             ),
-            token_persists: reg.counter(
-                "mongodb_cdc_token_persists_total",
-                "Total resume token persist ops",
-            ),
             reconnects: reg.counter(
                 "mongodb_cdc_reconnects_total",
                 "Total reconnection attempts",
-            ),
-            large_event_fragments: reg.counter(
-                "mongodb_cdc_large_event_fragments_total",
-                "Total large event fragments",
-            ),
-            large_events_reassembled: reg.counter(
-                "mongodb_cdc_large_events_reassembled_total",
-                "Total large events reassembled",
             ),
         }
     }
@@ -113,24 +95,9 @@ impl MongoDbCdcMetrics {
         self.batches_produced.inc();
     }
 
-    /// Records a resume token persistence operation.
-    pub fn record_token_persist(&self) {
-        self.token_persists.inc();
-    }
-
     /// Records a reconnection attempt.
     pub fn record_reconnect(&self) {
         self.reconnects.inc();
-    }
-
-    /// Records a large event fragment received.
-    pub fn record_large_event_fragment(&self) {
-        self.large_event_fragments.inc();
-    }
-
-    /// Records a large event reassembled.
-    pub fn record_large_event_reassembled(&self) {
-        self.large_events_reassembled.inc();
     }
 }
 
@@ -247,7 +214,6 @@ mod tests {
         m.record_bytes(1024);
         m.record_error();
         m.record_batch();
-        m.record_token_persist();
         m.record_reconnect();
 
         assert_eq!(m.events_received.get(), 5);
@@ -258,7 +224,6 @@ mod tests {
         assert_eq!(m.bytes_received.get(), 1024);
         assert_eq!(m.errors.get(), 1);
         assert_eq!(m.batches_produced.get(), 1);
-        assert_eq!(m.token_persists.get(), 1);
         assert_eq!(m.reconnects.get(), 1);
     }
 

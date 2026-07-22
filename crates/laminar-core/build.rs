@@ -10,7 +10,6 @@ fn main() {
 
     println!("cargo:rerun-if-changed=proto/shuffle.proto");
     println!("cargo:rerun-if-changed=proto/barrier.proto");
-    println!("cargo:rerun-if-changed=proto/query.proto");
 
     // Use the vendored protoc so codegen doesn't depend on the host's protoc:
     // stock distro versions (e.g. Ubuntu 22.04's 3.12) predate proto3 `optional`
@@ -21,13 +20,7 @@ fn main() {
     tonic_prost_build::configure()
         .build_client(true)
         .build_server(true)
-        .compile_protos(
-            &[
-                "proto/shuffle.proto",
-                "proto/barrier.proto",
-                "proto/query.proto",
-            ],
-            &["proto"],
-        )
+        .bytes(".laminar.shuffle.v1.RoutedData.arrow_ipc")
+        .compile_protos(&["proto/shuffle.proto", "proto/barrier.proto"], &["proto"])
         .expect("failed to compile cluster proto definitions");
 }

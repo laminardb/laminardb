@@ -131,12 +131,37 @@ jobs:
       # Windows: explicit features (default set, with vendored OpenSSL)
       - name: Run tests (Windows)
         if: runner.os == 'Windows'
-        run: cargo nextest run --workspace --features "kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,files,parquet-lookup"
+        run: cargo nextest run --workspace --features "kafka,postgres-cdc,postgres-sink,mongodb-cdc,delta-lake,delta,files,parquet-lookup"
 
       # Doc tests only on Linux (redundant across platforms)
       - name: Run doc tests
         if: runner.os == 'Linux'
         run: cargo test --doc --workspace
+
+  # ============================================
+  # PostgreSQL CDC Compatibility
+  # ============================================
+  postgres-cdc-integration:
+    name: PostgreSQL CDC (PostgreSQL ${{ matrix.postgres }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["17", "18"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: postgres-cdc-${{ matrix.postgres }}
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+      - name: Run PostgreSQL CDC integration tests
+        run: cargo test -p laminar-connectors --no-default-features --features postgres-cdc --test postgres_cdc_integration -- --test-threads=1 --nocapture
+        env:
+          LAMINAR_TEST_POSTGRES_MAJOR: ${{ matrix.postgres }}
+          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
   # ============================================
   # Release Build (main/develop only)
@@ -209,19 +234,19 @@ jobs:
         run: |
           # Core features
           cargo check -p laminar-core --no-default-features
-          cargo check -p laminar-core --features cluster
+          cargo check -p laminar-core --no-default-features --features cluster
 
           # DB features
-          cargo check -p laminar-db --features cluster
+          cargo check -p laminar-db --no-default-features --features cluster
 
           # Connector features
           cargo check -p laminar-connectors --no-default-features
-          cargo check -p laminar-connectors --features kafka
-          cargo check -p laminar-connectors --features postgres-cdc
-          cargo check -p laminar-connectors --features postgres-sink
-          cargo check -p laminar-connectors --features mysql-cdc
-          cargo check -p laminar-connectors --features files
-          cargo check -p laminar-connectors --features parquet-lookup
+          cargo check -p laminar-connectors --no-default-features --features kafka
+          cargo check -p laminar-connectors --no-default-features --features postgres-cdc
+          cargo check -p laminar-connectors --no-default-features --features postgres-sink
+          cargo check -p laminar-connectors --no-default-features --features mongodb-cdc
+          cargo check -p laminar-connectors --no-default-features --features files
+          cargo check -p laminar-connectors --no-default-features --features parquet-lookup
 
   # ============================================
   # MSRV Check
@@ -329,7 +354,7 @@ jobs:
   # ============================================
   ci-success:
     name: CI Success
-    needs: [fmt, clippy, build-and-test, features, msrv, docs]
+    needs: [fmt, clippy, build-and-test, postgres-cdc-integration, features, msrv, docs]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -338,6 +363,7 @@ jobs:
           if [[ "${{ needs.fmt.result }}" != "success" ]] || \
              [[ "${{ needs.clippy.result }}" != "success" ]] || \
              [[ "${{ needs.build-and-test.result }}" != "success" ]] || \
+             [[ "${{ needs.postgres-cdc-integration.result }}" != "success" ]] || \
              [[ "${{ needs.features.result }}" != "success" ]] || \
              [[ "${{ needs.msrv.result }}" != "success" ]] || \
              [[ "${{ needs.docs.result }}" != "success" ]]; then

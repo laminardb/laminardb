@@ -2,26 +2,20 @@
 
 ## [0.28.0]
 
-### Added
+### Changed
 
-- **Tiered operator state (ADR-005, experimental, `state-tier` feature)**: a disk
-  cold tier for larger-than-memory aggregate state. A node-level memory budget
-  (`state_memory_budget_bytes`) backpressures source intake when state grows; with a
-  cold tier configured (`state_tier_dir`, fjall-backed, capacity-not-durability —
-  wiped on restart, truth stays in the object-store checkpoint partials), idle state
-  approaching the budget is demoted to local disk and fetched back on demand instead.
-  v1 demotes at `(operator, vnode)`-slice granularity; v2 adds per-group granularity
-  (`state_tier_group_demotion`) so individual idle aggregate groups can be shed.
-  Requires a durable `[state]` backend; works single-node (no controller needed).
-  Observability via `state_bytes` / `state_over_budget` / `state_tier_*` metrics.
+- Key-group topology is mode-scoped: embedded and single-node use one group, while cluster uses
+  optional `server.key_groups` (default 256). Checkpoints and assignment certificates now bind the
+  partitioning ABI so incompatible recovery or shuffle peers fail closed.
 
-### Notes
+### Removed
 
-- `state_tier_group_demotion` defaults ON for embedded single-node (kill-9-soaked) and
-  OFF for cluster, where it stays vnode-granular pending correctness/soak work tracked
-  in `docs/plans/state-tier-hardening-followups.md`.
-- This release backfills the changelog for the state-tier subsystem only; the
-  0.23–0.27 history is otherwise not itemized here.
+- Removed the experimental tiered-state feature and configuration. Its demotion path could clear
+  vnode dirtiness before a checkpoint was durable, then replace newer live groups with bytes from
+  the prior durable checkpoint after an attempt failed. It is not a safe keyed-state foundation.
+- Removed WebSocket source-server, replay, connector-owned checkpoint, and connector-owned
+  event-time options. WebSocket sources are client-only and best-effort; event time is declared
+  with SQL `WATERMARK FOR` and decoded against an explicit timestamp schema.
 
 ## [0.22.0]
 
@@ -140,7 +134,7 @@ DataFusion handles `Timestamp ± INTERVAL` arithmetic natively.
 
 **Schema changes in connector-produced columns:**
 - OTel `_laminar_received_at`: `Int64` → `Timestamp(Nanosecond)`
-- Postgres / MySQL CDC `_ts_ms`: `Int64` → `Timestamp(Millisecond)`
+- Postgres CDC `_ts_ms`: `Int64` → `Timestamp(Millisecond)`
 - Kafka metadata `_timestamp`: `Int64` → `Timestamp(Millisecond)`
 - MongoDB CDC `_wall_time_ms`: `Int64` → `Timestamp(Millisecond)`
 - Files `_metadata.file_modification_time`: `Int64` → `Timestamp(Millisecond)`
@@ -195,56 +189,11 @@ DataFusion handles `Timestamp ± INTERVAL` arithmetic natively.
 
 ### Added: MongoDB CDC Source & Sink (`mongodb-cdc` feature, PR #255)
 
-Landed in the 0.20.x line via PR #255; the API surface below is what
-the `mongodb-cdc` feature exposes today.
+Landed in the 0.20.x line via PR #255. The feature provides MongoDB
+change-stream source and write-sink connectors, CDC envelope types,
+full-document modes, time-series sink configuration, and CDC replay writes.
 
-New public API symbols in `laminar_connectors::mongodb`:
-
-**Source Connector**
-- `MongoDbCdcSource`: `SourceConnector` impl for MongoDB change streams
-- `MongoDbSourceConfig`: connection, pipeline, full document mode config
-- `FullDocumentMode`: Delta / UpdateLookup / RequirePostImage / WhenAvailable
-- `mongodb_cdc_envelope_schema()`: Arrow schema for CDC envelope records
-
-**Sink Connector**
-- `MongoDbSink`: `SinkConnector` impl for MongoDB writes
-- `MongoDbSinkConfig`: connection, batching, write concern config
-- `WriteMode`: Insert / Upsert / Replace / CdcReplay
-- `WriteConcernConfig`, `WriteConcernLevel`: write durability settings
-
-**Change Events**
-- `MongoDbChangeEvent`: typed change stream event
-- `OperationType`: Insert / Update / Replace / Delete / Drop / Rename / Invalidate
-- `UpdateDescription`: delta fields for update events
-- `Namespace`: database + collection pair
-- `TruncatedArray`: truncated array metadata (MongoDB 6.0+)
-
-**Resume Token Persistence**
-- `ResumeTokenStore` trait: pluggable async persistence
-- `ResumeToken`: opaque resume token wrapper
-- `FileResumeTokenStore`: file-based persistence (embedded/test)
-- `MongoResumeTokenStore`: MongoDB-backed persistence (production, feature-gated)
-- `InMemoryResumeTokenStore`: in-memory persistence (testing)
-- `ResumeTokenStoreConfig`: configuration enum (File / Mongo / Memory)
-
-**Time Series Support**
-- `CollectionKind`: Standard / TimeSeries
-- `TimeSeriesConfig`: time field, meta field, granularity, TTL
-- `TimeSeriesGranularity`: Seconds / Minutes / Hours / Custom
-
-**Large Event Handling**
-- `LargeEventReassembler`: fragment reassembly for split events (MongoDB ≥ 6.0.9)
-- `EventFragment`, `SplitEventInfo`: fragment types
-
-**Write Model**
-- `MongoWriteOp`: InsertOne / ReplaceOne / UpdateOne / DeleteOne / Lifecycle
-- `build_update_document()`: $set/$unset update document builder
-- `cdc_replay_op()`: operation type to write op translation
-
-**Metrics**
-- `MongoSourceMetrics`: lock-free source connector metrics
-- `MongoSinkMetrics`: lock-free sink connector metrics
-
-**Registry**
-- `register_mongodb_cdc()`: registers source with ConnectorRegistry
-- `register_mongodb_sink()`: registers sink with ConnectorRegistry
+The experimental `ResumeTokenStore` and `LargeEventReassembler` APIs later
+proved unsafe or unwired and were removed. Resume tokens are no longer
+persisted independently of the engine checkpoint, and split-large-event
+handling is not advertised by the connector.

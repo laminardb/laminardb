@@ -3,7 +3,7 @@
 //! Replaces the compile-time `VNODE_COUNT` constant that previously
 //! lived in `laminar-storage`. A registry owns:
 //!
-//! - the current vnode count (configurable; 256 by default),
+//! - the runtime-selected vnode count,
 //! - the node-per-vnode assignment (for distributed modes),
 //! - a monotonically increasing `assignment_version` used by
 //!   [`ObjectStoreBackend`](super::object_store::ObjectStoreBackend) to
@@ -15,11 +15,135 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::num::NonZeroU16;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockReadGuard};
 use serde::{Deserialize, Serialize};
+
+use crate::checkpoint::{CheckpointWatermark, CommittedSourceHandoff, SourceHandoffState};
+use crate::state::CheckpointAttempt;
+
+/// Durable encoding and hashing contract used to map keys to key groups.
+///
+/// Any change to Arrow row encoding, key hashing, or modulo mapping requires a
+/// version bump and a coordinated compatibility fence. Placement is not part of
+/// this ABI: durable assignment publications are the ownership authority.
+pub const PARTITIONING_ABI_VERSION: u16 = 1;
+
+/// Validated number of stable key groups in a pipeline.
+///
+/// Zero and values above [`u16::MAX`] are rejected. The compact upper bound keeps
+/// ownership metadata bounded while providing substantially more rescale slots
+/// than a production pipeline should need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct KeyGroupCount(NonZeroU16);
+
+/// Fixed key-group count for embedded and single-node runtimes.
+pub const LOCAL_KEY_GROUP_COUNT: KeyGroupCount = KeyGroupCount(NonZeroU16::MIN);
+
+/// Default key-group count for cluster runtimes.
+pub const DEFAULT_CLUSTER_KEY_GROUP_COUNT: KeyGroupCount = match NonZeroU16::new(256) {
+    Some(value) => KeyGroupCount(value),
+    None => unreachable!(),
+};
+
+/// Largest key-group count representable by the persisted checkpoint ABI.
+pub const MAX_KEY_GROUP_COUNT: u32 = u16::MAX as u32;
+
+impl KeyGroupCount {
+    /// Build from a nonzero value.
+    #[must_use]
+    pub const fn new(value: NonZeroU16) -> Self {
+        Self(value)
+    }
+
+    /// Exact underlying count.
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0.get()
+    }
+
+    /// Exact nonzero representation.
+    #[must_use]
+    pub const fn into_non_zero(self) -> NonZeroU16 {
+        self.0
+    }
+}
+
+impl fmt::Display for KeyGroupCount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.get().fmt(f)
+    }
+}
+
+/// A key-group count outside the supported `1..=65535` range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("key-group count {value} is outside 1..={}", u16::MAX)]
+pub struct InvalidKeyGroupCount {
+    value: u32,
+}
+
+impl InvalidKeyGroupCount {
+    /// Rejected input value.
+    #[must_use]
+    pub const fn value(self) -> u32 {
+        self.value
+    }
+}
+
+impl TryFrom<u16> for KeyGroupCount {
+    type Error = InvalidKeyGroupCount;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        NonZeroU16::new(value)
+            .map(Self)
+            .ok_or(InvalidKeyGroupCount {
+                value: u32::from(value),
+            })
+    }
+}
+
+impl TryFrom<u32> for KeyGroupCount {
+    type Error = InvalidKeyGroupCount;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        let narrowed = u16::try_from(value).map_err(|_| InvalidKeyGroupCount { value })?;
+        Self::try_from(narrowed).map_err(|_| InvalidKeyGroupCount { value })
+    }
+}
+
+impl From<NonZeroU16> for KeyGroupCount {
+    fn from(value: NonZeroU16) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<KeyGroupCount> for NonZeroU16 {
+    fn from(value: KeyGroupCount) -> Self {
+        value.into_non_zero()
+    }
+}
+
+impl From<KeyGroupCount> for u16 {
+    fn from(value: KeyGroupCount) -> Self {
+        value.get()
+    }
+}
+
+impl From<KeyGroupCount> for u32 {
+    fn from(value: KeyGroupCount) -> Self {
+        u32::from(value.get())
+    }
+}
+
+impl From<KeyGroupCount> for usize {
+    fn from(value: KeyGroupCount) -> Self {
+        usize::from(value.get())
+    }
+}
 
 /// Unique identifier for a node. Also the owner id for vnodes; cluster
 /// membership and vnode ownership identify the same thing.
@@ -82,17 +206,136 @@ impl VnodeLifecycleState {
     }
 }
 
-/// Opaque source-checkpoint offsets (connector-defined `"key" -> "value"`
-/// strings) staged for a rotation handoff. A private alias keeps the single
-/// `disallowed_types` exception (cold path, mirrors the checkpoint map shape) in
-/// one place rather than blanket-allowing this perf-sensitive module.
-#[allow(clippy::disallowed_types)]
-type ResumeOffsets = std::collections::HashMap<String, String>;
+enum SourceHandoffPublication {
+    Clear,
+    Replace(Arc<CommittedSourceHandoff>),
+    Carry,
+}
+
+/// One immutable publication of vnode ownership and the source cursors that
+/// belong to the same assignment version.
+#[derive(Clone)]
+pub struct VnodeAssignmentSnapshot {
+    version: u64,
+    owners: Arc<[NodeId]>,
+    owner_changed_versions: Arc<[u64]>,
+    source_handoff: Option<Arc<CommittedSourceHandoff>>,
+    source_handoff_installed_version: Option<u64>,
+}
+
+impl VnodeAssignmentSnapshot {
+    /// Monotonic assignment version for this publication.
+    #[must_use]
+    pub const fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Immutable vnode-owner vector for this publication.
+    #[must_use]
+    pub fn owners(&self) -> &[NodeId] {
+        &self.owners
+    }
+
+    /// Version of the last ownership change for `vnode`.
+    #[must_use]
+    pub fn owner_changed_version(&self, vnode: u32) -> Option<u64> {
+        self.owner_changed_versions.get(vnode as usize).copied()
+    }
+
+    /// Whether this publication carries a durable decided checkpoint cut.
+    #[must_use]
+    pub const fn has_committed_handoff(&self) -> bool {
+        self.source_handoff.is_some()
+    }
+
+    /// Validated committed state for one source, without cloning its checkpoint maps.
+    #[must_use]
+    pub fn source_handoff(&self, source: &str) -> Option<&SourceHandoffState> {
+        self.source_handoff
+            .as_deref()
+            .and_then(|handoff| handoff.source(source))
+    }
+
+    /// Complete committed source cut carried by this publication, if present.
+    #[must_use]
+    pub fn committed_source_handoff(&self) -> Option<&CommittedSourceHandoff> {
+        self.source_handoff.as_deref()
+    }
+
+    /// Assignment version that installed the current handoff. Carry-only
+    /// publications preserve the earlier version so runtimes do not restore
+    /// the same recovery cut for an unrelated roster update.
+    #[must_use]
+    pub const fn source_handoff_installed_version(&self) -> Option<u64> {
+        self.source_handoff_installed_version
+    }
+
+    /// Exact checkpoint attempt supplying the committed handoff, if present.
+    #[must_use]
+    pub fn source_handoff_attempt(&self) -> Option<CheckpointAttempt> {
+        self.source_handoff
+            .as_deref()
+            .map(CommittedSourceHandoff::attempt)
+    }
+
+    /// Assignment version sealed by the committed handoff, if present.
+    #[must_use]
+    pub fn source_handoff_assignment_version(&self) -> Option<u64> {
+        self.source_handoff
+            .as_deref()
+            .map(CommittedSourceHandoff::checkpoint_assignment_version)
+    }
+
+    /// Explicit cluster event-time status at the committed cut, if present.
+    #[must_use]
+    pub fn source_handoff_cluster_watermark(&self) -> Option<CheckpointWatermark> {
+        self.source_handoff
+            .as_deref()
+            .map(CommittedSourceHandoff::cluster_watermark)
+    }
+}
+
+/// Read guard that pins one assignment publication while a source captures a
+/// data batch or checkpoint cursor.
+pub struct VnodeAssignmentReadGuard<'a>(RwLockReadGuard<'a, VnodeAssignmentSnapshot>);
+
+impl std::ops::Deref for VnodeAssignmentReadGuard<'_> {
+    type Target = VnodeAssignmentSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+fn changed_owner_versions(
+    current: &VnodeAssignmentSnapshot,
+    next_owners: &[NodeId],
+    next_version: u64,
+) -> Arc<[u64]> {
+    let skipped_generation = next_version > current.version.saturating_add(1);
+    current
+        .owners
+        .iter()
+        .zip(next_owners)
+        .enumerate()
+        .map(|(vnode, (current_owner, next_owner))| {
+            if current_owner == next_owner && !skipped_generation {
+                current.owner_changed_versions[vnode]
+            } else {
+                next_version
+            }
+        })
+        .collect::<Vec<_>>()
+        .into()
+}
 
 /// Runtime registry of vnode topology and assignment.
 pub struct VnodeRegistry {
     vnode_count: u32,
-    assignment: RwLock<Arc<[NodeId]>>,
+    assignment: RwLock<VnodeAssignmentSnapshot>,
+    /// Lock-free observation fence for hot runtime readiness checks. The
+    /// authoritative version also lives inside `assignment`, where it is bound
+    /// to owners and handoff cursors.
     assignment_version: AtomicU64,
     /// Per-vnode lifecycle, indexed by vnode id. `0` = `Active`,
     /// `1` = `Restoring`. Lock-free: rebalance flips individual entries
@@ -100,19 +343,6 @@ pub struct VnodeRegistry {
     /// serialized — rebuilt (all `Active`) from the `AssignmentSnapshot`
     /// on boot, so adding it never touches a wire format.
     lifecycle: Arc<[AtomicU8]>,
-    /// Per-vnode "draining" flag, set on a vnode this node is about to lose in a
-    /// rotation so a partitioned source pauses that vnode's input until the cut.
-    /// Orthogonal to `lifecycle`: a draining vnode is still owned and still emits;
-    /// it only stops *consuming*. `draining_generation` lets the source detect a
-    /// change lock-free without an assignment-version bump.
-    draining: Arc<[AtomicBool]>,
-    draining_generation: AtomicU64,
-    /// Opaque source-checkpoint offsets (connector-defined key/value strings)
-    /// staged by the engine just before an assignment-version bump. A partitioned
-    /// source reads them on rebind to resume partitions it is acquiring from the
-    /// previous owner's sealed position instead of `auto.offset.reset`. The engine
-    /// stays connector-agnostic; the source interprets the keys.
-    resume_offsets: parking_lot::Mutex<Arc<ResumeOffsets>>,
 }
 
 impl std::fmt::Debug for VnodeRegistry {
@@ -142,13 +372,37 @@ impl VnodeRegistry {
                 .into();
         Self {
             vnode_count,
-            assignment: RwLock::new(assignment),
+            assignment: RwLock::new(VnodeAssignmentSnapshot {
+                version: 1,
+                owners: assignment,
+                owner_changed_versions: std::iter::repeat_n(1, vnode_count as usize)
+                    .collect::<Vec<_>>()
+                    .into(),
+                source_handoff: None,
+                source_handoff_installed_version: None,
+            }),
             assignment_version: AtomicU64::new(1),
             lifecycle: new_lifecycle(vnode_count),
-            draining: new_draining(vnode_count),
-            draining_generation: AtomicU64::new(0),
-            resume_offsets: parking_lot::Mutex::new(Arc::new(ResumeOffsets::new())),
         }
+    }
+
+    /// Create a registry with every vnode unassigned at version 0, so the first stored
+    /// assignment snapshot (version >= 1) adopts through the standard rotation path.
+    ///
+    /// # Panics
+    /// Panics if `vnode_count == 0`.
+    #[must_use]
+    pub fn new_unassigned(vnode_count: u32) -> Self {
+        let registry = Self::new(vnode_count);
+        {
+            let mut initial = registry.assignment.write();
+            initial.version = 0;
+            initial.owner_changed_versions = std::iter::repeat_n(0, vnode_count as usize)
+                .collect::<Vec<_>>()
+                .into();
+        }
+        registry.assignment_version.store(0, Ordering::Release);
+        registry
     }
 
     /// Create a registry where every vnode is owned by the same node.
@@ -165,32 +419,18 @@ impl VnodeRegistry {
             .into();
         Self {
             vnode_count,
-            assignment: RwLock::new(assignment),
+            assignment: RwLock::new(VnodeAssignmentSnapshot {
+                version: 1,
+                owners: assignment,
+                owner_changed_versions: std::iter::repeat_n(1, vnode_count as usize)
+                    .collect::<Vec<_>>()
+                    .into(),
+                source_handoff: None,
+                source_handoff_installed_version: None,
+            }),
             assignment_version: AtomicU64::new(1),
             lifecycle: new_lifecycle(vnode_count),
-            draining: new_draining(vnode_count),
-            draining_generation: AtomicU64::new(0),
-            resume_offsets: parking_lot::Mutex::new(Arc::new(ResumeOffsets::new())),
         }
-    }
-
-    /// Stage opaque source-checkpoint offsets for the next rebind. MUST be called
-    /// before [`set_assignment_and_version`](Self::set_assignment_and_version) so
-    /// the source observes them. Replaces any prior staging; an empty map is
-    /// ignored so a transient load failure can't clobber a good snapshot.
-    pub fn stage_resume_offsets(&self, offsets: ResumeOffsets) {
-        if offsets.is_empty() {
-            return;
-        }
-        *self.resume_offsets.lock() = Arc::new(offsets);
-    }
-
-    /// The staged source-checkpoint offsets (see
-    /// [`stage_resume_offsets`](Self::stage_resume_offsets)). Reads (does not
-    /// drain), so every source on this node sees the same snapshot on rebind.
-    #[must_use]
-    pub fn resume_offsets(&self) -> Arc<ResumeOffsets> {
-        Arc::clone(&self.resume_offsets.lock())
     }
 
     /// Number of vnodes.
@@ -212,14 +452,26 @@ impl VnodeRegistry {
         if vnode >= self.vnode_count {
             return NodeId::UNASSIGNED;
         }
-        self.assignment.read()[vnode as usize]
+        self.assignment.read().owners[vnode as usize]
     }
 
     /// Snapshot the current assignment vector. Cheap — internally an
     /// `Arc::clone`.
     #[must_use]
     pub fn snapshot(&self) -> Arc<[NodeId]> {
-        Arc::clone(&self.assignment.read())
+        Arc::clone(&self.assignment.read().owners)
+    }
+
+    /// Consistent ownership, version, and source-handoff publication.
+    #[must_use]
+    pub fn versioned_snapshot(&self) -> VnodeAssignmentSnapshot {
+        self.assignment.read().clone()
+    }
+
+    /// Pin the current publication for a short, non-blocking source capture.
+    #[must_use]
+    pub fn read_assignment(&self) -> VnodeAssignmentReadGuard<'_> {
+        VnodeAssignmentReadGuard(self.assignment.read())
     }
 
     /// Replace the full assignment and bump the version.
@@ -234,8 +486,21 @@ impl VnodeRegistry {
             new_assignment.len(),
             self.vnode_count,
         );
-        *self.assignment.write() = new_assignment;
-        self.assignment_version.fetch_add(1, Ordering::AcqRel);
+        let mut current = self.assignment.write();
+        let version = current
+            .version
+            .checked_add(1)
+            .expect("assignment version overflow");
+        let owner_changed_versions = changed_owner_versions(&current, &new_assignment, version);
+        *current = VnodeAssignmentSnapshot {
+            version,
+            owners: new_assignment,
+            owner_changed_versions,
+            source_handoff: None,
+            source_handoff_installed_version: None,
+        };
+        self.assignment_version
+            .store(current.version, Ordering::Release);
     }
 
     /// Replace the full assignment and set the version to `version`
@@ -246,6 +511,43 @@ impl VnodeRegistry {
     /// Panics on length mismatch, or if `version` is less than the
     /// current one (assignment versions are monotonic).
     pub fn set_assignment_and_version(&self, new_assignment: Arc<[NodeId]>, version: u64) {
+        self.publish_assignment(new_assignment, version, SourceHandoffPublication::Clear);
+    }
+
+    /// Atomically publish ownership, its monotonic version, and the sealed
+    /// connector cursors used by sources acquiring partitions in that version.
+    ///
+    /// # Panics
+    /// Panics on length mismatch or version regression.
+    pub fn set_assignment_and_version_with_source_handoff(
+        &self,
+        new_assignment: Arc<[NodeId]>,
+        version: u64,
+        source_handoff: Arc<CommittedSourceHandoff>,
+    ) {
+        self.publish_assignment(
+            new_assignment,
+            version,
+            SourceHandoffPublication::Replace(source_handoff),
+        );
+    }
+
+    /// Publish a version that does not acquire local ownership while retaining
+    /// the prior version-bound handoff until the source has reconciled it.
+    pub fn set_assignment_and_version_carrying_source_handoff(
+        &self,
+        new_assignment: Arc<[NodeId]>,
+        version: u64,
+    ) {
+        self.publish_assignment(new_assignment, version, SourceHandoffPublication::Carry);
+    }
+
+    fn publish_assignment(
+        &self,
+        new_assignment: Arc<[NodeId]>,
+        version: u64,
+        source_handoff: SourceHandoffPublication,
+    ) {
         assert_eq!(
             new_assignment.len(),
             self.vnode_count as usize,
@@ -254,12 +556,29 @@ impl VnodeRegistry {
             self.vnode_count,
         );
         let mut guard = self.assignment.write();
-        let current = self.assignment_version.load(Ordering::Acquire);
+        let current = guard.version;
         assert!(
-            version >= current,
-            "assignment version must be monotonic: got {version}, current {current}",
+            version > current,
+            "assignment version must advance: got {version}, current {current}",
         );
-        *guard = new_assignment;
+        let owner_changed_versions = changed_owner_versions(&guard, &new_assignment, version);
+        let (source_handoff, source_handoff_installed_version) = match source_handoff {
+            SourceHandoffPublication::Clear => (None, None),
+            SourceHandoffPublication::Replace(source_handoff) => {
+                (Some(source_handoff), Some(version))
+            }
+            SourceHandoffPublication::Carry => (
+                guard.source_handoff.clone(),
+                guard.source_handoff_installed_version,
+            ),
+        };
+        *guard = VnodeAssignmentSnapshot {
+            version,
+            owners: new_assignment,
+            owner_changed_versions,
+            source_handoff,
+            source_handoff_installed_version,
+        };
         self.assignment_version.store(version, Ordering::Release);
     }
 
@@ -328,55 +647,11 @@ impl VnodeRegistry {
             })
             .collect()
     }
-
-    /// Mark `vnodes` as draining for a pending rotation so a partitioned source
-    /// pauses their input until the pre-rotation checkpoint cut. Out-of-range ids
-    /// are ignored. Bumps the draining generation so the source observes it.
-    pub fn mark_draining(&self, vnodes: &[u32]) {
-        for &v in vnodes {
-            if let Some(slot) = self.draining.get(v as usize) {
-                slot.store(true, Ordering::Release);
-            }
-        }
-        self.draining_generation.fetch_add(1, Ordering::Release);
-    }
-
-    /// Clear every draining flag (rotation committed or aborted). Bumps the
-    /// generation so the source resumes any partitions it paused for the drain.
-    pub fn clear_draining(&self) {
-        for slot in self.draining.iter() {
-            slot.store(false, Ordering::Release);
-        }
-        self.draining_generation.fetch_add(1, Ordering::Release);
-    }
-
-    /// Whether `vnode` is currently draining. Out-of-range ids report false.
-    #[must_use]
-    pub fn is_draining(&self, vnode: u32) -> bool {
-        self.draining
-            .get(vnode as usize)
-            .is_some_and(|s| s.load(Ordering::Acquire))
-    }
-
-    /// Monotonic counter bumped on each draining change; the source compares it
-    /// lock-free to detect drain/undrain without an assignment-version bump.
-    #[must_use]
-    pub fn draining_generation(&self) -> u64 {
-        self.draining_generation.load(Ordering::Acquire)
-    }
 }
 
 /// Build a fresh lifecycle array with every vnode [`Active`].
 fn new_lifecycle(vnode_count: u32) -> Arc<[AtomicU8]> {
     std::iter::repeat_with(|| AtomicU8::new(VnodeLifecycleState::ACTIVE))
-        .take(vnode_count as usize)
-        .collect::<Vec<_>>()
-        .into()
-}
-
-/// Build a fresh draining array with every vnode not draining.
-fn new_draining(vnode_count: u32) -> Arc<[AtomicBool]> {
-    std::iter::repeat_with(|| AtomicBool::new(false))
         .take(vnode_count as usize)
         .collect::<Vec<_>>()
         .into()
@@ -507,11 +782,15 @@ pub fn owners_per_domain(
 ///
 /// Used by the checkpoint coordinator to decide which vnodes' durability
 /// markers it is responsible for writing each epoch, and by the leader's
-/// `epoch_complete` gate to know the full set to check.
+/// `seal_checkpoint` gate to know the full set to check.
 #[must_use]
 pub fn owned_vnodes(registry: &VnodeRegistry, owner: NodeId) -> Vec<u32> {
-    (0..registry.vnode_count())
-        .filter(|&v| registry.owner(v) == owner)
+    let assignment = registry.snapshot();
+    assignment
+        .iter()
+        .enumerate()
+        .filter(|(_, assigned)| **assigned == owner)
+        .filter_map(|(vnode, _)| u32::try_from(vnode).ok())
         .collect()
 }
 
@@ -519,8 +798,10 @@ pub fn owned_vnodes(registry: &VnodeRegistry, owner: NodeId) -> Vec<u32> {
 /// node fans checkpoint barriers and shuffle data out to.
 #[must_use]
 pub fn peer_owners(registry: &VnodeRegistry, self_id: NodeId) -> Vec<NodeId> {
-    let mut peers: Vec<NodeId> = (0..registry.vnode_count())
-        .map(|v| registry.owner(v))
+    let assignment = registry.snapshot();
+    let mut peers: Vec<NodeId> = assignment
+        .iter()
+        .copied()
         .filter(|o| !o.is_unassigned() && *o != self_id)
         .collect();
     peers.sort_unstable();
@@ -531,6 +812,140 @@ pub fn peer_owners(registry: &VnodeRegistry, self_id: NodeId) -> Vec<NodeId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkpoint::{
+        CheckpointAssignmentFence, CheckpointParticipant, ClusterRecoveryCapsule,
+        ConnectorCheckpoint, ParticipantRecoveryRef, PipelineIdentity,
+        CLUSTER_RECOVERY_CAPSULE_VERSION, PIPELINE_IDENTITY_VERSION,
+    };
+
+    fn digest(byte: u8) -> String {
+        format!("{byte:02x}").repeat(32)
+    }
+
+    #[test]
+    fn partitioning_key_group_count_rejects_every_out_of_range_value() {
+        assert_eq!(KeyGroupCount::try_from(0_u16).unwrap_err().value(), 0);
+        assert_eq!(KeyGroupCount::try_from(0_u32).unwrap_err().value(), 0);
+        assert_eq!(
+            KeyGroupCount::try_from(u32::from(u16::MAX) + 1)
+                .unwrap_err()
+                .value(),
+            u32::from(u16::MAX) + 1
+        );
+
+        let one = KeyGroupCount::try_from(1_u16).unwrap();
+        let max = KeyGroupCount::try_from(u32::from(u16::MAX)).unwrap();
+        assert_eq!(u16::from(one), 1);
+        assert_eq!(u32::from(max), u32::from(u16::MAX));
+        assert_eq!(usize::from(max), usize::from(u16::MAX));
+        assert_eq!(NonZeroU16::from(one), NonZeroU16::MIN);
+    }
+
+    #[test]
+    fn partitioning_abi_v1_raw_key_hash_golden_vectors() {
+        assert_eq!(PARTITIONING_ABI_VERSION, 1);
+        let actual = [
+            key_hash(b""),
+            key_hash(b"a"),
+            key_hash(b"laminardb"),
+            key_hash(&[0, 1, 0xff]),
+            key_hash("key-☃".as_bytes()),
+        ];
+        assert_eq!(
+            actual,
+            [
+                3_244_421_341_483_603_138,
+                16_629_034_431_890_738_719,
+                16_801_042_214_008_847_674,
+                10_014_172_824_849_140_082,
+                17_604_077_472_932_801_374,
+            ]
+        );
+    }
+
+    #[test]
+    fn rendezvous_placement_policy_golden_vector() {
+        // Placement can evolve through an assignment transition; this vector
+        // detects accidental churn in the current policy but is not ABI v1.
+        let actual = rendezvous_assignment(12, &[NodeId(7), NodeId(3), NodeId(5)]);
+        assert_eq!(
+            actual.as_ref(),
+            &[
+                NodeId(5),
+                NodeId(7),
+                NodeId(3),
+                NodeId(5),
+                NodeId(5),
+                NodeId(7),
+                NodeId(5),
+                NodeId(5),
+                NodeId(5),
+                NodeId(5),
+                NodeId(5),
+                NodeId(5),
+            ]
+        );
+    }
+
+    fn committed_handoff(
+        source: Option<(&str, ConnectorCheckpoint, Option<i64>)>,
+        cluster_watermark: CheckpointWatermark,
+    ) -> Arc<CommittedSourceHandoff> {
+        let mut source_offsets = BTreeMap::new();
+        let mut source_metadata = BTreeMap::new();
+        let mut source_assignment_versions = BTreeMap::new();
+        let mut source_watermarks = BTreeMap::new();
+        if let Some((source, checkpoint, watermark)) = source {
+            let ConnectorCheckpoint {
+                offsets,
+                metadata,
+                source_assignment_version,
+            } = checkpoint;
+            source_offsets.insert(source.to_string(), offsets.into_iter().collect());
+            source_metadata.insert(source.to_string(), metadata.into_iter().collect());
+            if let Some(assignment_version) = source_assignment_version {
+                source_assignment_versions.insert(source.to_string(), assignment_version);
+            }
+            if let Some(watermark) = watermark {
+                source_watermarks.insert(source.to_string(), watermark);
+            }
+        }
+
+        let participant = CheckpointParticipant {
+            node_id: 7,
+            boot_incarnation: uuid::Uuid::from_u128(77),
+        };
+        let capsule = ClusterRecoveryCapsule {
+            version: CLUSTER_RECOVERY_CAPSULE_VERSION,
+            attempt: CheckpointAttempt::canonical(9),
+            deployment_id: uuid::Uuid::from_u128(99).to_string(),
+            pipeline_identity: PipelineIdentity {
+                canonical_version: PIPELINE_IDENTITY_VERSION,
+                sha256: digest(1),
+            },
+            assignment_fence: CheckpointAssignmentFence::from_owner_map(
+                17,
+                &[7],
+                vec![participant],
+            )
+            .unwrap(),
+            seal_inventory_sha256: digest(2),
+            participants: vec![ParticipantRecoveryRef {
+                participant_id: 7,
+                readiness_sha256: digest(3),
+                manifest_sha256: digest(4),
+                portable_state_sha256: digest(5),
+            }],
+            source_offsets,
+            source_metadata,
+            source_assignment_versions,
+            source_watermarks,
+            cluster_watermark,
+            recovery_watermark_frontier: cluster_watermark.active_value(),
+            portable_state_sha256: digest(5),
+        };
+        Arc::new(CommittedSourceHandoff::try_from(&capsule).unwrap())
+    }
 
     #[test]
     fn new_registry_is_unassigned() {
@@ -581,6 +996,168 @@ mod tests {
     fn owner_out_of_range_returns_unassigned() {
         let r = VnodeRegistry::single_owner(4, NodeId(1));
         assert!(r.owner(10).is_unassigned());
+    }
+
+    #[test]
+    fn committed_empty_source_is_distinct_from_a_missing_source() {
+        let r = VnodeRegistry::new_unassigned(4);
+        let owners = r.snapshot();
+        let orders = ConnectorCheckpoint {
+            offsets: [("orders:0".into(), "41".into())].into_iter().collect(),
+            metadata: [("topic".into(), "orders".into())].into_iter().collect(),
+            source_assignment_version: std::num::NonZeroU64::new(17),
+        };
+        let version_one_handoff = committed_handoff(
+            Some(("orders", orders, Some(700))),
+            CheckpointWatermark::Uninitialized,
+        );
+        r.set_assignment_and_version_with_source_handoff(
+            Arc::clone(&owners),
+            1,
+            version_one_handoff,
+        );
+        let version_one = r.versioned_snapshot();
+        assert_eq!(version_one.version(), 1);
+        assert!(version_one.has_committed_handoff());
+        assert_eq!(
+            version_one
+                .source_handoff("orders")
+                .unwrap()
+                .checkpoint()
+                .offsets
+                .get("orders:0")
+                .map(String::as_str),
+            Some("41")
+        );
+        assert_eq!(
+            version_one
+                .source_handoff("orders")
+                .unwrap()
+                .checkpoint()
+                .metadata
+                .get("topic")
+                .map(String::as_str),
+            Some("orders")
+        );
+        assert_eq!(
+            version_one
+                .source_handoff("orders")
+                .unwrap()
+                .checkpoint()
+                .source_assignment_version,
+            std::num::NonZeroU64::new(17)
+        );
+        assert_eq!(
+            version_one.source_handoff("orders").unwrap().watermark(),
+            Some(700)
+        );
+        assert_eq!(
+            version_one.source_handoff_cluster_watermark(),
+            Some(CheckpointWatermark::Uninitialized)
+        );
+        assert_eq!(
+            version_one.source_handoff_attempt(),
+            Some(CheckpointAttempt::canonical(9))
+        );
+        assert_eq!(version_one.source_handoff_assignment_version(), Some(17));
+        assert_eq!(version_one.source_handoff_installed_version(), Some(1));
+
+        let committed_empty_source = committed_handoff(
+            Some(("orders", ConnectorCheckpoint::new(), None)),
+            CheckpointWatermark::Idle,
+        );
+        r.set_assignment_and_version_with_source_handoff(owners, 2, committed_empty_source);
+        let published = r.versioned_snapshot();
+        assert_eq!(published.version(), 2);
+        assert_eq!(published.source_handoff_installed_version(), Some(2));
+        assert!(published.has_committed_handoff());
+        let orders = published.source_handoff("orders").unwrap();
+        assert!(orders.checkpoint().offsets.is_empty());
+        assert!(orders.checkpoint().metadata.is_empty());
+        assert_eq!(orders.watermark(), None);
+        assert!(published.source_handoff("missing").is_none());
+        assert_eq!(
+            published.source_handoff_cluster_watermark(),
+            Some(CheckpointWatermark::Idle)
+        );
+        assert_eq!(
+            version_one
+                .source_handoff("orders")
+                .unwrap()
+                .checkpoint()
+                .offsets
+                .get("orders:0")
+                .map(String::as_str),
+            Some("41"),
+            "older immutable publications keep their version-bound handoff"
+        );
+    }
+
+    #[test]
+    fn owner_generations_and_handoff_survive_skipped_publications() {
+        let r = VnodeRegistry::new_unassigned(1);
+        let self_id = NodeId(7);
+        let other = NodeId(8);
+        let handoff = committed_handoff(
+            Some((
+                "events",
+                ConnectorCheckpoint::with_offsets(
+                    [("events:0".to_string(), "41".to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+                None,
+            )),
+            CheckpointWatermark::Idle,
+        );
+        r.set_assignment_and_version_with_source_handoff(
+            vec![self_id].into(),
+            1,
+            Arc::clone(&handoff),
+        );
+        r.set_assignment_and_version_carrying_source_handoff(vec![other].into(), 2);
+        r.set_assignment_and_version_carrying_source_handoff(vec![self_id].into(), 3);
+
+        let published = r.versioned_snapshot();
+        assert_eq!(published.owner_changed_version(0), Some(3));
+        assert!(published.has_committed_handoff());
+        assert_eq!(published.source_handoff_installed_version(), Some(1));
+        assert!(std::ptr::eq(
+            published.committed_source_handoff().unwrap(),
+            handoff.as_ref()
+        ));
+        assert_eq!(
+            published
+                .source_handoff("events")
+                .unwrap()
+                .checkpoint()
+                .offsets
+                .get("events:0")
+                .map(String::as_str),
+            Some("41")
+        );
+    }
+
+    #[test]
+    fn skipped_assignment_generation_forces_owner_reconciliation() {
+        let r = VnodeRegistry::new_unassigned(1);
+        let self_id = NodeId(7);
+        r.set_assignment_and_version(vec![self_id].into(), 1);
+        assert_eq!(r.versioned_snapshot().owner_changed_version(0), Some(1));
+
+        r.set_assignment_and_version(vec![self_id].into(), 3);
+        assert_eq!(
+            r.versioned_snapshot().owner_changed_version(0),
+            Some(3),
+            "a missed intermediate generation may have transferred ownership"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "assignment version must advance")]
+    fn assignment_publication_rejects_equal_version_mutation() {
+        let r = VnodeRegistry::new(1);
+        r.set_assignment_and_version(vec![NodeId(9)].into(), 1);
     }
 
     #[test]
@@ -707,37 +1284,6 @@ mod tests {
         r.mark_restoring(&[2]);
         r.set_assignment(vec![NodeId(1), NodeId(1), NodeId(1), NodeId(1)].into());
         assert!(r.is_restoring(2));
-    }
-
-    #[test]
-    fn draining_marks_clear_and_bump_generation() {
-        let r = VnodeRegistry::new(4);
-        let g0 = r.draining_generation();
-        assert!(!r.is_draining(1));
-
-        r.mark_draining(&[1, 3]);
-        assert!(r.is_draining(1));
-        assert!(r.is_draining(3));
-        assert!(!r.is_draining(0));
-        assert!(r.draining_generation() > g0, "mark bumps the generation");
-
-        let g1 = r.draining_generation();
-        r.clear_draining();
-        assert!(!r.is_draining(1));
-        assert!(!r.is_draining(3));
-        assert!(r.draining_generation() > g1, "clear bumps the generation");
-    }
-
-    #[test]
-    fn draining_is_orthogonal_to_lifecycle_and_ignores_out_of_range() {
-        let r = VnodeRegistry::new(2);
-        // A draining vnode still emits (lifecycle stays Active) — only consumption pauses.
-        r.mark_draining(&[0]);
-        assert!(r.is_draining(0));
-        assert!(!r.is_restoring(0));
-        // Out-of-range ids are ignored, no panic.
-        r.mark_draining(&[5, 99]);
-        assert!(!r.is_draining(5));
     }
 
     // -- Topology-aware placement --------------------------------------------

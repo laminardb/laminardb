@@ -134,10 +134,6 @@ pub fn diff_configs(old: &ServerConfig, new: &ServerConfig) -> ConfigDiff {
         diff.warnings
             .push("sql field changed — requires restart".to_string());
     }
-    if old.coordination != new.coordination {
-        diff.warnings
-            .push("[coordination] section changed — requires restart".to_string());
-    }
     // Restart policy / coordinated recovery is captured once at startup (to_policy /
     // enable_supervision), so a live edit needs a restart rather than being silently dropped.
     if old.supervision != new.supervision {
@@ -431,7 +427,6 @@ mod tests {
             pipelines: vec![],
             sinks: vec![],
             discovery: None,
-            coordination: None,
             node_id: None,
             sql: None,
             ai: Default::default(),
@@ -462,7 +457,6 @@ mod tests {
             name: name.to_string(),
             pipeline: pipeline.to_string(),
             connector: "kafka".to_string(),
-            delivery: "at_least_once".to_string(),
             properties: toml::Table::new(),
         }
     }
@@ -555,7 +549,10 @@ mod tests {
         old.sinks.push(make_sink("out", "p1"));
         let mut new = empty_config();
         let mut changed = make_sink("out", "p1");
-        changed.delivery = "exactly_once".to_string();
+        changed.properties.insert(
+            "topic".to_string(),
+            toml::Value::String("new-topic".to_string()),
+        );
         new.sinks.push(changed);
         let diff = diff_configs(&old, &new);
         assert_eq!(diff.sinks_changed.len(), 1);

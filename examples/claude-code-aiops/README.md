@@ -41,7 +41,7 @@ laminardb --config examples/claude-code-aiops/config.toml
 
 ```bash
 cargo run --release -p laminar-server --no-default-features \
-    --features mimalloc,otel,websocket,files -- \
+    --features mimalloc,otel,websocket,delta-lake -- \
     --config examples/claude-code-aiops/config.toml
 ```
 
@@ -130,7 +130,11 @@ their SDK (no arbitrary SQL joins across event types).
 ## Persistence
 
 Pipeline output is written to `./data/aiops/` as Parquet files (zstd compressed).
-Survives server restarts. Query with DuckDB:
+The Delta sink durably acknowledges its direct commits, so published files survive
+server restarts. OTLP ingress is non-replayable, however, so the configuration
+explicitly selects pipeline-wide `best_effort`: a crash can lose accepted events
+and this example does not claim checkpoint recovery or exactly-once delivery.
+Query with DuckDB:
 
 ```bash
 duckdb -c "SELECT model, SUM(total_cost_usd) FROM 'data/aiops/cost/*.parquet' GROUP BY model"

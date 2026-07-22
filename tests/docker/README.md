@@ -8,23 +8,22 @@ Compose file for external systems used by LaminarDB integration tests.
 docker compose -f tests/docker/compose.yml up -d
 ```
 
-Wait ~8s for the Redpanda broker to pass its health check, or let the
-`wait_for_broker` helper in `crates/laminar-db/tests/common/mod.rs`
-block until `127.0.0.1:19092` is reachable.
+Wait for the Redpanda health check, or let the test helper wait until
+`127.0.0.1:19092` answers a Kafka metadata request.
 
 ## Run the scenarios
 
 ```
-# Happy path + exactly-once restart (runs in the default `cargo test`):
+# Happy path + checkpointed at-least-once restart (runs in the default `cargo test`):
 cargo test -p laminar-db --features kafka --test kafka_docker_scenarios
 
-# Including the disruption tests (broker kill, consumer rebalance):
+# Including the broker-outage test:
 cargo test -p laminar-db --features kafka --test kafka_docker_scenarios \
   -- --include-ignored --test-threads=1
 ```
 
-Tests skip gracefully when the broker is unreachable, so the same command
-is safe on CI environments without Docker.
+Tests skip gracefully when the broker is unreachable, so the same command is safe on developer
+machines without Docker. Set `LAMINAR_REQUIRE_REDPANDA=1` in release validation to fail instead.
 
 ### Windows build note
 
@@ -54,29 +53,38 @@ docker compose -f tests/docker/compose.yml down
 Host port 19000 (API) / 19001 (console). Login at
 http://localhost:19001 with `laminar` / `laminar-test-secret`.
 
-Used by `crates/laminar-db/tests/cluster_minio_flow.rs` to exercise
-`ObjectStoreBackend`'s cross-instance durability check with real
-shared storage rather than a shared `Arc<InProcessBackend>` shortcut.
-The test creates a unique bucket per run via `mc` exec, so repeated
-runs don't collide.
+Used by the `minio` cases in `crates/laminar-db/tests/cluster_integration.rs` to
+exercise shared state, control-plane CAS, and restart recovery through fresh
+object-store clients. Each test creates a unique bucket.
+
+```
+LAMINAR_REQUIRE_MINIO=1 cargo test -p laminar-db --no-default-features \
+  --features cluster --test cluster_integration minio:: -- --test-threads=1
+```
+
+Without `LAMINAR_REQUIRE_MINIO=1`, these cases skip when MinIO is unavailable.
 
 ## Scenarios covered
 
 1. **`scenario_1_kafka_roundtrip`** — 50-record round-trip through a
-   Kafka source → SQL projection → Kafka sink pipeline. Baseline proof
-   that the rig works.
-2. **`scenario_2_broker_kill_midstream`** (ignored) — kills the broker
-   mid-stream via `docker compose kill redpanda`, restarts it, produces
-   a second half of input, verifies at-least-once delivery to the sink.
-3. **`scenario_3_exactly_once_survives_db_restart`** — runs the
-   pipeline, forces a checkpoint, shuts down cleanly, reopens against
-   the same storage dir, verifies no duplicates on the output topic.
-4. **`scenario_4_consumer_rebalance_midstream`** (ignored) — runs two
-   DB instances on the same consumer group against a 2-partition
-   topic; joining the group triggers a rebalance mid-flight. Verifies
-   no data loss.
-5. **`cluster_minio_flow::two_node_minio_leader_commits_follower_mirrors`**
+   Kafka source → SQL projection → Kafka sink pipeline. Consumes through a
+   captured broker cut and requires each exact ID/value once.
+2. **`scenario_2_broker_outage_between_batches_reconnect_smoke`** (ignored) — produces one
+   input batch, kills the broker and proves metadata is unavailable, restarts
+   it, then produces a disjoint batch and verifies every expected ID and value.
+   This covers idle reconnect, not an in-flight checkpoint fault.
+3. **`scenario_3_at_least_once_has_no_loss_after_db_restart`** — runs the
+   first input batch, forces a checkpoint, shuts down cleanly, produces
+   a second batch while stopped, reopens against the same storage dir,
+   stops the writer, then verifies the final stable snapshot has exactly the
+   expected IDs and values and no growth in pre-checkpoint per-ID counts.
+4. **`minio::two_node_minio_leader_commits_follower_mirrors`**
    — 2-node cluster sharing one MinIO bucket via `ObjectStoreBackend`.
    Verifies the leader's full-registry gate reads follower markers off
-   shared storage, and the `_COMMIT` marker lands after the 2PC ack.
-   Run with `cargo test -p laminar-db --test cluster_minio_flow --features cluster`.
+   shared storage and seals the exact checkpoint after the 2PC ack.
+5. **`minio::cluster_control_state_survives_fresh_minio_client_restart`**
+   — restarts both cluster processes with a newly constructed MinIO client,
+   then verifies assignment recovery and a durable post-restart commit.
+6. **`minio::two_node_coordinated_descriptors_aggregate_on_leader`**
+   — verifies the designated committer seals only after both nodes publish
+   the required sink descriptors.

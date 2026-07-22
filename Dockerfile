@@ -34,41 +34,15 @@ ENV CARGO_PROFILE_RELEASE_LTO=thin \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS=2 \
     CARGO_PROFILE_RELEASE_STRIP=symbols
 
-# --- Dependency caching layer ---
-# Copy workspace Cargo files first so dependency builds are cached.
+# The server workspace uses vendored path dependencies, so both trees must be
+# present before Cargo resolves the build.
 COPY Cargo.toml Cargo.lock ./
 
 # Strip example crates from workspace members (not needed for server build)
 RUN sed -i '/"examples\//d' Cargo.toml
 
-# Copy all crate Cargo.toml files (preserving directory structure)
-COPY crates/laminar-core/Cargo.toml crates/laminar-core/Cargo.toml
-COPY crates/laminar-sql/Cargo.toml crates/laminar-sql/Cargo.toml
-COPY crates/laminar-connectors/Cargo.toml crates/laminar-connectors/Cargo.toml
-COPY crates/laminar-server/Cargo.toml crates/laminar-server/Cargo.toml
-COPY crates/laminar-db/Cargo.toml crates/laminar-db/Cargo.toml
-COPY crates/laminar-derive/Cargo.toml crates/laminar-derive/Cargo.toml
-
-# Create dummy source files so cargo can resolve the dependency graph and
-# download + compile all third-party crates. This layer is cached as long
-# as Cargo.toml / Cargo.lock don't change.
-RUN mkdir -p crates/laminar-core/src && echo "pub fn _dummy() {}" > crates/laminar-core/src/lib.rs \
-    && mkdir -p crates/laminar-sql/src && echo "pub fn _dummy() {}" > crates/laminar-sql/src/lib.rs \
-    && mkdir -p crates/laminar-connectors/src && echo "pub fn _dummy() {}" > crates/laminar-connectors/src/lib.rs \
-    && mkdir -p crates/laminar-db/src && echo "pub fn _dummy() {}" > crates/laminar-db/src/lib.rs \
-    && mkdir -p crates/laminar-derive/src && echo "pub fn _dummy() {}" > crates/laminar-derive/src/lib.rs \
-    && mkdir -p crates/laminar-server/src && echo "fn main() {}" > crates/laminar-server/src/main.rs
-
-# Build dependencies only (this layer is cached)
-RUN cargo build --release -p laminar-server 2>/dev/null || true
-
-# --- Real source build ---
-# Remove dummy sources and copy real code
-RUN rm -rf crates/
 COPY crates/ crates/
-
-# Touch main.rs to invalidate the binary cache but keep dep cache
-RUN touch crates/laminar-server/src/main.rs
+COPY vendor/ vendor/
 
 # Build the server binary in release mode
 RUN cargo build --release -p laminar-server
@@ -120,7 +94,7 @@ COPY <<'EOF' /etc/laminardb/laminardb.toml
 # See https://github.com/laminardb/laminardb for documentation.
 
 [server]
-mode = "embedded"
+mode = "single"
 bind = "0.0.0.0:8080"
 workers = 0
 log_level = "info"
@@ -132,8 +106,6 @@ path = "/var/lib/laminardb/state"
 [checkpoint]
 url = "file:///var/lib/laminardb/checkpoints"
 interval = "30s"
-mode = "aligned"
-snapshot_strategy = "full"
 EOF
 
 # Expose ports

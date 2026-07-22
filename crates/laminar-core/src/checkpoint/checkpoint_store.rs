@@ -18,38 +18,543 @@
 //!   latest.txt          # "checkpoint_000002" — pointer to latest good checkpoint
 //! ```
 
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use object_store::{GetOptions, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
+use bytes::BytesMut;
+use object_store::{
+    GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
+    UpdateVersion,
+};
+use rand::RngExt;
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
-use crate::checkpoint::checkpoint_manifest::CheckpointManifest;
+use crate::checkpoint::checkpoint_manifest::{
+    CheckpointManifest, DurableCheckpointPhase, OperatorCheckpoint,
+};
+use crate::durable_fs::{durable_rename, ensure_durable_directory, DurableRenameMode};
+use crate::state::{KeyGroupCount, LOCAL_KEY_GROUP_COUNT};
 
-/// Fsync a file to ensure its contents are durable on disk.
-async fn sync_file(path: &Path) -> Result<(), std::io::Error> {
-    // Must open with write access — Windows requires it for FlushFileBuffers.
-    let f = tokio::fs::OpenOptions::new().write(true).open(path).await?;
-    f.sync_all().await
+const MAX_LATEST_POINTER_BYTES: u64 = 1_024;
+const MAX_MANIFEST_BYTES: u64 = 16 * 1_024 * 1_024;
+/// Default upper bound for both one checkpoint's aggregate raw logical operator state and its
+/// external sidecar.
+pub const DEFAULT_MAX_CHECKPOINT_STATE_BYTES: u64 = 512 * 1024 * 1024;
+/// Maximum number of checkpoint entries one bounded inventory operation may materialize.
+pub const MAX_CHECKPOINT_INVENTORY_ENTRIES: usize = 65_536;
+const MAX_CAS_ATTEMPTS: usize = 16;
+
+/// Validate a configured per-checkpoint operator-state byte budget.
+///
+/// # Errors
+///
+/// Returns [`CheckpointStoreError::Invalid`] when the budget is zero or cannot
+/// be safely represented and overflow-probed by this process.
+pub fn validate_max_checkpoint_state_bytes(limit: u64) -> Result<(), CheckpointStoreError> {
+    if limit == 0 {
+        return Err(CheckpointStoreError::Invalid(
+            "checkpoint state sidecar safety limit must be greater than zero".into(),
+        ));
+    }
+    if limit.checked_add(1).is_none() {
+        return Err(CheckpointStoreError::Invalid(
+            "checkpoint state sidecar safety limit must leave room for a one-byte overflow probe"
+                .into(),
+        ));
+    }
+    if usize::try_from(limit).is_err() || isize::try_from(limit).is_err() {
+        return Err(CheckpointStoreError::Invalid(format!(
+            "checkpoint state sidecar safety limit {limit} exceeds this process address space"
+        )));
+    }
+    Ok(())
 }
 
-/// Fsync a directory to make rename operations durable.
-///
-/// On Unix, this flushes directory metadata (new/renamed entries).
-/// On Windows, directory sync is not supported; the OS handles durability.
-#[allow(clippy::unnecessary_wraps, clippy::unused_async)] // no-op on Windows
-async fn sync_dir(path: &Path) -> Result<(), std::io::Error> {
-    #[cfg(unix)]
-    {
-        let f = tokio::fs::File::open(path).await?;
-        f.sync_all().await?;
+async fn checkpoint_cas_backoff(attempt: usize) {
+    if attempt == 0 {
+        tokio::task::yield_now().await;
+        return;
     }
-    #[cfg(not(unix))]
+    let base_ms = 1_u64 << attempt.saturating_sub(1).min(5);
+    let jitter_ms = rand::rng().random_range(0..=base_ms);
+    tokio::time::sleep(std::time::Duration::from_millis(base_ms + jitter_ms)).await;
+}
+
+fn exact_phase_successor(prepared: &CheckpointManifest, finalized: &CheckpointManifest) -> bool {
+    if prepared.durable_phase != DurableCheckpointPhase::Prepared
+        || finalized.durable_phase != DurableCheckpointPhase::Finalized
     {
-        let _ = path;
+        return false;
     }
+    let mut expected = prepared.clone();
+    expected.durable_phase = DurableCheckpointPhase::Finalized;
+    expected == *finalized
+}
+
+struct TemporaryFile(PathBuf);
+
+impl Drop for TemporaryFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn unique_temporary_path(destination: &Path) -> Result<PathBuf, std::io::Error> {
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    let name = destination
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("checkpoint destination has no file name"))?
+        .to_string_lossy();
+    Ok(parent.join(format!(".{name}#{}", uuid::Uuid::new_v4().as_u128())))
+}
+
+fn write_synced_file(path: &Path, chunks: &[bytes::Bytes]) -> Result<(), std::io::Error> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    for chunk in chunks {
+        file.write_all(chunk)?;
+    }
+    file.sync_all()
+}
+
+fn oversized_metadata(kind: &str, size: u64, limit: u64) -> CheckpointStoreError {
+    CheckpointStoreError::Invalid(format!(
+        "{kind} is {size} bytes, exceeding the {limit}-byte safety limit"
+    ))
+}
+
+fn read_bounded_file(
+    path: &Path,
+    limit: u64,
+    kind: &str,
+) -> Result<Option<Vec<u8>>, CheckpointStoreError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => metadata,
+        Ok(_) => {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "{kind} '{}' is not a regular file",
+                path.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.len() > limit {
+        return Err(oversized_metadata(kind, metadata.len(), limit));
+    }
+
+    let mut file = File::open(path)?;
+    let capacity = usize::try_from(metadata.len()).map_err(|_| {
+        CheckpointStoreError::Invalid(format!(
+            "{kind} size {} cannot be represented by this process",
+            metadata.len()
+        ))
+    })?;
+    let mut bytes = Vec::with_capacity(capacity);
+    std::io::Read::by_ref(&mut file)
+        .take(limit + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(oversized_metadata(kind, bytes.len() as u64, limit));
+    }
+    Ok(Some(bytes))
+}
+
+fn open_bounded_regular_file(
+    path: &Path,
+    limit: u64,
+    kind: &str,
+) -> Result<Option<(File, u64)>, CheckpointStoreError> {
+    let path_metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => metadata,
+        Ok(_) => {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "{kind} '{}' is not a regular file",
+                path.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if path_metadata.len() > limit {
+        return Err(oversized_metadata(kind, path_metadata.len(), limit));
+    }
+
+    let file = File::open(path)?;
+    let opened_metadata = file.metadata()?;
+    if !opened_metadata.file_type().is_file() {
+        return Err(CheckpointStoreError::Invalid(format!(
+            "{kind} '{}' is not a regular file",
+            path.display()
+        )));
+    }
+    if opened_metadata.len() > limit {
+        return Err(oversized_metadata(kind, opened_metadata.len(), limit));
+    }
+    if opened_metadata.len() != path_metadata.len() {
+        return Err(CheckpointStoreError::Invalid(format!(
+            "{kind} '{}' changed length while it was opened ({} to {} bytes)",
+            path.display(),
+            path_metadata.len(),
+            opened_metadata.len()
+        )));
+    }
+    Ok(Some((file, opened_metadata.len())))
+}
+
+fn read_bounded_open_file(
+    file: &mut File,
+    expected_len: u64,
+    limit: u64,
+    kind: &str,
+) -> Result<Vec<u8>, CheckpointStoreError> {
+    if expected_len > limit {
+        return Err(oversized_metadata(kind, expected_len, limit));
+    }
+    let capacity = usize::try_from(expected_len).map_err(|_| {
+        CheckpointStoreError::Invalid(format!(
+            "{kind} length {expected_len} exceeds this process address space"
+        ))
+    })?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity).map_err(|error| {
+        CheckpointStoreError::Invalid(format!(
+            "{kind} cannot reserve its advertised {expected_len}-byte length: {error}"
+        ))
+    })?;
+
+    // Read through a fixed scratch buffer so neither EOF detection nor a concurrent one-byte
+    // growth can make the destination Vec reserve beyond the configured checkpoint budget.
+    let mut scratch = [0_u8; 64 * 1024];
+    while bytes.len() < capacity {
+        let remaining = capacity - bytes.len();
+        let read_len = remaining.min(scratch.len());
+        let read = file.read(&mut scratch[..read_len])?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&scratch[..read]);
+    }
+    let actual_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if actual_len != expected_len {
+        return Err(CheckpointStoreError::Invalid(format!(
+            "{kind} body length changed from {expected_len} to {actual_len} bytes while reading"
+        )));
+    }
+
+    let mut overflow_probe = [0_u8; 1];
+    let grew = file.read(&mut overflow_probe)? != 0;
+    let final_len = file.metadata()?.len();
+    if final_len > limit {
+        return Err(oversized_metadata(kind, final_len, limit));
+    }
+    if grew {
+        let observed_len = expected_len.saturating_add(1);
+        return Err(CheckpointStoreError::Invalid(format!(
+            "{kind} body grew beyond its advertised {expected_len}-byte length (observed at least {observed_len} bytes)"
+        )));
+    }
+    if final_len != expected_len {
+        return Err(CheckpointStoreError::Invalid(format!(
+            "{kind} length changed from {expected_len} to {final_len} bytes while reading"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn read_bounded_regular_file(
+    path: &Path,
+    limit: u64,
+    kind: &str,
+) -> Result<Option<Vec<u8>>, CheckpointStoreError> {
+    let Some((mut file, expected_len)) = open_bounded_regular_file(path, limit, kind)? else {
+        return Ok(None);
+    };
+    read_bounded_open_file(&mut file, expected_len, limit, kind).map(Some)
+}
+
+fn ensure_serialized_size(kind: &str, size: usize, limit: u64) -> Result<(), CheckpointStoreError> {
+    let size = u64::try_from(size).unwrap_or(u64::MAX);
+    if size > limit {
+        Err(oversized_metadata(kind, size, limit))
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_loaded_manifest(
+    manifest: &CheckpointManifest,
+    storage_checkpoint_id: u64,
+    storage_participant_id: u64,
+    key_group_count: KeyGroupCount,
+) -> Result<(), CheckpointStoreError> {
+    if manifest.checkpoint_id != storage_checkpoint_id {
+        return Err(CheckpointStoreError::Invalid(format!(
+            "storage checkpoint {storage_checkpoint_id} contains manifest checkpoint {}",
+            manifest.checkpoint_id
+        )));
+    }
+    if manifest.participant_id != storage_participant_id {
+        return Err(CheckpointStoreError::Invalid(format!(
+            "storage participant {storage_participant_id} contains manifest participant {}",
+            manifest.participant_id
+        )));
+    }
+    let errors = manifest.validate(key_group_count);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(CheckpointStoreError::Invalid(format!(
+            "stored checkpoint {storage_checkpoint_id} manifest validation: {}",
+            errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
+        )))
+    }
+}
+
+fn open_and_lock(path: &Path) -> Result<File, std::io::Error> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    file.lock()?;
+    Ok(file)
+}
+
+fn file_matches_chunks(path: &Path, chunks: &[bytes::Bytes]) -> Result<bool, std::io::Error> {
+    let expected_len = chunks.iter().try_fold(0_u64, |total, chunk| {
+        total.checked_add(chunk.len() as u64).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "checkpoint state is too large",
+            )
+        })
+    })?;
+    let mut file = File::open(path)?;
+    if file.metadata()?.len() != expected_len {
+        return Ok(false);
+    }
+    let mut scratch = [0_u8; 64 * 1024];
+    for chunk in chunks {
+        let mut offset = 0;
+        while offset < chunk.len() {
+            let length = scratch.len().min(chunk.len() - offset);
+            file.read_exact(&mut scratch[..length])?;
+            if scratch[..length] != chunk[offset..offset + length] {
+                return Ok(false);
+            }
+            offset += length;
+        }
+    }
+    Ok(true)
+}
+
+fn publish_filesystem_manifest(
+    checkpoint_dir: &Path,
+    manifest_path: &Path,
+    manifest: &CheckpointManifest,
+    encoded: bytes::Bytes,
+) -> Result<(), CheckpointStoreError> {
+    ensure_durable_directory(checkpoint_dir)?;
+    let _lock = open_and_lock(&checkpoint_dir.join(".manifest.lock"))?;
+
+    ensure_serialized_size("checkpoint manifest", encoded.len(), MAX_MANIFEST_BYTES)?;
+    if let Some(existing) =
+        read_bounded_file(manifest_path, MAX_MANIFEST_BYTES, "checkpoint manifest")?
+    {
+        let existing: CheckpointManifest = serde_json::from_slice(&existing)?;
+        if existing == *manifest || exact_phase_successor(manifest, &existing) {
+            return Ok(());
+        }
+        if !exact_phase_successor(&existing, manifest) {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "checkpoint {} manifest already exists with different immutable content",
+                manifest.checkpoint_id
+            )));
+        }
+    }
+
+    let temporary = unique_temporary_path(manifest_path)?;
+    let cleanup = TemporaryFile(temporary.clone());
+    write_synced_file(&temporary, &[encoded])?;
+    let mode = if manifest_path.exists() {
+        DurableRenameMode::Replace
+    } else {
+        DurableRenameMode::NoReplace
+    };
+    durable_rename(&temporary, manifest_path, mode)?;
+    drop(cleanup);
+    Ok(())
+}
+
+fn publish_filesystem_state(
+    checkpoint_dir: &Path,
+    state_path: &Path,
+    chunks: &[bytes::Bytes],
+) -> Result<(), CheckpointStoreError> {
+    ensure_durable_directory(checkpoint_dir)?;
+    let _lock = open_and_lock(&checkpoint_dir.join(".state.lock"))?;
+    match std::fs::symlink_metadata(state_path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "checkpoint state path '{}' is not a regular file",
+                state_path.display()
+            )));
+        }
+        Ok(_) if file_matches_chunks(state_path, chunks)? => return Ok(()),
+        Ok(_) => {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "checkpoint state '{}' already exists with different immutable content",
+                state_path.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let temporary = unique_temporary_path(state_path)?;
+    let cleanup = TemporaryFile(temporary.clone());
+    write_synced_file(&temporary, chunks)?;
+    durable_rename(&temporary, state_path, DurableRenameMode::NoReplace)?;
+    drop(cleanup);
+    Ok(())
+}
+
+fn parse_filesystem_latest(bytes: &[u8]) -> Result<u64, CheckpointStoreError> {
+    let content = std::str::from_utf8(bytes).map_err(|error| {
+        CheckpointStoreError::Invalid(format!("checkpoint recovery pointer is not UTF-8: {error}"))
+    })?;
+    let name = content.trim();
+    FileSystemCheckpointStore::parse_checkpoint_id(name).ok_or_else(|| {
+        CheckpointStoreError::Invalid(format!("invalid checkpoint recovery pointer {name:?}"))
+    })
+}
+
+fn load_filesystem_manifest(
+    path: &Path,
+    checkpoint_id: u64,
+    participant_id: u64,
+    key_group_count: KeyGroupCount,
+) -> Result<Option<CheckpointManifest>, CheckpointStoreError> {
+    let Some(bytes) = read_bounded_file(path, MAX_MANIFEST_BYTES, "checkpoint manifest")? else {
+        return Ok(None);
+    };
+    let manifest: CheckpointManifest = serde_json::from_slice(&bytes)?;
+    ensure_loaded_manifest(&manifest, checkpoint_id, participant_id, key_group_count)?;
+    Ok(Some(manifest))
+}
+
+fn ensure_filesystem_latest_target(
+    checkpoints_dir: &Path,
+    checkpoint_id: u64,
+    participant_id: u64,
+    key_group_count: KeyGroupCount,
+) -> Result<(), CheckpointStoreError> {
+    let manifest_path = checkpoints_dir
+        .join(format!("checkpoint_{checkpoint_id:06}"))
+        .join("manifest.json");
+    let manifest = load_filesystem_manifest(
+        &manifest_path,
+        checkpoint_id,
+        participant_id,
+        key_group_count,
+    )?
+    .ok_or_else(|| {
+        CheckpointStoreError::Invalid(format!(
+            "checkpoint recovery pointer references missing checkpoint {checkpoint_id}"
+        ))
+    })?;
+    if manifest.durable_phase != DurableCheckpointPhase::Finalized {
+        return Err(CheckpointStoreError::Invalid(format!(
+            "checkpoint recovery pointer references non-finalized checkpoint {checkpoint_id}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct FilesystemLatestPublicationGate {
+    state: std::sync::Mutex<(bool, bool)>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl FilesystemLatestPublicationGate {
+    fn block(&self) -> Result<(), std::io::Error> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| std::io::Error::other("latest publication gate is poisoned"))?;
+        state.0 = true;
+        self.changed.notify_all();
+        while !state.1 {
+            state = self
+                .changed
+                .wait(state)
+                .map_err(|_| std::io::Error::other("latest publication gate is poisoned"))?;
+        }
+        Ok(())
+    }
+
+    fn wait_until_entered(&self, timeout: std::time::Duration) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        self.changed
+            .wait_timeout_while(state, timeout, |state| !state.0)
+            .is_ok_and(|(state, _)| state.0)
+    }
+
+    fn release(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.1 = true;
+            self.changed.notify_all();
+        }
+    }
+}
+
+fn publish_filesystem_latest(
+    checkpoints_dir: &Path,
+    latest_path: &Path,
+    checkpoint_id: u64,
+    participant_id: u64,
+    key_group_count: KeyGroupCount,
+    #[cfg(test)] gate: Option<Arc<FilesystemLatestPublicationGate>>,
+) -> Result<(), CheckpointStoreError> {
+    ensure_durable_directory(checkpoints_dir)?;
+    let _lock = open_and_lock(&checkpoints_dir.join(".latest.lock"))?;
+    #[cfg(test)]
+    if let Some(gate) = gate {
+        gate.block()?;
+    }
+
+    if let Some(existing) = read_bounded_file(
+        latest_path,
+        MAX_LATEST_POINTER_BYTES,
+        "checkpoint recovery pointer",
+    )? {
+        let current = parse_filesystem_latest(&existing)?;
+        ensure_filesystem_latest_target(checkpoints_dir, current, participant_id, key_group_count)?;
+        if current >= checkpoint_id {
+            return Ok(());
+        }
+    }
+
+    let temporary = unique_temporary_path(latest_path)?;
+    let cleanup = TemporaryFile(temporary.clone());
+    let content = bytes::Bytes::from(format!("checkpoint_{checkpoint_id:06}"));
+    write_synced_file(&temporary, &[content])?;
+    durable_rename(&temporary, latest_path, DurableRenameMode::Replace)?;
+    drop(cleanup);
     Ok(())
 }
 
@@ -71,6 +576,10 @@ pub enum CheckpointStoreError {
     /// Object store error.
     #[error("object store error: {0}")]
     ObjectStore(#[from] object_store::Error),
+
+    /// Persisted checkpoint metadata violates the store contract.
+    #[error("invalid checkpoint: {0}")]
+    Invalid(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -79,30 +588,23 @@ pub enum CheckpointStoreError {
 
 /// Classification of a single validation finding.
 ///
-/// `ManifestWarning` is non-fatal — the checkpoint is still usable.
-/// `IntegrityFailure` is fatal — recovery must skip this checkpoint.
+/// Both variants are fatal. They remain distinct so diagnostics can separate
+/// an incompatible runtime contract from corrupt persisted bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationIssue {
-    /// Non-fatal manifest-level warning (e.g. `vnode_count` mismatch,
-    /// orphaned source offset).
-    ManifestWarning(String),
+    /// Fatal manifest-level incompatibility (for example a key-group-count mismatch).
+    ManifestIncompatibility(String),
     /// Fatal: manifest is missing/corrupt, or the sidecar integrity
     /// check (checksum, presence) failed.
     IntegrityFailure(String),
 }
 
 impl ValidationIssue {
-    /// True if this issue renders the checkpoint unusable for recovery.
-    #[must_use]
-    pub fn is_fatal(&self) -> bool {
-        matches!(self, Self::IntegrityFailure(_))
-    }
-
     /// Underlying human-readable message.
     #[must_use]
     pub fn message(&self) -> &str {
         match self {
-            Self::ManifestWarning(s) | Self::IntegrityFailure(s) => s,
+            Self::ManifestIncompatibility(s) | Self::IntegrityFailure(s) => s,
         }
     }
 }
@@ -119,10 +621,307 @@ pub struct ValidationResult {
     /// Checkpoint ID that was validated.
     pub checkpoint_id: u64,
     /// Whether the checkpoint is valid for recovery. A checkpoint is
-    /// valid iff it has no [`ValidationIssue::IntegrityFailure`] issues.
+    /// valid iff it has no validation issues.
     pub valid: bool,
     /// Issues found during validation.
     pub issues: Vec<ValidationIssue>,
+}
+
+/// Manifest and optional operator-state sidecar loaded for one exact checkpoint.
+///
+/// The sidecar is present only when the manifest's checksum shape requires it. Keeping both
+/// artifacts together lets recovery validate and restore the same bytes without a second read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckpointArtifacts {
+    /// Parsed checkpoint manifest.
+    pub manifest: CheckpointManifest,
+    /// Exact checksum-required `state.bin` bytes, if the manifest uses a sidecar.
+    pub state_data: Option<Vec<u8>>,
+}
+
+impl CheckpointArtifacts {
+    /// Validate these already-loaded bytes without blocking an async runtime worker.
+    ///
+    /// Ownership is returned with the result so recovery can restore the same sidecar allocation
+    /// that was checksummed instead of cloning or re-reading it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointStoreError::Invalid`] for an unusable state budget, or
+    /// [`CheckpointStoreError::Io`] if the blocking validation task cannot be joined.
+    pub async fn validate(
+        self,
+        checkpoint_id: u64,
+        participant_id: u64,
+        key_group_count: KeyGroupCount,
+        max_state_data_bytes: u64,
+    ) -> Result<(Self, ValidationResult), CheckpointStoreError> {
+        validate_max_checkpoint_state_bytes(max_state_data_bytes)?;
+        tokio::task::spawn_blocking(move || {
+            let result = validate_checkpoint_artifacts(
+                &self,
+                checkpoint_id,
+                participant_id,
+                key_group_count,
+                max_state_data_bytes,
+            );
+            (self, result)
+        })
+        .await
+        .map_err(|error| {
+            std::io::Error::other(format!("checkpoint validation task failed: {error}"))
+        })
+        .map_err(CheckpointStoreError::Io)
+    }
+}
+
+fn exact_inline_state_len(encoded: &str) -> Result<u64, String> {
+    let mut decoder = base64::read::DecoderReader::new(
+        encoded.as_bytes(),
+        &base64::engine::general_purpose::STANDARD,
+    );
+    let mut decoded_len = 0_u64;
+    let mut scratch = [0_u8; 8 * 1024];
+    loop {
+        let read = decoder
+            .read(&mut scratch)
+            .map_err(|error| format!("invalid base64: {error}"))?;
+        if read == 0 {
+            return Ok(decoded_len);
+        }
+        decoded_len = decoded_len
+            .checked_add(u64::try_from(read).unwrap_or(u64::MAX))
+            .ok_or_else(|| "decoded inline state length overflow".to_string())?;
+    }
+}
+
+type ExternalStateRange<'a> = (u64, u64, &'a str);
+
+fn operator_raw_state_len<'a>(
+    name: &'a str,
+    state: &OperatorCheckpoint,
+    external_ranges: &mut Vec<ExternalStateRange<'a>>,
+    issues: &mut Vec<ValidationIssue>,
+) -> Option<u64> {
+    if state.external {
+        if state.state_b64.is_some() {
+            issues.push(ValidationIssue::IntegrityFailure(format!(
+                "operator '{name}' external state also contains inline base64"
+            )));
+        }
+        if state.external_length == 0 {
+            issues.push(ValidationIssue::IntegrityFailure(format!(
+                "operator '{name}' has an empty external sidecar range"
+            )));
+        }
+        match state.external_offset.checked_add(state.external_length) {
+            Some(end) => external_ranges.push((state.external_offset, end, name)),
+            None => issues.push(ValidationIssue::IntegrityFailure(format!(
+                "operator '{name}' external sidecar range overflows"
+            ))),
+        }
+        return Some(state.external_length);
+    }
+
+    if state.external_offset != 0 || state.external_length != 0 {
+        issues.push(ValidationIssue::IntegrityFailure(format!(
+            "operator '{name}' inline state has nonzero external offset or length"
+        )));
+    }
+    let Some(encoded) = state.state_b64.as_deref() else {
+        issues.push(ValidationIssue::IntegrityFailure(format!(
+            "operator '{name}' inline state is missing base64 data"
+        )));
+        return None;
+    };
+    match exact_inline_state_len(encoded) {
+        Ok(length) => Some(length),
+        Err(error) => {
+            issues.push(ValidationIssue::IntegrityFailure(format!(
+                "operator '{name}' inline state {error}"
+            )));
+            None
+        }
+    }
+}
+
+fn validate_external_state_ranges(
+    mut external_ranges: Vec<ExternalStateRange<'_>>,
+    state_data_len: Option<u64>,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    external_ranges.sort_unstable();
+    if external_ranges.is_empty() {
+        if state_data_len.is_some() {
+            issues.push(ValidationIssue::IntegrityFailure(
+                "checkpoint state sidecar has no external operator ranges".into(),
+            ));
+        }
+        return;
+    }
+
+    let mut expected_offset = 0_u64;
+    for (start, end, name) in external_ranges {
+        if start != expected_offset {
+            issues.push(ValidationIssue::IntegrityFailure(format!(
+                "operator '{name}' external sidecar range starts at {start}, expected {expected_offset}"
+            )));
+        }
+        expected_offset = end;
+    }
+    match state_data_len {
+        Some(actual) if actual != expected_offset => {
+            issues.push(ValidationIssue::IntegrityFailure(format!(
+                "checkpoint state sidecar is {actual} bytes but external operator ranges cover {expected_offset} bytes"
+            )));
+        }
+        None => issues.push(ValidationIssue::IntegrityFailure(
+            "external operator state references a missing checkpoint state sidecar".into(),
+        )),
+        Some(_) => {}
+    }
+}
+
+fn operator_state_validation_issues(
+    manifest: &CheckpointManifest,
+    state_data_len: Option<u64>,
+    max_state_data_bytes: u64,
+) -> Vec<ValidationIssue> {
+    let mut issues = Vec::new();
+    if let Some(length) = state_data_len {
+        if length > max_state_data_bytes {
+            issues.push(ValidationIssue::IntegrityFailure(format!(
+                "checkpoint state sidecar is {length} bytes, exceeding the {max_state_data_bytes}-byte safety limit"
+            )));
+        }
+    }
+
+    let mut names = manifest.operator_states.keys().collect::<Vec<_>>();
+    names.sort_unstable();
+    let mut logical_bytes = 0_u64;
+    let mut logical_overflow = false;
+    let mut external_ranges = Vec::new();
+
+    for name in names {
+        let state = &manifest.operator_states[name];
+        let raw_length =
+            operator_raw_state_len(name.as_str(), state, &mut external_ranges, &mut issues);
+
+        if let Some(raw_length) = raw_length {
+            if let Some(total) = logical_bytes.checked_add(raw_length) {
+                logical_bytes = total;
+            } else if !logical_overflow {
+                logical_overflow = true;
+                issues.push(ValidationIssue::IntegrityFailure(
+                    "aggregate logical operator state length overflows".into(),
+                ));
+            }
+        }
+    }
+
+    if !logical_overflow && logical_bytes > max_state_data_bytes {
+        issues.push(ValidationIssue::IntegrityFailure(format!(
+            "aggregate logical operator state is {logical_bytes} bytes, exceeding the {max_state_data_bytes}-byte safety limit"
+        )));
+    }
+
+    validate_external_state_ranges(external_ranges, state_data_len, &mut issues);
+
+    if manifest.operator_states.is_empty() && manifest.state_checksum.is_some() {
+        issues.push(ValidationIssue::IntegrityFailure(
+            "state checksum has no operator state".into(),
+        ));
+    }
+    issues
+}
+
+fn validate_checkpoint_artifacts(
+    artifacts: &CheckpointArtifacts,
+    checkpoint_id: u64,
+    participant_id: u64,
+    key_group_count: KeyGroupCount,
+    max_state_data_bytes: u64,
+) -> ValidationResult {
+    let manifest = &artifacts.manifest;
+    let mut issues = manifest
+        .validate(key_group_count)
+        .into_iter()
+        .map(|error| {
+            ValidationIssue::ManifestIncompatibility(format!("manifest validation: {error}"))
+        })
+        .collect::<Vec<_>>();
+
+    if manifest.participant_id != participant_id {
+        issues.push(ValidationIssue::ManifestIncompatibility(format!(
+            "manifest participant {} does not match store participant {participant_id}",
+            manifest.participant_id
+        )));
+    }
+    if manifest.checkpoint_id != checkpoint_id {
+        issues.push(ValidationIssue::IntegrityFailure(format!(
+            "storage checkpoint {checkpoint_id} contains manifest checkpoint {}",
+            manifest.checkpoint_id
+        )));
+    }
+
+    let state_data_len = artifacts
+        .state_data
+        .as_ref()
+        .map(|data| u64::try_from(data.len()).unwrap_or(u64::MAX));
+    issues.extend(operator_state_validation_issues(
+        manifest,
+        state_data_len,
+        max_state_data_bytes,
+    ));
+
+    // Retain this integrity classification in addition to the manifest compatibility finding.
+    if manifest.epoch == 0 || manifest.checkpoint_id == 0 {
+        issues.push(ValidationIssue::IntegrityFailure(
+            "epoch or checkpoint_id is 0 — likely corrupted".into(),
+        ));
+    }
+
+    // Invalid shape, namespace, or budget is already fatal; avoid hashing a large sidecar that
+    // recovery cannot use.
+    if issues.is_empty() {
+        if let Some(expected) = &manifest.state_checksum {
+            let (any_inline, any_external) = operator_state_shape(manifest);
+            let actual = match (any_inline, any_external, artifacts.state_data.as_deref()) {
+                (true, true, Some(data)) => {
+                    sha256_hex_mixed(&manifest.operator_states, std::iter::once(data))
+                }
+                (true, false, _) => sha256_hex_inline_states(&manifest.operator_states),
+                (false, true, Some(data)) => sha256_hex(data),
+                _ => unreachable!("validated operator state shape must select checksum bytes"),
+            };
+            if actual != *expected {
+                let label = if any_inline && any_external {
+                    "mixed state checksum mismatch"
+                } else if any_inline {
+                    "inline state checksum mismatch"
+                } else {
+                    "state.bin checksum mismatch"
+                };
+                issues.push(ValidationIssue::IntegrityFailure(format!(
+                    "{label}: expected {expected}, got {actual}"
+                )));
+            }
+        }
+    }
+
+    ValidationResult {
+        checkpoint_id,
+        valid: issues.is_empty(),
+        issues,
+    }
+}
+
+fn artifact_load_failure(checkpoint_id: u64, message: String) -> ValidationResult {
+    ValidationResult {
+        checkpoint_id,
+        valid: false,
+        issues: vec![ValidationIssue::IntegrityFailure(message)],
+    }
 }
 
 /// Report from a crash-safe recovery walk.
@@ -156,7 +955,10 @@ fn parse_checkpoint_id_from_path(path: &str, prefix: &str, suffix: &str) -> Opti
             continue;
         };
         if let Ok(id) = id_str.parse::<u64>() {
-            return Some(id);
+            let canonical = format!("{prefix}{id:06}{suffix}");
+            if segment == canonical {
+                return Some(id);
+            }
         }
         warn!(
             path,
@@ -186,6 +988,17 @@ fn sha256_hex_chunks(chunks: &[bytes::Bytes]) -> String {
         hasher.update(chunk);
     }
     format!("{:x}", hasher.finalize())
+}
+
+fn checked_state_data_len(chunks: &[bytes::Bytes]) -> Result<u64, CheckpointStoreError> {
+    chunks.iter().try_fold(0_u64, |total, chunk| {
+        let chunk_len = u64::try_from(chunk.len()).map_err(|_| {
+            CheckpointStoreError::Invalid("checkpoint state sidecar length overflow".into())
+        })?;
+        total.checked_add(chunk_len).ok_or_else(|| {
+            CheckpointStoreError::Invalid("checkpoint state sidecar length overflow".into())
+        })
+    })
 }
 
 /// Combined checksum for a mixed (inline + external) manifest:
@@ -236,6 +1049,23 @@ fn sha256_hex_inline_states(
     format!("{:x}", hasher.finalize())
 }
 
+fn operator_state_shape(manifest: &CheckpointManifest) -> (bool, bool) {
+    manifest
+        .operator_states
+        .values()
+        .fold((false, false), |(inline, external), operator| {
+            (inline || !operator.external, external || operator.external)
+        })
+}
+
+fn requires_state_data(manifest: &CheckpointManifest) -> bool {
+    manifest.state_checksum.is_some()
+        && manifest
+            .operator_states
+            .values()
+            .any(|state| state.external)
+}
+
 /// Trait for checkpoint persistence backends.
 ///
 /// Implementations must guarantee atomic manifest writes (readers never see
@@ -243,13 +1073,69 @@ fn sha256_hex_inline_states(
 /// manifest is fully written and synced.
 #[async_trait]
 pub trait CheckpointStore: Send + Sync {
-    /// Runtime vnode count that manifests written by this store are
-    /// expected to use. Consulted when validating loaded manifests —
-    /// a mismatch is reported as a manifest warning. Defaults to
-    /// [`crate::checkpoint::checkpoint_manifest::DEFAULT_VNODE_COUNT`] when the
-    /// implementation has no configured value.
-    fn vnode_count(&self) -> u16 {
-        crate::checkpoint::checkpoint_manifest::DEFAULT_VNODE_COUNT
+    /// Maximum aggregate raw logical operator-state bytes admitted for one checkpoint.
+    ///
+    /// The same bound independently limits the physical sidecar. Implementations must enforce it
+    /// on writes, body reads, metadata-only length reads, and artifact validation.
+    fn max_state_data_bytes(&self) -> u64;
+
+    /// Runtime key-group count that manifests written by this store are
+    /// expected to use. Consulted when validating loaded manifests. Embedded
+    /// and single-node stores default to one key group.
+    fn key_group_count(&self) -> KeyGroupCount {
+        LOCAL_KEY_GROUP_COUNT
+    }
+
+    /// Participant whose manifests belong in this store namespace.
+    ///
+    /// Embedded and standalone stores use participant `0`; cluster stores use their stable
+    /// numeric instance id and a matching participant-specific namespace.
+    fn participant_id(&self) -> u64 {
+        0
+    }
+
+    /// Reject a manifest that was routed to another participant's namespace.
+    ///
+    /// # Errors
+    /// Returns [`CheckpointStoreError::Invalid`] when the manifest participant does not match
+    /// this store's participant.
+    fn ensure_manifest_participant(
+        &self,
+        manifest: &CheckpointManifest,
+    ) -> Result<(), CheckpointStoreError> {
+        if manifest.participant_id == self.participant_id() {
+            Ok(())
+        } else {
+            Err(CheckpointStoreError::Invalid(format!(
+                "manifest participant {} does not match store participant {}",
+                manifest.participant_id,
+                self.participant_id()
+            )))
+        }
+    }
+
+    /// Reject an invalid manifest before any sidecar, directory, or object is created.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointStoreError::Invalid`] when the manifest violates an invariant.
+    fn ensure_manifest_valid(
+        &self,
+        manifest: &CheckpointManifest,
+    ) -> Result<(), CheckpointStoreError> {
+        let errors = manifest.validate(self.key_group_count());
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(CheckpointStoreError::Invalid(format!(
+                "manifest validation: {}",
+                errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )))
+        }
     }
 
     /// Atomically persists a checkpoint manifest. Implementations must
@@ -259,11 +1145,13 @@ pub trait CheckpointStore: Send + Sync {
     /// Returns [`CheckpointStoreError`] on I/O or serialization failure.
     async fn save(&self, manifest: &CheckpointManifest) -> Result<(), CheckpointStoreError>;
 
-    /// Loads the most recent checkpoint manifest, or `Ok(None)` on a
-    /// fresh store.
+    /// Loads the most recent checkpoint manifest, or `Ok(None)` when the
+    /// recovery pointer does not exist in a fresh store.
     ///
     /// # Errors
-    /// Returns [`CheckpointStoreError`] on I/O or deserialization failure.
+    /// Returns [`CheckpointStoreError`] on I/O or deserialization failure, or
+    /// when an existing recovery pointer is malformed, dangling, or references
+    /// anything other than the matching Finalized manifest.
     async fn load_latest(&self) -> Result<Option<CheckpointManifest>, CheckpointStoreError>;
 
     /// Loads a specific manifest, or `Ok(None)` if absent.
@@ -273,12 +1161,31 @@ pub trait CheckpointStore: Send + Sync {
     async fn load_by_id(&self, id: u64)
         -> Result<Option<CheckpointManifest>, CheckpointStoreError>;
 
+    /// Load an exact checkpoint from a participant namespace.
+    ///
+    /// Cluster recovery uses this only when the durable decision proves that the local
+    /// participant was not part of the committed cut. Implementations that do not expose a
+    /// shared participant namespace reject non-local reads.
+    async fn load_manifest_for_participant(
+        &self,
+        participant_id: u64,
+        id: u64,
+    ) -> Result<Option<CheckpointManifest>, CheckpointStoreError> {
+        if participant_id != self.participant_id() {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "checkpoint store participant {} cannot read participant {participant_id}",
+                self.participant_id()
+            )));
+        }
+        self.load_by_id(id).await
+    }
+
     /// Lists all available checkpoints as `(id, epoch)` pairs, sorted
     /// ascending by ID. May read every manifest; callers that only
     /// need IDs should use [`Self::list_ids`].
     ///
     /// # Errors
-    /// Returns [`CheckpointStoreError`] on I/O failure.
+    /// Returns [`CheckpointStoreError`] on I/O, deserialization, or manifest validation failure.
     async fn list(&self) -> Result<Vec<(u64, u64)>, CheckpointStoreError>;
 
     /// Lists all checkpoint IDs, **sorted ascending**. Unlike
@@ -287,30 +1194,56 @@ pub trait CheckpointStore: Send + Sync {
     ///
     /// # Errors
     /// Returns [`CheckpointStoreError`] on I/O failure.
-    async fn list_ids(&self) -> Result<Vec<u64>, CheckpointStoreError> {
-        // Default: O(N) manifest reads via list(). Production backends
-        // should override; list() already sorts ascending.
-        Ok(self.list().await?.iter().map(|(id, _)| *id).collect())
-    }
+    async fn list_ids(&self) -> Result<Vec<u64>, CheckpointStoreError>;
 
-    /// Prunes old checkpoints, keeping at most `keep_count` recent
-    /// ones. Returns the number of checkpoints removed.
+    /// Prunes manifests whose checkpoint epoch is strictly below `before_epoch`.
+    ///
+    /// This is the production retention primitive. The coordinator supplies the
+    /// same externally-committed/recovery-safe horizon used for state and decision
+    /// retention, so all three durable inventories advance together. The manifest
+    /// referenced by the latest recovery pointer is always retained.
     ///
     /// # Errors
-    /// Returns [`CheckpointStoreError`] on I/O failure.
-    async fn prune(&self, keep_count: usize) -> Result<usize, CheckpointStoreError>;
+    /// Returns [`CheckpointStoreError`] on I/O or deserialization failure. A
+    /// malformed latest pointer or manifest fails closed without deleting it.
+    async fn prune_before(&self, before_epoch: u64) -> Result<usize, CheckpointStoreError>;
 
-    /// Overwrites an existing manifest, bypassing the conditional-PUT
-    /// fence used by [`Self::save`]. Used after a successful sink
-    /// commit to record per-sink status transitions.
+    /// Atomically publish a prepared checkpoint as the latest recoverable cut.
     ///
-    /// # Errors
-    /// Returns [`CheckpointStoreError`] on I/O or serialization failure.
-    async fn update_manifest(
+    /// The transition is idempotent and preserves the checksum stamped by
+    /// [`Self::save_with_state`].
+    async fn finalize(
         &self,
-        manifest: &CheckpointManifest,
-    ) -> Result<(), CheckpointStoreError> {
-        self.save(manifest).await
+        checkpoint_id: u64,
+    ) -> Result<CheckpointManifest, CheckpointStoreError> {
+        let mut manifest = self
+            .load_by_id(checkpoint_id)
+            .await?
+            .ok_or(CheckpointStoreError::NotFound(checkpoint_id))?;
+        if manifest.checkpoint_id != checkpoint_id {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "storage id {checkpoint_id} contains manifest id {}",
+                manifest.checkpoint_id
+            )));
+        }
+        self.ensure_manifest_participant(&manifest)?;
+        let errors = manifest.validate(self.key_group_count());
+        if !errors.is_empty() {
+            return Err(CheckpointStoreError::Invalid(
+                errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ));
+        }
+        if manifest.durable_phase == DurableCheckpointPhase::Prepared {
+            manifest.durable_phase = DurableCheckpointPhase::Finalized;
+        }
+        // Save even when the manifest was already Finalized: a crash may have landed that phase
+        // transition but not its recovery pointer, and finalize is the repair operation.
+        self.save(&manifest).await?;
+        Ok(manifest)
     }
 
     /// Writes operator state sidecar bytes for a checkpoint.
@@ -322,7 +1255,8 @@ pub trait CheckpointStore: Send + Sync {
     /// write sequentially.
     ///
     /// # Errors
-    /// Returns [`CheckpointStoreError`] on I/O failure.
+    /// Returns [`CheckpointStoreError`] on I/O failure or when the sidecar
+    /// exceeds [`Self::max_state_data_bytes`].
     async fn save_state_data(
         &self,
         id: u64,
@@ -333,8 +1267,78 @@ pub trait CheckpointStore: Send + Sync {
     /// if no sidecar was written.
     ///
     /// # Errors
-    /// Returns [`CheckpointStoreError`] on I/O failure.
+    /// Returns [`CheckpointStoreError`] on I/O failure, malformed storage
+    /// metadata/body, or a sidecar above [`Self::max_state_data_bytes`].
     async fn load_state_data(&self, id: u64) -> Result<Option<Vec<u8>>, CheckpointStoreError>;
+
+    /// Load operator state sidecar bytes from a participant namespace.
+    ///
+    /// Stores without a shared participant namespace reject non-local reads.
+    async fn load_state_data_for_participant(
+        &self,
+        participant_id: u64,
+        id: u64,
+    ) -> Result<Option<Vec<u8>>, CheckpointStoreError> {
+        if participant_id != self.participant_id() {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "checkpoint store participant {} cannot read participant {participant_id}",
+                self.participant_id()
+            )));
+        }
+        self.load_state_data(id).await
+    }
+
+    /// Read only the durable sidecar object's length from storage metadata.
+    ///
+    /// Cluster retention uses this to prove that a manifest's immutable sidecar still exists
+    /// without downloading its body. Custom stores fail closed until they provide an equivalent
+    /// metadata-only lookup.
+    async fn state_data_len_for_participant(
+        &self,
+        participant_id: u64,
+        id: u64,
+    ) -> Result<Option<u64>, CheckpointStoreError> {
+        Err(CheckpointStoreError::Invalid(format!(
+            "checkpoint store participant {} cannot provide metadata-only sidecar evidence for participant {participant_id} checkpoint {id}",
+            self.participant_id()
+        )))
+    }
+
+    /// Load the manifest and checksum-required sidecar for a local checkpoint exactly once.
+    async fn load_checkpoint_artifacts(
+        &self,
+        id: u64,
+    ) -> Result<Option<CheckpointArtifacts>, CheckpointStoreError> {
+        self.load_checkpoint_artifacts_for_participant(self.participant_id(), id)
+            .await
+    }
+
+    /// Load the manifest and checksum-required sidecar from a participant namespace exactly once.
+    ///
+    /// Inline-only checkpoints do not read `state.bin`. External and mixed shapes perform one
+    /// sidecar read after the manifest has selected that shape.
+    async fn load_checkpoint_artifacts_for_participant(
+        &self,
+        participant_id: u64,
+        id: u64,
+    ) -> Result<Option<CheckpointArtifacts>, CheckpointStoreError> {
+        let Some(manifest) = self
+            .load_manifest_for_participant(participant_id, id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let state_data = if requires_state_data(&manifest) {
+            self.load_state_data_for_participant(participant_id, id)
+                .await?
+        } else {
+            None
+        };
+        Ok(Some(CheckpointArtifacts {
+            manifest,
+            state_data,
+        }))
+    }
 
     /// Validate a specific checkpoint's integrity.
     ///
@@ -345,93 +1349,34 @@ pub trait CheckpointStore: Send + Sync {
     ///
     /// Returns [`CheckpointStoreError`] on I/O failure.
     async fn validate_checkpoint(&self, id: u64) -> Result<ValidationResult, CheckpointStoreError> {
-        let mut issues = Vec::new();
-
-        // Load manifest — corrupt JSON is a validation failure, not an I/O error.
-        let manifest = match self.load_by_id(id).await {
-            Ok(Some(m)) => m,
+        let artifacts = match self.load_checkpoint_artifacts(id).await {
+            Ok(Some(artifacts)) => artifacts,
             Ok(None) => {
-                return Ok(ValidationResult {
-                    checkpoint_id: id,
-                    valid: false,
-                    issues: vec![ValidationIssue::IntegrityFailure(format!(
-                        "manifest not found for checkpoint {id}"
-                    ))],
-                });
+                return Ok(artifact_load_failure(
+                    id,
+                    format!("manifest not found for checkpoint {id}"),
+                ));
             }
-            Err(CheckpointStoreError::Serde(e)) => {
-                return Ok(ValidationResult {
-                    checkpoint_id: id,
-                    valid: false,
-                    issues: vec![ValidationIssue::IntegrityFailure(format!(
-                        "corrupt manifest: {e}"
-                    ))],
-                });
+            Err(CheckpointStoreError::Serde(error)) => {
+                return Ok(artifact_load_failure(
+                    id,
+                    format!("corrupt manifest: {error}"),
+                ));
             }
-            Err(e) => return Err(e),
+            Err(CheckpointStoreError::Invalid(error)) => {
+                return Ok(artifact_load_failure(id, error));
+            }
+            Err(error) => return Err(error),
         };
-
-        for err in manifest.validate(self.vnode_count()) {
-            issues.push(ValidationIssue::ManifestWarning(format!(
-                "manifest validation: {err}"
-            )));
-        }
-
-        // `state_checksum` covers, depending on shape: the sidecar bytes
-        // (purely-external), the inline operator_states (purely-inline),
-        // or both (mixed) — see `sha256_hex_mixed`.
-        if let Some(expected) = &manifest.state_checksum {
-            let any_inline = manifest.operator_states.values().any(|o| !o.external);
-            let any_external = manifest.operator_states.values().any(|o| o.external);
-            let needs_sidecar = any_external || !any_inline;
-            let sidecar = if needs_sidecar {
-                self.load_state_data(id).await?
-            } else {
-                None
-            };
-            let actual = match (any_inline, &sidecar) {
-                (true, Some(data)) => {
-                    sha256_hex_mixed(&manifest.operator_states, std::iter::once(data.as_slice()))
-                }
-                (true, None) if !any_external => {
-                    sha256_hex_inline_states(&manifest.operator_states)
-                }
-                (_, Some(data)) => sha256_hex(data),
-                (_, None) => {
-                    issues.push(ValidationIssue::IntegrityFailure(
-                        "state.bin referenced by checksum but not found".into(),
-                    ));
-                    String::new()
-                }
-            };
-            if !actual.is_empty() && actual != *expected {
-                let label = if any_inline && any_external {
-                    "mixed state checksum mismatch"
-                } else if any_inline {
-                    "inline state checksum mismatch"
-                } else {
-                    "state.bin checksum mismatch"
-                };
-                issues.push(ValidationIssue::IntegrityFailure(format!(
-                    "{label}: expected {expected}, got {actual}"
-                )));
-            }
-        }
-
-        // epoch=0 or checkpoint_id=0 indicates a corrupted or nonsensical
-        // manifest — reject as invalid regardless of other issues.
-        if manifest.epoch == 0 || manifest.checkpoint_id == 0 {
-            issues.push(ValidationIssue::IntegrityFailure(
-                "epoch or checkpoint_id is 0 — likely corrupted".into(),
-            ));
-        }
-
-        let valid = issues.iter().all(|i| !i.is_fatal());
-        Ok(ValidationResult {
-            checkpoint_id: id,
-            valid,
-            issues,
-        })
+        let (_, validation) = artifacts
+            .validate(
+                id,
+                self.participant_id(),
+                self.key_group_count(),
+                self.max_state_data_bytes(),
+            )
+            .await?;
+        Ok(validation)
     }
 
     /// Walk backward from latest to find the first valid checkpoint.
@@ -454,14 +1399,43 @@ pub trait CheckpointStore: Send + Sync {
         let examined = ids.len();
 
         for id in &ids {
-            let result = self.validate_checkpoint(*id).await?;
+            let (result, durable_phase) = match self.load_checkpoint_artifacts(*id).await {
+                Ok(Some(artifacts)) => {
+                    let durable_phase = artifacts.manifest.durable_phase;
+                    let (_, validation) = artifacts
+                        .validate(
+                            *id,
+                            self.participant_id(),
+                            self.key_group_count(),
+                            self.max_state_data_bytes(),
+                        )
+                        .await?;
+                    (validation, Some(durable_phase))
+                }
+                Ok(None) => (
+                    artifact_load_failure(*id, format!("manifest not found for checkpoint {id}")),
+                    None,
+                ),
+                Err(CheckpointStoreError::Serde(error)) => (
+                    artifact_load_failure(*id, format!("corrupt manifest: {error}")),
+                    None,
+                ),
+                Err(CheckpointStoreError::Invalid(error)) => {
+                    (artifact_load_failure(*id, error), None)
+                }
+                Err(error) => return Err(error),
+            };
             if result.valid {
-                return Ok(RecoveryReport {
-                    chosen_id: Some(*id),
-                    skipped,
-                    examined,
-                    elapsed: start.elapsed(),
-                });
+                if durable_phase == Some(DurableCheckpointPhase::Finalized) {
+                    return Ok(RecoveryReport {
+                        chosen_id: Some(*id),
+                        skipped,
+                        examined,
+                        elapsed: start.elapsed(),
+                    });
+                }
+                skipped.push((*id, "checkpoint is prepared but not finalized".into()));
+                continue;
             }
             let reason = result
                 .issues
@@ -485,18 +1459,6 @@ pub trait CheckpointStore: Send + Sync {
         })
     }
 
-    /// Delete orphaned state files that have no matching manifest.
-    ///
-    /// Returns the number of orphans cleaned up.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CheckpointStoreError`] on I/O failure.
-    async fn cleanup_orphans(&self) -> Result<usize, CheckpointStoreError> {
-        // Default: no-op. Overridden by implementations that can detect orphans.
-        Ok(0)
-    }
-
     /// Atomically saves a checkpoint manifest with optional sidecar state data.
     ///
     /// When `state_data` is provided, the sidecar (`state.bin`) is written and
@@ -504,35 +1466,74 @@ pub trait CheckpointStore: Send + Sync {
     /// fails, the manifest is never persisted and `latest.txt` still points to
     /// the previous valid checkpoint.
     ///
-    /// Orphaned `state.bin` files (written but no manifest) are harmless and
-    /// cleaned up by [`prune()`](Self::prune).
+    /// A `state.bin` written without a manifest is not visible to checkpoint
+    /// inventory or recovery.
     ///
     /// # Errors
     ///
-    /// Returns [`CheckpointStoreError`] on I/O or serialization failure.
+    /// Returns [`CheckpointStoreError`] on I/O, serialization, validation, or operator state
+    /// above [`Self::max_state_data_bytes`].
     async fn save_with_state(
         &self,
         manifest: &CheckpointManifest,
         state_data: Option<&[bytes::Bytes]>,
-    ) -> Result<(), CheckpointStoreError> {
+    ) -> Result<CheckpointManifest, CheckpointStoreError> {
+        self.ensure_manifest_participant(manifest)?;
+        let max_state_data_bytes = self.max_state_data_bytes();
+        validate_max_checkpoint_state_bytes(max_state_data_bytes)?;
+
+        // Validate the cheap manifest invariants before scheduling a potentially large hash. The
+        // checksum is always restamped below, so a temporary value satisfies its presence rule.
         let mut manifest = manifest.clone();
-        if let Some(chunks) = state_data {
-            // Compute checksum across the chunks before writing. This is
-            // safe because: (1) save_state_data writes to a temp then
-            // renames atomically, so the on-disk bytes match the
-            // in-memory chain exactly; (2) if the sidecar write fails,
-            // save() is never called, so the manifest with the checksum
-            // is never persisted.
-            manifest.state_checksum = Some(stamp_checksum(&manifest.operator_states, Some(chunks)));
-            self.save_state_data(manifest.checkpoint_id, chunks).await?;
-        } else if !manifest.operator_states.is_empty()
-            && manifest.operator_states.values().all(|o| !o.external)
-            && manifest.state_checksum.is_none()
-        {
-            // Inline-only: checksum guards against a torn manifest.json write.
-            manifest.state_checksum = Some(sha256_hex_inline_states(&manifest.operator_states));
+        if !manifest.operator_states.is_empty() && manifest.state_checksum.is_none() {
+            manifest.state_checksum = Some("pending".into());
         }
-        self.save(&manifest).await
+        self.ensure_manifest_valid(&manifest)?;
+
+        // Bytes clones retain the capture buffers without copying their contents. Hashing and
+        // exact base64/layout validation are CPU work and must not occupy a Tokio worker.
+        let state_data = state_data.map(<[bytes::Bytes]>::to_vec);
+        let (manifest, state_data) = tokio::task::spawn_blocking(move || {
+            let state_data_len = state_data
+                .as_deref()
+                .map(checked_state_data_len)
+                .transpose()?;
+            let issues =
+                operator_state_validation_issues(&manifest, state_data_len, max_state_data_bytes);
+            if !issues.is_empty() {
+                return Err(CheckpointStoreError::Invalid(format!(
+                    "operator state validation: {}",
+                    issues
+                        .iter()
+                        .map(ValidationIssue::message)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )));
+            }
+
+            let mut manifest = manifest;
+            manifest.state_checksum = if let Some(chunks) = state_data.as_deref() {
+                Some(stamp_checksum(&manifest.operator_states, Some(chunks)))
+            } else if manifest.operator_states.is_empty() {
+                None
+            } else {
+                Some(sha256_hex_inline_states(&manifest.operator_states))
+            };
+            Ok((manifest, state_data))
+        })
+        .await
+        .map_err(|error| {
+            CheckpointStoreError::Io(std::io::Error::other(format!(
+                "checkpoint checksum task failed: {error}"
+            )))
+        })??;
+
+        self.ensure_manifest_valid(&manifest)?;
+        if let Some(chunks) = state_data.as_deref() {
+            self.save_state_data(manifest.checkpoint_id, chunks).await?;
+        }
+        self.save(&manifest).await?;
+        Ok(manifest)
     }
 }
 
@@ -561,8 +1562,11 @@ fn stamp_checksum(
 /// for Windows compatibility.
 pub struct FileSystemCheckpointStore {
     base_dir: PathBuf,
-    max_retained: usize,
-    vnode_count: u16,
+    key_group_count: KeyGroupCount,
+    participant_id: u64,
+    max_state_data_bytes: u64,
+    #[cfg(test)]
+    latest_publication_gate: Option<Arc<FilesystemLatestPublicationGate>>,
 }
 
 impl FileSystemCheckpointStore {
@@ -571,24 +1575,53 @@ impl FileSystemCheckpointStore {
     /// The `base_dir` is the parent directory; checkpoints are stored under
     /// `{base_dir}/checkpoints/`. The directory is created lazily on first save.
     ///
-    /// The store's `vnode_count` defaults to
-    /// [`crate::checkpoint::checkpoint_manifest::DEFAULT_VNODE_COUNT`]. Hosts that run
-    /// with a non-default value should chain [`Self::with_vnode_count`] so
-    /// manifest validation checks the right invariant.
+    /// Embedded and single-node stores default to one key group. Cluster hosts
+    /// must chain [`Self::with_key_group_count`] with their durable topology.
     #[must_use]
-    pub fn new(base_dir: impl Into<PathBuf>, max_retained: usize) -> Self {
+    pub fn new(base_dir: impl Into<PathBuf>) -> Self {
         Self {
             base_dir: base_dir.into(),
-            max_retained,
-            vnode_count: crate::checkpoint::checkpoint_manifest::DEFAULT_VNODE_COUNT,
+            key_group_count: LOCAL_KEY_GROUP_COUNT,
+            participant_id: 0,
+            max_state_data_bytes: DEFAULT_MAX_CHECKPOINT_STATE_BYTES,
+            #[cfg(test)]
+            latest_publication_gate: None,
         }
     }
 
-    /// Override the `vnode_count` used during manifest validation.
-    #[must_use]
-    pub fn with_vnode_count(mut self, vnode_count: u16) -> Self {
-        self.vnode_count = vnode_count;
+    #[cfg(test)]
+    fn with_latest_publication_gate(mut self, gate: Arc<FilesystemLatestPublicationGate>) -> Self {
+        self.latest_publication_gate = Some(gate);
         self
+    }
+
+    /// Override the stable key-group count used during manifest validation.
+    #[must_use]
+    pub fn with_key_group_count(mut self, key_group_count: KeyGroupCount) -> Self {
+        self.key_group_count = key_group_count;
+        self
+    }
+
+    /// Bind this store to one runtime participant.
+    #[must_use]
+    pub fn with_participant_id(mut self, participant_id: u64) -> Self {
+        self.participant_id = participant_id;
+        self
+    }
+
+    /// Override the aggregate raw logical-state and physical-sidecar bytes admitted per checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointStoreError::Invalid`] when the limit cannot safely
+    /// bound an in-memory restore allocation and its one-byte overflow probe.
+    pub fn with_max_state_data_bytes(
+        mut self,
+        max_state_data_bytes: u64,
+    ) -> Result<Self, CheckpointStoreError> {
+        validate_max_checkpoint_state_bytes(max_state_data_bytes)?;
+        self.max_state_data_bytes = max_state_data_bytes;
+        Ok(self)
     }
 
     /// Returns the checkpoints directory path.
@@ -616,14 +1649,35 @@ impl FileSystemCheckpointStore {
         self.checkpoints_dir().join("latest.txt")
     }
 
-    /// Parses a checkpoint ID from a directory name like `checkpoint_000042`.
-    fn parse_checkpoint_id(name: &str) -> Option<u64> {
-        name.strip_prefix("checkpoint_")
-            .and_then(|s| s.parse().ok())
+    /// Read the recovery pointer without loading its manifest. Retention must
+    /// preserve this exact ID even if newer prepared attempts sort after it.
+    async fn latest_checkpoint_id(&self) -> Result<Option<u64>, CheckpointStoreError> {
+        Ok(self
+            .load_latest()
+            .await?
+            .map(|manifest| manifest.checkpoint_id))
     }
 
-    /// Collects and sorts all checkpoint directory entries.
+    /// Parses a checkpoint ID from a directory name like `checkpoint_000042`.
+    fn parse_checkpoint_id(name: &str) -> Option<u64> {
+        let id = name.strip_prefix("checkpoint_")?.parse::<u64>().ok()?;
+        (name == format!("checkpoint_{id:06}")).then_some(id)
+    }
+
+    /// Collects and sorts checkpoint directories that contain a manifest.
+    ///
+    /// A sidecar-only directory is an expected crash orphan: it was written
+    /// before manifest publication and must not turn an otherwise fresh store
+    /// into unusable checkpoint history.
     async fn sorted_checkpoint_ids(&self) -> Result<Vec<u64>, CheckpointStoreError> {
+        self.sorted_checkpoint_ids_with_limit(MAX_CHECKPOINT_INVENTORY_ENTRIES)
+            .await
+    }
+
+    async fn sorted_checkpoint_ids_with_limit(
+        &self,
+        max_entries: usize,
+    ) -> Result<Vec<u64>, CheckpointStoreError> {
         let dir = self.checkpoints_dir();
         let mut reader = match tokio::fs::read_dir(&dir).await {
             Ok(r) => r,
@@ -632,17 +1686,43 @@ impl FileSystemCheckpointStore {
         };
 
         let mut ids: Vec<u64> = Vec::new();
+        let mut scanned = 0usize;
         while let Some(entry) = reader.next_entry().await? {
+            if scanned >= max_entries {
+                return Err(CheckpointStoreError::Invalid(format!(
+                    "checkpoint inventory exceeds the {max_entries}-entry safety limit"
+                )));
+            }
+            scanned += 1;
             let ft = entry.file_type().await?;
             if !ft.is_dir() {
                 continue;
             }
-            if let Some(id) = entry
-                .file_name()
-                .to_str()
-                .and_then(Self::parse_checkpoint_id)
-            {
-                ids.push(id);
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(id) = Self::parse_checkpoint_id(name) else {
+                if name.starts_with("checkpoint_") {
+                    return Err(CheckpointStoreError::Invalid(format!(
+                        "non-canonical checkpoint inventory entry '{name}'"
+                    )));
+                }
+                continue;
+            };
+            let manifest_path = entry.path().join("manifest.json");
+            match tokio::fs::symlink_metadata(&manifest_path).await {
+                Ok(meta) if meta.file_type().is_file() => {
+                    ids.push(id);
+                }
+                Ok(_) => {
+                    return Err(CheckpointStoreError::Invalid(format!(
+                        "checkpoint manifest '{}' is not a regular file",
+                        manifest_path.display()
+                    )));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
             }
         }
 
@@ -651,105 +1731,90 @@ impl FileSystemCheckpointStore {
     }
 }
 
-impl FileSystemCheckpointStore {
-    /// Find checkpoint directories that have state.bin but no manifest.json
-    /// (orphaned from a crash after sidecar write but before manifest commit).
-    async fn find_orphan_dirs(&self) -> Result<Vec<PathBuf>, CheckpointStoreError> {
-        let dir = self.checkpoints_dir();
-        let mut reader = match tokio::fs::read_dir(&dir).await {
-            Ok(r) => r,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(e.into()),
-        };
-
-        let mut orphans = Vec::new();
-        while let Some(entry) = reader.next_entry().await? {
-            let ft = entry.file_type().await?;
-            if !ft.is_dir() {
-                continue;
-            }
-            let path = entry.path();
-            let has_state = tokio::fs::metadata(path.join("state.bin")).await.is_ok();
-            let has_manifest = tokio::fs::metadata(path.join("manifest.json"))
-                .await
-                .is_ok();
-            if has_state && !has_manifest {
-                orphans.push(path);
-            }
-        }
-        Ok(orphans)
-    }
-}
-
 #[async_trait]
 impl CheckpointStore for FileSystemCheckpointStore {
-    fn vnode_count(&self) -> u16 {
-        self.vnode_count
+    fn max_state_data_bytes(&self) -> u64 {
+        self.max_state_data_bytes
+    }
+
+    fn key_group_count(&self) -> KeyGroupCount {
+        self.key_group_count
+    }
+
+    fn participant_id(&self) -> u64 {
+        self.participant_id
     }
 
     async fn save(&self, manifest: &CheckpointManifest) -> Result<(), CheckpointStoreError> {
+        self.ensure_manifest_participant(manifest)?;
+        self.ensure_manifest_valid(manifest)?;
         let cp_dir = self.checkpoint_dir(manifest.checkpoint_id);
-        tokio::fs::create_dir_all(&cp_dir).await?;
-
         let manifest_path = self.manifest_path(manifest.checkpoint_id);
-        let json = serde_json::to_string_pretty(manifest)?;
+        let encoded = bytes::Bytes::from(serde_json::to_vec_pretty(manifest)?);
+        let owned_manifest = manifest.clone();
+        tokio::task::spawn_blocking(move || {
+            publish_filesystem_manifest(&cp_dir, &manifest_path, &owned_manifest, encoded)
+        })
+        .await
+        .map_err(std::io::Error::other)??;
 
-        // Write to a temp file, fsync, then rename for atomic durability.
-        let tmp_path = manifest_path.with_extension("json.tmp");
-        let write_res = async {
-            tokio::fs::write(&tmp_path, &json).await?;
-            sync_file(&tmp_path).await?;
-            tokio::fs::rename(&tmp_path, &manifest_path).await?;
-            sync_dir(&cp_dir).await
-        }
-        .await;
-        if let Err(e) = write_res {
-            // Clean up temp file to avoid orphans on disk-full.
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return Err(e.into());
+        // Prepared attempts are inventory, never the published recovery cut.
+        if manifest.durable_phase == DurableCheckpointPhase::Prepared {
+            return Ok(());
         }
 
-        // Update latest.txt pointer — only after manifest is durable.
+        // The blocking task owns the lock and the complete compare/publish transaction. Dropping
+        // this future cannot leave a detached stale writer that later regresses the pointer.
         let latest = self.latest_path();
-        let latest_dir = latest.parent().unwrap_or(Path::new(".")).to_path_buf();
-        tokio::fs::create_dir_all(&latest_dir).await?;
-        let latest_content = format!("checkpoint_{:06}", manifest.checkpoint_id);
-        let tmp_latest = latest.with_extension("txt.tmp");
-        tokio::fs::write(&tmp_latest, &latest_content).await?;
-        sync_file(&tmp_latest).await?;
-        tokio::fs::rename(&tmp_latest, &latest).await?;
-        sync_dir(&latest_dir).await?;
-
-        // Auto-prune if configured.
-        if self.max_retained > 0 {
-            if let Err(e) = self.prune(self.max_retained).await {
-                tracing::warn!(
-                    max_retained = self.max_retained,
-                    error = %e,
-                    "[LDB-6009] Checkpoint prune failed — old checkpoints may accumulate on disk"
-                );
-            }
-        }
+        let checkpoints = self.checkpoints_dir();
+        let checkpoint_id = manifest.checkpoint_id;
+        let participant_id = self.participant_id;
+        let key_group_count = self.key_group_count;
+        #[cfg(test)]
+        let gate = self.latest_publication_gate.clone();
+        tokio::task::spawn_blocking(move || {
+            publish_filesystem_latest(
+                &checkpoints,
+                &latest,
+                checkpoint_id,
+                participant_id,
+                key_group_count,
+                #[cfg(test)]
+                gate,
+            )
+        })
+        .await
+        .map_err(std::io::Error::other)??;
 
         Ok(())
     }
 
     async fn load_latest(&self) -> Result<Option<CheckpointManifest>, CheckpointStoreError> {
         let latest = self.latest_path();
-        let content = match tokio::fs::read_to_string(&latest).await {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-        let dir_name = content.trim();
-        if dir_name.is_empty() {
+        let content = tokio::task::spawn_blocking(move || {
+            read_bounded_file(
+                &latest,
+                MAX_LATEST_POINTER_BYTES,
+                "checkpoint recovery pointer",
+            )
+        })
+        .await
+        .map_err(std::io::Error::other)??;
+        let Some(content) = content else {
             return Ok(None);
+        };
+        let checkpoint_id = parse_filesystem_latest(&content)?;
+        let manifest = self.load_by_id(checkpoint_id).await?.ok_or_else(|| {
+            CheckpointStoreError::Invalid(format!(
+                "checkpoint recovery pointer references missing checkpoint {checkpoint_id}"
+            ))
+        })?;
+        if manifest.durable_phase != DurableCheckpointPhase::Finalized {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "checkpoint recovery pointer references non-finalized checkpoint {checkpoint_id}"
+            )));
         }
-
-        match Self::parse_checkpoint_id(dir_name) {
-            Some(id) => self.load_by_id(id).await,
-            None => Ok(None),
-        }
+        Ok(Some(manifest))
     }
 
     async fn load_by_id(
@@ -757,24 +1822,13 @@ impl CheckpointStore for FileSystemCheckpointStore {
         id: u64,
     ) -> Result<Option<CheckpointManifest>, CheckpointStoreError> {
         let path = self.manifest_path(id);
-        let json = match tokio::fs::read_to_string(&path).await {
-            Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-        let manifest: CheckpointManifest = serde_json::from_str(&json)?;
-
-        let errors = manifest.validate(self.vnode_count());
-        if !errors.is_empty() {
-            tracing::warn!(
-                checkpoint_id = id,
-                error_count = errors.len(),
-                first_error = %errors[0],
-                "loaded checkpoint manifest has validation warnings"
-            );
-        }
-
-        Ok(Some(manifest))
+        let participant_id = self.participant_id;
+        let key_group_count = self.key_group_count;
+        tokio::task::spawn_blocking(move || {
+            load_filesystem_manifest(&path, id, participant_id, key_group_count)
+        })
+        .await
+        .map_err(std::io::Error::other)?
     }
 
     async fn list_ids(&self) -> Result<Vec<u64>, CheckpointStoreError> {
@@ -786,31 +1840,44 @@ impl CheckpointStore for FileSystemCheckpointStore {
         let mut result = Vec::with_capacity(ids.len());
 
         for id in ids {
-            // Skip missing/corrupt manifests — list() is best-effort.
-            if let Ok(Some(manifest)) = self.load_by_id(id).await {
-                result.push((manifest.checkpoint_id, manifest.epoch));
-            }
+            let manifest = self
+                .load_by_id(id)
+                .await?
+                .ok_or(CheckpointStoreError::NotFound(id))?;
+            result.push((manifest.checkpoint_id, manifest.epoch));
         }
 
         Ok(result)
     }
 
-    async fn prune(&self, keep_count: usize) -> Result<usize, CheckpointStoreError> {
-        let ids = self.sorted_checkpoint_ids().await?;
-        if ids.len() <= keep_count {
-            return Ok(0);
-        }
+    async fn prune_before(&self, before_epoch: u64) -> Result<usize, CheckpointStoreError> {
+        let latest_id = self.latest_checkpoint_id().await?;
+        let mut candidates = Vec::new();
 
-        let to_remove = ids.len() - keep_count;
-        let mut removed = 0;
-
-        for &id in &ids[..to_remove] {
-            let dir = self.checkpoint_dir(id);
-            if tokio::fs::remove_dir_all(&dir).await.is_ok() {
-                removed += 1;
+        // Resolve the complete candidate set before deleting anything. A corrupt
+        // manifest therefore fails this pass closed instead of partially advancing
+        // retention past an inventory we could not classify.
+        for id in self.sorted_checkpoint_ids().await? {
+            if Some(id) == latest_id {
+                continue;
+            }
+            let manifest = self
+                .load_by_id(id)
+                .await?
+                .ok_or(CheckpointStoreError::NotFound(id))?;
+            if manifest.epoch < before_epoch {
+                candidates.push(id);
             }
         }
 
+        let mut removed = 0;
+        for id in candidates {
+            match tokio::fs::remove_dir_all(self.checkpoint_dir(id)).await {
+                Ok(()) => removed += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         Ok(removed)
     }
 
@@ -819,84 +1886,137 @@ impl CheckpointStore for FileSystemCheckpointStore {
         id: u64,
         chunks: &[bytes::Bytes],
     ) -> Result<(), CheckpointStoreError> {
-        use tokio::io::AsyncWriteExt;
-
+        let state_len = checked_state_data_len(chunks)?;
+        if state_len > self.max_state_data_bytes {
+            return Err(oversized_metadata(
+                "checkpoint state sidecar",
+                state_len,
+                self.max_state_data_bytes,
+            ));
+        }
         let cp_dir = self.checkpoint_dir(id);
-        tokio::fs::create_dir_all(&cp_dir).await?;
-
         let path = self.state_path(id);
-        let tmp = path.with_extension("bin.tmp");
-
-        // Write chunks sequentially to the temp file — no concatenation
-        // into a contiguous buffer. Each chunk is already an owned Bytes;
-        // write_all borrows it.
-        let mut file = tokio::fs::File::create(&tmp).await?;
-        for chunk in chunks {
-            file.write_all(chunk).await?;
-        }
-        file.sync_all().await?;
-        drop(file);
-
-        tokio::fs::rename(&tmp, &path).await?;
-        sync_dir(&cp_dir).await?;
-
-        Ok(())
-    }
-
-    async fn save_with_state(
-        &self,
-        manifest: &CheckpointManifest,
-        state_data: Option<&[bytes::Bytes]>,
-    ) -> Result<(), CheckpointStoreError> {
-        let mut manifest = manifest.clone();
-        // Write sidecar FIRST — if this fails, manifest is never written
-        // and latest.txt still points to the previous valid checkpoint.
-        if let Some(chunks) = state_data {
-            manifest.state_checksum = Some(stamp_checksum(&manifest.operator_states, Some(chunks)));
-            self.save_state_data(manifest.checkpoint_id, chunks).await?;
-        } else if !manifest.operator_states.is_empty()
-            && manifest.operator_states.values().all(|o| !o.external)
-            && manifest.state_checksum.is_none()
-        {
-            // Inline-only: checksum guards against a torn manifest.json write.
-            manifest.state_checksum = Some(sha256_hex_inline_states(&manifest.operator_states));
-        }
-        self.save(&manifest).await
-    }
-
-    async fn cleanup_orphans(&self) -> Result<usize, CheckpointStoreError> {
-        let orphans = self.find_orphan_dirs().await?;
-        let mut cleaned = 0;
-        for dir in &orphans {
-            if tokio::fs::remove_dir_all(dir).await.is_ok() {
-                tracing::info!(
-                    path = %dir.display(),
-                    "cleaned up orphaned checkpoint directory"
-                );
-                cleaned += 1;
-            }
-        }
-        Ok(cleaned)
+        let chunks = chunks.to_vec();
+        tokio::task::spawn_blocking(move || publish_filesystem_state(&cp_dir, &path, &chunks))
+            .await
+            .map_err(std::io::Error::other)?
     }
 
     async fn load_state_data(&self, id: u64) -> Result<Option<Vec<u8>>, CheckpointStoreError> {
         let path = self.state_path(id);
-        match tokio::fs::read(&path).await {
-            Ok(data) => Ok(Some(data)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
+        let limit = self.max_state_data_bytes;
+        tokio::task::spawn_blocking(move || {
+            read_bounded_regular_file(&path, limit, "checkpoint state sidecar")
+        })
+        .await
+        .map_err(std::io::Error::other)?
+    }
+
+    async fn state_data_len_for_participant(
+        &self,
+        participant_id: u64,
+        id: u64,
+    ) -> Result<Option<u64>, CheckpointStoreError> {
+        if participant_id != self.participant_id {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "checkpoint store participant {} cannot read participant {participant_id}",
+                self.participant_id
+            )));
         }
+        let path = self.state_path(id);
+        let limit = self.max_state_data_bytes;
+        tokio::task::spawn_blocking(move || {
+            Ok(
+                open_bounded_regular_file(&path, limit, "checkpoint state sidecar")?
+                    .map(|(_, len)| len),
+            )
+        })
+        .await
+        .map_err(std::io::Error::other)?
     }
 }
 
 // ---------------------------------------------------------------------------
-// ObjectStoreCheckpointStore — sync wrapper around any ObjectStore backend
+// ObjectStoreCheckpointStore — adapter for any ObjectStore backend
 // ---------------------------------------------------------------------------
 
 /// JSON pointer stored in `manifests/latest.json`.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct LatestPointer {
     checkpoint_id: u64,
+}
+
+struct VersionedBytes {
+    bytes: bytes::Bytes,
+    version: UpdateVersion,
+}
+
+struct VersionedManifest {
+    manifest: CheckpointManifest,
+    version: UpdateVersion,
+}
+
+async fn collect_bounded_state_data(
+    result: object_store::GetResult,
+    expected_size: u64,
+    expected_len: usize,
+    limit: u64,
+) -> Result<Vec<u8>, CheckpointStoreError> {
+    use futures::TryStreamExt;
+
+    if result.meta.size > limit {
+        return Err(oversized_metadata(
+            "checkpoint state sidecar",
+            result.meta.size,
+            limit,
+        ));
+    }
+    if result.meta.size != expected_size {
+        return Err(CheckpointStoreError::Invalid(format!(
+            "checkpoint state sidecar length changed from {expected_size} to {} bytes after metadata preflight",
+            result.meta.size
+        )));
+    }
+    if result.range.start != 0 || result.range.end != expected_size {
+        return Err(CheckpointStoreError::Invalid(format!(
+            "checkpoint state sidecar response range {}..{} does not match its advertised {expected_size}-byte length",
+            result.range.start, result.range.end
+        )));
+    }
+
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(expected_len).map_err(|error| {
+        CheckpointStoreError::Invalid(format!(
+            "checkpoint state sidecar cannot reserve its advertised {expected_size}-byte length: {error}"
+        ))
+    })?;
+    let mut stream = result.into_stream();
+    while let Some(chunk) = stream.try_next().await? {
+        let next_len = bytes.len().checked_add(chunk.len()).ok_or_else(|| {
+            CheckpointStoreError::Invalid("checkpoint state sidecar body length overflow".into())
+        })?;
+        let next_len_u64 = u64::try_from(next_len).unwrap_or(u64::MAX);
+        if next_len_u64 > limit {
+            return Err(oversized_metadata(
+                "checkpoint state sidecar",
+                next_len_u64,
+                limit,
+            ));
+        }
+        if next_len > expected_len {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "checkpoint state sidecar body exceeded its advertised {expected_size}-byte length"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.len() != expected_len {
+        return Err(CheckpointStoreError::Invalid(format!(
+            "checkpoint state sidecar body length {} does not match its advertised {expected_size}-byte length",
+            bytes.len()
+        )));
+    }
+    Ok(bytes)
 }
 
 /// Object-store-backed checkpoint store.
@@ -918,13 +2038,15 @@ struct LatestPointer {
 ///     state-000002.bin
 /// ```
 ///
-/// Manifest writes use [`PutMode::Create`] for split-brain prevention
-/// (conditional PUT).
+/// Manifest creation, finalization, and recovery-pointer publication are all
+/// conditional writes. The only mutable manifest transition is the exact
+/// `Prepared` to `Finalized` phase change.
 pub struct ObjectStoreCheckpointStore {
     store: Arc<dyn ObjectStore>,
     prefix: String,
-    max_retained: usize,
-    vnode_count: u16,
+    key_group_count: KeyGroupCount,
+    participant_id: u64,
+    max_state_data_bytes: u64,
 }
 
 impl ObjectStoreCheckpointStore {
@@ -933,24 +2055,46 @@ impl ObjectStoreCheckpointStore {
     /// `prefix` is prepended to all object paths (e.g., `"nodes/abc123/"`).
     /// It should end with `/` or be empty.
     ///
-    /// The store's `vnode_count` defaults to
-    /// [`crate::checkpoint::checkpoint_manifest::DEFAULT_VNODE_COUNT`]. Hosts that run
-    /// with a non-default value should chain [`Self::with_vnode_count`].
+    /// Embedded and single-node stores default to one key group. Cluster hosts
+    /// must chain [`Self::with_key_group_count`] with their durable topology.
     #[must_use]
-    pub fn new(store: Arc<dyn ObjectStore>, prefix: String, max_retained: usize) -> Self {
+    pub fn new(store: Arc<dyn ObjectStore>, prefix: String) -> Self {
         Self {
             store,
             prefix,
-            max_retained,
-            vnode_count: crate::checkpoint::checkpoint_manifest::DEFAULT_VNODE_COUNT,
+            key_group_count: LOCAL_KEY_GROUP_COUNT,
+            participant_id: 0,
+            max_state_data_bytes: DEFAULT_MAX_CHECKPOINT_STATE_BYTES,
         }
     }
 
-    /// Override the `vnode_count` used during manifest validation.
+    /// Override the stable key-group count used during manifest validation.
     #[must_use]
-    pub fn with_vnode_count(mut self, vnode_count: u16) -> Self {
-        self.vnode_count = vnode_count;
+    pub fn with_key_group_count(mut self, key_group_count: KeyGroupCount) -> Self {
+        self.key_group_count = key_group_count;
         self
+    }
+
+    /// Bind this store to one runtime participant.
+    #[must_use]
+    pub fn with_participant_id(mut self, participant_id: u64) -> Self {
+        self.participant_id = participant_id;
+        self
+    }
+
+    /// Override the aggregate raw logical-state and physical-sidecar bytes admitted per checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointStoreError::Invalid`] when the limit cannot safely
+    /// bound an in-memory restore allocation and its one-byte overflow probe.
+    pub fn with_max_state_data_bytes(
+        mut self,
+        max_state_data_bytes: u64,
+    ) -> Result<Self, CheckpointStoreError> {
+        validate_max_checkpoint_state_bytes(max_state_data_bytes)?;
+        self.max_state_data_bytes = max_state_data_bytes;
+        Ok(self)
     }
 
     fn manifest_path(&self, id: u64) -> object_store::path::Path {
@@ -965,96 +2109,660 @@ impl ObjectStoreCheckpointStore {
         object_store::path::Path::from(format!("{}checkpoints/state-{id:06}.bin", self.prefix))
     }
 
+    fn prefix_for_participant(&self, participant_id: u64) -> Result<String, CheckpointStoreError> {
+        if participant_id == self.participant_id {
+            return Ok(self.prefix.clone());
+        }
+        let expected = format!("nodes/{}/", self.participant_id);
+        if self.prefix != expected {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "checkpoint prefix '{}' is not the shared {expected} namespace",
+                self.prefix
+            )));
+        }
+        Ok(format!("nodes/{participant_id}/"))
+    }
+
+    fn manifest_path_for_participant(
+        &self,
+        participant_id: u64,
+        id: u64,
+    ) -> Result<object_store::path::Path, CheckpointStoreError> {
+        let prefix = self.prefix_for_participant(participant_id)?;
+        Ok(object_store::path::Path::from(format!(
+            "{prefix}manifests/manifest-{id:06}.json"
+        )))
+    }
+
+    fn state_path_for_participant(
+        &self,
+        participant_id: u64,
+        id: u64,
+    ) -> Result<object_store::path::Path, CheckpointStoreError> {
+        let prefix = self.prefix_for_participant(participant_id)?;
+        Ok(object_store::path::Path::from(format!(
+            "{prefix}checkpoints/state-{id:06}.bin"
+        )))
+    }
+
+    /// Read the recovery pointer without loading its manifest. Retention must
+    /// preserve this exact ID even if newer prepared attempts sort after it.
+    async fn latest_checkpoint_id(&self) -> Result<Option<u64>, CheckpointStoreError> {
+        Ok(self
+            .load_latest()
+            .await?
+            .map(|manifest| manifest.checkpoint_id))
+    }
+
     // ── Helpers ──
 
-    /// Put a payload with bounded retry + jittered backoff for idempotent
-    /// writes (sidecar state, pointer update). Retries on
-    /// `object_store::Error::Generic` — which covers most transient
-    /// 5xx / connection failures across backends — and bubbles every
-    /// other error immediately. Non-idempotent writes (conditional
-    /// creates on the manifest path) MUST NOT use this helper.
+    /// Create an immutable object with bounded retry and report whether this call created it.
     ///
-    /// `payload` is consumed on the happy path and cloned on retry.
-    /// `PutPayload::clone` is cheap (Arc-bump on each underlying
-    /// `Bytes` chunk), so multi-chunk payloads cost nothing extra to
-    /// retry.
-    async fn put_with_retry(
+    /// An ambiguous transient failure is retried with the same conditional create. If the first
+    /// request actually succeeded, the retry returns `AlreadyExists`; callers then compare the
+    /// durable bytes with their intended content before treating the operation as idempotent.
+    async fn create_with_retry(
         &self,
         path: &object_store::path::Path,
         payload: PutPayload,
-        opts: &PutOptions,
-    ) -> Result<(), CheckpointStoreError> {
+    ) -> Result<bool, CheckpointStoreError> {
         const BACKOFFS_MS: &[u64] = &[100, 500, 2000];
+        let options = PutOptions {
+            mode: PutMode::Create,
+            ..PutOptions::default()
+        };
         let mut attempt = 0usize;
         loop {
-            let result = self
+            match self
                 .store
-                .put_opts(path, payload.clone(), opts.clone())
-                .await;
-            match result {
-                Ok(_) => return Ok(()),
+                .put_opts(path, payload.clone(), options.clone())
+                .await
+            {
+                Ok(_) => return Ok(true),
+                Err(object_store::Error::AlreadyExists { .. }) => return Ok(false),
                 Err(object_store::Error::Generic { .. }) if attempt < BACKOFFS_MS.len() => {
-                    let delay = std::time::Duration::from_millis(BACKOFFS_MS[attempt]);
+                    let base_ms = BACKOFFS_MS[attempt];
+                    let jitter_ms = rand::rng().random_range(0..=base_ms / 2);
+                    let delay = std::time::Duration::from_millis(base_ms + jitter_ms);
                     tracing::warn!(
                         path = %path,
                         attempt = attempt + 1,
                         delay_ms = delay.as_millis(),
-                        "transient put error, retrying"
+                        "transient immutable create error, retrying"
                     );
                     tokio::time::sleep(delay).await;
                     attempt += 1;
                 }
-                Err(e) => return Err(CheckpointStoreError::ObjectStore(e)),
+                Err(
+                    object_store::Error::NotImplemented { .. }
+                    | object_store::Error::NotSupported { .. },
+                ) => {
+                    return Err(CheckpointStoreError::Invalid(format!(
+                        "object store does not support conditional create required for immutable checkpoint object '{path}'"
+                    )));
+                }
+                Err(error) => return Err(CheckpointStoreError::ObjectStore(error)),
             }
         }
     }
 
-    /// GET an object, returning `Ok(None)` for `NotFound`.
-    async fn get_bytes(
+    /// Load a sidecar only after a metadata preflight has proved its allocation bound.
+    async fn get_bounded_state_data(
         &self,
         path: &object_store::path::Path,
-    ) -> Result<Option<bytes::Bytes>, CheckpointStoreError> {
-        match self.store.get_opts(path, GetOptions::default()).await {
-            Ok(get_result) => {
-                let data = get_result.bytes().await?;
-                Ok(Some(data))
+    ) -> Result<Option<Vec<u8>>, CheckpointStoreError> {
+        let limit = self.max_state_data_bytes;
+        let preflight = match self.store.head(path).await {
+            Ok(metadata) => metadata,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(CheckpointStoreError::ObjectStore(error)),
+        };
+        if preflight.size > limit {
+            return Err(oversized_metadata(
+                "checkpoint state sidecar",
+                preflight.size,
+                limit,
+            ));
+        }
+
+        let expected_len = usize::try_from(preflight.size).map_err(|_| {
+            CheckpointStoreError::Invalid(format!(
+                "checkpoint state sidecar size {} exceeds this process address space",
+                preflight.size
+            ))
+        })?;
+        let conditional_version = preflight.version.clone();
+        let conditional_etag = conditional_version
+            .is_none()
+            .then(|| preflight.e_tag.clone())
+            .flatten();
+
+        // An empty immutable object needs no body allocation. A conditional second HEAD still
+        // proves that the exact preflight version remains empty without issuing an invalid 0..0
+        // range request on backends that reject ranges against empty objects.
+        if expected_len == 0 {
+            let result = self
+                .store
+                .get_opts(
+                    path,
+                    GetOptions {
+                        if_match: conditional_etag,
+                        version: conditional_version,
+                        head: true,
+                        ..GetOptions::default()
+                    },
+                )
+                .await?;
+            if result.meta.size != 0 {
+                return Err(CheckpointStoreError::Invalid(format!(
+                    "checkpoint state sidecar length changed from 0 to {} bytes after metadata preflight",
+                    result.meta.size
+                )));
+            }
+            return Ok(Some(Vec::new()));
+        }
+
+        let request_end = preflight.size.checked_add(1).ok_or_else(|| {
+            CheckpointStoreError::Invalid(
+                "checkpoint state sidecar safety limit cannot be range-bounded".into(),
+            )
+        })?;
+        let result = self
+            .store
+            .get_opts(
+                path,
+                GetOptions {
+                    if_match: conditional_etag,
+                    range: Some(GetRange::Bounded(0..request_end)),
+                    version: conditional_version,
+                    ..GetOptions::default()
+                },
+            )
+            .await?;
+        collect_bounded_state_data(result, preflight.size, expected_len, limit)
+            .await
+            .map(Some)
+    }
+
+    async fn get_bounded_versioned(
+        &self,
+        path: &object_store::path::Path,
+        limit: u64,
+        kind: &str,
+    ) -> Result<Option<VersionedBytes>, CheckpointStoreError> {
+        let request_end = limit.checked_add(1).ok_or_else(|| {
+            CheckpointStoreError::Invalid(format!("{kind} limit cannot be range-bounded"))
+        })?;
+        match self
+            .store
+            .get_opts(
+                path,
+                GetOptions {
+                    range: Some(GetRange::Bounded(0..request_end)),
+                    ..GetOptions::default()
+                },
+            )
+            .await
+        {
+            Ok(result) => {
+                use futures::TryStreamExt;
+
+                let size = result.meta.size;
+                if size > limit {
+                    return Err(oversized_metadata(kind, size, limit));
+                }
+                let range_size = result
+                    .range
+                    .end
+                    .checked_sub(result.range.start)
+                    .unwrap_or(u64::MAX);
+                if range_size > limit {
+                    return Err(oversized_metadata(kind, range_size, limit));
+                }
+                if result.range.start != 0 || result.range.end != size {
+                    return Err(CheckpointStoreError::Invalid(format!(
+                        "{kind} response range {}..{} does not match object metadata size {size}",
+                        result.range.start, result.range.end
+                    )));
+                }
+                let version = UpdateVersion {
+                    e_tag: result.meta.e_tag.clone(),
+                    version: result.meta.version.clone(),
+                };
+                let capacity = usize::try_from(size).map_err(|_| {
+                    CheckpointStoreError::Invalid(format!(
+                        "{kind} size {size} exceeds this process address space"
+                    ))
+                })?;
+                let mut bytes = BytesMut::with_capacity(capacity);
+                let mut stream = result.into_stream();
+                while let Some(chunk) = stream.try_next().await? {
+                    let next_len = bytes.len().checked_add(chunk.len()).ok_or_else(|| {
+                        CheckpointStoreError::Invalid(format!("{kind} body length overflow"))
+                    })?;
+                    if next_len > capacity {
+                        return Err(CheckpointStoreError::Invalid(format!(
+                            "{kind} body exceeded its advertised {size}-byte length"
+                        )));
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                if bytes.len() != capacity {
+                    return Err(CheckpointStoreError::Invalid(format!(
+                        "{kind} body length {} does not match object metadata size {size}",
+                        bytes.len()
+                    )));
+                }
+                Ok(Some(VersionedBytes {
+                    bytes: bytes.freeze(),
+                    version,
+                }))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(CheckpointStoreError::ObjectStore(e)),
+            Err(error) => Err(CheckpointStoreError::ObjectStore(error)),
         }
     }
 
-    /// Load a manifest from a specific path, returning `Ok(None)` for `NotFound`.
+    fn require_update_version(
+        path: &object_store::path::Path,
+        version: UpdateVersion,
+    ) -> Result<UpdateVersion, CheckpointStoreError> {
+        if version.e_tag.is_none() && version.version.is_none() {
+            Err(CheckpointStoreError::Invalid(format!(
+                "object store returned no ETag or version required for conditional update of '{path}'"
+            )))
+        } else {
+            Ok(version)
+        }
+    }
+
+    async fn load_manifest_versioned_at(
+        &self,
+        path: &object_store::path::Path,
+        checkpoint_id: u64,
+        participant_id: u64,
+    ) -> Result<Option<VersionedManifest>, CheckpointStoreError> {
+        let Some(versioned) = self
+            .get_bounded_versioned(path, MAX_MANIFEST_BYTES, "checkpoint manifest")
+            .await?
+        else {
+            return Ok(None);
+        };
+        let manifest: CheckpointManifest = serde_json::from_slice(&versioned.bytes)?;
+        ensure_loaded_manifest(
+            &manifest,
+            checkpoint_id,
+            participant_id,
+            self.key_group_count,
+        )?;
+        Ok(Some(VersionedManifest {
+            manifest,
+            version: versioned.version,
+        }))
+    }
+
     async fn load_manifest_at(
         &self,
         path: &object_store::path::Path,
+        checkpoint_id: u64,
+        participant_id: u64,
     ) -> Result<Option<CheckpointManifest>, CheckpointStoreError> {
-        match self.get_bytes(path).await? {
-            Some(data) => {
-                let manifest: CheckpointManifest = serde_json::from_slice(&data)?;
-                Ok(Some(manifest))
-            }
-            None => Ok(None),
+        Ok(self
+            .load_manifest_versioned_at(path, checkpoint_id, participant_id)
+            .await?
+            .map(|versioned| versioned.manifest))
+    }
+
+    async fn load_latest_pointer_versioned(
+        &self,
+    ) -> Result<Option<(LatestPointer, UpdateVersion)>, CheckpointStoreError> {
+        let Some(versioned) = self
+            .get_bounded_versioned(
+                &self.latest_pointer_path(),
+                MAX_LATEST_POINTER_BYTES,
+                "checkpoint recovery pointer",
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let pointer: LatestPointer = serde_json::from_slice(&versioned.bytes)?;
+        Ok(Some((pointer, versioned.version)))
+    }
+
+    async fn load_finalized_manifest(
+        &self,
+        checkpoint_id: u64,
+    ) -> Result<CheckpointManifest, CheckpointStoreError> {
+        let manifest = self
+            .load_manifest_at(
+                &self.manifest_path(checkpoint_id),
+                checkpoint_id,
+                self.participant_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                CheckpointStoreError::Invalid(format!(
+                    "checkpoint recovery pointer references missing checkpoint {checkpoint_id}"
+                ))
+            })?;
+        if manifest.durable_phase != DurableCheckpointPhase::Finalized {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "checkpoint recovery pointer references non-finalized checkpoint {checkpoint_id}"
+            )));
         }
+        Ok(manifest)
+    }
+
+    async fn publish_latest(&self, checkpoint_id: u64) -> Result<(), CheckpointStoreError> {
+        let path = self.latest_pointer_path();
+        let encoded = bytes::Bytes::from(serde_json::to_vec(&LatestPointer { checkpoint_id })?);
+        ensure_serialized_size(
+            "checkpoint recovery pointer",
+            encoded.len(),
+            MAX_LATEST_POINTER_BYTES,
+        )?;
+
+        let mut last_storage_error = None;
+        for attempt in 0..MAX_CAS_ATTEMPTS {
+            let observed = self.load_latest_pointer_versioned().await?;
+            let mode = match observed {
+                Some((pointer, version)) => {
+                    self.load_finalized_manifest(pointer.checkpoint_id).await?;
+                    if pointer.checkpoint_id >= checkpoint_id {
+                        return Ok(());
+                    }
+                    PutMode::Update(Self::require_update_version(&path, version)?)
+                }
+                None => PutMode::Create,
+            };
+            let options = PutOptions {
+                mode,
+                ..PutOptions::default()
+            };
+            match self
+                .store
+                .put_opts(&path, PutPayload::from_bytes(encoded.clone()), options)
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(
+                    object_store::Error::AlreadyExists { .. }
+                    | object_store::Error::Precondition { .. },
+                ) => {
+                    // This also reconciles a successful write whose response was lost.
+                    checkpoint_cas_backoff(attempt).await;
+                }
+                Err(error @ object_store::Error::Generic { .. }) => {
+                    last_storage_error = Some(error.to_string());
+                    checkpoint_cas_backoff(attempt).await;
+                }
+                Err(
+                    object_store::Error::NotImplemented { .. }
+                    | object_store::Error::NotSupported { .. },
+                ) => {
+                    return Err(CheckpointStoreError::Invalid(format!(
+                        "object store does not support conditional latest-pointer update for '{path}'"
+                    )));
+                }
+                Err(error) => return Err(CheckpointStoreError::ObjectStore(error)),
+            }
+        }
+
+        if let Some((pointer, _)) = self.load_latest_pointer_versioned().await? {
+            self.load_finalized_manifest(pointer.checkpoint_id).await?;
+            if pointer.checkpoint_id >= checkpoint_id {
+                return Ok(());
+            }
+        }
+        let detail = last_storage_error
+            .map(|error| format!("; last storage error: {error}"))
+            .unwrap_or_default();
+        Err(CheckpointStoreError::Invalid(format!(
+            "latest-pointer update for checkpoint {checkpoint_id} exceeded the bounded contention budget{detail}"
+        )))
+    }
+
+    async fn replace_manifest_exactly(
+        &self,
+        path: &object_store::path::Path,
+        intended: &CheckpointManifest,
+        encoded: bytes::Bytes,
+    ) -> Result<(), CheckpointStoreError> {
+        let mut last_storage_error = None;
+        for attempt in 0..MAX_CAS_ATTEMPTS {
+            let observed = self
+                .load_manifest_versioned_at(path, intended.checkpoint_id, intended.participant_id)
+                .await?
+                .ok_or_else(|| {
+                    CheckpointStoreError::Invalid(format!(
+                        "checkpoint {} manifest disappeared during finalization",
+                        intended.checkpoint_id
+                    ))
+                })?;
+            if observed.manifest == *intended || exact_phase_successor(intended, &observed.manifest)
+            {
+                return Ok(());
+            }
+            if !exact_phase_successor(&observed.manifest, intended) {
+                return Err(CheckpointStoreError::Invalid(format!(
+                    "checkpoint {} manifest already exists with different immutable content",
+                    intended.checkpoint_id
+                )));
+            }
+            let options = PutOptions {
+                mode: PutMode::Update(Self::require_update_version(path, observed.version)?),
+                ..PutOptions::default()
+            };
+            match self
+                .store
+                .put_opts(path, PutPayload::from_bytes(encoded.clone()), options)
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(object_store::Error::Precondition { .. }) => {
+                    // Re-read to distinguish contention from a successful write with a lost ACK.
+                    checkpoint_cas_backoff(attempt).await;
+                }
+                Err(error @ object_store::Error::Generic { .. }) => {
+                    last_storage_error = Some(error.to_string());
+                    checkpoint_cas_backoff(attempt).await;
+                }
+                Err(
+                    object_store::Error::NotImplemented { .. }
+                    | object_store::Error::NotSupported { .. },
+                ) => {
+                    return Err(CheckpointStoreError::Invalid(format!(
+                        "object store does not support conditional manifest finalization for '{path}'"
+                    )));
+                }
+                Err(error) => return Err(CheckpointStoreError::ObjectStore(error)),
+            }
+        }
+
+        let observed = self
+            .load_manifest_at(path, intended.checkpoint_id, intended.participant_id)
+            .await?;
+        if observed.as_ref().is_some_and(|manifest| {
+            manifest == intended || exact_phase_successor(intended, manifest)
+        }) {
+            return Ok(());
+        }
+        let detail = last_storage_error
+            .map(|error| format!("; last storage error: {error}"))
+            .unwrap_or_default();
+        Err(CheckpointStoreError::Invalid(format!(
+            "checkpoint {} manifest finalization exceeded the bounded contention budget{detail}",
+            intended.checkpoint_id
+        )))
+    }
+
+    async fn publish_manifest(
+        &self,
+        manifest: &CheckpointManifest,
+        encoded: bytes::Bytes,
+    ) -> Result<(), CheckpointStoreError> {
+        ensure_serialized_size("checkpoint manifest", encoded.len(), MAX_MANIFEST_BYTES)?;
+        let path = self.manifest_path(manifest.checkpoint_id);
+        if self
+            .create_with_retry(&path, PutPayload::from_bytes(encoded.clone()))
+            .await?
+        {
+            return Ok(());
+        }
+
+        let existing = self
+            .load_manifest_at(&path, manifest.checkpoint_id, manifest.participant_id)
+            .await?
+            .ok_or_else(|| {
+                CheckpointStoreError::Invalid(format!(
+                    "checkpoint {} manifest create reported AlreadyExists but the object is missing",
+                    manifest.checkpoint_id
+                ))
+            })?;
+        if existing == *manifest || exact_phase_successor(manifest, &existing) {
+            return Ok(());
+        }
+        if exact_phase_successor(&existing, manifest) {
+            return self
+                .replace_manifest_exactly(&path, manifest, encoded)
+                .await;
+        }
+        Err(CheckpointStoreError::Invalid(format!(
+            "checkpoint {} manifest already exists with different immutable content",
+            manifest.checkpoint_id
+        )))
+    }
+
+    async fn state_matches_chunks(
+        &self,
+        path: &object_store::path::Path,
+        chunks: &[bytes::Bytes],
+    ) -> Result<Option<bool>, CheckpointStoreError> {
+        use futures::TryStreamExt;
+
+        let expected_len = checked_state_data_len(chunks)?;
+        if expected_len > self.max_state_data_bytes {
+            return Err(oversized_metadata(
+                "checkpoint state sidecar",
+                expected_len,
+                self.max_state_data_bytes,
+            ));
+        }
+        let options = if expected_len == 0 {
+            GetOptions {
+                head: true,
+                ..GetOptions::default()
+            }
+        } else {
+            GetOptions {
+                range: Some(GetRange::Bounded(
+                    0..expected_len.checked_add(1).ok_or_else(|| {
+                        CheckpointStoreError::Invalid(
+                            "checkpoint state sidecar length cannot be range-bounded".into(),
+                        )
+                    })?,
+                )),
+                ..GetOptions::default()
+            }
+        };
+        let result = match self.store.get_opts(path, options).await {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(CheckpointStoreError::ObjectStore(error)),
+        };
+        if result.meta.size > self.max_state_data_bytes {
+            return Err(oversized_metadata(
+                "checkpoint state sidecar",
+                result.meta.size,
+                self.max_state_data_bytes,
+            ));
+        }
+        if result.meta.size != expected_len {
+            return Ok(Some(false));
+        }
+        if expected_len == 0 {
+            return Ok(Some(true));
+        }
+        if result.range.start != 0 || result.range.end != expected_len {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "checkpoint state sidecar response range {}..{} does not match its advertised {expected_len}-byte length",
+                result.range.start, result.range.end
+            )));
+        }
+
+        let mut actual = Sha256::new();
+        let mut actual_len = 0_u64;
+        let mut stream = result.into_stream();
+        while let Some(chunk) = stream.try_next().await? {
+            actual_len = actual_len.checked_add(chunk.len() as u64).ok_or_else(|| {
+                CheckpointStoreError::Invalid(
+                    "checkpoint state sidecar body length overflow".into(),
+                )
+            })?;
+            if actual_len > self.max_state_data_bytes {
+                return Err(oversized_metadata(
+                    "checkpoint state sidecar",
+                    actual_len,
+                    self.max_state_data_bytes,
+                ));
+            }
+            if actual_len > expected_len {
+                return Err(CheckpointStoreError::Invalid(format!(
+                    "checkpoint state sidecar body exceeded its advertised {expected_len}-byte length"
+                )));
+            }
+            actual.update(&chunk);
+        }
+        if actual_len != expected_len {
+            return Err(CheckpointStoreError::Invalid(format!(
+                "checkpoint state sidecar body length {actual_len} does not match its advertised {expected_len}-byte length"
+            )));
+        }
+        let expected = sha256_hex_chunks(chunks);
+        Ok(Some(format!("{:x}", actual.finalize()) == expected))
     }
 
     /// List checkpoint IDs by scanning `manifests/manifest-NNNNNN.json`.
     async fn list_checkpoint_ids(&self) -> Result<Vec<u64>, CheckpointStoreError> {
+        self.list_checkpoint_ids_with_limit(MAX_CHECKPOINT_INVENTORY_ENTRIES)
+            .await
+    }
+
+    async fn list_checkpoint_ids_with_limit(
+        &self,
+        max_entries: usize,
+    ) -> Result<Vec<u64>, CheckpointStoreError> {
         use futures::TryStreamExt;
 
         let mut ids = std::collections::BTreeSet::new();
 
-        let manifests_prefix = object_store::path::Path::from(format!("{}manifests/", self.prefix));
-        let entries: Vec<_> = self
-            .store
-            .list(Some(&manifests_prefix))
-            .try_collect()
-            .await?;
-        for entry in &entries {
-            if let Some(id) =
-                parse_checkpoint_id_from_path(entry.location.as_ref(), "manifest-", ".json")
-            {
+        let manifest_namespace = format!("{}manifests/", self.prefix);
+        let manifests_prefix = object_store::path::Path::from(manifest_namespace.clone());
+        let mut entries = self.store.list(Some(&manifests_prefix));
+        let mut scanned = 0usize;
+        while let Some(entry) = entries.try_next().await? {
+            if scanned >= max_entries {
+                return Err(CheckpointStoreError::Invalid(format!(
+                    "checkpoint inventory exceeds the {max_entries}-entry safety limit"
+                )));
+            }
+            scanned += 1;
+            let path = entry.location.as_ref();
+            if let Some(id) = parse_checkpoint_id_from_path(path, "manifest-", ".json") {
+                if entry.location != self.manifest_path(id) {
+                    return Err(CheckpointStoreError::Invalid(format!(
+                        "non-canonical checkpoint manifest path '{path}'"
+                    )));
+                }
                 ids.insert(id);
+            } else if path
+                .strip_prefix(&manifest_namespace)
+                .is_some_and(|name| name.starts_with("manifest-"))
+            {
+                return Err(CheckpointStoreError::Invalid(format!(
+                    "non-canonical checkpoint manifest path '{path}'"
+                )));
             }
         }
 
@@ -1064,124 +2772,77 @@ impl ObjectStoreCheckpointStore {
 
 #[async_trait]
 impl CheckpointStore for ObjectStoreCheckpointStore {
-    fn vnode_count(&self) -> u16 {
-        self.vnode_count
+    fn max_state_data_bytes(&self) -> u64 {
+        self.max_state_data_bytes
+    }
+
+    fn key_group_count(&self) -> KeyGroupCount {
+        self.key_group_count
+    }
+
+    fn participant_id(&self) -> u64 {
+        self.participant_id
     }
 
     async fn save(&self, manifest: &CheckpointManifest) -> Result<(), CheckpointStoreError> {
-        let json = serde_json::to_string_pretty(manifest)?;
-        let path = self.manifest_path(manifest.checkpoint_id);
-        let json_bytes = bytes::Bytes::from(json);
+        self.ensure_manifest_participant(manifest)?;
+        self.ensure_manifest_valid(manifest)?;
+        let encoded = bytes::Bytes::from(serde_json::to_vec_pretty(manifest)?);
+        self.publish_manifest(manifest, encoded).await?;
 
-        // Conditional PUT — prevents duplicate manifest writes (split-brain safety).
-        let create_opts = PutOptions {
-            mode: PutMode::Create,
-            ..PutOptions::default()
-        };
-        let result = self
-            .store
-            .put_opts(
-                &path,
-                PutPayload::from_bytes(json_bytes.clone()),
-                create_opts,
-            )
-            .await;
-
-        match result {
-            Ok(_) => {}
-            Err(object_store::Error::AlreadyExists { .. }) => {
-                tracing::warn!(
-                    checkpoint_id = manifest.checkpoint_id,
-                    "[LDB-6010] Manifest already exists — skipping write"
-                );
-            }
-            Err(object_store::Error::NotImplemented { .. }) => {
-                // Backend doesn't support conditional PUT — fall back to overwrite.
-                self.store
-                    .put_opts(
-                        &path,
-                        PutPayload::from_bytes(json_bytes),
-                        PutOptions::default(),
-                    )
-                    .await?;
-            }
-            Err(e) => return Err(CheckpointStoreError::ObjectStore(e)),
+        // A prepared manifest is deliberately invisible to the normal latest
+        // pointer. Recovery inventory still discovers it through list_ids().
+        if manifest.durable_phase == DurableCheckpointPhase::Prepared {
+            return Ok(());
         }
 
-        // Monotonic pointer update. A stale writer must not regress the
-        // pointer from id N+1 back to id N. Read the current pointer; if
-        // it already references a newer id, skip the write. Same-writer
-        // races (not expected — one coordinator per store instance) can
-        // still race past this check, but cross-leader stomps from a
-        // delayed ex-leader are caught.
-        let latest = self.latest_pointer_path();
-        if let Some(current) = self.get_bytes(&latest).await? {
-            if let Ok(existing) = serde_json::from_slice::<LatestPointer>(&current) {
-                if existing.checkpoint_id > manifest.checkpoint_id {
-                    tracing::warn!(
-                        current = existing.checkpoint_id,
-                        ours = manifest.checkpoint_id,
-                        "[LDB-6010] latest.json already points at a newer checkpoint — \
-                         skipping pointer update (possible split-brain or delayed writer)"
-                    );
-                    return Ok(());
-                }
-            }
-        }
-        let pointer = serde_json::to_string(&LatestPointer {
-            checkpoint_id: manifest.checkpoint_id,
-        })?;
-        self.put_with_retry(
-            &latest,
-            PutPayload::from_bytes(bytes::Bytes::from(pointer)),
-            &PutOptions::default(),
-        )
-        .await?;
-
-        // Auto-prune
-        if self.max_retained > 0 {
-            if let Err(e) = self.prune(self.max_retained).await {
-                tracing::warn!(
-                    max_retained = self.max_retained,
-                    error = %e,
-                    "[LDB-6009] Object store checkpoint prune failed"
-                );
-            }
-        }
-
-        Ok(())
+        self.publish_latest(manifest.checkpoint_id).await
     }
 
-    async fn update_manifest(
+    async fn finalize(
         &self,
-        manifest: &CheckpointManifest,
-    ) -> Result<(), CheckpointStoreError> {
-        let json = serde_json::to_string_pretty(manifest)?;
-        let path = self.manifest_path(manifest.checkpoint_id);
-        let payload = PutPayload::from_bytes(bytes::Bytes::from(json));
-
-        // Unconditional PUT — overwrites the existing manifest.
-        self.store
-            .put_opts(&path, payload, PutOptions::default())
-            .await?;
-
-        Ok(())
+        checkpoint_id: u64,
+    ) -> Result<CheckpointManifest, CheckpointStoreError> {
+        let path = self.manifest_path(checkpoint_id);
+        let mut manifest = self
+            .load_manifest_at(&path, checkpoint_id, self.participant_id)
+            .await?
+            .ok_or(CheckpointStoreError::NotFound(checkpoint_id))?;
+        if manifest.durable_phase == DurableCheckpointPhase::Prepared {
+            manifest.durable_phase = DurableCheckpointPhase::Finalized;
+            let encoded = bytes::Bytes::from(serde_json::to_vec_pretty(&manifest)?);
+            ensure_serialized_size("checkpoint manifest", encoded.len(), MAX_MANIFEST_BYTES)?;
+            self.replace_manifest_exactly(&path, &manifest, encoded)
+                .await?;
+        }
+        self.publish_latest(manifest.checkpoint_id).await?;
+        Ok(manifest)
     }
 
     async fn load_latest(&self) -> Result<Option<CheckpointManifest>, CheckpointStoreError> {
-        if let Some(data) = self.get_bytes(&self.latest_pointer_path()).await? {
-            let pointer: LatestPointer = serde_json::from_slice(&data)?;
-            return self.load_by_id(pointer.checkpoint_id).await;
-        }
-
-        Ok(None)
+        let Some((pointer, _)) = self.load_latest_pointer_versioned().await? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.load_finalized_manifest(pointer.checkpoint_id).await?,
+        ))
     }
 
     async fn load_by_id(
         &self,
         id: u64,
     ) -> Result<Option<CheckpointManifest>, CheckpointStoreError> {
-        self.load_manifest_at(&self.manifest_path(id)).await
+        self.load_manifest_at(&self.manifest_path(id), id, self.participant_id)
+            .await
+    }
+
+    async fn load_manifest_for_participant(
+        &self,
+        participant_id: u64,
+        id: u64,
+    ) -> Result<Option<CheckpointManifest>, CheckpointStoreError> {
+        let path = self.manifest_path_for_participant(participant_id, id)?;
+        self.load_manifest_at(&path, id, participant_id).await
     }
 
     async fn list_ids(&self) -> Result<Vec<u64>, CheckpointStoreError> {
@@ -1193,62 +2854,54 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
         let mut result = Vec::with_capacity(ids.len());
 
         for id in ids {
-            if let Ok(Some(manifest)) = self.load_by_id(id).await {
-                result.push((manifest.checkpoint_id, manifest.epoch));
-            }
+            let manifest = self
+                .load_by_id(id)
+                .await?
+                .ok_or(CheckpointStoreError::NotFound(id))?;
+            result.push((manifest.checkpoint_id, manifest.epoch));
         }
 
         Ok(result)
     }
 
-    async fn prune(&self, keep_count: usize) -> Result<usize, CheckpointStoreError> {
-        let ids = self.list_checkpoint_ids().await?;
-        if ids.len() <= keep_count {
-            return Ok(0);
+    async fn prune_before(&self, before_epoch: u64) -> Result<usize, CheckpointStoreError> {
+        let latest_id = self.latest_checkpoint_id().await?;
+        let mut candidates = Vec::new();
+
+        // Resolve the complete candidate set before deleting anything. A corrupt
+        // manifest therefore fails this pass closed instead of partially advancing
+        // retention past an inventory we could not classify.
+        for id in self.list_checkpoint_ids().await? {
+            if Some(id) == latest_id {
+                continue;
+            }
+            let manifest = self
+                .load_by_id(id)
+                .await?
+                .ok_or(CheckpointStoreError::NotFound(id))?;
+            if manifest.epoch < before_epoch {
+                candidates.push(id);
+            }
         }
 
-        let to_remove = ids.len() - keep_count;
         let mut removed = 0;
-        let mut logged_error = false;
-
-        for &id in &ids[..to_remove] {
+        for id in candidates {
             let manifest = self.manifest_path(id);
             let state = self.state_path(id);
-            let manifest_res = self.store.delete(&manifest).await;
-            let state_res = self.store.delete(&state).await;
-
-            // Count the id as removed only if the manifest is gone
-            // (state.bin is optional — its absence is fine).
-            let manifest_ok = matches!(
-                manifest_res,
-                Ok(()) | Err(object_store::Error::NotFound { .. })
-            );
-            if manifest_ok {
-                removed += 1;
+            // The manifest is the inventory record. Delete the sidecar first so
+            // a failed or ambiguously acknowledged sidecar delete remains
+            // discoverable and can be completed by a later retention pass.
+            if let Err(error) = self.store.delete(&state).await {
+                if !matches!(error, object_store::Error::NotFound { .. }) {
+                    return Err(CheckpointStoreError::ObjectStore(error));
+                }
             }
-
-            // Surface the first real error so operators can notice.
-            // Permission errors silently leak old checkpoints forever
-            // otherwise.
-            for err in [manifest_res, state_res]
-                .into_iter()
-                .filter_map(Result::err)
-            {
-                if matches!(err, object_store::Error::NotFound { .. }) {
-                    continue;
-                }
-                if !logged_error {
-                    tracing::warn!(
-                        checkpoint_id = id,
-                        error = %err,
-                        "[LDB-6027] checkpoint prune: delete failed — \
-                         retained objects may accumulate"
-                    );
-                    logged_error = true;
-                }
+            match self.store.delete(&manifest).await {
+                Ok(()) => removed += 1,
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(error) => return Err(CheckpointStoreError::ObjectStore(error)),
             }
         }
-
         Ok(removed)
     }
 
@@ -1257,973 +2910,71 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
         id: u64,
         chunks: &[bytes::Bytes],
     ) -> Result<(), CheckpointStoreError> {
+        let state_len = checked_state_data_len(chunks)?;
+        if state_len > self.max_state_data_bytes {
+            return Err(oversized_metadata(
+                "checkpoint state sidecar",
+                state_len,
+                self.max_state_data_bytes,
+            ));
+        }
         let path = self.state_path(id);
         // PutPayload is a chain of Bytes — no concatenation into a
         // contiguous buffer. Each Arc bump is ~nothing; the underlying
         // bytes reach the object-store client untouched.
         let payload: PutPayload = chunks.iter().cloned().collect();
-        // Sidecar writes are idempotent — retry transients.
-        self.put_with_retry(&path, payload, &PutOptions::default())
-            .await
+        if self.create_with_retry(&path, payload).await? {
+            Ok(())
+        } else {
+            let matches = self
+                .state_matches_chunks(&path, chunks)
+                .await?
+                .ok_or_else(|| {
+                    CheckpointStoreError::Invalid(format!(
+                    "checkpoint {id} state create reported AlreadyExists but the object is missing"
+                ))
+                })?;
+            if matches {
+                Ok(())
+            } else {
+                Err(CheckpointStoreError::Invalid(format!(
+                    "checkpoint {id} state already exists with different immutable content"
+                )))
+            }
+        }
     }
 
     async fn load_state_data(&self, id: u64) -> Result<Option<Vec<u8>>, CheckpointStoreError> {
-        Ok(self
-            .get_bytes(&self.state_path(id))
-            .await?
-            .map(|d| d.to_vec()))
+        self.get_bounded_state_data(&self.state_path(id)).await
     }
 
-    async fn cleanup_orphans(&self) -> Result<usize, CheckpointStoreError> {
-        use futures::{StreamExt, TryStreamExt};
+    async fn load_state_data_for_participant(
+        &self,
+        participant_id: u64,
+        id: u64,
+    ) -> Result<Option<Vec<u8>>, CheckpointStoreError> {
+        let path = self.state_path_for_participant(participant_id, id)?;
+        self.get_bounded_state_data(&path).await
+    }
 
-        // Collect state IDs that have a state.bin but no matching manifest.
-        let manifest_ids: std::collections::BTreeSet<u64> =
-            self.list_checkpoint_ids().await?.into_iter().collect();
-
-        // List state files: checkpoints/state-NNNNNN.bin
-        let state_prefix = object_store::path::Path::from(format!("{}checkpoints/", self.prefix));
-        let entries: Vec<_> = self.store.list(Some(&state_prefix)).try_collect().await?;
-
-        let mut orphan_paths = Vec::new();
-        for entry in &entries {
-            if let Some(id) =
-                parse_checkpoint_id_from_path(entry.location.as_ref(), "state-", ".bin")
-            {
-                if !manifest_ids.contains(&id) {
-                    orphan_paths.push(entry.location.clone());
-                }
-            }
+    async fn state_data_len_for_participant(
+        &self,
+        participant_id: u64,
+        id: u64,
+    ) -> Result<Option<u64>, CheckpointStoreError> {
+        let path = self.state_path_for_participant(participant_id, id)?;
+        match self.store.head(&path).await {
+            Ok(metadata) if metadata.size <= self.max_state_data_bytes => Ok(Some(metadata.size)),
+            Ok(metadata) => Err(oversized_metadata(
+                "checkpoint state sidecar",
+                metadata.size,
+                self.max_state_data_bytes,
+            )),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(error) => Err(CheckpointStoreError::ObjectStore(error)),
         }
-
-        let count = orphan_paths.len();
-        if !orphan_paths.is_empty() {
-            let stream = futures::stream::iter(orphan_paths.into_iter().map(Ok)).boxed();
-            let mut results = self.store.delete_stream(stream);
-            while let Some(result) = results.next().await {
-                if let Err(e) = result {
-                    tracing::warn!(error = %e, "failed to delete orphan state file");
-                }
-            }
-        }
-
-        Ok(count)
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::checkpoint::checkpoint_manifest::{ConnectorCheckpoint, OperatorCheckpoint};
-    #[allow(clippy::disallowed_types)] // cold path: checkpoint store
-    use std::collections::HashMap;
-
-    fn make_store(dir: &Path) -> FileSystemCheckpointStore {
-        FileSystemCheckpointStore::new(dir, 3)
-    }
-
-    fn make_manifest(id: u64, epoch: u64) -> CheckpointManifest {
-        CheckpointManifest::new(id, epoch)
-    }
-
-    #[tokio::test]
-    async fn test_save_and_load_latest() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = make_store(dir.path());
-
-        let m = make_manifest(1, 1);
-        store.save(&m).await.unwrap();
-
-        let loaded = store.load_latest().await.unwrap().unwrap();
-        assert_eq!(loaded.checkpoint_id, 1);
-        assert_eq!(loaded.epoch, 1);
-    }
-
-    #[tokio::test]
-    async fn test_load_latest_returns_none_when_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = make_store(dir.path());
-        assert!(store.load_latest().await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_load_latest_returns_most_recent() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 10);
-
-        for i in 1..=5 {
-            store.save(&make_manifest(i, i)).await.unwrap();
-        }
-
-        let latest = store.load_latest().await.unwrap().unwrap();
-        assert_eq!(latest.checkpoint_id, 5);
-        assert_eq!(latest.epoch, 5);
-    }
-
-    #[tokio::test]
-    async fn test_load_by_id() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 10);
-
-        store.save(&make_manifest(1, 10)).await.unwrap();
-        store.save(&make_manifest(2, 20)).await.unwrap();
-
-        let m = store.load_by_id(1).await.unwrap().unwrap();
-        assert_eq!(m.epoch, 10);
-
-        let m = store.load_by_id(2).await.unwrap().unwrap();
-        assert_eq!(m.epoch, 20);
-
-        assert!(store.load_by_id(99).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_list() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 10);
-
-        store.save(&make_manifest(1, 10)).await.unwrap();
-        store.save(&make_manifest(3, 30)).await.unwrap();
-        store.save(&make_manifest(2, 20)).await.unwrap();
-
-        let list = store.list().await.unwrap();
-        assert_eq!(list, vec![(1, 10), (2, 20), (3, 30)]);
-    }
-
-    #[tokio::test]
-    async fn test_prune_keeps_max() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 10); // no auto-prune
-
-        for i in 1..=5 {
-            store.save(&make_manifest(i, i)).await.unwrap();
-        }
-
-        let removed = store.prune(2).await.unwrap();
-        assert_eq!(removed, 3);
-
-        let list = store.list().await.unwrap();
-        assert_eq!(list.len(), 2);
-        assert_eq!(list[0].0, 4);
-        assert_eq!(list[1].0, 5);
-    }
-
-    #[tokio::test]
-    async fn test_auto_prune_on_save() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 2);
-
-        for i in 1..=5 {
-            store.save(&make_manifest(i, i)).await.unwrap();
-        }
-
-        let list = store.list().await.unwrap();
-        assert_eq!(list.len(), 2);
-        // Should keep the two most recent
-        assert_eq!(list[0].0, 4);
-        assert_eq!(list[1].0, 5);
-    }
-
-    #[tokio::test]
-    async fn test_save_and_load_state_data() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = make_store(dir.path());
-
-        store.save(&make_manifest(1, 1)).await.unwrap();
-
-        let data = b"large operator state binary blob";
-        store
-            .save_state_data(1, &[bytes::Bytes::from_static(data)])
-            .await
-            .unwrap();
-
-        let loaded = store.load_state_data(1).await.unwrap().unwrap();
-        assert_eq!(loaded, data);
-    }
-
-    #[tokio::test]
-    async fn test_load_state_data_returns_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = make_store(dir.path());
-        assert!(store.load_state_data(99).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_full_manifest_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = make_store(dir.path());
-
-        let mut m = make_manifest(1, 5);
-        m.source_offsets.insert(
-            "kafka-src".into(),
-            ConnectorCheckpoint::with_offsets(
-                5,
-                HashMap::from([("0".into(), "1000".into()), ("1".into(), "2000".into())]),
-            ),
-        );
-        m.sink_epochs.insert("pg-sink".into(), 4);
-        m.table_offsets.insert(
-            "instruments".into(),
-            ConnectorCheckpoint::with_offsets(5, HashMap::from([("lsn".into(), "0/AB".into())])),
-        );
-        m.operator_states
-            .insert("window".into(), OperatorCheckpoint::inline(b"data"));
-        m.watermark = Some(999_000);
-
-        store.save(&m).await.unwrap();
-
-        let loaded = store.load_latest().await.unwrap().unwrap();
-        assert_eq!(loaded.checkpoint_id, 1);
-        assert_eq!(loaded.epoch, 5);
-        assert_eq!(loaded.watermark, Some(999_000));
-
-        let src = loaded.source_offsets.get("kafka-src").unwrap();
-        assert_eq!(src.offsets.get("0"), Some(&"1000".into()));
-
-        assert_eq!(loaded.sink_epochs.get("pg-sink"), Some(&4));
-
-        let tbl = loaded.table_offsets.get("instruments").unwrap();
-        assert_eq!(tbl.offsets.get("lsn"), Some(&"0/AB".into()));
-
-        let op = loaded.operator_states.get("window").unwrap();
-        assert_eq!(op.decode_inline().unwrap(), b"data");
-    }
-
-    #[tokio::test]
-    async fn test_empty_latest_txt() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = make_store(dir.path());
-
-        let cp_dir = dir.path().join("checkpoints");
-        std::fs::create_dir_all(&cp_dir).unwrap();
-        std::fs::write(cp_dir.join("latest.txt"), "").unwrap();
-
-        assert!(store.load_latest().await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_latest_points_to_missing_checkpoint() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = make_store(dir.path());
-
-        let cp_dir = dir.path().join("checkpoints");
-        std::fs::create_dir_all(&cp_dir).unwrap();
-        std::fs::write(cp_dir.join("latest.txt"), "checkpoint_000099").unwrap();
-
-        assert!(store.load_latest().await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_prune_no_op_when_under_limit() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = make_store(dir.path());
-
-        store.save(&make_manifest(1, 1)).await.unwrap();
-        let removed = store.prune(5).await.unwrap();
-        assert_eq!(removed, 0);
-    }
-
-    #[tokio::test]
-    async fn test_save_with_state_writes_sidecar_before_manifest() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = make_store(dir.path());
-
-        let m = make_manifest(1, 1);
-        let state = b"large-operator-state-blob";
-        store
-            .save_with_state(&m, Some(&[bytes::Bytes::from_static(state)]))
-            .await
-            .unwrap();
-
-        // Both manifest and state should be present.
-        let loaded = store.load_latest().await.unwrap().unwrap();
-        assert_eq!(loaded.checkpoint_id, 1);
-
-        let loaded_state = store.load_state_data(1).await.unwrap().unwrap();
-        assert_eq!(loaded_state, state);
-    }
-
-    #[tokio::test]
-    async fn test_save_with_state_none_is_same_as_save() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = make_store(dir.path());
-
-        let m = make_manifest(1, 1);
-        store.save_with_state(&m, None).await.unwrap();
-
-        let loaded = store.load_latest().await.unwrap().unwrap();
-        assert_eq!(loaded.checkpoint_id, 1);
-        assert!(store.load_state_data(1).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_orphaned_state_without_manifest_is_ignored() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = make_store(dir.path());
-
-        // Write only sidecar state, no manifest (simulates crash after
-        // state write but before manifest write).
-        store
-            .save_state_data(1, &[bytes::Bytes::from_static(b"orphaned")])
-            .await
-            .unwrap();
-
-        // load_latest should return None — the orphan is not visible.
-        assert!(store.load_latest().await.unwrap().is_none());
-
-        // list should not include the orphan (no manifest.json).
-        assert!(store.list().await.unwrap().is_empty());
-    }
-
-    // -----------------------------------------------------------------------
-    // ObjectStoreCheckpointStore tests (using InMemory backend)
-    // -----------------------------------------------------------------------
-
-    fn make_obj_store() -> ObjectStoreCheckpointStore {
-        let store = Arc::new(object_store::memory::InMemory::new());
-        ObjectStoreCheckpointStore::new(store, String::new(), 3)
-    }
-
-    #[tokio::test]
-    async fn test_obj_save_and_load_latest() {
-        let store = make_obj_store();
-        let m = make_manifest(1, 1);
-        store.save(&m).await.unwrap();
-
-        let loaded = store.load_latest().await.unwrap().unwrap();
-        assert_eq!(loaded.checkpoint_id, 1);
-        assert_eq!(loaded.epoch, 1);
-    }
-
-    #[tokio::test]
-    async fn test_obj_load_latest_returns_none_when_empty() {
-        let store = make_obj_store();
-        assert!(store.load_latest().await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_obj_load_by_id() {
-        let store = ObjectStoreCheckpointStore::new(
-            Arc::new(object_store::memory::InMemory::new()),
-            String::new(),
-            10,
-        );
-
-        store.save(&make_manifest(1, 10)).await.unwrap();
-        store.save(&make_manifest(2, 20)).await.unwrap();
-
-        let m = store.load_by_id(1).await.unwrap().unwrap();
-        assert_eq!(m.epoch, 10);
-        let m = store.load_by_id(2).await.unwrap().unwrap();
-        assert_eq!(m.epoch, 20);
-        assert!(store.load_by_id(99).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_obj_list() {
-        let store = ObjectStoreCheckpointStore::new(
-            Arc::new(object_store::memory::InMemory::new()),
-            String::new(),
-            10,
-        );
-
-        store.save(&make_manifest(1, 10)).await.unwrap();
-        store.save(&make_manifest(3, 30)).await.unwrap();
-        store.save(&make_manifest(2, 20)).await.unwrap();
-
-        let list = store.list().await.unwrap();
-        assert_eq!(list, vec![(1, 10), (2, 20), (3, 30)]);
-    }
-
-    #[tokio::test]
-    async fn test_obj_prune() {
-        let store = ObjectStoreCheckpointStore::new(
-            Arc::new(object_store::memory::InMemory::new()),
-            String::new(),
-            10,
-        );
-
-        for i in 1..=5 {
-            store.save(&make_manifest(i, i)).await.unwrap();
-        }
-
-        let removed = store.prune(2).await.unwrap();
-        assert_eq!(removed, 3);
-
-        let list = store.list().await.unwrap();
-        assert_eq!(list.len(), 2);
-        assert_eq!(list[0].0, 4);
-        assert_eq!(list[1].0, 5);
-    }
-
-    #[tokio::test]
-    async fn test_obj_auto_prune_on_save() {
-        let store = ObjectStoreCheckpointStore::new(
-            Arc::new(object_store::memory::InMemory::new()),
-            String::new(),
-            2,
-        );
-
-        for i in 1..=5 {
-            store.save(&make_manifest(i, i)).await.unwrap();
-        }
-
-        let list = store.list().await.unwrap();
-        assert_eq!(list.len(), 2);
-        assert_eq!(list[0].0, 4);
-        assert_eq!(list[1].0, 5);
-    }
-
-    #[tokio::test]
-    async fn test_obj_save_and_load_state_data() {
-        let store = make_obj_store();
-        store.save(&make_manifest(1, 1)).await.unwrap();
-
-        let data = b"large operator state binary blob";
-        store
-            .save_state_data(1, &[bytes::Bytes::from_static(data)])
-            .await
-            .unwrap();
-
-        let loaded = store.load_state_data(1).await.unwrap().unwrap();
-        assert_eq!(loaded, data);
-    }
-
-    #[tokio::test]
-    async fn test_obj_load_state_data_returns_none() {
-        let store = make_obj_store();
-        assert!(store.load_state_data(99).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_obj_with_prefix() {
-        let inner = Arc::new(object_store::memory::InMemory::new());
-        let store = ObjectStoreCheckpointStore::new(inner, "nodes/abc123/".to_string(), 10);
-
-        store.save(&make_manifest(1, 42)).await.unwrap();
-        let loaded = store.load_latest().await.unwrap().unwrap();
-        assert_eq!(loaded.checkpoint_id, 1);
-        assert_eq!(loaded.epoch, 42);
-    }
-
-    // -----------------------------------------------------------------------
-    // v2 layout verification + backward compatibility tests
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_obj_layout_paths() {
-        let inner = Arc::new(object_store::memory::InMemory::new());
-        let store = ObjectStoreCheckpointStore::new(inner.clone(), String::new(), 10);
-
-        store.save(&make_manifest(1, 10)).await.unwrap();
-
-        let result = inner
-            .get_opts(
-                &object_store::path::Path::from("manifests/manifest-000001.json"),
-                GetOptions::default(),
-            )
-            .await;
-        assert!(result.is_ok(), "manifest path should exist");
-
-        let result = inner
-            .get_opts(
-                &object_store::path::Path::from("manifests/latest.json"),
-                GetOptions::default(),
-            )
-            .await;
-        assert!(result.is_ok(), "latest.json should exist");
-    }
-
-    #[tokio::test]
-    async fn test_obj_conditional_put_idempotent() {
-        let store = ObjectStoreCheckpointStore::new(
-            Arc::new(object_store::memory::InMemory::new()),
-            String::new(),
-            10,
-        );
-
-        let m = make_manifest(1, 10);
-        store.save(&m).await.unwrap();
-
-        // Second save with same ID should succeed (logs warning, skips write)
-        store.save(&m).await.unwrap();
-
-        let loaded = store.load_latest().await.unwrap().unwrap();
-        assert_eq!(loaded.checkpoint_id, 1);
-        assert_eq!(loaded.epoch, 10);
-    }
-
-    #[tokio::test]
-    async fn test_obj_update_manifest_overwrites() {
-        use crate::checkpoint::checkpoint_manifest::SinkCommitStatus;
-
-        let store = make_obj_store();
-
-        // Step 5: initial save with Pending sink status
-        let mut m = make_manifest(1, 10);
-        m.sink_commit_statuses
-            .insert("pg-sink".into(), SinkCommitStatus::Pending);
-        store.save(&m).await.unwrap();
-
-        // Verify Pending persisted
-        let loaded = store.load_by_id(1).await.unwrap().unwrap();
-        assert_eq!(
-            loaded.sink_commit_statuses.get("pg-sink"),
-            Some(&SinkCommitStatus::Pending)
-        );
-
-        // Step 6b: update manifest with Committed status
-        m.sink_commit_statuses
-            .insert("pg-sink".into(), SinkCommitStatus::Committed);
-        store.update_manifest(&m).await.unwrap();
-
-        // Verify Committed persisted (the bug: save() would skip this)
-        let loaded = store.load_by_id(1).await.unwrap().unwrap();
-        assert_eq!(
-            loaded.sink_commit_statuses.get("pg-sink"),
-            Some(&SinkCommitStatus::Committed)
-        );
-    }
-
-    #[tokio::test]
-    async fn test_obj_save_still_uses_conditional_put() {
-        let store = make_obj_store();
-
-        let m = make_manifest(1, 10);
-        store.save(&m).await.unwrap();
-
-        // Second save() with same ID skips (conditional PUT)
-        // but does not error
-        store.save(&m).await.unwrap();
-
-        // update_manifest() with same ID overwrites
-        let mut m2 = make_manifest(1, 10);
-        m2.watermark = Some(42);
-        store.update_manifest(&m2).await.unwrap();
-
-        let loaded = store.load_by_id(1).await.unwrap().unwrap();
-        assert_eq!(loaded.watermark, Some(42));
-    }
-
-    #[tokio::test]
-    async fn test_fs_update_manifest_overwrites() {
-        use crate::checkpoint::checkpoint_manifest::SinkCommitStatus;
-
-        let dir = tempfile::tempdir().unwrap();
-        let store = make_store(dir.path());
-
-        let mut m = make_manifest(1, 10);
-        m.sink_commit_statuses
-            .insert("sink-a".into(), SinkCommitStatus::Pending);
-        store.save(&m).await.unwrap();
-
-        m.sink_commit_statuses
-            .insert("sink-a".into(), SinkCommitStatus::Committed);
-        store.update_manifest(&m).await.unwrap();
-
-        let loaded = store.load_by_id(1).await.unwrap().unwrap();
-        assert_eq!(
-            loaded.sink_commit_statuses.get("sink-a"),
-            Some(&SinkCommitStatus::Committed)
-        );
-    }
-
-    #[tokio::test]
-    async fn test_obj_state_paths() {
-        let inner = Arc::new(object_store::memory::InMemory::new());
-        let store = ObjectStoreCheckpointStore::new(inner.clone(), String::new(), 10);
-
-        store.save(&make_manifest(1, 1)).await.unwrap();
-        store
-            .save_state_data(1, &[bytes::Bytes::from_static(b"state-blob")])
-            .await
-            .unwrap();
-
-        let result = inner
-            .get_opts(
-                &object_store::path::Path::from("checkpoints/state-000001.bin"),
-                GetOptions::default(),
-            )
-            .await;
-        assert!(result.is_ok(), "state path should exist");
-    }
-
-    #[tokio::test]
-    async fn test_obj_latest_json_format() {
-        let inner = Arc::new(object_store::memory::InMemory::new());
-        let store = ObjectStoreCheckpointStore::new(inner.clone(), String::new(), 10);
-
-        store.save(&make_manifest(5, 50)).await.unwrap();
-
-        let data = inner
-            .get_opts(
-                &object_store::path::Path::from("manifests/latest.json"),
-                GetOptions::default(),
-            )
-            .await
-            .unwrap()
-            .bytes()
-            .await
-            .unwrap();
-
-        let pointer: super::LatestPointer = serde_json::from_slice(&data).unwrap();
-        assert_eq!(pointer.checkpoint_id, 5);
-    }
-
-    #[tokio::test]
-    async fn test_obj_latest_monotonic_guard_skips_regression() {
-        let inner = Arc::new(object_store::memory::InMemory::new());
-        let store = ObjectStoreCheckpointStore::new(inner.clone(), String::new(), 10);
-
-        store.save(&make_manifest(10, 10)).await.unwrap();
-        // A delayed writer (e.g., paused ex-leader) tries to write id=5
-        // after the current leader already advanced to id=10. The pointer
-        // must not regress.
-        store.save(&make_manifest(5, 5)).await.unwrap();
-
-        let loaded = store.load_latest().await.unwrap().unwrap();
-        assert_eq!(
-            loaded.checkpoint_id, 10,
-            "latest pointer should not regress to an older id"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_validate_checkpoint_valid() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = make_store(dir.path());
-
-        let m = make_manifest(1, 1);
-        store.save(&m).await.unwrap();
-
-        let result = store.validate_checkpoint(1).await.unwrap();
-        assert!(result.valid, "valid checkpoint: {:?}", result.issues);
-        assert!(result.issues.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_validate_checkpoint_epoch_zero_invalid() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = make_store(dir.path());
-
-        // Manually save a manifest with epoch=0 (bypassing normal creation)
-        let m = make_manifest(1, 0);
-        store.save(&m).await.unwrap();
-
-        let result = store.validate_checkpoint(1).await.unwrap();
-        assert!(!result.valid, "epoch=0 should be invalid");
-        assert!(
-            result.issues.iter().any(|i| i.message().contains("epoch")),
-            "should mention epoch: {:?}",
-            result.issues
-        );
-    }
-
-    #[tokio::test]
-    async fn test_validate_checkpoint_missing_manifest() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = make_store(dir.path());
-
-        let result = store.validate_checkpoint(99).await.unwrap();
-        assert!(!result.valid);
-        assert!(result.issues[0].message().contains("not found"));
-    }
-
-    #[tokio::test]
-    async fn test_validate_checkpoint_corrupt_manifest() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 10);
-
-        // Create a checkpoint dir with corrupt manifest JSON.
-        let cp_dir = dir.path().join("checkpoints/checkpoint_000001");
-        std::fs::create_dir_all(&cp_dir).unwrap();
-        std::fs::write(cp_dir.join("manifest.json"), "not valid json").unwrap();
-
-        // Corrupt manifest is a validation failure, not an I/O error.
-        let result = store.validate_checkpoint(1).await.unwrap();
-        assert!(!result.valid);
-        assert!(
-            result.issues[0].message().contains("corrupt manifest"),
-            "expected corrupt manifest issue: {:?}",
-            result.issues
-        );
-    }
-
-    #[tokio::test]
-    async fn test_validate_checkpoint_state_checksum_ok() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 10);
-
-        let state = b"important operator state";
-        let m = make_manifest(1, 1);
-        store
-            .save_with_state(&m, Some(&[bytes::Bytes::from_static(state)]))
-            .await
-            .unwrap();
-
-        let result = store.validate_checkpoint(1).await.unwrap();
-        assert!(result.valid, "checksum should match: {:?}", result.issues);
-    }
-
-    #[tokio::test]
-    async fn test_validate_checkpoint_state_checksum_mismatch() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 10);
-
-        // Save with state to get a checksum.
-        let state = b"original state";
-        let m = make_manifest(1, 1);
-        store
-            .save_with_state(&m, Some(&[bytes::Bytes::from_static(state)]))
-            .await
-            .unwrap();
-
-        // Now corrupt the state.bin on disk.
-        let state_path = dir.path().join("checkpoints/checkpoint_000001/state.bin");
-        std::fs::write(&state_path, b"corrupted data!!").unwrap();
-
-        let result = store.validate_checkpoint(1).await.unwrap();
-        assert!(!result.valid, "corrupted state should be invalid");
-        assert!(
-            result
-                .issues
-                .iter()
-                .any(|i| i.message().contains("checksum mismatch")),
-            "should report checksum mismatch: {:?}",
-            result.issues
-        );
-    }
-
-    #[tokio::test]
-    async fn test_validate_checkpoint_state_missing_when_expected() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 10);
-
-        // Save with state.
-        let m = make_manifest(1, 1);
-        store
-            .save_with_state(&m, Some(&[bytes::Bytes::from_static(b"state")]))
-            .await
-            .unwrap();
-
-        // Delete the state.bin file to simulate partial crash.
-        let state_path = dir.path().join("checkpoints/checkpoint_000001/state.bin");
-        std::fs::remove_file(&state_path).unwrap();
-
-        let result = store.validate_checkpoint(1).await.unwrap();
-        assert!(!result.valid);
-        assert!(
-            result
-                .issues
-                .iter()
-                .any(|i| i.message().contains("not found")),
-            "should report missing state: {:?}",
-            result.issues
-        );
-    }
-
-    #[tokio::test]
-    async fn test_recover_latest_validated_skips_corrupt() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 10);
-
-        // Save two checkpoints.
-        store.save(&make_manifest(1, 10)).await.unwrap();
-        store.save(&make_manifest(2, 20)).await.unwrap();
-
-        // Corrupt the latest checkpoint's manifest.
-        let cp2_manifest = dir
-            .path()
-            .join("checkpoints/checkpoint_000002/manifest.json");
-        std::fs::write(cp2_manifest, "<<<corrupt>>>").unwrap();
-
-        // Recovery should skip checkpoint 2 and pick checkpoint 1.
-        let report = store.recover_latest_validated().await.unwrap();
-        assert_eq!(report.chosen_id, Some(1));
-        assert_eq!(report.skipped.len(), 1);
-        assert_eq!(report.skipped[0].0, 2);
-        assert_eq!(report.examined, 2);
-    }
-
-    #[tokio::test]
-    async fn test_recover_latest_validated_fresh_start() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = make_store(dir.path());
-
-        let report = store.recover_latest_validated().await.unwrap();
-        assert!(report.chosen_id.is_none());
-        assert_eq!(report.examined, 0);
-    }
-
-    #[tokio::test]
-    async fn test_recover_latest_validated_all_corrupt_is_fresh_start() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 10);
-
-        // Save a checkpoint, then corrupt it.
-        store.save(&make_manifest(1, 1)).await.unwrap();
-        let cp_manifest = dir
-            .path()
-            .join("checkpoints/checkpoint_000001/manifest.json");
-        std::fs::write(cp_manifest, "corrupt").unwrap();
-
-        // The corrupt manifest will cause load_by_id (via list()) to fail,
-        // so it may not appear in the list at all. Either way, recovery
-        // should not select it.
-        let report = store.recover_latest_validated().await.unwrap();
-        assert!(report.chosen_id.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_cleanup_orphans_removes_stateless_dirs() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 10);
-
-        // Create an orphan: state.bin exists but no manifest.json.
-        let orphan_dir = dir.path().join("checkpoints/checkpoint_000099");
-        std::fs::create_dir_all(&orphan_dir).unwrap();
-        std::fs::write(orphan_dir.join("state.bin"), b"orphaned").unwrap();
-
-        // Normal checkpoint (has manifest).
-        store.save(&make_manifest(1, 1)).await.unwrap();
-
-        let cleaned = store.cleanup_orphans().await.unwrap();
-        assert_eq!(cleaned, 1);
-
-        // Orphan dir should be gone.
-        assert!(!orphan_dir.exists());
-        // Normal checkpoint should still be there.
-        assert!(store.load_by_id(1).await.unwrap().is_some());
-    }
-
-    #[tokio::test]
-    async fn test_cleanup_orphans_noop_when_clean() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 10);
-
-        store.save(&make_manifest(1, 1)).await.unwrap();
-        let cleaned = store.cleanup_orphans().await.unwrap();
-        assert_eq!(cleaned, 0);
-    }
-
-    #[tokio::test]
-    async fn test_save_with_state_writes_checksum() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FileSystemCheckpointStore::new(dir.path(), 10);
-
-        let state = b"state-data-for-checksum";
-        let m = make_manifest(1, 1);
-        store
-            .save_with_state(&m, Some(&[bytes::Bytes::from_static(state)]))
-            .await
-            .unwrap();
-
-        let loaded = store.load_latest().await.unwrap().unwrap();
-        assert!(
-            loaded.state_checksum.is_some(),
-            "state_checksum should be set"
-        );
-        let expected = sha256_hex(state);
-        assert_eq!(loaded.state_checksum.unwrap(), expected);
-    }
-
-    #[tokio::test]
-    async fn test_state_checksum_backward_compat() {
-        // Older manifests without state_checksum should deserialize fine.
-        let json = r#"{
-            "version": 1,
-            "checkpoint_id": 1,
-            "epoch": 1,
-            "timestamp_ms": 1000
-        }"#;
-        let m: CheckpointManifest = serde_json::from_str(json).unwrap();
-        assert!(m.state_checksum.is_none());
-    }
-
-    // ObjectStore variants
-
-    #[tokio::test]
-    async fn test_obj_validate_checkpoint_valid() {
-        let store = make_obj_store();
-        store.save(&make_manifest(1, 1)).await.unwrap();
-
-        let result = store.validate_checkpoint(1).await.unwrap();
-        assert!(result.valid, "valid checkpoint: {:?}", result.issues);
-    }
-
-    #[tokio::test]
-    async fn test_obj_validate_checkpoint_missing() {
-        let store = make_obj_store();
-        let result = store.validate_checkpoint(99).await.unwrap();
-        assert!(!result.valid);
-    }
-
-    #[tokio::test]
-    async fn test_obj_validate_state_checksum() {
-        let store = ObjectStoreCheckpointStore::new(
-            Arc::new(object_store::memory::InMemory::new()),
-            String::new(),
-            10,
-        );
-
-        let state = b"obj-store-state-data";
-        let m = make_manifest(1, 1);
-        store
-            .save_with_state(&m, Some(&[bytes::Bytes::from_static(state)]))
-            .await
-            .unwrap();
-
-        let result = store.validate_checkpoint(1).await.unwrap();
-        assert!(result.valid, "checksum should match: {:?}", result.issues);
-    }
-
-    #[tokio::test]
-    async fn test_obj_recover_latest_validated() {
-        let store = ObjectStoreCheckpointStore::new(
-            Arc::new(object_store::memory::InMemory::new()),
-            String::new(),
-            10,
-        );
-
-        store.save(&make_manifest(1, 10)).await.unwrap();
-        store.save(&make_manifest(2, 20)).await.unwrap();
-
-        let report = store.recover_latest_validated().await.unwrap();
-        assert_eq!(report.chosen_id, Some(2));
-        assert!(report.skipped.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_obj_cleanup_orphans() {
-        let inner = Arc::new(object_store::memory::InMemory::new());
-        let store = ObjectStoreCheckpointStore::new(inner.clone(), String::new(), 10);
-
-        // Save a checkpoint (creates manifest + state).
-        let state = b"state-with-manifest";
-        store
-            .save_with_state(
-                &make_manifest(1, 1),
-                Some(&[bytes::Bytes::from_static(state)]),
-            )
-            .await
-            .unwrap();
-
-        // Write an orphan state file (no manifest).
-        let orphan_path = object_store::path::Path::from("checkpoints/state-000099.bin");
-        inner
-            .put_opts(
-                &orphan_path,
-                PutPayload::from_bytes(bytes::Bytes::from_static(b"orphan")),
-                PutOptions::default(),
-            )
-            .await
-            .unwrap();
-
-        let cleaned = store.cleanup_orphans().await.unwrap();
-        assert_eq!(cleaned, 1);
-
-        // Verify orphan is gone but real state is intact.
-        let real_state = store.load_state_data(1).await.unwrap();
-        assert!(real_state.is_some());
-    }
-}
+mod tests;

@@ -31,8 +31,7 @@ impl Backoff {
     }
 
     /// Default broker-reconnect schedule: 1s → 30s, ±25 % jitter.
-    /// Matches what Kafka clients do; safe under simultaneous broker
-    /// restarts (jitter avoids reconnect storms).
+    /// Jitter prevents reconnect storms during simultaneous endpoint restarts.
     #[must_use]
     pub const fn broker_reconnect() -> Self {
         Self::new(Duration::from_secs(1), Duration::from_secs(30), 0.25)
@@ -66,7 +65,7 @@ impl Backoff {
             clippy::cast_possible_truncation
         )]
         let jittered_nanos = (raw.as_nanos() as f64 * (1.0 + frac)).max(0.0) as u64;
-        Duration::from_nanos(jittered_nanos)
+        Duration::from_nanos(jittered_nanos).min(self.max)
     }
 }
 
@@ -101,6 +100,14 @@ mod tests {
                 actual >= lo && actual <= hi,
                 "attempt {attempt}: {actual} not in [{lo}, {hi}]"
             );
+        }
+    }
+
+    #[test]
+    fn jitter_never_exceeds_hard_cap() {
+        let b = Backoff::new(Duration::from_secs(30), Duration::from_secs(30), 0.25);
+        for _ in 0..100 {
+            assert!(b.delay(0) <= Duration::from_secs(30));
         }
     }
 

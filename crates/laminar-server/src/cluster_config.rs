@@ -3,7 +3,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use crate::config::{CoordinationSection, DiscoverySection, ServerConfig};
+use crate::config::{cluster_tls_server_name_is_valid, DiscoverySection, ServerConfig, ServerMode};
 
 /// Node identity for cluster mode (non-empty, max 64 chars).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,7 +64,6 @@ impl fmt::Display for ClusterNodeId {
 pub struct ClusterConfig {
     pub node_id: ClusterNodeId,
     pub discovery: DiscoverySection,
-    pub coordination: CoordinationSection,
     pub formation_timeout: Duration,
 }
 
@@ -72,7 +71,7 @@ impl ClusterConfig {
     const DEFAULT_FORMATION_TIMEOUT: Duration = Duration::from_secs(60);
 
     pub fn from_server_config(config: &ServerConfig) -> Result<Option<Self>, ClusterConfigError> {
-        if config.server.mode != "cluster" {
+        if config.server.mode != ServerMode::Cluster {
             return Ok(None);
         }
 
@@ -81,13 +80,29 @@ impl ClusterConfig {
             .clone()
             .ok_or_else(|| ClusterConfigError::MissingSection("[discovery]".to_string()))?;
 
-        let coordination = config
-            .coordination
-            .clone()
-            .ok_or_else(|| ClusterConfigError::MissingSection("[coordination]".to_string()))?;
+        if !matches!(discovery.strategy.as_str(), "gossip" | "static") {
+            return Err(ClusterConfigError::InvalidDiscoveryStrategy(
+                discovery.strategy,
+            ));
+        }
 
         if discovery.seeds.is_empty() && discovery.strategy == "static" {
             return Err(ClusterConfigError::EmptySeeds);
+        }
+
+        let tls_configured = [
+            discovery.cluster_tls_cert.is_some(),
+            discovery.cluster_tls_key.is_some(),
+            discovery.cluster_tls_client_ca.is_some(),
+            discovery.cluster_tls_server_name.is_some(),
+        ];
+        let tls_complete = tls_configured.iter().all(|is_set| *is_set)
+            && discovery
+                .cluster_tls_server_name
+                .as_ref()
+                .is_some_and(|name| cluster_tls_server_name_is_valid(name));
+        if tls_configured.iter().any(|is_set| *is_set) && !tls_complete {
+            return Err(ClusterConfigError::IncompleteControlPlaneTls);
         }
 
         let node_id = match &config.node_id {
@@ -98,7 +113,6 @@ impl ClusterConfig {
         Ok(Some(Self {
             node_id,
             discovery,
-            coordination,
             formation_timeout: Self::DEFAULT_FORMATION_TIMEOUT,
         }))
     }
@@ -112,6 +126,10 @@ pub enum ClusterConfigError {
     InvalidNodeId(String),
     #[error("static discovery requires at least one seed address")]
     EmptySeeds,
+    #[error("unsupported discovery strategy {0:?}; expected \"gossip\" or \"static\"")]
+    InvalidDiscoveryStrategy(String),
+    #[error("cluster mutual TLS configuration must be complete and use a valid server name")]
+    IncompleteControlPlaneTls,
 }
 
 #[cfg(test)]
@@ -130,7 +148,6 @@ mod tests {
             pipelines: vec![],
             sinks: vec![],
             discovery: None,
-            coordination: None,
             node_id: None,
             sql: None,
             ai: Default::default(),
@@ -140,7 +157,7 @@ mod tests {
 
     fn cluster_config() -> ServerConfig {
         let mut config = base_config();
-        config.server.mode = "cluster".to_string();
+        config.server.mode = ServerMode::Cluster;
         config.node_id = Some("test-node-1".to_string());
         config.discovery = Some(DiscoverySection {
             strategy: "static".to_string(),
@@ -154,12 +171,6 @@ mod tests {
             cluster_tls_client_ca: None,
             cluster_tls_server_name: None,
         });
-        config.coordination = Some(CoordinationSection {
-            strategy: "raft".to_string(),
-            raft_port: 7947,
-            election_timeout: Duration::from_millis(1500),
-            heartbeat_interval: Duration::from_millis(300),
-        });
         config
     }
 
@@ -170,12 +181,11 @@ mod tests {
         let cluster_cfg = result.expect("should return Some for cluster mode");
         assert_eq!(cluster_cfg.node_id.as_str(), "test-node-1");
         assert_eq!(cluster_cfg.discovery.strategy, "static");
-        assert_eq!(cluster_cfg.coordination.raft_port, 7947);
         assert_eq!(cluster_cfg.formation_timeout, Duration::from_secs(60));
     }
 
     #[test]
-    fn test_cluster_config_embedded_mode_returns_none() {
+    fn test_cluster_config_single_mode_returns_none() {
         let config = base_config();
         let result = ClusterConfig::from_server_config(&config).unwrap();
         assert!(result.is_none());
@@ -187,14 +197,6 @@ mod tests {
         config.discovery = None;
         let err = ClusterConfig::from_server_config(&config).unwrap_err();
         assert!(err.to_string().contains("[discovery]"));
-    }
-
-    #[test]
-    fn test_cluster_config_missing_coordination() {
-        let mut config = cluster_config();
-        config.coordination = None;
-        let err = ClusterConfig::from_server_config(&config).unwrap_err();
-        assert!(err.to_string().contains("[coordination]"));
     }
 
     #[test]
@@ -226,6 +228,40 @@ mod tests {
         assert!(ClusterConfigError::EmptySeeds
             .to_string()
             .contains("at least one seed"));
+        assert!(ClusterConfigError::IncompleteControlPlaneTls
+            .to_string()
+            .contains("complete"));
+    }
+
+    #[test]
+    fn programmatic_remote_cluster_config_accepts_plaintext() {
+        let mut config = cluster_config();
+        config.server.bind = "0.0.0.0:8080".into();
+        let discovery = config.discovery.as_mut().unwrap();
+        discovery.advertise_host = Some("10.0.0.7".into());
+        discovery.seeds = vec!["10.0.0.8:7946".into()];
+
+        assert!(ClusterConfig::from_server_config(&config).is_ok());
+    }
+
+    #[test]
+    fn programmatic_partial_cluster_tls_fails() {
+        let mut config = cluster_config();
+        config.discovery.as_mut().unwrap().cluster_tls_cert = Some("node.pem".into());
+
+        assert!(matches!(
+            ClusterConfig::from_server_config(&config),
+            Err(ClusterConfigError::IncompleteControlPlaneTls)
+        ));
+
+        for invalid_name in ["", " bad.example", "bad name"] {
+            let mut config = cluster_config();
+            config.discovery.as_mut().unwrap().cluster_tls_server_name = Some(invalid_name.into());
+            assert!(matches!(
+                ClusterConfig::from_server_config(&config),
+                Err(ClusterConfigError::IncompleteControlPlaneTls)
+            ));
+        }
     }
 
     #[test]
@@ -237,5 +273,17 @@ mod tests {
             ClusterConfigError::EmptySeeds => {}
             other => panic!("expected EmptySeeds, got: {other}"),
         }
+    }
+
+    #[test]
+    fn test_unknown_discovery_strategy_is_rejected() {
+        let mut config = cluster_config();
+        config.discovery.as_mut().unwrap().strategy = "typo".into();
+
+        let err = ClusterConfig::from_server_config(&config).unwrap_err();
+        assert!(matches!(
+            err,
+            ClusterConfigError::InvalidDiscoveryStrategy(strategy) if strategy == "typo"
+        ));
     }
 }

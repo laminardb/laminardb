@@ -170,19 +170,6 @@ impl RefBuffer {
         self.ingest_count = 0;
         Ok(())
     }
-
-    fn estimated_size_bytes(&self) -> usize {
-        let index_size: usize = self
-            .index
-            .values()
-            .map(|btree| btree.len() * (8 + 8 + 24))
-            .sum();
-        let batch_size = self
-            .right_concat
-            .as_ref()
-            .map_or(0, RecordBatch::get_array_memory_size);
-        index_size + batch_size
-    }
 }
 
 pub(crate) struct TemporalProbeState {
@@ -206,17 +193,6 @@ impl TemporalProbeState {
             carried_probes: Vec::new(),
             last_watermark: i64::MIN,
         }
-    }
-
-    pub fn estimated_size_bytes(&self) -> usize {
-        let carried_size: usize = self
-            .carried_probes
-            .iter()
-            .map(|p| {
-                p.left_row_batch.get_array_memory_size() + p.remaining_offsets_ms.len() * 8 + 32
-            })
-            .sum();
-        self.ref_buffer.estimated_size_bytes() + carried_size
     }
 }
 
@@ -914,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compaction_reduces_memory() {
+    fn test_compaction_removes_evicted_rows() {
         let config = test_config(&ProbeOffsetSpec::List(vec![0]));
         let mut state = TemporalProbeState::new();
 
@@ -924,15 +900,26 @@ mod tests {
             execute_temporal_probe_cycle(&mut state, &[], &[market], &config, 0).unwrap();
         }
 
-        let size_before = state.ref_buffer.estimated_size_bytes();
-        assert!(size_before > 0);
+        assert_eq!(
+            state.ref_buffer.right_concat.as_ref().unwrap().num_rows(),
+            40
+        );
 
         execute_temporal_probe_cycle(&mut state, &[], &[], &config, 35_000).unwrap();
 
-        let size_after = state.ref_buffer.estimated_size_bytes();
-        assert!(
-            size_after < size_before,
-            "compaction should reduce memory: before={size_before}, after={size_after}"
+        assert_eq!(
+            state.ref_buffer.right_concat.as_ref().unwrap().num_rows(),
+            5
+        );
+        assert_eq!(
+            state
+                .ref_buffer
+                .index
+                .values()
+                .flat_map(BTreeMap::values)
+                .map(Vec::len)
+                .sum::<usize>(),
+            5
         );
     }
 

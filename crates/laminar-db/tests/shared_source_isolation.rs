@@ -1,12 +1,12 @@
 //! Shared-source failure isolation, end to end.
 //!
-//! Two streams read one source: an aggregation forced to fault every cycle (1-byte
-//! state limit) and a healthy projection. With `shared_source_isolation` on the
+//! Two streams read one source: an intentionally rejected temporal expression and a healthy
+//! projection. With `shared_source_isolation` on the
 //! healthy sibling keeps producing; with it off the whole shared-source domain faults
 //! and starves it.
 //!
 //! Transient-fault replay lives in the unit test
-//! `test_shared_source_isolation_replays_faulted_domain`; a state-limit fault is
+//! `test_shared_source_isolation_replays_faulted_domain`; this planner rejection is
 //! persistent, so this covers only the sibling-survives half.
 
 use std::sync::Arc;
@@ -31,7 +31,10 @@ impl FromBatch for CapturedBatch {
 
 fn drain_rows(sub: &mut TypedSubscription<CapturedBatch>) -> usize {
     let mut rows = 0;
-    while let Some(batches) = sub.poll() {
+    while let Some(batches) = sub
+        .poll()
+        .expect("healthy subscription must remain contiguous")
+    {
         for cb in batches {
             rows += cb.0.num_rows();
         }
@@ -54,8 +57,6 @@ async fn healthy_rows_with_isolation(isolation: bool) -> usize {
     let dir = tempfile::tempdir().unwrap();
     let config = LaminarConfig {
         storage_dir: Some(dir.path().to_path_buf()),
-        // 1 byte trips on any aggregate state (faults every cycle) but not a stateless projection.
-        max_state_bytes_per_operator: Some(1),
         shared_source_isolation: isolation,
         ..LaminarConfig::default()
     };
@@ -71,15 +72,14 @@ async fn healthy_rows_with_isolation(isolation: bool) -> usize {
     db.execute("CREATE STREAM healthy AS SELECT symbol, price FROM trades")
         .await
         .unwrap();
-    // Faulting: aggregate state trips the 1-byte limit every cycle.
-    db.execute(
-        "CREATE STREAM aggy AS SELECT symbol, SUM(price) AS total FROM trades GROUP BY symbol",
-    )
-    .await
-    .unwrap();
+    // Faulting: non-windowed now() is rejected by the runtime operator unless it is the supported
+    // EMIT CHANGES temporal-filter shape.
+    db.execute("CREATE STREAM broken AS SELECT symbol, price FROM trades WHERE ts > now()")
+        .await
+        .unwrap();
     db.start().await.unwrap();
 
-    let mut healthy = db.subscribe::<CapturedBatch>("healthy").unwrap();
+    let mut healthy = db.subscribe::<CapturedBatch>("healthy").await.unwrap();
 
     let source = db.source_untyped("trades").unwrap();
     for i in 0..20 {

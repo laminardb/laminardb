@@ -3,21 +3,21 @@ replicaCount: 3
 laminardb:
   mode: cluster
   logLevel: info
+  state:
+    backend: object_store
+    url: "s3://laminardb-ci/state"
+  checkpoint:
+    url: "s3://laminardb-ci/checkpoints"
   cluster:
     discovery:
       strategy: gossip
       gossipPort: 7946
-    coordination:
-      strategy: raft
-      raftPort: 7947
 
 persistence:
   state:
-    enabled: true
-    size: 10Gi
+    enabled: false
   checkpoints:
-    enabled: true
-    size: 50Gi
+    enabled: false
 
 podDisruptionBudget:
   enabled: true

@@ -20,7 +20,7 @@ LaminarDB is pre-1.0. Single-node embedded and standalone server deployments are
 
 ## Connectors
 
-- [Connectors overview](https://raw.githubusercontent.com/laminardb/laminardb/main/crates/laminar-connectors/README.md): Kafka, CDC (PostgreSQL, MySQL, MongoDB), Delta Lake, Iceberg, OpenTelemetry, WebSocket, files, lookups
+- [Connectors overview](https://raw.githubusercontent.com/laminardb/laminardb/main/crates/laminar-connectors/README.md): Kafka, CDC (PostgreSQL, MongoDB), Delta Lake, Iceberg, OpenTelemetry, WebSocket, files, lookups
 
 ## Crates
 

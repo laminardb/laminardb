@@ -23,9 +23,7 @@ impl Connection {
     /// Returns `ApiError` if database creation fails.
     pub fn open() -> Result<Self, ApiError> {
         let db = LaminarDB::open().map_err(ApiError::from)?;
-        Ok(Self {
-            inner: Arc::new(db),
-        })
+        Ok(Self { inner: db })
     }
 
     /// Open with custom configuration.
@@ -35,9 +33,7 @@ impl Connection {
     /// Returns `ApiError` if database creation fails.
     pub fn open_with_config(config: LaminarConfig) -> Result<Self, ApiError> {
         let db = LaminarDB::open_with_config(config).map_err(ApiError::from)?;
-        Ok(Self {
-            inner: Arc::new(db),
-        })
+        Ok(Self { inner: db })
     }
 
     /// Execute a SQL statement (blocking wrapper around async).
@@ -213,10 +209,30 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// Currently always succeeds.
-    #[allow(clippy::unnecessary_wraps)]
+    /// Returns an error if shutdown or creation of the temporary runtime fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the scoped shutdown thread panics.
     pub fn close(self) -> Result<(), ApiError> {
-        self.inner.close();
+        let shutdown = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let inner = Arc::clone(&self.inner);
+                        handle.block_on(async move { inner.shutdown().await })
+                    })
+                    .join()
+                    .unwrap()
+            })
+        } else {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| ApiError::internal(format!("Runtime error: {error}")))?;
+            runtime.block_on(self.inner.shutdown())
+        };
+        shutdown.map_err(ApiError::from)?;
         // Exclusive ownership → cleanup runs in drop; else other handles persist.
         match Arc::try_unwrap(self.inner) {
             Ok(_db) => Ok(()),
@@ -341,13 +357,6 @@ impl Connection {
         self.inner.metrics()
     }
 
-    /// Cold-tier demotion/promotion metrics (single-node observability).
-    #[cfg(feature = "state-tier")]
-    #[must_use]
-    pub fn tier_metrics(&self) -> crate::TierMetrics {
-        self.inner.tier_metrics()
-    }
-
     /// Get metrics for a specific source.
     #[must_use]
     pub fn source_metrics(&self, name: &str) -> Option<crate::SourceMetrics> {
@@ -412,23 +421,42 @@ impl Connection {
         result.map_err(ApiError::from)
     }
 
-    /// Subscribe to a named stream.
+    /// Subscribe to a named stream from synchronous code.
     ///
     /// # Errors
     ///
-    /// Returns `ApiError` if the stream is not found.
+    /// Returns `ApiError` if called inside an async runtime or if the stream or
+    /// its output schema is unresolved.
     pub fn subscribe(
         &self,
         stream_name: &str,
     ) -> Result<super::subscription::ArrowSubscription, ApiError> {
-        let sub = self
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(ApiError::subscription(
+                "blocking subscribe is unavailable inside an async runtime; use subscribe_async",
+            ));
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| ApiError::internal(format!("Runtime error: {error}")))?;
+        runtime.block_on(self.subscribe_async(stream_name))
+    }
+
+    /// Subscribe to a named stream without blocking the calling runtime.
+    ///
+    /// # Errors
+    /// Returns `ApiError` if the stream or its output schema is unresolved.
+    pub async fn subscribe_async(
+        &self,
+        stream_name: &str,
+    ) -> Result<super::subscription::ArrowSubscription, ApiError> {
+        let portal = self
             .inner
-            .subscribe_raw(stream_name)
+            .open_subscription(stream_name, None, crate::subscription::SubscribeStart::Tail)
+            .await
             .map_err(ApiError::from)?;
-        Ok(super::subscription::ArrowSubscription::new(
-            sub,
-            std::sync::Arc::new(arrow::datatypes::Schema::empty()),
-        ))
+        Ok(super::subscription::ArrowSubscription::new(portal))
     }
 }
 
@@ -475,6 +503,37 @@ mod tests {
         let conn = Connection::open().unwrap();
         assert!(!conn.is_closed());
         conn.close().unwrap();
+    }
+
+    #[test]
+    fn close_is_terminal_after_start_from_temporary_runtime() {
+        let conn = Connection::open().unwrap();
+        conn.execute("CREATE SOURCE events (id BIGINT)").unwrap();
+
+        conn.start().unwrap();
+        let db = Arc::clone(&conn.inner);
+        assert_eq!(
+            crate::db::DbState::load(&db.state),
+            crate::db::DbState::Running
+        );
+
+        let inspection_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        conn.close().unwrap();
+        assert_eq!(
+            crate::db::DbState::load(&db.state),
+            crate::db::DbState::Stopped
+        );
+        inspection_runtime.block_on(async {
+            assert!(db.runtime_handle.lock().await.is_none());
+            assert!(db.committer_handle.lock().await.is_none());
+        });
+        assert!(db.owned_source_tasks.lock().is_empty());
+        assert!(db.owned_sink_handles.lock().is_empty());
+        assert!(db.checkpoint_namespace_lock.lock().is_none());
     }
 
     #[test]
@@ -525,6 +584,68 @@ mod tests {
             result.unwrap_err().code(),
             super::super::error::codes::TABLE_NOT_FOUND
         );
+    }
+
+    #[test]
+    fn named_subscription_uses_resolved_output_schema() {
+        let conn = Connection::open().unwrap();
+        conn.execute("CREATE SOURCE input (id BIGINT, value DOUBLE)")
+            .unwrap();
+        conn.execute("CREATE STREAM output AS SELECT id, value FROM input")
+            .unwrap();
+
+        let Err(unresolved) = conn.subscribe("output") else {
+            panic!("unresolved stream schema must not open a subscription");
+        };
+        assert_eq!(
+            unresolved.code(),
+            super::super::error::codes::TABLE_NOT_FOUND
+        );
+
+        conn.start().unwrap();
+        let subscription = conn.subscribe("output").unwrap();
+        let schema = subscription.schema();
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(1).name(), "value");
+        conn.shutdown().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_subscribe_fails_closed_inside_runtime() {
+        let conn = Connection::open().unwrap();
+        let Err(error) = conn.subscribe("anything") else {
+            panic!("blocking subscribe must reject an async runtime");
+        };
+        assert_eq!(
+            error.code(),
+            super::super::error::codes::SUBSCRIPTION_FAILED
+        );
+        assert!(error.message().contains("subscribe_async"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_subscribe_opens_on_current_thread_runtime() {
+        let conn = Connection::open().unwrap();
+        conn.inner
+            .execute("CREATE SOURCE async_input (id BIGINT)")
+            .await
+            .unwrap();
+        conn.inner
+            .execute("CREATE STREAM async_output AS SELECT id FROM async_input")
+            .await
+            .unwrap();
+        conn.inner.start().await.unwrap();
+
+        let mut subscription = conn.subscribe_async("async_output").await.unwrap();
+        assert_eq!(subscription.schema().field(0).name(), "id");
+        let error = subscription.next_frame().unwrap_err();
+        assert_eq!(
+            error.code(),
+            super::super::error::codes::SUBSCRIPTION_FAILED
+        );
+        assert!(error.message().contains("next_frame_async"));
+        conn.inner.shutdown().await.unwrap();
     }
 
     #[test]

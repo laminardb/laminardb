@@ -8,7 +8,7 @@
 
 # LaminarDB
 
-A streaming SQL engine for Rust. Embed it as a library or run the standalone server. Continuous queries, event-time windows, exactly-once checkpoints. No JVM, no cluster required.
+A streaming SQL engine for Rust. Embed it as a library or run the standalone server. Continuous queries, event-time windows, and checkpointed recovery. No JVM, no cluster required.
 
 ## Quick Start
 
@@ -86,7 +86,7 @@ conn.close()
 |------|-----|
 | Embedded | `cargo add laminar-db`. Runs in-process. |
 | Standalone | `laminardb` binary. TOML config, REST API, Postgres wire protocol, Prometheus metrics, hot reload. |
-| Cluster | Multi-node deployment. Gossip discovery, Raft coordination, dynamic partition/vnode rebalance, distributed 2PC checkpointer. |
+| Cluster | Multi-node deployment. Static or gossip discovery, lease-fenced control paths, dynamic partition/vnode rebalance, and distributed checkpoints. |
 
 ### Prebuilt binaries
 
@@ -139,44 +139,53 @@ LaminarDB supports multi-node cluster deployments. In this mode, streaming pipel
 ### Architecture & Dynamics
 
 * **Membership & Discovery**: Nodes discover one another using either a gossip-based protocol (Chitchat peer-to-peer membership over a configured `gossip_port`) or a static seeds list.
-* **Coordination**: Raft consensus manages metadata and leases. A consensus group elects a leader, tracks node lease lifecycles, and maintains the partition layout table (`AssignmentSnapshotStore`).
-* **Dynamic Rebalancing**: A total of 256 virtual nodes (vnodes) are dynamically distributed across active cluster nodes. When a new node joins or an existing node departs (or fails), the leader automatically rebalances the vnode assignments. When shutting down gracefully, a node announces a `Draining` state, letting the leader reallocate its vnodes before the node terminates.
-* **Distributed Checkpoints & 2PC**: Checkpoint barriers flow through the distributed operator graph. Exactly-once sink commits are governed by a distributed two-phase commit (2PC) protocol managed by the leader node. Checkpoints require a minimum interval of 2 seconds to ensure manifest durability gates and sink commit coordination.
-* **State Store**: Requires a shared storage backend (`object_store` mode, e.g., S3, GCS, Azure Blob, or a shared filesystem) to allow nodes to read and recover state partitions.
+* **Coordination**: Membership selects a leader candidate, while a renewable shared-store lease fences leader-only control paths. Vnode assignments are CAS-published through `AssignmentSnapshotStore`; there is no embedded Raft service.
+* **Dynamic Rebalancing**: Stable key groups (256 by default) are dynamically distributed across active cluster nodes. When a new node joins or an existing node departs (or fails), the leader automatically rebalances the assignments. When shutting down gracefully, a node announces a `Draining` state, letting the leader reallocate its key groups before the node terminates.
+* **Distributed Checkpoints**: Checkpoint barriers flow through the distributed operator graph and state is sealed in shared storage. Cluster delivery is currently admitted only as `at_least_once`.
+* **State Store**: Requires a cluster-shared `object_store` backend (S3, GCS, or Azure Blob) so another node can read and recover state partitions. Local paths and `file://` URLs are node-durable, not cluster-shared.
+
+> [!IMPORTANT]
+> Cluster exactly-once currently fails closed with `[LDB-0013]`. Checkpoint decisions are term-fenced, but no supported connector path yet has both certified term-fenced source handoff and an external sink cursor commit. Use cluster `at_least_once`; the only admitted local exact candidate is the certified deterministic generator with append-mode Delta, and it is not yet production-certified end to end.
+> Embedded/single-node exactly-once requires node-durable state and the built-in local checkpoint/decision store, held under an OS-released exclusive deployment lock. For the standalone server, a `file://` checkpoint URL selects that store. Shared object-store URLs and library-injected object or decision stores fail closed with `[LDB-0014]` because their writer-fencing provenance cannot yet be proved.
+> Cluster materialized views currently fail closed with `[LDB-4007]`; their output does not yet have a planner-certified distribution plus assignment-fenced checkpoint/read lifecycle. Stateless `CREATE STREAM` remains supported, while embedded and single-node materialized views are unaffected.
 
 ### Cluster Configuration Example
 
-To deploy in cluster mode, configure the `[discovery]` and `[coordination]` sections in `laminardb.toml`, and set `server.mode` to `"cluster"`.
+To deploy in cluster mode, configure `[discovery]` in `laminardb.toml` and set `server.mode` to `"cluster"`.
 
 ```toml
+node_id = "node-1" # Required and unique per node
+
 [server]
 mode = "cluster"
 bind = "0.0.0.0:8080"
-node_id = "node-1" # Unique node identifier (auto-generated if omitted)
+delivery = "at_least_once"
+key_groups = 256
 
 [discovery]
 strategy = "gossip" # "gossip" or "static"
 gossip_port = 7946
 advertise_host = "10.0.0.1"
 seeds = ["10.0.0.1:7946", "10.0.0.2:7946"]
-
-[coordination]
-strategy = "raft"
-raft_port = 8888
-election_timeout = "3s"
-heartbeat_interval = "500ms"
+cluster_tls_cert = "/etc/laminardb/tls/node.crt"
+cluster_tls_key = "/etc/laminardb/tls/node.key"
+cluster_tls_client_ca = "/etc/laminardb/tls/cluster-ca.crt"
+cluster_tls_server_name = "laminardb-cluster.internal"
 
 [state]
 backend = "object_store"
 url = "s3://my-bucket/laminardb/state"
-instance_id = "node-1"
-vnode_capacity = 256
-discovery = "dynamic"
-seed_peers = ["10.0.0.1:7946", "10.0.0.2:7946"]
+
+[checkpoint]
+url = "s3://my-bucket/laminardb/checkpoints"
+interval = "30s"
+timeout = "120s"
 ```
 
+Cluster barrier/shuffle RPC uses plaintext when all four `cluster_tls_*` fields are omitted. To enable mTLS, configure all four fields; every node certificate must chain to the configured CA and contain `cluster_tls_server_name` as a SAN. These fields do not wrap Chitchat gossip, so restrict `gossip_port` to a trusted network. Use mTLS for production clusters unless transport security is provided by the deployment network.
+
 > [!NOTE]
-> If `server.mode` is set to `"embedded"` (the default), no cluster services (Gossip, Raft) are started or bound, avoiding interference with any existing cluster configurations, even if the server binary was built with the cluster feature flag enabled.
+> If `server.mode` is set to `"single"` (the default), no discovery, cluster control-plane, or shuffle services are started or bound, even when the binary includes cluster support.
 
 
 ---
@@ -247,9 +256,15 @@ TEMPORAL PROBE JOIN prices r
     RANGE FROM 0s TO 30s STEP 5s AS p;
 
 -- Lookup join against external Postgres table
-CREATE LOOKUP TABLE instruments FROM POSTGRES (
-    hostname = 'db.example.com', port = '5432',
-    database = 'market', query = 'SELECT * FROM instruments'
+CREATE LOOKUP TABLE instruments (
+    symbol VARCHAR NOT NULL,
+    sector VARCHAR,
+    exchange VARCHAR,
+    PRIMARY KEY (symbol)
+) WITH (
+    'connector' = 'postgres',
+    'connection' = 'host=db.example.com port=5432 dbname=market',
+    'table' = 'instruments'
 );
 
 SELECT t.symbol, t.price, i.sector, i.exchange
@@ -288,7 +303,7 @@ CREATE SOURCE ... [FROM connector(...)]
 CREATE STREAM ... AS SELECT ...                    [WITH ('retain_history' = '64mb')]
 CREATE MATERIALIZED VIEW ... AS SELECT ...
 CREATE SINK ... INTO connector(...) AS SELECT ...
-CREATE LOOKUP TABLE ... FROM POSTGRES(...) | PARQUET(...)
+CREATE LOOKUP TABLE ... (...) WITH ('connector' = '<lookup-connector>', ...)
 DROP SOURCE | STREAM | SINK | MATERIALIZED VIEW
 SHOW SOURCES | STREAMS | SINKS | MATERIALIZED VIEWS
 SHOW CREATE SOURCE name
@@ -298,7 +313,7 @@ SUBSCRIBE <stream> [AS OF EPOCH n] [WHERE …]      -- live tail of a stream
 DECLARE c CURSOR FOR SUBSCRIBE … ; FETCH n FROM c -- cursored consumption
 ```
 
-`retain_history` keeps a bounded ring of recent committed epochs in memory; combined with `SUBSCRIBE … AS OF EPOCH n`, a client can resume from the last epoch it saw and reconnect without gaps.
+`retain_history` keeps a bounded suffix of committed epochs in memory. Resume only from a progress marker the client durably recorded: WebSocket emits `type=progress` frames, while pgwire emits `__laminar_kind=progress` rows with epoch and checkpoint ID. `SUBSCRIBE … AS OF EPOCH n` then starts strictly after that committed cut or fails visibly if it is unavailable.
 
 All aggregation functions from DataFusion 52 are available: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `FIRST_VALUE`, `LAST_VALUE`, `STDDEV`, `PERCENTILE_CONT`, `APPROX_COUNT_DISTINCT`, `LAG`, `LEAD`, `ROW_NUMBER`, and 40+ more. JSON extraction, array/struct/map functions, and `UNNEST` are also supported.
 
@@ -330,34 +345,32 @@ Local models are encoder-only (BERT / DistilBERT / MiniLM family) and run on **O
 
 ## Connectors
 
-Feature-gated connectors for external systems. Each implements `SourceConnector` or `SinkConnector` with two-phase commit for exactly-once semantics.
+Feature-gated connectors for external systems. Each advertises a typed recovery, durability, topology, and input contract; startup rejects combinations that cannot uphold the pipeline-wide delivery guarantee.
 
 ### Sources
 
 | Connector | Feature Flag | Notes | Status |
 |-----------|-------------|-------|--------|
-| Kafka | `kafka` | Consumer group, Schema Registry, Avro/JSON/CSV/Debezium | ✅ |
-| PostgreSQL CDC | `postgres-cdc` | Logical replication (pgoutput), Z-set changelog | ✅ |
-| MySQL CDC | `mysql-cdc` | Binlog replication, GTID position tracking | ✅ |
-| MongoDB CDC | `mongodb-cdc` | Change streams, resume token tracking | ✅ |
+| Kafka | `kafka` | Replayable at-least-once; exact delivery rejected pending certification | ✅ |
+| PostgreSQL CDC | `postgres-cdc` | Resume-only pgoutput replication; fresh startup is rejected | ✅ |
+| MongoDB CDC | `mongodb-cdc` | UUID-bound fixed-collection resume; replayable at-least-once only | ✅ |
 | OpenTelemetry OTLP | `otel` | OTLP/gRPC receiver for traces, metrics, and logs | ✅ |
 | WebSocket Client | `websocket` | Connect to external WebSocket servers | ✅ |
 | WebSocket Server | `websocket` | Accept incoming WebSocket connections | ✅ |
-| Delta Lake | `delta-lake` | Read from Delta Lake tables, version polling | ✅ |
-| Iceberg | `iceberg` | Apache Iceberg table source (REST/Glue/Hive catalogs) | ✅ |
+| Delta Lake | `delta-lake` | Version polling; local best-effort-only `Ephemeral` singleton, unavailable in cluster | ✅ |
+| Iceberg | `iceberg` | REST catalog polling; local best-effort-only `Ephemeral` singleton, unavailable in cluster | ✅ |
 | Files (AutoLoader) | `files` | Glob pattern discovery, watch mode, Parquet/CSV | ✅ |
-| Parquet Lookup | `parquet-lookup` | Read Parquet files as reference tables | ✅ |
-| Postgres Lookup | `postgres-cdc` | Query external Postgres tables for enrichment | ✅ |
+| Postgres Lookup | `postgres-cdc` | Connector name `postgres`; external table enrichment | ✅ |
 
 ### Sinks
 
 | Connector | Feature Flag | Notes | Status |
 |-----------|-------------|-------|--------|
-| Kafka | `kafka` | Exactly-once transactions, configurable partitioning | ✅ |
-| PostgreSQL | `postgres-sink` | COPY BINARY, upsert, co-transactional exactly-once | ✅ |
-| MongoDB | `mongodb-cdc` | Ordered/unordered writes, upsert, CDC replay | ✅ |
-| Delta Lake | `delta-lake` | S3/Azure/GCS, epoch-aligned Parquet commits | ✅ |
-| Iceberg | `iceberg` | Apache Iceberg sink (REST/Glue/Hive catalogs) | ✅ |
+| Kafka | `kafka` | Durable at-least-once, configurable partitioning | ✅ |
+| PostgreSQL | `postgres-sink` | COPY BINARY and upsert, durable at-least-once | ✅ |
+| MongoDB | `mongodb-cdc` | Majority-journaled ordered writes, upsert/CDC replay, durable at-least-once | ✅ |
+| Delta Lake | `delta-lake` | Coordinated append candidate; not production-certified end to end | ✅ |
+| Iceberg | `iceberg` | REST catalog append, durable at-least-once; never checkpoint-committable | ✅ |
 | WebSocket Server | `websocket` | Fan-out to connected subscribers | ✅ |
 | WebSocket Client | `websocket` | Push to external WebSocket server | ✅ |
 | Files | `files` | Parquet/CSV with timestamp/partition templates | ✅ |
@@ -371,19 +384,22 @@ CREATE SOURCE trades (
     symbol VARCHAR, price DOUBLE, volume BIGINT, ts TIMESTAMP,
     WATERMARK FOR ts AS ts - INTERVAL '5' SECOND
 ) FROM KAFKA (
-    brokers = '${KAFKA_BROKERS}',
+    'bootstrap.servers' = '${KAFKA_BROKERS}',
     topic = 'market-trades',
-    group_id = 'laminar-analytics',
+    'group.id' = 'laminar-analytics',
     format = 'json',
-    offset_reset = 'earliest'
+    'auto.offset.reset' = 'earliest'
 );
 
-CREATE SINK trade_archive INTO DELTA_LAKE (
-    path = 's3://my-bucket/trade_summary',
-    write_mode = 'append',
-    delivery.guarantee = 'exactly-once'
+CREATE SINK trade_archive INTO "delta-lake" (
+    "table.path" = 's3://my-bucket/trade_summary',
+    "write.mode" = 'append'
 ) AS SELECT * FROM trade_summary;
 ```
+
+Delivery is one pipeline-wide runtime setting (`[server].delivery` for the standalone server or
+`LaminarDbBuilder::delivery_guarantee` when embedded). Per-sink delivery flags are rejected rather
+than silently creating mixed checkpoint semantics.
 
 Supported formats: `json`, `csv`, `avro` (with Schema Registry), `raw` (bytes), `debezium` (CDC envelope).
 
@@ -424,11 +440,10 @@ The HTTP API binds to `bind` configured under `[server]`. It serves the followin
 
 * **DDL & SQL Execution**: `POST /api/v1/sql` accepts SQL queries. It returns JSON-formatted results (including Arrow record batches, metadata, and error diagnostics).
 * **Lineage & Dependency Graph**: `GET /api/v1/graph` traces upstream and downstream relationship edges (`source -> stream -> MV -> sink`) to generate dependency DAGs.
-* **Ad-hoc Live Streaming Queries**: `POST /api/v1/queries` registers an ephemeral query stream, returning a unique `ws_url`. The UI opens a WebSocket connection to `GET /ws/{stream_id}` to subscribe to and tail live output. The ephemeral stream is dropped once the WebSocket closes or times out.
 * **Cluster Management**:
   * `GET /api/v1/cluster/nodes` returns the list of active/draining/suspected nodes.
-  * `GET /api/v1/cluster/vnodes` returns the 256 vnode partition assignments.
-  * `GET /api/v1/cluster/leader` returns the current Raft leader lease holder.
+  * `GET /api/v1/cluster/vnodes` returns the configured key-group assignments.
+  * `GET /api/v1/cluster/leader` returns the current durable leader-lease holder.
   * `GET /api/v1/cluster/checkpoints` returns completed checkpoint metadata.
 * **Pipeline Administration**:
   * `GET /api/v1/sources` | `/api/v1/sinks` | `/api/v1/streams` | `/api/v1/mvs` to inspect existing entities.
@@ -559,13 +574,13 @@ graph TD
 ```
 
 ### 4. Cluster Mode (Distributed Deployment)
-Runs as a distributed cluster of cooperative nodes. Nodes discover one another peer-to-peer using **Chitchat Gossip**, coordinate virtual node assignments (VNodes) and metadata leases via **Raft Consensus** (OpenRaft), exchange partition streams via high-performance **gRPC & Arrow-Flight** shuffles, and persist coordinated checkpoints to a shared object store.
+Runs as a distributed cluster of cooperative nodes. Nodes use static membership or **Chitchat Gossip**, fence leader-only work with a renewable shared-store lease, publish VNode assignments through create/CAS operations, exchange partition streams via high-performance **gRPC & Arrow-Flight** shuffles, and persist coordinated checkpoints to shared object storage.
 
 ```mermaid
 graph TD
     classDef clientClass fill:#10b981,fill-opacity:0.15,stroke:#10b981,stroke-width:1px;
     classDef engineClass fill:#8b5cf6,fill-opacity:0.15,stroke:#8b5cf6,stroke-width:2px,font-weight:bold;
-    classDef raftClass fill:#3b82f6,fill-opacity:0.1,stroke:#3b82f6,stroke-width:1px;
+    classDef controlClass fill:#3b82f6,fill-opacity:0.1,stroke:#3b82f6,stroke-width:1px;
     classDef gossipClass fill:#06b6d4,fill-opacity:0.15,stroke:#06b6d4,stroke-width:1px;
     classDef vnodeClass fill:#78716c,fill-opacity:0.15,stroke:#78716c,stroke-width:1px;
     classDef storageClass fill:#f97316,fill-opacity:0.15,stroke:#f97316,stroke-width:1px;
@@ -575,18 +590,18 @@ graph TD
     subgraph Node1["LaminarDB Node 1 (Coordinator Leader)"]
         direction TB
         E1["Streaming Engine"]:::engineClass
-        Raft1["Raft Consensus<br/>(OpenRaft)"]:::raftClass
+        Control1["Lease-Fenced<br/>Control Plane"]:::controlClass
         Gossip1["Chitchat Gossip"]:::gossipClass
-        VNodes1["Virtual Nodes<br/>(VNodes 1 - 128)"]:::vnodeClass
+        VNodes1["Owned Key Groups<br/>(Dynamic Subset)"]:::vnodeClass
         E1 <--> VNodes1
     end
 
     subgraph Node2["LaminarDB Node 2 (Follower)"]
         direction TB
         E2["Streaming Engine"]:::engineClass
-        Raft2["Raft Consensus<br/>(OpenRaft)"]:::raftClass
+        Control2["Cluster Control<br/>Follower"]:::controlClass
         Gossip2["Chitchat Gossip"]:::gossipClass
-        VNodes2["Virtual Nodes<br/>(VNodes 129 - 256)"]:::vnodeClass
+        VNodes2["Owned Key Groups<br/>(Dynamic Subset)"]:::vnodeClass
         E2 <--> VNodes2
     end
 
@@ -596,11 +611,12 @@ graph TD
 
     %% Node Communication
     Gossip1 ---|"Peer Discovery"| Gossip2
-    Raft1 ---|"Metadata and<br/>Partition Leases"| Raft2
     E1 ---|"gRPC and Arrow-Flight<br/>Data Shuffle"| E2
 
     %% Distributed Durability
-    Node1 -->|"Coordinated 2-Phase<br/>Commit Checkpoints"| SharedStore["Shared Object Store (S3 / GCS / Azure)"]:::storageClass
+    Control1 -->|"Leader Lease and<br/>Assignment CAS"| SharedStore["Shared Object Store (S3 / GCS / Azure)"]:::storageClass
+    Control2 -->|"Read Shared<br/>Control State"| SharedStore
+    Node1 -->|"Coordinated 2-Phase<br/>Commit Checkpoints"| SharedStore
     Node2 -->|"Coordinated 2-Phase<br/>Commit Checkpoints"| SharedStore:::storageClass
 
     style Node1 fill:#6b7280,fill-opacity:0.05,stroke:#4b5563,stroke-width:1.5px
@@ -678,23 +694,23 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
 ### Checkpointing and Recovery
 
 1. **Coordinated snapshots.** Chandy-Lamport barriers injected at sources; operators with multiple inputs align before snapshotting.
-2. **Two-phase commit.** Exactly-once sinks participate in pre-commit / commit phases coordinated by `CheckpointCoordinator`.
-3. **Atomic manifest.** Each checkpoint writes a JSON manifest (operator state + connector offsets) via temp-file-plus-rename, to filesystem or object store (S3 / GCS / Azure).
-4. **Recovery.** `RecoveryManager` loads the latest manifest, restores operator state, rolls back exactly-once sinks, and resumes connectors from committed offsets.
+2. **External commit.** In embedded/single-node exactly-once mode, checkpoint-committable sinks stage output and publish it only after the durable checkpoint decision.
+3. **Durable decision.** Prepared and finalized manifests bind the deployment, pipeline, exact attempt, state seals, connector positions, and participants. Filesystem/object-store writes use create/CAS boundaries appropriate to the backend.
+4. **Recovery.** `RecoveryManager` accepts the latest finalized identity-matching manifest, restores state and source positions, and reconciles coordinated sinks from their exact external cursor.
 
 ```rust
 // Note: StreamCheckpointConfig is from laminar-core (add as a dependency)
 let db = LaminarDB::builder()
     .storage_dir("./data")
     .checkpoint(laminar_core::streaming::StreamCheckpointConfig {
-        interval: std::time::Duration::from_secs(30),
+        interval_ms: Some(30_000),
         ..Default::default()
     })
     .build()
     .await?;
 ```
 
-On crash, events between the last completed checkpoint and the crash are lost. Checkpoint interval is configurable; shorter intervals reduce the data loss window at the cost of higher I/O overhead.
+Recovery resumes from the latest finalized checkpoint. Replayable sources may resend records after that cut under at-least-once delivery; a certified single-node exactly-once pipeline suppresses duplicate external visibility through coordinated sink commits. Non-replayable sources are admitted only under `best_effort`, where failure can lose accepted events. Shorter checkpoint intervals reduce replay work but increase storage and coordination I/O.
 
 ### Compiled Query Execution
 
@@ -723,9 +739,8 @@ Criterion suites live under `crates/laminar-core/benches/`, `crates/laminar-db/b
 | Flag | Description |
 |------|-------------|
 | `kafka` | Kafka source/sink, Avro serde, Schema Registry |
-| `postgres-cdc` | PostgreSQL CDC source via logical replication (also enables Postgres lookup) |
+| `postgres-cdc` | PostgreSQL CDC source via logical replication (also builds the standalone `postgres` lookup connector) |
 | `postgres-sink` | PostgreSQL sink via COPY BINARY |
-| `mysql-cdc` | MySQL CDC source via binlog replication |
 | `mongodb-cdc` | MongoDB CDC source and sink |
 | `delta-lake` | Delta Lake source and sink |
 | `delta-lake-s3` / `delta-lake-azure` / `delta-lake-gcs` | Cloud storage backends for Delta Lake |
@@ -734,7 +749,7 @@ Criterion suites live under `crates/laminar-core/benches/`, `crates/laminar-db/b
 | `websocket` | WebSocket source and sink connectors |
 | `files` | File source (AutoLoader) and sink (rolling Parquet/CSV/JSON) |
 | `otel` | OpenTelemetry OTLP/gRPC source (traces, metrics, logs) |
-| `parquet-lookup` | Parquet lookup source for reference tables |
+| `parquet-lookup` | Parquet schema and codec helpers; no standalone connector |
 | `api` / `ffi` | C FFI layer with Arrow C Data Interface |
 
 ---
@@ -753,7 +768,7 @@ cargo bench                    # Run all benchmarks
 cargo doc --no-deps --open     # Generate API docs
 
 # With optional connectors
-cargo test --features kafka,postgres-cdc,mysql-cdc,delta-lake,websocket
+cargo test --features kafka,postgres-cdc,mongodb-cdc,delta-lake,websocket
 
 # Run the Binance WebSocket demo
 cargo run -p binance-ws
@@ -765,7 +780,7 @@ cargo run -p binance-ws
 crates/
   laminar-core/        Core engine: operators, windows, streaming channels, checkpoint barriers, error codes, storage/checkpoint stores
   laminar-sql/         SQL parser, planner, DataFusion integration, streaming optimizer, watermark pushdown
-  laminar-connectors/  Kafka, CDC (PG/MySQL/Mongo), WebSocket, Files, Delta Lake, Iceberg, OTEL
+  laminar-connectors/  Kafka, CDC (PostgreSQL/MongoDB), WebSocket, Files, Delta Lake, Iceberg, OTEL
   laminar-db/          Unified database facade, StreamingCoordinator, checkpoint coordination, recovery, FFI
   laminar-derive/      Derive macros: Record, FromRecordBatch, FromRow, ConnectorConfig
   laminar-server/      Standalone server binary (HTTP API, Docker, Helm)

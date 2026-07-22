@@ -210,10 +210,6 @@ impl GraphOperator for TemporalJoinOperator {
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
         Ok(None) // stateless
     }
-
-    fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
-        Ok(()) // stateless
-    }
 }
 
 #[cfg(test)]

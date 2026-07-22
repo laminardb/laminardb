@@ -22,8 +22,9 @@ use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::{WindowOperatorConfig, WindowType};
 
 use crate::aggregate_state::{
-    compile_having_filter, expr_to_sql, extract_clauses, find_aggregate, AggFuncSpec,
-    CompiledProjection, GroupCheckpoint, PreAggBuilder, WindowCheckpoint,
+    compile_having_filter, expr_to_sql, extract_clauses, find_aggregate,
+    query_fingerprint_with_config, AggFuncSpec, CompiledProjection, GroupCheckpoint, PreAggBuilder,
+    WindowCheckpoint,
 };
 use crate::eowc_state::{extract_i64_timestamps, NULL_TIMESTAMP};
 use crate::error::DbError;
@@ -138,6 +139,8 @@ pub(crate) struct CoreWindowState {
     agg_specs: Vec<AggFuncSpec>,
     num_group_cols: usize,
     group_types: Vec<DataType>,
+    query_sql: String,
+    #[cfg(test)]
     pre_agg_sql: String,
     time_col_index: usize,
     output_schema: SchemaRef,
@@ -510,6 +513,8 @@ impl CoreWindowState {
             agg_specs,
             num_group_cols,
             group_types,
+            query_sql: sql.to_string(),
+            #[cfg(test)]
             pre_agg_sql,
             output_schema,
             time_col_index,
@@ -1217,7 +1222,8 @@ impl CoreWindowState {
     }
 
     #[cfg(test)]
-    pub fn pre_agg_sql(&self) -> &str {
+    #[cfg(test)]
+    fn pre_agg_sql(&self) -> &str {
         &self.pre_agg_sql
     }
 
@@ -1323,24 +1329,24 @@ impl CoreWindowState {
     }
 
     pub(crate) fn query_fingerprint(&self) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::hash::DefaultHasher::new();
-        self.pre_agg_sql.hash(&mut h);
-        for f in self.output_schema.fields() {
-            f.name().hash(&mut h);
-            f.data_type().to_string().hash(&mut h);
-        }
-        self.window_type_tag().hash(&mut h);
+        let mut config = Vec::with_capacity(25);
         match &self.assigner {
-            CoreWindowAssigner::Tumbling(t) => t.size_ms().hash(&mut h),
-            CoreWindowAssigner::Hopping(s) => {
-                s.size_ms().hash(&mut h);
-                s.slide_ms().hash(&mut h);
+            CoreWindowAssigner::Tumbling(t) => {
+                config.push(1);
+                config.extend_from_slice(&t.size_ms().to_le_bytes());
             }
-            CoreWindowAssigner::Session { gap_ms } => gap_ms.hash(&mut h),
+            CoreWindowAssigner::Hopping(s) => {
+                config.push(2);
+                config.extend_from_slice(&s.size_ms().to_le_bytes());
+                config.extend_from_slice(&s.slide_ms().to_le_bytes());
+            }
+            CoreWindowAssigner::Session { gap_ms } => {
+                config.push(3);
+                config.extend_from_slice(&gap_ms.to_le_bytes());
+            }
         }
-        self.allowed_lateness_ms.hash(&mut h);
-        h.finish()
+        config.extend_from_slice(&self.allowed_lateness_ms.to_le_bytes());
+        query_fingerprint_with_config(&self.query_sql, &self.output_schema, &config)
     }
 
     fn window_type_tag(&self) -> &'static str {
@@ -1349,29 +1355,6 @@ impl CoreWindowState {
             CoreWindowAssigner::Hopping(_) => "hopping",
             CoreWindowAssigner::Session { .. } => "session",
         }
-    }
-
-    /// Estimated memory usage in bytes across all open windows and groups.
-    pub(crate) fn estimated_size_bytes(&self) -> usize {
-        let mut total = 0;
-        for groups in self.windows.values() {
-            for (key, accs) in groups {
-                total += key.as_ref().len();
-                for acc in accs {
-                    total += acc.size();
-                }
-            }
-        }
-        for (key, group_state) in &self.session_groups {
-            total += key.as_ref().len();
-            for session in group_state.sessions.values() {
-                for acc in &session.accs {
-                    total += acc.size();
-                }
-                total += 16; // start + end timestamps
-            }
-        }
-        total
     }
 
     pub(crate) fn checkpoint_windows(&mut self) -> Result<CoreWindowCheckpoint, DbError> {
@@ -1654,6 +1637,8 @@ mod tests {
                 DataType::Utf8,
             )])
             .unwrap(),
+            query_sql: String::new(),
+            #[cfg(test)]
             pre_agg_sql: String::new(),
             output_schema,
             time_col_index: 2,
@@ -1721,6 +1706,8 @@ mod tests {
                 DataType::Utf8,
             )])
             .unwrap(),
+            query_sql: String::new(),
+            #[cfg(test)]
             pre_agg_sql: String::new(),
             output_schema,
             time_col_index: 2,
@@ -1776,6 +1763,8 @@ mod tests {
                 DataType::Utf8,
             )])
             .unwrap(),
+            query_sql: String::new(),
+            #[cfg(test)]
             pre_agg_sql: String::new(),
             output_schema,
             time_col_index: 2,
@@ -1829,6 +1818,8 @@ mod tests {
                 DataType::Utf8,
             )])
             .unwrap(),
+            query_sql: String::new(),
+            #[cfg(test)]
             pre_agg_sql: String::new(),
             output_schema,
             time_col_index: 2,
@@ -2188,6 +2179,22 @@ mod tests {
         let mut state2 = make_core_window_state(1000);
         let result = state2.restore_windows(&cp);
         assert!(result.is_err(), "Should fail on fingerprint mismatch");
+    }
+
+    #[test]
+    fn core_window_checkpoint_rejects_a_different_state_query() {
+        let mut state = make_core_window_state(1000);
+        state.query_sql = "SELECT symbol, SUM(value) FROM trades GROUP BY symbol".into();
+        let checkpoint = state.checkpoint_windows().unwrap();
+
+        let mut restored = make_core_window_state(1000);
+        restored.query_sql = "SELECT symbol, MAX(value) FROM trades GROUP BY symbol".into();
+
+        assert!(restored
+            .restore_windows(&checkpoint)
+            .unwrap_err()
+            .to_string()
+            .contains("fingerprint mismatch"));
     }
 
     #[tokio::test]

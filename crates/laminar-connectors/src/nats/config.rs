@@ -1,11 +1,24 @@
 //! NATS source and sink configuration.
 
+use std::str::FromStr;
 use std::time::Duration;
 
+use async_nats::HeaderName;
+
 use crate::config::ConnectorConfig;
-use crate::connector::DeliveryGuarantee;
 use crate::error::ConnectorError;
 use crate::serde::Format;
+
+/// Keep retained acknowledgement futures below async-nats' internal publish
+/// window and put a fixed ceiling on connector memory.
+pub(super) const MAX_PENDING_PUBLISH_ACKS: usize = 4_096;
+
+/// A connector operation must always have a finite client-side bound. This is
+/// deliberately an implementation ceiling rather than another deployment knob.
+pub(super) const MAX_NATS_IO_TIMEOUT: Duration = Duration::from_secs(300);
+
+const NATS_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+const NATS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// NATS connector mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -130,9 +143,6 @@ pub struct NatsSourceConfig {
     pub max_ack_pending: i64,
     pub fetch_batch: usize,
     pub fetch_max_wait: Duration,
-    /// Consecutive fetch errors before `health_check` reports
-    /// `Unhealthy`. Zero disables the flip.
-    pub fetch_error_threshold: u32,
     /// Interval between `consumer.info()` polls that feed the
     /// `nats_source_consumer_lag` gauge. Zero disables the poll.
     pub lag_poll_interval: Duration,
@@ -170,7 +180,6 @@ impl NatsSourceConfig {
         let fetch_batch = require_positive_usize(config, "fetch.batch", 500)?;
         let fetch_max_wait =
             require_positive_duration(config, "fetch.max.wait.ms", Duration::from_millis(500))?;
-        let fetch_error_threshold = parse_u32(config, "fetch.error.threshold", 10)?;
         let lag_poll_interval =
             parse_duration_ms(config, "lag.poll.interval.ms", Duration::from_secs(10))?;
         let queue_group = config.get("queue.group").map(str::to_string);
@@ -194,7 +203,6 @@ impl NatsSourceConfig {
             max_ack_pending,
             fetch_batch,
             fetch_max_wait,
-            fetch_error_threshold,
             lag_poll_interval,
             queue_group,
             format,
@@ -261,17 +269,14 @@ pub struct NatsSinkConfig {
     pub tls: TlsConfig,
     pub stream: Option<String>,
     pub subject: SubjectSpec,
-    pub expected_stream: Option<String>,
-    pub delivery_guarantee: DeliveryGuarantee,
     pub dedup_id_column: Option<String>,
-    /// Stream's `duplicate_window` must be at least this long under
-    /// exactly-once — else rollback redelivery can land outside the
-    /// dedup horizon.
+    /// Stream's `duplicate_window` must be at least this long when bounded
+    /// `Nats-Msg-Id` deduplication is enabled.
     pub min_duplicate_window: Duration,
     pub max_pending: usize,
     pub ack_timeout: Duration,
     pub format: Format,
-    pub header_columns: Vec<String>,
+    pub header_columns: Vec<HeaderName>,
 }
 
 impl NatsSinkConfig {
@@ -299,9 +304,6 @@ impl NatsSinkConfig {
             }
         };
 
-        let delivery_guarantee =
-            parse_or_default::<DeliveryGuarantee>(config, "delivery.guarantee")
-                .map_err(|_| cfg_err("[LDB-5052] invalid delivery.guarantee"))?;
         let dedup_id_column = config.get("dedup.id.column").map(str::to_string);
 
         let cfg = Self {
@@ -309,17 +311,19 @@ impl NatsSinkConfig {
             mode,
             auth,
             tls,
-            stream: config.get("stream").map(str::to_string),
+            stream: config
+                .get("stream")
+                .map(str::trim)
+                .filter(|stream| !stream.is_empty())
+                .map(str::to_string),
             subject,
-            expected_stream: config.get("expected.stream").map(str::to_string),
-            delivery_guarantee,
             dedup_id_column,
             min_duplicate_window: require_positive_duration(
                 config,
                 "min.duplicate.window.ms",
                 Duration::from_secs(120),
             )?,
-            max_pending: require_positive_usize(config, "max.pending", 4096)?,
+            max_pending: require_positive_usize(config, "max.pending", MAX_PENDING_PUBLISH_ACKS)?,
             ack_timeout: require_positive_duration(
                 config,
                 "ack.timeout.ms",
@@ -329,48 +333,81 @@ impl NatsSinkConfig {
             header_columns: config
                 .get("header.columns")
                 .map(split_csv)
-                .unwrap_or_default(),
+                .unwrap_or_default()
+                .into_iter()
+                .map(|name| {
+                    if !name
+                        .bytes()
+                        .all(|byte| (33..=126).contains(&byte) && byte != b':')
+                    {
+                        return Err(cfg_err(&format!(
+                            "[LDB-5066] header.columns entry '{name}' is not a valid ASCII NATS header name"
+                        )));
+                    }
+                    HeaderName::from_str(&name).map_err(|error| {
+                        cfg_err(&format!(
+                            "[LDB-5066] header.columns entry '{name}' is not a valid NATS header name: {error}"
+                        ))
+                    })
+                })
+                .collect::<Result<_, _>>()?,
         };
         cfg.validate()?;
         Ok(cfg)
     }
 
     fn validate(&self) -> Result<(), ConnectorError> {
-        if self.mode == Mode::Core && self.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
+        if self.max_pending > MAX_PENDING_PUBLISH_ACKS {
+            return Err(cfg_err(&format!(
+                "max.pending must be <= {MAX_PENDING_PUBLISH_ACKS}"
+            )));
+        }
+        if self.ack_timeout > MAX_NATS_IO_TIMEOUT {
+            return Err(cfg_err(&format!(
+                "ack.timeout.ms must be <= {}",
+                MAX_NATS_IO_TIMEOUT.as_millis()
+            )));
+        }
+        if self.mode == Mode::Core && self.dedup_id_column.is_some() {
             return Err(cfg_err(
-                "[LDB-5053] delivery.guarantee=exactly_once is not supported in mode=core \
-                 (no server-side dedup); use mode=jetstream",
+                "[LDB-5053] 'dedup.id.column' requires mode=jetstream because core NATS has no \
+                 server-side Nats-Msg-Id deduplication",
             ));
         }
-        if self.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
-            && self.dedup_id_column.is_none()
-        {
+        if self.dedup_id_column.is_some() && self.stream.is_none() {
             return Err(cfg_err(
-                "[LDB-5054] delivery.guarantee=exactly_once requires 'dedup.id.column' — \
-                 msg-id dedup with epoch-row hashing is not supported (deterministic replay \
-                 is too fragile; name a unique-per-row column)",
-            ));
-        }
-        if self.delivery_guarantee == DeliveryGuarantee::ExactlyOnce && self.stream.is_none() {
-            return Err(cfg_err(
-                "[LDB-5055] delivery.guarantee=exactly_once requires 'stream' so the sink \
-                 can validate its duplicate_window at startup",
+                "[LDB-5055] 'dedup.id.column' requires 'stream' so the sink can validate its \
+                 duplicate_window at startup",
             ));
         }
         for h in &self.header_columns {
-            if is_reserved_header(h) {
+            if is_reserved_header(h.as_ref()) {
                 return Err(cfg_err(&format!(
                     "[LDB-5065] header.columns entry '{h}' collides with a reserved NATS \
                      header (Nats-Msg-Id / Nats-Expected-Stream); rename the column",
                 )));
             }
         }
+        match self.mode {
+            Mode::JetStream if self.stream.is_none() => {
+                return Err(cfg_err(
+                    "[LDB-5071] mode=jetstream requires an explicit 'stream' so durable storage, \
+                     replica count, and publish routing can be validated",
+                ));
+            }
+            Mode::Core if self.stream.is_some() => {
+                return Err(cfg_err(
+                    "[LDB-5071] 'stream' is valid only in mode=jetstream; remove it for core NATS",
+                ));
+            }
+            Mode::Core | Mode::JetStream => {}
+        }
         Ok(())
     }
 }
 
 /// Header names the sink manages itself; a user header with the same
-/// name would otherwise silently clobber exactly-once semantics.
+/// name would otherwise silently clobber bounded dedup or stream fencing.
 fn is_reserved_header(name: &str) -> bool {
     const RESERVED: &[&str] = &["Nats-Msg-Id", "Nats-Expected-Stream"];
     RESERVED.iter().any(|r| r.eq_ignore_ascii_case(name))
@@ -443,10 +480,6 @@ fn parse_usize(
     key: &str,
     default: usize,
 ) -> Result<usize, ConnectorError> {
-    config.get(key).map_or(Ok(default), |s| parse_int(key, s))
-}
-
-fn parse_u32(config: &ConnectorConfig, key: &str, default: u32) -> Result<u32, ConnectorError> {
     config.get(key).map_or(Ok(default), |s| parse_int(key, s))
 }
 
@@ -603,7 +636,9 @@ pub(super) fn build_connect_options(
     if let (Some(cert), Some(key)) = (&tls.cert_location, &tls.key_location) {
         opts = opts.add_client_certificate(cert.into(), key.into());
     }
-    Ok(opts)
+    Ok(opts
+        .connection_timeout(NATS_CONNECTION_TIMEOUT)
+        .request_timeout(Some(NATS_REQUEST_TIMEOUT)))
 }
 
 #[cfg(test)]
@@ -748,12 +783,26 @@ mod tests {
     }
 
     #[test]
-    fn sink_rejects_core_with_exactly_once() {
+    fn sink_rejects_invalid_header_column_name() {
+        for name in ["trace:id", "trŁce"] {
+            let err = NatsSinkConfig::from_config(&cfg(&[
+                ("servers", "nats://a:4222"),
+                ("subject", "x"),
+                ("header.columns", name),
+            ]))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("LDB-5066"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn sink_rejects_core_with_dedup() {
         let err = NatsSinkConfig::from_config(&cfg(&[
             ("servers", "nats://a:4222"),
             ("mode", "core"),
             ("subject", "x"),
-            ("delivery.guarantee", "exactly_once"),
+            ("dedup.id.column", "event_id"),
         ]))
         .unwrap_err()
         .to_string();
@@ -761,11 +810,10 @@ mod tests {
     }
 
     #[test]
-    fn sink_rejects_exactly_once_without_stream() {
+    fn sink_rejects_dedup_without_stream() {
         let err = NatsSinkConfig::from_config(&cfg(&[
             ("servers", "nats://a:4222"),
             ("subject", "x"),
-            ("delivery.guarantee", "exactly_once"),
             ("dedup.id.column", "event_id"),
         ]))
         .unwrap_err()
@@ -774,33 +822,58 @@ mod tests {
     }
 
     #[test]
-    fn sink_rejects_exactly_once_without_dedup_column() {
-        let err = NatsSinkConfig::from_config(&cfg(&[
-            ("servers", "nats://a:4222"),
-            ("stream", "OUT"),
-            ("subject", "x.processed"),
-            ("delivery.guarantee", "exactly_once"),
-        ]))
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("LDB-5054"), "got: {err}");
+    fn jetstream_sink_requires_named_stream() {
+        let err =
+            NatsSinkConfig::from_config(&cfg(&[("servers", "nats://a:4222"), ("subject", "x")]))
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("LDB-5071"), "got: {err}");
     }
 
     #[test]
-    fn sink_happy_path_exactly_once() {
+    fn jetstream_sink_rejects_blank_stream() {
+        let err = NatsSinkConfig::from_config(&cfg(&[
+            ("servers", "nats://a:4222"),
+            ("stream", "   "),
+            ("subject", "x"),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("LDB-5071"), "got: {err}");
+    }
+
+    #[test]
+    fn core_sink_rejects_ignored_stream() {
+        let err = NatsSinkConfig::from_config(&cfg(&[
+            ("servers", "nats://a:4222"),
+            ("mode", "core"),
+            ("stream", "OUT"),
+            ("subject", "x"),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("LDB-5071"), "got: {err}");
+    }
+
+    #[test]
+    fn sink_happy_path_bounded_dedup() {
         let parsed = NatsSinkConfig::from_config(&cfg(&[
             ("servers", "nats://a:4222"),
             ("stream", "OUT"),
             ("subject.column", "out_subject"),
-            ("delivery.guarantee", "exactly_once"),
             ("dedup.id.column", "event_id"),
             ("header.columns", "trace_id,tenant"),
         ]))
         .unwrap();
+        assert_eq!(parsed.stream.as_deref(), Some("OUT"));
         assert_eq!(parsed.subject, SubjectSpec::Column("out_subject".into()));
-        assert_eq!(parsed.delivery_guarantee, DeliveryGuarantee::ExactlyOnce);
         assert_eq!(parsed.dedup_id_column.as_deref(), Some("event_id"));
-        assert_eq!(parsed.header_columns, vec!["trace_id", "tenant"]);
+        let header_columns: Vec<&str> = parsed
+            .header_columns
+            .iter()
+            .map(AsRef::<str>::as_ref)
+            .collect();
+        assert_eq!(header_columns, vec!["trace_id", "tenant"]);
     }
 
     // ── servers ──
@@ -854,6 +927,33 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("max.pending must be > 0"), "got: {err}");
+    }
+
+    #[test]
+    fn sink_max_pending_is_capped_below_the_client_publish_window() {
+        let err = NatsSinkConfig::from_config(&cfg(&[
+            ("servers", "nats://a:4222"),
+            ("subject", "x"),
+            ("max.pending", "4097"),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("max.pending must be <= 4096"), "got: {err}");
+    }
+
+    #[test]
+    fn sink_ack_timeout_has_a_fixed_client_side_ceiling() {
+        let err = NatsSinkConfig::from_config(&cfg(&[
+            ("servers", "nats://a:4222"),
+            ("subject", "x"),
+            ("ack.timeout.ms", "300001"),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("ack.timeout.ms must be <= 300000"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -1016,6 +1116,7 @@ mod tests {
     fn auth_and_tls_on_sink() {
         let parsed = NatsSinkConfig::from_config(&cfg(&[
             ("servers", "nats://a:4222"),
+            ("stream", "OUT"),
             ("subject", "x"),
             ("auth.mode", "user_pass"),
             ("user", "alice"),

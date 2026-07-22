@@ -7,7 +7,6 @@
 use std::collections::HashMap;
 
 use laminar_connectors::config::ConnectorConfig;
-use laminar_connectors::reference::RefreshMode;
 
 use crate::error::DbError;
 
@@ -39,6 +38,8 @@ pub(crate) struct StreamRegistration {
     pub window_config: Option<laminar_sql::translator::WindowOperatorConfig>,
     pub order_config: Option<laminar_sql::translator::OrderOperatorConfig>,
     pub join_config: Option<Vec<laminar_sql::translator::JoinOperatorConfig>>,
+    pub has_analytic: bool,
+    pub has_frame: bool,
     /// Marks this MV to emit a dirty-only changelog into a keyed `Upsert` store. Decided at DDL
     /// time (`incremental_emit` flag + terminal non-windowed agg); drives operator + store mode.
     pub incremental: bool,
@@ -52,23 +53,15 @@ pub(crate) struct TableRegistration {
     pub connector_options: HashMap<String, String>,
     pub format: Option<String>,
     pub format_options: HashMap<String, String>,
-    pub refresh: Option<RefreshMode>,
+    /// Whether misses are served directly by a lookup-source factory.
+    pub on_demand: bool,
     pub cache_max_bytes: Option<usize>,
     pub cache_ttl: Option<std::time::Duration>,
 }
 
-/// Lowercase + replace underscores with hyphens.
+/// Connector identifiers are ASCII case-insensitive; punctuation remains provider-owned.
 pub(crate) fn normalize_connector_type(raw: &str) -> String {
-    raw.to_lowercase().replace('_', "-")
-}
-
-fn normalize_option_key(key: &str) -> String {
-    match key {
-        "brokers" => "bootstrap.servers".to_string(),
-        "group_id" => "group.id".to_string(),
-        "offset_reset" => "auto.offset.reset".to_string(),
-        other => other.to_string(),
-    }
+    raw.to_ascii_lowercase()
 }
 
 /// Build a `ConnectorConfig` from any registration that has connector fields.
@@ -84,7 +77,7 @@ fn build_connector_config(
         .ok_or_else(|| DbError::Connector(format!("{kind} '{name}' has no connector type")))?;
     let mut config = ConnectorConfig::new(normalize_connector_type(ct));
     for (k, v) in connector_options {
-        config.set(normalize_option_key(k), v.clone());
+        config.set(k.clone(), v.clone());
     }
     if let Some(fmt_str) = format {
         let lower = fmt_str.to_lowercase();
@@ -102,25 +95,43 @@ fn build_connector_config(
 }
 
 pub(crate) fn build_source_config(reg: &SourceRegistration) -> Result<ConnectorConfig, DbError> {
-    build_connector_config(
+    let mut config = build_connector_config(
         "Source",
         &reg.name,
         reg.connector_type.as_deref(),
         &reg.connector_options,
         reg.format.as_deref(),
         &reg.format_options,
-    )
+    )?;
+    config.set("laminar.source.name", reg.name.clone());
+    Ok(config)
 }
 
-pub(crate) fn build_sink_config(reg: &SinkRegistration) -> Result<ConnectorConfig, DbError> {
-    build_connector_config(
+pub(crate) fn build_sink_config(
+    reg: &SinkRegistration,
+    delivery_guarantee: laminar_connectors::connector::DeliveryGuarantee,
+) -> Result<ConnectorConfig, DbError> {
+    if reg
+        .connector_options
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case("delivery.guarantee"))
+    {
+        return Err(DbError::Connector(format!(
+            "Sink '{}' cannot set 'delivery.guarantee'; delivery is configured once for the pipeline",
+            reg.name
+        )));
+    }
+    let mut config = build_connector_config(
         "Sink",
         &reg.name,
         reg.connector_type.as_deref(),
         &reg.connector_options,
         reg.format.as_deref(),
         &reg.format_options,
-    )
+    )?;
+    // Internal connector behavior follows the one pipeline-wide delivery contract.
+    config.set("delivery.guarantee", delivery_guarantee.to_string());
+    Ok(config)
 }
 
 pub(crate) fn build_table_config(reg: &TableRegistration) -> Result<ConnectorConfig, DbError> {
@@ -132,24 +143,6 @@ pub(crate) fn build_table_config(reg: &TableRegistration) -> Result<ConnectorCon
         reg.format.as_deref(),
         &reg.format_options,
     )
-}
-
-/// Parse DDL `WITH (refresh = '...')` into a `RefreshMode`.
-pub(crate) fn parse_refresh_mode(s: &str) -> Result<RefreshMode, DbError> {
-    let lower = s.to_lowercase();
-    match lower.as_str() {
-        "snapshot_only" | "snapshot" => Ok(RefreshMode::SnapshotOnly),
-        "cdc" | "snapshot_plus_cdc" => Ok(RefreshMode::SnapshotPlusCdc),
-        "manual" => Ok(RefreshMode::Manual),
-        _ if lower.starts_with("periodic:") => Err(DbError::Connector(format!(
-            "Refresh mode '{s}' is not implemented: the pipeline does not yet \
-             schedule periodic re-snapshots. Use 'cdc' for incremental updates \
-             or 'manual' for caller-driven refresh."
-        ))),
-        _ => Err(DbError::Connector(format!(
-            "Unknown refresh mode '{s}': expected snapshot_only, cdc, or manual"
-        ))),
-    }
 }
 
 /// Accumulates DDL registrations; pipeline lifecycle reads them at start.
@@ -375,6 +368,8 @@ mod tests {
             window_config: None,
             order_config: None,
             join_config: None,
+            has_analytic: false,
+            has_frame: false,
             incremental: false,
         });
         assert_eq!(mgr.stream_names(), vec!["agg_stream"]);
@@ -534,6 +529,8 @@ mod tests {
             window_config: None,
             order_config: None,
             join_config: None,
+            has_analytic: false,
+            has_frame: false,
             incremental: false,
         });
         assert!(mgr.unregister_sink("s1"));
@@ -553,7 +550,7 @@ mod tests {
             connector_options: HashMap::from([("topic".to_string(), "instruments".to_string())]),
             format: Some("JSON".to_string()),
             format_options: HashMap::new(),
-            refresh: None,
+            on_demand: false,
             cache_max_bytes: None,
             cache_ttl: None,
         });
@@ -571,7 +568,7 @@ mod tests {
             connector_options: HashMap::new(),
             format: None,
             format_options: HashMap::new(),
-            refresh: None,
+            on_demand: false,
             cache_max_bytes: None,
             cache_ttl: None,
         });
@@ -590,7 +587,7 @@ mod tests {
             connector_options: HashMap::new(),
             format: None,
             format_options: HashMap::new(),
-            refresh: None,
+            on_demand: false,
             cache_max_bytes: None,
             cache_ttl: None,
         });
@@ -620,6 +617,24 @@ mod tests {
         assert_eq!(config.get("bootstrap.servers"), Some("localhost:9092"));
         assert_eq!(config.get("format"), Some("json"));
         assert_eq!(config.get("format.include_schema"), Some("true"));
+    }
+
+    #[test]
+    fn connector_options_are_not_rewritten_by_the_generic_bridge() {
+        let reg = SourceRegistration {
+            name: "custom".to_string(),
+            connector_type: Some("custom".to_string()),
+            connector_options: HashMap::from([
+                ("provider.endpoint".to_string(), "host:1234".to_string()),
+                ("opaque_key".to_string(), "provider-value".to_string()),
+            ]),
+            format: None,
+            format_options: HashMap::new(),
+        };
+
+        let config = build_source_config(&reg).unwrap();
+        assert_eq!(config.get("provider.endpoint"), Some("host:1234"));
+        assert_eq!(config.get("opaque_key"), Some("provider-value"));
     }
 
     #[test]
@@ -674,10 +689,44 @@ mod tests {
             format_options: HashMap::new(),
             filter_expr: Some("id > 10".to_string()),
         };
-        let config = build_sink_config(&reg).unwrap();
+        let config = build_sink_config(
+            &reg,
+            laminar_connectors::connector::DeliveryGuarantee::AtLeastOnce,
+        )
+        .unwrap();
         assert_eq!(config.connector_type(), "kafka");
         assert_eq!(config.get("topic"), Some("output"));
         assert_eq!(config.get("format"), Some("json"));
+        assert_eq!(
+            config.get("delivery.guarantee"),
+            Some("at-least-once"),
+            "the runtime must inject the pipeline-wide delivery contract"
+        );
+    }
+
+    #[test]
+    fn test_build_sink_config_rejects_per_sink_delivery() {
+        let reg = SinkRegistration {
+            name: "output".to_string(),
+            input: "events".to_string(),
+            connector_type: Some("kafka".to_string()),
+            connector_options: HashMap::from([(
+                "DELIVERY.GUARANTEE".to_string(),
+                "exactly-once".to_string(),
+            )]),
+            format: None,
+            format_options: HashMap::new(),
+            filter_expr: None,
+        };
+
+        let error = build_sink_config(
+            &reg,
+            laminar_connectors::connector::DeliveryGuarantee::AtLeastOnce,
+        )
+        .expect_err("per-sink delivery must not be silently overwritten");
+        let message = error.to_string();
+        assert!(message.contains("delivery.guarantee"), "{message}");
+        assert!(message.contains("pipeline"), "{message}");
     }
 
     #[test]
@@ -691,7 +740,11 @@ mod tests {
             format_options: HashMap::new(),
             filter_expr: None,
         };
-        let err = build_sink_config(&reg).unwrap_err();
+        let err = build_sink_config(
+            &reg,
+            laminar_connectors::connector::DeliveryGuarantee::AtLeastOnce,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("no connector type"));
     }
 
@@ -706,7 +759,11 @@ mod tests {
             format_options: HashMap::new(),
             filter_expr: None,
         };
-        let err = build_sink_config(&reg).unwrap_err();
+        let err = build_sink_config(
+            &reg,
+            laminar_connectors::connector::DeliveryGuarantee::AtLeastOnce,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("Invalid format"));
     }
 
@@ -735,7 +792,7 @@ mod tests {
             connector_options: HashMap::from([("topic".to_string(), "instruments".to_string())]),
             format: Some("JSON".to_string()),
             format_options: HashMap::new(),
-            refresh: None,
+            on_demand: false,
             cache_max_bytes: None,
             cache_ttl: None,
         };
@@ -754,7 +811,7 @@ mod tests {
             connector_options: HashMap::new(),
             format: None,
             format_options: HashMap::new(),
-            refresh: None,
+            on_demand: false,
             cache_max_bytes: None,
             cache_ttl: None,
         };
@@ -763,44 +820,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_refresh_mode_variants() {
-        assert_eq!(
-            parse_refresh_mode("snapshot_only").unwrap(),
-            RefreshMode::SnapshotOnly
-        );
-        assert_eq!(
-            parse_refresh_mode("snapshot").unwrap(),
-            RefreshMode::SnapshotOnly
-        );
-        assert_eq!(
-            parse_refresh_mode("cdc").unwrap(),
-            RefreshMode::SnapshotPlusCdc
-        );
-        assert_eq!(
-            parse_refresh_mode("snapshot_plus_cdc").unwrap(),
-            RefreshMode::SnapshotPlusCdc
-        );
-        assert_eq!(parse_refresh_mode("manual").unwrap(), RefreshMode::Manual);
-    }
-
-    #[test]
-    fn test_parse_refresh_mode_invalid() {
-        assert!(parse_refresh_mode("bogus").is_err());
-        // Periodic was advertised but never wired to a scheduler. Until
-        // it is, the parser rejects it loudly rather than letting the
-        // request land in pipeline_callback as a no-op.
-        assert!(parse_refresh_mode("periodic:60").is_err());
-        assert!(parse_refresh_mode("PERIODIC:30").is_err());
-    }
-
-    #[test]
-    fn test_normalize_connector_type_variants() {
-        // All forms of "delta-lake" must resolve to the same canonical name.
+    fn connector_type_normalization_preserves_provider_identifiers() {
         assert_eq!(normalize_connector_type("delta-lake"), "delta-lake");
-        assert_eq!(normalize_connector_type("delta_lake"), "delta-lake");
-        assert_eq!(normalize_connector_type("DELTA_LAKE"), "delta-lake");
+        assert_eq!(normalize_connector_type("delta_lake"), "delta_lake");
+        assert_eq!(normalize_connector_type("DELTA_LAKE"), "delta_lake");
         assert_eq!(normalize_connector_type("DELTA-LAKE"), "delta-lake");
-        assert_eq!(normalize_connector_type("Delta_Lake"), "delta-lake");
+        assert_eq!(normalize_connector_type("Vendor_V2"), "vendor_v2");
     }
 
     #[test]
@@ -814,18 +839,16 @@ mod tests {
     #[test]
     fn test_normalize_connector_type_hyphenated() {
         assert_eq!(normalize_connector_type("postgres-cdc"), "postgres-cdc");
-        assert_eq!(normalize_connector_type("POSTGRES_CDC"), "postgres-cdc");
-        assert_eq!(normalize_connector_type("mysql-cdc"), "mysql-cdc");
-        assert_eq!(normalize_connector_type("MYSQL_CDC"), "mysql-cdc");
+        assert_eq!(normalize_connector_type("POSTGRES-CDC"), "postgres-cdc");
         assert_eq!(normalize_connector_type("postgres-sink"), "postgres-sink");
-        assert_eq!(normalize_connector_type("POSTGRES_SINK"), "postgres-sink");
+        assert_eq!(normalize_connector_type("POSTGRES-SINK"), "postgres-sink");
     }
 
     #[test]
-    fn test_build_source_config_normalizes_hyphenated_type() {
+    fn test_build_source_config_normalizes_case_only() {
         let reg = SourceRegistration {
             name: "cdc".to_string(),
-            connector_type: Some("POSTGRES_CDC".to_string()),
+            connector_type: Some("POSTGRES-CDC".to_string()),
             connector_options: HashMap::new(),
             format: None,
             format_options: HashMap::new(),
@@ -835,17 +858,21 @@ mod tests {
     }
 
     #[test]
-    fn test_build_sink_config_normalizes_hyphenated_type() {
+    fn test_build_sink_config_normalizes_case_only() {
         let reg = SinkRegistration {
             name: "lake".to_string(),
             input: "events".to_string(),
-            connector_type: Some("DELTA_LAKE".to_string()),
+            connector_type: Some("DELTA-LAKE".to_string()),
             connector_options: HashMap::new(),
             format: None,
             format_options: HashMap::new(),
             filter_expr: None,
         };
-        let config = build_sink_config(&reg).unwrap();
+        let config = build_sink_config(
+            &reg,
+            laminar_connectors::connector::DeliveryGuarantee::AtLeastOnce,
+        )
+        .unwrap();
         assert_eq!(config.connector_type(), "delta-lake");
     }
 }

@@ -11,19 +11,18 @@ node_id = "star-1"
 [server]
 mode = "cluster"
 bind = "0.0.0.0:8080"
+delivery = "at_least_once"
+key_groups = 256
 metrics_bind = "0.0.0.0:9090"
 workers = 8
 
 [state]
-backend = "local"
-path = "/data/laminardb/state"
-vnode_capacity = 256
+backend = "object_store"
+url = "s3://laminardb-checkpoints/prod-state"
 
 [checkpoint]
 url = "s3://laminardb-checkpoints/prod"
 interval = "30s"
-mode = "aligned"
-snapshot_strategy = "fork_cow"
 
 [discovery]
 strategy = "static"
@@ -33,12 +32,12 @@ seeds = [
     "star-3.laminardb.svc:7946",
 ]
 gossip_port = 7946
-
-[coordination]
-strategy = "raft"
-raft_port = 7947
-election_timeout = "1500ms"
-heartbeat_interval = "300ms"
+# Optional barrier/shuffle mTLS. Uncomment all four fields together.
+# Protect Chitchat gossip separately at the network layer.
+# cluster_tls_cert = "${LAMINAR_CLUSTER_TLS_CERT}"
+# cluster_tls_key = "${LAMINAR_CLUSTER_TLS_KEY}"
+# cluster_tls_client_ca = "${LAMINAR_CLUSTER_TLS_CLIENT_CA}"
+# cluster_tls_server_name = "${LAMINAR_CLUSTER_TLS_SERVER_NAME}"
 
 # ── Sources ─────────────────────────────────────────────────────────────
 
@@ -47,10 +46,10 @@ name = "orders"
 connector = "kafka"
 format = "avro"
 [source.properties]
-brokers = "${KAFKA_BROKERS}"
+"bootstrap.servers" = "${KAFKA_BROKERS}"
 topic = "orders"
-group_id = "laminardb-orders"
-schema_registry = "${SCHEMA_REGISTRY_URL}"
+"group.id" = "laminardb-orders"
+"schema.registry.url" = "${SCHEMA_REGISTRY_URL}"
 
 # ── Pipelines ───────────────────────────────────────────────────────────
 
@@ -69,7 +68,6 @@ parallelism = 8
 name = "enriched_orders"
 pipeline = "order_enrichment"
 connector = "kafka"
-delivery = "exactly_once"
 [sink.properties]
-brokers = "${KAFKA_BROKERS}"
+"bootstrap.servers" = "${KAFKA_BROKERS}"
 topic = "enriched_orders"

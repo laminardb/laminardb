@@ -1,66 +1,88 @@
-//! Versioned envelope shared by coordinated-commit descriptors; the payload is
-//! sink-specific (Iceberg data files, Delta add actions).
+//! Durable Delta coordinated-commit descriptor.
 
-use serde::de::DeserializeOwned;
+use deltalake::kernel::Add;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ConnectorError;
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct DeltaTableBinding {
+    pub table_id: String,
+    pub write_metadata_sha256: String,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct DeltaCommitDescriptor {
+    pub binding: DeltaTableBinding,
+    pub adds: Vec<Add>,
+}
 
 #[derive(Serialize, Deserialize)]
-struct Envelope<T> {
+struct Envelope {
     version: u32,
-    payload: T,
+    binding: DeltaTableBinding,
+    adds: Vec<Add>,
 }
 
-/// Version-only view, so a rolling upgrade can reject a future descriptor by
-/// version before its (possibly changed) payload shape is deserialized.
-#[derive(Deserialize)]
-struct Header {
-    version: u32,
-}
-
-pub(super) fn encode<T: Serialize>(payload: T) -> Result<Vec<u8>, ConnectorError> {
+pub(super) fn encode(binding: &DeltaTableBinding, adds: &[Add]) -> Result<Vec<u8>, ConnectorError> {
     serde_json::to_vec(&Envelope {
         version: VERSION,
-        payload,
+        binding: binding.clone(),
+        adds: adds.to_vec(),
     })
-    .map_err(|e| ConnectorError::WriteError(format!("encode commit descriptor: {e}")))
+    .map_err(|error| ConnectorError::WriteError(format!("encode commit descriptor: {error}")))
 }
 
-/// Rejects an unknown version before touching the payload.
-pub(super) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ConnectorError> {
-    let header: Header = serde_json::from_slice(bytes).map_err(|e| {
-        ConnectorError::TransactionError(format!("decode commit descriptor header: {e}"))
+pub(super) fn encoded_add_array_len(adds: &[Add]) -> Result<usize, ConnectorError> {
+    serde_json::to_vec(adds)
+        .map(|bytes| bytes.len())
+        .map_err(|error| ConnectorError::WriteError(format!("encode Delta Adds: {error}")))
+}
+
+pub(super) fn decode(bytes: &[u8]) -> Result<DeltaCommitDescriptor, ConnectorError> {
+    let envelope: Envelope = serde_json::from_slice(bytes).map_err(|error| {
+        ConnectorError::TransactionError(format!("decode commit descriptor: {error}"))
     })?;
-    if header.version != VERSION {
+    if envelope.version != VERSION {
         return Err(ConnectorError::TransactionError(format!(
-            "unsupported commit descriptor version {} (this build supports {VERSION})",
-            header.version
+            "unsupported Delta commit descriptor version {} (this build supports {VERSION})",
+            envelope.version
         )));
     }
-    let envelope: Envelope<T> = serde_json::from_slice(bytes)
-        .map_err(|e| ConnectorError::TransactionError(format!("decode commit descriptor: {e}")))?;
-    Ok(envelope.payload)
+    Ok(DeltaCommitDescriptor {
+        binding: envelope.binding,
+        adds: envelope.adds,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn roundtrip_then_reject_future_version() {
-        let bytes = encode(vec![1u32, 2, 3]).unwrap();
-        assert_eq!(decode::<Vec<u32>>(&bytes).unwrap(), vec![1, 2, 3]);
+    fn binding() -> DeltaTableBinding {
+        DeltaTableBinding {
+            table_id: "018f0000-0000-7000-8000-000000000001".into(),
+            write_metadata_sha256: "11".repeat(32),
+        }
+    }
 
-        // A future version is rejected by version, regardless of payload shape.
-        let future = br#"{"version":999,"payload":{"unknown":"shape"}}"#;
-        let err = decode::<Vec<u32>>(future).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("unsupported commit descriptor version 999"),
-            "got: {err}"
-        );
+    #[test]
+    fn roundtrip_empty_descriptor_and_reject_non_current_versions() {
+        let bytes = encode(&binding(), &[]).unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.binding, binding());
+        assert!(decoded.adds.is_empty());
+
+        let obsolete =
+            br#"{"version":1,"binding":{"table_id":"t","write_metadata_sha256":"00"},"adds":[]}"#;
+        let error = decode(obsolete).unwrap_err().to_string();
+        assert!(error.contains("version 1"), "got: {error}");
+
+        let future =
+            br#"{"version":999,"binding":{"table_id":"t","write_metadata_sha256":"00"},"adds":[]}"#;
+        let error = decode(future).unwrap_err().to_string();
+        assert!(error.contains("version 999"), "got: {error}");
     }
 }

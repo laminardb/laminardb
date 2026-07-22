@@ -24,6 +24,10 @@ out-of-orderness) advances from the live max event time, so windows close
 continuously; backfill replayed on reconnect is older than the watermark and
 is dropped as late (standard late-data handling).
 
+The WebSocket feed is not replayable after a process failure, so the example
+sets the one pipeline-wide delivery option to `best_effort`. Stronger delivery
+contracts fail admission rather than silently degrading.
+
 ## Run
 
 ```sh

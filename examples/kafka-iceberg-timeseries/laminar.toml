@@ -11,9 +11,7 @@ CREATE SOURCE crypto_ticks (
     'bootstrap.servers'      = 'localhost:9092',
     'topic'                  = 'crypto.ticks',
     'group.id'               = 'laminar-ohlc-demo',
-    'startup.mode'           = 'earliest',
-    'event.time.column'      = 'ts',
-    'max.out.of.orderness.ms' = '5000'
+    'startup.mode'           = 'earliest'
 ) FORMAT JSON;
 
 CREATE MATERIALIZED VIEW ohlc_1m AS
@@ -55,3 +53,14 @@ INTO ICEBERG (
 [server]
 bind         = "127.0.0.1:7777"
 pgwire_bind  = "127.0.0.1:5432"
+delivery     = "at_least_once"
+
+# Kafka can replay from committed offsets and Iceberg durably acknowledges each
+# append, but Iceberg publication is not checkpoint-committable. A failure may
+# therefore replay an already-published append; this demo is at-least-once.
+[state]
+backend      = "local"
+path         = "./.laminardb/state"
+
+[checkpoint]
+interval = "10s"

@@ -3,11 +3,12 @@
 // Source modules
 pub mod avro;
 pub mod config;
+mod metadata_error;
 pub mod metrics;
-pub mod offsets;
+mod offsets;
 pub mod rebalance;
 pub mod source;
-pub mod watermarks;
+mod vnode_routing;
 
 // Sink modules
 pub mod avro_serializer;
@@ -27,9 +28,7 @@ pub use config::{
     TopicSubscription,
 };
 pub use metrics::KafkaSourceMetrics;
-pub use offsets::OffsetTracker;
 pub use source::KafkaSource;
-pub use watermarks::{KafkaWatermarkTracker, WatermarkMetrics};
 
 // Sink re-exports
 pub use avro_serializer::AvroSerializer;
@@ -37,10 +36,33 @@ pub use partitioner::{
     KafkaPartitioner, KeyHashPartitioner, RoundRobinPartitioner, StickyPartitioner,
 };
 pub use sink::KafkaSink;
-pub use sink_config::{
-    Acks, CompressionType, DeliveryGuarantee, KafkaSinkConfig, PartitionStrategy,
-};
+pub use sink_config::{CompressionType, KafkaSinkConfig, PartitionStrategy};
 pub use sink_metrics::KafkaSinkMetrics;
+
+/// Test-only access to Kafka-specific routing probes.
+#[cfg(feature = "testing")]
+pub mod testing {
+    use crate::error::ConnectorError;
+
+    /// Map a complete Kafka topic inventory to engine vnodes.
+    ///
+    /// # Errors
+    /// Returns a configuration error when the Kafka route identity, partition
+    /// inventory, or vnode count is invalid.
+    pub fn partition_vnodes(
+        source_identity: &str,
+        topic: &str,
+        total_partitions: i32,
+        vnode_count: u32,
+    ) -> Result<Vec<u32>, ConnectorError> {
+        super::vnode_routing::partition_vnodes(
+            source_identity,
+            topic,
+            total_partitions,
+            vnode_count,
+        )
+    }
+}
 
 // Shared re-exports
 pub use schema_registry::{CachedSchema, CompatibilityResult, SchemaRegistryClient, SchemaType};
@@ -51,7 +73,14 @@ use crate::config::{ConfigKeySpec, ConnectorInfo};
 use crate::registry::ConnectorRegistry;
 
 /// Registers the Kafka source connector with the given registry.
-pub fn register_kafka_source(registry: &ConnectorRegistry) {
+///
+/// # Errors
+///
+/// Returns an error if a Kafka source factory is already registered or the
+/// registry has been frozen.
+pub fn register_kafka_source(
+    registry: &ConnectorRegistry,
+) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
         name: "kafka".to_string(),
         display_name: "Apache Kafka Source".to_string(),
@@ -64,20 +93,27 @@ pub fn register_kafka_source(registry: &ConnectorRegistry) {
     registry.register_source(
         "kafka",
         info,
-        Arc::new(|registry: Option<&prometheus::Registry>| {
+        Arc::new(|registry: Option<&Arc<prometheus::Registry>>| {
             // Empty schema — filled in by discover_schema / open() / SQL DDL columns.
             let empty = Arc::new(arrow_schema::Schema::empty());
-            Box::new(KafkaSource::new(
+            Ok(Box::new(KafkaSource::new(
                 empty,
                 KafkaSourceConfig::default(),
-                registry,
-            ))
+                registry.map(Arc::as_ref),
+            )))
         }),
-    );
+    )
 }
 
 /// Registers the Kafka sink connector with the given registry.
-pub fn register_kafka_sink(registry: &ConnectorRegistry) {
+///
+/// # Errors
+///
+/// Returns an error if a Kafka sink factory is already registered or the
+/// registry has been frozen.
+pub fn register_kafka_sink(
+    registry: &ConnectorRegistry,
+) -> Result<(), crate::error::ConnectorError> {
     let info = ConnectorInfo {
         name: "kafka".to_string(),
         display_name: "Apache Kafka Sink".to_string(),
@@ -90,12 +126,16 @@ pub fn register_kafka_sink(registry: &ConnectorRegistry) {
     registry.register_sink(
         "kafka",
         info,
-        Arc::new(|registry: Option<&prometheus::Registry>| {
+        Arc::new(|_config, registry: Option<&Arc<prometheus::Registry>>| {
             // Empty schema — the sink's schema is bound from the upstream query at build time.
             let empty = Arc::new(arrow_schema::Schema::empty());
-            Box::new(KafkaSink::new(empty, KafkaSinkConfig::default(), registry))
+            Ok(Box::new(KafkaSink::new(
+                empty,
+                KafkaSinkConfig::default(),
+                registry.map(Arc::as_ref),
+            )))
         }),
-    );
+    )
 }
 
 /// Returns the configuration key specifications for the Kafka source.
@@ -105,9 +145,17 @@ fn kafka_source_config_keys() -> Vec<ConfigKeySpec> {
         // Required
         ConfigKeySpec::required("bootstrap.servers", "Kafka broker addresses"),
         ConfigKeySpec::required("group.id", "Consumer group identifier"),
-        ConfigKeySpec::required("topic", "Comma-separated list of topics"),
-        // Topic subscription (alternative to 'topic')
-        ConfigKeySpec::optional("topic.pattern", "Regex pattern for topic subscription", ""),
+        // The key schema cannot express alternatives; parsing requires one of these two.
+        ConfigKeySpec::optional(
+            "topic",
+            "Comma-separated topics (required unless topic.pattern is set)",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "topic.pattern",
+            "Topic regex (required unless topic is set)",
+            "",
+        ),
         // Format
         ConfigKeySpec::optional("format", "Data format (json/csv/avro/raw/debezium)", "json"),
         // Security
@@ -203,23 +251,6 @@ fn kafka_source_config_keys() -> Vec<ConfigKeySpec> {
             "false",
         ),
         ConfigKeySpec::optional("include.headers", "Include _headers column", "false"),
-        ConfigKeySpec::optional(
-            "event.time.column",
-            "Column name for event time extraction",
-            "",
-        ),
-        // Watermark
-        ConfigKeySpec::optional(
-            "max.out.of.orderness.ms",
-            "Max out-of-orderness for watermarks",
-            "5000",
-        ),
-        ConfigKeySpec::optional("idle.timeout.ms", "Idle partition timeout", "30000"),
-        ConfigKeySpec::optional(
-            "enable.watermark.tracking",
-            "Enable per-partition watermark tracking",
-            "false",
-        ),
         // Backpressure
         ConfigKeySpec::optional(
             "backpressure.high.watermark",
@@ -270,6 +301,36 @@ fn kafka_source_config_keys() -> Vec<ConfigKeySpec> {
             "Runtime schema evolution handling (log/reject/ignore)",
             "log",
         ),
+        ConfigKeySpec::optional(
+            "schema.registry.subject.name.strategy",
+            "Schema Registry subject naming (topic-name/record-name/topic-record-name)",
+            "topic-name",
+        ),
+        ConfigKeySpec::optional(
+            "schema.registry.record.name",
+            "Avro record name for record-based subject naming",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "schema.registry.discovery.timeout.ms",
+            "Schema discovery timeout in milliseconds",
+            "10000",
+        ),
+        ConfigKeySpec::optional(
+            "max.poll.interval.ms",
+            "Maximum interval between consumer polls in milliseconds",
+            "600000",
+        ),
+        ConfigKeySpec::optional(
+            "broker.commit.on.checkpoint",
+            "Commit broker offsets after checkpoint completion",
+            "true",
+        ),
+        ConfigKeySpec::optional(
+            "reader.channel.capacity",
+            "Bounded reader channel capacity in records",
+            "8192",
+        ),
     ]
 }
 
@@ -302,26 +363,9 @@ fn kafka_sink_config_keys() -> Vec<ConfigKeySpec> {
         ),
         ConfigKeySpec::optional("ssl.key.location", "Client SSL private key file path", ""),
         ConfigKeySpec::optional("ssl.key.password", "Password for encrypted SSL key", ""),
-        // Delivery & Transactions
-        ConfigKeySpec::optional(
-            "delivery.guarantee",
-            "Delivery guarantee (at-least-once/exactly-once)",
-            "at-least-once",
-        ),
-        ConfigKeySpec::optional(
-            "transactional.id",
-            "Transactional ID prefix (auto-generated if not set)",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "transaction.timeout.ms",
-            "Transaction timeout in milliseconds",
-            "60000",
-        ),
-        ConfigKeySpec::optional("acks", "Acknowledgment level (0/1/all)", "all"),
         ConfigKeySpec::optional(
             "max.in.flight.requests",
-            "Max in-flight requests (<=5 for exactly-once)",
+            "Maximum in-flight producer requests per connection (1-5)",
             "5",
         ),
         ConfigKeySpec::optional(
@@ -331,6 +375,7 @@ fn kafka_sink_config_keys() -> Vec<ConfigKeySpec> {
         ),
         // Partitioning
         ConfigKeySpec::optional("key.column", "Column name to use as Kafka message key", ""),
+        ConfigKeySpec::optional("envelope", "Output envelope (append/upsert)", "append"),
         ConfigKeySpec::optional(
             "partitioner",
             "Partitioning strategy (key-hash/round-robin/sticky)",
@@ -350,11 +395,6 @@ fn kafka_sink_config_keys() -> Vec<ConfigKeySpec> {
             "dlq.topic",
             "Dead letter queue topic for failed records",
             "",
-        ),
-        ConfigKeySpec::optional(
-            "flush.batch.size",
-            "Max records to buffer before flushing",
-            "1000",
         ),
         // Schema Registry
         ConfigKeySpec::optional(
@@ -613,7 +653,7 @@ mod tests {
     #[test]
     fn test_register_kafka_source() {
         let registry = ConnectorRegistry::new();
-        register_kafka_source(&registry);
+        register_kafka_source(&registry).unwrap();
 
         let sources = registry.list_sources();
         assert!(sources.contains(&"kafka".to_string()));
@@ -624,13 +664,40 @@ mod tests {
         assert_eq!(info.name, "kafka");
         assert!(info.is_source);
         assert!(!info.is_sink);
-        assert!(!info.config_keys.is_empty());
+        let required: Vec<&str> = info
+            .config_keys
+            .iter()
+            .filter(|key| key.required)
+            .map(|key| key.key.as_str())
+            .collect();
+        assert!(required.contains(&"bootstrap.servers"));
+        assert!(required.contains(&"group.id"));
+        assert!(!required.contains(&"topic"));
+        assert!(!required.contains(&"topic.pattern"));
+        assert!(info.config_keys.iter().any(|key| key.key == "topic"));
+        assert!(info
+            .config_keys
+            .iter()
+            .any(|key| key.key == "topic.pattern"));
+        for supported in [
+            "schema.registry.subject.name.strategy",
+            "schema.registry.record.name",
+            "schema.registry.discovery.timeout.ms",
+            "max.poll.interval.ms",
+            "broker.commit.on.checkpoint",
+            "reader.channel.capacity",
+        ] {
+            assert!(
+                info.config_keys.iter().any(|key| key.key == supported),
+                "registered Kafka source descriptor omits {supported}"
+            );
+        }
     }
 
     #[test]
     fn test_factory_creates_source() {
         let registry = ConnectorRegistry::new();
-        register_kafka_source(&registry);
+        register_kafka_source(&registry).unwrap();
 
         let config = crate::config::ConnectorConfig::new("kafka");
         let source = registry.create_source(&config, None);
@@ -640,7 +707,7 @@ mod tests {
     #[test]
     fn test_register_kafka_sink() {
         let registry = ConnectorRegistry::new();
-        register_kafka_sink(&registry);
+        register_kafka_sink(&registry).unwrap();
 
         let sinks = registry.list_sinks();
         assert!(sinks.contains(&"kafka".to_string()));
@@ -651,13 +718,18 @@ mod tests {
         assert_eq!(info.name, "kafka");
         assert!(!info.is_source);
         assert!(info.is_sink);
-        assert!(!info.config_keys.is_empty());
+        assert!(info.config_keys.iter().any(|key| key.key == "envelope"));
+        assert!(info.config_keys.iter().any(|key| key.key == "key.column"));
+        assert!(!info
+            .config_keys
+            .iter()
+            .any(|key| key.key == "delivery.guarantee"));
     }
 
     #[test]
     fn test_factory_creates_sink() {
         let registry = ConnectorRegistry::new();
-        register_kafka_sink(&registry);
+        register_kafka_sink(&registry).unwrap();
 
         let config = crate::config::ConnectorConfig::new("kafka");
         let sink = registry.create_sink(&config, None);

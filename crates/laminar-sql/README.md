@@ -39,7 +39,10 @@ SELECT ... EMIT FINAL
 SELECT ... FROM orders ASOF JOIN trades ON o.symbol = t.symbol AND o.ts >= t.ts
 
 -- Lookup tables
-CREATE LOOKUP TABLE instruments FROM POSTGRES (...)
+CREATE LOOKUP TABLE instruments (
+    symbol VARCHAR NOT NULL,
+    PRIMARY KEY (symbol)
+) WITH ('connector' = 'postgres', 'connection' = '...', 'table' = 'instruments')
 
 -- Late data handling
 SELECT ... ALLOW LATENESS INTERVAL '10' SECOND
@@ -53,11 +56,10 @@ SELECT ..., ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY price DESC) FROM tra
 SELECT ..., SUM(vol) OVER (PARTITION BY sym ORDER BY ts ROWS BETWEEN 5 PRECEDING AND CURRENT ROW)
 
 -- Connector DDL
-CREATE SOURCE ... FROM KAFKA (brokers = '...', topic = '...', format = 'json')
-CREATE SOURCE ... FROM POSTGRES_CDC (hostname = '...', database = '...')
-CREATE SOURCE ... FROM MYSQL_CDC (hostname = '...', database = '...')
-CREATE SINK ... INTO KAFKA (brokers = '...', topic = '...')
-CREATE SINK ... INTO DELTA_LAKE (path = '...')
+CREATE SOURCE ... FROM KAFKA ('bootstrap.servers' = '...', topic = '...', format = 'json')
+CREATE SOURCE ... FROM "postgres-cdc" (host = '...', database = '...')
+CREATE SINK ... INTO KAFKA ('bootstrap.servers' = '...', topic = '...')
+CREATE SINK ... INTO "delta-lake" ('table.path' = '...')
 
 -- Retain a bounded ring of recent epochs so SUBSCRIBE clients can
 -- reconnect without gaps.

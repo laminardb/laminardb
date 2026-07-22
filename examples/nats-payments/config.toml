@@ -1,15 +1,10 @@
-# LaminarDB demo — payments + fraud-check stream-to-stream join.
-#
-# Build:
-#   cargo build --release -p laminar-server \
-#       --no-default-features --features mimalloc,nats,iceberg,websocket
-#
-# Run:
-#   ./target/release/laminardb --config examples/nats-payments/config.toml
-
+# Both NATS source modes are currently ephemeral: JetStream acknowledgement is
+# delivery progress, not a LaminarDB checkpoint cursor. The durable Iceberg
+# sink does not upgrade that source contract, so this demo is best-effort.
 [server]
-mode = "embedded"
+mode = "single"
 bind = "127.0.0.1:8080"
+delivery = "best_effort"
 
 [state]
 backend = "in_process"

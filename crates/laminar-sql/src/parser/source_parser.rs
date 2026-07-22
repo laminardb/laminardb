@@ -20,7 +20,10 @@ use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Token;
 
 use super::statements::{CreateSourceStatement, FormatSpec, WatermarkDef};
-use super::tokenizer::{expect_custom_keyword, parse_with_options, try_parse_custom_keyword};
+use super::tokenizer::{
+    expect_custom_keyword, expect_statement_end, insert_unique_option, parse_with_options,
+    try_parse_custom_keyword,
+};
 use super::ParseError;
 
 /// Parse a CREATE SOURCE statement from a sqlparser `Parser`.
@@ -92,6 +95,7 @@ pub fn parse_create_source(parser: &mut Parser) -> Result<CreateSourceStatement,
 
     // WITH options (optional) — contains watermark config like event_time, watermark_delay
     let with_options = parse_with_options(parser)?;
+    expect_statement_end(parser)?;
 
     Ok(CreateSourceStatement {
         name,
@@ -270,7 +274,7 @@ fn parse_from_connector(
                 .expect_token(&Token::Eq)
                 .map_err(ParseError::SqlParseError)?;
             let value = parse_connector_option_string(parser)?;
-            opts.insert(key, value);
+            insert_unique_option(&mut opts, key, value)?;
             if !parser.consume_token(&Token::Comma) {
                 parser
                     .expect_token(&Token::RParen)
@@ -533,6 +537,18 @@ mod tests {
     }
 
     #[test]
+    fn quoted_hyphenated_connector_preserves_provider_id() {
+        let source = parse(
+            r#"CREATE SOURCE changes FROM "postgres-cdc" (
+                host = 'localhost',
+                database = 'app'
+            ) SCHEMA (id BIGINT)"#,
+        );
+
+        assert_eq!(source.connector_type.as_deref(), Some("POSTGRES-CDC"));
+    }
+
+    #[test]
     fn test_from_kafka_format_json() {
         let source = parse(
             "CREATE SOURCE events FROM KAFKA (
@@ -644,18 +660,18 @@ mod tests {
                 price DOUBLE NOT NULL,
                 ts BIGINT NOT NULL
             ) FROM KAFKA (
-                brokers = 'localhost:19092',
+                'bootstrap.servers' = 'localhost:19092',
                 topic = 'market-ticks',
-                group_id = 'laminar-demo',
+                'group.id' = 'laminar-demo',
                 format = 'json',
-                offset_reset = 'earliest'
+                'auto.offset.reset' = 'earliest'
             )",
         );
         assert_eq!(source.name.to_string(), "market_ticks");
         assert_eq!(source.connector_type, Some("KAFKA".to_string()));
         assert_eq!(source.columns.len(), 3);
         assert_eq!(
-            source.connector_options.get("brokers"),
+            source.connector_options.get("bootstrap.servers"),
             Some(&"localhost:19092".to_string())
         );
         assert_eq!(
@@ -663,7 +679,7 @@ mod tests {
             Some(&"market-ticks".to_string())
         );
         assert_eq!(
-            source.connector_options.get("group_id"),
+            source.connector_options.get("group.id"),
             Some(&"laminar-demo".to_string())
         );
         assert_eq!(source.connector_options.len(), 5);

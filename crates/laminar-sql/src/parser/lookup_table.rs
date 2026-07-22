@@ -1,7 +1,7 @@
 //! Parser for CREATE/DROP LOOKUP TABLE DDL statements.
 //!
 //! Lookup tables are dimension/reference tables used in enrichment joins.
-//! They can be backed by external connectors (PostgreSQL CDC, Redis, etc.)
+//! They can be backed by registered snapshot-capable or on-demand connectors
 //! with configurable caching and predicate pushdown strategies.
 
 #[allow(clippy::disallowed_types)] // cold path: SQL parsing
@@ -12,7 +12,7 @@ use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Token;
 
-use super::tokenizer::{expect_custom_keyword, parse_with_options};
+use super::tokenizer::{expect_custom_keyword, expect_statement_end, parse_with_options};
 use super::ParseError;
 
 /// CREATE LOOKUP TABLE statement.
@@ -35,65 +35,60 @@ pub struct CreateLookupTableStatement {
 /// Validated lookup table properties from the WITH clause.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LookupTableProperties {
-    /// Connector type.
-    pub connector: ConnectorType,
-    /// Connection string.
-    pub connection: Option<String>,
+    /// Lookup connector.
+    pub connector: LookupConnector,
     /// Lookup strategy.
     pub strategy: LookupStrategy,
     /// In-memory cache size.
     pub cache_memory: Option<ByteSize>,
-    /// On-disk cache size.
-    pub cache_disk: Option<ByteSize>,
     /// Cache TTL in seconds.
     pub cache_ttl: Option<u64>,
     /// Predicate pushdown mode.
     pub pushdown_mode: PushdownMode,
 }
 
-/// Connector type for lookup tables.
+/// Connector backing a lookup table.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConnectorType {
-    /// PostgreSQL standalone connector (poll-based snapshot, no CDC).
-    Postgres,
-    /// PostgreSQL CDC connector.
-    PostgresCdc,
-    /// MySQL CDC connector.
-    MysqlCdc,
-    /// Redis connector.
-    Redis,
-    /// S3 Parquet connector.
-    S3Parquet,
-    /// Delta Lake connector.
-    DeltaLake,
+pub enum LookupConnector {
     /// Static in-memory data.
     Static,
-    /// Custom connector type.
-    Custom(String),
+    /// Name resolved against the frozen connector registry.
+    External(String),
 }
 
-impl ConnectorType {
-    /// Parse a connector type from a string.
+impl LookupConnector {
+    /// Parse a lookup connector from a string.
     ///
     /// # Errors
     ///
-    /// Returns `ParseError` if the connector type is empty.
+    /// Returns `ParseError` if the connector name is empty.
     pub fn parse(s: &str) -> Result<Self, ParseError> {
-        if s.is_empty() {
+        let connector = s.trim().to_ascii_lowercase();
+        if connector.is_empty() {
             return Err(ParseError::ValidationError(
-                "connector type cannot be empty".to_string(),
+                "connector name cannot be empty".to_string(),
             ));
         }
-        Ok(match s.to_lowercase().as_str() {
-            "postgres" => Self::Postgres,
-            "postgres-cdc" | "postgres_cdc" | "postgresql" => Self::PostgresCdc,
-            "mysql-cdc" | "mysql_cdc" | "mysql" => Self::MysqlCdc,
-            "redis" => Self::Redis,
-            "s3-parquet" | "s3_parquet" | "s3" => Self::S3Parquet,
-            "delta-lake" | "delta_lake" | "delta" | "deltalake" => Self::DeltaLake,
-            "static" | "memory" => Self::Static,
-            other => Self::Custom(other.to_string()),
+        Ok(if connector == "static" {
+            Self::Static
+        } else {
+            Self::External(connector)
         })
+    }
+
+    /// Canonical connector name used for registry lookup and plan metadata.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Static => "static",
+            Self::External(name) => name,
+        }
+    }
+}
+
+impl std::fmt::Display for LookupConnector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -103,8 +98,6 @@ pub enum LookupStrategy {
     /// Full table replicated on every node.
     #[default]
     Replicated,
-    /// Table partitioned across nodes by key.
-    Partitioned,
     /// Rows fetched on demand (no pre-loading).
     OnDemand,
 }
@@ -116,13 +109,12 @@ impl LookupStrategy {
     ///
     /// Returns `ParseError` if the strategy is unknown.
     pub fn parse(s: &str) -> Result<Self, ParseError> {
-        match s.to_lowercase().as_str() {
-            "replicated" | "full" | "poll" | "snapshot" | "cdc" => Ok(Self::Replicated),
-            "partitioned" | "sharded" => Ok(Self::Partitioned),
-            "on-demand" | "on_demand" | "lazy" | "manual" => Ok(Self::OnDemand),
+        match s.as_bytes() {
+            b"replicated" => Ok(Self::Replicated),
+            b"on-demand" => Ok(Self::OnDemand),
             other => Err(ParseError::ValidationError(format!(
-                "unknown lookup strategy: '{other}' \
-                 (expected: replicated, partitioned, on-demand)"
+                "unknown lookup strategy: '{}' (expected: replicated or on-demand)",
+                String::from_utf8_lossy(other)
             ))),
         }
     }
@@ -211,8 +203,8 @@ impl ByteSize {
 ///   ...
 ///   PRIMARY KEY (<col>, ...)
 /// ) WITH (
-///   'connector' = 'postgres-cdc',
-///   'connection' = 'postgresql://...',
+///   'connector' = 'catalog-source',
+///   'endpoint' = 'https://catalog.example',
 ///   ...
 /// );
 /// ```
@@ -307,6 +299,7 @@ pub fn parse_create_lookup_table(
             "LOOKUP TABLE requires a WITH clause".to_string(),
         ));
     }
+    expect_statement_end(parser)?;
 
     Ok(CreateLookupTableStatement {
         name,
@@ -356,9 +349,7 @@ pub fn validate_properties<S: ::std::hash::BuildHasher>(
     let connector_str = options.get("connector").ok_or_else(|| {
         ParseError::ValidationError("missing required property: 'connector'".to_string())
     })?;
-    let connector = ConnectorType::parse(connector_str)?;
-
-    let connection = options.get("connection").cloned();
+    let connector = LookupConnector::parse(connector_str)?;
 
     let strategy = match options.get("strategy") {
         Some(s) => LookupStrategy::parse(s)?,
@@ -370,10 +361,11 @@ pub fn validate_properties<S: ::std::hash::BuildHasher>(
         .map(|s| ByteSize::parse(s))
         .transpose()?;
 
-    let cache_disk = options
-        .get("cache.disk")
-        .map(|s| ByteSize::parse(s))
-        .transpose()?;
+    if options.contains_key("cache.disk") {
+        return Err(ParseError::ValidationError(
+            "cache.disk is unsupported; on-demand lookup caching is memory-only".into(),
+        ));
+    }
 
     let cache_ttl = options
         .get("cache.ttl")
@@ -388,12 +380,16 @@ pub fn validate_properties<S: ::std::hash::BuildHasher>(
         None => PushdownMode::default(),
     };
 
+    if strategy == LookupStrategy::Replicated && (cache_memory.is_some() || cache_ttl.is_some()) {
+        return Err(ParseError::ValidationError(
+            "cache.memory and cache.ttl require strategy = 'on-demand'".into(),
+        ));
+    }
+
     Ok(LookupTableProperties {
         connector,
-        connection,
         strategy,
         cache_memory,
-        cache_disk,
         cache_ttl,
         pushdown_mode,
     })
@@ -420,8 +416,8 @@ mod tests {
                 name VARCHAR,
                 PRIMARY KEY (symbol)
             ) WITH (
-                'connector' = 'postgres-cdc',
-                'connection' = 'postgresql://localhost/db'
+                'connector' = 'catalog-source',
+                'endpoint' = 'https://catalog.example'
             )",
         );
         match stmt {
@@ -433,7 +429,7 @@ mod tests {
                 assert!(!lt.if_not_exists);
                 assert_eq!(
                     lt.with_options.get("connector"),
-                    Some(&"postgres-cdc".to_string())
+                    Some(&"catalog-source".to_string())
                 );
             }
             _ => panic!("Expected CreateLookupTable, got {stmt:?}"),
@@ -485,9 +481,9 @@ mod tests {
                 id INT,
                 PRIMARY KEY (id)
             ) WITH (
-                'connector' = 'postgres-cdc',
-                'connection' = 'postgresql://localhost/db',
-                'strategy' = 'replicated',
+                'connector' = 'mock-direct',
+                'connection' = 'endpoint=localhost',
+                'strategy' = 'on-demand',
                 'cache.memory' = '512mb',
                 'pushdown' = 'auto'
             )",
@@ -495,12 +491,15 @@ mod tests {
         match stmt {
             StreamingStatement::CreateLookupTable(lt) => {
                 let props = validate_properties(&lt.with_options).unwrap();
-                assert_eq!(props.connector, ConnectorType::PostgresCdc);
                 assert_eq!(
-                    props.connection.as_deref(),
-                    Some("postgresql://localhost/db")
+                    props.connector,
+                    LookupConnector::External("mock-direct".into())
                 );
-                assert_eq!(props.strategy, LookupStrategy::Replicated);
+                assert_eq!(
+                    lt.with_options.get("connection").map(String::as_str),
+                    Some("endpoint=localhost")
+                );
+                assert_eq!(props.strategy, LookupStrategy::OnDemand);
                 assert_eq!(props.cache_memory, Some(ByteSize(512 * 1024 * 1024)));
                 assert_eq!(props.pushdown_mode, PushdownMode::Auto);
             }
@@ -552,36 +551,24 @@ mod tests {
     }
 
     #[test]
-    fn test_connector_type_parsing() {
+    fn lookup_connector_parsing_is_provider_neutral() {
         assert_eq!(
-            ConnectorType::parse("postgres-cdc").unwrap(),
-            ConnectorType::PostgresCdc
+            LookupConnector::parse(" STATIC ").unwrap(),
+            LookupConnector::Static
         );
         assert_eq!(
-            ConnectorType::parse("mysql-cdc").unwrap(),
-            ConnectorType::MysqlCdc
-        );
-        assert_eq!(ConnectorType::parse("redis").unwrap(), ConnectorType::Redis);
-        assert_eq!(
-            ConnectorType::parse("s3-parquet").unwrap(),
-            ConnectorType::S3Parquet
+            LookupConnector::parse("CuStOm-SrC").unwrap(),
+            LookupConnector::External("custom-src".to_string())
         );
         assert_eq!(
-            ConnectorType::parse("static").unwrap(),
-            ConnectorType::Static
+            LookupConnector::parse("memory").unwrap(),
+            LookupConnector::External("memory".to_string())
         );
         assert_eq!(
-            ConnectorType::parse("delta-lake").unwrap(),
-            ConnectorType::DeltaLake
+            LookupConnector::parse("alpha_lookup").unwrap(),
+            LookupConnector::External("alpha_lookup".to_string())
         );
-        assert_eq!(
-            ConnectorType::parse("delta").unwrap(),
-            ConnectorType::DeltaLake
-        );
-        assert_eq!(
-            ConnectorType::parse("custom-src").unwrap(),
-            ConnectorType::Custom("custom-src".to_string())
-        );
+        assert!(LookupConnector::parse("  ").is_err());
     }
 
     #[test]
@@ -600,9 +587,45 @@ mod tests {
     #[test]
     fn test_error_invalid_property() {
         let mut options = HashMap::new();
-        options.insert("connector".to_string(), "postgres-cdc".to_string());
+        options.insert("connector".to_string(), "catalog-source".to_string());
         options.insert("strategy".to_string(), "invalid-strategy".to_string());
         let result = validate_properties(&options);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn lookup_strategy_and_cache_surface_is_strict() {
+        assert_eq!(
+            LookupStrategy::parse("replicated").unwrap(),
+            LookupStrategy::Replicated
+        );
+        assert_eq!(
+            LookupStrategy::parse("on-demand").unwrap(),
+            LookupStrategy::OnDemand
+        );
+        for unsupported in [
+            "partitioned",
+            "sharded",
+            "full",
+            "poll",
+            "snapshot",
+            "cdc",
+            "on_demand",
+            "lazy",
+            "manual",
+        ] {
+            assert!(LookupStrategy::parse(unsupported).is_err(), "{unsupported}");
+        }
+
+        let mut replicated_cache = HashMap::from([
+            ("connector".to_string(), "catalog-source".to_string()),
+            ("strategy".to_string(), "replicated".to_string()),
+            ("cache.memory".to_string(), "1mb".to_string()),
+        ]);
+        assert!(validate_properties(&replicated_cache).is_err());
+        replicated_cache.insert("strategy".into(), "on-demand".into());
+        assert!(validate_properties(&replicated_cache).is_ok());
+        replicated_cache.insert("cache.disk".into(), "1gb".into());
+        assert!(validate_properties(&replicated_cache).is_err());
     }
 }

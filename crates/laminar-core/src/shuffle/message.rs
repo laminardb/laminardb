@@ -1,31 +1,53 @@
-//! Logical messages carried on a shuffle stream.
+//! Logical messages carried by the ordered shuffle transport.
 //!
-//! The wire encoding is gRPC/protobuf (`proto/shuffle.proto`, `ShuffleFrame`);
-//! the `<->` conversion lives in [`super::transport`]. A `VnodeData`'s batch is
-//! Arrow IPC-encoded with a per-stage streaming encoder (see
-//! [`crate::serialization::BatchStreamEncoder`]): the schema rides only the first
-//! frame of each stage and later frames are schema-less continuations. This
-//! assumes a stage's schema is stable for the life of a connection.
+//! The data/barrier wire encoding is gRPC/protobuf (`proto/shuffle.proto`, `ShuffleFrame`);
+//! transport identity is internal to [`super::transport`]. A data message's batch is
+//! Arrow IPC-encoded as one self-contained logical payload. Wire fragmentation
+//! slices that allocation without copying it or retaining per-stage codec state.
+
+use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 
 use crate::checkpoint::barrier::CheckpointBarrier;
 
-/// Maximum Arrow IPC payload accepted for a single `VnodeData` frame: 64 MiB.
-pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum reassembled Arrow IPC payload for one logical shuffled batch: 16 MiB.
+pub const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 
 /// Logical message carried on a shuffle connection.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ShuffleMessage {
-    /// A checkpoint barrier (Chandy-Lamport).
+    /// An aligned checkpoint barrier ordered after preceding checkpointed data.
     Barrier(CheckpointBarrier),
-    /// Peer identifying itself during the connection handshake.
-    Hello(u64),
-    /// A batch of rows pre-routed to `vnode`, tagged with the logical `stage`
-    /// (the operator / MV name) it belongs to. The stage lets a receiver shared
-    /// by multiple sharded operators demux frames to the correct one instead of
-    /// cross-feeding them.
-    VnodeData(String, u32, RecordBatch),
-    /// Sender announcing graceful shutdown with a brief reason.
-    Close(String),
+    /// A stage batch with a non-empty canonical route set.
+    Data {
+        /// Stable stage demultiplexing scope.
+        stage: String,
+        /// Ascending, duplicate-free receiver-owned vnode route set.
+        routed_vnodes: Arc<[u32]>,
+        /// User batch, with its schema left unchanged.
+        batch: RecordBatch,
+    },
+}
+
+impl ShuffleMessage {
+    /// Construct stateful data covered by checkpoint delivery accounting.
+    #[must_use]
+    pub fn checkpointed(stage: String, vnode: u32, batch: RecordBatch) -> Self {
+        Self::checkpointed_routed(stage, Arc::from([vnode]), batch)
+    }
+
+    /// Construct owner-coalesced stateful data with canonical out-of-band vnode metadata.
+    #[must_use]
+    pub fn checkpointed_routed(
+        stage: String,
+        routed_vnodes: Arc<[u32]>,
+        batch: RecordBatch,
+    ) -> Self {
+        Self::Data {
+            stage,
+            routed_vnodes,
+            batch,
+        }
+    }
 }

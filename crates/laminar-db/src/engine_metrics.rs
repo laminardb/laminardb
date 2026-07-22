@@ -30,30 +30,6 @@ pub struct EngineMetrics {
     pub mv_updates: IntCounter,
     /// Approximate MV bytes stored.
     pub mv_bytes_stored: IntGauge,
-    /// Estimated operator state bytes held in memory, summed across all
-    /// operators. Refreshed by the memory-budget probe.
-    pub state_bytes: IntGauge,
-    /// Estimated state bytes per operator. Label: `operator`.
-    pub operator_state_bytes: IntGaugeVec,
-    /// Configured node-level state memory budget; `0` = unlimited.
-    pub state_memory_budget_bytes: IntGauge,
-    /// `1` while operator state exceeds the memory budget (ingest paused), else `0`.
-    pub state_over_budget: IntGauge,
-    /// Cycles whose source intake was paused by the state memory budget.
-    pub state_budget_paused_cycles: IntCounter,
-    /// Logical bytes held by the disk cold tier for demoted operator state.
-    pub state_tier_bytes: IntGauge,
-    /// Slices (operator, vnode) currently resident in the cold tier.
-    pub state_tier_slices: IntGauge,
-    /// Slices written to the cold tier (demotions).
-    pub state_tier_demote_total: IntCounter,
-    /// Slice reads from the cold tier (promotion fetches).
-    pub state_tier_fetch_total: IntCounter,
-    /// Cold-tier fetch latency (the promotion path's disk read).
-    pub state_tier_fetch_duration: Histogram,
-    /// Groups found resident AND cold at capture (the resident∩cold disjoint-set invariant broken).
-    /// Must stay 0; a non-zero value is a demote/promote overlap that double-counts on recovery.
-    pub state_tier_overlap_total: IntCounter,
     /// Global pipeline watermark.
     pub pipeline_watermark: IntGauge,
     /// Per-source watermark (epoch-ms). Label: `source`.
@@ -101,10 +77,16 @@ pub struct EngineMetrics {
     pub cycle_duration: Histogram,
     /// Checkpoint cycle duration.
     pub checkpoint_duration: Histogram,
-    /// Pipeline stall per barrier: time the pipeline task is blocked by
-    /// a checkpoint (shuffle alignment + state capture + the Aligned
-    /// resume gate), excluding the background durable tail.
+    /// Pipeline stall per barrier: sink write fence, shuffle alignment, state capture, and the
+    /// Aligned resume gate. Exactly-once mode also includes its inline durable tail; other modes
+    /// resume at Aligned while that tail remains supervised in the background.
     pub checkpoint_pipeline_stall_duration: Histogram,
+    /// Local barrier work while the pipeline is paused: sink fencing, shuffle alignment, state
+    /// capture, and construction of the immutable durable-tail handoff.
+    pub checkpoint_barrier_local_duration: Histogram,
+    /// Cluster-shuffle pause after local capture while waiting for the global Aligned release.
+    /// Embedded and single-node runtimes do not observe this metric.
+    pub checkpoint_aligned_resume_wait: Histogram,
     /// Time the leader's restorable gate spends polling for vnode
     /// partials (failed gates that burn the timeout are observed too).
     /// When this dominates restorable latency at production cadence,
@@ -119,8 +101,6 @@ pub struct EngineMetrics {
     pub coordinated_committer_lag_epochs: IntGauge,
     /// Sink pre-commit round-trip (2PC phase 1).
     pub sink_precommit_duration: Histogram,
-    /// Sink commit round-trip (2PC phase 2).
-    pub sink_commit_duration: Histogram,
     /// On-demand lookup cache hits (served without a source fetch). Label: `table`.
     pub lookup_cache_hits: IntCounterVec,
     /// On-demand lookup cache misses (not in cache). Label: `table`.
@@ -129,9 +109,6 @@ pub struct EngineMetrics {
     pub lookup_source_errors: IntCounterVec,
     /// On-demand lookup rows awaiting a source fetch. Label: `table`.
     pub lookup_in_flight_rows: IntGaugeVec,
-    /// Output batches dropped when a remote subscriber's routing queue is full
-    /// (cluster mode, best-effort delivery under backpressure).
-    pub remote_subscription_batches_dropped: IntCounter,
     /// Vnodes owned per failure domain (cluster mode). Label: `domain`.
     pub placement_vnodes_per_domain: IntGaugeVec,
     /// Largest single domain's share of all vnodes (`[0, 1]`) — the blast radius.
@@ -146,6 +123,8 @@ pub struct EngineMetrics {
     pub coordinated_recoveries_total: IntCounter,
     /// Leader-coordinated recovery rounds abandoned (self-restore failed or restore quorum timed out).
     pub coordinated_recovery_failures_total: IntCounter,
+    /// Shuffle delivery-loss incidents; each one fences an epoch and forces replay.
+    pub shuffle_delivery_loss_incidents_total: IntCounter,
 }
 
 impl EngineMetrics {
@@ -200,70 +179,6 @@ impl EngineMetrics {
             mv_bytes_stored: reg!(
                 IntGauge::new("mv_bytes_stored", "Approximate MV bytes stored").unwrap()
             ),
-            state_bytes: reg!(IntGauge::new(
-                "state_bytes",
-                "Estimated operator state bytes held in memory (all operators)"
-            )
-            .unwrap()),
-            // Labels are catalog-bound (one per registered query/operator).
-            operator_state_bytes: reg!(IntGaugeVec::new(
-                Opts::new(
-                    "operator_state_bytes",
-                    "Estimated state bytes per operator"
-                ),
-                &["operator"],
-            )
-            .unwrap()),
-            state_memory_budget_bytes: reg!(IntGauge::new(
-                "state_memory_budget_bytes",
-                "Configured node-level state memory budget (0 = unlimited)"
-            )
-            .unwrap()),
-            state_over_budget: reg!(IntGauge::new(
-                "state_over_budget",
-                "1 while operator state exceeds the memory budget (ingest paused)"
-            )
-            .unwrap()),
-            state_budget_paused_cycles: reg!(IntCounter::new(
-                "state_budget_paused_cycles_total",
-                "Cycles whose source intake was paused by the state memory budget"
-            )
-            .unwrap()),
-            state_tier_bytes: reg!(IntGauge::new(
-                "state_tier_bytes",
-                "Logical bytes held by the disk cold tier"
-            )
-            .unwrap()),
-            state_tier_slices: reg!(IntGauge::new(
-                "state_tier_slices",
-                "Slices (operator, vnode) resident in the cold tier"
-            )
-            .unwrap()),
-            state_tier_demote_total: reg!(IntCounter::new(
-                "state_tier_demote_total",
-                "Slices written to the cold tier"
-            )
-            .unwrap()),
-            state_tier_fetch_total: reg!(IntCounter::new(
-                "state_tier_fetch_total",
-                "Slice reads from the cold tier"
-            )
-            .unwrap()),
-            // Dev-box bench: cold 4 MiB slice fetch p99 ~18ms; cover to ~80s
-            // so a degraded disk is visible rather than clipped.
-            state_tier_fetch_duration: reg!(Histogram::with_opts(
-                HistogramOpts::new(
-                    "state_tier_fetch_duration_seconds",
-                    "Cold-tier slice fetch latency"
-                )
-                .buckets(prometheus::exponential_buckets(0.0005, 2.0, 18).unwrap()),
-            )
-            .unwrap()),
-            state_tier_overlap_total: reg!(IntCounter::new(
-                "state_tier_overlap_total",
-                "Groups found resident AND cold at capture (disjoint-set invariant broken)"
-            )
-            .unwrap()),
             pipeline_watermark: reg!(IntGauge::new(
                 "pipeline_watermark",
                 "Global pipeline watermark"
@@ -394,6 +309,22 @@ impl EngineMetrics {
                 .buckets(prometheus::exponential_buckets(0.001, 2.0, 16).unwrap()),
             )
             .unwrap()),
+            checkpoint_barrier_local_duration: reg!(Histogram::with_opts(
+                HistogramOpts::new(
+                    "checkpoint_barrier_local_duration_seconds",
+                    "Local paused barrier work (sink fence + shuffle align + state capture + tail handoff)",
+                )
+                .buckets(prometheus::exponential_buckets(0.001, 2.0, 16).unwrap()),
+            )
+            .unwrap()),
+            checkpoint_aligned_resume_wait: reg!(Histogram::with_opts(
+                HistogramOpts::new(
+                    "checkpoint_aligned_resume_wait_seconds",
+                    "Cluster-shuffle pause waiting for the global Aligned release",
+                )
+                .buckets(prometheus::exponential_buckets(0.001, 2.0, 16).unwrap()),
+            )
+            .unwrap()),
             // Gate timeout default 10s. 0.001 * 2^14 = 16.38s.
             checkpoint_restorable_gate_wait: reg!(Histogram::with_opts(
                 HistogramOpts::new(
@@ -413,16 +344,10 @@ impl EngineMetrics {
                 "Vnode partials written as unchanged-base references"
             )
             .unwrap()),
-            // pre_commit_timeout=30s. 0.005 * 2^13 = 40.96s.
+            // The one attempt deadline defaults to 120s. 0.005 * 2^15 = 163.84s.
             sink_precommit_duration: reg!(Histogram::with_opts(
                 HistogramOpts::new("sink_precommit_duration_seconds", "Sink pre-commit latency")
-                    .buckets(prometheus::exponential_buckets(0.005, 2.0, 14).unwrap()),
-            )
-            .unwrap()),
-            // commit_timeout=60s. 0.005 * 2^14 = 81.92s.
-            sink_commit_duration: reg!(Histogram::with_opts(
-                HistogramOpts::new("sink_commit_duration_seconds", "Sink commit latency")
-                    .buckets(prometheus::exponential_buckets(0.005, 2.0, 15).unwrap()),
+                    .buckets(prometheus::exponential_buckets(0.005, 2.0, 16).unwrap()),
             )
             .unwrap()),
             // Labels are bound to the registered lookup tables, so cardinality is finite.
@@ -450,11 +375,6 @@ impl EngineMetrics {
                     "On-demand lookup rows awaiting a source fetch"
                 ),
                 &["table"],
-            )
-            .unwrap()),
-            remote_subscription_batches_dropped: reg!(IntCounter::new(
-                "remote_subscription_batches_dropped_total",
-                "Output batches dropped under remote-subscriber backpressure"
             )
             .unwrap()),
             placement_vnodes_per_domain: reg!(IntGaugeVec::new(
@@ -493,6 +413,11 @@ impl EngineMetrics {
             coordinated_recovery_failures_total: reg!(IntCounter::new(
                 "coordinated_recovery_failures_total",
                 "Leader-coordinated recovery rounds abandoned (self-restore failed or quorum timed out)"
+            )
+            .unwrap()),
+            shuffle_delivery_loss_incidents_total: reg!(IntCounter::new(
+                "shuffle_delivery_loss_incidents_total",
+                "Cross-node shuffle delivery-loss incidents (fences the epoch, forces replay)"
             )
             .unwrap()),
         }

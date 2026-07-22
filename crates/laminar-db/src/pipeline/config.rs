@@ -6,6 +6,39 @@ use laminar_connectors::connector::DeliveryGuarantee;
 
 use crate::config::BackpressurePolicy;
 
+/// Checkpoint triggering configured for the running pipeline.
+///
+/// The three states mirror [`LaminarConfig::checkpoint`](crate::config::LaminarConfig::checkpoint)
+/// without allowing an enabled flag and timer interval to contradict each other.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CheckpointSchedule {
+    /// No durable checkpoint service is configured.
+    #[default]
+    Disabled,
+    /// Checkpoints run only when explicitly requested.
+    Manual,
+    /// Checkpoints wait at least this long after a terminal outcome before the next automatic
+    /// admission; they may also be requested explicitly.
+    Periodic(Duration),
+}
+
+impl CheckpointSchedule {
+    /// Whether the durable checkpoint service is configured.
+    #[must_use]
+    pub const fn is_enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    /// The periodic cadence, if automatic checkpoints are configured.
+    #[must_use]
+    pub const fn periodic_interval(self) -> Option<Duration> {
+        match self {
+            Self::Periodic(interval) => Some(interval),
+            Self::Disabled | Self::Manual => None,
+        }
+    }
+}
+
 /// Configuration for the event-driven connector pipeline.
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
@@ -18,11 +51,8 @@ pub struct PipelineConfig {
     /// Fallback poll interval when a source returns no `data_ready_notify`.
     pub fallback_poll_interval: Duration,
 
-    /// Timer-based checkpoint interval (at-least-once). `None` disables auto-checkpointing.
-    ///
-    /// For exactly-once, use barrier-aligned checkpoints via
-    /// [`PipelineCallback::checkpoint_with_barrier`](super::callback::PipelineCallback::checkpoint_with_barrier).
-    pub checkpoint_interval: Option<Duration>,
+    /// Whether checkpoints are disabled, manual-only, or periodic.
+    pub checkpoint_schedule: CheckpointSchedule,
 
     /// Sleep after the first event in a cycle to let more data accumulate.
     ///
@@ -30,8 +60,10 @@ pub struct PipelineConfig {
     /// channel provides natural backpressure during the window. `ZERO` = no batching.
     pub batch_window: Duration,
 
-    /// Maximum time to wait for all sources to align on a checkpoint barrier.
-    pub barrier_alignment_timeout: Duration,
+    /// Sole checkpoint-derived control-plane budget. Each connector startup stage and checkpoint
+    /// barrier creates one absolute deadline from this duration; individual connectors cannot
+    /// reset it.
+    pub checkpoint_timeout: Duration,
 
     /// End-to-end delivery guarantee for the pipeline.
     pub delivery_guarantee: DeliveryGuarantee,
@@ -73,9 +105,9 @@ impl Default for PipelineConfig {
             max_poll_records: 1024,
             channel_capacity: 64,
             fallback_poll_interval: Duration::from_millis(10),
-            checkpoint_interval: None,
+            checkpoint_schedule: CheckpointSchedule::Disabled,
             batch_window: Duration::from_millis(5),
-            barrier_alignment_timeout: Duration::from_secs(30),
+            checkpoint_timeout: Duration::from_secs(30),
             delivery_guarantee: DeliveryGuarantee::default(),
             cycle_budget_ns: 10_000_000,     // 10ms
             drain_budget_ns: 1_000_000,      // 1ms
@@ -88,4 +120,10 @@ impl Default for PipelineConfig {
             max_replay_buffer_bytes: 256 * 1024 * 1024, // 256 MiB per source
         }
     }
+}
+
+impl PipelineConfig {
+    /// Private rollback budget for a failed connector startup stage. This is deliberately fixed:
+    /// cleanup is fail-safe implementation policy, not another latency tuning dimension.
+    pub(crate) const CONNECTOR_STARTUP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
 }

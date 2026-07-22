@@ -1,21 +1,16 @@
 //! Schema types used across the connector framework.
 //!
 //! Defines the core data structures for schema inference, resolution,
-//! and connector configuration:
+//! and schema annotations:
 //!
 //! - [`RawRecord`]: A raw record with key, value, timestamp, and headers
 //! - [`SourceMetadata`]: Type-erased metadata from a source connector
 //! - [`FieldMeta`]: Per-field metadata for schema annotations
-//! - [`SourceConfig`]: Configuration for a source connector (schema module)
-//! - [`SinkConfig`]: Configuration for a sink connector (schema module)
 
 #![allow(clippy::disallowed_types)] // cold path: schema management
 
 use std::any::Any;
 use std::collections::HashMap;
-
-use crate::config::ConnectorConfig;
-use crate::serde::Format;
 
 /// A raw record read from a source before schema application.
 ///
@@ -198,103 +193,6 @@ impl FieldMeta {
     }
 }
 
-/// Configuration for a source connector in the schema module.
-///
-/// This is distinct from [`crate::config::ConnectorConfig`] — it adds
-/// format awareness and typed accessors for schema-related options.
-#[derive(Debug, Clone)]
-pub struct SourceConfig {
-    /// Connector type identifier (e.g., `"kafka"`, `"postgres-cdc"`).
-    pub connector_type: String,
-
-    /// Data format (e.g., JSON, CSV, Avro).
-    pub format: Format,
-
-    /// Arbitrary key-value options.
-    pub options: HashMap<String, String>,
-}
-
-impl SourceConfig {
-    /// Creates a new source config.
-    #[must_use]
-    pub fn new(connector_type: impl Into<String>, format: Format) -> Self {
-        Self {
-            connector_type: connector_type.into(),
-            format,
-            options: HashMap::new(),
-        }
-    }
-
-    /// Sets an option.
-    #[must_use]
-    pub fn with_option(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.options.insert(key.into(), value.into());
-        self
-    }
-
-    /// Gets an option value.
-    #[must_use]
-    pub fn get_option(&self, key: &str) -> Option<&str> {
-        self.options.get(key).map(String::as_str)
-    }
-
-    /// Converts to a [`ConnectorConfig`] for use with existing connector APIs.
-    #[must_use]
-    pub fn as_connector_config(&self) -> ConnectorConfig {
-        let mut props = self.options.clone();
-        props.insert("format".to_string(), self.format.to_string());
-        ConnectorConfig::with_properties(&self.connector_type, props)
-    }
-}
-
-/// Configuration for a sink connector in the schema module.
-///
-/// Mirror of [`SourceConfig`] for sink connectors.
-#[derive(Debug, Clone)]
-pub struct SinkConfig {
-    /// Connector type identifier (e.g., `"kafka"`, `"postgres"`).
-    pub connector_type: String,
-
-    /// Output data format.
-    pub format: Format,
-
-    /// Arbitrary key-value options.
-    pub options: HashMap<String, String>,
-}
-
-impl SinkConfig {
-    /// Creates a new sink config.
-    #[must_use]
-    pub fn new(connector_type: impl Into<String>, format: Format) -> Self {
-        Self {
-            connector_type: connector_type.into(),
-            format,
-            options: HashMap::new(),
-        }
-    }
-
-    /// Sets an option.
-    #[must_use]
-    pub fn with_option(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.options.insert(key.into(), value.into());
-        self
-    }
-
-    /// Gets an option value.
-    #[must_use]
-    pub fn get_option(&self, key: &str) -> Option<&str> {
-        self.options.get(key).map(String::as_str)
-    }
-
-    /// Converts to a [`ConnectorConfig`] for use with existing connector APIs.
-    #[must_use]
-    pub fn as_connector_config(&self) -> ConnectorConfig {
-        let mut props = self.options.clone();
-        props.insert("format".to_string(), self.format.to_string());
-        ConnectorConfig::with_properties(&self.connector_type, props)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,32 +248,5 @@ mod tests {
         assert_eq!(meta.source_type.as_deref(), Some("BIGINT"));
         assert_eq!(meta.default_expr.as_deref(), Some("0"));
         assert_eq!(meta.properties.get("pii").map(String::as_str), Some("true"));
-    }
-
-    #[test]
-    fn test_source_config() {
-        let cfg = SourceConfig::new("kafka", Format::Json)
-            .with_option("topic", "events")
-            .with_option("group.id", "my-group");
-
-        assert_eq!(cfg.connector_type, "kafka");
-        assert_eq!(cfg.format, Format::Json);
-        assert_eq!(cfg.get_option("topic"), Some("events"));
-
-        let cc = cfg.as_connector_config();
-        assert_eq!(cc.connector_type(), "kafka");
-        assert_eq!(cc.get("format"), Some("json"));
-        assert_eq!(cc.get("topic"), Some("events"));
-    }
-
-    #[test]
-    fn test_sink_config() {
-        let cfg = SinkConfig::new("postgres", Format::Json).with_option("table", "output");
-
-        assert_eq!(cfg.connector_type, "postgres");
-        assert_eq!(cfg.get_option("table"), Some("output"));
-
-        let cc = cfg.as_connector_config();
-        assert_eq!(cc.get("format"), Some("json"));
     }
 }

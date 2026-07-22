@@ -65,9 +65,6 @@ spec:
             - name: gossip
               containerPort: {{ ($cluster.discovery | default dict).gossipPort | default 7946 }}
               protocol: TCP
-            - name: raft
-              containerPort: {{ ($cluster.coordination | default dict).raftPort | default 7947 }}
-              protocol: TCP
             {{- end }}
           startupProbe:
             httpGet:
@@ -140,10 +137,6 @@ spec:
             {{- end }}
             - name: checkpoints
               mountPath: /var/lib/laminardb/checkpoints
-            {{- if .Values.laminardb.state.tier.enabled }}
-            - name: state-tier
-              mountPath: "{{ .Values.laminardb.state.tier.path }}"
-            {{- end }}
             {{- if and .Values.laminardb.pgwire.enabled .Values.laminardb.pgwire.tls.existingSecret }}
             - name: pgwire-tls
               mountPath: /etc/laminardb/pgwire-tls
@@ -172,14 +165,6 @@ spec:
         # Volatile; durable checkpoints need the StatefulSet PVC or an object store.
         - name: checkpoints
           emptyDir: {}
-        {{- if .Values.laminardb.state.tier.enabled }}
-        # Cold-tier scratch; rebuilt from checkpoints on restart, so ephemeral.
-        - name: state-tier
-          emptyDir:
-            {{- if .Values.laminardb.state.tier.emptyDirMedium }}
-            medium: {{ .Values.laminardb.state.tier.emptyDirMedium }}
-            {{- end }}
-        {{- end }}
         {{- if and .Values.laminardb.pgwire.enabled .Values.laminardb.pgwire.tls.existingSecret }}
         - name: pgwire-tls
           secret:

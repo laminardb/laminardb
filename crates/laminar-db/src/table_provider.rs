@@ -61,6 +61,7 @@ impl TableProvider for ReferenceTableProvider {
             .table_store
             .read()
             .to_record_batch(&self.table_name)
+            .map_err(|error| DataFusionError::Execution(error.to_string()))?
             .unwrap_or_else(|| arrow::array::RecordBatch::new_empty(self.schema.clone()));
 
         let schema = batch.schema();
@@ -190,10 +191,12 @@ impl TableProvider for MvTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        // Propagate a materialization error; an empty batch would look like a legitimately empty MV.
         let batch = self
             .mv_store
             .read()
             .to_record_batch(&self.mv_name)
+            .map_err(|e| DataFusionError::Execution(format!("MV scan '{}': {e}", self.mv_name)))?
             .unwrap_or_else(|| arrow::array::RecordBatch::new_empty(self.schema.clone()));
 
         let schema = batch.schema();

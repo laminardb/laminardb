@@ -10,6 +10,7 @@ use datafusion::prelude::SessionContext;
 use datafusion_common::DFSchema;
 use datafusion_expr::{Expr, LogicalPlan};
 
+use crate::db::exact_table_reference;
 use crate::error::DbError;
 
 static COMPILE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -28,7 +29,7 @@ impl<'a> ScopedTable<'a> {
         );
         let empty = datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![]])
             .map_err(|e| DbError::Pipeline(format!("filter compile (build temp table): {e}")))?;
-        ctx.register_table(&name, Arc::new(empty))
+        ctx.register_table(exact_table_reference(&name), Arc::new(empty))
             .map_err(|e| DbError::Pipeline(format!("filter compile (register temp table): {e}")))?;
         Ok(Self { ctx, name })
     }
@@ -36,7 +37,7 @@ impl<'a> ScopedTable<'a> {
 
 impl Drop for ScopedTable<'_> {
     fn drop(&mut self) {
-        let _ = self.ctx.deregister_table(&self.name);
+        let _ = self.ctx.deregister_table(exact_table_reference(&self.name));
     }
 }
 

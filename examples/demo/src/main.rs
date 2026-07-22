@@ -25,7 +25,7 @@
 //! - Event counters: `total_events_ingested`, `total_events_emitted`
 //! - Cycle metrics: `total_cycles`, `last_cycle_duration_ns`
 //! - Pipeline watermark: `pipeline_watermark`
-//! - Source/stream backpressure: `db.source_metrics()`, `db.stream_metrics()`
+//! - Source backpressure and per-stream emitted rows: `db.source_metrics()`, `db.stream_metrics()`
 //! - System stats (CPU/memory) use `sysinfo` directly.
 
 #![allow(clippy::disallowed_types)]
@@ -77,14 +77,16 @@ struct Subscriptions {
 }
 
 impl Subscriptions {
-    fn from_db(db: &LaminarDB) -> Result<Self, Box<dyn std::error::Error>> {
+    async fn from_db(db: &LaminarDB) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
-            ohlc: db.subscribe::<OhlcBar>("ohlc_bars")?,
-            volume: db.subscribe::<VolumeMetrics>("volume_metrics")?,
-            spread: db.subscribe::<SpreadMetrics>("spread_metrics")?,
-            anomaly: db.subscribe::<AnomalyAlert>("anomaly_alerts")?,
-            imbalance: db.subscribe::<BookImbalanceMetrics>("book_imbalance")?,
-            depth: db.subscribe::<DepthMetrics>("depth_metrics")?,
+            ohlc: db.subscribe::<OhlcBar>("ohlc_bars").await?,
+            volume: db.subscribe::<VolumeMetrics>("volume_metrics").await?,
+            spread: db.subscribe::<SpreadMetrics>("spread_metrics").await?,
+            anomaly: db.subscribe::<AnomalyAlert>("anomaly_alerts").await?,
+            imbalance: db
+                .subscribe::<BookImbalanceMetrics>("book_imbalance")
+                .await?,
+            depth: db.subscribe::<DepthMetrics>("depth_metrics").await?,
         })
     }
 }
@@ -274,7 +276,7 @@ async fn run_embedded_mode() -> Result<(), Box<dyn std::error::Error>> {
     let tick_source = db.source::<MarketTick>("market_ticks")?;
     let order_source = db.source::<OrderEvent>("order_events")?;
     let book_source = db.source::<OrderBookUpdate>("book_updates")?;
-    let mut subs = Subscriptions::from_db(&db)?;
+    let mut subs = Subscriptions::from_db(&db).await?;
 
     let mut generator = MarketGenerator::new();
     let mut app = App::new();
@@ -372,7 +374,7 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // -- Subscribe and setup app state --
-    let mut subs = Subscriptions::from_db(&db)?;
+    let mut subs = Subscriptions::from_db(&db).await?;
 
     let mut app = App::new();
     app.set_topology(db.pipeline_topology());
@@ -497,7 +499,7 @@ async fn run_tui_loop<D: PipelineDataSource>(
 
         if !app.paused {
             data_source.push_cycle(app).await?;
-            drain_subscriptions(app, subs);
+            drain_subscriptions(app, subs)?;
         }
     }
 
@@ -505,41 +507,45 @@ async fn run_tui_loop<D: PipelineDataSource>(
 }
 
 /// Poll all subscription channels and merge results into app state.
-fn drain_subscriptions(app: &mut App, subs: &mut Subscriptions) {
+fn drain_subscriptions(
+    app: &mut App,
+    subs: &mut Subscriptions,
+) -> Result<(), laminar_db::SubscriptionError> {
     for _ in 0..64 {
-        match subs.ohlc.poll() {
+        match subs.ohlc.poll()? {
             Some(rows) => app.ingest_ohlc(rows),
             None => break,
         }
     }
     for _ in 0..64 {
-        match subs.volume.poll() {
+        match subs.volume.poll()? {
             Some(rows) => app.ingest_volume(rows),
             None => break,
         }
     }
     for _ in 0..64 {
-        match subs.spread.poll() {
+        match subs.spread.poll()? {
             Some(rows) => app.ingest_spread(rows),
             None => break,
         }
     }
     for _ in 0..64 {
-        match subs.anomaly.poll() {
+        match subs.anomaly.poll()? {
             Some(rows) => app.ingest_anomaly(rows),
             None => break,
         }
     }
     for _ in 0..64 {
-        match subs.imbalance.poll() {
+        match subs.imbalance.poll()? {
             Some(rows) => app.ingest_book_imbalance(rows),
             None => break,
         }
     }
     for _ in 0..64 {
-        match subs.depth.poll() {
+        match subs.depth.poll()? {
             Some(rows) => app.ingest_depth_metrics(rows),
             None => break,
         }
     }
+    Ok(())
 }

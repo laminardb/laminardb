@@ -196,15 +196,9 @@ impl GraphOperator for WindowFrameOperator {
 
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
         let batch = deserialize_batch_stream(&checkpoint.data)
-            .map_err(|e| DbError::Pipeline(format!("window frame: restore: {e}")))?;
+            .map_err(|e| DbError::Checkpoint(format!("window frame: restore: {e}")))?;
         self.history = Some(batch);
         Ok(())
-    }
-
-    fn estimated_state_bytes(&self) -> usize {
-        self.history
-            .as_ref()
-            .map_or(0, RecordBatch::get_array_memory_size)
     }
 }
 

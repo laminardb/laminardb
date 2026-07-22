@@ -4,6 +4,8 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::duration_suboptimal_units)] // MSRV 1.85; from_mins/from_hours are 1.91+
 #![allow(clippy::module_name_repetitions)]
+#![allow(clippy::too_many_arguments, clippy::too_many_lines)]
+// Connector protocols keep explicit inputs and contiguous state transitions.
 // Connectors are Ring 1 (cold path): std HashMap/HashSet are acceptable
 // throughout config, registry, schema, checkpoint, and CDC modules.
 #![allow(clippy::disallowed_types)]
@@ -37,6 +39,9 @@ mod macros;
 /// Connector configuration types.
 pub mod config;
 
+/// Secret classification and durable connector-identity sanitization.
+pub mod security;
+
 /// Core connector traits (`SourceConnector`, `SinkConnector`).
 pub mod connector;
 pub mod generator;
@@ -60,11 +65,6 @@ pub mod schema;
 /// Connector registry with factory pattern.
 pub mod registry;
 
-/// Engine-controlled partition → vnode ownership for partitioned sources
-/// (Kafka). Pure mapping logic, ungated so it builds and is tested without a
-/// native Kafka/OpenSSL toolchain.
-pub mod partition_assignment;
-
 /// Testing utilities (mock connectors, helpers).
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
@@ -75,15 +75,9 @@ pub mod testing;
 #[cfg(feature = "kafka")]
 pub mod kafka;
 
-/// Change Data Capture connectors for databases.
-pub mod cdc;
-
-/// PostgreSQL sink connector.
-#[cfg(feature = "postgres-sink")]
+/// PostgreSQL connector-specific configuration and implementations.
+#[cfg(any(feature = "postgres-cdc", feature = "postgres-sink"))]
 pub mod postgres;
-
-/// Lookup table support for enrichment joins.
-pub mod lookup;
 
 /// Lakehouse connectors (Delta Lake, Iceberg).
 pub mod lakehouse;
@@ -96,7 +90,7 @@ pub mod changelog;
 /// Cloud storage infrastructure (credential resolution, validation, secret masking).
 pub mod storage;
 
-/// Reference table source trait and refresh modes.
+/// Finite startup snapshot sources for reference tables.
 pub mod reference;
 
 /// WebSocket source and sink connectors.

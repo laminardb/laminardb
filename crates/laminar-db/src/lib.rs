@@ -24,6 +24,36 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::duration_suboptimal_units)] // MSRV 1.85; from_mins/from_hours are 1.91+
 #![allow(clippy::module_name_repetitions)]
+#![allow(clippy::too_many_arguments, clippy::too_many_lines)] // Lifecycle protocols remain contiguous and keep fencing inputs explicit.
+#![allow(clippy::disallowed_types)] // Control-plane maps mirror persisted and cross-crate checkpoint types.
+#![allow(clippy::unused_self)]
+// Feature stubs preserve shared protocol call sites.
+// Lifecycle fixtures favor explicit protocol setup and boundary assertions.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::assertions_on_constants,
+        clippy::default_trait_access,
+        clippy::field_reassign_with_default,
+        clippy::filter_map_bool_then,
+        clippy::float_cmp,
+        clippy::items_after_statements,
+        clippy::manual_let_else,
+        clippy::match_wildcard_for_single_variants,
+        clippy::needless_borrow,
+        clippy::needless_pass_by_value,
+        clippy::needless_return,
+        clippy::redundant_closure,
+        clippy::similar_names,
+        clippy::single_char_pattern,
+        clippy::type_complexity,
+        clippy::unchecked_time_subtraction,
+        clippy::unnecessary_to_owned,
+        clippy::unnecessary_wraps,
+        clippy::unnested_or_patterns,
+        clippy::used_underscore_binding
+    )
+)]
 
 mod aggregate_state;
 /// AI inference module, containing model registry, provider trait, and backends.
@@ -36,9 +66,13 @@ mod catalog;
 mod catalog_connector;
 mod changelog_filter;
 /// Unified checkpoint coordination.
+#[doc(hidden)]
 pub mod checkpoint_coordinator;
+#[cfg(feature = "cluster")]
+mod cluster_recovery_capsule;
 mod config;
 mod connector_manager;
+mod connector_task_fence;
 mod coordinated_committer;
 #[cfg(feature = "cluster")]
 mod coordinated_recovery;
@@ -74,6 +108,7 @@ mod operator_graph;
 /// Thread-per-core connector pipeline.
 pub mod pipeline;
 mod pipeline_callback;
+mod pipeline_identity;
 mod pipeline_lifecycle;
 /// Deployment profiles.
 pub mod profile;
@@ -87,14 +122,9 @@ mod show_commands;
 mod sink_task;
 mod sql_analysis;
 mod sql_utils;
-/// Disk cold tier for demoted operator state.
-#[cfg(feature = "state-tier")]
-mod state_tier;
-/// External `SUBSCRIBE` substrate: per-name broadcast channel and the
-/// per-portal pump task.
+/// External named-subscription substrate: byte-bounded shared logs and cursor portals.
 pub mod subscription;
 mod table_backend;
-mod table_cache_mode;
 mod table_provider;
 mod table_store;
 mod temporal_probe;
@@ -120,8 +150,7 @@ pub mod ffi;
 pub use builder::LaminarDbBuilder;
 pub use catalog::{ArrowRecord, SourceCatalog, SourceEntry};
 pub use checkpoint_coordinator::{
-    CheckpointConfig, CheckpointCoordinator, CheckpointPhase, CheckpointRequest, CheckpointResult,
-    CheckpointStats,
+    CheckpointFailureDisposition, CheckpointPhase, CheckpointResult, CheckpointStats,
 };
 pub use config::{BackpressurePolicy, LaminarConfig, RestartPolicy};
 pub use db::LaminarDB;
@@ -130,17 +159,16 @@ pub use error::DbError;
 pub use handle::{
     DdlInfo, ExecuteResult, FromBatch, MaterializedViewInfo, PipelineEdge, PipelineNode,
     PipelineNodeType, PipelineTopology, QueryHandle, QueryInfo, SinkInfo, SourceHandle, SourceInfo,
-    StreamInfo, TypedSubscription, UntypedSourceHandle,
+    StreamInfo, SubscriptionError, TypedSubscription, TypedSubscriptionFrame, UntypedSourceHandle,
 };
-#[cfg(feature = "state-tier")]
-pub use metrics::TierMetrics;
+pub use laminar_connectors::connector::DeliveryGuarantee;
 pub use metrics::{PipelineMetrics, PipelineState, SourceMetrics, StreamMetrics};
 pub use profile::{Profile, ProfileError};
 pub use recovery_manager::{RecoveredState, RecoveryManager, VnodeRehydration, VnodeRehydrator};
 
 /// Rebalance-driven state-rehydration types (cluster mode).
 #[cfg(feature = "cluster")]
-pub use db::{RehydratedVnode, SnapshotAdoption};
+pub use db::{ClusterStartupDisposition, RehydratedVnode, SnapshotAdoption};
 
 /// Re-export the connector registry for custom connector registration.
 pub use laminar_connectors::registry::ConnectorRegistry;

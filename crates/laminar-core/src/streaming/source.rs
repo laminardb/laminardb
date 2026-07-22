@@ -92,6 +92,10 @@ impl SourceWatermark {
         }
     }
 
+    fn restore_for_recovery(&self, timestamp: i64) {
+        self.current.store(timestamp, Ordering::Release);
+    }
+
     fn get(&self) -> i64 {
         self.current.load(Ordering::Acquire)
     }
@@ -277,6 +281,16 @@ impl<T: Record> Source<T> {
         // read it via `watermark_atomic()`. Subscribers receive data only,
         // so there is no in-band watermark message to emit.
         self.inner.watermark.update(timestamp);
+    }
+
+    /// Replaces the shared watermark with an exact recovered value.
+    ///
+    /// Unlike [`Self::watermark`], this may lower the watermark. The caller
+    /// must hold the intake/compute recovery fence and ensure every clone and
+    /// producer of this source is quiesced until restoration completes. Use
+    /// [`Self::watermark`] during normal operation.
+    pub fn restore_watermark_for_recovery(&self, timestamp: i64) {
+        self.inner.watermark.restore_for_recovery(timestamp);
     }
 
     /// Returns the current watermark value.
@@ -569,6 +583,22 @@ mod tests {
         // Watermark should not go backwards
         source.watermark(1500);
         assert_eq!(source.current_watermark(), 2000);
+    }
+
+    #[tokio::test]
+    async fn recovery_restore_lowers_shared_watermark_then_runtime_advances() {
+        let (source, _sink) = create::<TestEvent>(16);
+        let clone = source.clone();
+        source.watermark(2_000);
+
+        source.restore_watermark_for_recovery(500);
+        assert_eq!(source.current_watermark(), 500);
+        assert_eq!(clone.current_watermark(), 500);
+
+        clone.watermark(600);
+        assert_eq!(source.current_watermark(), 600);
+        clone.watermark(550);
+        assert_eq!(source.current_watermark(), 600);
     }
 
     #[tokio::test]

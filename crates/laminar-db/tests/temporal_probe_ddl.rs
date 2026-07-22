@@ -9,15 +9,15 @@ async fn create_stream_with_temporal_probe_join_preserves_clause() {
     let db = LaminarDB::open().unwrap();
 
     db.execute(
-        "CREATE SOURCE trades (s VARCHAR, p DOUBLE, ts BIGINT, \
-         WATERMARK FOR ts AS ts - 500)",
+        "CREATE SOURCE trades (s VARCHAR, p DOUBLE, ts TIMESTAMP, \
+         WATERMARK FOR ts AS ts - INTERVAL '500' MILLISECOND)",
     )
     .await
     .unwrap();
 
     db.execute(
-        "CREATE SOURCE prices (s VARCHAR, mid DOUBLE, ts BIGINT, \
-         WATERMARK FOR ts AS ts - 500)",
+        "CREATE SOURCE prices (s VARCHAR, mid DOUBLE, ts TIMESTAMP, \
+         WATERMARK FOR ts AS ts - INTERVAL '500' MILLISECOND)",
     )
     .await
     .unwrap();

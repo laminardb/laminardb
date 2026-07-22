@@ -332,6 +332,7 @@ fn grab_port() -> u16 {
 pub struct NodeHandle {
     /// This node's identity.
     pub instance_id: NodeId,
+    process_generation: u64,
     /// Gossip address this node listens on.
     pub gossip_addr: String,
     /// The cluster control facade. `Arc`-shared so tests can observe
@@ -387,12 +388,23 @@ fn current_info(node: &NodeHandle) -> NodeInfo {
         rpc_address: String::new(),
         raft_address: String::new(),
         state: NodeState::Active,
-        metadata: NodeMetadata {
-            cores: 1,
-            ..NodeMetadata::default()
-        },
+        metadata: minicluster_metadata(node.instance_id, node.process_generation),
         last_heartbeat_ms: 0,
     }
+}
+
+fn minicluster_metadata(instance_id: NodeId, process_generation: u64) -> NodeMetadata {
+    let incarnation =
+        uuid::Uuid::from_u128((u128::from(process_generation) << 64) | u128::from(instance_id.0));
+    let mut metadata = NodeMetadata {
+        cores: 1,
+        ..NodeMetadata::default()
+    };
+    metadata.tags.insert(
+        "laminardb.process-incarnation".into(),
+        incarnation.to_string(),
+    );
+    metadata
 }
 
 /// Builder + wrapper for a set of in-process cluster nodes.
@@ -461,16 +473,14 @@ impl MiniCluster {
         let port = grab_port();
         let gossip_addr = format!("127.0.0.1:{port}");
 
+        let process_generation = 2;
         let local_node = NodeInfo {
             id: instance_id,
             name: format!("minicluster-rejoin-{}", instance_id.0),
             rpc_address: String::new(),
             raft_address: String::new(),
             state: NodeState::Active,
-            metadata: NodeMetadata {
-                cores: 1,
-                ..NodeMetadata::default()
-            },
+            metadata: minicluster_metadata(instance_id, process_generation),
             last_heartbeat_ms: 0,
         };
 
@@ -482,6 +492,7 @@ impl MiniCluster {
             dead_node_grace_period: Duration::from_secs(1),
             cluster_id: "minicluster".to_string(),
             node_id: instance_id,
+            process_generation,
             local_node,
             advertise_host: None,
         };
@@ -511,6 +522,7 @@ impl MiniCluster {
 
         self.nodes.push(NodeHandle {
             instance_id,
+            process_generation,
             gossip_addr,
             controller,
             discovery,
@@ -533,6 +545,7 @@ impl MiniCluster {
         let mut nodes = Vec::with_capacity(n);
         for (idx, port) in ports.iter().enumerate() {
             let instance_id = NodeId((idx as u64) + 1); // skip UNASSIGNED=0
+            let process_generation = 1;
             let gossip_addr = format!("127.0.0.1:{port}");
 
             let local_node = NodeInfo {
@@ -541,10 +554,7 @@ impl MiniCluster {
                 rpc_address: String::new(),
                 raft_address: String::new(),
                 state: NodeState::Active,
-                metadata: NodeMetadata {
-                    cores: 1,
-                    ..NodeMetadata::default()
-                },
+                metadata: minicluster_metadata(instance_id, process_generation),
                 last_heartbeat_ms: 0,
             };
 
@@ -564,6 +574,7 @@ impl MiniCluster {
                 dead_node_grace_period: Duration::from_secs(1),
                 cluster_id: "minicluster".to_string(),
                 node_id: instance_id,
+                process_generation,
                 local_node,
                 advertise_host: None,
             };
@@ -590,6 +601,7 @@ impl MiniCluster {
 
             nodes.push(NodeHandle {
                 instance_id,
+                process_generation,
                 gossip_addr,
                 controller,
                 discovery,

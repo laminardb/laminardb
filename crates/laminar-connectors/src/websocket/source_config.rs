@@ -1,457 +1,337 @@
-//! WebSocket source connector configuration.
-//!
-//! Provides [`WebSocketSourceConfig`] for configuring a WebSocket source
-//! connector in either client mode (connecting to an upstream server) or
-//! server mode (accepting incoming connections). Includes reconnection,
-//! authentication, message format, and event-time extraction options.
+//! WebSocket client-source configuration.
 
 use std::time::Duration;
-
-use serde::{Deserialize, Serialize};
 
 use super::backpressure::WsBackpressure;
 use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
 
-// ---------------------------------------------------------------------------
-// Serde helper: Duration as milliseconds
-// ---------------------------------------------------------------------------
+pub(super) const INGRESS_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 
-/// Serde helper that encodes a [`Duration`] as a `u64` millisecond count.
-mod duration_millis {
-    use std::time::Duration;
+const SOURCE_OPTIONS: &[&str] = &[
+    "_arrow_schema",
+    "format",
+    "json.explode",
+    "json.path",
+    "laminar.source.name",
+    "max.message.size",
+    "nested.as.jsonb",
+    "on.backpressure",
+    "reconnect.enabled",
+    "reconnect.initial.delay.ms",
+    "reconnect.max.delay.ms",
+    "reconnect.max.retries",
+    "schema.enforcement",
+    "subscribe.message",
+    "url",
+];
 
-    use serde::{self, Deserialize, Deserializer, Serializer};
-
-    #[allow(clippy::cast_possible_truncation)]
-    pub fn serialize<S>(d: &Duration, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_u64(d.as_millis() as u64)
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let millis = u64::deserialize(deserializer)?;
-        Ok(Duration::from_millis(millis))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Default helpers
-// ---------------------------------------------------------------------------
-
-/// Default backpressure strategy: block the WebSocket read loop.
-fn default_backpressure() -> WsBackpressure {
-    WsBackpressure::Block
-}
-
-/// Default maximum message size: 64 MiB.
 const fn default_max_message_size() -> usize {
     64 * 1024 * 1024
 }
 
-/// Default ping interval for client mode: 30 seconds.
-const fn default_ping_interval() -> Duration {
-    Duration::from_secs(30)
-}
-
-/// Default ping timeout for client mode: 10 seconds.
-const fn default_ping_timeout() -> Duration {
-    Duration::from_secs(10)
-}
-
-/// Default maximum concurrent connections for server mode: 1024.
-const fn default_max_connections() -> usize {
-    1024
-}
-
-/// Default reconnect initial delay: 100 ms.
 const fn default_initial_delay() -> Duration {
     Duration::from_millis(100)
 }
 
-/// Default reconnect maximum delay: 30 seconds.
 const fn default_max_delay() -> Duration {
     Duration::from_secs(30)
 }
 
-/// Default exponential backoff multiplier.
-const fn default_backoff_multiplier() -> f64 {
-    2.0
-}
-
-/// Returns `true` (used for `#[serde(default)]` on boolean fields).
-const fn default_true() -> bool {
-    true
-}
-
-// ---------------------------------------------------------------------------
-// Top-level config
-// ---------------------------------------------------------------------------
-
-/// WebSocket source connector configuration.
-///
-/// Supports two operating modes:
-/// - **Client**: connects to one or more upstream WebSocket servers and
-///   optionally sends a subscribe message after the handshake.
-/// - **Server**: binds a local address and accepts incoming WebSocket
-///   connections (e.g., from `IoT` devices or browser clients).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// WebSocket client-source configuration.
+#[derive(Debug, Clone)]
 pub struct WebSocketSourceConfig {
-    /// Operating mode (client or server).
-    pub mode: SourceMode,
-
-    /// Message format used for deserialization.
+    /// Upstream URLs in failover order.
+    pub urls: Vec<String>,
+    /// Optional message sent after each successful handshake.
+    pub subscribe_message: Option<String>,
+    /// Reconnection and failover policy.
+    pub reconnect: ReconnectConfig,
+    /// Incoming message representation.
     pub format: MessageFormat,
-
-    /// Backpressure strategy when the Ring 0 channel is full.
-    #[serde(default = "default_backpressure")]
+    /// Behavior when the bounded ingress channel is full.
     pub on_backpressure: WsBackpressure,
-
-    /// JSON field path used to extract event time from each message.
-    ///
-    /// When `None`, processing time is used as the event timestamp.
-    pub event_time_field: Option<String>,
-
-    /// Format of the event time value extracted from `event_time_field`.
-    pub event_time_format: Option<EventTimeFormat>,
-
     /// Maximum accepted WebSocket message size in bytes.
-    ///
-    /// Messages exceeding this limit are rejected. Defaults to 64 MiB.
-    #[serde(default = "default_max_message_size")]
     pub max_message_size: usize,
-
-    /// Optional authentication configuration for the WebSocket connection.
-    pub auth: Option<WsAuthConfig>,
 }
 
 impl Default for WebSocketSourceConfig {
     fn default() -> Self {
         Self {
-            mode: SourceMode::default(),
+            urls: Vec::new(),
+            subscribe_message: None,
+            reconnect: ReconnectConfig::default(),
             format: MessageFormat::default(),
-            on_backpressure: default_backpressure(),
-            event_time_field: None,
-            event_time_format: None,
+            on_backpressure: WsBackpressure::default(),
             max_message_size: default_max_message_size(),
-            auth: None,
         }
     }
 }
 
 impl WebSocketSourceConfig {
-    /// Builds a [`WebSocketSourceConfig`] from a flat [`ConnectorConfig`] property map.
-    ///
-    /// Maps well-known keys from `WITH (...)` clauses to the structured config.
-    /// Unknown keys are silently ignored (forward compatibility).
+    /// Builds source configuration from a SQL/programmatic connector map.
     ///
     /// # Errors
     ///
-    /// Returns `ConnectorError::ConfigurationError` if a required key is missing
-    /// or a value cannot be parsed.
+    /// Returns a configuration error for missing or invalid properties and for
+    /// removed properties that previously had no production runtime behavior.
     pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
-        let mode = Self::parse_mode(config)?;
-        let format = Self::parse_format(config)?;
+        reject_removed_source_options(config)?;
+        reject_unknown_source_options(config)?;
 
-        let on_backpressure = match config.get("on.backpressure").map(str::to_lowercase) {
-            Some(ref s) if s == "block" => WsBackpressure::Block,
-            Some(ref s) if s == "drop" || s == "drop_newest" => WsBackpressure::DropNewest,
-            Some(ref other) => {
+        let urls = parse_urls(config.require("url")?)?;
+        let format = match config.get("format").map(str::to_ascii_lowercase).as_deref() {
+            None | Some("json") => MessageFormat::Json,
+            Some("csv") => MessageFormat::Csv {
+                delimiter: ',',
+                has_header: false,
+            },
+            Some("binary") => MessageFormat::Binary,
+            Some(other) => {
                 return Err(ConnectorError::ConfigurationError(format!(
-                    "invalid backpressure strategy '{other}': expected 'block' or 'drop'"
+                    "invalid WebSocket source format '{other}': expected json, csv, or binary"
                 )));
             }
-            None => default_backpressure(),
+        };
+        reject_json_options_for_non_json(config, &format)?;
+
+        let on_backpressure = match config
+            .get("on.backpressure")
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            None | Some("block") => WsBackpressure::Block,
+            Some("drop_newest") => WsBackpressure::DropNewest,
+            Some(other) => {
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "invalid WebSocket source on.backpressure '{other}': expected block or drop_newest"
+                )));
+            }
         };
 
-        let max_message_size: usize = config
+        let max_message_size = config
             .get_parsed("max.message.size")?
             .unwrap_or(default_max_message_size());
 
-        let event_time_field = config.get("event.time.field").map(ToString::to_string);
-        let event_time_format = Self::parse_event_time_format(config);
-        let auth = Self::parse_auth(config)?;
-
-        Ok(Self {
-            mode,
+        let reconnect = ReconnectConfig {
+            enabled: config.get_parsed("reconnect.enabled")?.unwrap_or(true),
+            initial_delay: Duration::from_millis(
+                config
+                    .get_parsed("reconnect.initial.delay.ms")?
+                    .unwrap_or(100),
+            ),
+            max_delay: Duration::from_millis(
+                config
+                    .get_parsed("reconnect.max.delay.ms")?
+                    .unwrap_or(30_000),
+            ),
+            max_retries: config.get_parsed("reconnect.max.retries")?,
+        };
+        let parsed = Self {
+            urls,
+            subscribe_message: config
+                .get("subscribe.message")
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string),
+            reconnect,
             format,
             on_backpressure,
-            event_time_field,
-            event_time_format,
             max_message_size,
-            auth,
+        };
+        parsed.validate()?;
+        Ok(parsed)
+    }
+
+    pub(super) fn validate(&self) -> Result<(), ConnectorError> {
+        validate_urls(&self.urls)?;
+        if self.max_message_size == 0 || self.max_message_size > INGRESS_BUFFER_BYTES {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "WebSocket source max.message.size must be between 1 and {INGRESS_BUFFER_BYTES} bytes"
+            )));
+        }
+        self.reconnect.validate("source")?;
+        Ok(())
+    }
+}
+
+impl ReconnectConfig {
+    pub(super) fn validate(&self, owner: &str) -> Result<(), ConnectorError> {
+        if self.initial_delay.is_zero() || self.max_delay.is_zero() {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "WebSocket {owner} reconnect delays must be greater than zero"
+            )));
+        }
+        if self.initial_delay > self.max_delay {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "WebSocket {owner} reconnect.initial.delay.ms must not exceed reconnect.max.delay.ms"
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn parse_urls(value: &str) -> Result<Vec<String>, ConnectorError> {
+    let urls: Vec<String> = value
+        .split(',')
+        .map(str::trim)
+        .map(ToString::to_string)
+        .collect();
+    validate_urls(&urls)?;
+    Ok(urls)
+}
+
+fn validate_urls(urls: &[String]) -> Result<(), ConnectorError> {
+    if urls.is_empty() || urls.iter().any(String::is_empty) {
+        return Err(ConnectorError::ConfigurationError(
+            "WebSocket source url must contain one or more non-empty URLs".into(),
+        ));
+    }
+    for value in urls {
+        let safe_value = crate::security::sanitize_identity_value("url", value);
+        let parsed = url::Url::parse(value).map_err(|error| {
+            ConnectorError::ConfigurationError(format!(
+                "invalid WebSocket source URL '{safe_value}': {error}"
+            ))
+        })?;
+        if !matches!(parsed.scheme(), "ws" | "wss") || parsed.host().is_none() {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "invalid WebSocket source URL '{safe_value}': expected ws:// or wss:// with a host"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn reject_removed_source_options(config: &ConnectorConfig) -> Result<(), ConnectorError> {
+    for key in ["event.time.field", "event.time.format"] {
+        if config.get(key).is_some() {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "WebSocket source option '{key}' was removed; decode the value with json.column.<column>[.epoch_unit] and declare event-time policy with SQL WATERMARK FOR"
+            )));
+        }
+    }
+    for key in ["mode", "bind.address", "max.connections", "path"] {
+        if config.get(key).is_some() {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "WebSocket source option '{key}' was removed; WebSocket sources operate only as clients"
+            )));
+        }
+    }
+    for key in ["ping.interval.ms", "ping.timeout.ms"] {
+        if config.get(key).is_some() {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "WebSocket source option '{key}' is not supported"
+            )));
+        }
+    }
+    for key in [
+        "auth.type",
+        "auth.token",
+        "auth.username",
+        "auth.password",
+        "auth.api.key",
+        "auth.secret",
+    ] {
+        if config.get(key).is_some() {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "WebSocket source option '{key}' is not supported"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn reject_unknown_source_options(config: &ConnectorConfig) -> Result<(), ConnectorError> {
+    let mut unknown: Vec<&str> = config
+        .properties()
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !SOURCE_OPTIONS.contains(key) && !is_json_column_option(key))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+
+    unknown.sort_unstable();
+    Err(ConnectorError::ConfigurationError(format!(
+        "unknown WebSocket source propert{}: {}",
+        if unknown.len() == 1 { "y" } else { "ies" },
+        unknown.join(", ")
+    )))
+}
+
+fn reject_json_options_for_non_json(
+    config: &ConnectorConfig,
+    format: &MessageFormat,
+) -> Result<(), ConnectorError> {
+    if matches!(format, MessageFormat::Json) {
+        return Ok(());
+    }
+    let mut invalid = config
+        .properties()
+        .keys()
+        .filter(|key| {
+            matches!(
+                key.as_str(),
+                "json.path" | "json.explode" | "schema.enforcement" | "nested.as.jsonb"
+            ) || key.starts_with("json.column.")
         })
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if invalid.is_empty() {
+        return Ok(());
+    }
+    invalid.sort_unstable();
+    Err(ConnectorError::ConfigurationError(format!(
+        "WebSocket source JSON option{} {} require format = 'json'",
+        if invalid.len() == 1 { "" } else { "s" },
+        invalid.join(", ")
+    )))
+}
+
+fn is_json_column_option(key: &str) -> bool {
+    let Some(column) = key.strip_prefix("json.column.") else {
+        return false;
+    };
+    if column.is_empty() {
+        return false;
     }
 
-    /// Parses the `mode` property into a [`SourceMode`].
-    fn parse_mode(config: &ConnectorConfig) -> Result<SourceMode, ConnectorError> {
-        let mode_str = config.get("mode").unwrap_or("client");
-        match mode_str.to_lowercase().as_str() {
-            "client" => {
-                let urls = if let Some(url) = config.get("url") {
-                    url.split(',').map(|s| s.trim().to_string()).collect()
-                } else {
-                    return Err(ConnectorError::ConfigurationError(
-                        "WebSocket client mode requires 'url'. \
-                         Set url='wss://...' in the WITH clause."
-                            .into(),
-                    ));
-                };
-
-                let subscribe_message = config.get("subscribe.message").map(ToString::to_string);
-
-                let reconnect_enabled: bool =
-                    config.get_parsed("reconnect.enabled")?.unwrap_or(true);
-                let initial_delay_ms: u64 = config
-                    .get_parsed("reconnect.initial.delay.ms")?
-                    .unwrap_or(100);
-                let max_delay_ms: u64 = config
-                    .get_parsed("reconnect.max.delay.ms")?
-                    .unwrap_or(30_000);
-                let max_retries: Option<u32> = config.get_parsed("reconnect.max.retries")?;
-
-                let ping_interval_ms: u64 =
-                    config.get_parsed("ping.interval.ms")?.unwrap_or(30_000);
-                let ping_timeout_ms: u64 = config.get_parsed("ping.timeout.ms")?.unwrap_or(10_000);
-
-                Ok(SourceMode::Client {
-                    urls,
-                    subscribe_message,
-                    reconnect: ReconnectConfig {
-                        enabled: reconnect_enabled,
-                        initial_delay: Duration::from_millis(initial_delay_ms),
-                        max_delay: Duration::from_millis(max_delay_ms),
-                        backoff_multiplier: default_backoff_multiplier(),
-                        max_retries,
-                        jitter: true,
-                    },
-                    ping_interval: Duration::from_millis(ping_interval_ms),
-                    ping_timeout: Duration::from_millis(ping_timeout_ms),
-                })
-            }
-            "server" => {
-                let bind_address = config.require("bind.address").map(ToString::to_string)?;
-                let max_connections: usize = config
-                    .get_parsed("max.connections")?
-                    .unwrap_or(default_max_connections());
-                let path = config.get("path").map(ToString::to_string);
-
-                Ok(SourceMode::Server {
-                    bind_address,
-                    max_connections,
-                    path,
-                })
-            }
-            other => Err(ConnectorError::ConfigurationError(format!(
-                "invalid WebSocket mode '{other}': expected 'client' or 'server'"
-            ))),
-        }
-    }
-
-    /// Parses the `format` property into a [`MessageFormat`].
-    fn parse_format(config: &ConnectorConfig) -> Result<MessageFormat, ConnectorError> {
-        match config.get("format").map(str::to_lowercase) {
-            Some(ref s) if s == "json" => Ok(MessageFormat::Json),
-            Some(ref s) if s == "jsonlines" || s == "json_lines" => Ok(MessageFormat::JsonLines),
-            Some(ref s) if s == "binary" => Ok(MessageFormat::Binary),
-            Some(ref s) if s == "csv" => Ok(MessageFormat::Csv {
-                delimiter: ',',
-                has_header: false,
-            }),
-            Some(ref other) => Err(ConnectorError::ConfigurationError(format!(
-                "invalid WebSocket format '{other}': expected json, jsonlines, binary, or csv"
-            ))),
-            None => Ok(MessageFormat::Json),
-        }
-    }
-
-    /// Parses the `event.time.format` property into an [`EventTimeFormat`].
-    fn parse_event_time_format(config: &ConnectorConfig) -> Option<EventTimeFormat> {
-        match config.get("event.time.format").map(str::to_lowercase) {
-            Some(ref s) if s == "epoch_millis" => Some(EventTimeFormat::EpochMillis),
-            Some(ref s) if s == "epoch_micros" => Some(EventTimeFormat::EpochMicros),
-            Some(ref s) if s == "epoch_nanos" => Some(EventTimeFormat::EpochNanos),
-            Some(ref s) if s == "epoch_seconds" => Some(EventTimeFormat::EpochSeconds),
-            Some(ref s) if s == "iso8601" => Some(EventTimeFormat::Iso8601),
-            Some(other) => Some(EventTimeFormat::Custom(other.clone())),
-            None => None,
-        }
-    }
-
-    /// Parses the `auth.*` properties into an optional [`WsAuthConfig`].
-    fn parse_auth(config: &ConnectorConfig) -> Result<Option<WsAuthConfig>, ConnectorError> {
-        match config.get("auth.type").map(str::to_lowercase) {
-            Some(ref s) if s == "bearer" => {
-                let token = config.require("auth.token").map(ToString::to_string)?;
-                Ok(Some(WsAuthConfig::Bearer { token }))
-            }
-            Some(ref s) if s == "basic" => {
-                let username = config.require("auth.username").map(ToString::to_string)?;
-                let password = config.require("auth.password").map(ToString::to_string)?;
-                Ok(Some(WsAuthConfig::Basic { username, password }))
-            }
-            Some(ref s) if s == "hmac" => {
-                let api_key = config.require("auth.api.key").map(ToString::to_string)?;
-                let secret = config.require("auth.secret").map(ToString::to_string)?;
-                Ok(Some(WsAuthConfig::Hmac { api_key, secret }))
-            }
-            Some(ref other) => Err(ConnectorError::ConfigurationError(format!(
-                "unsupported auth type '{other}': expected bearer, basic, or hmac"
-            ))),
-            None => Ok(None),
-        }
+    match column.rsplit_once('.') {
+        None => true,
+        Some((column, "epoch_unit")) => !column.is_empty() && !column.contains('.'),
+        Some(_) => false,
     }
 }
 
-// ---------------------------------------------------------------------------
-// SourceMode
-// ---------------------------------------------------------------------------
-
-/// Operating mode for the WebSocket source connector.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum SourceMode {
-    /// Client mode: connect to upstream WebSocket server(s).
-    Client {
-        /// One or more WebSocket URLs to connect to (e.g., `wss://feed.example.com/v1`).
-        urls: Vec<String>,
-
-        /// Optional message to send after the WebSocket handshake completes
-        /// (e.g., a JSON subscribe payload).
-        subscribe_message: Option<String>,
-
-        /// Reconnection policy applied when the connection drops.
-        #[serde(default)]
-        reconnect: ReconnectConfig,
-
-        /// Interval between WebSocket ping frames.
-        #[serde(default = "default_ping_interval", with = "duration_millis")]
-        ping_interval: Duration,
-
-        /// Time to wait for a pong reply before considering the connection dead.
-        #[serde(default = "default_ping_timeout", with = "duration_millis")]
-        ping_timeout: Duration,
-    },
-
-    /// Server mode: listen for incoming WebSocket connections.
-    Server {
-        /// Socket address to bind (e.g., `0.0.0.0:9443`).
-        bind_address: String,
-
-        /// Maximum number of concurrent WebSocket connections.
-        #[serde(default = "default_max_connections")]
-        max_connections: usize,
-
-        /// Optional URL path to accept connections on (e.g., `/ingest`).
-        ///
-        /// When `None`, connections are accepted on any path.
-        path: Option<String>,
-    },
-}
-
-impl Default for SourceMode {
-    fn default() -> Self {
-        Self::Client {
-            urls: vec![String::new()],
-            subscribe_message: None,
-            reconnect: ReconnectConfig::default(),
-            ping_interval: default_ping_interval(),
-            ping_timeout: default_ping_timeout(),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// MessageFormat
-// ---------------------------------------------------------------------------
-
-/// Deserialization format for incoming WebSocket messages.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Incoming WebSocket message representation.
+#[derive(Debug, Clone, Default)]
 pub enum MessageFormat {
-    /// Each message is a single JSON object.
+    /// One JSON object per WebSocket message.
     #[default]
     Json,
-
-    /// Each message contains one or more newline-delimited JSON objects.
-    JsonLines,
-
-    /// Raw binary payload (passed through as-is).
+    /// Raw binary payload.
     Binary,
-
-    /// CSV-formatted payload.
+    /// One CSV record per message.
     Csv {
-        /// Field delimiter character (defaults to `,`).
+        /// Field delimiter.
         delimiter: char,
-        /// Whether the first row is a header row.
+        /// Whether each message includes a header row.
         has_header: bool,
     },
 }
 
-// ---------------------------------------------------------------------------
-// EventTimeFormat
-// ---------------------------------------------------------------------------
-
-/// Format of the event timestamp extracted from messages.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum EventTimeFormat {
-    /// Milliseconds since the Unix epoch.
-    EpochMillis,
-
-    /// Microseconds since the Unix epoch.
-    EpochMicros,
-
-    /// Nanoseconds since the Unix epoch.
-    EpochNanos,
-
-    /// Seconds since the Unix epoch (integer or floating-point).
-    EpochSeconds,
-
-    /// ISO 8601 datetime string (e.g., `2026-02-21T12:00:00Z`).
-    Iso8601,
-
-    /// Custom `strftime`-compatible format string.
-    Custom(String),
-}
-
-// ---------------------------------------------------------------------------
-// ReconnectConfig
-// ---------------------------------------------------------------------------
-
-/// Exponential-backoff reconnection policy for client mode.
-///
-/// When the WebSocket connection is lost, the connector will attempt to
-/// reconnect with exponentially increasing delays between attempts,
-/// optionally capped at `max_retries`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Exponential-backoff reconnection policy.
+#[derive(Debug, Clone)]
 pub struct ReconnectConfig {
     /// Whether automatic reconnection is enabled.
     pub enabled: bool,
-
-    /// Initial delay before the first reconnection attempt.
-    #[serde(default = "default_initial_delay", with = "duration_millis")]
+    /// Delay before the first retry.
     pub initial_delay: Duration,
-
-    /// Maximum delay between reconnection attempts.
-    #[serde(default = "default_max_delay", with = "duration_millis")]
+    /// Maximum retry delay.
     pub max_delay: Duration,
-
-    /// Multiplier applied to the delay after each failed attempt.
-    #[serde(default = "default_backoff_multiplier")]
-    pub backoff_multiplier: f64,
-
-    /// Optional upper bound on reconnection attempts.
-    ///
-    /// `None` means retry indefinitely.
+    /// Maximum retry attempts, or unlimited when absent.
     pub max_retries: Option<u32>,
-
-    /// Whether to apply random jitter to backoff delays to avoid thundering-herd.
-    #[serde(default = "default_true")]
-    pub jitter: bool,
 }
 
 impl Default for ReconnectConfig {
@@ -460,492 +340,179 @@ impl Default for ReconnectConfig {
             enabled: true,
             initial_delay: default_initial_delay(),
             max_delay: default_max_delay(),
-            backoff_multiplier: default_backoff_multiplier(),
             max_retries: None,
-            jitter: true,
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// WsAuthConfig
-// ---------------------------------------------------------------------------
-
-/// Authentication configuration for WebSocket connections.
-///
-/// Applied during the HTTP upgrade handshake as headers, query parameters,
-/// or used to compute a signature.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum WsAuthConfig {
-    /// Bearer token authentication (sent as `Authorization: Bearer <token>`).
-    Bearer {
-        /// The bearer token value.
-        token: String,
-    },
-
-    /// HTTP Basic authentication (sent as `Authorization: Basic <base64>`).
-    Basic {
-        /// Username for basic auth.
-        username: String,
-        /// Password for basic auth.
-        password: String,
-    },
-
-    /// Arbitrary HTTP headers added to the upgrade request.
-    Headers {
-        /// Key-value pairs added as HTTP headers.
-        headers: Vec<(String, String)>,
-    },
-
-    /// Single query parameter appended to the WebSocket URL.
-    QueryParam {
-        /// Query parameter name.
-        key: String,
-        /// Query parameter value.
-        value: String,
-    },
-
-    /// HMAC signature authentication (e.g., for exchange APIs).
-    Hmac {
-        /// API key (sent as a header or query parameter).
-        api_key: String,
-        /// HMAC secret used to sign requests.
-        secret: String,
-    },
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // -- Default impls -------------------------------------------------------
-
-    #[test]
-    fn test_default_websocket_source_config() {
-        let cfg = WebSocketSourceConfig::default();
-
-        assert!(matches!(cfg.mode, SourceMode::Client { .. }));
-        assert!(matches!(cfg.format, MessageFormat::Json));
-        assert!(matches!(cfg.on_backpressure, WsBackpressure::Block));
-        assert_eq!(cfg.max_message_size, 64 * 1024 * 1024);
-        assert!(cfg.event_time_field.is_none());
-        assert!(cfg.event_time_format.is_none());
-        assert!(cfg.auth.is_none());
-    }
-
-    #[test]
-    fn test_default_source_mode() {
-        let mode = SourceMode::default();
-        match mode {
-            SourceMode::Client {
-                urls,
-                subscribe_message,
-                reconnect,
-                ping_interval,
-                ping_timeout,
-            } => {
-                assert_eq!(urls.len(), 1);
-                assert_eq!(urls[0], "");
-                assert!(subscribe_message.is_none());
-                assert!(reconnect.enabled);
-                assert_eq!(ping_interval, Duration::from_secs(30));
-                assert_eq!(ping_timeout, Duration::from_secs(10));
-            }
-            SourceMode::Server { .. } => panic!("expected Client mode"),
-        }
-    }
-
-    #[test]
-    fn test_default_message_format() {
-        let fmt = MessageFormat::default();
-        assert!(matches!(fmt, MessageFormat::Json));
-    }
-
-    #[test]
-    fn test_default_reconnect_config() {
-        let rc = ReconnectConfig::default();
-        assert!(rc.enabled);
-        assert_eq!(rc.initial_delay, Duration::from_millis(100));
-        assert_eq!(rc.max_delay, Duration::from_secs(30));
-        assert!((rc.backoff_multiplier - 2.0).abs() < f64::EPSILON);
-        assert!(rc.max_retries.is_none());
-        assert!(rc.jitter);
-    }
-
-    // -- Serde round-trip -----------------------------------------------------
-
-    #[test]
-    fn test_serde_round_trip_client_mode() {
-        let cfg = WebSocketSourceConfig {
-            mode: SourceMode::Client {
-                urls: vec!["wss://feed.example.com/v1".into()],
-                subscribe_message: Some(r#"{"op":"subscribe","channel":"trades"}"#.into()),
-                reconnect: ReconnectConfig::default(),
-                ping_interval: Duration::from_secs(15),
-                ping_timeout: Duration::from_secs(5),
-            },
-            format: MessageFormat::Json,
-            on_backpressure: WsBackpressure::Block,
-            event_time_field: Some("timestamp".into()),
-            event_time_format: Some(EventTimeFormat::EpochMillis),
-            max_message_size: 1024 * 1024,
-            auth: Some(WsAuthConfig::Bearer {
-                token: "tok_abc123".into(),
-            }),
-        };
-
-        let json = serde_json::to_string_pretty(&cfg).expect("serialize");
-        let deser: WebSocketSourceConfig = serde_json::from_str(&json).expect("deserialize");
-
-        // Verify key fields survived the round-trip.
-        match &deser.mode {
-            SourceMode::Client {
-                urls,
-                subscribe_message,
-                ping_interval,
-                ping_timeout,
-                ..
-            } => {
-                assert_eq!(urls, &["wss://feed.example.com/v1"]);
-                assert_eq!(
-                    subscribe_message.as_deref(),
-                    Some(r#"{"op":"subscribe","channel":"trades"}"#)
-                );
-                assert_eq!(*ping_interval, Duration::from_secs(15));
-                assert_eq!(*ping_timeout, Duration::from_secs(5));
-            }
-            SourceMode::Server { .. } => panic!("expected Client"),
-        }
-        assert_eq!(deser.event_time_field.as_deref(), Some("timestamp"));
-        assert!(matches!(
-            deser.event_time_format,
-            Some(EventTimeFormat::EpochMillis)
-        ));
-        assert_eq!(deser.max_message_size, 1024 * 1024);
-        assert!(matches!(
-            deser.auth,
-            Some(WsAuthConfig::Bearer { ref token }) if token == "tok_abc123"
-        ));
-    }
-
-    #[test]
-    fn test_serde_round_trip_server_mode() {
-        let cfg = WebSocketSourceConfig {
-            mode: SourceMode::Server {
-                bind_address: "0.0.0.0:9443".into(),
-                max_connections: 512,
-                path: Some("/ingest".into()),
-            },
-            format: MessageFormat::JsonLines,
-            on_backpressure: WsBackpressure::Block,
-            event_time_field: None,
-            event_time_format: None,
-            max_message_size: default_max_message_size(),
-            auth: None,
-        };
-
-        let json = serde_json::to_string(&cfg).expect("serialize");
-        let deser: WebSocketSourceConfig = serde_json::from_str(&json).expect("deserialize");
-
-        match &deser.mode {
-            SourceMode::Server {
-                bind_address,
-                max_connections,
-                path,
-            } => {
-                assert_eq!(bind_address, "0.0.0.0:9443");
-                assert_eq!(*max_connections, 512);
-                assert_eq!(path.as_deref(), Some("/ingest"));
-            }
-            SourceMode::Client { .. } => panic!("expected Server"),
-        }
-    }
-
-    #[test]
-    fn test_serde_round_trip_reconnect_config() {
-        let rc = ReconnectConfig {
-            enabled: false,
-            initial_delay: Duration::from_millis(500),
-            max_delay: Duration::from_secs(60),
-            backoff_multiplier: 1.5,
-            max_retries: Some(10),
-            jitter: false,
-        };
-
-        let json = serde_json::to_string(&rc).expect("serialize");
-        let deser: ReconnectConfig = serde_json::from_str(&json).expect("deserialize");
-
-        assert!(!deser.enabled);
-        assert_eq!(deser.initial_delay, Duration::from_millis(500));
-        assert_eq!(deser.max_delay, Duration::from_secs(60));
-        assert!((deser.backoff_multiplier - 1.5).abs() < f64::EPSILON);
-        assert_eq!(deser.max_retries, Some(10));
-        assert!(!deser.jitter);
-    }
-
-    #[test]
-    fn test_serde_round_trip_csv_format() {
-        let cfg = WebSocketSourceConfig {
-            format: MessageFormat::Csv {
-                delimiter: '|',
-                has_header: true,
-            },
-            ..WebSocketSourceConfig::default()
-        };
-
-        let json = serde_json::to_string(&cfg).expect("serialize");
-        let deser: WebSocketSourceConfig = serde_json::from_str(&json).expect("deserialize");
-
-        match deser.format {
-            MessageFormat::Csv {
-                delimiter,
-                has_header,
-            } => {
-                assert_eq!(delimiter, '|');
-                assert!(has_header);
-            }
-            _ => panic!("expected Csv format"),
-        }
-    }
-
-    #[test]
-    fn test_serde_round_trip_auth_variants() {
-        // Basic auth
-        let basic = WsAuthConfig::Basic {
-            username: "user".into(),
-            password: "pass".into(),
-        };
-        let json = serde_json::to_string(&basic).expect("serialize");
-        let deser: WsAuthConfig = serde_json::from_str(&json).expect("deserialize");
-        assert!(matches!(
-            deser,
-            WsAuthConfig::Basic { ref username, ref password }
-                if username == "user" && password == "pass"
-        ));
-
-        // Headers auth
-        let headers = WsAuthConfig::Headers {
-            headers: vec![("X-Api-Key".into(), "key123".into())],
-        };
-        let json = serde_json::to_string(&headers).expect("serialize");
-        let deser: WsAuthConfig = serde_json::from_str(&json).expect("deserialize");
-        assert!(matches!(deser, WsAuthConfig::Headers { ref headers } if headers.len() == 1));
-
-        // QueryParam auth
-        let qp = WsAuthConfig::QueryParam {
-            key: "token".into(),
-            value: "abc".into(),
-        };
-        let json = serde_json::to_string(&qp).expect("serialize");
-        let deser: WsAuthConfig = serde_json::from_str(&json).expect("deserialize");
-        assert!(matches!(
-            deser,
-            WsAuthConfig::QueryParam { ref key, ref value }
-                if key == "token" && value == "abc"
-        ));
-
-        // Hmac auth
-        let hmac = WsAuthConfig::Hmac {
-            api_key: "ak".into(),
-            secret: "sk".into(),
-        };
-        let json = serde_json::to_string(&hmac).expect("serialize");
-        let deser: WsAuthConfig = serde_json::from_str(&json).expect("deserialize");
-        assert!(matches!(
-            deser,
-            WsAuthConfig::Hmac { ref api_key, ref secret }
-                if api_key == "ak" && secret == "sk"
-        ));
-    }
-
-    #[test]
-    fn test_serde_round_trip_event_time_formats() {
-        let formats = vec![
-            EventTimeFormat::EpochMillis,
-            EventTimeFormat::EpochMicros,
-            EventTimeFormat::EpochNanos,
-            EventTimeFormat::EpochSeconds,
-            EventTimeFormat::Iso8601,
-            EventTimeFormat::Custom("%Y-%m-%dT%H:%M:%S".into()),
-        ];
-
-        for fmt in formats {
-            let json = serde_json::to_string(&fmt).expect("serialize");
-            let deser: EventTimeFormat = serde_json::from_str(&json).expect("deserialize");
-
-            // Verify variant is preserved.
-            match (&fmt, &deser) {
-                (EventTimeFormat::EpochMillis, EventTimeFormat::EpochMillis)
-                | (EventTimeFormat::EpochMicros, EventTimeFormat::EpochMicros)
-                | (EventTimeFormat::EpochNanos, EventTimeFormat::EpochNanos)
-                | (EventTimeFormat::EpochSeconds, EventTimeFormat::EpochSeconds)
-                | (EventTimeFormat::Iso8601, EventTimeFormat::Iso8601) => {}
-                (EventTimeFormat::Custom(a), EventTimeFormat::Custom(b)) => {
-                    assert_eq!(a, b);
-                }
-                _ => panic!("event time format mismatch after round-trip"),
-            }
-        }
-    }
-
-    #[test]
-    fn test_serde_defaults_applied() {
-        // Minimal JSON: only required fields are set, all defaulted fields omitted.
-        let json = r#"{
-            "mode": {
-                "type": "Server",
-                "bind_address": "127.0.0.1:8080"
-            },
-            "format": "Json"
-        }"#;
-
-        let cfg: WebSocketSourceConfig =
-            serde_json::from_str(json).expect("deserialize with defaults");
-
-        assert!(matches!(cfg.on_backpressure, WsBackpressure::Block));
-        assert_eq!(cfg.max_message_size, 64 * 1024 * 1024);
-        assert!(cfg.event_time_field.is_none());
-        assert!(cfg.auth.is_none());
-
-        match cfg.mode {
-            SourceMode::Server {
-                max_connections, ..
-            } => {
-                assert_eq!(max_connections, 1024);
-            }
-            SourceMode::Client { .. } => panic!("expected Server"),
-        }
-    }
-
-    // -- Default helper functions -------------------------------------------
-
-    #[test]
-    fn test_default_helper_values() {
-        assert_eq!(default_max_message_size(), 64 * 1024 * 1024);
-        assert_eq!(default_ping_interval(), Duration::from_secs(30));
-        assert_eq!(default_ping_timeout(), Duration::from_secs(10));
-        assert_eq!(default_max_connections(), 1024);
-        assert_eq!(default_initial_delay(), Duration::from_millis(100));
-        assert_eq!(default_max_delay(), Duration::from_secs(30));
-        assert!((default_backoff_multiplier() - 2.0).abs() < f64::EPSILON);
-        assert!(default_true());
-    }
-
-    // -- from_config tests ---------------------------------------------------
-
-    #[test]
-    fn test_from_config_client_mode() {
+    fn valid_config() -> ConnectorConfig {
         let mut config = ConnectorConfig::new("websocket");
-        config.set("url", "wss://feed.example.com/v1");
-        config.set("format", "json");
+        config.set("url", "wss://one.example/events");
+        config
+    }
+
+    #[test]
+    fn defaults_are_bounded_and_client_only() {
+        let config = WebSocketSourceConfig::default();
+        assert!(config.urls.is_empty());
+        assert!(matches!(config.format, MessageFormat::Json));
+        assert!(matches!(config.on_backpressure, WsBackpressure::Block));
+        assert_eq!(config.max_message_size, 64 * 1024 * 1024);
+        assert!(config.reconnect.enabled);
+    }
+
+    #[test]
+    fn parses_runtime_source_options() {
+        let mut config = valid_config();
+        config.set(
+            "url",
+            "wss://one.example/events, ws://two.example:8080/feed",
+        );
+        config.set("format", "csv");
         config.set("subscribe.message", r#"{"op":"subscribe"}"#);
-        config.set("reconnect.enabled", "true");
+        config.set("on.backpressure", "drop_newest");
+        config.set("max.message.size", "4096");
+        config.set("reconnect.enabled", "false");
         config.set("reconnect.initial.delay.ms", "200");
-        config.set("reconnect.max.delay.ms", "60000");
-        config.set("ping.interval.ms", "15000");
-        config.set("ping.timeout.ms", "5000");
+        config.set("reconnect.max.delay.ms", "5000");
+        config.set("reconnect.max.retries", "7");
 
-        let cfg = WebSocketSourceConfig::from_config(&config).unwrap();
-
-        match &cfg.mode {
-            SourceMode::Client {
-                urls,
-                subscribe_message,
-                reconnect,
-                ping_interval,
-                ping_timeout,
-            } => {
-                assert_eq!(urls, &["wss://feed.example.com/v1"]);
-                assert_eq!(subscribe_message.as_deref(), Some(r#"{"op":"subscribe"}"#));
-                assert!(reconnect.enabled);
-                assert_eq!(reconnect.initial_delay, Duration::from_millis(200));
-                assert_eq!(reconnect.max_delay, Duration::from_secs(60));
-                assert_eq!(*ping_interval, Duration::from_secs(15));
-                assert_eq!(*ping_timeout, Duration::from_secs(5));
-            }
-            SourceMode::Server { .. } => panic!("expected Client mode"),
-        }
-        assert!(matches!(cfg.format, MessageFormat::Json));
+        let parsed = WebSocketSourceConfig::from_config(&config).unwrap();
+        assert_eq!(parsed.urls.len(), 2);
+        assert!(matches!(parsed.format, MessageFormat::Csv { .. }));
+        assert!(matches!(parsed.on_backpressure, WsBackpressure::DropNewest));
+        assert_eq!(parsed.max_message_size, 4096);
+        assert!(!parsed.reconnect.enabled);
+        assert_eq!(parsed.reconnect.max_retries, Some(7));
+        assert_eq!(
+            parsed.subscribe_message.as_deref(),
+            Some(r#"{"op":"subscribe"}"#)
+        );
     }
 
     #[test]
-    fn test_from_config_server_mode() {
-        let mut config = ConnectorConfig::new("websocket");
-        config.set("mode", "server");
-        config.set("bind.address", "0.0.0.0:9443");
-        config.set("max.connections", "512");
-        config.set("path", "/ingest");
+    fn rejects_missing_or_invalid_urls() {
+        let missing = ConnectorConfig::new("websocket");
+        assert!(WebSocketSourceConfig::from_config(&missing).is_err());
 
-        let cfg = WebSocketSourceConfig::from_config(&config).unwrap();
-
-        match &cfg.mode {
-            SourceMode::Server {
-                bind_address,
-                max_connections,
-                path,
-            } => {
-                assert_eq!(bind_address, "0.0.0.0:9443");
-                assert_eq!(*max_connections, 512);
-                assert_eq!(path.as_deref(), Some("/ingest"));
-            }
-            SourceMode::Client { .. } => panic!("expected Server mode"),
+        for value in ["", "https://example.test/events", "wss://ok.example,"] {
+            let mut config = ConnectorConfig::new("websocket");
+            config.set("url", value);
+            assert!(
+                WebSocketSourceConfig::from_config(&config).is_err(),
+                "accepted {value:?}"
+            );
         }
     }
 
     #[test]
-    fn test_from_config_missing_url_errors() {
-        let config = ConnectorConfig::new("websocket");
-        // Client mode is default — missing URL should error.
-        let result = WebSocketSourceConfig::from_config(&config);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("url"));
+    fn rejects_invalid_limits_and_enums() {
+        for (key, value) in [
+            ("format", "jsonlines"),
+            ("on.backpressure", "drop"),
+            ("on.backpressure", "drop_oldest"),
+            ("max.message.size", "0"),
+            ("max.message.size", "67108865"),
+            ("reconnect.initial.delay.ms", "0"),
+        ] {
+            let mut config = valid_config();
+            config.set(key, value);
+            assert!(
+                WebSocketSourceConfig::from_config(&config).is_err(),
+                "accepted {key}={value}"
+            );
+        }
+
+        let mut inverted = valid_config();
+        inverted.set("reconnect.initial.delay.ms", "200");
+        inverted.set("reconnect.max.delay.ms", "100");
+        assert!(WebSocketSourceConfig::from_config(&inverted).is_err());
     }
 
     #[test]
-    fn test_from_config_bearer_auth() {
-        let mut config = ConnectorConfig::new("websocket");
-        config.set("url", "wss://api.example.com");
-        config.set("auth.type", "bearer");
-        config.set("auth.token", "tok_abc123");
-
-        let cfg = WebSocketSourceConfig::from_config(&config).unwrap();
-        assert!(matches!(
-            cfg.auth,
-            Some(WsAuthConfig::Bearer { ref token }) if token == "tok_abc123"
-        ));
-    }
-
-    #[test]
-    fn test_from_config_multiple_urls() {
-        let mut config = ConnectorConfig::new("websocket");
-        config.set("url", "wss://a.example.com, wss://b.example.com");
-
-        let cfg = WebSocketSourceConfig::from_config(&config).unwrap();
-        match &cfg.mode {
-            SourceMode::Client { urls, .. } => {
-                assert_eq!(urls.len(), 2);
-                assert_eq!(urls[0], "wss://a.example.com");
-                assert_eq!(urls[1], "wss://b.example.com");
-            }
-            SourceMode::Server { .. } => panic!("expected Client mode"),
+    fn rejects_removed_event_time_and_server_options() {
+        for key in [
+            "event.time.field",
+            "event.time.format",
+            "mode",
+            "bind.address",
+            "max.connections",
+            "path",
+            "ping.interval.ms",
+            "ping.timeout.ms",
+            "auth.type",
+            "auth.token",
+            "auth.username",
+            "auth.password",
+            "auth.api.key",
+            "auth.secret",
+        ] {
+            let mut config = valid_config();
+            config.set(key, "removed");
+            let error = WebSocketSourceConfig::from_config(&config)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(key), "{error}");
         }
     }
 
     #[test]
-    fn test_from_config_defaults() {
-        let mut config = ConnectorConfig::new("websocket");
-        config.set("url", "wss://feed.example.com");
+    fn accepts_engine_and_json_decoder_options() {
+        let mut config = valid_config();
+        config.set("_arrow_schema", "engine-injected");
+        config.set("laminar.source.name", "orders");
+        config.set("json.path", "payload");
+        config.set("json.column.ts", "metadata.timestamp");
+        config.set("json.column.ts.epoch_unit", "micros");
+        config.set("json.explode", "id,value");
+        config.set("schema.enforcement", "strict");
+        config.set("nested.as.jsonb", "true");
 
-        let cfg = WebSocketSourceConfig::from_config(&config).unwrap();
-        assert!(matches!(cfg.format, MessageFormat::Json));
-        assert!(matches!(cfg.on_backpressure, WsBackpressure::Block));
-        assert_eq!(cfg.max_message_size, 64 * 1024 * 1024);
-        assert!(cfg.event_time_field.is_none());
-        assert!(cfg.auth.is_none());
+        WebSocketSourceConfig::from_config(&config).unwrap();
+    }
+
+    #[test]
+    fn rejects_unknown_and_malformed_json_column_options() {
+        for key in [
+            "max.message.szie",
+            "json.colum.ts",
+            "json.column.",
+            "json.column.ts.epcoh_unit",
+        ] {
+            let mut config = valid_config();
+            config.set(key, "1");
+
+            let error = WebSocketSourceConfig::from_config(&config)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(key), "{error}");
+        }
+    }
+
+    #[test]
+    fn rejects_json_options_for_csv_and_binary() {
+        for format in ["csv", "binary"] {
+            for key in [
+                "json.path",
+                "json.column.ts",
+                "json.column.ts.epoch_unit",
+                "json.explode",
+                "schema.enforcement",
+                "nested.as.jsonb",
+            ] {
+                let mut config = valid_config();
+                config.set("format", format);
+                config.set(key, "value");
+                let error = WebSocketSourceConfig::from_config(&config)
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains(key), "{error}");
+                assert!(error.contains("format = 'json'"), "{error}");
+            }
+        }
     }
 }

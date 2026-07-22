@@ -357,7 +357,7 @@ mod tests {
             laminar_open(&mut conn);
 
             // Create a table for querying
-            let sql = b"CREATE TABLE callback_test (id BIGINT)\0";
+            let sql = b"CREATE TABLE callback_test (id BIGINT PRIMARY KEY)\0";
             laminar_execute(conn, sql.as_ptr().cast(), ptr::null_mut());
 
             // Subscribe (no callbacks, just test lifecycle)
@@ -404,7 +404,7 @@ mod tests {
         unsafe {
             laminar_open(&mut conn);
 
-            let sql = b"CREATE TABLE userdata_test (id BIGINT)\0";
+            let sql = b"CREATE TABLE userdata_test (id BIGINT PRIMARY KEY)\0";
             laminar_execute(conn, sql.as_ptr().cast(), ptr::null_mut());
 
             let query = b"SELECT * FROM userdata_test\0";
@@ -466,7 +466,7 @@ mod tests {
         unsafe {
             laminar_open(&mut conn);
 
-            let sql = b"CREATE TABLE callback_data_test (id BIGINT)\0";
+            let sql = b"CREATE TABLE callback_data_test (id BIGINT PRIMARY KEY)\0";
             laminar_execute(conn, sql.as_ptr().cast(), ptr::null_mut());
 
             let query = b"SELECT * FROM callback_data_test\0";
@@ -503,7 +503,7 @@ mod tests {
 
         unsafe {
             laminar_open(&mut conn);
-            let sql = b"CREATE TABLE active_test (id BIGINT)\0";
+            let sql = b"CREATE TABLE active_test (id BIGINT PRIMARY KEY)\0";
             laminar_execute(conn, sql.as_ptr().cast(), ptr::null_mut());
 
             let query = b"SELECT * FROM active_test\0";

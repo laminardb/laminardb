@@ -3,11 +3,11 @@
 # Bring up:   docker compose -f tests/docker/compose.yml up -d
 # Tear down:  docker compose -f tests/docker/compose.yml down
 #
-# Tests that use this compose file gate on a TCP probe of
-# `127.0.0.1:19092`; they skip gracefully when the daemon is down.
+# Kafka tests gate on a metadata request to `127.0.0.1:19092`; they
+# skip gracefully when the broker is unavailable.
 #
 # Port 19092 is the host-side Kafka advertisement. Keep it in sync with
-# the `KAFKA_BROKERS` constant in `crates/laminar-db/tests/common/mod.rs`.
+# the `KAFKA_BROKERS` constant in `crates/laminar-db/tests/common/kafka.rs`.
 
 services:
   minio:
@@ -27,7 +27,7 @@ services:
       retries: 20
 
   redpanda:
-    image: redpandadata/redpanda:v24.3.1
+    image: docker.redpanda.com/redpandadata/redpanda:v26.1.13
     container_name: laminardb-redpanda
     ports:
       - "19092:19092"
@@ -35,14 +35,14 @@ services:
       - redpanda
       - start
       - --smp=1
-      - --memory=256M
+      - --memory=1G
       - --overprovisioned
       - --kafka-addr=PLAINTEXT://0.0.0.0:19092
       - --advertise-kafka-addr=PLAINTEXT://127.0.0.1:19092
       - --node-id=0
       - --check=false
     healthcheck:
-      test: ["CMD", "rpk", "cluster", "health", "-x", "all_nodes_healthy=true"]
+      test: ["CMD", "rpk", "cluster", "health", "-e", "-X", "brokers=127.0.0.1:19092"]
       interval: 2s
       timeout: 3s
       retries: 20

@@ -13,10 +13,6 @@ pub struct KafkaSinkMetrics {
     pub bytes_written: IntCounter,
     /// Errors encountered.
     pub errors_total: IntCounter,
-    /// Epochs committed.
-    pub epochs_committed: IntCounter,
-    /// Epochs rolled back.
-    pub epochs_rolled_back: IntCounter,
     /// Records routed to dead letter queue.
     pub dlq_records: IntCounter,
     /// Serialization errors.
@@ -44,9 +40,6 @@ impl KafkaSinkMetrics {
             ),
             bytes_written: reg.counter("kafka_sink_bytes_written_total", "Bytes written to Kafka"),
             errors_total: reg.counter("kafka_sink_errors_total", "Kafka sink errors"),
-            epochs_committed: reg.counter("kafka_sink_epochs_committed_total", "Epochs committed"),
-            epochs_rolled_back: reg
-                .counter("kafka_sink_epochs_rolled_back_total", "Epochs rolled back"),
             dlq_records: reg.counter("kafka_sink_dlq_records_total", "Records routed to DLQ"),
             serialization_errors: reg.counter(
                 "kafka_sink_serialization_errors_total",
@@ -76,16 +69,6 @@ impl KafkaSinkMetrics {
     /// Records a production error.
     pub fn record_error(&self) {
         self.errors_total.inc();
-    }
-
-    /// Records a successful epoch commit.
-    pub fn record_commit(&self) {
-        self.epochs_committed.inc();
-    }
-
-    /// Records an epoch rollback.
-    pub fn record_rollback(&self) {
-        self.epochs_rolled_back.inc();
     }
 
     /// Records a DLQ routing event.

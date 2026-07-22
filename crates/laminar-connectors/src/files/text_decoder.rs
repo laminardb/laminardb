@@ -62,7 +62,7 @@ impl FormatDecoder for TextLineDecoder {
             .map_err(|e| SchemaError::DecodeError(format!("batch construction error: {e}")))
     }
 
-    fn format_name(&self) -> &str {
+    fn format_name(&self) -> &'static str {
         "text"
     }
 }

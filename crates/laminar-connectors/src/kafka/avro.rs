@@ -14,7 +14,7 @@ use arrow_avro::schema::{AvroSchema, Fingerprint, FingerprintAlgorithm, SchemaSt
 use arrow_schema::SchemaRef;
 use parking_lot::Mutex;
 
-use crate::error::SerdeError;
+use crate::error::{ConnectorError, SerdeError};
 use crate::kafka::schema_registry::SchemaRegistryClient;
 use crate::serde::{Format, RecordDeserializer};
 
@@ -102,25 +102,27 @@ impl AvroDeserializer {
     ///
     /// # Errors
     ///
-    /// Returns `SerdeError` if the schema cannot be fetched or registered.
+    /// Preserves Schema Registry `ConnectorError` classification for remote
+    /// resolution failures and returns `ConnectorError::Serde` for local
+    /// decoder registration failures.
     /// Returns `Ok(true)` if this was a newly registered schema ID,
     /// `Ok(false)` if already known.
-    pub async fn ensure_schema_registered(&mut self, schema_id: i32) -> Result<bool, SerdeError> {
+    pub async fn ensure_schema_registered(
+        &mut self,
+        schema_id: i32,
+    ) -> Result<bool, ConnectorError> {
         if self.known_ids.contains(&schema_id) {
             return Ok(false);
         }
 
-        let registry = self
-            .schema_registry
-            .as_ref()
-            .ok_or(SerdeError::SchemaNotFound { schema_id })?;
+        let registry = self.schema_registry.as_ref().ok_or(ConnectorError::Serde(
+            SerdeError::SchemaNotFound { schema_id },
+        ))?;
 
-        let cached = registry
-            .resolve_confluent_id(schema_id)
-            .await
-            .map_err(|_| SerdeError::SchemaNotFound { schema_id })?;
+        let cached = registry.resolve_confluent_id(schema_id).await?;
 
-        self.register_schema(schema_id, &cached.schema_str)?;
+        self.register_schema(schema_id, &cached.schema_str)
+            .map_err(ConnectorError::Serde)?;
         Ok(true)
     }
 
@@ -354,6 +356,36 @@ mod tests {
         let result = deser.register_schema(1, TEST_AVRO_SCHEMA);
         assert!(result.is_ok());
         assert!(deser.known_ids.contains(&1));
+    }
+
+    #[tokio::test]
+    async fn hot_schema_resolution_preserves_registry_error_type_and_context() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/schemas/ids/42"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("invalid credentials"))
+            .mount(&server)
+            .await;
+        let registry = Arc::new(SchemaRegistryClient::new(server.uri(), None).unwrap());
+        let mut deser = AvroDeserializer::with_schema_registry(registry);
+
+        let error = deser.ensure_schema_registered(42).await.unwrap_err();
+        assert!(matches!(error, ConnectorError::ConfigurationError(_)));
+        assert!(!error.is_transient());
+        assert!(error.to_string().contains("schema ID 42"));
+    }
+
+    #[tokio::test]
+    async fn missing_hot_path_registry_remains_a_serde_error() {
+        let mut deser = AvroDeserializer::new();
+        let error = deser.ensure_schema_registered(42).await.unwrap_err();
+        assert!(matches!(
+            error,
+            ConnectorError::Serde(SerdeError::SchemaNotFound { schema_id: 42 })
+        ));
     }
 
     #[test]

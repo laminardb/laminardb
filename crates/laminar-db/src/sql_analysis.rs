@@ -19,7 +19,7 @@ use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Location, Token, TokenWithSpan};
 
 use crate::ai::{BackendKind, ModelRegistry, Task};
-use laminar_sql::parser::join_parser::analyze_joins;
+use laminar_sql::parser::join_parser::{analyze_join, analyze_joins};
 
 use crate::error::DbError;
 use crate::operator::window_frame::MomentFn;
@@ -214,6 +214,7 @@ fn collect_tables_from_set_expr(set_expr: &SetExpr, tables: &mut FxHashSet<Strin
 
 fn collect_tables_from_factor(factor: &TableFactor, tables: &mut FxHashSet<String>) {
     match factor {
+        TableFactor::Table { .. } if is_inline_unnest_factor(factor) => {}
         TableFactor::Table { name, args, .. } => {
             tables.insert(resolve_tvf_source(name, args.as_ref()));
         }
@@ -333,7 +334,10 @@ fn resolve_tvf_source(
     name: &sqlparser::ast::ObjectName,
     args: Option<&sqlparser::ast::TableFunctionArgs>,
 ) -> String {
-    let name_str = name.to_string();
+    let name_str = match name.0.as_slice() {
+        [ObjectNamePart::Identifier(ident)] => normalize_ident(ident),
+        _ => name.to_string(),
+    };
     let base_name = name_str.rsplit('.').next().unwrap_or(&name_str);
     if let Some(tfa) = args {
         if is_window_tvf(base_name) {
@@ -354,19 +358,25 @@ fn is_window_tvf(name: &str) -> bool {
 
 fn first_ident_arg(args: &[FunctionArg]) -> Option<String> {
     match args.first()? {
-        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(id))) => Some(id.value.clone()),
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(id))) => {
+            Some(normalize_ident(id))
+        }
         FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::CompoundIdentifier(parts))) => {
             let mut buf = String::new();
             for (i, part) in parts.iter().enumerate() {
                 if i > 0 {
                     buf.push('.');
                 }
-                buf.push_str(&part.value);
+                buf.push_str(&normalize_ident(part));
             }
             Some(buf)
         }
         _ => None,
     }
+}
+
+fn normalize_ident(ident: &Ident) -> String {
+    ident.value.clone()
 }
 
 /// Compiled post-join projection for ASOF/temporal queries.
@@ -741,6 +751,14 @@ pub(crate) const CHANGELOG_ENRICH_TMP: &str = "__changelog_enrich_tmp";
 pub(crate) struct ChangelogEnrichConfig {
     /// The left (incremental MV / changelog) table the operator consumes from `input_bufs`.
     pub changelog_table: String,
+    /// Static dimension relation on the right side.
+    pub static_table: String,
+    /// Ordered left equi-join keys certified by detection.
+    pub left_keys: Vec<String>,
+    /// Ordered right equi-join keys certified by detection.
+    pub right_keys: Vec<String>,
+    /// Whether this is a LEFT rather than INNER join.
+    pub left_outer: bool,
     /// Temp-rewritten join SQL (over [`CHANGELOG_ENRICH_TMP`]) that preserves `__weight`.
     pub projection_sql: String,
 }
@@ -852,8 +870,24 @@ pub(crate) fn detect_changelog_enrich_query(
         "SELECT {} FROM {CHANGELOG_ENRICH_TMP} AS {lalias} {join_kw} {right_from} ON {on}{where_clause}",
         items.join(", ")
     );
+    let mut left_keys = vec![j.left_key_column.clone()];
+    let mut right_keys = vec![j.right_key_column.clone()];
+    left_keys.extend(
+        j.additional_key_columns
+            .iter()
+            .map(|(left, _)| left.clone()),
+    );
+    right_keys.extend(
+        j.additional_key_columns
+            .iter()
+            .map(|(_, right)| right.clone()),
+    );
     Some(ChangelogEnrichConfig {
         changelog_table: j.left_table.clone(),
+        static_table: j.right_table.clone(),
+        left_keys,
+        right_keys,
+        left_outer: j.join_type == JoinType::Left,
         projection_sql,
     })
 }
@@ -1028,289 +1062,38 @@ pub(crate) fn detect_changelog_incremental_join(
     })
 }
 
-/// Reserved name prefix for the hidden intermediate MVs a single-statement N-way join decomposes into.
-pub(crate) const MULTIWAY_INTERMEDIATE_PREFIX: &str = "__ivm_";
-
-/// A single-statement N-way incremental join decomposed into a left-deep chain of 2-way changelog
-/// joins: the hidden `intermediates` (each `(name, SELECT-sql)`) are created first, then the original
-/// MV's body is replaced by `final_query` (a 2-way join over the last intermediate).
-pub(crate) struct MultiwayJoinPlan {
-    pub intermediates: Vec<(String, String)>,
-    pub final_query: String,
-}
-
-type QualCol = (String, String); // (qualifier, column)
-type EquiPair = (QualCol, QualCol);
-type JoinStep = (bool, Vec<EquiPair>); // (is_left, ON equi-pairs)
-type OrientedPair = (usize, String, String); // (earlier_rel_index, earlier_col, new_col)
-type FinalItem = (usize, String, Option<String>); // (rel_index, column, alias)
-
-fn qual_col(e: &Expr) -> Option<QualCol> {
-    match e {
-        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-            Some((parts[0].value.clone(), parts[1].value.clone()))
-        }
-        _ => None,
-    }
-}
-
-/// Collect every `qual.col = qual.col` pair from a pure-equi ON conjunction; `false` if any conjunct
-/// is not an equality of two 2-part qualified columns.
-fn collect_equi_pairs(expr: &Expr, out: &mut Vec<EquiPair>) -> bool {
-    use sqlparser::ast::BinaryOperator;
-    match expr {
-        Expr::Nested(inner) => collect_equi_pairs(inner, out),
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => collect_equi_pairs(left, out) && collect_equi_pairs(right, out),
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::Eq,
-            right,
-        } => match (qual_col(left), qual_col(right)) {
-            (Some(l), Some(r)) => {
-                out.push((l, r));
-                true
-            }
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
-fn table_and_alias(factor: &sqlparser::ast::TableFactor) -> Option<(String, String)> {
-    let sqlparser::ast::TableFactor::Table { name, alias, .. } = factor else {
-        return None;
+/// Return whether a query is a single-statement join of three or more incremental MVs.
+///
+/// Such a query would need one atomic admission transaction for all internal pairwise operators.
+/// Until that transaction exists, callers reject it and require explicitly named two-way stages.
+pub(crate) fn is_multiway_incremental_join(sql: &str, incremental_mvs: &FxHashSet<String>) -> bool {
+    let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
+        return false;
     };
-    // A compound (schema-qualified) name with no alias would emit a dotted alias
-    // (`FROM schema.tbl schema.tbl`) — invalid SQL. Reject, matching the 2-way enrich guard.
-    if alias.is_none() && name.0.len() > 1 {
-        return None;
-    }
-    let table = name.to_string();
-    let al = alias
-        .as_ref()
-        .map_or_else(|| table.clone(), |a| a.name.value.clone());
-    Some((table, al))
-}
-
-/// Decompose a single-statement N-way (`>= 2` joins) all-incremental equi-join into a left-deep chain
-/// of 2-way changelog joins. Each hidden intermediate carries forward — via `{origin_alias}__{col}`
-/// aliases, so names never collide — only the columns that later steps or the final `SELECT` reference.
-/// Supports linear AND star/back-reference shapes (its own qualifier-aware ON analysis attributes each
-/// key to its origin relation). `None` for the single-join case (handled by the 2-way detector) or any
-/// unsupported shape (non-equi/unqualified ON, WHERE/GROUP/etc., RIGHT/FULL, wildcard/expr projection,
-/// a non-incremental participant, or an ON pair not joining the new table to an earlier one).
-#[allow(clippy::too_many_lines)]
-pub(crate) fn plan_multiway_incremental_join(
-    mv_name: &str,
-    sql: &str,
-    incremental_mvs: &FxHashSet<String>,
-) -> Option<MultiwayJoinPlan> {
-    use sqlparser::ast::JoinConstraint::On;
-    use sqlparser::ast::JoinOperator;
-
-    let statements = laminar_sql::parse_streaming_sql(sql).ok()?;
-    let laminar_sql::parser::StreamingStatement::Standard(stmt) = statements.first()? else {
-        return None;
+    let Some(laminar_sql::parser::StreamingStatement::Standard(statement)) = statements.first()
+    else {
+        return false;
     };
-    let Statement::Query(query) = stmt.as_ref() else {
-        return None;
+    let Statement::Query(query) = statement.as_ref() else {
+        return false;
     };
     let SetExpr::Select(select) = query.body.as_ref() else {
-        return None;
+        return false;
     };
-    let has_group_by = match &select.group_by {
-        sqlparser::ast::GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
-        sqlparser::ast::GroupByExpr::All(_) => false,
-    };
-    if select.distinct.is_some()
-        || has_group_by
-        || select.having.is_some()
-        || select.selection.is_some()
-        || query.order_by.is_some()
-        || query.limit_clause.is_some()
-        || query.fetch.is_some()
-        || query.with.is_some()
-        || select.from.len() != 1
-    {
-        return None;
-    }
-    let twj = &select.from[0];
-    if twj.joins.len() < 2 {
-        return None; // single join → the 2-way detector handles it
+    if select.from.len() != 1 || select.from[0].joins.len() < 2 {
+        return false;
     }
 
-    // Relations r[0] = base, r[i] = joins[i-1]'s table (with aliases); one (is_left, equi-pairs) per step.
-    let (t0, a0) = table_and_alias(&twj.relation)?;
-    let mut rels: Vec<(String, String)> = vec![(t0, a0)];
-    let mut steps: Vec<JoinStep> = Vec::new();
-    for join in &twj.joins {
-        let (table, alias) = table_and_alias(&join.relation)?;
-        let (is_left, on_expr) = match &join.join_operator {
-            JoinOperator::Inner(On(e)) | JoinOperator::Join(On(e)) => (false, e),
-            JoinOperator::Left(On(e)) | JoinOperator::LeftOuter(On(e)) => (true, e),
-            _ => return None,
-        };
-        let mut pairs = Vec::new();
-        if !collect_equi_pairs(on_expr, &mut pairs) {
-            return None;
-        }
-        rels.push((table, alias));
-        steps.push((is_left, pairs));
-    }
-    for (table, _) in &rels {
-        if !incremental_mvs.contains(table) {
-            return None;
-        }
-    }
-    let rel_of = |alias: &str| rels.iter().position(|(t, a)| a == alias || t == alias);
-
-    // Orient each step's pairs so exactly one side is the NEW table r[s] and the other is an earlier
-    // relation; keep `(earlier_rel_index, earlier_col, new_col)`.
-    let mut oriented: Vec<Vec<OrientedPair>> = Vec::with_capacity(steps.len());
-    for (s, (_is_left, pairs)) in steps.iter().enumerate() {
-        let new_idx = s + 1; // r[s+1] is the table joined at step s+1 (0-indexed step s)
-        let mut ov = Vec::with_capacity(pairs.len());
-        for ((la, lc), (ra, rc)) in pairs {
-            let li = rel_of(la)?;
-            let ri = rel_of(ra)?;
-            let (earlier, ecol, ncol) = if ri == new_idx && li < new_idx {
-                (li, lc.clone(), rc.clone())
-            } else if li == new_idx && ri < new_idx {
-                (ri, rc.clone(), lc.clone())
-            } else {
-                return None; // a pair not joining the new table to an earlier one
-            };
-            ov.push((earlier, ecol, ncol));
-        }
-        oriented.push(ov);
-    }
-
-    // Final SELECT: qualified columns only, each attributed to its origin relation.
-    let mut final_items: Vec<FinalItem> = Vec::with_capacity(select.projection.len());
-    for item in &select.projection {
-        let (expr, alias) = match item {
-            SelectItem::UnnamedExpr(e) => (e, None),
-            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
-            _ => return None,
-        };
-        let (q, c) = qual_col(expr)?;
-        final_items.push((rel_of(&q)?, c, alias));
-    }
-
-    // Liveness: a column of r[j] must be carried by intermediate I_s (covers r[0..=s]) iff j <= s and
-    // it is referenced by a later step's ON (as the earlier side) or by the final SELECT.
-    let n = twj.joins.len(); // steps 1..=n; I_n is the final MV
-    let name_of = |s: usize| -> String {
-        if s == n {
-            mv_name.to_string()
-        } else {
-            format!("{MULTIWAY_INTERMEDIATE_PREFIX}{mv_name}_{}", s - 1)
-        }
-    };
-    let carry_alias = |idx: usize, col: &str| format!("{}__{col}", rels[idx].1);
-    // Downstream references for I_s = earlier-side refs of steps s+1..=n ∪ final SELECT refs, kept when
-    // the origin relation index <= s.
-    let carried = |s: usize| -> Vec<(usize, String)> {
-        let mut set: Vec<(usize, String)> = Vec::new();
-        let push = |idx: usize, col: &str, set: &mut Vec<(usize, String)>| {
-            if idx <= s && !set.iter().any(|(i, c)| *i == idx && c == col) {
-                set.push((idx, col.to_string()));
-            }
-        };
-        for later in &oriented[s..] {
-            for (eidx, ecol, _ncol) in later {
-                push(*eidx, ecol, &mut set);
-            }
-        }
-        for (idx, col, _) in &final_items {
-            push(*idx, col, &mut set);
-        }
-        set.sort();
-        set
-    };
-
-    // Build each step's SQL. Left input of step s (1-indexed) is I_{s-1} (its name is name_of(s-1),
-    // whose columns are already `{alias}__{col}`), or r[0] for step 1.
-    let mut intermediates = Vec::new();
-    let mut final_query = String::new();
-    for s in 1..=n {
-        let (left_name, left_alias, left_is_base) = if s == 1 {
-            (rels[0].0.clone(), rels[0].1.clone(), true)
-        } else {
-            (name_of(s - 1), name_of(s - 1), false)
-        };
-        let (rtable, ralias) = &rels[s];
-        let is_left = steps[s - 1].0;
-        let join_kw = if is_left { "LEFT JOIN" } else { "JOIN" };
-
-        // Column reference into the left input for origin relation j (< s).
-        let left_ref = |j: usize, col: &str| -> String {
-            if left_is_base {
-                format!("{}.{col}", rels[j].1)
-            } else {
-                format!("{left_alias}.{}", carry_alias(j, col))
-            }
-        };
-
-        // ON clause.
-        let on = oriented[s - 1]
-            .iter()
-            .map(|(eidx, ecol, ncol)| format!("{} = {ralias}.{ncol}", left_ref(*eidx, ecol)))
-            .collect::<Vec<_>>()
-            .join(" AND ");
-
-        // Projection.
-        let proj = if s == n {
-            final_items
-                .iter()
-                .map(|(idx, col, alias)| {
-                    let src = if *idx == s {
-                        format!("{ralias}.{col}")
-                    } else {
-                        left_ref(*idx, col)
-                    };
-                    // Keep the user's output name: an unaliased `a.k` stays `k`, not the rewritten src.
-                    let out = alias.clone().unwrap_or_else(|| col.clone());
-                    format!("{src} AS {out}")
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        } else {
-            carried(s)
-                .iter()
-                .map(|(idx, col)| {
-                    let out = carry_alias(*idx, col);
-                    let src = if *idx == s {
-                        format!("{ralias}.{col}")
-                    } else {
-                        left_ref(*idx, col)
-                    };
-                    format!("{src} AS {out}")
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-
-        let from = if left_is_base {
-            format!("{left_name} {left_alias}")
-        } else {
-            left_name.clone()
-        };
-        let body = format!("SELECT {proj} FROM {from} {join_kw} {rtable} {ralias} ON {on}");
-        if s == n {
-            final_query = body;
-        } else {
-            intermediates.push((name_of(s), body));
-        }
-    }
-    Some(MultiwayJoinPlan {
-        intermediates,
-        final_query,
-    })
+    let table_with_joins = &select.from[0];
+    std::iter::once(&table_with_joins.relation)
+        .chain(table_with_joins.joins.iter().map(|join| &join.relation))
+        .all(|factor| {
+            matches!(
+                factor,
+                TableFactor::Table { name, .. }
+                    if incremental_mvs.contains(&name.to_string())
+            )
+        })
 }
 
 /// `true` if the single join's ON clause is a pure conjunction of `col = col` equalities (or a
@@ -1703,176 +1486,7 @@ mod ai {
     }
 
     #[cfg(test)]
-    mod ai_detection_tests {
-        use super::{detect_ai_functions, validate_ai_calls, AiCallSpec};
-        use crate::ai::{ModelBackend, ModelEntry, ModelRegistry, Task};
-
-        fn spec(task: Task, model: Option<&str>, labels: Option<Vec<&str>>) -> AiCallSpec {
-            AiCallSpec {
-                task,
-                model: model.map(str::to_string),
-                labels: labels.map(|ls| ls.into_iter().map(str::to_string).collect()),
-                input: "x".to_string(),
-                output_alias: None,
-                parse_errors: Vec::new(),
-            }
-        }
-
-        fn registry() -> ModelRegistry {
-            let mut reg = ModelRegistry::new();
-            reg.register(ModelEntry {
-                id: "finbert".into(),
-                tasks: vec![Task::Classify, Task::Sentiment],
-                backend: ModelBackend::Local {
-                    source: "hf:onnx-community/finbert".into(),
-                    labels: Some(vec!["positive".into(), "negative".into(), "neutral".into()]),
-                },
-            })
-            .unwrap();
-            reg.register(ModelEntry {
-                id: "haiku".into(),
-                tasks: vec![Task::Classify, Task::Complete, Task::Sentiment],
-                backend: ModelBackend::Remote {
-                    provider: "anthropic".into(),
-                    model: "claude-haiku-4-5-20251001".into(),
-                },
-            })
-            .unwrap();
-            reg.set_default(Task::Sentiment, "finbert");
-            reg
-        }
-
-        #[test]
-        fn detects_single_classify_with_model_and_alias() {
-            let calls = detect_ai_functions(
-                "SELECT id, ai_classify(headline, model => 'finbert') AS label FROM news",
-            );
-            assert_eq!(calls.len(), 1);
-            let call = &calls[0];
-            assert_eq!(call.task, Task::Classify);
-            assert_eq!(call.model.as_deref(), Some("finbert"));
-            assert_eq!(call.input, "headline");
-            assert_eq!(call.output_alias.as_deref(), Some("label"));
-            assert!(call.labels.is_none());
-        }
-
-        #[test]
-        fn detects_labels_array() {
-            let calls = detect_ai_functions(
-                "SELECT ai_classify(text, model => 'haiku', labels => ARRAY['up','down']) FROM s",
-            );
-            assert_eq!(calls.len(), 1);
-            assert_eq!(
-                calls[0].labels,
-                Some(vec!["up".to_string(), "down".to_string()])
-            );
-        }
-
-        #[test]
-        fn ignores_queries_without_ai_functions() {
-            assert!(detect_ai_functions("SELECT a, b FROM s").is_empty());
-        }
-
-        #[test]
-        fn malformed_arguments_are_rejected() {
-            // Non-column input, missing input, and wrong-typed model/labels each
-            // record a parse error that validation surfaces (not silently dropped).
-            let cases = [
-                "SELECT ai_classify(UPPER(headline), model => 'finbert') AS x FROM s",
-                "SELECT ai_classify(model => 'finbert') AS x FROM s",
-                "SELECT ai_classify(headline, model => 123) AS x FROM s",
-                "SELECT ai_classify(headline, model => 'finbert', labels => 'up') AS x FROM s",
-                "SELECT ai_classify(headline, extra, model => 'finbert') AS x FROM s",
-                "SELECT ai_classify(headline, model => 'finbert', who => 'me') AS x FROM s",
-            ];
-            for sql in cases {
-                let calls = detect_ai_functions(sql);
-                assert_eq!(calls.len(), 1, "{sql}");
-                assert!(!calls[0].parse_errors.is_empty(), "{sql}");
-                assert!(validate_ai_calls(&registry(), &calls).is_err(), "{sql}");
-            }
-        }
-
-        #[test]
-        fn plan_rewrites_projection_over_tmp_table() {
-            let plan = super::plan_ai_query(
-                "SELECT id, ai_classify(headline, model => 'finbert') AS label FROM news WHERE id > 0",
-            )
-            .expect("single aliased AI call is plannable");
-            assert_eq!(plan.source_table, "news");
-            assert_eq!(plan.call.output_alias.as_deref(), Some("label"));
-            let sql = plan.projection_sql.to_lowercase();
-            assert!(sql.contains("__ai_tmp"), "{sql}");
-            assert!(!sql.contains("ai_classify"), "{sql}");
-            assert!(sql.contains("label"));
-            assert!(sql.contains("where id > 0"), "{sql}");
-        }
-
-        #[test]
-        fn plan_requires_alias_and_single_call() {
-            assert!(super::plan_ai_query("SELECT ai_classify(t, model => 'm') FROM s").is_none());
-            assert!(super::plan_ai_query(
-                "SELECT ai_classify(a, model => 'm') AS x, ai_embed(b, model => 'e') AS y FROM s"
-            )
-            .is_none());
-            assert!(super::plan_ai_query("SELECT a FROM s").is_none());
-        }
-
-        #[test]
-        fn unknown_model_is_rejected() {
-            let calls = [spec(Task::Classify, Some("ghost"), Some(vec!["a"]))];
-            assert!(validate_ai_calls(&registry(), &calls).is_err());
-        }
-
-        #[test]
-        fn unsupported_task_is_rejected() {
-            let calls = [spec(Task::Summarize, Some("finbert"), None)];
-            assert!(validate_ai_calls(&registry(), &calls).is_err());
-        }
-
-        #[test]
-        fn local_labels_must_be_a_subset() {
-            let bad = [spec(Task::Classify, Some("finbert"), Some(vec!["bullish"]))];
-            assert!(validate_ai_calls(&registry(), &bad).is_err());
-            let ok = [spec(
-                Task::Classify,
-                Some("finbert"),
-                Some(vec!["positive"]),
-            )];
-            assert!(validate_ai_calls(&registry(), &ok).is_ok());
-        }
-
-        #[test]
-        fn local_labels_are_optional() {
-            let calls = [spec(Task::Classify, Some("finbert"), None)];
-            assert!(validate_ai_calls(&registry(), &calls).is_ok());
-        }
-
-        #[test]
-        fn remote_classification_requires_labels() {
-            let without = [spec(Task::Classify, Some("haiku"), None)];
-            assert!(validate_ai_calls(&registry(), &without).is_err());
-            let with = [spec(Task::Classify, Some("haiku"), Some(vec!["a", "b"]))];
-            assert!(validate_ai_calls(&registry(), &with).is_ok());
-        }
-
-        #[test]
-        fn remote_sentiment_needs_no_labels() {
-            // Sentiment is numeric — a remote model scores it without a candidate set.
-            let calls = [spec(Task::Sentiment, Some("haiku"), None)];
-            assert!(validate_ai_calls(&registry(), &calls).is_ok());
-        }
-
-        #[test]
-        fn default_model_resolves_or_fails() {
-            // Sentiment has a default (finbert).
-            let defaulted = [spec(Task::Sentiment, None, None)];
-            assert!(validate_ai_calls(&registry(), &defaulted).is_ok());
-            // Embed has no default.
-            let no_default = [spec(Task::Embed, None, None)];
-            assert!(validate_ai_calls(&registry(), &no_default).is_err());
-        }
-    }
+    mod ai_detection_tests;
 }
 
 pub(crate) use ai::{detect_ai_functions, plan_ai_query, validate_ai_calls, AiQueryPlan};
@@ -1993,56 +1607,6 @@ fn bivariate_column_args(func: &sqlparser::ast::Function) -> Option<(String, Str
     match cols.as_slice() {
         [x, y] => Some((x.clone(), y.clone())),
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod frame_plan_tests {
-    use super::plan_frame_query;
-
-    #[test]
-    fn detects_corr_frame_and_rewrites_to_alias() {
-        let plan = plan_frame_query(
-            "SELECT bucket_start, close, mean_sentiment, \
-             CORR(close, mean_sentiment) OVER (ORDER BY bucket_start ROWS 30 PRECEDING) AS corr_30 \
-             FROM sentiment_price_join",
-        )
-        .expect("frame plan");
-        assert_eq!(plan.x_column, "close");
-        assert_eq!(plan.y_column, "mean_sentiment");
-        assert_eq!(plan.output_alias, "corr_30");
-        assert_eq!(plan.retain, 30);
-        assert_eq!(plan.source_table, "sentiment_price_join");
-        // The CORR term is gone; the residual reads the alias from the temp table.
-        assert!(!plan.projection_sql.to_uppercase().contains("CORR("));
-        assert!(plan.projection_sql.contains("corr_30"));
-        assert!(plan.projection_sql.contains("__frame_tmp"));
-    }
-
-    #[test]
-    fn detects_processtime_equijoin() {
-        let d = super::detect_processtime_join(
-            "SELECT p.bucket AS bucket, p.price AS price, s.ms AS ms \
-             FROM price_b p JOIN sent_b s ON p.bucket = s.bucket",
-        )
-        .expect("plain INNER equi-join routes to the processing-time join");
-        // No time columns is the marker `create_operator` keys on.
-        assert!(d.config.left_time_column.is_empty() && d.config.right_time_column.is_empty());
-        assert_eq!(d.config.left_key, "bucket");
-        assert_eq!(d.config.right_key, "bucket");
-        assert_eq!(d.config.left_table, "price_b");
-        assert_eq!(d.config.right_table, "sent_b");
-    }
-
-    #[test]
-    fn rejects_partition_by_and_non_frame_queries() {
-        // PARTITION BY is not supported.
-        assert!(plan_frame_query(
-            "SELECT CORR(a, b) OVER (PARTITION BY g ORDER BY t ROWS 5 PRECEDING) AS c FROM s"
-        )
-        .is_none());
-        // No window frame → not a frame query.
-        assert!(plan_frame_query("SELECT a, b FROM s").is_none());
     }
 }
 
@@ -2360,6 +1924,73 @@ pub(crate) struct StreamJoinDetection {
     pub right_pre_filter: Option<String>,
 }
 
+pub(crate) fn detect_unbounded_join_steps(sql: &str) -> Option<Vec<(String, String)>> {
+    let statements = laminar_sql::parse_streaming_sql(sql).ok()?;
+    let laminar_sql::parser::StreamingStatement::Standard(statement) = statements.first()? else {
+        return None;
+    };
+    let Statement::Query(query) = statement.as_ref() else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    let multi = analyze_joins(select).ok()??;
+    let steps: Vec<_> = multi
+        .joins
+        .iter()
+        .filter(|join| !join.is_bounded())
+        .map(|join| (join.left_table.clone(), join.right_table.clone()))
+        .collect();
+    (!steps.is_empty()).then_some(steps)
+}
+
+pub(crate) fn has_join_clause(sql: &str) -> bool {
+    join_clause_count(sql) > 0
+}
+
+pub(crate) fn join_clause_count(sql: &str) -> usize {
+    let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
+        return 0;
+    };
+    let Some(laminar_sql::parser::StreamingStatement::Standard(statement)) = statements.first()
+    else {
+        return 0;
+    };
+    let Statement::Query(query) = statement.as_ref() else {
+        return 0;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return 0;
+    };
+    select
+        .from
+        .iter()
+        .filter(|from| !is_inline_unnest_factor(&from.relation))
+        .count()
+        .saturating_sub(1)
+        + select
+            .from
+            .iter()
+            .map(|from| from.joins.len())
+            .sum::<usize>()
+}
+
+fn is_inline_unnest_factor(factor: &TableFactor) -> bool {
+    match factor {
+        TableFactor::UNNEST { .. } => true,
+        TableFactor::Table {
+            name,
+            args: Some(_),
+            ..
+        }
+        | TableFactor::Function { name, .. } => {
+            name.0.len() == 1 && name.to_string().eq_ignore_ascii_case("unnest")
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn detect_stream_join_query(sql: &str) -> Option<StreamJoinDetection> {
     let statements = laminar_sql::parse_streaming_sql(sql).ok()?;
 
@@ -2375,14 +2006,24 @@ pub(crate) fn detect_stream_join_query(sql: &str) -> Option<StreamJoinDetection>
         return None;
     };
 
-    let multi = analyze_joins(select).ok()??;
-
-    let stream_analysis = multi.joins.iter().find(|j| {
-        j.time_bound.is_some() && !j.is_asof_join && !j.is_temporal_join && !j.is_lookup_join
-    })?;
+    // The interval operator consumes the first two inputs; any later static joins run in the
+    // residual DataFusion projection. Analyzing the full chain both misattributes back-references
+    // to the original left input and could select a bounded later step that this operator cannot
+    // execute.
+    if select.from.len() != 1 {
+        return None;
+    }
+    let stream_analysis = analyze_join(select).ok()??;
+    if stream_analysis.time_bound.is_none()
+        || stream_analysis.is_asof_join
+        || stream_analysis.is_temporal_join
+        || stream_analysis.is_lookup_join
+    {
+        return None;
+    }
 
     let JoinOperatorConfig::StreamStream(config) =
-        JoinOperatorConfig::from_analysis(stream_analysis)
+        JoinOperatorConfig::from_analysis(&stream_analysis)
     else {
         return None;
     };
@@ -2399,14 +2040,13 @@ pub(crate) fn detect_stream_join_query(sql: &str) -> Option<StreamJoinDetection>
     ) {
         tracing::warn!(
             join_type = ?stream_analysis.join_type,
-            "RightSemi/RightAnti not implemented for streaming interval joins; \
-             falling back to per-cycle batch join."
+            "RightSemi/RightAnti are not implemented for streaming interval joins; rejecting"
         );
         return None;
     }
 
     let pre_filters = if config.left_table == config.right_table {
-        extract_self_join_pre_filters(select, stream_analysis, &config)
+        extract_self_join_pre_filters(select, &stream_analysis, &config)
     } else {
         None
     };
@@ -2433,88 +2073,13 @@ pub(crate) fn detect_stream_join_query(sql: &str) -> Option<StreamJoinDetection>
             .unwrap_or_default(),
     };
     let projection_sql =
-        build_stream_join_projection_sql(select, stream_analysis, &config, &where_clause);
+        build_stream_join_projection_sql(select, &stream_analysis, &config, &where_clause);
 
     Some(StreamJoinDetection {
         config,
         projection_sql,
         left_pre_filter: pre_filters.as_ref().and_then(|f| f.left_sql.clone()),
         right_pre_filter: pre_filters.as_ref().and_then(|f| f.right_sql.clone()),
-    })
-}
-
-/// Detect a processing-time equi-join: `INNER a JOIN b ON a.k = b.k` with no temporal predicate.
-///
-/// Returns the same shape as [`detect_stream_join_query`] with empty time columns, which is
-/// how `create_operator` distinguishes this from an interval join.
-pub(crate) fn detect_processtime_join(sql: &str) -> Option<StreamJoinDetection> {
-    use laminar_sql::parser::join_parser::JoinType;
-
-    let statements = laminar_sql::parse_streaming_sql(sql).ok()?;
-    let laminar_sql::parser::StreamingStatement::Standard(stmt) = statements.first()? else {
-        return None;
-    };
-    let Statement::Query(query) = stmt.as_ref() else {
-        return None;
-    };
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return None;
-    };
-    let multi = analyze_joins(select).ok()??;
-
-    // Self-joins would collide on the suffixed output schema.
-    if multi.joins.len() != 1 {
-        return None;
-    }
-    let step = &multi.joins[0];
-    // `analyze_joins` tags no-time-bound equi-joins as is_lookup_join; real lookup joins
-    // never reach this detector (the planner emits a Lookup config first), so accept it.
-    if step.time_bound.is_some()
-        || step.is_asof_join
-        || step.is_temporal_join
-        || !matches!(step.join_type, JoinType::Inner)
-    {
-        return None;
-    }
-    // `from_analysis` would yield a Lookup config for this shape; build directly.
-    let config = StreamJoinConfig {
-        left_key: step.left_key_column.clone(),
-        right_key: step.right_key_column.clone(),
-        left_time_column: String::new(),
-        right_time_column: String::new(),
-        left_table: step.left_table.clone(),
-        right_table: step.right_table.clone(),
-        time_bound: std::time::Duration::ZERO,
-        join_type: StreamJoinType::Inner,
-    };
-    if config.left_key.is_empty()
-        || config.right_key.is_empty()
-        || config.left_table == config.right_table
-    {
-        return None;
-    }
-
-    let where_clause = select
-        .selection
-        .as_ref()
-        .map(|expr| {
-            let rewritten = rewrite_stream_join_expr(
-                expr,
-                step.left_alias.as_deref(),
-                step.right_alias.as_deref(),
-                &config,
-                None,
-            );
-            format!(" WHERE {rewritten}")
-        })
-        .unwrap_or_default();
-    let projection_sql = build_stream_join_projection_sql(select, step, &config, &where_clause);
-
-    Some(StreamJoinDetection {
-        config,
-        projection_sql,
-        left_pre_filter: None,
-        right_pre_filter: None,
     })
 }
 
@@ -3844,546 +3409,13 @@ pub(crate) fn analyze_temporal_filter(sql: &str) -> TemporalFilterAnalysis {
 }
 
 #[cfg(test)]
-mod temporal_filter_recognition_tests {
-    use super::*;
-
-    fn cfg(sql: &str) -> TemporalFilterConfig {
-        match analyze_temporal_filter(sql) {
-            TemporalFilterAnalysis::Recognized(c) => *c,
-            TemporalFilterAnalysis::PresentUnrecognized => {
-                panic!("expected Recognized, got PresentUnrecognized: {sql}")
-            }
-            TemporalFilterAnalysis::NotPresent => {
-                panic!("expected Recognized, got NotPresent: {sql}")
-            }
-        }
-    }
-
-    #[test]
-    fn projection_list_recognised() {
-        let c = cfg("SELECT id, amount FROM events WHERE ts > now() - INTERVAL '1' MINUTE");
-        assert_eq!(c.proj_cols, vec!["id".to_string(), "amount".to_string()]);
-        assert_eq!(c.time_col, "ts");
-        // Expression / aliased / qualified projections stay out of scope.
-        assert!(matches!(
-            analyze_temporal_filter(
-                "SELECT id + 1 FROM events WHERE ts > now() - INTERVAL '1' MINUTE"
-            ),
-            TemporalFilterAnalysis::PresentUnrecognized
-        ));
-    }
-
-    #[test]
-    fn lower_bound_ttl_strict() {
-        let c = cfg("SELECT * FROM events WHERE evt > now() - INTERVAL '10' MINUTE");
-        assert_eq!(c.source_table, "events");
-        assert!(c.proj_cols.is_empty(), "`SELECT *` ⇒ no explicit columns");
-        assert_eq!(c.time_col, "evt");
-        assert_eq!(
-            c.lower,
-            Some(TemporalBound {
-                off_ms: -600_000,
-                strict: true
-            })
-        );
-        assert_eq!(c.upper, None);
-    }
-
-    #[test]
-    fn between_inclusive_both_bounds() {
-        let c = cfg(
-            "SELECT * FROM e WHERE ts BETWEEN now() - INTERVAL '2' MINUTE \
-             AND now() + INTERVAL '30' SECOND",
-        );
-        assert_eq!(
-            c.lower,
-            Some(TemporalBound {
-                off_ms: -120_000,
-                strict: false
-            })
-        );
-        assert_eq!(
-            c.upper,
-            Some(TemporalBound {
-                off_ms: 30_000,
-                strict: false
-            })
-        );
-    }
-
-    #[test]
-    fn unrecognised_when_extra_conjunct() {
-        assert!(matches!(
-            analyze_temporal_filter(
-                "SELECT * FROM e WHERE region = 'us' AND ts > now() - INTERVAL '1' MINUTE"
-            ),
-            TemporalFilterAnalysis::PresentUnrecognized
-        ));
-    }
-
-    #[test]
-    fn not_present_for_ordinary_query() {
-        // No false positives — ordinary queries are untouched.
-        assert!(matches!(
-            analyze_temporal_filter("SELECT * FROM e WHERE region = 'us'"),
-            TemporalFilterAnalysis::NotPresent
-        ));
-    }
-}
+mod temporal_filter_recognition_tests;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn lookup_fixtures() -> (FxHashMap<String, Vec<String>>, FxHashMap<String, SchemaRef>) {
-        use arrow::datatypes::{DataType, Field, Schema};
-        let mut partial = FxHashMap::default();
-        partial.insert(
-            "customers".to_string(),
-            vec!["id".to_string(), "name".to_string()],
-        );
-        let mut schemas = FxHashMap::default();
-        schemas.insert(
-            "orders".to_string(),
-            Arc::new(Schema::new(vec![
-                Field::new("order_id", DataType::Int64, false),
-                Field::new("customer_id", DataType::Int64, true),
-                Field::new("name", DataType::Utf8, true),
-            ])) as SchemaRef,
-        );
-        (partial, schemas)
-    }
-
-    fn dim_schema() -> SchemaRef {
-        use arrow::datatypes::{DataType, Field, Schema};
-        Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, true),
-            Field::new("email", DataType::Utf8, true),
-            Field::new("region", DataType::Utf8, true),
-        ]))
-    }
-
-    #[test]
-    fn lookup_projection_unions_referenced_columns_plus_key() {
-        let pk = vec!["id".to_string()];
-        // q1 selects dim.name; q2 filters on dim.region. Union + key = id,name,region.
-        let q1 = "SELECT o.x, d.name FROM orders o JOIN dim d ON o.k = d.id";
-        let q2 = "SELECT o.y FROM orders o JOIN dim d ON o.k = d.id WHERE d.region = 'US'";
-        let proj = compute_lookup_projection(&dim_schema(), &pk, "dim", [q1, q2]);
-        assert_eq!(
-            proj,
-            vec![0, 1, 3],
-            "id(0)+name(1)+region(3); email(2) dropped"
-        );
-    }
-
-    #[test]
-    fn lookup_projection_bails_to_full_on_wildcard() {
-        let pk = vec!["id".to_string()];
-        let q = "SELECT * FROM orders o JOIN dim d ON o.k = d.id";
-        assert!(
-            compute_lookup_projection(&dim_schema(), &pk, "dim", [q]).is_empty(),
-            "a wildcard references every column, so fetch all"
-        );
-    }
-
-    #[test]
-    fn lookup_projection_empty_when_all_columns_used() {
-        let pk = vec!["id".to_string()];
-        let q = "SELECT d.name, d.email, d.region FROM orders o JOIN dim d ON o.k = d.id";
-        assert!(
-            compute_lookup_projection(&dim_schema(), &pk, "dim", [q]).is_empty(),
-            "full coverage collapses to empty (= fetch all)"
-        );
-    }
-
-    #[test]
-    fn lookup_enrich_detects_and_rewrites() {
-        let (partial, schemas) = lookup_fixtures();
-        let sql =
-            "SELECT o.order_id, c.name FROM orders o JOIN customers c ON o.customer_id = c.id";
-        let (cfg, proj) = detect_lookup_enrich_query(sql, &partial, &schemas);
-        let cfg = cfg.expect("partial lookup join should be detected");
-        assert_eq!(cfg.table_name, "customers");
-        assert_eq!(cfg.key_columns, vec!["customer_id".to_string()]);
-        let proj = proj.unwrap();
-        assert!(proj.contains("__lookup_enrich_tmp"));
-        // Qualifiers stripped; `c.name` collides with stream `name` → suffixed.
-        assert!(proj.contains("order_id"));
-        assert!(
-            proj.contains("name_customers"),
-            "collision not suffixed: {proj}"
-        );
-        assert!(
-            !proj.contains("o."),
-            "stream qualifier not stripped: {proj}"
-        );
-        assert!(
-            !proj.contains("c."),
-            "lookup qualifier not stripped: {proj}"
-        );
-    }
-
-    #[test]
-    fn lookup_enrich_rewrites_where_clause() {
-        let (partial, schemas) = lookup_fixtures();
-        let sql = "SELECT o.order_id FROM orders o JOIN customers c ON o.customer_id = c.id \
-                   WHERE c.name = 'vip'";
-        let (_, proj) = detect_lookup_enrich_query(sql, &partial, &schemas);
-        let proj = proj.unwrap();
-        // `c.name` in WHERE rewrites to the suffixed flattened column.
-        assert!(proj.contains("WHERE name_customers = 'vip'"), "{proj}");
-    }
-
-    #[test]
-    fn lookup_enrich_skips_non_partial_table() {
-        let (_partial, schemas) = lookup_fixtures();
-        let empty = FxHashMap::default();
-        let sql = "SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id";
-        let (cfg, _) = detect_lookup_enrich_query(sql, &empty, &schemas);
-        assert!(
-            cfg.is_none(),
-            "no partial tables → must fall through to DataFusion"
-        );
-    }
-
-    #[test]
-    fn extract_table_refs_plain() {
-        let refs = extract_table_references("SELECT * FROM events WHERE id > 1");
-        assert_eq!(refs.len(), 1);
-        assert!(refs.contains("events"));
-    }
-
-    #[test]
-    fn test_temporal_probe_strips_quoted_timestamp_columns() {
-        let sql = "SELECT t.s FROM trades t \
-                   TEMPORAL PROBE JOIN book r \
-                   ON (s) TIMESTAMPS (\"T\", \"E\") \
-                   LIST (0s, 1s) AS p";
-        let (config, _) = detect_temporal_probe_query(sql);
-        let config = config.expect("temporal probe detected");
-        assert_eq!(config.left_time_column, "T");
-        assert_eq!(config.right_time_column, "E");
-    }
-
-    #[test]
-    fn test_temporal_probe_ignores_literal_in_where() {
-        let sql = "SELECT * FROM trades WHERE msg = 'TEMPORAL PROBE JOIN'";
-        let (config, _) = detect_temporal_probe_query(sql);
-        assert!(
-            config.is_none(),
-            "must not detect a probe join inside a string literal"
-        );
-    }
-
-    #[test]
-    fn test_temporal_probe_ignores_block_comment_literal() {
-        let sql = "SELECT * FROM trades WHERE comment = '/* TEMPORAL PROBE JOIN */'";
-        let (config, _) = detect_temporal_probe_query(sql);
-        assert!(config.is_none());
-    }
-
-    #[test]
-    fn test_temporal_probe_through_block_comments() {
-        let sql = "SELECT t.s FROM trades t \
-                   /* outer */ TEMPORAL PROBE JOIN /* inner */ book r \
-                   ON (s) TIMESTAMPS (ts, ts) \
-                   LIST (0s, 1s) AS p";
-        let (config, _) = detect_temporal_probe_query(sql);
-        let config = config.expect("block comments must not block detection");
-        assert_eq!(config.left_table, "trades");
-        assert_eq!(config.right_table, "book");
-    }
-
-    #[test]
-    fn test_temporal_probe_qualified_quoted_timestamps() {
-        let sql = "SELECT t.s FROM trades t \
-                   TEMPORAL PROBE JOIN book r \
-                   ON (s) TIMESTAMPS (t.\"T\", r.\"E\") \
-                   LIST (0s, 1s) AS p";
-        let (config, _) = detect_temporal_probe_query(sql);
-        let config = config.expect("qualified quoted idents must resolve");
-        assert_eq!(config.left_time_column, "T");
-        assert_eq!(config.right_time_column, "E");
-    }
-
-    #[test]
-    fn test_temporal_probe_range_spec() {
-        let sql = "SELECT t.s FROM trades t \
-                   TEMPORAL PROBE JOIN book r \
-                   ON (s) TIMESTAMPS (ts, ts) \
-                   RANGE FROM 0s TO 30s STEP 5s AS p";
-        let (config, _) = detect_temporal_probe_query(sql);
-        let config = config.expect("range spec must parse");
-        // 0,5,10,15,20,25,30 = 7 offsets
-        assert_eq!(
-            config.expanded_offsets_ms.len(),
-            7,
-            "got {:?}",
-            config.expanded_offsets_ms
-        );
-    }
-
-    #[test]
-    fn extract_table_refs_tumble_in_from() {
-        let refs = extract_table_references(
-            "SELECT COUNT(*) FROM TUMBLE(events, ts, INTERVAL '10' SECOND) \
-             GROUP BY window_start",
-        );
-        assert_eq!(refs.len(), 1);
-        assert!(refs.contains("events"), "got {refs:?}");
-    }
-
-    #[test]
-    fn extract_table_refs_tumble_join() {
-        let refs = extract_table_references(
-            "SELECT * FROM TUMBLE(events, ts, INTERVAL '1' MINUTE) e \
-             JOIN dim ON e.key = dim.key",
-        );
-        assert!(refs.contains("events"), "got {refs:?}");
-        assert!(refs.contains("dim"), "got {refs:?}");
-    }
-
-    #[test]
-    fn extract_table_refs_temporal_probe_join() {
-        let refs = extract_table_references(
-            "SELECT t.s FROM trades t \
-             TEMPORAL PROBE JOIN prices r ON (s) TIMESTAMPS (ts, ts) \
-             LIST (0s, 5s) AS p",
-        );
-        assert!(refs.contains("trades"), "got {refs:?}");
-        assert!(refs.contains("prices"), "got {refs:?}");
-    }
-
-    #[test]
-    fn single_source_tumble() {
-        let name =
-            single_source_table("SELECT COUNT(*) FROM TUMBLE(trades, ts, INTERVAL '5' SECOND)");
-        assert_eq!(name.as_deref(), Some("trades"));
-    }
-
-    #[test]
-    fn is_window_tvf_case_insensitive() {
-        assert!(is_window_tvf("TUMBLE"));
-        assert!(is_window_tvf("tumble"));
-        assert!(is_window_tvf("Hop"));
-        assert!(is_window_tvf("SESSION"));
-        assert!(!is_window_tvf("my_func"));
-    }
-}
+mod frame_plan_tests;
 
 #[cfg(test)]
-mod self_join_filter_tests {
-    use super::*;
+mod tests;
 
-    #[test]
-    fn test_basic_self_join_simple_predicates() {
-        let d = detect_stream_join_query(
-            "SELECT l.key, r.key FROM events l \
-             JOIN events r ON l.key = r.key \
-             AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '10' SECOND \
-             WHERE l.type = 'A' AND r.type = 'B'",
-        )
-        .expect("should detect self-join");
-
-        assert_eq!(d.left_pre_filter.as_deref(), Some("type = 'A'"));
-        assert_eq!(d.right_pre_filter.as_deref(), Some("type = 'B'"));
-        // Only the directional filter remains (user's WHERE pushed to
-        // pre-filters); no user-derived predicate stays post-join.
-        assert!(
-            !d.projection_sql.contains("type"),
-            "user predicates should be pushed to pre-filters, got: {}",
-            d.projection_sql
-        );
-    }
-
-    #[test]
-    fn test_cross_alias_predicate_stays_post_join() {
-        let d = detect_stream_join_query(
-            "SELECT p.key FROM events p \
-             JOIN events a ON p.key = a.key \
-             AND a.ts BETWEEN p.ts AND p.ts + INTERVAL '10' SECOND \
-             WHERE p.type = 'A' AND a.type = 'B' AND p.cost > a.cost",
-        )
-        .expect("should detect self-join");
-
-        assert_eq!(d.left_pre_filter.as_deref(), Some("type = 'A'"));
-        assert_eq!(d.right_pre_filter.as_deref(), Some("type = 'B'"));
-        assert!(
-            d.projection_sql.contains("WHERE"),
-            "cross-alias p.cost > a.cost should stay post-join: {}",
-            d.projection_sql
-        );
-    }
-
-    #[test]
-    fn test_unqualified_column_stays_post_join() {
-        let d = detect_stream_join_query(
-            "SELECT p.key FROM events p \
-             JOIN events a ON p.key = a.key \
-             AND a.ts BETWEEN p.ts AND p.ts + INTERVAL '10' SECOND \
-             WHERE p.type = 'A' AND status = 'active'",
-        )
-        .expect("should detect self-join");
-
-        assert_eq!(d.left_pre_filter.as_deref(), Some("type = 'A'"));
-        assert!(d.right_pre_filter.is_none());
-        assert!(
-            d.projection_sql.contains("WHERE"),
-            "unqualified 'status' should stay post-join: {}",
-            d.projection_sql
-        );
-    }
-
-    #[test]
-    fn test_non_self_join_no_pre_filters() {
-        let d = detect_stream_join_query(
-            "SELECT o.order_id FROM orders o \
-             JOIN payments p ON o.order_id = p.order_id \
-             AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' HOUR \
-             WHERE o.amount > 100",
-        )
-        .expect("should detect interval join");
-
-        assert!(d.left_pre_filter.is_none());
-        assert!(d.right_pre_filter.is_none());
-        assert!(d.projection_sql.contains("WHERE"));
-    }
-
-    #[test]
-    fn test_left_join_keeps_right_predicate_in_post_where() {
-        let d = detect_stream_join_query(
-            "SELECT p.key FROM events p \
-             LEFT JOIN events a ON p.key = a.key \
-             AND a.ts BETWEEN p.ts AND p.ts + INTERVAL '10' SECOND \
-             WHERE p.type = 'A' AND a.type = 'B'",
-        )
-        .expect("should detect self-join");
-
-        assert_eq!(d.left_pre_filter.as_deref(), Some("type = 'A'"));
-        assert_eq!(d.right_pre_filter.as_deref(), Some("type = 'B'"));
-        assert!(
-            d.projection_sql.contains("WHERE"),
-            "LEFT JOIN must keep right predicate in WHERE: {}",
-            d.projection_sql
-        );
-    }
-
-    #[test]
-    fn test_residual_self_join_aliases_collisions() {
-        // `p.type` and `a.type` both rewrite to step-0 columns and would
-        // otherwise alias to `AS type` twice. Collision-aware aliasing
-        // must emit `AS p_type` / `AS a_type` so output names stay unique.
-        let d = detect_stream_join_query(
-            "SELECT p.type, a.type, p.key FROM events p \
-             JOIN events a ON p.key = a.key \
-             AND a.ts BETWEEN p.ts AND p.ts + INTERVAL '10' SECOND \
-             JOIN dim d ON d.key = p.key",
-        )
-        .expect("should detect self-join");
-
-        assert!(
-            d.projection_sql.contains("AS p_type"),
-            "expected `AS p_type`, got: {}",
-            d.projection_sql
-        );
-        assert!(
-            d.projection_sql.contains("AS a_type"),
-            "expected `AS a_type`, got: {}",
-            d.projection_sql
-        );
-        // Non-colliding `p.key` keeps the natural-name alias.
-        assert!(
-            d.projection_sql.contains("AS key"),
-            "non-colliding `p.key` should still alias to `key`: {}",
-            d.projection_sql
-        );
-    }
-
-    #[test]
-    fn test_self_join_no_where_clause() {
-        let d = detect_stream_join_query(
-            "SELECT l.key, r.key FROM events l \
-             JOIN events r ON l.key = r.key \
-             AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '10' SECOND",
-        )
-        .expect("should detect self-join");
-
-        assert!(d.left_pre_filter.is_none());
-        assert!(d.right_pre_filter.is_none());
-    }
-
-    #[test]
-    fn test_nested_function_predicate() {
-        let d = detect_stream_join_query(
-            "SELECT p.key FROM events p \
-             JOIN events a ON p.key = a.key \
-             AND a.ts BETWEEN p.ts AND p.ts + INTERVAL '10' SECOND \
-             WHERE jsonb_get_text(from_json(p.attrs), 'name') = 'prompt' \
-             AND jsonb_get_text(from_json(a.attrs), 'name') = 'api'",
-        )
-        .expect("should detect self-join");
-
-        assert!(d.left_pre_filter.is_some());
-        assert!(d.right_pre_filter.is_some());
-        let left = d.left_pre_filter.unwrap();
-        assert!(!left.contains("p."), "alias should be stripped: {left}");
-        assert!(left.contains("attrs"), "column name should survive: {left}");
-    }
-
-    #[test]
-    fn test_cast_predicate_classified_correctly() {
-        let d = detect_stream_join_query(
-            "SELECT l.key FROM events l \
-             JOIN events r ON l.key = r.key \
-             AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '10' SECOND \
-             WHERE CAST(l.duration AS DOUBLE) > 1000",
-        )
-        .expect("should detect self-join");
-
-        assert!(d.left_pre_filter.is_some());
-        assert!(d.right_pre_filter.is_none());
-        let left = d.left_pre_filter.unwrap();
-        assert!(!left.contains("l."), "alias should be stripped: {left}");
-    }
-
-    #[test]
-    fn test_is_not_null_predicate() {
-        let d = detect_stream_join_query(
-            "SELECT l.key FROM events l \
-             JOIN events r ON l.key = r.key \
-             AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '10' SECOND \
-             WHERE l.name IS NOT NULL AND r.name IS NOT NULL",
-        )
-        .expect("should detect self-join");
-
-        assert!(d.left_pre_filter.is_some());
-        assert!(d.right_pre_filter.is_some());
-        let left = d.left_pre_filter.unwrap();
-        assert!(
-            left.contains("IS NOT NULL"),
-            "should preserve IS NOT NULL: {left}"
-        );
-        assert!(!left.contains("l."), "alias should be stripped: {left}");
-    }
-
-    #[test]
-    fn test_string_literal_containing_alias_not_corrupted() {
-        let d = detect_stream_join_query(
-            "SELECT p.key FROM events p \
-             JOIN events a ON p.key = a.key \
-             AND a.ts BETWEEN p.ts AND p.ts + INTERVAL '10' SECOND \
-             WHERE a.type = 'p.internal'",
-        )
-        .expect("should detect self-join");
-
-        assert!(d.left_pre_filter.is_none());
-        assert!(d.right_pre_filter.is_some());
-        let right = d.right_pre_filter.unwrap();
-        assert!(
-            right.contains("'p.internal'"),
-            "string literal must not be corrupted: {right}"
-        );
-    }
-}
+#[cfg(test)]
+mod self_join_filter_tests;

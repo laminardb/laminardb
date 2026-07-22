@@ -9,12 +9,12 @@
 //!
 //! - Time series collections only accept `insert` operations; other write
 //!   modes are rejected at the sink level.
-//! - Granularity can only be increased (seconds → minutes → hours), never
-//!   decreased after collection creation.
 //! - `MongoDB` does not support `watch()` (change streams) on time series
-//!   collections — the source pre-flight guard rejects these.
+//!   collections — a source targeting one named collection rejects these.
 
 use crate::error::ConnectorError;
+
+const MAX_CUSTOM_BUCKET_SPAN_SECONDS: u32 = 31_536_000;
 
 /// Whether the target collection is a standard or time series collection.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -47,6 +47,75 @@ pub struct TimeSeriesConfig {
     pub expire_after_seconds: Option<u64>,
 }
 
+impl TimeSeriesConfig {
+    /// Validate server-enforced time-series collection invariants before I/O.
+    pub(crate) fn validate(&self) -> Result<(), ConnectorError> {
+        validate_field_name(&self.time_field, "time_field")?;
+        if let Some(meta_field) = self.meta_field.as_deref() {
+            validate_field_name(meta_field, "meta_field")?;
+            if meta_field == self.time_field {
+                return Err(ConnectorError::ConfigurationError(
+                    "time series meta_field must differ from time_field".into(),
+                ));
+            }
+            if meta_field == "_id" {
+                return Err(ConnectorError::ConfigurationError(
+                    "time series meta_field must not be '_id'".into(),
+                ));
+            }
+        }
+        if self
+            .expire_after_seconds
+            .is_some_and(|ttl| ttl > u64::try_from(i64::MAX).expect("i64::MAX fits u64"))
+        {
+            return Err(ConnectorError::ConfigurationError(
+                "time series expire_after_seconds exceeds MongoDB's signed 64-bit range".into(),
+            ));
+        }
+        if let TimeSeriesGranularity::Custom {
+            bucket_max_span_seconds,
+            bucket_rounding_seconds,
+        } = self.granularity
+        {
+            validate_custom_bucket(bucket_max_span_seconds, bucket_rounding_seconds)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_field_name(field: &str, label: &str) -> Result<(), ConnectorError> {
+    if field.trim().is_empty() {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "time series {label} must not be empty"
+        )));
+    }
+    if field.contains('\0') {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "time series {label} must not contain NUL"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_custom_bucket(
+    bucket_max_span_seconds: u32,
+    bucket_rounding_seconds: u32,
+) -> Result<(), ConnectorError> {
+    if bucket_max_span_seconds != bucket_rounding_seconds {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "time series custom granularity requires bucket_max_span_seconds ({bucket_max_span_seconds}) \
+             == bucket_rounding_seconds ({bucket_rounding_seconds})"
+        )));
+    }
+    if !(1..=MAX_CUSTOM_BUCKET_SPAN_SECONDS).contains(&bucket_max_span_seconds) {
+        return Err(ConnectorError::ConfigurationError(format!(
+            "time series custom granularity bucket_max_span_seconds must be between 1 and \
+             {MAX_CUSTOM_BUCKET_SPAN_SECONDS}"
+        )));
+    }
+    Ok(())
+}
+
 /// Time series bucketing granularity.
 ///
 /// Controls the bucket span for time series collections:
@@ -58,9 +127,6 @@ pub struct TimeSeriesConfig {
 /// | Hours       | 30 days     |
 /// | Custom      | User-defined (`MongoDB` ≥ 6.3) |
 ///
-/// Granularity can only increase (seconds → minutes → hours) on an
-/// existing collection. Attempting to decrease returns
-/// `GranularityDecreaseDenied`.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
 )]
@@ -97,59 +163,11 @@ impl TimeSeriesGranularity {
         bucket_max_span_seconds: u32,
         bucket_rounding_seconds: u32,
     ) -> Result<Self, ConnectorError> {
-        if bucket_max_span_seconds != bucket_rounding_seconds {
-            return Err(ConnectorError::ConfigurationError(format!(
-                "time series custom granularity requires bucket_max_span_seconds ({bucket_max_span_seconds}) \
-                 == bucket_rounding_seconds ({bucket_rounding_seconds})"
-            )));
-        }
-        if bucket_max_span_seconds == 0 {
-            return Err(ConnectorError::ConfigurationError(
-                "time series custom granularity bucket_max_span_seconds must be > 0".to_string(),
-            ));
-        }
+        validate_custom_bucket(bucket_max_span_seconds, bucket_rounding_seconds)?;
         Ok(Self::Custom {
             bucket_max_span_seconds,
             bucket_rounding_seconds,
         })
-    }
-
-    /// Returns an ordinal for comparison (higher = coarser granularity).
-    /// Custom granularity returns the span as its ordinal.
-    #[must_use]
-    fn ordinal(self) -> u32 {
-        match self {
-            Self::Seconds => 1,
-            Self::Minutes => 2,
-            Self::Hours => 3,
-            Self::Custom {
-                bucket_max_span_seconds,
-                ..
-            } => bucket_max_span_seconds,
-        }
-    }
-
-    /// Returns `true` if `self` is a finer (or equal) granularity than `other`.
-    ///
-    /// Used to validate that granularity changes only increase.
-    #[must_use]
-    pub fn is_finer_or_equal(self, other: Self) -> bool {
-        self.ordinal() <= other.ordinal()
-    }
-
-    /// Validates that changing from `current` to `requested` is allowed.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ConnectorError::ConfigurationError` if the change would
-    /// decrease granularity.
-    pub fn validate_change(current: Self, requested: Self) -> Result<(), ConnectorError> {
-        if !current.is_finer_or_equal(requested) {
-            return Err(ConnectorError::ConfigurationError(format!(
-                "cannot decrease time series granularity from {current:?} to {requested:?}"
-            )));
-        }
-        Ok(())
     }
 }
 
@@ -194,34 +212,13 @@ mod tests {
     #[test]
     fn test_custom_granularity_zero() {
         let err = TimeSeriesGranularity::custom(0, 0).unwrap_err();
-        assert!(err.to_string().contains("must be > 0"));
+        assert!(err.to_string().contains("between 1"));
     }
 
     #[test]
-    fn test_granularity_ordering() {
-        assert!(TimeSeriesGranularity::Seconds.is_finer_or_equal(TimeSeriesGranularity::Minutes));
-        assert!(TimeSeriesGranularity::Minutes.is_finer_or_equal(TimeSeriesGranularity::Hours));
-        assert!(!TimeSeriesGranularity::Hours.is_finer_or_equal(TimeSeriesGranularity::Seconds));
-        assert!(TimeSeriesGranularity::Seconds.is_finer_or_equal(TimeSeriesGranularity::Seconds));
-    }
-
-    #[test]
-    fn test_validate_change_increase_ok() {
-        TimeSeriesGranularity::validate_change(
-            TimeSeriesGranularity::Seconds,
-            TimeSeriesGranularity::Minutes,
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn test_validate_change_decrease_denied() {
-        let err = TimeSeriesGranularity::validate_change(
-            TimeSeriesGranularity::Hours,
-            TimeSeriesGranularity::Seconds,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("decrease"));
+    fn custom_granularity_rejects_server_limit_overflow() {
+        let error = TimeSeriesGranularity::custom(31_536_001, 31_536_001).unwrap_err();
+        assert!(error.to_string().contains("31536000"));
     }
 
     #[test]
@@ -239,5 +236,53 @@ mod tests {
         assert_eq!(TimeSeriesGranularity::Hours.to_string(), "hours");
         let custom = TimeSeriesGranularity::custom(7200, 7200).unwrap();
         assert_eq!(custom.to_string(), "custom(7200s)");
+    }
+
+    #[test]
+    fn time_series_config_rejects_conflicting_metadata_and_ttl_overflow() {
+        let mut config = TimeSeriesConfig {
+            time_field: "ts".into(),
+            meta_field: Some("ts".into()),
+            granularity: TimeSeriesGranularity::Seconds,
+            expire_after_seconds: None,
+        };
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("differ"));
+
+        config.meta_field = Some("_id".into());
+        assert!(config.validate().unwrap_err().to_string().contains("_id"));
+
+        config.meta_field = None;
+        config.expire_after_seconds = Some(u64::try_from(i64::MAX).unwrap() + 1);
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("signed 64-bit"));
+    }
+
+    #[test]
+    fn config_validation_cannot_bypass_field_and_custom_bucket_invariants() {
+        let mut config = TimeSeriesConfig {
+            time_field: "bad\0field".into(),
+            meta_field: None,
+            granularity: TimeSeriesGranularity::Seconds,
+            expire_after_seconds: None,
+        };
+        assert!(config.validate().unwrap_err().to_string().contains("NUL"));
+
+        config.time_field = "ts".into();
+        config.granularity = TimeSeriesGranularity::Custom {
+            bucket_max_span_seconds: 60,
+            bucket_rounding_seconds: 30,
+        };
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("bucket_rounding_seconds"));
     }
 }

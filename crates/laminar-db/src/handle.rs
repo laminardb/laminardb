@@ -47,6 +47,9 @@ pub struct DdlInfo {
     pub statement_type: String,
     /// Object affected.
     pub object_name: String,
+    /// Whether this statement changed catalog/runtime state. `IF NOT EXISTS`
+    /// success uses `false` so the attempted definition cannot replace durable DDL.
+    pub(crate) applied: bool,
 }
 
 /// Handle to a running streaming query.
@@ -97,18 +100,6 @@ impl QueryHandle {
             .ok_or_else(|| DbError::InvalidOperation("Subscription already consumed".to_string()))
     }
 
-    /// Subscribe to typed results. `T` must derive `FromRecordBatch`.
-    ///
-    /// # Errors
-    /// Returns error if subscription was already consumed.
-    pub fn subscribe<T: FromBatch>(&mut self) -> Result<TypedSubscription<T>, DbError> {
-        let sub = self.subscribe_raw()?;
-        Ok(TypedSubscription {
-            inner: sub,
-            _phantom: PhantomData,
-        })
-    }
-
     /// Cancel the query and drop its subscription.
     pub fn cancel(&mut self) {
         self.active = false;
@@ -131,70 +122,184 @@ pub trait FromBatch: Sized {
     fn from_batch_all(batch: &RecordBatch) -> Vec<Self>;
 }
 
-/// Typed subscription that deserializes `RecordBatch` rows.
+/// A typed frame from a named subscription.
+#[derive(Debug)]
+pub enum TypedSubscriptionFrame<T> {
+    /// Rows emitted by one processing cycle.
+    Rows {
+        /// Deserialized rows in the shared-log entry.
+        rows: Vec<T>,
+        /// Physical sequence within this in-memory object incarnation; not a durable resume token.
+        sequence: u64,
+    },
+    /// Durable progress frontier for this checkpoint.
+    Barrier {
+        /// Physical sequence of this progress entry within the current object incarnation.
+        sequence: u64,
+        /// Engine checkpoint epoch.
+        epoch: u64,
+        /// Engine checkpoint identifier.
+        checkpoint_id: u64,
+        /// Every logical entry below this sequence is covered by the cut.
+        through_sequence: u64,
+    },
+}
+
+/// Terminal failure from a named subscription.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SubscriptionError {
+    /// The consumer fell behind the bounded shared log.
+    #[error("subscription fell behind by {skipped} entries")]
+    Lagged {
+        /// Number of entries no longer available.
+        skipped: u64,
+    },
+    /// The subscribed object or its delivery path failed.
+    #[error("subscription failed: {message}")]
+    Failed {
+        /// Failure detail.
+        message: String,
+    },
+}
+
+/// Typed subscription that deserializes named-stream `RecordBatch` rows.
 pub struct TypedSubscription<T: FromBatch> {
-    inner: Subscription<ArrowRecord>,
+    portal: crate::subscription::SubscriptionPortal,
     _phantom: PhantomData<T>,
 }
 
 impl<T: FromBatch> TypedSubscription<T> {
-    pub(crate) fn from_raw(sub: Subscription<ArrowRecord>) -> Self {
+    pub(crate) fn new(portal: crate::subscription::SubscriptionPortal) -> Self {
         Self {
-            inner: sub,
+            portal,
             _phantom: PhantomData,
         }
     }
 
-    /// Non-blocking poll for the next batch.
-    pub fn poll(&mut self) -> Option<Vec<T>> {
-        self.inner.poll().map(|batch| T::from_batch_all(&batch))
+    /// Schema resolved while the portal was attached under the topology lock.
+    #[must_use]
+    pub fn schema(&self) -> SchemaRef {
+        self.portal.schema()
     }
 
-    /// Blocking receive.
+    /// Wait for the next data or checkpoint frame.
     ///
     /// # Errors
-    /// Returns `RecvError` if the channel is closed.
-    pub fn recv(&mut self) -> Result<Vec<T>, laminar_core::streaming::RecvError> {
-        self.inner.recv().map(|batch| T::from_batch_all(&batch))
-    }
-
-    /// Receive with timeout.
-    ///
-    /// # Errors
-    /// Returns `RecvError` on timeout or closed channel.
-    pub fn recv_timeout(
+    /// Returns a terminal error if delivery has a gap or the object fails.
+    pub async fn next_frame(
         &mut self,
-        timeout: Duration,
-    ) -> Result<Vec<T>, laminar_core::streaming::RecvError> {
-        self.inner
-            .recv_timeout(timeout)
-            .map(|batch| T::from_batch_all(&batch))
+    ) -> Result<Option<TypedSubscriptionFrame<T>>, SubscriptionError> {
+        self.portal
+            .next_frame()
+            .await
+            .map(convert_typed_frame)
+            .transpose()
     }
 
-    /// Callback-based drain. Return `false` from `f` to stop.
-    pub fn poll_each<F: FnMut(T) -> bool>(&mut self, max_batches: usize, mut f: F) -> usize {
-        let mut count = 0;
-        for _ in 0..max_batches {
-            match self.inner.poll() {
-                Some(batch) => {
-                    let items = T::from_batch_all(&batch);
-                    for item in items {
-                        count += 1;
-                        if !f(item) {
-                            return count;
-                        }
-                    }
-                }
-                None => break,
+    /// Return the next immediately available data or checkpoint frame.
+    ///
+    /// # Errors
+    /// Returns a terminal error if delivery has a gap or the object fails.
+    pub fn try_next_frame(
+        &mut self,
+    ) -> Result<Option<TypedSubscriptionFrame<T>>, SubscriptionError> {
+        self.portal
+            .try_next_frame()
+            .map(convert_typed_frame)
+            .transpose()
+    }
+
+    /// Return the next immediately available row batch, skipping checkpoint markers.
+    ///
+    /// # Errors
+    /// Returns a terminal error if delivery has a gap or the object fails.
+    pub fn poll(&mut self) -> Result<Option<Vec<T>>, SubscriptionError> {
+        loop {
+            match self.try_next_frame()? {
+                Some(TypedSubscriptionFrame::Rows { rows, .. }) => return Ok(Some(rows)),
+                Some(TypedSubscriptionFrame::Barrier { .. }) => {}
+                None => return Ok(None),
             }
         }
-        count
+    }
+}
+
+fn convert_typed_frame<T: FromBatch>(
+    frame: crate::subscription::PortalFrame,
+) -> Result<TypedSubscriptionFrame<T>, SubscriptionError> {
+    match frame {
+        crate::subscription::PortalFrame::Batch {
+            batch,
+            sequence,
+            lease: _lease,
+        } => Ok(TypedSubscriptionFrame::Rows {
+            rows: T::from_batch_all(&batch),
+            sequence,
+        }),
+        crate::subscription::PortalFrame::Barrier {
+            sequence,
+            epoch,
+            checkpoint_id,
+            through_sequence,
+        } => Ok(TypedSubscriptionFrame::Barrier {
+            sequence,
+            epoch,
+            checkpoint_id,
+            through_sequence,
+        }),
+        crate::subscription::PortalFrame::Lagged(skipped) => {
+            Err(SubscriptionError::Lagged { skipped })
+        }
+        crate::subscription::PortalFrame::Error { message } => {
+            Err(SubscriptionError::Failed { message })
+        }
     }
 }
 
 impl<T: FromBatch> std::fmt::Debug for TypedSubscription<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TypedSubscription").finish()
+        f.debug_struct("TypedSubscription")
+            .field("portal", &self.portal)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod typed_subscription_tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct Row;
+
+    impl FromBatch for Row {
+        fn from_batch(_batch: &RecordBatch, _row: usize) -> Self {
+            Self
+        }
+
+        fn from_batch_all(_batch: &RecordBatch) -> Vec<Self> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn delivery_gap_is_not_converted_to_empty_poll() {
+        let error =
+            convert_typed_frame::<Row>(crate::subscription::PortalFrame::Lagged(7)).unwrap_err();
+        assert_eq!(error, SubscriptionError::Lagged { skipped: 7 });
+    }
+
+    #[test]
+    fn delivery_failure_preserves_detail() {
+        let error = convert_typed_frame::<Row>(crate::subscription::PortalFrame::Error {
+            message: "object dropped".into(),
+        })
+        .unwrap_err();
+        assert_eq!(
+            error,
+            SubscriptionError::Failed {
+                message: "object dropped".into()
+            }
+        );
     }
 }
 

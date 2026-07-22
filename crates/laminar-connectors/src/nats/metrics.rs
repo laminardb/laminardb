@@ -52,8 +52,11 @@ impl NatsSourceMetrics {
                 c
             }};
         }
-        let pending_acks =
-            IntGauge::new("nats_source_pending_acks", "Unacked JetStream messages").unwrap();
+        let pending_acks = IntGauge::new(
+            "nats_source_pending_acks",
+            "JetStream acks queued or in flight",
+        )
+        .unwrap();
         register_collector(reg, "nats_source_pending_acks", &pending_acks);
         let consumer_lag = IntGauge::new(
             "nats_source_consumer_lag",
@@ -84,19 +87,41 @@ impl NatsSourceMetrics {
         self.fetch_errors_total.inc();
     }
 
+    pub(crate) fn record_ack_enqueued(&self) {
+        self.pending_acks.inc();
+    }
+
     #[allow(missing_docs)]
     pub fn record_ack(&self) {
         self.acks_total.inc();
+        self.pending_acks.dec();
     }
 
     #[allow(missing_docs)]
     pub fn record_ack_error(&self) {
         self.ack_errors_total.inc();
+        self.pending_acks.dec();
+    }
+
+    pub(crate) fn record_ack_enqueue_errors(&self, n: usize) {
+        self.ack_errors_total
+            .inc_by(u64::try_from(n).unwrap_or(u64::MAX));
     }
 
     #[allow(missing_docs, clippy::cast_possible_wrap)]
-    pub fn set_pending_acks(&self, n: usize) {
-        self.pending_acks.set(n as i64);
+    pub fn record_ack_abandoned(&self, n: usize) {
+        self.ack_errors_total
+            .inc_by(u64::try_from(n).unwrap_or(u64::MAX));
+        self.pending_acks.sub(n as i64);
+    }
+
+    pub(crate) fn record_abandoned_acks(&self) {
+        let pending = self.pending_acks.get();
+        if pending > 0 {
+            self.ack_errors_total
+                .inc_by(u64::try_from(pending).unwrap_or(u64::MAX));
+            self.pending_acks.set(0);
+        }
     }
 
     #[allow(missing_docs, clippy::cast_possible_wrap)]
@@ -115,7 +140,6 @@ pub struct NatsSinkMetrics {
     pub ack_errors_total: IntCounter,
     /// Publishes the broker dropped as `Nats-Msg-Id` duplicates.
     pub dedup_total: IntCounter,
-    pub epochs_rolled_back: IntCounter,
     pub pending_futures: IntGauge,
 }
 
@@ -145,7 +169,6 @@ impl NatsSinkMetrics {
             publish_errors_total: reg_c!("nats_sink_publish_errors_total", "Publish errors"),
             ack_errors_total: reg_c!("nats_sink_ack_errors_total", "Publish-ack errors"),
             dedup_total: reg_c!("nats_sink_dedup_total", "Broker-dropped duplicates"),
-            epochs_rolled_back: reg_c!("nats_sink_epochs_rolled_back_total", "Epochs rolled back"),
             pending_futures,
         }
     }
@@ -169,11 +192,6 @@ impl NatsSinkMetrics {
     #[allow(missing_docs)]
     pub fn record_dedup(&self) {
         self.dedup_total.inc();
-    }
-
-    #[allow(missing_docs)]
-    pub fn record_rollback(&self) {
-        self.epochs_rolled_back.inc();
     }
 
     #[allow(missing_docs, clippy::cast_possible_wrap)]
@@ -200,10 +218,14 @@ mod tests {
         let m = NatsSourceMetrics::new(None);
         m.record_poll(100, 4096);
         m.record_poll(50, 1024);
+        m.record_ack_enqueued();
         m.record_ack();
-        m.record_ack();
+        m.record_ack_enqueued();
+        m.record_ack_error();
+        m.record_ack_enqueued();
+        m.record_ack_enqueued();
+        m.record_ack_abandoned(2);
         m.record_fetch_error();
-        m.set_pending_acks(7);
 
         m.set_consumer_lag(42);
 
@@ -211,8 +233,9 @@ mod tests {
         assert_eq!(m.bytes_total.get(), 5120);
         assert_eq!(m.fetch_errors_total.get(), 1);
         assert_eq!(m.consumer_lag.get(), 42);
-        assert_eq!(m.acks_total.get(), 2);
-        assert_eq!(m.pending_acks.get(), 7);
+        assert_eq!(m.acks_total.get(), 1);
+        assert_eq!(m.ack_errors_total.get(), 3);
+        assert_eq!(m.pending_acks.get(), 0);
     }
 
     #[test]
@@ -223,14 +246,12 @@ mod tests {
         }
         m.record_dedup();
         m.record_dedup();
-        m.record_rollback();
         m.set_pending_futures(3);
 
         assert_eq!(m.records_total.get(), 10);
         assert_eq!(m.bytes_total.get(), 2000);
         assert_eq!(m.pending_futures.get(), 3);
         assert_eq!(m.dedup_total.get(), 2);
-        assert_eq!(m.epochs_rolled_back.get(), 1);
     }
 
     #[test]

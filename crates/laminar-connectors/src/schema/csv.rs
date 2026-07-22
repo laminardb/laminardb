@@ -222,23 +222,26 @@ impl FormatDecoder for CsvDecoder {
         self.schema.clone()
     }
 
-    /// Decodes a batch of raw CSV records into an Arrow `RecordBatch`.
-    ///
-    /// Each `RawRecord.value` contains one or more CSV lines (typically one
-    /// line per record for streaming sources; may contain multiple lines
-    /// for file-based sources).
-    ///
-    /// # Algorithm
-    ///
-    /// 1. Initialize one Arrow `ArrayBuilder` per schema column.
-    /// 2. Concatenate all raw record bytes into a single buffer.
-    /// 3. Create a `csv::Reader` with pre-configured settings.
-    /// 4. For each CSV row:
-    ///    - Skip rows per `skip_rows` config.
-    ///    - For each field: apply the pre-computed `CsvCoercion`.
-    ///    - Handle field count mismatches per config.
-    /// 5. Finish all builders and assemble into `RecordBatch`.
     fn decode_batch(&self, records: &[RawRecord]) -> SchemaResult<RecordBatch> {
+        let values: Vec<&[u8]> = records
+            .iter()
+            .map(|record| record.value.as_slice())
+            .collect();
+        self.decode_slices(&values)
+    }
+
+    fn format_name(&self) -> &'static str {
+        "csv"
+    }
+}
+
+impl CsvDecoder {
+    /// Decodes borrowed CSV payloads without first copying them into raw records.
+    ///
+    /// # Errors
+    ///
+    /// Returns a decode error for malformed CSV or values incompatible with the schema.
+    pub fn decode_slices(&self, records: &[&[u8]]) -> SchemaResult<RecordBatch> {
         if records.is_empty() {
             return Ok(RecordBatch::new_empty(self.schema.clone()));
         }
@@ -250,10 +253,10 @@ impl FormatDecoder for CsvDecoder {
         let mut builders = create_builders(&self.schema, capacity);
 
         // Concatenate all raw record bytes, ensuring newline separation.
-        let mut combined = Vec::with_capacity(records.iter().map(|r| r.value.len() + 1).sum());
+        let mut combined = Vec::with_capacity(records.iter().map(|record| record.len() + 1).sum());
         for record in records {
-            combined.extend_from_slice(&record.value);
-            if !record.value.ends_with(b"\n") {
+            combined.extend_from_slice(record);
+            if !record.ends_with(b"\n") {
                 combined.push(b'\n');
             }
         }
@@ -342,11 +345,6 @@ impl FormatDecoder for CsvDecoder {
 
         RecordBatch::try_new(self.schema.clone(), columns)
             .map_err(|e| SchemaError::DecodeError(format!("RecordBatch construction: {e}")))
-    }
-
-    #[allow(clippy::unnecessary_literal_bound)]
-    fn format_name(&self) -> &str {
-        "csv"
     }
 }
 
@@ -582,8 +580,7 @@ impl FormatEncoder for CsvEncoder {
         Ok(output)
     }
 
-    #[allow(clippy::unnecessary_literal_bound)]
-    fn format_name(&self) -> &str {
+    fn format_name(&self) -> &'static str {
         "csv"
     }
 }

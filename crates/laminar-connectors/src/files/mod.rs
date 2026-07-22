@@ -13,8 +13,8 @@ pub mod sink;
 pub mod source;
 pub mod text_decoder;
 
-pub use config::{FileFormat, FileSinkConfig, FileSourceConfig, SinkMode};
-pub use manifest::{FileEntry, FileIngestionManifest};
+pub use config::{FileFormat, FileSinkConfig, FileSourceConfig};
+pub use manifest::FileIngestionManifest;
 pub use sink::FileSink;
 pub use source::FileSource;
 pub use text_decoder::TextLineDecoder;
@@ -24,7 +24,13 @@ pub use text_decoder::TextLineDecoder;
 /// This is called by `LaminarDB::register_builtin_connectors()` when the
 /// `files` feature is enabled, and makes `connector = 'files'` available
 /// in `CREATE SOURCE` statements.
-pub fn register_file_source(registry: &ConnectorRegistry) {
+///
+/// # Errors
+///
+/// Returns an error if the connector name is already registered or the registry is frozen.
+pub fn register_file_source(
+    registry: &ConnectorRegistry,
+) -> Result<(), crate::error::ConnectorError> {
     use crate::config::ConfigKeySpec;
     let info = ConnectorInfo {
         name: "files".to_string(),
@@ -49,16 +55,24 @@ pub fn register_file_source(registry: &ConnectorRegistry) {
     registry.register_source(
         "files",
         info,
-        Arc::new(|registry: Option<&prometheus::Registry>| {
-            Box::new(FileSource::with_registry(registry))
+        Arc::new(|registry: Option<&Arc<prometheus::Registry>>| {
+            Ok(Box::new(FileSource::with_registry(
+                registry.map(Arc::as_ref),
+            )))
         }),
-    );
+    )
 }
 
 /// Registers the file sink connector in the registry.
 ///
 /// Makes `connector = 'files'` available in `CREATE SINK` statements.
-pub fn register_file_sink(registry: &ConnectorRegistry) {
+///
+/// # Errors
+///
+/// Returns an error if the connector name is already registered or the registry is frozen.
+pub fn register_file_sink(
+    registry: &ConnectorRegistry,
+) -> Result<(), crate::error::ConnectorError> {
     use crate::config::ConfigKeySpec;
     let info = ConnectorInfo {
         name: "files".to_string(),
@@ -69,17 +83,16 @@ pub fn register_file_sink(registry: &ConnectorRegistry) {
         config_keys: vec![
             ConfigKeySpec::required("path", "Output directory path"),
             ConfigKeySpec::required("format", "Output format (csv, json, text, parquet, arrow)"),
-            ConfigKeySpec::optional("mode", "Write mode (append, rolling)", "rolling"),
-            ConfigKeySpec::optional("prefix", "File name prefix for rolling mode", "part"),
+            ConfigKeySpec::optional("prefix", "Immutable output file name prefix", "part"),
         ],
     };
     registry.register_sink(
         "files",
         info,
-        Arc::new(|registry: Option<&prometheus::Registry>| {
-            Box::new(FileSink::with_registry(registry))
+        Arc::new(|_config, registry: Option<&Arc<prometheus::Registry>>| {
+            Ok(Box::new(FileSink::with_registry(registry.map(Arc::as_ref))))
         }),
-    );
+    )
 }
 
 #[cfg(test)]
@@ -89,7 +102,7 @@ mod tests {
     #[test]
     fn test_register_file_source() {
         let registry = ConnectorRegistry::new();
-        register_file_source(&registry);
+        register_file_source(&registry).unwrap();
 
         let sources = registry.list_sources();
         assert!(sources.contains(&"files".to_string()));
@@ -103,7 +116,7 @@ mod tests {
     #[test]
     fn test_register_file_sink() {
         let registry = ConnectorRegistry::new();
-        register_file_sink(&registry);
+        register_file_sink(&registry).unwrap();
 
         let sinks = registry.list_sinks();
         assert!(sinks.contains(&"files".to_string()));
@@ -117,7 +130,7 @@ mod tests {
     #[test]
     fn test_create_source_from_registry() {
         let registry = ConnectorRegistry::new();
-        register_file_source(&registry);
+        register_file_source(&registry).unwrap();
 
         let config = crate::config::ConnectorConfig::new("files");
         let source = registry.create_source(&config, None);
@@ -127,7 +140,7 @@ mod tests {
     #[test]
     fn test_create_sink_from_registry() {
         let registry = ConnectorRegistry::new();
-        register_file_sink(&registry);
+        register_file_sink(&registry).unwrap();
 
         let config = crate::config::ConnectorConfig::new("files");
         let sink = registry.create_sink(&config, None);

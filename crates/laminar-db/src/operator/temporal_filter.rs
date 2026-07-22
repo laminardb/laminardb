@@ -613,19 +613,22 @@ impl GraphOperator for TemporalFilterOperator {
         let env: TemporalFilterCheckpoint =
             rkyv::from_bytes::<TemporalFilterCheckpoint, rkyv::rancor::Error>(&checkpoint.data)
                 .map_err(|e| {
-                    DbError::Pipeline(format!(
+                    DbError::Checkpoint(format!(
                         "temporal filter checkpoint deserialize for '{}': {e}",
                         self.op_name
                     ))
                 })?;
         if env.batch_ipc.is_empty() {
-            return Ok(());
+            return Err(DbError::Checkpoint(format!(
+                "temporal filter checkpoint for '{}' has no buffered-state payload",
+                self.op_name
+            )));
         }
         let batch = laminar_core::serialization::deserialize_batch_stream(&env.batch_ipc)
-            .map_err(|e| DbError::Pipeline(format!("temporal filter restore IPC: {e}")))?;
+            .map_err(|e| DbError::Checkpoint(format!("temporal filter restore IPC: {e}")))?;
         let total = batch.num_columns();
         if total < 4 {
-            return Err(DbError::Pipeline(
+            return Err(DbError::Checkpoint(
                 "temporal filter restore: malformed checkpoint batch".into(),
             ));
         }
@@ -645,38 +648,20 @@ impl GraphOperator for TemporalFilterOperator {
 
         let current_fp = crate::aggregate_state::query_fingerprint(&self.sql, &out_schema);
         if current_fp != env.fingerprint {
-            return Err(DbError::Pipeline(format!(
+            return Err(DbError::Checkpoint(format!(
                 "temporal filter checkpoint fingerprint mismatch for '{}': \
                  saved={}, current={}",
                 self.op_name, env.fingerprint, current_fp
             )));
         }
 
-        self.state = Self::rebuild_state(&batch, ncols, env.last_frontier)?;
+        let state = Self::rebuild_state(&batch, ncols, env.last_frontier).map_err(|error| {
+            DbError::Checkpoint(format!("temporal filter checkpoint restore: {error}"))
+        })?;
+        self.state = state;
         self.row_schema = Some(row_schema);
         self.output_schema = Some(out_schema);
         Ok(())
-    }
-
-    fn estimated_state_bytes(&self) -> usize {
-        // Dedup by Arc identity so a shared batch is counted once.
-        let mut seen: rustc_hash::FxHashSet<*const RecordBatch> = rustc_hash::FxHashSet::default();
-        let mut batch_bytes = 0usize;
-        let mut row_count = 0usize;
-        for row in self
-            .state
-            .by_enter
-            .values()
-            .chain(self.state.by_exit.values())
-            .flatten()
-        {
-            row_count += 1;
-            let ptr: *const RecordBatch = Arc::as_ptr(&row.batch);
-            if seen.insert(ptr) {
-                batch_bytes += row.batch.get_array_memory_size();
-            }
-        }
-        batch_bytes + row_count * std::mem::size_of::<BufferedRow>()
     }
 }
 
@@ -705,10 +690,6 @@ impl GraphOperator for RejectingOperator {
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
         Ok(None)
-    }
-
-    fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
-        Ok(())
     }
 }
 
@@ -763,6 +744,30 @@ mod tests {
             out.extend(c.iter().map(Option::unwrap));
         }
         out
+    }
+
+    #[test]
+    fn empty_checkpoint_payload_is_a_recovery_fault() {
+        let mut op = TemporalFilterOperator::new(
+            "tf",
+            "SELECT * FROM events",
+            lower_strict_ttl(10_000),
+            None,
+        );
+        let env = TemporalFilterCheckpoint {
+            fingerprint: 0,
+            last_frontier: 0,
+            batch_ipc: Vec::new(),
+        };
+        let data = rkyv::to_bytes::<rkyv::rancor::Error>(&env)
+            .unwrap()
+            .to_vec();
+
+        let error = op.restore(OperatorCheckpoint { data }).unwrap_err();
+
+        assert!(matches!(error, DbError::Checkpoint(_)));
+        assert!(error.requires_pipeline_recovery());
+        assert!(error.to_string().contains("no buffered-state payload"));
     }
 
     #[tokio::test]

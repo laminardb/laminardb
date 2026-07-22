@@ -100,42 +100,6 @@ impl ClusterKv for ChitchatKv {
             .filter_map(|(id, (_, val))| val.map(|v| (id, v)))
             .collect()
     }
-
-    async fn scan_prefix(&self, prefix: &str) -> Vec<(NodeId, String, String)> {
-        let guard = self.chitchat.lock().await;
-        let live: Vec<&chitchat::ChitchatId> = guard.live_nodes().collect();
-        let mut best_gen: std::collections::HashMap<NodeId, u64> = std::collections::HashMap::new();
-        let mut best_states: std::collections::HashMap<NodeId, Vec<(String, String)>> =
-            std::collections::HashMap::new();
-
-        for (cc_id, state) in guard.node_states() {
-            if !live.contains(&cc_id) {
-                continue;
-            }
-            let Some(node_id) = decode_chitchat_id(cc_id) else {
-                continue;
-            };
-            let current_best_gen = *best_gen.get(&node_id).unwrap_or(&0);
-            if cc_id.generation_id >= current_best_gen {
-                best_gen.insert(node_id, cc_id.generation_id);
-                let mut node_kvs = Vec::new();
-                for (key, val) in state.key_values() {
-                    if key.starts_with(prefix) {
-                        node_kvs.push((key.to_string(), val.to_string()));
-                    }
-                }
-                best_states.insert(node_id, node_kvs);
-            }
-        }
-
-        let mut out = Vec::new();
-        for (node_id, kvs) in best_states {
-            for (k, v) in kvs {
-                out.push((node_id, k, v));
-            }
-        }
-        out
-    }
 }
 
 #[cfg(test)]

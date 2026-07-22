@@ -4,12 +4,35 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::duration_suboptimal_units)] // MSRV 1.85; from_mins/from_hours are 1.91+
 #![allow(clippy::module_name_repetitions)]
+#![allow(clippy::too_many_arguments, clippy::too_many_lines)]
+// Protocol state machines remain contiguous and keep authority inputs explicit.
+#![allow(clippy::enum_variant_names, clippy::trivially_copy_pass_by_ref)]
+// Generated protobuf APIs retain schema-defined names and callback signatures.
+// Protocol fixtures use explicit boundary values and full state construction.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::cast_possible_truncation,
+        clippy::default_trait_access,
+        clippy::disallowed_types,
+        clippy::field_reassign_with_default,
+        clippy::items_after_statements,
+        clippy::large_futures,
+        clippy::similar_names,
+        clippy::struct_excessive_bools
+    )
+)]
 
+/// Feature-neutral catalog identity types.
+pub mod catalog;
 /// Z-set changelog `__weight` column name, shared between the MV producer and
 /// upsert-sink consumers.
 pub mod changelog;
 /// Distributed checkpoint barrier protocol.
 pub mod checkpoint;
+/// Crash-durable same-directory file publication primitives.
+pub mod durable_fs;
+mod durable_local_store;
 /// Compatibility alias for checkpoint storage
 pub use checkpoint as storage;
 /// Structured error code registry (`LDB-NNNN`) and Ring 0 hot path error type.
@@ -27,8 +50,8 @@ pub mod state;
 pub mod streaming;
 pub mod time;
 
-/// Distributed cluster coordination. Unstable: gated behind `cluster`.
-#[cfg(feature = "cluster")]
+/// Distributed cluster coordination. Runtime services are gated behind `cluster`; the control
+/// namespace retains feature-neutral checkpoint value types in every build.
 pub mod cluster;
 
 /// Per-epoch checkpoint commit marker store. Used by the checkpoint

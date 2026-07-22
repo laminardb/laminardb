@@ -1,3 +1,4 @@
+#[cfg(feature = "delta-lake")]
 use super::super::delta_config::DeltaCatalogType;
 use super::*;
 use arrow_array::{Float64Array, Int64Array, StringArray};
@@ -53,12 +54,158 @@ fn test_batch(n: usize) -> RecordBatch {
 
 // ── Constructor tests ──
 
+#[cfg(feature = "delta-lake")]
+#[test]
+fn typed_delta_failures_are_classified_without_message_heuristics() {
+    use deltalake::kernel::transaction::{CommitConflictError, TransactionError};
+
+    let conflict =
+        classify_delta_attempt_error(super::super::delta_io::DeltaWriteAttemptError::Delta(
+            deltalake::DeltaTableError::Transaction {
+                source: TransactionError::CommitConflict(CommitConflictError::ConcurrentDeleteRead),
+            },
+        ));
+    assert!(matches!(conflict, ConnectorError::WriteError(_)));
+    assert!(conflict.is_transient());
+
+    let false_positive =
+        classify_delta_attempt_error(super::super::delta_io::DeltaWriteAttemptError::Delta(
+            deltalake::DeltaTableError::InvalidData {
+                message: "concurrent conflict while decoding user data".into(),
+            },
+        ));
+    assert!(matches!(
+        false_positive,
+        ConnectorError::OutcomeUnknown {
+            retryable: false,
+            ..
+        }
+    ));
+
+    let protocol_change =
+        classify_delta_attempt_error(super::super::delta_io::DeltaWriteAttemptError::Delta(
+            deltalake::DeltaTableError::Transaction {
+                source: TransactionError::CommitConflict(CommitConflictError::ProtocolChanged(
+                    "concurrent conflict".into(),
+                )),
+            },
+        ));
+    assert!(!protocol_change.is_transient());
+
+    let local =
+        classify_delta_attempt_error(super::super::delta_io::DeltaWriteAttemptError::Local(
+            ConnectorError::ConfigurationError("invalid merge".into()),
+        ));
+    assert!(matches!(local, ConnectorError::ConfigurationError(_)));
+}
+
+#[cfg(feature = "delta-lake")]
+#[test]
+fn object_store_retryability_uses_typed_positive_allowlist() {
+    use delta_object_store::client::{HttpError, HttpErrorKind};
+
+    let transient =
+        classify_delta_attempt_error(super::super::delta_io::DeltaWriteAttemptError::Delta(
+            deltalake::DeltaTableError::ObjectStore {
+                source: deltalake::ObjectStoreError::Generic {
+                    store: "test",
+                    source: Box::new(HttpError::new(
+                        HttpErrorKind::Timeout,
+                        std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"),
+                    )),
+                },
+            },
+        ));
+    assert!(matches!(
+        transient,
+        ConnectorError::OutcomeUnknown {
+            retryable: true,
+            ..
+        }
+    ));
+
+    let permanent =
+        classify_delta_attempt_error(super::super::delta_io::DeltaWriteAttemptError::Delta(
+            deltalake::DeltaTableError::ObjectStore {
+                source: deltalake::ObjectStoreError::PermissionDenied {
+                    path: "table".into(),
+                    source: Box::new(HttpError::new(
+                        HttpErrorKind::Timeout,
+                        std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"),
+                    )),
+                },
+            },
+        ));
+    assert!(matches!(
+        permanent,
+        ConnectorError::OutcomeUnknown {
+            retryable: false,
+            ..
+        }
+    ));
+
+    let unknown =
+        classify_delta_attempt_error(super::super::delta_io::DeltaWriteAttemptError::Delta(
+            deltalake::DeltaTableError::ObjectStore {
+                source: deltalake::ObjectStoreError::Generic {
+                    store: "test",
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "untyped timeout",
+                    )),
+                },
+            },
+        ));
+    assert!(matches!(
+        unknown,
+        ConnectorError::OutcomeUnknown {
+            retryable: false,
+            ..
+        }
+    ));
+}
+
+#[cfg(feature = "delta-lake")]
+#[test]
+fn tracked_delta_future_owns_guard_before_first_poll() {
+    let sink = DeltaLakeSink::new(test_config(), None);
+    let terminal = sink.terminal_task_tracker().unwrap();
+    let guard = sink.task_owner.track().unwrap();
+    let task = run_tracked_delta_task(guard, std::future::pending::<()>());
+
+    drop(sink);
+    assert!(!terminal.is_terminated());
+    drop(task);
+    assert!(terminal.is_terminated());
+}
+
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
+async fn dropped_join_handle_does_not_publish_false_terminal_proof() {
+    let sink = DeltaLakeSink::new(test_config(), None);
+    let terminal = sink.terminal_task_tracker().unwrap();
+    let guard = sink.task_owner.track().unwrap();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let join = tokio::spawn(run_tracked_delta_task(guard, async move {
+        let _ = started_tx.send(());
+        let _ = release_rx.await;
+    }));
+    started_rx.await.unwrap();
+    drop(join);
+    drop(sink);
+    assert!(!terminal.is_terminated());
+
+    let _ = release_tx.send(());
+    terminal.wait_terminated().await;
+    assert!(terminal.is_terminated());
+}
+
 #[test]
 fn test_new_defaults() {
     let sink = DeltaLakeSink::new(test_config(), None);
     assert_eq!(sink.state(), ConnectorState::Created);
     assert_eq!(sink.current_epoch(), 0);
-    assert_eq!(sink.last_committed_epoch(), 0);
     assert_eq!(sink.buffered_rows(), 0);
     assert_eq!(sink.buffered_bytes(), 0);
     assert_eq!(sink.delta_version(), 0);
@@ -86,6 +233,7 @@ fn test_deferred_init_flag_default_false() {
     assert!(!sink.needs_deferred_delta_init);
 }
 
+#[cfg(feature = "delta-lake")]
 fn unity_config() -> DeltaLakeSinkConfig {
     let mut config = test_config();
     config.catalog_type = DeltaCatalogType::Unity {
@@ -159,6 +307,7 @@ async fn test_write_batch_accepts_initializing_state() {
     assert!(sink.schema.is_some());
 }
 
+#[cfg(feature = "delta-lake")]
 #[test]
 fn test_no_deferred_init_without_catalog_storage_location() {
     // Unity catalog without catalog.storage.location should NOT defer.
@@ -169,6 +318,7 @@ fn test_no_deferred_init_without_catalog_storage_location() {
     assert!(!sink.needs_deferred_delta_init);
 }
 
+#[cfg(feature = "delta-lake")]
 #[test]
 fn test_no_deferred_init_with_schema() {
     // Unity catalog with schema already set should NOT defer.
@@ -227,40 +377,27 @@ fn test_should_flush_empty() {
 }
 
 #[tokio::test]
-async fn test_exactly_once_buffer_backpressure() {
-    // Exactly-once mode rejects writes once the cumulative pending
-    // buffer exceeds the hard cap (4× max_buffer_records). A single
-    // incoming batch that by itself exceeds the cap is admitted (we
-    // cannot split it without breaking exactly-once), but subsequent
-    // batches hit backpressure.
+async fn test_at_least_once_failed_flush_backpressure() {
+    // A failed at-least-once flush retains its staged rows. The next write
+    // must be rejected before it grows that in-memory retry backlog.
     let mut config = test_config();
-    config.delivery_guarantee = crate::connector::DeliveryGuarantee::ExactlyOnce;
+    config.delivery_guarantee = DeliveryGuarantee::AtLeastOnce;
     config.max_buffer_records = 10;
     let mut sink = DeltaLakeSink::new(config, None);
     sink.state = ConnectorState::Running;
+    sink.staged_rows = 50;
 
-    // First batch of 50 rows exceeds 4× cap (40) but we admit it —
-    // rejecting would wedge the pipeline with no way to split.
-    let first = test_batch(50);
-    sink.write_batch(&first)
-        .await
-        .expect("single oversized batch must be admitted");
-    assert_eq!(sink.buffered_rows(), 50);
-
-    // A second normal batch must now be rejected: cumulative pending
-    // (50 + 5 = 55) exceeds the effective cap (max(40, 5) = 40).
-    let second = test_batch(5);
+    let batch = test_batch(5);
     let err = sink
-        .write_batch(&second)
+        .write_batch(&batch)
         .await
-        .expect_err("should reject once cumulative buffer exceeds cap");
+        .expect_err("retained at-least-once backlog must remain bounded");
     let msg = err.to_string();
     assert!(
         msg.contains("buffer full"),
         "expected backpressure error, got: {msg}"
     );
-    // Rejected batch must NOT have been buffered.
-    assert_eq!(sink.buffered_rows(), 50);
+    assert_eq!(sink.buffered_rows(), 0);
 }
 
 // ── Batch buffering tests ──
@@ -377,9 +514,7 @@ async fn test_rollback_after_pre_commit_discards_staged() {
     assert_eq!(sink.delta_version(), 0); // no Delta write occurred
 }
 
-/// Staged data is preserved across `pre_commit` → failed commit → rollback.
-/// This verifies that `pre_commit` does not destroy staged state, so a
-/// subsequent rollback can discard it cleanly.
+/// Staged data remains available for rollback until preparation completes.
 #[tokio::test]
 async fn test_staged_data_preserved_until_commit_or_rollback() {
     let mut config = test_config();
@@ -397,51 +532,11 @@ async fn test_staged_data_preserved_until_commit_or_rollback() {
     assert_eq!(sink.staged_batches.len(), 2);
     assert_eq!(sink.buffered_rows(), 0);
 
-    // Simulate: commit_epoch would write to Delta, but without the
-    // feature we exercise the local path. Verify staged state is
-    // consumed only on success.
-    // (Without delta-lake feature, commit_epoch calls commit_local
-    // which succeeds.)
-
-    // Instead, test rollback: staged data should be discarded.
+    // A failed preparation is followed by rollback, which discards the cut.
     sink.rollback_epoch(1).await.unwrap();
     assert!(sink.staged_batches.is_empty());
     assert_eq!(sink.staged_rows, 0);
     assert_eq!(sink.staged_bytes, 0);
-}
-
-#[tokio::test]
-async fn test_commit_empty_epoch() {
-    let mut sink = DeltaLakeSink::new(test_config(), None);
-    sink.state = ConnectorState::Running;
-
-    sink.begin_epoch(1).await.unwrap();
-    // No writes
-    sink.commit_epoch(1).await.unwrap();
-    assert_eq!(sink.last_committed_epoch(), 1);
-    assert_eq!(sink.delta_version(), 0); // No version bump (no files)
-}
-
-// ── Flush tests ──
-// Note: These tests bypass open() and test business logic only.
-
-#[tokio::test]
-async fn test_flush_coalesces_buffer() {
-    let mut config = test_config();
-    config.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
-    config.writer_id = "test-writer".to_string();
-    let mut sink = DeltaLakeSink::new(config, None);
-    sink.state = ConnectorState::Running;
-
-    let batch = test_batch(10);
-    sink.write_batch(&batch).await.unwrap();
-    sink.write_batch(&batch).await.unwrap();
-    assert_eq!(sink.buffer.len(), 2);
-
-    // flush() coalesces batches but does not write to Delta.
-    sink.flush().await.unwrap();
-    assert_eq!(sink.buffer.len(), 1);
-    assert_eq!(sink.buffered_rows(), 20);
 }
 
 // ── Open and close tests ──
@@ -458,57 +553,44 @@ async fn test_close() {
     assert_eq!(sink.state(), ConnectorState::Closed);
 }
 
-// ── Capabilities tests ──
+// ── Contract tests ──
 
 #[test]
-fn test_capabilities_append_exactly_once() {
+fn test_contract_append_exactly_once() {
     let mut config = test_config();
     config.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
     let sink = DeltaLakeSink::new(config, None);
-    let caps = sink.capabilities();
-    assert!(caps.exactly_once);
-    assert!(caps.idempotent);
-    assert!(!caps.upsert);
-    assert!(!caps.changelog);
-    assert!(!caps.schema_evolution);
-    assert!(!caps.partitioned);
+    let contract = sink.contract(&ConnectorConfig::new("delta-lake")).unwrap();
+    assert_eq!(contract.consistency, SinkConsistency::CheckpointCommittable);
+    assert_eq!(contract.input_mode, SinkInputMode::AppendOnly);
+    assert_eq!(sink.suggested_write_timeout(), Duration::from_secs(30));
+}
+
+#[cfg(feature = "delta-lake")]
+#[test]
+fn write_timeout_is_one_operation_budget_not_per_retry() {
+    let mut config = test_config();
+    config.write_timeout = Duration::from_secs(7);
+    let sink = DeltaLakeSink::new(config, None);
+
+    assert_eq!(sink.suggested_write_timeout(), Duration::from_secs(7));
 }
 
 #[test]
-fn test_capabilities_upsert() {
+fn test_contract_upsert() {
     let sink = DeltaLakeSink::new(upsert_config(), None);
-    let caps = sink.capabilities();
-    assert!(caps.upsert);
-    assert!(caps.changelog);
-    assert!(caps.idempotent);
+    let contract = sink.contract(&ConnectorConfig::new("delta-lake")).unwrap();
+    assert_eq!(contract.consistency, SinkConsistency::DurableAtLeastOnce);
+    assert_eq!(contract.input_mode, SinkInputMode::FullChangelog);
 }
 
 #[test]
-fn test_capabilities_schema_evolution() {
-    let mut config = test_config();
-    config.schema_evolution = true;
-    let sink = DeltaLakeSink::new(config, None);
-    let caps = sink.capabilities();
-    assert!(caps.schema_evolution);
-}
-
-#[test]
-fn test_capabilities_partitioned() {
-    let mut config = test_config();
-    config.partition_columns = vec!["trade_date".to_string()];
-    let sink = DeltaLakeSink::new(config, None);
-    let caps = sink.capabilities();
-    assert!(caps.partitioned);
-}
-
-#[test]
-fn test_capabilities_at_least_once() {
+fn test_contract_at_least_once() {
     let mut config = test_config();
     config.delivery_guarantee = DeliveryGuarantee::AtLeastOnce;
     let sink = DeltaLakeSink::new(config, None);
-    let caps = sink.capabilities();
-    assert!(!caps.exactly_once);
-    assert!(caps.idempotent);
+    let contract = sink.contract(&ConnectorConfig::new("delta-lake")).unwrap();
+    assert_eq!(contract.consistency, SinkConsistency::DurableAtLeastOnce);
 }
 
 // ── Changelog splitting tests ──
@@ -677,13 +759,11 @@ fn zset_changelog(rows: &[(&str, i64, i64)]) -> RecordBatch {
     .unwrap()
 }
 
-/// Drive one full epoch through the exactly-once sink lifecycle.
+/// Land one at-least-once write cut through the durable flush path.
 #[cfg(feature = "delta-lake")]
-async fn run_epoch(sink: &mut DeltaLakeSink, epoch: u64, batch: &RecordBatch) {
-    sink.begin_epoch(epoch).await.unwrap();
+async fn flush_batch(sink: &mut DeltaLakeSink, batch: &RecordBatch) {
     sink.write_batch(batch).await.unwrap();
-    sink.pre_commit(epoch).await.unwrap();
-    sink.commit_epoch(epoch).await.unwrap();
+    sink.flush().await.unwrap();
 }
 
 /// Read the table back and return its current `(region, total)` rows, sorted.
@@ -746,9 +826,7 @@ async fn upsert_collapses_aggregating_mv_to_current_state() {
     let mut cfg = DeltaLakeSinkConfig::new(&path);
     cfg.write_mode = DeltaWriteMode::Upsert;
     cfg.merge_key_columns = vec!["region".to_string()];
-    // Exactly-once buffers the whole epoch and flushes once at commit, so
-    // each epoch's changelog is collapsed together (deterministic).
-    cfg.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
+    cfg.delivery_guarantee = DeliveryGuarantee::AtLeastOnce;
 
     // No explicit schema: the schema (and table) is derived from the first
     // batch, exactly like the production pipeline — exercising the
@@ -758,10 +836,8 @@ async fn upsert_collapses_aggregating_mv_to_current_state() {
         .await
         .unwrap();
 
-    // Epoch 1: two brand-new groups.
-    run_epoch(
+    flush_batch(
         &mut sink,
-        1,
         &zset_changelog(&[("east", 10, 1), ("west", 5, 1)]),
     )
     .await;
@@ -770,10 +846,9 @@ async fn upsert_collapses_aggregating_mv_to_current_state() {
         vec![("east".into(), 10), ("west".into(), 5)]
     );
 
-    // Epoch 2: update east (retract 10 + insert 30), drop west, add north.
-    run_epoch(
+    // Second cut: update east (retract 10 + insert 30), drop west, add north.
+    flush_batch(
         &mut sink,
-        2,
         &zset_changelog(&[
             ("east", 10, -1),
             ("east", 30, 1),
@@ -787,12 +862,11 @@ async fn upsert_collapses_aggregating_mv_to_current_state() {
         vec![("east".into(), 30), ("north".into(), 7)]
     );
 
-    // Epoch 3: two consecutive updates to "east" in one epoch. Without
+    // Third cut: two consecutive updates to "east" in one batch. Without
     // collapse this is multiple source rows for one merge key → delta-rs
     // cardinality violation. With collapse it folds to the final value.
-    run_epoch(
+    flush_batch(
         &mut sink,
-        3,
         &zset_changelog(&[
             ("east", 30, -1),
             ("east", 40, 1),
@@ -809,105 +883,13 @@ async fn upsert_collapses_aggregating_mv_to_current_state() {
     // The target table never carried the Z-set weight column.
     assert!(sink.schema.as_ref().unwrap().index_of("__weight").is_err());
 
-    // Collapse observability fired across the three epochs.
+    // Collapse observability fired across the three durable flushes.
     let m = sink.sink_metrics();
     assert_eq!(m.collapse_rows_in.get(), 10);
     assert!(m.collapse_deletes_out.get() >= 1, "west was dropped");
     assert!(m.collapse_upserts_out.get() >= 4);
 
     sink.close().await.unwrap();
-}
-
-/// Exactly-once replay: a writer that recovers an already-committed epoch
-/// (from Delta `txn` metadata) and re-applies it must leave the table
-/// byte-for-byte unchanged — no new snapshot, same per-key state.
-#[cfg(feature = "delta-lake")]
-#[tokio::test]
-async fn upsert_replay_of_committed_epoch_is_idempotent() {
-    let dir = tempfile::tempdir().unwrap();
-    let table_dir = dir.path().join("agg_replay");
-    std::fs::create_dir_all(&table_dir).unwrap();
-    let path = table_dir.to_string_lossy().to_string();
-
-    let mk_cfg = || {
-        let mut cfg = DeltaLakeSinkConfig::new(&path);
-        cfg.write_mode = DeltaWriteMode::Upsert;
-        cfg.merge_key_columns = vec!["region".to_string()];
-        cfg.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
-        // Exactly-once recovery keys off a STABLE writer_id (default is a
-        // random UUID); a restart must reuse it to find its prior epoch.
-        cfg.writer_id = "replay-writer".to_string();
-        cfg
-    };
-    let epoch2 = || {
-        zset_changelog(&[
-            ("east", 10, -1),
-            ("east", 30, 1),
-            ("west", 5, -1),
-            ("north", 7, 1),
-        ])
-    };
-
-    // Writer A commits epochs 1 and 2, then "crashes" (close).
-    let mut sink_a = DeltaLakeSink::new(mk_cfg(), None);
-    sink_a
-        .open(&ConnectorConfig::new("delta-lake"))
-        .await
-        .unwrap();
-    run_epoch(
-        &mut sink_a,
-        1,
-        &zset_changelog(&[("east", 10, 1), ("west", 5, 1)]),
-    )
-    .await;
-    run_epoch(&mut sink_a, 2, &epoch2()).await;
-    let expected = vec![("east".to_string(), 30), ("north".to_string(), 7)];
-    assert_eq!(read_regions(&path).await, expected);
-    let version_after_2 = sink_a.delta_version();
-    sink_a.close().await.unwrap();
-
-    // Writer B recovers against the same table + writer_id.
-    let mut sink_b = DeltaLakeSink::new(mk_cfg(), None);
-    sink_b
-        .open(&ConnectorConfig::new("delta-lake"))
-        .await
-        .unwrap();
-    assert_eq!(
-        sink_b.last_committed_epoch(),
-        2,
-        "epoch must be recovered from Delta txn metadata"
-    );
-
-    // Replay the already-committed epoch 2: it must be skipped end-to-end.
-    sink_b.begin_epoch(2).await.unwrap();
-    sink_b.write_batch(&epoch2()).await.unwrap();
-    sink_b.pre_commit(2).await.unwrap();
-    sink_b.commit_epoch(2).await.unwrap();
-
-    assert_eq!(
-        read_regions(&path).await,
-        expected,
-        "replay must not change state"
-    );
-    assert_eq!(
-        sink_b.delta_version(),
-        version_after_2,
-        "replayed epoch must not create a new Delta version"
-    );
-
-    // The recovered writer continues normally with a fresh epoch.
-    run_epoch(
-        &mut sink_b,
-        3,
-        &zset_changelog(&[("east", 30, -1), ("east", 55, 1)]),
-    )
-    .await;
-    assert_eq!(
-        read_regions(&path).await,
-        vec![("east".to_string(), 55), ("north".to_string(), 7)]
-    );
-
-    sink_b.close().await.unwrap();
 }
 
 // ── Coordinated-commit (designated-committer) regressions ──
@@ -917,15 +899,41 @@ fn coordinated_config(path: &str) -> DeltaLakeSinkConfig {
     let mut cfg = DeltaLakeSinkConfig::new(path);
     cfg.write_mode = DeltaWriteMode::Append;
     cfg.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
-    cfg.writer_id = "writer-A".to_string();
     cfg
 }
 
-/// `is_coordinated()` drives the recovery-id selection; it must be true only
-/// for append + exactly-once (the path where the committer, not the writer,
-/// owns the Delta txn id).
+#[cfg(feature = "delta-lake")]
+fn coordinated_commit_context() -> crate::connector::CoordinatedCommitContext {
+    crate::connector::CoordinatedCommitContext::new(
+        tokio::time::Instant::now() + Duration::from_secs(30),
+    )
+}
+
+#[cfg(feature = "delta-lake")]
+async fn coordinated_row_count(path: &str) -> usize {
+    let ctx = datafusion::prelude::SessionContext::new();
+    crate::lakehouse::delta_table_provider::register_delta_table(
+        &ctx,
+        "t",
+        path,
+        std::collections::HashMap::new(),
+    )
+    .await
+    .unwrap();
+    ctx.sql("SELECT id FROM t")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap()
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum()
+}
+
+/// Exactly-once Delta is admitted only for coordinated append.
 #[test]
-fn coordinated_only_for_append_exactly_once() {
+fn exactly_once_is_coordinated_append_only() {
     let mut cfg = test_config();
     cfg.write_mode = DeltaWriteMode::Append;
     cfg.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
@@ -939,24 +947,140 @@ fn coordinated_only_for_append_exactly_once() {
     let mut cfg = test_config();
     cfg.write_mode = DeltaWriteMode::Upsert;
     cfg.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
-    assert!(!DeltaLakeSink::new(cfg, None).is_coordinated());
+    let sink = DeltaLakeSink::new(cfg, None);
+    assert!(sink.contract(&ConnectorConfig::new("delta-lake")).is_err());
 }
 
-/// Finding A: a coordinated sink recovering against an already-committed table
-/// must read the committer's txn id, not the (never-committed) `writer_id`. Before
-/// the fix recovery always saw 0 and re-staged sealed epochs into orphan files.
+/// An exact epoch larger than the former 4x in-memory cap is staged across
+/// uniquely named, log-invisible Parquet files and published by one checkpoint
+/// without replay.
 #[cfg(feature = "delta-lake")]
 #[tokio::test]
-async fn coordinated_recovery_reads_committer_epoch() {
-    use crate::connector::CoordinatedCommitter;
+async fn coordinated_epoch_over_four_times_buffer_cap_commits_once() {
+    use std::collections::HashSet;
+
+    use crate::connector::{
+        CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
+        CoordinatedCommitPayload, CoordinatedCommitter,
+    };
+    use laminar_core::state::CheckpointAttempt;
+    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+
+    let dir = tempfile::tempdir().unwrap();
+    let table_dir = dir.path().join("coord_large_epoch");
+    std::fs::create_dir_all(&table_dir).unwrap();
+    let path = table_dir.to_string_lossy().to_string();
+
+    let mut config = coordinated_config(&path);
+    config.max_buffer_records = 2;
+    let mut sink = DeltaLakeSink::with_schema(config, test_schema());
+    sink.open(&ConnectorConfig::new("delta-lake"))
+        .await
+        .unwrap();
+    sink.begin_epoch(1).await.unwrap();
+
+    // Twelve rows exceed the removed 4 x 2 row cap. Every three-row write
+    // crosses the staging threshold and must succeed without replay.
+    for _ in 0..4 {
+        sink.write_batch(&test_batch(3)).await.unwrap();
+    }
+    assert!(sink.buffer.is_empty());
+    assert!(sink.staged_batches.is_empty());
+    assert_eq!(sink.coordinated_adds.len(), 4);
+    assert_eq!(
+        coordinated_row_count(&path).await,
+        0,
+        "staged files must remain invisible before their Delta Add commit"
+    );
+
+    let descriptor = sink
+        .pre_commit(1)
+        .await
+        .unwrap()
+        .expect("non-empty exact epoch returns one descriptor");
+    assert!(descriptor.len() <= crate::connector::MAX_COORDINATED_COMMIT_PAYLOAD_BYTES);
+    assert!(sink.coordinated_adds.is_empty());
+    assert_eq!(sink.coordinated_descriptor_bytes, 0);
+
+    let adds = super::super::delta_io::decode_commit_descriptors(std::slice::from_ref(&descriptor))
+        .unwrap()
+        .unwrap()
+        .adds;
+    assert_eq!(adds.len(), 4);
+    assert_eq!(
+        adds.iter()
+            .map(|add| add.path.as_str())
+            .collect::<HashSet<_>>()
+            .len(),
+        adds.len(),
+        "each incremental stage must use an attempt-unique object path"
+    );
+    assert_eq!(coordinated_row_count(&path).await, 0);
+
+    let namespace = CoordinatedCommitNamespace::try_new(
+        PipelineIdentity::empty(),
+        "018f0000-0000-7000-8000-000000000001",
+        "delta_out",
+    )
+    .unwrap();
+    let attempt = CheckpointAttempt::canonical(101);
+    sink.commit_aggregated(
+        CoordinatedCommitBatch {
+            namespace: namespace.clone(),
+            expected_predecessor: CoordinatedCommitCursor {
+                checkpoint_id: 0,
+                fencing_token: 0,
+            },
+            fencing_token: 1,
+            target: attempt,
+            entries: vec![CoordinatedCommitPayload {
+                attempt,
+                participant_id: 0,
+                payload: Some(descriptor),
+            }],
+        },
+        coordinated_commit_context(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(coordinated_row_count(&path).await, 12);
+    assert_eq!(
+        sink.committed_cursor(&namespace).await.unwrap(),
+        Some(CoordinatedCommitCursor {
+            checkpoint_id: 101,
+            fencing_token: 1,
+        })
+    );
+    sink.close().await.unwrap();
+}
+
+/// The designated cursor stores the canonical engine checkpoint identity;
+/// Delta's local staging epoch remains connector-local.
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
+async fn coordinated_recovery_reads_namespaced_checkpoint_id() {
+    use crate::connector::{
+        CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
+        CoordinatedCommitPayload, CoordinatedCommitter,
+    };
+    use laminar_core::state::CheckpointAttempt;
+    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
 
     let dir = tempfile::tempdir().unwrap();
     let table_dir = dir.path().join("coord_recover");
     std::fs::create_dir_all(&table_dir).unwrap();
     let path = table_dir.to_string_lossy().to_string();
 
-    // Writer stages epoch 1 and 2; the designated committer seals them under
-    // COORDINATED_COMMITTER_ID (nothing is ever committed under "writer-A").
+    let namespace = CoordinatedCommitNamespace::try_new(
+        PipelineIdentity::empty(),
+        "018f0000-0000-7000-8000-000000000001",
+        "delta_out",
+    )
+    .unwrap();
+
+    // Writer stages epochs 1 and 2; the designated committer advances the
+    // exact checkpoint-id cursor under `namespace`.
     let mut writer = DeltaLakeSink::with_schema(coordinated_config(&path), test_schema());
     writer
         .open(&ConnectorConfig::new("delta-lake"))
@@ -971,35 +1095,168 @@ async fn coordinated_recovery_reads_committer_epoch() {
             .await
             .unwrap()
             .expect("coordinated pre_commit returns a descriptor");
-        writer.commit_epoch(epoch).await.unwrap();
+        let attempt = CheckpointAttempt::canonical(100 + epoch);
         writer
-            .commit_aggregated(epoch, vec![descriptor])
+            .commit_aggregated(
+                CoordinatedCommitBatch {
+                    namespace: namespace.clone(),
+                    expected_predecessor: CoordinatedCommitCursor {
+                        checkpoint_id: if epoch == 1 { 0 } else { 100 + epoch - 1 },
+                        fencing_token: u64::from(epoch != 1),
+                    },
+                    fencing_token: 1,
+                    target: attempt,
+                    entries: vec![CoordinatedCommitPayload {
+                        attempt,
+                        participant_id: 0,
+                        payload: Some(descriptor),
+                    }],
+                },
+                coordinated_commit_context(),
+            )
             .await
             .unwrap();
     }
     writer.close().await.unwrap();
 
-    // A fresh writer (same writer_id) recovers from the table. The committer
-    // never used "writer-A", so reading writer_id would yield 0.
+    // A fresh connector reads the exact external cursor independently of its
+    // local descriptor-preparation lifecycle.
     let mut recovered = DeltaLakeSink::with_schema(coordinated_config(&path), test_schema());
     recovered
         .open(&ConnectorConfig::new("delta-lake"))
         .await
         .unwrap();
     assert_eq!(
-        recovered.last_committed_epoch(),
-        2,
-        "coordinated recovery must read the committer's sealed epoch"
-    );
-
-    // Replaying a sealed epoch must be a no-op: pre_commit returns no descriptor.
-    recovered.begin_epoch(2).await.unwrap();
-    recovered.write_batch(&test_batch(3)).await.unwrap();
-    assert!(
-        recovered.pre_commit(2).await.unwrap().is_none(),
-        "sealed epoch must not re-stage Parquet"
+        recovered.committed_cursor(&namespace).await.unwrap(),
+        Some(crate::connector::CoordinatedCommitCursor {
+            checkpoint_id: 102,
+            fencing_token: 1,
+        })
     );
     recovered.close().await.unwrap();
+}
+
+/// A new designated leader may construct its batch before observing a late
+/// commit from the old leader. The fresh external cursor read must filter the
+/// already-published attempt while still publishing the new attempt and
+/// advancing the cursor to the batch target.
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
+async fn coordinated_failover_overlap_does_not_duplicate_committed_attempt() {
+    use crate::connector::{
+        CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
+        CoordinatedCommitPayload, CoordinatedCommitter,
+    };
+    use laminar_core::state::CheckpointAttempt;
+    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+
+    let dir = tempfile::tempdir().unwrap();
+    let table_dir = dir.path().join("coord_failover_overlap");
+    std::fs::create_dir_all(&table_dir).unwrap();
+    let path = table_dir.to_string_lossy().to_string();
+    let namespace = CoordinatedCommitNamespace::try_new(
+        PipelineIdentity::empty(),
+        "018f0000-0000-7000-8000-000000000001",
+        "delta_out",
+    )
+    .unwrap();
+    let first_attempt = CheckpointAttempt::canonical(101);
+    let second_attempt = CheckpointAttempt::canonical(102);
+
+    let mut writer = DeltaLakeSink::with_schema(coordinated_config(&path), test_schema());
+    writer
+        .open(&ConnectorConfig::new("delta-lake"))
+        .await
+        .unwrap();
+
+    writer.begin_epoch(1).await.unwrap();
+    writer.write_batch(&test_batch(3)).await.unwrap();
+    let first_descriptor = writer
+        .pre_commit(1)
+        .await
+        .unwrap()
+        .expect("first coordinated descriptor");
+    writer
+        .commit_aggregated(
+            CoordinatedCommitBatch {
+                namespace: namespace.clone(),
+                expected_predecessor: CoordinatedCommitCursor {
+                    checkpoint_id: 0,
+                    fencing_token: 0,
+                },
+                fencing_token: 1,
+                target: first_attempt,
+                entries: vec![CoordinatedCommitPayload {
+                    attempt: first_attempt,
+                    participant_id: 0,
+                    payload: Some(first_descriptor.clone()),
+                }],
+            },
+            coordinated_commit_context(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(coordinated_row_count(&path).await, 3);
+    assert_eq!(
+        writer.committed_cursor(&namespace).await.unwrap(),
+        Some(crate::connector::CoordinatedCommitCursor {
+            checkpoint_id: 101,
+            fencing_token: 1,
+        })
+    );
+
+    writer.begin_epoch(2).await.unwrap();
+    writer.write_batch(&test_batch(2)).await.unwrap();
+    let second_descriptor = writer
+        .pre_commit(2)
+        .await
+        .unwrap()
+        .expect("second coordinated descriptor");
+
+    // Simulate leadership overlap: the replacement leader assembled this
+    // batch before learning that checkpoint 101 had just committed.
+    writer
+        .commit_aggregated(
+            CoordinatedCommitBatch {
+                namespace: namespace.clone(),
+                expected_predecessor: CoordinatedCommitCursor {
+                    checkpoint_id: 0,
+                    fencing_token: 0,
+                },
+                fencing_token: 2,
+                target: second_attempt,
+                entries: vec![
+                    CoordinatedCommitPayload {
+                        attempt: first_attempt,
+                        participant_id: 0,
+                        payload: Some(first_descriptor),
+                    },
+                    CoordinatedCommitPayload {
+                        attempt: second_attempt,
+                        participant_id: 0,
+                        payload: Some(second_descriptor),
+                    },
+                ],
+            },
+            coordinated_commit_context(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        coordinated_row_count(&path).await,
+        5,
+        "the already-committed three-row descriptor must not be appended twice"
+    );
+    assert_eq!(
+        writer.committed_cursor(&namespace).await.unwrap(),
+        Some(crate::connector::CoordinatedCommitCursor {
+            checkpoint_id: 102,
+            fencing_token: 2,
+        }),
+        "the overlapping batch must still advance the external cursor"
+    );
+    writer.close().await.unwrap();
 }
 
 /// Finding B: the coordinated descriptor write must honor configured Parquet
@@ -1038,34 +1295,270 @@ async fn coordinated_open_caches_configured_writer_properties() {
     sink.close().await.unwrap();
 }
 
-/// Finding C: the coordinated staging write is wrapped in the same write
-/// timeout the commit path uses, so a wedged object store can't hang the sink
-/// task forever. A near-zero timeout forces the wrapper to fire.
 #[cfg(feature = "delta-lake")]
 #[tokio::test]
-async fn coordinated_pre_commit_honors_write_timeout() {
+async fn coordinated_unresolved_publication_allows_only_the_exact_batch_retry() {
+    use crate::connector::{
+        CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
+        CoordinatedCommitPayload, CoordinatedCommitter,
+    };
+    use laminar_core::state::CheckpointAttempt;
+    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+
     let dir = tempfile::tempdir().unwrap();
-    let table_dir = dir.path().join("coord_timeout");
+    let table_dir = dir.path().join("coord_reconcile");
     std::fs::create_dir_all(&table_dir).unwrap();
     let path = table_dir.to_string_lossy().to_string();
-
-    let mut cfg = coordinated_config(&path);
-    cfg.write_timeout = Duration::from_nanos(1);
-
-    let mut sink = DeltaLakeSink::with_schema(cfg, test_schema());
+    let mut sink = DeltaLakeSink::with_schema(coordinated_config(&path), test_schema());
     sink.open(&ConnectorConfig::new("delta-lake"))
         .await
         .unwrap();
+    let namespace = CoordinatedCommitNamespace::try_new(
+        PipelineIdentity::empty(),
+        "018f0000-0000-7000-8000-000000000001",
+        "delta_out",
+    )
+    .unwrap();
+    let attempt = CheckpointAttempt::canonical(101);
+    let committed = CoordinatedCommitCursor {
+        checkpoint_id: 101,
+        fencing_token: 1,
+    };
+    sink.commit_aggregated(
+        CoordinatedCommitBatch {
+            namespace: namespace.clone(),
+            expected_predecessor: CoordinatedCommitCursor {
+                checkpoint_id: 0,
+                fencing_token: 0,
+            },
+            fencing_token: 1,
+            target: attempt,
+            entries: vec![CoordinatedCommitPayload {
+                attempt,
+                participant_id: 0,
+                payload: None,
+            }],
+        },
+        coordinated_commit_context(),
+    )
+    .await
+    .unwrap();
 
-    sink.begin_epoch(1).await.unwrap();
-    sink.write_batch(&test_batch(3)).await.unwrap();
-    let err = sink
-        .pre_commit(1)
-        .await
-        .expect_err("a 1ns write timeout must trip the wrapper");
-    assert!(
-        err.to_string().contains("timed out"),
-        "expected a timeout error, got: {err}"
+    let second = CheckpointAttempt::canonical(102);
+    let third = CheckpointAttempt::canonical(103);
+    let second_batch = CoordinatedCommitBatch {
+        namespace: namespace.clone(),
+        expected_predecessor: committed,
+        fencing_token: 1,
+        target: second,
+        entries: vec![CoordinatedCommitPayload {
+            attempt: second,
+            participant_id: 0,
+            payload: None,
+        }],
+    };
+    *sink.coordinated_unresolved_publication.lock() = Some(UnresolvedDeltaPublication {
+        external_key: namespace.external_key(),
+        target: CoordinatedCommitCursor {
+            checkpoint_id: 102,
+            fencing_token: 1,
+        },
+        exact_batch_fingerprint: second_batch.exact_fingerprint(),
+    });
+
+    assert_eq!(
+        sink.committed_cursor(&namespace).await.unwrap(),
+        Some(committed)
     );
+    assert!(sink.coordinated_unresolved_publication.lock().is_some());
+    assert!(sink.begin_epoch(2).await.is_err());
+
+    let higher_batch = CoordinatedCommitBatch {
+        namespace: namespace.clone(),
+        expected_predecessor: committed,
+        fencing_token: 1,
+        target: third,
+        entries: vec![
+            CoordinatedCommitPayload {
+                attempt: second,
+                participant_id: 0,
+                payload: None,
+            },
+            CoordinatedCommitPayload {
+                attempt: third,
+                participant_id: 0,
+                payload: None,
+            },
+        ],
+    };
+    assert!(sink
+        .commit_aggregated(higher_batch, coordinated_commit_context())
+        .await
+        .is_err());
+    assert!(sink.coordinated_unresolved_publication.lock().is_some());
+
+    sink.commit_aggregated(second_batch, coordinated_commit_context())
+        .await
+        .unwrap();
+    assert!(sink.coordinated_unresolved_publication.lock().is_none());
+    let second_cursor = CoordinatedCommitCursor {
+        checkpoint_id: 102,
+        fencing_token: 1,
+    };
+    assert_eq!(
+        sink.committed_cursor(&namespace).await.unwrap(),
+        Some(second_cursor)
+    );
+
+    sink.commit_aggregated(
+        CoordinatedCommitBatch {
+            namespace: namespace.clone(),
+            expected_predecessor: second_cursor,
+            fencing_token: 1,
+            target: third,
+            entries: vec![CoordinatedCommitPayload {
+                attempt: third,
+                participant_id: 0,
+                payload: None,
+            }],
+        },
+        coordinated_commit_context(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sink.committed_cursor(&namespace).await.unwrap(),
+        Some(CoordinatedCommitCursor {
+            checkpoint_id: 103,
+            fencing_token: 1,
+        })
+    );
+    sink.begin_epoch(4).await.unwrap();
+    sink.close().await.unwrap();
+}
+
+#[cfg(feature = "delta-lake")]
+#[tokio::test(start_paused = true)]
+async fn coordinated_catalog_commit_timeout_fences_later_work_until_cursor_read() {
+    use crate::connector::{
+        CoordinatedCommitBatch, CoordinatedCommitCursor, CoordinatedCommitNamespace,
+        CoordinatedCommitPayload, CoordinatedCommitter,
+    };
+    use laminar_core::state::CheckpointAttempt;
+    use laminar_core::storage::checkpoint_manifest::PipelineIdentity;
+
+    let dir = tempfile::tempdir().unwrap();
+    let table_dir = dir.path().join("coord_commit_timeout");
+    std::fs::create_dir_all(&table_dir).unwrap();
+    let path = table_dir.to_string_lossy().to_string();
+    let mut sink = DeltaLakeSink::with_schema(coordinated_config(&path), test_schema());
+    sink.open(&ConnectorConfig::new("delta-lake"))
+        .await
+        .unwrap();
+    let namespace = CoordinatedCommitNamespace::try_new(
+        PipelineIdentity::empty(),
+        "018f0000-0000-7000-8000-000000000001",
+        "delta_timeout",
+    )
+    .unwrap();
+    let attempt = CheckpointAttempt::canonical(101);
+    let batch = CoordinatedCommitBatch {
+        namespace: namespace.clone(),
+        expected_predecessor: CoordinatedCommitCursor {
+            checkpoint_id: 0,
+            fencing_token: 0,
+        },
+        fencing_token: 1,
+        target: attempt,
+        entries: vec![CoordinatedCommitPayload {
+            attempt,
+            participant_id: 0,
+            payload: None,
+        }],
+    };
+    let delayed_commit = super::super::delta_io::DelayedCoordinatedCatalogCommit {
+        started: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let error = super::super::delta_io::DELAY_COORDINATED_CATALOG_COMMIT
+        .scope(
+            delayed_commit.clone(),
+            sink.commit_aggregated(
+                batch,
+                crate::connector::CoordinatedCommitContext::new(deadline),
+            ),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("coordinated publication exceeded"),
+        "got: {error}"
+    );
+    delayed_commit.started.notified().await;
+    assert!(sink.coordinated_unresolved_publication.lock().is_some());
+    assert!(sink.begin_epoch(2).await.is_err());
+
+    assert_eq!(sink.committed_cursor(&namespace).await.unwrap(), None);
+    assert!(sink.coordinated_unresolved_publication.lock().is_some());
+    assert!(sink.begin_epoch(2).await.is_err());
+
+    delayed_commit.release.notify_one();
+    let target = CoordinatedCommitCursor {
+        checkpoint_id: 101,
+        fencing_token: 1,
+    };
+    let mut observed = None;
+    for _ in 0..100 {
+        observed = sink.committed_cursor(&namespace).await.unwrap();
+        if observed == Some(target) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(observed, Some(target));
+    assert!(sink.coordinated_unresolved_publication.lock().is_none());
+    sink.begin_epoch(2).await.unwrap();
+    sink.close().await.unwrap();
+}
+
+/// Coordinated preparation times out without discarding the staged checkpoint cut.
+#[cfg(feature = "delta-lake")]
+#[tokio::test]
+async fn coordinated_pre_commit_timeout_preserves_staged_data_until_rollback() {
+    let dir = tempfile::tempdir().unwrap();
+    let table_dir = dir.path().join("coord_prepare_timeout");
+    std::fs::create_dir_all(&table_dir).unwrap();
+    let config = coordinated_config(&table_dir.to_string_lossy());
+
+    let mut sink = DeltaLakeSink::with_schema(config, test_schema());
+    sink.open(&ConnectorConfig::new("delta-lake"))
+        .await
+        .unwrap();
+    sink.config.write_timeout = Duration::from_millis(10);
+    sink.stall_descriptor_write = true;
+    sink.begin_epoch(7).await.unwrap();
+    sink.write_batch(&test_batch(3)).await.unwrap();
+
+    let error = sink
+        .pre_commit(7)
+        .await
+        .expect_err("the injected stalled descriptor write must time out");
+    assert!(
+        error.to_string().contains("timed out"),
+        "expected a timeout error, got: {error}"
+    );
+
+    assert_eq!(sink.buffered_rows, 0, "pre_commit must stage the buffer");
+    assert!(sink.buffer.is_empty());
+    assert_eq!(sink.staged_rows, 3, "timeout must preserve staged rows");
+    assert_eq!(sink.staged_batches.len(), 1);
+    assert!(sink.staged_bytes > 0);
+
+    sink.rollback_epoch(7).await.unwrap();
+    assert_eq!(sink.staged_rows, 0);
+    assert_eq!(sink.staged_bytes, 0);
+    assert!(sink.staged_batches.is_empty());
     sink.close().await.unwrap();
 }

@@ -19,12 +19,17 @@ name = "hash_test"
 path = "src/bin/hash_test.rs"
 required-features = ["cluster"]
 
+[[test]]
+name = "cluster_soak"
+path = "tests/cluster_soak.rs"
+required-features = ["cluster"]
+
 [dependencies]
 # LaminarDB crates. laminar-db re-exports the rest of the workspace; the
 # server only needs the unified facade plus laminar-core for things like
 # metrics types referenced directly.
 laminar-core = { path = "../laminar-core", version = "0.28.0" }
-laminar-db = { path = "../laminar-db", version = "0.28.0", features = ["api", "remote", "local"] }
+laminar-db = { path = "../laminar-db", version = "0.28.0", default-features = false, features = ["api", "remote", "local"] }
 laminar-sql = { path = "../laminar-sql", version = "0.28.0" }
 
 # For pgwire dispatch on parsed AST
@@ -59,6 +64,7 @@ thiserror = { workspace = true }
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+tungstenite = "0.28"
 toml = "1.1"
 
 # Web framework
@@ -69,7 +75,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 # Postgres wire with optional TLS (aws-lc-rs backend). pg-type-chrono and
 # pg-type-rust-decimal pull in the postgres-types ToSql impls used by the
 # extended-query binary-format encoders for TIMESTAMP/DATE/NUMERIC columns.
-pgwire = { version = "0.40", default-features = false, features = [
+pgwire = { version = "=0.40.4", default-features = false, features = [
     "server-api",
     "_aws-lc-rs",
     "pg-type-chrono",
@@ -87,6 +93,7 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 rand = { workspace = true }
 subtle = { workspace = true }
+sha2 = { workspace = true, optional = true }
 percent-encoding = "2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
 
@@ -114,9 +121,18 @@ openssl = { version = "0.10", features = ["vendored"], optional = true }
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { workspace = true, optional = true }
 
+# Kafka admin, producer, and committed-offset oracle used by the cluster soak.
+# Optional normal dependencies let the existing `kafka` feature exclude librdkafka
+# from no-default test builds; Windows resolves OpenSSL via OPENSSL_DIR.
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+rdkafka = { version = "0.39", features = ["cmake-build", "ssl"], optional = true }
+
 # Allocator: mimalloc for Windows MSVC where jemalloc is unavailable.
 [target.'cfg(target_env = "msvc")'.dependencies]
 mimalloc = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+rdkafka = { version = "0.39", features = ["cmake-build"], optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -124,15 +140,6 @@ tokio-postgres = "0.7"
 tokio-postgres-rustls = "0.13"
 rcgen = "0.13"
 serde_json = { workspace = true }
-
-# Kafka consumer/admin used by the cluster_soak exactly-once output diff.
-# Same per-platform split as laminar-db's kafka_docker_scenarios dev-dep
-# (Windows resolves OpenSSL via OPENSSL_DIR instead of the ssl feature).
-[target.'cfg(not(target_os = "windows"))'.dev-dependencies]
-rdkafka = { version = "0.39", features = ["cmake-build", "ssl"] }
-
-[target.'cfg(target_os = "windows")'.dev-dependencies]
-rdkafka = { version = "0.39", features = ["cmake-build"] }
 
 [features]
 # Cross-platform defaults.
@@ -145,14 +152,12 @@ default = [
     "iceberg",
     "postgres-cdc",
     "postgres-sink",
-    "mysql-cdc",
     "mongodb-cdc",
     "nats",
     "files",
     "parquet-lookup",
     "otel",
     "cluster",
-    "state-tier",
     "aws",
     "gcs",
     "azure",
@@ -160,11 +165,10 @@ default = [
 jemalloc = ["dep:tikv-jemallocator"]
 mimalloc = ["dep:mimalloc"]
 # Connector features (forwarded to laminar-db → laminar-connectors)
-kafka = ["laminar-db/kafka"]
+kafka = ["laminar-db/kafka", "dep:rdkafka"]
 websocket = ["laminar-db/websocket"]
 postgres-cdc = ["laminar-db/postgres-cdc"]
 postgres-sink = ["laminar-db/postgres-sink"]
-mysql-cdc = ["laminar-db/mysql-cdc"]
 mongodb-cdc = ["laminar-db/mongodb-cdc"]
 nats = ["laminar-db/nats"]
 delta-lake = ["laminar-db/delta-lake"]
@@ -191,9 +195,8 @@ cluster = [
     "laminar-db/cluster",
     "dep:uuid",
     "dep:xxhash-rust",
+    "dep:sha2",
     "dep:tokio-util",
     "dep:reqwest",
 ]
-# Disk cold tier for demoted operator state (experimental). Implies cluster.
-state-tier = ["cluster", "laminar-db/state-tier"]
 vendored-openssl = ["dep:openssl"]
