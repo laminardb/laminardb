@@ -116,7 +116,7 @@ handshakes, checkpoint descriptors, and local-state metadata:
   timestamp unit/timezone, and binary collation semantics;
 - key hash algorithm/seed and vnode mapping;
 - the vnode-0 convention for singleton global state;
-- operator/table ID derivation;
+- operator/state-table ID derivation;
 - state-key ordering and value encoding; and
 - timer-key ordering.
 
@@ -136,11 +136,11 @@ v1 has no implicit mixed-version reader window. Assignment generation and worker
 access but are not part of logical state keys, so ownership can change without rewriting every
 key.
 
-The physical key prefix is ordered by pipeline, operator/table, and vnode before the logical key.
-This permits bounded vnode scans, bulk restore, range deletion, and quota attribution. The initial
-layout uses one worker-local database with a small fixed set of physical keyspaces; pipeline,
-operator, table, and vnode are logical prefixes, never separate databases. Phase 0 must confirm
-that this layout gives acceptable failure isolation and cleanup cost. A database or keyspace per
+The physical key prefix is ordered by pipeline, operator/state-table, and vnode before the logical
+key. This permits bounded vnode scans, bulk restore, range deletion, and quota attribution. The
+initial layout uses one worker-local database with a small fixed set of physical keyspaces;
+pipeline, operator, table, and vnode are logical prefixes, never separate databases. Phase 0 must
+confirm that this layout gives acceptable failure isolation and cleanup cost. A database or keyspace per
 vnode is forbidden; Fjall keyspaces are physical LSM trees with their own write buffers.
 
 ### 3. Batched local working-state service
@@ -289,8 +289,8 @@ only; a query fingerprint alone is not a keyed-state compatibility contract.
 
 Routing compatibility and stored-state compatibility are separate identities. A grouped artifact
 persists the hydrated `PartitionKeySchemaV1` used by the partition ABI and a Laminar-owned state
-contract containing key mode, stable operator/table identity, ordered accumulator codec IDs and
-versions, and exact logical input/output/null semantics. Dictionary inputs are hydrated before key
+contract containing key mode, stable operator/state-table identity, ordered accumulator codec IDs
+and versions, and exact logical input/output/null semantics. Dictionary inputs are hydrated before key
 encoding; dictionary index width is never durable identity. Global state has an explicit
 `GlobalSingleton` mode and is valid only on vnode 0—it is not inferred from an empty descriptor.
 
@@ -316,17 +316,19 @@ global singleton. `EMPTY` is identified only by artifact kind and row count. Key
 aggregate key bytes, state bytes, descriptor bytes, artifact bytes, and full-plus-delta chain
 bytes are checked against the approved profile with checked arithmetic before allocation. Keys are
 unique and strictly increasing, and every keyed row must hash to the claimed vnode. `EMPTY` is the
-only zero-row representation. A `FULL` image replaces the entire operator/table/vnode namespace;
+only zero-row representation. A `FULL` image replaces the entire operator/state-table/vnode namespace;
 `DELTA` carries sorted latest values; append-only v1 has no deletes or tombstones. Restored routing
 keys remain opaque hash/LSM identity and are never passed to Arrow `RowParser`, whose format assumes
 converter-produced input; any future materializing consumer requires a strict, panic-free decoder.
 Decode rejects a zero-row `FULL`/`DELTA` payload, a stored row with `COUNT(*) == 0` or
 `COUNT(*) > i64::MAX`, a non-null SUM count greater than COUNT, and zero non-null count with a
-nonzero accumulator. Zero non-null count has canonical zero accumulator bytes and evaluates to SQL
-`NULL`; otherwise the exact signed `i64` accumulator is the nullable `Int64` result. The artifact
-implementation commit must publish one normative binary layout with every magic, field offset,
-width, byte order, and digest range plus goldens; this ADR does not treat an archived Rust type or
-prose alone as the wire specification.
+nonzero accumulator. When the cached contract declares a non-nullable SUM input, its non-null count
+must equal COUNT. Zero non-null count has canonical zero accumulator bytes and evaluates to SQL
+`NULL`; otherwise the exact signed `i64` accumulator is the nullable `Int64` result. Cycle 5
+publishes one normative binary layout with every magic, field offset, width, byte order, and digest
+range plus frozen goldens, a private borrowed reader, and a full-buffer fixture/reference encoder.
+The reference encoder is not the production streaming writer; this ADR does not treat an archived
+Rust type or prose alone as the wire specification.
 Current `last_updated_ms` is not part of v1 because no aggregate execution path consumes it.
 Changed-group append output derives its stable
 operation identity from the canonical key and checked count version, so v1 also carries no
@@ -337,7 +339,7 @@ The payload sits inside the manually parsed, allocation-bounded
 [managed state artifact v1 envelope](managed-state-artifact-format-v1.md). It binds exact
 format/header length, inner `FULL`/`DELTA`/`EMPTY`, key mode, partition ABI, codec ID/version, total and
 section lengths, row/key/state totals, checkpoint and parent identity, assignment version, vnode
-count and vnode, owner-map certificate digest, stable operator/table/contract digests, and payload
+count and vnode, owner-map certificate digest, stable operator/state-table/contract digests, and payload
 digest. Reserved fields must be zero; total length must equal the supplied slice with no trailing
 bytes. Descriptor bytes are compared byte-for-byte with the immutable plan-time contract after
 their digest is checked. SHA-256 supplies corruption evidence, not authentication; trust and
@@ -346,12 +348,21 @@ encryption remain checkpoint-store/deployment properties.
 Managed artifacts cannot be nested in the current `VnodePartial` rkyv object, whose attacker-sized
 vectors are materialized before an inner payload can reserve memory. `VnodePartialV2` has an
 unambiguous magic/version selected by the checkpoint manifest—decoders never try v2 and then fall
-back to rkyv. Its canonical directory has one sorted, unique operator/table/vnode entry for the
-authoritative roster. An entry is either `BODY`, naming an exact inner FULL/DELTA/EMPTY slice, or
-`REFERENCE`, naming the exact parent checkpoint and entry digest for unchanged state. Absence is
-corruption, `REFERENCE` is not empty state, and `EMPTY` remains an authoritative zero-row base.
-BODY ranges are non-overlapping, in bounds, and exactly cover the declared body region with no
-padding.
+back to rkyv. Its canonical directory has a 160-byte header and one sorted, unique
+operator/state-table/vnode entry for the authoritative roster. An entry is either `BODY`, naming an
+exact inner FULL/DELTA/EMPTY slice, or `REFERENCE`, naming the exact parent checkpoint and entry
+digest for unchanged state. Absence is corruption, `REFERENCE` is not empty state, and `EMPTY`
+remains an authoritative zero-row base. BODY ranges are non-overlapping, in bounds, and exactly
+cover the declared body region with no padding. The directory digest covers the directory and each
+BODY entry covers its exact slice; a redundant whole-body digest is deliberately omitted.
+
+Cycle 5 lands a private borrowed outer-structural V2 reader and a full-buffer fixture/reference
+encoder. The outer reader validates checked layout, roster, ranges, entry kinds, ancestry shape, and
+per-entry BODY digests against its expected source context. It does not authenticate the complete
+object or establish aggregate-state semantics. Production composition must first match the complete
+payload to the trusted seal/inventory digest and manifest selector, then invoke the expected inner
+reader for every BODY with exact identity, kind, parent, codec, routing-schema, and state-contract
+context. The landed encoders allocate complete vectors and are not production streaming writers.
 
 The trusted checkpoint pointer first identifies the inventory object and its expected digest. A
 metadata/HEAD request must expose its encoded length; restore rejects a value above
@@ -361,6 +372,10 @@ cap, digest-verified, and then authenticates expected artifact type/version, con
 digests, checkpoint/assignment provenance, and legacy/managed dispatch. Each artifact repeats the
 same reserve-before-GET protocol. Short, long, or digest-mismatched bodies fail closed.
 
+That trusted sealed-object composition, manifest dispatch, and bounded fetch path are not wired in
+Cycle 5. The private structural reader must not be called directly on bytes fetched by the current
+whole-object `read_partial` path and must not be used as evidence to relax cluster admission.
+
 V2 parsing runs under the encoded charge; separate task/global **scratch** reservations cover
 directory metadata, key/state bytes, rows, shadow ingestion, operators, and vnodes. Transition-owned
 validated spool bytes are charged to the local-disk governor and retained until prepare completes;
@@ -369,7 +384,9 @@ per-chain encoded caps, a directory-entry cap, a global encoded-byte pool, and p
 scratch caps; that machine-readable profile remains the sole numerical source. One "artifact" is
 the complete raw `VnodePartialV2` payload (excluding the existing fixed provenance wrapper), not
 each inner BODY: its row, key-byte, state-byte, and encoded-byte caps are cumulative across all BODY
-entries. Wrapper plus payload is checked before fetch. `resolved_parent_links_max` counts every
+entries. Inner aggregate decodes consume one caller-owned, non-`Copy` mutable
+`AggregateObjectBudget` ledger for the complete V2 object; the ledger is never reset per BODY.
+Wrapper plus payload is checked before fetch. `resolved_parent_links_max` counts every
 outer `REFERENCE` and inner `DELTA` parent edge; a FULL/EMPTY base has depth zero, exactly the
 maximum is accepted, and maximum-plus-one is rejected. Whole-transition preflight resolves every
 REFERENCE and validates every chain and row into that immutable spool before any operator callback.
@@ -394,6 +411,10 @@ failures; and N/N-1 compatibility tests precede a writer. Contract derivation is
 sorting, encoding, hashing, and restore decoding run on bounded blocking workers. None runs on the
 record/event-loop hot path, and qualification still measures their CPU, memory, pause, and tail
 effects.
+
+The landed borrowed readers and reference encoders are admission-neutral conformance primitives.
+They do not resolve REFERENCE/DELTA chains, produce the authoritative replacement namespace, ingest
+shadow state, publish a graph transition, alter a checkpoint manifest, or relax `[LDB-4007]`.
 
 #### Whole-graph publication boundary
 

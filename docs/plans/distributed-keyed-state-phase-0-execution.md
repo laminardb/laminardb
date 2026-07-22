@@ -1,6 +1,6 @@
 # Phase 0 execution plan: distributed keyed state
 
-- **Status:** In progress; contracts and inventory only
+- **Status:** In progress; admission-neutral contracts/codecs only
 - **Started:** 2026-07-22
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
@@ -123,7 +123,7 @@ booleans, every signed/unsigned integer width and boundary, decimal precision/sc
 representations, timestamp unit/timezone metadata, dictionary hydration, and composite boundary
 cases. A handwritten schema descriptor records arity/order and all type parameters; neither
 `DataType::to_string` nor a vnode-only vector is an ABI proof. Persist the encoding/hash version,
-schema fingerprint, vnode count, operator/table identity, and state schema version together.
+schema fingerprint, vnode count, operator/state-table identity, and state schema version together.
 
 Every base and delta restore artifact retains its declared vnode. Before any live mutation, decode
 and validate the complete chain against the planned key schema, require every canonical group key
@@ -134,7 +134,7 @@ explicit replay/migration and rollback policy; there is no implicit N/N-1 reader
 
 The keyed checkpoint format must gain a manually parsed, allocation-bounded envelope containing
 partition ABI, vnode count and claimed vnode, explicit global/keyed mode, canonical routing-key
-schema, stable operator/table identities, state contract, payload codec, checkpoint ancestry and
+schema, stable operator/state-table identities, state contract, payload codec, checkpoint ancestry and
 assignment/owner-map provenance, exact section lengths and counts, digests, and `FULL`, `DELTA`, or
 `EMPTY` kind. Preflight uses the immutable expected contract cached from the plan, never a contract
 inferred from the payload. It rejects a changed vnode count, wrong ancestry/provenance, duplicate or
@@ -151,9 +151,10 @@ count plus a signed `i64` accumulator, with nullable `Int64` SQL output. The exe
 group-local input prefix in fixed source order, preflights the complete Arrow batch, then publishes
 one atomic state/output mutation. Any count/SUM overflow, including in a late group, faults with no
 part of that batch applied; split and coalesced replay therefore agree. Decode requires
-`1 <= COUNT <= i64::MAX`, non-null count no greater than COUNT, and canonical zero/SQL NULL when it
-is zero; otherwise the exact signed `i64` accumulator is the nullable `Int64` result. This checked
-Laminar implementation must also execute the
+`1 <= COUNT <= i64::MAX`, non-null count no greater than COUNT, equality between those counts when
+the cached contract marks the SUM input non-nullable, and canonical zero/SQL NULL when the non-null
+count is zero; otherwise the exact signed `i64` accumulator is the nullable `Int64` result. This
+checked Laminar implementation must also execute the
 exact embedded/reference shape before cluster admission; DataFusion 52.3's wrapping SUM and
 release-dependent count overflow are not durable semantics. Decimal, unsigned, floating, AVG,
 MIN/MAX, retraction, UDAF, and changelog codecs remain unavailable. Current `last_updated_ms` has no
@@ -166,13 +167,23 @@ arithmetic boundary tests, and deterministic bytes across insertion orders prece
 Direct rkyv of the live checkpoint struct and hash-map order are not stable. The existing
 `VnodePartial` rkyv container must be replaced for managed state by an allocation-bounded
 `VnodePartialV2` directory selected by manifest magic/version with no decode fallback. Its sorted,
-unique operator/table/vnode roster uses `BODY` for a checked FULL/DELTA/EMPTY slice and `REFERENCE`
-for an exact unchanged parent entry. Absence is corruption and REFERENCE is never treated as EMPTY.
-BODY ranges are in bounds, non-overlapping, and exactly cover the unpadded body region. Legacy v1
-requires manifest/type proof of the admitted global vnode-0 path. Cache the immutable contract at
-plan/init time;
+unique operator/state-table/vnode roster uses `BODY` for a checked FULL/DELTA/EMPTY slice and
+`REFERENCE` for an exact unchanged parent entry. Absence is corruption and REFERENCE is never
+treated as EMPTY. BODY ranges are in bounds, non-overlapping, and exactly cover the unpadded body
+region. Legacy v1 requires manifest/type proof of the admitted global vnode-0 path. Cache the
+immutable contract at plan/init time;
 introspection, canonicalization, dependency selection, SHA-256, rkyv/format parsing, sorting, and
 post-freeze encoding never run per row or per processing batch.
+
+Cycle 5 freezes the normative layout and goldens with private, admission-neutral codecs: a borrowed
+aggregate reader plus full-buffer fixture/reference encoder, and a borrowed outer-structural
+`VnodePartialV2` reader plus full-buffer fixture/reference encoder. The 160-byte V2 header hashes the
+directory; each BODY entry hashes its exact slice, so there is no redundant whole-body hash. The
+outer reader does not authenticate the object or validate aggregate semantics. Production restore
+must first match the complete payload to the trusted seal/inventory digest, select the format from
+the manifest, and run every BODY through its expected inner reader while sharing the object budget.
+Production streaming writing, bounded fetch, chain resolution, shadow ingestion, and publication
+remain future work. Neither private codec is an admission consumer.
 
 From the trusted checkpoint pointer, obtain the inventory object's encoded length and expected
 digest. Reject a length above `transition_metadata_bytes_max`, acquire the global encoded-byte
@@ -182,8 +193,10 @@ and exact-length/digest enforcement. Per-artifact/per-chain encoded caps, the pe
 directory-entry cap, the global encoded pool, and per-task/global decoder/ingestion scratch are
 distinct candidate-profile fields. "Per artifact" means one complete raw `VnodePartialV2` payload,
 excluding the existing fixed provenance wrapper: rows, key bytes, state bytes, and encoded bytes are
-summed across its BODY entries rather than reset for each inner payload. Wrapper plus payload is
-checked before fetch. The resolved-parent limit counts both outer REFERENCE and inner DELTA edges.
+summed across its BODY entries rather than reset for each inner payload. Every aggregate BODY decode
+must consume one caller-owned, non-`Copy` mutable `AggregateObjectBudget` ledger for the whole V2
+object. Wrapper plus payload is checked before fetch. The resolved-parent limit counts both outer
+REFERENCE and inner DELTA edges.
 
 Represent restore as one assignment-scoped transition, not separate acquire/revoke maps or flat
 payload vectors. It binds the exact committed cut and checkpoint assignment fence to the target
@@ -358,9 +371,12 @@ bounded routing-schema identity, source/sink and output-identity contracts, inde
 charter and ineligible validator scaffold, plus aggregate/graph restore audits. None is an
 admission consumer. A reviewed Cycle 3 experiment removed the generic strict IPC helper because
 Arrow 57.2 can allocate from attacker-declared lengths before proving input availability; the
-initial aggregate artifact is therefore specified to use a bounded Laminar row codec instead. Its
-writer/decoder and the allocation-bounded outer `VnodePartialV2` directory remain future
-admission-neutral slices.
+initial aggregate artifact therefore uses a bounded Laminar row codec instead. Cycle 5 adds its
+private borrowed reader and full-buffer fixture/reference encoder, the private outer-structural
+`VnodePartialV2` reader and full-buffer fixture/reference encoder, and frozen wire goldens. These
+codecs remain unwired. They do not provide a production streaming writer, trusted sealed-object
+composition, manifest dispatch, bounded inventory/object fetch, parent-chain resolution, shadow
+restore, or whole-graph publication, and `[LDB-4007]` remains unchanged.
 
 Remaining commits are kept reviewable in this order:
 
@@ -369,17 +385,13 @@ Remaining commits are kept reviewable in this order:
      runner identity; a separately reviewed approved-profile schema/status records signatures and
      candidate-profile hash. The current validator intentionally accepts only null approvals and
      `qualification_eligible=false` and cannot be edited in place after results exist;
-2. `test: freeze aggregate artifact and codec contract`
-   - dedicated bounded row DTO, concrete checked COUNT/SUM registry, semantic/state goldens,
-     hostile-input preflight, authoritative roster plus BODY/REFERENCE/EMPTY vectors, and no live
-     restore wiring;
-3. `tools: define state backend qualification model`
+2. `tools: define state backend qualification model`
    - standalone backend-neutral model, deterministic workload, digest oracle, and validated output;
-4. separate exact-pin Fjall and RocksDB adapter commits behind the private spike contract;
-5. `test: exercise backend crash resource and endurance gates`;
-6. `docs: select managed-state backend from evidence`;
-7. `tools: remove rejected state backend spike`; and
-8. `docs: review distributed keyed state phase zero`.
+3. separate exact-pin Fjall and RocksDB adapter commits behind the private spike contract;
+4. `test: exercise backend crash resource and endurance gates`;
+5. `docs: select managed-state backend from evidence`;
+6. `tools: remove rejected state backend spike`; and
+7. `docs: review distributed keyed state phase zero`.
 
 Each commit runs its affected feature matrix. Backend candidates do not touch runtime crates, and
 the first graph-lifecycle implementation remains a Phase 1 change. The first guard-removal commit
