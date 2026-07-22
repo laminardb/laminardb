@@ -6,8 +6,13 @@ use serde::de::{Error as _, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
+pub mod model;
+pub mod model_result;
+pub mod workload;
+
 pub const NOTICE: &str = "NOT QUALIFICATION EVIDENCE";
 pub const MAX_PROFILE_BYTES: usize = 1_048_576;
+pub const MAX_MODEL_RESULT_BYTES: usize = 1_048_576;
 
 const PROFILE_SCHEMA: &str = include_str!("../schema/profile-v1.schema.json");
 
@@ -17,13 +22,13 @@ pub struct CheckErrors {
 }
 
 impl CheckErrors {
-    fn one(message: impl Into<String>) -> Self {
+    pub(crate) fn one(message: impl Into<String>) -> Self {
         Self {
             messages: vec![message.into()],
         }
     }
 
-    fn many(mut messages: Vec<String>) -> Self {
+    pub(crate) fn many(mut messages: Vec<String>) -> Self {
         messages.sort();
         messages.dedup();
         Self { messages }
@@ -144,14 +149,18 @@ impl<'de> Deserialize<'de> for UniqueValue {
 }
 
 pub fn validate_profile(bytes: &[u8]) -> Result<ProfileSummary, CheckErrors> {
-    if bytes.len() > MAX_PROFILE_BYTES {
-        return Err(CheckErrors::one(format!(
-            "profile is {} bytes; maximum is {MAX_PROFILE_BYTES}",
-            bytes.len()
-        )));
-    }
-    let UniqueValue(profile) = serde_json::from_slice(bytes)
-        .map_err(|error| CheckErrors::one(format!("decode profile: {error}")))?;
+    let profile = validated_profile_value(bytes)?;
+
+    Ok(ProfileSummary {
+        schema_version: text_at(&profile, "/schema_version").to_owned(),
+        profile_id: text_at(&profile, "/profile_id").to_owned(),
+        status: text_at(&profile, "/status").to_owned(),
+        qualification_eligible: bool_at(&profile, "/qualification_eligible"),
+    })
+}
+
+pub(crate) fn validated_profile_value(bytes: &[u8]) -> Result<Value, CheckErrors> {
+    let profile = decode_unique_json(bytes, MAX_PROFILE_BYTES, "profile")?;
     let schema: Value = serde_json::from_str(PROFILE_SCHEMA)
         .map_err(|error| CheckErrors::one(format!("decode embedded schema: {error}")))?;
     let validator = jsonschema::validator_for(&schema)
@@ -176,12 +185,23 @@ pub fn validate_profile(bytes: &[u8]) -> Result<ProfileSummary, CheckErrors> {
         return Err(CheckErrors::many(errors));
     }
 
-    Ok(ProfileSummary {
-        schema_version: text_at(&profile, "/schema_version").to_owned(),
-        profile_id: text_at(&profile, "/profile_id").to_owned(),
-        status: text_at(&profile, "/status").to_owned(),
-        qualification_eligible: bool_at(&profile, "/qualification_eligible"),
-    })
+    Ok(profile)
+}
+
+pub(crate) fn decode_unique_json(
+    bytes: &[u8],
+    maximum_bytes: usize,
+    label: &str,
+) -> Result<Value, CheckErrors> {
+    if bytes.len() > maximum_bytes {
+        return Err(CheckErrors::one(format!(
+            "{label} is {} bytes; maximum is {maximum_bytes}",
+            bytes.len()
+        )));
+    }
+    let UniqueValue(value) = serde_json::from_slice(bytes)
+        .map_err(|error| CheckErrors::one(format!("decode {label}: {error}")))?;
+    Ok(value)
 }
 
 fn check_semantics(profile: &Value, errors: &mut Vec<String>) {

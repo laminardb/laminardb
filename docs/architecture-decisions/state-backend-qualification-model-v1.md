@@ -98,9 +98,17 @@ required and null otherwise. Counts and widths fit `u32`; other numeric fields a
 
 `request_count` is `1..=4096`, but that limit alone is not a memory bound. Before replay, the tool
 sums each request's canonical encoded bytes, declared read capacity, and mutation bytes using
-checked `u64` arithmetic. The total must be at most 64 MiB. The
-validator streams digests and observations rather than retaining the trace. These C1 bounds do not
-replace the profile's C2 operation-count requirements.
+checked `u64` arithmetic. The total must be at most 64 MiB. Before constructing key, value, or
+canonical-request payloads, it computes the exact post-deduplication shape with bounded metadata;
+aggregate group count and join range count therefore use their actual distinct counts rather than
+raw input rows. The validator streams digests and observations rather than retaining the trace.
+
+C1 also rejects a model profile if any batch-row member exceeds 65,536, any configured key width
+exceeds 4,096 bytes, any configured value width exceeds 65,536 bytes, or `hard_batch_bytes` exceeds
+64 MiB. A case is rejected if `request_count * batch_rows` exceeds 4,194,304 logical rows. These
+are model-tool safety ceilings, not candidate qualification thresholds, and do not replace the
+profile's C2 operation-count requirements. Direct ordinal generation checks the named ordinal's
+exact charge; constructing a sequential replay additionally enforces the cumulative 64 MiB bound.
 
 There is no implicit workload cross-product. The approved runner must name its exact matrix and
 pacing separately.
@@ -283,7 +291,9 @@ unreviewed floating-point implementation.
 ## Canonical encodings and result
 
 Integers are unsigned big-endian. `bytes` is `u32 length || payload`; a collection is `u32 count ||
-elements`; booleans are exactly `0x00` or `0x01`. Counts and lengths are checked before allocation.
+elements`; booleans are exactly `0x00` or `0x01`. Counts and lengths are checked before canonical
+output allocation, the request encoder reserves its exact checked length once, and a canonical
+request may not exceed the 64 MiB model-core ceiling.
 
 A logical key is `table_u8 || vnode_u32 || bytes(key)`. A request is request domain, `kind_u8`,
 `scenario_u8`, `ordinal_u64`, `logical_rows_u32`, the four `BatchLimits` values in the order defined

@@ -313,6 +313,15 @@ That second slice still contains no Fjall or RocksDB adapter and no candidate-ex
 Tests prove deterministic request bytes, batch atomicity, model results, and rejection of malformed
 profiles/results.
 
+The C1 model is resource-bounded before payload construction: model-only width, batch, logical-row
+work, per-request, and cumulative 64 MiB replay ceilings are normative in the protocol. Exact
+aggregate and join accounting occurs after logical deduplication so the safety gate does not reject
+a valid compact request merely because its raw input batch was wide.
+
+C1 is not complete at this checkpoint. Closure still requires the documented occurrence-addressed
+lifecycle fault cuts, immutable snapshot export, literal wire/result goldens, and the full boundary
+matrix. Until those land, the model is scaffolding and cannot support adapter-conformance claims.
+
 The provisional C1 semantics, encoding, digest, result, and fault vocabulary are specified in
 [state backend qualification model v1](../architecture-decisions/state-backend-qualification-model-v1.md).
 Model/conformance scaffolding may be implemented while the checked-in candidate remains unapproved
