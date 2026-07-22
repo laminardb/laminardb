@@ -1,4 +1,4 @@
-name: Benchmarks
+name: Benchmark regression smoke
 
 on:
   push:
@@ -206,15 +206,9 @@ jobs:
 
       - name: Generate summary
         run: |
-          echo "## Benchmark Results" >> $GITHUB_STEP_SUMMARY
+          echo "## Non-qualifying benchmark regression smoke" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Latency Targets" >> $GITHUB_STEP_SUMMARY
-          echo "| Metric | Target | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|--------|--------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| State lookup | < 500ns | See artifacts |" >> $GITHUB_STEP_SUMMARY
-          echo "| Routing lookup | < 50ns | See artifacts |" >> $GITHUB_STEP_SUMMARY
-          echo "| 3-node latency | < 500ns | See artifacts |" >> $GITHUB_STEP_SUMMARY
-          echo "| Throughput/core | > 500K/s | See artifacts |" >> $GITHUB_STEP_SUMMARY
+          echo "Hosted-runner Criterion data is trend-only. It is not state-backend qualification or production evidence." >> $GITHUB_STEP_SUMMARY
 
       - name: Store benchmark result
         uses: benchmark-action/github-action-benchmark@v1

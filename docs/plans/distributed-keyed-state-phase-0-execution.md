@@ -97,6 +97,13 @@ results are visible. If production targets are not yet known, first measure the 
 stateless/global baseline; those measurements inform an owner decision but do not set the gate
 automatically.
 
+The machine-readable [`linux-nvme-v1` candidate](../../tools/state-backend-qual/profiles/linux-nvme-v1.candidate.json)
+is the sole source for proposed backend numbers. Its validator deliberately reports
+`VALID_INELIGIBLE_PROFILE`: workload/operations owners and an immutable image/package identity are
+unset, no candidate has run, and it is not qualification evidence. The source/object-store/sink
+deployment profile remains a separate required part of the product scenario and independent soak;
+an LSM result cannot certify those boundaries.
+
 ### B2. Typed partition ABI
 
 Freeze the existing ABI v1 rather than introduce another encoder: Arrow row bytes using default
@@ -213,23 +220,26 @@ Create a standalone, unpublished tool at `tools/state-backend-qual` with its own
 committed lockfile. The root workspace and `crates/**` must gain no candidate dependency during the
 spike.
 
-### C1. Backend-neutral model first
+### C1. Profile, then backend-neutral model
 
-The first tool commit contains only:
+The first tool commit contains only the candidate profile, schema, and an ineligible-profile
+validator. It has no backend, workload generator, result vocabulary, or candidate-execution
+workflow. The next tool commit adds:
 
-- a validated profile format with mandatory numerical gates;
 - deterministic counter-seeded aggregate, timer/window, and join request generation;
 - Arrow-batch-sized logical multi-read and atomic mutation batches;
 - an in-memory semantic model and digest oracle; and
 - structured run identity and result output.
 
-It contains no Fjall or RocksDB adapter and no CI workflow. Tests prove profile rejection,
-deterministic request bytes, batch atomicity, and model results.
+That second slice still contains no Fjall or RocksDB adapter and no candidate-execution workflow.
+Tests prove deterministic request bytes, batch atomicity, model results, and rejection of malformed
+profiles/results.
 
 ### C2. Candidate adapters
 
-Add exact, optional candidate pins in separate commits: Fjall 3.1.8 and one reviewed RocksDB Rust
-binding/version. Build exactly one candidate per binary. The private qualification contract covers
+Add exact, optional candidate pins in separate commits: Fjall `=3.1.8` and RocksDB Rust wrapper
+`=0.24.0` with its bundled RocksDB 10.4.2 engine. Build exactly one candidate per binary. The
+private qualification contract covers
 batched reads, atomic write/delete/timer mutations, bounded range scans, consistent snapshots,
 vnode cleanup, sorted restore, explicit crash persistence, and resource/operability statistics. It
 is not the future production trait.

@@ -554,6 +554,12 @@ size relative to RAM, key/value distributions, hot-key skew, batch size, ingress
 bounds, checkpoint cadence, and numerical p99/p99.9 latency, throughput, pause, and recovery goals.
 Targets are chosen before optimization results are known; “fast on a laptop” is not a release gate.
 
+The checked-in [`linux-nvme-v1` candidate](../../tools/state-backend-qual/profiles/linux-nvme-v1.candidate.json)
+is a proposed backend budget, not a benchmark result or approval. Its standalone validator accepts
+only the explicitly ineligible form, rejects measured/result fields, and has no runtime or backend
+dependency. Named owner approval, immutable runner identity, actual Fjall/RocksDB evidence, the
+product connector/object-store profile, and the independent release soak all remain outstanding.
+
 Regardless of the profile, these architecture invariants are mandatory:
 
 - no network or object-store I/O per state access;
