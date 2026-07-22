@@ -442,7 +442,7 @@ impl SqlQueryOperator {
                         vnodes = self.deferred_revoke_vnodes.len(),
                         "lazy_init fold: dropping deferred-revoked vnodes"
                     );
-                    agg_state.drop_vnodes(&self.deferred_revoke_vnodes, vc);
+                    agg_state.drop_vnodes(&self.deferred_revoke_vnodes, vc)?;
                 }
 
                 self.pending_restore = None;
@@ -1444,7 +1444,7 @@ impl GraphOperator for SqlQueryOperator {
                         self.op_name
                     ))
                 })?;
-                agg_state.drop_vnodes(revoked, vc);
+                agg_state.drop_vnodes(revoked, vc)?;
             }
             // Uninit: the revoked vnode's groups are still in `pending_restore`; defer the drop until
             // `lazy_init` folds them in, else this node could expose state it no longer owns.

@@ -150,6 +150,66 @@ async fn test_try_from_sql_with_group_by() {
 }
 
 #[tokio::test]
+async fn embedded_float_grouping_remains_supported_without_partition_codec_gate() {
+    let ctx = laminar_sql::create_session_context();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("bucket", DataType::Float64, false),
+        Field::new("value", DataType::Float64, false),
+    ]));
+    let dummy = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(arrow::array::Float64Array::from(vec![0.0])),
+            Arc::new(arrow::array::Float64Array::from(vec![0.0])),
+        ],
+    )
+    .unwrap();
+    let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![dummy]]).unwrap();
+    ctx.register_table("events", Arc::new(mem_table)).unwrap();
+
+    let mut state = IncrementalAggState::try_from_sql(
+        &ctx,
+        "SELECT bucket, SUM(value) AS total FROM events GROUP BY bucket",
+        false,
+    )
+    .await
+    .unwrap()
+    .expect("embedded aggregate planning must continue to accept float keys");
+
+    let pre_agg = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("bucket", DataType::Float64, true),
+            Field::new("__agg_input_1", DataType::Float64, true),
+        ])),
+        vec![
+            Arc::new(arrow::array::Float64Array::from(vec![1.5, 2.5, 1.5])),
+            Arc::new(arrow::array::Float64Array::from(vec![10.0, 20.0, 30.0])),
+        ],
+    )
+    .unwrap();
+    state.process_batch(&pre_agg, i64::MIN).unwrap();
+
+    let output = state.emit().unwrap();
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0].num_rows(), 2);
+    let keys = output[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .unwrap();
+    let totals = output[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .unwrap();
+    let actual = (0..output[0].num_rows())
+        .map(|row| (keys.value(row).to_bits(), totals.value(row)))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(actual[&1.5f64.to_bits()], 40.0);
+    assert_eq!(actual[&2.5f64.to_bits()], 20.0);
+}
+
+#[tokio::test]
 async fn test_incremental_aggregation_across_batches() {
     let ctx = laminar_sql::create_session_context();
     let schema = Arc::new(Schema::new(vec![
@@ -1568,7 +1628,11 @@ async fn drop_vnodes_purges_revoked_keeps_sibling() {
             .owned()
     };
     let vnode_of = |state: &IncrementalAggState, key: &str| {
-        state.delta_vnode_of(row_of(state, key).as_ref(), VC)
+        IncrementalAggState::vnode_for_group_key(
+            state.num_group_cols,
+            &row_of(state, key),
+            NonZeroU32::new(VC).unwrap(),
+        )
     };
 
     // A vnode `y` with two keys and a distinct vnode `x`.
@@ -1615,7 +1679,7 @@ async fn drop_vnodes_purges_revoked_keeps_sibling() {
 
     // Revoke vy.
     let revoked: rustc_hash::FxHashSet<u32> = [vy].into_iter().collect();
-    state.drop_vnodes(&revoked, VC);
+    state.drop_vnodes(&revoked, VC).unwrap();
 
     // Every vy entry is gone.
     assert!(

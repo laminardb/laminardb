@@ -41,19 +41,22 @@ async fn fresh_state() -> IncrementalAggState {
 }
 
 fn feed(state: &mut IncrementalAggState, rows: &[(&str, i64)]) {
+    let batch = pre_agg_batch(rows);
+    state.process_batch(&batch, 1000).unwrap();
+}
+
+fn pre_agg_batch(rows: &[(&str, i64)]) -> RecordBatch {
     let syms: Vec<&str> = rows.iter().map(|(s, _)| *s).collect();
     let tots: Vec<i64> = rows.iter().map(|(_, t)| *t).collect();
-    let n = rows.len();
-    let batch = RecordBatch::try_new(
+    RecordBatch::try_new(
         pre_agg_schema(),
         vec![
             Arc::new(arrow::array::StringArray::from(syms)),
             Arc::new(arrow::array::Int64Array::from(tots)),
-            Arc::new(arrow::array::Int64Array::from(vec![1i64; n])),
+            Arc::new(arrow::array::Int64Array::from(vec![1i64; rows.len()])),
         ],
     )
-    .unwrap();
-    state.process_batch(&batch, 1000).unwrap();
+    .unwrap()
 }
 
 fn totals(state: &mut IncrementalAggState) -> std::collections::BTreeMap<String, i64> {
@@ -138,4 +141,103 @@ async fn full_replay_replaces_preexisting_rows_and_is_idempotent() {
         acquirer.merge_groups(slice).unwrap();
     }
     assert_eq!(totals(&mut acquirer), first);
+}
+
+#[tokio::test]
+async fn aggregate_key_mapping_matches_shuffle_capture_and_drop() {
+    let rows = [
+        ("AAPL", 1),
+        ("GOOG", 2),
+        ("MSFT", 3),
+        ("AMZN", 4),
+        ("META", 5),
+        ("NVDA", 6),
+        ("ORCL", 7),
+        ("TSLA", 8),
+    ];
+    let batch = pre_agg_batch(&rows);
+    let expected = laminar_core::shuffle::row_vnodes(&batch, &[0], VNODES).unwrap();
+    let vnode_count = NonZeroU32::new(VNODES).unwrap();
+
+    let mut state = fresh_state().await;
+    let encoded = state
+        .row_converter
+        .convert_columns(&[Arc::clone(batch.column(0))])
+        .unwrap();
+    let aggregate_mapping = encoded
+        .iter()
+        .map(|row| {
+            IncrementalAggState::vnode_for_group_key(
+                state.num_group_cols,
+                &row.owned(),
+                vnode_count,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(aggregate_mapping, expected);
+
+    state.process_batch(&batch, 1000).unwrap();
+    let expected_counts = expected.into_iter().fold(
+        std::collections::BTreeMap::<u32, usize>::new(),
+        |mut counts, vnode| {
+            *counts.entry(vnode).or_default() += 1;
+            counts
+        },
+    );
+    let captures = state.checkpoint_groups_by_vnode(VNODES).unwrap();
+    let capture_counts = captures
+        .iter()
+        .map(|(vnode, checkpoint)| (*vnode, checkpoint.last_updated_ms.len()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(capture_counts, expected_counts);
+
+    let revoked_vnode = *expected_counts.keys().next().unwrap();
+    let revoked = [revoked_vnode].into_iter().collect();
+    state.drop_vnodes(&revoked, VNODES).unwrap();
+    assert_eq!(
+        state.groups.len(),
+        rows.len() - expected_counts[&revoked_vnode]
+    );
+    assert!(state.groups.keys().all(|key| {
+        IncrementalAggState::vnode_for_group_key(state.num_group_cols, key, vnode_count)
+            != revoked_vnode
+    }));
+}
+
+#[tokio::test]
+async fn delta_capture_rejects_vnode_count_change_before_mutation() {
+    let mut state = fresh_state().await;
+    state.set_delta_enabled(true);
+    feed(&mut state, &[("AAPL", 1), ("GOOG", 2), ("MSFT", 3)]);
+    state.checkpoint_delta_by_vnode(VNODES, 8).unwrap();
+    assert_eq!(state.delta_vnode_count, NonZeroU32::new(VNODES));
+
+    feed(&mut state, &[("AAPL", 10)]);
+    let dirty_before = state.dirty_keys_by_vnode.clone();
+    let emission_dirty_before = state.last_emitted_dirty_by_vnode.clone();
+    let chains_before = state.delta_chain_len.clone();
+    let force_rebase_before = state.force_rebase_vnodes.clone();
+
+    let error = state
+        .checkpoint_delta_by_vnode(VNODES * 2, 8)
+        .err()
+        .expect("a delta generation must not reinterpret its vnode space");
+    assert!(error.to_string().contains(
+        "aggregate delta vnode_count changed within one partition epoch: active=16, requested=32"
+    ));
+    assert_eq!(state.delta_vnode_count, NonZeroU32::new(VNODES));
+    assert_eq!(state.dirty_keys_by_vnode, dirty_before);
+    assert_eq!(state.last_emitted_dirty_by_vnode, emission_dirty_before);
+    assert_eq!(state.delta_chain_len, chains_before);
+    assert_eq!(state.force_rebase_vnodes, force_rebase_before);
+
+    let full_error = state
+        .checkpoint_groups_by_vnode(VNODES * 2)
+        .err()
+        .expect("a full capture cannot silently rotate an active delta generation");
+    assert!(full_error.to_string().contains("active=16, requested=32"));
+    assert_eq!(state.dirty_keys_by_vnode, dirty_before);
+    assert_eq!(state.delta_chain_len, chains_before);
+
+    state.checkpoint_delta_by_vnode(VNODES, 8).unwrap();
 }

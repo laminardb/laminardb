@@ -4,6 +4,7 @@
 //! aggregate per group. Cross-vnode partial merges live in
 //! `laminar_core::state::partial_aggregate` and are a separate concern.
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use ahash::{AHashMap, AHashSet};
@@ -18,6 +19,7 @@ use datafusion::prelude::SessionContext;
 use datafusion_common::ScalarValue;
 use datafusion_expr::function::AccumulatorArgs;
 use datafusion_expr::AggregateUDF;
+use laminar_core::state::PartitionKeyCodecV1;
 
 use crate::db::exact_table_reference;
 use crate::error::DbError;
@@ -794,7 +796,7 @@ pub(crate) struct IncrementalAggState {
     // Populated only while `delta_vnode_count` is set (off by default → zero cost).
     #[cfg(feature = "cluster")]
     delta_enabled: bool,
-    delta_vnode_count: Option<u32>,
+    delta_vnode_count: Option<NonZeroU32>,
     dirty_keys_by_vnode: AHashMap<u32, AHashSet<arrow::row::OwnedRow>>,
     // Changelog emission keys whose `last_emitted` changed since the last per-vnode
     // capture (set in `emit_changelog_delta`). Populated only while `delta_vnode_count`
@@ -1185,23 +1187,47 @@ impl IncrementalAggState {
         self.delta_enabled = enabled;
     }
 
-    /// Vnode for a group key under delta bucketing — same hash as the capture path.
-    fn delta_vnode_of(&self, key_bytes: &[u8], count: u32) -> u32 {
-        if self.num_group_cols == 0 {
+    /// Map an already Arrow-row-encoded aggregate key through partitioning ABI v1.
+    ///
+    /// The aggregate hot path already owns these bytes, so this deliberately uses the
+    /// codec's static mapping rather than constructing another codec or re-encoding the key.
+    /// Global aggregate state is pinned to vnode zero.
+    fn vnode_for_group_key(
+        num_group_cols: usize,
+        key: &arrow::row::OwnedRow,
+        vnode_count: NonZeroU32,
+    ) -> u32 {
+        if num_group_cols == 0 {
             0
         } else {
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                (laminar_core::state::key_hash(key_bytes) % u64::from(count)) as u32
+            PartitionKeyCodecV1::vnode_for_encoded(key.as_ref(), vnode_count)
+        }
+    }
+
+    /// Freeze vnode cardinality for one delta-chain generation. Changing it would reinterpret
+    /// already-bucketed dirty keys, so a future repartition lifecycle must rotate the generation
+    /// explicitly instead of silently changing this value at capture time.
+    #[cfg(feature = "cluster")]
+    fn validate_delta_vnode_count(&self, requested: u32) -> Result<NonZeroU32, DbError> {
+        let requested = NonZeroU32::new(requested)
+            .ok_or_else(|| DbError::Pipeline("vnode_count must be > 0".to_string()))?;
+        if let Some(active) = self.delta_vnode_count {
+            if active != requested {
+                return Err(DbError::Pipeline(format!(
+                    "aggregate delta vnode_count changed within one partition epoch: active={}, requested={}",
+                    active.get(),
+                    requested.get()
+                )));
             }
         }
+        Ok(requested)
     }
 
     /// Mark a changelog emission key dirty for the delta path. No-op unless delta
     /// capture is enabled (`delta_vnode_count` set), so it costs nothing by default.
     fn mark_last_emitted_dirty(&mut self, key: &arrow::row::OwnedRow) {
         if let Some(count) = self.delta_vnode_count {
-            let v = self.delta_vnode_of(key.as_ref(), count);
+            let v = Self::vnode_for_group_key(self.num_group_cols, key, count);
             self.last_emitted_dirty_by_vnode
                 .entry(v)
                 .or_default()
@@ -1311,7 +1337,7 @@ impl IncrementalAggState {
                 self.mark_emit_dirty(key.clone());
             }
             if let Some(count) = self.delta_vnode_count {
-                let v = self.delta_vnode_of(key.as_ref(), count);
+                let v = Self::vnode_for_group_key(self.num_group_cols, &key, count);
                 insert_vnode_tracking_key(&mut self.dirty_keys_by_vnode, v, key);
             }
         }
@@ -1781,22 +1807,10 @@ impl IncrementalAggState {
         &mut self,
         vnode_count: u32,
     ) -> Result<std::collections::HashMap<u32, AggStateCheckpoint>, DbError> {
-        if vnode_count == 0 {
-            return Err(DbError::Pipeline("vnode_count must be > 0".to_string()));
-        }
+        let vnode_count = self.validate_delta_vnode_count(vnode_count)?;
         let fingerprint = self.query_fingerprint();
-        let global = self.num_group_cols == 0;
+        let num_group_cols = self.num_group_cols;
         let retractable = self.weight_col_idx.is_some();
-        let vnode_of = |row_key: &arrow::row::OwnedRow| -> u32 {
-            if global {
-                0
-            } else {
-                #[allow(clippy::cast_possible_truncation)]
-                let v = (laminar_core::state::key_hash(row_key.as_ref()) % u64::from(vnode_count))
-                    as u32;
-                v
-            }
-        };
 
         // Bucket the live groups by vnode first, then columnar-encode each subset.
         let mut by_vnode: std::collections::HashMap<
@@ -1804,7 +1818,7 @@ impl IncrementalAggState {
             Vec<(arrow::row::OwnedRow, &mut GroupEntry)>,
         > = std::collections::HashMap::new();
         for (row_key, entry) in &mut self.groups {
-            let vnode = vnode_of(row_key);
+            let vnode = Self::vnode_for_group_key(num_group_cols, row_key, vnode_count);
             by_vnode
                 .entry(vnode)
                 .or_default()
@@ -1837,7 +1851,7 @@ impl IncrementalAggState {
 
         if self.emit_changelog {
             for (row_key, vals) in &self.last_emitted {
-                let vnode = vnode_of(row_key);
+                let vnode = Self::vnode_for_group_key(num_group_cols, row_key, vnode_count);
                 let sv_key =
                     row_to_scalar_key_with_types(&self.row_converter, row_key, &self.group_types)?;
                 buckets
@@ -1872,22 +1886,15 @@ impl IncrementalAggState {
     fn checkpoint_full_vnode(
         &mut self,
         vnode: u32,
-        vnode_count: u32,
+        vnode_count: NonZeroU32,
         fingerprint: u64,
         retractable: bool,
     ) -> Result<VnodeCapture, DbError> {
-        let global = self.num_group_cols == 0;
-        let vnode_of = |key: &arrow::row::OwnedRow| -> u64 {
-            if global {
-                0
-            } else {
-                laminar_core::state::key_hash(key.as_ref()) % u64::from(vnode_count)
-            }
-        };
+        let num_group_cols = self.num_group_cols;
         let mut entries: Vec<(arrow::row::OwnedRow, &mut GroupEntry)> = self
             .groups
             .iter_mut()
-            .filter(|(key, _)| vnode_of(key) == u64::from(vnode))
+            .filter(|(key, _)| Self::vnode_for_group_key(num_group_cols, key, vnode_count) == vnode)
             .map(|(key, entry)| (key.clone(), entry))
             .collect();
         let encoded = encode_groups_columnar(
@@ -1921,29 +1928,20 @@ impl IncrementalAggState {
         vnode_count: u32,
         chain_bound: u32,
     ) -> Result<std::collections::HashMap<u32, VnodeCapture>, DbError> {
-        if vnode_count == 0 {
-            return Err(DbError::Pipeline("vnode_count must be > 0".to_string()));
-        }
+        let vnode_count = self.validate_delta_vnode_count(vnode_count)?;
 
         let retractable = self.weight_col_idx.is_some();
         let fingerprint = self.query_fingerprint();
-        let global = self.num_group_cols == 0;
-        let vnode_of = |row_key: &arrow::row::OwnedRow| -> u32 {
-            if global {
-                0
-            } else {
-                #[allow(clippy::cast_possible_truncation)]
-                {
-                    (laminar_core::state::key_hash(row_key.as_ref()) % u64::from(vnode_count))
-                        as u32
-                }
-            }
-        };
+        let num_group_cols = self.num_group_cols;
 
         // Vnodes holding groups remain in the chain even when this epoch has no changes.
         let mut touched: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for row_key in self.groups.keys() {
-            touched.insert(vnode_of(row_key));
+            touched.insert(Self::vnode_for_group_key(
+                num_group_cols,
+                row_key,
+                vnode_count,
+            ));
         }
         // Re-visit vnodes a failed epoch must re-base — even emptied ones that fell out of the sets
         // above; `force_full_rebase` dropped their chain len, so each re-bases FULL below.
@@ -1983,7 +1981,7 @@ impl IncrementalAggState {
     fn last_emitted_for_vnode(
         &self,
         vnode: u32,
-        vnode_count: u32,
+        vnode_count: NonZeroU32,
         only: Option<&AHashSet<arrow::row::OwnedRow>>,
     ) -> Result<Vec<EmittedCheckpoint>, DbError> {
         if !self.emit_changelog {
@@ -1991,7 +1989,7 @@ impl IncrementalAggState {
         }
         let mut out = Vec::new();
         for (row_key, vals) in &self.last_emitted {
-            if self.delta_vnode_of(row_key.as_ref(), vnode_count) != vnode {
+            if Self::vnode_for_group_key(self.num_group_cols, row_key, vnode_count) != vnode {
                 continue;
             }
             if only.is_some_and(|keys| !keys.contains(row_key)) {
@@ -2035,7 +2033,11 @@ impl IncrementalAggState {
         let (keys_ipc, acc_state_ipc, last_updated_ms) = encoded?;
 
         // Changed emission entries ride in `changed.last_emitted`.
-        let vnode_count = self.delta_vnode_count.unwrap_or(1);
+        let vnode_count = self.delta_vnode_count.ok_or_else(|| {
+            DbError::Pipeline(
+                "aggregate delta encoding requires an established vnode_count".to_string(),
+            )
+        })?;
         let last_emitted = self.last_emitted_for_vnode(
             vnode,
             vnode_count,
@@ -2240,7 +2242,7 @@ impl IncrementalAggState {
                 self.mark_emit_dirty(row_key.clone());
             }
             if let Some(count) = self.delta_vnode_count {
-                let vnode = self.delta_vnode_of(row_key.as_ref(), count);
+                let vnode = Self::vnode_for_group_key(self.num_group_cols, row_key, count);
                 insert_vnode_tracking_key(&mut self.dirty_keys_by_vnode, vnode, row_key.clone());
             }
         }
@@ -2355,20 +2357,18 @@ impl IncrementalAggState {
     /// transition, not a logical relation change, so it must not emit changelog rows. Purging
     /// prevents stale keys absent from a later FULL image from surviving a re-acquire.
     #[cfg(feature = "cluster")]
-    pub(crate) fn drop_vnodes(&mut self, revoked: &rustc_hash::FxHashSet<u32>, vnode_count: u32) {
+    pub(crate) fn drop_vnodes(
+        &mut self,
+        revoked: &rustc_hash::FxHashSet<u32>,
+        vnode_count: u32,
+    ) -> Result<(), DbError> {
         if revoked.is_empty() {
-            return;
+            return Ok(());
         }
-        let global = self.num_group_cols == 0;
+        let vnode_count = self.validate_delta_vnode_count(vnode_count)?;
+        let num_group_cols = self.num_group_cols;
         let vnode_of = |k: &arrow::row::OwnedRow| -> u32 {
-            if global {
-                0
-            } else {
-                #[allow(clippy::cast_possible_truncation)]
-                {
-                    (laminar_core::state::key_hash(k.as_ref()) % u64::from(vnode_count)) as u32
-                }
-            }
+            Self::vnode_for_group_key(num_group_cols, k, vnode_count)
         };
         let in_revoked = |k: &arrow::row::OwnedRow| -> bool { revoked.contains(&vnode_of(k)) };
 
@@ -2380,6 +2380,7 @@ impl IncrementalAggState {
             self.last_emitted_dirty_by_vnode.remove(v);
             self.delta_chain_len.remove(v);
         }
+        Ok(())
     }
 }
 
