@@ -6,8 +6,10 @@ use serde::de::{Error as _, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
+pub mod latency_samples;
 pub mod model;
 pub mod model_result;
+pub mod resource_samples;
 pub mod workload;
 
 pub const NOTICE: &str = "NOT QUALIFICATION EVIDENCE";
