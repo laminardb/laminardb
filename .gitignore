@@ -49,6 +49,7 @@ data/
 checkpoints/
 wal/
 /tools/*
+!/tools/independent-soak-contract/
 
 # Private configs (symlinked from private repo)
 CLAUDE.md

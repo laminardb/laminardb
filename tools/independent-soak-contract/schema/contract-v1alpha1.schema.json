@@ -1,0 +1,179 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ldb:distributed-state-soak-contract:v1alpha1",
+  "title": "Distributed state soak contract — ineligible draft",
+  "description": "Schema validation is not certification evidence. This alpha schema cannot represent an eligible contract.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "notice",
+    "status",
+    "certification_eligible",
+    "scenario",
+    "oracle",
+    "gates"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "distributed-state-soak/v1alpha1"
+    },
+    "notice": {
+      "const": "NOT CERTIFICATION EVIDENCE"
+    },
+    "status": {
+      "const": "draft_ineligible"
+    },
+    "certification_eligible": {
+      "const": false
+    },
+    "scenario": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "admission",
+        "delivery_guarantee",
+        "source",
+        "source_group_ordering",
+        "operator",
+        "output",
+        "sink"
+      ],
+      "properties": {
+        "id": {
+          "const": "grouped-count-sum-alo"
+        },
+        "admission": {
+          "const": "blocked_ldb_4007"
+        },
+        "delivery_guarantee": {
+          "const": "at_least_once"
+        },
+        "source": {
+          "const": "replayable_splittable_kafka"
+        },
+        "source_group_ordering": {
+          "const": "one_topic_partition_per_logical_group"
+        },
+        "operator": {
+          "const": "grouped_count_star_sum_exact_integer_decimal"
+        },
+        "output": {
+          "const": "append_result_snapshots"
+        },
+        "sink": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["required_capability", "implementation", "eligibility"],
+          "properties": {
+            "required_capability": {
+              "const": "durable_multiwriter_append"
+            },
+            "implementation": {
+              "const": "kafka_envelope_append_candidate"
+            },
+            "eligibility": {
+              "const": "candidate_ineligible"
+            }
+          }
+        }
+      }
+    },
+    "oracle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "public_surfaces_only",
+        "laminar_library_dependencies",
+        "numeric_coverage",
+        "stable_operation_identity",
+        "assignment_generation"
+      ],
+      "properties": {
+        "status": {
+          "const": "fixture_only"
+        },
+        "public_surfaces_only": {
+          "const": true
+        },
+        "laminar_library_dependencies": {
+          "const": false
+        },
+        "numeric_coverage": {
+          "const": "integer_fixture_only_decimal_required"
+        },
+        "stable_operation_identity": {
+          "const": "required_not_implemented"
+        },
+        "assignment_generation": {
+          "const": "required_not_implemented"
+        }
+      }
+    },
+    "gates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "owners_and_independent_review",
+        "immutable_artifact_identities",
+        "production_environment",
+        "numerical_contract",
+        "fault_controller",
+        "evidence_store",
+        "cluster_admission",
+        "operation_identity",
+        "assignment_provenance_and_fencing",
+        "independent_dry_run"
+      ],
+      "properties": {
+        "owners_and_independent_review": {
+          "$ref": "#/$defs/unresolved_gate"
+        },
+        "immutable_artifact_identities": {
+          "$ref": "#/$defs/unresolved_gate"
+        },
+        "production_environment": {
+          "$ref": "#/$defs/unresolved_gate"
+        },
+        "numerical_contract": {
+          "$ref": "#/$defs/unresolved_gate"
+        },
+        "fault_controller": {
+          "$ref": "#/$defs/unresolved_gate"
+        },
+        "evidence_store": {
+          "$ref": "#/$defs/unresolved_gate"
+        },
+        "cluster_admission": {
+          "$ref": "#/$defs/unresolved_gate"
+        },
+        "operation_identity": {
+          "$ref": "#/$defs/unresolved_gate"
+        },
+        "assignment_provenance_and_fencing": {
+          "$ref": "#/$defs/unresolved_gate"
+        },
+        "independent_dry_run": {
+          "$ref": "#/$defs/unresolved_gate"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "unresolved_gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "approved_values"],
+      "properties": {
+        "state": {
+          "const": "unresolved"
+        },
+        "approved_values": {
+          "type": "null"
+        }
+      }
+    }
+  }
+}
