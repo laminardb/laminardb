@@ -3302,6 +3302,11 @@ mod grpc {
         }
 
         #[cfg(test)]
+        pub(crate) fn barrier_arrivals_for_test(&self) -> u64 {
+            self.barrier_arrivals.load(Ordering::Acquire)
+        }
+
+        #[cfg(test)]
         pub(super) fn assignment_fence_for_test(&self) -> CheckpointAssignmentFence {
             self.assignment
                 .read()

@@ -1377,7 +1377,7 @@ async fn pre_rotation_retired_barrier_is_discarded_after_rotation_without_loss()
     send_barrier(&sender, &[2], CheckpointBarrier::new(70, 70))
         .await
         .unwrap();
-    wait_until(|| receiver.committed_sequence_for_test(1) == Some(0)).await;
+    wait_until(|| receiver.barrier_arrivals_for_test() == 1).await;
     receiver
         .retire_checkpoint_barriers(terminal, receiver.assignment_fence_for_test().digest())
         .unwrap();
