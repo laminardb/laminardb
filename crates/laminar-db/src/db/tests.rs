@@ -6881,16 +6881,18 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
         assert!(!db.ctx.table_exist(name).unwrap());
     }
 
-    async fn assert_cluster_rejection(db: &LaminarDB, name: &str, ddl: &str) {
+    async fn assert_cluster_rejection(db: &LaminarDB, name: &str, ddl: &str) -> String {
         let error = db
             .execute(ddl)
             .await
             .expect_err("unsupported cluster query shape must fail closed");
+        let message = error.to_string();
         assert!(
-            error.to_string().contains("LDB-4007"),
+            message.contains("LDB-4007"),
             "unexpected rejection for {name}: {error}"
         );
         assert_no_query_residue(db, name);
+        message
     }
 
     let db = one_owner_cluster().await;
@@ -6976,6 +6978,33 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
                  FROM left_events WHERE ts > now() - INTERVAL '10' SECOND EMIT CHANGES",
             )
             .await;
+            let keyed_error = assert_cluster_rejection(
+                &db,
+                "rejected_keyed_aggregate",
+                "CREATE STREAM rejected_keyed_aggregate AS \
+                 SELECT id, SUM(value) AS total FROM left_events GROUP BY id",
+            )
+            .await;
+            assert!(
+                keyed_error.contains(
+                    "keyed aggregates retain operator-owned map state without a live-state byte budget"
+                ),
+                "unexpected keyed aggregate rejection: {keyed_error}"
+            );
+            let global_window_error = assert_cluster_rejection(
+                &db,
+                "rejected_global_window",
+                "CREATE STREAM rejected_global_window AS \
+                 SELECT TUMBLE(ts, INTERVAL '1' MINUTE) AS bucket, SUM(value) AS total \
+                 FROM left_events GROUP BY TUMBLE(ts, INTERVAL '1' MINUTE)",
+            )
+            .await;
+            assert!(
+                global_window_error.contains(
+                    "keyed aggregates retain operator-owned map state without a live-state byte budget"
+                ),
+                "unexpected global window rejection: {global_window_error}"
+            );
             assert_cluster_rejection(
                 &db,
                 "rejected_keyed_window",
