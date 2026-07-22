@@ -338,7 +338,16 @@ candidate performance, resource, fault, endurance, selection, and qualification 
 prohibited until the final profile and runner are approved.
 There is no implicit workload cross-product or pacing policy in C1.
 
-### C2. Candidate adapters
+### C2. Runner contract, then candidate adapters
+
+The provisional candidate-neutral measurement and evidence policy is specified in
+[state backend qualification runner v1](../architecture-decisions/state-backend-qualification-runner-v1.md).
+Its strict plan schema always represents a complete, nonempty exact matrix; synthetic fixtures may
+exercise validators, but no real plan is checked in while its DKS-Q2 blockers remain open. The
+runner contract freezes open-loop pacing, raw latency samples, gate populations, resource formulas,
+physical layout, attempt classification, fault identity, provenance, and immutable retention before
+candidate observations exist. The CLI exposes validation only and has no candidate-execution
+command.
 
 Add exact, optional candidate pins in separate commits: Fjall `=3.1.8` and RocksDB Rust wrapper
 `=0.24.0` with its bundled RocksDB 10.4.2 engine. Build exactly one candidate per binary. The
@@ -354,9 +363,10 @@ chosen Rust binding's actual MultiGet behavior, DeleteRange tombstone/read cost,
 cross-column-family stall propagation, rate-limiter scope, native memory accounting, and
 SST-ingest write pauses. Pin the exact RocksDB engine and wrapper before results are accepted.
 
-Run identical fixed-operation workloads, alternate candidate order across repetitions, and record
-service latency separately from queue latency. Retain raw samples or losslessly mergeable
-histograms and derive p50/p90/p95/p99/p99.9/max, throughput, CPU, RSS/PSS,
+Only after named owners approve the exact profile and complete runner-plan hashes, run identical
+fixed-operation workloads in the frozen candidate order and record offered end-to-end, service,
+and queue latency separately. Retain the exact raw samples required by runner v1 and derive
+p50/p90/p95/p99/p99.9/max, throughput, CPU, RSS/PSS,
 cache/memtable/journal/compaction pressure, physical writes, disk/FD use, snapshot/export overlap,
 restore/cleanup RTO, oracle digest, binary/lock/profile hashes, and target hardware identity.
 
@@ -366,6 +376,15 @@ snapshot/export/restore/cleanup timings are diagnostic primitive observations an
 the separately owned artifact-conformance, checkpoint, or recovery gates.
 
 ### C3. Fault and endurance gates
+
+Before backend selection, run a separately frozen shared-database concurrency matrix; C2's
+single-worker service evidence is necessary but insufficient. Use deterministic disjoint-vnode
+lanes with a sequential oracle per lane, including a hot writer and latency-victim lane, concurrent
+point/write/range traffic, and snapshot/export overlap. Gate victim and aggregate p99/p99.9/max,
+global stalls, CPU/memory/I/O and resource tails. Barrier-addressed cases race normal operations
+with restore activation, cleanup, and pinned-snapshot release while preserving the lifecycle-fence
+oracle. Both candidates use the same lane schedule, database/keyspace layout, seeds, barriers, and
+paired order.
 
 For each candidate, exercise kill during atomic write, snapshot/export, restore, and cleanup;
 explicit persistence recovery; corruption/truncation; wrong identity/schema; concurrent open; FD

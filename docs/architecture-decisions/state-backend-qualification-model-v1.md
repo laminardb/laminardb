@@ -3,7 +3,8 @@
 - **Status:** Implemented provisional C1 reference model; ineligible for qualification
 - **Scope:** `tools/state-backend-qual` only
 - **Approval needed before qualification execution:** workload owner and operations owner
-- **Related decision:** [ADR-008](ADR-008-managed-vnode-keyed-state.md)
+- **Related decisions:** [ADR-008](ADR-008-managed-vnode-keyed-state.md) and the
+  [state backend qualification runner v1](state-backend-qualification-runner-v1.md)
 
 ## Decision and authority boundary
 
@@ -394,8 +395,9 @@ checked-overflow and 64 MiB replay rejection; validate-before-mutate atomicity; 
 immutable snapshots; vnode isolation; explicit restore budgets; persist/reopen cuts; and strict
 result regeneration including duplicate/unknown-field rejection.
 
-Backend runner policy, raw samples and derived quantiles, pass/invalid aggregation, resource
-formulas, N/N-1 versions, physical keyspace layout, candidate-specific durability, and immutable
-evidence retention are C2/C3 decisions in the Phase 0 plan. Backend-local observations cannot
-satisfy product checkpoint, recovery, delivery, exactly-once, or the
+The provisional [runner v1 contract](state-backend-qualification-runner-v1.md) specifies C2 pacing,
+finite raw samples, resource formulas, physical layout, attempt classification, and immutable
+evidence. Candidate durability, concurrency, physical faults, N/N-1, and endurance remain blocked
+until their named C2/C3 prerequisites close. Backend-local observations cannot satisfy product
+checkpoint, recovery, delivery, exactly-once, or the
 [independent production soak](../testing/distributed-state-production-soak-charter.md).
