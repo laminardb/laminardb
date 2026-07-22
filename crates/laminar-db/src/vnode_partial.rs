@@ -4,6 +4,9 @@
 
 use crate::error::DbError;
 
+#[cfg(not(test))]
+mod v2;
+#[cfg(test)]
 pub(crate) mod v2;
 
 /// Operator-state slices for one vnode at one epoch, in one of three shapes:

@@ -4,6 +4,8 @@
 //! future manifest-selected reader may consume it only after the bounded fetch and whole-transition
 //! contracts in ADR-008 are implemented.
 
+// Temporary reader-first compatibility seam. DKS-P1-001 owns removal of this allowance in the
+// first trusted manifest-selected restore-composition commit, before any capability advertisement.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::cmp::Ordering;
@@ -94,6 +96,7 @@ impl ArtifactKind {
 }
 
 /// One already-sorted entry supplied to the directory encoder.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct EncodeEntry<'a> {
     pub(crate) operator_identity_sha256: [u8; SHA256_LEN],
@@ -102,6 +105,7 @@ pub(crate) struct EncodeEntry<'a> {
 }
 
 /// BODY bytes or an exact REFERENCE parent.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum EncodeEntryPayload<'a> {
     Body {
@@ -383,6 +387,7 @@ pub(crate) fn decode<'a>(
 /// Encode one canonical V2 outer directory from caller-sorted entries.
 ///
 /// BODY bytes are treated as opaque and must be produced by the selected managed-envelope writer.
+#[cfg(test)]
 pub(crate) fn encode(
     expected: ExpectedContext<'_>,
     entries: &[EncodeEntry<'_>],
@@ -746,6 +751,7 @@ fn raw_parent(entry: RawEntry) -> Option<ParentEntryLink> {
     }
 }
 
+#[cfg(test)]
 fn put_parent(raw: &mut [u8], parent: ParentEntryLink) -> Result<(), VnodePartialV2Error> {
     put(raw, 120, &parent.attempt.epoch.to_be_bytes())?;
     put(raw, 128, &parent.attempt.checkpoint_id.to_be_bytes())?;
@@ -837,6 +843,7 @@ fn read_array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], Vn
         .ok_or_else(|| invalid("truncated fixed-width field"))
 }
 
+#[cfg(test)]
 fn put(target: &mut [u8], offset: usize, value: &[u8]) -> Result<(), VnodePartialV2Error> {
     let end = offset
         .checked_add(value.len())

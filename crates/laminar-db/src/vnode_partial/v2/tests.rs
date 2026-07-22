@@ -133,7 +133,7 @@ fn frozen_v2_outer_directory_goldens_decode_and_encoder_reproduces_them() {
         },
     ];
     let mixed_fixture = fixture_bytes(include_str!(
-        "../../../tests/fixtures/managed_state_v1/vnode_partial_mixed.hex"
+        "../../../tests/fixtures/managed_state_v1/vnode_partial_outer_mixed.hex"
     ));
     let mixed_encoded = encode(context(&mixed_roster), &mixed, limits()).unwrap();
     assert_eq!(mixed_encoded, mixed_fixture);

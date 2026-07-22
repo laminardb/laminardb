@@ -326,8 +326,8 @@ nonzero accumulator. When the cached contract declares a non-nullable SUM input,
 must equal COUNT. Zero non-null count has canonical zero accumulator bytes and evaluates to SQL
 `NULL`; otherwise the exact signed `i64` accumulator is the nullable `Int64` result. Cycle 5
 publishes one normative binary layout with every magic, field offset, width, byte order, and digest
-range plus frozen goldens, a private borrowed reader, and a full-buffer fixture/reference encoder.
-The reference encoder is not the production streaming writer; this ADR does not treat an archived
+range plus frozen goldens, a private borrowed reader, and a test-only full-buffer fixture encoder.
+The fixture encoder is not release code or the production streaming writer; this ADR does not treat an archived
 Rust type or prose alone as the wire specification.
 Current `last_updated_ms` is not part of v1 because no aggregate execution path consumes it.
 Changed-group append output derives its stable
@@ -356,13 +356,14 @@ remains an authoritative zero-row base. BODY ranges are non-overlapping, in boun
 cover the declared body region with no padding. The directory digest covers the directory and each
 BODY entry covers its exact slice; a redundant whole-body digest is deliberately omitted.
 
-Cycle 5 lands a private borrowed outer-structural V2 reader and a full-buffer fixture/reference
+Cycle 5 lands a private borrowed outer-structural V2 reader and a test-only full-buffer fixture
 encoder. The outer reader validates checked layout, roster, ranges, entry kinds, ancestry shape, and
 per-entry BODY digests against its expected source context. It does not authenticate the complete
 object or establish aggregate-state semantics. Production composition must first match the complete
 payload to the trusted seal/inventory digest and manifest selector, then invoke the expected inner
 reader for every BODY with exact identity, kind, parent, codec, routing-schema, and state-contract
-context. The landed encoders allocate complete vectors and are not production streaming writers.
+context. The fixture encoders compile only in tests, allocate complete vectors, and are not
+production streaming writers.
 
 The trusted checkpoint pointer first identifies the inventory object and its expected digest. A
 metadata/HEAD request must expose its encoded length; restore rejects a value above
@@ -412,8 +413,8 @@ sorting, encoding, hashing, and restore decoding run on bounded blocking workers
 record/event-loop hot path, and qualification still measures their CPU, memory, pause, and tail
 effects.
 
-The landed borrowed readers and reference encoders are admission-neutral conformance primitives.
-They do not resolve REFERENCE/DELTA chains, produce the authoritative replacement namespace, ingest
+The landed borrowed readers and frozen fixture vectors are admission-neutral conformance
+primitives. They do not resolve REFERENCE/DELTA chains, produce the authoritative replacement namespace, ingest
 shadow state, publish a graph transition, alter a checkpoint manifest, or relax `[LDB-4007]`.
 
 #### Whole-graph publication boundary

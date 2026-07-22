@@ -3,6 +3,8 @@
 //! This module is intentionally unwired. A later manifest-selected restore path will consume it;
 //! until then it must not change cluster admission or legacy checkpoint dispatch.
 
+// Temporary reader-first compatibility seam. DKS-P1-001 owns removal of this allowance in the
+// first trusted manifest-selected restore-composition commit, before any capability advertisement.
 #![cfg_attr(not(test), allow(dead_code))]
 
 use std::num::NonZeroU32;
@@ -54,6 +56,7 @@ pub(super) enum ArtifactError {
     Limit(&'static str),
     #[error("managed aggregate artifact arithmetic overflow")]
     ArithmeticOverflow,
+    #[cfg(test)]
     #[error("managed aggregate artifact allocation failed")]
     Allocation,
     #[error("COUNT(*) overflow")]
@@ -154,6 +157,7 @@ impl CountSumStateV1 {
         Ok(())
     }
 
+    #[cfg(test)]
     fn encode(self) -> Result<[u8; STATE_WIDTH], ArtifactError> {
         self.validate_persisted()?;
         let mut bytes = [0; STATE_WIDTH];
@@ -257,7 +261,8 @@ pub(super) struct ArtifactContext<'a> {
 ///
 /// Every successfully encoded or decoded BODY consumes this same non-`Copy` ledger. Failed
 /// operations leave it unchanged.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
+#[cfg_attr(test, derive(Clone))]
 pub(super) struct AggregateObjectBudget {
     pub(super) envelope_metadata_bytes_max: u64,
     pub(super) routing_schema_bytes_max: u64,
@@ -382,6 +387,7 @@ impl<'a> Iterator for DecodedRows<'a> {
     }
 }
 
+#[cfg(test)]
 pub(super) fn encode(
     context: ArtifactContext<'_>,
     rows: &[AggregateRow<'_>],
@@ -512,6 +518,7 @@ pub(super) fn encode(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn write_header(
     output: &mut [u8],
     context: ArtifactContext<'_>,
@@ -860,6 +867,7 @@ fn field<const N: usize>(bytes: &[u8], start: usize) -> Result<[u8; N], Artifact
         .ok_or(ArtifactError::Truncated)
 }
 
+#[cfg(test)]
 fn put(output: &mut [u8], start: usize, value: &[u8]) -> Result<(), ArtifactError> {
     let end = start
         .checked_add(value.len())

@@ -175,9 +175,8 @@ immutable contract at plan/init time;
 introspection, canonicalization, dependency selection, SHA-256, rkyv/format parsing, sorting, and
 post-freeze encoding never run per row or per processing batch.
 
-Cycle 5 freezes the normative layout and goldens with private, admission-neutral codecs: a borrowed
-aggregate reader plus full-buffer fixture/reference encoder, and a borrowed outer-structural
-`VnodePartialV2` reader plus full-buffer fixture/reference encoder. The 160-byte V2 header hashes the
+Cycle 5 freezes the normative layout and goldens with private, admission-neutral borrowed aggregate
+and outer-structural `VnodePartialV2` readers plus test-only full-buffer fixture encoders. The 160-byte V2 header hashes the
 directory; each BODY entry hashes its exact slice, so there is no redundant whole-body hash. The
 outer reader does not authenticate the object or validate aggregate semantics. Production restore
 must first match the complete payload to the trusted seal/inventory digest, select the format from
@@ -371,12 +370,9 @@ bounded routing-schema identity, source/sink and output-identity contracts, inde
 charter and ineligible validator scaffold, plus aggregate/graph restore audits. None is an
 admission consumer. A reviewed Cycle 3 experiment removed the generic strict IPC helper because
 Arrow 57.2 can allocate from attacker-declared lengths before proving input availability; the
-initial aggregate artifact therefore uses a bounded Laminar row codec instead. Cycle 5 adds its
-private borrowed reader and full-buffer fixture/reference encoder, the private outer-structural
-`VnodePartialV2` reader and full-buffer fixture/reference encoder, and frozen wire goldens. These
-codecs remain unwired. They do not provide a production streaming writer, trusted sealed-object
-composition, manifest dispatch, bounded inventory/object fetch, parent-chain resolution, shadow
-restore, or whole-graph publication, and `[LDB-4007]` remains unchanged.
+initial aggregate artifact therefore uses the bounded Laminar row codec and wire contract frozen in
+[managed state artifact format v1](../architecture-decisions/managed-state-artifact-format-v1.md).
+The Cycle 5 readers remain unwired; `[LDB-4007]` remains unchanged.
 
 Remaining commits are kept reviewable in this order:
 
@@ -392,6 +388,13 @@ Remaining commits are kept reviewable in this order:
 5. `docs: select managed-state backend from evidence`;
 6. `tools: remove rejected state backend spike`; and
 7. `docs: review distributed keyed state phase zero`.
+
+Phase 1 tracks the temporary reader-first dead-code allowances as **DKS-P1-001**. Owner:
+distributed-state lifecycle implementation. Deadline: 2026-08-31 or the first trusted,
+manifest-selected restore-composition commit, whichever comes first. That commit removes both
+module-level allowances, installs the sole sealed outer-plus-inner consumer, and must land before a
+reader capability is advertised or any admission guard is relaxed. Test-only fixture encoders do
+not compile into release builds.
 
 Each commit runs its affected feature matrix. Backend candidates do not touch runtime crates, and
 the first graph-lifecycle implementation remains a Phase 1 change. The first guard-removal commit
