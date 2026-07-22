@@ -489,6 +489,12 @@ impl TemporalFilterOperator {
 
 #[async_trait]
 impl GraphOperator for TemporalFilterOperator {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::fixed(
+            crate::operator::capability::OperatorImplementation::TemporalFilter,
+        )
+    }
+
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],
@@ -680,6 +686,12 @@ impl RejectingOperator {
 
 #[async_trait]
 impl GraphOperator for RejectingOperator {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::fixed(
+            crate::operator::capability::OperatorImplementation::Rejecting,
+        )
+    }
+
     async fn process(
         &mut self,
         _inputs: &[Vec<RecordBatch>],

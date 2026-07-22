@@ -310,6 +310,12 @@ impl AiInferenceOperator {
 
 #[async_trait]
 impl GraphOperator for AiInferenceOperator {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::fixed(
+            crate::operator::capability::OperatorImplementation::AiInference,
+        )
+    }
+
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],

@@ -1,5 +1,7 @@
 //! `GraphOperator` implementations for each streaming operator type.
 
+pub(crate) mod capability;
+
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;

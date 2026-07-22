@@ -595,6 +595,12 @@ fn output_schema(
 
 #[async_trait]
 impl GraphOperator for LookupEnrichOperator {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::fixed(
+            crate::operator::capability::OperatorImplementation::LookupEnrich,
+        )
+    }
+
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],

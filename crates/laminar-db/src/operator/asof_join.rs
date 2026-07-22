@@ -50,6 +50,12 @@ impl AsofJoinOperator {
 
 #[async_trait]
 impl GraphOperator for AsofJoinOperator {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::fixed(
+            crate::operator::capability::OperatorImplementation::AsofJoin,
+        )
+    }
+
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],

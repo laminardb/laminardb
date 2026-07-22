@@ -792,6 +792,12 @@ impl IncrementalJoinOperator {
 
 #[async_trait]
 impl GraphOperator for IncrementalJoinOperator {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::fixed(
+            crate::operator::capability::OperatorImplementation::IncrementalJoin,
+        )
+    }
+
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],

@@ -6,6 +6,7 @@
 //! - Simple single-source -> compiled `PhysicalExpr` projection
 //! - Complex non-aggregate -> cached physical plan (`LiveSourceExec` reads fresh data)
 
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 #[cfg(feature = "cluster")]
@@ -17,6 +18,9 @@ use datafusion::execution::TaskContext;
 use datafusion::prelude::SessionContext;
 #[cfg(feature = "cluster")]
 use laminar_core::shuffle::ShuffleMessage;
+use sqlparser::ast::{
+    visit_expressions, Expr, GroupByExpr, Query, Select, SetExpr, Statement, TableFactor,
+};
 
 use crate::aggregate_state::{
     apply_compiled_having, AggStateCheckpoint, CompiledProjection, IncrementalAggState,
@@ -25,6 +29,7 @@ use crate::aggregate_state::{
 use crate::aggregate_state::{merge_serialized_agg_cps, validate_agg_checkpoint_slice};
 use crate::engine_metrics::EngineMetrics;
 use crate::error::DbError;
+use crate::operator::capability::{OperatorCapability, OperatorImplementation};
 use crate::operator_graph::{try_evaluate_compiled, GraphOperator, OperatorCheckpoint};
 use crate::sql_analysis::{extract_projection_filter, single_source_table};
 
@@ -81,9 +86,150 @@ fn serialize_agg_cp(cp: &AggStateCheckpoint, op_name: &str) -> Result<Vec<u8>, D
         })
 }
 
+fn is_direct_single_source_shape(query: &Query, select: &Select) -> bool {
+    if query.with.is_some()
+        || query.order_by.is_some()
+        || query.limit_clause.is_some()
+        || query.fetch.is_some()
+        || !query.locks.is_empty()
+        || query.for_clause.is_some()
+        || query.settings.is_some()
+        || query.format_clause.is_some()
+        || !query.pipe_operators.is_empty()
+        || select.distinct.is_some()
+        || select.top.is_some()
+        || select.exclude.is_some()
+        || select.into.is_some()
+        || !select.lateral_views.is_empty()
+        || select.prewhere.is_some()
+        || !select.cluster_by.is_empty()
+        || !select.distribute_by.is_empty()
+        || !select.sort_by.is_empty()
+        || !select.named_window.is_empty()
+        || select.qualify.is_some()
+        || select.value_table_mode.is_some()
+        || select.connect_by.is_some()
+        || select.from.len() != 1
+        || !select.from[0].joins.is_empty()
+    {
+        return false;
+    }
+
+    matches!(
+        &select.from[0].relation,
+        TableFactor::Table {
+            args: None,
+            with_hints,
+            version: None,
+            with_ordinality: false,
+            partitions,
+            json_path: None,
+            sample: None,
+            index_hints,
+            ..
+        } if with_hints.is_empty() && partitions.is_empty() && index_hints.is_empty()
+    )
+}
+
+fn is_stream_window_marker(name: &str) -> bool {
+    matches!(name, "TUMBLE" | "HOP" | "SLIDE" | "SESSION" | "CUMULATE")
+}
+
+/// Conservatively classify the immutable SQL before lazy execution-path initialization.
+///
+/// The parser analysis is exact for direct aggregate and single-source projection/filter shapes.
+/// Complex structure, unknown functions, analytics, and unrecognized grouping remain local-only;
+/// the descriptor must never guess "stateless".
+fn classify_sql_capability(sql: &str, ctx: &SessionContext) -> OperatorCapability {
+    let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
+        return OperatorCapability::unclassified_sql_query();
+    };
+    if statements.len() != 1 {
+        return OperatorCapability::unclassified_sql_query();
+    }
+    let Some(laminar_sql::parser::StreamingStatement::Standard(statement)) = statements.first()
+    else {
+        return OperatorCapability::unclassified_sql_query();
+    };
+    let Statement::Query(query) = statement.as_ref() else {
+        return OperatorCapability::unclassified_sql_query();
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return OperatorCapability::unclassified_sql_query();
+    };
+
+    let function_registry = ctx.state();
+    let mut has_registered_aggregate = false;
+    let mut has_stream_window = false;
+    let mut has_ambiguous_expression = false;
+    let _ = visit_expressions(statement.as_ref(), |expression| {
+        if let Expr::Function(function) = expression {
+            if function.over.is_some() {
+                has_ambiguous_expression = true;
+                return ControlFlow::Break(());
+            }
+            let name = function.name.to_string();
+            let normalized = name.to_ascii_lowercase();
+            if function_registry
+                .aggregate_functions()
+                .contains_key(&normalized)
+            {
+                has_registered_aggregate = true;
+            } else if is_stream_window_marker(&name.to_ascii_uppercase()) {
+                has_stream_window = true;
+            } else if !function_registry
+                .scalar_functions()
+                .contains_key(&normalized)
+            {
+                has_ambiguous_expression = true;
+                return ControlFlow::Break(());
+            }
+        } else if matches!(
+            expression,
+            Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::Subquery(_)
+        ) {
+            has_ambiguous_expression = true;
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    });
+    if has_ambiguous_expression {
+        return OperatorCapability::unclassified_sql_query();
+    }
+
+    let aggregation =
+        laminar_sql::parser::aggregation_parser::analyze_aggregates(statement.as_ref());
+    let has_grouping = match &select.group_by {
+        GroupByExpr::Expressions(expressions, _) => !expressions.is_empty(),
+        GroupByExpr::All(_) => true,
+    };
+    if !is_direct_single_source_shape(query, select) {
+        return OperatorCapability::unclassified_sql_query();
+    }
+
+    if aggregation.has_aggregates() || has_registered_aggregate {
+        return if has_grouping {
+            if has_stream_window {
+                OperatorCapability::windowed_keyed_sql_aggregate()
+            } else {
+                OperatorCapability::keyed_sql_aggregate()
+            }
+        } else {
+            OperatorCapability::global_sql_aggregate()
+        };
+    }
+
+    if has_grouping || select.having.is_some() {
+        OperatorCapability::unclassified_sql_query()
+    } else {
+        OperatorCapability::stateless_sql_query()
+    }
+}
+
 pub(crate) struct SqlQueryOperator {
     op_name: Arc<str>,
     sql: String,
+    capability: OperatorCapability,
     ctx: SessionContext,
     task_ctx: Arc<TaskContext>,
     state: QueryState,
@@ -133,10 +279,12 @@ impl SqlQueryOperator {
         prom: Option<Arc<EngineMetrics>>,
         emit_changelog: bool,
     ) -> Self {
+        let capability = classify_sql_capability(sql, &ctx);
         let task_ctx = ctx.task_ctx();
         Self {
             op_name: Arc::from(name),
             sql: sql.to_string(),
+            capability,
             ctx,
             task_ctx,
             state: QueryState::Uninit,
@@ -839,6 +987,14 @@ impl SqlQueryOperator {
 
 #[async_trait]
 impl GraphOperator for SqlQueryOperator {
+    fn cluster_capability(&self) -> OperatorCapability {
+        debug_assert_eq!(
+            self.capability.implementation,
+            OperatorImplementation::SqlQuery
+        );
+        self.capability
+    }
+
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],
@@ -1314,6 +1470,86 @@ mod checkpoint_tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+
+    #[test]
+    fn sql_capability_classification_is_shape_aware_and_fail_closed() {
+        use crate::operator::capability::{ClusterExecutionStatus, OperatorStateClass};
+
+        let context = laminar_sql::create_session_context();
+        let classify = |sql| classify_sql_capability(sql, &context);
+
+        let stateless = classify("SELECT key, value * 2 FROM events");
+        assert_eq!(stateless.state_class, OperatorStateClass::Stateless);
+        assert_eq!(stateless.cluster_status, ClusterExecutionStatus::DdlGuarded);
+
+        let scalar = classify("SELECT UPPER(key) FROM events");
+        assert_eq!(scalar.state_class, OperatorStateClass::Stateless);
+        assert_eq!(scalar.cluster_status, ClusterExecutionStatus::DdlGuarded);
+
+        let global = classify("SELECT COUNT(*) AS n FROM events");
+        assert_eq!(global.state_class, OperatorStateClass::GlobalSingleton);
+        assert_eq!(global.cluster_status, ClusterExecutionStatus::DdlGuarded);
+
+        let keyed = classify("SELECT key, SUM(value) AS total FROM events GROUP BY key");
+        assert_eq!(keyed.state_class, OperatorStateClass::VnodeKeyed);
+        assert!(matches!(
+            keyed.cluster_status,
+            ClusterExecutionStatus::Rejected { .. }
+        ));
+
+        let window_keyed = classify(
+            "SELECT TUMBLE(ts, INTERVAL '1' MINUTE), SUM(value) FROM events \
+             GROUP BY TUMBLE(ts, INTERVAL '1' MINUTE)",
+        );
+        assert_eq!(window_keyed.state_class, OperatorStateClass::VnodeKeyed);
+        let ClusterExecutionStatus::Rejected { reason } = window_keyed.cluster_status else {
+            panic!("windowed aggregate must remain rejected")
+        };
+        assert!(reason.contains("timer"), "{reason}");
+        assert!(reason.contains("watermark"), "{reason}");
+
+        let analytic = classify("SELECT SUM(value) OVER (PARTITION BY key) AS running FROM events");
+        assert_eq!(analytic.state_class, OperatorStateClass::LocalOnly);
+        assert!(matches!(
+            analytic.cluster_status,
+            ClusterExecutionStatus::Rejected { .. }
+        ));
+
+        for ambiguous_sql in [
+            "SELECT mystery(value) FROM events",
+            "SELECT DISTINCT key FROM events",
+            "SELECT key FROM events GROUP BY key",
+            "SELECT key FROM (SELECT key FROM events) nested",
+            "SELECT a.key FROM events a JOIN other b ON a.key = b.key",
+            "SELECT COUNT(*) FROM (SELECT * FROM events) nested",
+            "WITH nested AS (SELECT * FROM events) SELECT COUNT(*) FROM nested",
+            "SELECT COUNT(*) FROM events a JOIN other b ON a.key = b.key",
+            "SELECT DISTINCT COUNT(*) FROM events",
+            "SELECT key FROM events ORDER BY key",
+            "SELECT key FROM events; SELECT key FROM events",
+        ] {
+            let ambiguous = classify(ambiguous_sql);
+            assert_eq!(
+                ambiguous.state_class,
+                OperatorStateClass::LocalOnly,
+                "{ambiguous_sql}"
+            );
+            assert!(
+                matches!(
+                    ambiguous.cluster_status,
+                    ClusterExecutionStatus::Rejected { .. }
+                ),
+                "{ambiguous_sql}"
+            );
+        }
+
+        let malformed = classify("not sql");
+        assert_eq!(malformed.state_class, OperatorStateClass::LocalOnly);
+        assert!(matches!(
+            malformed.cluster_status,
+            ClusterExecutionStatus::Rejected { .. }
+        ));
+    }
 
     pub(super) fn context_and_batch() -> (SessionContext, RecordBatch) {
         let context = laminar_sql::create_session_context();

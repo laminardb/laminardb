@@ -44,6 +44,10 @@ struct RestoreProbe(Arc<std::sync::atomic::AtomicUsize>);
 
 #[async_trait]
 impl GraphOperator for RestoreProbe {
+    fn cluster_capability(&self) -> OperatorCapability {
+        OperatorCapability::test_probe()
+    }
+
     async fn process(
         &mut self,
         _inputs: &[Vec<RecordBatch>],
@@ -76,6 +80,10 @@ impl Drop for RestoreFailureProbe {
 
 #[async_trait]
 impl GraphOperator for RestoreFailureProbe {
+    fn cluster_capability(&self) -> OperatorCapability {
+        OperatorCapability::test_probe()
+    }
+
     async fn process(
         &mut self,
         _inputs: &[Vec<RecordBatch>],
@@ -108,6 +116,10 @@ struct RestoredReplayWatermarkProbe {
 #[cfg(feature = "cluster")]
 #[async_trait]
 impl GraphOperator for RestoredReplayWatermarkProbe {
+    fn cluster_capability(&self) -> OperatorCapability {
+        OperatorCapability::test_probe()
+    }
+
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],
@@ -155,13 +167,11 @@ impl GraphOperator for RestoredReplayWatermarkProbe {
 fn whole_graph_restore_rejects_old_abi_before_mutation() {
     let restores = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
-    graph.allocate_node(GraphNode {
-        name: Arc::from("present"),
-        operator: Box::new(RestoreProbe(Arc::clone(&restores))),
-        input_port_count: 1,
-        output_routes: Vec::new(),
-        removed: false,
-    });
+    graph.allocate_node(GraphNode::new(
+        Arc::from("present"),
+        Box::new(RestoreProbe(Arc::clone(&restores))),
+        1,
+    ));
     let mut operators = OperatorStateMap::new();
     operators.insert("present".into(), vec![1]);
 
@@ -251,13 +261,11 @@ async fn restored_replay_seeds_and_holds_output_watermark_through_final_emission
 fn whole_graph_restore_rejects_missing_operator_before_mutation() {
     let restores = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
-    graph.allocate_node(GraphNode {
-        name: Arc::from("present"),
-        operator: Box::new(RestoreProbe(Arc::clone(&restores))),
-        input_port_count: 1,
-        output_routes: Vec::new(),
-        removed: false,
-    });
+    graph.allocate_node(GraphNode::new(
+        Arc::from("present"),
+        Box::new(RestoreProbe(Arc::clone(&restores))),
+        1,
+    ));
     let mut operators = OperatorStateMap::new();
     operators.insert("present".into(), vec![1]);
     operators.insert("missing".into(), vec![2]);
@@ -278,13 +286,11 @@ fn whole_graph_restore_rejects_missing_operator_before_mutation() {
 async fn whole_graph_restore_closes_before_first_execution_cycle() {
     let restores = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
-    graph.allocate_node(GraphNode {
-        name: Arc::from("present"),
-        operator: Box::new(RestoreProbe(Arc::clone(&restores))),
-        input_port_count: 1,
-        output_routes: Vec::new(),
-        removed: false,
-    });
+    graph.allocate_node(GraphNode::new(
+        Arc::from("present"),
+        Box::new(RestoreProbe(Arc::clone(&restores))),
+        1,
+    ));
     graph
         .execute_cycle(&FxHashMap::default(), i64::MIN, None)
         .await
@@ -311,17 +317,15 @@ fn late_restore_failure_consumes_and_drops_partial_graph() {
     let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
     for (name, fail) in [("first", false), ("second", true)] {
-        graph.allocate_node(GraphNode {
-            name: Arc::from(name),
-            operator: Box::new(RestoreFailureProbe {
+        graph.allocate_node(GraphNode::new(
+            Arc::from(name),
+            Box::new(RestoreFailureProbe {
                 restores: Arc::clone(&restores),
                 drops: Arc::clone(&drops),
                 fail,
             }),
-            input_port_count: 1,
-            output_routes: Vec::new(),
-            removed: false,
-        });
+            1,
+        ));
     }
     let operators = [
         ("first".to_string(), vec![1]),
@@ -348,13 +352,11 @@ fn late_restore_failure_consumes_and_drops_partial_graph() {
 #[test]
 fn stateless_operator_rejects_unexpected_checkpoint_state() {
     let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
-    graph.allocate_node(GraphNode {
-        name: Arc::from("source"),
-        operator: Box::new(SourcePassthrough),
-        input_port_count: 1,
-        output_routes: Vec::new(),
-        removed: false,
-    });
+    graph.allocate_node(GraphNode::new(
+        Arc::from("source"),
+        Box::new(SourcePassthrough),
+        1,
+    ));
     let operators = [("source".to_string(), vec![1])].into_iter().collect();
 
     let error = graph
@@ -378,6 +380,10 @@ struct RecordingOperator(Arc<parking_lot::Mutex<Vec<RetainedBatch>>>);
 #[cfg(feature = "cluster")]
 #[async_trait]
 impl GraphOperator for RecordingOperator {
+    fn cluster_capability(&self) -> OperatorCapability {
+        OperatorCapability::test_probe()
+    }
+
     async fn process(
         &mut self,
         _inputs: &[Vec<RecordBatch>],
@@ -411,6 +417,10 @@ struct RehydrationApplyOperator {
 #[cfg(feature = "cluster")]
 #[async_trait]
 impl GraphOperator for RehydrationApplyOperator {
+    fn cluster_capability(&self) -> OperatorCapability {
+        OperatorCapability::test_probe()
+    }
+
     async fn process(
         &mut self,
         _inputs: &[Vec<RecordBatch>],
@@ -2297,6 +2307,10 @@ struct DelayOperator;
 
 #[async_trait]
 impl GraphOperator for DelayOperator {
+    fn cluster_capability(&self) -> OperatorCapability {
+        OperatorCapability::test_probe()
+    }
+
     async fn process(
         &mut self,
         _inputs: &[Vec<RecordBatch>],
@@ -2336,6 +2350,10 @@ struct AlwaysFailOperator;
 
 #[async_trait]
 impl GraphOperator for AlwaysFailOperator {
+    fn cluster_capability(&self) -> OperatorCapability {
+        OperatorCapability::test_probe()
+    }
+
     async fn process(
         &mut self,
         _inputs: &[Vec<RecordBatch>],
@@ -2357,6 +2375,10 @@ struct TerminalShuffleOperator;
 
 #[async_trait]
 impl GraphOperator for TerminalShuffleOperator {
+    fn cluster_capability(&self) -> OperatorCapability {
+        OperatorCapability::test_probe()
+    }
+
     async fn process(
         &mut self,
         _inputs: &[Vec<RecordBatch>],
@@ -2417,6 +2439,10 @@ fn vnode_revoke_failure_faults_and_retains_pending_work() {
 
     #[async_trait]
     impl GraphOperator for RevokeFailureOperator {
+        fn cluster_capability(&self) -> OperatorCapability {
+            OperatorCapability::test_probe()
+        }
+
         async fn process(
             &mut self,
             _inputs: &[Vec<RecordBatch>],
@@ -2835,6 +2861,10 @@ async fn test_shared_source_isolation_replays_faulted_domain() {
     }
     #[async_trait]
     impl GraphOperator for ReplayTestOp {
+        fn cluster_capability(&self) -> OperatorCapability {
+            OperatorCapability::test_probe()
+        }
+
         async fn process(
             &mut self,
             inputs: &[Vec<RecordBatch>],
@@ -3421,6 +3451,10 @@ async fn checkpoint_drain_failure_or_no_progress_preserves_pending_edges() {
 
     #[async_trait]
     impl GraphOperator for PausedOperator {
+        fn cluster_capability(&self) -> OperatorCapability {
+            OperatorCapability::test_probe()
+        }
+
         async fn process(
             &mut self,
             inputs: &[Vec<RecordBatch>],

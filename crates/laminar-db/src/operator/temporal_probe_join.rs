@@ -38,6 +38,12 @@ impl TemporalProbeJoinOperator {
 
 #[async_trait]
 impl GraphOperator for TemporalProbeJoinOperator {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::fixed(
+            crate::operator::capability::OperatorImplementation::TemporalProbeJoin,
+        )
+    }
+
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],

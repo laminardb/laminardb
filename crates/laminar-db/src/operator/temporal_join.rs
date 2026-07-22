@@ -192,6 +192,12 @@ fn build_temporal_output_schema(stream_schema: &SchemaRef, table_schema: &Schema
 
 #[async_trait]
 impl GraphOperator for TemporalJoinOperator {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::fixed(
+            crate::operator::capability::OperatorImplementation::TemporalJoin,
+        )
+    }
+
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],

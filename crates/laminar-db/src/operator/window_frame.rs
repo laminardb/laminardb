@@ -157,6 +157,12 @@ impl WindowFrameOperator {
 
 #[async_trait]
 impl GraphOperator for WindowFrameOperator {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::fixed(
+            crate::operator::capability::OperatorImplementation::WindowFrame,
+        )
+    }
+
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],

@@ -9,6 +9,10 @@ struct DrainingCaptureFailureOperator {
 
 #[async_trait::async_trait]
 impl crate::operator_graph::GraphOperator for DrainingCaptureFailureOperator {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::test_probe()
+    }
+
     async fn process(
         &mut self,
         _inputs: &[Vec<RecordBatch>],
@@ -59,6 +63,10 @@ struct DrainingCaptureOperator {
 
 #[async_trait::async_trait]
 impl crate::operator_graph::GraphOperator for DrainingCaptureOperator {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::test_probe()
+    }
+
     async fn process(
         &mut self,
         _inputs: &[Vec<RecordBatch>],
@@ -81,6 +89,10 @@ struct FollowerCheckpointEvidenceOperator;
 #[cfg(feature = "cluster")]
 #[async_trait::async_trait]
 impl crate::operator_graph::GraphOperator for FollowerCheckpointEvidenceOperator {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::test_probe()
+    }
+
     async fn process(
         &mut self,
         _inputs: &[Vec<RecordBatch>],

@@ -15,6 +15,7 @@ use crate::config::BackpressurePolicy;
 use crate::db::exact_table_reference;
 use crate::engine_metrics::EngineMetrics;
 use crate::error::DbError;
+use crate::operator::capability::{OperatorCapability, OperatorImplementation};
 #[cfg(feature = "cluster")]
 use crate::operator::RetainedBatch;
 use crate::sql_analysis::{
@@ -29,6 +30,12 @@ use laminar_sql::translator::{
 
 #[async_trait]
 pub(crate) trait GraphOperator: Send {
+    /// Admission-neutral inventory of this implementation's current cluster state shape.
+    ///
+    /// This method is intentionally mandatory: a new physical operator must be classified before
+    /// it compiles. Cluster DDL admission does not consume this descriptor yet.
+    fn cluster_capability(&self) -> OperatorCapability;
+
     /// `watermarks[i]` is the upstream output watermark for `inputs[i]`.
     async fn process(
         &mut self,
@@ -159,6 +166,38 @@ struct GraphNode {
     removed: bool,
 }
 
+impl GraphNode {
+    fn new(name: Arc<str>, operator: Box<dyn GraphOperator>, input_port_count: usize) -> Self {
+        let capability = operator.cluster_capability();
+        tracing::debug!(
+            operator = %name,
+            implementation = ?capability.implementation,
+            state_class = ?capability.state_class,
+            cluster_status = ?capability.cluster_status,
+            "registered physical operator capability inventory"
+        );
+        Self {
+            name,
+            operator,
+            input_port_count,
+            output_routes: Vec::new(),
+            removed: false,
+        }
+    }
+
+    fn replace_operator(&mut self, operator: Box<dyn GraphOperator>) {
+        let capability = operator.cluster_capability();
+        tracing::debug!(
+            operator = %self.name,
+            implementation = ?capability.implementation,
+            state_class = ?capability.state_class,
+            cluster_status = ?capability.cluster_status,
+            "replaced physical operator capability inventory"
+        );
+        self.operator = operator;
+    }
+}
+
 struct GraphEdge {
     source: usize,
     target: usize,
@@ -168,6 +207,10 @@ struct SourcePassthrough;
 
 #[async_trait]
 impl GraphOperator for SourcePassthrough {
+    fn cluster_capability(&self) -> OperatorCapability {
+        OperatorCapability::fixed(OperatorImplementation::SourcePassthrough)
+    }
+
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],
@@ -185,6 +228,10 @@ struct TombstonedOperator;
 
 #[async_trait]
 impl GraphOperator for TombstonedOperator {
+    fn cluster_capability(&self) -> OperatorCapability {
+        OperatorCapability::fixed(OperatorImplementation::Tombstoned)
+    }
+
     async fn process(
         &mut self,
         _inputs: &[Vec<RecordBatch>],
@@ -222,6 +269,10 @@ impl SqlFilterOperator {
 
 #[async_trait]
 impl GraphOperator for SqlFilterOperator {
+    fn cluster_capability(&self) -> OperatorCapability {
+        OperatorCapability::fixed(OperatorImplementation::SqlFilter)
+    }
+
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],
@@ -280,6 +331,10 @@ impl ChangelogEnrichOperator {
 
 #[async_trait]
 impl GraphOperator for ChangelogEnrichOperator {
+    fn cluster_capability(&self) -> OperatorCapability {
+        OperatorCapability::fixed(OperatorImplementation::ChangelogEnrich)
+    }
+
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],
@@ -1031,26 +1086,22 @@ impl OperatorGraph {
             return id;
         }
         let name: Arc<str> = Arc::from(table_name);
-        let node_id = self.allocate_node(GraphNode {
-            name: Arc::clone(&name),
-            operator: Box::new(SourcePassthrough),
-            input_port_count: 1,
-            output_routes: Vec::new(),
-            removed: false,
-        });
+        let node_id = self.allocate_node(GraphNode::new(
+            Arc::clone(&name),
+            Box::new(SourcePassthrough),
+            1,
+        ));
         self.source_map.insert(name, node_id);
         self.source_node_ids.insert(node_id);
         node_id
     }
 
     fn insert_filter_node(&mut self, name: &str, filter_sql: String, source_id: usize) -> usize {
-        let node_id = self.allocate_node(GraphNode {
-            name: Arc::from(name),
-            operator: Box::new(SqlFilterOperator::new(filter_sql, self.ctx.clone(), name)),
-            input_port_count: 1,
-            output_routes: Vec::new(),
-            removed: false,
-        });
+        let node_id = self.allocate_node(GraphNode::new(
+            Arc::from(name),
+            Box::new(SqlFilterOperator::new(filter_sql, self.ctx.clone(), name)),
+            1,
+        ));
         self.add_edge(source_id, node_id, 0);
         self.topo_dirty = true;
         node_id
@@ -1477,7 +1528,7 @@ impl OperatorGraph {
         input_port_count: usize,
     ) -> usize {
         if let Some(&id) = self.source_map.get(name) {
-            self.nodes[id].operator = operator;
+            self.nodes[id].replace_operator(operator);
             self.nodes[id].input_port_count = input_port_count;
             self.input_bufs[id] = vec![Vec::new(); input_port_count];
             self.input_buf_bytes[id] = vec![0; input_port_count];
@@ -1490,13 +1541,7 @@ impl OperatorGraph {
             }
             id
         } else {
-            self.allocate_node(GraphNode {
-                name: Arc::from(name),
-                operator,
-                input_port_count,
-                output_routes: Vec::new(),
-                removed: false,
-            })
+            self.allocate_node(GraphNode::new(Arc::from(name), operator, input_port_count))
         }
     }
 
@@ -1803,7 +1848,7 @@ impl OperatorGraph {
 
         for &id in &ids_to_remove {
             self.nodes[id].removed = true;
-            self.nodes[id].operator = Box::new(TombstonedOperator);
+            self.nodes[id].replace_operator(Box::new(TombstonedOperator));
             self.nodes[id].output_routes.clear();
             for port_buf in &mut self.input_bufs[id] {
                 port_buf.clear();
@@ -3259,13 +3304,7 @@ impl OperatorGraph {
 
     #[cfg(test)]
     pub(crate) fn push_test_node(&mut self, name: &str, operator: Box<dyn GraphOperator>) {
-        self.allocate_node(GraphNode {
-            name: Arc::from(name),
-            operator,
-            input_port_count: 1,
-            output_routes: Vec::new(),
-            removed: false,
-        });
+        self.allocate_node(GraphNode::new(Arc::from(name), operator, 1));
         self.topo_dirty = true;
     }
 
