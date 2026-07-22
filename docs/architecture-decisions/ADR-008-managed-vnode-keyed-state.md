@@ -254,11 +254,28 @@ full bases range-scan a snapshot asynchronously. Restore may use Fjall sorted in
 SSTs as a backend-specific optimization, but correctness is defined by portable records and
 descriptor digests.
 
+Keyed restore is a prepare/commit transaction, not an incremental merge of trusted bytes. Its
+versioned envelope binds the partition ABI, vnode count and claimed vnode, canonical key schema,
+operator identity, accumulator-state schema, and payload version. Preflight uses the schemas
+cached by the physical plan, validates every group and emission key against the claimed vnode,
+checks complete-chain ordering and cross-vnode disjointness, reserves the bounded restore budget,
+and computes an authoritative replacement for the entire vnode namespace. Emission keys require
+exact arity and types; restore never casts them. Only after every chain is prepared does an
+infallible state-engine generation swap publish the result. The current raw aggregate checkpoint
+is legacy input for the admitted global vnode-0 aggregate only; a query fingerprint alone is not a
+keyed-state compatibility contract.
+
 Frozen generations remain referenced until a later committed base/delta chain contains them. An
 aborted or failed capture cannot clear its changes; the next attempt includes their union or emits
 a full rebase. Limits on concurrent attempts, frozen bytes, and delta-chain length apply
 backpressure. A mutable-capture or encoding error faults the pipeline rather than retrying against
 partially consumed dirty state.
+
+Capture and revoke operate on vnode-prefixed ranges and frozen mutation journals. They must not
+scan every live group once per vnode on the barrier or ownership-transfer path. Qualification
+therefore measures checkpoint/rebalance CPU time and scheduler stalls as well as storage latency;
+constant-time generation freeze is not sufficient if record encoding, range deletion, or cleanup
+later steals the operator hot path.
 
 Local WAL/fsync policy is a recovery-time optimization, not cluster authority. Correctness must
 hold after complete local-disk loss by restoring the sealed cut and replaying source input. A local

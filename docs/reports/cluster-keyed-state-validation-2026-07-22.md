@@ -95,12 +95,42 @@ wrong vnode label. Phase 0 must centralize the existing Arrow-row/xxh3 partition
 the vnode tag for every staged base and delta, and preflight the complete chain against the planned
 key schema and vnode count before mutating live state.
 
+The audit found that vnode membership is coupled to several other restore invariants and therefore
+must not be patched as an isolated assertion:
+
+- the raw aggregate payload has no envelope carrying partition ABI, vnode count and claimed vnode,
+  canonical key-schema fingerprint, or accumulator-state schema/version;
+- accumulator validation checks payload count and row count, but an empty payload can be decoded as
+  absent state and rebuild a stateful accumulator at its default unless expected state fields are
+  known independently;
+- `last_emitted` keys are cast toward planned types and an empty keyed tuple can take the global
+  sentinel path, so exact arity/type checks must precede conversion;
+- a FULL apply replaces only keys present in its payload; a stale live key in the same vnode but
+  absent from the authoritative image can survive unless the complete vnode namespace is replaced;
+- delta bucketing remembers one vnode count while capture accepts another, with no local immutable
+  count assertion;
+- an initialized chain is transactionally decoded off-side, but staged bases and deltas lose chain
+  identity and graph-level application can mutate an earlier operator before a later preflight
+  fails; and
+- ordinary grouped batch processing mutates groups and accumulators sequentially, so a late error
+  can leave an in-memory partial batch. Cluster execution must recover from the sealed cut rather
+  than retry that batch locally until the managed state write is one atomic transaction.
+
+The safe design is a prepared vnode-restore transaction: validate the complete tagged chain,
+planned key and accumulator schemas, resource reservation, membership, disjointness, and
+authoritative replacement set first; then publish it with an infallible commit. Legacy raw payloads
+may remain only for the currently admitted singleton global aggregate. A partial validator over the
+existing raw keyed payload is not a production restore contract.
+
 This code is useful implementation substrate, but it does not make the operator production safe.
 The current one-million-group guard counts entries, not bytes. The live `groups`, changelog
 emission state, distinct/counting side state, dirty generations, Arrow buffers, and allocator
 retention are not governed by one truthful byte budget, and there is no local spillable
 working-state engine. Capture also walks and serializes operator maps rather than freezing a
-state-engine generation in constant time.
+state-engine generation in constant time. Initial delta FULL capture can scan all groups and all
+`last_emitted` entries once per touched vnode; delta discovery and revoke also scan live maps
+synchronously. That approaches `O(vnodes x groups)` work at the checkpoint/rebalance cut and is a
+direct tail-latency blocker, not merely an implementation detail.
 
 ### Windows and joins have additional gaps
 

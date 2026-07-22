@@ -110,6 +110,21 @@ and validate the complete chain against the planned key schema, require every gr
 or widened type semantics require an ABI version bump plus an explicit replay/migration and
 rollback policy; there is no implicit N/N-1 reader window.
 
+The keyed checkpoint format must gain a versioned envelope containing partition ABI, vnode count,
+claimed vnode, canonical key-schema fingerprint, operator fingerprint, accumulator-state schema
+fingerprint, and payload version. Preflight uses expected key and accumulator schemas cached from
+the plan, never schemas inferred only from the payload. It rejects empty state for an accumulator
+that declares state fields, coercive or empty keyed emission keys, a changed vnode count, and any
+decoded group/byte reservation above the frozen limits. A FULL image replaces the complete target
+vnode namespace, including removal of live keys absent from the image.
+
+Represent one uninitialized restore as tagged base-plus-delta chains rather than separate flat
+vectors. Prepare all chains, prove cross-vnode key disjointness, and reserve resources before any
+chain mutates the temporary aggregate; publish that aggregate only after every preflight succeeds.
+The later graph-level lifecycle must likewise prevent a failed late operator from exposing earlier
+partial application. Keep legacy raw checkpoint compatibility limited to the admitted global
+vnode-0 aggregate until an explicit keyed migration policy exists.
+
 ### B3. Delivery scenario
 
 Freeze the first vertical as:
