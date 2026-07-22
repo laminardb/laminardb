@@ -95,6 +95,12 @@ wrong vnode label. Phase 0 must centralize the existing Arrow-row/xxh3 partition
 the vnode tag for every staged base and delta, and preflight the complete chain against the planned
 key schema and vnode count before mutating live state.
 
+The feature branch began that work in `562cc590`: capture, delta tracking, `last_emitted`
+bucketing, recovery bookkeeping, and revoke now call one allocation-free mapping over the existing
+encoded `OwnedRow`, and an active delta generation rejects a changed or zero vnode count before
+capture/revoke mutation. This is partition-path hardening only. It does not add a persisted vnode
+count, a count-rotation lifecycle, payload membership validation, or tagged restore chains.
+
 The audit found that vnode membership is coupled to several other restore invariants and therefore
 must not be patched as an isolated assertion:
 
@@ -107,8 +113,9 @@ must not be patched as an isolated assertion:
   sentinel path, so exact arity/type checks must precede conversion;
 - a FULL apply replaces only keys present in its payload; a stale live key in the same vnode but
   absent from the authoritative image can survive unless the complete vnode namespace is replaced;
-- delta bucketing remembers one vnode count while capture accepts another, with no local immutable
-  count assertion;
+- at the validated baseline, delta bucketing remembered one vnode count while capture accepted
+  another. `562cc590` now rejects that local drift, but artifacts still do not bind their vnode
+  count or define an explicit generation-rotation lifecycle;
 - an initialized chain is transactionally decoded off-side, but staged bases and deltas lose chain
   identity and graph-level application can mutate an earlier operator before a later preflight
   fails; and
@@ -249,6 +256,19 @@ MinIO/object-store integration, Kafka/Docker, and server HTTP/Flight admission s
 they require heavier process or external-service setup and are not represented as passing evidence.
 The ADR/plan consequently forbid a production-ready claim until an independently reviewed,
 black-box release-candidate soak passes with real source/object-store/sink dependencies.
+
+The admission-neutral hardening in `562cc590` was then checked separately:
+
+| Current-branch check | Result | Evidence |
+|---|---:|---|
+| `aggregate_state::vnode_partition_tests` (cluster lib-test binary) | PASS, 4/4 | Existing raw capture/merge/idempotence plus new shuffle/capture/drop parity and pre-mutation drift rejection; not keyed-envelope validation |
+| `aggregate_state::tests::drop_vnodes_purges_revoked_keeps_sibling` | PASS, 1/1 | Revoke retains sibling-vnode state after the fallible count check was added |
+| `aggregate_state::tests::global_changelog_delta_checkpoint_roundtrips` | PASS, 1/1 | The admitted global aggregate remains pinned to vnode 0 |
+| `db::tests::cluster_query_shape_admission_is_pre_mutation_and_mode_derived` | PASS, 1/1 | The `[LDB-4007]` feature matrix remains closed while stateless/global shapes remain admitted |
+| `aggregate_state::tests::embedded_float_grouping_remains_supported_without_partition_codec_gate` (`--no-default-features`) | PASS, 1/1 | Embedded planning and execution still accept a float key excluded from cluster partition ABI v1 |
+
+Both cluster and no-feature `cargo check` and `cargo clippy -D warnings` configurations passed, as
+did formatting and diff checks. These focused results do not exercise keyed cluster restore.
 
 These are admission and focused operator tests, not a production certification. No existing test
 demonstrates a distributed keyed operator processing remote rows through crash, restore, and
