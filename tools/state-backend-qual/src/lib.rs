@@ -12,6 +12,9 @@ pub mod model_result;
 pub mod resource_samples;
 pub mod workload;
 
+#[cfg(all(test, feature = "zipf-feasibility"))]
+mod zipf_candidate;
+
 pub const NOTICE: &str = "NOT QUALIFICATION EVIDENCE";
 pub const MAX_PROFILE_BYTES: usize = 1_048_576;
 pub const MAX_MODEL_RESULT_BYTES: usize = 1_048_576;

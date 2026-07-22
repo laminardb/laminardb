@@ -187,10 +187,11 @@ SHA-256(
 ```
 
 The proposal uses the following rounded temporaries. `word >> 11` is converted exactly to
-binary64. `x + one_half` must be finite and in the range convertible to signed 64-bit; conversion
-truncates toward zero. Any violation is `zipf_invalid_sample`, which makes finite plan validation
-fail and an executing attempt INVALID. Every evaluated function result and temporary through `g`
-must be finite; a non-finite value is the same error rather than an ordinary rejection.
+binary64. `b = x + one_half` must satisfy `0 <= b < 2^63`; conversion to signed 64-bit truncates
+toward zero. A negative inverse is deliberately invalid even though the real-valued method cannot
+produce one. Any violation is `zipf_invalid_sample`, which makes finite plan validation fail and an
+executing attempt INVALID. Every evaluated function result and temporary through `g` must be
+finite; a non-finite value is the same error rather than an ordinary rejection.
 
 ```text
 u_bits = word >> 11
@@ -252,10 +253,12 @@ DKS-Q2-001 remains blocked until all of the following are checked into immutable
 3. **Retry bound.** Review states its uniform-word/random-oracle assumptions and derives a
    conservative acceptance lower bound and 64-rejection probability. A million-sample observation
    is secondary evidence, not the proof.
-4. **Independent goldens.** Hand-authored word-to-rank vectors cover `u` endpoints, clamp edges,
-   both acceptance branches, rejection, and injected cap exhaustion. Separate tooling produces
-   bounded corpus digests without calling the implementation under test; it need not regenerate an
-   entire endurance run.
+4. **Independent goldens.** Hand-authored word-to-rank vectors cover `u` endpoints, the reachable
+   upper clamp, both acceptance branches, rejection, and injected cap exhaustion. Separately
+   injected numerical-boundary vectors cover the lower clamp and invalid negative/non-finite
+   inverse values; no valid-word vector is claimed for an unreachable edge. Separate tooling
+   produces bounded corpus digests without calling the implementation under test; it need not
+   regenerate an entire endurance run.
 5. **Schedule and hardware isolation.** Before results, every approved batch shape and peak raw
    rows/s gets sampler-on versus counter-only/null gates for preparation p50/p99/p99.9/max,
    scheduler lateness, queue age/occupancy, controller CPU, attempts/sample, and sustained
