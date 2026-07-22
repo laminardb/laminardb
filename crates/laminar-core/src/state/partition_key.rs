@@ -22,6 +22,9 @@ use super::vnode::key_hash;
 /// Failure to construct the ABI-v1 typed-key encoder.
 #[derive(Debug, thiserror::Error)]
 pub enum PartitionKeyCodecError {
+    /// A keyed partitioning codec requires at least one logical key column.
+    #[error("partition key schema is empty")]
+    EmptyKeySchema,
     /// The resolved key type has no frozen ABI-v1 equality and encoding contract.
     #[error("partition key column {index} has unsupported ABI-v1 type {data_type}")]
     UnsupportedKeyType {
@@ -46,6 +49,38 @@ pub struct PartitionKeyCodecV1 {
     converter: RowConverter,
 }
 
+/// Internal one-pass builder used where key-column lookup and validation must
+/// preserve their original request order.
+pub(crate) struct PartitionKeyCodecV1Builder {
+    fields: Vec<SortField>,
+}
+
+impl PartitionKeyCodecV1Builder {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            fields: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub(crate) fn push(&mut self, data_type: DataType) -> Result<(), PartitionKeyCodecError> {
+        let index = self.fields.len();
+        if !is_supported_key_type(&data_type) {
+            return Err(PartitionKeyCodecError::UnsupportedKeyType { index, data_type });
+        }
+        self.fields.push(SortField::new(data_type));
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> Result<PartitionKeyCodecV1, PartitionKeyCodecError> {
+        if self.fields.is_empty() {
+            return Err(PartitionKeyCodecError::EmptyKeySchema);
+        }
+        Ok(PartitionKeyCodecV1 {
+            converter: RowConverter::new(self.fields)?,
+        })
+    }
+}
+
 impl PartitionKeyCodecV1 {
     /// Construct a codec for one resolved, ordered composite-key schema.
     ///
@@ -54,19 +89,12 @@ impl PartitionKeyCodecV1 {
     pub fn try_new(
         data_types: impl IntoIterator<Item = DataType>,
     ) -> Result<Self, PartitionKeyCodecError> {
-        let data_types: Vec<DataType> = data_types.into_iter().collect();
-        for (index, data_type) in data_types.iter().enumerate() {
-            if !is_supported_key_type(data_type) {
-                return Err(PartitionKeyCodecError::UnsupportedKeyType {
-                    index,
-                    data_type: data_type.clone(),
-                });
-            }
+        let data_types = data_types.into_iter();
+        let mut builder = PartitionKeyCodecV1Builder::with_capacity(data_types.size_hint().0);
+        for data_type in data_types {
+            builder.push(data_type)?;
         }
-        let fields = data_types.into_iter().map(SortField::new).collect();
-        Ok(Self {
-            converter: RowConverter::new(fields)?,
-        })
+        builder.finish()
     }
 
     /// Encode all key columns in one vectorized Arrow-row pass.
@@ -172,7 +200,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::datatypes::{i256, IntervalDayTime, IntervalMonthDayNano};
-    use arrow_array::types::Int8Type;
+    use arrow_array::types::{Int16Type, Int8Type};
     use arrow_array::{
         ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
         Decimal128Array, Decimal256Array, Decimal32Array, Decimal64Array, DictionaryArray,
@@ -634,6 +662,33 @@ mod tests {
             ])),
             &expected,
         );
+
+        let inner = DictionaryArray::<Int16Type>::try_new(
+            Int16Array::from(vec![Some(0), Some(1)]),
+            Arc::new(StringArray::from(vec!["alpha", ""])),
+        )
+        .unwrap();
+        let nested = DictionaryArray::<Int8Type>::try_new(
+            Int8Array::from(vec![Some(0), Some(1), None, Some(0)]),
+            Arc::new(inner),
+        )
+        .unwrap();
+        let nested_expected = [
+            ("02616c70686100000005", 11_628_646_776_760_013_362, 44),
+            ("01", 16_226_181_191_752_404_715, 224),
+            ("00", 14_144_645_293_874_801_883, 211),
+            ("02616c70686100000005", 11_628_646_776_760_013_362, 44),
+        ];
+        assert_array_golden(Arc::new(nested), &nested_expected);
+        assert_array_golden(
+            Arc::new(StringArray::from(vec![
+                Some("alpha"),
+                Some(""),
+                None,
+                Some("alpha"),
+            ])),
+            &nested_expected,
+        );
     }
 
     #[test]
@@ -722,6 +777,11 @@ mod tests {
 
     #[test]
     fn partitioning_abi_v1_type_gate_is_explicit_and_fail_closed() {
+        assert!(matches!(
+            PartitionKeyCodecV1::try_new(Vec::new()),
+            Err(PartitionKeyCodecError::EmptyKeySchema)
+        ));
+
         let item = Arc::new(Field::new("item", DataType::Int64, true));
         let rejected = [
             DataType::Float16,
@@ -768,6 +828,14 @@ mod tests {
                 }) if rejected == data_type
             ));
         }
+
+        assert!(matches!(
+            PartitionKeyCodecV1::try_new([DataType::Int64, DataType::Float32, DataType::Float64,]),
+            Err(PartitionKeyCodecError::UnsupportedKeyType {
+                index: 1,
+                data_type: DataType::Float32,
+            })
+        ));
     }
 
     #[test]

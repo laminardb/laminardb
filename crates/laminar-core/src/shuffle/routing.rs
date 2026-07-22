@@ -6,6 +6,7 @@ use std::sync::Arc;
 use arrow::compute::take;
 use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
 
+use crate::state::partition_key::PartitionKeyCodecV1Builder;
 use crate::state::{NodeId, PartitionKeyCodecError, PartitionKeyCodecV1, VnodeAssignmentSnapshot};
 
 /// Target decoded size for one routed batch. This is intentionally below the hard receiver bound
@@ -189,28 +190,36 @@ pub fn row_vnodes(
     if vnode_count == 0 {
         return Err(ShuffleRoutingError::EmptyVnodeSpace);
     }
-    let cols: Vec<ArrayRef> =
-        columns
-            .iter()
-            .map(|&index| {
-                batch.columns().get(index).cloned().ok_or(
-                    ShuffleRoutingError::KeyColumnOutOfRange {
-                        index,
-                        columns: batch.num_columns(),
-                    },
-                )
-            })
-            .collect::<Result<_, _>>()?;
-    let codec = PartitionKeyCodecV1::try_new(cols.iter().map(|column| column.data_type().clone()))
-        .map_err(|error| match error {
-            PartitionKeyCodecError::UnsupportedKeyType { index, data_type } => {
-                ShuffleRoutingError::UnsupportedKeyType {
-                    index: columns[index],
-                    data_type,
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(columns.len());
+    let mut builder = PartitionKeyCodecV1Builder::with_capacity(columns.len());
+    for &index in columns {
+        let column = batch.columns().get(index).cloned().ok_or(
+            ShuffleRoutingError::KeyColumnOutOfRange {
+                index,
+                columns: batch.num_columns(),
+            },
+        )?;
+        builder
+            .push(column.data_type().clone())
+            .map_err(|error| match error {
+                PartitionKeyCodecError::EmptyKeySchema => ShuffleRoutingError::EmptyKey,
+                PartitionKeyCodecError::UnsupportedKeyType { data_type, .. } => {
+                    ShuffleRoutingError::UnsupportedKeyType { index, data_type }
                 }
+                PartitionKeyCodecError::Arrow(error) => ShuffleRoutingError::Arrow(error),
+            })?;
+        cols.push(column);
+    }
+    let codec = builder.finish().map_err(|error| match error {
+        PartitionKeyCodecError::EmptyKeySchema => ShuffleRoutingError::EmptyKey,
+        PartitionKeyCodecError::UnsupportedKeyType { index, data_type } => {
+            ShuffleRoutingError::UnsupportedKeyType {
+                index: columns[index],
+                data_type,
             }
-            PartitionKeyCodecError::Arrow(error) => ShuffleRoutingError::Arrow(error),
-        })?;
+        }
+        PartitionKeyCodecError::Arrow(error) => ShuffleRoutingError::Arrow(error),
+    })?;
     let rows = codec.encode_columns(&cols)?;
     let vnode_count =
         std::num::NonZeroU32::new(vnode_count).ok_or(ShuffleRoutingError::EmptyVnodeSpace)?;
@@ -687,6 +696,14 @@ mod tests {
 
         assert!(matches!(
             row_vnodes(&batch, &[0], 257),
+            Err(ShuffleRoutingError::UnsupportedKeyType {
+                index: 0,
+                data_type: DataType::Float64,
+            })
+        ));
+
+        assert!(matches!(
+            row_vnodes(&batch, &[0, 1], 257),
             Err(ShuffleRoutingError::UnsupportedKeyType {
                 index: 0,
                 data_type: DataType::Float64,
