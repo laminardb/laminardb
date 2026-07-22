@@ -9,6 +9,7 @@ use serde_json::{Map, Value};
 pub const NOTICE: &str = "NOT QUALIFICATION EVIDENCE";
 
 const PROFILE_SCHEMA: &str = include_str!("../schema/profile-v1.schema.json");
+const MAX_PROFILE_BYTES: usize = 1_048_576;
 
 #[derive(Debug)]
 pub struct CheckErrors {
@@ -143,6 +144,12 @@ impl<'de> Deserialize<'de> for UniqueValue {
 }
 
 pub fn validate_profile(bytes: &[u8]) -> Result<ProfileSummary, CheckErrors> {
+    if bytes.len() > MAX_PROFILE_BYTES {
+        return Err(CheckErrors::one(format!(
+            "profile is {} bytes; maximum is {MAX_PROFILE_BYTES}",
+            bytes.len()
+        )));
+    }
     let UniqueValue(profile) = serde_json::from_slice(bytes)
         .map_err(|error| CheckErrors::one(format!("decode profile: {error}")))?;
     let schema: Value = serde_json::from_str(PROFILE_SCHEMA)
@@ -292,7 +299,7 @@ fn check_semantics(profile: &Value, errors: &mut Vec<String>) {
     if matches.len() != match_weights.len() {
         errors.push("join match counts and weights must have equal length".to_owned());
     }
-    if match_weights.iter().sum::<u64>() != 1000 {
+    if checked_sum(match_weights.iter().copied()) != Some(1000) {
         errors.push("join match weights must sum to 1000 permille".to_owned());
     }
 
@@ -313,7 +320,9 @@ fn check_semantics(profile: &Value, errors: &mut Vec<String>) {
     {
         errors.push("minimum total requests do not cover every repetition".to_owned());
     }
-    if numbers_at(profile, "/measurement/fixed_seeds").len() < repetitions as usize {
+    let seed_count =
+        u64::try_from(numbers_at(profile, "/measurement/fixed_seeds").len()).unwrap_or(u64::MAX);
+    if seed_count < repetitions {
         errors.push("one fixed seed is required per paired repetition".to_owned());
     }
 
@@ -323,9 +332,9 @@ fn check_semantics(profile: &Value, errors: &mut Vec<String>) {
         "/checkpoint_gates/deadline_seconds",
         errors,
     );
-    if number_at(profile, "/checkpoint_gates/sink_flush_ms/max")
-        >= number_at(profile, "/checkpoint_gates/deadline_seconds") * 1000
-    {
+    let sink_flush_ms = number_at(profile, "/checkpoint_gates/sink_flush_ms/max");
+    let deadline_ms = number_at(profile, "/checkpoint_gates/deadline_seconds").checked_mul(1000);
+    if deadline_ms.is_none_or(|deadline| sink_flush_ms >= deadline) {
         errors.push("sink flush maximum must fit inside checkpoint deadline".to_owned());
     }
     check_less_than(
@@ -411,14 +420,15 @@ fn check_sum(
     label: &str,
     errors: &mut Vec<String>,
 ) {
-    if paths
-        .iter()
-        .map(|path| number_at(profile, path))
-        .sum::<u64>()
-        != expected
-    {
+    if checked_sum(paths.iter().map(|path| number_at(profile, path))) != Some(expected) {
         errors.push(format!("{label} must sum to {expected} permille"));
     }
+}
+
+fn checked_sum(values: impl IntoIterator<Item = u64>) -> Option<u64> {
+    values
+        .into_iter()
+        .try_fold(0_u64, |sum, value| sum.checked_add(value))
 }
 
 fn reject_placeholder_strings(value: &Value, path: &str, errors: &mut Vec<String>) {
@@ -584,6 +594,28 @@ mod tests {
         assert!(validate_profile(source.as_bytes()).is_err());
 
         let bytes = mutated(|profile| profile["environment"]["provider"] = "TBD".into());
+        assert!(validate_profile(&bytes).is_err());
+    }
+
+    #[test]
+    fn hostile_sizes_and_semantic_arithmetic_fail_without_panicking() {
+        let bytes = vec![b' '; MAX_PROFILE_BYTES + 1];
+        assert!(validate_profile(&bytes).is_err());
+
+        let bytes = mutated(|profile| {
+            profile["workload"]["join_match_weights_permille"] =
+                serde_json::json!([u64::MAX, u64::MAX, 1, 1]);
+        });
+        assert!(validate_profile(&bytes).is_err());
+
+        let bytes = mutated(|profile| {
+            profile["checkpoint_gates"]["deadline_seconds"] = u64::MAX.into();
+        });
+        assert!(validate_profile(&bytes).is_err());
+
+        let bytes = mutated(|profile| {
+            profile["measurement"]["paired_repetitions"] = u64::MAX.into();
+        });
         assert!(validate_profile(&bytes).is_err());
     }
 
