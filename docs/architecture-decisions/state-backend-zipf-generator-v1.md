@@ -4,8 +4,9 @@
 - **Scope:** standalone state-backend qualification workload only
 - **Not runtime code:** this does not change cluster admission or operator execution
 - **Approval required:** workload owner and operations owner
-- **Related decisions:** [qualification model v1](state-backend-qualification-model-v1.md) and
-  [runner/evidence contract v1](state-backend-qualification-runner-v1.md)
+- **Related decisions:** [qualification model v1](state-backend-qualification-model-v1.md),
+  [runner/evidence contract v1](state-backend-qualification-runner-v1.md), and the
+  [long-stream workload/identity v2](state-backend-workload-v2.md)
 
 ## Decision
 
@@ -15,10 +16,10 @@ Hörmann--Derflinger rejection-inversion method and the stabilized construction 
 RNG 1.7.
 
 This sampler is a subordinate transform, not an amendment to `state-backend-workload/v1`.
-Integrating it reserves `state-backend-workload/v2` plus a versioned C2 plan/result schema that
-binds sampler identity, math-source identity, domain, counter identity, and case-stream identity.
-No v1 model result can claim Zipf behavior. Those C2 encodings are deliberately not invented in
-this ADR and block implementation beyond isolated numerical feasibility tests.
+Integrating it uses `state-backend-workload/v2` and the separate C2 case/stream identity contract,
+which binds sampler identity, math-source identity, domain, counter identity, and case-stream
+identity without importing C1's complete seed vector. No v1 model result can claim Zipf behavior.
+The C2 scenario schemas and named cases remain blocked beyond isolated numerical feasibility tests.
 
 The sampler is not approved for qualification execution yet. It becomes usable only if the same
 setup constants and output goldens are bit-identical on every declared qualification target, an
@@ -52,10 +53,10 @@ preflight are part of the decision rather than implementation details.
 
 ## Mathematical and numerical contract
 
-For domain size `N`, output rank `r` is in `0..N`. The ideal reference distribution is
+For domain size `N`, output rank `r` satisfies `0 <= r < N`. The ideal reference distribution is
 
 ```text
-P(r) = (r + 1)^(-99/100) / sum(j = 1..N, j^(-99/100)).
+P(r) = (r + 1)^(-99/100) / sum(j = 1,...,N, j^(-99/100)).
 ```
 
 V1 accepts only `zipf_exponent_milli = 990` and `1 <= N <= 2_147_483_647`. The runner plan stores
@@ -154,37 +155,19 @@ for testing the built artifact.
 
 ## Counter and sampling contract
 
-Each planned case will have a 32-byte `case_stream_id`. It is derived as SHA-256 over a separate
-domain and the length-prefixed canonical C2 case body, excluding the derived ID, schedule slots,
-candidates, approvals, results, and evidence. The body must bind distribution, sampler/math
-identities, `N`, scenario semantics, widths, batch shape, setup/churn/retention policies, phase
-counts/rates, cardinality bands, and all generator limits. DKS-Q2-002/003 must freeze that body's
-domain, field order, widths, and encoding before counter code exists; this rule prevents a
-self-hash but is not yet an executable derivation. Paired candidates use the same ID and seed.
+Each planned case has the 32-byte `case_stream_id` and each selected seed has the 32-byte
+`stream_instance_id` defined by the [long-stream workload/identity v2](state-backend-workload-v2.md).
+The body binds distribution, sampler/math identities, `N`, scenario semantics, widths, batch shape,
+setup/churn/retention policies, phase counts/rates, cardinality bands, and generator limits. It
+excludes derived expectations as well as the derived ID, seed, schedule slots, candidates,
+approvals, results, and evidence. Paired candidates use the same seeded stream instance.
 
-Finite-run phase tags are `0x00 setup`, `0x01 warmup`, and `0x02 measured`. Request and row
-ordinals are unsigned, zero-based, and reset to zero at each phase; a row ordinal addresses the
-logical input row before deduplication. Scenario tags reuse the frozen C1 values `0x01 aggregate`,
-`0x02 timer_window`, and `0x03 join`. Setup/prefill row semantics remain a DKS-Q2-003 blocker.
-Adding or changing a tag, coordinate scope, or reset rule requires a new counter identity.
-
-For attempts `a = 0, 1, ..., 63`, the random word is the first eight bytes, interpreted big-endian,
-of:
-
-```text
-SHA-256(
-  "LDB-SBQ-ZIPF-RI-HD99-SOFTF64-V1\0" ||
-  model_input_sha256[32] ||
-  case_stream_id[32] ||
-  seed_u64_be ||
-  phase_tag_u8 ||
-  scenario_tag_u8 ||
-  N_u64_be ||
-  request_ordinal_u64_be ||
-  row_ordinal_u32_be ||
-  attempt_u8
-)
-```
+The [long-stream workload/identity v2](state-backend-workload-v2.md) is the single normative owner
+of phase/scenario tags, case and seeded-stream derivation, ordinal scopes, and the SHA-256 proposal
+word address. For attempts `a = 0, 1, ..., 63`, this sampler consumes that address's first eight
+bytes as an unsigned big-endian word. Adding or changing a tag, coordinate scope, reset rule, or
+counter message requires a new workload-counter identity; changing the word-to-rank transform
+requires a new sampler identity.
 
 The proposal uses the following rounded temporaries. `word >> 11` is converted exactly to
 binary64. `b = x + one_half` must satisfy `0 <= b < 2^63`; conversion to signed 64-bit truncates
@@ -270,7 +253,7 @@ DKS-Q2-001 remains blocked until all of the following are checked into immutable
 6. **Named case assignment.** The workload owner approves the exact non-Cartesian cases using
    `hot_mix_v1` and `zipf_ri_hd99_softf64_v1`, including timer/join semantics, domain sizes, live
    cardinality bands, phase ordinals, raw rows/s, post-dedup candidate operations/s, expected
-   hottest-vnode share, and resident/spill behavior. Every rank in `0..N` must map to a valid
+   hottest-vnode share, and resident/spill behavior. Every rank satisfying `0 <= r < N` must map to a valid
    logical identity; the plan states whether that universe is prefilled or sparsely materialized and
    binds expected distinct-touched/live-cardinality bands relative to `N`. It need not touch or
    retain every rank unless the named setup policy says so. Exponent 0.99 is one synthetic point,
@@ -291,9 +274,9 @@ implemented or approved until these are closed:
 
 | ID | Required closure |
 |---|---|
-| `Z1` | Freeze the non-circular canonical C2 case body and `case_stream_id` encoding. |
-| `Z2` | Add workload-v2 plan/result/evidence identities and schema bindings without changing C1. |
-| `Z3` | Freeze per-scenario setup, phase, row, lifecycle, domain, and cardinality semantics. |
+| `Z1` | After Z3, implement and independently golden-test the closed non-circular C2 case body, case ID, and seeded stream encoding. |
+| `Z2` | Implement the frozen workload-v2 case/expectations/result schemas and runner/evidence bindings without changing C1. |
+| `Z3` | First freeze the closed per-scenario setup, phase, row, lifecycle, domain, cardinality, and policy-ID registry required to make Z1 injective. |
 | `Z4` | Freeze the exact math package checksum/build and prove actual-artifact conformance. |
 | `Z5` | Approve the independent finite-precision error metrics, thresholds, corpus, and retry bound. |
 | `Z6` | Approve named hot-mix/Zipf cases and all schedule/interference gates before backend data. |

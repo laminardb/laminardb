@@ -3,8 +3,9 @@
 - **Status:** provisional C2 engineering contract; no executable runner plan exists
 - **Scope:** standalone `tools/state-backend-qual` qualification tooling only
 - **Approval required before candidate execution:** workload owner and operations owner
-- **Related decisions:** [ADR-008](ADR-008-managed-vnode-keyed-state.md) and
-  [state backend qualification model v1](state-backend-qualification-model-v1.md)
+- **Related decisions:** [ADR-008](ADR-008-managed-vnode-keyed-state.md),
+  [state backend qualification model v1](state-backend-qualification-model-v1.md), and the
+  [long-stream workload/identity v2](state-backend-workload-v2.md)
 
 ## Decision and safety boundary
 
@@ -45,8 +46,12 @@ The canonical latency stream begins with `LDB-SBQ-LATENCY-SAMPLES-V1\0`; the zer
 the wire domain and not the printable identity. Any incompatible encoding, formula, layout,
 classification, or schedule change requires a new identity.
 
-The plan binds the exact raw profile SHA-256, model-input SHA-256, generator and model identities,
-physical layout, and every policy identity above. It does not bind its containing source revision.
+The plan binds the exact raw profile SHA-256, physical layout, and every policy identity above. C1
+adapter-conformance entries additionally bind their model-input SHA-256 plus v1 generator/model
+identities; those values are provenance and never a C2 generation input. Every C2 entry instead
+binds the exact workload-v2 case wrapper/body IDs and, for each selected seed, immutable
+expectations, preflight-provenance, and required independent-audit descriptors. It does not bind its
+containing source revision.
 A separate, detached approval record avoids that identity cycle by binding exact profile bytes,
 plan bytes, runner source archive, lockfile, both candidate binaries/configurations, toolchain,
 target, build flags, and environment image/package manifest. The approval record is excluded from
@@ -75,8 +80,10 @@ The case matrix is an explicit list, never a Cartesian product of profile vector
   (`normal` or `hot_vnode`) dimensions, active vnode count, fixed- or deterministically
   variable-width policy, batch rows, and join fanout where applicable;
 - exact setup/prefill, warmup, measured-stream, churn/retention, and persistence policy identities;
-- low/target/high logical live-state bytes, cardinality/timer-density bands, and setup,
-  post-warmup, and expected final state digests;
+- low/target/high logical live-state bytes and cardinality/timer-density state-control bands, plus
+  descriptors for separate per-seed expectations containing setup, post-warmup, and final state
+  digests and exact derived counters; the plan does not copy those derived values into mutable case
+  fields;
 - exact warmup and measured request counts plus rational offered requests-per-second for each phase;
 - the v1-required single foreground worker, maximum in-flight requests, queue byte/entry ceilings,
   drain deadline, and terminal timeout;
