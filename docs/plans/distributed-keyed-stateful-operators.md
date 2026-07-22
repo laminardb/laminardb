@@ -4,6 +4,7 @@
 - **Date:** 2026-07-22
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
+- **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
 
 ## Objective
 

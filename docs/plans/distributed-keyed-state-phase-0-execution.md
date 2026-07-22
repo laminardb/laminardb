@@ -1,0 +1,209 @@
+# Phase 0 execution plan: distributed keyed state
+
+- **Status:** In progress; contracts and inventory only
+- **Started:** 2026-07-22
+- **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
+- **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
+- **Baseline:** `1e2f8429`; working branch `feature/distributed-keyed-state-adr`
+
+## Outcome
+
+Phase 0 selects and proves the contracts needed before a production working-state implementation
+can begin. It does not add an LSM to the runtime, relax `[LDB-4007]`, enable a materialized view, or
+change the cluster delivery guarantee.
+
+The phase is complete only when maintainers can answer, with versioned evidence:
+
+1. which physical operators retain state and what distribution model each requires;
+2. which key/state ABI is durable across restore, rescale, and rolling upgrade;
+3. what numerical workload, latency, resource, checkpoint, and RTO limits define success;
+4. which one local LSM passed the same workload and fault contract;
+5. which source/operator/output/sink scenario is being certified at-least-once; and
+6. how an independent black-box soak will prevent an unearned production-ready claim.
+
+## Existing substrate to reuse
+
+- `laminar_core::state::PARTITIONING_ABI_VERSION` and raw-key hash golden vectors already exist.
+  Extend them for canonical typed SQL-key encoding; do not create a second partition ABI.
+- `VnodeRegistry`, assignment/process fencing, shuffle alignment, per-vnode artifact sealing, and
+  source handoff remain the ownership/checkpoint authority.
+- `crates/laminar-server/tests/cluster_soak.rs` already demonstrates three-process control, broker
+  input cuts, frozen output cuts, and Kafka output oracles. Reuse those concepts for engineering
+  tests, not as independent production certification.
+- `.github/workflows/checkpoint-fault-soak.yml` remains a short weekly regression. It builds a
+  debug-asserting test binary on a hosted runner and is not renamed as the production soak.
+- The removed `tools/state-tier-bench` is historical workload evidence only. Its single-point
+  Fjall wrapper and results are not restored.
+
+## Workstream A — Mandatory operator capability inventory
+
+### A1. Compile-time declaration
+
+Add a required, non-default method to `GraphOperator`. The descriptor separates:
+
+- implementation identity;
+- state class: `Stateless`, `GlobalSingleton`, `VnodeKeyed`, `RebuildableReplicated`, or
+  `LocalOnly`; and
+- current cluster status: `DdlGuarded`, `Rejected(reason)`, or `InternalOnly`.
+
+`DdlGuarded` is intentionally not called “certified”: existing DDL validation remains the sole
+admission authority in Phase 0. `Rejected` must carry a non-empty fail-closed reason. No default is
+allowed, so a new operator cannot compile without being inventoried.
+
+`SqlQueryOperator` is classified once from its SQL shape: projection is `Stateless`, a direct
+ungrouped aggregate is `GlobalSingleton`, `GROUP BY` is `VnodeKeyed`, and any parse/shape ambiguity
+is `LocalOnly + Rejected`. It must never infer safety from an uninitialized runtime state or from
+the presence of default vnode hooks.
+
+### A2. Inventory and tests
+
+Inventory all production implementations and all test probes. Focused tests cover projection,
+global aggregate, grouped aggregate, and ambiguous SQL, plus descriptor invariants. Compiler errors
+are the exhaustiveness check for new implementations.
+
+**Exit:** both cluster and non-cluster feature builds pass; admission regression tests remain
+byte-for-byte equivalent in outcome; no DDL path consumes the descriptor yet.
+
+## Workstream B — Frozen workload, ABI, and delivery contracts
+
+### B1. Numerical target profile
+
+Before either backend is measured, named workload and operations owners must approve a target
+profile containing:
+
+- exact Linux/kernel/filesystem, CPU, RAM, NVMe, cgroup, and object-store/network environment;
+- cache-resident and larger-than-RAM state sizes;
+- fixed/variable key and value widths, cardinality, Zipf skew, batch rows, offered rate, and vnode
+  count;
+- aggregate, timer/window, and bounded two-input join operation mixes;
+- p50/p95/p99/p99.9 end-to-end and state-service latency limits;
+- maximum compute/event-loop stall, checkpoint freeze/tail/seal time, sink flush time, and RTO;
+- hard RSS, local disk, FD, queue, frozen-generation, snapshot, compaction-debt, and write
+  amplification limits; and
+- repetition count, warm-up, fixed operation count, and invalid-run policy.
+
+Numerical fields cannot be `TBD` in a qualification run and cannot be changed after candidate
+results are visible. If production targets are not yet known, first measure the existing
+stateless/global baseline; those measurements inform an owner decision but do not set the gate
+automatically.
+
+### B2. Typed partition ABI
+
+Specify and test canonical bytes for nulls, booleans, signed/unsigned integers, decimals, floats
+(NaN and signed zero), UTF-8/binary, timestamps/timezones, and composite keys. Persist encoding
+version, hash version, vnode count, operator/table identity, and schema version together. Golden
+vectors must be platform-independent and verified in both shuffle and state-key callers.
+
+### B3. Delivery scenario
+
+Freeze the first vertical as:
+
+```text
+Kafka splittable/replayable source
+  -> grouped COUNT/SUM append-result stream
+  -> durable at-least-once multiwriter append sink
+  -> shared object-store checkpoint authority
+```
+
+The oracle permits bit-identical external replay duplicates but rejects missing input, internal
+double application, impossible aggregate state, stale-owner output, or a source cut that advances
+before sink flush. FullChangelog, mutable-key sinks, MVs, and exactly-once remain outside this
+vertical.
+
+## Workstream C — Evidence-only LSM qualification
+
+Create a standalone, unpublished tool at `tools/state-backend-qual` with its own workspace and
+committed lockfile. The root workspace and `crates/**` must gain no candidate dependency during the
+spike.
+
+### C1. Backend-neutral model first
+
+The first tool commit contains only:
+
+- a validated profile format with mandatory numerical gates;
+- deterministic counter-seeded aggregate, timer/window, and join request generation;
+- Arrow-batch-sized logical multi-read and atomic mutation batches;
+- an in-memory semantic model and digest oracle; and
+- structured run identity and result output.
+
+It contains no Fjall or RocksDB adapter and no CI workflow. Tests prove profile rejection,
+deterministic request bytes, batch atomicity, and model results.
+
+### C2. Candidate adapters
+
+Add exact, optional candidate pins in separate commits: Fjall 3.1.8 and one reviewed RocksDB Rust
+binding/version. Build exactly one candidate per binary. The private qualification contract covers
+batched reads, atomic write/delete/timer mutations, bounded range scans, consistent snapshots,
+vnode cleanup, sorted restore, explicit crash persistence, and resource/operability statistics. It
+is not the future production trait.
+
+Run identical fixed-operation workloads, alternate candidate order across repetitions, and record
+service latency separately from queue latency. Required outputs include raw p50/p90/p99/p99.9/max,
+throughput, CPU, RSS/PSS, cache/memtable/journal/compaction pressure, physical writes, disk/FD use,
+snapshot/export overlap, restore/cleanup RTO, oracle digest, binary/lock/profile hashes, and target
+hardware identity.
+
+### C3. Fault and endurance gates
+
+For each candidate, exercise kill during atomic write, snapshot/export, restore, and cleanup;
+explicit persistence recovery; corruption/truncation; wrong identity/schema; concurrent open; FD
+pressure; scoped Linux `ENOSPC`; complete local loss plus portable restore; and N/N-1 behavior. A
+24–72-hour backend churn/TTL soak measures compaction and resource slopes but is not the independent
+product soak.
+
+Select one backend in a reviewed report, delete the rejected adapter/dependency, and preserve raw
+evidence by immutable URI and digest. Phase 1 may start only after this decision.
+
+## Workstream D — Independent production-soak contract
+
+The detailed charter is [distributed-state production soak](../testing/distributed-state-production-soak-charter.md).
+Phase 0 freezes its identities, numerical gates, scenarios, oracle, fault schedule, artifact set,
+invalid-run rules, and independent reviewer before implementation results can influence them.
+
+The final soak must consume an immutable release archive or OCI digest and may not build the SUT.
+Its oracle has no LaminarDB library dependency and derives expected results from a broker-acknowledged
+input ledger plus frozen source/sink cuts. Every failed and invalid attempt is retained; retrying
+until green is prohibited. A relevant binary, chart, configuration, charter, or oracle change
+requires a complete rerun.
+
+The current Dockerfile toolchain mismatch (`rust:1.93` versus workspace `rust-version = 1.95`) must
+be resolved before an OCI artifact can be eligible. This is a release prerequisite, not permission
+for a drive-by Docker change in the capability-inventory commit.
+
+## Commit sequence
+
+1. `docs: detail phase zero keyed-state execution`
+   - this plan and draft independent-soak charter;
+2. `refactor: inventory operator cluster capabilities`
+   - mandatory descriptor, all implementations, focused tests, no admission consumer;
+3. `test: freeze keyed-state workload and ABI gates`
+   - approved numerical profile, typed key vectors, delivery/fault oracle contract;
+4. `tools: define state backend qualification model`
+   - standalone model-only harness;
+5. `tools: qualify Fjall state backend candidate`;
+6. `tools: qualify RocksDB state backend candidate`;
+7. `test: exercise backend crash and resource gates`;
+8. `docs: select managed-state backend from evidence`;
+9. `tools: remove rejected state backend spike`; and
+10. `docs: review distributed keyed state cycle 1`.
+
+Each commit runs its affected feature matrix and keeps the worktree reviewable. Backend candidate
+commits do not touch runtime crates. The capability commit does not change admission. The first
+guard-removal commit is reserved for the later grouped-aggregate vertical after Phase 1 passes.
+
+## Phase 0 exit review
+
+The Cycle 1 reviewer must conclude `APPROVE`, `APPROVE WITH OWNED FOLLOW-UPS`, or `BLOCK` across the
+six required passes. Any unowned correctness, numerical, backend, connector, independent-soak,
+upgrade, or evidence-retention gap is `BLOCK` for Phase 1 and leaves `[LDB-4007]` unchanged.
+
+Required attached evidence:
+
+- named human owners and approvals for the target profile and soak charter;
+- operator capability inventory and exact test commands;
+- typed ABI vectors and compatibility/rollback decision;
+- raw and summarized Fjall/RocksDB results with hashes and rejected-candidate rationale;
+- fault/endurance results including every failed or invalid attempt;
+- source/operator/sink ALO oracle specification;
+- AI-slop, overengineering, unused-code, production-readiness, documentation, and test review; and
+- explicit confirmation that no keyed/window/join/MV admission or exactly-once guarantee changed.
