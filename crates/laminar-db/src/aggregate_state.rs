@@ -24,6 +24,7 @@ use laminar_core::state::PartitionKeyCodecV1;
 use crate::db::exact_table_reference;
 use crate::error::DbError;
 
+mod artifact_v1;
 mod checkpoints;
 mod compile;
 mod keys;

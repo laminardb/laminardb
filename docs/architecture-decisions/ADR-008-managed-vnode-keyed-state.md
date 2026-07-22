@@ -333,7 +333,8 @@ operation identity from the canonical key and checked count version, so v1 also 
 `last_emitted` value. Timer/TTL or changelog codecs must add their own named state rather than
 silently extending this record.
 
-The payload sits inside a manually parsed, allocation-bounded managed envelope. It binds exact
+The payload sits inside the manually parsed, allocation-bounded
+[managed state artifact v1 envelope](managed-state-artifact-format-v1.md). It binds exact
 format/header length, inner `FULL`/`DELTA`/`EMPTY`, key mode, partition ABI, codec ID/version, total and
 section lengths, row/key/state totals, checkpoint and parent identity, assignment version, vnode
 count and vnode, owner-map certificate digest, stable operator/table/contract digests, and payload
@@ -366,8 +367,9 @@ validated spool bytes are charged to the local-disk governor and retained until 
 they are never an unbounded in-memory copy. The candidate profile separately names per-artifact and
 per-chain encoded caps, a directory-entry cap, a global encoded-byte pool, and per-task/global
 scratch caps; that machine-readable profile remains the sole numerical source. One "artifact" is
-the complete encoded `VnodePartialV2` object, not each inner BODY: its row, key-byte, state-byte, and
-encoded-byte caps are cumulative across all BODY entries. `resolved_parent_links_max` counts every
+the complete raw `VnodePartialV2` payload (excluding the existing fixed provenance wrapper), not
+each inner BODY: its row, key-byte, state-byte, and encoded-byte caps are cumulative across all BODY
+entries. Wrapper plus payload is checked before fetch. `resolved_parent_links_max` counts every
 outer `REFERENCE` and inner `DELTA` parent edge; a FULL/EMPTY base has depth zero, exactly the
 maximum is accepted, and maximum-plus-one is rejected. Whole-transition preflight resolves every
 REFERENCE and validates every chain and row into that immutable spool before any operator callback.

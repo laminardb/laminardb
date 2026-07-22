@@ -180,9 +180,10 @@ charge, then stream the inventory to the exact cap before parsing it. Its verifi
 artifact lengths/digests, provenance, and decoder dispatch; each artifact repeats reserve-before-GET
 and exact-length/digest enforcement. Per-artifact/per-chain encoded caps, the per-artifact
 directory-entry cap, the global encoded pool, and per-task/global decoder/ingestion scratch are
-distinct candidate-profile fields. "Per artifact" means one complete `VnodePartialV2` object: rows,
-key bytes, state bytes, and encoded bytes are summed across its BODY entries rather than reset for
-each inner payload. The resolved-parent limit counts both outer REFERENCE and inner DELTA edges.
+distinct candidate-profile fields. "Per artifact" means one complete raw `VnodePartialV2` payload,
+excluding the existing fixed provenance wrapper: rows, key bytes, state bytes, and encoded bytes are
+summed across its BODY entries rather than reset for each inner payload. Wrapper plus payload is
+checked before fetch. The resolved-parent limit counts both outer REFERENCE and inner DELTA edges.
 
 Represent restore as one assignment-scoped transition, not separate acquire/revoke maps or flat
 payload vectors. It binds the exact committed cut and checkpoint assignment fence to the target
