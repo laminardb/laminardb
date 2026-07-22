@@ -6,7 +6,7 @@ use std::sync::Arc;
 use arrow::compute::take;
 use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
 
-use crate::state::partition_key::PartitionKeyCodecV1Builder;
+use crate::state::partition_key::{PartitionKeyCodecV1Builder, MAX_PARTITION_KEY_COLUMNS};
 use crate::state::{NodeId, PartitionKeyCodecError, PartitionKeyCodecV1, VnodeAssignmentSnapshot};
 
 /// Target decoded size for one routed batch. This is intentionally below the hard receiver bound
@@ -124,6 +124,9 @@ pub enum ShuffleRoutingError {
         /// Rejected Arrow type.
         data_type: arrow_schema::DataType,
     },
+    /// A bounded partition-key ABI invariant failed before row encoding.
+    #[error("shuffle partition-key contract: {0}")]
+    PartitionKeyContract(PartitionKeyCodecError),
     /// Arrow row encoding or slicing failed.
     #[error("shuffle Arrow routing: {0}")]
     Arrow(#[from] arrow_schema::ArrowError),
@@ -190,6 +193,14 @@ pub fn row_vnodes(
     if vnode_count == 0 {
         return Err(ShuffleRoutingError::EmptyVnodeSpace);
     }
+    if columns.len() > MAX_PARTITION_KEY_COLUMNS {
+        return Err(ShuffleRoutingError::PartitionKeyContract(
+            PartitionKeyCodecError::TooManyKeyColumns {
+                count: columns.len(),
+                limit: MAX_PARTITION_KEY_COLUMNS,
+            },
+        ));
+    }
     let mut cols: Vec<ArrayRef> = Vec::with_capacity(columns.len());
     let mut builder = PartitionKeyCodecV1Builder::with_capacity(columns.len());
     for &index in columns {
@@ -207,6 +218,7 @@ pub fn row_vnodes(
                     ShuffleRoutingError::UnsupportedKeyType { index, data_type }
                 }
                 PartitionKeyCodecError::Arrow(error) => ShuffleRoutingError::Arrow(error),
+                other => ShuffleRoutingError::PartitionKeyContract(other),
             })?;
         cols.push(column);
     }
@@ -219,6 +231,7 @@ pub fn row_vnodes(
             }
         }
         PartitionKeyCodecError::Arrow(error) => ShuffleRoutingError::Arrow(error),
+        other => ShuffleRoutingError::PartitionKeyContract(other),
     })?;
     let rows = codec.encode_columns(&cols)?;
     let vnode_count =
@@ -607,6 +620,13 @@ mod tests {
         assert!(matches!(
             row_vnodes(&batch, &[1], 1),
             Err(ShuffleRoutingError::KeyColumnOutOfRange { .. })
+        ));
+        let over_wide = vec![0; MAX_PARTITION_KEY_COLUMNS + 1];
+        assert!(matches!(
+            row_vnodes(&batch, &over_wide, 1),
+            Err(ShuffleRoutingError::PartitionKeyContract(
+                PartitionKeyCodecError::TooManyKeyColumns { .. }
+            ))
         ));
     }
 

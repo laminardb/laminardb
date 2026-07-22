@@ -102,60 +102,6 @@ pub fn deserialize_batch_stream(bytes: &[u8]) -> Result<RecordBatch, arrow_schem
     })?
 }
 
-/// Deserializes exactly one [`RecordBatch`] from a complete Arrow IPC stream.
-///
-/// Unlike [`deserialize_batch_stream`], this rejects streams with no batch, more than one batch,
-/// a missing end-of-stream marker, or bytes after that marker. This is suitable for persisted
-/// artifacts whose byte boundary must be unambiguous; callers that intentionally consume only the
-/// first batch should continue to use [`deserialize_batch_stream`].
-///
-/// # Errors
-///
-/// Returns [`arrow_schema::ArrowError`] if the stream is malformed or is not the canonical encoding
-/// of exactly one batch.
-pub fn deserialize_single_batch_stream(
-    bytes: &[u8],
-) -> Result<RecordBatch, arrow_schema::ArrowError> {
-    const END_OF_STREAM: [u8; 8] = [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
-
-    let cursor = std::io::Cursor::new(bytes);
-    let mut reader = StreamReader::try_new(cursor, None)?;
-    let batch = reader.next().ok_or_else(|| {
-        ArrowError::IpcError("expected exactly one record batch, found none".to_string())
-    })??;
-    let batch_end = usize::try_from(reader.get_ref().position()).map_err(|_| {
-        ArrowError::IpcError("IPC stream position does not fit in memory".to_string())
-    })?;
-
-    if let Some(next) = reader.next() {
-        next?;
-        return Err(ArrowError::IpcError(
-            "expected exactly one record batch, found another".to_string(),
-        ));
-    }
-
-    let stream_end = usize::try_from(reader.get_ref().position()).map_err(|_| {
-        ArrowError::IpcError("IPC stream position does not fit in memory".to_string())
-    })?;
-    let canonical_end = batch_end
-        .checked_add(END_OF_STREAM.len())
-        .ok_or_else(|| ArrowError::IpcError("IPC stream end position overflowed".to_string()))?;
-    if stream_end != canonical_end
-        || bytes.get(batch_end..canonical_end) != Some(END_OF_STREAM.as_slice())
-    {
-        return Err(ArrowError::IpcError(
-            "single-batch IPC stream is missing its canonical end-of-stream marker".to_string(),
-        ));
-    }
-    if stream_end != bytes.len() {
-        return Err(ArrowError::IpcError(
-            "single-batch IPC stream contains trailing bytes".to_string(),
-        ));
-    }
-
-    Ok(batch)
-}
-
 /// Test encoder for exercising incrementally chunked Arrow IPC streams.
 #[cfg(test)]
 pub(crate) struct BatchStreamEncoder {
@@ -378,52 +324,5 @@ mod tests {
         let tiny_error =
             serialize_batches_stream_bounded(schema.as_ref(), inputs.iter(), 1).unwrap_err();
         assert!(tiny_error.to_string().contains("configured bound"));
-    }
-
-    #[test]
-    fn strict_single_batch_stream_round_trips_canonical_stream() {
-        let input = batch(&[1, 2, 3]);
-        let encoded = serialize_batch_stream(&input).unwrap();
-
-        assert_eq!(deserialize_single_batch_stream(&encoded).unwrap(), input);
-    }
-
-    #[test]
-    fn strict_single_batch_stream_rejects_zero_or_multiple_batches() {
-        let input = batch(&[1, 2, 3]);
-        let schema = input.schema();
-        let no_batches = serialize_batches_stream_bounded(
-            schema.as_ref(),
-            std::iter::empty::<&RecordBatch>(),
-            usize::MAX,
-        )
-        .unwrap();
-        let multiple = serialize_batches_stream_bounded(
-            schema.as_ref(),
-            [&input, &batch(&[4, 5, 6])],
-            usize::MAX,
-        )
-        .unwrap();
-
-        assert!(deserialize_single_batch_stream(&no_batches).is_err());
-        assert!(deserialize_single_batch_stream(&multiple).is_err());
-    }
-
-    #[test]
-    fn strict_single_batch_stream_rejects_malformed_or_truncated_input() {
-        assert!(deserialize_single_batch_stream(&[1, 2, 3]).is_err());
-
-        let encoded = serialize_batch_stream(&batch(&[1, 2, 3])).unwrap();
-        assert!(deserialize_single_batch_stream(&encoded[..encoded.len() - 1]).is_err());
-        assert!(deserialize_single_batch_stream(&encoded[..encoded.len() - 8]).is_err());
-    }
-
-    #[test]
-    fn strict_single_batch_stream_rejects_bytes_after_end_of_stream() {
-        let mut encoded = serialize_batch_stream(&batch(&[1, 2, 3])).unwrap();
-        encoded.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
-
-        let error = deserialize_single_batch_stream(&encoded).unwrap_err();
-        assert!(error.to_string().contains("trailing bytes"));
     }
 }

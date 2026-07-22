@@ -8,7 +8,7 @@ pub mod config;
 pub mod in_process;
 pub mod object_store;
 pub mod partition_key;
-pub mod schema_descriptor;
+mod partition_key_schema;
 pub mod vnode;
 
 pub use backend::{
@@ -20,7 +20,6 @@ pub use config::{StateBackendBuildError, StateBackendConfig};
 pub use in_process::InProcessBackend;
 pub use object_store::ObjectStoreBackend;
 pub use partition_key::{PartitionKeyCodecError, PartitionKeyCodecV1, PartitionKeySchemaV1};
-pub use schema_descriptor::{SchemaDescriptorV1, SCHEMA_DESCRIPTOR_VERSION};
 pub use vnode::{
     key_hash, owned_vnodes, owners_per_domain, peer_owners, rendezvous_assignment,
     InvalidKeyGroupCount, KeyGroupCount, Locality, NodeId, VnodeAssignmentReadGuard,

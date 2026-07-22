@@ -18,8 +18,15 @@ use arrow_array::ArrayRef;
 use arrow_row::{RowConverter, Rows, SortField};
 use arrow_schema::{DataType, FieldRef, TimeUnit};
 
-use super::schema_descriptor::SchemaDescriptorV1;
+pub use super::partition_key_schema::PartitionKeySchemaV1;
 use super::vnode::key_hash;
+
+/// Maximum number of columns in partitioning ABI v1's composite key.
+pub(crate) const MAX_PARTITION_KEY_COLUMNS: usize = 256;
+/// Maximum recursive dictionary depth in one partition-key type.
+pub(crate) const MAX_PARTITION_KEY_NESTING: usize = 32;
+/// Maximum encoded timezone parameter length in one partition-key type.
+pub(crate) const MAX_PARTITION_KEY_TIMEZONE_BYTES: usize = 256;
 
 /// Failure to construct the ABI-v1 typed-key encoder.
 #[derive(Debug, thiserror::Error)]
@@ -27,6 +34,42 @@ pub enum PartitionKeyCodecError {
     /// A keyed partitioning codec requires at least one logical key column.
     #[error("partition key schema is empty")]
     EmptyKeySchema,
+    /// The composite key is too wide for bounded plan-time construction.
+    #[error("partition key has {count} columns; hard limit is {limit}")]
+    TooManyKeyColumns {
+        /// Requested key-column count.
+        count: usize,
+        /// Hard key-column limit.
+        limit: usize,
+    },
+    /// Arrow extension metadata has no routing semantics in partitioning ABI v1.
+    #[error("partition key column {index} has metadata unsupported by ABI v1")]
+    UnsupportedKeyMetadata {
+        /// Zero-based position in the composite key.
+        index: usize,
+    },
+    /// Recursive dictionary hydration is bounded before Arrow row construction.
+    #[error("partition key column {index} exceeds dictionary nesting depth {limit}")]
+    KeyTypeNestingTooDeep {
+        /// Zero-based position in the composite key.
+        index: usize,
+        /// Hard dictionary nesting limit.
+        limit: usize,
+    },
+    /// A variable type parameter crossed its partition ABI resource bound.
+    #[error(
+        "partition key column {index} {parameter} occupies {bytes} bytes; hard limit is {limit}"
+    )]
+    KeyTypeParameterTooLarge {
+        /// Zero-based position in the composite key.
+        index: usize,
+        /// Bounded type parameter.
+        parameter: &'static str,
+        /// Observed parameter bytes.
+        bytes: usize,
+        /// Hard parameter limit.
+        limit: usize,
+    },
     /// The resolved key type has no frozen ABI-v1 equality and encoding contract.
     #[error("partition key column {index} has unsupported ABI-v1 type {data_type}")]
     UnsupportedKeyType {
@@ -38,6 +81,12 @@ pub enum PartitionKeyCodecError {
     /// Arrow rejected the otherwise admitted row layout.
     #[error("partition key Arrow row encoding: {0}")]
     Arrow(#[from] arrow_schema::ArrowError),
+    /// The opaque routing-schema descriptor crossed its hard allocation bound.
+    #[error("partition key schema descriptor exceeds {limit} bytes")]
+    KeySchemaDescriptorTooLarge {
+        /// Hard encoded descriptor limit.
+        limit: usize,
+    },
 }
 
 /// Vectorized encoder for the exact typed-key representation covered by
@@ -51,54 +100,6 @@ pub struct PartitionKeyCodecV1 {
     converter: RowConverter,
 }
 
-/// Persistable schema identity for partition-key ABI v1.
-///
-/// Dictionary index widths are physical transport details for partition keys:
-/// recursively dictionary-encoded keys have the same descriptor as their
-/// hydrated value type. Top-level field names are not key identity, while key
-/// order and nullability are.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PartitionKeySchemaV1 {
-    descriptor: SchemaDescriptorV1,
-}
-
-impl PartitionKeySchemaV1 {
-    /// Validate and describe an ordered, resolved partition-key schema.
-    ///
-    /// # Errors
-    /// Returns the same empty/unsupported-type errors as
-    /// [`PartitionKeyCodecV1::try_new`].
-    pub fn try_new(fields: &[FieldRef]) -> Result<Self, PartitionKeyCodecError> {
-        if fields.is_empty() {
-            return Err(PartitionKeyCodecError::EmptyKeySchema);
-        }
-        for (index, field) in fields.iter().enumerate() {
-            let data_type = field.data_type();
-            if !is_supported_key_type(data_type) {
-                return Err(PartitionKeyCodecError::UnsupportedKeyType {
-                    index,
-                    data_type: data_type.clone(),
-                });
-            }
-        }
-        Ok(Self {
-            descriptor: SchemaDescriptorV1::from_fields_hydrating_dictionaries(fields),
-        })
-    }
-
-    /// Canonical, versioned descriptor bytes.
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        self.descriptor.as_bytes()
-    }
-
-    /// SHA-256 of [`Self::as_bytes`].
-    #[must_use]
-    pub const fn sha256(&self) -> [u8; 32] {
-        self.descriptor.sha256()
-    }
-}
-
 /// Internal one-pass builder used where key-column lookup and validation must
 /// preserve their original request order.
 pub(crate) struct PartitionKeyCodecV1Builder {
@@ -108,15 +109,19 @@ pub(crate) struct PartitionKeyCodecV1Builder {
 impl PartitionKeyCodecV1Builder {
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
-            fields: Vec::with_capacity(capacity),
+            fields: Vec::with_capacity(capacity.min(MAX_PARTITION_KEY_COLUMNS)),
         }
     }
 
     pub(crate) fn push(&mut self, data_type: DataType) -> Result<(), PartitionKeyCodecError> {
         let index = self.fields.len();
-        if !is_supported_key_type(&data_type) {
-            return Err(PartitionKeyCodecError::UnsupportedKeyType { index, data_type });
+        if index >= MAX_PARTITION_KEY_COLUMNS {
+            return Err(PartitionKeyCodecError::TooManyKeyColumns {
+                count: index + 1,
+                limit: MAX_PARTITION_KEY_COLUMNS,
+            });
         }
+        validate_key_type(&data_type, index, 0)?;
         self.fields.push(SortField::new(data_type));
         Ok(())
     }
@@ -174,7 +179,37 @@ impl PartitionKeyCodecV1 {
     }
 }
 
-fn is_supported_key_type(data_type: &DataType) -> bool {
+pub(crate) fn validate_key_fields(fields: &[FieldRef]) -> Result<(), PartitionKeyCodecError> {
+    if fields.is_empty() {
+        return Err(PartitionKeyCodecError::EmptyKeySchema);
+    }
+    if fields.len() > MAX_PARTITION_KEY_COLUMNS {
+        return Err(PartitionKeyCodecError::TooManyKeyColumns {
+            count: fields.len(),
+            limit: MAX_PARTITION_KEY_COLUMNS,
+        });
+    }
+    for (index, field) in fields.iter().enumerate() {
+        if !field.metadata().is_empty() {
+            return Err(PartitionKeyCodecError::UnsupportedKeyMetadata { index });
+        }
+        validate_key_type(field.data_type(), index, 0)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_key_type(
+    data_type: &DataType,
+    index: usize,
+    depth: usize,
+) -> Result<(), PartitionKeyCodecError> {
+    if depth > MAX_PARTITION_KEY_NESTING {
+        return Err(PartitionKeyCodecError::KeyTypeNestingTooDeep {
+            index,
+            limit: MAX_PARTITION_KEY_NESTING,
+        });
+    }
+
     match data_type {
         DataType::Null
         | DataType::Boolean
@@ -186,7 +221,6 @@ fn is_supported_key_type(data_type: &DataType) -> bool {
         | DataType::UInt16
         | DataType::UInt32
         | DataType::UInt64
-        | DataType::Timestamp(_, _)
         | DataType::Date32
         | DataType::Date64
         | DataType::Duration(_)
@@ -196,24 +230,63 @@ fn is_supported_key_type(data_type: &DataType) -> bool {
         | DataType::BinaryView
         | DataType::Utf8
         | DataType::LargeUtf8
-        | DataType::Utf8View => true,
-        DataType::FixedSizeBinary(length) => *length >= 0,
+        | DataType::Utf8View => Ok(()),
+        DataType::Timestamp(_, timezone) => {
+            let bytes = timezone.as_ref().map_or(0, |value| value.len());
+            if bytes <= MAX_PARTITION_KEY_TIMEZONE_BYTES {
+                Ok(())
+            } else {
+                Err(PartitionKeyCodecError::KeyTypeParameterTooLarge {
+                    index,
+                    parameter: "timezone",
+                    bytes,
+                    limit: MAX_PARTITION_KEY_TIMEZONE_BYTES,
+                })
+            }
+        }
+        DataType::FixedSizeBinary(length) if *length >= 0 => Ok(()),
         DataType::Time32(unit) => {
-            matches!(unit, TimeUnit::Second | TimeUnit::Millisecond)
+            if matches!(unit, TimeUnit::Second | TimeUnit::Millisecond) {
+                Ok(())
+            } else {
+                Err(PartitionKeyCodecError::UnsupportedKeyType {
+                    index,
+                    data_type: data_type.clone(),
+                })
+            }
         }
         DataType::Time64(unit) => {
-            matches!(unit, TimeUnit::Microsecond | TimeUnit::Nanosecond)
+            if matches!(unit, TimeUnit::Microsecond | TimeUnit::Nanosecond) {
+                Ok(())
+            } else {
+                Err(PartitionKeyCodecError::UnsupportedKeyType {
+                    index,
+                    data_type: data_type.clone(),
+                })
+            }
         }
-        DataType::Decimal32(precision, scale) => valid_decimal::<Decimal32Type>(*precision, *scale),
-        DataType::Decimal64(precision, scale) => valid_decimal::<Decimal64Type>(*precision, *scale),
-        DataType::Decimal128(precision, scale) => {
-            valid_decimal::<Decimal128Type>(*precision, *scale)
+        DataType::Decimal32(precision, scale)
+            if valid_decimal::<Decimal32Type>(*precision, *scale) =>
+        {
+            Ok(())
         }
-        DataType::Decimal256(precision, scale) => {
-            valid_decimal::<Decimal256Type>(*precision, *scale)
+        DataType::Decimal64(precision, scale)
+            if valid_decimal::<Decimal64Type>(*precision, *scale) =>
+        {
+            Ok(())
         }
-        DataType::Dictionary(indices, values) => {
-            matches!(
+        DataType::Decimal128(precision, scale)
+            if valid_decimal::<Decimal128Type>(*precision, *scale) =>
+        {
+            Ok(())
+        }
+        DataType::Decimal256(precision, scale)
+            if valid_decimal::<Decimal256Type>(*precision, *scale) =>
+        {
+            Ok(())
+        }
+        DataType::Dictionary(indices, values)
+            if matches!(
                 indices.as_ref(),
                 DataType::Int8
                     | DataType::Int16
@@ -223,7 +296,17 @@ fn is_supported_key_type(data_type: &DataType) -> bool {
                     | DataType::UInt16
                     | DataType::UInt32
                     | DataType::UInt64
-            ) && is_supported_key_type(values)
+            ) =>
+        {
+            match validate_key_type(values, index, depth + 1) {
+                Err(PartitionKeyCodecError::UnsupportedKeyType { .. }) => {
+                    Err(PartitionKeyCodecError::UnsupportedKeyType {
+                        index,
+                        data_type: data_type.clone(),
+                    })
+                }
+                result => result,
+            }
         }
         DataType::Float16
         | DataType::Float32
@@ -236,7 +319,16 @@ fn is_supported_key_type(data_type: &DataType) -> bool {
         | DataType::Struct(_)
         | DataType::Union(_, _)
         | DataType::Map(_, _)
-        | DataType::RunEndEncoded(_, _) => false,
+        | DataType::RunEndEncoded(_, _)
+        | DataType::FixedSizeBinary(_)
+        | DataType::Decimal32(_, _)
+        | DataType::Decimal64(_, _)
+        | DataType::Decimal128(_, _)
+        | DataType::Decimal256(_, _)
+        | DataType::Dictionary(_, _) => Err(PartitionKeyCodecError::UnsupportedKeyType {
+            index,
+            data_type: data_type.clone(),
+        }),
     }
 }
 
@@ -262,7 +354,7 @@ mod tests {
         TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
         TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
     };
-    use arrow_schema::{DataType, Field, Schema, TimeUnit, UnionFields, UnionMode};
+    use arrow_schema::{DataType, Field, IntervalUnit, Schema, TimeUnit, UnionFields, UnionMode};
 
     use super::*;
     use crate::state::PARTITIONING_ABI_VERSION;
@@ -963,11 +1055,101 @@ mod tests {
         }
         assert_eq!(
             descriptor,
-            "4c44425343484d00000100000000000000030018010d0201000000000000000355544300251204"
+            "4c4442504b530000000100000000000000030015010a02010000000000000003555443001a1204"
         );
         assert_eq!(
             digest,
-            "d9d6f998b482cf2ec874bee4d11d3b5021c34dca2350a8af98aa476391172f3f"
+            "25eec077e4aa1db396aea8df199851993f6ab73acac53ae2757f0902aa2f4ca4"
+        );
+    }
+
+    #[test]
+    fn partition_key_schema_v1_ignores_aliases_but_preserves_order_and_nullability() {
+        let describe = |fields: Vec<Field>| {
+            let fields = fields.into_iter().map(Arc::new).collect::<Vec<_>>();
+            PartitionKeySchemaV1::try_new(&fields).unwrap()
+        };
+        let base = describe(vec![
+            Field::new("tenant", DataType::Int64, false),
+            Field::new("region", DataType::Utf8, true),
+        ]);
+        let renamed = describe(vec![
+            Field::new("x", DataType::Int64, false),
+            Field::new("y", DataType::Utf8, true),
+        ]);
+        let reordered = describe(vec![
+            Field::new("region", DataType::Utf8, true),
+            Field::new("tenant", DataType::Int64, false),
+        ]);
+        let changed_nullability = describe(vec![
+            Field::new("tenant", DataType::Int64, true),
+            Field::new("region", DataType::Utf8, true),
+        ]);
+
+        assert_eq!(base, renamed);
+        assert_ne!(base, reordered);
+        assert_ne!(base, changed_nullability);
+    }
+
+    #[test]
+    fn partition_key_schema_v1_freezes_every_admitted_type_family() {
+        let data_types = vec![
+            DataType::Null,
+            DataType::Boolean,
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64,
+            DataType::Timestamp(TimeUnit::Second, None),
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            DataType::Date32,
+            DataType::Date64,
+            DataType::Time32(TimeUnit::Second),
+            DataType::Time32(TimeUnit::Millisecond),
+            DataType::Time64(TimeUnit::Microsecond),
+            DataType::Time64(TimeUnit::Nanosecond),
+            DataType::Duration(TimeUnit::Second),
+            DataType::Duration(TimeUnit::Millisecond),
+            DataType::Duration(TimeUnit::Microsecond),
+            DataType::Duration(TimeUnit::Nanosecond),
+            DataType::Interval(IntervalUnit::YearMonth),
+            DataType::Interval(IntervalUnit::DayTime),
+            DataType::Interval(IntervalUnit::MonthDayNano),
+            DataType::Binary,
+            DataType::FixedSizeBinary(4),
+            DataType::LargeBinary,
+            DataType::BinaryView,
+            DataType::Utf8,
+            DataType::LargeUtf8,
+            DataType::Utf8View,
+            DataType::Decimal32(9, 2),
+            DataType::Decimal64(18, 2),
+            DataType::Decimal128(38, 2),
+            DataType::Decimal256(76, 2),
+        ];
+        let fields = data_types
+            .into_iter()
+            .enumerate()
+            .map(|(index, data_type)| {
+                Arc::new(Field::new(index.to_string(), data_type, index % 2 == 0))
+            })
+            .collect::<Vec<_>>();
+        let schema = PartitionKeySchemaV1::try_new(&fields).unwrap();
+        let mut digest = String::with_capacity(64);
+        for byte in schema.sha256() {
+            write!(&mut digest, "{byte:02x}").unwrap();
+        }
+
+        assert_eq!(schema.as_bytes().len(), 136);
+        assert_eq!(
+            digest,
+            "9e674163d2cd44f2f5ccc9c4f43191ff6ed55af0ba1672157fd16b6d536b7d59"
         );
     }
 
@@ -1015,6 +1197,55 @@ mod tests {
                 index: 1,
                 data_type: DataType::Float32,
             })
+        ));
+    }
+
+    #[test]
+    fn partition_key_plan_limits_fail_closed_before_large_allocation_or_recursion() {
+        let too_many_types = std::iter::repeat_n(DataType::Null, MAX_PARTITION_KEY_COLUMNS + 1);
+        assert!(matches!(
+            PartitionKeyCodecV1::try_new(too_many_types),
+            Err(PartitionKeyCodecError::TooManyKeyColumns { .. })
+        ));
+
+        let too_many_fields = (0..=MAX_PARTITION_KEY_COLUMNS)
+            .map(|index| Arc::new(Field::new(index.to_string(), DataType::Null, true)))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            PartitionKeySchemaV1::try_new(&too_many_fields),
+            Err(PartitionKeyCodecError::TooManyKeyColumns { .. })
+        ));
+
+        let metadata = vec![Arc::new(
+            Field::new("key", DataType::Utf8, false).with_metadata(
+                std::collections::HashMap::from([("extension".to_owned(), "v1".to_owned())]),
+            ),
+        )];
+        assert!(matches!(
+            PartitionKeySchemaV1::try_new(&metadata),
+            Err(PartitionKeyCodecError::UnsupportedKeyMetadata { index: 0 })
+        ));
+
+        let long_timezone = "x".repeat(MAX_PARTITION_KEY_TIMEZONE_BYTES + 1);
+        assert!(matches!(
+            PartitionKeyCodecV1::try_new([DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some(long_timezone.into())
+            )]),
+            Err(PartitionKeyCodecError::KeyTypeParameterTooLarge {
+                index: 0,
+                parameter: "timezone",
+                ..
+            })
+        ));
+
+        let mut nested = DataType::Utf8;
+        for _ in 0..=MAX_PARTITION_KEY_NESTING {
+            nested = DataType::Dictionary(Box::new(DataType::Int8), Box::new(nested));
+        }
+        assert!(matches!(
+            PartitionKeyCodecV1::try_new([nested]),
+            Err(PartitionKeyCodecError::KeyTypeNestingTooDeep { index: 0, .. })
         ));
     }
 }
