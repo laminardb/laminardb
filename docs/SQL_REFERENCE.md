@@ -294,11 +294,22 @@ while let Some(rows) = sub.poll() {
 
 **Critical:** `FromRow` struct field order must match the SQL `SELECT` column order. Field names don't matter, only position does.
 
+### Cluster SQL boundary
+
+Cluster `CREATE STREAM` currently admits projection/filter pipelines and one direct ungrouped
+aggregate stage composed of supported non-`DISTINCT` `COUNT`, `SUM`, `AVG`, `MIN`, and `MAX` calls.
+The aggregate must use the exact incremental path; derived/multi-stage aggregates may still be
+rejected. Every `GROUP BY`, windowed aggregate, and stateful join fails closed with `[LDB-4007]`.
+
+Cluster materialized-view creation is rejected with `[LDB-4007]` regardless of query shape because
+retained output and reads do not yet have a planner-certified distributed lifecycle. Consequently,
+the materialized-view form of `SUBSCRIBE` below applies to embedded and single-node runtimes. See
+the [cluster validation report](reports/cluster-keyed-state-validation-2026-07-22.md) for the exact
+admission matrix and limitations.
+
 ### SUBSCRIBE over the Postgres wire protocol
 
 When the server is started with `pgwire_bind` set, materialized views can be streamed directly to any libpq client (psql, JDBC, asyncpg, etc.):
-
-Cluster mode currently rejects materialized-view creation with `[LDB-4007]`; this interface applies to embedded and single-node materialized views.
 
 ```sql
 SUBSCRIBE <name> [WHERE <predicate>] [AS OF EPOCH <n>]

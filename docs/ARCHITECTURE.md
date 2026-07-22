@@ -217,10 +217,21 @@ let db = LaminarDB::builder()
 
 ### Operator State
 
-The production SQL execution path (`StreamExecutor`) holds state in internal FxHashMaps (per-group accumulators, window buffers) and checkpoints via JSON serialization. Each stateful operator (`SqlQuery`, `EowcQuery`, `CoreWindowState`, `IncrementalAggState`) implements its own `checkpoint()`/`restore()` methods.
+The production SQL path currently retains hot state in operator-specific maps and buffers.
+Checkpoint formats are likewise operator-specific: aggregate state uses versioned rkyv metadata and
+Arrow IPC columnar payloads, while other operators have their own local snapshot formats. This is
+not one managed hot-state engine.
 
 Unbounded keyed aggregates can outgrow RAM. They remain memory-resident until a production-ready
 spill path is implemented and validated; deployments must size or bound those queries accordingly.
+
+`laminar_core::state::StateBackend` persists immutable checkpoint-attempt vnode artifacts and the
+exact-attempt durability seal. It is shared recovery authority, not a point/range state store used
+while processing rows. Cluster aggregate code already has key shuffle and per-vnode
+capture/restore/revoke substrate, but grouped state remains inadmissible because its live map lacks
+a byte-governed spill path. Window-close and join operators also lack complete per-vnode
+state/timer/input lifecycles. The proposed managed-state design is
+[ADR-008](architecture-decisions/ADR-008-managed-vnode-keyed-state.md).
 
 ### Streaming Channels
 
@@ -410,3 +421,10 @@ requires cluster-shared S3/GCS/Azure state. Cluster `exactly_once` fails closed
 with `[LDB-0013]`: checkpoint decisions are term-fenced, but supported connectors
 do not yet provide certified term-fenced source handoff and external sink cursor
 commits, so end-to-end term fencing cannot yet be proven.
+
+**SQL boundary**: cluster `CREATE STREAM` admits stateless projection/filter pipelines and one
+direct ungrouped aggregate stage on the exact incremental path. Every keyed aggregate, windowed
+aggregate, and stateful join fails closed with `[LDB-4007]`. Every cluster materialized view is
+also rejected because retained output and distributed reads need their own assignment-fenced
+lifecycle. This admission is derived from configured runtime mode, even when one node currently
+owns every vnode. See the [validated matrix](reports/cluster-keyed-state-validation-2026-07-22.md).

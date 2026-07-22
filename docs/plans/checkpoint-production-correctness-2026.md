@@ -4,6 +4,11 @@
 must pass deterministic, connector-integration, fault, soak, and latency gates before any guarantee
 is widened. Cluster exactly-once remains rejected by LDB-0013.
 
+Distributed aggregate/window/join working state is designed separately in
+[ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md) and its
+[phased plan](distributed-keyed-stateful-operators.md). This plan remains authoritative for
+checkpoint/CDC/connector delivery and external commit certification, not keyed-operator admission.
+
 LaminarDB uses a decision-led checkpoint protocol. An immutable, provenance-checked state seal and
 one durable decision commit the recovery cut. External sink publication is re-driven from that
 decision and is not part of the pipeline pause.
@@ -221,9 +226,9 @@ checkpoint surface.
   [state backends](https://nightlies.apache.org/flink/flink-docs-stable/docs/ops/state/state_backends/),
   [experimental disaggregated state](https://nightlies.apache.org/flink/flink-docs-stable/docs/ops/state/disaggregated_state/),
   and [network tuning](https://nightlies.apache.org/flink/flink-docs-stable/docs/deployment/memory/network_mem_tuning/)
-- Apache Spark 4.1.2 [state and shuffle invariants](https://spark.apache.org/docs/latest/streaming/additional-information.html),
+- Apache Spark 4.2.0 [state and shuffle invariants](https://spark.apache.org/docs/latest/streaming/additional-information.html),
   RisingWave [stable vnode mapping](https://risingwavelabs.github.io/risingwave/design/consistent-hash.html),
-  Apache Kafka 4.3 [task and partition assignment](https://kafka.apache.org/43/streams/developer-guide/streams-rebalance-protocol/),
+  Apache Kafka 4.3.1 [task and partition assignment](https://kafka.apache.org/43/streams/developer-guide/streams-rebalance-protocol/),
   Apache Arrow 57.2 [row encoding](https://arrow.apache.org/rust/arrow_row/struct.RowConverter.html), and Arroyo
   [architecture](https://doc.arroyo.dev/architecture/)
 - PostgreSQL 18 [replication protocol](https://www.postgresql.org/docs/18/protocol-replication.html),
@@ -234,9 +239,9 @@ checkpoint surface.
   and the accepted [driver specification](https://github.com/mongodb/specifications/blob/master/source/change-streams/change-streams.md)
 - Apache Flink CDC 3.6 [PostgreSQL](https://nightlies.apache.org/flink/flink-cdc-docs-release-3.6/docs/connectors/flink-sources/postgres-cdc/)
   and [MongoDB](https://nightlies.apache.org/flink/flink-cdc-docs-release-3.6/docs/connectors/flink-sources/mongodb-cdc/)
-- [DBLog](https://arxiv.org/abs/2010.12597), its 2026
-  [certified virtual-cut formalization](https://arxiv.org/abs/2605.31475), and Moonlink's
+- [DBLog](https://arxiv.org/abs/2010.12597), the CDC-specific 2026 preprint on
+  [certified virtual cuts](https://arxiv.org/abs/2605.31475), and Moonlink's
   [Arrow/NVMe design](https://github.com/Mooncake-Labs/moonlink)
-- [CheckMate](https://arxiv.org/abs/2403.13629) for workload-sensitive checkpoint protocol choice
+- the [CheckMate preprint](https://arxiv.org/abs/2403.13629) for workload-sensitive checkpoint protocol choice
   and [PGVal](https://www.vldb.org/pvldb/vol18/p585-tahir.pdf) for end-to-end guarantee validation
   under injected process and network faults

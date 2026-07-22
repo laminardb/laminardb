@@ -147,7 +147,13 @@ LaminarDB supports multi-node cluster deployments. In this mode, streaming pipel
 > [!IMPORTANT]
 > Cluster exactly-once currently fails closed with `[LDB-0013]`. Checkpoint decisions are term-fenced, but no supported connector path yet has both certified term-fenced source handoff and an external sink cursor commit. Use cluster `at_least_once`; the only admitted local exact candidate is the certified deterministic generator with append-mode Delta, and it is not yet production-certified end to end.
 > Embedded/single-node exactly-once requires node-durable state and the built-in local checkpoint/decision store, held under an OS-released exclusive deployment lock. For the standalone server, a `file://` checkpoint URL selects that store. Shared object-store URLs and library-injected object or decision stores fail closed with `[LDB-0014]` because their writer-fencing provenance cannot yet be proved.
-> Cluster materialized views currently fail closed with `[LDB-4007]`; their output does not yet have a planner-certified distribution plus assignment-fenced checkpoint/read lifecycle. Stateless `CREATE STREAM` remains supported, while embedded and single-node materialized views are unaffected.
+> Cluster SQL is deliberately narrower than embedded SQL. `CREATE STREAM` admits stateless
+> projection/filter pipelines and one direct ungrouped aggregate stage using supported
+> non-`DISTINCT` built-ins. Every `GROUP BY`, windowed aggregate, and stateful join fails closed with
+> `[LDB-4007]`. Cluster materialized views also fail closed regardless of query shape because their
+> retained output lacks a planner-certified distribution and assignment-fenced checkpoint/read
+> lifecycle. Embedded and single-node operators are unaffected. See the
+> [validation report](docs/reports/cluster-keyed-state-validation-2026-07-22.md) for the exact matrix.
 
 ### Cluster Configuration Example
 

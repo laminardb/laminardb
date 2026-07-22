@@ -6,7 +6,7 @@
 
 ## Verdict
 
-The reported fail-closed boundary is genuine, with two qualifications:
+The reported fail-closed boundary is genuine, with three qualifications:
 
 1. It applies to cluster `CREATE STREAM`. Cluster materialized views are rejected with
    `[LDB-4007]` even when their query is stateless.
@@ -15,6 +15,9 @@ The reported fail-closed boundary is genuine, with two qualifications:
    revoke code. It remains rejected because its live groups are held in unbounded operator-owned
    maps with no enforceable byte budget or spillable hot-state tier. Windows and joins have larger
    lifecycle gaps.
+3. Restoring operator admission alone would not certify every runnable pipeline. Cluster delivery
+   is currently at-least-once only, source/sink topology is checked independently, and there is no
+   built-in cluster-admissible FullChangelog sink for retraction output.
 
 The current cluster admission matrix is therefore:
 
@@ -105,6 +108,50 @@ and fail-closed. They are not a scalable proof mechanism: a new stateful operato
 without declaring a distribution contract. The ADR replaces that implicit convention with a
 planner-visible capability descriptor and runtime assertions.
 
+### Delivery and connector constraints are independent guards
+
+Cluster runtime admission currently rejects `BestEffort` and `ExactlyOnce`; only `AtLeastOnce` is
+accepted. A cluster source must be non-ephemeral and `Splittable`, and a cluster sink must be
+`DurableAtLeastOnce + MultiWriter`. At this baseline, Kafka is the only built-in external source
+with the required cluster topology. Several built-in append sinks qualify, but no built-in
+cluster-admissible sink accepts `FullChangelog`.
+
+Evidence is the typed capability vocabulary in
+[`connector.rs`](../../crates/laminar-connectors/src/connector.rs), its exhaustive compatibility
+checks in [`pipeline_lifecycle.rs`](../../crates/laminar-db/src/pipeline_lifecycle.rs), and each
+connector's registered descriptor—not an inference from connector names.
+
+That does not block every grouped stream. Ordinary `CREATE STREAM` queries are registered as
+non-incremental and emit append-result rows, so their compatible append-sink paths can be certified.
+It does mean retraction/full-changelog modes cannot be called production-ready merely because the
+operator can compute them. A mutable cluster sink also needs key-affine assignment and stale-writer
+fencing; a `MultiWriter` flag alone does not establish ownership.
+
+The current source handoff already binds checkpoint attempt, source assignment version, cursors,
+per-source watermarks, cluster watermark, and recovery frontier. SQL-key vnode placement is a
+separate shuffle from Kafka source-partition placement, so a stateful checkpoint must preserve both
+authorities. Under at-least-once, recovered state and the source cursor share a coherent sealed cut,
+but external records flushed after that cut may repeat. Local LSM durability cannot turn this into
+end-to-end exactly-once; that later guarantee needs connector/provider commits fenced by the same
+leader/assignment proof already used by the checkpoint coordinator.
+
+### Fjall is historical, not current infrastructure
+
+The current baseline contains no Fjall dependency or state-tier module. Fjall 3.1 was previously
+used by the v0.26-era optional `state-tier` feature as a rebuildable cold cache for demoted
+checkpoint slices/groups. The current [`CHANGELOG.md`](../../CHANGELOG.md) records why commit
+`1e2f8429` removed it: a correctness defect allowed demotion to clear vnode dirtiness before
+durable checkpoint authority, so a failed attempt could recover older bytes. The deleted tier was
+not always-current working state and is not safe substrate to restore wholesale.
+
+Its archived benchmark is useful warning data, not production qualification. It used individual
+point inserts and uniform cold reads; the wrapper also read before write/remove for byte gauges and
+copied returned values. Formal target-Linux/NVMe testing never ran. Current Fjall 3.1.8 has useful
+atomic batches, snapshots, range scans, and sorted ingestion, but lacks native multi-get/range
+delete and a mature supported memory/compaction observability surface. The ADR therefore requires
+the same real state workload and fault gates against Fjall and RocksDB, then selects one production
+backend rather than assuming the historical dependency is fit.
+
 ## Empirical validation
 
 The validation uses a real configured cluster builder with a controller, shared object-store
@@ -121,25 +168,34 @@ The repository test `cluster_query_shape_admission_is_pre_mutation_and_mode_deri
 - startup rejection of residual materialized state; and
 - separation from embedded mode, where local query rules apply instead of `[LDB-4007]`.
 
-The integration test `persisted_keyed_mv_fails_closed_on_every_cluster_node` injects a persisted
-keyed MV and verifies that each node rejects both initial startup and restart with `[LDB-4007]`.
+The rendered error is an outer generic invalid-operation `[LDB-0005]` containing the specific
+`[LDB-4007]` cluster lifecycle code and reason. Tests search for the specific nested code.
+
+The integration test `sealed_materialized_view_manifest_is_rejected_by_every_node_after_restart`
+injects a persisted keyed MV and verifies that each node rejects both initial startup and restart
+with `[LDB-4007]`.
 Local unit/integration tests separately execute grouped aggregates, window-close aggregates, ASOF
 joins, temporal joins, and incremental changelog joins. Those local tests establish operator
 availability; they do not imply that every unbounded SQL join is semantically admissible.
 
-Commands and results for this baseline are recorded here after a clean targeted run:
+Clean targeted commands use `--no-default-features --features cluster` throughout. Results:
 
-```text
-cargo test -p laminar-db --features cluster cluster_query_shape_admission_is_pre_mutation_and_mode_derived
-RESULT: PASS — 1 passed, 0 failed (the final clean run used --no-default-features and --exact)
+| Test filter | Result | Evidence |
+|---|---:|---|
+| `db::tests::cluster_query_shape_admission_is_pre_mutation_and_mode_derived` (`--lib --exact`) | PASS, 1/1 | Exact admission matrix and no-residue rollback; rerun after adding explicit plain-keyed and global-window assertions |
+| `pipeline_lifecycle::connector_admission_tests::source_contract_admission_matrix_is_fail_closed` (`--lib --exact`) | PASS, 1/1 | Exhaustive delivery/consistency/topology source matrix |
+| `pipeline_lifecycle::connector_admission_tests::sink_contract_admission_matrix_is_fail_closed` (`--lib --exact`) | PASS, 1/1 | Exhaustive delivery/consistency/topology/output-mode sink matrix |
+| `incremental_emit_snapshot_matches_full_recompute` (`--test incremental_emit --exact`) | PASS, 1/1 | Embedded grouped aggregate matches full recomputation across four multi-key batches |
+| `db::tests::test_nullif_float_with_int_literal_runs_without_error` (`--lib --exact`) | PASS, 1/1 | Embedded tumbling window closes and emits |
+| `db::tests::asof_join_in_materialized_view_emits_backward_match` (`--lib --exact`) | PASS, 1/1 | Embedded ASOF MV produces expected backward matches |
+| `operator::interval_join::tests::test_checkpoint_roundtrip` (`--lib --exact`) | PASS, 1/1 | Local interval-join buffered state restores and matches a later batch |
+| `rebalance::dead_aggregate_owner_advances_to_a_successor_recovery_quorum` (`--test cluster_integration --exact`) | PASS, 1/1 | Multi-node global aggregate checkpoints, loses vnode-0 owner, and reaches successor recovery quorum |
+| `failures::zero_vnode_workers_start_idle_without_joining_assignment_quorum` (`--test cluster_integration --exact`) | PASS, 1/1 | Three-node stateless stream runs with zero-vnode workers |
+| `failures::sealed_materialized_view_manifest_is_rejected_by_every_node_after_restart` (`--test cluster_integration --exact`) | PASS, 1/1 | Persisted unsupported MV is rejected by every node before and after restart |
 
-cargo test -p laminar-db --features cluster persisted_keyed_mv_fails_closed_on_every_cluster_node
-RESULT: PASS — existing integration coverage; see the final cycle review for the exact invocation
-
-cargo test -p laminar-db --test incremental_emit --no-default-features --features cluster \
-  incremental_emit_snapshot_matches_full_recompute -- --exact
-RESULT: PASS — 1 passed, 0 failed; embedded grouped state matched full recomputation
-```
+The exact invocations and timings are repeated in the Cycle 0 review. Real multi-process soak,
+MinIO/object-store integration, Kafka/Docker, and server HTTP/Flight admission suites were not run;
+they require heavier process or external-service setup and are not represented as passing evidence.
 
 These are admission and focused operator tests, not a production certification. No existing test
 demonstrates a distributed keyed operator processing remote rows through crash, restore, and
@@ -170,7 +226,10 @@ a managed keyed working-state capability connected to the distributed execution 
    sides plus unmatched-output state.
 7. **Materialized output lifecycle:** separately partition, checkpoint, restore, and serve retained
    MV output before cluster MVs can be admitted.
-8. **Proof:** differential semantics, deterministic fault injection at every cut, skew and quota
+8. **Delivery composition:** bind supported source handoff, operator state/timers/output identity,
+   compatible sink mode, and checkpoint-tail ordering; keep unsupported changelog and exactly-once
+   combinations fail-closed.
+9. **Proof:** differential semantics, deterministic fault injection at every cut, skew and quota
    tests, process-death/rebalance output oracles, recovery compatibility, and published latency and
    resource profiles.
 
@@ -187,17 +246,21 @@ hot get/put/scan/write-batch/timer interface and is correctly kept as remote rec
 | `docs/plans/cluster-production-readiness.md` | Keep, narrow | Relevant umbrella plan; the focused ADR/plan becomes the source of truth for keyed operators |
 | `docs/ARCHITECTURE.md` | Correct | Its JSON/checkpoint wording and admission description are stale |
 | `docs/SQL_REFERENCE.md` and `README.md` | Correct | State the exact stream/global-aggregate/MV boundary |
-| ignored `docs/adr`, `docs/research`, and `.claude` content | Do not mutate in this branch | These paths are machine-local, ignored, and in the `.claude` case junctioned outside the repository; they cannot be reviewed or removed as versioned project artifacts |
+| `.claude/fix-plans/state-backend.md` | Remove locally | Stale Claude plan: it conflated artifact `StateBackend` with live state, proposed speculative OpenRaft/config tiers, and described already-changed code; the path is an ignored junction, so deletion is not a branch commit |
+| ignored `docs/adr` and `docs/research` content | Retain outside branch authority | The accepted cache/checkpoint and implemented incremental-emit notes still explain current code; schema research concerns another active area. Their cluster assertions do not override the tracked validation/ADR |
 
 No tracked `docs/research` directory exists on this baseline. Relevant primary sources are retained
-as citations in the design ADR; superseded narrative is not copied into a new research dump.
+as citations in the design ADR; superseded narrative is not copied into a new research dump. The
+removed Claude fix-plan lived through a junction at
+`C:\Users\sujit\.claude-private-configs\laminardb\.claude`; repository Git cannot recover it.
 
 ## Confidence and limitations
 
 Confidence is high for the admission boundary because independent pre-plan, post-plan, startup,
 and MV guards converge on the same error and targeted tests execute those paths. Confidence is
 also high that a common managed hot-state tier is absent: the checkpoint backend explicitly denies
-that role and no local LSM dependency or equivalent API is present.
+that role and no local LSM dependency or equivalent API is present in the current tree. Fjall's
+deleted cold-cache history does not change that conclusion.
 
 This report does not claim production behavior for an unreachable distributed stateful data path.
 It also does not claim cluster exactly-once; cluster delivery remains at-least-once and
