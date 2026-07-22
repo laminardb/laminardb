@@ -68,6 +68,98 @@ fn refresh_rows_digest(bytes: &mut [u8]) {
     put_test(bytes, 320, &digest);
 }
 
+fn fixture_bytes(text: &str) -> Vec<u8> {
+    let compact = text
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    let mut chunks = compact.chunks_exact(2);
+    let bytes = chunks
+        .by_ref()
+        .map(|pair| {
+            u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16)
+                .expect("fixture contains only hexadecimal bytes")
+        })
+        .collect();
+    assert!(chunks.remainder().is_empty(), "fixture has an odd nibble");
+    bytes
+}
+
+#[test]
+fn frozen_aggregate_goldens_decode_and_encoder_reproduces_them() {
+    let int64 = schema(DataType::Int64, false);
+    let empty_context = context(&int64, ArtifactKind::Empty, 1, None);
+    let empty_fixture = fixture_bytes(include_str!(
+        "../../../tests/fixtures/managed_state_v1/aggregate_empty.hex"
+    ));
+    assert_eq!(encode(empty_context, &[], limits()).unwrap(), empty_fixture);
+    assert_eq!(
+        decode(&empty_fixture, empty_context, limits())
+            .unwrap()
+            .row_count(),
+        0
+    );
+
+    let null = schema(DataType::Null, true);
+    let null_context = context(&null, ArtifactKind::Full, 1, None);
+    let null_rows = [row(&[], 3, 0, 0)];
+    let null_fixture = fixture_bytes(include_str!(
+        "../../../tests/fixtures/managed_state_v1/aggregate_full_null_sum.hex"
+    ));
+    assert_eq!(
+        encode(null_context, &null_rows, limits()).unwrap(),
+        null_fixture
+    );
+    assert_eq!(
+        decode(&null_fixture, null_context, limits())
+            .unwrap()
+            .rows()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        null_rows
+    );
+
+    let binary = schema(DataType::Binary, false);
+    let full_context = context(&binary, ArtifactKind::Full, 1, None);
+    let full_rows = [
+        row(&[0], 1, 1, i64::MIN),
+        row(&[u8::MAX], MAX_SQL_COUNT, 1, i64::MAX),
+    ];
+    let full_fixture = fixture_bytes(include_str!(
+        "../../../tests/fixtures/managed_state_v1/aggregate_full_two_rows.hex"
+    ));
+    assert_eq!(
+        encode(full_context, &full_rows, limits()).unwrap(),
+        full_fixture
+    );
+    assert_eq!(
+        decode(&full_fixture, full_context, limits())
+            .unwrap()
+            .rows()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        full_rows
+    );
+
+    let delta_context = context(&binary, ArtifactKind::Delta, 2, Some(1));
+    let delta_rows = [row(&[0x7f], 2, 1, 9)];
+    let delta_fixture = fixture_bytes(include_str!(
+        "../../../tests/fixtures/managed_state_v1/aggregate_delta_one_row.hex"
+    ));
+    assert_eq!(
+        encode(delta_context, &delta_rows, limits()).unwrap(),
+        delta_fixture
+    );
+    assert_eq!(
+        decode(&delta_fixture, delta_context, limits())
+            .unwrap()
+            .rows()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        delta_rows
+    );
+}
+
 #[test]
 fn state_is_exactly_24_bytes_and_rejects_impossible_values() {
     let state = CountSumStateV1::persisted(2, 1, -2).unwrap();

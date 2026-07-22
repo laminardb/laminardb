@@ -72,6 +72,105 @@ fn rehash_body(bytes: &mut [u8]) {
     put_test(bytes, 160, &digest);
 }
 
+fn fixture_bytes(text: &str) -> Vec<u8> {
+    let compact = text
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    let mut chunks = compact.chunks_exact(2);
+    let bytes = chunks
+        .by_ref()
+        .map(|pair| {
+            u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16)
+                .expect("fixture contains only hexadecimal bytes")
+        })
+        .collect();
+    assert!(chunks.remainder().is_empty(), "fixture has an odd nibble");
+    bytes
+}
+
+#[test]
+fn frozen_v2_goldens_decode_and_encoder_reproduces_them() {
+    let reference_roster = [roster_entry(1, 11)];
+    let reference = [EncodeEntry {
+        operator_identity_sha256: digest(1),
+        state_table_identity_sha256: digest(11),
+        payload: EncodeEntryPayload::Reference {
+            parent: parent(4, 0x44),
+        },
+    }];
+    let reference_fixture = fixture_bytes(include_str!(
+        "../../../tests/fixtures/managed_state_v1/vnode_partial_reference.hex"
+    ));
+    assert_eq!(
+        encode(context(&reference_roster), &reference, limits()).unwrap(),
+        reference_fixture
+    );
+    let decoded_reference =
+        decode(&reference_fixture, context(&reference_roster), limits()).unwrap();
+    assert!(matches!(
+        decoded_reference.entries().next().unwrap().unwrap().payload,
+        DecodedEntryPayload::Reference { parent: link }
+            if link == parent(4, 0x44)
+    ));
+
+    let mixed_roster = [
+        roster_entry(1, 11),
+        roster_entry(2, 12),
+        roster_entry(3, 13),
+    ];
+    let mixed = [
+        full_entry(1, 11, b"full-envelope"),
+        EncodeEntry {
+            operator_identity_sha256: digest(2),
+            state_table_identity_sha256: digest(12),
+            payload: EncodeEntryPayload::Body {
+                artifact_kind: ArtifactKind::Empty,
+                body: b"empty-envelope",
+                parent: None,
+            },
+        },
+        EncodeEntry {
+            operator_identity_sha256: digest(3),
+            state_table_identity_sha256: digest(13),
+            payload: EncodeEntryPayload::Reference {
+                parent: parent(4, 0x44),
+            },
+        },
+    ];
+    let mixed_fixture = fixture_bytes(include_str!(
+        "../../../tests/fixtures/managed_state_v1/vnode_partial_mixed.hex"
+    ));
+    assert_eq!(
+        encode(context(&mixed_roster), &mixed, limits()).unwrap(),
+        mixed_fixture
+    );
+    let decoded_mixed = decode(&mixed_fixture, context(&mixed_roster), limits()).unwrap();
+    let payloads = decoded_mixed
+        .entries()
+        .map(|entry| entry.unwrap().payload)
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        payloads[0],
+        DecodedEntryPayload::Body {
+            artifact_kind: ArtifactKind::Full,
+            body: b"full-envelope",
+            parent: None,
+            ..
+        }
+    ));
+    assert!(matches!(
+        payloads[1],
+        DecodedEntryPayload::Body {
+            artifact_kind: ArtifactKind::Empty,
+            body: b"empty-envelope",
+            parent: None,
+            ..
+        }
+    ));
+    assert!(matches!(payloads[2], DecodedEntryPayload::Reference { .. }));
+}
+
 #[test]
 fn mixed_directory_round_trips_as_borrowed_views() {
     let roster = [
