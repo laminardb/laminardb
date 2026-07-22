@@ -55,6 +55,13 @@ ungrouped aggregate is `GlobalSingleton`, `GROUP BY` is `VnodeKeyed`, and any pa
 is `LocalOnly + Rejected`. It must never infer safety from an uninitialized runtime state or from
 the presence of default vnode hooks.
 
+The later physical checkpoint contract is a second, positive proof. Queuing bytes while the SQL
+operator is `Uninit` is not validation and cannot produce an activation token. Restore preparation
+must construct enough of the exact incremental physical plan to select registered codecs and
+decode private state. Contract derivation failure is recorded as cluster `Unavailable(reason)` and
+keeps `[LDB-4007]`; it must not make an otherwise supported embedded aggregate fail merely because
+the binary includes the cluster feature.
+
 ### A2. Inventory and tests
 
 Inventory all production implementations and all test probes. Focused tests cover projection,
@@ -79,7 +86,10 @@ profile containing:
 - p50/p95/p99/p99.9 end-to-end and state-service latency limits;
 - maximum compute/event-loop stall, checkpoint freeze/tail/seal time, sink flush time, and RTO;
 - hard RSS, local disk, FD, queue, frozen-generation, snapshot, compaction-debt, and write
-  amplification limits; and
+  amplification limits;
+- hard encoded artifact/descriptor/payload bytes, chain-link/delta depth, operators/vnodes per
+  transition, groups/accumulators/IPC streams/emitted rows, decoded Arrow variable bytes, and
+  restore-staging limits; and
 - repetition count, warm-up, fixed operation count, and invalid-run policy.
 
 Numerical fields cannot be `TBD` in a qualification run and cannot be changed after candidate
@@ -111,19 +121,47 @@ or widened type semantics require an ABI version bump plus an explicit replay/mi
 rollback policy; there is no implicit N/N-1 reader window.
 
 The keyed checkpoint format must gain a versioned envelope containing partition ABI, vnode count,
-claimed vnode, canonical key-schema fingerprint, operator fingerprint, accumulator-state schema
-fingerprint, and payload version. Preflight uses expected key and accumulator schemas cached from
-the plan, never schemas inferred only from the payload. It rejects empty state for an accumulator
-that declares state fields, coercive or empty keyed emission keys, a changed vnode count, and any
-decoded group/byte reservation above the frozen limits. A FULL image replaces the complete target
-vnode namespace, including removal of live keys absent from the image.
+claimed vnode, explicit global/keyed mode, canonical routing-key schema, exact stored-key schema,
+operator fingerprint, state-table/accumulator schema, payload codec, and `FULL`, `DELTA`, or
+`EMPTY` kind. Preflight uses expected schemas cached from the plan, never schemas inferred only
+from the payload. It rejects empty state for an accumulator that declares state fields, coercive or
+empty keyed emission keys, a changed vnode count, and any decoded group/byte reservation above the
+frozen limits. A FULL image replaces the complete target vnode namespace, including removal of
+live keys absent from the image; a missing operator entry never means empty.
 
-Represent one uninitialized restore as tagged base-plus-delta chains rather than separate flat
-vectors. Prepare all chains, prove cross-vnode key disjointness, and reserve resources before any
-chain mutates the temporary aggregate; publish that aggregate only after every preflight succeeds.
-The later graph-level lifecycle must likewise prevent a failed late operator from exposing earlier
-partial application. Keep legacy raw checkpoint compatibility limited to the admitted global
-vnode-0 aggregate until an explicit keyed migration policy exists.
+Freeze two schema layers deliberately. `PartitionKeySchemaV1` is the hydrated logical routing
+identity; artifact codec v1 separately records exact physical non-dictionary Arrow fields and
+nullability, hydrating dictionary inputs before writing. Accumulator contracts retain semantic
+state fields and exact stored fields. Encoding must use planned fields rather than synthesize
+all-nullable `c0...cN` fields. Before Arrow parsing, the decoder reserves from the global restore
+budget, bounds and validates IPC framing/metadata/body/nodes/buffers, matches the cached schema
+frame, and requires exactly `Schema -> RecordBatch -> EOS`, exact arity/type/nullability and row
+count, and no casts/default state. Initial v1 rejects compression and dictionary messages. The
+physical descriptor lands with the bounded DTO/writer/decoder and covers or rejects every relevant
+metadata scope; routing ABI v1 rejects field metadata.
+
+The aggregate codec registry is keyed by concrete reviewed builtin implementation, Laminar codec
+ID, and explicit version—not by a spoofable UDAF name or a floating dependency version. Exact
+DataFusion pins, fresh and populated state goldens, and explicit COUNT/SUM/AVG/MIN/MAX and
+retractable invariants precede a writer. The persisted payload is a bounded wire DTO; direct rkyv
+of the live checkpoint struct is not declared stable. Enforce artifact and decoded-size ceilings
+before allocation/hashing and benchmark cold-path hashing/copying separately from the record path.
+Cache the immutable contract at plan/init time: UDF introspection, schema canonicalization,
+dependency-version formatting, SHA-256, IPC/rkyv parsing, and compatibility selection never run
+per row or per processing batch, and post-freeze artifact encoding stays off the event-loop thread.
+
+Represent restore as one assignment-scoped transition, not separate acquire/revoke maps or flat
+payload vectors. It binds the exact committed cut and checkpoint assignment fence to the target
+assignment version, vnode count, owner-map digest, acquired chains, revoked set, and authoritative
+operator-lifecycle inventory. Snapshot rather than drain it; preflight all vnodes/operators;
+prepare shadow state for every lifecycle participant; then enter exclusive graph/callback
+publication with intake closed, revalidate assignment authority under the rotation fence, and
+publish only infallible shard/generation swaps. Retain old handles for destruction after the short
+section. A failed late prepare aborts all shadows, retains the identical transition, mutates no
+live operator, and activates no vnode.
+An uninitialized SQL operator must build and validate its exact incremental plan during prepare.
+Keep legacy raw checkpoint compatibility limited to the admitted global vnode-0 aggregate until
+an explicit keyed migration policy exists.
 
 ### B3. Delivery scenario
 
@@ -194,6 +232,13 @@ batched reads, atomic write/delete/timer mutations, bounded range scans, consist
 vnode cleanup, sorted restore, explicit crash persistence, and resource/operability statistics. It
 is not the future production trait.
 
+For Fjall, test consistency and power-loss durability separately: ordinary buffered writes versus
+the proposed grouped `SyncData`/`SyncAll` boundary, retained slices, snapshot/iterator reclamation,
+prefix cleanup without a range tombstone, and every stable pressure counter. For RocksDB, test the
+chosen Rust binding's actual MultiGet behavior, DeleteRange tombstone/read cost,
+cross-column-family stall propagation, rate-limiter scope, native memory accounting, and
+SST-ingest write pauses. Pin the exact RocksDB engine and wrapper before results are accepted.
+
 Run identical fixed-operation workloads, alternate candidate order across repetitions, and record
 service latency separately from queue latency. Required outputs include raw p50/p90/p99/p99.9/max,
 throughput, CPU, RSS/PSS, cache/memtable/journal/compaction pressure, physical writes, disk/FD use,
@@ -227,32 +272,41 @@ The current Dockerfile toolchain mismatch (`rust:1.93` versus workspace `rust-ve
 be resolved before an OCI artifact can be eligible. This is a release prerequisite, not permission
 for a drive-by Docker change in the capability-inventory commit.
 
-## Commit sequence
+## Progress and remaining commit sequence
 
-1. `docs: detail phase zero keyed-state execution`
-   - this plan and draft independent-soak charter;
-2. `refactor: inventory operator cluster capabilities`
-   - mandatory descriptor, all implementations, focused tests, no admission consumer;
-3. `test: freeze keyed-state workload and ABI gates`
-   - approved numerical profile, typed key vectors, delivery/fault oracle contract;
-4. `tools: define state backend qualification model`
-   - standalone model-only harness;
-5. `tools: qualify Fjall state backend candidate`;
-6. `tools: qualify RocksDB state backend candidate`;
-7. `test: exercise backend crash and resource gates`;
-8. `docs: select managed-state backend from evidence`;
-9. `tools: remove rejected state backend spike`; and
-10. `docs: review distributed keyed state cycle 1`.
+Completed Phase 0 slices now include the operator capability inventory, partition ABI v1 and its
+bounded routing-schema identity, source/sink and output-identity contracts, independent-soak
+charter and ineligible validator scaffold, plus aggregate/graph restore audits. None is an
+admission consumer. A reviewed Cycle 3 experiment removed the generic strict IPC helper because
+Arrow 57.2 can allocate from attacker-declared lengths before proving input availability; the
+artifact-specific bounded decoder remains part of the next format-contract slice.
 
-Each commit runs its affected feature matrix and keeps the worktree reviewable. Backend candidate
-commits do not touch runtime crates. The capability commit does not change admission. The first
-guard-removal commit is reserved for the later grouped-aggregate vertical after Phase 1 passes.
+Remaining commits are kept reviewable in this order:
+
+1. `test: freeze keyed-state numerical qualification profile`
+   - named owner approvals and complete latency/resource/RTO gates;
+2. `test: freeze aggregate artifact and codec contract`
+   - dedicated bounded DTO, exact dependency pins, concrete builtin registry, semantic/physical
+     schema goldens, artifact-specific hostile-input IPC preflight, authoritative roster/explicit-
+     empty vectors, and no live restore wiring;
+3. `tools: define state backend qualification model`
+   - standalone backend-neutral model, deterministic workload, digest oracle, and validated output;
+4. separate exact-pin Fjall and RocksDB adapter commits behind the private spike contract;
+5. `test: exercise backend crash resource and endurance gates`;
+6. `docs: select managed-state backend from evidence`;
+7. `tools: remove rejected state backend spike`; and
+8. `docs: review distributed keyed state phase zero`.
+
+Each commit runs its affected feature matrix. Backend candidates do not touch runtime crates, and
+the first graph-lifecycle implementation remains a Phase 1 change. The first guard-removal commit
+is reserved for the later grouped-aggregate vertical after Phase 1 passes.
 
 ## Phase 0 exit review
 
-The Cycle 1 reviewer must conclude `APPROVE`, `APPROVE WITH OWNED FOLLOW-UPS`, or `BLOCK` across the
-six required passes. Any unowned correctness, numerical, backend, connector, independent-soak,
-upgrade, or evidence-retention gap is `BLOCK` for Phase 1 and leaves `[LDB-4007]` unchanged.
+The final Phase 0 reviewer must conclude `APPROVE`, `APPROVE WITH OWNED FOLLOW-UPS`, or `BLOCK`
+across the six required passes. Any unowned correctness, numerical, backend, connector,
+independent-soak, upgrade, or evidence-retention gap is `BLOCK` for Phase 1 and leaves
+`[LDB-4007]` unchanged.
 
 Required attached evidence:
 

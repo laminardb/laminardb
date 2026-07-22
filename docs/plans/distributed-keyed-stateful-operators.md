@@ -126,11 +126,15 @@ Work:
    - Arrow batch sizes, input rate, checkpoint cadence, and failure/rebalance schedule;
    - source replay/handoff and sink-flush latency/backpressure profiles;
    - aggregate, window, and two-input join workloads; and
-   - absolute p99/p99.9 latency, throughput, checkpoint-pause, RTO, RSS, and disk limits.
-3. Specify the partition/state ABI and add golden vectors for every supported key type, including
-   null, decimal, timestamp/timezone, floating-point edge cases, and composite keys.
-4. Specify stable operator/table ID derivation, state-schema compatibility rules, and N/N-1 rolling
-   upgrade/rollback behavior.
+   - absolute p99/p99.9 latency, throughput, checkpoint-pause, RTO, RSS, disk, artifact/decode,
+     chain-depth, operator/vnode-count, and restore-staging limits.
+3. Specify the partition/state ABI and add golden vectors for every admitted key type plus explicit
+   rejection vectors for floating-point, nested, and other excluded types. Persist hydrated routing
+   identity separately from the artifact's canonical non-dictionary physical IPC schema; initial
+   artifact decoding rejects compression and dictionary messages.
+4. Specify stable operator/table ID derivation, concrete builtin codec registry, Laminar-owned codec
+   versions, semantic and physical state-schema contracts, a dedicated bounded wire DTO, exact
+   dependency pins, populated-state goldens, and N/N-1 rolling upgrade/rollback behavior.
 5. Add the mandatory capability descriptor to design tests. Inventory every current operator as
    `Stateless`, `GlobalSingleton`, `VnodeKeyed`, `RebuildableReplicated`, or `LocalOnly` without
    changing admission.
@@ -167,7 +171,7 @@ Exit gate:
 - the independent production-soak charter is approved before implementation results can influence
   its duration, workload, oracle, or thresholds;
 - every operator has an explicit current capability classification; and
-- Cycle 0/Phase 0 review contains no unowned blocker.
+- the latest Phase 0 cycle review contains no unowned blocker.
 
 No DDL guard is relaxed in this phase.
 
@@ -193,6 +197,10 @@ Work packages:
 
 ### 1B. Hot-path scheduler
 
+- Build and cache immutable codec/schema contracts at planning or initialization. Concrete-UDF
+  checks, schema canonicalization, dependency-version selection, SHA-256, IPC/rkyv parsing, and
+  compatibility lookup never run per row or per processing batch; post-freeze artifact work runs
+  off the compute/event-loop thread.
 - Deduplicate state keys per Arrow batch and submit one logical multi-read plus one atomic mutation
   batch; a backend without native multi-get must still satisfy the same batched latency contract.
 - Complete cache-only work inline only when it cannot block. Route every disk-capable call to a
@@ -224,17 +232,43 @@ Work packages:
 
 - Implement `Unowned -> Acquiring -> Restoring -> Validated -> Active` and
   `Active -> Frozen/Draining -> Revoked` in the graph/runtime.
-- Reuse assignment/process fences and restoring-output suppression.
+- Replace the split acquired/revoked staging maps with one exact transition identity containing
+  the committed cut, checkpoint fence, target assignment/vnode count/owner digest, acquired
+  chains, revoked set, and authoritative lifecycle roster. Never convert a missing chain to empty.
+- Add a mandatory state-lifecycle interface separate from ordinary `GraphOperator` methods.
+  Stateful capability without that interface is a preflight error; stateless operators remain
+  legitimate nonparticipants, and no successful default can discard named state.
+- Preflight the complete batch before callbacks, prepare all operator/vnode shadows, and abort all
+  shadows on error while retaining the exact inbox item. With intake closed, enter exclusive graph
+  publication, use the rotation fence to revalidate assignment/process scope, and perform only
+  infallible shard/generation swaps. Retain old handles for destruction after the short section;
+  activate the complete set and remove the inbox item only after every operator publishes.
+- Require an authoritative, canonical operator roster and explicit `FULL`/`DELTA`/`EMPTY` state in
+  the portable partial format. Omission, duplicate names, mixed attempts, and topology drift fail
+  before prepare.
+- Build and validate an uninitialized SQL operator's exact physical plan during prepare; activation
+  cannot precede semantic codec validation or fall back to node-local DataFusion state.
+- Reuse assignment/process fences and restoring-output suppression. Intake remains closed while
+  the current assignment has restoring vnodes or a staged transition.
 - Bound acquired-vnode input buffering, bulk install, post-acquire full rebase, and revoked-range
   cleanup. Prove stale owners cannot read/write/publish after rotation.
+- Introduce vnode-owned state shards before the aggregate migration so acquire/revoke publication
+  is a bounded pointer swap rather than a full-map scan.
 
 Tests:
 
 - backend model/conformance tests over random atomic batches, scans, deletes, snapshots, and restore;
 - crash before/after write, freeze, encode, upload, seal, install, activate, revoke, and range delete;
+- late-operator and later-vnode prepare failure leaves all live state unchanged, retains the exact
+  staged transition, and activates no vnode; explicit empty FULL removes stale state while
+  missing/extra/duplicate roster entries fail before prepare;
+- uninitialized operators cannot activate after byte staging alone; exact semantic/physical schema
+  goldens, same-name custom UDAF rejection, global vnode-0, huge declared IPC lengths, compression,
+  dictionary messages, second-batch/trailing-byte, and every encoded/decoded resource limit fail
+  closed before Arrow sees untrusted bytes;
 - checksum, truncated artifact, wrong ABI/schema/owner, disk full, object-store stall, compaction
   stall, and complete local directory loss;
-- generation/iterator leak tests and resident/native byte accounting under sustained churn; and
+- generation/iterator leak tests and resident/native byte accounting under sustained churn;
 - scheduler saturation tests proving bounded queues, lane order, watermark holds, and no event-loop
   blocking; and
 - microbenchmarks with state both inside and outside cache, concurrent checkpoint, and restore.
@@ -256,13 +290,17 @@ distributed keyed operator end to end.
 Work:
 
 1. Add the aggregate `VnodeKeyed` descriptor and make planner admission consume it.
+   Cache the exact codec/schema contract on the physical operator; processing only reuses the
+   existing encoded key and static vnode mapping.
 2. Reuse the existing canonical pre-aggregate shuffle and ownership/barrier fences. Remove duplicate
    map-era dirty/full/delta tracking only after the managed path is equivalent and all callers move.
 3. Encode group accumulator, last-updated metadata, stable output identity, and last-emitted value as
    stable state tables. Apply one Arrow batch with one grouped state read and one atomic mutation
    batch; no record performs its own blocking LSM operation.
-4. Implement reviewed encodings for `COUNT`, `SUM`, `AVG`, and append-only `MIN`/`MAX`; preserve null,
-   overflow, decimal, floating-point, update, and retraction semantics.
+4. Implement reviewed Laminar-owned encodings for concrete builtin `COUNT`, `SUM`, `AVG`, and
+   append-only `MIN`/`MAX`; preserve null, overflow, decimal, floating-point, update, and retraction
+   semantics. Pin the supplying DataFusion versions exactly and require deterministic fresh and
+   populated state goldens; a matching UDAF name is not codec identity.
 5. Keep `DISTINCT`, UDAFs, changelog `MIN`/`MAX`, multi-stage/derived fallback, and cluster MVs closed.
 6. Add per-operator/vnode keys, bytes, dirty bytes, cache hit rate, batch read/write, skew, checkpoint,
    restore, and pressure metrics.
@@ -279,7 +317,7 @@ Correctness matrix:
 - checkpoints during dirty state, failed capture, owner death before/after seal, `1 -> 3 -> 2`
   rotation, stale messages, and repeated acquire/revoke;
 - output oracle under the advertised at-least-once boundary: no lost state/result, documented
-  replay duplicates only, and no double-application inside restored state; and
+  replay duplicates only, and no double-application inside restored state;
 - Kafka assignment handoff plus at least one admitted durable multiwriter append sink, including
   crash before/after sink flush and source-position seal; and
 - cache-resident and spill-heavy latency/throughput/compaction profiles.
@@ -480,8 +518,8 @@ Required passes:
    that matches zero cases or needs unrecorded temporary instrumentation is a failure.
 
 The reviewer must conclude `APPROVE`, `APPROVE WITH OWNED FOLLOW-UPS`, or `BLOCK`. A block leaves the
-admission flag closed. The current documentation cycle's concrete review is
-[Cycle 0](../reviews/distributed-keyed-state-cycle-0.md).
+admission flag closed. Reviews are cumulative; the latest format/lifecycle audit is
+[Cycle 3](../reviews/distributed-keyed-state-cycle-3.md).
 
 ## Commit and change discipline
 

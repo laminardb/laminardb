@@ -170,18 +170,30 @@ accumulator payloads. Checkpoint export may re-columnarize many logical records 
 
 #### Evidence-based local-LSM qualification
 
-[Fjall 3.1.8](https://docs.rs/fjall/latest/fjall/) is a credible fit on paper: safe Rust, atomic
+[Fjall 3.1.8](https://docs.rs/fjall/3.1.8/fjall/) is a credible fit on paper: safe Rust, atomic
 cross-keyspace write batches, consistent cross-keyspace snapshots, forward/reverse prefix and range
-iteration, sorted bulk ingestion, a bounded block cache, configurable memtables/journals and worker
-threads, and a documented stable disk-format policy. It also avoids RocksDB's C++ build and opaque
-native allocator. LaminarDB already has Fjall-shaped benchmark and operational experience.
+iteration, sorted bulk ingestion, a configurable block-cache capacity, configurable
+memtables/journals and worker threads, and a documented stable disk-format policy. It also avoids
+RocksDB's C++ build and opaque native allocator. LaminarDB already has Fjall-shaped benchmark and
+operational experience.
 
 It is not accepted on API shape alone. The current public API has no native multi-get or range
-tombstone, returned slices/snapshots can pin cache blocks, each keyspace has a separate memtable,
-some compaction/cache/write-buffer counters are documented as hidden or experimental, and recent
-3.1 releases include recovery/poisoned-write fixes. The service may coalesce point gets and perform
-bounded scan/delete, but Phase 0 must prove that these do not violate tail latency or cleanup RTO
-and must obtain stable observability needed for production pressure control.
+tombstone. Slices can retain backing buffers including cache blocks; snapshots and iterators retain
+old MVCC versions and delay reclamation. Each keyspace has a separate memtable, while the O(1)
+`Keyspace::clear()` cannot clean one vnode prefix in the shared-keyspace layout. Public counters
+cover items such as write-buffer bytes, journals, disk use, approximate length, and fragmented blob
+bytes, but stable cache-hit, compaction-debt/backlog, stall, and total-pressure telemetry is still
+insufficient. The configured block-cache capacity is not a hard process-memory governor.
+
+An atomic Fjall batch defines consistency, not power-loss durability: ordinary writes reach OS
+buffers, and the selected policy must explicitly call `persist(SyncData|SyncAll)` or prove an
+equivalent group-durability boundary. Version 3.1.8 was four days old at this ADR date and followed
+recent [recovery](https://github.com/fjall-rs/fjall/releases/tag/3.1.1),
+[clear/recovery](https://github.com/fjall-rs/fjall/releases/tag/3.1.4), and
+[poisoned/buffered-write](https://github.com/fjall-rs/fjall/releases/tag/3.1.7) fixes. The service
+may coalesce point gets and perform bounded scan/delete, but Phase 0 must prove tail latency,
+cleanup RTO, crash behavior, and upgrade compatibility rather than treating the disk-format policy
+as a substitute for N/N-1 testing.
 
 Historical Windows/consumer-NVMe results from `7b6ad7aa` are warning data, not qualification:
 with 300 million 240-byte values (74 GB), Fjall cold-read p99 was about 0.55 ms at 100 writes/s,
@@ -198,9 +210,13 @@ fault schedule against RocksDB rather than comparing unrelated vendor microbench
 multi-get, range delete, rate limiting, mature operational telemetry, and physical
 [checkpoint](https://github.com/facebook/rocksdb/wiki/Checkpoints)/SST-ingest primitives are
 advantages; its C++ build, native-memory accounting, platform burden, and compaction tuning are
-costs. Physical checkpoints are whole-database, backend-specific mirrors, not portable vnode
-artifacts. Select one production backend from evidence, record the rejected candidate and reason,
-and keep the service contract independent of both.
+costs. MultiGet benefits depend on table/filter configuration and the chosen Rust binding.
+DeleteRange tombstones can degrade reads, one column family's write stall can stall the database,
+and the generic rate limiter governs background flush/compaction I/O rather than WAL durability or
+per-vnode QoS. Physical checkpoints are whole-database mirrors; column-family export is still not a
+portable logical vnode artifact. SST ingest needs sorted input and may flush overlapping memtables
+or briefly block writes, so it is a measured restore optimization. Qualification pins an exact
+RocksDB release and Rust wrapper before relying on any API behavior.
 
 The in-memory backend is required for model/differential tests and may serve explicitly bounded
 local workloads. It is not the cluster production fallback: inability to open or govern the
@@ -216,7 +232,9 @@ One worker-level governor owns reservations across:
 - active, frozen, and not-yet-committed mutation generations;
 - timer indexes and window/join side metadata;
 - shuffle queues and bounded acquire/replay buffers; and
-- local state bytes, temporary checkpoint files, compaction debt, and restore staging.
+- local state bytes, temporary checkpoint files, compaction debt, and restore staging, including
+  artifact/descriptor/payload bytes, chain links/depth, operators/vnodes per transition,
+  groups/accumulators/streams/emitted rows, and decoded Arrow variable bytes.
 
 Cardinality counters remain metrics, not safety limits. Reservations happen before mutation with a
 documented maximum one-batch slack. Pressure first triggers safe flush/compaction and bounded
@@ -226,9 +244,11 @@ invent eviction. TTL/retention deletes state only when it is part of the SQL/ope
 
 Memory and disk have separate hard limits. Compaction debt and write amplification are explicit
 admission/health signals because free disk alone does not prove that the state path can sustain its
-write rate. Returned Fjall slices must be released or copied before they pin cache blocks beyond a
-batch. If RocksDB is selected, native allocations are included; Kafka Streams' 2026 RocksDB leak
-fix is a useful warning against relying on Rust heap metrics alone.
+write rate. Fjall slices must release/copy retained backing buffers before a batch ends, and
+snapshots/iterators have bounded lifetimes so old MVCC versions can be reclaimed. If RocksDB is
+selected, native allocations are included; [Kafka Streams' 2026 RocksDB leak
+fix](https://kafka.apache.org/blog/2026/06/25/apache-kafka-4.3.1-release-announcement/) is a useful
+warning against relying on Rust heap metrics alone.
 
 ### 5. Checkpoint bridge
 
@@ -254,16 +274,98 @@ full bases range-scan a snapshot asynchronously. Restore may use Fjall sorted in
 SSTs as a backend-specific optimization, but correctness is defined by portable records and
 descriptor digests.
 
-Keyed restore is a prepare/commit transaction, not an incremental merge of trusted bytes. Its
-versioned envelope binds the partition ABI, vnode count and claimed vnode, canonical key schema,
-operator identity, accumulator-state schema, and payload version. Preflight uses the schemas
-cached by the physical plan, validates every group and emission key against the claimed vnode,
-checks complete-chain ordering and cross-vnode disjointness, reserves the bounded restore budget,
-and computes an authoritative replacement for the entire vnode namespace. Emission keys require
-exact arity and types; restore never casts them. Only after every chain is prepared does an
-infallible state-engine generation swap publish the result. The current raw aggregate checkpoint
-is legacy input for the admitted global vnode-0 aggregate only; a query fingerprint alone is not a
-keyed-state compatibility contract.
+Keyed restore is a prepare/publish transaction, not an incremental merge of trusted bytes. Its
+versioned envelope binds the partition ABI, vnode count and claimed vnode, key mode, canonical key
+schema, operator identity, state-table/accumulator schema, payload codec, and explicit `FULL`,
+`DELTA`, or `EMPTY` kind. Preflight uses schemas cached by the physical plan, validates every state
+and emission key against the claimed vnode, checks complete-chain ordering and cross-vnode
+disjointness, reserves the bounded restore budget, and computes an authoritative replacement for
+the entire vnode namespace. Emission keys require exact arity and types; restore never casts them.
+The current raw aggregate checkpoint is legacy input for the admitted global vnode-0 aggregate
+only; a query fingerprint alone is not a keyed-state compatibility contract.
+
+#### Artifact and schema contract
+
+Routing compatibility and stored Arrow representation are separate identities. A grouped key
+persists the hydrated `PartitionKeySchemaV1` used by the partition ABI and, in the artifact
+contract, the exact physical field sequence written to IPC. Artifact codec v1 hydrates dictionary
+arrays to their expected non-dictionary value fields before encoding and rejects dictionary IPC
+messages; dictionary index width is therefore never durable identity. Global state has an explicit
+`GlobalSingleton` key mode and is valid only on vnode 0—it is not inferred from an empty
+descriptor.
+
+Each accumulator/table contract retains its concrete codec ID/version, semantic state fields, and
+physical stored fields. Writers must construct batches from those expected fields, require exact
+arity and `DataType`, and reject nulls in a non-nullable field. Readers require exactly one complete
+IPC batch, its end-of-stream marker, no second batch or trailing bytes, exact schema/nullability,
+and the expected row count. Before Arrow parses attacker-controlled bytes, an artifact-specific
+preflight holds a global restore-memory reservation, checks the encoded/metadata/body/node/buffer
+bounds and all signed ranges with checked arithmetic, matches the cached canonical schema frame,
+and requires exactly `Schema -> RecordBatch -> EOS`. Codec v1 rejects IPC compression and
+dictionary messages; supporting either later requires separately bounded expansion accounting.
+Empty bytes are valid only where the format explicitly defines no columns or no rows; they can
+never default a required accumulator state. The same exact rules apply to `last_emitted` keys and
+values.
+
+The initial codec registry admits only concrete reviewed built-in implementations. Function names
+are not codec identity because a UDAF can reuse a built-in name. Laminar-owned codec IDs and
+versions, exact dependency pins, fresh and populated state goldens, and a compatibility table are
+required before a writer is enabled. Serializing the live Rust/DataFusion checkpoint struct with
+`rkyv` is transitional, not payload ABI v1; the production writer uses a deliberate bounded wire
+DTO. The physical/semantic artifact descriptor is introduced in the same reviewed slice as that
+DTO, canonical writer, and hostile-input decoder—not as a generic Arrow API in advance. It covers
+or explicitly rejects every relevant schema and field metadata scope. Partition-key ABI v1 rejects
+field metadata because it has no defined routing semantics; any other unsupported nonempty metadata
+makes the cluster codec unavailable while embedded execution remains unchanged.
+
+Envelope decoding enforces a configured byte ceiling before hashing or allocation, uses checked
+length arithmetic, rejects trailing data and downgrade-shaped corruption, and compares descriptor
+bytes as well as digests. SHA-256 is corruption evidence, not authentication; trust and encryption
+remain properties of the checkpoint store and deployment. Descriptor construction is plan-time,
+and envelope/IPC validation is checkpoint/restore-time. None of it runs per row. Capture benchmarks
+must still measure hashing/copying CPU, checkpoint pause, and event-loop stalls before the writer is
+accepted.
+
+#### Whole-graph publication boundary
+
+One staged transition binds the exact committed checkpoint attempt and checkpoint assignment fence
+to one target assignment version, nonzero vnode count, and owner-map digest. It contains acquired
+base-plus-delta chains, revoked vnodes, and a digest of the complete state-lifecycle operator
+inventory. Every required operator/vnode pair has an explicit full image or `EMPTY` entry; absence
+is corruption. The old split staging maps and successful default vnode hooks are not eligible for
+the managed path.
+
+Restore follows this protocol:
+
+1. snapshot the exact staged transition without removing it;
+2. preflight the whole batch—attempt/parent links, assignment provenance, vnode ranges,
+   acquire/revoke disjointness, duplicate-free canonical operator inventory, explicit bases, plan
+   contracts, key membership, resource limits, and topology—before any operator is called;
+3. ask every lifecycle participant to prepare all of its acquired and revoked vnodes into shadow
+   state; on any error, abort prepared shadows in reverse order and retain the identical staged
+   transition with every acquired vnode still `Restoring`;
+4. enter the graph's exclusive callback/publication section with source, shuffle, checkpoint, and
+   output intake closed; acquire the existing rotation fence to freeze assignment authority, then
+   revalidate the target owner-map digest, registry states, transport scope, and exact transition;
+5. complete every fallible action before publication, then perform only unit-returning pointer or
+   generation swaps, mark the complete acquired set `Active`, and remove that exact transition;
+   and
+6. leave the short publication section, destroy retired shard handles asynchronously, and open
+   source/shuffle/output intake only after complete publication.
+
+Sequential in-memory swaps are logically atomic because exclusive graph/callback serialization and
+closed intake prevent a source row, shuffle row, checkpoint, or output from observing the graph
+between them; the rotation fence separately prevents assignment change. Swaps retain old handles
+so refcount drops and destructors cannot extend the fenced section. A process crash in that short
+publication section discards the process image and reconstructs from the unchanged durable cut. A
+changed assignment during asynchronous prepare aborts the shadows and publishes nothing.
+
+An uninitialized SQL operator must build and validate its exact incremental plan during prepare,
+not after the graph marks a vnode active; DataFusion node-local fallback remains rejected. The
+current flat aggregate maps are only diagnostic substrate: production publication first shards
+groups, emission state, dirty generations, timers, and deduplication metadata by vnode so prepare
+can build a replacement shard and publish/revoke it with bounded pointer swaps instead of scanning
+all groups.
 
 Frozen generations remain referenced until a later committed base/delta chain contains them. An
 aborted or failed capture cannot clear its changes; the next attempt includes their union or emits
@@ -296,6 +398,10 @@ the decided checkpoint, assignment/process provenance, ABI, schema, and full-plu
 installs the vnode; then opens its input/output gate. Rows targeting a restoring vnode are held in
 a byte/time-bounded replay buffer or kept at the upstream barrier. They are never processed against
 partial state. Other vnodes should continue where the graph can isolate their gates.
+
+Acquire and revoke for one assignment change publish as the whole-graph transition defined above.
+No acquired vnode becomes `Active` merely because its own operator loop finished while another
+operator or vnode in that transition can still fail.
 
 After acquisition, the successor's next checkpoint emits a full base for that vnode, bounding
 cross-owner delta dependencies. Local range deletion is asynchronous and only follows durable
@@ -476,11 +582,15 @@ meaning of checkpoint authority.
 
 ### Object-store-primary LSM now — rejected
 
-RisingWave Hummock, Materialize Persist, and Flink ForSt demonstrate that this is a storage system:
-it needs version metadata/consensus, pinned snapshots, async execution, tiered caches, compaction
-ownership, garbage collection, and failure isolation. LaminarDB does not currently have that
-system, and ForSt is still documented as experimental. Reconsider only if local-disk operations or
-recovery objectives justify the cost.
+RisingWave Hummock demonstrates versioned and pinned snapshots, cache tiers, and explicit
+compaction/vacuum ownership. Flink ForSt demonstrates remote SSTs, local file caching, asynchronous
+State V2 access, and lightweight incremental checkpoints, but remains experimental and its current
+implementation is being replaced. Materialize Persist demonstrates durable object-store
+collections with transactional consensus metadata feeding cluster-local hydrated arrangements.
+Together they show that remote state is a storage subsystem—not a backend setting—and needs
+version authority, caches, compaction/GC ownership, async execution, and failure isolation.
+LaminarDB does not currently have that subsystem. Reconsider only if measured local-disk operations
+or recovery objectives justify its cost.
 
 ### One database or checkpoint file per vnode — rejected
 
@@ -550,25 +660,30 @@ checks, and admission flags that remain disabled until each vertical passes its 
 
 | System/research | Relevant fact | Decision taken here |
 |---|---|---|
-| [Fjall 3.1.8 API](https://docs.rs/fjall/latest/fjall/) and [RocksDB operations](https://github.com/facebook/rocksdb/wiki/Basic-Operations) | Fjall offers safe-Rust batches/snapshots/ranges but lacks native multi-get and a mature public governance surface; RocksDB offers broader batch/operations controls at native-build cost | Run one workload/fault contract, select one production LSM, and retain portable Laminar artifacts |
-| [Flink 2.3 key groups](https://nightlies.apache.org/flink/flink-docs-release-2.3/docs/dev/datastream/execution/parallel/) and [state backends](https://nightlies.apache.org/flink/flink-docs-release-2.3/docs/ops/state/state_backends/) | Fixed key groups are rescale units; heap is low-latency but bounded by memory; EmbeddedRocksDB supports large/incremental state | Keep fixed vnodes; start with a local LSM and portable checkpoints |
-| [Flink ForSt](https://nightlies.apache.org/flink/flink-docs-release-2.3/docs/ops/state/disaggregated_state/) | Remote/disaggregated primary state uses async access/caching and remains experimental | Do not put object storage on LaminarDB's initial hot path |
+| [Fjall 3.1.8 API](https://docs.rs/fjall/3.1.8/fjall/) and [RocksDB operations](https://github.com/facebook/rocksdb/wiki/Basic-Operations) | Fjall offers safe-Rust batches/snapshots/ranges but lacks native multi-get/range tombstones and sufficient governance telemetry; RocksDB offers broader batch/operations controls at native-build/accounting cost | Run one workload/fault contract, including explicit durability and pressure tests, select one production LSM, and retain portable Laminar artifacts |
+| [Flink 2.3 keyed state](https://nightlies.apache.org/flink/flink-docs-release-2.3/docs/concepts/stateful-stream-processing/) and [state backends](https://nightlies.apache.org/flink/flink-docs-release-2.3/docs/ops/state/state_backends/) | Key groups are the atomic redistribution unit; heap is low-latency but memory-bound; EmbeddedRocksDB supports large local state and incremental checkpoints | Keep fixed vnodes; start with a local LSM and portable checkpoints |
+| [Flink ForSt](https://nightlies.apache.org/flink/flink-docs-release-2.3/docs/ops/state/disaggregated_state/) | Remote SSTs, local cache and async State V2 access enable lightweight checkpoints, but ForSt remains experimental; synchronous state is local unless explicitly overridden, and the current implementation is slated for replacement | Do not put object storage on LaminarDB's initial hot path |
 | [Flink checkpoint backpressure guidance](https://nightlies.apache.org/flink/flink-docs-release-2.3/docs/ops/state/checkpointing_under_backpressure/) | Unaligned capture is useful when measured alignment delay is the problem and captures in-flight data | Keep aligned barriers; instrument before adding unaligned state |
-| [RisingWave architecture](https://docs.risingwave.com/get-started/architecture), [consistent hashing](https://risingwavelabs.github.io/risingwave/design/consistent-hash.html), and [checkpoint design](https://risingwavelabs.github.io/risingwave/design/checkpoint.html) | Stable vnodes and barriers combine with Hummock, Meta, cache, version, and compaction services | Reuse vnodes/barriers; do not imitate Hummock without its control/storage services |
-| [Materialize views](https://materialize.com/docs/concepts/views/) and [arrangements](https://materialize.com/docs/get-started/arrangements/) | Durable collections and cluster-local indexes have distinct persistence/hydration roles; indexed state may be shared by operators | Keep materialized output separate; consider shared arrangements only after the common store works |
-| [Spark Structured Streaming state](https://spark.apache.org/docs/latest/streaming/apis-on-dataframes-and-datasets.html) | Stable shuffle partitions, RocksDB, locality, and changelog checkpointing govern state; stateful exact processing is primarily micro-batch | Borrow the local store/journal pattern, not Spark's latency/execution model |
-| [Kafka Streams runtime](https://kafka.apache.org/43/streams/developer-guide/running-app/) and [rebalance protocol](https://kafka.apache.org/43/streams/developer-guide/streams-rebalance-protocol/) | Partition tasks use local stores/changelogs and standby/warmup mechanisms; Kafka is assignment authority | Learn from local restore/standby, but keep LaminarDB's connector-independent vnode authority |
+| [RisingWave architecture](https://docs.risingwave.com/get-started/architecture), [v3.0 vnode mapping](https://github.com/risingwavelabs/risingwave/blob/v3.0.0/docs/dev/src/design/consistent-hash.md), and [v3.0 checkpoints](https://github.com/risingwavelabs/risingwave/blob/v3.0.0/docs/dev/src/design/checkpoint.md) | Key-to-vnode mapping/storage encoding stay invariant while Meta changes vnode ownership during scaling; barriers combine with Hummock cache, version, and compaction services | Reuse fixed vnode identity/barriers; do not imitate Hummock without its control/storage services |
+| [Materialize views](https://materialize.com/docs/concepts/views/), [clusters](https://materialize.com/docs/concepts/clusters/), and [arrangements](https://materialize.com/docs/get-started/arrangements/) | Materialized results are durable/cross-cluster, while indexes and shared arrangements are cluster-local; views also hydrate maintenance state proportional to inputs/outputs | Keep materialized output separate and budget hydration; consider shared arrangements only after the common store works |
+| [Spark 4.2 state](https://spark.apache.org/docs/4.2.0/streaming/apis-on-dataframes-and-datasets.html) and [streaming modes](https://spark.apache.org/docs/4.2.0/streaming/index.html) | Persisted hash state depends on stable shuffle partitions; RocksDB changelog checkpointing is optional, locality is preferred rather than fenced, and bounded memory is soft. Stateful checkpointed execution remains batch/cut-oriented; Continuous Processing is at-least-once | Borrow the local store/journal pattern and compatibility discipline, not Spark's ownership or latency model |
+| [Kafka Streams runtime](https://kafka.apache.org/43/streams/developer-guide/running-app/), [rebalance protocol](https://kafka.apache.org/43/streams/developer-guide/streams-rebalance-protocol/), and [configuration](https://kafka.apache.org/43/streams/developer-guide/config-streams/) | Partition-derived tasks restore local stores from changelogs. Standbys exist; classic assignment's High Availability Assignor has warmups and rack-aware placement, while opt-in broker-authoritative `group.protocol=streams` in 4.3 does not yet provide that assignor. ALO is default and Kafka EOS is opt-in/Kafka-scoped | Learn from local restore/standby, but keep LaminarDB's connector-independent vnode and external-delivery authority |
 | [Asynchronous Barrier Snapshotting](https://arxiv.org/abs/1506.08603) and [Flink state management](https://www.vldb.org/pvldb/vol10/p1718-carbone.pdf) | A short consistent cut can be separated from asynchronous state materialization | Freeze state at the existing aligned cut and upload outside the pause |
 | [Dataflow Model](https://research.google/pubs/the-dataflow-model-a-practical-approach-to-balancing-correctness-latency-and-cost-in-massive-scale-unbounded-out-of-order-data-processing/) and [MillWheel](https://research.google/pubs/millwheel-fault-tolerant-stream-processing-at-internet-scale/) | Event time, watermarks, triggers, persistent per-key state, and timers are correctness concepts | Make timers/frontiers first-class managed state |
 | [Differential Dataflow](https://www.microsoft.com/en-us/research/publication/differential-dataflow/) | Incremental collections carry changes/differences | Preserve explicit weights/multiplicity for changelog joins rather than overwriting rows |
 | [Megaphone](https://www.vldb.org/pvldb/vol12/p1002-hoffmann.pdf) | Fine-grained migration can reduce latency spikes | Defer until checkpoint-cut migration is measured |
-| [CheckMate](https://arxiv.org/abs/2403.13629) | Coordinated versus uncoordinated checkpoint results vary with topology/skew | Treat checkpoint mode as an empirical decision |
-| [PGVal](https://www.vldb.org/pvldb/vol18/p585-tahir.pdf) | Claimed guarantees vary across topology, rate, partitioning, and injected faults | Require a multidimensional output-oracle fault matrix |
+| [Disaggregated State Management in Flink](https://www.vldb.org/pvldb/vol18/p4846-mei.pdf) (2025) | Remote-primary state required asynchronous access, local caching, streamed updates, and lightweight checkpoint/recovery machinery | Keep synchronous object storage off the initial hot path; treat any future remote state as a subsystem |
+| [CheckMate](https://arxiv.org/abs/2403.13629) | Coordinated checkpoints performed best under uniform load, while uncoordinated checkpoints could benefit skewed workloads and cyclic dataflows | Treat checkpoint mode as an empirical decision |
+| [PGVal](https://www.vldb.org/pvldb/vol18/p585-tahir.pdf) | Observed end-to-end reliability varied with input rate, partition count, topology, parallelism, and fault type | Require a multidimensional output-oracle fault matrix including network faults |
+| [Timely and Accurate Prefetching](https://arxiv.org/abs/2603.19890) (ICDE 2026) | Known future state keys can be prefetched to reduce cold-state latency | Defer; reconsider only if qualification shows cold reads dominate p99/p99.9 |
 
-Flink 2.3.0 (2026-06-25), Spark 4.2.0 (2026-07-14), Kafka 4.3.1 (2026-06-25),
-RisingWave 3.0 documentation, and Materialize's current 2026 documentation were checked for this
-decision. Vendor documentation establishes what those systems do; the LaminarDB choices above are
-explicit design inferences, not claims that another system proves this implementation correct.
+[Flink 2.3.0](https://flink.apache.org/2026/06/25/apache-flink-2.3.0-release-announcement/)
+(2026-06-25), [Spark 4.2.0](https://spark.apache.org/releases/spark-release-4-2-0.html)
+(2026-07-14), [Kafka 4.3.1](https://kafka.apache.org/blog/2026/06/25/apache-kafka-4.3.1-release-announcement/)
+(2026-06-25), [RisingWave 3.0](https://github.com/risingwavelabs/risingwave/releases/tag/v3.0.0),
+and Materialize's current 2026 documentation were checked for this decision. Vendor documentation
+establishes what those systems do; the LaminarDB choices above are explicit design inferences, not
+claims that another system proves this implementation correct.
 
 ## Revisit conditions
 

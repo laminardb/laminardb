@@ -86,6 +86,9 @@ specifies at minimum:
   Zipf/hot-key skew, vnode count, and checkpoint cadence;
 - p50/p95/p99/p99.9 end-to-end latency and maximum event-loop stall;
 - checkpoint align/freeze/export/upload/sink-flush/seal limits and recovery RTO;
+- hard encoded envelope/artifact/descriptor/payload bytes; checkpoint chain links/delta depth;
+  operators and vnodes per transition; IPC metadata/body/node/buffer/row limits; decoded Arrow
+  variable bytes; and aggregate plus per-restore staging reservations;
 - maximum RSS/PSS/cgroup memory, LSM cache/memtable/journal/native memory, queue bytes/age, local
   bytes, disk utilization, FD count, snapshot/iterator count, frozen generations, timer count,
   checkpoint artifacts, compaction debt, and write amplification;

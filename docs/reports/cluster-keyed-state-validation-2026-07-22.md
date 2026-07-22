@@ -101,11 +101,28 @@ encoded `OwnedRow`, and an active delta generation rejects a changed or zero vno
 capture/revoke mutation. This is partition-path hardening only. It does not add a persisted vnode
 count, a count-rotation lifecycle, payload membership validation, or tagged restore chains.
 
+The branch later experimented with a generic Arrow schema descriptor (`b0ac1a7a`) and strict
+single-record-batch IPC helper (`12a34c38`). Cycle 3 review (`1e8b1a59`, `f4ded97b`) narrowed the
+former to the bounded,
+opaque routing identity actually consumed by `PartitionKeySchemaV1` and removed the latter. The
+generic helper used Arrow 57.2's `StreamReader`, which can allocate from IPC-declared metadata/body
+lengths before proving those bytes exist. A production decoder must be artifact-specific, reserve a
+global restore budget, and preflight hostile framing before calling Arrow. These changes remain
+admission-neutral and do not close the runtime lifecycle gap.
+
 The audit found that vnode membership is coupled to several other restore invariants and therefore
 must not be patched as an isolated assertion:
 
 - the raw aggregate payload has no envelope carrying partition ABI, vnode count and claimed vnode,
   canonical key-schema fingerprint, or accumulator-state schema/version;
+- the payload directly archives the live `AggStateCheckpoint` Rust type rather than a bounded,
+  independently versioned wire DTO, so its compatibility surface is implicit;
+- columnar checkpoint writers synthesize every Arrow IPC field as nullable `c0...cN` instead of
+  preserving the accumulator's declared semantic fields. For example, a non-nullable COUNT state
+  is physically described as nullable, so one descriptor cannot honestly identify both forms;
+- the ordinary IPC helper returns the first record batch and does not require exactly one batch,
+  the end-of-stream marker, or complete byte consumption. Exact persisted restore must reject a
+  second batch/trailing bytes and validate declared lengths/decoded expansion before Arrow parsing;
 - accumulator validation checks payload count and row count, but an empty payload can be decoded as
   absent state and rebuild a stateful accumulator at its default unless expected state fields are
   known independently;
@@ -123,11 +140,32 @@ must not be patched as an isolated assertion:
   can leave an in-memory partial batch. Cluster execution must recover from the sealed cut rather
   than retry that batch locally until the managed state write is one atomic transaction.
 
-The safe design is a prepared vnode-restore transaction: validate the complete tagged chain,
-planned key and accumulator schemas, resource reservation, membership, disjointness, and
-authoritative replacement set first; then publish it with an infallible commit. Legacy raw payloads
-may remain only for the currently admitted singleton global aggregate. A partial validator over the
-existing raw keyed payload is not a production restore contract.
+The graph-level audit makes the restore gap more precise. `apply_rehydrated_vnodes` removes all
+currently owned chains from the shared staging map before it decodes them, applies one vnode and
+one operator at a time, and marks each vnode active immediately after that vnode's operators
+return. A failure therefore discards the exact staged retry material, can leave an earlier
+operator mutated, and can leave an earlier vnode active when a later vnode fails. The existing
+`rehydration_apply_failure_faults_without_activating_vnode` test records this behavior explicitly:
+the first test operator is applied before the second operator's injected failure, even though the
+vnode remains `Restoring`. Revocation has the same sequential partial-graph boundary.
+
+The current partial also has no authoritative operator inventory. It derives the operator names
+from entries that happen to be present, so omission cannot distinguish an intentionally empty
+state from a missing/corrupt lifecycle participant. `GraphOperator` supplies successful no-op
+defaults for vnode apply/drop, allowing a stateful implementation without hooks to discard named
+state silently if admission ever becomes permissive. `RehydratedVnode` retains only an epoch and
+raw chain bytes; adoption drops the exact checkpoint attempt, checkpoint/target assignment
+identity, vnode count, and owner-map identity, and uses `unwrap_or_default()` for a missing acquired
+chain. Finally, an uninitialized SQL operator can queue bytes and be followed by the graph's
+`Restoring -> Active` transition before asynchronous plan construction proves the exact aggregate
+implementation and state schema. These are independent reasons that the existing apply path
+cannot be reused for keyed admission.
+
+The required replacement is the assignment-scoped prepare/publish protocol in
+[ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#whole-graph-publication-boundary):
+authoritative roster and explicit empty state, whole-batch preflight, off-side shadows, exclusive
+graph publication, and no activation after partial success. A validator patched onto the current
+raw keyed payload would not satisfy that boundary.
 
 This code is useful implementation substrate, but it does not make the operator production safe.
 The current one-million-group guard counts entries, not bytes. The live `groups`, changelog
@@ -257,15 +295,19 @@ they require heavier process or external-service setup and are not represented a
 The ADR/plan consequently forbid a production-ready claim until an independently reviewed,
 black-box release-candidate soak passes with real source/object-store/sink dependencies.
 
-The admission-neutral hardening in `562cc590` was then checked separately:
+The current branch's admission-neutral hardening was then checked separately:
 
 | Current-branch check | Result | Evidence |
 |---|---:|---|
+| `state::partition_key::tests` | PASS, 15/15 | Typed row/hash/vnode ABI plus bounded routing-only schema identity, every admitted family golden, alias/order/nullability policy, dictionary hydration, and exact resource/type gates |
+| `cargo test -p laminar-core --lib` | PASS, 562/562 | Complete core library regression set after the Cycle 3 safety follow-up |
+| Generic strict IPC experiment | REMOVED after review | Arrow 57.2 parses attacker-declared lengths too early; the artifact-specific preflight and global decoded-memory reservation remain an explicit Phase 0 blocker |
 | `aggregate_state::vnode_partition_tests` (cluster lib-test binary) | PASS, 4/4 | Existing raw capture/merge/idempotence plus new shuffle/capture/drop parity and pre-mutation drift rejection; not keyed-envelope validation |
 | `aggregate_state::tests::drop_vnodes_purges_revoked_keeps_sibling` | PASS, 1/1 | Revoke retains sibling-vnode state after the fallible count check was added |
 | `aggregate_state::tests::global_changelog_delta_checkpoint_roundtrips` | PASS, 1/1 | The admitted global aggregate remains pinned to vnode 0 |
 | `db::tests::cluster_query_shape_admission_is_pre_mutation_and_mode_derived` | PASS, 1/1 | The `[LDB-4007]` feature matrix remains closed while stateless/global shapes remain admitted |
 | `aggregate_state::tests::embedded_float_grouping_remains_supported_without_partition_codec_gate` (`--no-default-features`) | PASS, 1/1 | Embedded planning and execution still accept a float key excluded from cluster partition ABI v1 |
+| `operator_graph::tests::rehydration_apply_failure_faults_without_activating_vnode` | PASS, 1/1 | Empirically confirms the current unsafe boundary: the first operator is mutated before a later failure, although the vnode stays `Restoring`; this is blocker evidence, not a desired regression contract |
 
 Both cluster and no-feature `cargo check` and `cargo clippy -D warnings` configurations passed, as
 did formatting and diff checks. These focused results do not exercise keyed cluster restore.
@@ -293,9 +335,11 @@ a managed keyed working-state capability connected to the distributed execution 
 4. **Checkpoint bridge:** atomic state mutation plus dirty-journal update, cheap generation freeze
    at an aligned barrier, asynchronous full/delta artifact production, exact-attempt sealing, and
    safe retry/rebase after failed capture.
-5. **Ownership lifecycle:** install and validate acquired vnode chains before input is released;
-   fence the old owner before revoke; suppress or bounded-buffer rows for restoring vnodes; drop
-   local ranges only after authority changes.
+5. **Ownership lifecycle:** preserve one exact committed-cut/target-assignment transition; require
+   an authoritative operator roster and explicit empty state; preflight all acquired/revoked
+   vnodes and prepare every operator off-side; publish only infallible graph-wide shard swaps under
+   the execution fence; activate the complete set once; retain the exact transition on failure;
+   fence the old owner before revoke; and drop local ranges only after authority changes.
 6. **Operator contracts:** aggregates externalize accumulators/emission state; windows externalize
    event-time timers and firing state; joins co-partition both inputs and externalize both indexed
    sides plus unmatched-output state.
@@ -316,18 +360,21 @@ hot get/put/scan/write-batch/timer interface and is correctly kept as remote rec
 
 | Artifact | Disposition | Reason |
 |---|---|---|
-| `docs/AGENT_KNOWLEDGE.md` | Remove | Stale Claude handoff memory: it describes already-completed transport/barrier work as future work, uses machine-local links, and is not authoritative project documentation |
+| former `docs/AGENT_KNOWLEDGE.md` | Removed in `0f4b37ff` | Stale Claude handoff memory described completed transport/barrier work as future work and was not authoritative project documentation |
 | `docs/plans/checkpoint-production-correctness-2026.md` | Keep, cross-link | Current and relevant; correctly distinguishes checkpoint artifacts from hot keyed state |
 | `docs/plans/cluster-production-readiness.md` | Keep, narrow | Relevant umbrella plan; the focused ADR/plan becomes the source of truth for keyed operators |
-| `docs/ARCHITECTURE.md` | Correct | Its JSON/checkpoint wording and admission description are stale |
-| `docs/SQL_REFERENCE.md` and `README.md` | Correct | State the exact stream/global-aggregate/MV boundary |
-| `.claude/fix-plans/state-backend.md` | Remove locally | Stale Claude plan: it conflated artifact `StateBackend` with live state, proposed speculative OpenRaft/config tiers, and described already-changed code; the path is an ignored junction, so deletion is not a branch commit |
-| ignored `docs/adr` and `docs/research` content | Retain outside branch authority | The accepted cache/checkpoint and implemented incremental-emit notes still explain current code; schema research concerns another active area. Their cluster assertions do not override the tracked validation/ADR |
+| `docs/ARCHITECTURE.md` | Corrected in `706270dc` | Now distinguishes immutable checkpoint artifacts from absent live keyed state |
+| `docs/SQL_REFERENCE.md` and `README.md` | Corrected in `706270dc` | State the exact stream/global-aggregate/MV boundary |
+| former `.claude/fix-plans/state-backend.md` | Removed outside the tracked tree | Stale Claude plan conflated artifact `StateBackend` with live state and proposed unrelated control-plane work; none of it is used as design authority |
+| private `docs/research/extensible-schema-traits.md` and `schema-inference-design.md` | Reject as current evidence; public copies already removed in `52daf683` | They describe removed/unwired registries plus unsupported DDL, format, inference, zero-copy, and latency claims; neither reflects the current connector implementation |
 
-No tracked `docs/research` directory exists on this baseline. Relevant primary sources are retained
-as citations in the design ADR; superseded narrative is not copied into a new research dump. The
-removed Claude fix-plan lived through a junction at
-`C:\Users\sujit\.claude-private-configs\laminardb\.claude`; repository Git cannot recover it.
+No tracked `docs/research` artifact exists on this baseline. The visible path and `.claude` are
+ignored Windows junctions into a separate, already-dirty private configuration repository.
+Deleting through either path would silently mutate context outside this branch, so Cycle 3 did not
+do so. The two obsolete
+research files need a separately authorized private-repository archive/removal commit; they are not
+copied, cited, or treated as evidence here. Relevant primary sources live as citations in the ADR,
+not another research dump.
 
 ## Confidence and limitations
 
