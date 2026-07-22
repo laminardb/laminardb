@@ -317,9 +317,9 @@ Correctness matrix:
 - checkpoints during dirty state, failed capture, owner death before/after seal, `1 -> 3 -> 2`
   rotation, stale messages, and repeated acquire/revoke;
 - output oracle under the advertised at-least-once boundary: no lost state/result, documented
-  replay duplicates only, and no double-application inside restored state;
+  replay duplicates only, and no double-application inside restored state.
 - Kafka assignment handoff plus at least one admitted durable multiwriter append sink, including
-  crash before/after sink flush and source-position seal; and
+  crash before/after sink flush and source-position seal.
 - cache-resident and spill-heavy latency/throughput/compaction profiles.
 
 Exit gate:
