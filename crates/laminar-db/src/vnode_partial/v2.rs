@@ -77,6 +77,7 @@ pub(crate) enum ArtifactKind {
 }
 
 impl ArtifactKind {
+    #[cfg(test)]
     const fn encoded(self) -> u8 {
         match self {
             Self::Full => ARTIFACT_KIND_FULL,
