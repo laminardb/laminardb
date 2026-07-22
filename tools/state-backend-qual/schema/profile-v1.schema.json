@@ -1,0 +1,288 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://laminardb.dev/schemas/distributed-state-qual-v1.json",
+  "title": "LaminarDB distributed state backend qualification profile v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "notice", "profile_id", "status", "qualification_eligible",
+    "approvals", "environment", "comparison_candidates", "store_layout", "preflight",
+    "workload", "measurement", "latency_gates", "throughput_gates", "checkpoint_gates",
+    "recovery_gates", "resource_gates", "restore_limits"
+  ],
+  "properties": {
+    "schema_version": {"const": "distributed-state-qual/v1"},
+    "notice": {"const": "NOT QUALIFICATION EVIDENCE"},
+    "profile_id": {"type": "string", "minLength": 1},
+    "status": {"const": "candidate_unapproved"},
+    "qualification_eligible": {"const": false},
+    "approvals": {"$ref": "#/$defs/approvals"},
+    "environment": {"$ref": "#/$defs/environment"},
+    "comparison_candidates": {"$ref": "#/$defs/comparisonCandidates"},
+    "store_layout": {"$ref": "#/$defs/storeLayout"},
+    "preflight": {"$ref": "#/$defs/preflight"},
+    "workload": {"$ref": "#/$defs/workload"},
+    "measurement": {"$ref": "#/$defs/measurement"},
+    "latency_gates": {"$ref": "#/$defs/latencyGates"},
+    "throughput_gates": {"$ref": "#/$defs/throughputGates"},
+    "checkpoint_gates": {"$ref": "#/$defs/checkpointGates"},
+    "recovery_gates": {"$ref": "#/$defs/recoveryGates"},
+    "resource_gates": {"$ref": "#/$defs/resourceGates"},
+    "restore_limits": {"$ref": "#/$defs/restoreLimits"}
+  },
+  "$defs": {
+    "positive": {"type": "integer", "minimum": 1},
+    "nullableText": {"type": ["string", "null"], "minLength": 1},
+    "latency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["p50", "p95", "p99", "p999", "max"],
+      "properties": {
+        "p50": {"$ref": "#/$defs/positive"},
+        "p95": {"$ref": "#/$defs/positive"},
+        "p99": {"$ref": "#/$defs/positive"},
+        "p999": {"$ref": "#/$defs/positive"},
+        "max": {"$ref": "#/$defs/positive"}
+      }
+    },
+    "approvals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workload_owner", "operations_owner", "approved_at_utc"],
+      "properties": {
+        "workload_owner": {"type": "null"},
+        "operations_owner": {"type": "null"},
+        "approved_at_utc": {"type": "null"}
+      }
+    },
+    "cgroup": {
+      "type": "object", "additionalProperties": false,
+      "required": ["cpu_capacity_millicores", "memory_high_bytes", "memory_max_bytes", "swap_disabled"],
+      "properties": {
+        "cpu_capacity_millicores": {"$ref": "#/$defs/positive"},
+        "memory_high_bytes": {"$ref": "#/$defs/positive"},
+        "memory_max_bytes": {"$ref": "#/$defs/positive"},
+        "swap_disabled": {"const": true}
+      }
+    },
+    "environment": {
+      "type": "object", "additionalProperties": false,
+      "required": ["provider", "instance_type", "cpu_vcpus", "physical_memory_bytes", "local_nvme_bytes", "os", "kernel", "libc", "image_id", "package_snapshot", "filesystem", "filesystem_block_bytes", "mount_options", "nvme_scheduler", "project_quota_bytes", "rust_version", "build_profile", "cgroup"],
+      "properties": {
+        "provider": {"type": "string", "minLength": 1},
+        "instance_type": {"type": "string", "minLength": 1},
+        "cpu_vcpus": {"$ref": "#/$defs/positive"},
+        "physical_memory_bytes": {"$ref": "#/$defs/positive"},
+        "local_nvme_bytes": {"$ref": "#/$defs/positive"},
+        "os": {"type": "string", "minLength": 1},
+        "kernel": {"type": "string", "minLength": 1},
+        "libc": {"type": "string", "minLength": 1},
+        "image_id": {"type": "null"},
+        "package_snapshot": {"type": "null"},
+        "filesystem": {"type": "string", "minLength": 1},
+        "filesystem_block_bytes": {"$ref": "#/$defs/positive"},
+        "mount_options": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "nvme_scheduler": {"type": "string", "minLength": 1},
+        "project_quota_bytes": {"$ref": "#/$defs/positive"},
+        "rust_version": {"type": "string", "minLength": 1},
+        "build_profile": {"type": "string", "minLength": 1},
+        "cgroup": {"$ref": "#/$defs/cgroup"}
+      }
+    },
+    "comparisonCandidates": {
+      "type": "object", "additionalProperties": false,
+      "required": ["fjall_crate_version", "rocksdb_crate_version", "rocksdb_bundled_engine_version", "one_candidate_per_binary", "common_floor_compression_disabled", "common_floor_blob_optimizations_disabled"],
+      "properties": {
+        "fjall_crate_version": {"type": "string", "pattern": "^="},
+        "rocksdb_crate_version": {"type": "string", "pattern": "^="},
+        "rocksdb_bundled_engine_version": {"type": "string", "minLength": 1},
+        "one_candidate_per_binary": {"const": true},
+        "common_floor_compression_disabled": {"const": true},
+        "common_floor_blob_optimizations_disabled": {"const": true}
+      }
+    },
+    "storeLayout": {
+      "type": "object", "additionalProperties": false,
+      "required": ["database_count", "physical_keyspace_count", "logical_vnode_count", "block_cache_bytes", "write_buffer_bytes", "background_workers"],
+      "properties": {
+        "database_count": {"$ref": "#/$defs/positive"},
+        "physical_keyspace_count": {"$ref": "#/$defs/positive"},
+        "logical_vnode_count": {"$ref": "#/$defs/positive"},
+        "block_cache_bytes": {"$ref": "#/$defs/positive"},
+        "write_buffer_bytes": {"$ref": "#/$defs/positive"},
+        "background_workers": {"$ref": "#/$defs/positive"}
+      }
+    },
+    "preflight": {
+      "type": "object", "additionalProperties": false,
+      "required": ["random_read_iops", "random_write_iops", "sequential_read_bytes_per_second", "sequential_write_bytes_per_second", "synchronized_write_p99_us", "max_cpu_steal_permille", "require_no_thermal_throttling", "require_no_nvme_errors", "require_no_swap_activity", "require_exclusive_test_device"],
+      "properties": {
+        "random_read_iops": {"$ref": "#/$defs/positive"},
+        "random_write_iops": {"$ref": "#/$defs/positive"},
+        "sequential_read_bytes_per_second": {"$ref": "#/$defs/positive"},
+        "sequential_write_bytes_per_second": {"$ref": "#/$defs/positive"},
+        "synchronized_write_p99_us": {"$ref": "#/$defs/positive"},
+        "max_cpu_steal_permille": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "require_no_thermal_throttling": {"const": true},
+        "require_no_nvme_errors": {"const": true},
+        "require_no_swap_activity": {"const": true},
+        "require_exclusive_test_device": {"const": true}
+      }
+    },
+    "permilleMix": {
+      "type": "object", "additionalProperties": false,
+      "required": ["one_key", "nine_keys", "uniform_remainder"],
+      "properties": {
+        "one_key": {"$ref": "#/$defs/positive"},
+        "nine_keys": {"$ref": "#/$defs/positive"},
+        "uniform_remainder": {"$ref": "#/$defs/positive"}
+      }
+    },
+    "timerMix": {
+      "type": "object", "additionalProperties": false,
+      "required": ["state_or_timer_mutation", "bounded_due_scan", "atomic_fire_delete"],
+      "properties": {
+        "state_or_timer_mutation": {"$ref": "#/$defs/positive"},
+        "bounded_due_scan": {"$ref": "#/$defs/positive"},
+        "atomic_fire_delete": {"$ref": "#/$defs/positive"}
+      }
+    },
+    "workload": {
+      "type": "object", "additionalProperties": false,
+      "required": ["logical_state_bytes", "batch_rows", "target_batch_bytes", "hard_batch_bytes", "compact_key_bytes", "compact_state_bytes", "variable_key_bytes", "variable_state_bytes", "primary_vnode_count", "metadata_edge_vnode_counts", "zipf_exponent_milli", "hot_distribution_permille", "single_vnode_distinct_keys_permille", "timer_mix_permille", "timer_scan_max_rows", "timer_scan_max_bytes", "join_match_counts", "join_match_weights_permille"],
+      "properties": {
+        "logical_state_bytes": {"type": "array", "minItems": 2, "uniqueItems": true, "items": {"$ref": "#/$defs/positive"}},
+        "batch_rows": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/positive"}},
+        "target_batch_bytes": {"$ref": "#/$defs/positive"},
+        "hard_batch_bytes": {"$ref": "#/$defs/positive"},
+        "compact_key_bytes": {"$ref": "#/$defs/positive"},
+        "compact_state_bytes": {"$ref": "#/$defs/positive"},
+        "variable_key_bytes": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/positive"}},
+        "variable_state_bytes": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/positive"}},
+        "primary_vnode_count": {"$ref": "#/$defs/positive"},
+        "metadata_edge_vnode_counts": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/positive"}},
+        "zipf_exponent_milli": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "hot_distribution_permille": {"$ref": "#/$defs/permilleMix"},
+        "single_vnode_distinct_keys_permille": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "timer_mix_permille": {"$ref": "#/$defs/timerMix"},
+        "timer_scan_max_rows": {"$ref": "#/$defs/positive"},
+        "timer_scan_max_bytes": {"$ref": "#/$defs/positive"},
+        "join_match_counts": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "integer", "minimum": 0}},
+        "join_match_weights_permille": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/positive"}}
+      }
+    },
+    "measurement": {
+      "type": "object", "additionalProperties": false,
+      "required": ["warmup_seconds", "measured_seconds", "paired_repetitions", "minimum_requests_per_repetition", "minimum_requests_total", "fixed_seeds", "alternate_candidate_order", "coordinated_omission_corrected", "queue_and_service_latency_separate", "outlier_deletion_prohibited"],
+      "properties": {
+        "warmup_seconds": {"$ref": "#/$defs/positive"},
+        "measured_seconds": {"$ref": "#/$defs/positive"},
+        "paired_repetitions": {"$ref": "#/$defs/positive"},
+        "minimum_requests_per_repetition": {"$ref": "#/$defs/positive"},
+        "minimum_requests_total": {"$ref": "#/$defs/positive"},
+        "fixed_seeds": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/positive"}},
+        "alternate_candidate_order": {"const": true},
+        "coordinated_omission_corrected": {"const": true},
+        "queue_and_service_latency_separate": {"const": true},
+        "outlier_deletion_prohibited": {"const": true}
+      }
+    },
+    "latencyGates": {
+      "type": "object", "additionalProperties": false,
+      "required": ["resident_request_us", "spill_request_us", "hot_vnode_request_us", "timer_join_range_request_us", "state_queue_wait_us"],
+      "properties": {
+        "resident_request_us": {"$ref": "#/$defs/latency"},
+        "spill_request_us": {"$ref": "#/$defs/latency"},
+        "hot_vnode_request_us": {"$ref": "#/$defs/latency"},
+        "timer_join_range_request_us": {"$ref": "#/$defs/latency"},
+        "state_queue_wait_us": {"$ref": "#/$defs/latency"}
+      }
+    },
+    "throughputGates": {
+      "type": "object", "additionalProperties": false,
+      "required": ["aggregate_rows_per_second", "timer_rows_per_second", "join_rows_per_second", "minimum_achieved_rate_permille", "maximum_cpu_utilization_permille"],
+      "properties": {
+        "aggregate_rows_per_second": {"$ref": "#/$defs/positive"},
+        "timer_rows_per_second": {"$ref": "#/$defs/positive"},
+        "join_rows_per_second": {"$ref": "#/$defs/positive"},
+        "minimum_achieved_rate_permille": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "maximum_cpu_utilization_permille": {"type": "integer", "minimum": 1, "maximum": 1000}
+      }
+    },
+    "checkpointGates": {
+      "type": "object", "additionalProperties": false,
+      "required": ["local_generation_freeze_us", "delta_export_ms", "cadence_seconds", "deadline_seconds", "full_base_export_max_seconds", "maximum_throughput_loss_permille", "maximum_p999_inflation_permille", "sink_flush_ms"],
+      "properties": {
+        "local_generation_freeze_us": {"$ref": "#/$defs/latency"},
+        "delta_export_ms": {"$ref": "#/$defs/latency"},
+        "cadence_seconds": {"$ref": "#/$defs/positive"},
+        "deadline_seconds": {"$ref": "#/$defs/positive"},
+        "full_base_export_max_seconds": {"$ref": "#/$defs/positive"},
+        "maximum_throughput_loss_permille": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "maximum_p999_inflation_permille": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "sink_flush_ms": {"$ref": "#/$defs/latency"}
+      }
+    },
+    "recoveryGates": {
+      "type": "object", "additionalProperties": false,
+      "required": ["owner_failover_ms", "complete_local_loss_restore_max_seconds", "single_vnode_acquire_max_seconds", "quarter_vnode_rotation_max_seconds"],
+      "properties": {
+        "owner_failover_ms": {"$ref": "#/$defs/latency"},
+        "complete_local_loss_restore_max_seconds": {"$ref": "#/$defs/positive"},
+        "single_vnode_acquire_max_seconds": {"$ref": "#/$defs/positive"},
+        "quarter_vnode_rotation_max_seconds": {"$ref": "#/$defs/positive"}
+      }
+    },
+    "resourceGates": {
+      "type": "object", "additionalProperties": false,
+      "required": ["process_memory_max_bytes", "state_queue_max_bytes", "open_file_descriptors_max", "live_snapshots_max", "live_iterators_max", "frozen_generations_max", "aggregate_write_amplification_milli", "timer_write_amplification_milli", "space_amplification_milli", "compaction_debt_max_bytes", "compaction_debt_clear_max_seconds", "write_stall_time_max_permille", "unexplained_stall_max_ms", "slope_measurement_start_seconds", "rss_growth_max_bytes_per_hour", "rss_growth_total_max_bytes", "stable_live_disk_growth_max_permille_per_hour", "normal_disk_bytes", "pressure_disk_bytes", "hard_stop_disk_bytes", "candidate_endurance_seconds", "selected_backend_endurance_seconds"],
+      "properties": {
+        "process_memory_max_bytes": {"$ref": "#/$defs/positive"},
+        "state_queue_max_bytes": {"$ref": "#/$defs/positive"},
+        "open_file_descriptors_max": {"$ref": "#/$defs/positive"},
+        "live_snapshots_max": {"$ref": "#/$defs/positive"},
+        "live_iterators_max": {"$ref": "#/$defs/positive"},
+        "frozen_generations_max": {"$ref": "#/$defs/positive"},
+        "aggregate_write_amplification_milli": {"$ref": "#/$defs/positive"},
+        "timer_write_amplification_milli": {"$ref": "#/$defs/positive"},
+        "space_amplification_milli": {"$ref": "#/$defs/positive"},
+        "compaction_debt_max_bytes": {"$ref": "#/$defs/positive"},
+        "compaction_debt_clear_max_seconds": {"$ref": "#/$defs/positive"},
+        "write_stall_time_max_permille": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "unexplained_stall_max_ms": {"$ref": "#/$defs/positive"},
+        "slope_measurement_start_seconds": {"$ref": "#/$defs/positive"},
+        "rss_growth_max_bytes_per_hour": {"$ref": "#/$defs/positive"},
+        "rss_growth_total_max_bytes": {"$ref": "#/$defs/positive"},
+        "stable_live_disk_growth_max_permille_per_hour": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "normal_disk_bytes": {"$ref": "#/$defs/positive"},
+        "pressure_disk_bytes": {"$ref": "#/$defs/positive"},
+        "hard_stop_disk_bytes": {"$ref": "#/$defs/positive"},
+        "candidate_endurance_seconds": {"$ref": "#/$defs/positive"},
+        "selected_backend_endurance_seconds": {"$ref": "#/$defs/positive"}
+      }
+    },
+    "restoreLimits": {
+      "type": "object", "additionalProperties": false,
+      "required": ["routing_key_columns_max", "routing_schema_bytes_max", "envelope_metadata_bytes_max", "state_contract_bytes_max", "encoded_key_bytes_max", "stored_state_bytes_max", "encoded_artifact_bytes_max", "delta_depth_max", "encoded_chain_bytes_max", "accumulators_per_operator_max", "operators_per_transition_max", "vnodes_per_transition_max", "operator_vnode_pairs_max", "transition_metadata_bytes_max", "restore_task_reservation_bytes_max", "global_restore_reservation_bytes_max", "concurrent_restore_decoders_max"],
+      "properties": {
+        "routing_key_columns_max": {"$ref": "#/$defs/positive"},
+        "routing_schema_bytes_max": {"$ref": "#/$defs/positive"},
+        "envelope_metadata_bytes_max": {"$ref": "#/$defs/positive"},
+        "state_contract_bytes_max": {"$ref": "#/$defs/positive"},
+        "encoded_key_bytes_max": {"$ref": "#/$defs/positive"},
+        "stored_state_bytes_max": {"$ref": "#/$defs/positive"},
+        "encoded_artifact_bytes_max": {"$ref": "#/$defs/positive"},
+        "delta_depth_max": {"$ref": "#/$defs/positive"},
+        "encoded_chain_bytes_max": {"$ref": "#/$defs/positive"},
+        "accumulators_per_operator_max": {"$ref": "#/$defs/positive"},
+        "operators_per_transition_max": {"$ref": "#/$defs/positive"},
+        "vnodes_per_transition_max": {"$ref": "#/$defs/positive"},
+        "operator_vnode_pairs_max": {"$ref": "#/$defs/positive"},
+        "transition_metadata_bytes_max": {"$ref": "#/$defs/positive"},
+        "restore_task_reservation_bytes_max": {"$ref": "#/$defs/positive"},
+        "global_restore_reservation_bytes_max": {"$ref": "#/$defs/positive"},
+        "concurrent_restore_decoders_max": {"$ref": "#/$defs/positive"}
+      }
+    }
+  }
+}

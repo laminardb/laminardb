@@ -50,6 +50,7 @@ checkpoints/
 wal/
 /tools/*
 !/tools/independent-soak-contract/
+!/tools/state-backend-qual/
 
 # Private configs (symlinked from private repo)
 CLAUDE.md
