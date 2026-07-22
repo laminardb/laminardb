@@ -401,6 +401,10 @@ jobs:
         run: cargo clippy --locked --manifest-path tools/state-backend-qual/Cargo.toml --all-targets -- -D warnings
       - name: Test standalone state qualification model tool
         run: cargo test --locked --manifest-path tools/state-backend-qual/Cargo.toml
+      - name: Test provisional Zipf feasibility corpus (NOT evidence)
+        run: cargo test --locked --manifest-path tools/state-backend-qual/Cargo.toml --lib --features zipf-feasibility
+      - name: Test release Zipf feasibility corpus (NOT evidence)
+        run: cargo test --locked --release --manifest-path tools/state-backend-qual/Cargo.toml --lib --features zipf-feasibility
       - name: Reject runtime and candidate dependencies
         shell: bash
         run: |
