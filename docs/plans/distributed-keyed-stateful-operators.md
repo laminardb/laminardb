@@ -81,7 +81,8 @@ The following are blocking inputs rather than tasks to hand-wave inside an opera
 | Milestone | Newly eligible `CREATE STREAM` shapes | Still fail-closed |
 |---|---|---|
 | Current | Stateless projection/filter; one direct global aggregate stage | Every group/window/join; all MVs |
-| Phase 2 | Grouped `COUNT`/`SUM`/`AVG`, append-only `MIN`/`MAX` | `DISTINCT`, arbitrary UDAF, changelog min/max, windows/joins |
+| Phase 2 first gate | Append-only grouped `COUNT(*)` plus `SUM(Int64)` | All broader aggregates, retractions, windows/joins |
+| Later Phase 2 gates | Reviewed broader `COUNT`/`SUM`, `AVG`, append-only `MIN`/`MAX` | `DISTINCT`, arbitrary UDAF, changelog min/max, windows/joins |
 | Phase 3A/B | Certified tumbling then hopping event-time aggregates | Sessions, processing-time/custom triggers, analytic frames, joins |
 | Phase 3C/D | Certified session windows and bounded analytic frames | Unbounded frames and uncertified trigger modes |
 | Phase 4A | Append-only inner equi-interval join | Outer/changelog/ASOF/temporal/unbounded joins |
@@ -101,7 +102,7 @@ isolation:
 | Runtime guarantee | `AtLeastOnce` | `BestEffort` and `ExactlyOnce` remain rejected; the latter stays behind `[LDB-0013]` |
 | Source | Non-ephemeral, `Splittable`, assignment-scoped handoff | Kafka is the only current built-in external source path; source partitions and SQL-key vnodes remain distinct |
 | Operator state | One sealed state/timer/output-bookkeeping cut with the source cursor | Replay cannot double-apply internal state; externally flushed results may repeat |
-| Append-result output | `DurableAtLeastOnce + MultiWriter + AppendOnly` (or broader) | Existing append sinks can serve ordinary streams and final-window output |
+| Changed-group append snapshots | `DurableAtLeastOnce + MultiWriter + AppendOnly` (or broader) | Initial grouped output emits one current row per touched group/batch; retries may repeat its stable operation ID |
 | Retraction/changelog output | `DurableAtLeastOnce + MultiWriter + FullChangelog`, or a new assignment-fenced mutable-sink contract | No current built-in cluster sink qualifies, so these combinations remain closed |
 
 Checkpoint certification preserves CP-5 ordering: drain/enqueue operator output, flush every
@@ -130,16 +131,17 @@ Work:
      chain-depth, operator/vnode-count, and restore-staging limits.
 3. Specify the partition/state ABI and add golden vectors for every admitted key type plus explicit
    rejection vectors for floating-point, nested, and other excluded types. Persist hydrated routing
-   identity separately from the artifact's canonical non-dictionary physical IPC schema; initial
-   artifact decoding rejects compression and dictionary messages.
+   identity separately from the artifact's Laminar-owned state contract. Treat restored routing
+   bytes as opaque unless a panic-free strict decoder has independently validated them.
 4. Specify stable operator/table ID derivation, concrete builtin codec registry, Laminar-owned codec
-   versions, semantic and physical state-schema contracts, a dedicated bounded wire DTO, exact
-   dependency pins, populated-state goldens, and N/N-1 rolling upgrade/rollback behavior.
+   versions, checked arithmetic/null semantics, a dedicated bounded row DTO and outer artifact
+   directory, populated-state goldens, and N/N-1 rolling upgrade/rollback behavior. Initial managed
+   state is append-only `COUNT(*)` plus `SUM(Int64)`; no live DataFusion/rkyv type is durable ABI.
 5. Add the mandatory capability descriptor to design tests. Inventory every current operator as
    `Stateless`, `GlobalSingleton`, `VnodeKeyed`, `RebuildableReplicated`, or `LocalOnly` without
    changing admission.
-6. Run a bounded backend qualification against the workload profile using current Fjall 3.1.x and
-   a pinned RocksDB binding behind the same spike-only adapter. Exercise Arrow-sized atomic batches,
+6. Run a bounded backend qualification against the workload profile using exact Fjall and RocksDB
+   Rust-binding pins behind the same spike-only adapter. Exercise Arrow-batch-sized atomic requests,
    realistic hot/cold multi-key reads, timer scans, snapshot/export overlap, sorted restore, vnode
    drop/GC, compaction/write stalls, hard memory/disk/FD limits, `kill -9`, torn/corrupt data,
    `ENOSPC`, and N/N-1 format rehearsal. Include 24–72-hour churn/TTL soak. Select and record one
@@ -191,8 +193,9 @@ Work packages:
   conformance suite. Do not retain the losing qualification adapter.
 - Use one worker-local database with a small fixed keyspace/column-family count and logical
   pipeline/operator/table/vnode prefixes. Do not allocate a database or physical tree per vnode.
-- Encode hot values with a compact schema-versioned binary format. Do not revive per-group Arrow
-  IPC framing, read-before-write accounting, or the removed cold-tier wrapper.
+- Encode hot values with a compact schema-versioned binary format. Do not use per-group Arrow IPC,
+  live DataFusion/rkyv checkpoint types, read-before-write accounting, or the removed cold-tier
+  wrapper.
 - Reject wrong deployment/pipeline/ABI/schema/decided-checkpoint identity before exposing any key.
 
 ### 1B. Hot-path scheduler
@@ -294,14 +297,16 @@ Work:
    existing encoded key and static vnode mapping.
 2. Reuse the existing canonical pre-aggregate shuffle and ownership/barrier fences. Remove duplicate
    map-era dirty/full/delta tracking only after the managed path is equivalent and all callers move.
-3. Encode group accumulator, last-updated metadata, stable output identity, and last-emitted value as
-   stable state tables. Apply one Arrow batch with one grouped state read and one atomic mutation
-   batch; no record performs its own blocking LSM operation.
-4. Implement reviewed Laminar-owned encodings for concrete builtin `COUNT`, `SUM`, `AVG`, and
-   append-only `MIN`/`MAX`; preserve null, overflow, decimal, floating-point, update, and retraction
-   semantics. Pin the supplying DataFusion versions exactly and require deterministic fresh and
-   populated state goldens; a matching UDAF name is not codec identity.
-5. Keep `DISTINCT`, UDAFs, changelog `MIN`/`MAX`, multi-stage/derived fallback, and cluster MVs closed.
+3. Encode only named semantic state. For the first vertical that is the canonical group key, checked
+   count, and checked SUM non-null count/accumulator; map-era `last_updated_ms` and `last_emitted`
+   are not copied without a consumer. Apply one Arrow input batch with one grouped state read and one
+   atomic mutation/output-enqueue batch; no record performs its own blocking LSM operation.
+4. Implement the reviewed Laminar codec for append-only `COUNT(*)` plus nullable `SUM(Int64)`.
+   Checked arithmetic must fault before mutation/output instead of inheriting DataFusion 52.3's
+   wrapping SUM or profile-dependent count overflow. Require deterministic fresh/populated and
+   overflow goldens; a matching UDAF name is not codec identity.
+5. Keep broader COUNT/SUM types, `AVG`, `MIN`/`MAX`, `DISTINCT`, retractions, UDAFs,
+   multi-stage/derived fallback, and cluster MVs closed.
 6. Add per-operator/vnode keys, bytes, dirty bytes, cache hit rate, batch read/write, skew, checkpoint,
    restore, and pressure metrics.
 7. Remove the one-million-group safety fiction once the new hard byte policy is the only admitted
@@ -329,8 +334,9 @@ Exit gate:
 - fault/differential suites report zero state divergence;
 - numerical p99/p99.9, checkpoint, resource, and RTO targets pass on the Phase 0 profile;
 - local embedded performance has a reviewed regression result;
-- append-result versus full-changelog modes are explicit: the certified append scenario passes,
-  while every unsupported retraction/changelog sink combination remains fail-closed;
+- changed-group append-snapshot versus full-changelog modes are explicit: the certified append
+  scenario passes, while every unsupported retraction/changelog sink combination remains
+  fail-closed;
 - rolling upgrade/rollback and checkpoint compatibility pass; and
 - Phase 2 review approves removal of obsolete map code and docs.
 

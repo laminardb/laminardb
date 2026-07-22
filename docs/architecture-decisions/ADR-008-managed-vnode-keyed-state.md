@@ -234,7 +234,7 @@ One worker-level governor owns reservations across:
 - shuffle queues and bounded acquire/replay buffers; and
 - local state bytes, temporary checkpoint files, compaction debt, and restore staging, including
   artifact/descriptor/payload bytes, chain links/depth, operators/vnodes per transition,
-  groups/accumulators/streams/emitted rows, and decoded Arrow variable bytes.
+  groups/accumulators/rows, canonical key/state bytes, and output-buffer bytes.
 
 Cardinality counters remain metrics, not safety limits. Reservations happen before mutation with a
 documented maximum one-batch slack. Pressure first triggers safe flush/compaction and bounded
@@ -286,45 +286,64 @@ only; a query fingerprint alone is not a keyed-state compatibility contract.
 
 #### Artifact and schema contract
 
-Routing compatibility and stored Arrow representation are separate identities. A grouped key
-persists the hydrated `PartitionKeySchemaV1` used by the partition ABI and, in the artifact
-contract, the exact physical field sequence written to IPC. Artifact codec v1 hydrates dictionary
-arrays to their expected non-dictionary value fields before encoding and rejects dictionary IPC
-messages; dictionary index width is therefore never durable identity. Global state has an explicit
-`GlobalSingleton` key mode and is valid only on vnode 0—it is not inferred from an empty
-descriptor.
+Routing compatibility and stored-state compatibility are separate identities. A grouped artifact
+persists the hydrated `PartitionKeySchemaV1` used by the partition ABI and a Laminar-owned state
+contract containing key mode, stable operator/table identity, ordered accumulator codec IDs and
+versions, and exact logical input/output/null semantics. Dictionary inputs are hydrated before key
+encoding; dictionary index width is never durable identity. Global state has an explicit
+`GlobalSingleton` mode and is valid only on vnode 0—it is not inferred from an empty descriptor.
 
-Each accumulator/table contract retains its concrete codec ID/version, semantic state fields, and
-physical stored fields. Writers must construct batches from those expected fields, require exact
-arity and `DataType`, and reject nulls in a non-nullable field. Readers require exactly one complete
-IPC batch, its end-of-stream marker, no second batch or trailing bytes, exact schema/nullability,
-and the expected row count. Before Arrow parses attacker-controlled bytes, an artifact-specific
-preflight holds a global restore-memory reservation, checks the encoded/metadata/body/node/buffer
-bounds and all signed ranges with checked arithmetic, matches the cached canonical schema frame,
-and requires exactly `Schema -> RecordBatch -> EOS`. Codec v1 rejects IPC compression and
-dictionary messages; supporting either later requires separately bounded expansion accounting.
-Empty bytes are valid only where the format explicitly defines no columns or no rows; they can
-never default a required accumulator state. The same exact rules apply to `last_emitted` keys and
-values.
+The first managed aggregate payload does **not** use Arrow IPC. COUNT/SUM state is a compact,
+length-delimited Laminar row record, sorted strictly by canonical encoded key off the event-loop.
+The contract determines a fixed state width: checked `u64` `COUNT(*)`, followed for each admitted
+`SUM(Int64)` by checked `u64` non-null count and checked signed `i128` accumulator, all in canonical
+big-endian form. COUNT's SQL result remains non-null `Int64` and SUM's remains nullable `Int64`; a
+batch whose next count, accumulator, or result cannot be represented faults before state mutation
+or output. The initial managed vertical
+does not inherit DataFusion 52.3's wrapping SUM implementation. Decimal, unsigned, floating,
+`AVG`, `MIN`/`MAX`, retractions, and UDAFs remain codec-unavailable until separately specified and
+tested.
 
-The initial codec registry admits only concrete reviewed built-in implementations. Function names
-are not codec identity because a UDAF can reuse a built-in name. Laminar-owned codec IDs and
-versions, exact dependency pins, fresh and populated state goldens, and a compatibility table are
-required before a writer is enabled. Serializing the live Rust/DataFusion checkpoint struct with
-`rkyv` is transitional, not payload ABI v1; the production writer uses a deliberate bounded wire
-DTO. The physical/semantic artifact descriptor is introduced in the same reviewed slice as that
-DTO, canonical writer, and hostile-input decoder—not as a generic Arrow API in advance. It covers
-or explicitly rejects every relevant schema and field metadata scope. Partition-key ABI v1 rejects
-field metadata because it has no defined routing semantics; any other unsupported nonempty metadata
-makes the cluster codec unavailable while embedded execution remains unchanged.
+Each non-empty payload row is `u32 key_length | key_bytes | fixed_state_bytes`. Key length, row
+count, aggregate key bytes, state bytes, descriptor bytes, artifact bytes, and full-plus-delta chain
+bytes are checked against the approved profile with checked arithmetic before allocation. Keys are
+unique and strictly increasing, and every keyed row must hash to the claimed vnode. `EMPTY` is the
+only zero-row representation. A `FULL` image replaces the entire operator/table/vnode namespace;
+`DELTA` carries sorted latest values; append-only v1 has no deletes or tombstones. Restored routing
+keys remain opaque hash/LSM identity and are never passed to Arrow `RowParser`, whose format assumes
+converter-produced input; any future materializing consumer requires a strict, panic-free decoder.
+Current `last_updated_ms` is not part of v1 because no aggregate execution path consumes it.
+Changed-group append output derives its stable
+operation identity from the canonical key and checked count version, so v1 also carries no
+`last_emitted` value. Timer/TTL or changelog codecs must add their own named state rather than
+silently extending this record.
 
-Envelope decoding enforces a configured byte ceiling before hashing or allocation, uses checked
-length arithmetic, rejects trailing data and downgrade-shaped corruption, and compares descriptor
-bytes as well as digests. SHA-256 is corruption evidence, not authentication; trust and encryption
-remain properties of the checkpoint store and deployment. Descriptor construction is plan-time,
-and envelope/IPC validation is checkpoint/restore-time. None of it runs per row. Capture benchmarks
-must still measure hashing/copying CPU, checkpoint pause, and event-loop stalls before the writer is
-accepted.
+The payload sits inside a manually parsed, allocation-bounded managed envelope. It binds exact
+format/header length, `FULL`/`DELTA`/`EMPTY`, key mode, partition ABI, codec ID/version, total and
+section lengths, row/key/state totals, checkpoint and parent identity, assignment version, vnode
+count and vnode, owner-map certificate digest, stable operator/table/contract digests, and payload
+digest. Reserved fields must be zero; total length must equal the supplied slice with no trailing
+bytes. Descriptor bytes are compared byte-for-byte with the immutable plan-time contract after
+their digest is checked. SHA-256 supplies corruption evidence, not authentication; trust and
+encryption remain checkpoint-store/deployment properties.
+
+Managed artifacts cannot be nested in the current `VnodePartial` rkyv object, whose attacker-sized
+vectors are materialized before an inner payload can reserve memory. A `VnodePartialV2` directory
+must first provide a canonical, authoritative operator roster with explicit `EMPTY` entries,
+checked slice ranges/digests, and no allocation based on untrusted counts. Whole-transition
+preflight acquires one non-cloneable global reservation for envelope bytes, staging bytes, key/state
+bytes, artifacts, rows, operators, and vnodes; it validates every chain and row before streaming
+borrowed records into shadow LSM state. The legacy rkyv/Arrow checkpoint remains confined to the
+currently admitted global vnode-0 path.
+
+The initial codec registry admits only concrete reviewed Laminar implementations. Function names
+are not codec identity because a UDAF can reuse a built-in name. Direct rkyv of live Rust/DataFusion
+types and hash-map iteration order are not durable ABI. Fresh/populated goldens, truncation and
+every-limit/max-plus-one vectors, duplicate/out-of-order/cross-vnode keys, checksum/provenance
+failures, and N/N-1 compatibility tests precede a writer. Contract derivation is plan-time;
+sorting, encoding, hashing, and restore decoding run on bounded blocking workers. None runs on the
+record/event-loop hot path, and qualification still measures their CPU, memory, pause, and tail
+effects.
 
 #### Whole-graph publication boundary
 
@@ -415,15 +434,16 @@ correctness path.
 
 ### Grouped aggregate
 
-Managed tables hold the encoded group key, versioned accumulator state, last-update metadata, and
-last-emitted changelog value. Accumulator and emission mutations are atomic. Dirty tracking belongs
-to the state service, not a second operator map.
+Managed tables hold the encoded group key and versioned accumulator state. Any timestamp, timer,
+or emitted-value field requires a named semantic consumer; vestigial map-era fields are not copied
+into the durable schema. Accumulator and output-enqueue mutations are atomic, and dirty tracking
+belongs to the state service rather than a second operator map.
 
-The first admitted functions are `COUNT`, `SUM`, `AVG`, and append-only `MIN`/`MAX` with reviewed,
-portable accumulator encodings. Changelog `MIN`/`MAX`, `DISTINCT`, and arbitrary UDAFs remain
-closed until their multiset/set state is managed and their growth contract is classified. A UDAF
-must declare a stable serializer, merge/restore compatibility, and resource behavior before it can
-be cluster-capable.
+The first candidate is append-only `COUNT(*)` plus `SUM(Int64)` using the checked Laminar codec
+above. Broader `COUNT`/`SUM` types, `AVG`, append-only or changelog `MIN`/`MAX`, `DISTINCT`,
+retractions, and arbitrary UDAFs remain closed until their arithmetic, null, state-growth, and
+portable encoding contracts are reviewed. A UDAF must declare a stable serializer, merge/restore
+compatibility, and resource behavior before it can be cluster-capable.
 
 The existing global aggregate remains vnode 0. Distributed partial/global aggregation is a
 separate optimization; it is not required to admit grouped state.
@@ -489,11 +509,13 @@ external results flushed after that cut may appear again after a crash. The chec
 the existing ordering: enqueue operator output, flush every durable sink, then seal source
 positions. State capture and real sink-flush latency share the checkpoint deadline. A stable output
 identity and provenance envelope must be added before the initial release. For the narrow
-append-only `COUNT(*)`/`SUM` vertical, the count is the batching-independent logical state version;
+append-only `COUNT(*)`/`SUM(Int64)` vertical, the checked count is the batching-independent logical
+state version;
 identity binds that version and canonical group to deployment, pipeline, and operator identity,
 while a separate canonical payload digest detects conflicting values at one version. The input
 contract maps each logical group to one Kafka partition so group-local broker order is stable, and
-`SUM` is initially limited to exact integer/decimal semantics. Vnode and partition ABI, assignment
+SUM faults atomically rather than wrapping when its next state or `Int64` result is out of range.
+Vnode and partition ABI, assignment
 version, node ID, boot UUID, and process term accompany the identity. A checkpoint attempt alone is
 insufficient because replay can cross attempts and owners. This is evidence for at-least-once
 correctness; it is not presented as exactly-once.
@@ -501,9 +523,12 @@ correctness; it is not presented as exactly-once.
 A cluster sink used by this release must be `DurableAtLeastOnce + MultiWriter` and accept the
 operator's declared output mode. The first candidate is Kafka `envelope=append`; broker topic,
 partitioning, acknowledgement, replication/min-ISR, election, DLQ, and retention settings are part
-of the certified contract. Ordinary `CREATE STREAM` aggregates emit repeated full running
-append-result snapshots, not only modified groups or a final monotonic aggregate. Kafka producer
-idempotence cannot deduplicate recovery from a new producer incarnation. There is currently no
+of the certified contract. The first managed aggregate emits one current result for each distinct
+group changed by a successfully committed input batch. Multiple rows for one group may be
+coalesced, so intermediate count versions may be absent; output never scans or republishes every
+resident group merely because another group changed. Recovery may repeat the same operation ID and
+bit-identical payload. Kafka producer idempotence cannot deduplicate recovery from a new producer
+incarnation. There is currently no
 built-in cluster-admissible `FullChangelog` sink. Any retraction/full-changelog output remains
 fail-closed until either a multiwriter changelog-log sink is certified or mutable sinks gain
 key-affine assignment, old-writer fencing, deterministic operation IDs, and vnode handoff. Merely

@@ -61,7 +61,7 @@ mode, connector, or delivery guarantee.
 | Scenario | Initial intended path | Current status |
 |---|---|---|
 | Harness control | Kafka source -> stateless projection -> Kafka append sink | Engineering-only; proves oracle/deployment, never keyed-state production support |
-| Grouped aggregate ALO | Kafka source -> grouped `COUNT`/`SUM` append-result stream -> certified durable multiwriter append sink | Blocked by `[LDB-4007]` and Phase 0/1 evidence |
+| Grouped aggregate ALO | Kafka source -> grouped `COUNT(*)`/`SUM(Int64)` changed-group append snapshots -> certified durable multiwriter append sink | Blocked by `[LDB-4007]` and Phase 0/1 evidence |
 | Fixed event-time window ALO | Certified source -> tumbling window/final append output -> compatible sink | Blocked by `[LDB-4007]` and timer/frontier lifecycle |
 | Bounded interval join ALO | Two certified inputs -> inner equi-interval join -> compatible append sink | Blocked by `[LDB-4007]` and co-partitioned join lifecycle |
 | Retraction/FullChangelog | Stateful operator -> FullChangelog-capable cluster sink | Blocked; no built-in qualifying sink |
@@ -72,9 +72,12 @@ release must pass.
 
 The initial grouped-aggregate scenario is narrower than the general row: each logical group is
 routed to one fixed Kafka input partition, `COUNT(*)` is mandatory as its logical state version,
-and `SUM` uses exact integer/decimal semantics. The append sink contains repeated full running
-snapshots. The oracle may observe any valid group-local prefix and repeated unchanged snapshots,
-but after the frozen source cut it must observe the exact final version for every group.
+and `SUM` is nullable `Int64` using checked Laminar arithmetic. Each successfully committed input
+batch appends one current row per touched group; rows within the batch may be coalesced, so the
+oracle accepts a strictly increasing subsequence of legal group-local count versions. Recovery may
+repeat the same version only with the same operation identity and bit-identical payload. After the
+frozen source cut, the exact final version for every group is mandatory. A full scan/republication
+of all resident groups per processing cycle is neither required nor eligible evidence.
 
 ## Frozen numerical contract
 
@@ -87,8 +90,8 @@ specifies at minimum:
 - p50/p95/p99/p99.9 end-to-end latency and maximum event-loop stall;
 - checkpoint align/freeze/export/upload/sink-flush/seal limits and recovery RTO;
 - hard encoded envelope/artifact/descriptor/payload bytes; checkpoint chain links/delta depth;
-  operators and vnodes per transition; IPC metadata/body/node/buffer/row limits; decoded Arrow
-  variable bytes; and aggregate plus per-restore staging reservations;
+  operators and vnodes per transition; rows, canonical key/state bytes, output-buffer bytes; and
+  aggregate plus per-restore staging reservations;
 - maximum RSS/PSS/cgroup memory, LSM cache/memtable/journal/native memory, queue bytes/age, local
   bytes, disk utilization, FD count, snapshot/iterator count, frozen generations, timer count,
   checkpoint artifacts, compaction debt, and write amplification;
@@ -114,7 +117,8 @@ per-partition sink high-watermarks. An incomplete source or sink cut cannot pass
 The independent model derives expected results solely from the ledger and published SQL semantics:
 
 - projection: exact event IDs and values;
-- grouped aggregate: required final count/sum per key plus validation of every observed legal prefix;
+- grouped aggregate: required final count/sum per key plus validation that every observed version is
+  a legal, strictly increasing group-local prefix (apart from permitted bit-identical replay);
 - fixed window: exact key/window/aggregate rows after the declared watermark and lateness policy;
 - bounded join: exact stable left/right event-ID pairs; and
 - future changelog: exact signed operations and deterministic operation identity.

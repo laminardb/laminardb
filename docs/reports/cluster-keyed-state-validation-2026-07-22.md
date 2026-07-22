@@ -106,9 +106,10 @@ single-record-batch IPC helper (`12a34c38`). Cycle 3 review (`1e8b1a59`, `f4ded9
 former to the bounded,
 opaque routing identity actually consumed by `PartitionKeySchemaV1` and removed the latter. The
 generic helper used Arrow 57.2's `StreamReader`, which can allocate from IPC-declared metadata/body
-lengths before proving those bytes exist. A production decoder must be artifact-specific, reserve a
-global restore budget, and preflight hostile framing before calling Arrow. These changes remain
-admission-neutral and do not close the runtime lifecycle gap.
+lengths before proving those bytes exist. The reviewed first COUNT/SUM artifact therefore uses a
+bounded Laminar row codec and never calls Arrow on restored state. Any future IPC codec must first
+reserve a global restore budget and preflight hostile framing. These changes remain admission-neutral
+and do not close the runtime lifecycle gap.
 
 The audit found that vnode membership is coupled to several other restore invariants and therefore
 must not be patched as an isolated assertion:
@@ -117,6 +118,8 @@ must not be patched as an isolated assertion:
   canonical key-schema fingerprint, or accumulator-state schema/version;
 - the payload directly archives the live `AggStateCheckpoint` Rust type rather than a bounded,
   independently versioned wire DTO, so its compatibility surface is implicit;
+- FULL and DELTA rows inherit `AHashMap`/`AHashSet` iteration order, so identical logical state does
+  not have canonical bytes across insertion order, process hash seed, or restart;
 - columnar checkpoint writers synthesize every Arrow IPC field as nullable `c0...cN` instead of
   preserving the accumulator's declared semantic fields. For example, a non-nullable COUNT state
   is physically described as nullable, so one descriptor cannot honestly identify both forms;
@@ -128,6 +131,16 @@ must not be patched as an isolated assertion:
   known independently;
 - `last_emitted` keys are cast toward planned types and an empty keyed tuple can take the global
   sentinel path, so exact arity/type checks must precede conversion;
+- `last_updated_ms` is written and round-tripped but has no aggregate execution, TTL, or eviction
+  reader, so copying it into a durable managed schema would ossify vestigial state;
+- the resolved DataFusion 52.3 non-distinct integer/decimal SUM uses wrapping addition, while COUNT
+  uses ordinary integer addition and the release profile does not enable overflow checks. The soak
+  profile does enable them, so behavior can differ by build profile. A portable artifact cannot
+  repair that arithmetic; the first managed vertical needs Laminar-owned checked semantics or an
+  independently enforced input/state bound before a writer or admission proof exists;
+- Arrow 57.2's row parser assumes converter-produced well-formed bytes and may panic on malformed
+  input. Restored partition-key bytes must remain opaque for hash/LSM identity, or pass a separate
+  strict decoder before any materialization; artifact bytes cannot be fed directly to `RowParser`;
 - a FULL apply replaces only keys present in its payload; a stale live key in the same vnode but
   absent from the authoritative image can survive unless the complete vnode namespace is replaced;
 - at the validated baseline, delta bucketing remembered one vnode count while capture accepted

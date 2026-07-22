@@ -88,7 +88,7 @@ profile containing:
 - hard RSS, local disk, FD, queue, frozen-generation, snapshot, compaction-debt, and write
   amplification limits;
 - hard encoded artifact/descriptor/payload bytes, chain-link/delta depth, operators/vnodes per
-  transition, groups/accumulators/IPC streams/emitted rows, decoded Arrow variable bytes, and
+  transition, groups/accumulators/rows, canonical key/state bytes, output buffering, and
   restore-staging limits; and
 - repetition count, warm-up, fixed operation count, and invalid-run policy.
 
@@ -115,40 +115,40 @@ cases. A handwritten schema descriptor records arity/order and all type paramete
 schema fingerprint, vnode count, operator/table identity, and state schema version together.
 
 Every base and delta restore artifact retains its declared vnode. Before any live mutation, decode
-and validate the complete chain against the planned key schema, require every group and
-`last_emitted` key to hash to that vnode, and require global state to use vnode 0. Any changed bytes
-or widened type semantics require an ABI version bump plus an explicit replay/migration and
-rollback policy; there is no implicit N/N-1 reader window.
+and validate the complete chain against the planned key schema, require every canonical group key
+to hash to that vnode, and require global state to use vnode 0. Key bytes remain opaque unless a
+separately reviewed, panic-free decoder validates them; untrusted bytes must never be passed to
+Arrow `RowParser`. Any changed bytes or widened type semantics require an ABI version bump plus an
+explicit replay/migration and rollback policy; there is no implicit N/N-1 reader window.
 
-The keyed checkpoint format must gain a versioned envelope containing partition ABI, vnode count,
-claimed vnode, explicit global/keyed mode, canonical routing-key schema, exact stored-key schema,
-operator fingerprint, state-table/accumulator schema, payload codec, and `FULL`, `DELTA`, or
-`EMPTY` kind. Preflight uses expected schemas cached from the plan, never schemas inferred only
-from the payload. It rejects empty state for an accumulator that declares state fields, coercive or
-empty keyed emission keys, a changed vnode count, and any decoded group/byte reservation above the
-frozen limits. A FULL image replaces the complete target vnode namespace, including removal of
-live keys absent from the image; a missing operator entry never means empty.
+The keyed checkpoint format must gain a manually parsed, allocation-bounded envelope containing
+partition ABI, vnode count and claimed vnode, explicit global/keyed mode, canonical routing-key
+schema, stable operator/table identities, state contract, payload codec, checkpoint ancestry and
+assignment/owner-map provenance, exact section lengths and counts, digests, and `FULL`, `DELTA`, or
+`EMPTY` kind. Preflight uses the immutable expected contract cached from the plan, never a contract
+inferred from the payload. It rejects a changed vnode count, wrong ancestry/provenance, duplicate or
+out-of-order keys, cross-vnode rows, trailing bytes, nonzero reserved fields, and any byte/count
+reservation above the approved profile. A FULL image replaces the complete target vnode namespace,
+including removal of live keys absent from the image; a missing operator entry never means empty.
 
-Freeze two schema layers deliberately. `PartitionKeySchemaV1` is the hydrated logical routing
-identity; artifact codec v1 separately records exact physical non-dictionary Arrow fields and
-nullability, hydrating dictionary inputs before writing. Accumulator contracts retain semantic
-state fields and exact stored fields. Encoding must use planned fields rather than synthesize
-all-nullable `c0...cN` fields. Before Arrow parsing, the decoder reserves from the global restore
-budget, bounds and validates IPC framing/metadata/body/nodes/buffers, matches the cached schema
-frame, and requires exactly `Schema -> RecordBatch -> EOS`, exact arity/type/nullability and row
-count, and no casts/default state. Initial v1 rejects compression and dictionary messages. The
-physical descriptor lands with the bounded DTO/writer/decoder and covers or rejects every relevant
-metadata scope; routing ABI v1 rejects field metadata.
+The first managed aggregate payload is not Arrow IPC. It is a Laminar-owned sorted row format:
+length-delimited canonical key bytes followed by fixed-width state selected by a cached contract.
+The first candidate contract is append-only `COUNT(*)` plus `SUM(Int64)`: checked count and non-null
+count plus a checked signed `i128` accumulator, with nullable `Int64` SQL output. Overflow faults the
+batch before mutation/output; DataFusion 52.3's wrapping SUM and release-dependent count overflow
+are not a durable semantic. Decimal, unsigned, floating, AVG, MIN/MAX, retraction, UDAF, and
+changelog codecs remain unavailable. Current `last_updated_ms` has no aggregate semantic consumer
+and is omitted; changed-group append output needs no persisted `last_emitted` value.
 
-The aggregate codec registry is keyed by concrete reviewed builtin implementation, Laminar codec
-ID, and explicit version—not by a spoofable UDAF name or a floating dependency version. Exact
-DataFusion pins, fresh and populated state goldens, and explicit COUNT/SUM/AVG/MIN/MAX and
-retractable invariants precede a writer. The persisted payload is a bounded wire DTO; direct rkyv
-of the live checkpoint struct is not declared stable. Enforce artifact and decoded-size ceilings
-before allocation/hashing and benchmark cold-path hashing/copying separately from the record path.
-Cache the immutable contract at plan/init time: UDF introspection, schema canonicalization,
-dependency-version formatting, SHA-256, IPC/rkyv parsing, and compatibility selection never run
-per row or per processing batch, and post-freeze artifact encoding stays off the event-loop thread.
+The aggregate codec registry is keyed by concrete reviewed implementation, Laminar codec ID, and
+explicit version—not by a spoofable UDAF name or floating dependency. Fresh/populated state goldens,
+arithmetic boundary tests, and deterministic bytes across insertion orders precede a writer.
+Direct rkyv of the live checkpoint struct and hash-map order are not stable. The existing
+`VnodePartial` rkyv container must be replaced for managed state by an allocation-bounded
+`VnodePartialV2` directory with an authoritative operator/table roster, explicit `EMPTY`, and
+checked borrowed ranges before inner decode. Cache the immutable contract at plan/init time;
+introspection, canonicalization, dependency selection, SHA-256, rkyv/format parsing, sorting, and
+post-freeze encoding never run per row or per processing batch.
 
 Represent restore as one assignment-scoped transition, not separate acquire/revoke maps or flat
 payload vectors. It binds the exact committed cut and checkpoint assignment fence to the target
@@ -169,7 +169,7 @@ Freeze the first vertical as:
 
 ```text
 Kafka splittable/replayable source, fixed topics/partitions and replay start
-  -> grouped COUNT(*) plus SUM append-result snapshots
+  -> grouped COUNT(*) plus SUM(Int64) changed-group append snapshots
   -> Kafka durable at-least-once multiwriter envelope=append sink
   -> shared object-store checkpoint authority
 ```
@@ -179,11 +179,13 @@ double application, impossible aggregate state, stale-owner output, or durable/e
 progress published before sink flush succeeds. Capturing a source position before the flush is
 expected. FullChangelog, mutable-key sinks, MVs, and exactly-once remain outside this vertical.
 
-The output is a repeated full running snapshot of every group on each processing cycle, not a
-monotonic append aggregate or changed-group stream. `COUNT(*)` is mandatory because it supplies a
-batching-independent logical state version for the narrow COUNT/SUM identity; `SUM` is initially
-limited to exact integer/decimal input and result semantics. The producer must route every logical
-group to exactly one fixed Kafka input partition so its broker offsets define group-local order.
+After each successfully committed input batch, output contains one current row per distinct group
+touched by that batch. Rows for one group may be coalesced, so legal intermediate count versions may
+be absent; output cost is proportional to changed input rather than total resident cardinality.
+Recovery may repeat a bit-identical operation. `COUNT(*)` is mandatory because its checked value is
+the batching-independent logical state version; `SUM` is initially only nullable `Int64` with
+checked Laminar arithmetic. The producer must route every logical group to exactly one fixed Kafka
+input partition so its broker offsets define group-local order.
 Freeze the input and run-specific output topic inventory, partition counts, explicit replay
 offsets, canonical group-key partitioning, `acks=all`, replication/min-ISR, unclean-election, DLQ,
 and evidence-retention settings as part of the contract.
@@ -279,16 +281,18 @@ bounded routing-schema identity, source/sink and output-identity contracts, inde
 charter and ineligible validator scaffold, plus aggregate/graph restore audits. None is an
 admission consumer. A reviewed Cycle 3 experiment removed the generic strict IPC helper because
 Arrow 57.2 can allocate from attacker-declared lengths before proving input availability; the
-artifact-specific bounded decoder remains part of the next format-contract slice.
+initial aggregate artifact therefore uses a bounded Laminar row codec instead. Its writer/decoder
+and the allocation-bounded outer `VnodePartialV2` directory remain future admission-neutral slices.
 
 Remaining commits are kept reviewable in this order:
 
 1. `test: freeze keyed-state numerical qualification profile`
-   - named owner approvals and complete latency/resource/RTO gates;
+   - complete candidate latency/resource/RTO gates and validator; named owner approval remains an
+     explicit eligibility transition;
 2. `test: freeze aggregate artifact and codec contract`
-   - dedicated bounded DTO, exact dependency pins, concrete builtin registry, semantic/physical
-     schema goldens, artifact-specific hostile-input IPC preflight, authoritative roster/explicit-
-     empty vectors, and no live restore wiring;
+   - dedicated bounded row DTO, concrete checked COUNT/SUM registry, semantic/state goldens,
+     hostile-input preflight, authoritative roster/explicit-empty vectors, and no live restore
+     wiring;
 3. `tools: define state backend qualification model`
    - standalone backend-neutral model, deterministic workload, digest oracle, and validated output;
 4. separate exact-pin Fjall and RocksDB adapter commits behind the private spike contract;
