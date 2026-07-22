@@ -650,7 +650,7 @@ resolved and independently reviewed. Backend selection additionally requires DKS
 
 | ID | Blocker |
 |---|---|
-| **DKS-Q2-001** | Approve a cross-platform deterministic Zipf sampler, new generator identity/goldens, and exact hot-mix-versus-Zipf case assignment. |
+| **DKS-Q2-001** | Close the provisional [Zipf generator](state-backend-zipf-generator-v1.md) sub-blockers; approve its exact-target determinism/error/interference evidence, workload-v2 identity/goldens, and hot-mix-versus-Zipf case assignment. |
 | **DKS-Q2-002** | Freeze a nonempty exact matrix, rational offered rates, fixed/variable-width policies, gate mappings, and compatible dimensions. For an all-distinct write, `128 * (16 + 65,536) = 8,390,656` bytes before framing already exceeds 8 MiB; 1,000 compact join probes at fanout 64 declare 15,360,000 range bytes. Every actual ordinal still requires exact post-dedup preflight. |
 | **DKS-Q2-003** | Define long-stream ordinals, streaming resident/spill prefill, live-byte/cardinality/timer bands and control law, exact opposite-side join fanout, stabilization, deterministic TTL/churn, and setup/post-warmup/final digests. C1's 4,096-request oracle and state-size salt cannot be repeated into a 200,000-request performance claim. |
 | **DKS-Q2-004** | Freeze exact warmup/measured counts and rates, per-case total semantics, drain/cooldown/reset, scheduler calibration/affinity, and an explicit balanced seeded order vector. The current minimum-count/minimum-duration booleans and five-pair alternation are not a complete schedule. |

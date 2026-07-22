@@ -296,7 +296,9 @@ The v1 aggregate generator covers the profile's explicit one/nine/uniform hot mi
 claim to implement the separate Zipf parameter. **DKS-Q2-001** blocks qualification execution until
 the workload owner approves a cross-platform deterministic Zipf sampler and assigns named cases to
 hot-mix versus Zipf workloads. That addition requires a new generator identity and goldens, not an
-unreviewed floating-point implementation.
+unreviewed floating-point implementation. The provisional
+[Zipf generator decision](state-backend-zipf-generator-v1.md) selects a conditional algorithm and
+lists the remaining DKS-Q2-001 sub-blockers; it does not make v1 Zipf-capable.
 
 ## Canonical encodings and result
 
