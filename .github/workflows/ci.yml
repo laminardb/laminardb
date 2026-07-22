@@ -353,7 +353,7 @@ jobs:
   # Independent Evidence Contract Scaffolds
   # ============================================
   soak-contract-scaffold:
-    name: Evidence contract scaffolds (NOT certification)
+    name: Ineligible contract/model scaffolds (NOT evidence)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -407,15 +407,15 @@ jobs:
           set -euo pipefail
           manifest=tools/state-backend-qual/Cargo.toml
           if grep -Eq '(path|workspace)[[:space:]]*=' "$manifest"; then
-            echo "state qualification profile unexpectedly uses a path or workspace dependency"
+            echo "state qualification model tool unexpectedly uses a path or workspace dependency"
             exit 1
           fi
           dependency_tree="$(cargo tree --locked --all-features --target all --manifest-path tools/state-backend-qual/Cargo.toml --prefix none)"
           if grep -Eqi '^(laminar([[:space:]_-]|$)|fjall([[:space:]]|$)|rocksdb([[:space:]]|$)|librocksdb[-_]|arrow([[:space:]_-]|$)|datafusion([[:space:]_-]|$))' <<< "$dependency_tree"; then
-            echo "state qualification profile unexpectedly has a runtime or candidate dependency"
+            echo "state qualification model tool unexpectedly has a runtime or candidate dependency"
             exit 1
           fi
-      - name: Validate explicitly ineligible state qualification candidate
+      - name: Validate explicitly ineligible state qualification profile and model result
         shell: bash
         run: |
           set -euo pipefail

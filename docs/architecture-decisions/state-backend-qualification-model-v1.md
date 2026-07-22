@@ -1,13 +1,13 @@
 # State backend qualification model v1
 
-- **Status:** provisional C1 engineering contract; ineligible for qualification
+- **Status:** Implemented provisional C1 reference model; ineligible for qualification
 - **Scope:** `tools/state-backend-qual` only
 - **Approval needed before qualification execution:** workload owner and operations owner
 - **Related decision:** [ADR-008](ADR-008-managed-vnode-keyed-state.md)
 
 ## Decision and authority boundary
 
-The standalone qualification tool will contain a deterministic storage-semantics model before it
+The standalone qualification tool contains a deterministic storage-semantics model before it
 contains a Fjall or RocksDB adapter. The model gives later adapters identical batched point reads,
 bounded scans, atomic mutations, and lifecycle operations. It is an oracle for storage behavior,
 not a fallback backend or a model of complete SQL operator semantics.
@@ -21,9 +21,10 @@ LaminarDB runtime crates, Arrow, DataFusion, Fjall, RocksDB, and async runtimes.
 The checked-in profile is still an unapproved candidate. C1 code and goldens may be revised during
 engineering review. Before qualification execution, named owners may change the profile or this
 contract; approval then hashes the final profile plus the candidate-neutral runner contract/source
-revision. Evidence records the exact built binary and lockfile separately. Before approval, work is
-limited to builds and semantic adapter conformance; candidate performance, resource, fault,
-endurance, and selection measurements are prohibited, not merely labelled diagnostic.
+revision. Evidence records the exact built binary and lockfile separately. Before approval,
+candidate-specific work is limited to exact builds and semantic adapter-conformance tests;
+candidate performance, resource, fault, endurance, selection, and qualification execution are
+prohibited, not merely labelled diagnostic.
 
 ## Stable identities
 
@@ -66,6 +67,10 @@ Two hashes serve different purposes:
   `workload` object in the order below, then `measurement.fixed_seeds`. Scalars are `u64`
   big-endian; a vector is `u32` count followed by `u64` elements. Formatting, status, approvals,
   environment, and evidence metadata do not affect generated requests.
+
+`profile_id` is a 1–64 byte lowercase ASCII slug matching
+`[a-z0-9][a-z0-9._-]{0,63}`. This makes it safe to copy into one-line diagnostics and evidence
+identities without control-character or case-normalization ambiguity.
 
 The exact model-input order is `logical_state_bytes`, `batch_rows`, `target_batch_bytes`,
 `hard_batch_bytes`, `compact_key_bytes`, `compact_state_bytes`, `variable_key_bytes`,
@@ -166,9 +171,11 @@ maximum bytes. Both sums are checked, and the declared read-byte maximum must fi
 hard-batch limit. Because limits are encoded in the request, they are part of its digest identity.
 
 The complete request and limits are validated before reading. All reads then observe one immutable
-pre-mutation cut. Only after every read succeeds do all mutations become visible together. Any
-validation, oversized-row, injected pre-commit, or capacity error leaves the live-state digest
-unchanged. A successful result cannot mix pre- and post-mutation values.
+pre-mutation cut. Only after every read succeeds do all mutations become visible together. The
+single-threaded oracle applies that already-validated set as one non-interleaved install, with no
+observation or fallible hook inside the install. Any validation, oversized-row, injected
+pre-commit, or capacity error leaves the live-state digest unchanged. A successful result cannot
+mix pre- and post-mutation values.
 
 ### Lifecycle operations
 
@@ -349,7 +356,7 @@ generated requests, performs no implicit setup or persistence, streams its diges
 final live state. The validator revalidates the profile, checks the case, regenerates the replay,
 and compares every property; JSON Schema validation alone is insufficient. Duplicate JSON keys,
 unknown fields, negative/floating values, malformed or uppercase hashes, and inconsistent counters
-are errors. The CLI may validate a model result but exposes no candidate execution command.
+are errors. The CLI validates a model result but exposes no candidate execution command.
 
 ## Fault vocabulary and required tests
 

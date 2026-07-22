@@ -1,6 +1,8 @@
 # Phase 0 execution plan: distributed keyed state
 
-- **Status:** In progress; admission-neutral contracts/codecs only
+- **Status:** In progress; admission-neutral contracts, codecs, and provisional model tooling only;
+  no backend selected, no qualification evidence, no independent production-soak result, and no
+  admission change
 - **Started:** 2026-07-22
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
@@ -305,7 +307,7 @@ validator. It has no backend, workload generator, result vocabulary, or candidat
 workflow. The next tool commit adds:
 
 - deterministic counter-seeded aggregate, timer/window, and join request generation;
-- Arrow-batch-sized logical multi-read and atomic mutation batches;
+- profile-sized logical multi-read and atomic mutation batches;
 - an in-memory semantic model and digest oracle; and
 - structured deterministic model-replay identity and result output.
 
@@ -318,11 +320,14 @@ work, per-request, and cumulative 64 MiB replay ceilings are normative in the pr
 aggregate and join accounting occurs after logical deduplication so the safety gate does not reject
 a valid compact request merely because its raw input batch was wide.
 
-This checkpoint contains the occurrence-addressed lifecycle cuts, immutable snapshot export, and
-independently checked literal wire/result goldens. C1 is not complete until the remaining boundary
-matrix proves multi-mutation atomic cuts, ordering rejection, scan-byte exact/+1 behavior, every
-restore-budget dimension, and zero-hook invalid/empty operations. Until then, the model is
-scaffolding and cannot support adapter-conformance claims.
+The C1 reference implementation is complete against the provisional v1 contract. It contains
+deterministic aggregate, timer/window, and join generation; bounded preflight; an in-memory
+semantic and lifecycle oracle; occurrence-addressed lifecycle cuts; immutable snapshot export;
+independently checked literal wire/result fixtures; strict deterministic result regeneration; and
+a validation-only CLI. The CLI cannot execute a backend candidate. The profile and protocol remain
+unapproved and `qualification_eligible=false`. C1 selects no backend, supplies no candidate
+performance, resource, fault, endurance, checkpoint, source/sink, admission, or exactly-once
+evidence, and changes neither `[LDB-4007]` nor `[LDB-0013]`.
 
 The provisional C1 semantics, encoding, digest, result, and fault vocabulary are specified in
 [state backend qualification model v1](../architecture-decisions/state-backend-qualification-model-v1.md).
@@ -392,8 +397,10 @@ for a drive-by Docker change in the capability-inventory commit.
 
 Completed Phase 0 slices now include the operator capability inventory, partition ABI v1 and its
 bounded routing-schema identity, source/sink and output-identity contracts, independent-soak
-charter and ineligible validator scaffold, plus aggregate/graph restore audits. None is an
-admission consumer. A reviewed Cycle 3 experiment removed the generic strict IPC helper because
+charter and ineligible validator scaffold, aggregate/graph restore audits, and the provisional C1
+model, generator, literal fixtures, deterministic result regeneration, lifecycle fault cuts, and
+validation-only CLI. None is an admission consumer. A reviewed Cycle 3 experiment removed the
+generic strict IPC helper because
 Arrow 57.2 can allocate from attacker-declared lengths before proving input availability; the
 initial aggregate artifact therefore uses the bounded Laminar row codec and wire contract frozen in
 [managed state artifact format v1](../architecture-decisions/managed-state-artifact-format-v1.md).
@@ -401,23 +408,19 @@ The Cycle 5 readers remain unwired; `[LDB-4007]` remains unchanged.
 
 Remaining commits are kept reviewable in this dependency order:
 
-1. `docs: specify provisional backend-neutral qualification model protocol`
-   - the explicitly ineligible contract can change during engineering review;
-2. `tools: define state backend qualification model`
-   - standalone backend-neutral model, deterministic workload, digest oracle, and validated output;
-3. `tools: define candidate-neutral runner and evidence schema`
+1. `tools: define candidate-neutral runner and evidence schema`
    - pacing, histograms, invalid-run rules, resource formulas, and fault schedules/evidence policy
      land without a runtime dependency;
-4. separate exact-pin Fjall and RocksDB adapter commits behind the private spike contract;
-5. `docs: approve keyed-state qualification profile and runner`
+2. separate exact-pin Fjall and RocksDB adapter commits behind the private spike contract;
+3. `docs: approve keyed-state qualification profile and runner`
    - named workload/operations owners may revise the candidate before approving final thresholds,
      case matrix, Zipf sampler, runner source/build identity, and evidence rules. A separately
      reviewed approved-profile schema/status records signatures and hashes. The current validator
      intentionally accepts only null approvals and `qualification_eligible=false`;
-6. `test: exercise backend crash resource and endurance gates` using only the approved artifacts;
-7. `docs: select managed-state backend from evidence`;
-8. `tools: remove rejected state backend spike`; and
-9. `docs: review distributed keyed state phase zero`.
+4. `test: exercise backend crash resource and endurance gates` using only the approved artifacts;
+5. `docs: select managed-state backend from evidence`;
+6. `tools: remove rejected state backend spike`; and
+7. `docs: review distributed keyed state phase zero`.
 
 Phase 1 tracks the temporary reader-first dead-code allowances as **DKS-P1-001**. Owner:
 distributed-state lifecycle implementation. Deadline: 2026-08-31 or the first trusted,
