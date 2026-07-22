@@ -1,7 +1,9 @@
 # Cluster keyed/stateful operator validation — 2026-07-22
 
-**Branch:** `feature/distributed-keyed-state-adr`  
-**Baseline:** `1e2f8429` (`main`, 2026-07-22)  
+**Branch:** `feature/distributed-keyed-state-adr`
+
+**Baseline:** `1e2f8429` (`main`, 2026-07-22)
+
 **Scope:** admission and lifecycle validation only; no cluster capability is enabled by this work.
 
 ## Verdict
