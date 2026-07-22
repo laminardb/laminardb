@@ -5,9 +5,8 @@ use std::sync::Arc;
 
 use arrow::compute::take;
 use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
-use arrow_row::{RowConverter, SortField};
 
-use crate::state::{key_hash, NodeId, VnodeAssignmentSnapshot};
+use crate::state::{NodeId, PartitionKeyCodecError, PartitionKeyCodecV1, VnodeAssignmentSnapshot};
 
 /// Target decoded size for one routed batch. This is intentionally below the hard receiver bound
 /// so schema/allocator variance does not turn ordinary skew into a transport failure.
@@ -190,60 +189,34 @@ pub fn row_vnodes(
     if vnode_count == 0 {
         return Err(ShuffleRoutingError::EmptyVnodeSpace);
     }
-    let cols: Vec<ArrayRef> = columns
-        .iter()
-        .map(|&index| {
-            let column = batch.columns().get(index).cloned().ok_or(
-                ShuffleRoutingError::KeyColumnOutOfRange {
-                    index,
-                    columns: batch.num_columns(),
-                },
-            )?;
-            if !is_supported_key_type(column.data_type()) {
-                return Err(ShuffleRoutingError::UnsupportedKeyType {
-                    index,
-                    data_type: column.data_type().clone(),
-                });
+    let cols: Vec<ArrayRef> =
+        columns
+            .iter()
+            .map(|&index| {
+                batch.columns().get(index).cloned().ok_or(
+                    ShuffleRoutingError::KeyColumnOutOfRange {
+                        index,
+                        columns: batch.num_columns(),
+                    },
+                )
+            })
+            .collect::<Result<_, _>>()?;
+    let codec = PartitionKeyCodecV1::try_new(cols.iter().map(|column| column.data_type().clone()))
+        .map_err(|error| match error {
+            PartitionKeyCodecError::UnsupportedKeyType { index, data_type } => {
+                ShuffleRoutingError::UnsupportedKeyType {
+                    index: columns[index],
+                    data_type,
+                }
             }
-            Ok(column)
-        })
-        .collect::<Result<_, _>>()?;
-    let fields: Vec<SortField> = cols
-        .iter()
-        .map(|column| SortField::new(column.data_type().clone()))
-        .collect();
-    let converter = RowConverter::new(fields)?;
-    let rows = converter.convert_columns(&cols)?;
-    (0..batch.num_rows())
-        .map(|row| {
-            u32::try_from(key_hash(rows.row(row).as_ref()) % u64::from(vnode_count))
-                .map_err(|_| ShuffleRoutingError::EmptyVnodeSpace)
-        })
-        .collect()
-}
-
-fn is_supported_key_type(data_type: &arrow_schema::DataType) -> bool {
-    match data_type {
-        // Dictionary indices are an encoding detail. Hash the hydrated scalar
-        // value, but apply the same ABI gate recursively to that value type.
-        arrow_schema::DataType::Dictionary(indices, values) => {
-            matches!(
-                indices.as_ref(),
-                arrow_schema::DataType::Int8
-                    | arrow_schema::DataType::Int16
-                    | arrow_schema::DataType::Int32
-                    | arrow_schema::DataType::Int64
-                    | arrow_schema::DataType::UInt8
-                    | arrow_schema::DataType::UInt16
-                    | arrow_schema::DataType::UInt32
-                    | arrow_schema::DataType::UInt64
-            ) && is_supported_key_type(values)
-        }
-        // Run-end encoding is also representation-level, but is excluded until
-        // equivalence with plain arrays is frozen by vectors.
-        arrow_schema::DataType::RunEndEncoded(_, _) => false,
-        data_type => !data_type.is_floating() && !data_type.is_nested(),
-    }
+            PartitionKeyCodecError::Arrow(error) => ShuffleRoutingError::Arrow(error),
+        })?;
+    let rows = codec.encode_columns(&cols)?;
+    let vnode_count =
+        std::num::NonZeroU32::new(vnode_count).ok_or(ShuffleRoutingError::EmptyVnodeSpace)?;
+    Ok((0..batch.num_rows())
+        .map(|row| PartitionKeyCodecV1::vnode_for_encoded(rows.row(row).as_ref(), vnode_count))
+        .collect())
 }
 
 /// Build a complete local/remote plan from one caller-pinned assignment.
@@ -749,19 +722,22 @@ mod tests {
         ];
         assert!(nested
             .iter()
-            .all(|data_type| !is_supported_key_type(data_type)));
-        assert!(!is_supported_key_type(&DataType::Dictionary(
+            .all(|data_type| PartitionKeyCodecV1::try_new([data_type.clone()]).is_err()));
+        assert!(PartitionKeyCodecV1::try_new([DataType::Dictionary(
             Box::new(DataType::Int8),
             Box::new(DataType::Float64),
-        )));
-        assert!(!is_supported_key_type(&DataType::Dictionary(
+        )])
+        .is_err());
+        assert!(PartitionKeyCodecV1::try_new([DataType::Dictionary(
             Box::new(DataType::Int8),
             Box::new(DataType::List(item)),
-        )));
-        assert!(!is_supported_key_type(&DataType::Dictionary(
+        )])
+        .is_err());
+        assert!(PartitionKeyCodecV1::try_new([DataType::Dictionary(
             Box::new(DataType::Float64),
             Box::new(DataType::Utf8),
-        )));
+        )])
+        .is_err());
     }
 
     #[test]
