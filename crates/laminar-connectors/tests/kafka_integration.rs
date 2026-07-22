@@ -128,18 +128,32 @@ async fn expand_topic_and_wait(brokers: &str, topic: &str, partition_count: usiz
         .expect("partition inventory observer creation");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let observed = observer
+        let metadata = observer
             .fetch_metadata(Some(topic), Duration::from_secs(1))
-            .expect("partition inventory metadata query")
+            .expect("partition inventory metadata query");
+        let observed = metadata
             .topics()
             .first()
-            .map_or(0, |metadata| metadata.partitions().len());
+            .map_or(0, |topic| topic.partitions().len());
         if observed == partition_count {
-            return;
+            let mut watermarks_ready = true;
+            for partition in 0..partition_count {
+                let partition = i32::try_from(partition).expect("test partition fits in i32");
+                if observer
+                    .fetch_watermarks(topic, partition, Duration::from_secs(1))
+                    .is_err()
+                {
+                    watermarks_ready = false;
+                    break;
+                }
+            }
+            if watermarks_ready {
+                return;
+            }
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "Kafka metadata did not expose {partition_count} partitions for {topic}"
+            "Kafka did not make all {partition_count} partitions ready for {topic}"
         );
         sleep(Duration::from_millis(50)).await;
     }
