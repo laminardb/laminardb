@@ -13,7 +13,12 @@
   "properties": {
     "schema_version": {"const": "distributed-state-qual/v1"},
     "notice": {"const": "NOT QUALIFICATION EVIDENCE"},
-    "profile_id": {"type": "string", "minLength": 1},
+    "profile_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"
+    },
     "status": {"const": "candidate_unapproved"},
     "qualification_eligible": {"const": false},
     "approvals": {"$ref": "#/$defs/approvals"},

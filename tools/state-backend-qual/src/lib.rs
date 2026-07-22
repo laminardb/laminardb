@@ -687,6 +687,15 @@ mod tests {
     }
 
     #[test]
+    fn rejects_non_slug_profile_identifiers() {
+        let too_long = "a".repeat(65);
+        for identifier in ["line\nbreak", "UPPERCASE", too_long.as_str()] {
+            let bytes = mutated(|profile| profile["profile_id"] = identifier.into());
+            assert!(validate_profile(&bytes).is_err(), "{identifier:?}");
+        }
+    }
+
+    #[test]
     fn rejects_zero_negative_fraction_overflow_and_placeholder() {
         let bytes = mutated(|profile| profile["workload"]["target_batch_bytes"] = 0.into());
         assert!(validate_profile(&bytes).is_err());

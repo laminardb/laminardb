@@ -288,6 +288,23 @@ mod tests {
     const AGGREGATE_RESULT_FIXTURE: &[u8] =
         include_bytes!("../tests/fixtures/model-result-aggregate-v1.json");
 
+    struct FrozenReplayExpectation {
+        name: &'static str,
+        scenario: Scenario,
+        seed: u64,
+        request_count: u32,
+        join_match_count: Option<u32>,
+        counters: ResultCounters,
+        digests: FrozenDigests,
+    }
+
+    struct FrozenDigests {
+        requests_sha256: &'static str,
+        observations_sha256: &'static str,
+        trace_sha256: &'static str,
+        live_state_sha256: &'static str,
+    }
+
     fn case() -> ModelCase {
         ModelCase {
             scenario: Scenario::Aggregate,
@@ -376,57 +393,175 @@ mod tests {
     }
 
     #[test]
-    fn two_request_timer_mutation_and_join_results_match_frozen_digests() {
+    fn timer_modes_and_join_results_match_frozen_replay_expectations() {
         let cases = [
-            (
-                Scenario::TimerWindow,
-                None,
-                256,
-                0,
-                512,
-                "c1f496c244dacb77f82ebe9ee0a563c5fdb5161bf71f04102049508a894c53d1",
-                "aab4890b53a30d1edbd6dc91bef3194d5f4dc12405aebee052041f45e495ab29",
-                "40f6fd151c80353e48a8df710d714e8ef3fa0046d9871350e93ef4bd21502ea5",
-                "f1d924bbd423716d02245fac93695354960a7703b1b22644ddb9052613aa4cca",
-            ),
-            (
-                Scenario::Join,
-                Some(8),
-                0,
-                256,
-                256,
-                "5f7f4e4181b0f679ca5d3501ec0f3a1382a8e104e043933d83cc49dda063d888",
-                "7e99bee3a9c4424048b220eefc1ddff3f4b98d5c4638a8e30b1a443cd3d16314",
-                "233bd2fd8387606d4c16123b268b8132bc6c5e07044a162cad410d6c93a32108",
-                "4ce0bf71dc178c3b489f6b6cff8c8fe6e0fb1755a485fbff97589c4b6a7d39df",
-            ),
+            FrozenReplayExpectation {
+                name: "timer mutation: two requests",
+                scenario: Scenario::TimerWindow,
+                seed: 2_026_072_201,
+                request_count: 2,
+                join_match_count: None,
+                counters: ResultCounters {
+                    requests: 2,
+                    logical_input_rows: 256,
+                    point_reads: 256,
+                    range_reads: 0,
+                    puts: 512,
+                    deletes: 0,
+                    returned_point_values: 0,
+                    returned_point_bytes: 4_096,
+                    returned_range_rows: 0,
+                    returned_range_bytes: 0,
+                },
+                digests: FrozenDigests {
+                    requests_sha256:
+                        "c1f496c244dacb77f82ebe9ee0a563c5fdb5161bf71f04102049508a894c53d1",
+                    observations_sha256:
+                        "aab4890b53a30d1edbd6dc91bef3194d5f4dc12405aebee052041f45e495ab29",
+                    trace_sha256:
+                        "40f6fd151c80353e48a8df710d714e8ef3fa0046d9871350e93ef4bd21502ea5",
+                    live_state_sha256:
+                        "f1d924bbd423716d02245fac93695354960a7703b1b22644ddb9052613aa4cca",
+                },
+            },
+            FrozenReplayExpectation {
+                name: "timer due scan: shortest approved-seed prefix (scan at ordinal 2)",
+                scenario: Scenario::TimerWindow,
+                seed: 2_026_072_205,
+                request_count: 3,
+                join_match_count: None,
+                counters: ResultCounters {
+                    requests: 3,
+                    logical_input_rows: 384,
+                    point_reads: 256,
+                    range_reads: 1,
+                    puts: 512,
+                    deletes: 0,
+                    returned_point_values: 0,
+                    returned_point_bytes: 4_096,
+                    returned_range_rows: 0,
+                    returned_range_bytes: 0,
+                },
+                digests: FrozenDigests {
+                    requests_sha256:
+                        "a9136620e27e0591dc8cf6b7c39e0f93226781db7305466c2f8ab4e7be34a51b",
+                    observations_sha256:
+                        "5da3e51c1798a723eb272dd6fceaf1ed6009bfe3be8a39b0dc3124d6d2c9cee5",
+                    trace_sha256:
+                        "68ca0c4a4e5e07b7e1320c0d1752aa568228a4e9c6c0b5fdbd2e36737c46e5fb",
+                    live_state_sha256:
+                        "95627bf4b983bcca189d17413d06eb6ae95b9f861600cf2e73d13dffdab1c88c",
+                },
+            },
+            FrozenReplayExpectation {
+                name: "timer atomic fire/delete: one request",
+                scenario: Scenario::TimerWindow,
+                seed: 2_026_072_202,
+                request_count: 1,
+                join_match_count: None,
+                counters: ResultCounters {
+                    requests: 1,
+                    logical_input_rows: 128,
+                    point_reads: 256,
+                    range_reads: 0,
+                    puts: 128,
+                    deletes: 128,
+                    returned_point_values: 0,
+                    returned_point_bytes: 4_096,
+                    returned_range_rows: 0,
+                    returned_range_bytes: 0,
+                },
+                digests: FrozenDigests {
+                    requests_sha256:
+                        "2da940a81cca824b7e6322f2282f553b48bf3c3382389ccfd52330751a171e99",
+                    observations_sha256:
+                        "e4a45f79d8e9818b06caedbe694a93ac6a7fcbc2808ae38ede7f8369c22af79d",
+                    trace_sha256:
+                        "37f580a163932a84c188d2a7d95f2a073b10f96b64b8e51cbc8d65af88021813",
+                    live_state_sha256:
+                        "bae8f74617719bf89aea1945b4074b2fd2b9170655bb6291cbaecbd240b27740",
+                },
+            },
+            FrozenReplayExpectation {
+                name: "join: two requests with match-count limit eight",
+                scenario: Scenario::Join,
+                seed: 2_026_072_201,
+                request_count: 2,
+                join_match_count: Some(8),
+                counters: ResultCounters {
+                    requests: 2,
+                    logical_input_rows: 256,
+                    point_reads: 0,
+                    range_reads: 256,
+                    puts: 256,
+                    deletes: 0,
+                    returned_point_values: 0,
+                    returned_point_bytes: 0,
+                    returned_range_rows: 0,
+                    returned_range_bytes: 0,
+                },
+                digests: FrozenDigests {
+                    requests_sha256:
+                        "5f7f4e4181b0f679ca5d3501ec0f3a1382a8e104e043933d83cc49dda063d888",
+                    observations_sha256:
+                        "7e99bee3a9c4424048b220eefc1ddff3f4b98d5c4638a8e30b1a443cd3d16314",
+                    trace_sha256:
+                        "233bd2fd8387606d4c16123b268b8132bc6c5e07044a162cad410d6c93a32108",
+                    live_state_sha256:
+                        "4ce0bf71dc178c3b489f6b6cff8c8fe6e0fb1755a485fbff97589c4b6a7d39df",
+                },
+            },
         ];
-        for (
-            scenario,
-            join_match_count,
-            point_reads,
-            range_reads,
-            puts,
-            requests_sha256,
-            observations_sha256,
-            trace_sha256,
-            live_state_sha256,
-        ) in cases
-        {
+
+        for expected in cases {
             let mut selected = case();
-            selected.scenario = scenario;
+            selected.scenario = expected.scenario;
+            selected.seed = expected.seed;
+            selected.request_count = expected.request_count;
             selected.key_bytes = 16;
-            selected.join_match_count = join_match_count;
+            selected.join_match_count = expected.join_match_count;
             let result = generate_model_result(PROFILE, &selected).unwrap();
-            assert_eq!(result.counters.point_reads, point_reads);
-            assert_eq!(result.counters.range_reads, range_reads);
-            assert_eq!(result.counters.puts, puts);
-            assert_eq!(result.digests.requests_sha256, requests_sha256);
-            assert_eq!(result.digests.observations_sha256, observations_sha256);
-            assert_eq!(result.digests.trace_sha256, trace_sha256);
-            assert_eq!(result.digests.live_state_sha256, live_state_sha256);
+            assert_eq!(result.counters, expected.counters, "{}", expected.name);
+            assert_eq!(
+                result.digests.requests_sha256, expected.digests.requests_sha256,
+                "{}",
+                expected.name
+            );
+            assert_eq!(
+                result.digests.observations_sha256, expected.digests.observations_sha256,
+                "{}",
+                expected.name
+            );
+            assert_eq!(
+                result.digests.trace_sha256, expected.digests.trace_sha256,
+                "{}",
+                expected.name
+            );
+            assert_eq!(
+                result.digests.live_state_sha256, expected.digests.live_state_sha256,
+                "{}",
+                expected.name
+            );
             let bytes = serialize_model_result(&result).unwrap();
-            assert!(validate_model_result(PROFILE, &bytes).is_ok());
+            assert!(
+                validate_model_result(PROFILE, &bytes).is_ok(),
+                "{}",
+                expected.name
+            );
         }
+    }
+
+    #[test]
+    fn maximum_request_count_replay_stays_within_the_bounded_model_path() {
+        let mut selected = case();
+        selected.request_count = crate::workload::MAX_REQUEST_COUNT;
+        selected.key_bytes = 16;
+        selected.value_bytes = 64;
+        let result = generate_model_result(PROFILE, &selected).unwrap();
+        assert_eq!(result.counters.requests, u64::from(selected.request_count));
+        assert_eq!(
+            result.counters.logical_input_rows,
+            u64::from(selected.request_count) * u64::from(selected.batch_rows)
+        );
     }
 }

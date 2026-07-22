@@ -518,7 +518,7 @@ impl Counter<'_> {
         hasher.update(COUNTER_DOMAIN);
         hasher.update(self.profile.model_input_sha256);
         hasher.update(self.case.seed.to_be_bytes());
-        hasher.update([scenario_tag(self.case.scenario)]);
+        hasher.update([self.case.scenario.tag()]);
         hasher.update(self.request_ordinal.to_be_bytes());
         hasher.update(row_ordinal.to_be_bytes());
         hasher.update(lane.to_be_bytes());
@@ -980,7 +980,7 @@ fn generate_aggregate(
         point_reads.push(key.clone());
         mutations.push(Mutation::Put {
             key,
-            value: expanded_value(counter, table_tag(Table::AggregateState), lowest_row)?,
+            value: expanded_value(counter, Table::AggregateState.tag(), lowest_row)?,
         });
     }
 
@@ -1082,11 +1082,11 @@ fn generate_timer_mutation(
         point_reads.push(window_key.clone());
         mutations.push(Mutation::Put {
             key: window_key,
-            value: expanded_value(counter, table_tag(Table::WindowState), row)?,
+            value: expanded_value(counter, Table::WindowState.tag(), row)?,
         });
         mutations.push(Mutation::Put {
             key: timer_key,
-            value: expanded_value(counter, table_tag(Table::TimerIndex), row)?,
+            value: expanded_value(counter, Table::TimerIndex.tag(), row)?,
         });
     }
 
@@ -1168,7 +1168,7 @@ fn generate_timer_fire_delete(
         point_reads.push(timer_key.clone());
         mutations.push(Mutation::Put {
             key: window_key,
-            value: expanded_value(counter, table_tag(Table::WindowState), row)?,
+            value: expanded_value(counter, Table::WindowState.tag(), row)?,
         });
         mutations.push(Mutation::Delete { key: timer_key });
     }
@@ -1239,7 +1239,7 @@ fn generate_join(
         )?;
         mutations.push(Mutation::Put {
             key,
-            value: expanded_value(counter, table_tag(arriving_table), row)?,
+            value: expanded_value(counter, arriving_table.tag(), row)?,
         });
     }
 
@@ -1293,10 +1293,10 @@ fn finish_batch(
     point_reads.dedup_by(|left, right| logical_key_cmp(left, right).is_eq());
     ranges.sort_by(range_cmp);
     ranges.dedup_by(|left, right| range_cmp(left, right).is_eq());
-    mutations.sort_by(|left, right| logical_key_cmp(mutation_key(left), mutation_key(right)));
+    mutations.sort_by(|left, right| logical_key_cmp(left.key(), right.key()));
     if mutations
         .windows(2)
-        .any(|pair| logical_key_cmp(mutation_key(&pair[0]), mutation_key(&pair[1])).is_eq())
+        .any(|pair| logical_key_cmp(pair[0].key(), pair[1].key()).is_eq())
     {
         return Err(CheckErrors::one(
             "generated request contains duplicate mutation keys",
@@ -1371,7 +1371,7 @@ fn aggregate_or_window_key(
     let key = entity_key(
         profile,
         case,
-        table_tag(table),
+        table.tag(),
         vnode,
         &[identity],
         identity.to_be_bytes().to_vec(),
@@ -1392,7 +1392,7 @@ fn timer_key(
     let key = entity_key(
         profile,
         case,
-        table_tag(Table::TimerIndex),
+        Table::TimerIndex.tag(),
         vnode,
         &[logical_time, stable_row],
         base,
@@ -1420,7 +1420,7 @@ fn join_key(
     let key = entity_key(
         profile,
         case,
-        table_tag(table),
+        table.tag(),
         vnode,
         &[identity, u64::from(event_time), stable_row],
         base,
@@ -1496,15 +1496,9 @@ fn vnode_from_word(word: u64, profile: &ModelProfile) -> Result<u32, CheckErrors
         .map_err(|_| CheckErrors::one("vnode remainder does not fit u32"))
 }
 
-fn mutation_key(mutation: &Mutation) -> &LogicalKey {
-    match mutation {
-        Mutation::Put { key, .. } | Mutation::Delete { key } => key,
-    }
-}
-
 fn mutation_charge(mutations: &[Mutation]) -> Result<u64, CheckErrors> {
     mutations.iter().try_fold(0_u64, |total, mutation| {
-        let key_bytes = u64::try_from(mutation_key(mutation).key.len())
+        let key_bytes = u64::try_from(mutation.key().key.len())
             .map_err(|_| CheckErrors::one("mutation key length exceeds u64"))?;
         let charge = match mutation {
             Mutation::Put { value, .. } => key_bytes
@@ -1527,28 +1521,22 @@ fn encoded_request_len(request: &LogicalBatch) -> Result<u64, CheckErrors> {
 }
 
 fn logical_key_cmp(left: &LogicalKey, right: &LogicalKey) -> std::cmp::Ordering {
-    table_tag(left.table)
-        .cmp(&table_tag(right.table))
+    left.table
+        .tag()
+        .cmp(&right.table.tag())
         .then_with(|| left.vnode.cmp(&right.vnode))
         .then_with(|| left.key.cmp(&right.key))
 }
 
 fn range_cmp(left: &RangeRead, right: &RangeRead) -> std::cmp::Ordering {
-    table_tag(left.table)
-        .cmp(&table_tag(right.table))
+    left.table
+        .tag()
+        .cmp(&right.table.tag())
         .then_with(|| left.vnode.cmp(&right.vnode))
         .then_with(|| left.start_inclusive.cmp(&right.start_inclusive))
         .then_with(|| left.end_exclusive.cmp(&right.end_exclusive))
         .then_with(|| left.max_rows.cmp(&right.max_rows))
         .then_with(|| left.max_bytes.cmp(&right.max_bytes))
-}
-
-const fn table_tag(table: Table) -> u8 {
-    table.tag()
-}
-
-const fn scenario_tag(scenario: Scenario) -> u8 {
-    scenario.tag()
 }
 
 fn checked_add(left: u64, right: u64, label: &str) -> Result<u64, CheckErrors> {
@@ -1725,8 +1713,8 @@ mod tests {
             .windows(2)
             .all(|pair| logical_key_cmp(&pair[0], &pair[1]).is_lt()));
         assert!(direct.mutations.windows(2).all(|pair| logical_key_cmp(
-            mutation_key(&pair[0]),
-            mutation_key(&pair[1])
+            pair[0].key(),
+            pair[1].key()
         )
         .is_lt()));
     }
@@ -1802,7 +1790,7 @@ mod tests {
         let mut saw_right = false;
         for ordinal in 0..u64::from(case.request_count) {
             let request = profile.generate_request(&case, ordinal).unwrap();
-            let mutation_table = mutation_key(&request.mutations[0]).table;
+            let mutation_table = request.mutations[0].key().table;
             saw_left |= mutation_table == Table::JoinLeftRows;
             saw_right |= mutation_table == Table::JoinRightRows;
             let expected_scan_table = if mutation_table == Table::JoinLeftRows {
@@ -1938,28 +1926,115 @@ mod tests {
     }
 
     #[test]
-    fn replay_and_model_safety_bounds_accept_exact_and_reject_max_plus_one() {
+    fn model_batch_rows_safety_max_accepts_exact_and_rejects_plus_one() {
         assert!(validate_model_profile_bounds(
             &[MAX_MODEL_BATCH_ROWS],
+            8 * 1024 * 1024,
+            32,
+            &[256],
+            208,
+            &[1_024],
+        )
+        .is_ok());
+        let error = validate_model_profile_bounds(
+            &[MAX_MODEL_BATCH_ROWS + 1],
+            8 * 1024 * 1024,
+            32,
+            &[256],
+            208,
+            &[1_024],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("batch_rows"));
+    }
+
+    #[test]
+    fn model_hard_batch_safety_max_accepts_exact_and_rejects_plus_one() {
+        assert!(validate_model_profile_bounds(
+            &[128],
             MAX_MODEL_HARD_BATCH_BYTES,
+            32,
+            &[256],
+            208,
+            &[1_024],
+        )
+        .is_ok());
+        let error = validate_model_profile_bounds(
+            &[128],
+            MAX_MODEL_HARD_BATCH_BYTES + 1,
+            32,
+            &[256],
+            208,
+            &[1_024],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("hard_batch_bytes"));
+    }
+
+    #[test]
+    fn model_key_width_safety_max_accepts_exact_and_rejects_plus_one() {
+        assert!(validate_model_profile_bounds(
+            &[128],
+            8 * 1024 * 1024,
             MAX_MODEL_KEY_BYTES,
             &[MAX_MODEL_KEY_BYTES],
+            208,
+            &[1_024],
+        )
+        .is_ok());
+
+        for (compact, variable) in [
+            (MAX_MODEL_KEY_BYTES + 1, Vec::new()),
+            (32, vec![MAX_MODEL_KEY_BYTES + 1]),
+        ] {
+            let error = validate_model_profile_bounds(
+                &[128],
+                8 * 1024 * 1024,
+                compact,
+                &variable,
+                208,
+                &[1_024],
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("key width"));
+        }
+    }
+
+    #[test]
+    fn model_value_width_safety_max_accepts_exact_and_rejects_plus_one() {
+        assert!(validate_model_profile_bounds(
+            &[128],
+            8 * 1024 * 1024,
+            32,
+            &[256],
             MAX_MODEL_VALUE_BYTES,
             &[MAX_MODEL_VALUE_BYTES],
         )
         .is_ok());
-        assert!(validate_model_profile_bounds(
-            &[MAX_MODEL_BATCH_ROWS + 1],
-            MAX_MODEL_HARD_BATCH_BYTES + 1,
-            MAX_MODEL_KEY_BYTES + 1,
-            &[],
-            MAX_MODEL_VALUE_BYTES + 1,
-            &[],
-        )
-        .unwrap_err()
-        .to_string()
-        .contains("batch_rows"));
 
+        for (compact, variable) in [
+            (MAX_MODEL_VALUE_BYTES + 1, Vec::new()),
+            (208, vec![MAX_MODEL_VALUE_BYTES + 1]),
+        ] {
+            let error = validate_model_profile_bounds(
+                &[128],
+                8 * 1024 * 1024,
+                32,
+                &[256],
+                compact,
+                &variable,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("value width"));
+        }
+    }
+
+    #[test]
+    fn replay_work_and_accounting_bounds_accept_exact_and_reject_plus_one() {
         let mut work = aggregate_case();
         work.batch_rows = 8_192;
         work.request_count = 512;
@@ -2069,6 +2144,181 @@ mod tests {
         assert!(model_encoded_request_len(&request).unwrap() <= profile.hard_batch_bytes);
         assert!(request.limits.read_bytes_max_u64 <= profile.hard_batch_bytes);
         assert!(mutation_charge(&request.mutations).unwrap() <= profile.hard_batch_bytes);
+    }
+
+    #[test]
+    fn aggregate_dedup_uses_the_lowest_input_row_value() {
+        let mut profile = profile();
+        profile.hot_distribution = HotDistribution {
+            one_key: 1_000,
+            nine_keys: 0,
+            uniform_remainder: 0,
+        };
+        profile.single_vnode_distinct_keys_permille = 1_000;
+        let mut case = aggregate_case();
+        case.request_count = 1;
+        let request = profile.generate_request(&case, 0).unwrap();
+        assert_eq!(request.point_reads.len(), 1);
+        assert_eq!(request.mutations.len(), 1);
+
+        let counter = Counter {
+            profile: &profile,
+            case: &case,
+            request_ordinal: 0,
+        };
+        let Mutation::Put { value, .. } = &request.mutations[0] else {
+            panic!("aggregate request must contain a put")
+        };
+        assert_eq!(
+            value,
+            &expanded_value(&counter, Table::AggregateState.tag(), 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn timer_fire_observes_and_atomically_replaces_the_prior_mutation_cut() {
+        let profile = profile();
+        let mut case = aggregate_case();
+        case.scenario = Scenario::TimerWindow;
+        case.key_bytes = 16;
+        case.request_count = 256;
+        let fire_ordinal = (1..u64::from(case.request_count))
+            .find(|ordinal| {
+                let prior = Counter {
+                    profile: &profile,
+                    case: &case,
+                    request_ordinal: ordinal - 1,
+                };
+                let current = Counter {
+                    profile: &profile,
+                    case: &case,
+                    request_ordinal: *ordinal,
+                };
+                timer_request_kind(&profile, &prior).unwrap() == TimerRequestKind::Mutation
+                    && timer_request_kind(&profile, &current).unwrap()
+                        == TimerRequestKind::FireDelete
+            })
+            .expect("fixed timer replay must contain mutation followed by fire/delete");
+        let mutation = profile.generate_request(&case, fire_ordinal - 1).unwrap();
+        let fire = profile.generate_request(&case, fire_ordinal).unwrap();
+
+        let mut model = crate::model::ReferenceModel::new(
+            profile.primary_vnode_count,
+            profile.encoded_key_bytes_max,
+            profile.stored_state_bytes_max,
+        )
+        .unwrap();
+        model.execute(&mutation).unwrap();
+        let pre_fire = model.live_records().clone();
+        let observation = model.execute(&fire).unwrap();
+        assert_eq!(
+            observation.point_results.len(),
+            usize_from_u32(case.batch_rows).unwrap() * 2
+        );
+        assert!(observation
+            .point_results
+            .iter()
+            .all(|result| result.value.is_some()));
+        for result in &observation.point_results {
+            assert_eq!(result.value.as_ref(), pre_fire.get(&result.key));
+        }
+
+        let mut replaced_window_value = false;
+        for mutation in &fire.mutations {
+            match mutation {
+                Mutation::Put { key, value } => {
+                    assert_eq!(key.table, Table::WindowState);
+                    assert_eq!(model.live_records().get(key), Some(value));
+                    replaced_window_value |= pre_fire.get(key) != Some(value);
+                }
+                Mutation::Delete { key } => {
+                    assert_eq!(key.table, Table::TimerIndex);
+                    assert!(!model.live_records().contains_key(key));
+                }
+            }
+        }
+        assert!(replaced_window_value);
+    }
+
+    #[test]
+    fn timer_due_scan_returns_prior_timers_and_excludes_its_end_boundary() {
+        let mut mutation_profile = profile();
+        mutation_profile.primary_vnode_count = 1;
+        mutation_profile.timer_mix = TimerMix {
+            state_or_timer_mutation: 1_000,
+            bounded_due_scan: 0,
+            atomic_fire_delete: 0,
+        };
+        let mut case = aggregate_case();
+        case.scenario = Scenario::TimerWindow;
+        case.key_bytes = 16;
+        case.request_count = 1_026;
+        let mutation = mutation_profile.generate_request(&case, 0).unwrap();
+
+        let mut scan_profile = mutation_profile.clone();
+        scan_profile.timer_mix = TimerMix {
+            state_or_timer_mutation: 0,
+            bounded_due_scan: 1_000,
+            atomic_fire_delete: 0,
+        };
+        let scan = scan_profile.generate_request(&case, 1_025).unwrap();
+        assert_eq!(scan.ranges.len(), 1);
+        let range = &scan.ranges[0];
+        assert_eq!(range.table, Table::TimerIndex);
+        assert_eq!(range.vnode, 0);
+
+        let expected_keys = mutation
+            .mutations
+            .iter()
+            .filter(|mutation| mutation.key().table == Table::TimerIndex)
+            .map(|mutation| mutation.key().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expected_keys.len(),
+            usize_from_u32(case.batch_rows).unwrap()
+        );
+
+        let future = timer_key(&scan_profile, &case, 0, 1_026, 0).unwrap();
+        assert_eq!(future.key, range.end_exclusive);
+        let mut model = crate::model::ReferenceModel::new(
+            scan_profile.primary_vnode_count,
+            scan_profile.encoded_key_bytes_max,
+            scan_profile.stored_state_bytes_max,
+        )
+        .unwrap();
+        model.execute(&mutation).unwrap();
+        model
+            .execute(&LogicalBatch {
+                kind: BatchKind::Setup,
+                scenario: Scenario::TimerWindow,
+                ordinal: 1_025,
+                logical_rows: 0,
+                limits: BatchLimits {
+                    request_bytes_max_u64: scan_profile.hard_batch_bytes,
+                    read_rows_max_u64: 0,
+                    read_bytes_max_u64: 0,
+                    mutation_bytes_max_u64: u64::from(case.key_bytes + case.value_bytes),
+                },
+                point_reads: Vec::new(),
+                ranges: Vec::new(),
+                mutations: vec![Mutation::Put {
+                    key: future,
+                    value: vec![0xee; usize_from_u32(case.value_bytes).unwrap()],
+                }],
+            })
+            .unwrap();
+
+        let observation = model.execute(&scan).unwrap();
+        let result = &observation.range_results[0];
+        assert_eq!(
+            result
+                .rows
+                .iter()
+                .map(|row| row.key.clone())
+                .collect::<Vec<_>>(),
+            expected_keys
+        );
+        assert!(!result.has_more);
     }
 
     #[test]

@@ -62,7 +62,12 @@
       "additionalProperties": false,
       "required": ["id", "sha256", "model_input_sha256"],
       "properties": {
-        "id": {"type": "string", "minLength": 1},
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"
+        },
         "sha256": {"$ref": "#/$defs/digest"},
         "model_input_sha256": {"$ref": "#/$defs/digest"}
       }

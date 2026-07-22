@@ -405,20 +405,18 @@ impl ReferenceModel {
     ) -> Result<Observation, ModelError> {
         self.validate_batch(batch)?;
         let observation = self.observe(batch)?;
-        let mut next_live = self.live.clone();
+        faults.visit(FaultPhase::BatchBeforeCommit)?;
+        // The single-threaded oracle exposes no observation or fallible hook inside this install.
         for mutation in &batch.mutations {
             match mutation {
                 Mutation::Put { key, value } => {
-                    next_live.insert(key.clone(), value.clone());
+                    self.live.insert(key.clone(), value.clone());
                 }
                 Mutation::Delete { key } => {
-                    next_live.remove(key);
+                    self.live.remove(key);
                 }
             }
         }
-
-        faults.visit(FaultPhase::BatchBeforeCommit)?;
-        self.live = next_live;
         faults.visit(FaultPhase::BatchAfterCommitBeforeAck)?;
         Ok(observation)
     }
@@ -1045,6 +1043,33 @@ mod tests {
     }
 
     #[test]
+    fn fault_phase_names_match_the_v1_wire_vocabulary() {
+        let phases = [
+            FaultPhase::BatchBeforeCommit,
+            FaultPhase::BatchAfterCommitBeforeAck,
+            FaultPhase::PersistBefore,
+            FaultPhase::PersistAfterSuccessBeforeAck,
+            FaultPhase::SnapshotOpen,
+            FaultPhase::ExportRecord,
+            FaultPhase::RestoreRecord,
+            FaultPhase::CleanupRecord,
+        ];
+        assert_eq!(
+            serde_json::to_value(phases).unwrap(),
+            serde_json::json!([
+                "batch_before_commit",
+                "batch_after_commit_before_ack",
+                "persist_before",
+                "persist_after_success_before_ack",
+                "snapshot_open",
+                "export_record",
+                "restore_record",
+                "cleanup_record"
+            ])
+        );
+    }
+
+    #[test]
     fn empty_key_and_value_are_distinct_from_missing() {
         let mut model = ReferenceModel::new(4, 64, 64).unwrap();
         let empty = key(Table::AggregateState, 0, b"");
@@ -1063,43 +1088,65 @@ mod tests {
 
     #[test]
     fn batch_fault_ordinals_produce_only_complete_pre_or_post_cuts() {
-        let mut model = ReferenceModel::new(4, 64, 64).unwrap();
-        let first = key(Table::AggregateState, 0, b"a");
-        let second = key(Table::AggregateState, 0, b"b");
-        let first_write = batch(vec![Mutation::Put {
-            key: first.clone(),
-            value: b"first".to_vec(),
-        }]);
-        let second_write = batch(vec![Mutation::Put {
-            key: second.clone(),
-            value: b"second".to_vec(),
-        }]);
+        let deleted = key(Table::AggregateState, 0, b"a");
+        let first_put = key(Table::AggregateState, 0, b"b");
+        let second_put = key(Table::AggregateState, 0, b"c");
+        let retained = key(Table::AggregateState, 0, b"d");
+        let mut baseline = ReferenceModel::new(4, 64, 64).unwrap();
+        baseline
+            .execute(&batch(vec![
+                Mutation::Put {
+                    key: deleted.clone(),
+                    value: b"old".to_vec(),
+                },
+                Mutation::Put {
+                    key: retained,
+                    value: b"keep".to_vec(),
+                },
+            ]))
+            .unwrap();
+        let change = batch(vec![
+            Mutation::Delete {
+                key: deleted.clone(),
+            },
+            Mutation::Put {
+                key: first_put,
+                value: b"first".to_vec(),
+            },
+            Mutation::Put {
+                key: second_put,
+                value: b"second".to_vec(),
+            },
+        ]);
+        let pre_records = baseline.live_records().clone();
+        let pre_digest = baseline.live_digest().unwrap();
+        let mut expected_post = baseline.clone();
+        expected_post.execute(&change).unwrap();
+        let post_records = expected_post.live_records().clone();
+        let post_digest = expected_post.live_digest().unwrap();
 
-        let mut before = fault(FaultPhase::BatchBeforeCommit, 1);
-        model.execute_with_fault(&first_write, &mut before).unwrap();
-        let pre = model.live_digest().unwrap();
+        let mut model = baseline.clone();
+        let mut before = fault(FaultPhase::BatchBeforeCommit, 0);
         assert_eq!(
-            model.execute_with_fault(&second_write, &mut before),
-            Err(injected(FaultPhase::BatchBeforeCommit, 1))
+            model.execute_with_fault(&change, &mut before),
+            Err(injected(FaultPhase::BatchBeforeCommit, 0))
         );
-        assert_eq!(model.live_digest().unwrap(), pre);
-        assert!(model.live_records().contains_key(&first));
-        assert!(!model.live_records().contains_key(&second));
+        assert_eq!(model.live_digest().unwrap(), pre_digest);
+        assert_eq!(model.live_records(), &pre_records);
         assert!(before.fired());
-        assert_eq!(before.visits(FaultPhase::BatchBeforeCommit), 2);
+        assert_eq!(before.visits(FaultPhase::BatchBeforeCommit), 1);
         assert_eq!(before.verify_reached(), Ok(()));
 
-        let mut model = ReferenceModel::new(4, 64, 64).unwrap();
-        let mut after = fault(FaultPhase::BatchAfterCommitBeforeAck, 1);
-        model.execute_with_fault(&first_write, &mut after).unwrap();
+        let mut model = baseline;
+        let mut after = fault(FaultPhase::BatchAfterCommitBeforeAck, 0);
         assert_eq!(
-            model.execute_with_fault(&second_write, &mut after),
-            Err(ambiguous(FaultPhase::BatchAfterCommitBeforeAck, 1))
+            model.execute_with_fault(&change, &mut after),
+            Err(ambiguous(FaultPhase::BatchAfterCommitBeforeAck, 0))
         );
-        assert_eq!(model.live_records().get(&first), Some(&b"first".to_vec()));
-        assert_eq!(model.live_records().get(&second), Some(&b"second".to_vec()));
+        assert_eq!(model.live_digest().unwrap(), post_digest);
+        assert_eq!(model.live_records(), &post_records);
         assert!(after.fired());
-        assert_eq!(after.visits(FaultPhase::BatchAfterCommitBeforeAck), 2);
+        assert_eq!(after.visits(FaultPhase::BatchAfterCommitBeforeAck), 1);
         assert_eq!(after.verify_reached(), Ok(()));
     }
 
@@ -1151,11 +1198,18 @@ mod tests {
             max_rows: 1,
             max_bytes: 8,
         }];
+        let mut faults = fault(FaultPhase::BatchBeforeCommit, 0);
         assert_eq!(
-            model.execute(&scan),
+            model.execute_with_fault(&scan, &mut faults),
             Err(ModelError::RowTooLarge { required_bytes: 9 })
         );
         assert_eq!(model.live_digest().unwrap(), pre);
+        assert_eq!(faults.visits(FaultPhase::BatchBeforeCommit), 0);
+        assert_eq!(faults.visits(FaultPhase::BatchAfterCommitBeforeAck), 0);
+        assert_eq!(
+            faults.verify_reached(),
+            Err(not_reached(FaultPhase::BatchBeforeCommit, 0, 0))
+        );
     }
 
     #[test]
@@ -1174,8 +1228,15 @@ mod tests {
             },
         ]);
         let pre = model.live_digest().unwrap();
-        assert!(model.execute(&request).is_err());
+        let mut faults = fault(FaultPhase::BatchBeforeCommit, 0);
+        assert!(model.execute_with_fault(&request, &mut faults).is_err());
         assert_eq!(model.live_digest().unwrap(), pre);
+        assert_eq!(faults.visits(FaultPhase::BatchBeforeCommit), 0);
+        assert_eq!(faults.visits(FaultPhase::BatchAfterCommitBeforeAck), 0);
+        assert_eq!(
+            faults.verify_reached(),
+            Err(not_reached(FaultPhase::BatchBeforeCommit, 0, 0))
+        );
     }
 
     #[test]
@@ -1274,7 +1335,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_open_fault_precedes_publishing_the_immutable_cut() {
+    fn snapshot_retry_captures_mutation_made_after_failed_open() {
         let first = key(Table::WindowState, 0, b"a");
         let second = key(Table::WindowState, 0, b"b");
         let mut model = ReferenceModel::new(4, 64, 64).unwrap();
@@ -1285,40 +1346,24 @@ mod tests {
             }]))
             .unwrap();
 
-        let mut faults = fault(FaultPhase::SnapshotOpen, 1);
-        let first_cut = model.snapshot_with_fault(&mut faults).unwrap();
+        let mut faults = fault(FaultPhase::SnapshotOpen, 0);
         assert_eq!(
-            faults.target(),
-            Some(FaultOrdinal {
-                phase: FaultPhase::SnapshotOpen,
-                occurrence: 1,
-            })
+            model.snapshot_with_fault(&mut faults),
+            Err(injected(FaultPhase::SnapshotOpen, 0))
         );
-        assert!(!faults.fired());
+        assert!(faults.fired());
         assert_eq!(faults.visits(FaultPhase::SnapshotOpen), 1);
         assert_eq!(faults.visits(FaultPhase::ExportRecord), 0);
-        assert_eq!(
-            faults.verify_reached(),
-            Err(not_reached(FaultPhase::SnapshotOpen, 1, 1))
-        );
+        assert_eq!(faults.verify_reached(), Ok(()));
+
         model
             .execute(&batch(vec![Mutation::Put {
                 key: second.clone(),
                 value: vec![2],
             }]))
             .unwrap();
-        assert_eq!(
-            model.snapshot_with_fault(&mut faults),
-            Err(injected(FaultPhase::SnapshotOpen, 1))
-        );
-        assert!(faults.fired());
-        assert_eq!(faults.visits(FaultPhase::SnapshotOpen), 2);
-        assert_eq!(faults.verify_reached(), Ok(()));
-        assert!(first_cut.records().contains_key(&first));
-        assert!(!first_cut.records().contains_key(&second));
-
         let retry_cut = model.snapshot_with_fault(&mut faults).unwrap();
-        assert_eq!(faults.visits(FaultPhase::SnapshotOpen), 3);
+        assert_eq!(faults.visits(FaultPhase::SnapshotOpen), 2);
         assert!(retry_cut.records().contains_key(&first));
         assert!(retry_cut.records().contains_key(&second));
     }
@@ -1487,6 +1532,417 @@ mod tests {
     }
 
     #[test]
+    fn empty_lifecycle_operations_consume_no_record_fault_ordinals() {
+        let snapshot = ReferenceModel::new(2, 64, 64).unwrap().snapshot();
+        let mut export_faults = fault(FaultPhase::ExportRecord, 0);
+        assert_eq!(
+            snapshot.export_vnode_with_fault(0, &mut export_faults),
+            Ok(Vec::new())
+        );
+        assert_eq!(export_faults.visits(FaultPhase::ExportRecord), 0);
+        assert_eq!(
+            export_faults.verify_reached(),
+            Err(not_reached(FaultPhase::ExportRecord, 0, 0))
+        );
+
+        let mut model = ReferenceModel::new(2, 64, 64).unwrap();
+        let empty_digest = model.live_digest().unwrap();
+        let mut restore_faults = fault(FaultPhase::RestoreRecord, 0);
+        assert_eq!(
+            model.restore_vnode_with_fault(0, &[], generous_restore_budget(), &mut restore_faults,),
+            Ok(())
+        );
+        assert_eq!(restore_faults.visits(FaultPhase::RestoreRecord), 0);
+        assert_eq!(
+            restore_faults.verify_reached(),
+            Err(not_reached(FaultPhase::RestoreRecord, 0, 0))
+        );
+        assert_eq!(model.live_digest().unwrap(), empty_digest);
+
+        let mut cleanup_faults = fault(FaultPhase::CleanupRecord, 0);
+        assert_eq!(model.drop_vnode_with_fault(0, &mut cleanup_faults), Ok(()));
+        assert_eq!(cleanup_faults.visits(FaultPhase::CleanupRecord), 0);
+        assert_eq!(
+            cleanup_faults.verify_reached(),
+            Err(not_reached(FaultPhase::CleanupRecord, 0, 0))
+        );
+        assert_eq!(model.live_digest().unwrap(), empty_digest);
+    }
+
+    #[test]
+    fn fault_counters_are_independent_across_mixed_phases() {
+        let seed = [b"a".as_slice(), b"b", b"c", b"d"]
+            .into_iter()
+            .map(|bytes| Mutation::Put {
+                key: key(Table::AggregateState, 0, bytes),
+                value: vec![1],
+            })
+            .collect();
+        let mut model = ReferenceModel::new(2, 64, 64).unwrap();
+        let mut faults = fault(FaultPhase::CleanupRecord, 99);
+        model.execute_with_fault(&batch(seed), &mut faults).unwrap();
+        model.persist_with_fault(&mut faults).unwrap();
+        model.persist_with_fault(&mut faults).unwrap();
+        model.snapshot_with_fault(&mut faults).unwrap();
+        model.snapshot_with_fault(&mut faults).unwrap();
+        let snapshot = model.snapshot_with_fault(&mut faults).unwrap();
+        assert_eq!(
+            snapshot
+                .export_vnode_with_fault(0, &mut faults)
+                .unwrap()
+                .len(),
+            4
+        );
+
+        let replacement = [b"a".as_slice(), b"b", b"c", b"d", b"e"]
+            .into_iter()
+            .map(|bytes| (key(Table::JoinLeftRows, 0, bytes), vec![2]))
+            .collect::<Vec<_>>();
+        model
+            .restore_vnode_with_fault(0, &replacement, generous_restore_budget(), &mut faults)
+            .unwrap();
+        model
+            .execute(&batch(vec![Mutation::Put {
+                key: key(Table::JoinLeftRows, 0, b"f"),
+                value: vec![2],
+            }]))
+            .unwrap();
+        model.drop_vnode_with_fault(0, &mut faults).unwrap();
+
+        assert_eq!(faults.visits(FaultPhase::BatchBeforeCommit), 1);
+        assert_eq!(faults.visits(FaultPhase::BatchAfterCommitBeforeAck), 1);
+        assert_eq!(faults.visits(FaultPhase::PersistBefore), 2);
+        assert_eq!(faults.visits(FaultPhase::PersistAfterSuccessBeforeAck), 2);
+        assert_eq!(faults.visits(FaultPhase::SnapshotOpen), 3);
+        assert_eq!(faults.visits(FaultPhase::ExportRecord), 4);
+        assert_eq!(faults.visits(FaultPhase::RestoreRecord), 5);
+        assert_eq!(faults.visits(FaultPhase::CleanupRecord), 6);
+        assert_eq!(
+            faults.verify_reached(),
+            Err(not_reached(FaultPhase::CleanupRecord, 99, 6))
+        );
+    }
+
+    #[test]
+    fn request_collections_reject_out_of_order_and_duplicate_entries() {
+        let a = key(Table::AggregateState, 0, b"a");
+        let b = key(Table::AggregateState, 0, b"b");
+        let range_a = RangeRead {
+            table: Table::AggregateState,
+            vnode: 0,
+            start_inclusive: b"a".to_vec(),
+            end_exclusive: b"b".to_vec(),
+            max_rows: 1,
+            max_bytes: 64,
+        };
+        let range_b = RangeRead {
+            start_inclusive: b"b".to_vec(),
+            end_exclusive: b"c".to_vec(),
+            ..range_a.clone()
+        };
+
+        let mut point_unsorted = batch(Vec::new());
+        point_unsorted.point_reads = vec![b.clone(), a.clone()];
+        let mut point_duplicate = batch(Vec::new());
+        point_duplicate.point_reads = vec![a.clone(), a.clone()];
+        let mut range_unsorted = batch(Vec::new());
+        range_unsorted.ranges = vec![range_b.clone(), range_a.clone()];
+        let mut range_duplicate = batch(Vec::new());
+        range_duplicate.ranges = vec![range_a.clone(), range_a];
+        let mutation_unsorted = batch(vec![
+            Mutation::Put {
+                key: b,
+                value: vec![2],
+            },
+            Mutation::Put {
+                key: a.clone(),
+                value: vec![1],
+            },
+        ]);
+        let mutation_duplicate = batch(vec![
+            Mutation::Put {
+                key: a.clone(),
+                value: vec![1],
+            },
+            Mutation::Delete { key: a },
+        ]);
+        let cases = [
+            (
+                "point reads out of order",
+                point_unsorted,
+                "point reads must be strictly increasing and unique",
+            ),
+            (
+                "duplicate point read",
+                point_duplicate,
+                "point reads must be strictly increasing and unique",
+            ),
+            (
+                "range reads out of order",
+                range_unsorted,
+                "range reads must be strictly increasing and unique",
+            ),
+            (
+                "duplicate range read",
+                range_duplicate,
+                "range reads must be strictly increasing and unique",
+            ),
+            (
+                "mutations out of order",
+                mutation_unsorted,
+                "mutations must be strictly increasing and unique by key",
+            ),
+            (
+                "duplicate mutation key",
+                mutation_duplicate,
+                "mutations must be strictly increasing and unique by key",
+            ),
+        ];
+
+        let mut model = ReferenceModel::new(1, 64, 64).unwrap();
+        let empty_digest = model.live_digest().unwrap();
+        for (name, request, message) in cases {
+            assert_eq!(
+                model.execute(&request),
+                Err(ModelError::Invalid(message.to_owned())),
+                "{name}"
+            );
+            assert_eq!(model.live_digest().unwrap(), empty_digest, "{name}");
+        }
+    }
+
+    #[test]
+    fn range_scan_accepts_exact_bytes_and_stops_before_max_plus_one() {
+        let mut model = ReferenceModel::new(1, 64, 64).unwrap();
+        model
+            .execute(&batch(vec![
+                Mutation::Put {
+                    key: key(Table::TimerIndex, 0, b"a"),
+                    value: vec![1, 2],
+                },
+                Mutation::Put {
+                    key: key(Table::TimerIndex, 0, b"b"),
+                    value: vec![3, 4, 5],
+                },
+            ]))
+            .unwrap();
+        let scan = |max_bytes| {
+            let mut request = batch(Vec::new());
+            request.ranges = vec![RangeRead {
+                table: Table::TimerIndex,
+                vnode: 0,
+                start_inclusive: b"a".to_vec(),
+                end_exclusive: b"c".to_vec(),
+                max_rows: 2,
+                max_bytes,
+            }];
+            request
+        };
+
+        let capped = model.execute(&scan(6)).unwrap();
+        assert_eq!(capped.range_results[0].rows.len(), 1);
+        assert_eq!(capped.range_results[0].rows[0].key.key, b"a");
+        assert!(capped.range_results[0].has_more);
+
+        let exact = model.execute(&scan(7)).unwrap();
+        assert_eq!(exact.range_results[0].rows.len(), 2);
+        assert!(!exact.range_results[0].has_more);
+    }
+
+    #[test]
+    fn restore_budget_dimensions_accept_exact_and_reject_actual_plus_one() {
+        #[derive(Clone, Copy)]
+        enum Dimension {
+            Records,
+            KeyBytes,
+            ValueBytes,
+            CanonicalBytes,
+        }
+
+        let old = key(Table::AggregateState, 0, b"old");
+        let retained = key(Table::AggregateState, 1, b"keep");
+        let mut baseline = ReferenceModel::new(2, 4, 3).unwrap();
+        baseline
+            .execute(&batch(vec![
+                Mutation::Put {
+                    key: old.clone(),
+                    value: vec![9],
+                },
+                Mutation::Put {
+                    key: retained.clone(),
+                    value: vec![8],
+                },
+            ]))
+            .unwrap();
+        let replacement = vec![
+            (key(Table::AggregateState, 0, b"a"), vec![1, 2]),
+            (key(Table::AggregateState, 0, b"bb"), vec![3, 4, 5]),
+        ];
+        let budget = |dimension, maximum| {
+            let mut budget = RestoreBudget {
+                records_max_u64: u64::MAX,
+                key_bytes_max_u64: u64::MAX,
+                value_bytes_max_u64: u64::MAX,
+                canonical_bytes_max_u64: u64::MAX,
+            };
+            match dimension {
+                Dimension::Records => budget.records_max_u64 = maximum,
+                Dimension::KeyBytes => budget.key_bytes_max_u64 = maximum,
+                Dimension::ValueBytes => budget.value_bytes_max_u64 = maximum,
+                Dimension::CanonicalBytes => budget.canonical_bytes_max_u64 = maximum,
+            }
+            budget
+        };
+
+        for (name, dimension, exact) in [
+            ("records", Dimension::Records, 2),
+            ("key bytes", Dimension::KeyBytes, 3),
+            ("value bytes", Dimension::ValueBytes, 5),
+            ("canonical bytes", Dimension::CanonicalBytes, 34),
+        ] {
+            let mut accepted = baseline.clone();
+            assert_eq!(
+                accepted.restore_vnode(0, &replacement, budget(dimension, exact)),
+                Ok(()),
+                "exact {name} budget"
+            );
+            assert!(!accepted.live_records().contains_key(&old));
+            assert!(accepted.live_records().contains_key(&retained));
+            assert_eq!(
+                accepted
+                    .live_records()
+                    .iter()
+                    .filter(|(key, _)| key.vnode == 0)
+                    .count(),
+                2
+            );
+
+            let mut rejected = baseline.clone();
+            let before_records = rejected.live_records().clone();
+            let before_digest = rejected.live_digest().unwrap();
+            assert_eq!(
+                rejected.restore_vnode(0, &replacement, budget(dimension, exact - 1)),
+                Err(ModelError::Invalid("restore budget exceeded".to_owned())),
+                "{name} budget plus one"
+            );
+            assert_eq!(rejected.live_records(), &before_records, "{name}");
+            assert_eq!(rejected.live_digest().unwrap(), before_digest, "{name}");
+        }
+    }
+
+    #[test]
+    fn invalid_restore_records_preserve_the_full_live_state() {
+        let old = key(Table::AggregateState, 0, b"old");
+        let retained = key(Table::AggregateState, 1, b"keep");
+        let mut baseline = ReferenceModel::new(2, 4, 3).unwrap();
+        baseline
+            .execute(&batch(vec![
+                Mutation::Put {
+                    key: old,
+                    value: vec![9],
+                },
+                Mutation::Put {
+                    key: retained,
+                    value: vec![8],
+                },
+            ]))
+            .unwrap();
+        let duplicate = key(Table::AggregateState, 0, b"a");
+        let cases = [
+            (
+                "wrong vnode",
+                vec![(key(Table::AggregateState, 1, b"a"), vec![1])],
+                "restore record belongs to another vnode",
+            ),
+            (
+                "duplicate key",
+                vec![(duplicate.clone(), vec![1]), (duplicate, vec![2])],
+                "restore records must be strictly increasing and unique",
+            ),
+            (
+                "key width",
+                vec![(key(Table::AggregateState, 0, b"wide!"), vec![1])],
+                "logical key width exceeds active limit",
+            ),
+            (
+                "value width",
+                vec![(key(Table::AggregateState, 0, b"a"), vec![1; 4])],
+                "value width exceeds active limit",
+            ),
+        ];
+
+        for (name, records, message) in cases {
+            let mut model = baseline.clone();
+            let before_records = model.live_records().clone();
+            let before_digest = model.live_digest().unwrap();
+            assert_eq!(
+                model.restore_vnode(0, &records, generous_restore_budget()),
+                Err(ModelError::Invalid(message.to_owned())),
+                "{name}"
+            );
+            assert_eq!(model.live_records(), &before_records, "{name}");
+            assert_eq!(model.live_digest().unwrap(), before_digest, "{name}");
+        }
+    }
+
+    #[test]
+    fn lifecycle_record_order_is_canonical_across_tables() {
+        let tables = [
+            Table::AggregateState,
+            Table::WindowState,
+            Table::TimerIndex,
+            Table::JoinLeftRows,
+            Table::JoinRightRows,
+            Table::OutputBookkeeping,
+        ];
+        let keys = tables.map(|table| key(table, 0, b"k"));
+        let mutations = keys
+            .iter()
+            .map(|key| Mutation::Put {
+                key: key.clone(),
+                value: vec![key.table.tag()],
+            })
+            .collect();
+        let mut model = ReferenceModel::new(1, 64, 64).unwrap();
+        model.execute(&batch(mutations)).unwrap();
+        let exported = model.snapshot().export_vnode(0).unwrap();
+        assert_eq!(
+            exported
+                .iter()
+                .map(|(key, _)| key.table)
+                .collect::<Vec<_>>(),
+            tables
+        );
+
+        let mut restored = ReferenceModel::new(1, 64, 64).unwrap();
+        restored
+            .restore_vnode(0, &exported, generous_restore_budget())
+            .unwrap();
+        assert_eq!(
+            restored
+                .live_records()
+                .keys()
+                .map(|key| key.table)
+                .collect::<Vec<_>>(),
+            tables
+        );
+
+        let mut faults = fault(FaultPhase::CleanupRecord, 2);
+        assert_eq!(
+            model.drop_vnode_with_fault(0, &mut faults),
+            Err(injected(FaultPhase::CleanupRecord, 2))
+        );
+        assert!(keys[..2]
+            .iter()
+            .all(|key| !model.live_records().contains_key(key)));
+        assert!(keys[2..]
+            .iter()
+            .all(|key| model.live_records().contains_key(key)));
+        model.drop_vnode_with_fault(0, &mut faults).unwrap();
+        assert!(model.live_records().is_empty());
+    }
+
+    #[test]
     fn request_encoding_binds_limits_and_is_deterministic() {
         let request = batch(vec![Mutation::Put {
             key: key(Table::AggregateState, 0, b"a"),
@@ -1537,41 +1993,12 @@ mod tests {
 
     #[test]
     fn canonical_request_ceiling_accepts_exact_and_rejects_max_plus_one() {
-        let mut request = batch(vec![Mutation::Put {
-            key: key(Table::AggregateState, 0, b""),
-            value: Vec::new(),
-        }]);
-        request.limits.request_bytes_max_u64 = MAX_MODEL_CANONICAL_BYTES;
-        request.limits.mutation_bytes_max_u64 = MAX_MODEL_CANONICAL_BYTES;
-        let envelope_bytes = encoded_request_len(&request).unwrap();
-        let payload_bytes = usize::try_from(MAX_MODEL_CANONICAL_BYTES - envelope_bytes).unwrap();
-        let Mutation::Put { value, .. } = &mut request.mutations[0] else {
-            panic!("test request must contain a put")
-        };
-        value.reserve_exact(payload_bytes + 1);
-        value.resize(payload_bytes, 0);
-
         assert_eq!(
-            encoded_request_len(&request).unwrap(),
-            MAX_MODEL_CANONICAL_BYTES
-        );
-        let encoded = encode_request(&request).unwrap();
-        assert_eq!(
-            u64::try_from(encoded.len()).unwrap(),
-            MAX_MODEL_CANONICAL_BYTES
-        );
-        drop(encoded);
-
-        let Mutation::Put { value, .. } = &mut request.mutations[0] else {
-            panic!("test request must contain a put")
-        };
-        value.push(0);
-        assert_eq!(
-            encoded_request_len(&request).unwrap(),
-            MAX_MODEL_CANONICAL_BYTES + 1
+            validate_canonical_request_ceiling(MAX_MODEL_CANONICAL_BYTES),
+            Ok(())
         );
         assert_eq!(
-            encode_request(&request),
+            validate_canonical_request_ceiling(MAX_MODEL_CANONICAL_BYTES + 1),
             Err(ModelError::Invalid(format!(
                 "canonical request is {} bytes; model maximum is {MAX_MODEL_CANONICAL_BYTES}",
                 MAX_MODEL_CANONICAL_BYTES + 1
