@@ -2,8 +2,9 @@
 //!
 //! The encoded bytes are Arrow row-format bytes produced with ascending,
 //! nulls-first sort fields. They are schema-bound rather than self-describing.
-//! This slice freezes the encoder and type gate only; a persisted key-schema
-//! descriptor/fingerprint remains required before durable keyed-state restore.
+//! The separately constructed [`PartitionKeySchemaV1`] freezes the persisted
+//! schema descriptor. It is not constructed by routing and adds no work to the
+//! record-processing hot path.
 //! Changing the admitted type set, row encoding, hash, or vnode mapping requires
 //! a partitioning ABI decision.
 
@@ -15,8 +16,9 @@ use arrow_array::types::{
 };
 use arrow_array::ArrayRef;
 use arrow_row::{RowConverter, Rows, SortField};
-use arrow_schema::{DataType, TimeUnit};
+use arrow_schema::{DataType, FieldRef, TimeUnit};
 
+use super::schema_descriptor::SchemaDescriptorV1;
 use super::vnode::key_hash;
 
 /// Failure to construct the ABI-v1 typed-key encoder.
@@ -47,6 +49,54 @@ pub enum PartitionKeyCodecError {
 #[derive(Debug)]
 pub struct PartitionKeyCodecV1 {
     converter: RowConverter,
+}
+
+/// Persistable schema identity for partition-key ABI v1.
+///
+/// Dictionary index widths are physical transport details for partition keys:
+/// recursively dictionary-encoded keys have the same descriptor as their
+/// hydrated value type. Top-level field names are not key identity, while key
+/// order and nullability are.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PartitionKeySchemaV1 {
+    descriptor: SchemaDescriptorV1,
+}
+
+impl PartitionKeySchemaV1 {
+    /// Validate and describe an ordered, resolved partition-key schema.
+    ///
+    /// # Errors
+    /// Returns the same empty/unsupported-type errors as
+    /// [`PartitionKeyCodecV1::try_new`].
+    pub fn try_new(fields: &[FieldRef]) -> Result<Self, PartitionKeyCodecError> {
+        if fields.is_empty() {
+            return Err(PartitionKeyCodecError::EmptyKeySchema);
+        }
+        for (index, field) in fields.iter().enumerate() {
+            let data_type = field.data_type();
+            if !is_supported_key_type(data_type) {
+                return Err(PartitionKeyCodecError::UnsupportedKeyType {
+                    index,
+                    data_type: data_type.clone(),
+                });
+            }
+        }
+        Ok(Self {
+            descriptor: SchemaDescriptorV1::from_fields_hydrating_dictionaries(fields),
+        })
+    }
+
+    /// Canonical, versioned descriptor bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.descriptor.as_bytes()
+    }
+
+    /// SHA-256 of [`Self::as_bytes`].
+    #[must_use]
+    pub const fn sha256(&self) -> [u8; 32] {
+        self.descriptor.sha256()
+    }
 }
 
 /// Internal one-pass builder used where key-column lookup and validation must
@@ -888,5 +938,83 @@ mod tests {
                 }) if rejected == data_type
             ));
         }
+    }
+
+    #[test]
+    fn partition_key_schema_v1_has_golden_bytes_and_digest() {
+        let fields = vec![
+            Arc::new(Field::new("tenant", DataType::Utf8, false)),
+            Arc::new(Field::new(
+                "event_time",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            )),
+            Arc::new(Field::new("amount", DataType::Decimal128(18, 4), false)),
+        ];
+        let schema = PartitionKeySchemaV1::try_new(&fields).unwrap();
+
+        let mut descriptor = String::with_capacity(schema.as_bytes().len() * 2);
+        for byte in schema.as_bytes() {
+            write!(&mut descriptor, "{byte:02x}").unwrap();
+        }
+        let mut digest = String::with_capacity(64);
+        for byte in schema.sha256() {
+            write!(&mut digest, "{byte:02x}").unwrap();
+        }
+        assert_eq!(
+            descriptor,
+            "4c44425343484d00000100000000000000030018010d0201000000000000000355544300251204"
+        );
+        assert_eq!(
+            digest,
+            "d9d6f998b482cf2ec874bee4d11d3b5021c34dca2350a8af98aa476391172f3f"
+        );
+    }
+
+    #[test]
+    fn partition_key_schema_v1_hydrates_recursive_dictionaries() {
+        let hydrated = vec![Arc::new(Field::new("key", DataType::Utf8, true))];
+        let int8_dictionary = vec![Arc::new(Field::new(
+            "different_name",
+            DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+            true,
+        ))];
+        let nested_int16_dictionary = vec![Arc::new(Field::new(
+            "key",
+            DataType::Dictionary(
+                Box::new(DataType::UInt32),
+                Box::new(DataType::Dictionary(
+                    Box::new(DataType::Int16),
+                    Box::new(DataType::Utf8),
+                )),
+            ),
+            true,
+        ))];
+
+        let hydrated = PartitionKeySchemaV1::try_new(&hydrated).unwrap();
+        let int8_dictionary = PartitionKeySchemaV1::try_new(&int8_dictionary).unwrap();
+        let nested_int16_dictionary =
+            PartitionKeySchemaV1::try_new(&nested_int16_dictionary).unwrap();
+        assert_eq!(hydrated, int8_dictionary);
+        assert_eq!(hydrated, nested_int16_dictionary);
+    }
+
+    #[test]
+    fn partition_key_schema_v1_reuses_the_codec_type_gate() {
+        assert!(matches!(
+            PartitionKeySchemaV1::try_new(&[]),
+            Err(PartitionKeyCodecError::EmptyKeySchema)
+        ));
+        let fields = vec![
+            Arc::new(Field::new("ok", DataType::Int64, false)),
+            Arc::new(Field::new("unsupported", DataType::Float32, false)),
+        ];
+        assert!(matches!(
+            PartitionKeySchemaV1::try_new(&fields),
+            Err(PartitionKeyCodecError::UnsupportedKeyType {
+                index: 1,
+                data_type: DataType::Float32,
+            })
+        ));
     }
 }
