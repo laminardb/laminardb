@@ -114,10 +114,14 @@ The sink reader consumes from the beginning through the frozen boundary and emit
 digests plus missing, extra, malformed, duplicate, conflicting, and stale-generation records.
 
 For at-least-once, an external duplicate is allowed only when it is bit-equivalent and carries the
-same stable operation identity. Missing output, state double application, two different records
-sharing an operation identity, output from a fenced owner, or output beyond the frozen boundary is
-a failure. If output metadata cannot distinguish replay from stale-owner publication, that scenario
-is not certifiable; logs are not a substitute.
+same replay-stable logical operation identity. That identity is tied to deterministic emission
+causality and cannot be a checkpoint attempt alone. Each record also carries deployment, pipeline,
+operator, vnode, assignment-generation, and writer-process provenance. Missing output, state double
+application, two different records sharing an operation identity, work admitted after an owner's
+authority was fenced, or output beyond the frozen boundary is a failure. A record admitted while
+the generation was authoritative is not reclassified as stale merely because a broker acknowledged
+it after the fence; it remains subject to the ordinary duplicate/conflict rules. If output metadata
+cannot prove these distinctions, that scenario is not certifiable; logs are not a substitute.
 
 ## Externally actuated fault schedule
 

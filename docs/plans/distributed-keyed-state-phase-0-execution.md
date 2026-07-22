@@ -89,26 +89,65 @@ automatically.
 
 ### B2. Typed partition ABI
 
-Specify and test canonical bytes for nulls, booleans, signed/unsigned integers, decimals, floats
-(NaN and signed zero), UTF-8/binary, timestamps/timezones, and composite keys. Persist encoding
-version, hash version, vnode count, operator/table identity, and schema version together. Golden
-vectors must be platform-independent and verified in both shuffle and state-key callers.
+Freeze the existing ABI v1 rather than introduce another encoder: Arrow row bytes using default
+sort fields, xxh3-64 with the existing seed, then modulo the nonzero vnode count. Put construction,
+the supported-type gate, encoding, hashing, and vnode mapping behind one vectorized codec shared by
+shuffle and state. ABI v1 admits the explicitly enumerated scalar types and integer-indexed
+dictionaries over those types; it rejects floats (therefore NaN and signed-zero semantics), nested
+types, and run-end encoding. Cluster planning must reject an unsupported key before data reaches
+the hot path even where embedded mode can group it.
+
+Golden vectors record exact encoded bytes, the full 64-bit hash, and vnode result for nulls,
+booleans, every signed/unsigned integer width and boundary, decimal precision/scale, UTF-8/binary
+representations, timestamp unit/timezone metadata, dictionary hydration, and composite boundary
+cases. A handwritten schema descriptor records arity/order and all type parameters; neither
+`DataType::to_string` nor a vnode-only vector is an ABI proof. Persist the encoding/hash version,
+schema fingerprint, vnode count, operator/table identity, and state schema version together.
+
+Every base and delta restore artifact retains its declared vnode. Before any live mutation, decode
+and validate the complete chain against the planned key schema, require every group and
+`last_emitted` key to hash to that vnode, and require global state to use vnode 0. Any changed bytes
+or widened type semantics require an ABI version bump plus an explicit replay/migration and
+rollback policy; there is no implicit N/N-1 reader window.
 
 ### B3. Delivery scenario
 
 Freeze the first vertical as:
 
 ```text
-Kafka splittable/replayable source
-  -> grouped COUNT/SUM append-result stream
-  -> durable at-least-once multiwriter append sink
+Kafka splittable/replayable source, fixed topics/partitions and replay start
+  -> grouped COUNT(*) plus SUM append-result snapshots
+  -> Kafka durable at-least-once multiwriter envelope=append sink
   -> shared object-store checkpoint authority
 ```
 
 The oracle permits bit-identical external replay duplicates but rejects missing input, internal
-double application, impossible aggregate state, stale-owner output, or a source cut that advances
-before sink flush. FullChangelog, mutable-key sinks, MVs, and exactly-once remain outside this
-vertical.
+double application, impossible aggregate state, stale-owner output, or durable/external source
+progress published before sink flush succeeds. Capturing a source position before the flush is
+expected. FullChangelog, mutable-key sinks, MVs, and exactly-once remain outside this vertical.
+
+The output is a repeated full running snapshot of every group on each processing cycle, not a
+monotonic append aggregate or changed-group stream. `COUNT(*)` is mandatory because it supplies a
+batching-independent logical state version for the narrow COUNT/SUM identity. Freeze the Kafka
+input and run-specific output topic inventory, partition counts, explicit replay offsets, key-hash
+partitioning on the canonical group key, `acks=all`, replication/min-ISR, unclean-election, DLQ,
+and evidence-retention settings as part of the contract.
+
+Do not certify the path from connector flags or Kafka producer idempotence alone. Current records
+lack replay-stable operation identity and ownership provenance. Before the scenario is eligible,
+add golden-tested `operation_id_v1` derived from domain, deployment/pipeline/operator identities,
+canonical group key, count state version, and canonical payload; carry its payload digest, vnode and
+partition ABI, assignment version, node ID, boot UUID, and process term. The same ID and payload is
+a legal replay; the same ID with a different payload is a failure. “Stale” means work computed or
+admitted after the writer's authority was fenced. A previously admitted in-flight append arriving
+later is evaluated under the ordinary at-least-once duplicate rules. Checkpoint-attempt identity is
+not stable across source replay.
+
+The expected checkpoint order is source position capture followed by a FIFO sink synchronization
+fence and successful durable flush before manifest readiness, durable decision, and external source
+progress notification. The asynchronous tail may overflush post-cut output, which may replay. A
+cross-layer test must block and fail sink flush to prove that no durable decision or source
+notification escapes early.
 
 ## Workstream C — Evidence-only LSM qualification
 

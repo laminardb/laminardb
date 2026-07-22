@@ -105,21 +105,35 @@ the managed state service.
 
 ### 2. Stable partition and state ABI
 
-The resolved vnode count remains fixed for a deployment/pipeline namespace. The following are one
-versioned ABI and are persisted in catalog identity, shuffle handshakes, checkpoint descriptors,
-and local-state metadata:
+The resolved vnode count remains fixed for a deployment/pipeline namespace. ABI v1 freezes the
+existing Arrow `RowConverter` bytes using default sort fields, xxh3-64 with its existing seed, and
+modulo vnode mapping; the new codec is a single authority around those semantics, not a second
+encoder. The following are one versioned ABI and are persisted in catalog identity, shuffle
+handshakes, checkpoint descriptors, and local-state metadata:
 
-- canonical typed key encoding, including null, decimal, timestamp, collation, and NaN semantics;
+- canonical typed key encoding and schema identity, including null, decimal precision/scale,
+  timestamp unit/timezone, and binary collation semantics;
 - key hash algorithm/seed and vnode mapping;
 - the vnode-0 convention for singleton global state;
 - operator/table ID derivation;
 - state-key ordering and value encoding; and
 - timer-key ordering.
 
-Golden vectors cover supported Arrow types. Any incompatible change requires an ABI bump and
-explicit migration or rejection; it must never silently reinterpret a checkpoint. Assignment
-generation and worker identity fence access but are not part of logical state keys, so ownership
-can change without rewriting every key.
+ABI v1 rejects floating keys, including every NaN and signed-zero representation, rather than
+inventing equality semantics different from embedded Arrow grouping. It also rejects nested and
+run-end-encoded keys. Integer-indexed dictionaries hydrate to their admitted logical value type;
+index width is representation, not key identity. Strings and binary use raw bytes with no Unicode
+normalization, decimal keys use the unscaled coefficient with precision/scale in schema identity,
+and timestamps hash their stored epoch integer while unit and exact timezone remain schema
+identity.
+
+Golden vectors cover exact encoded bytes, the complete hash, and vnode for every supported family
+and rejection class. Restore additionally validates the planned typed schema and every decoded key
+against the artifact's claimed vnode before mutation. Any incompatible change requires an ABI bump
+and explicit replay/migration or rejection; it must never silently reinterpret a checkpoint. ABI
+v1 has no implicit mixed-version reader window. Assignment generation and worker identity fence
+access but are not part of logical state keys, so ownership can change without rewriting every
+key.
 
 The physical key prefix is ordered by pipeline, operator/table, and vnode before the logical key.
 This permits bounded vnode scans, bulk restore, range deletion, and quota attribution. The initial
@@ -351,16 +365,29 @@ not double-apply replay within recovered state, lose timer/output bookkeeping, o
 external results flushed after that cut may appear again after a crash. The checkpoint tail keeps
 the existing ordering: enqueue operator output, flush every durable sink, then seal source
 positions. State capture and real sink-flush latency share the checkpoint deadline. A stable output
-identity—pipeline/operator/vnode plus checkpoint attempt or deterministic operation key—is recorded
-now so later sinks can deduplicate, but it is not presented as exactly-once.
+identity and provenance envelope must be added before the initial release. For the narrow
+append-only `COUNT(*)`/`SUM` vertical, the count is the batching-independent logical state version;
+identity binds the canonical group and payload to deployment, pipeline, and operator identity.
+Vnode and partition ABI, assignment version, node ID, boot UUID, and process term accompany it. A
+checkpoint attempt alone is insufficient because replay can cross attempts and owners. This is
+evidence for at-least-once correctness; it is not presented as exactly-once.
 
 A cluster sink used by this release must be `DurableAtLeastOnce + MultiWriter` and accept the
-operator's declared output mode. Ordinary `CREATE STREAM` aggregates emit append-result records,
-and fixed final-window/append outputs can use existing multiwriter append sinks. There is currently
-no built-in cluster-admissible `FullChangelog` sink. Any retraction/full-changelog output remains
+operator's declared output mode. The first candidate is Kafka `envelope=append`; broker topic,
+partitioning, acknowledgement, replication/min-ISR, election, DLQ, and retention settings are part
+of the certified contract. Ordinary `CREATE STREAM` aggregates emit repeated full running
+append-result snapshots, not only modified groups or a final monotonic aggregate. Kafka producer
+idempotence cannot deduplicate recovery from a new producer incarnation. There is currently no
+built-in cluster-admissible `FullChangelog` sink. Any retraction/full-changelog output remains
 fail-closed until either a multiwriter changelog-log sink is certified or mutable sinks gain
 key-affine assignment, old-writer fencing, deterministic operation IDs, and vnode handoff. Merely
 marking a mutable sink `MultiWriter` is not sufficient.
+
+A stale-owner append is defined by computation or sink admission after the writer lost process or
+vnode authority, not by broker arrival time. The current append sink cannot retract an operation
+already admitted to broker I/O before the fence; a late acknowledgement of that operation remains
+valid at-least-once output and provenance lets the oracle classify it. Mutable output and
+exactly-once require provider-side transaction/fencing rather than this observational contract.
 
 End-to-end exactly-once is a later certification per concrete source/state/sink combination. It
 requires an exact-certified source and a checkpoint-committable external sink whose transaction

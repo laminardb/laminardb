@@ -85,6 +85,16 @@ The same type nevertheless implements:
 - state removal for revoked vnodes; and
 - assignment-aware shuffle/barrier integration through `SqlQueryOperator`.
 
+That partial restore path has an additional integrity gap which does not affect an admitted keyed
+cluster workload today because admission remains closed. Restore validates the internal shape and
+query fingerprint of an aggregate slice, but it does not prove that every decoded key hashes to
+the vnode named by the checkpoint artifact. The uninitialized staging path also retains base and
+delta payloads without their vnode identity, so it cannot perform that proof after the SQL key
+schema is available. An initialized apply path can therefore merge a well-formed slice under the
+wrong vnode label. Phase 0 must centralize the existing Arrow-row/xxh3 partition codec, preserve
+the vnode tag for every staged base and delta, and preflight the complete chain against the planned
+key schema and vnode count before mutating live state.
+
 This code is useful implementation substrate, but it does not make the operator production safe.
 The current one-million-group guard counts entries, not bytes. The live `groups`, changelog
 emission state, distinct/counting side state, dirty generations, Arrow buffers, and allocator
@@ -125,9 +135,11 @@ connector's registered descriptor—not an inference from connector names.
 
 That does not block every grouped stream. Ordinary `CREATE STREAM` queries are registered as
 non-incremental and emit append-result rows, so their compatible append-sink paths can be certified.
-It does mean retraction/full-changelog modes cannot be called production-ready merely because the
-operator can compute them. A mutable cluster sink also needs key-affine assignment and stale-writer
-fencing; a `MultiWriter` flag alone does not establish ownership.
+The current aggregate emits a repeated full running snapshot of all groups each processing cycle,
+not only changed groups or a final monotonic result. It does mean retraction/full-changelog modes
+cannot be called production-ready merely because the operator can compute them. A mutable cluster
+sink also needs key-affine assignment and stale-writer fencing; a `MultiWriter` flag alone does not
+establish ownership.
 
 The current source handoff already binds checkpoint attempt, source assignment version, cursors,
 per-source watermarks, cluster watermark, and recovery frontier. SQL-key vnode placement is a
@@ -136,6 +148,13 @@ authorities. Under at-least-once, recovered state and the source cursor share a 
 but external records flushed after that cut may repeat. Local LSM durability cannot turn this into
 end-to-end exactly-once; that later guarantee needs connector/provider commits fenced by the same
 leader/assignment proof already used by the checkpoint coordinator.
+
+The first candidate Kafka-to-Kafka append path has one more certification blocker. Kafka source is
+replayable and splittable, and the append sink declares durable at-least-once multiwriter
+capability, but aggregate output is currently serialized without a replay-stable logical operation
+ID or ownership-provenance envelope. The independent oracle therefore cannot tell a legal replay
+from internal double application or work admitted by a stale owner. Sink flush ordering and
+connector capability flags do not replace that evidence.
 
 ### Fjall is historical, not current infrastructure
 
@@ -210,8 +229,10 @@ rebalance, because that path is deliberately unreachable.
 LaminarDB does **not** need a second cluster coordinator or a generic “checkpoint system.” It needs
 a managed keyed working-state capability connected to the distributed execution contract:
 
-1. **Stable distribution ABI:** canonical key encoding and hash, fixed vnode count, stable operator
-   and state-table IDs, schema/version compatibility, and an explicit global-vnode convention.
+1. **Stable distribution ABI:** one canonical typed key codec shared by shuffle, state, and restore;
+   exact encoded-byte/hash/vnode vectors; fixed vnode count; stable operator and state-table IDs;
+   schema/version compatibility; artifact-to-vnode membership validation; and an explicit
+   global-vnode convention.
 2. **Batch hot-state API:** local low-latency point/multi-get, prefix/range scan, atomic write batch,
    timer index, range delete, and truthful memory/disk accounting. The public record path must not
    await object storage per row.
