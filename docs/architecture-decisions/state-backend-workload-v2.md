@@ -302,9 +302,9 @@ plan can be approved. It has identity `state-backend-workload-expectations/v2`, 
   counters. The expectations artifact's own serialized length is excluded.
 
 The artifact has no candidate, plan, approval, machine-result, or status field. The implementation
-under test cannot serve as its independent numerical oracle. Preflight is streamed once into a
-content-addressed expectations artifact and reused for both candidates; it is not regenerated
-inside measured service time.
+under test cannot serve as its independent numerical oracle. Once its bounded algorithm and quotas
+are approved, preflight runs once into a content-addressed expectations artifact reused for both
+candidates; it is not regenerated inside measured service time.
 
 A separate `state-backend-workload-preflight/v2` provenance artifact binds the expectations length
 and digest, preflight source archive/binary/lock/toolchain identities, start/end UTC timestamps,
@@ -366,23 +366,204 @@ The CLI remains validation-only. Synthetic fixtures must say `NOT QUALIFICATION 
 not be accepted by a runner approval path. No real runner plan exists until DKS-Q2-001 through
 DKS-Q2-008 close and independent review plus named owner approval succeeds.
 
-## Remaining lifecycle and matrix work
+## Rejected M1 arithmetic sketch
 
-This framing decision intentionally does not guess the scenario union. The dependency order is
-DKS-Q2-001/Z3 (closed semantics and registry), then Z1 (body encoder and independent goldens), then
-Z2 (strict schemas and runner/evidence bindings); Z6 and DKS-Q2-002/003 additionally require one
-non-Cartesian named matrix. Those policies must prove:
+M1 is a reviewed non-Cartesian arithmetic and campaign-cost sketch. It is **not** a lifecycle
+candidate, an executable plan, or measurement evidence, and it does not close Z3 or
+DKS-Q2-002/003. Its exact numbers are retained so an M2 replacement cannot silently repeat the
+same infeasible state shapes or lose the useful phase-alignment arithmetic.
+
+All rows below assume 256 vnodes, one foreground state worker, 128 raw logical rows per request,
+full logical prefill, no explicit persist during warmup/measurement, and the shorthand
+`setup_final_persist_v1`: persist, close/reopen, and verify setup before warmup; preserve warm state
+across the measurement boundary; then persist and verify after measured drain with writes charged
+to the resource tail. That shorthand has no tag in the current case-body persistence union, so no
+canonical M1 case body can be encoded. M2 must either add one exact lifecycle tag or choose an
+existing representable policy; the exact Fjall/RocksDB calls remain DKS-Q2-007.
+
+| Slug | Scenario | Distribution | Residency / placement | Width | Logical state |
+|---|---|---|---|---|---|
+| `agg-r-c-hm-normal-128` | aggregate | `hot_mix_v1` | resident / identity-mod | compact | `N=17,716,740`, `M=178,957`, `C=17,895,697`, `B=4,294,967,280` |
+| `agg-s-v-zipf-normal-128` | aggregate | Zipf v1 | spill / identity-mod | bounded variable | `N=60,028,485`, `M=606,349`, `C=60,634,834`, `B=103,079,214,800` (artifact-compatibility risk) |
+| `timer-r-v-hm-hot-128` | timer/window | `hot_mix_v1` for mutations | resident / forced vnode 0 | bounded variable | `N=1,244,027`, `M=12,800`, `C=1,256,827`, `R=2,526,454`, `B=4,294,964,960` (artifact-compatibility risk) |
+| `timer-s-c-zipf-normal-128` | timer/window | Zipf v1 for mutations | spill / identity-mod | compact | `N=211,543,116`, `M=2,136,832`, `C=213,679,948`, `R=429,496,728`, `B=103,079,214,720` (artifact/transition-compatibility risk) |
+| `join-r-c-hm-mix-128` | static range probe | `hot_mix_v1` | resident / identity-mod | compact | `N=245,140`, `B=[4,294,928,880, 4,294,944,240, 4,294,959,600]` |
+| `join-s-c-zipf-mix-128` | static range probe | Zipf v1 | spill / identity-mod | compact | `N=5,883,510`, `B=[103,079,171,280, 103,079,186,640, 103,079,202,000]` (artifact/transition-compatibility risk) |
+
+`C` is the stable entity/record count named by each scenario, `M` is its churn/TTL pool, `R` is
+total live records, and `B` is logical key-plus-value bytes. A three-value `B` is low/setup/high
+over the join output cycle. These are declarative generation inputs or arithmetic
+consequences, not allocated filesystem bytes, RSS claims, or observed residency. In particular,
+calling a case `spill` from its live-byte target does not prove a cold-I/O working set.
+
+Compact records are 32-byte keys plus 208-byte values. `bounded_var_mod4_v1` selects by stable
+logical record class, never request order:
+
+| Class | Key bytes | Value bytes | Logical record bytes |
+|---:|---:|---:|---:|
+| 0 | 16 | 64 | 80 |
+| 1 | 64 | 256 | 320 |
+| 2 | 256 | 1,024 | 1,280 |
+| 3 | 4,096 | 1,024 | 5,120 |
+
+For M1 arithmetic only, aggregate sampled rank `r` uses global ordinal `r` and cold slot `s` uses
+global ordinal `N+s`; both width and identity-mod placement consume that ordinal. A timer entity
+uses its entity ordinal modulo four for all of its records, and a TTL slot uses `slot mod 4` across
+successors. Both join cases are compact. This is not a registered width-selection policy.
+The modulo-four sketch maps rank zero—the hottest hot-mix and Zipf rank—to the cheapest 80-byte
+class. It therefore does not qualify hot-wide latency. M2 must use a reviewed identity-hash class
+mapping with exact balance and a named hot-wide control, or explicitly narrow the claimed width
+coverage.
+
+An all-distinct 128-row request is therefore at most 655,360 logical bytes for one record per row.
+The profile's 65,536-byte value remains in one-record semantic/storage conformance and an explicit
+all-distinct negative preflight: `128 * (16 + 65,536) = 8,390,656` already exceeds the 8 MiB hard
+limit before framing. It is not smuggled into a positive case through expected hot-key deduplication.
+
+### Rates, counts, and campaign floor
+
+M1's offered rates are the minimum at which 950-permille achieved rows equal the current absolute
+scenario throughput gate. They are provisional owner inputs, not demonstrated headroom:
+
+| Scenario | Offered requests/s | Offered raw rows/s | Warmup requests | Measured requests |
+|---|---:|---:|---:|---:|
+| aggregate | `15,625 / 19` | `2,000,000 / 19` | 740,132 | 1,480,264 |
+| timer/window | `46,875 / 76` | `1,500,000 / 19` | 555,100 | 1,110,200 |
+| join | `15,625 / 38` | `1,000,000 / 19` | 370,125 | 740,250 |
+
+Counts meet the 900/1,800-second and 200,000-request minima. Timer counts are multiples of five;
+join counts are multiples of 125, so 128 rows/request completes an integer number of 1,000-row
+fanout cycles. Across six cases, five repetitions, and two candidates, schedule time alone is at
+least 162,000 seconds (45 hours), before setup, reopen, stabilization, drain, resource tail,
+cooldown, validation, or failures. Fresh setup writes approximately 3,000 GiB of logical live state
+across the 60 slots before write amplification. The two candidates together schedule 99,921,420
+warmup-plus-measured requests and 12,789,941,760 raw logical rows. Plan approval must add measured
+setup throughput, cooldown, disk endurance, and a bounded campaign deadline; state reuse is still
+forbidden.
+
+The candidate-neutral finite runtime preflight alone would replay 49,960,710 requests and
+6,394,970,880 raw rows over 30 case/seed streams, before its full setup streams. Calling that replay
+"streamed" is not a resource bound. M2 needs a bounded, deterministic, candidate-independent oracle
+design with memory/scratch/time/artifact ceilings, isolated storage, cleanup rules, and a
+fail-closed deadline before its feasibility can be approved. External run/sort/merge is one option,
+not a decision. Fjall and RocksDB cannot serve as the independent oracle.
+
+Raw input rows are not backend operations. Each expectations artifact separately binds requests/s,
+raw rows/s, post-dedup point/range/mutation operations/s, logical mutation bytes/s, and returned
+rows/bytes/s. A hot-mix case cannot claim LSM throughput from its raw row count.
+
+### Reviewed arithmetic retained from M1
+
+- Aggregate uses `N` sampled ranks plus `M=ceil(C/100)` disjoint cold slots. Request
+  `G=runtime_event_ordinal` replaces each distinct sampled group and rotates slot `G mod M` from
+  generation `floor(G/M)` to its successor. This keeps the sketched count/bytes stable, but M1 did
+  not freeze complete entity/key/value encodings or conflict rules.
+- Timer uses a five-request cycle: three mutations, one due scan, one fire. Its count identity is
+  `R=2*C+M`; before request `G`, fired rows are `F=128*floor(G/5)`. The `M`-slot ring and
+  `D=8,192`/`D=1,048,832` frontiers yield 4,096 rows with `has_more=true`; the resident variable
+  scan is 6,963,200 logical bytes. One 128-row control request emits one range operation, not 128
+  scans. Only the ring tests ordered timer fire; the `N` mutation companions are not timer
+  reschedules.
+- Static join-range setup has 73 immutable fixtures per rank. The reviewed M1 fanout sketch gives
+  exact 500/350/140/10 weights for 0/1/8/64 matches per 1,000 rows and 189--317 live outputs per
+  125-request cycle (253 at setup/final, mean 270.08). Live-record bands are
+  17,895,537/17,895,601/17,895,665 resident and
+  429,496,547/429,496,611/429,496,675 spill.
+
+These are arithmetic facts, not accepted lifecycle semantics. M1 never froze timer/join key and
+interval encodings, row/byte lookahead, setup-placeholder identity, canonical dedup/conflicts, or a
+dynamic two-sided expiry schedule. Reads followed by one atomic mutation batch are not an atomic
+read-modify-write transaction. The static probe cannot qualify a stateful join, and its
+bookkeeping token proves neither watermark behavior nor external exactly-once delivery.
+
+### Proposed gate mapping and explicit gaps
+
+Aggregate maps to its resident/spill end-to-end gate. Timer mutation/fire maps to hot-vnode or
+spill, while due scans map to timer/join-range. The static join sketch maps only to range-probe
+gates. Every finite case maps to state-queue, scenario throughput, achieved-rate, CPU,
+memory/disk/FD/stall/debt maxima, and applicable finite write/space-amplification gates. RSS/disk
+slope gates whose sampling starts at 21,600 seconds cannot consume these 2,700-second attempts;
+they belong only to the separately frozen DKS-Q2-008 endurance population.
+
+This mapping cannot be approved yet. The profile has no candidate-service thresholds and no
+join-specific write-amplification gate; neither may be inferred from an end-to-end threshold or
+silently borrowed from timer state. DKS-Q2-005 must also freeze scheduler, runner-preparation,
+oracle-lag, result-ring, observation-skew, and sampler/null interference gates. Maximum 1,000/8,192
+batch shapes remain semantic/null/capacity controls unless owners deliberately add a gate-bearing
+case and accept its campaign cost.
+
+M1 also fails to prove compatibility with the current product limits. If one logical record becomes
+one managed row and one transition carries all 256 vnodes, the compact spill timer has
+1,677,721--1,677,723 rows per vnode and 429,496,728 rows total; the compact spill join has
+1,677,686--1,677,759 fixture rows per vnode and 429,496,547--429,496,675 live rows total. Those would
+exceed 1,048,576 rows per complete per-vnode artifact and 268,435,456 rows per transition.
+Forced-vnode resident timer state would place 2,526,454 logical records and 4,294,964,960 logical
+bytes in vnode zero. Aggregate spill also correlates `rank mod 4` width with `rank mod 256`
+placement: a wide-class vnode reaches 236,855 records, 1,212,697,600 logical bytes, and 970,158,080
+logical key bytes, above the numerical 512-MiB artifact caps if encoded directly.
+
+Only the initial aggregate artifact codec is currently frozen; timer/join codecs, logical-to-row
+mapping, and exact transition rosters are not. These calculations are therefore incompatibility
+risks, not claims about nonexistent physical artifacts. The documented format still has no
+within-vnode chunk identity and the transition contract has no state-shape splitting rule. M2 must
+prove compatible encoded placement/width/cardinality shapes or first freeze and test an explicit
+format/runtime split.
+
+All three 96-GiB cases use Zipf, so size alone does not prove cold-read I/O. M2 needs at least one
+uniform/all-distinct spill case or a pre-approved candidate-neutral device-read/cache-miss floor.
+The resident timer sketch's one due scan returns 6,963,200 logical bytes at roughly 123.36 scans/s,
+about 819 MiB/s before result-ring and oracle copies. Its offered rate cannot be approved until
+paired counter-only/null controls bound sampler, memory-bandwidth, ring, oracle-lag, and observation
+interference. A frozen warmup-end debt/stall baseline must also prevent delayed warmup writes from
+entering the measured physical-write numerator without corresponding logical mutation bytes.
+
+Short positive boundary trials must cover the limits that M1 otherwise leaves as prose: supported
+large values, maximum accepted input/output batches, byte-bound scans, and near-limit atomic
+mutations. They remain distinct from the five-repetition latency population and cannot donate
+samples. Any untested maximum is lowered in the certified profile instead of inferred from a
+negative or smaller case. Direct-I/O preflight order and cooldown are also frozen so it cannot
+thermally or physically condition one candidate's subsequent slots.
+
+The setup candidate digest is verified and charged to setup before warmup. Final persistence and
+digest verification run after measured drain and are charged to the frozen resource tail. A
+post-warmup expectation in a performance attempt is reference-oracle provenance only: a full
+candidate scan/export at that boundary would perturb cache, I/O, snapshot, and compaction state. A
+separately classified conformance replay may cover the deterministic boundary but cannot prove
+equality for the actual performance attempt or donate performance samples. M1 therefore cannot
+claim full candidate-state equality at the warmup boundary. M2 must either bind a
+candidate-observed boundary witness whose retention and measurement interference are qualified, or
+explicitly narrow approval to setup/final full-state equality plus in-service read/observation
+validation.
+
+## Why M1 is rejected and what M2 must close
+
+M1's state-byte, phase-alignment, fanout-cycle, and timer-ring arithmetic passed independent
+read-only review. M1 as a whole failed review because its persistence shorthand is unencodable,
+four state shapes have unresolved product row/byte compatibility, its width mapping makes the
+hottest rank cheapest and correlates width with vnode, its timer scope is narrower than required
+for qualification, and its join is not a dynamic two-sided lifecycle. No M1 body, expectations
+object, plan, or backend result may be created.
+
+The dependency order remains DKS-Q2-001/Z3 (independent review and closed binary union/registry),
+then Z1 (body encoder and independent goldens), then Z2 (strict schemas and runner/evidence
+bindings). Z6 and DKS-Q2-002/003 require named workload and operations owners to approve M2. At a
+minimum, closure must freeze:
 
 - aggregate full-domain versus sparse materialization, stable replacement, natural Zipf pressure,
   forced-vnode placement, and broad/all-distinct storage pressure;
-- timer insertion time, monotonic frontier, half-open due ranges, row/byte pagination, exact atomic
-  fire/delete replacement, TTL/backlog control, and separate window/timer/due/live-byte bands;
-- deterministic opposite-side join prefill, exact returned fanout with `has_more=false`, side
-  schedule, event interval, stable identities, two-sided expiry, per-side cardinality, and output
-  bookkeeping; and
+- timer insertion time, monotonic frontier, half-open due ranges, row/byte pagination, serialized
+  validation followed by one atomic mutation batch, TTL/backlog control, and separate
+  window/timer/due/output/live-byte bands;
+- deterministic setup order and complete entity/key/value encodings; canonical sort, deduplication,
+  and conflict rules; exact timer slot/generation/vnode mapping; and checked live-count bands;
+- deterministic dynamic two-sided join prefill and arrivals, exact event-time interval/key bounds,
+  row and byte lookahead, stable arrival/output identities, expiry/replenishment, per-side
+  cardinality, and mismatch-before-mutation behavior; and
 - exact fixed/variable width pairs, compatible fanout/batch limits, raw rows/s, requests/s,
   post-dedup candidate operations/s, logical/returned bytes/s, rational rates/counts, gate mapping,
-  and total campaign wall-clock/storage cost.
+  and total campaign wall-clock/storage/endurance/preflight cost; and
+- either a candidate-observed, interference-qualified post-warmup state witness or an explicitly
+  narrower correctness claim that does not present the oracle digest as candidate equality.
 
 Every decision uses only ordinal, seed, and oracle state—not candidate latency, compaction, or
 results. The current candidate's impossible `128 * (16 + 65,536)` write and 1,000-row compact
@@ -397,6 +578,6 @@ cluster admission. `[LDB-4007]` and `[LDB-0013]` remain fail-closed.
 
 The independent production soak keeps its own workload manifest, driver/counter domain, fresh
 precommitted seed, real source and sink coordinates, immutable release artifact, external oracle,
-and independent operator. It may reuse an approved Zipf mathematical transform and its numerical
-goldens, but it does not inherit this backend case body, counter, stream ID, seed rule, preflight, or
-result schema.
+and independent operator. It may reuse the specification and numerical goldens of an approved Zipf
+mathematical transform, but not the backend generator implementation or binary; it does not inherit
+this backend case body, counter, stream ID, seed rule, preflight, or result schema.
