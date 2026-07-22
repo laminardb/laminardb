@@ -367,10 +367,13 @@ the existing ordering: enqueue operator output, flush every durable sink, then s
 positions. State capture and real sink-flush latency share the checkpoint deadline. A stable output
 identity and provenance envelope must be added before the initial release. For the narrow
 append-only `COUNT(*)`/`SUM` vertical, the count is the batching-independent logical state version;
-identity binds the canonical group and payload to deployment, pipeline, and operator identity.
-Vnode and partition ABI, assignment version, node ID, boot UUID, and process term accompany it. A
-checkpoint attempt alone is insufficient because replay can cross attempts and owners. This is
-evidence for at-least-once correctness; it is not presented as exactly-once.
+identity binds that version and canonical group to deployment, pipeline, and operator identity,
+while a separate canonical payload digest detects conflicting values at one version. The input
+contract maps each logical group to one Kafka partition so group-local broker order is stable, and
+`SUM` is initially limited to exact integer/decimal semantics. Vnode and partition ABI, assignment
+version, node ID, boot UUID, and process term accompany the identity. A checkpoint attempt alone is
+insufficient because replay can cross attempts and owners. This is evidence for at-least-once
+correctness; it is not presented as exactly-once.
 
 A cluster sink used by this release must be `DurableAtLeastOnce + MultiWriter` and accept the
 operator's declared output mode. The first candidate is Kafka `envelope=append`; broker topic,

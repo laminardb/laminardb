@@ -128,20 +128,23 @@ expected. FullChangelog, mutable-key sinks, MVs, and exactly-once remain outside
 
 The output is a repeated full running snapshot of every group on each processing cycle, not a
 monotonic append aggregate or changed-group stream. `COUNT(*)` is mandatory because it supplies a
-batching-independent logical state version for the narrow COUNT/SUM identity. Freeze the Kafka
-input and run-specific output topic inventory, partition counts, explicit replay offsets, key-hash
-partitioning on the canonical group key, `acks=all`, replication/min-ISR, unclean-election, DLQ,
+batching-independent logical state version for the narrow COUNT/SUM identity; `SUM` is initially
+limited to exact integer/decimal input and result semantics. The producer must route every logical
+group to exactly one fixed Kafka input partition so its broker offsets define group-local order.
+Freeze the input and run-specific output topic inventory, partition counts, explicit replay
+offsets, canonical group-key partitioning, `acks=all`, replication/min-ISR, unclean-election, DLQ,
 and evidence-retention settings as part of the contract.
 
 Do not certify the path from connector flags or Kafka producer idempotence alone. Current records
 lack replay-stable operation identity and ownership provenance. Before the scenario is eligible,
 add golden-tested `operation_id_v1` derived from domain, deployment/pipeline/operator identities,
-canonical group key, count state version, and canonical payload; carry its payload digest, vnode and
-partition ABI, assignment version, node ID, boot UUID, and process term. The same ID and payload is
-a legal replay; the same ID with a different payload is a failure. “Stale” means work computed or
-admitted after the writer's authority was fenced. A previously admitted in-flight append arriving
-later is evaluated under the ordinary at-least-once duplicate rules. Checkpoint-attempt identity is
-not stable across source replay.
+canonical group key, and count state version; carry its separate canonical payload digest, vnode
+and partition ABI, assignment version, node ID, boot UUID, and process term. Excluding the payload
+from the identity makes two payloads for one logical state version a detectable conflict. The same
+ID and payload is a legal replay; the same ID with a different payload is a failure. “Stale” means
+work computed or admitted after the writer's authority was fenced. A previously admitted in-flight
+append arriving later is evaluated under the ordinary at-least-once duplicate rules.
+Checkpoint-attempt identity is not stable across source replay.
 
 The expected checkpoint order is source position capture followed by a FIFO sink synchronization
 fence and successful durable flush before manifest readiness, durable decision, and external source

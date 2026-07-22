@@ -70,6 +70,12 @@ mode, connector, or delivery guarantee.
 Only scenarios explicitly proposed for a release are run, but every scenario proposed for that
 release must pass.
 
+The initial grouped-aggregate scenario is narrower than the general row: each logical group is
+routed to one fixed Kafka input partition, `COUNT(*)` is mandatory as its logical state version,
+and `SUM` uses exact integer/decimal semantics. The append sink contains repeated full running
+snapshots. The oracle may observe any valid group-local prefix and repeated unchanged snapshots,
+but after the frozen source cut it must observe the exact final version for every group.
+
 ## Frozen numerical contract
 
 An eligible machine-readable charter contains no `TBD`, zero, or results-derived threshold. It
@@ -105,7 +111,7 @@ per-partition sink high-watermarks. An incomplete source or sink cut cannot pass
 The independent model derives expected results solely from the ledger and published SQL semantics:
 
 - projection: exact event IDs and values;
-- grouped aggregate: final count/sum/average per key and legal prefix results;
+- grouped aggregate: required final count/sum per key plus validation of every observed legal prefix;
 - fixed window: exact key/window/aggregate rows after the declared watermark and lateness policy;
 - bounded join: exact stable left/right event-ID pairs; and
 - future changelog: exact signed operations and deterministic operation identity.
