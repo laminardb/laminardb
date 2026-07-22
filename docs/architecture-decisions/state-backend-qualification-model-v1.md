@@ -257,6 +257,9 @@ boundary bases are `(time=0,row=0)` and
 `(time=request_ordinal+1,row=0)` with zero padding to the selected width. All generated lists are
 sorted and deduplicated.
 
+Every measured generator request encodes `logical_rows=case.batch_rows`, including a timer
+due-scan request; the field identifies the selected logical batch size rather than returned rows.
+
 Join arriving side is left for an even `word(0xffffffff,0)` and right otherwise. Stable row ID is
 `(request_ordinal << 32) | row_ordinal`; join identity is `word(row,0) % uniform_domain`; event time
 low is `((request_ordinal << 16) | (word(row,1) & 0xffff))` as `u32`. Vnode is join identity modulo
