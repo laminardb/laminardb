@@ -21,11 +21,13 @@ use arrow_schema::{DataType, FieldRef, TimeUnit};
 pub use super::partition_key_schema::PartitionKeySchemaV1;
 use super::vnode::key_hash;
 
-/// Maximum number of columns in partitioning ABI v1's composite key.
+// These are structural ABI safety ceilings, not deployment SLOs. A numerical
+// workload profile may admit less but cannot raise them without an ABI review.
+/// Maximum number of columns retained by one ABI-v1 row-converter plan.
 pub(crate) const MAX_PARTITION_KEY_COLUMNS: usize = 256;
-/// Maximum recursive dictionary depth in one partition-key type.
+/// Maximum recursive dictionary wrappers inspected while hydrating one key type.
 pub(crate) const MAX_PARTITION_KEY_NESTING: usize = 32;
-/// Maximum encoded timezone parameter length in one partition-key type.
+/// Maximum timezone parameter bytes copied into one routing descriptor.
 pub(crate) const MAX_PARTITION_KEY_TIMEZONE_BYTES: usize = 256;
 
 /// Failure to construct the ABI-v1 typed-key encoder.

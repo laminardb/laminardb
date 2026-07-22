@@ -12,6 +12,10 @@ use super::partition_key::{validate_key_type, PartitionKeyCodecError};
 /// Version of the partition-key schema descriptor byte format.
 pub const PARTITION_KEY_SCHEMA_VERSION: u16 = 1;
 /// Hard allocation bound for one partition-key schema descriptor.
+///
+/// The widest currently admitted schema is below 69 KiB: 256 nullable timestamp
+/// slots with 256-byte timezones plus framing. The 128-KiB ceiling leaves bounded
+/// encoder headroom but does not admit new types or wider parameters.
 pub const MAX_PARTITION_KEY_SCHEMA_BYTES: usize = 128 * 1024;
 
 const MAGIC: &[u8; 8] = b"LDBPKS\0\0";
