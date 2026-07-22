@@ -307,11 +307,20 @@ workflow. The next tool commit adds:
 - deterministic counter-seeded aggregate, timer/window, and join request generation;
 - Arrow-batch-sized logical multi-read and atomic mutation batches;
 - an in-memory semantic model and digest oracle; and
-- structured run identity and result output.
+- structured deterministic model-replay identity and result output.
 
 That second slice still contains no Fjall or RocksDB adapter and no candidate-execution workflow.
 Tests prove deterministic request bytes, batch atomicity, model results, and rejection of malformed
 profiles/results.
+
+The provisional C1 semantics, encoding, digest, result, and fault vocabulary are specified in
+[state backend qualification model v1](../architecture-decisions/state-backend-qualification-model-v1.md).
+Model/conformance scaffolding may be implemented while the checked-in candidate remains unapproved
+because it cannot produce qualification evidence. Named owners may revise the candidate or model
+before approval. Exact candidate builds and semantic adapter-conformance tests may follow, but
+candidate performance, resource, fault, endurance, selection, and qualification execution are
+prohibited until the final profile and runner are approved.
+There is no implicit workload cross-product or pacing policy in C1.
 
 ### C2. Candidate adapters
 
@@ -330,10 +339,15 @@ cross-column-family stall propagation, rate-limiter scope, native memory account
 SST-ingest write pauses. Pin the exact RocksDB engine and wrapper before results are accepted.
 
 Run identical fixed-operation workloads, alternate candidate order across repetitions, and record
-service latency separately from queue latency. Required outputs include raw p50/p90/p99/p99.9/max,
-throughput, CPU, RSS/PSS, cache/memtable/journal/compaction pressure, physical writes, disk/FD use,
-snapshot/export overlap, restore/cleanup RTO, oracle digest, binary/lock/profile hashes, and target
-hardware identity.
+service latency separately from queue latency. Retain raw samples or losslessly mergeable
+histograms and derive p50/p90/p95/p99/p99.9/max, throughput, CPU, RSS/PSS,
+cache/memtable/journal/compaction pressure, physical writes, disk/FD use, snapshot/export overlap,
+restore/cleanup RTO, oracle digest, binary/lock/profile hashes, and target hardware identity.
+
+Every quantile and maximum named under a profile latency gate is enforced; p90 is retained as an
+additional diagnostic. Candidate-local
+snapshot/export/restore/cleanup timings are diagnostic primitive observations and cannot satisfy
+the separately owned artifact-conformance, checkpoint, or recovery gates.
 
 ### C3. Fault and endurance gates
 
@@ -374,20 +388,25 @@ initial aggregate artifact therefore uses the bounded Laminar row codec and wire
 [managed state artifact format v1](../architecture-decisions/managed-state-artifact-format-v1.md).
 The Cycle 5 readers remain unwired; `[LDB-4007]` remains unchanged.
 
-Remaining commits are kept reviewable in this order:
+Remaining commits are kept reviewable in this dependency order:
 
-1. `docs: approve keyed-state qualification profile`
-   - named workload/operations owners approve the unchanged candidate thresholds and immutable
-     runner identity; a separately reviewed approved-profile schema/status records signatures and
-     candidate-profile hash. The current validator intentionally accepts only null approvals and
-     `qualification_eligible=false` and cannot be edited in place after results exist;
+1. `docs: specify provisional backend-neutral qualification model protocol`
+   - the explicitly ineligible contract can change during engineering review;
 2. `tools: define state backend qualification model`
    - standalone backend-neutral model, deterministic workload, digest oracle, and validated output;
-3. separate exact-pin Fjall and RocksDB adapter commits behind the private spike contract;
-4. `test: exercise backend crash resource and endurance gates`;
-5. `docs: select managed-state backend from evidence`;
-6. `tools: remove rejected state backend spike`; and
-7. `docs: review distributed keyed state phase zero`.
+3. `tools: define candidate-neutral runner and evidence schema`
+   - pacing, histograms, invalid-run rules, resource formulas, and fault ordinals land without a
+     runtime dependency;
+4. separate exact-pin Fjall and RocksDB adapter commits behind the private spike contract;
+5. `docs: approve keyed-state qualification profile and runner`
+   - named workload/operations owners may revise the candidate before approving final thresholds,
+     case matrix, Zipf sampler, runner source/build identity, and evidence rules. A separately
+     reviewed approved-profile schema/status records signatures and hashes. The current validator
+     intentionally accepts only null approvals and `qualification_eligible=false`;
+6. `test: exercise backend crash resource and endurance gates` using only the approved artifacts;
+7. `docs: select managed-state backend from evidence`;
+8. `tools: remove rejected state backend spike`; and
+9. `docs: review distributed keyed state phase zero`.
 
 Phase 1 tracks the temporary reader-first dead-code allowances as **DKS-P1-001**. Owner:
 distributed-state lifecycle implementation. Deadline: 2026-08-31 or the first trusted,
