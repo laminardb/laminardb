@@ -547,7 +547,7 @@ Required passes:
 
 The reviewer must conclude `APPROVE`, `APPROVE WITH OWNED FOLLOW-UPS`, or `BLOCK`. A block leaves the
 admission flag closed. Reviews are cumulative; the latest format/lifecycle audit is
-[Cycle 3](../reviews/distributed-keyed-state-cycle-3.md).
+[Cycle 5](../reviews/distributed-keyed-state-cycle-5.md).
 
 ## Commit and change discipline
 
