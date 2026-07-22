@@ -86,9 +86,13 @@ Blocking evidence, owned by the Phase 0/backend and connector leads:
 4. certify a Kafka/state/append-sink ALO scenario with CP-5 flush-before-source-seal ordering and a
    no-gap/allowed-duplicate oracle;
 5. keep retraction/FullChangelog publication closed until a suitable multiwriter log sink or
-   assignment-fenced mutable-sink lifecycle exists; and
-6. pass deterministic crash, multi-process, object-store, connector, soak, rolling-upgrade,
-   security, and `1 -> 3 -> 2` rebalance evidence before any admission flag changes.
+   assignment-fenced mutable-sink lifecycle exists;
+6. pass deterministic crash, multi-process, object-store, connector, rolling-upgrade, security, and
+   `1 -> 3 -> 2` rebalance evidence before any admission flag changes; and
+7. before any production-ready claim, pass the separately chartered black-box soak using unchanged
+   release-candidate bits, real source/object-store/sink dependencies, an external oracle, retained
+   raw artifacts, and a reviewer independent of the implementation. An integration run, backend
+   soak, or canary is not a substitute.
 
 Exactly-once remains independently rejected by `[LDB-0013]`. A local LSM fsync does not replace an
 exact-certified source and a leader-term-fenced external sink transaction.
@@ -159,6 +163,9 @@ passes and specifically:
 - reject abstraction or configuration retained only for the losing backend spike;
 - inspect every crash/fault oracle for zero matched cases, retries, and allowed-duplicate wording;
 - verify source assignment, SQL vnode assignment, state/timer/output cut, sink flush, and durable
-  decision across the same fault matrix; and
+  decision across the same fault matrix;
+- verify that the independent soak charter was fixed before results, cannot use LaminarDB internals
+  as its oracle, invalidates unexplained gaps/retries, and requires a full rerun after relevant
+  release-binary or configuration changes; and
 - leave `[LDB-4007]` closed if any correctness, resource, tail-latency, operability, compatibility,
   documentation, or test owner is unresolved.

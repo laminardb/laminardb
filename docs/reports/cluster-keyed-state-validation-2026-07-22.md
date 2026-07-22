@@ -198,6 +198,8 @@ Clean targeted commands use `--no-default-features --features cluster` throughou
 The exact invocations and timings are repeated in the Cycle 0 review. Real multi-process soak,
 MinIO/object-store integration, Kafka/Docker, and server HTTP/Flight admission suites were not run;
 they require heavier process or external-service setup and are not represented as passing evidence.
+The ADR/plan consequently forbid a production-ready claim until an independently reviewed,
+black-box release-candidate soak passes with real source/object-store/sink dependencies.
 
 These are admission and focused operator tests, not a production certification. No existing test
 demonstrates a distributed keyed operator processing remote rows through crash, restore, and

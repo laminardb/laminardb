@@ -146,7 +146,11 @@ Work:
 8. Freeze a fault-point vocabulary and output-oracle format shared by later phases. Cross source
    drain/replay, state mutation/freeze, timer fire, output enqueue, sink flush, durable decision,
    external publication, assignment rotation, and ambiguous commit.
-9. Audit existing aggregate vnode code for reusable invariants versus map-specific logic. Resolve
+9. Freeze an independent production-soak charter: release artifact and topology, real connector and
+   object-store dependencies, external oracle, minimum duration/event volume, scheduled faults and
+   rebalances, leak-slope/latency/progress thresholds, raw-artifact retention, invalid-run rules,
+   and a reviewer who did not implement the operator/backend under test.
+10. Audit existing aggregate vnode code for reusable invariants versus map-specific logic. Resolve
    or document vestigial values such as the discarded `has_ownership_partitioned_state` result;
    do not carry dead compatibility scaffolding into the new API.
 
@@ -159,6 +163,8 @@ Exit gate:
   evidence, or the ADR is reopened;
 - at least one source/operator/append-sink scenario has a complete ALO oracle and every unsupported
   output/delivery combination has a fail-closed assertion;
+- the independent production-soak charter is approved before implementation results can influence
+  its duration, workload, oracle, or thresholds;
 - every operator has an explicit current capability classification; and
 - Cycle 0/Phase 0 review contains no unowned blocker.
 
@@ -422,9 +428,14 @@ This phase does not add operator semantics. It closes cross-cutting evidence:
 1. Run the complete PGVal-style matrix over data rate, topology, partitions, skew, checkpoints,
    process death, network disruption, object-store stalls, disk full/corruption, compaction stalls,
    and rolling upgrade/rollback.
-2. Run sustained soak with leak slopes for Rust heap, LSM cache/memtables/journal and any native
-   allocation, file descriptors, iterators/snapshots, local bytes, frozen generations, timers, and
-   checkpoint artifacts.
+2. Run the Phase 0-chartered independent black-box soak against the unchanged release-candidate
+   binary in a production-like multi-process environment. Use real certified source, object store,
+   and sink; an external oracle must check progress, output/state correctness, allowed ALO
+   duplicates, recovery, and ownership fencing for every scenario proposed for GA. Track leak
+   slopes for Rust heap, LSM cache/memtables/journal and any native allocation, file descriptors,
+   iterators/snapshots, local bytes, frozen generations, timers, and checkpoint artifacts. Archive
+   raw evidence and obtain independent reviewer sign-off. The backend spike, ordinary integration
+   suite, or canary cannot satisfy this gate.
 3. Publish reproducible p50/p95/p99/p99.9 and RTO results for cache-resident, spill-heavy, skewed,
    checkpointing, and rebalancing workloads. A skipped external test is reported as missing
    evidence, never a pass.
@@ -435,9 +446,11 @@ This phase does not add operator semantics. It closes cross-cutting evidence:
 6. Remove experimental flags only per operator matrix, with staged canary percentages and automatic
    rollback thresholds.
 
-General availability requires zero correctness-oracle failures, all committed numerical gates,
-approved production/operations review, and no unresolved severity-1/2 issue. This does not remove
-`[LDB-0013]`; cluster exactly-once has its own plan and evidence.
+General availability requires zero correctness-oracle failures, all committed numerical gates, a
+valid independently reviewed release-candidate soak, approved production/operations review, and no
+unresolved severity-1/2 issue. Any relevant binary/configuration change or unexplained soak anomaly
+requires a complete rerun. This does not remove `[LDB-0013]`; cluster exactly-once has its own plan
+and evidence.
 
 ## End-of-cycle review contract
 
@@ -457,7 +470,8 @@ Required passes:
    assign a dated removal issue.
 4. **Production readiness:** review failure containment, resource bounds, security, upgrades,
    rollback, observability, on-call actions, data compatibility, and evidence against numerical
-   SLO/RTO gates.
+   SLO/RTO gates. For a production claim, verify the independent soak's release identity, external
+   oracle, raw artifacts, reviewer independence, and complete valid pass without unexplained gaps.
 5. **Documentation:** keep ADR as decision authority and this file as sequencing authority; update
    public capability docs, remove superseded diaries/research, test every link, and cut repetition.
 6. **Tests:** list exact commands/results, skipped suites and prerequisites, nondeterminism/retry

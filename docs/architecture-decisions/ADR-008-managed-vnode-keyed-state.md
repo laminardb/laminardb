@@ -385,7 +385,8 @@ Regardless of the profile, these architecture invariants are mandatory:
 - no successor output before state validation and ownership activation;
 - no admission based only on a SQL string or a default no-op hook;
 - no silent state eviction, partial restore, checkpoint downgrade, or guarantee widening; and
-- no claimed production support when the fault/latency suite is skipped.
+- no claimed production support when the fault/latency suite or independent release-candidate soak
+  is skipped.
 
 Release evidence reports p50/p95/p99/p99.9 end-to-end latency and event-loop stall, throughput,
 checkpoint align/freeze/upload/seal times, RSS/native/cache/memtable bytes, local bytes and
@@ -399,6 +400,18 @@ deterministic crash points before and after state batch, timer fire, freeze, upl
 assignment publish, revoke, install, and activation. A PGVal-style matrix varies data rate,
 partitions, topology, parallelism, skew, and fault timing; one happy-path recovery test is not a
 guarantee.
+
+Production certification also requires a black-box soak that is independent of the implementation
+and its in-process model tests. It runs the release-candidate binary in a production-like
+multi-process deployment with real certified source, shared object store, and sink. An external
+oracle—not LaminarDB's operator state—checks output/state progress, allowed duplicates, checkpoint
+recovery, and stale-owner exclusion for every source/operator/output/sink scenario proposed for
+production. The duration, event volume, fault/rebalance schedule, resource leak slopes, and pass
+thresholds are committed before the run; raw logs, metrics, manifests, output digests,
+configuration, and binary identity are retained for an independent reviewer. An
+unexpected harness gap, unexplained anomaly, assertion failure, or relevant binary/configuration
+change invalidates the evidence and requires a complete clean rerun. A canary, benchmark, or the
+backend qualification soak is not a substitute.
 
 ## Alternatives considered
 
