@@ -102,7 +102,7 @@ isolation:
 | Runtime guarantee | `AtLeastOnce` | `BestEffort` and `ExactlyOnce` remain rejected; the latter stays behind `[LDB-0013]` |
 | Source | Non-ephemeral, `Splittable`, assignment-scoped handoff | Kafka is the only current built-in external source path; source partitions and SQL-key vnodes remain distinct |
 | Operator state | One sealed state/timer/output-bookkeeping cut with the source cursor | Replay cannot double-apply internal state; externally flushed results may repeat |
-| Changed-group append snapshots | `DurableAtLeastOnce + MultiWriter + AppendOnly` (or broader) | Initial grouped output emits one current row per touched group/batch; retries may repeat its stable operation ID |
+| Changed-group append snapshots | `DurableAtLeastOnce + MultiWriter + AppendOnly` (or broader) | One current row per touched group/batch; versions increase per authority interval, while a fenced recovery interval may replay an older sealed prefix |
 | Retraction/changelog output | `DurableAtLeastOnce + MultiWriter + FullChangelog`, or a new assignment-fenced mutable-sink contract | No current built-in cluster sink qualifies, so these combinations remain closed |
 
 Checkpoint certification preserves CP-5 ordering: drain/enqueue operator output, flush every

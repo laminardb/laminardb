@@ -189,10 +189,13 @@ expected. FullChangelog, mutable-key sinks, MVs, and exactly-once remain outside
 After each successfully committed input batch, output contains one current row per distinct group
 touched by that batch. Rows for one group may be coalesced, so legal intermediate count versions may
 be absent; output cost is proportional to changed input rather than total resident cardinality.
-Recovery may repeat a bit-identical operation. `COUNT(*)` is mandatory because its checked value is
-the batching-independent logical state version; `SUM` is initially only nullable `Int64` with
-checked Laminar arithmetic. The producer must route every logical group to exactly one fixed Kafka
-input partition so its broker offsets define group-local order.
+Versions increase within a writer-authority interval. Recovery from an older sealed cut may append
+lower legal prefixes after an unsealed higher version that reached Kafka under the prior interval;
+provenance must show the fence/recovery boundary, and the same version must retain one operation ID
+and bit-identical payload. `COUNT(*)` is mandatory because its checked value is the
+batching-independent logical state version; `SUM` is initially only nullable `Int64` with checked
+Laminar arithmetic. The producer must route every logical group to exactly one fixed Kafka input
+partition so its broker offsets define group-local order.
 Freeze the input and run-specific output topic inventory, partition counts, explicit replay
 offsets, canonical group-key partitioning, `acks=all`, replication/min-ISR, unclean-election, DLQ,
 and evidence-retention settings as part of the contract.

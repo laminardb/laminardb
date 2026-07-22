@@ -74,10 +74,13 @@ The initial grouped-aggregate scenario is narrower than the general row: each lo
 routed to one fixed Kafka input partition, `COUNT(*)` is mandatory as its logical state version,
 and `SUM` is nullable `Int64` using checked Laminar arithmetic. Each successfully committed input
 batch appends one current row per touched group; rows within the batch may be coalesced, so the
-oracle accepts a strictly increasing subsequence of legal group-local count versions. Recovery may
-repeat the same version only with the same operation identity and bit-identical payload. After the
-frozen source cut, the exact final version for every group is mandatory. A full scan/republication
-of all resident groups per processing cycle is neither required nor eligible evidence.
+oracle accepts legal group-local count prefixes with gaps. Versions must increase within one
+writer-authority interval. After a crash, a new fenced interval may replay from the older sealed cut
+and therefore append a lower version after an unsealed higher version from its predecessor. The same
+version must always carry the same operation identity and bit-identical payload, and provenance must
+explain every interval boundary. After the frozen source cut, the exact final version for every
+group is mandatory. A full scan/republication of all resident groups per processing cycle is neither
+required nor eligible evidence.
 
 ## Frozen numerical contract
 
@@ -117,8 +120,8 @@ per-partition sink high-watermarks. An incomplete source or sink cut cannot pass
 The independent model derives expected results solely from the ledger and published SQL semantics:
 
 - projection: exact event IDs and values;
-- grouped aggregate: required final count/sum per key plus validation that every observed version is
-  a legal, strictly increasing group-local prefix (apart from permitted bit-identical replay);
+- grouped aggregate: required final count/sum per key, every observed version is a legal input
+  prefix, and version order is valid within each fenced writer-authority interval;
 - fixed window: exact key/window/aggregate rows after the declared watermark and lateness policy;
 - bounded join: exact stable left/right event-ID pairs; and
 - future changelog: exact signed operations and deterministic operation identity.

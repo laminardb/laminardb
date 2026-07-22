@@ -526,9 +526,12 @@ partitioning, acknowledgement, replication/min-ISR, election, DLQ, and retention
 of the certified contract. The first managed aggregate emits one current result for each distinct
 group changed by a successfully committed input batch. Multiple rows for one group may be
 coalesced, so intermediate count versions may be absent; output never scans or republishes every
-resident group merely because another group changed. Recovery may repeat the same operation ID and
-bit-identical payload. Kafka producer idempotence cannot deduplicate recovery from a new producer
-incarnation. There is currently no
+resident group merely because another group changed. Versions increase within one writer-authority
+interval. After a crash, an unsealed higher version may already be external while recovery starts
+from an older sealed cut, so a new fenced writer interval may append lower legal prefixes before it
+reaches the final version again. The same version always has the same operation ID and bit-identical
+payload. Kafka producer idempotence cannot deduplicate recovery from a new producer incarnation.
+There is currently no
 built-in cluster-admissible `FullChangelog` sink. Any retraction/full-changelog output remains
 fail-closed until either a multiwriter changelog-log sink is certified or mutable sinks gain
 key-affine assignment, old-writer fencing, deterministic operation IDs, and vnode handoff. Merely
