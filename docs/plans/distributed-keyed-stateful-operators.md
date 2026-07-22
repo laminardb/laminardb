@@ -53,7 +53,9 @@ Not in the initial program:
 - a new consensus service, Raft implementation, or control-plane rewrite;
 - object-store-primary live state, a Hummock/Persist clone, or per-record remote state calls;
 - unaligned checkpoints, dual-write migration, or Megaphone-style routing before measurements;
-- cluster exactly-once certification, transactional sinks, or guarantee widening;
+- cluster exactly-once certification, checkpoint-coupled transactional sink commits, or guarantee
+  widening; bounded Kafka transactions used only for externally auditable writer fencing remain
+  required by the initial at-least-once scenario;
 - arbitrary UDAFs, unbounded joins, implicit semantic TTL, or best-effort state eviction;
 - one database/file per vnode; or
 - a new crate or generic framework before two concrete consumers demonstrate the boundary.
