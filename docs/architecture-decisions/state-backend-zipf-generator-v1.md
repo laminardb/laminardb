@@ -81,10 +81,14 @@ Constants are constructed with `f64::from_bits`; parsing decimal text is not nor
 v1 math candidate is `libm = 0.2.16` with default features disabled and
 `force-soft-floats` enabled for `log`, `exp`, `log1p`, and `expm1`. It does not become the v1 math
 source until an exact Cargo package checksum, source archive, lockfile, Rust 1.95.0 artifact,
-target/CPU features, build flags, and feature set are frozen by approval. Changing any of them
-requires a new identity. Rust `std` transcendental methods and the host C math library are
-prohibited. The executable uses round-to-nearest-even binary64 basic operations, no fast-math and
-no fused replacement of a specified multiply followed by add.
+target/CPU features, build flags, and feature set are frozen by approval. A package, algorithm,
+math, operation-order, bit-mapping, or retry semantic change requires a new sampler identity. A
+source, lock, toolchain, target, CPU-feature, flag, feature-set, object, or binary change requires
+new build/approval identities and fresh actual-build conformance; cross-target builds retain the
+same sampler identity only when the frozen corpus is bit-identical. Rust `std` transcendental
+methods and the host C math library are prohibited. The executable uses round-to-nearest-even
+binary64 basic operations, no fast-math and no fused replacement of a specified multiply followed
+by add.
 
 Pure Rust is not accepted as proof of reproducibility. Only the cross-target gates below may admit
 this math source.

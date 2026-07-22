@@ -229,7 +229,7 @@ Three ordinals have different meanings and must never be substituted:
 
 1. `phase_request_ordinal` resets to zero independently in setup, warmup, and measurement and
    addresses counter output; setup's exact request count is derived from its record stream;
-2. `runtime_event_ordinal` is warmup's ordinal and
+2. `runtime_event_ordinal` is `warmup_phase_request_ordinal` in warmup and
    `warmup_request_count + measured_phase_request_ordinal` in measurement, using checked `u64`;
    it is monotonic across the warmup/measurement boundary and drives logical time, retention, timer
    and join lifecycle; and
@@ -255,7 +255,7 @@ SHA-256(
 )
 ```
 
-The Zipf proposal word for attempt `0..63` is the first eight bytes of:
+The Zipf proposal word for `0 <= attempt <= 63` is the first eight bytes of:
 
 ```text
 SHA-256(
