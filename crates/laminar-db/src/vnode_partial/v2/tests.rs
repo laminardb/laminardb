@@ -15,7 +15,7 @@ fn roster_entry(operator: u8, table: u8) -> ExpectedRosterEntry {
     }
 }
 
-fn context<'a>(roster: &'a [ExpectedRosterEntry]) -> ExpectedContext<'a> {
+fn context(roster: &[ExpectedRosterEntry]) -> ExpectedContext<'_> {
     ExpectedContext {
         attempt: CheckpointAttempt::canonical(10),
         assignment_version: 7,
@@ -66,12 +66,6 @@ fn rehash_directory(bytes: &mut [u8]) {
     put_test(bytes, 128, &digest);
 }
 
-fn rehash_body(bytes: &mut [u8]) {
-    let body_offset = usize::try_from(read_u64(bytes, 80).unwrap()).unwrap();
-    let digest = sha256(&bytes[body_offset..]);
-    put_test(bytes, 160, &digest);
-}
-
 fn fixture_bytes(text: &str) -> Vec<u8> {
     let compact = text
         .bytes()
@@ -90,7 +84,7 @@ fn fixture_bytes(text: &str) -> Vec<u8> {
 }
 
 #[test]
-fn frozen_v2_goldens_decode_and_encoder_reproduces_them() {
+fn frozen_v2_outer_directory_goldens_decode_and_encoder_reproduces_them() {
     let reference_roster = [roster_entry(1, 11)];
     let reference = [EncodeEntry {
         operator_identity_sha256: digest(1),
@@ -102,10 +96,8 @@ fn frozen_v2_goldens_decode_and_encoder_reproduces_them() {
     let reference_fixture = fixture_bytes(include_str!(
         "../../../tests/fixtures/managed_state_v1/vnode_partial_reference.hex"
     ));
-    assert_eq!(
-        encode(context(&reference_roster), &reference, limits()).unwrap(),
-        reference_fixture
-    );
+    let reference_encoded = encode(context(&reference_roster), &reference, limits()).unwrap();
+    assert_eq!(reference_encoded, reference_fixture);
     let decoded_reference =
         decode(&reference_fixture, context(&reference_roster), limits()).unwrap();
     assert!(matches!(
@@ -119,6 +111,8 @@ fn frozen_v2_goldens_decode_and_encoder_reproduces_them() {
         roster_entry(2, 12),
         roster_entry(3, 13),
     ];
+    // These placeholder BODY bytes deliberately exercise only the outer directory layer. A
+    // composed golden separately validates real managed-envelope BODY bytes.
     let mixed = [
         full_entry(1, 11, b"full-envelope"),
         EncodeEntry {
@@ -141,10 +135,8 @@ fn frozen_v2_goldens_decode_and_encoder_reproduces_them() {
     let mixed_fixture = fixture_bytes(include_str!(
         "../../../tests/fixtures/managed_state_v1/vnode_partial_mixed.hex"
     ));
-    assert_eq!(
-        encode(context(&mixed_roster), &mixed, limits()).unwrap(),
-        mixed_fixture
-    );
+    let mixed_encoded = encode(context(&mixed_roster), &mixed, limits()).unwrap();
+    assert_eq!(mixed_encoded, mixed_fixture);
     let decoded_mixed = decode(&mixed_fixture, context(&mixed_roster), limits()).unwrap();
     let payloads = decoded_mixed
         .entries()
@@ -172,7 +164,7 @@ fn frozen_v2_goldens_decode_and_encoder_reproduces_them() {
 }
 
 #[test]
-fn mixed_directory_round_trips_as_borrowed_views() {
+fn outer_mixed_directory_round_trips_as_borrowed_views() {
     let roster = [
         roster_entry(1, 11),
         roster_entry(2, 12),
@@ -259,10 +251,6 @@ fn all_reference_directory_has_canonical_empty_body() {
     let encoded = encode(context(&roster), &entries, limits()).unwrap();
 
     assert_eq!(read_u64(&encoded, 88).unwrap(), 0);
-    assert_eq!(
-        read_array::<SHA256_LEN>(&encoded, 160).unwrap(),
-        sha256(&[])
-    );
     let decoded = decode(&encoded, context(&roster), limits()).unwrap();
     assert!(matches!(
         decoded.entries().next().unwrap().unwrap().payload,
@@ -371,7 +359,6 @@ fn hostile_header_and_directory_shapes_fail_after_digest_repair() {
     let mut forged_body = valid;
     let body_offset = usize::try_from(read_u64(&forged_body, 80).unwrap()).unwrap();
     forged_body[body_offset] ^= 1;
-    rehash_body(&mut forged_body);
     assert!(decode(&forged_body, context(&roster), limits()).is_err());
 }
 

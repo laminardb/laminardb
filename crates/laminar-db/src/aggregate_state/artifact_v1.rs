@@ -16,20 +16,13 @@ use sha2::{Digest, Sha256};
 const CONTRACT_MAGIC: &[u8; 8] = b"LDBMAC\0\0";
 const CONTRACT_VERSION: u16 = 1;
 const CONTRACT_LEN: usize = 64;
-const CONTRACT_LEN_U16: u16 = 64;
-const CONTRACT_LEN_U64: u64 = 64;
 const ARTIFACT_MAGIC: &[u8; 8] = b"LDBMGA\0\0";
 const ARTIFACT_VERSION: u16 = 1;
 const ARTIFACT_HEADER_LEN: usize = 384;
-const ARTIFACT_HEADER_LEN_U16: u16 = 384;
-const ARTIFACT_HEADER_LEN_U64: u64 = 384;
 const STATE_CODEC_ID: u32 = 1;
 const STATE_CODEC_VERSION: u16 = 1;
 const KEY_MODE_VNODE_KEYED: u8 = 1;
 const STATE_WIDTH: usize = 24;
-const STATE_WIDTH_U16: u16 = 24;
-const STATE_WIDTH_U32: u32 = 24;
-const STATE_WIDTH_U64: u64 = 24;
 const MAX_SQL_COUNT: u64 = i64::MAX.unsigned_abs();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,8 +58,6 @@ pub(super) enum ArtifactError {
     Allocation,
     #[error("COUNT(*) overflow")]
     CountOverflow,
-    #[error("SUM non-null count overflow")]
-    NonNullCountOverflow,
     #[error("SUM(Int64) overflow")]
     SumOverflow,
 }
@@ -132,7 +123,7 @@ impl CountSumStateV1 {
                 candidate.sum_non_null_count = candidate
                     .sum_non_null_count
                     .checked_add(1)
-                    .ok_or(ArtifactError::NonNullCountOverflow)?;
+                    .ok_or(ArtifactError::ArithmeticOverflow)?;
                 candidate.sum = candidate
                     .sum
                     .checked_add(*value)
@@ -203,7 +194,7 @@ impl AggregateContractV1 {
         let mut bytes = [0; CONTRACT_LEN];
         bytes[0..8].copy_from_slice(CONTRACT_MAGIC);
         bytes[8..10].copy_from_slice(&CONTRACT_VERSION.to_be_bytes());
-        bytes[10..12].copy_from_slice(&CONTRACT_LEN_U16.to_be_bytes());
+        bytes[10..12].copy_from_slice(&64_u16.to_be_bytes());
         bytes[12..16].copy_from_slice(&STATE_CODEC_ID.to_be_bytes());
         bytes[16..18].copy_from_slice(&STATE_CODEC_VERSION.to_be_bytes());
         bytes[18..20].copy_from_slice(&PARTITIONING_ABI_VERSION.to_be_bytes());
@@ -217,9 +208,17 @@ impl AggregateContractV1 {
         bytes[27] = 0; // COUNT output is non-null
         bytes[28] = 1; // INT64
         bytes[29] = 1; // SUM output is nullable
-        bytes[30..32].copy_from_slice(&STATE_WIDTH_U16.to_be_bytes());
+        bytes[30..32].copy_from_slice(&24_u16.to_be_bytes());
         bytes[32..64].copy_from_slice(&self.routing_schema_sha256);
         bytes
+    }
+
+    fn validate_state(self, state: CountSumStateV1) -> Result<(), ArtifactError> {
+        state.validate_persisted()?;
+        if !self.sum_input_nullable && state.sum_non_null_count != state.count {
+            return Err(ArtifactError::Invalid("non-null SUM count"));
+        }
+        Ok(())
     }
 }
 
@@ -247,19 +246,19 @@ pub(super) struct ArtifactContext<'a> {
     pub(super) assignment_version: u64,
     pub(super) assignment_certificate_sha256: [u8; 32],
     pub(super) operator_identity_sha256: [u8; 32],
-    pub(super) table_identity_sha256: [u8; 32],
+    pub(super) state_table_identity_sha256: [u8; 32],
     pub(super) vnode_count: NonZeroU32,
     pub(super) vnode: u32,
     pub(super) routing_schema: &'a PartitionKeySchemaV1,
     pub(super) contract: AggregateContractV1,
 }
 
-/// Remaining per-object counters plus fixed per-envelope limits.
+/// Monotonic per-V2-object budget plus fixed per-envelope limits.
 ///
-/// The caller subtracts every accepted BODY from the same V2-object budget; these values must not
-/// be reset for each entry.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct AggregateBodyLimits {
+/// Every successfully encoded or decoded BODY consumes this same non-`Copy` ledger. Failed
+/// operations leave it unchanged.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct AggregateObjectBudget {
     pub(super) envelope_metadata_bytes_max: u64,
     pub(super) routing_schema_bytes_max: u64,
     pub(super) state_contract_bytes_max: u64,
@@ -269,6 +268,39 @@ pub(super) struct AggregateBodyLimits {
     pub(super) remaining_rows: u64,
     pub(super) remaining_key_bytes: u64,
     pub(super) remaining_state_bytes: u64,
+}
+
+impl AggregateObjectBudget {
+    fn charge(
+        &mut self,
+        artifact_bytes: u64,
+        rows: u64,
+        key_bytes: u64,
+        state_bytes: u64,
+    ) -> Result<(), ArtifactError> {
+        let remaining_artifact_bytes = self
+            .remaining_artifact_bytes
+            .checked_sub(artifact_bytes)
+            .ok_or(ArtifactError::Limit("remaining artifact byte limit"))?;
+        let remaining_rows = self
+            .remaining_rows
+            .checked_sub(rows)
+            .ok_or(ArtifactError::Limit("remaining row limit"))?;
+        let remaining_key_bytes = self
+            .remaining_key_bytes
+            .checked_sub(key_bytes)
+            .ok_or(ArtifactError::Limit("remaining key byte limit"))?;
+        let remaining_state_bytes = self
+            .remaining_state_bytes
+            .checked_sub(state_bytes)
+            .ok_or(ArtifactError::Limit("remaining state byte limit"))?;
+
+        self.remaining_artifact_bytes = remaining_artifact_bytes;
+        self.remaining_rows = remaining_rows;
+        self.remaining_key_bytes = remaining_key_bytes;
+        self.remaining_state_bytes = remaining_state_bytes;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -353,26 +385,26 @@ impl<'a> Iterator for DecodedRows<'a> {
 pub(super) fn encode(
     context: ArtifactContext<'_>,
     rows: &[AggregateRow<'_>],
-    limits: AggregateBodyLimits,
+    budget: &mut AggregateObjectBudget,
 ) -> Result<Vec<u8>, ArtifactError> {
     validate_context(context)?;
-    validate_fixed_limits(limits)?;
+    validate_fixed_limits(budget)?;
 
     let routing = context.routing_schema.as_bytes();
     let contract = context.contract.encode();
     let routing_len = as_u64(routing.len())?;
     let contract_len = as_u64(contract.len())?;
-    if routing_len > limits.routing_schema_bytes_max {
+    if routing_len > budget.routing_schema_bytes_max {
         return Err(ArtifactError::Limit("routing schema byte limit"));
     }
-    if contract_len > limits.state_contract_bytes_max {
+    if contract_len > budget.state_contract_bytes_max {
         return Err(ArtifactError::Limit("state contract byte limit"));
     }
     let metadata_len = as_u64(ARTIFACT_HEADER_LEN)?
         .checked_add(routing_len)
         .and_then(|value| value.checked_add(contract_len))
         .ok_or(ArtifactError::ArithmeticOverflow)?;
-    if metadata_len > limits.envelope_metadata_bytes_max {
+    if metadata_len > budget.envelope_metadata_bytes_max {
         return Err(ArtifactError::Limit("envelope metadata byte limit"));
     }
 
@@ -386,7 +418,7 @@ pub(super) fn encode(
         }
         _ => {}
     }
-    if row_count > limits.remaining_rows {
+    if row_count > budget.remaining_rows {
         return Err(ArtifactError::Limit("remaining row limit"));
     }
 
@@ -395,7 +427,7 @@ pub(super) fn encode(
     let mut previous_key: Option<&[u8]> = None;
     for row in rows {
         let key_len = as_u64(row.key.len())?;
-        if key_len > u64::from(u32::MAX) || key_len > limits.encoded_key_bytes_max {
+        if key_len > u64::from(u32::MAX) || key_len > budget.encoded_key_bytes_max {
             return Err(ArtifactError::Limit("encoded key byte limit"));
         }
         if previous_key.is_some_and(|previous| previous >= row.key) {
@@ -404,7 +436,7 @@ pub(super) fn encode(
         if PartitionKeyCodecV1::vnode_for_encoded(row.key, context.vnode_count) != context.vnode {
             return Err(ArtifactError::Invalid("row vnode"));
         }
-        row.state.validate_persisted()?;
+        context.contract.validate_state(row.state)?;
         previous_key = Some(row.key);
         key_bytes = key_bytes
             .checked_add(key_len)
@@ -412,22 +444,22 @@ pub(super) fn encode(
         rows_len = rows_len
             .checked_add(4)
             .and_then(|value| value.checked_add(key_len))
-            .and_then(|value| value.checked_add(STATE_WIDTH_U64))
+            .and_then(|value| value.checked_add(24_u64))
             .ok_or(ArtifactError::ArithmeticOverflow)?;
     }
     let state_bytes = row_count
-        .checked_mul(STATE_WIDTH_U64)
+        .checked_mul(24_u64)
         .ok_or(ArtifactError::ArithmeticOverflow)?;
-    validate_totals(key_bytes, state_bytes, limits)?;
+    validate_totals(key_bytes, state_bytes, budget)?;
 
     let total_len = metadata_len
         .checked_add(rows_len)
         .ok_or(ArtifactError::ArithmeticOverflow)?;
-    if total_len > limits.remaining_artifact_bytes {
+    if total_len > budget.remaining_artifact_bytes {
         return Err(ArtifactError::Limit("remaining artifact byte limit"));
     }
     let total_len_usize = usize::try_from(total_len).map_err(|_| ArtifactError::Allocation)?;
-    let routing_offset = ARTIFACT_HEADER_LEN_U64;
+    let routing_offset = 384_u64;
     let contract_offset = routing_offset
         .checked_add(routing_len)
         .ok_or(ArtifactError::ArithmeticOverflow)?;
@@ -475,6 +507,7 @@ pub(super) fn encode(
         sha256(&contract),
         rows_digest,
     )?;
+    budget.charge(total_len, row_count, key_bytes, state_bytes)?;
     Ok(output)
 }
 
@@ -497,7 +530,7 @@ fn write_header(
 ) -> Result<(), ArtifactError> {
     put(output, 0, ARTIFACT_MAGIC)?;
     put(output, 8, &ARTIFACT_VERSION.to_be_bytes())?;
-    put(output, 10, &ARTIFACT_HEADER_LEN_U16.to_be_bytes())?;
+    put(output, 10, &384_u16.to_be_bytes())?;
     put(output, 12, &[context.kind as u8])?;
     put(output, 13, &[KEY_MODE_VNODE_KEYED])?;
     put(output, 14, &0_u16.to_be_bytes())?;
@@ -520,17 +553,17 @@ fn write_header(
     put(output, 80, &row_count.to_be_bytes())?;
     put(output, 88, &key_bytes.to_be_bytes())?;
     put(output, 96, &state_bytes.to_be_bytes())?;
-    put(output, 104, &STATE_WIDTH_U32.to_be_bytes())?;
+    put(output, 104, &24_u32.to_be_bytes())?;
     put(output, 108, &0_u32.to_be_bytes())?;
     put(output, 112, &routing_offset.to_be_bytes())?;
     put(output, 120, &routing_len.to_be_bytes())?;
     put(output, 128, &contract_offset.to_be_bytes())?;
-    put(output, 136, &CONTRACT_LEN_U64.to_be_bytes())?;
+    put(output, 136, &64_u64.to_be_bytes())?;
     put(output, 144, &rows_offset.to_be_bytes())?;
     put(output, 152, &rows_len.to_be_bytes())?;
     put(output, 160, &context.assignment_certificate_sha256)?;
     put(output, 192, &context.operator_identity_sha256)?;
-    put(output, 224, &context.table_identity_sha256)?;
+    put(output, 224, &context.state_table_identity_sha256)?;
     put(output, 256, &routing_digest)?;
     put(output, 288, &contract_digest)?;
     put(output, 320, &rows_digest)?;
@@ -541,11 +574,11 @@ fn write_header(
 pub(super) fn decode<'a>(
     bytes: &'a [u8],
     expected: ArtifactContext<'_>,
-    limits: AggregateBodyLimits,
+    budget: &mut AggregateObjectBudget,
 ) -> Result<DecodedArtifact<'a>, ArtifactError> {
     validate_context(expected)?;
-    validate_fixed_limits(limits)?;
-    if as_u64(bytes.len())? > limits.remaining_artifact_bytes {
+    validate_fixed_limits(budget)?;
+    if as_u64(bytes.len())? > budget.remaining_artifact_bytes {
         return Err(ArtifactError::Limit("remaining artifact byte limit"));
     }
     if bytes.len() < ARTIFACT_HEADER_LEN {
@@ -605,11 +638,11 @@ pub(super) fn decode<'a>(
     }
     if field::<32>(bytes, 160)? != expected.assignment_certificate_sha256
         || field::<32>(bytes, 192)? != expected.operator_identity_sha256
-        || field::<32>(bytes, 224)? != expected.table_identity_sha256
+        || field::<32>(bytes, 224)? != expected.state_table_identity_sha256
     {
         return Err(ArtifactError::Invalid("identity context"));
     }
-    if u32::from_be_bytes(field(bytes, 104)?) != STATE_WIDTH_U32
+    if u32::from_be_bytes(field(bytes, 104)?) != 24_u32
         || u32::from_be_bytes(field(bytes, 108)?) != 0
     {
         return Err(ArtifactError::Invalid("state width/reserved field"));
@@ -625,7 +658,7 @@ pub(super) fn decode<'a>(
     let rows_offset = u64::from_be_bytes(field(bytes, 144)?);
     let rows_len = u64::from_be_bytes(field(bytes, 152)?);
 
-    if routing_offset != ARTIFACT_HEADER_LEN_U64
+    if routing_offset != 384_u64
         || contract_offset
             != routing_offset
                 .checked_add(routing_len)
@@ -638,26 +671,26 @@ pub(super) fn decode<'a>(
             != rows_offset
                 .checked_add(rows_len)
                 .ok_or(ArtifactError::ArithmeticOverflow)?
-        || contract_len != CONTRACT_LEN_U64
+        || contract_len != 64_u64
     {
         return Err(ArtifactError::Invalid("section layout"));
     }
-    if routing_len > limits.routing_schema_bytes_max {
+    if routing_len > budget.routing_schema_bytes_max {
         return Err(ArtifactError::Limit("routing schema byte limit"));
     }
-    if contract_len > limits.state_contract_bytes_max {
+    if contract_len > budget.state_contract_bytes_max {
         return Err(ArtifactError::Limit("state contract byte limit"));
     }
-    if rows_offset > limits.envelope_metadata_bytes_max {
+    if rows_offset > budget.envelope_metadata_bytes_max {
         return Err(ArtifactError::Limit("envelope metadata byte limit"));
     }
-    if row_count > limits.remaining_rows {
+    if row_count > budget.remaining_rows {
         return Err(ArtifactError::Limit("remaining row limit"));
     }
-    validate_totals(key_bytes, state_bytes, limits)?;
+    validate_totals(key_bytes, state_bytes, budget)?;
     if state_bytes
         != row_count
-            .checked_mul(STATE_WIDTH_U64)
+            .checked_mul(24_u64)
             .ok_or(ArtifactError::ArithmeticOverflow)?
     {
         return Err(ArtifactError::Invalid("state byte total"));
@@ -692,7 +725,8 @@ pub(super) fn decode<'a>(
         ArtifactKind::Full | ArtifactKind::Delta => {}
     }
 
-    validate_rows(rows, row_count, key_bytes, expected, limits)?;
+    validate_rows(rows, row_count, key_bytes, expected, budget)?;
+    budget.charge(total_len, row_count, key_bytes, state_bytes)?;
     Ok(DecodedArtifact {
         rows,
         row_count,
@@ -706,7 +740,7 @@ fn validate_rows(
     expected_rows: u64,
     expected_key_bytes: u64,
     context: ArtifactContext<'_>,
-    limits: AggregateBodyLimits,
+    budget: &AggregateObjectBudget,
 ) -> Result<(), ArtifactError> {
     let mut offset = 0_usize;
     let mut row_count = 0_u64;
@@ -716,7 +750,7 @@ fn validate_rows(
         let key_len = usize::try_from(u32::from_be_bytes(field(rows, offset)?))
             .map_err(|_| ArtifactError::ArithmeticOverflow)?;
         let key_len_u64 = as_u64(key_len)?;
-        if key_len_u64 > limits.encoded_key_bytes_max {
+        if key_len_u64 > budget.encoded_key_bytes_max {
             return Err(ArtifactError::Limit("encoded key byte limit"));
         }
         let key_start = offset
@@ -740,7 +774,9 @@ fn validate_rows(
         if PartitionKeyCodecV1::vnode_for_encoded(key, context.vnode_count) != context.vnode {
             return Err(ArtifactError::Invalid("row vnode"));
         }
-        CountSumStateV1::decode(state)?;
+        context
+            .contract
+            .validate_state(CountSumStateV1::decode(state)?)?;
         previous_key = Some(key);
         offset = state_end;
         row_count = row_count
@@ -761,7 +797,7 @@ fn validate_context(context: ArtifactContext<'_>) -> Result<(), ArtifactError> {
         || context.assignment_version == 0
         || context.assignment_certificate_sha256 == [0; 32]
         || context.operator_identity_sha256 == [0; 32]
-        || context.table_identity_sha256 == [0; 32]
+        || context.state_table_identity_sha256 == [0; 32]
         || context.vnode_count.get() > MAX_KEY_GROUP_COUNT
         || context.vnode >= context.vnode_count.get()
         || context.routing_schema.as_bytes().is_empty()
@@ -784,8 +820,8 @@ fn validate_context(context: ArtifactContext<'_>) -> Result<(), ArtifactError> {
     }
 }
 
-fn validate_fixed_limits(limits: AggregateBodyLimits) -> Result<(), ArtifactError> {
-    if STATE_WIDTH_U64 > limits.stored_state_bytes_max {
+fn validate_fixed_limits(budget: &AggregateObjectBudget) -> Result<(), ArtifactError> {
+    if 24_u64 > budget.stored_state_bytes_max {
         return Err(ArtifactError::Limit("stored state byte limit"));
     }
     Ok(())
@@ -794,12 +830,12 @@ fn validate_fixed_limits(limits: AggregateBodyLimits) -> Result<(), ArtifactErro
 fn validate_totals(
     key_bytes: u64,
     state_bytes: u64,
-    limits: AggregateBodyLimits,
+    budget: &AggregateObjectBudget,
 ) -> Result<(), ArtifactError> {
-    if key_bytes > limits.remaining_key_bytes {
+    if key_bytes > budget.remaining_key_bytes {
         return Err(ArtifactError::Limit("remaining key byte limit"));
     }
-    if state_bytes > limits.remaining_state_bytes {
+    if state_bytes > budget.remaining_state_bytes {
         return Err(ArtifactError::Limit("remaining state byte limit"));
     }
     Ok(())

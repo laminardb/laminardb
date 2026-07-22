@@ -4,7 +4,7 @@
 
 use crate::error::DbError;
 
-mod v2;
+pub(crate) mod v2;
 
 /// Operator-state slices for one vnode at one epoch, in one of three shapes:
 ///

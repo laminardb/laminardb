@@ -13,8 +13,8 @@ use sha2::{Digest, Sha256};
 
 const MAGIC: &[u8; 8] = b"LDBVPD\0\0";
 const FORMAT_VERSION: u16 = 2;
-const HEADER_LEN: usize = 192;
-const HEADER_LEN_U16: u16 = 192;
+const HEADER_LEN: usize = 160;
+const HEADER_LEN_U16: u16 = 160;
 const ENTRY_LEN: usize = 168;
 const ENTRY_LEN_U16: u16 = 168;
 const MANAGED_ENVELOPE_VERSION: u16 = 1;
@@ -114,7 +114,7 @@ pub(crate) enum EncodeEntryPayload<'a> {
     },
 }
 
-/// A validated borrowed directory entry.
+/// An outer-structurally validated borrowed directory entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DecodedEntry<'a> {
     pub(crate) operator_identity_sha256: [u8; SHA256_LEN],
@@ -125,7 +125,7 @@ pub(crate) struct DecodedEntry<'a> {
     pub(crate) payload: DecodedEntryPayload<'a>,
 }
 
-/// Borrowed BODY data or a REFERENCE link from a validated directory.
+/// Borrowed opaque BODY data or a REFERENCE link from an outer-validated directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DecodedEntryPayload<'a> {
     Body {
@@ -139,7 +139,10 @@ pub(crate) enum DecodedEntryPayload<'a> {
     },
 }
 
-/// A fully validated view over the caller-owned V2 bytes.
+/// An outer-structurally validated view over the caller-owned V2 bytes.
+///
+/// BODY bytes have integrity protection here, but remain semantically opaque until the selected
+/// managed-envelope decoder validates them against its own trusted context.
 #[derive(Debug)]
 pub(crate) struct DecodedVnodePartialV2<'a> {
     bytes: &'a [u8],
@@ -186,7 +189,7 @@ impl<'a> DecodedVnodePartialV2<'a> {
     }
 }
 
-/// Allocation-free iterator over entries in a validated borrowed directory.
+/// Allocation-free iterator over entries in an outer-validated borrowed directory.
 pub(crate) struct DecodedEntryIter<'a> {
     chunks: std::slice::ChunksExact<'a, u8>,
     bytes: &'a [u8],
@@ -199,7 +202,7 @@ impl<'a> Iterator for DecodedEntryIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         self.chunks
             .next()
-            .map(|raw| decode_validated_entry(raw, self.bytes, self.digest_context))
+            .map(|raw| decode_outer_validated_entry(raw, self.bytes, self.digest_context))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -218,7 +221,7 @@ const fn invalid(message: &'static str) -> VnodePartialV2Error {
     VnodePartialV2Error(message)
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct EntryDigestContext {
     attempt: CheckpointAttempt,
     assignment_version: u64,
@@ -243,7 +246,10 @@ struct RawEntry {
     parent_entry_sha256: [u8; SHA256_LEN],
 }
 
-/// Decode and fully validate a V2 directory without allocating or trusting self-declared context.
+/// Validate the V2 outer directory without allocating or trusting self-declared context.
+///
+/// This verifies canonical ranges, roster/provenance, directory integrity, and each BODY digest.
+/// It does not interpret or semantically validate the opaque managed-envelope BODY bytes.
 pub(crate) fn decode<'a>(
     bytes: &'a [u8],
     expected: ExpectedContext<'_>,
@@ -290,7 +296,7 @@ pub(crate) fn decode<'a>(
         assignment_certificate_sha256: read_array(bytes, 96)?,
     };
     let expected_digest_context = digest_context(expected);
-    if !same_digest_context(actual_context, expected_digest_context) {
+    if actual_context != expected_digest_context {
         return Err(invalid(
             "directory provenance does not match expected context",
         ));
@@ -334,7 +340,6 @@ pub(crate) fn decode<'a>(
     }
 
     let directory = checked_slice(bytes, directory_offset, directory_len)?;
-    let body = checked_slice(bytes, body_offset, body_len)?;
     if sha256(directory) != read_array::<SHA256_LEN>(bytes, 128)? {
         return Err(invalid("directory SHA-256 mismatch"));
     }
@@ -357,9 +362,6 @@ pub(crate) fn decode<'a>(
     if next_body_offset != supplied_len {
         return Err(invalid("BODY ranges do not exactly cover the body region"));
     }
-    if sha256(body) != read_array::<SHA256_LEN>(bytes, 160)? {
-        return Err(invalid("body SHA-256 mismatch"));
-    }
     for raw in directory.chunks_exact(ENTRY_LEN) {
         let entry = parse_raw_entry(raw)?;
         if entry.entry_kind == ENTRY_KIND_BODY {
@@ -378,7 +380,9 @@ pub(crate) fn decode<'a>(
     })
 }
 
-/// Encode one canonical V2 directory from caller-sorted entries.
+/// Encode one canonical V2 outer directory from caller-sorted entries.
+///
+/// BODY bytes are treated as opaque and must be produced by the selected managed-envelope writer.
 pub(crate) fn encode(
     expected: ExpectedContext<'_>,
     entries: &[EncodeEntry<'_>],
@@ -536,13 +540,7 @@ pub(crate) fn encode(
             .get(HEADER_LEN..body_offset_usize)
             .ok_or_else(|| invalid("encoder directory range is unavailable"))?,
     );
-    let body_sha256 = sha256(
-        output
-            .get(body_offset_usize..)
-            .ok_or_else(|| invalid("encoder body range is unavailable"))?,
-    );
     put(&mut output, 128, &directory_sha256)?;
-    put(&mut output, 160, &body_sha256)?;
     Ok(output)
 }
 
@@ -686,7 +684,7 @@ fn validate_reference_parent(
     Ok(())
 }
 
-fn decode_validated_entry<'a>(
+fn decode_outer_validated_entry<'a>(
     raw: &[u8],
     bytes: &'a [u8],
     context: EntryDigestContext,
@@ -704,9 +702,9 @@ fn decode_validated_entry<'a>(
         }
         ENTRY_KIND_REFERENCE => DecodedEntryPayload::Reference {
             parent: raw_parent(entry)
-                .ok_or_else(|| invalid("validated REFERENCE lost its parent"))?,
+                .ok_or_else(|| invalid("outer-validated REFERENCE lost its parent"))?,
         },
-        _ => return Err(invalid("validated entry has an unknown kind")),
+        _ => return Err(invalid("outer-validated entry has an unknown kind")),
     };
     Ok(DecodedEntry {
         operator_identity_sha256: entry.operator_identity_sha256,
@@ -763,15 +761,6 @@ fn digest_context(expected: ExpectedContext<'_>) -> EntryDigestContext {
         vnode: expected.vnode,
         assignment_certificate_sha256: expected.assignment_certificate_sha256,
     }
-}
-
-fn same_digest_context(left: EntryDigestContext, right: EntryDigestContext) -> bool {
-    left.attempt == right.attempt
-        && left.assignment_version == right.assignment_version
-        && left.partitioning_abi_version == right.partitioning_abi_version
-        && left.vnode_count == right.vnode_count
-        && left.vnode == right.vnode
-        && left.assignment_certificate_sha256 == right.assignment_certificate_sha256
 }
 
 fn contextual_entry_sha256(
