@@ -43,7 +43,8 @@ In scope:
 - positive physical-plan capability descriptors;
 - grouped built-in aggregates, event-time windows, and progressively broader joins;
 - truthful byte/disk/timer accounting and controlled pressure behavior;
-- local-vs-cluster differential, fault, rescale, and latency certification; and
+- local-vs-cluster differential, fault, rescale, and latency certification;
+- source/operator/sink delivery compatibility and checkpoint-tail certification; and
 - a separate distributed materialized-output lifecycle.
 
 Not in the initial program:
@@ -63,12 +64,16 @@ The following are blocking inputs rather than tasks to hand-wave inside an opera
 1. The existing cluster at-least-once checkpoint, exact-attempt seal, assignment fence, and recovery
    capsule must pass their own deterministic fault gates. Stateful admission cannot mask a known
    durability-authority defect.
-2. Cluster sources used by a certified scenario must have a supported placement/handoff contract.
-   A stateful operator does not make an unsupported singleton or consumer-group source safe.
-3. The deployment's vnode count and partitioning ABI are immutable and present in pipeline identity.
-4. Shared object storage remains required recovery authority; local state storage is configured and
+2. Cluster sources used by a certified scenario must be non-ephemeral, `Splittable`, and have a
+   supported assignment-scoped checkpoint/handoff contract. At this baseline, Kafka is the only
+   built-in external source that qualifies. A stateful operator does not make a singleton or
+   consumer-group-only source safe.
+3. A certified external-output scenario needs a `DurableAtLeastOnce + MultiWriter` sink that accepts
+   the operator's output mode. A connector mismatch remains fail-closed before I/O.
+4. The deployment's vnode count and partitioning ABI are immutable and present in pipeline identity.
+5. Shared object storage remains required recovery authority; local state storage is configured and
    quota-controlled but may be lost completely.
-5. Numerical production workload and latency/recovery targets are checked in during Phase 0.
+6. Numerical production workload and latency/recovery targets are checked in during Phase 0.
 
 ## Admission progression
 
@@ -85,6 +90,26 @@ The following are blocking inputs rather than tasks to hand-wave inside an opera
 Admission changes are granular capability flags tied to descriptors and tests. A later phase never
 widens an earlier operator's function, update, timer, or output mode by accident.
 
+## Delivery compatibility gate
+
+The release unit is a certified source/operator/output/sink scenario, not an operator name in
+isolation:
+
+| Dimension | Initial cluster requirement | Consequence |
+|---|---|---|
+| Runtime guarantee | `AtLeastOnce` | `BestEffort` and `ExactlyOnce` remain rejected; the latter stays behind `[LDB-0013]` |
+| Source | Non-ephemeral, `Splittable`, assignment-scoped handoff | Kafka is the only current built-in external source path; source partitions and SQL-key vnodes remain distinct |
+| Operator state | One sealed state/timer/output-bookkeeping cut with the source cursor | Replay cannot double-apply internal state; externally flushed results may repeat |
+| Append-result output | `DurableAtLeastOnce + MultiWriter + AppendOnly` (or broader) | Existing append sinks can serve ordinary streams and final-window output |
+| Retraction/changelog output | `DurableAtLeastOnce + MultiWriter + FullChangelog`, or a new assignment-fenced mutable-sink contract | No current built-in cluster sink qualifies, so these combinations remain closed |
+
+Checkpoint certification preserves CP-5 ordering: drain/enqueue operator output, flush every
+durable sink, then seal source positions. It measures real sink flush and state-capture latency in
+the same deadline. A stable output identity is part of the state ABI so replay can be recognized,
+but at-least-once permits an externally visible duplicate after a crash. Exactly-once is a later
+per-combination program requiring an exact-certified source and leader-term-fenced external commit;
+local LSM durability is neither necessary nor sufficient for that claim.
+
 ## Phase 0 — Contract and evidence freeze
 
 **Purpose:** make correctness, compatibility, and performance measurable before backend code sets
@@ -98,6 +123,7 @@ Work:
    - state smaller than RAM and state larger than RAM;
    - fixed and variable-width keys/values, key cardinality, Zipf/hot-key skew;
    - Arrow batch sizes, input rate, checkpoint cadence, and failure/rebalance schedule;
+   - source replay/handoff and sink-flush latency/backpressure profiles;
    - aggregate, window, and two-input join workloads; and
    - absolute p99/p99.9 latency, throughput, checkpoint-pause, RTO, RSS, and disk limits.
 3. Specify the partition/state ABI and add golden vectors for every supported key type, including
@@ -107,12 +133,20 @@ Work:
 5. Add the mandatory capability descriptor to design tests. Inventory every current operator as
    `Stateless`, `GlobalSingleton`, `VnodeKeyed`, `RebuildableReplicated`, or `LocalOnly` without
    changing admission.
-6. Run a bounded backend spike against the workload profile. Qualify RocksDB build/platform support,
-   write batches, snapshots, prefix/range scans, bulk restore, range delete, native-memory controls,
-   compaction stalls, disk-full behavior, and corruption detection. Compare with the in-memory
-   reference; do not turn the spike into an alternative framework bake-off.
-7. Freeze a fault-point vocabulary and output-oracle format shared by later phases.
-8. Audit existing aggregate vnode code for reusable invariants versus map-specific logic. Resolve
+6. Run a bounded backend qualification against the workload profile using current Fjall 3.1.x and
+   a pinned RocksDB binding behind the same spike-only adapter. Exercise Arrow-sized atomic batches,
+   realistic hot/cold multi-key reads, timer scans, snapshot/export overlap, sorted restore, vnode
+   drop/GC, compaction/write stalls, hard memory/disk/FD limits, `kill -9`, torn/corrupt data,
+   `ENOSPC`, and N/N-1 format rehearsal. Include 24–72-hour churn/TTL soak. Select and record one
+   production LSM; discard the losing spike rather than maintaining two backends.
+7. Record the complete delivery matrix: source consistency/topology and handoff; operator update
+   mode and output identity; sink durability/topology/input mode; CP-5 ordering; permitted ALO
+   duplicates; and combinations that remain closed. Benchmark at least one real certified source
+   and sink rather than only an in-memory harness.
+8. Freeze a fault-point vocabulary and output-oracle format shared by later phases. Cross source
+   drain/replay, state mutation/freeze, timer fire, output enqueue, sink flush, durable decision,
+   external publication, assignment rotation, and ambiguous commit.
+9. Audit existing aggregate vnode code for reusable invariants versus map-specific logic. Resolve
    or document vestigial values such as the discarded `has_ownership_partitioned_state` result;
    do not carry dead compatibility scaffolding into the new API.
 
@@ -121,7 +155,10 @@ Exit gate:
 - ADR accepted with named reviewers and no unresolved correctness decision;
 - benchmark and numerical SLO/RTO profile is reproducible on a clean runner;
 - golden ABI/schema vectors and compatibility policy pass;
-- backend spike meets the profile or the ADR is reopened;
+- one LSM is selected from reproducible conformance, latency, resource, fault, and operability
+  evidence, or the ADR is reopened;
+- at least one source/operator/append-sink scenario has a complete ALO oracle and every unsupported
+  output/delivery combination has a fail-closed assertion;
 - every operator has an explicit current capability classification; and
 - Cycle 0/Phase 0 review contains no unowned blocker.
 
@@ -139,19 +176,35 @@ Work packages:
   Extract a crate only if dependency direction or a second non-DB consumer requires it.
 - Add canonical physical prefixes, persisted local metadata, process locking, ABI/schema validation,
   and safe cleanup scoped to one resolved pipeline directory.
-- Provide in-memory reference and RocksDB production implementations behind the same conformance
-  suite.
+- Provide the Phase 0-selected production LSM and an in-memory semantic reference behind the same
+  conformance suite. Do not retain the losing qualification adapter.
+- Use one worker-local database with a small fixed keyspace/column-family count and logical
+  pipeline/operator/table/vnode prefixes. Do not allocate a database or physical tree per vnode.
+- Encode hot values with a compact schema-versioned binary format. Do not revive per-group Arrow
+  IPC framing, read-before-write accounting, or the removed cold-tier wrapper.
 - Reject wrong deployment/pipeline/ABI/schema/decided-checkpoint identity before exposing any key.
 
-### 1B. Resource governor
+### 1B. Hot-path scheduler
 
-- Reserve before mutation across Rust/Arrow/operator buffers and RocksDB native cache/memtables.
+- Deduplicate state keys per Arrow batch and submit one logical multi-read plus one atomic mutation
+  batch; a backend without native multi-get must still satisfy the same batched latency contract.
+- Complete cache-only work inline only when it cannot block. Route every disk-capable call to a
+  long-lived bounded blocking-worker pool; do not create a future or `spawn_blocking` task per row.
+- Preserve mutation order within each vnode/table lane while allowing independent lanes to run in
+  parallel. Bound queue bytes, age, and concurrency, and propagate storage pressure to ingestion.
+- Defer a cold Arrow batch as one unit with bounded input and watermark holds. Aligned barriers drain
+  all pre-cut state requests before freezing; the compute/event-loop thread never performs LSM I/O.
+
+### 1C. Resource governor
+
+- Reserve before mutation across Rust/Arrow/operator buffers, LSM cache/memtables/journal,
+  snapshots/iterators/pinned values, OS page cache, and native memory when applicable.
 - Enforce separate memory, local bytes, restore staging, frozen-generation, and compaction-debt
   limits with one-batch documented slack.
 - Define pressure states, bounded backpressure, health transitions, and a typed controlled-fault
   error. Test disk full and native allocation failure; never rely on the OS OOM killer.
 
-### 1C. Checkpoint bridge
+### 1D. Checkpoint bridge
 
 - Atomically journal state mutations per vnode with the logical write batch.
 - Rotate/freeze generations at an aligned barrier and materialize portable per-vnode deltas
@@ -160,7 +213,7 @@ Work packages:
   backpressure.
 - Prove full local-disk-loss recovery, checksum/corruption rejection, and N/N-1 decoding.
 
-### 1D. Ownership lifecycle
+### 1E. Ownership lifecycle
 
 - Implement `Unowned -> Acquiring -> Restoring -> Validated -> Active` and
   `Active -> Frozen/Draining -> Revoked` in the graph/runtime.
@@ -175,6 +228,8 @@ Tests:
 - checksum, truncated artifact, wrong ABI/schema/owner, disk full, object-store stall, compaction
   stall, and complete local directory loss;
 - generation/iterator leak tests and resident/native byte accounting under sustained churn; and
+- scheduler saturation tests proving bounded queues, lane order, watermark holds, and no event-loop
+  blocking; and
 - microbenchmarks with state both inside and outside cache, concurrent checkpoint, and restore.
 
 Exit gate:
@@ -196,8 +251,9 @@ Work:
 1. Add the aggregate `VnodeKeyed` descriptor and make planner admission consume it.
 2. Reuse the existing canonical pre-aggregate shuffle and ownership/barrier fences. Remove duplicate
    map-era dirty/full/delta tracking only after the managed path is equivalent and all callers move.
-3. Encode group accumulator, last-updated metadata, and last-emitted changelog value as stable state
-   tables. Apply one Arrow batch with grouped multi-get and one atomic mutation batch.
+3. Encode group accumulator, last-updated metadata, stable output identity, and last-emitted value as
+   stable state tables. Apply one Arrow batch with one grouped state read and one atomic mutation
+   batch; no record performs its own blocking LSM operation.
 4. Implement reviewed encodings for `COUNT`, `SUM`, `AVG`, and append-only `MIN`/`MAX`; preserve null,
    overflow, decimal, floating-point, update, and retraction semantics.
 5. Keep `DISTINCT`, UDAFs, changelog `MIN`/`MAX`, multi-stage/derived fallback, and cluster MVs closed.
@@ -217,6 +273,8 @@ Correctness matrix:
   rotation, stale messages, and repeated acquire/revoke;
 - output oracle under the advertised at-least-once boundary: no lost state/result, documented
   replay duplicates only, and no double-application inside restored state; and
+- Kafka assignment handoff plus at least one admitted durable multiwriter append sink, including
+  crash before/after sink flush and source-position seal; and
 - cache-resident and spill-heavy latency/throughput/compaction profiles.
 
 Exit gate:
@@ -226,6 +284,8 @@ Exit gate:
 - fault/differential suites report zero state divergence;
 - numerical p99/p99.9, checkpoint, resource, and RTO targets pass on the Phase 0 profile;
 - local embedded performance has a reviewed regression result;
+- append-result versus full-changelog modes are explicit: the certified append scenario passes,
+  while every unsupported retraction/changelog sink combination remains fail-closed;
 - rolling upgrade/rollback and checkpoint compatibility pass; and
 - Phase 2 review approves removal of obsolete map code and docs.
 
@@ -242,6 +302,9 @@ key.
 
 - Implement vnode-owned event-time timer tables, input watermark/frontier checkpointing, allowed
   lateness, trigger state, output/retraction markers, and atomic fire/cleanup.
+- Extend the existing committed source-handoff cut, which already binds source cursors and
+  watermarks; do not create a competing watermark authority. Source drain/reassignment cannot move
+  the frontier past unprocessed input.
 - Unify running and window-close state on the managed representation; do not preserve two unrelated
   map/checkpoint paths.
 - Certify append-only tumbling aggregates first.
@@ -267,6 +330,9 @@ Tests and exit gates:
 - differential event-time oracle across out-of-order rows, equal timestamps, empty windows, nulls,
   watermark stalls/regression attempts, allowed lateness, late drops, and session merges;
 - crash at timer selection, output, deletion, watermark checkpoint, and post-restore refire;
+- timer selection, state mutation, timer removal/advance, emission identity, and output bookkeeping
+  are one atomic transition; ALO recovery may re-fire an externally visible output but cannot lose
+  or internally double-apply it;
 - skewed windows, millions of timers, disk pressure, checkpoint/rebalance with pending timers, and
   owner change exactly at close time;
 - no premature fire, lost fire, unbounded retained closed window, or silent late-data policy;
@@ -274,6 +340,8 @@ Tests and exit gates:
   review before its admission bit changes.
 
 Processing-time/custom-trigger support is not implied by event-time certification.
+Any subphase that emits retractions remains closed to external cluster sinks until the delivery
+gate has a certified `FullChangelog` path.
 
 ## Phase 4 — Stateful joins
 
@@ -295,6 +363,10 @@ Processing-time/custom-trigger support is not implied by event-time certificatio
 
 - Add signed multiplicities, unique/deterministic row identity, join-result weights, and retraction
   state. Test negative/zero multiplicity and cross-cycle duplicate inputs.
+- Keep external publication fail-closed until a multiwriter FullChangelog log sink or an
+  assignment/key-affine mutable-sink lifecycle is certified. A mutable path must expose vnode
+  assignment, fence its previous writer, and use deterministic operation IDs; `MultiWriter` alone
+  is not a correctness proof.
 
 ### 4D. ASOF, temporal, and lookup variants
 
@@ -313,7 +385,7 @@ Tests and exit gates:
 - finite state follows from declared interval/watermark/retention semantics—an internal TTL is never
   the proof;
 - each join family has a separate admission flag, compatibility vector, production metrics, and
-  approved cycle review.
+  approved cycle review; compute support and external-output support are reported separately.
 
 Unbounded joins remain `[LDB-4007]` until a separately reviewed semantic retention contract exists.
 
@@ -327,6 +399,8 @@ Work:
 - define output partitioning and stable row identity for append and changelog/upsert MVs;
 - write output through assignment-fenced managed tables and checkpoint it with upstream operator
   state;
+- add an assignment-aware sink/read topology rather than reusing `MultiWriter` as a mutable-key
+  ownership claim;
 - route point/range reads to owners or implement a reviewed distributed merge;
 - specify read snapshot/epoch consistency during rebalance and recovery;
 - restore/activate MV output before serving it;
@@ -348,8 +422,9 @@ This phase does not add operator semantics. It closes cross-cutting evidence:
 1. Run the complete PGVal-style matrix over data rate, topology, partitions, skew, checkpoints,
    process death, network disruption, object-store stalls, disk full/corruption, compaction stalls,
    and rolling upgrade/rollback.
-2. Run sustained soak with leak slopes for Rust heap, RocksDB native memory, file descriptors,
-   iterators/snapshots, local bytes, frozen generations, timers, and checkpoint artifacts.
+2. Run sustained soak with leak slopes for Rust heap, LSM cache/memtables/journal and any native
+   allocation, file descriptors, iterators/snapshots, local bytes, frozen generations, timers, and
+   checkpoint artifacts.
 3. Publish reproducible p50/p95/p99/p99.9 and RTO results for cache-resident, spill-heavy, skewed,
    checkpointing, and rebalancing workloads. A skipped external test is reported as missing
    evidence, never a pass.
