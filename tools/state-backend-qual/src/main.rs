@@ -1,10 +1,10 @@
 #![forbid(unsafe_code)]
 
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::Path;
 use std::process::ExitCode;
 
-use state_backend_qual::{validate_profile, NOTICE};
+use state_backend_qual::{validate_profile, MAX_PROFILE_BYTES, NOTICE};
 
 fn main() -> ExitCode {
     println!("{NOTICE}");
@@ -23,7 +23,7 @@ fn main() -> ExitCode {
     }
 
     let path = Path::new(&path);
-    let bytes = match std::fs::read(path) {
+    let bytes = match read_bounded(path) {
         Ok(bytes) => bytes,
         Err(error) => {
             eprintln!("INVALID_INPUT {}: {error}", path.display());
@@ -46,7 +46,33 @@ fn main() -> ExitCode {
     }
 }
 
+fn read_bounded(path: &Path) -> std::io::Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take((MAX_PROFILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 fn usage() -> ExitCode {
     eprintln!("usage: state-backend-qual validate-profile <json-path>");
     ExitCode::from(64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_reader_stops_after_the_rejection_sentinel() {
+        let path = std::env::temp_dir().join(format!(
+            "state-backend-qual-reader-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, vec![b' '; MAX_PROFILE_BYTES + 32]).unwrap();
+        let bytes = read_bounded(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        assert_eq!(bytes.len(), MAX_PROFILE_BYTES + 1);
+    }
 }

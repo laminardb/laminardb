@@ -19,10 +19,14 @@ fn candidate_prints_ineligible_notice() {
         .output()
         .unwrap();
     assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.starts_with(NOTICE));
-    assert!(stdout.contains("VALID_INELIGIBLE_PROFILE"));
-    assert!(!stdout.contains("QUALIFIED"));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!(
+            "{NOTICE}\nVALID_INELIGIBLE_PROFILE schema=distributed-state-qual/v1 \
+             profile=linux-nvme-v1 status=candidate_unapproved\n"
+        )
+    );
+    assert!(output.stderr.is_empty());
 }
 
 #[test]
@@ -49,4 +53,26 @@ fn usage_error_returns_sixty_four_after_notice() {
         format!("{NOTICE}\n")
     );
     assert!(String::from_utf8_lossy(&output.stderr).starts_with("usage:"));
+}
+
+#[test]
+fn oversized_file_is_read_only_to_the_validation_cap() {
+    let path = std::env::temp_dir().join(format!(
+        "state-backend-qual-oversized-{}.json",
+        std::process::id()
+    ));
+    std::fs::write(&path, vec![b' '; state_backend_qual::MAX_PROFILE_BYTES + 2]).unwrap();
+    let output = binary()
+        .arg("validate-profile")
+        .arg(&path)
+        .output()
+        .unwrap();
+    std::fs::remove_file(path).unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("{NOTICE}\n")
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("maximum is 1048576"));
 }

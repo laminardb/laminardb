@@ -7,9 +7,9 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
 pub const NOTICE: &str = "NOT QUALIFICATION EVIDENCE";
+pub const MAX_PROFILE_BYTES: usize = 1_048_576;
 
 const PROFILE_SCHEMA: &str = include_str!("../schema/profile-v1.schema.json");
-const MAX_PROFILE_BYTES: usize = 1_048_576;
 
 #[derive(Debug)]
 pub struct CheckErrors {
@@ -231,6 +231,12 @@ fn check_semantics(profile: &Value, errors: &mut Vec<String>) {
     );
     check_at_most(
         profile,
+        "/environment/project_quota_bytes",
+        "/environment/local_nvme_bytes",
+        errors,
+    );
+    check_at_most(
+        profile,
         "/workload/target_batch_bytes",
         "/workload/hard_batch_bytes",
         errors,
@@ -251,13 +257,10 @@ fn check_semantics(profile: &Value, errors: &mut Vec<String>) {
     check_strict_chain(profile, &disk_paths, errors);
 
     let state_sizes = numbers_at(profile, "/workload/logical_state_bytes");
-    let memory_max = number_at(profile, "/environment/cgroup/memory_max_bytes");
+    let block_cache = number_at(profile, "/store_layout/block_cache_bytes_total");
     let physical_memory = number_at(profile, "/environment/physical_memory_bytes");
-    if state_sizes
-        .first()
-        .is_some_and(|value| *value >= memory_max)
-    {
-        errors.push("workload must include a cache-resident state size".to_owned());
+    if state_sizes.first().is_none_or(|value| *value > block_cache) {
+        errors.push("resident state size must fit the total block-cache budget".to_owned());
     }
     if state_sizes
         .last()
@@ -265,11 +268,54 @@ fn check_semantics(profile: &Value, errors: &mut Vec<String>) {
     {
         errors.push("workload must include a state size larger than physical RAM".to_owned());
     }
+    let concurrent_memory_envelope = checked_sum([
+        block_cache,
+        number_at(profile, "/store_layout/write_buffer_bytes_total"),
+        number_at(profile, "/product_runtime_limits/state_queue_max_bytes"),
+        number_at(profile, "/product_runtime_limits/output_buffer_max_bytes"),
+        number_at(
+            profile,
+            "/product_runtime_limits/global_restore_scratch_bytes_max",
+        ),
+        number_at(
+            profile,
+            "/product_runtime_limits/global_encoded_restore_bytes_max",
+        ),
+    ]);
+    if concurrent_memory_envelope
+        .is_none_or(|bytes| bytes > number_at(profile, "/environment/cgroup/memory_high_bytes"))
+    {
+        errors.push("concurrent memory envelope exceeds cgroup memory.high".to_owned());
+    }
+    let largest_state = state_sizes.last().copied().unwrap_or_default();
+    let space_amplification = number_at(profile, "/resource_gates/space_amplification_milli");
+    if scale_ceil_milli(largest_state, space_amplification)
+        .is_none_or(|required| required > number_at(profile, "/resource_gates/normal_disk_bytes"))
+    {
+        errors.push("largest state plus space amplification exceeds normal disk budget".to_owned());
+    }
 
     if number_at(profile, "/workload/primary_vnode_count")
         != number_at(profile, "/store_layout/logical_vnode_count")
     {
         errors.push("workload primary vnode count must match store layout".to_owned());
+    }
+
+    let encoded_key_max = number_at(profile, "/restore_limits/encoded_key_bytes_max");
+    if number_at(profile, "/workload/compact_key_bytes") > encoded_key_max
+        || numbers_at(profile, "/workload/variable_key_bytes")
+            .into_iter()
+            .any(|bytes| bytes > encoded_key_max)
+    {
+        errors.push("workload key width exceeds the artifact key cap".to_owned());
+    }
+    let stored_state_max = number_at(profile, "/restore_limits/stored_state_bytes_max");
+    if number_at(profile, "/workload/compact_state_bytes") > stored_state_max
+        || numbers_at(profile, "/workload/variable_state_bytes")
+            .into_iter()
+            .any(|bytes| bytes > stored_state_max)
+    {
+        errors.push("workload state width exceeds the artifact state cap".to_owned());
     }
 
     check_sum(
@@ -322,8 +368,8 @@ fn check_semantics(profile: &Value, errors: &mut Vec<String>) {
     }
     let seed_count =
         u64::try_from(numbers_at(profile, "/measurement/fixed_seeds").len()).unwrap_or(u64::MAX);
-    if seed_count < repetitions {
-        errors.push("one fixed seed is required per paired repetition".to_owned());
+    if seed_count != repetitions {
+        errors.push("exactly one fixed seed is required per paired repetition".to_owned());
     }
 
     check_less_than(
@@ -346,18 +392,27 @@ fn check_semantics(profile: &Value, errors: &mut Vec<String>) {
 
     check_at_most(
         profile,
-        "/restore_limits/restore_task_reservation_bytes_max",
-        "/restore_limits/global_restore_reservation_bytes_max",
+        "/product_runtime_limits/restore_task_scratch_bytes_max",
+        "/product_runtime_limits/global_restore_scratch_bytes_max",
+        errors,
+    );
+    check_at_most(
+        profile,
+        "/product_runtime_limits/transition_metadata_bytes_max",
+        "/product_runtime_limits/global_restore_scratch_bytes_max",
         errors,
     );
     let task_reservation = number_at(
         profile,
-        "/restore_limits/restore_task_reservation_bytes_max",
+        "/product_runtime_limits/restore_task_scratch_bytes_max",
     );
-    let decoder_count = number_at(profile, "/restore_limits/concurrent_restore_decoders_max");
+    let decoder_count = number_at(
+        profile,
+        "/product_runtime_limits/concurrent_restore_decoders_max",
+    );
     let global_reservation = number_at(
         profile,
-        "/restore_limits/global_restore_reservation_bytes_max",
+        "/product_runtime_limits/global_restore_scratch_bytes_max",
     );
     if task_reservation
         .checked_mul(decoder_count)
@@ -365,14 +420,54 @@ fn check_semantics(profile: &Value, errors: &mut Vec<String>) {
     {
         errors.push("concurrent restore task reservations exceed the global cap".to_owned());
     }
-    let operators = number_at(profile, "/restore_limits/operators_per_transition_max");
-    let vnodes = number_at(profile, "/restore_limits/vnodes_per_transition_max");
-    let pairs = number_at(profile, "/restore_limits/operator_vnode_pairs_max");
+    let operators = number_at(
+        profile,
+        "/product_runtime_limits/operators_per_transition_max",
+    );
+    let vnodes = number_at(profile, "/product_runtime_limits/vnodes_per_transition_max");
+    let pairs = number_at(profile, "/product_runtime_limits/operator_vnode_pairs_max");
     if operators
         .checked_mul(vnodes)
         .is_none_or(|maximum| pairs > maximum)
     {
         errors.push("operator-vnode pair cap exceeds the product cap".to_owned());
+    }
+    let artifact_bytes = number_at(profile, "/restore_limits/encoded_artifact_bytes_max");
+    let chain_bytes = number_at(profile, "/restore_limits/encoded_chain_bytes_max");
+    let global_encoded = number_at(
+        profile,
+        "/product_runtime_limits/global_encoded_restore_bytes_max",
+    );
+    if artifact_bytes > chain_bytes || chain_bytes > global_encoded {
+        errors
+            .push("artifact and chain bytes must fit the global encoded restore budget".to_owned());
+    }
+    for path in [
+        "/restore_limits/key_bytes_per_artifact_max",
+        "/restore_limits/state_bytes_per_artifact_max",
+    ] {
+        if number_at(profile, path) > artifact_bytes {
+            errors.push(format!("{path} must fit the encoded artifact cap"));
+        }
+    }
+    let rows_per_artifact = number_at(profile, "/restore_limits/rows_per_artifact_max");
+    let rows_per_transition = number_at(profile, "/product_runtime_limits/rows_per_transition_max");
+    if rows_per_artifact
+        .checked_mul(pairs)
+        .is_none_or(|maximum| rows_per_transition > maximum)
+    {
+        errors.push("transition row cap exceeds artifact/pair capacity".to_owned());
+    }
+    let largest_batch = numbers_at(profile, "/workload/batch_rows")
+        .last()
+        .copied()
+        .unwrap_or_default();
+    if number_at(
+        profile,
+        "/product_runtime_limits/output_records_per_batch_max",
+    ) > largest_batch
+    {
+        errors.push("output record cap exceeds the largest admitted input batch".to_owned());
     }
 }
 
@@ -429,6 +524,13 @@ fn checked_sum(values: impl IntoIterator<Item = u64>) -> Option<u64> {
     values
         .into_iter()
         .try_fold(0_u64, |sum, value| sum.checked_add(value))
+}
+
+fn scale_ceil_milli(value: u64, multiplier_milli: u64) -> Option<u64> {
+    value
+        .checked_mul(multiplier_milli)?
+        .checked_add(999)?
+        .checked_div(1000)
 }
 
 fn reject_placeholder_strings(value: &Value, path: &str, errors: &mut Vec<String>) {
@@ -617,6 +719,26 @@ mod tests {
             profile["measurement"]["paired_repetitions"] = u64::MAX.into();
         });
         assert!(validate_profile(&bytes).is_err());
+
+        let bytes = mutated(|profile| {
+            profile["store_layout"]["block_cache_bytes_total"] = u64::MAX.into();
+        });
+        assert!(validate_profile(&bytes).is_err());
+
+        let bytes = mutated(|profile| {
+            profile["resource_gates"]["space_amplification_milli"] = u64::MAX.into();
+        });
+        assert!(validate_profile(&bytes).is_err());
+
+        let bytes = mutated(|profile| {
+            profile["product_runtime_limits"]["concurrent_restore_decoders_max"] = u64::MAX.into();
+        });
+        assert!(validate_profile(&bytes).is_err());
+
+        let bytes = mutated(|profile| {
+            profile["product_runtime_limits"]["operators_per_transition_max"] = u64::MAX.into();
+        });
+        assert!(validate_profile(&bytes).is_err());
     }
 
     #[test]
@@ -637,6 +759,26 @@ mod tests {
                 profile["resource_gates"]["normal_disk_bytes"].clone();
         });
         assert!(validate_profile(&bytes).is_err());
+
+        let bytes = mutated(|profile| {
+            profile["environment"]["project_quota_bytes"] = profile["environment"]
+                ["local_nvme_bytes"]
+                .as_u64()
+                .unwrap()
+                .saturating_add(1)
+                .into();
+        });
+        assert!(validate_profile(&bytes).is_err());
+
+        let bytes = mutated(|profile| {
+            profile["store_layout"]["block_cache_bytes_total"] = 1024.into();
+        });
+        assert!(validate_profile(&bytes).is_err());
+
+        let bytes = mutated(|profile| {
+            profile["resource_gates"]["normal_disk_bytes"] = 107374182400_u64.into();
+        });
+        assert!(validate_profile(&bytes).is_err());
     }
 
     #[test]
@@ -650,15 +792,58 @@ mod tests {
             profile["workload"]["variable_key_bytes"] = serde_json::json!([16, 64, 64]);
         });
         assert!(validate_profile(&bytes).is_err());
+
+        let bytes = mutated(|profile| {
+            profile["measurement"]["fixed_seeds"]
+                .as_array_mut()
+                .unwrap()
+                .push(2026072206_u64.into());
+        });
+        assert!(validate_profile(&bytes).is_err());
     }
 
     #[test]
-    fn dependency_manifest_stays_runtime_neutral() {
-        let manifest = include_str!("../Cargo.toml");
-        for forbidden in ["fjall", "rocksdb", "arrow", "datafusion", "laminar"] {
-            assert!(!manifest.contains(forbidden));
-        }
-        assert!(!manifest.contains("path ="));
-        assert!(!manifest.contains("workspace = true"));
+    fn rejects_incoherent_restore_and_output_caps() {
+        let bytes = mutated(|profile| {
+            profile["product_runtime_limits"]["global_encoded_restore_bytes_max"] = 1048576.into();
+        });
+        assert!(validate_profile(&bytes).is_err());
+
+        let bytes = mutated(|profile| {
+            profile["restore_limits"]["key_bytes_per_artifact_max"] = 536870913_u64.into();
+        });
+        assert!(validate_profile(&bytes).is_err());
+
+        let bytes = mutated(|profile| {
+            profile["product_runtime_limits"]["output_records_per_batch_max"] = 8193.into();
+        });
+        assert!(validate_profile(&bytes).is_err());
+
+        let bytes = mutated(|profile| {
+            profile["product_runtime_limits"]["global_restore_scratch_bytes_max"] = u64::MAX.into();
+        });
+        assert!(validate_profile(&bytes)
+            .unwrap_err()
+            .to_string()
+            .contains("concurrent memory envelope exceeds cgroup memory.high"));
+
+        let bytes = mutated(|profile| {
+            profile["product_runtime_limits"]["transition_metadata_bytes_max"] =
+                2147483649_u64.into();
+        });
+        assert!(validate_profile(&bytes)
+            .unwrap_err()
+            .to_string()
+            .contains("transition_metadata_bytes_max must not exceed"));
+
+        let bytes = mutated(|profile| {
+            profile["workload"]["variable_key_bytes"] = serde_json::json!([16, 64, 256, 4097]);
+        });
+        assert!(validate_profile(&bytes).is_err());
+
+        let bytes = mutated(|profile| {
+            profile["workload"]["variable_state_bytes"] = serde_json::json!([64, 256, 1024, 65537]);
+        });
+        assert!(validate_profile(&bytes).is_err());
     }
 }

@@ -350,10 +350,10 @@ jobs:
         continue-on-error: true
 
   # ============================================
-  # Independent Soak Contract Scaffold
+  # Independent Evidence Contract Scaffolds
   # ============================================
   soak-contract-scaffold:
-    name: Soak contract scaffold (NOT certification)
+    name: Evidence contract scaffolds (NOT certification)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -394,6 +394,35 @@ jobs:
           echo "$fixture_output"
           grep -Fqx 'NOT CERTIFICATION EVIDENCE' <<< "$fixture_output"
           grep -Fq 'ORACLE_FIXTURE_OK' <<< "$fixture_output"
+
+      - name: Format standalone state qualification profile tool
+        run: cargo fmt --manifest-path tools/state-backend-qual/Cargo.toml -- --check
+      - name: Lint standalone state qualification profile tool
+        run: cargo clippy --locked --manifest-path tools/state-backend-qual/Cargo.toml --all-targets -- -D warnings
+      - name: Test standalone state qualification profile tool
+        run: cargo test --locked --manifest-path tools/state-backend-qual/Cargo.toml
+      - name: Reject runtime and candidate dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest=tools/state-backend-qual/Cargo.toml
+          if grep -Eq '(path|workspace)[[:space:]]*=' "$manifest"; then
+            echo "state qualification profile unexpectedly uses a path or workspace dependency"
+            exit 1
+          fi
+          dependency_tree="$(cargo tree --locked --all-features --target all --manifest-path tools/state-backend-qual/Cargo.toml --prefix none)"
+          if grep -Eqi '^(laminar([[:space:]_-]|$)|fjall([[:space:]]|$)|rocksdb([[:space:]]|$)|librocksdb[-_]|arrow([[:space:]_-]|$)|datafusion([[:space:]_-]|$))' <<< "$dependency_tree"; then
+            echo "state qualification profile unexpectedly has a runtime or candidate dependency"
+            exit 1
+          fi
+      - name: Validate explicitly ineligible state qualification candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          profile_output="$(cargo run --quiet --locked --manifest-path tools/state-backend-qual/Cargo.toml -- validate-profile tools/state-backend-qual/profiles/linux-nvme-v1.candidate.json 2>&1)"
+          echo "$profile_output"
+          expected_output=$'NOT QUALIFICATION EVIDENCE\nVALID_INELIGIBLE_PROFILE schema=distributed-state-qual/v1 profile=linux-nvme-v1 status=candidate_unapproved'
+          [[ "$profile_output" == "$expected_output" ]]
 
   # ============================================
   # CI Success Gate

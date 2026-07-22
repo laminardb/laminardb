@@ -9,12 +9,22 @@
     "operations_owner": null,
     "approved_at_utc": null
   },
+  "evidence_ownership": {
+    "backend_qualification_sections": [
+      "environment", "comparison_candidates", "store_layout", "preflight", "workload",
+      "measurement", "latency_gates", "throughput_gates", "resource_gates"
+    ],
+    "artifact_conformance_sections": ["restore_limits"],
+    "product_integration_sections": [
+      "product_runtime_limits", "checkpoint_gates", "recovery_gates"
+    ]
+  },
   "environment": {
     "provider": "aws",
     "instance_type": "i4i.2xlarge",
     "cpu_vcpus": 8,
     "physical_memory_bytes": 68719476736,
-    "local_nvme_bytes": 2013265920000,
+    "local_nvme_bytes": 1875000000000,
     "os": "Debian 12.11 amd64",
     "kernel": "6.1.0-37-cloud-amd64",
     "libc": "glibc 2.36",
@@ -46,15 +56,26 @@
     "database_count": 1,
     "physical_keyspace_count": 4,
     "logical_vnode_count": 256,
-    "block_cache_bytes": 8589934592,
-    "write_buffer_bytes": 2147483648,
+    "block_cache_bytes_total": 8589934592,
+    "write_buffer_bytes_total": 2147483648,
     "background_workers": 6
   },
   "preflight": {
+    "random_io_block_bytes": 4096,
+    "random_io_queue_depth": 32,
+    "random_io_duration_seconds": 300,
+    "random_io_direct": true,
     "random_read_iops": 200000,
     "random_write_iops": 100000,
+    "sequential_io_block_bytes": 1048576,
+    "sequential_io_queue_depth": 8,
+    "sequential_io_duration_seconds": 300,
+    "sequential_io_direct": true,
     "sequential_read_bytes_per_second": 2147483648,
     "sequential_write_bytes_per_second": 1073741824,
+    "synchronized_write_bytes": 4096,
+    "synchronized_write_duration_seconds": 300,
+    "synchronized_write_operation": "write_then_fdatasync",
     "synchronized_write_p99_us": 2000,
     "max_cpu_steal_permille": 10,
     "require_no_thermal_throttling": true,
@@ -134,7 +155,6 @@
   },
   "resource_gates": {
     "process_memory_max_bytes": 50465865728,
-    "state_queue_max_bytes": 268435456,
     "open_file_descriptors_max": 4096,
     "live_snapshots_max": 2,
     "live_iterators_max": 64,
@@ -156,6 +176,20 @@
     "candidate_endurance_seconds": 86400,
     "selected_backend_endurance_seconds": 259200
   },
+  "product_runtime_limits": {
+    "state_queue_max_bytes": 268435456,
+    "output_buffer_max_bytes": 268435456,
+    "output_records_per_batch_max": 8192,
+    "operators_per_transition_max": 64,
+    "vnodes_per_transition_max": 256,
+    "operator_vnode_pairs_max": 16384,
+    "rows_per_transition_max": 268435456,
+    "transition_metadata_bytes_max": 67108864,
+    "restore_task_scratch_bytes_max": 268435456,
+    "global_restore_scratch_bytes_max": 2147483648,
+    "global_encoded_restore_bytes_max": 2147483648,
+    "concurrent_restore_decoders_max": 4
+  },
   "restore_limits": {
     "routing_key_columns_max": 256,
     "routing_schema_bytes_max": 131072,
@@ -164,15 +198,11 @@
     "encoded_key_bytes_max": 4096,
     "stored_state_bytes_max": 65536,
     "encoded_artifact_bytes_max": 536870912,
+    "rows_per_artifact_max": 1048576,
+    "key_bytes_per_artifact_max": 536870912,
+    "state_bytes_per_artifact_max": 536870912,
     "delta_depth_max": 8,
     "encoded_chain_bytes_max": 1073741824,
-    "accumulators_per_operator_max": 16,
-    "operators_per_transition_max": 64,
-    "vnodes_per_transition_max": 256,
-    "operator_vnode_pairs_max": 16384,
-    "transition_metadata_bytes_max": 67108864,
-    "restore_task_reservation_bytes_max": 268435456,
-    "global_restore_reservation_bytes_max": 2147483648,
-    "concurrent_restore_decoders_max": 4
+    "accumulators_per_operator_max": 16
   }
 }
