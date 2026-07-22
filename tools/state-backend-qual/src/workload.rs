@@ -1732,6 +1732,32 @@ mod tests {
     }
 
     #[test]
+    fn direct_and_sequential_generation_match_for_every_scenario() {
+        let profile = profile();
+        let aggregate = aggregate_case();
+        let mut timer = aggregate.clone();
+        timer.scenario = Scenario::TimerWindow;
+        timer.key_bytes = 16;
+        let mut join = aggregate.clone();
+        join.scenario = Scenario::Join;
+        join.key_bytes = 16;
+        join.join_match_count = Some(8);
+
+        for case in [&aggregate, &timer, &join] {
+            for ordinal in [0, 7, u64::from(case.request_count - 1)] {
+                let direct = profile.generate_request(case, ordinal).unwrap();
+                let sequential = profile
+                    .requests(case)
+                    .unwrap()
+                    .nth(usize::try_from(ordinal).unwrap())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(direct, sequential);
+            }
+        }
+    }
+
+    #[test]
     fn timer_generator_reaches_all_modes_and_always_reports_case_rows() {
         let profile = profile();
         let mut case = aggregate_case();
@@ -1794,6 +1820,85 @@ mod tests {
             }
         }
         assert!(saw_left && saw_right);
+    }
+
+    #[test]
+    fn join_probe_returns_manual_zero_one_eight_and_sixty_four_fanout() {
+        let profile = profile();
+        for matches in [0, 1, 8, 64] {
+            let mut case = aggregate_case();
+            case.scenario = Scenario::Join;
+            case.key_bytes = 16;
+            case.value_bytes = 64;
+            case.join_match_count = Some(matches);
+            case.request_count = 1;
+            let generated = profile.generate_request(&case, 0).unwrap();
+            let range = generated.ranges[0].clone();
+
+            let mut records = Vec::new();
+            for suffix in 1..=matches {
+                let mut bytes = range.start_inclusive.clone();
+                bytes[12..].copy_from_slice(&suffix.to_be_bytes());
+                records.push((
+                    LogicalKey {
+                        table: range.table,
+                        vnode: range.vnode,
+                        key: bytes,
+                    },
+                    vec![u8::try_from(suffix).unwrap(); usize_from_u32(case.value_bytes).unwrap()],
+                ));
+            }
+            records.push((
+                LogicalKey {
+                    table: range.table,
+                    vnode: range.vnode,
+                    key: range.end_exclusive.clone(),
+                },
+                vec![0xff; usize_from_u32(case.value_bytes).unwrap()],
+            ));
+            records.sort_by(|left, right| left.0.cmp(&right.0));
+
+            let mut model = crate::model::ReferenceModel::new(
+                profile.primary_vnode_count,
+                profile.encoded_key_bytes_max,
+                profile.stored_state_bytes_max,
+            )
+            .unwrap();
+            model
+                .restore_vnode(
+                    range.vnode,
+                    &records,
+                    crate::model::RestoreBudget {
+                        records_max_u64: u64::MAX,
+                        key_bytes_max_u64: u64::MAX,
+                        value_bytes_max_u64: u64::MAX,
+                        canonical_bytes_max_u64: u64::MAX,
+                    },
+                )
+                .unwrap();
+            let probe = LogicalBatch {
+                kind: BatchKind::Setup,
+                scenario: Scenario::Join,
+                ordinal: 0,
+                logical_rows: 0,
+                limits: BatchLimits {
+                    request_bytes_max_u64: profile.hard_batch_bytes,
+                    read_rows_max_u64: u64::from(range.max_rows),
+                    read_bytes_max_u64: range.max_bytes,
+                    mutation_bytes_max_u64: 0,
+                },
+                point_reads: Vec::new(),
+                ranges: vec![range.clone()],
+                mutations: Vec::new(),
+            };
+            let observed = model.execute(&probe).unwrap();
+            assert_eq!(observed.range_results[0].rows.len(), matches as usize);
+            assert!(!observed.range_results[0].has_more);
+            assert!(observed.range_results[0]
+                .rows
+                .iter()
+                .all(|row| row.key.key < range.end_exclusive));
+        }
     }
 
     #[test]

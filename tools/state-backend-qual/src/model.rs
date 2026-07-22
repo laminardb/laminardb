@@ -149,13 +149,6 @@ pub struct Observation {
     pub range_results: Vec<RangeResult>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CommitFault {
-    None,
-    BeforeCommit,
-    AfterCommitBeforeAck,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FaultPhase {
@@ -169,6 +162,36 @@ pub enum FaultPhase {
     CleanupRecord,
 }
 
+impl FaultPhase {
+    const COUNT: usize = 8;
+
+    const fn index(self) -> usize {
+        match self {
+            Self::BatchBeforeCommit => 0,
+            Self::BatchAfterCommitBeforeAck => 1,
+            Self::PersistBefore => 2,
+            Self::PersistAfterSuccessBeforeAck => 3,
+            Self::SnapshotOpen => 4,
+            Self::ExportRecord => 5,
+            Self::RestoreRecord => 6,
+            Self::CleanupRecord => 7,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::BatchBeforeCommit => "batch_before_commit",
+            Self::BatchAfterCommitBeforeAck => "batch_after_commit_before_ack",
+            Self::PersistBefore => "persist_before",
+            Self::PersistAfterSuccessBeforeAck => "persist_after_success_before_ack",
+            Self::SnapshotOpen => "snapshot_open",
+            Self::ExportRecord => "export_record",
+            Self::RestoreRecord => "restore_record",
+            Self::CleanupRecord => "cleanup_record",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FaultOrdinal {
     pub phase: FaultPhase,
@@ -176,11 +199,88 @@ pub struct FaultOrdinal {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FaultInjector {
+    target: Option<FaultOrdinal>,
+    visits: [u64; FaultPhase::COUNT],
+    fired: bool,
+}
+
+impl FaultInjector {
+    pub const fn disabled() -> Self {
+        Self {
+            target: None,
+            visits: [0; FaultPhase::COUNT],
+            fired: false,
+        }
+    }
+
+    pub const fn armed(target: FaultOrdinal) -> Self {
+        Self {
+            target: Some(target),
+            visits: [0; FaultPhase::COUNT],
+            fired: false,
+        }
+    }
+
+    pub const fn target(&self) -> Option<FaultOrdinal> {
+        self.target
+    }
+
+    pub const fn fired(&self) -> bool {
+        self.fired
+    }
+
+    pub const fn visits(&self, phase: FaultPhase) -> u64 {
+        self.visits[phase.index()]
+    }
+
+    pub fn verify_reached(&self) -> Result<(), ModelError> {
+        if let Some(target) = self.target {
+            if !self.fired {
+                return Err(ModelError::FaultTargetNotReached {
+                    target,
+                    visits: self.visits(target.phase),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn visit(&mut self, phase: FaultPhase) -> Result<(), ModelError> {
+        let index = phase.index();
+        let occurrence = self.visits[index];
+        self.visits[index] = occurrence
+            .checked_add(1)
+            .ok_or_else(|| ModelError::invalid("fault occurrence counter overflow"))?;
+        if let Some(target) = self.target {
+            if !self.fired && target.phase == phase && target.occurrence == occurrence {
+                self.fired = true;
+                return Err(match phase {
+                    FaultPhase::BatchAfterCommitBeforeAck
+                    | FaultPhase::PersistAfterSuccessBeforeAck => {
+                        ModelError::AmbiguousAfterSuccess { ordinal: target }
+                    }
+                    _ => ModelError::InjectedFault { ordinal: target },
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Default for FaultInjector {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModelError {
     Invalid(String),
     RowTooLarge { required_bytes: u64 },
-    InjectedBeforeCommit,
-    AmbiguousAfterCommit,
+    InjectedFault { ordinal: FaultOrdinal },
+    AmbiguousAfterSuccess { ordinal: FaultOrdinal },
+    FaultTargetNotReached { target: FaultOrdinal, visits: u64 },
 }
 
 impl ModelError {
@@ -196,10 +296,24 @@ impl Display for ModelError {
             Self::RowTooLarge { required_bytes } => {
                 write!(formatter, "range row requires {required_bytes} bytes")
             }
-            Self::InjectedBeforeCommit => formatter.write_str("injected before commit"),
-            Self::AmbiguousAfterCommit => {
-                formatter.write_str("commit completed before acknowledgement was lost")
-            }
+            Self::InjectedFault { ordinal } => write!(
+                formatter,
+                "injected fault at {} occurrence {}",
+                ordinal.phase.name(),
+                ordinal.occurrence
+            ),
+            Self::AmbiguousAfterSuccess { ordinal } => write!(
+                formatter,
+                "operation succeeded before acknowledgement fault at {} occurrence {}",
+                ordinal.phase.name(),
+                ordinal.occurrence
+            ),
+            Self::FaultTargetNotReached { target, visits } => write!(
+                formatter,
+                "fault target {} occurrence {} was not reached after {visits} eligible visits",
+                target.phase.name(),
+                target.occurrence
+            ),
         }
     }
 }
@@ -216,6 +330,7 @@ pub struct RestoreBudget {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
+    vnode_count: u32,
     records: BTreeMap<LogicalKey, Vec<u8>>,
 }
 
@@ -226,6 +341,28 @@ impl Snapshot {
 
     pub fn digest(&self) -> Result<[u8; 32], ModelError> {
         digest_records(&self.records)
+    }
+
+    pub fn export_vnode(&self, vnode: u32) -> Result<Vec<(LogicalKey, Vec<u8>)>, ModelError> {
+        let mut faults = FaultInjector::disabled();
+        self.export_vnode_with_fault(vnode, &mut faults)
+    }
+
+    pub fn export_vnode_with_fault(
+        &self,
+        vnode: u32,
+        faults: &mut FaultInjector,
+    ) -> Result<Vec<(LogicalKey, Vec<u8>)>, ModelError> {
+        if vnode >= self.vnode_count {
+            return Err(ModelError::invalid("vnode is outside the active range"));
+        }
+
+        let mut exported = Vec::new();
+        for (key, value) in self.records.iter().filter(|(key, _)| key.vnode == vnode) {
+            faults.visit(FaultPhase::ExportRecord)?;
+            exported.push((key.clone(), value.clone()));
+        }
+        Ok(exported)
     }
 }
 
@@ -257,51 +394,45 @@ impl ReferenceModel {
     }
 
     pub fn execute(&mut self, batch: &LogicalBatch) -> Result<Observation, ModelError> {
-        self.execute_with_fault(batch, CommitFault::None)
+        let mut faults = FaultInjector::disabled();
+        self.execute_with_fault(batch, &mut faults)
     }
 
     pub fn execute_with_fault(
         &mut self,
         batch: &LogicalBatch,
-        fault: CommitFault,
+        faults: &mut FaultInjector,
     ) -> Result<Observation, ModelError> {
         self.validate_batch(batch)?;
         let observation = self.observe(batch)?;
-        if fault == CommitFault::BeforeCommit {
-            return Err(ModelError::InjectedBeforeCommit);
-        }
-
+        let mut next_live = self.live.clone();
         for mutation in &batch.mutations {
             match mutation {
                 Mutation::Put { key, value } => {
-                    self.live.insert(key.clone(), value.clone());
+                    next_live.insert(key.clone(), value.clone());
                 }
                 Mutation::Delete { key } => {
-                    self.live.remove(key);
+                    next_live.remove(key);
                 }
             }
         }
 
-        if fault == CommitFault::AfterCommitBeforeAck {
-            return Err(ModelError::AmbiguousAfterCommit);
-        }
+        faults.visit(FaultPhase::BatchBeforeCommit)?;
+        self.live = next_live;
+        faults.visit(FaultPhase::BatchAfterCommitBeforeAck)?;
         Ok(observation)
     }
 
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
+            vnode_count: self.vnode_count,
             records: self.live.clone(),
         }
     }
 
-    pub fn export_vnode(&self, vnode: u32) -> Result<Vec<(LogicalKey, Vec<u8>)>, ModelError> {
-        self.validate_vnode(vnode)?;
-        Ok(self
-            .live
-            .iter()
-            .filter(|(key, _)| key.vnode == vnode)
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect())
+    pub fn snapshot_with_fault(&self, faults: &mut FaultInjector) -> Result<Snapshot, ModelError> {
+        faults.visit(FaultPhase::SnapshotOpen)?;
+        Ok(self.snapshot())
     }
 
     pub fn restore_vnode(
@@ -309,6 +440,17 @@ impl ReferenceModel {
         vnode: u32,
         records: &[(LogicalKey, Vec<u8>)],
         budget: RestoreBudget,
+    ) -> Result<(), ModelError> {
+        let mut faults = FaultInjector::disabled();
+        self.restore_vnode_with_fault(vnode, records, budget, &mut faults)
+    }
+
+    pub fn restore_vnode_with_fault(
+        &mut self,
+        vnode: u32,
+        records: &[(LogicalKey, Vec<u8>)],
+        budget: RestoreBudget,
+        faults: &mut FaultInjector,
     ) -> Result<(), ModelError> {
         self.validate_vnode(vnode)?;
         let mut record_count = 0_u64;
@@ -353,31 +495,54 @@ impl ReferenceModel {
             }
         }
 
-        self.live.retain(|key, _| key.vnode != vnode);
+        let mut staged = BTreeMap::new();
         for (key, value) in records {
-            self.live.insert(key.clone(), value.clone());
+            faults.visit(FaultPhase::RestoreRecord)?;
+            staged.insert(key.clone(), value.clone());
         }
+
+        let mut next_live = self.live.clone();
+        next_live.retain(|key, _| key.vnode != vnode);
+        next_live.append(&mut staged);
+        self.live = next_live;
         Ok(())
     }
 
     pub fn drop_vnode(&mut self, vnode: u32) -> Result<(), ModelError> {
+        let mut faults = FaultInjector::disabled();
+        self.drop_vnode_with_fault(vnode, &mut faults)
+    }
+
+    pub fn drop_vnode_with_fault(
+        &mut self,
+        vnode: u32,
+        faults: &mut FaultInjector,
+    ) -> Result<(), ModelError> {
         self.validate_vnode(vnode)?;
-        self.live.retain(|key, _| key.vnode != vnode);
+        let selected: Vec<_> = self
+            .live
+            .keys()
+            .filter(|key| key.vnode == vnode)
+            .cloned()
+            .collect();
+        for key in selected {
+            faults.visit(FaultPhase::CleanupRecord)?;
+            self.live.remove(&key);
+        }
         Ok(())
     }
 
     pub fn persist(&mut self) {
-        self.durable.clone_from(&self.live);
+        let mut faults = FaultInjector::disabled();
+        self.persist_with_fault(&mut faults)
+            .expect("disabled fault injector cannot fail");
     }
 
-    pub fn persist_with_fault(&mut self, fault: CommitFault) -> Result<(), ModelError> {
-        if fault == CommitFault::BeforeCommit {
-            return Err(ModelError::InjectedBeforeCommit);
-        }
-        self.persist();
-        if fault == CommitFault::AfterCommitBeforeAck {
-            return Err(ModelError::AmbiguousAfterCommit);
-        }
+    pub fn persist_with_fault(&mut self, faults: &mut FaultInjector) -> Result<(), ModelError> {
+        let next_durable = self.live.clone();
+        faults.visit(FaultPhase::PersistBefore)?;
+        self.durable = next_durable;
+        faults.visit(FaultPhase::PersistAfterSuccessBeforeAck)?;
         Ok(())
     }
 
@@ -847,6 +1012,38 @@ mod tests {
         }
     }
 
+    fn fault(phase: FaultPhase, occurrence: u64) -> FaultInjector {
+        FaultInjector::armed(FaultOrdinal { phase, occurrence })
+    }
+
+    fn injected(phase: FaultPhase, occurrence: u64) -> ModelError {
+        ModelError::InjectedFault {
+            ordinal: FaultOrdinal { phase, occurrence },
+        }
+    }
+
+    fn ambiguous(phase: FaultPhase, occurrence: u64) -> ModelError {
+        ModelError::AmbiguousAfterSuccess {
+            ordinal: FaultOrdinal { phase, occurrence },
+        }
+    }
+
+    fn not_reached(phase: FaultPhase, occurrence: u64, visits: u64) -> ModelError {
+        ModelError::FaultTargetNotReached {
+            target: FaultOrdinal { phase, occurrence },
+            visits,
+        }
+    }
+
+    fn generous_restore_budget() -> RestoreBudget {
+        RestoreBudget {
+            records_max_u64: 64,
+            key_bytes_max_u64: 4_096,
+            value_bytes_max_u64: 4_096,
+            canonical_bytes_max_u64: 16_384,
+        }
+    }
+
     #[test]
     fn empty_key_and_value_are_distinct_from_missing() {
         let mut model = ReferenceModel::new(4, 64, 64).unwrap();
@@ -865,24 +1062,45 @@ mod tests {
     }
 
     #[test]
-    fn before_and_after_commit_faults_are_only_complete_cuts() {
+    fn batch_fault_ordinals_produce_only_complete_pre_or_post_cuts() {
         let mut model = ReferenceModel::new(4, 64, 64).unwrap();
-        let record = key(Table::AggregateState, 0, b"a");
-        let write = batch(vec![Mutation::Put {
-            key: record.clone(),
-            value: b"value".to_vec(),
+        let first = key(Table::AggregateState, 0, b"a");
+        let second = key(Table::AggregateState, 0, b"b");
+        let first_write = batch(vec![Mutation::Put {
+            key: first.clone(),
+            value: b"first".to_vec(),
         }]);
+        let second_write = batch(vec![Mutation::Put {
+            key: second.clone(),
+            value: b"second".to_vec(),
+        }]);
+
+        let mut before = fault(FaultPhase::BatchBeforeCommit, 1);
+        model.execute_with_fault(&first_write, &mut before).unwrap();
         let pre = model.live_digest().unwrap();
         assert_eq!(
-            model.execute_with_fault(&write, CommitFault::BeforeCommit),
-            Err(ModelError::InjectedBeforeCommit)
+            model.execute_with_fault(&second_write, &mut before),
+            Err(injected(FaultPhase::BatchBeforeCommit, 1))
         );
         assert_eq!(model.live_digest().unwrap(), pre);
+        assert!(model.live_records().contains_key(&first));
+        assert!(!model.live_records().contains_key(&second));
+        assert!(before.fired());
+        assert_eq!(before.visits(FaultPhase::BatchBeforeCommit), 2);
+        assert_eq!(before.verify_reached(), Ok(()));
+
+        let mut model = ReferenceModel::new(4, 64, 64).unwrap();
+        let mut after = fault(FaultPhase::BatchAfterCommitBeforeAck, 1);
+        model.execute_with_fault(&first_write, &mut after).unwrap();
         assert_eq!(
-            model.execute_with_fault(&write, CommitFault::AfterCommitBeforeAck),
-            Err(ModelError::AmbiguousAfterCommit)
+            model.execute_with_fault(&second_write, &mut after),
+            Err(ambiguous(FaultPhase::BatchAfterCommitBeforeAck, 1))
         );
-        assert_eq!(model.live_records().get(&record), Some(&b"value".to_vec()));
+        assert_eq!(model.live_records().get(&first), Some(&b"first".to_vec()));
+        assert_eq!(model.live_records().get(&second), Some(&b"second".to_vec()));
+        assert!(after.fired());
+        assert_eq!(after.visits(FaultPhase::BatchAfterCommitBeforeAck), 2);
+        assert_eq!(after.verify_reached(), Ok(()));
     }
 
     #[test]
@@ -1003,7 +1221,231 @@ mod tests {
     }
 
     #[test]
-    fn restore_rejects_unsorted_or_over_budget_without_replacing() {
+    fn persist_fault_ordinals_preserve_complete_durable_cuts() {
+        let first = key(Table::AggregateState, 0, b"a");
+        let second = key(Table::AggregateState, 0, b"b");
+        let first_write = batch(vec![Mutation::Put {
+            key: first.clone(),
+            value: vec![1],
+        }]);
+        let second_write = batch(vec![Mutation::Put {
+            key: second.clone(),
+            value: vec![2],
+        }]);
+        let third = key(Table::AggregateState, 0, b"c");
+        let third_write = batch(vec![Mutation::Put {
+            key: third.clone(),
+            value: vec![3],
+        }]);
+
+        let mut model = ReferenceModel::new(4, 64, 64).unwrap();
+        let mut before = fault(FaultPhase::PersistBefore, 1);
+        model.execute(&first_write).unwrap();
+        model.persist_with_fault(&mut before).unwrap();
+        let first_durable = model.durable_digest().unwrap();
+        model.execute(&second_write).unwrap();
+        assert_eq!(
+            model.persist_with_fault(&mut before),
+            Err(injected(FaultPhase::PersistBefore, 1))
+        );
+        assert_eq!(model.durable_digest().unwrap(), first_durable);
+        assert_eq!(before.verify_reached(), Ok(()));
+        model.crash_reopen();
+        assert!(model.live_records().contains_key(&first));
+        assert!(!model.live_records().contains_key(&second));
+
+        let mut model = ReferenceModel::new(4, 64, 64).unwrap();
+        let mut after = fault(FaultPhase::PersistAfterSuccessBeforeAck, 1);
+        model.execute(&first_write).unwrap();
+        model.persist_with_fault(&mut after).unwrap();
+        model.execute(&second_write).unwrap();
+        assert_eq!(
+            model.persist_with_fault(&mut after),
+            Err(ambiguous(FaultPhase::PersistAfterSuccessBeforeAck, 1))
+        );
+        assert!(model.durable_records().contains_key(&first));
+        assert!(model.durable_records().contains_key(&second));
+        assert_eq!(after.verify_reached(), Ok(()));
+        model.execute(&third_write).unwrap();
+        assert!(model.live_records().contains_key(&third));
+        model.crash_reopen();
+        assert!(model.live_records().contains_key(&second));
+        assert!(!model.live_records().contains_key(&third));
+    }
+
+    #[test]
+    fn snapshot_open_fault_precedes_publishing_the_immutable_cut() {
+        let first = key(Table::WindowState, 0, b"a");
+        let second = key(Table::WindowState, 0, b"b");
+        let mut model = ReferenceModel::new(4, 64, 64).unwrap();
+        model
+            .execute(&batch(vec![Mutation::Put {
+                key: first.clone(),
+                value: vec![1],
+            }]))
+            .unwrap();
+
+        let mut faults = fault(FaultPhase::SnapshotOpen, 1);
+        let first_cut = model.snapshot_with_fault(&mut faults).unwrap();
+        assert_eq!(
+            faults.target(),
+            Some(FaultOrdinal {
+                phase: FaultPhase::SnapshotOpen,
+                occurrence: 1,
+            })
+        );
+        assert!(!faults.fired());
+        assert_eq!(faults.visits(FaultPhase::SnapshotOpen), 1);
+        assert_eq!(faults.visits(FaultPhase::ExportRecord), 0);
+        assert_eq!(
+            faults.verify_reached(),
+            Err(not_reached(FaultPhase::SnapshotOpen, 1, 1))
+        );
+        model
+            .execute(&batch(vec![Mutation::Put {
+                key: second.clone(),
+                value: vec![2],
+            }]))
+            .unwrap();
+        assert_eq!(
+            model.snapshot_with_fault(&mut faults),
+            Err(injected(FaultPhase::SnapshotOpen, 1))
+        );
+        assert!(faults.fired());
+        assert_eq!(faults.visits(FaultPhase::SnapshotOpen), 2);
+        assert_eq!(faults.verify_reached(), Ok(()));
+        assert!(first_cut.records().contains_key(&first));
+        assert!(!first_cut.records().contains_key(&second));
+
+        let retry_cut = model.snapshot_with_fault(&mut faults).unwrap();
+        assert_eq!(faults.visits(FaultPhase::SnapshotOpen), 3);
+        assert!(retry_cut.records().contains_key(&first));
+        assert!(retry_cut.records().contains_key(&second));
+    }
+
+    #[test]
+    fn export_fault_publishes_nothing_and_retries_from_an_immutable_snapshot() {
+        let vnode_records = [b"a".as_slice(), b"b", b"c"];
+        let mutations = vnode_records
+            .iter()
+            .enumerate()
+            .map(|(index, bytes)| Mutation::Put {
+                key: key(Table::JoinLeftRows, 0, bytes),
+                value: vec![u8::try_from(index).unwrap()],
+            })
+            .collect();
+        let mut model = ReferenceModel::new(4, 64, 64).unwrap();
+        model.execute(&batch(mutations)).unwrap();
+        let snapshot = model.snapshot();
+
+        model.drop_vnode(0).unwrap();
+        let mut faults = fault(FaultPhase::ExportRecord, 1);
+        assert_eq!(
+            snapshot.export_vnode_with_fault(0, &mut faults),
+            Err(injected(FaultPhase::ExportRecord, 1))
+        );
+
+        let exported = snapshot.export_vnode_with_fault(0, &mut faults).unwrap();
+        assert_eq!(exported.len(), 3);
+        assert_eq!(
+            exported
+                .iter()
+                .map(|(key, _)| key.key.as_slice())
+                .collect::<Vec<_>>(),
+            vnode_records
+        );
+        assert!(model.live_records().is_empty());
+    }
+
+    #[test]
+    fn restore_fault_leaves_active_vnode_unchanged_until_full_replacement() {
+        let old = key(Table::JoinRightRows, 0, b"old");
+        let other = key(Table::JoinRightRows, 1, b"keep");
+        let mut model = ReferenceModel::new(4, 64, 64).unwrap();
+        model
+            .execute(&batch(vec![
+                Mutation::Put {
+                    key: old.clone(),
+                    value: vec![9],
+                },
+                Mutation::Put {
+                    key: other.clone(),
+                    value: vec![8],
+                },
+            ]))
+            .unwrap();
+        let before = model.live_records().clone();
+        let replacement = [b"a".as_slice(), b"b", b"c"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, bytes)| {
+                (
+                    key(Table::JoinRightRows, 0, bytes),
+                    vec![u8::try_from(index).unwrap()],
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut faults = fault(FaultPhase::RestoreRecord, 1);
+        assert_eq!(
+            model
+                .restore_vnode_with_fault(0, &replacement, generous_restore_budget(), &mut faults,),
+            Err(injected(FaultPhase::RestoreRecord, 1))
+        );
+        assert_eq!(model.live_records(), &before);
+
+        model
+            .restore_vnode_with_fault(0, &replacement, generous_restore_budget(), &mut faults)
+            .unwrap();
+        assert!(!model.live_records().contains_key(&old));
+        assert!(model.live_records().contains_key(&other));
+        for (key, value) in replacement {
+            assert_eq!(model.live_records().get(&key), Some(&value));
+        }
+    }
+
+    #[test]
+    fn cleanup_fault_removes_only_a_canonical_prefix_and_retry_is_idempotent() {
+        let removed = [b"a".as_slice(), b"b", b"c"]
+            .into_iter()
+            .map(|bytes| key(Table::OutputBookkeeping, 0, bytes))
+            .collect::<Vec<_>>();
+        let retained = key(Table::OutputBookkeeping, 1, b"keep");
+        let mut mutations = removed
+            .iter()
+            .enumerate()
+            .map(|(index, key)| Mutation::Put {
+                key: key.clone(),
+                value: vec![u8::try_from(index).unwrap()],
+            })
+            .collect::<Vec<_>>();
+        mutations.push(Mutation::Put {
+            key: retained.clone(),
+            value: vec![9],
+        });
+        let mut model = ReferenceModel::new(4, 64, 64).unwrap();
+        model.execute(&batch(mutations)).unwrap();
+
+        let mut faults = fault(FaultPhase::CleanupRecord, 1);
+        assert_eq!(
+            model.drop_vnode_with_fault(0, &mut faults),
+            Err(injected(FaultPhase::CleanupRecord, 1))
+        );
+        assert!(!model.live_records().contains_key(&removed[0]));
+        assert!(model.live_records().contains_key(&removed[1]));
+        assert!(model.live_records().contains_key(&removed[2]));
+        assert!(model.live_records().contains_key(&retained));
+
+        model.drop_vnode_with_fault(0, &mut faults).unwrap();
+        model.drop_vnode_with_fault(0, &mut faults).unwrap();
+        assert!(removed
+            .iter()
+            .all(|key| !model.live_records().contains_key(key)));
+        assert!(model.live_records().contains_key(&retained));
+    }
+
+    #[test]
+    fn invalid_restore_is_fully_rejected_before_record_hooks_or_replacement() {
         let mut model = ReferenceModel::new(4, 64, 64).unwrap();
         let old = key(Table::AggregateState, 0, b"old");
         model
@@ -1016,13 +1458,31 @@ mod tests {
             (key(Table::AggregateState, 0, b"z"), vec![2]),
             (key(Table::AggregateState, 0, b"a"), vec![3]),
         ];
-        let generous = RestoreBudget {
-            records_max_u64: 10,
-            key_bytes_max_u64: 100,
-            value_bytes_max_u64: 100,
-            canonical_bytes_max_u64: 1_000,
-        };
-        assert!(model.restore_vnode(0, &records, generous).is_err());
+        let mut unsorted_faults = fault(FaultPhase::RestoreRecord, 0);
+        assert!(model
+            .restore_vnode_with_fault(0, &records, generous_restore_budget(), &mut unsorted_faults,)
+            .is_err());
+        assert_eq!(unsorted_faults.visits(FaultPhase::RestoreRecord), 0);
+        assert_eq!(
+            unsorted_faults.verify_reached(),
+            Err(not_reached(FaultPhase::RestoreRecord, 0, 0))
+        );
+
+        let sorted = vec![
+            (key(Table::AggregateState, 0, b"a"), vec![3]),
+            (key(Table::AggregateState, 0, b"z"), vec![2]),
+        ];
+        let mut one_record = generous_restore_budget();
+        one_record.records_max_u64 = 1;
+        let mut budget_faults = fault(FaultPhase::RestoreRecord, 0);
+        assert!(model
+            .restore_vnode_with_fault(0, &sorted, one_record, &mut budget_faults)
+            .is_err());
+        assert_eq!(budget_faults.visits(FaultPhase::RestoreRecord), 0);
+        assert_eq!(
+            budget_faults.verify_reached(),
+            Err(not_reached(FaultPhase::RestoreRecord, 0, 0))
+        );
         assert_eq!(model.live_records().get(&old), Some(&vec![1]));
     }
 

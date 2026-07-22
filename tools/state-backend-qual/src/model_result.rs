@@ -169,8 +169,7 @@ pub fn generate_model_result(
 
         let observation_bytes = encode_observation(&observation).map_err(model_error)?;
         update_stream(&mut observations_hasher, &observation_bytes)?;
-        update_stream(&mut trace_hasher, &request_bytes)?;
-        update_stream(&mut trace_hasher, &observation_bytes)?;
+        update_trace(&mut trace_hasher, &request_bytes, &observation_bytes)?;
     }
 
     let live_state = model.live_digest().map_err(model_error)?;
@@ -258,6 +257,15 @@ fn update_stream(hasher: &mut Sha256, bytes: &[u8]) -> Result<(), CheckErrors> {
     Ok(())
 }
 
+fn update_trace(
+    hasher: &mut Sha256,
+    request: &[u8],
+    observation: &[u8],
+) -> Result<(), CheckErrors> {
+    update_stream(hasher, request)?;
+    update_stream(hasher, observation)
+}
+
 fn checked_add(left: u64, right: u64, label: &str) -> Result<u64, CheckErrors> {
     left.checked_add(right)
         .ok_or_else(|| CheckErrors::one(format!("{label} overflow")))
@@ -277,6 +285,8 @@ mod tests {
     use crate::model::Scenario;
 
     const PROFILE: &[u8] = include_bytes!("../profiles/linux-nvme-v1.candidate.json");
+    const AGGREGATE_RESULT_FIXTURE: &[u8] =
+        include_bytes!("../tests/fixtures/model-result-aggregate-v1.json");
 
     fn case() -> ModelCase {
         ModelCase {
@@ -294,8 +304,11 @@ mod tests {
     #[test]
     fn generated_result_round_trips_through_schema_and_replay() {
         let result = generate_model_result(PROFILE, &case()).unwrap();
+        let fixture: ModelResult = serde_json::from_slice(AGGREGATE_RESULT_FIXTURE).unwrap();
+        assert_eq!(result, fixture);
         let bytes = serialize_model_result(&result).unwrap();
         let summary = validate_model_result(PROFILE, &bytes).unwrap();
+        assert!(validate_model_result(PROFILE, AGGREGATE_RESULT_FIXTURE).is_ok());
         assert_eq!(summary.profile_id, "linux-nvme-v1");
         assert_eq!(summary.scenario, Scenario::Aggregate);
         assert_eq!(summary.requests, 2);
@@ -331,5 +344,89 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("maximum is 1048576"));
+    }
+
+    #[test]
+    fn stream_framing_matches_frozen_v1_golden() {
+        let finish = |hasher: Sha256| {
+            let digest: [u8; 32] = hasher.finalize().into();
+            lowercase_sha256(&digest)
+        };
+
+        let mut requests = stream_hasher(REQUEST_STREAM_DOMAIN, 1);
+        update_stream(&mut requests, b"r").unwrap();
+        assert_eq!(
+            finish(requests),
+            "f4a6d86c65a614f38b59cabfdd719ee0869c2015ba1fdcd99daa85d5c8846368"
+        );
+
+        let mut observations = stream_hasher(OBSERVATION_STREAM_DOMAIN, 1);
+        update_stream(&mut observations, b"o").unwrap();
+        assert_eq!(
+            finish(observations),
+            "82ad3153f8885bef8bf744054001a225c61fd4482b8299b3a865f39ef6830118"
+        );
+
+        let mut trace = stream_hasher(TRACE_DOMAIN, 1);
+        update_trace(&mut trace, b"r", b"o").unwrap();
+        assert_eq!(
+            finish(trace),
+            "7580fa0c032a61997728f9127e8fcb4ffb9e087c970cfa9189bda93499ea3f71"
+        );
+    }
+
+    #[test]
+    fn two_request_timer_mutation_and_join_results_match_frozen_digests() {
+        let cases = [
+            (
+                Scenario::TimerWindow,
+                None,
+                256,
+                0,
+                512,
+                "c1f496c244dacb77f82ebe9ee0a563c5fdb5161bf71f04102049508a894c53d1",
+                "aab4890b53a30d1edbd6dc91bef3194d5f4dc12405aebee052041f45e495ab29",
+                "40f6fd151c80353e48a8df710d714e8ef3fa0046d9871350e93ef4bd21502ea5",
+                "f1d924bbd423716d02245fac93695354960a7703b1b22644ddb9052613aa4cca",
+            ),
+            (
+                Scenario::Join,
+                Some(8),
+                0,
+                256,
+                256,
+                "5f7f4e4181b0f679ca5d3501ec0f3a1382a8e104e043933d83cc49dda063d888",
+                "7e99bee3a9c4424048b220eefc1ddff3f4b98d5c4638a8e30b1a443cd3d16314",
+                "233bd2fd8387606d4c16123b268b8132bc6c5e07044a162cad410d6c93a32108",
+                "4ce0bf71dc178c3b489f6b6cff8c8fe6e0fb1755a485fbff97589c4b6a7d39df",
+            ),
+        ];
+        for (
+            scenario,
+            join_match_count,
+            point_reads,
+            range_reads,
+            puts,
+            requests_sha256,
+            observations_sha256,
+            trace_sha256,
+            live_state_sha256,
+        ) in cases
+        {
+            let mut selected = case();
+            selected.scenario = scenario;
+            selected.key_bytes = 16;
+            selected.join_match_count = join_match_count;
+            let result = generate_model_result(PROFILE, &selected).unwrap();
+            assert_eq!(result.counters.point_reads, point_reads);
+            assert_eq!(result.counters.range_reads, range_reads);
+            assert_eq!(result.counters.puts, puts);
+            assert_eq!(result.digests.requests_sha256, requests_sha256);
+            assert_eq!(result.digests.observations_sha256, observations_sha256);
+            assert_eq!(result.digests.trace_sha256, trace_sha256);
+            assert_eq!(result.digests.live_state_sha256, live_state_sha256);
+            let bytes = serialize_model_result(&result).unwrap();
+            assert!(validate_model_result(PROFILE, &bytes).is_ok());
+        }
     }
 }

@@ -103,12 +103,14 @@ canonical-request payloads, it computes the exact post-deduplication shape with 
 aggregate group count and join range count therefore use their actual distinct counts rather than
 raw input rows. The validator streams digests and observations rather than retaining the trace.
 
-C1 also rejects a model profile if any batch-row member exceeds 65,536, any configured key width
-exceeds 4,096 bytes, any configured value width exceeds 65,536 bytes, or `hard_batch_bytes` exceeds
-64 MiB. A case is rejected if `request_count * batch_rows` exceeds 4,194,304 logical rows. These
-are model-tool safety ceilings, not candidate qualification thresholds, and do not replace the
-profile's C2 operation-count requirements. Direct ordinal generation checks the named ordinal's
-exact charge; constructing a sequential replay additionally enforces the cumulative 64 MiB bound.
+C1 also rejects a model profile if any batch-row member exceeds 65,536, any compact or variable
+workload key width exceeds 4,096 bytes, any compact or variable workload value width exceeds 65,536
+bytes, or `hard_batch_bytes` exceeds 64 MiB. Restore maxima remain separate validation ceilings; no
+payload is allocated merely from those maxima. A case is rejected if `request_count * batch_rows`
+exceeds 4,194,304 logical rows. These are model-tool safety ceilings, not candidate qualification
+thresholds, and do not replace the profile's C2 operation-count requirements. Direct ordinal
+generation checks the named ordinal's exact charge; constructing a sequential replay additionally
+enforces the cumulative 64 MiB bound.
 
 There is no implicit workload cross-product. The approved runner must name its exact matrix and
 pacing separately.
@@ -202,8 +204,8 @@ SHA-256(
 ```
 
 `word(row,lane)` is the first eight bytes as big-endian `u64`. Consecutive counter lanes expand
-values. Row `0xffffffff` is reserved for request-level choices. Generator work is outside the
-measured service path.
+values. Row `0xffffffff` is reserved for request-level choices. Generator and reference-oracle
+execution, state cloning, and digesting are outside the measured candidate service interval.
 
 Keys have a fixed base followed, when needed, by entity-suffix blocks. A suffix block is SHA-256 of
 the entity domain, model-input digest, `seed_u64`, `table_u8`, `vnode_u32`, `component_count_u8`,
@@ -291,9 +293,9 @@ unreviewed floating-point implementation.
 ## Canonical encodings and result
 
 Integers are unsigned big-endian. `bytes` is `u32 length || payload`; a collection is `u32 count ||
-elements`; booleans are exactly `0x00` or `0x01`. Counts and lengths are checked before canonical
-output allocation, the request encoder reserves its exact checked length once, and a canonical
-request may not exceed the 64 MiB model-core ceiling.
+elements`; booleans are exactly `0x00` or `0x01`. For canonical requests, counts and lengths are
+checked before output allocation, the encoder reserves its exact checked length once, and the
+result may not exceed the 64 MiB model-core ceiling.
 
 A logical key is `table_u8 || vnode_u32 || bytes(key)`. A request is request domain, `kind_u8`,
 `scenario_u8`, `ordinal_u64`, `logical_rows_u32`, the four `BatchLimits` values in the order defined
@@ -352,11 +354,14 @@ are errors. The CLI may validate a model result but exposes no candidate executi
 ## Fault vocabulary and required tests
 
 Fault locations are stable zero-based `(phase, occurrence)` values. Occurrence counts eligible hook
-visits from zero across one fresh scenario replay and resets only when that replay starts. Batch
-hooks fire immediately before the complete mutation install and immediately after that install but
+visits independently per phase from zero across one fresh scenario replay and resets only when that
+replay starts. The same one-shot injector and counters continue across an operation retry. An armed
+target that was not reached makes the replay invalid; the runner must finalize the injector and
+check this explicitly. Batch hooks fire immediately before the complete mutation install and
+immediately after that install but
 before acknowledgement. Persist hooks fire immediately before and immediately after the durable
 image swap. `snapshot_open` fires before capturing/publishing the cut. Record hooks fire
-immediately before copying or staging the selected canonical record; records with smaller
+immediately before copying, staging, or deleting the selected canonical record; records with smaller
 occurrences have completed. A failed export publishes nothing, a failed restore leaves the active
 vnode unchanged, and cleanup may have removed only smaller-occurrence physical records and must be
 safe to retry under an external ownership fence. V1 phases are
@@ -367,6 +372,13 @@ persist is a complete durable cut, failed export is unpublished, restore is unch
 replacement, and cleanup is idempotent. Real kills, torn files, `ENOSPC`, corruption, FD pressure,
 ownership fences, and endurance remain C3 evidence under the
 [Phase 0 plan](../plans/distributed-keyed-state-phase-0-execution.md).
+
+Pre-success and record cuts return `InjectedFault` with the exact ordinal. The two post-success cuts
+return `AmbiguousAfterSuccess` with the exact ordinal: the live or durable cut is complete even
+though acknowledgement was lost. Retrying a batch may observe a different pre-mutation cut, so
+this model does not turn an ambiguous acknowledgement into an exactly-once output claim. Invalid
+batches, failed reads, and invalid restore inputs consume no batch or restore hooks; empty
+record sets consume no record hooks.
 
 C1 tests must cover frozen request/observation/state/trace goldens; direct versus sequential
 generation; aggregate deduplication and timer modes; both join sides and manual 0/1/8/64 fanout;

@@ -1,0 +1,2 @@
+# Exact profile bytes participate in qualification identity hashes.
+/tools/state-backend-qual/profiles/** text eol=lf

@@ -318,9 +318,11 @@ work, per-request, and cumulative 64 MiB replay ceilings are normative in the pr
 aggregate and join accounting occurs after logical deduplication so the safety gate does not reject
 a valid compact request merely because its raw input batch was wide.
 
-C1 is not complete at this checkpoint. Closure still requires the documented occurrence-addressed
-lifecycle fault cuts, immutable snapshot export, literal wire/result goldens, and the full boundary
-matrix. Until those land, the model is scaffolding and cannot support adapter-conformance claims.
+This checkpoint contains the occurrence-addressed lifecycle cuts, immutable snapshot export, and
+independently checked literal wire/result goldens. C1 is not complete until the remaining boundary
+matrix proves multi-mutation atomic cuts, ordering rejection, scan-byte exact/+1 behavior, every
+restore-budget dimension, and zero-hook invalid/empty operations. Until then, the model is
+scaffolding and cannot support adapter-conformance claims.
 
 The provisional C1 semantics, encoding, digest, result, and fault vocabulary are specified in
 [state backend qualification model v1](../architecture-decisions/state-backend-qualification-model-v1.md).
@@ -404,8 +406,8 @@ Remaining commits are kept reviewable in this dependency order:
 2. `tools: define state backend qualification model`
    - standalone backend-neutral model, deterministic workload, digest oracle, and validated output;
 3. `tools: define candidate-neutral runner and evidence schema`
-   - pacing, histograms, invalid-run rules, resource formulas, and fault ordinals land without a
-     runtime dependency;
+   - pacing, histograms, invalid-run rules, resource formulas, and fault schedules/evidence policy
+     land without a runtime dependency;
 4. separate exact-pin Fjall and RocksDB adapter commits behind the private spike contract;
 5. `docs: approve keyed-state qualification profile and runner`
    - named workload/operations owners may revise the candidate before approving final thresholds,
