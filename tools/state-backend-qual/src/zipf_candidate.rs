@@ -489,6 +489,14 @@ mod tests {
             ZipfCandidateError::InvalidSample
         );
         assert_eq!(
+            round_and_clamp(-0.5, 10).unwrap_err(),
+            ZipfCandidateError::InvalidSample
+        );
+        assert_eq!(
+            round_and_clamp(f64::from_bits(0x8000_0000_0000_0001), 10).unwrap_err(),
+            ZipfCandidateError::InvalidSample
+        );
+        assert_eq!(
             round_and_clamp(f64::INFINITY, 10).unwrap_err(),
             ZipfCandidateError::InvalidSample
         );
