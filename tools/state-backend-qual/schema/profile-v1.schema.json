@@ -304,7 +304,7 @@
     },
     "restoreLimits": {
       "type": "object", "additionalProperties": false,
-      "required": ["routing_key_columns_max", "routing_schema_bytes_max", "envelope_metadata_bytes_max", "state_contract_bytes_max", "encoded_key_bytes_max", "stored_state_bytes_max", "encoded_artifact_bytes_max", "rows_per_artifact_max", "key_bytes_per_artifact_max", "state_bytes_per_artifact_max", "delta_depth_max", "encoded_chain_bytes_max", "accumulators_per_operator_max"],
+      "required": ["routing_key_columns_max", "routing_schema_bytes_max", "envelope_metadata_bytes_max", "state_contract_bytes_max", "encoded_key_bytes_max", "stored_state_bytes_max", "encoded_artifact_bytes_max", "directory_entries_per_artifact_max", "rows_per_artifact_max", "key_bytes_per_artifact_max", "state_bytes_per_artifact_max", "resolved_parent_links_max", "encoded_chain_bytes_max", "accumulators_per_operator_max"],
       "properties": {
         "routing_key_columns_max": {"$ref": "#/$defs/positive"},
         "routing_schema_bytes_max": {"$ref": "#/$defs/positive"},
@@ -313,10 +313,11 @@
         "encoded_key_bytes_max": {"$ref": "#/$defs/positive"},
         "stored_state_bytes_max": {"$ref": "#/$defs/positive"},
         "encoded_artifact_bytes_max": {"$ref": "#/$defs/positive"},
+        "directory_entries_per_artifact_max": {"$ref": "#/$defs/positive"},
         "rows_per_artifact_max": {"$ref": "#/$defs/positive"},
         "key_bytes_per_artifact_max": {"$ref": "#/$defs/positive"},
         "state_bytes_per_artifact_max": {"$ref": "#/$defs/positive"},
-        "delta_depth_max": {"$ref": "#/$defs/positive"},
+        "resolved_parent_links_max": {"$ref": "#/$defs/positive"},
         "encoded_chain_bytes_max": {"$ref": "#/$defs/positive"},
         "accumulators_per_operator_max": {"$ref": "#/$defs/positive"}
       }

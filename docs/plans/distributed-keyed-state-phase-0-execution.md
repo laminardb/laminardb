@@ -89,7 +89,7 @@ profile containing:
 - maximum compute/event-loop stall, checkpoint freeze/tail/seal time, sink flush time, and RTO;
 - hard RSS, local disk, FD, queue, frozen-generation, snapshot, compaction-debt, and write
   amplification limits;
-- hard encoded artifact/descriptor/payload bytes, chain-link/delta depth, operators/vnodes per
+- hard encoded artifact/descriptor/payload bytes, total resolved parent links, operators/vnodes per
   transition, groups/accumulators/rows, canonical key/state bytes, output buffering, and
   restore-staging limits; and
 - repetition count, warm-up, fixed operation count, and invalid-run policy.
@@ -144,6 +144,8 @@ including removal of live keys absent from the image; a missing operator entry n
 
 The first managed aggregate payload is not Arrow IPC. It is a Laminar-owned sorted row format:
 length-delimited canonical key bytes followed by fixed-width state selected by a cached contract.
+Zero encoded key bytes remain valid for a nonempty ABI-v1 `Null` grouping schema; EMPTY is an
+artifact kind, not an inference from key length.
 The first candidate contract is append-only `COUNT(*)` plus `SUM(Int64)`: checked count and non-null
 count plus a signed `i64` accumulator, with nullable `Int64` SQL output. The executor checks every
 group-local input prefix in fixed source order, preflights the complete Arrow batch, then publishes
@@ -176,8 +178,11 @@ From the trusted checkpoint pointer, obtain the inventory object's encoded lengt
 digest. Reject a length above `transition_metadata_bytes_max`, acquire the global encoded-byte
 charge, then stream the inventory to the exact cap before parsing it. Its verified declarations bind
 artifact lengths/digests, provenance, and decoder dispatch; each artifact repeats reserve-before-GET
-and exact-length/digest enforcement. Per-artifact/per-chain encoded caps, the global encoded pool,
-and per-task/global decoder/ingestion scratch are distinct candidate-profile fields.
+and exact-length/digest enforcement. Per-artifact/per-chain encoded caps, the per-artifact
+directory-entry cap, the global encoded pool, and per-task/global decoder/ingestion scratch are
+distinct candidate-profile fields. "Per artifact" means one complete `VnodePartialV2` object: rows,
+key bytes, state bytes, and encoded bytes are summed across its BODY entries rather than reset for
+each inner payload. The resolved-parent limit counts both outer REFERENCE and inner DELTA edges.
 
 Represent restore as one assignment-scoped transition, not separate acquire/revoke maps or flat
 payload vectors. It binds the exact committed cut and checkpoint assignment fence to the target

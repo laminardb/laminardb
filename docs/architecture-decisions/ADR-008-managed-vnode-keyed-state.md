@@ -309,8 +309,11 @@ note for the former DataFusion 52.3 wrapping/profile-dependent behavior. Decimal
 floating, `AVG`, `MIN`/`MAX`, retractions, and UDAFs remain codec-unavailable until separately
 specified and tested.
 
-Each non-empty payload row is `u32_be key_length | key_bytes | fixed_state_bytes`. Key length, row
-count, aggregate key bytes, state bytes, descriptor bytes, artifact bytes, and full-plus-delta chain
+Each non-empty payload row is `u32_be key_length | key_bytes | fixed_state_bytes`. A zero key length
+is valid: ABI v1 admits a nonempty `Null` grouping schema, for which Arrow 57.2 encodes the row as
+zero bytes; the persisted nonempty routing-schema descriptor distinguishes that keyed row from a
+global singleton. `EMPTY` is identified only by artifact kind and row count. Key length, row count,
+aggregate key bytes, state bytes, descriptor bytes, artifact bytes, and full-plus-delta chain
 bytes are checked against the approved profile with checked arithmetic before allocation. Keys are
 unique and strictly increasing, and every keyed row must hash to the claimed vnode. `EMPTY` is the
 only zero-row representation. A `FULL` image replaces the entire operator/table/vnode namespace;
@@ -361,10 +364,14 @@ V2 parsing runs under the encoded charge; separate task/global **scratch** reser
 directory metadata, key/state bytes, rows, shadow ingestion, operators, and vnodes. Transition-owned
 validated spool bytes are charged to the local-disk governor and retained until prepare completes;
 they are never an unbounded in-memory copy. The candidate profile separately names per-artifact and
-per-chain encoded caps, a global encoded-byte pool, and per-task/global scratch caps; that
-machine-readable profile remains the sole numerical source. Whole-transition preflight resolves
-every REFERENCE and validates every chain and row into that immutable spool before any operator
-callback. Prepare then consumes the spool into abortable shadow LSM state.
+per-chain encoded caps, a directory-entry cap, a global encoded-byte pool, and per-task/global
+scratch caps; that machine-readable profile remains the sole numerical source. One "artifact" is
+the complete encoded `VnodePartialV2` object, not each inner BODY: its row, key-byte, state-byte, and
+encoded-byte caps are cumulative across all BODY entries. `resolved_parent_links_max` counts every
+outer `REFERENCE` and inner `DELTA` parent edge; a FULL/EMPTY base has depth zero, exactly the
+maximum is accepted, and maximum-plus-one is rejected. Whole-transition preflight resolves every
+REFERENCE and validates every chain and row into that immutable spool before any operator callback.
+Prepare then consumes the spool into abortable shadow LSM state.
 Legacy rkyv/Arrow decoding is selected only by manifest/type proof for the currently admitted global
 vnode-0 path.
 

@@ -198,10 +198,11 @@
     "encoded_key_bytes_max": 4096,
     "stored_state_bytes_max": 65536,
     "encoded_artifact_bytes_max": 536870912,
+    "directory_entries_per_artifact_max": 64,
     "rows_per_artifact_max": 1048576,
     "key_bytes_per_artifact_max": 536870912,
     "state_bytes_per_artifact_max": 536870912,
-    "delta_depth_max": 8,
+    "resolved_parent_links_max": 8,
     "encoded_chain_bytes_max": 1073741824,
     "accumulators_per_operator_max": 16
   }
