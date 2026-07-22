@@ -30,6 +30,37 @@ fn candidate_prints_ineligible_notice() {
 }
 
 #[test]
+fn validates_only_a_matching_model_result() {
+    let profile = manifest_path("profiles/linux-nvme-v1.candidate.json");
+    let result = manifest_path("tests/fixtures/model-result-aggregate-v1.json");
+    let output = binary()
+        .arg("validate-model-result")
+        .arg(&profile)
+        .arg(&result)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("{NOTICE}\nVALID_INELIGIBLE_MODEL_RESULT profile=linux-nvme-v1 requests=2\n")
+    );
+    assert!(output.stderr.is_empty());
+
+    let output = binary()
+        .arg("validate-model-result")
+        .arg(profile)
+        .arg(manifest_path("schema/model-result-v1.schema.json"))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("{NOTICE}\n")
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).starts_with("INVALID_MODEL_RESULT"));
+}
+
+#[test]
 fn invalid_input_still_prints_notice_and_returns_two() {
     let output = binary()
         .arg("validate-profile")

@@ -395,11 +395,11 @@ jobs:
           grep -Fqx 'NOT CERTIFICATION EVIDENCE' <<< "$fixture_output"
           grep -Fq 'ORACLE_FIXTURE_OK' <<< "$fixture_output"
 
-      - name: Format standalone state qualification profile tool
+      - name: Format standalone state qualification model tool
         run: cargo fmt --manifest-path tools/state-backend-qual/Cargo.toml -- --check
-      - name: Lint standalone state qualification profile tool
+      - name: Lint standalone state qualification model tool
         run: cargo clippy --locked --manifest-path tools/state-backend-qual/Cargo.toml --all-targets -- -D warnings
-      - name: Test standalone state qualification profile tool
+      - name: Test standalone state qualification model tool
         run: cargo test --locked --manifest-path tools/state-backend-qual/Cargo.toml
       - name: Reject runtime and candidate dependencies
         shell: bash
@@ -423,6 +423,11 @@ jobs:
           echo "$profile_output"
           expected_output=$'NOT QUALIFICATION EVIDENCE\nVALID_INELIGIBLE_PROFILE schema=distributed-state-qual/v1 profile=linux-nvme-v1 status=candidate_unapproved'
           [[ "$profile_output" == "$expected_output" ]]
+
+          result_output="$(cargo run --quiet --locked --manifest-path tools/state-backend-qual/Cargo.toml -- validate-model-result tools/state-backend-qual/profiles/linux-nvme-v1.candidate.json tools/state-backend-qual/tests/fixtures/model-result-aggregate-v1.json 2>&1)"
+          echo "$result_output"
+          expected_result=$'NOT QUALIFICATION EVIDENCE\nVALID_INELIGIBLE_MODEL_RESULT profile=linux-nvme-v1 requests=2'
+          [[ "$result_output" == "$expected_result" ]]
 
   # ============================================
   # CI Success Gate
