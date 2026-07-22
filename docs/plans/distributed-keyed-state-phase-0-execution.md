@@ -55,12 +55,14 @@ ungrouped aggregate is `GlobalSingleton`, `GROUP BY` is `VnodeKeyed`, and any pa
 is `LocalOnly + Rejected`. It must never infer safety from an uninitialized runtime state or from
 the presence of default vnode hooks.
 
-The later physical checkpoint contract is a second, positive proof. Queuing bytes while the SQL
-operator is `Uninit` is not validation and cannot produce an activation token. Restore preparation
-must construct enough of the exact incremental physical plan to select registered codecs and
-decode private state. Contract derivation failure is recorded as cluster `Unavailable(reason)` and
-keeps `[LDB-4007]`; it must not make an otherwise supported embedded aggregate fail merely because
-the binary includes the cluster feature.
+The later physical checkpoint contract is a second, positive proof. Before artifact fetch, a pure,
+fallible graph-construction phase builds and caches enough of the exact incremental physical plan to
+select registered implementations/codecs and derive the immutable state contract. `Uninit` means no
+working shards are installed and no data-plane callback may run; it does not mean the plan contract
+is absent. Queuing bytes is not validation and cannot produce an activation token. Contract
+derivation failure is recorded as cluster `Unavailable(reason)` and keeps `[LDB-4007]`; it must not
+make an otherwise supported embedded aggregate fail merely because the binary includes the cluster
+feature.
 
 ### A2. Inventory and tests
 
@@ -98,7 +100,9 @@ stateless/global baseline; those measurements inform an owner decision but do no
 automatically.
 
 The machine-readable [`linux-nvme-v1` candidate](../../tools/state-backend-qual/profiles/linux-nvme-v1.candidate.json)
-is the sole source for proposed backend numbers. Its validator deliberately reports
+is the sole source for proposed numerical gates. Its evidence-ownership map assigns backend,
+artifact-conformance, and product-integration sections to different executors, so an LSM run cannot
+claim sink/checkpoint/failover gates. Its validator deliberately reports
 `VALID_INELIGIBLE_PROFILE`: workload/operations owners and an immutable image/package identity are
 unset, no candidate has run, and it is not qualification evidence. The source/object-store/sink
 deployment profile remains a separate required part of the product scenario and independent soak;
@@ -141,34 +145,64 @@ including removal of live keys absent from the image; a missing operator entry n
 The first managed aggregate payload is not Arrow IPC. It is a Laminar-owned sorted row format:
 length-delimited canonical key bytes followed by fixed-width state selected by a cached contract.
 The first candidate contract is append-only `COUNT(*)` plus `SUM(Int64)`: checked count and non-null
-count plus a checked signed `i128` accumulator, with nullable `Int64` SQL output. Overflow faults the
-batch before mutation/output; DataFusion 52.3's wrapping SUM and release-dependent count overflow
-are not a durable semantic. Decimal, unsigned, floating, AVG, MIN/MAX, retraction, UDAF, and
-changelog codecs remain unavailable. Current `last_updated_ms` has no aggregate semantic consumer
-and is omitted; changed-group append output needs no persisted `last_emitted` value.
+count plus a signed `i64` accumulator, with nullable `Int64` SQL output. The executor checks every
+group-local input prefix in fixed source order, preflights the complete Arrow batch, then publishes
+one atomic state/output mutation. Any count/SUM overflow, including in a late group, faults with no
+part of that batch applied; split and coalesced replay therefore agree. Decode requires
+`1 <= COUNT <= i64::MAX`, non-null count no greater than COUNT, and canonical zero/SQL NULL when it
+is zero; otherwise the exact signed `i64` accumulator is the nullable `Int64` result. This checked
+Laminar implementation must also execute the
+exact embedded/reference shape before cluster admission; DataFusion 52.3's wrapping SUM and
+release-dependent count overflow are not durable semantics. Decimal, unsigned, floating, AVG,
+MIN/MAX, retraction, UDAF, and changelog codecs remain unavailable. Current `last_updated_ms` has no
+aggregate semantic consumer and is omitted; changed-group append output needs no persisted
+`last_emitted` value.
 
 The aggregate codec registry is keyed by concrete reviewed implementation, Laminar codec ID, and
 explicit version—not by a spoofable UDAF name or floating dependency. Fresh/populated state goldens,
 arithmetic boundary tests, and deterministic bytes across insertion orders precede a writer.
 Direct rkyv of the live checkpoint struct and hash-map order are not stable. The existing
 `VnodePartial` rkyv container must be replaced for managed state by an allocation-bounded
-`VnodePartialV2` directory with an authoritative operator/table roster, explicit `EMPTY`, and
-checked borrowed ranges before inner decode. Cache the immutable contract at plan/init time;
+`VnodePartialV2` directory selected by manifest magic/version with no decode fallback. Its sorted,
+unique operator/table/vnode roster uses `BODY` for a checked FULL/DELTA/EMPTY slice and `REFERENCE`
+for an exact unchanged parent entry. Absence is corruption and REFERENCE is never treated as EMPTY.
+BODY ranges are in bounds, non-overlapping, and exactly cover the unpadded body region. Legacy v1
+requires manifest/type proof of the admitted global vnode-0 path. Cache the immutable contract at
+plan/init time;
 introspection, canonicalization, dependency selection, SHA-256, rkyv/format parsing, sorting, and
 post-freeze encoding never run per row or per processing batch.
+
+From the trusted checkpoint pointer, obtain the inventory object's encoded length and expected
+digest. Reject a length above `transition_metadata_bytes_max`, acquire the global encoded-byte
+charge, then stream the inventory to the exact cap before parsing it. Its verified declarations bind
+artifact lengths/digests, provenance, and decoder dispatch; each artifact repeats reserve-before-GET
+and exact-length/digest enforcement. Per-artifact/per-chain encoded caps, the global encoded pool,
+and per-task/global decoder/ingestion scratch are distinct candidate-profile fields.
 
 Represent restore as one assignment-scoped transition, not separate acquire/revoke maps or flat
 payload vectors. It binds the exact committed cut and checkpoint assignment fence to the target
 assignment version, vnode count, owner-map digest, acquired chains, revoked set, and authoritative
-operator-lifecycle inventory. Snapshot rather than drain it; preflight all vnodes/operators;
-prepare shadow state for every lifecycle participant; then enter exclusive graph/callback
+operator-lifecycle inventory. Snapshot rather than drain it; reserve the inventory-declared spool
+bytes against the local disk governor, then preflight every chain and row into a bounded immutable
+spool before any operator callback; prepare shadow state for every
+lifecycle participant from that spool; then enter exclusive graph/callback
 publication with intake closed, revalidate assignment authority under the rotation fence, and
 publish only infallible shard/generation swaps. Retain old handles for destruction after the short
 section. A failed late prepare aborts all shadows, retains the identical transition, mutates no
-live operator, and activates no vnode.
-An uninitialized SQL operator must build and validate its exact incremental plan during prepare.
+live operator, and activates no vnode. Prepare uses the previously cached plan/codec contract only
+to consume the validated spool into abortable shadow state; it cannot select a different decoder.
+The transition digest namespaces the spool. Retry retains an atomically completed spool; restart
+removes incomplete/unreferenced spools and rebuilds from remote authority; success or terminal
+rejection reclaims it outside the ownership fence.
 Keep legacy raw checkpoint compatibility limited to the admitted global vnode-0 aggregate until
 an explicit keyed migration policy exists.
+
+The initial positive plan proof admits exactly one `COUNT(*)`, one `SUM` over a direct `Int64` input
+column, and one or more direct partition-ABI-v1 grouping columns. Aggregate FILTER/DISTINCT/order,
+explicit null treatment, HAVING, derived group/aggregate expressions, multiple aggregates, and
+retractions stay closed. Every upstream projection/filter must be replay-deterministic; processing
+time, watermark-relative `now()`, random/volatile functions, AI calls, and unclassified UDFs fail
+with `[LDB-4007]` before runtime.
 
 ### B3. Delivery scenario
 
@@ -177,7 +211,7 @@ Freeze the first vertical as:
 ```text
 Kafka splittable/replayable source, fixed topics/partitions and replay start
   -> grouped COUNT(*) plus SUM(Int64) changed-group append snapshots
-  -> Kafka durable at-least-once multiwriter envelope=append sink
+  -> externally fenced, transactional Kafka envelope=append sink (end-to-end at-least-once)
   -> shared object-store checkpoint authority
 ```
 
@@ -186,7 +220,7 @@ double application, impossible aggregate state, stale-owner output, or durable/e
 progress published before sink flush succeeds. Capturing a source position before the flush is
 expected. FullChangelog, mutable-key sinks, MVs, and exactly-once remain outside this vertical.
 
-After each successfully committed input batch, output contains one current row per distinct group
+After each atomically applied input batch, output contains one current row per distinct group
 touched by that batch. Rows for one group may be coalesced, so legal intermediate count versions may
 be absent; output cost is proportional to changed input rather than total resident cardinality.
 Versions increase within a writer-authority interval. Recovery from an older sealed cut may append
@@ -203,13 +237,36 @@ and evidence-retention settings as part of the contract.
 Do not certify the path from connector flags or Kafka producer idempotence alone. Current records
 lack replay-stable operation identity and ownership provenance. Before the scenario is eligible,
 add golden-tested `operation_id_v1` derived from domain, deployment/pipeline/operator identities,
-canonical group key, and count state version; carry its separate canonical payload digest, vnode
-and partition ABI, assignment version, node ID, boot UUID, and process term. Excluding the payload
+pipeline incarnation, canonical group key, and count state version; carry its separate canonical
+payload digest, vnode and partition ABI, assignment version, node ID, boot UUID, and process term.
+Excluding the payload
 from the identity makes two payloads for one logical state version a detectable conflict. The same
 ID and payload is a legal replay; the same ID with a different payload is a failure. “Stale” means
-work computed or admitted after the writer's authority was fenced. A previously admitted in-flight
-append arriving later is evaluated under the ordinary at-least-once duplicate rules.
-Checkpoint-attempt identity is not stable across source replay.
+work computed or admitted after the writer's authority was fenced. A predecessor transaction
+committed before the successor's partition marker remains an ordinary at-least-once record even if
+its acknowledgement arrives later; fencing aborts any still-open transaction, so it is invisible.
+Checkpoint-attempt identity is not stable across source replay. Ordinary recovery retains pipeline
+incarnation; an intentional rewind/recreate changes it.
+
+Metadata cannot prove whether admission preceded a fence. Each output therefore carries a
+writer-interval ID and a sink-admission sequence that starts at zero and strictly increases within
+each `(sink-writer shard, writer interval)`, and the certified sink supplies an external fence cut.
+The Kafka candidate derives a
+stable transactional ID from deployment, pipeline incarnation, sink, and bounded writer shard. The
+successor initializes it to broker-fence the predecessor, then commits deterministic
+predecessor/successor markers to all affected output partitions in one confirmed transaction before
+admitting data. Every output record then uses transactions from that fenced producer. An ambiguous
+marker commit kills that writer; a new interval fences it before retry. A read-committed oracle
+rejects any old-interval row after the marker and the fault suite brackets
+producer initialization and marker commit. This is provider-enforced stale-writer exclusion, not
+exactly-once; source cursor/state and Kafka transaction remain separate commits. Plain multiwriter
+append without this proof stays closed.
+
+The input oracle likewise cannot use acknowledgement callbacks as its ledger: Kafka may persist a
+record whose acknowledgement is lost. The producer durably records stable intents, then the
+controller reads and reconciles every actual input record through the frozen partition cuts. The
+model consumes that broker-derived ledger, including physical retries, and rejects unknown or
+conflicting records.
 
 The expected checkpoint order is source position capture followed by a FIFO sink synchronization
 fence and successful durable flush before manifest readiness, durable decision, and external source
@@ -278,8 +335,9 @@ Phase 0 freezes its identities, numerical gates, scenarios, oracle, fault schedu
 invalid-run rules, and independent reviewer before implementation results can influence them.
 
 The final soak must consume an immutable release archive or OCI digest and may not build the SUT.
-Its oracle has no LaminarDB library dependency and derives expected results from a broker-acknowledged
-input ledger plus frozen source/sink cuts. Every failed and invalid attempt is retained; retrying
+Its oracle has no LaminarDB library dependency and derives expected results from durable producer
+intents reconciled against every actual broker record through frozen source cuts, plus frozen sink
+cuts. Every failed and invalid attempt is retained; retrying
 until green is prohibited. A relevant binary, chart, configuration, charter, or oracle change
 requires a complete rerun.
 
@@ -294,18 +352,21 @@ bounded routing-schema identity, source/sink and output-identity contracts, inde
 charter and ineligible validator scaffold, plus aggregate/graph restore audits. None is an
 admission consumer. A reviewed Cycle 3 experiment removed the generic strict IPC helper because
 Arrow 57.2 can allocate from attacker-declared lengths before proving input availability; the
-initial aggregate artifact therefore uses a bounded Laminar row codec instead. Its writer/decoder
-and the allocation-bounded outer `VnodePartialV2` directory remain future admission-neutral slices.
+initial aggregate artifact is therefore specified to use a bounded Laminar row codec instead. Its
+writer/decoder and the allocation-bounded outer `VnodePartialV2` directory remain future
+admission-neutral slices.
 
 Remaining commits are kept reviewable in this order:
 
-1. `test: freeze keyed-state numerical qualification profile`
-   - complete candidate latency/resource/RTO gates and validator; named owner approval remains an
-     explicit eligibility transition;
+1. `docs: approve keyed-state qualification profile`
+   - named workload/operations owners approve the unchanged candidate thresholds and immutable
+     runner identity; a separately reviewed approved-profile schema/status records signatures and
+     candidate-profile hash. The current validator intentionally accepts only null approvals and
+     `qualification_eligible=false` and cannot be edited in place after results exist;
 2. `test: freeze aggregate artifact and codec contract`
    - dedicated bounded row DTO, concrete checked COUNT/SUM registry, semantic/state goldens,
-     hostile-input preflight, authoritative roster/explicit-empty vectors, and no live restore
-     wiring;
+     hostile-input preflight, authoritative roster plus BODY/REFERENCE/EMPTY vectors, and no live
+     restore wiring;
 3. `tools: define state backend qualification model`
    - standalone backend-neutral model, deterministic workload, digest oracle, and validated output;
 4. separate exact-pin Fjall and RocksDB adapter commits behind the private spike contract;

@@ -9,9 +9,10 @@
 ## Decision
 
 LaminarDB will add a common, byte-governed, spillable **working-state service** for keyed
-operators. Phase 0 will qualify current Fjall 3.x and RocksDB behind the same narrow service and
-workload/fault harness, then record one production backend; it will not ship and maintain both by
-default. Fjall is the incumbent project candidate, not an accepted dependency—the current tree no
+operators. Phase 0 will qualify Fjall `=3.1.8` and RocksDB Rust wrapper `=0.24.0` (bundled RocksDB
+10.4.2) behind the same narrow service and workload/fault harness, then record one production
+backend; it will not ship and maintain both by default. Fjall is the incumbent project candidate,
+not an accepted dependency—the current tree no
 longer contains it. An in-memory implementation remains a semantic reference and a small
 local-mode option. Cluster-shared object storage and the existing `StateBackend` remain the
 authoritative checkpoint/recovery layer; neither local LSM is remote recovery authority.
@@ -296,15 +297,19 @@ encoding; dictionary index width is never durable identity. Global state has an 
 The first managed aggregate payload does **not** use Arrow IPC. COUNT/SUM state is a compact,
 length-delimited Laminar row record, sorted strictly by canonical encoded key off the event-loop.
 The contract determines a fixed state width: checked `u64` `COUNT(*)`, followed for each admitted
-`SUM(Int64)` by checked `u64` non-null count and checked signed `i128` accumulator, all in canonical
-big-endian form. COUNT's SQL result remains non-null `Int64` and SUM's remains nullable `Int64`; a
-batch whose next count, accumulator, or result cannot be represented faults before state mutation
-or output. The initial managed vertical
-does not inherit DataFusion 52.3's wrapping SUM implementation. Decimal, unsigned, floating,
-`AVG`, `MIN`/`MAX`, retractions, and UDAFs remain codec-unavailable until separately specified and
-tested.
+`SUM(Int64)` by checked `u64` non-null count and signed `i64` accumulator, all in canonical
+big-endian form. COUNT's SQL result remains non-null `Int64` and SUM's remains nullable `Int64`.
+For each group, the executor evaluates rows in fixed source order and checks count, non-null count,
+and SUM at **every input prefix**, not just the coalesced batch result. It preflights all groups in
+the Arrow batch before publishing one atomic state/output mutation; overflow in a late row or group
+faults with no group or output from that batch applied. Thus `[MAX, +1, -1]` cannot pass merely
+because it was coalesced into one batch. The same Laminar checked implementation becomes the
+embedded/reference executor for this exact shape before cluster admission, with a compatibility
+note for the former DataFusion 52.3 wrapping/profile-dependent behavior. Decimal, unsigned,
+floating, `AVG`, `MIN`/`MAX`, retractions, and UDAFs remain codec-unavailable until separately
+specified and tested.
 
-Each non-empty payload row is `u32 key_length | key_bytes | fixed_state_bytes`. Key length, row
+Each non-empty payload row is `u32_be key_length | key_bytes | fixed_state_bytes`. Key length, row
 count, aggregate key bytes, state bytes, descriptor bytes, artifact bytes, and full-plus-delta chain
 bytes are checked against the approved profile with checked arithmetic before allocation. Keys are
 unique and strictly increasing, and every keyed row must hash to the claimed vnode. `EMPTY` is the
@@ -312,6 +317,13 @@ only zero-row representation. A `FULL` image replaces the entire operator/table/
 `DELTA` carries sorted latest values; append-only v1 has no deletes or tombstones. Restored routing
 keys remain opaque hash/LSM identity and are never passed to Arrow `RowParser`, whose format assumes
 converter-produced input; any future materializing consumer requires a strict, panic-free decoder.
+Decode rejects a zero-row `FULL`/`DELTA` payload, a stored row with `COUNT(*) == 0` or
+`COUNT(*) > i64::MAX`, a non-null SUM count greater than COUNT, and zero non-null count with a
+nonzero accumulator. Zero non-null count has canonical zero accumulator bytes and evaluates to SQL
+`NULL`; otherwise the exact signed `i64` accumulator is the nullable `Int64` result. The artifact
+implementation commit must publish one normative binary layout with every magic, field offset,
+width, byte order, and digest range plus goldens; this ADR does not treat an archived Rust type or
+prose alone as the wire specification.
 Current `last_updated_ms` is not part of v1 because no aggregate execution path consumes it.
 Changed-group append output derives its stable
 operation identity from the canonical key and checked count version, so v1 also carries no
@@ -319,7 +331,7 @@ operation identity from the canonical key and checked count version, so v1 also 
 silently extending this record.
 
 The payload sits inside a manually parsed, allocation-bounded managed envelope. It binds exact
-format/header length, `FULL`/`DELTA`/`EMPTY`, key mode, partition ABI, codec ID/version, total and
+format/header length, inner `FULL`/`DELTA`/`EMPTY`, key mode, partition ABI, codec ID/version, total and
 section lengths, row/key/state totals, checkpoint and parent identity, assignment version, vnode
 count and vnode, owner-map certificate digest, stable operator/table/contract digests, and payload
 digest. Reserved fields must be zero; total length must equal the supplied slice with no trailing
@@ -328,19 +340,48 @@ their digest is checked. SHA-256 supplies corruption evidence, not authenticatio
 encryption remain checkpoint-store/deployment properties.
 
 Managed artifacts cannot be nested in the current `VnodePartial` rkyv object, whose attacker-sized
-vectors are materialized before an inner payload can reserve memory. A `VnodePartialV2` directory
-must first provide a canonical, authoritative operator roster with explicit `EMPTY` entries,
-checked slice ranges/digests, and no allocation based on untrusted counts. Whole-transition
-preflight acquires one non-cloneable global reservation for envelope bytes, staging bytes, key/state
-bytes, artifacts, rows, operators, and vnodes; it validates every chain and row before streaming
-borrowed records into shadow LSM state. The legacy rkyv/Arrow checkpoint remains confined to the
-currently admitted global vnode-0 path.
+vectors are materialized before an inner payload can reserve memory. `VnodePartialV2` has an
+unambiguous magic/version selected by the checkpoint manifest—decoders never try v2 and then fall
+back to rkyv. Its canonical directory has one sorted, unique operator/table/vnode entry for the
+authoritative roster. An entry is either `BODY`, naming an exact inner FULL/DELTA/EMPTY slice, or
+`REFERENCE`, naming the exact parent checkpoint and entry digest for unchanged state. Absence is
+corruption, `REFERENCE` is not empty state, and `EMPTY` remains an authoritative zero-row base.
+BODY ranges are non-overlapping, in bounds, and exactly cover the declared body region with no
+padding.
+
+The trusted checkpoint pointer first identifies the inventory object and its expected digest. A
+metadata/HEAD request must expose its encoded length; restore rejects a value above
+`transition_metadata_bytes_max` and acquires the global encoded-byte charge before GET, response
+buffering, transport reassembly, alignment copy, or parsing. The inventory is streamed to that exact
+cap, digest-verified, and then authenticates expected artifact type/version, content lengths and
+digests, checkpoint/assignment provenance, and legacy/managed dispatch. Each artifact repeats the
+same reserve-before-GET protocol. Short, long, or digest-mismatched bodies fail closed.
+
+V2 parsing runs under the encoded charge; separate task/global **scratch** reservations cover
+directory metadata, key/state bytes, rows, shadow ingestion, operators, and vnodes. Transition-owned
+validated spool bytes are charged to the local-disk governor and retained until prepare completes;
+they are never an unbounded in-memory copy. The candidate profile separately names per-artifact and
+per-chain encoded caps, a global encoded-byte pool, and per-task/global scratch caps; that
+machine-readable profile remains the sole numerical source. Whole-transition preflight resolves
+every REFERENCE and validates every chain and row into that immutable spool before any operator
+callback. Prepare then consumes the spool into abortable shadow LSM state.
+Legacy rkyv/Arrow decoding is selected only by manifest/type proof for the currently admitted global
+vnode-0 path.
+
+Before the first artifact GET, checked inventory arithmetic reserves the transition's declared spool
+bytes against the local state-disk governor and project quota. Spools are namespaced by transition
+digest and become readable only through an atomic completion marker. A retry retains the same
+completed spool; process restart discards incomplete/unreferenced spools and can rebuild them from
+remote authority. Successful publication or terminal transition rejection releases and removes the
+spool outside the ownership fence. Pressure/hard-stop policy includes live state, LSM amplification,
+and all retained spools; restore backpressures rather than exceeding the reservation.
 
 The initial codec registry admits only concrete reviewed Laminar implementations. Function names
 are not codec identity because a UDAF can reuse a built-in name. Direct rkyv of live Rust/DataFusion
-types and hash-map iteration order are not durable ABI. Fresh/populated goldens, truncation and
-every-limit/max-plus-one vectors, duplicate/out-of-order/cross-vnode keys, checksum/provenance
-failures, and N/N-1 compatibility tests precede a writer. Contract derivation is plan-time;
+types and hash-map iteration order are not durable ABI. Fresh/populated, null-only, per-prefix
+overflow, split/coalesced, late-group rollback, and impossible-restored-state goldens; truncation and
+every-limit/max-plus-one vectors; duplicate/out-of-order/cross-vnode keys; checksum/provenance
+failures; and N/N-1 compatibility tests precede a writer. Contract derivation is plan-time;
 sorting, encoding, hashing, and restore decoding run on bounded blocking workers. None runs on the
 record/event-loop hot path, and qualification still measures their CPU, memory, pause, and tail
 effects.
@@ -350,9 +391,9 @@ effects.
 One staged transition binds the exact committed checkpoint attempt and checkpoint assignment fence
 to one target assignment version, nonzero vnode count, and owner-map digest. It contains acquired
 base-plus-delta chains, revoked vnodes, and a digest of the complete state-lifecycle operator
-inventory. Every required operator/vnode pair has an explicit full image or `EMPTY` entry; absence
-is corruption. The old split staging maps and successful default vnode hooks are not eligible for
-the managed path.
+inventory. Every required operator/vnode pair has an explicit `BODY` or `REFERENCE` entry, and each
+resolved chain terminates in an authoritative `FULL` or `EMPTY` base; absence is corruption. The
+old split staging maps and successful default vnode hooks are not eligible for the managed path.
 
 Restore follows this protocol:
 
@@ -379,9 +420,14 @@ so refcount drops and destructors cannot extend the fenced section. A process cr
 publication section discards the process image and reconstructs from the unchanged durable cut. A
 changed assignment during asynchronous prepare aborts the shadows and publishes nothing.
 
-An uninitialized SQL operator must build and validate its exact incremental plan during prepare,
-not after the graph marks a vnode active; DataFusion node-local fallback remains rejected. The
-current flat aggregate maps are only diagnostic substrate: production publication first shards
+Before any artifact fetch, graph construction runs a pure, fallible state-contract derivation for
+every lifecycle participant and caches the exact incremental physical plan, implementation/codec
+IDs, schemas, and digest. `Uninit` thereafter means that no working shards are installed and no
+data-plane callback may run; it does not mean that the plan contract is unknown. A missing or
+changed contract blocks the transition before row preflight. Prepare consumes the already validated
+spool using that cached implementation and builds only abortable shadow state; DataFusion node-local
+fallback remains rejected. The current flat aggregate maps are only diagnostic substrate:
+production publication first shards
 groups, emission state, dirty generations, timers, and deduplication metadata by vnode so prepare
 can build a replacement shard and publish/revoke it with bounded pointer swaps instead of scanning
 all groups.
@@ -439,9 +485,14 @@ or emitted-value field requires a named semantic consumer; vestigial map-era fie
 into the durable schema. Accumulator and output-enqueue mutations are atomic, and dirty tracking
 belongs to the state service rather than a second operator map.
 
-The first candidate is append-only `COUNT(*)` plus `SUM(Int64)` using the checked Laminar codec
-above. Broader `COUNT`/`SUM` types, `AVG`, append-only or changelog `MIN`/`MAX`, `DISTINCT`,
-retractions, and arbitrary UDAFs remain closed until their arithmetic, null, state-growth, and
+The first candidate is one append-only stage with one mandatory `COUNT(*)`, one `SUM` over a direct
+`Int64` input column, and one or more direct grouping columns accepted by partition ABI v1. Output
+aliases are naming only. Aggregate `FILTER`, `DISTINCT`, `ORDER BY`, explicit null treatment,
+`HAVING`, derived aggregate/group expressions, multiple COUNT/SUM calls, and retractions remain
+closed. Any preceding projection/filter expression must have a positive replay-determinism proof;
+processing time, watermark-relative `now()`, volatile/random functions, AI calls, and unclassified
+UDFs keep `[LDB-4007]`. Broader `COUNT`/`SUM` shapes, `AVG`, append-only or changelog `MIN`/`MAX`,
+and arbitrary UDAFs remain closed until their arithmetic, null, state-growth, determinism, and
 portable encoding contracts are reviewed. A UDAF must declare a stable serializer, merge/restore
 compatibility, and resource behavior before it can be cluster-capable.
 
@@ -503,6 +554,13 @@ that cut with vnode timer/frontier state rather than creating a second watermark
 source drain or reassignment cannot advance the frontier past input that has not reached managed
 state.
 
+Certification does not infer the input set from producer acknowledgements: Kafka can persist a
+record and lose its acknowledgement. The workload producer first durably records a stable event
+intent, then the independent controller reads back every actual broker record through the frozen
+partition high-watermarks and reconciles event ID/payload/offset against those intents. The oracle
+models the reconciled broker log, including any physical retry records; an unknown or conflicting
+record makes the run fail or invalid according to the charter.
+
 At-least-once recovery restores operator state and the source cursor from one sealed cut. It must
 not double-apply replay within recovered state, lose timer/output bookkeeping, or skip a result;
 external results flushed after that cut may appear again after a crash. The checkpoint tail keeps
@@ -511,10 +569,13 @@ positions. State capture and real sink-flush latency share the checkpoint deadli
 identity and provenance envelope must be added before the initial release. For the narrow
 append-only `COUNT(*)`/`SUM(Int64)` vertical, the checked count is the batching-independent logical
 state version;
-identity binds that version and canonical group to deployment, pipeline, and operator identity,
+identity binds that version and canonical group to deployment, pipeline **incarnation**, and
+operator identity,
 while a separate canonical payload digest detects conflicting values at one version. The input
 contract maps each logical group to one Kafka partition so group-local broker order is stable, and
-SUM faults atomically rather than wrapping when its next state or `Int64` result is out of range.
+the planner rejects any expression that cannot reproduce the same group/SUM prefix from replay.
+Intentional rewind/recreate gets a new incarnation; ordinary crash recovery retains it. SUM checks
+every source-ordered prefix and faults the whole input batch atomically rather than wrapping.
 Vnode and partition ABI, assignment
 version, node ID, boot UUID, and process term accompany the identity. A checkpoint attempt alone is
 insufficient because replay can cross attempts and owners. This is evidence for at-least-once
@@ -524,7 +585,7 @@ A cluster sink used by this release must be `DurableAtLeastOnce + MultiWriter` a
 operator's declared output mode. The first candidate is Kafka `envelope=append`; broker topic,
 partitioning, acknowledgement, replication/min-ISR, election, DLQ, and retention settings are part
 of the certified contract. The first managed aggregate emits one current result for each distinct
-group changed by a successfully committed input batch. Multiple rows for one group may be
+group changed by an atomically applied input batch. Multiple rows for one group may be
 coalesced, so intermediate count versions may be absent; output never scans or republishes every
 resident group merely because another group changed. Versions increase within one writer-authority
 interval. After a crash, an unsealed higher version may already be external while recovery starts
@@ -538,10 +599,28 @@ key-affine assignment, old-writer fencing, deterministic operation IDs, and vnod
 marking a mutable sink `MultiWriter` is not sufficient.
 
 A stale-owner append is defined by computation or sink admission after the writer lost process or
-vnode authority, not by broker arrival time. The current append sink cannot retract an operation
-already admitted to broker I/O before the fence; a late acknowledgement of that operation remains
-valid at-least-once output and provenance lets the oracle classify it. Mutable output and
-exactly-once require provider-side transaction/fencing rather than this observational contract.
+vnode authority, not by broker acknowledgement time. Assignment/node/process metadata alone cannot
+prove that boundary. Every output carries a writer-interval ID and a sink-admission sequence that
+starts at zero and strictly increases within each `(sink-writer shard, writer interval)`. Activation
+requires an externally auditable fence proof. For the Kafka candidate, a bounded sink-writer shard
+has a stable
+transactional ID derived from deployment, pipeline incarnation, sink, and shard—not the ephemeral
+writer interval—so successor initialization broker-fences the old producer. In one confirmed
+transaction the successor then writes a deterministic predecessor/successor interval marker to
+every affected output partition; it admits no data before that commit is known successful. All
+subsequent output also uses transactions from that fenced producer and is captured read-committed;
+transaction batching is bounded and must meet the latency profile.
+
+The oracle reads committed records, uses the first valid marker for the successor as the immutable
+partition cut, and rejects an old-interval record after it. A predecessor transaction committed
+before the marker remains legal even if its acknowledgement arrived later; an in-flight transaction
+aborted by fencing is invisible. Ambiguous marker commit is fatal to that writer process and a new
+interval must fence it before retry; crash/fault tests bracket initialization and marker commit.
+Broker configuration, transactional-ID derivation, markers, read-committed capture, and forced old
+producer rejection form the retained proof—timestamps or Laminar logs alone do not. This
+provider-enforced fencing is qualified for latency and failure behavior but does not make delivery
+exactly-once because source cursor, managed state, and Kafka transaction are not one atomic commit.
+If this topology cannot meet the profile, the Kafka scenario stays closed.
 
 End-to-end exactly-once is a later certification per concrete source/state/sink combination. It
 requires an exact-certified source and a checkpoint-committable external sink whose transaction
@@ -558,10 +637,12 @@ bounds, checkpoint cadence, and numerical p99/p99.9 latency, throughput, pause, 
 Targets are chosen before optimization results are known; “fast on a laptop” is not a release gate.
 
 The checked-in [`linux-nvme-v1` candidate](../../tools/state-backend-qual/profiles/linux-nvme-v1.candidate.json)
-is a proposed backend budget, not a benchmark result or approval. Its standalone validator accepts
-only the explicitly ineligible form, rejects measured/result fields, and has no runtime or backend
-dependency. Named owner approval, immutable runner identity, actual Fjall/RocksDB evidence, the
-product connector/object-store profile, and the independent release soak all remain outstanding.
+is a proposed numerical contract, not a benchmark result or approval. Its evidence-ownership map
+assigns backend, artifact-conformance, and product-integration sections to different executors; an
+LSM run cannot satisfy sink/checkpoint/failover gates. Its standalone validator accepts only the
+explicitly ineligible form, rejects measured/result fields, and has no runtime or backend dependency.
+Named owner approval, immutable runner identity, actual Fjall/RocksDB evidence, the product
+connector/object-store profile, and the independent release soak all remain outstanding.
 
 Regardless of the profile, these architecture invariants are mandatory:
 

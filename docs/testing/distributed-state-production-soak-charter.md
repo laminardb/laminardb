@@ -61,7 +61,7 @@ mode, connector, or delivery guarantee.
 | Scenario | Initial intended path | Current status |
 |---|---|---|
 | Harness control | Kafka source -> stateless projection -> Kafka append sink | Engineering-only; proves oracle/deployment, never keyed-state production support |
-| Grouped aggregate ALO | Kafka source -> grouped `COUNT(*)`/`SUM(Int64)` changed-group append snapshots -> certified durable multiwriter append sink | Blocked by `[LDB-4007]` and Phase 0/1 evidence |
+| Grouped aggregate ALO | Kafka source -> grouped `COUNT(*)`/`SUM(Int64)` changed-group append snapshots -> certified, externally fenced Kafka append sink | Blocked by `[LDB-4007]` and Phase 0/1 evidence |
 | Fixed event-time window ALO | Certified source -> tumbling window/final append output -> compatible sink | Blocked by `[LDB-4007]` and timer/frontier lifecycle |
 | Bounded interval join ALO | Two certified inputs -> inner equi-interval join -> compatible append sink | Blocked by `[LDB-4007]` and co-partitioned join lifecycle |
 | Retraction/FullChangelog | Stateful operator -> FullChangelog-capable cluster sink | Blocked; no built-in qualifying sink |
@@ -72,7 +72,7 @@ release must pass.
 
 The initial grouped-aggregate scenario is narrower than the general row: each logical group is
 routed to one fixed Kafka input partition, `COUNT(*)` is mandatory as its logical state version,
-and `SUM` is nullable `Int64` using checked Laminar arithmetic. Each successfully committed input
+and `SUM` is nullable `Int64` using checked Laminar arithmetic. Each atomically applied input
 batch appends one current row per touched group; rows within the batch may be coalesced, so the
 oracle accepts legal group-local count prefixes with gaps. Versions must increase within one
 writer-authority interval. After a crash, a new fenced interval may replay from the older sealed cut
@@ -82,19 +82,24 @@ explain every interval boundary. After the frozen source cut, the exact final ve
 group is mandatory. A full scan/republication of all resident groups per processing cycle is neither
 required nor eligible evidence.
 
+The admitted SQL shape has exactly one `COUNT(*)`, one SUM of a direct `Int64` column, and direct
+partition-ABI-v1 grouping columns. Aggregate filters/HAVING/derived or multiple aggregates are not
+part of this scenario. The planner must reject every volatile, time-relative, AI, or unclassified
+upstream expression so the same Kafka prefix reproduces the same key and SUM payload.
+
 ## Frozen numerical contract
 
 An eligible machine-readable charter contains no `TBD`, zero, or results-derived threshold. It
 specifies at minimum:
 
-- elapsed duration and acknowledged event count, with both minima required;
+- elapsed duration and reconciled broker-record count, with both minima required;
 - event rate, Arrow-batch shape, key/value widths, key cardinality, state size relative to RAM,
   Zipf/hot-key skew, vnode count, and checkpoint cadence;
 - p50/p95/p99/p99.9 end-to-end latency and maximum event-loop stall;
 - checkpoint align/freeze/export/upload/sink-flush/seal limits and recovery RTO;
 - hard encoded envelope/artifact/descriptor/payload bytes; checkpoint chain links/delta depth;
-  operators and vnodes per transition; rows, canonical key/state bytes, output-buffer bytes; and
-  aggregate plus per-restore staging reservations;
+  operators and vnodes per transition; rows, canonical key/state bytes, output-buffer bytes;
+  global encoded restore bytes; and separate per-task/global restore scratch;
 - maximum RSS/PSS/cgroup memory, LSM cache/memtable/journal/native memory, queue bytes/age, local
   bytes, disk utilization, FD count, snapshot/iterator count, frozen generations, timer count,
   checkpoint artifacts, compaction debt, and write amplification;
@@ -106,16 +111,22 @@ decision but cannot automatically become the gate.
 
 ## External input and output oracle
 
-The producer records one immutable ledger row for every broker-acknowledged input:
+Before sending, the producer durably records one immutable intent per stable event ID and payload.
+Acknowledgement is observation, not membership: Kafka may persist a record and lose its response.
+After production/faults stop, the controller reads every actual source record from the run's start
+offsets through frozen per-partition high-watermarks and reconciles it to intent. That broker-derived
+ledger, including physical retries, is the oracle input:
 
 ```text
-run_id, scenario_id, event_id, topic, partition, offset,
-event_time, logical_key, logical_values, payload_sha256, acknowledged_at
+run_id, scenario_id, intent_id, event_id, topic, partition, offset,
+event_time, logical_key, logical_values, payload_sha256, acknowledgement_outcome
 ```
 
-After production stops, the controller freezes exact per-partition source high-watermarks. It waits
-for LaminarDB's durable source cut and required post-cut checkpoint progression, then freezes exact
-per-partition sink high-watermarks. An incomplete source or sink cut cannot pass.
+An actual record without matching intent, conflicting payloads for one event ID, unreadable range,
+or mismatch between reconciliation and frozen cuts is a harness failure/invalid run, never silently
+missing input. The controller then waits for LaminarDB's durable source cut and required post-cut
+checkpoint progression and freezes exact per-partition sink high-watermarks. An incomplete source or
+sink cut cannot pass.
 
 The independent model derives expected results solely from the ledger and published SQL semantics:
 
@@ -131,13 +142,24 @@ digests plus missing, extra, malformed, duplicate, conflicting, and stale-genera
 
 For at-least-once, an external duplicate is allowed only when it is bit-equivalent and carries the
 same replay-stable logical operation identity. That identity is tied to deterministic emission
-causality and cannot be a checkpoint attempt alone. Each record also carries deployment, pipeline,
-operator, vnode, assignment-generation, and writer-process provenance. Missing output, state double
-application, two different records sharing an operation identity, work admitted after an owner's
-authority was fenced, or output beyond the frozen boundary is a failure. A record admitted while
-the generation was authoritative is not reclassified as stale merely because a broker acknowledged
-it after the fence; it remains subject to the ordinary duplicate/conflict rules. If output metadata
-cannot prove these distinctions, that scenario is not certifiable; logs are not a substitute.
+causality and cannot be a checkpoint attempt alone. Each record also carries deployment, pipeline
+incarnation, operator, vnode, assignment generation, writer interval, sink-writer shard, and a
+sink-admission sequence that starts at zero and strictly increases within each `(shard, interval)`,
+plus writer-process provenance. Intentional rewind or recreate changes pipeline incarnation; crash
+replay does not.
+
+Metadata alone cannot prove pre-fence admission. Each bounded Kafka sink-writer shard uses a stable
+transactional ID derived from deployment, pipeline incarnation, sink, and shard. A successor
+initializes it to broker-fence the predecessor, then commits deterministic predecessor/successor
+markers to all affected output partitions in one confirmed transaction before admitting data. Every
+output record then uses transactions from that fenced producer. The oracle reads committed data and
+rejects an old-interval record after the marker. A predecessor
+transaction committed before the marker remains legal even if its acknowledgement arrived later;
+an open transaction aborted by fencing is invisible. An ambiguous marker commit terminates that
+writer and a new interval fences it before retry. Missing output, state double application, two
+payloads sharing an operation identity, old-interval output after its partition marker, or output
+beyond the frozen boundary is a failure. If provider-enforced fencing and markers cannot prove these
+distinctions, the scenario is not certifiable; timestamps and Laminar logs are not substitutes.
 
 ## Externally actuated fault schedule
 
@@ -152,8 +174,10 @@ includes the applicable subset of:
 - local disk pressure/`ENOSPC`, compaction pressure, and state larger than RAM;
 - local-volume loss followed by portable restore;
 - rolling N/N-1 upgrade and rollback; and
-- faults bracketing state mutation/freeze, timer fire, output enqueue, sink flush, durable seal,
-  source-cut publication, and assignment activation.
+- faults bracketing state mutation/freeze, timer fire, output enqueue, Kafka producer fencing and
+  marker commit, sink flush, durable seal, source-cut publication, and assignment activation; and
+- forced predecessor write attempts after each successor marker, which must be broker-rejected and
+  absent from read-committed output.
 
 Every scheduled fault must have independent actuation evidence. A missed fault makes the attempt
 invalid rather than silently reducing coverage.
@@ -186,7 +210,7 @@ from the attempt history.
 - attempt/run manifest and complete attempt history;
 - archive/image/chart/SBOM, charter, oracle, controller, config, and dependency digests;
 - rendered deployment resources and redacted configuration hash;
-- producer acknowledgement ledger and frozen source cuts;
+- durable producer-intent log, broker-readback reconciliation ledger, and frozen source cuts;
 - complete sink capture and frozen sink cuts;
 - normalized expected/actual digests and machine-readable oracle result;
 - full node, source, sink, object-store, controller, and Kubernetes event logs;
@@ -206,7 +230,8 @@ This charter remains ineligible until all of these are resolved:
 - [ ] approved target hardware/deployment and all numerical fields;
 - [ ] immutable release and standalone-oracle artifact pipelines;
 - [ ] machine-readable charter schema and preflight validator;
-- [ ] stable output operation identity and assignment-generation evidence;
+- [ ] stable output operation identity, assignment-generation evidence, and provider-enforced
+      writer-fence markers;
 - [ ] grouped aggregate state path admitted after Phase 1 correctness gates;
 - [ ] production-compatible source/object-store/sink environment;
 - [ ] external fault controller and immutable evidence store; and

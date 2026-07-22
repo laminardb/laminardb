@@ -106,10 +106,10 @@ single-record-batch IPC helper (`12a34c38`). Cycle 3 review (`1e8b1a59`, `f4ded9
 former to the bounded,
 opaque routing identity actually consumed by `PartitionKeySchemaV1` and removed the latter. The
 generic helper used Arrow 57.2's `StreamReader`, which can allocate from IPC-declared metadata/body
-lengths before proving those bytes exist. The reviewed first COUNT/SUM artifact therefore uses a
-bounded Laminar row codec and never calls Arrow on restored state. Any future IPC codec must first
-reserve a global restore budget and preflight hostile framing. These changes remain admission-neutral
-and do not close the runtime lifecycle gap.
+lengths before proving those bytes exist. The reviewed first `COUNT(*)`/`SUM(Int64)` artifact is
+specified to use a bounded Laminar row codec and will not call Arrow on restored state. Any future
+IPC codec must first reserve a global restore budget and preflight hostile framing. These changes
+remain admission-neutral and do not close the runtime lifecycle gap.
 
 The audit found that vnode membership is coupled to several other restore invariants and therefore
 must not be patched as an isolated assertion:
@@ -314,7 +314,7 @@ The current branch's admission-neutral hardening was then checked separately:
 |---|---:|---|
 | `state::partition_key::tests` | PASS, 15/15 | Typed row/hash/vnode ABI plus bounded routing-only schema identity, every admitted family golden, alias/order/nullability policy, dictionary hydration, and exact resource/type gates |
 | `cargo test -p laminar-core --lib` | PASS, 562/562 | Complete core library regression set after the Cycle 3 safety follow-up |
-| Generic strict IPC experiment | REMOVED after review | Arrow 57.2 parses attacker-declared lengths too early; the artifact-specific preflight and global decoded-memory reservation remain an explicit Phase 0 blocker |
+| Generic strict IPC experiment | REMOVED after review | Arrow 57.2 parses attacker-declared lengths too early; artifact-specific preflight, a global encoded-byte charge, and separate task/global scratch charges remain explicit Phase 0 blockers |
 | `aggregate_state::vnode_partition_tests` (cluster lib-test binary) | PASS, 4/4 | Existing raw capture/merge/idempotence plus new shuffle/capture/drop parity and pre-mutation drift rejection; not keyed-envelope validation |
 | `aggregate_state::tests::drop_vnodes_purges_revoked_keeps_sibling` | PASS, 1/1 | Revoke retains sibling-vnode state after the fallible count check was added |
 | `aggregate_state::tests::global_changelog_delta_checkpoint_roundtrips` | PASS, 1/1 | The admitted global aggregate remains pinned to vnode 0 |

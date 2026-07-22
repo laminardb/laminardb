@@ -102,7 +102,7 @@ isolation:
 | Runtime guarantee | `AtLeastOnce` | `BestEffort` and `ExactlyOnce` remain rejected; the latter stays behind `[LDB-0013]` |
 | Source | Non-ephemeral, `Splittable`, assignment-scoped handoff | Kafka is the only current built-in external source path; source partitions and SQL-key vnodes remain distinct |
 | Operator state | One sealed state/timer/output-bookkeeping cut with the source cursor | Replay cannot double-apply internal state; externally flushed results may repeat |
-| Changed-group append snapshots | `DurableAtLeastOnce + MultiWriter + AppendOnly` (or broader) | One current row per touched group/batch; versions increase per authority interval, while a fenced recovery interval may replay an older sealed prefix |
+| Changed-group append snapshots | `DurableAtLeastOnce + MultiWriter + AppendOnly` plus externally auditable writer fencing | One current row per touched group/batch; versions increase per authority interval, while a fenced recovery interval may replay an older sealed prefix |
 | Retraction/changelog output | `DurableAtLeastOnce + MultiWriter + FullChangelog`, or a new assignment-fenced mutable-sink contract | No current built-in cluster sink qualifies, so these combinations remain closed |
 
 Checkpoint certification preserves CP-5 ordering: drain/enqueue operator output, flush every
@@ -129,9 +129,11 @@ Work:
    - aggregate, window, and two-input join workloads; and
    - absolute p99/p99.9 latency, throughput, checkpoint-pause, RTO, RSS, disk, artifact/decode,
      chain-depth, operator/vnode-count, and restore-staging limits.
-   The backend numbers live only in the machine-readable
+   The candidate numerical gates live only in the machine-readable
    [`linux-nvme-v1` candidate](../../tools/state-backend-qual/profiles/linux-nvme-v1.candidate.json),
-   which remains explicitly unapproved and is not evidence.
+   which remains explicitly unapproved and is not evidence. Its ownership map assigns backend,
+   artifact-conformance, and product-integration sections to different executors; an LSM run cannot
+   satisfy sink, checkpoint, or failover gates.
 3. Specify the partition/state ABI and add golden vectors for every admitted key type plus explicit
    rejection vectors for floating-point, nested, and other excluded types. Persist hydrated routing
    identity separately from the artifact's Laminar-owned state contract. Treat restored routing
@@ -140,6 +142,9 @@ Work:
    versions, checked arithmetic/null semantics, a dedicated bounded row DTO and outer artifact
    directory, populated-state goldens, and N/N-1 rolling upgrade/rollback behavior. Initial managed
    state is append-only `COUNT(*)` plus `SUM(Int64)`; no live DataFusion/rkyv type is durable ABI.
+   The outer directory has manifest-selected magic/version, canonical BODY entries, explicit
+   unchanged-parent REFERENCE entries, and no fallback decoder. Reserve encoded bytes before fetch;
+   account decode/ingestion scratch separately.
 5. Add the mandatory capability descriptor to design tests. Inventory every current operator as
    `Stateless`, `GlobalSingleton`, `VnodeKeyed`, `RebuildableReplicated`, or `LocalOnly` without
    changing admission.
@@ -152,7 +157,9 @@ Work:
 7. Record the complete delivery matrix: source consistency/topology and handoff; operator update
    mode and output identity; sink durability/topology/input mode; CP-5 ordering; permitted ALO
    duplicates; and combinations that remain closed. Benchmark at least one real certified source
-   and sink rather than only an in-memory harness.
+   and sink rather than only an in-memory harness. Kafka output needs broker-enforced writer fencing
+   plus partition fence markers; the source oracle derives its ledger by reconciling durable intents
+   with actual broker records rather than acknowledgement callbacks.
 8. Freeze a fault-point vocabulary and output-oracle format shared by later phases. Cross source
    drain/replay, state mutation/freeze, timer fire, output enqueue, sink flush, durable decision,
    external publication, assignment rotation, and ambiguous commit.
@@ -249,11 +256,14 @@ Work packages:
   publication, use the rotation fence to revalidate assignment/process scope, and perform only
   infallible shard/generation swaps. Retain old handles for destruction after the short section;
   activate the complete set and remove the inbox item only after every operator publishes.
-- Require an authoritative, canonical operator roster and explicit `FULL`/`DELTA`/`EMPTY` state in
-  the portable partial format. Omission, duplicate names, mixed attempts, and topology drift fail
-  before prepare.
-- Build and validate an uninitialized SQL operator's exact physical plan during prepare; activation
-  cannot precede semantic codec validation or fall back to node-local DataFusion state.
+- Require an authoritative, canonical operator roster with an explicit `BODY` or `REFERENCE` for
+  every operator/vnode pair. Each BODY declares `FULL`/`DELTA`/`EMPTY`, and every resolved chain
+  terminates in `FULL` or `EMPTY`. Omission, duplicate names, mixed attempts, and topology drift
+  fail before prepare.
+- Build and cache an uninitialized SQL operator's exact plan/codec contract in a pure, fallible graph
+  construction phase before artifact fetch. Prepare consumes only preflighted rows under that
+  contract; activation cannot precede semantic validation or fall back to node-local DataFusion
+  state.
 - Reuse assignment/process fences and restoring-output suppression. Intake remains closed while
   the current assignment has restoring vnodes or a staged transition.
 - Bound acquired-vnode input buffering, bulk install, post-acquire full rebase, and revoked-range
@@ -266,12 +276,14 @@ Tests:
 - backend model/conformance tests over random atomic batches, scans, deletes, snapshots, and restore;
 - crash before/after write, freeze, encode, upload, seal, install, activate, revoke, and range delete;
 - late-operator and later-vnode prepare failure leaves all live state unchanged, retains the exact
-  staged transition, and activates no vnode; explicit empty FULL removes stale state while
+  staged transition, and activates no vnode; an explicit `EMPTY` base removes stale state while
   missing/extra/duplicate roster entries fail before prepare;
-- uninitialized operators cannot activate after byte staging alone; exact semantic/physical schema
-  goldens, same-name custom UDAF rejection, global vnode-0, huge declared IPC lengths, compression,
-  dictionary messages, second-batch/trailing-byte, and every encoded/decoded resource limit fail
-  closed before Arrow sees untrusted bytes;
+- uninitialized operators cannot activate after byte staging alone; exact semantic/state-contract
+  goldens, same-name custom UDAF rejection, global vnode-0, truncation at every envelope/row
+  boundary, declared length/count max and max-plus-one, reserved fields, unknown versions, duplicate
+  or out-of-order/cross-vnode keys, trailing bytes, and every restore reservation fail closed without
+  passing managed artifact bytes to Arrow. Any future IPC codec owns its separate framing,
+  compression, dictionary, decoded-expansion, and second-batch/EOS matrix;
 - checksum, truncated artifact, wrong ABI/schema/owner, disk full, object-store stall, compaction
   stall, and complete local directory loss;
 - generation/iterator leak tests and resident/native byte accounting under sustained churn;
@@ -301,15 +313,18 @@ Work:
 2. Reuse the existing canonical pre-aggregate shuffle and ownership/barrier fences. Remove duplicate
    map-era dirty/full/delta tracking only after the managed path is equivalent and all callers move.
 3. Encode only named semantic state. For the first vertical that is the canonical group key, checked
-   count, and checked SUM non-null count/accumulator; map-era `last_updated_ms` and `last_emitted`
+   count, and checked `Int64` SUM non-null count/accumulator; map-era `last_updated_ms` and `last_emitted`
    are not copied without a consumer. Apply one Arrow input batch with one grouped state read and one
    atomic mutation/output-enqueue batch; no record performs its own blocking LSM operation.
-4. Implement the reviewed Laminar codec for append-only `COUNT(*)` plus nullable `SUM(Int64)`.
-   Checked arithmetic must fault before mutation/output instead of inheriting DataFusion 52.3's
-   wrapping SUM or profile-dependent count overflow. Require deterministic fresh/populated and
-   overflow goldens; a matching UDAF name is not codec identity.
-5. Keep broader COUNT/SUM types, `AVG`, `MIN`/`MAX`, `DISTINCT`, retractions, UDAFs,
-   multi-stage/derived fallback, and cluster MVs closed.
+4. Implement the reviewed Laminar codec/executor for exactly one append-only `COUNT(*)`, one nullable
+   `SUM` of a direct `Int64` column, and direct ABI-v1 grouping columns. Check every group-local input
+   prefix in source order, preflight the whole Arrow batch, and fault with no mutation/output on a
+   late overflow. Use the same implementation for this embedded/reference shape before admission.
+   Require fresh/populated, null-only, split/coalesced overflow, late-group rollback, and impossible
+   restored-state goldens; a matching UDAF name is not codec identity.
+5. Keep multiple aggregates, filters/HAVING/derived expressions, broader COUNT/SUM types, `AVG`,
+   `MIN`/`MAX`, `DISTINCT`, retractions, UDAFs, multi-stage fallback, and cluster MVs closed. Require
+   positive replay-determinism for all upstream expressions; reject volatile/time-relative/AI UDFs.
 6. Add per-operator/vnode keys, bytes, dirty bytes, cache hit rate, batch read/write, skew, checkpoint,
    restore, and pressure metrics.
 7. Remove the one-million-group safety fiction once the new hard byte policy is the only admitted
@@ -318,16 +333,18 @@ Work:
 
 Correctness matrix:
 
-- random append/update/retract batches versus embedded full recomputation;
-- all supported Arrow key/value types, nulls, overflow/error paths, hash golden vectors, many
-  aggregates in one logical stage, and hot keys;
+- random append-only batches versus the shared checked embedded/reference implementation;
+- all admitted Arrow key types, null-only SUM, prefix overflow/error paths, hash golden vectors,
+  unsupported multiple aggregates, deterministic-expression proofs, volatile-UDF rejection, and
+  hot keys;
 - multi-node remote shuffle with every vnode boundary and zero-vnode workers;
 - checkpoints during dirty state, failed capture, owner death before/after seal, `1 -> 3 -> 2`
   rotation, stale messages, and repeated acquire/revoke;
 - output oracle under the advertised at-least-once boundary: no lost state/result, documented
   replay duplicates only, and no double-application inside restored state.
 - Kafka assignment handoff plus at least one admitted durable multiwriter append sink, including
-  crash before/after sink flush and source-position seal.
+  broker-enforced old-writer fencing, partition fence markers, ambiguous source acknowledgements,
+  and crash before/after sink flush and source-position seal.
 - cache-resident and spill-heavy latency/throughput/compaction profiles.
 
 Exit gate:
