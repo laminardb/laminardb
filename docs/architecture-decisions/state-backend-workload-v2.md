@@ -401,8 +401,9 @@ authorize an encoder.
 ### Canonical operations and state equality
 
 Scenario-specific folding consumes every raw source row before generic canonicalization. In an
-aggregate group, multiplicity contributes to the replacement value; the least source ordinal only
-selects representative provenance. Generic canonicalization is separate per collection: point reads
+aggregate group, multiplicity contributes only to the folded request and exact counters; persisted
+hot bytes remain the stable identity-derived value, and the least source ordinal selects
+representative provenance. Generic canonicalization is separate per collection: point reads
 sort by logical key, ranges by their complete `(start,end,row_cap,byte_cap)` tuple, and mutations by
 logical key and mutation kind. Each range endpoint is a complete logical key including role/table,
 vnode, and opaque key bytes. Byte-identical entries collapse to the least provenance ordinal. Two
@@ -600,12 +601,12 @@ prove these bounds is not encodable.
 The aggregate cold slots admit a closed form. For cold slot `j`, request `t` selects `j=t mod M`,
 deletes its current generation, and inserts its successor, so after `T` requests its generation is
 `0` when `T<=j`, otherwise `1+floor((T-1-j)/M)`. This bounds exact setup/final iteration without
-expanded request replay. It does not decide stable hot-rank values or prove aggregate multiplicity;
-those policies remain open.
+expanded request replay. The Cycle 12 subsection below fixes stable hot-rank values while retaining
+multiplicity in request/counter evidence; it does not claim cumulative SQL aggregate arithmetic.
 
 The timer proof may enumerate only its `256K` deadline ring and affine generation deltas, jumping
-complete cycles and replaying a bounded remainder. It must prove that the exact, still-unfrozen
-reschedule permutation returns the roster shape to closure; the 8,388,608-visit ceiling applies.
+complete cycles and replaying a bounded remainder. The exact Cycle 12 reschedule permutation below
+must return the roster shape to two-ring closure; the 8,388,608-visit ceiling applies.
 J2 may use its 200-row classifier period and 3,200-row/25-request batching superperiod only when a
 phase starts at `t mod 3200 = 0`; the exact
 128-row return vector is
@@ -620,10 +621,10 @@ analytical proof and the runtime expected observation both establish that the co
 otherwise it is runner INVALID. Zipf uses the approved analytical retry bound plus runtime
 fail-closed/no-reseed semantics unless owners choose a total sampler under a new identity.
 
-This closes only the infeasible-replay design choice. Exact payload codecs, field-mode schema,
-aggregate hot-value policy, timer recurrence proof, J2 routing and signed bounds, runtime ring/lead/
-lag limits, binary goldens, and named approvals remain blockers. No workload plan or backend run is
-authorized.
+The bounded proof closes the infeasible-replay design choice. Cycle 12 additionally narrows the
+aggregate, timer, and J2 arithmetic below. Exact payload codecs, field-mode schema, runtime ring/
+lead/lag limits, binary goldens, and named approvals remain blockers. No workload plan or backend
+run is authorized.
 
 Raw input rows are not backend operations. Each expectation contract/result pair separately binds requests/s,
 raw rows/s, post-dedup point/range/mutation operations/s, logical mutation bytes/s, and returned
@@ -807,9 +808,27 @@ roster proof is still required.
 
 Aggregate requests apply the 128 source rows in source order and fold repeated point updates by
 logical key, then rotate one disjoint cold slot. That gives stable cardinality while separating
-natural distribution pressure from guaranteed churn. Exact values, generations, conflict rules,
-distribution assignments, operation counts, and an all-distinct cold-read case remain to be
-frozen; a Zipf-labelled 96-GiB shape alone is not cold-I/O evidence.
+natural distribution pressure from guaranteed churn. Cycle 12 fixes the stable values and cold-slot
+generations below. Exact codec conflict rules, distribution assignments, operation counts, and an
+all-distinct cold-read case remain open; a Zipf-labelled 96-GiB shape alone is not cold-I/O evidence.
+
+Cycle 12 narrows the bounded-backend workload deliberately: sampled aggregate ranks are stable,
+idempotent rewrites of one identity-derived value. Multiplicity is preserved in canonical request
+and counter evidence but does not evolve a cumulative value. Request `t` independently rotates
+exactly one disjoint cold slot:
+
+```text
+slot = t mod M
+old_generation = floor(t / M)
+new_generation = old_generation + 1
+```
+
+The old cold key is deleted and the successor key is inserted atomically with the folded hot puts.
+This keeps the reference path bounded and proves backend get/dedup/put/churn behavior; it does **not**
+claim to execute SQL aggregate arithmetic. Cumulative aggregate evolution remains a product semantic,
+recovery, and independent-soak obligation. A workload owner who requires cumulative values in this
+backend campaign must reject this arm and fund a separately bounded/spilling oracle; it cannot
+silently add an unbounded hot-rank map.
 
 ### Timer lifecycle candidate
 
@@ -848,14 +867,51 @@ rejected 5,347,799,040-byte (4.98-GiB) active shape. It still cannot prove physi
 the presence of OS cache, compression, prefetch, or locality. A pre-approved external device-read
 or verified cache-miss floor remains mandatory.
 
+#### Cycle 12 timer recurrence and fairness boundary
+
+Require positive even `K` and let `L=256K`. For runtime request ordinal `G`, let `r=G mod 5`,
+`q=floor(G/5)`, `v=q mod 256`, and `local=floor(q/256)`. Requests `r=0,1,2` each swap 64 same-lane
+entity pairs between materialized deadlines `q` and `q+256` in vnode `v`. For even `local`, pair
+positions are `i=64r..64r+63`; for odd `local`, they are `i=64(r+3)..64(r+3)+63`. Request `r=3`
+scans the due roster at `q`; request `r=4` validates and atomically fires it, requeuing that roster at
+`q+L`. The rejected `q+256`/`q+512` odd-slot proposal is invalid during startup because its latter
+cohort is not yet materialized.
+
+This recurrence has exact **two-ring**, not one-ring, fairness. At the odd wrap edge one partner
+fires twice and the other zero times in one ring; each fires twice over two rings. After two rings,
+the roster identity is restored, selected entities have timer generation `+4`, unselected entities
+have timer generation `+2`, every output generation is `+2`, and every deadline advances `2L`.
+Warmup and measurement must therefore each begin at a two-ring boundary and contain a request count
+divisible by `10L`; otherwise the case is not encodable. This deliberate 0/2-fire boundary needs a
+literal golden and workload-owner acceptance. It is not silently described as once-per-ring timer
+fairness. Prior provisional counts that are not multiples of `10L` are rejected rather than rounded;
+DKS-Q2-004 must choose replacement counts/rates that also meet the profile minima.
+
+The spill static proof enumerates one ring and symbolically applies the even-`K` closure:
+
+```text
+8,192 * (3 * 128 + 512) = 7,340,032 entity visits
+```
+
+This fits the 8,388,608-visit cap. The `512` term is one static enumeration of the due roster: the
+proof derives both the expected scan and fire transition from that roster without traversing it a
+second time. Runtime scan and fire remain separate requests and do not borrow this static-proof
+budget. Resident behavior must instantiate the same proof rather than spending a second enumeration
+budget.
+
 ### Dynamic two-sided join candidate J2
 
-For integer `Q`, the live horizon is `W=12,800Q`. A signed event ordinal `t` uses Euclidean
+For integer `Q`, the live horizon is `W=12,800Q`. Runtime row `j` in `0..128` of request
+`G=runtime_event_ordinal` has checked signed event ordinal `t=128G+j`; setup separately materializes
+the exact history `[-W,0)`. A signed event ordinal `t` uses Euclidean
 arithmetic and `p=(11*(t mod 200)) mod 200`; bands `[0,100)`, `[100,170)`, `[170,198)`, and
 `[198,200)` select fanout 0, 1, 8, and 64. This is a permutation with exact 500/350/140/10 weights.
-Its class group counts are `n0=3,200Q`, `n1=2,240Q`, `n8=112Q`, and `n64=Q`. A class-event ordinal
-selects group modulo `n`, alternates side by occurrence, and rotates through `max(1,fanout)` slots.
-Fanout zero uses side-distinct join generations.
+Its class group counts are `n0=3,200Q`, `n1=2,240Q`, `n8=112Q`, and `n64=Q`. For signed class-event
+occurrence `a`, define `g=rem_euclid(a,n_f)`, `h=div_euclid(a,n_f)`,
+`side=rem_euclid(h,2)`, `s_f=max(1,f)`, and
+`slot=rem_euclid(div_euclid(h,2),s_f)`. The logical match namespace is `side` for fanout zero and
+constant zero otherwise; it is included in both stored join keys and the opposite-side range. Thus
+fanout-zero rows on opposite sides never match, while positive-fanout sides share a namespace.
 
 `W` contains exactly `64Q` complete classifier periods, so advancing by `W` shifts a group's
 occurrence by exactly 2/2/16/128. The row at `t-W` is therefore the same class, group, side, and
@@ -876,23 +932,115 @@ are not workload rows or samples. Endpoint sentinels cover exact lower inclusion
 exclusion. This case deliberately does not qualify lateness, idleness, watermark-only idle-group
 eviction, expiry retractions, or sink commits.
 
-Whole groups of 128, 16, or 2 rows can be assigned to the least-loaded vnode and the 2-row groups
-fill every vnode to exactly `50Q`; the arithmetic is feasible. The canonical routed-group ID,
-constant-time routing formula, signed timestamp/key padding, range bounds, and globally balanced
-tail-rule stream-offset derivation remain unfrozen. The proposed setup uses negative logical
-history and an order-preserving sign-bit-biased key timestamp; it must not ambiguously apply a
-second epoch offset. The greedy allocator is a setup feasibility proof, not a measured hot-path
-operation; runtime routing needs the still-unfrozen constant-time formula, with generator overhead
-charged and controlled.
+Whole groups of 128, 16, or 2 rows can be assigned while filling every vnode to exactly `50Q`; the
+arithmetic is feasible. Cycle 12 replaces the earlier least-loaded greedy sketch with the exact
+prefix routing below. The canonical key padding and physical codec remain unfrozen, and generator
+overhead remains charged and controlled.
 J2 is therefore a pass for logical lifecycle feasibility only, not an accepted workload or product
 join semantic.
 
+For this v1 candidate, `Q` is restricted to the two reviewed shapes `{197, 4,737}`; adding another
+value requires a new checked nonnegativity/width proof and identity. Cycle 12 replaces the proposed
+greedy runtime allocator with exact prefix routing. Define
+`split(n,o,v) = floor(n/256) + 1[rem_euclid(v-o,256) < (n mod 256)]` for vnode `v` in `0..256`; this
+assigns the remainder to one contiguous vnode run rotated by offset `o`. Then define:
+
+```text
+c64(v) = split(Q, 0, v)
+c8(v)  = split(112Q, 1, v)
+c0(v)  = split(3200Q, 2, v)
+c1(v)  = 25Q - 64*c64(v) - 8*c8(v) - c0(v)
+```
+
+The class rotations are fixed: `c64` offset 0, `c8` offset 1, and `c0` offset 2. Every `c1(v)` is
+nonnegative (minimum 1,702 for `Q=197`, 41,412 for `Q=4,737`). The weighted sum is exactly `25Q`
+live rows per side and therefore `50Q` across both sides for every vnode. Canonical concatenated
+`u32_be (c0,c1,c8,c64)` vectors have SHA-256
+`8939451f9ed96eade16afdf1b368739d48530d199db0705eacc57193991af5d6` for `Q=197` and
+`9dfc424e04d79def89cf66c6270656f6eb552fd54c8cfe6edd0dbe5aead5030b` for `Q=4,737` under that
+rotation. The witness bytes iterate `v=0..255` and append
+`c0(v) || c1(v) || c8(v) || c64(v)`, each as `u32_be`, with no framing between tuples.
+
+For each class, define `P(0)=0` and `P(v+1)=P(v)+c(v)`. Group `g` with `0 <= g < n_f` routes to
+`max { v < 256 : P(v) <= g }`, implemented as a fixed eight-comparison upper-bound lookup over the
+256 endpoints `P(1)..P(256)` in the 257-entry table; taking the greatest index makes duplicate
+prefixes from zero-count vnodes unambiguous. Its vnode-local group ordinal is exactly `g-P(v)`.
+Routing performs no per-row hashing and no greedy measured-path allocation. Width and filler
+generation remain separate open codec work.
+
+This routing is state-balanced, not service-balanced. Over one horizon, exact matched-row work per
+vnode is `2*c1 + 128*c8 + 8192*c64`: `14,558..22,734` (1.5616x) for `Q=197` and
+`495,640..503,818` (1.0165x) for `Q=4,737`. For `Q=197`, every fanout-64 group is on vnodes
+`0..196` for every seed. Expectations must bind the complete 256-vnode matched-row vector and its
+hottest-vnode witnesses; equal state bytes cannot be reported as equal service work.
+
+J2 uses mathematical signed event time with Euclidean division/remainder. The only order-preserving
+wire transform is `(t as u64) XOR 0x8000000000000000`, encoded big-endian; no second epoch offset is
+permitted. Setup occupies negative history. Every phase starts with `t mod 3,200 = 0`; at 128 rows
+per request, phase request counts are divisible by 25. Checked construction rejects an event time,
+`t-W`, or endpoint outside `i64`, and half-open ranges remain exactly `[t-W,t)`.
+
+Expected setup/final state needs no sort or spool. For class `f`, let `positions_f` be its fixed
+ordered positions within the 200-event classifier period and `m_f=|positions_f|`. The signed,
+zero-anchored occurrence prefix is:
+
+```text
+a_f(T) = floor_euclid(T,200) * m_f
+       + |{p in positions_f : p < rem_euclid(T,200)}|
+```
+
+Thus `a_f(0)=0`; it counts `[0,T)` for positive `T` and is the negative count of `[T,0)` for
+negative `T`. Its inverse occurrence is:
+
+```text
+t(a,f) = 200 * div_euclid(a, m_f) + positions_f[rem_euclid(a, m_f)]
+```
+
+For final interval `[T-W,T)`, let `s_f=max(1,f)`. With `A=a_f(T)`, group `g` enumerates
+`a=g+n_f*h` over the checked half-open `h` bounds induced by
+`A-2*s_f*n_f <= a < A`. Exactly `2*s_f` occurrences remain; parity chooses side, and ascending `h`
+yields each side's `s_f` ordered timestamps. Iteration by role, vnode prefix, class, group, then
+timestamp uses O(1) scratch and the 200-entry constant table. The future opaque key codec must
+preserve that exact order or this no-sort proof is invalid; it cannot hide an external sort.
+
+### Cycle 12 codec boundary: no premature encoder
+
+The logical role registry is reserved as `0x01 aggregate_state`, `0x02 window_state`,
+`0x03 timer_index`, `0x04 join_left`, `0x05 join_right`, `0x06 output_bookkeeping`, and
+`0x07 frontier`. These role bytes order the canonical state stream; they do not finish opaque
+key/value codecs.
+
+Zero padding is rejected. It would make the nominal 96-GiB population trivially compressible and
+invalidate spill/cache pressure. Selected-width keys and values need a pinned, identity-derived,
+one-pass compression-resistant filler with literal vectors and a bounded setup/verifier cost. A BLAKE3 XOF
+is a candidate, not a decision; C1-style SHA-256 per 32-byte block would require billions of hashes.
+Compression-disabled configuration alone does not decide OS cache/device-read evidence.
+
+The balanced 512-entity timer fire also blocks a rushed wire. A straightforward index-aligned
+precondition layout is about 7,555,724 bytes—only 832,884 bytes below 8 MiB—and at the provisional
+rate would move roughly 0.93 GB/s through the request ring before reference/adapter copies. A sorted
+per-request key dictionary with `u32` indexes is approximately 4.72 MB and permits borrowed key
+slices, but at that rate the dictionary bytes alone are roughly 0.582 GB/s before copies and filler
+generation. Its exact tags, duplicate/conflict rules, observation binding, and preparation/null-
+control cost need a benchmarkable codec spike. Logical mutation-byte accounting remains expanded;
+wire dictionary compression cannot reduce the physical work charged to the candidate.
+
+Therefore no workload-v2 encoder, schema, or literal binary lands in Cycle 12. Freezing goldens
+before the filler and dictionary decision would fossilize an unproved hot path. The future module
+must use independent C2 types, checked manual big-endian encoding, lengths before allocation, and
+observation-to-request leaf binding; it may not deserialize through C1. If the dictionary candidate
+passes its spike, its later contract must define exactly one canonical dictionary, duplicate/conflict
+rules, and index-aligned preconditions. DKS-Q2-003 remains BLOCK on this codec work, runtime
+expectation/result unions, lifecycle registration, ring limits, owner acceptance, and product/soak
+semantics.
+
 ### Remaining M2 blockers
 
-The complete matrix remains **BLOCK**. It still needs registered scenario/role/width/churn/retention
+The complete matrix remains **BLOCK**. Cycle 12 decides the bounded stable-aggregate arm, two-ring
+timer recurrence, and J2 routing/signed-time/alignment arithmetic, but they still require owner
+acceptance and literal proof. The matrix still needs registered scenario/width/churn/retention
 identities and exact binary encodings; complete timer/join logical-to-physical codecs; literal
-goldens implementing the canonical dedup/range rules; aggregate hot-value semantics; the exact timer
-recurrence/closure proof; J2 routing/signed bounds/alignment; the runtime expectation/result union
+goldens implementing the canonical dedup/range rules; the runtime expectation/result union
 and ring/lead/lag caps; an encodable lifecycle arm; cold-I/O evidence; rates, counts, schedule,
 service/runner/interference/resource gates; campaign time/endurance budget; and named workload/
 operations approvals. The bounded static-proof/runtime-commitment direction is accepted only as an
