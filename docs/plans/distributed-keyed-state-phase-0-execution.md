@@ -378,12 +378,18 @@ distribution/rejection/retry metrics and has not been independently operated by 
 operations owners. It therefore closes no DKS-Q2 item, does not authorize a backend run, and cannot
 be reused as production or soak evidence.
 
-Cycle 15 publishes commit `1cc095bc` and runs the configured workflow as [CI run 30047503740,
-attempt 2](https://github.com/laminardb/laminardb/actions/runs/30047503740). Hosted Linux x86_64,
-Windows x86_64, and native Linux arm64 pass the standalone oracle tests; the arm job also passes the
-Rust Zipf corpus in debug and release. Attempt 1 failed only in an unchanged broad Windows recovery
-test after 3,240 other tests passed. The exact test then passed 1,250 local Windows stress runs and
-attempt 2's complete 5,772-test Windows suite; aggregate `CI Success` passed. The intermittent first
+Cycle 15 publishes commit `1cc095bc` and runs the configured workflow as [CI run
+30047503740](https://github.com/laminardb/laminardb/actions/runs/30047503740). On attempt 1, hosted
+Linux x86_64, Windows x86_64, and native Linux arm64 pass the standalone oracle tests; the arm job
+also passes the 111-test standalone-validator library suite with `zipf-feasibility` enabled in debug
+and release. Attempt 1 fails only in an unchanged broad Windows recovery test after 3,240 other
+tests pass. The exact test then passes 1,250 local Windows stress runs and attempt 2's complete
+5,772-test Windows suite; aggregate `CI Success` passes. Attempt 2 reruns the failed and dependent
+jobs, not the already-green target jobs. The local stress uses a pre-existing test binary. A
+current-source integration-target build fails with Windows OS error 1455 when the host exhausts its
+paging file; a reduced lib-only build then reaches its five-minute time limit without a result. The
+pre-existing binary's SHA-256 is
+`8330213baee1ab67fc1d38c96daf5ab6084a3ffdc9c559a35019a94585a49848`. The intermittent first
 failure remains recorded and is not a fixed defect, soak, or qualification result. Hosted execution
 closes only the prototype's configured-platform gap; all DKS-Q2-001 policy, numerical, provenance,
 independent-operation, and candidate-comparison blockers remain.

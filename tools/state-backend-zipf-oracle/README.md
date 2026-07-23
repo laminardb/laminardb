@@ -46,12 +46,13 @@ python -m venv .venv
 
 On Linux, replace `.venv/Scripts/python` with `.venv/bin/python`. The notice is written to stderr;
 NDJSON alone is written to stdout. `requirements.txt` pins the exact CPython 3.13 wheels for the
-three declared platforms. [CI run 30047503740, attempt
-2](https://github.com/laminardb/laminardb/actions/runs/30047503740) exercised CPython 3.13.1 and
-gmpy2 2.3.1 on hosted Linux x86-64, Windows x86-64, and native Linux arm64. All three passed the 14
-tests that bind the 865,397-byte canonical observation and its SHA-256. This is cross-platform
-prototype stability, not qualification or target-host evidence. Runtime checks additionally
-require MPFR 4.2.2, GMP 6.3.0, and MPC 1.4.0.
+three declared platforms. In [CI run
+30047503740](https://github.com/laminardb/laminardb/actions/runs/30047503740), the three target jobs
+passed on attempt 1 with CPython 3.13.1 and gmpy2 2.3.1 on hosted Linux x86-64, Windows x86-64, and
+native Linux arm64. All three passed the 14 tests that bind the 865,397-byte canonical observation
+and its SHA-256. The failed-job rerun did not re-execute those already-green jobs. This is
+cross-platform prototype stability, not qualification or target-host evidence. Runtime checks
+additionally require MPFR 4.2.2, GMP 6.3.0, and MPC 1.4.0.
 
 ## Dependency and evidence boundary
 

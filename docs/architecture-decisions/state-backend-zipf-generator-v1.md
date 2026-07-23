@@ -294,13 +294,16 @@ its literal corpus, escalates unresolved decisions through 4,096-bit precision, 
 record ineligible and non-authorizing. CI is configured for Linux x86_64, Windows x86_64, and native
 Linux arm64.
 
-Cycle 15 [CI run 30047503740, attempt
-2](https://github.com/laminardb/laminardb/actions/runs/30047503740) exercises all three hosted paths
-at commit `1cc095bc`. Linux x86_64 passes the 14 oracle tests plus an explicit CLI byte-count/hash
-check. Native Linux arm64 passes 111 Rust Zipf tests in both debug and release and all 14 oracle
-tests. Hosted Windows passes the standalone validator, 111 Rust Zipf tests in both modes, and all
-14 oracle tests. This closes the prototype's configured-platform execution debt; it does not make
-the same-tool canonical hash an independent distribution or candidate-conformance result.
+In Cycle 15 [CI run
+30047503740](https://github.com/laminardb/laminardb/actions/runs/30047503740), all three target jobs
+pass on attempt 1 at commit `1cc095bc`. Linux x86_64 passes the 14 oracle tests plus an explicit CLI
+byte-count/hash check. Native Linux arm64 passes the 111-test standalone-validator library suite
+with `zipf-feasibility` enabled in debug and release plus all 14 oracle tests. Hosted Windows passes
+the all-target/all-feature debug suite (128 passed; one additional benchmark ignored), the same
+111-test release library suite, and all 14 oracle tests. Attempt 2 reruns the failed broad Windows
+job and aggregate gate, not those already-green target jobs, and ends green. This closes the
+prototype's configured-platform execution debt; it does not make the same-tool canonical hash an
+independent distribution or candidate-conformance result.
 
 This prototype is decision input, not the independent audit or qualification corpus. It has no
 candidate-output comparator, approved head/CDF/tail/total-variation thresholds, finite-grid
