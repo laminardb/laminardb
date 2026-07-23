@@ -48,6 +48,13 @@ service configuration was changed.
 | cgroup | cgroup v2 exposes `memory.stat` dirty/writeback and virtual-device `io.stat`; Docker child cgroups expose `memory.peak` |
 | Toolchain | `rust:1.95-bookworm` resolved to local image/index digest `sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1`; `rustc 1.95.0` and `cargo 1.95.0` ran in Linux; the repository Dockerfile now matches workspace Rust 1.95 |
 
+The repository's `rust-toolchain.toml` names moving channel `stable`. When the checkout is mounted,
+rustup therefore overrides the image default unless `RUSTUP_TOOLCHAIN=1.95.0-<target>` is set. The
+first unpinned smoke invocation updated to Rust 1.97.1 and passed, but is excluded from the pinned
+result. The repeated run explicitly reported Rust/Cargo 1.95.0 and passed all 94 default targets.
+Future evidence manifests must record the active toolchain output; an image tag alone is
+insufficient.
+
 The 15.17-GiB Docker memory ceiling and shared virtual disk also cannot satisfy the provisional
 64-GiB/96-GiB profile. Microsoft recommends keeping Linux-tool workloads in the Linux filesystem,
 not under `/mnt/c`, for both performance and Linux filesystem semantics
@@ -87,6 +94,25 @@ The local lane is deliberately narrower than qualification:
    volume per trial;
 5. retain `NOT QUALIFICATION EVIDENCE` in every local artifact and reject attempts to merge these
    results with the native-host campaign.
+
+The confirmed default-tool command includes both the immutable image reference and the explicit
+toolchain override:
+
+```powershell
+docker run --rm --pull=never `
+  --cpus=4 --memory=6g `
+  -e RUSTUP_TOOLCHAIN=1.95.0-x86_64-unknown-linux-gnu `
+  -e CARGO_BUILD_JOBS=2 `
+  --mount "type=bind,source=$((Get-Location).Path),target=/work,readonly" `
+  --mount "type=volume,source=laminardb-state-qual-cargo-1_95,target=/usr/local/cargo/registry" `
+  --mount "type=volume,source=laminardb-state-qual-target-exact-1_95,target=/target" `
+  -w /work `
+  rust@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 `
+  sh -c 'rustc --version && cargo --version && cargo test --locked --all-targets --manifest-path tools/state-backend-qual/Cargo.toml --target-dir /target'
+```
+
+The named Cargo/target volumes are development caches only. They are not evidence artifacts and
+must not be reused as candidate database state.
 
 Provisioning a loopback or VHD-backed XFS filesystem could exercise quota plumbing, but would still
 sit above VHDX/NTFS and the shared system device. Such a run may be labelled a functional XFS quota
