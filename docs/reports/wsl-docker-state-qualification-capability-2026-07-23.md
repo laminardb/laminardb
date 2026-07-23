@@ -51,9 +51,10 @@ service configuration was changed.
 The repository's `rust-toolchain.toml` names moving channel `stable`. When the checkout is mounted,
 rustup therefore overrides the image default unless `RUSTUP_TOOLCHAIN=1.95.0-<target>` is set. The
 first unpinned smoke invocation updated to Rust 1.97.1 and passed, but is excluded from the pinned
-result. The repeated run explicitly reported Rust/Cargo 1.95.0 and passed all 94 default targets;
-the later exact-image `zipf-feasibility` matrix passed all 103 targets. Future evidence manifests
-must record the active toolchain output; an image tag alone is insufficient.
+result. The repeated run explicitly reported Rust/Cargo 1.95.0 and passed all 94 tests from the
+default all-targets invocation; the later exact-image `zipf-feasibility` invocation passed all 103
+tests. Future evidence manifests must record the active toolchain output; an image tag alone is
+insufficient.
 
 The 15.17-GiB Docker memory ceiling and shared virtual disk also cannot satisfy the provisional
 64-GiB/96-GiB profile. Microsoft recommends keeping Linux-tool workloads in the Linux filesystem,
