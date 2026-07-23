@@ -76,7 +76,12 @@
   "allOf": [
     {
       "if": {"properties": {"record_class": {"const": "synthetic_fixture"}}, "required": ["record_class"]},
-      "then": {"properties": {"fixture_ineligible": {"const": true}}},
+      "then": {
+        "properties": {
+          "fixture_ineligible": {"const": true},
+          "disposition": {"const": "DEFER"}
+        }
+      },
       "else": {"properties": {"fixture_ineligible": {"const": false}}}
     },
     {

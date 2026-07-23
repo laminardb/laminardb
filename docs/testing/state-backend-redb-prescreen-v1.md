@@ -73,6 +73,10 @@ exact protocol bytes; harness/oracle source, binary, lockfile, SBOM, toolchain, 
 wire/result schemas and literal goldens; complete seed/order schedule; target identity and preflight/
 noise rules; clock/cgroup/cache-reset procedures; trigger and bounded adaptive-delay rule; every
 deadline/resource/artifact cap; and all-false qualification/selection/production/admission fields.
+The result schema restricts every `synthetic_fixture` to `fixture_ineligible=true` and disposition
+`DEFER`; a fixture cannot encode even a smoke pass or a native prescreen decision. A real-shaped
+record still has no authority until the future semantic verifier checks its referenced bytes,
+attestations, run class, and disposition.
 The command must verify the detached record before opening redb. Any bound input change requires a
 new approval, and no prescreen approval can authorize or donate C1/C2/C3 evidence.
 

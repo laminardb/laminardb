@@ -1094,6 +1094,7 @@ mod redb_prescreen_contract_tests {
         assert!(jsonschema::draft202012::is_valid(&result_schema, &result));
         assert_eq!(approval["fixture_ineligible"], true);
         assert_eq!(result["fixture_ineligible"], true);
+        assert_eq!(result["disposition"], "DEFER");
         assert_eq!(approval["evidence_scope"]["production_eligible"], false);
         assert_eq!(result["evidence_scope"]["independent_soak_eligible"], false);
 
@@ -1157,18 +1158,36 @@ mod redb_prescreen_contract_tests {
         docker_pass["disposition"] = "PRESCREEN_PASS".into();
         assert!(!jsonschema::draft202012::is_valid(&schema, &docker_pass));
 
+        let mut synthetic_smoke_pass = docker.clone();
+        synthetic_smoke_pass["disposition"] = "SMOKE_PASS".into();
+        assert!(!jsonschema::draft202012::is_valid(
+            &schema,
+            &synthetic_smoke_pass
+        ));
+
         let mut docker_probe = docker.clone();
         docker_probe["mechanism_probe"] =
             descriptor("redb-prescreen-bounded-mechanism-probe-result", '1');
         assert!(!jsonschema::draft202012::is_valid(&schema, &docker_probe));
 
         let mut native = docker.clone();
+        native["record_class"] = "prescreen_record".into();
+        native["fixture_ineligible"] = false.into();
         native["run_class"] = "native_prescreen_decision".into();
         native["prior_smoke_result"] = descriptor("redb-prescreen-reviewed-smoke-result", '2');
         native["mechanism_probe"] =
             descriptor("redb-prescreen-bounded-mechanism-probe-result", '3');
         native["disposition"] = "PRESCREEN_NO_GO".into();
         assert!(jsonschema::draft202012::is_valid(&schema, &native));
+
+        let mut synthetic_native_pass = native.clone();
+        synthetic_native_pass["record_class"] = "synthetic_fixture".into();
+        synthetic_native_pass["fixture_ineligible"] = true.into();
+        synthetic_native_pass["disposition"] = "PRESCREEN_PASS".into();
+        assert!(!jsonschema::draft202012::is_valid(
+            &schema,
+            &synthetic_native_pass
+        ));
 
         let mut missing_probe = native.clone();
         missing_probe["mechanism_probe"] = Value::Null;

@@ -100,7 +100,7 @@
     "hard_bound_hit": false,
     "hit_codes": []
   },
-  "disposition": "SMOKE_PASS",
+  "disposition": "DEFER",
   "artifacts": {
     "raw_run_manifest": {
       "role": "redb-prescreen-raw-run-manifest",
