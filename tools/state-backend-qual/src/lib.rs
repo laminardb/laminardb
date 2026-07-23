@@ -7,6 +7,8 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
 pub mod latency_samples;
+pub mod mechanism_mapping;
+pub mod mechanism_samples;
 pub mod model;
 pub mod model_result;
 pub mod resource_samples;
@@ -21,6 +23,7 @@ pub const MAX_MODEL_RESULT_BYTES: usize = 1_048_576;
 
 const PROFILE_SCHEMA_V1: &str = include_str!("../schema/profile-v1.schema.json");
 const PROFILE_SCHEMA_V2: &str = include_str!("../schema/profile-v2.schema.json");
+const PROFILE_SCHEMA_V3: &str = include_str!("../schema/profile-v3.schema.json");
 
 #[derive(Debug)]
 pub struct CheckErrors {
@@ -170,6 +173,7 @@ pub(crate) fn validated_profile_value(bytes: &[u8]) -> Result<Value, CheckErrors
     let schema_source = match profile.pointer("/schema_version").and_then(Value::as_str) {
         Some("distributed-state-qual/v1") => PROFILE_SCHEMA_V1,
         Some("distributed-state-qual/v2") => PROFILE_SCHEMA_V2,
+        Some("distributed-state-qual/v3") => PROFILE_SCHEMA_V3,
         Some(version) => {
             return Err(CheckErrors::one(format!(
                 "profile schema version `{version}` is unsupported"
@@ -573,7 +577,7 @@ fn scale_ceil_milli(value: u64, multiplier_milli: u64) -> Option<u64> {
         .checked_div(1000)
 }
 
-fn reject_placeholder_strings(value: &Value, path: &str, errors: &mut Vec<String>) {
+pub(crate) fn reject_placeholder_strings(value: &Value, path: &str, errors: &mut Vec<String>) {
     match value {
         Value::String(text) => {
             let normalized = text.trim().to_ascii_uppercase();
@@ -595,7 +599,7 @@ fn reject_placeholder_strings(value: &Value, path: &str, errors: &mut Vec<String
     }
 }
 
-fn reject_non_u64_numbers(value: &Value, path: &str, errors: &mut Vec<String>) {
+pub(crate) fn reject_non_u64_numbers(value: &Value, path: &str, errors: &mut Vec<String>) {
     match value {
         Value::Number(number) if number.as_u64().is_none() => {
             errors.push(format!("non-u64 numerical value at {path}"));
@@ -656,6 +660,7 @@ mod tests {
 
     const PROFILE: &[u8] = include_bytes!("../profiles/linux-nvme-v1.candidate.json");
     const PROFILE_V2: &[u8] = include_bytes!("../profiles/linux-nvme-v2.candidate.json");
+    const PROFILE_V3: &[u8] = include_bytes!("../profiles/linux-nvme-v3.candidate.json");
 
     fn profile_value() -> Value {
         serde_json::from_slice(PROFILE).unwrap()
@@ -669,6 +674,12 @@ mod tests {
 
     fn mutated_v2(mutator: impl FnOnce(&mut Value)) -> Vec<u8> {
         let mut profile: Value = serde_json::from_slice(PROFILE_V2).unwrap();
+        mutator(&mut profile);
+        serde_json::to_vec(&profile).unwrap()
+    }
+
+    fn mutated_v3(mutator: impl FnOnce(&mut Value)) -> Vec<u8> {
+        let mut profile: Value = serde_json::from_slice(PROFILE_V3).unwrap();
         mutator(&mut profile);
         serde_json::to_vec(&profile).unwrap()
     }
@@ -692,6 +703,88 @@ mod tests {
     }
 
     #[test]
+    fn committed_v3_candidate_is_valid_but_ineligible() {
+        let summary = validate_profile(PROFILE_V3).unwrap();
+        assert_eq!(summary.schema_version, "distributed-state-qual/v3");
+        assert_eq!(summary.profile_id, "linux-nvme-v3");
+        assert_eq!(summary.status, "candidate_unapproved");
+        assert!(!summary.qualification_eligible);
+    }
+
+    #[test]
+    fn v3_has_only_truthful_additive_field_replacements_from_v2() {
+        let profile_v2: Value = serde_json::from_slice(PROFILE_V2).unwrap();
+        let mut profile_v3: Value = serde_json::from_slice(PROFILE_V3).unwrap();
+        profile_v3["schema_version"] = profile_v2["schema_version"].clone();
+        profile_v3["profile_id"] = profile_v2["profile_id"].clone();
+        let v3_gate = profile_v3["resource_gates"]
+            .as_object_mut()
+            .unwrap()
+            .remove("target_device_io_latency_max_ms")
+            .unwrap();
+        profile_v3["resource_gates"]
+            .as_object_mut()
+            .unwrap()
+            .insert("unexplained_storage_pause_max_ms".to_owned(), v3_gate);
+        let measurement = profile_v3["measurement"].as_object_mut().unwrap();
+        measurement.remove("open_loop_due_to_return").unwrap();
+        measurement
+            .remove("synthetic_coordinated_omission_correction")
+            .unwrap();
+        measurement.insert("coordinated_omission_corrected".to_owned(), true.into());
+        assert_eq!(profile_v3, profile_v2);
+
+        let schema_v2: Value = serde_json::from_str(PROFILE_SCHEMA_V2).unwrap();
+        let mut schema_v3: Value = serde_json::from_str(PROFILE_SCHEMA_V3).unwrap();
+        schema_v3["$id"] = schema_v2["$id"].clone();
+        schema_v3["title"] = schema_v2["title"].clone();
+        schema_v3["properties"]["schema_version"] =
+            schema_v2["properties"]["schema_version"].clone();
+        let required = schema_v3["$defs"]["resourceGates"]["required"]
+            .as_array_mut()
+            .unwrap();
+        let field = required
+            .iter_mut()
+            .find(|field| field.as_str() == Some("target_device_io_latency_max_ms"))
+            .unwrap();
+        *field = "unexplained_storage_pause_max_ms".into();
+        let v3_gate = schema_v3["$defs"]["resourceGates"]["properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove("target_device_io_latency_max_ms")
+            .unwrap();
+        schema_v3["$defs"]["resourceGates"]["properties"]
+            .as_object_mut()
+            .unwrap()
+            .insert("unexplained_storage_pause_max_ms".to_owned(), v3_gate);
+        let required = schema_v3["$defs"]["measurement"]["required"]
+            .as_array_mut()
+            .unwrap();
+        let open_loop = required
+            .iter_mut()
+            .find(|field| field.as_str() == Some("open_loop_due_to_return"))
+            .unwrap();
+        *open_loop = "coordinated_omission_corrected".into();
+        let synthetic = required
+            .iter()
+            .position(|field| field.as_str() == Some("synthetic_coordinated_omission_correction"))
+            .unwrap();
+        required.remove(synthetic);
+        let measurement = schema_v3["$defs"]["measurement"]["properties"]
+            .as_object_mut()
+            .unwrap();
+        measurement.remove("open_loop_due_to_return").unwrap();
+        measurement
+            .remove("synthetic_coordinated_omission_correction")
+            .unwrap();
+        measurement.insert(
+            "coordinated_omission_corrected".to_owned(),
+            serde_json::json!({"const": true}),
+        );
+        assert_eq!(schema_v3, schema_v2);
+    }
+
+    #[test]
     fn profile_versions_reject_each_others_resource_gate_vocabulary() {
         let bytes = mutated_v2(|profile| {
             let gates = profile["resource_gates"].as_object_mut().unwrap();
@@ -699,6 +792,20 @@ mod tests {
                 .remove("background_maintenance_debt_max_bytes")
                 .unwrap();
             gates.insert("compaction_debt_max_bytes".to_owned(), value);
+        });
+        assert!(validate_profile(&bytes).is_err());
+
+        let bytes = mutated_v3(|profile| {
+            let gates = profile["resource_gates"].as_object_mut().unwrap();
+            let value = gates.remove("target_device_io_latency_max_ms").unwrap();
+            gates.insert("unexplained_storage_pause_max_ms".to_owned(), value);
+        });
+        assert!(validate_profile(&bytes).is_err());
+
+        let bytes = mutated_v2(|profile| {
+            let gates = profile["resource_gates"].as_object_mut().unwrap();
+            let value = gates.remove("unexplained_storage_pause_max_ms").unwrap();
+            gates.insert("target_device_io_latency_max_ms".to_owned(), value);
         });
         assert!(validate_profile(&bytes).is_err());
 
@@ -713,7 +820,7 @@ mod tests {
     #[test]
     fn rejects_unknown_profile_schema_version_before_semantic_checks() {
         let bytes = mutated_v2(|profile| {
-            profile["schema_version"] = "distributed-state-qual/v3".into();
+            profile["schema_version"] = "distributed-state-qual/v4".into();
         });
         assert!(validate_profile(&bytes)
             .unwrap_err()

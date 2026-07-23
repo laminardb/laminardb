@@ -4,6 +4,9 @@ use std::io::{Read as _, Write as _};
 use std::path::Path;
 use std::process::ExitCode;
 
+use state_backend_qual::mechanism_mapping::{
+    validate_mechanism_mapping, MAX_MECHANISM_MAPPING_BYTES,
+};
 use state_backend_qual::model_result::validate_model_result;
 use state_backend_qual::{validate_profile, MAX_MODEL_RESULT_BYTES, MAX_PROFILE_BYTES, NOTICE};
 
@@ -38,7 +41,53 @@ fn main() -> ExitCode {
             }
             validate_model_result_paths(Path::new(&profile_path), Path::new(&result_path))
         }
+        Some("validate-mechanism-mapping") => {
+            let Some(profile_path) = arguments.next() else {
+                return usage();
+            };
+            let Some(mapping_path) = arguments.next() else {
+                return usage();
+            };
+            if arguments.next().is_some() {
+                return usage();
+            }
+            validate_mechanism_mapping_paths(Path::new(&profile_path), Path::new(&mapping_path))
+        }
         _ => usage(),
+    }
+}
+
+fn validate_mechanism_mapping_paths(profile_path: &Path, mapping_path: &Path) -> ExitCode {
+    let profile_bytes = match read_bounded(profile_path, MAX_PROFILE_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("INVALID_INPUT {}: {error}", profile_path.display());
+            return ExitCode::from(2);
+        }
+    };
+    let mapping_bytes = match read_bounded(mapping_path, MAX_MECHANISM_MAPPING_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("INVALID_INPUT {}: {error}", mapping_path.display());
+            return ExitCode::from(2);
+        }
+    };
+
+    match validate_mechanism_mapping(&profile_bytes, &mapping_bytes) {
+        Ok(summary) => {
+            println!(
+                "VALID_INELIGIBLE_MECHANISM_MAPPING mapping={} candidate={} debt={} stalls={}",
+                summary.mapping_id,
+                summary.candidate_id,
+                summary.background_maintenance_debt_kind,
+                summary.engine_pressure_stalls_kind
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("INVALID_MECHANISM_MAPPING {error}");
+            ExitCode::from(2)
+        }
     }
 }
 
@@ -108,7 +157,8 @@ fn read_bounded(path: &Path, maximum_bytes: usize) -> std::io::Result<Vec<u8>> {
 fn usage() -> ExitCode {
     eprintln!(
         "usage: state-backend-qual validate-profile <profile-json-path>\n       \
-         state-backend-qual validate-model-result <profile-json-path> <result-json-path>"
+         state-backend-qual validate-model-result <profile-json-path> <result-json-path>\n       \
+         state-backend-qual validate-mechanism-mapping <profile-json-path> <mapping-json-path>"
     );
     ExitCode::from(64)
 }

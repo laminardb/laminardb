@@ -680,14 +680,14 @@ size relative to RAM, key/value distributions, hot-key skew, batch size, ingress
 bounds, checkpoint cadence, and numerical p99/p99.9 latency, throughput, pause, and recovery goals.
 Targets are chosen before optimization results are known; “fast on a laptop” is not a release gate.
 
-The checked-in [`linux-nvme-v2` candidate](../../tools/state-backend-qual/profiles/linux-nvme-v2.candidate.json)
-is a proposed numerical contract, not a benchmark result or approval. Its evidence-ownership map
+The checked-in [`linux-nvme-v3` candidate](../../tools/state-backend-qual/profiles/linux-nvme-v3.candidate.json)
+is the current proposed numerical contract, not a benchmark result or approval. Its evidence-ownership map
 assigns backend, artifact-conformance, and product-integration sections to different executors; an
 LSM run cannot satisfy sink/checkpoint/failover gates. Its standalone validator accepts only the
 explicitly ineligible form, rejects measured/result fields, and has no runtime or backend dependency.
 Named owner approval, immutable runner identity, actual Fjall/RocksDB evidence, the product
 connector/object-store profile, and the independent release soak all remain outstanding. The v1
-profile is retained only as an immutable validation/model regression fixture.
+and v2 profiles are retained only as immutable validation/model regression fixtures.
 
 Regardless of the profile, these architecture invariants are mandatory:
 

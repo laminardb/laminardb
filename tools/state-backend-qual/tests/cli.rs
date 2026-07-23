@@ -48,6 +48,24 @@ fn candidate_neutral_v2_prints_ineligible_notice() {
 }
 
 #[test]
+fn candidate_neutral_v3_prints_ineligible_notice() {
+    let output = binary()
+        .arg("validate-profile")
+        .arg(manifest_path("profiles/linux-nvme-v3.candidate.json"))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!(
+            "{NOTICE}\nVALID_INELIGIBLE_PROFILE schema=distributed-state-qual/v3 \
+             profile=linux-nvme-v3 status=candidate_unapproved\n"
+        )
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn validates_only_a_matching_model_result() {
     let profile = manifest_path("profiles/linux-nvme-v1.candidate.json");
     let result = manifest_path("tests/fixtures/model-result-aggregate-v1.json");
@@ -76,6 +94,36 @@ fn validates_only_a_matching_model_result() {
         format!("{NOTICE}\n")
     );
     assert!(String::from_utf8_lossy(&output.stderr).starts_with("INVALID_MODEL_RESULT"));
+}
+
+#[test]
+fn validates_only_an_exact_profile_bound_mechanism_mapping() {
+    let profile = manifest_path("profiles/linux-nvme-v3.candidate.json");
+    let mapping = manifest_path("tests/fixtures/mechanism-mapping-observed-v1.json");
+    let output = binary()
+        .arg("validate-mechanism-mapping")
+        .arg(&profile)
+        .arg(&mapping)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!(
+            "{NOTICE}\nVALID_INELIGIBLE_MECHANISM_MAPPING mapping=synthetic-observed-v1 \
+             candidate=synthetic-candidate debt=observed stalls=observed\n"
+        )
+    );
+    assert!(output.stderr.is_empty());
+
+    let output = binary()
+        .arg("validate-mechanism-mapping")
+        .arg(manifest_path("profiles/linux-nvme-v2.candidate.json"))
+        .arg(mapping)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).starts_with("INVALID_MECHANISM_MAPPING"));
 }
 
 #[test]

@@ -253,8 +253,9 @@ quick-repair/shrink commit, kernel writeback, and any thread/background activity
 absence of activity in a short run—decides which DKS-Q2-006 arms may be `not_applicable`. The probe
 only corroborates the pinned source/configuration mapping. The note also freezes the XFS quota query,
 units, one-second/boundary cuts, 16-GiB hard-quota setup, and error/wrap behavior used by the
-allocation gate. Because profile v2 is Fjall/RocksDB-specific, even a pass needs an additive redb
-profile/schema proposal rather than editing or reinterpreting `linux-nvme-v2`.
+allocation gate. The current profile v3 remains Fjall/RocksDB-specific, so even a pass needs an
+additive redb profile/schema proposal rather than editing or reinterpreting `linux-nvme-v3`;
+`linux-nvme-v2` remains an immutable regression fixture.
 
 ## Docker Desktop/WSL smoke subset
 

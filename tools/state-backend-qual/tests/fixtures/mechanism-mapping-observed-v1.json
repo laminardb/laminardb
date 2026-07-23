@@ -1,0 +1,90 @@
+{
+  "schema_version": "state-backend-mechanism-mapping/v1",
+  "notice": "NOT QUALIFICATION EVIDENCE",
+  "mapping_id": "synthetic-observed-v1",
+  "status": "candidate_unapproved",
+  "qualification_eligible": false,
+  "profile": {
+    "id": "linux-nvme-v3",
+    "sha256": "d5faf06c9c63d6334b93c05c5bb75400753afd12140184b02cc4137f4ca37b0b"
+  },
+  "candidate": {
+    "id": "synthetic-candidate",
+    "engine": "synthetic",
+    "version": "1",
+    "source": {
+      "role": "candidate-source",
+      "byte_length": 1,
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "media_type": "application/octet-stream"
+    },
+    "configuration": {
+      "role": "candidate-configuration",
+      "byte_length": 1,
+      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "media_type": "application/octet-stream"
+    }
+  },
+  "background_maintenance_debt": {
+    "kind": "observed",
+    "artifact_schema_version": "state-backend-maintenance-debt-samples/v1",
+    "normalization": "direct-unsigned-bytes/v1",
+    "population": "common-resource-v2-samples-and-required-cuts/v1",
+    "aggregation": "checked-sum-per-observation-then-maximum/v1",
+    "mechanisms": [
+      {
+        "mechanism_id": "pending-work",
+        "source_contract": "synthetic-pending-work-bytes/v1",
+        "unit": "bytes",
+        "value_semantics": "outstanding-background-work-bytes",
+        "population_relation": "pairwise-disjoint-with-other-mapped-mechanisms",
+        "source_proof": {
+          "role": "mechanism-source-proof",
+          "byte_length": 1,
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "media_type": "application/octet-stream"
+        },
+        "configuration_proof": {
+          "role": "mechanism-configuration-proof",
+          "byte_length": 1,
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "media_type": "application/octet-stream"
+        }
+      }
+    ]
+  },
+  "engine_pressure_stalls": {
+    "kind": "observed",
+    "artifact_schema_version": "state-backend-stall-intervals/v1",
+    "population": "all-source-intervals-intersecting-measurement/v1",
+    "aggregation": "interval-union-intersect-measurement-ceil-permille/v1",
+    "mechanisms": [
+      {
+        "mechanism_id": "writer-pressure",
+        "source_contract": "synthetic-writer-pressure-intervals/v1",
+        "coverage": "foreground-admission-or-progress-stall-intervals",
+        "source_proof": {
+          "role": "mechanism-source-proof",
+          "byte_length": 1,
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "media_type": "application/octet-stream"
+        },
+        "configuration_proof": {
+          "role": "mechanism-configuration-proof",
+          "byte_length": 1,
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "media_type": "application/octet-stream"
+        }
+      }
+    ]
+  },
+  "target_device_io_latency": {
+    "kind": "observed",
+    "artifact_schema_version": "state-backend-target-device-io/v1",
+    "population": "requests-issued-during-measurement/v1",
+    "operations": ["read", "write", "flush"],
+    "attribution": "exclusive-target-device",
+    "aggregation": "maximum-issue-to-terminal-ceil-milliseconds/v1",
+    "incomplete_request_policy": "candidate-fail-with-censored-lower-bound"
+  }
+}

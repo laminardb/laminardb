@@ -43,6 +43,9 @@ V1 reserves these printable identities:
 | common resource cuts | `state-backend-resource-cuts/v2` |
 | resource formulas | `state-backend-resource-formulas/v2` |
 | candidate mechanism mapping | `state-backend-mechanism-mapping/v1` |
+| maintenance-debt samples | `state-backend-maintenance-debt-samples/v1` |
+| engine-stall intervals | `state-backend-stall-intervals/v1` |
+| target-device I/O summary | `state-backend-target-device-io/v1` |
 | physical layout | `state-backend-physical-layout/v1` |
 | physical faults | `state-backend-physical-faults/v1` |
 | attempt classification | `state-backend-attempt-classification/v1` |
@@ -57,18 +60,26 @@ are retired before approval because they made LSM compaction debt and engine sta
 fields for every backend. A future executable plan must bind the candidate-neutral v2 resource
 wires and a reviewed mechanism mapping; it cannot mix v1 and v2 resource identities.
 
-The comparison profile follows the same additive rule. `distributed-state-qual/v1` and
-`linux-nvme-v1` remain immutable regression fixtures. The unapproved
-`distributed-state-qual/v2`/`linux-nvme-v2` profile replaces the four LSM-shaped resource names with
+The comparison profile follows the same additive rule. `distributed-state-qual/v1`/`linux-nvme-v1`
+and `distributed-state-qual/v2`/`linux-nvme-v2` remain immutable regression fixtures. The
+unapproved v2 profile replaced the four LSM-shaped resource names with
 `background_maintenance_debt_max_bytes`, `resource_tail_clear_max_seconds`,
-`engine_pressure_stall_time_max_permille`, and `unexplained_storage_pause_max_ms`. The first and
-third thresholds apply only to an `observed` candidate mechanism arm; the common tail and observed-
-outcome gates apply to every candidate. Resource-formulas v2 below currently defines only the
-engine-pressure and tail-clear fields. Maintenance debt has no approved byte-normalization/maximum
-rule, and unexplained storage pause has no objective event population or artifact. Their positive
-profile values are syntactically validated
-proposals that plan validation must not consume until DKS-Q2-006 freezes those definitions. Neither
-profile is execution-eligible.
+`engine_pressure_stall_time_max_permille`, and `unexplained_storage_pause_max_ms`. The last name
+asks a causal application-pause question that target-device latency cannot answer: a long background
+I/O can fail without pausing foreground service, while an engine mutex pause can produce no I/O.
+V2 therefore remains structurally unusable by a runner plan.
+
+Cycle 12 adds `distributed-state-qual/v3`/`linux-nvme-v3`. Its exact profile is v2 except for the
+schema/profile IDs, the honest additive rename to `target_device_io_latency_max_ms`, and replacement
+of ambiguous `coordinated_omission_corrected=true` with `open_loop_due_to_return=true` plus
+`synthetic_coordinated_omission_correction=false`; it does not reinterpret v2. Maintenance debt and
+engine-pressure thresholds apply only to matching `observed`
+mechanism arms. Common resource-tail and target-device-I/O gates apply to every v3 candidate. No
+runner plan or evidence object exists, and all three profiles remain execution-ineligible. The
+mechanism-mapping v1 validator binds v3 while this contract is reviewed. A future executable plan
+must instead bind the then-approved additive profile, its matching mapping version, and all three
+artifact validators, while satisfying every DKS-Q2 blocker; schema validity alone cannot consume a
+threshold.
 
 The plan binds the exact raw profile SHA-256, physical layout, and every policy identity above. C1
 adapter-conformance entries additionally bind their model-input SHA-256 plus v1 generator/model
@@ -493,6 +504,16 @@ tail inflation, retained versions, memory, disk, and time-to-reclaim.
 
 ## Resource observations and formulas
 
+Before candidate-process creation and warmup, the supervisor records one attempt
+`CLOCK_MONOTONIC_RAW` origin. Every `_offset_ns` in common resource samples/cuts, maintenance-debt
+samples, stall intervals, and target-device I/O is a checked unsigned subtraction from that exact
+origin; these wires never use the measured-phase-relative latency origin. The manifest binds the
+origin reading and `measured_phase_start_offset_ns`. A future cross-artifact validator must require
+stall/device header `measurement_start` to equal `measured_phase_start_offset_ns`, header
+`measurement_end` to equal its checked sum with measured elapsed ns, and convert a latency offset to
+attempt time only by checked addition to `measured_phase_start_offset_ns`. This makes a stall that
+starts during warmup representable without giving the same bytes two clock meanings.
+
 The adapter child and all backend threads execute in one dedicated candidate leaf cgroup v2. A new,
 empty leaf is created for every attempt, its identity is recorded, and zero tasks are verified
 before assigning the child; on the pinned Linux 6.1 environment this creation boundary, not an
@@ -515,22 +536,24 @@ escaping the root, an unexpected project ID, or disagreement outside the approve
 tolerance invalidates the attempt. Logical mutation bytes reuse C1's exact charge: opaque key plus
 value for put and opaque key for delete.
 
-Every candidate supplies one immutable `state-backend-mechanism-mapping/v1` record bound to the
-exact candidate source archive, build flags, configuration, adapter source, and runner plan. It has
-two required typed arms:
+Every candidate supplies one immutable `state-backend-mechanism-mapping/v1` record. The checked-in
+schema and validator bind it to the exact profile bytes and candidate source/configuration
+descriptors; a future plan must additionally bind the exact mapping bytes, adapter, runner, build,
+and approval. The mapping is strict, no larger than 262,144 bytes, duplicate-key rejecting, and
+always `candidate_unapproved`/`qualification_eligible=false`. It has two required typed arms:
 
 ```text
 background_maintenance_debt =
-    observed { mechanism inventory, byte-normalization formula, complete source contract,
-               sample/cut artifact descriptor }
-  | not_applicable { no-asynchronous-maintenance reason, source-proof digest,
-                     exact-configuration digest, bounded-probe evidence digest }
+    observed { sorted nonempty mechanism inventory, direct unsigned-byte sources,
+               complete source/configuration proof, maintenance-debt-samples/v1 }
+  | not_applicable { exact no-background-maintenance reason, complete-process scope,
+                     source/configuration/probe proof descriptors }
 
 engine_pressure_stalls =
-    observed { exhaustive delay/stop/block-path inventory, normalized interval source,
-               cumulative cross-check source, artifact descriptor }
-  | not_applicable { no-distinct-engine-pressure-stall-state reason, source-proof digest,
-                     exact-configuration digest, bounded-probe evidence digest }
+    observed { sorted nonempty mechanism inventory, exhaustive admission/progress coverage,
+               complete source/configuration proof, stall-intervals/v1 }
+  | not_applicable { exact no-engine-pressure-state reason, complete-process scope,
+                     source/configuration/probe proof descriptors }
 ```
 
 The mapping is candidate-specific; applicability therefore does not live in the common comparison
@@ -540,7 +563,16 @@ missing proof, both/neither union arms, configuration drift, or a mechanism arti
 with its arm. Background maintenance includes asynchronous flush, compaction, garbage collection,
 vacuum, or any other work that can remain after a request returns. Synchronous/offline maintenance
 is still charged to foreground service, operation RTO, disk, and endurance gates; calling it N/A
-does not remove its cost.
+does not remove its cost. Descriptor roles are closed; hashes are lowercase and nonzero; and
+observed mechanism IDs are strictly increasing. The validator does not bless the claims in a
+source-proof object. Named owners and independent review must approve its content before a future
+plan may reference the mapping.
+
+Mechanism-mapping v1 requires an exact v3 profile and fixes the common target-device arm to
+`state-backend-target-device-io/v1`: read, write, and flush requests issued during measurement on
+the exclusive target device, with no candidate-specific N/A or causal exclusion. It evaluates only
+v3's `target_device_io_latency_max_ms`. V2's `unexplained_storage_pause_max_ms` remains unevaluable
+and cannot enter a plan.
 
 The common observation set is mandatory for every backend: adapter queue/service/offered timings;
 cgroup CPU, memory, dirty/writeback, and I/O; XFS project quota; target-device writes; complete
@@ -608,14 +640,112 @@ Applicable maintenance-debt artifacts use the same cut tags and observation brac
 deadline and hold schedule are anchored to `write_stop_offset_ns`. The plan's clock/resource-error
 gate covers every encoded skew.
 
-No v2 formula currently evaluates `background_maintenance_debt_max_bytes`: an observed mapping must
-first define an independently reviewable unsigned-byte normalization, exact sample/cut population,
-aggregation across mechanisms, and maximum rule. A non-byte engine work unit is unsupported, not
-silently compared with the byte threshold. Likewise, `unexplained_storage_pause_max_ms` has no
-normative event stream or deterministic attribution/exclusion rule; reviewer causal judgment is
-forbidden. Until additive mechanism-artifact schemas and both formulas are frozen and tested, a
-runner plan referencing either field is structurally invalid. `observed(0)`, `not_applicable`, and
-unsupported remain distinct and none supplies a placeholder value.
+Cycle 12 freezes the missing mechanism-artifact populations. These wires are independently bounded
+at 256 MiB and reject wrong domains/bindings/counts, truncation, trailing bytes, reserved bytes,
+overflow, noncanonical order, and unknown tags.
+
+`state-backend-maintenance-debt-samples/v1` begins with the 28-byte
+`LDB-SBQ-MAINTENANCE-DEBT-V1\0` domain, the exact mechanism-mapping SHA-256, `mechanism_count_u32_be`,
+and `record_count_u64_be`. For `m` mechanisms, each record is exactly `32 + 8m` bytes:
+
+```text
+population_tag_u8 || seven_zero_bytes || population_index_u64_be ||
+observation_begin_offset_ns_u64_be || observation_end_offset_ns_u64_be ||
+direct_debt_bytes_u64_be[m]
+```
+
+The exact stream length is `72 + (32 + 8m) * record_count`. Mechanism order is the mapping's sorted
+order. Records are every common-resource-v2 nominal sample (`0x00`, contiguous sample index), then
+the five matching cuts: `0x10 pre_measurement`, `0x11 write_stop`, `0x12 last_terminal`,
+`0x13 measured_elapsed_end`, and exactly one of `0x14 resource_tail_stable_end` or
+`0x15 resource_tail_deadline`; cut population indices are zero. A future cross-artifact validator
+must require each index/tag and observation bracket to equal its common resource record. A gauge is
+an unsigned byte quantity with the reviewed meaning “outstanding background work bytes.” Every
+mapped mechanism must prove its byte population is pairwise disjoint from every other mapped
+mechanism; an overlapping set must expose one source-proved union gauge or is unsupported. At each
+record the formula checked-sums all mechanisms, then the gate uses the maximum total over the
+complete population. Overflow is invalid. Count, score, run, level, percentage, or estimated work
+that cannot be source-proved as that byte quantity is unsupported; the runner cannot invent a
+multiplier. A genuine observed all-zero population remains numeric zero, not N/A.
+
+`state-backend-stall-intervals/v1` begins with the 27-byte
+`LDB-SBQ-STALL-INTERVALS-V1\0` domain, mapping SHA-256, `mechanism_count_u32_be`, measurement start
+and end offsets, then `record_count_u64_be`. Its exact length is `87 + 32 * record_count`; each
+record is:
+
+```text
+mechanism_index_u32_be || four_zero_bytes || source_sequence_u64_be ||
+start_offset_ns_u64_be || end_offset_ns_u64_be
+```
+
+Intervals are half-open and nonempty, intersect measurement, use contiguous per-mechanism sequences
+from zero, and sort by `(start,end,mechanism,sequence)`. A stall already active at measurement start
+retains its actual earlier start. A stall still active at measurement end is deterministically
+censored with `end=measurement_end`; the source collector may not wait for a future close or omit
+it. The formula clips intervals to measurement, unions overlaps across every mechanism, and ceiling-
+divides union nanoseconds times 1,000 by measured nanoseconds. An empty observed stream is numeric
+zero only when the approved source contract proves complete coverage. A cumulative scalar cannot
+replace intervals.
+
+`state-backend-target-device-io/v1` begins with the 28-byte
+`LDB-SBQ-TARGET-DEVICE-IO-V1\0` domain, exact profile SHA-256, target major/minor, measurement start,
+measurement end, capture end, `shard_count_u32_be`, and `trace_anomaly_flags_u32_be`. Shards are
+contiguous from zero and capped at 256. Its exact length is `100 + 112 * shard_count`; each record
+is:
+
+```text
+shard_u32_be || four_zero_bytes ||
+issued_u64_be || success_u64_be || error_u64_be || incomplete_u64_be ||
+untracked_issue_u64_be || orphan_completion_u64_be || duplicate_issue_u64_be ||
+maximum_duration_ns_u64_be || maximum_issue_ns_u64_be || maximum_terminal_ns_u64_be ||
+maximum_logical_bytes_u64_be || maximum_local_sequence_u64_be ||
+maximum_operation_u8 || maximum_status_u8 || witness_present_u8 || five_zero_bytes
+```
+
+The pinned tracer retains bounded issue state until completion/capture. Issue counters are charged
+to the current issue shard. Successful/error outcomes and maxima are charged to the current
+completion-CPU shard, so completion does not update a remote issue-shard cache line. The capture
+sweep charges an incomplete to its recorded issue shard; this happens after issue admission has
+stopped and is not foreground work. Each terminal/capture classification receives a sequence
+monotonic within that outcome shard. Each shard keeps its maximum witness, preferring the least
+local outcome sequence on equal duration; the offline global tie order is `(duration descending,
+shard ascending, local_sequence ascending)`. No shared global issue counter enters the block hot
+path.
+
+The tracer does **not** emit one record per block request: at 200,000 IOPS a 40-byte event stream
+would produce 14.4 GB in 30 minutes and violate the evidence/hot-path bar. Exact tracer program/map
+sizes, atomic operations, issue-map capacity, CPU overhead, kernel attachment, and loss handling
+remain DKS-Q2-005/006 implementation and control-trial gates.
+
+Operations are `0x00 read`, `0x01 write`, and `0x02 flush`; status is `0x00 success`, `0x01 error`,
+or `0x02 incomplete`. Read/write witness bytes are positive and flush bytes are zero. Across the
+whole artifact, checked `sum(issued) = sum(success + error + incomplete + untracked_issue)`; no
+per-shard equality is required. A shard with terminal outcomes requires a self-consistent maximum
+witness; a shard without outcomes has only zero witness fields. The population is every request
+issued in `[measurement_start, measurement_end)`, with
+matching continuing through `capture_end`. The performance filesystem is mounted without online
+discard and the target device is exclusive. The runner and artifact store use another device.
+
+Flags are `0x01 issue-state-capacity-exhausted`, `0x02 event-loss`, `0x04 counter-overflow`,
+`0x08 unsupported-operation`, `0x10 target-identity-mismatch`, `0x20 tracer-lifecycle-error`, and
+`0x40 capture-iteration-error`; other bits are invalid wire. On overflow a counter saturates and
+latches `0x04`, never wraps. An unsupported issued operation increments `issued` and
+`untracked_issue` and latches `0x08`; issue-state exhaustion does the same and latches `0x01`.
+
+Any nonzero known flag, untracked issue, orphan completion, duplicate issue, causal exclusion, or
+cross-artifact population mismatch makes the attempt INVALID unless a
+previously proved candidate failure takes precedence. A future plan/attempt validator must inspect
+the summary counters and flags; successful wire decoding alone is not an attempt verdict. An incomplete
+request is witnessed at `capture_end`, is a candidate FAIL after a valid environment, and contributes
+only a censored lower-bound duration. A device error is also candidate FAIL. The numerical profile
+gate is the maximum of the per-shard `maximum_duration_ns`, rounded up to whole milliseconds; an
+empty total or wholly untracked population cannot evaluate it. This is device-request latency, not
+a claim that it explains an application-level service pause.
+
+These formulas make v3's debt and target-device fields objectively evaluable, but DKS-Q2-006 remains open:
+there is no approved real candidate mapping, no cross-artifact plan validator, no target trace/XFS/
+cgroup implementation, and no approved source coverage. `observed(0)`, `not_applicable`,
+unsupported, INVALID, and candidate FAIL remain distinct.
 
 Normative resource-formulas v2 use checked integer arithmetic. Lower-bound gates round down; upper-bound
 gates round up:
@@ -635,12 +765,19 @@ gates round up:
   `min(logical_live_before, logical_live_after)`; the gate uses the maximum sampled ratio and reports
   the resource-tail bracket. It is explicitly a bracketed sampled gate, not an atomic filesystem
   peak;
+- background-maintenance debt bytes, when observed, is the maximum checked per-observation sum over
+  the complete mechanism-debt population above. Every input is already a source-proved unsigned
+  byte gauge; resource-formulas v2 performs no conversion. A typed N/A arm omits this numerical gate
+  and only this engine-specific conjunct;
 - engine-pressure-stall permille, when the mapping arm is `observed`, is the ceiling of the union of
   normalized candidate stall intervals intersected with `[pre_measurement,
-  measured_elapsed_end]`, times 1000 divided by measured elapsed ns. A cumulative scalar is only a
+  measured_elapsed_end)`, times 1000 divided by measured elapsed ns. A cumulative scalar is only a
   cross-check because it cannot reconstruct overlaps. A `not_applicable` arm produces a typed N/A,
   not numeric zero; queue wait, writer acquisition, candidate service, end-to-end latency,
   throughput, and timeout gates still charge every observed pause; and
+- target-device I/O maximum milliseconds is the ceiling of the largest issue-to-terminal duration
+  in the complete nonempty common device population divided by 1,000,000. Error and incomplete
+  statuses fail independently of this upper-bound value; there is no causal subtraction; and
 - resource-tail clear time starts at `write_stop_offset_ns`, after the final queued/in-flight
   mutation is terminal, and ends only after cgroup `memory.stat` `file_dirty` and `file_writeback`
   plus target-device `io.stat` write-byte growth remain within approved baselines/tolerances for the
@@ -777,7 +914,7 @@ resolved and independently reviewed. Backend selection additionally requires DKS
 | **DKS-Q2-003** | Freeze aggregate hot-value semantics, timer recurrence/closure, J2 routing/signed bounds/alignment, exact codecs and lifecycle arm, runtime expectation/result union, setup/final merge and post-warmup no-equality claim. The bounded static-proof/one-generation runtime-commitment direction is decided, but C1's 4,096-request oracle cannot be repeated or presented as this long-stream proof. |
 | **DKS-Q2-004** | Freeze exact warmup/measured counts and rates, per-case total semantics, drain/cooldown/reset, scheduler calibration/affinity, and an explicit balanced seeded order vector. The current minimum-count/minimum-duration booleans and five-pair alternation are not a complete schedule. |
 | **DKS-Q2-005** | Add service-latency, runner-overhead, scheduler, reference-lead/comparison-lag, ring occupancy and observation-skew gates; freeze request/result-ring and raw-sample ceilings plus telemetry control trials; and complete image/package/CPU/microcode/NUMA/NVMe identities. |
-| **DKS-Q2-006** | Implement and approve exact candidate mechanism mappings plus common XFS project-quota, cgroup dirty/writeback/device I/O, process memory, adapter lifecycle, and pressure observations. The contract distinguishes `observed` from proof-backed `not_applicable` and requires common resource-v2 wires, but has no mechanism-map schema/artifact or complete candidate mapping. It also lacks the maintenance-debt byte normalization/maximum formula and objective unexplained-storage-pause population, so plan validation cannot consume those profile fields. Unmodified Fjall 3.1.8 still fails because applicable debt/stall signals are absent; the current RocksDB binding remains blocked because its stall ticker omits a verified write-buffer-manager/database-scope path; redb 4.1.0 remains deferred pending proof of its N/A arms and non-interfering mapping. Supply a complete source, patch/upstream, or reject; never encode unsupported as zero. |
+| **DKS-Q2-006** | Approve complete real candidate mappings and implement the cross-artifact plan validator plus common XFS project-quota, cgroup dirty/writeback/device I/O, process-memory, adapter-lifecycle, pressure, and target-device trace observations. Cycle 12 adds truthful profile v3, the strict mapping schema/validator, direct disjoint-byte debt population/formula, censored stall-interval wire/formula, and objective low-volume device-I/O summary/formula; synthetic validation is not candidate coverage. V2's causal `unexplained_storage_pause` field remains unusable. Unmodified Fjall 3.1.8 still fails because applicable debt/stall signals are absent; the current RocksDB binding remains blocked because its stall ticker omits a verified write-buffer-manager/database-scope path; redb 4.1.0 remains deferred until its separately approved probe can supply proof for a later redb-specific profile and mapping. Supply a complete source, patch/upstream, or reject; never encode unsupported as zero or infer causal exclusions. |
 | **DKS-Q2-007** | Implement and review detached approval/completion records, pinned Fjall/RocksDB persistence mappings, complete configuration dumps, and cache-loss truth-table conformance. |
 | **DKS-Q2-008** | Freeze the paired physical-fault and 24/72-hour endurance matrices, actuator and N/N-1 pins, recovery criteria, and a bounded time-resolved endurance encoding distinct from finite raw samples. |
 | **DKS-Q2-009** | Before selection, approve and pass a separate C3 shared-database concurrency contract: deterministic disjoint-vnode lanes and per-lane oracle order; hot-writer/victim and mixed point/range/snapshot traffic; victim plus aggregate tails, global stalls/resources; and barrier-controlled races with restore activation, cleanup, and pinned snapshots. |

@@ -1,0 +1,204 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://laminardb.dev/schemas/state-backend-mechanism-mapping-v1.json",
+  "title": "LaminarDB state backend candidate mechanism mapping v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "notice", "mapping_id", "status", "qualification_eligible",
+    "profile", "candidate", "background_maintenance_debt", "engine_pressure_stalls",
+    "target_device_io_latency"
+  ],
+  "properties": {
+    "schema_version": {"const": "state-backend-mechanism-mapping/v1"},
+    "notice": {"const": "NOT QUALIFICATION EVIDENCE"},
+    "mapping_id": {"$ref": "#/$defs/id"},
+    "status": {"const": "candidate_unapproved"},
+    "qualification_eligible": {"const": false},
+    "profile": {"$ref": "#/$defs/profile"},
+    "candidate": {"$ref": "#/$defs/candidate"},
+    "background_maintenance_debt": {
+      "oneOf": [
+        {"$ref": "#/$defs/observedDebt"},
+        {"$ref": "#/$defs/notApplicableDebt"}
+      ]
+    },
+    "engine_pressure_stalls": {
+      "oneOf": [
+        {"$ref": "#/$defs/observedStalls"},
+        {"$ref": "#/$defs/notApplicableStalls"}
+      ]
+    },
+    "target_device_io_latency": {"$ref": "#/$defs/deviceLatency"}
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9][a-z0-9._/-]{0,127}$"
+    },
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "descriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "byte_length", "sha256", "media_type"],
+      "properties": {
+        "role": {"$ref": "#/$defs/id"},
+        "byte_length": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 17179869184
+        },
+        "sha256": {"$ref": "#/$defs/digest"},
+        "media_type": {
+          "enum": ["application/json", "application/octet-stream", "application/zstd"]
+        }
+      }
+    },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "sha256"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "sha256": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "engine", "version", "source", "configuration"
+      ],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "engine": {"$ref": "#/$defs/id"},
+        "version": {"type": "string", "minLength": 1, "maxLength": 64},
+        "source": {"$ref": "#/$defs/descriptor"},
+        "configuration": {"$ref": "#/$defs/descriptor"}
+      }
+    },
+    "debtMechanism": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mechanism_id", "source_contract", "unit", "value_semantics", "population_relation",
+        "source_proof", "configuration_proof"
+      ],
+      "properties": {
+        "mechanism_id": {"$ref": "#/$defs/id"},
+        "source_contract": {"$ref": "#/$defs/id"},
+        "unit": {"const": "bytes"},
+        "value_semantics": {"const": "outstanding-background-work-bytes"},
+        "population_relation": {"const": "pairwise-disjoint-with-other-mapped-mechanisms"},
+        "source_proof": {"$ref": "#/$defs/descriptor"},
+        "configuration_proof": {"$ref": "#/$defs/descriptor"}
+      }
+    },
+    "stallMechanism": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mechanism_id", "source_contract", "coverage", "source_proof",
+        "configuration_proof"
+      ],
+      "properties": {
+        "mechanism_id": {"$ref": "#/$defs/id"},
+        "source_contract": {"$ref": "#/$defs/id"},
+        "coverage": {"const": "foreground-admission-or-progress-stall-intervals"},
+        "source_proof": {"$ref": "#/$defs/descriptor"},
+        "configuration_proof": {"$ref": "#/$defs/descriptor"}
+      }
+    },
+    "observedDebt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind", "artifact_schema_version", "normalization", "population",
+        "aggregation", "mechanisms"
+      ],
+      "properties": {
+        "kind": {"const": "observed"},
+        "artifact_schema_version": {"const": "state-backend-maintenance-debt-samples/v1"},
+        "normalization": {"const": "direct-unsigned-bytes/v1"},
+        "population": {"const": "common-resource-v2-samples-and-required-cuts/v1"},
+        "aggregation": {"const": "checked-sum-per-observation-then-maximum/v1"},
+        "mechanisms": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {"$ref": "#/$defs/debtMechanism"}
+        }
+      }
+    },
+    "observedStalls": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind", "artifact_schema_version", "population", "aggregation", "mechanisms"
+      ],
+      "properties": {
+        "kind": {"const": "observed"},
+        "artifact_schema_version": {"const": "state-backend-stall-intervals/v1"},
+        "population": {"const": "all-source-intervals-intersecting-measurement/v1"},
+        "aggregation": {"const": "interval-union-intersect-measurement-ceil-permille/v1"},
+        "mechanisms": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {"$ref": "#/$defs/stallMechanism"}
+        }
+      }
+    },
+    "notApplicableDebt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind", "reason_code", "claim_scope", "source_proof", "configuration_proof",
+        "bounded_probe_proof"
+      ],
+      "properties": {
+        "kind": {"const": "not_applicable"},
+        "reason_code": {"const": "no-background-maintenance-mechanism-in-exact-build"},
+        "claim_scope": {"const": "complete-candidate-process"},
+        "source_proof": {"$ref": "#/$defs/descriptor"},
+        "configuration_proof": {"$ref": "#/$defs/descriptor"},
+        "bounded_probe_proof": {"$ref": "#/$defs/descriptor"}
+      }
+    },
+    "notApplicableStalls": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind", "reason_code", "claim_scope", "source_proof", "configuration_proof",
+        "bounded_probe_proof"
+      ],
+      "properties": {
+        "kind": {"const": "not_applicable"},
+        "reason_code": {"const": "no-engine-pressure-stall-mechanism-in-exact-build"},
+        "claim_scope": {"const": "complete-candidate-process"},
+        "source_proof": {"$ref": "#/$defs/descriptor"},
+        "configuration_proof": {"$ref": "#/$defs/descriptor"},
+        "bounded_probe_proof": {"$ref": "#/$defs/descriptor"}
+      }
+    },
+    "deviceLatency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind", "artifact_schema_version", "population", "operations", "attribution",
+        "aggregation", "incomplete_request_policy"
+      ],
+      "properties": {
+        "kind": {"const": "observed"},
+        "artifact_schema_version": {"const": "state-backend-target-device-io/v1"},
+        "population": {"const": "requests-issued-during-measurement/v1"},
+        "operations": {"const": ["read", "write", "flush"]},
+        "attribution": {"const": "exclusive-target-device"},
+        "aggregation": {"const": "maximum-issue-to-terminal-ceil-milliseconds/v1"},
+        "incomplete_request_policy": {"const": "candidate-fail-with-censored-lower-bound"}
+      }
+    }
+  }
+}

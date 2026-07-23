@@ -102,15 +102,15 @@ results are visible. If production targets are not yet known, first measure the 
 stateless/global baseline; those measurements inform an owner decision but do not set the gate
 automatically.
 
-The machine-readable [`linux-nvme-v2` candidate](../../tools/state-backend-qual/profiles/linux-nvme-v2.candidate.json)
-is the sole source for proposed numerical gates. Its evidence-ownership map assigns backend,
+The machine-readable [`linux-nvme-v3` candidate](../../tools/state-backend-qual/profiles/linux-nvme-v3.candidate.json)
+is the current sole source for proposed numerical gates. Its evidence-ownership map assigns backend,
 artifact-conformance, and product-integration sections to different executors, so an LSM run cannot
 claim sink/checkpoint/failover gates. Its validator deliberately reports
 `VALID_INELIGIBLE_PROFILE`: workload/operations owners and an immutable image/package identity are
 unset, no candidate has run, and it is not qualification evidence. The source/object-store/sink
-deployment profile remains a separate required part of the product scenario and independent soak;
-an LSM result cannot certify those boundaries. The v1 profile remains an immutable validator/model
-regression fixture and is not eligible for a new runner plan.
+  deployment profile remains a separate required part of the product scenario and independent soak;
+  an LSM result cannot certify those boundaries. The v1 and v2 profiles remain immutable
+  validator/model regression fixtures and are not eligible for a new runner plan.
 
 ### B2. Typed partition ABI
 
