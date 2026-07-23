@@ -408,9 +408,16 @@ cuts. Every failed and invalid attempt is retained; retrying
 until green is prohibited. A relevant binary, chart, configuration, charter, or oracle change
 requires a complete rerun.
 
-The current Dockerfile toolchain mismatch (`rust:1.93` versus workspace `rust-version = 1.95`) must
-be resolved before an OCI artifact can be eligible. This is a release prerequisite, not permission
-for a drive-by Docker change in the capability-inventory commit.
+The release Dockerfile now uses `rust:1.95-bookworm`, matching workspace `rust-version = 1.95`.
+Release eligibility still requires the workflow to resolve and record the exact base-image digest,
+build the immutable multi-architecture OCI artifact, and pass the release/soak gates; a matching tag
+alone is not provenance or production evidence.
+
+The current workstation's WSL/Docker lane is classified separately in the
+[local capability report](../reports/wsl-docker-state-qualification-capability-2026-07-23.md). It may
+run Linux correctness and process-crash smoke tests, but its overlayfs/ext4/VHDX/NTFS stack cannot
+satisfy XFS project-quota, dedicated-device, NVMe latency, cache-loss, endurance, or independent-soak
+evidence.
 
 ## Progress and remaining commit sequence
 

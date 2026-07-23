@@ -7,9 +7,10 @@
 
 ## Result
 
-Docker Desktop is already available on WSL 2 and can run Linux/amd64 containers with cgroup v2.
-After provisioning a Rust 1.95 image, this machine is suitable for qualification-tool builds,
-schema/golden tests, connector integration, and bounded process-kill/reopen probes. It is not a
+Docker Desktop is already available on WSL 2 and can run Linux/amd64 containers with cgroup v2. A
+Rust 1.95 image was pulled and its toolchain smoke check passed, so this machine is suitable for
+qualification-tool builds, schema/golden tests, connector integration, and bounded process-kill/
+reopen probes. It is not a
 substitute for the approved Linux/XFS/dedicated-NVMe qualification host.
 
 The observed storage path is materially different from that target:
@@ -45,7 +46,7 @@ service configuration was changed.
 | Block identity | Linux exposes Hyper-V virtual SCSI disks, not the host NVMe namespace, controller, firmware, cache, or SMART/NVMe telemetry |
 | XFS | Kernel support is present, but no XFS filesystem is mounted and `xfs_quota` is absent; no `prjquota` path exists |
 | cgroup | cgroup v2 exposes `memory.stat` dirty/writeback and virtual-device `io.stat`; Docker child cgroups expose `memory.peak` |
-| Toolchain | no Rust image is cached; the repository Dockerfile still starts from Rust 1.93 while the workspace requires Rust 1.95 |
+| Toolchain | `rust:1.95-bookworm` resolved to local image/index digest `sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1`; `rustc 1.95.0` and `cargo 1.95.0` ran in Linux; the repository Dockerfile now matches workspace Rust 1.95 |
 
 The 15.17-GiB Docker memory ceiling and shared virtual disk also cannot satisfy the provisional
 64-GiB/96-GiB profile. Microsoft recommends keeping Linux-tool workloads in the Linux filesystem,
@@ -76,7 +77,9 @@ than the physical device ([Linux cgroup v2 documentation](https://docs.kernel.or
 
 The local lane is deliberately narrower than qualification:
 
-1. pin a Rust 1.95 Linux image by digest and record Docker/WSL versions;
+1. resolve the Rust 1.95 Linux image to the platform-specific manifest/config digests in the test
+   manifest and record Docker/WSL versions; the multi-platform index digest above alone is not a
+   release artifact identity;
 2. mount the checkout read-only when possible, and put Cargo target, temporary files, and test
    databases on Docker-managed ext4 volumes rather than the 9p/DrvFs checkout;
 3. run deterministic/default/all-feature qualification-tool checks and selected connector tests;
