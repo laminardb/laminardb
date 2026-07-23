@@ -51,6 +51,7 @@ wal/
 /tools/*
 !/tools/independent-soak-contract/
 !/tools/state-backend-qual/
+!/tools/state-backend-zipf-oracle/
 
 # Private configs (symlinked from private repo)
 CLAUDE.md
