@@ -373,10 +373,20 @@ identity, outward rounding, precision escalation, caps, canonical bytes, and non
 Local Windows x86_64 and pinned Docker Linux x86_64 generate the same 865,397-byte observation and
 SHA-256 `8ad14317bdb1f12d67b9f823bea0759d33034e4c01164c2dbac90ad870f2474b`. Required CI now exercises
 that prototype on Linux x86_64, Windows x86_64, and native Linux arm64 and participates in
-`ci-success`; the branch has no upstream and those hosted jobs have not run. The prototype does not
-consume candidate output or compute approved distribution/rejection/retry metrics and has not been
-independently operated by the workload and operations owners. It therefore closes no DKS-Q2 item,
-does not authorize a backend run, and cannot be reused as production or soak evidence.
+`ci-success`. The prototype does not consume candidate output or compute approved
+distribution/rejection/retry metrics and has not been independently operated by the workload and
+operations owners. It therefore closes no DKS-Q2 item, does not authorize a backend run, and cannot
+be reused as production or soak evidence.
+
+Cycle 15 publishes commit `1cc095bc` and runs the configured workflow as [CI run 30047503740,
+attempt 2](https://github.com/laminardb/laminardb/actions/runs/30047503740). Hosted Linux x86_64,
+Windows x86_64, and native Linux arm64 pass the standalone oracle tests; the arm job also passes the
+Rust Zipf corpus in debug and release. Attempt 1 failed only in an unchanged broad Windows recovery
+test after 3,240 other tests passed. The exact test then passed 1,250 local Windows stress runs and
+attempt 2's complete 5,772-test Windows suite; aggregate `CI Success` passed. The intermittent first
+failure remains recorded and is not a fixed defect, soak, or qualification result. Hosted execution
+closes only the prototype's configured-platform gap; all DKS-Q2-001 policy, numerical, provenance,
+independent-operation, and candidate-comparison blockers remain.
 
 redb 4.1.0 remains outside C2. The independent optional prescreen branch may design its isolated
 [bounded redb prescreen](../testing/state-backend-redb-prescreen-v1.md), but no run is authorized

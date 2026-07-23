@@ -292,13 +292,21 @@ NDJSON records (865,397 bytes, SHA-256
 Windows x86_64 host and a pinned Linux x86_64 container. It imports neither the Rust candidate nor
 its literal corpus, escalates unresolved decisions through 4,096-bit precision, and marks every
 record ineligible and non-authorizing. CI is configured for Linux x86_64, Windows x86_64, and native
-Linux arm64, but none of those hosted jobs has run on this branch.
+Linux arm64.
+
+Cycle 15 [CI run 30047503740, attempt
+2](https://github.com/laminardb/laminardb/actions/runs/30047503740) exercises all three hosted paths
+at commit `1cc095bc`. Linux x86_64 passes the 14 oracle tests plus an explicit CLI byte-count/hash
+check. Native Linux arm64 passes 111 Rust Zipf tests in both debug and release and all 14 oracle
+tests. Hosted Windows passes the standalone validator, 111 Rust Zipf tests in both modes, and all
+14 oracle tests. This closes the prototype's configured-platform execution debt; it does not make
+the same-tool canonical hash an independent distribution or candidate-conformance result.
 
 This prototype is decision input, not the independent audit or qualification corpus. It has no
 candidate-output comparator, approved head/CDF/tail/total-variation thresholds, finite-grid
-rejection or retry bound, dependency-installation attestation, native-arm result, workload-owner
-operation, or sampler/case approval. Exact-equality and one-interval-step adversarial tests are also
-required before promotion. Z4/Z5, the interference harness, workload-v2 registry, complete
+rejection or retry bound, observation-bound dependency-installation receipt, workload-owner
+operation, or sampler/case approval. Exact-equality and one-interval-step adversarial tests are
+also required before promotion. Z4/Z5, the interference harness, workload-v2 registry, complete
 licensing/SBOM record, and named-owner sampler/case decision therefore remain open.
 
 This ADR may be committed as a provisional selection, but the reserved identities cannot be
