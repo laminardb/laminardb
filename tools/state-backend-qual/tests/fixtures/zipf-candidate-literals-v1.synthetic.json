@@ -1,0 +1,78 @@
+{
+  "record_type": "state-backend-zipf-candidate-literal-corpus/v1",
+  "notice": "NOT QUALIFICATION EVIDENCE",
+  "corpus_class": "provisional_feasibility",
+  "fixture_ineligible": true,
+  "qualification_eligible": false,
+  "validation_authorizes_execution": false,
+  "independently_generated": false,
+  "provenance": "transcribed_from_preexisting_cycle_8_implementation_tests",
+  "setup_vectors": [
+    {
+      "domain": 1,
+      "bits": ["bfe2ffafd36ddd94", "3fda00a0592444d8", "bff0000000000000", "3fdef7d5f8a587e8"]
+    },
+    {
+      "domain": 2,
+      "bits": ["bfe2ffafd36ddd94", "3fed74bf9e1758f7", "bff83a37b8c29b46", "3fdef7d5f8a587e8"]
+    },
+    {
+      "domain": 3,
+      "bits": ["bfe2ffafd36ddd94", "3ff42b97e7c2defb", "bffdab6fd179cdc5", "3fdef7d5f8a587e8"]
+    },
+    {
+      "domain": 10,
+      "bits": ["bfe2ffafd36ddd94", "400308adf4795558", "c007c899e954ccbd", "3fdef7d5f8a587e8"]
+    },
+    {
+      "domain": 17,
+      "bits": ["bfe2ffafd36ddd94", "40073a7b48ac4d42", "c00bfa673d87c4a7", "3fdef7d5f8a587e8"]
+    },
+    {
+      "domain": 1288490188,
+      "bits": ["bfe2ffafd36ddd94", "403756cfede0cec2", "c037eecd6c7c3daf", "3fdef7d5f8a587e8"]
+    },
+    {
+      "domain": 2147483647,
+      "bits": ["bfe2ffafd36ddd94", "4037f88461de7e3f", "c0389081e079ed2c", "3fdef7d5f8a587e8"]
+    }
+  ],
+  "proposal_vectors": [
+    {
+      "domain": 2147483647,
+      "word": "0000000000000000",
+      "rank": 2147483646,
+      "acceptance_path": "squeeze"
+    },
+    {
+      "domain": 2147483647,
+      "word": "00000000000007ff",
+      "rank": 2147483646,
+      "acceptance_path": null
+    },
+    {
+      "domain": 2147483647,
+      "word": "7fffffffffffffff",
+      "rank": 63219,
+      "acceptance_path": null
+    },
+    {
+      "domain": 2147483647,
+      "word": "ffffffffffffffff",
+      "rank": 0,
+      "acceptance_path": null
+    },
+    {
+      "domain": 2147483647,
+      "word": "bf675a41b36c58dc",
+      "rank": 233,
+      "acceptance_path": "boundary"
+    },
+    {
+      "domain": 2147483647,
+      "word": "f57a1071812faf86",
+      "rank": null,
+      "acceptance_path": null
+    }
+  ]
+}

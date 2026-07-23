@@ -276,11 +276,78 @@ fn sample_error(_: ZipfCandidateError) -> ZipfCandidateError {
 
 #[cfg(test)]
 mod tests {
+    use serde::Deserialize;
     use sha2::{Digest, Sha256};
 
     use super::*;
 
+    const LITERAL_CORPUS: &str =
+        include_str!("../tests/fixtures/zipf-candidate-literals-v1.synthetic.json");
     const REJECTED_WORD_AT_MAX_DOMAIN: u64 = 0xf57a_1071_812f_af86;
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LiteralCorpus {
+        record_type: String,
+        notice: String,
+        corpus_class: String,
+        fixture_ineligible: bool,
+        qualification_eligible: bool,
+        validation_authorizes_execution: bool,
+        independently_generated: bool,
+        provenance: String,
+        setup_vectors: Vec<SetupVector>,
+        proposal_vectors: Vec<ProposalVector>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct SetupVector {
+        domain: u64,
+        bits: [String; 4],
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ProposalVector {
+        domain: u64,
+        word: String,
+        rank: Option<u64>,
+        acceptance_path: Option<String>,
+    }
+
+    fn literal_corpus() -> LiteralCorpus {
+        assert_eq!(
+            format!("{:x}", Sha256::digest(LITERAL_CORPUS.as_bytes())),
+            "dd6c569cfef0a82627e280b4a0072b9a898f5467dc1ab07683c5ffeaf1c97c32"
+        );
+        let corpus: LiteralCorpus = serde_json::from_str(LITERAL_CORPUS).unwrap();
+        assert_eq!(
+            corpus.record_type,
+            "state-backend-zipf-candidate-literal-corpus/v1"
+        );
+        assert_eq!(corpus.notice, "NOT QUALIFICATION EVIDENCE");
+        assert_eq!(corpus.corpus_class, "provisional_feasibility");
+        assert!(corpus.fixture_ineligible);
+        assert!(!corpus.qualification_eligible);
+        assert!(!corpus.validation_authorizes_execution);
+        assert!(!corpus.independently_generated);
+        assert_eq!(
+            corpus.provenance,
+            "transcribed_from_preexisting_cycle_8_implementation_tests"
+        );
+        assert_eq!(corpus.setup_vectors.len(), 7);
+        assert_eq!(corpus.proposal_vectors.len(), 6);
+        corpus
+    }
+
+    fn parse_hex_u64(value: &str) -> u64 {
+        assert_eq!(value.len(), 16);
+        assert!(value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        u64::from_str_radix(value, 16).unwrap()
+    }
 
     #[test]
     fn constants_match_the_provisional_contract() {
@@ -369,111 +436,50 @@ mod tests {
     }
 
     #[test]
-    fn literal_setup_vectors_are_stable() {
-        let vectors = [
-            (
-                1,
-                [
-                    0xbfe2_ffaf_d36d_dd94,
-                    0x3fda_00a0_5924_44d8,
-                    0xbff0_0000_0000_0000,
-                    0x3fde_f7d5_f8a5_87e8,
-                ],
-            ),
-            (
-                2,
-                [
-                    0xbfe2_ffaf_d36d_dd94,
-                    0x3fed_74bf_9e17_58f7,
-                    0xbff8_3a37_b8c2_9b46,
-                    0x3fde_f7d5_f8a5_87e8,
-                ],
-            ),
-            (
-                3,
-                [
-                    0xbfe2_ffaf_d36d_dd94,
-                    0x3ff4_2b97_e7c2_defb,
-                    0xbffd_ab6f_d179_cdc5,
-                    0x3fde_f7d5_f8a5_87e8,
-                ],
-            ),
-            (
-                10,
-                [
-                    0xbfe2_ffaf_d36d_dd94,
-                    0x4003_08ad_f479_5558,
-                    0xc007_c899_e954_ccbd,
-                    0x3fde_f7d5_f8a5_87e8,
-                ],
-            ),
-            (
-                17,
-                [
-                    0xbfe2_ffaf_d36d_dd94,
-                    0x4007_3a7b_48ac_4d42,
-                    0xc00b_fa67_3d87_c4a7,
-                    0x3fde_f7d5_f8a5_87e8,
-                ],
-            ),
-            (
-                1_288_490_188,
-                [
-                    0xbfe2_ffaf_d36d_dd94,
-                    0x4037_56cf_ede0_cec2,
-                    0xc037_eecd_6c7c_3daf,
-                    0x3fde_f7d5_f8a5_87e8,
-                ],
-            ),
-            (
-                MAX_DOMAIN,
-                [
-                    0xbfe2_ffaf_d36d_dd94,
-                    0x4037_f884_61de_7e3f,
-                    0xc038_9081_e079_ed2c,
-                    0x3fde_f7d5_f8a5_87e8,
-                ],
-            ),
-        ];
-
-        for (domain, expected) in vectors {
-            assert_eq!(ZipfCandidate::new(domain).unwrap().setup_bits(), expected);
+    fn detached_literal_setup_vectors_are_stable() {
+        let corpus = literal_corpus();
+        for vector in corpus.setup_vectors {
+            let expected = vector.bits.map(|bits| parse_hex_u64(&bits));
+            assert_eq!(
+                ZipfCandidate::new(vector.domain).unwrap().setup_bits(),
+                expected
+            );
         }
     }
 
     #[test]
-    fn literal_words_cover_mapping_and_both_acceptance_paths() {
-        let sampler = ZipfCandidate::new(MAX_DOMAIN).unwrap();
-        assert_eq!(
-            sampler.evaluate_proposal(0).unwrap(),
-            Some(AcceptedProposal {
-                rank: MAX_DOMAIN - 1,
-                path: AcceptancePath::Squeeze,
-            })
-        );
-        assert_eq!(sampler.proposal_from_word(0).unwrap(), Some(MAX_DOMAIN - 1));
-        assert_eq!(
-            sampler.proposal_from_word(0x7ff).unwrap(),
-            sampler.proposal_from_word(0).unwrap()
-        );
-        assert_eq!(
-            sampler.proposal_from_word(0x7fff_ffff_ffff_ffff).unwrap(),
-            Some(63_219)
-        );
-        assert_eq!(sampler.proposal_from_word(u64::MAX).unwrap(), Some(0));
-        assert_eq!(
-            sampler.evaluate_proposal(0xbf67_5a41_b36c_58dc).unwrap(),
-            Some(AcceptedProposal {
-                rank: 233,
-                path: AcceptancePath::Boundary,
-            })
-        );
-        assert_eq!(
-            sampler
-                .proposal_from_word(REJECTED_WORD_AT_MAX_DOMAIN)
-                .unwrap(),
-            None
-        );
+    fn detached_literal_words_cover_mapping_and_both_acceptance_paths() {
+        let corpus = literal_corpus();
+        let mut saw_squeeze = false;
+        let mut saw_boundary = false;
+        let mut saw_rejection = false;
+
+        for vector in corpus.proposal_vectors {
+            let sampler = ZipfCandidate::new(vector.domain).unwrap();
+            let word = parse_hex_u64(&vector.word);
+            assert_eq!(sampler.proposal_from_word(word).unwrap(), vector.rank);
+
+            if let Some(expected_path) = vector.acceptance_path.as_deref() {
+                let accepted = sampler.evaluate_proposal(word).unwrap().unwrap();
+                match expected_path {
+                    "squeeze" => {
+                        assert_eq!(accepted.path, AcceptancePath::Squeeze);
+                        saw_squeeze = true;
+                    }
+                    "boundary" => {
+                        assert_eq!(accepted.path, AcceptancePath::Boundary);
+                        saw_boundary = true;
+                    }
+                    unexpected => panic!("unexpected acceptance path: {unexpected}"),
+                }
+            } else if vector.rank.is_none() {
+                saw_rejection = true;
+            }
+        }
+
+        assert!(saw_squeeze);
+        assert!(saw_boundary);
+        assert!(saw_rejection);
     }
 
     #[test]

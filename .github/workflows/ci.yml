@@ -398,11 +398,9 @@ jobs:
       - name: Format standalone state qualification model tool
         run: cargo fmt --manifest-path tools/state-backend-qual/Cargo.toml -- --check
       - name: Lint standalone state qualification model tool
-        run: cargo clippy --locked --manifest-path tools/state-backend-qual/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --locked --manifest-path tools/state-backend-qual/Cargo.toml --all-targets --all-features -- -D warnings
       - name: Test standalone state qualification model tool
-        run: cargo test --locked --manifest-path tools/state-backend-qual/Cargo.toml
-      - name: Test provisional Zipf feasibility corpus (NOT evidence)
-        run: cargo test --locked --manifest-path tools/state-backend-qual/Cargo.toml --lib --features zipf-feasibility
+        run: cargo test --locked --manifest-path tools/state-backend-qual/Cargo.toml --all-targets --all-features
       - name: Test release Zipf feasibility corpus (NOT evidence)
         run: cargo test --locked --release --manifest-path tools/state-backend-qual/Cargo.toml --lib --features zipf-feasibility
       - name: Reject runtime and candidate dependencies
@@ -438,12 +436,42 @@ jobs:
           expected_result=$'NOT QUALIFICATION EVIDENCE\nVALID_INELIGIBLE_MODEL_RESULT profile=linux-nvme-v1 requests=2'
           [[ "$result_output" == "$expected_result" ]]
 
+  state-qualification-windows:
+    name: Ineligible state qualification validator (Windows, NOT evidence)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/state-backend-qual
+      - name: Test all standalone validator targets and features
+        run: cargo test --locked --manifest-path tools/state-backend-qual/Cargo.toml --all-targets --all-features
+      - name: Test release Zipf feasibility corpus (NOT evidence)
+        run: cargo test --locked --release --manifest-path tools/state-backend-qual/Cargo.toml --lib --features zipf-feasibility
+
+  state-qualification-arm64:
+    name: Ineligible Zipf feasibility (Linux arm64, NOT evidence)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+      - name: Test debug Zipf feasibility corpus (NOT evidence)
+        run: cargo test --locked --manifest-path tools/state-backend-qual/Cargo.toml --lib --features zipf-feasibility
+      - name: Test release Zipf feasibility corpus (NOT evidence)
+        run: cargo test --locked --release --manifest-path tools/state-backend-qual/Cargo.toml --lib --features zipf-feasibility
+
   # ============================================
   # CI Success Gate
   # ============================================
   ci-success:
     name: CI Success
-    needs: [fmt, clippy, build-and-test, postgres-cdc-integration, features, msrv, docs, soak-contract-scaffold]
+    needs: [fmt, clippy, build-and-test, postgres-cdc-integration, features, msrv, docs, soak-contract-scaffold, state-qualification-windows, state-qualification-arm64]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -456,7 +484,9 @@ jobs:
              [[ "${{ needs.features.result }}" != "success" ]] || \
              [[ "${{ needs.msrv.result }}" != "success" ]] || \
              [[ "${{ needs.docs.result }}" != "success" ]] || \
-             [[ "${{ needs.soak-contract-scaffold.result }}" != "success" ]]; then
+             [[ "${{ needs.soak-contract-scaffold.result }}" != "success" ]] || \
+             [[ "${{ needs.state-qualification-windows.result }}" != "success" ]] || \
+             [[ "${{ needs.state-qualification-arm64.result }}" != "success" ]]; then
             echo "One or more required jobs failed"
             exit 1
           fi
