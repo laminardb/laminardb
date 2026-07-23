@@ -6,7 +6,7 @@
 - **Related decisions:** [ADR-008](ADR-008-managed-vnode-keyed-state.md),
   [state backend qualification model v1](state-backend-qualification-model-v1.md), and the
   [long-stream workload/identity v2](state-backend-workload-v2.md)
-- **Pinned-source findings:** [Fjall/RocksDB static audit](../reports/state-backend-static-audit-2026-07-23.md)
+- **Pinned-source findings:** [Fjall/RocksDB/redb static audit](../reports/state-backend-static-audit-2026-07-23.md)
 
 ## Decision and safety boundary
 
@@ -665,7 +665,7 @@ resolved and independently reviewed. Backend selection additionally requires DKS
 | **DKS-Q2-003** | Define long-stream ordinals, streaming resident/spill prefill, live-byte/cardinality/timer bands and control law, exact opposite-side join fanout, stabilization, deterministic TTL/churn, and setup/post-warmup/final digests. C1's 4,096-request oracle and state-size salt cannot be repeated into a 200,000-request performance claim. |
 | **DKS-Q2-004** | Freeze exact warmup/measured counts and rates, per-case total semantics, drain/cooldown/reset, scheduler calibration/affinity, and an explicit balanced seeded order vector. The current minimum-count/minimum-duration booleans and five-pair alternation are not a complete schedule. |
 | **DKS-Q2-005** | Add service-latency, runner-overhead, scheduler, oracle-lag and observation-skew gates; freeze result-ring/raw-sample ceilings and gate-bearing telemetry control trials; and complete image/package/CPU/microcode/NUMA/NVMe identities. |
-| **DKS-Q2-006** | Prove stable mappings for compaction debt, stalls, XFS project-quota bytes, cgroup dirty/writeback, device writes, snapshots/iterators, native memory, and pressure counters. The static audit fails unmodified Fjall 3.1.8 because debt/stall signals are absent and blocks the current RocksDB binding because its stall ticker omits a verified write-buffer-manager/database-scope path. Supply a proven complete source, patch/upstream, or reject; never encode unsupported as zero. |
+| **DKS-Q2-006** | Prove stable mappings for compaction debt, stalls, XFS project-quota bytes, cgroup dirty/writeback, device writes, snapshots/iterators, native memory, and pressure counters. The static audit fails unmodified Fjall 3.1.8 because debt/stall signals are absent and blocks the current RocksDB binding because its stall ticker omits a verified write-buffer-manager/database-scope path. redb 4.1.0 is deferred until the contract defines non-LSM debt semantics, adapter queue/service timing, and non-interfering observations. Supply a proven complete source, patch/upstream, or reject; never encode unsupported as zero. |
 | **DKS-Q2-007** | Implement and review detached approval/completion records, pinned Fjall/RocksDB persistence mappings, complete configuration dumps, and cache-loss truth-table conformance. |
 | **DKS-Q2-008** | Freeze the paired physical-fault and 24/72-hour endurance matrices, actuator and N/N-1 pins, recovery criteria, and a bounded time-resolved endurance encoding distinct from finite raw samples. |
 | **DKS-Q2-009** | Before selection, approve and pass a separate C3 shared-database concurrency contract: deterministic disjoint-vnode lanes and per-lane oracle order; hot-writer/victim and mixed point/range/snapshot traffic; victim plus aggregate tails, global stalls/resources; and barrier-controlled races with restore activation, cleanup, and pinned snapshots. |

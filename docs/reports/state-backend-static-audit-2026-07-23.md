@@ -1,4 +1,4 @@
-# Fjall 3.1.8 and RocksDB 10.4.2 static backend audit
+# Fjall 3.1.8, RocksDB 10.4.2, and redb 4.1.0 static backend audit
 
 - **Date:** 2026-07-23
 - **Scope:** exact-source API, durability, pressure, restore, and hot-path review
@@ -8,18 +8,26 @@
 
 ## Result
 
-Both candidates expose the primitives from which a backend-neutral semantic adapter can be tested,
-but neither audited source is ready to enter a gate-bearing campaign unchanged.
+Fjall and RocksDB expose the primitives from which a backend-neutral semantic adapter can be
+tested, but neither retained candidate is ready to enter a gate-bearing campaign unchanged. redb
+4.1.0 can implement the bounded C1 semantics. Its database-wide blocking writer and not-yet-approved
+durability, cache, and telemetry mappings need a preliminary writer/commit/recovery microprobe and
+a reviewed contract mapping before deciding whether to expand the bake-off. It is deferred, not
+failed or selected against by unmeasured tail latency.
 
 | Candidate | Required primitives | Governance/telemetry | Static disposition |
 |---|---|---|---|
 | Fjall 3.1.8 | Cross-keyspace atomic batch, consistent snapshot, ordered range/prefix iteration, and explicit journal persistence are present. | No stable compaction-debt counter, complete write-stall duration/counter, enforceable global write-buffer cap, or complete cache/pinned-memory accounting. | **FAIL DKS-Q2-006 as published.** Patch/upstream the missing stable signals and controls or remove Fjall from the campaign. |
 | `rocksdb` 0.24.0 / RocksDB 10.4.2 | Cross-column-family `WriteBatch`, snapshots, bounded iterators, multi-get, WAL flush, checkpoint, and SST ingest are present. | Pending-compaction and pressure properties exist, but the exposed stall ticker omits verified write-buffer-manager/database-scope paths. | **BLOCK DKS-Q2-006.** Supply a proven complete signal or narrow it only with pre-approved evidence that no uncovered stall class is possible. |
+| redb 4.1.0 | Atomic cross-table write transaction, snapshot reads, ordered ranges, an open-time cache budget, and immediate-durability commit are present. | A single database-wide writer blocks without a timeout/cancel API; storage statistics traverse the trees while holding that writer; the current contract has no approved non-LSM debt/stall mapping. | **DEFER.** Freeze that mapping and run a non-gating writer/commit/recovery microprobe before deciding whether to add a third C2/C3 candidate. |
 
 This does not select RocksDB by elimination. Fjall remains smaller and safe-Rust, while RocksDB has
 broader operational controls at the cost of synchronous FFI, native-memory/build provenance, and
-shared database write-control risk. Only equivalent C1/C2, C3, fault, endurance, and restore
-evidence may select one. The losing adapter is then removed.
+shared database write-control risk. redb's Rust-native, no-C++-engine implementation and
+copy-on-write B-trees are attractive, but adding a third adapter before its cheaper risk screen
+passes would expand scope without selection evidence. Only equivalent C1/C2, C3, fault, endurance,
+and restore evidence may select between candidates admitted to the bake-off. The losing adapter is
+then removed.
 
 ## Provenance and current-tree correction
 
@@ -27,7 +35,8 @@ The candidate profile declares Fjall `=3.1.8`, `rocksdb =0.24.0`, and bundled Ro
 Those strings are comparison inputs, not project pins. `cargo metadata`, the root lockfile, and the
 qualification-tool lockfile contain no Fjall, RocksDB, or `librocksdb-sys` package, and no backend
 adapter exists. The current tree therefore does not “use Fjall”; the former cold tier remains
-removed.
+removed. redb is not in the profile, dependency graph, or lockfiles; its 4.1.0 audit is a requested
+static alternative screen, not a silently added third candidate.
 
 The audit read cached crate archives and the adjacent expanded registry sources. The hashes below
 identify the archives; they do not by themselves authenticate a subsequently mutable extraction:
@@ -38,13 +47,20 @@ identify the archives; they do not by themselves authenticate a subsequently mut
 | `lsm-tree-3.1.8` | `055a908d502129cf63bedae52f2db222e4436d2da32a69df9b84ac9fb9147761` |
 | `rocksdb-0.24.0` | `ddb7af00d2b17dbd07d82c0063e25411959748ff03e8d4f96134c2ff41fce34f` |
 | `librocksdb-sys-0.17.3+10.4.2` | `cef2a00ee60fe526157c9023edab23943fae1ce2ab6f4abb2a807c1746835de9` |
+| `redb-4.1.0` | `8e925444704b5f17d32bf42f5b6e2df050bceebc3dcd6e71cc73dafe8092e839` |
 
 The RocksDB wrapper and sys crate record VCS revision
 `bb7d2168eab1bc7849f23adbcb825e3aba1bd2f4`; the bundled
 `include/rocksdb/version.h` identifies 10.4.2. Fjall's manifest accepts `lsm-tree ~3.1.8`, so even
-an exact top-level Fjall constraint is not a complete build identity. A future candidate needs an
-isolated exact lockfile, package archive, SBOM, feature set, target, toolchain, and build flags.
-This Windows source audit did not exercise the target Linux/XFS/NVMe mappings.
+an exact top-level Fjall constraint is not a complete build identity. redb's packaged VCS record
+and upstream `v4.1.0` tag identify `6ed1f981ba4deab0b2adbdd7bccb46ec409b2191`; its declared MSRV is
+1.89. A future candidate needs an isolated exact lockfile, package archive, SBOM, feature set,
+target, toolchain, and build flags. This Windows source audit did not exercise the target
+Linux/XFS/NVMe mappings.
+
+Primary redb provenance is the [crates.io 4.1.0 release](https://crates.io/crates/redb/4.1.0),
+[versioned API documentation](https://docs.rs/redb/4.1.0/redb/), and the
+[matching upstream revision](https://github.com/cberner/redb/tree/6ed1f981ba4deab0b2adbdd7bccb46ec409b2191).
 
 ## Common semantic boundary
 
@@ -104,6 +120,38 @@ background work, not WAL durability or vnode QoS. Checkpoint may flush all colum
 ingest may require a blocking flush. Both need foreground-tail evidence. Database-level write
 queues/controllers mean column-family isolation cannot be assumed.
 
+### redb semantics and static deferral
+
+redb stores multiple named tables in one database file using copy-on-write B-trees. One write
+transaction can atomically mutate all four logical tables, while MVCC read transactions and ordered
+ranges supply the basic C1 adapter semantics. Guard-backed keys and values still have to be copied
+into bounded result slots. There is no native multi-get or range-tombstone primitive; ranged
+removal scans entries through `extract_from_if`/`retain_in`. A read transaction can drive portable
+export. There is no native physical checkpoint, online backup, or bulk/sorted-ingest primitive to
+promote into the vnode format.
+
+The primary risk is the writer contract. `Database::begin_write` permits one database-wide
+writer and blocks until the existing writer completes. The API exposes no try, timeout, or
+cancellation form. That is workable for C2's single serialized foreground worker. In C3,
+independent disjoint-vnode lanes would share this acquisition point, but the frozen contract
+requires measured victim/hot-writer tails rather than assuming that serialization fails them. An
+adapter-owned queue can measure/reject before `begin_write`; it cannot create write parallelism or
+bound engine work after acquisition.
+
+`WriteTransaction::stats` traverses the data and system B-trees and counts allocated/free pages;
+using it for periodic 96-GiB resource sampling would occupy the sole writer and contaminate the
+latency population, so a redb mapping must prohibit it during measured trials. The returned
+allocated, leaf, branch, stored, metadata, and fragmented-byte figures remain useful offline.
+External cgroup/device/quota counters, adapter queue/service timing, and optional cache hit/miss/
+eviction/used-byte counters may form a mapping, but that mapping has not been frozen or reviewed.
+
+`Database::compact` requires exclusive mutable database access, rejects live readers/savepoints,
+and performs foreground relocation through repeated write transactions. It is an offline
+maintenance path, not background debt management or an online vnode-rebalance primitive.
+Savepoints retain otherwise reclaimable pages and are not portable vnode artifacts. These
+properties make global-writer, durable-commit, crash-open, and compaction behavior the correct
+cheap microprobe targets before implementing a full third adapter.
+
 ## Persistence mapping: static proposal, not durability evidence
 
 | Contract boundary | Fjall 3.1.8 | RocksDB wrapper 0.24.0 | Status |
@@ -120,8 +168,21 @@ is ineligible for authoritative state.
 Fjall `Buffer` flushes its userspace `BufWriter`; `SyncData` and `SyncAll` call the corresponding
 file methods on the active journal. Rotation and table/version paths include file and directory
 sync operations, but static ordering cannot prove the target filesystem/device cache-loss
-contract. Neither candidate's fence publishes a Laminar checkpoint, seals a source-offset cut, or
-commits a sink transaction.
+contract. Neither retained candidate's fence publishes a Laminar checkpoint, seals a source-offset
+cut, or commits a sink transaction.
+
+redb is deferred before persistence qualification. `Durability::None` is documented to remain
+unpersisted until a later `Immediate` commit, so it cannot satisfy this contract's process-death
+guarantee for `buffered_batch`. The default `Durability::Immediate` one-phase commit flushes the
+userspace write cache and calls `sync_data`; optional two-phase commit performs two syncs. Using
+`Immediate` for every batch may satisfy a stronger durability boundary, but collapses
+`buffered_batch` and `persist_data` onto the same durability operation, eliminating the intended
+latency distinction. Quick repair persists allocator state
+and forces two-phase commit, trading slower commits for fast crash reopen. Without usable allocator
+state, an unclean open can perform extensive tree/allocator repair. There is no distinct standard
+`persist_all`/directory-sync primitive. None of these source-level mappings satisfies Laminar's
+cache-loss or failover gates without the physical truth-table testing required of retained
+candidates.
 
 ## Pressure and resource audit
 
@@ -169,11 +230,22 @@ DKS-Q2-006 therefore stays blocked for RocksDB until a reviewed source exposes c
 events/time, or the approved configuration and fault evidence prove that every uncovered path is
 impossible. One-second polling cannot prove absence of short stalls.
 
+### redb mapping gap
+
+redb has no background LSM compaction, so LSM debt cannot simply be demanded from it or silently
+encoded as an unsupported zero. DKS-Q2-006 needs an explicit non-LSM rule: identify which debt gate
+is not applicable, preserve authoritative external cgroup/device/quota observations, time the
+adapter-owned queue and service interval, and prohibit full-tree statistics during measurement.
+Version 4.1.0 does not expose internal read/write bytes or pinned-snapshot bytes, but the frozen
+contract has not established that candidate-internal versions of those observations are mandatory.
+The mapping is therefore **BLOCK**, not a demonstrated telemetry or latency failure.
+
 ## Configuration, restore, and decision gates
 
-Neither library exposes a complete applied-options dump. Each adapter must emit one closed canonical
-configuration record and archive engine files needed to cross-check it. For RocksDB this includes
-the OPTIONS files plus cache/WBM, thread pools, rate limiter, paths, recovery mode, compression/table
+Neither retained library exposes a complete applied-options dump. Each adapter must emit one closed
+canonical configuration record and archive engine files needed to cross-check it. For RocksDB this
+includes the OPTIONS files plus cache/WBM, thread pools, rate limiter, paths, recovery mode,
+compression/table
 format, statistics level, allocator, native features, and compiler flags. For Fjall it includes
 database/keyspace options, feature flags, and non-configurable pressure constants.
 
@@ -188,6 +260,9 @@ The static disposition is:
 - DKS-Q2-006: **FAIL for unmodified Fjall; BLOCK for the current RocksDB binding**;
 - DKS-Q2-007: **BLOCK for both** until exact candidate locks/builds/options, approval/completion
   records, cache-loss truth-table evidence, and N/N-1 recovery exist;
+- redb 4.1.0: **DEFER before DKS-Q2-006/007 implementation**; first approve a non-LSM telemetry,
+  cache, and persistence mapping and a bounded non-gating writer/commit/recovery microprobe. Do not
+  add it to the profile or dependency graph yet;
 - candidate execution: still blocked on the complete workload/runner approval set;
 - backend selection: still additionally blocked on C3 shared-database concurrency; and
 - production: still blocked on the vnode lifecycle, checkpoint/source/sink delivery protocol,
