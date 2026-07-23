@@ -7,12 +7,18 @@ use crate::CheckErrors;
 
 const RESOURCE_SAMPLES_DOMAIN: &[u8] = b"LDB-SBQ-RESOURCE-SAMPLES-V1\0";
 const RESOURCE_CUTS_DOMAIN: &[u8] = b"LDB-SBQ-RESOURCE-CUTS-V1\0";
+const COMMON_RESOURCE_SAMPLES_V2_DOMAIN: &[u8] = b"LDB-SBQ-RESOURCE-SAMPLES-V2\0";
+const COMMON_RESOURCE_CUTS_V2_DOMAIN: &[u8] = b"LDB-SBQ-RESOURCE-CUTS-V2\0";
 const COUNT_BYTES: usize = 8;
 const SAMPLE_FIELD_COUNT: usize = 22;
 const SAMPLE_RECORD_BYTES: usize = SAMPLE_FIELD_COUNT * 8;
+const COMMON_SAMPLE_V2_FIELD_COUNT: usize = 20;
+const COMMON_SAMPLE_V2_RECORD_BYTES: usize = COMMON_SAMPLE_V2_FIELD_COUNT * 8;
 const CUT_RESERVED_BYTES: usize = 7;
 const CUT_FIELD_COUNT: usize = 15;
 const CUT_RECORD_BYTES: usize = 1 + CUT_RESERVED_BYTES + CUT_FIELD_COUNT * 8;
+const COMMON_CUT_V2_FIELD_COUNT: usize = 13;
+const COMMON_CUT_V2_RECORD_BYTES: usize = 1 + CUT_RESERVED_BYTES + COMMON_CUT_V2_FIELD_COUNT * 8;
 const REQUIRED_CUT_RECORDS: u64 = 5;
 
 const SAMPLE_INDEX: usize = 0;
@@ -24,8 +30,12 @@ const CUT_END_NS: usize = 1;
 
 const _: [(); 28] = [(); RESOURCE_SAMPLES_DOMAIN.len()];
 const _: [(); 25] = [(); RESOURCE_CUTS_DOMAIN.len()];
+const _: [(); 28] = [(); COMMON_RESOURCE_SAMPLES_V2_DOMAIN.len()];
+const _: [(); 25] = [(); COMMON_RESOURCE_CUTS_V2_DOMAIN.len()];
 const _: [(); 176] = [(); SAMPLE_RECORD_BYTES];
 const _: [(); 128] = [(); CUT_RECORD_BYTES];
+const _: [(); 160] = [(); COMMON_SAMPLE_V2_RECORD_BYTES];
+const _: [(); 112] = [(); COMMON_CUT_V2_RECORD_BYTES];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResourceSamplesSummary {
@@ -131,6 +141,116 @@ pub fn validate_resource_cuts(
         let begin = field_u64(fields, CUT_BEGIN_NS);
         let end = field_u64(fields, CUT_END_NS);
         let skew = validate_bracket(begin, end, maximum_skew_ns, "resource cut", index)?;
+        maximum_skew = maximum_skew.max(skew);
+    }
+
+    Ok(ResourceCutsSummary {
+        record_count,
+        resource_tail_tag: tail_tag,
+        maximum_skew_ns: maximum_skew,
+    })
+}
+
+/// Validates the candidate-neutral v2 common resource-sample wire without allocating per record.
+/// Engine-specific maintenance-debt and pressure-stall evidence is intentionally absent.
+pub fn validate_common_resource_samples_v2(
+    bytes: &[u8],
+    maximum_records: u64,
+    maximum_skew_ns: u64,
+) -> Result<ResourceSamplesSummary, CheckErrors> {
+    let (record_count, records) = validate_stream_envelope(
+        bytes,
+        COMMON_RESOURCE_SAMPLES_V2_DOMAIN,
+        COMMON_SAMPLE_V2_RECORD_BYTES,
+        maximum_records,
+        "v2 common resource samples",
+    )?;
+
+    let mut maximum_skew = 0;
+    for (index, record) in records
+        .chunks_exact(COMMON_SAMPLE_V2_RECORD_BYTES)
+        .enumerate()
+    {
+        let wire_index = field_u64(record, SAMPLE_INDEX);
+        let expected_index = u64::try_from(index)
+            .map_err(|_| CheckErrors::one("v2 common resource sample index does not fit u64"))?;
+        if wire_index != expected_index {
+            return Err(CheckErrors::one(format!(
+                "v2 common resource sample {index} has index {wire_index}; expected {expected_index}"
+            )));
+        }
+
+        let begin = field_u64(record, SAMPLE_BEGIN_NS);
+        let end = field_u64(record, SAMPLE_END_NS);
+        let skew = validate_bracket(
+            begin,
+            end,
+            maximum_skew_ns,
+            "v2 common resource sample",
+            index,
+        )?;
+        maximum_skew = maximum_skew.max(skew);
+    }
+
+    Ok(ResourceSamplesSummary {
+        record_count,
+        maximum_skew_ns: maximum_skew,
+    })
+}
+
+/// Validates the candidate-neutral v2 common resource-cut wire without allocating per record.
+/// Engine-specific maintenance-debt and pressure-stall evidence is intentionally absent.
+pub fn validate_common_resource_cuts_v2(
+    bytes: &[u8],
+    maximum_records: u64,
+    maximum_skew_ns: u64,
+) -> Result<ResourceCutsSummary, CheckErrors> {
+    let (record_count, records) = validate_stream_envelope(
+        bytes,
+        COMMON_RESOURCE_CUTS_V2_DOMAIN,
+        COMMON_CUT_V2_RECORD_BYTES,
+        maximum_records,
+        "v2 common resource cuts",
+    )?;
+    if record_count != REQUIRED_CUT_RECORDS {
+        return Err(CheckErrors::one(format!(
+            "v2 common resource cuts record count is {record_count}; expected {REQUIRED_CUT_RECORDS}"
+        )));
+    }
+
+    let mut maximum_skew = 0;
+    let mut tail_tag = 0;
+    for (index, record) in records.chunks_exact(COMMON_CUT_V2_RECORD_BYTES).enumerate() {
+        let tag = record[0];
+        let expected_tag = u8::try_from(index)
+            .map_err(|_| CheckErrors::one("v2 common resource cut index does not fit u8"))?;
+        if index < 4 {
+            if tag != expected_tag {
+                return Err(CheckErrors::one(format!(
+                    "v2 common resource cut {index} has tag 0x{tag:02x}; expected 0x{expected_tag:02x}"
+                )));
+            }
+        } else if !matches!(tag, 0x04 | 0x05) {
+            return Err(CheckErrors::one(format!(
+                "v2 common resource tail cut has tag 0x{tag:02x}; expected 0x04 or 0x05"
+            )));
+        } else {
+            tail_tag = tag;
+        }
+
+        if record[1..1 + CUT_RESERVED_BYTES]
+            .iter()
+            .any(|byte| *byte != 0)
+        {
+            return Err(CheckErrors::one(format!(
+                "v2 common resource cut {index} has nonzero reserved bytes"
+            )));
+        }
+
+        let fields = &record[1 + CUT_RESERVED_BYTES..];
+        let begin = field_u64(fields, CUT_BEGIN_NS);
+        let end = field_u64(fields, CUT_END_NS);
+        let skew = validate_bracket(begin, end, maximum_skew_ns, "v2 common resource cut", index)?;
         maximum_skew = maximum_skew.max(skew);
     }
 
@@ -268,6 +388,39 @@ mod tests {
         bytes
     }
 
+    fn common_v2_sample_stream(record_count: u64) -> Vec<u8> {
+        let mut bytes = Vec::from(COMMON_RESOURCE_SAMPLES_V2_DOMAIN);
+        bytes.extend_from_slice(&record_count.to_be_bytes());
+        for index in 0..record_count {
+            let mut record = [0_u8; COMMON_SAMPLE_V2_RECORD_BYTES];
+            let begin = 100 + index * 20;
+            set_u64(&mut record, SAMPLE_INDEX * 8, index);
+            set_u64(&mut record, SAMPLE_BEGIN_NS * 8, begin);
+            set_u64(&mut record, SAMPLE_END_NS * 8, begin + 5);
+            bytes.extend_from_slice(&record);
+        }
+        bytes
+    }
+
+    fn common_v2_cut_stream(tail_tag: u8) -> Vec<u8> {
+        let mut bytes = Vec::from(COMMON_RESOURCE_CUTS_V2_DOMAIN);
+        bytes.extend_from_slice(&REQUIRED_CUT_RECORDS.to_be_bytes());
+        for index in 0..REQUIRED_CUT_RECORDS {
+            let mut record = [0_u8; COMMON_CUT_V2_RECORD_BYTES];
+            record[0] = if index == 4 {
+                tail_tag
+            } else {
+                u8::try_from(index).unwrap()
+            };
+            let fields = &mut record[1 + CUT_RESERVED_BYTES..];
+            let begin = 100 + index * 20;
+            set_u64(fields, CUT_BEGIN_NS * 8, begin);
+            set_u64(fields, CUT_END_NS * 8, begin + 5);
+            bytes.extend_from_slice(&record);
+        }
+        bytes
+    }
+
     #[test]
     fn accepts_sample_stream_and_returns_compact_summary() {
         let summary = validate_resource_samples(&sample_stream(3), 3, 5).unwrap();
@@ -288,6 +441,106 @@ mod tests {
             assert_eq!(summary.resource_tail_tag, tail_tag);
             assert_eq!(summary.maximum_skew_ns, 5);
         }
+    }
+
+    #[test]
+    fn accepts_compact_candidate_neutral_v2_common_streams() {
+        let samples = common_v2_sample_stream(2);
+        assert_eq!(samples.len(), 36 + 2 * 160);
+        assert_eq!(
+            validate_common_resource_samples_v2(&samples, 2, 5).unwrap(),
+            ResourceSamplesSummary {
+                record_count: 2,
+                maximum_skew_ns: 5,
+            }
+        );
+
+        for tail_tag in [0x04, 0x05] {
+            let cuts = common_v2_cut_stream(tail_tag);
+            assert_eq!(cuts.len(), 33 + 5 * 112);
+            assert_eq!(
+                validate_common_resource_cuts_v2(&cuts, 5, 5).unwrap(),
+                ResourceCutsSummary {
+                    record_count: 5,
+                    resource_tail_tag: tail_tag,
+                    maximum_skew_ns: 5,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn v1_and_v2_resource_domains_and_record_widths_are_not_interchangeable() {
+        let v1_samples = sample_stream(1);
+        let v2_samples = common_v2_sample_stream(1);
+        assert!(validate_common_resource_samples_v2(&v1_samples, 1, 5).is_err());
+        assert!(validate_resource_samples(&v2_samples, 1, 5).is_err());
+
+        let v1_cuts = cut_stream(0x04);
+        let v2_cuts = common_v2_cut_stream(0x04);
+        assert!(validate_common_resource_cuts_v2(&v1_cuts, 5, 5).is_err());
+        assert!(validate_resource_cuts(&v2_cuts, 5, 5).is_err());
+
+        let mut widened_v2_sample = v2_samples;
+        widened_v2_sample.extend_from_slice(&[0; 16]);
+        assert!(validate_common_resource_samples_v2(&widened_v2_sample, 1, 5).is_err());
+    }
+
+    #[test]
+    fn v2_common_streams_reject_every_truncation_and_trailing_byte() {
+        let samples = common_v2_sample_stream(1);
+        for length in 0..samples.len() {
+            assert!(validate_common_resource_samples_v2(&samples[..length], 1, 5).is_err());
+        }
+        let mut trailing_samples = samples;
+        trailing_samples.push(0);
+        assert!(validate_common_resource_samples_v2(&trailing_samples, 1, 5).is_err());
+
+        let cuts = common_v2_cut_stream(0x04);
+        for length in 0..cuts.len() {
+            assert!(validate_common_resource_cuts_v2(&cuts[..length], 5, 5).is_err());
+        }
+        let mut trailing_cuts = cuts;
+        trailing_cuts.push(0);
+        assert!(validate_common_resource_cuts_v2(&trailing_cuts, 5, 5).is_err());
+    }
+
+    #[test]
+    fn v2_common_streams_reject_domain_index_tag_reserved_and_skew_errors() {
+        let sample_header = COMMON_RESOURCE_SAMPLES_V2_DOMAIN.len() + COUNT_BYTES;
+        let sample = common_v2_sample_stream(1);
+        for index in 0..COMMON_RESOURCE_SAMPLES_V2_DOMAIN.len() {
+            let mut wrong_domain = sample.clone();
+            wrong_domain[index] ^= 1;
+            assert!(validate_common_resource_samples_v2(&wrong_domain, 1, 5).is_err());
+        }
+        let mut wrong_index = sample.clone();
+        set_u64(&mut wrong_index, sample_header + SAMPLE_INDEX * 8, 1);
+        assert!(validate_common_resource_samples_v2(&wrong_index, 1, 5).is_err());
+        let mut skew = sample;
+        set_u64(&mut skew, sample_header + SAMPLE_END_NS * 8, 106);
+        assert!(validate_common_resource_samples_v2(&skew, 1, 5).is_err());
+
+        let cut_header = COMMON_RESOURCE_CUTS_V2_DOMAIN.len() + COUNT_BYTES;
+        let cuts = common_v2_cut_stream(0x04);
+        for index in 0..COMMON_RESOURCE_CUTS_V2_DOMAIN.len() {
+            let mut wrong_domain = cuts.clone();
+            wrong_domain[index] ^= 1;
+            assert!(validate_common_resource_cuts_v2(&wrong_domain, 5, 5).is_err());
+        }
+        let mut wrong_tag = cuts.clone();
+        wrong_tag[cut_header + COMMON_CUT_V2_RECORD_BYTES] = 0x02;
+        assert!(validate_common_resource_cuts_v2(&wrong_tag, 5, 5).is_err());
+        let mut reserved = cuts.clone();
+        reserved[cut_header + 1] = 1;
+        assert!(validate_common_resource_cuts_v2(&reserved, 5, 5).is_err());
+        let mut wrong_tail = cuts.clone();
+        wrong_tail[cut_header + 4 * COMMON_CUT_V2_RECORD_BYTES] = 0x06;
+        assert!(validate_common_resource_cuts_v2(&wrong_tail, 5, 5).is_err());
+        let mut skew = cuts;
+        let cut_fields = cut_header + 1 + CUT_RESERVED_BYTES;
+        set_u64(&mut skew, cut_fields + CUT_END_NS * 8, 106);
+        assert!(validate_common_resource_cuts_v2(&skew, 5, 5).is_err());
     }
 
     #[test]

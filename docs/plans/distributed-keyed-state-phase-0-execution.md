@@ -89,7 +89,8 @@ profile containing:
 - aggregate, timer/window, and bounded two-input join operation mixes;
 - p50/p95/p99/p99.9 end-to-end and state-service latency limits;
 - maximum compute/event-loop stall, checkpoint freeze/tail/seal time, sink flush time, and RTO;
-- hard RSS, local disk, FD, queue, frozen-generation, snapshot, compaction-debt, and write
+- hard RSS, local disk, FD, queue, frozen-generation, snapshot, applicable background-maintenance,
+  and write
   amplification limits;
 - hard encoded artifact/descriptor/payload bytes, total resolved parent links, operators/vnodes per
   transition, groups/accumulators/rows, canonical key/state bytes, output buffering, and
@@ -101,14 +102,15 @@ results are visible. If production targets are not yet known, first measure the 
 stateless/global baseline; those measurements inform an owner decision but do not set the gate
 automatically.
 
-The machine-readable [`linux-nvme-v1` candidate](../../tools/state-backend-qual/profiles/linux-nvme-v1.candidate.json)
+The machine-readable [`linux-nvme-v2` candidate](../../tools/state-backend-qual/profiles/linux-nvme-v2.candidate.json)
 is the sole source for proposed numerical gates. Its evidence-ownership map assigns backend,
 artifact-conformance, and product-integration sections to different executors, so an LSM run cannot
 claim sink/checkpoint/failover gates. Its validator deliberately reports
 `VALID_INELIGIBLE_PROFILE`: workload/operations owners and an immutable image/package identity are
 unset, no candidate has run, and it is not qualification evidence. The source/object-store/sink
 deployment profile remains a separate required part of the product scenario and independent soak;
-an LSM result cannot certify those boundaries.
+an LSM result cannot certify those boundaries. The v1 profile remains an immutable validator/model
+regression fixture and is not eligible for a new runner plan.
 
 ### B2. Typed partition ABI
 

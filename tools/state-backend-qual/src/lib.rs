@@ -19,7 +19,8 @@ pub const NOTICE: &str = "NOT QUALIFICATION EVIDENCE";
 pub const MAX_PROFILE_BYTES: usize = 1_048_576;
 pub const MAX_MODEL_RESULT_BYTES: usize = 1_048_576;
 
-const PROFILE_SCHEMA: &str = include_str!("../schema/profile-v1.schema.json");
+const PROFILE_SCHEMA_V1: &str = include_str!("../schema/profile-v1.schema.json");
+const PROFILE_SCHEMA_V2: &str = include_str!("../schema/profile-v2.schema.json");
 
 #[derive(Debug)]
 pub struct CheckErrors {
@@ -166,7 +167,21 @@ pub fn validate_profile(bytes: &[u8]) -> Result<ProfileSummary, CheckErrors> {
 
 pub(crate) fn validated_profile_value(bytes: &[u8]) -> Result<Value, CheckErrors> {
     let profile = decode_unique_json(bytes, MAX_PROFILE_BYTES, "profile")?;
-    let schema: Value = serde_json::from_str(PROFILE_SCHEMA)
+    let schema_source = match profile.pointer("/schema_version").and_then(Value::as_str) {
+        Some("distributed-state-qual/v1") => PROFILE_SCHEMA_V1,
+        Some("distributed-state-qual/v2") => PROFILE_SCHEMA_V2,
+        Some(version) => {
+            return Err(CheckErrors::one(format!(
+                "profile schema version `{version}` is unsupported"
+            )))
+        }
+        None => {
+            return Err(CheckErrors::one(
+                "profile schema version is missing or invalid",
+            ))
+        }
+    };
+    let schema: Value = serde_json::from_str(schema_source)
         .map_err(|error| CheckErrors::one(format!("decode embedded schema: {error}")))?;
     let validator = jsonschema::validator_for(&schema)
         .map_err(|error| CheckErrors::one(format!("compile embedded schema: {error}")))?;
@@ -640,6 +655,7 @@ mod tests {
     use super::*;
 
     const PROFILE: &[u8] = include_bytes!("../profiles/linux-nvme-v1.candidate.json");
+    const PROFILE_V2: &[u8] = include_bytes!("../profiles/linux-nvme-v2.candidate.json");
 
     fn profile_value() -> Value {
         serde_json::from_slice(PROFILE).unwrap()
@@ -651,6 +667,12 @@ mod tests {
         serde_json::to_vec(&profile).unwrap()
     }
 
+    fn mutated_v2(mutator: impl FnOnce(&mut Value)) -> Vec<u8> {
+        let mut profile: Value = serde_json::from_slice(PROFILE_V2).unwrap();
+        mutator(&mut profile);
+        serde_json::to_vec(&profile).unwrap()
+    }
+
     #[test]
     fn committed_candidate_is_valid_but_ineligible() {
         let summary = validate_profile(PROFILE).unwrap();
@@ -658,6 +680,45 @@ mod tests {
         assert_eq!(summary.profile_id, "linux-nvme-v1");
         assert_eq!(summary.status, "candidate_unapproved");
         assert!(!summary.qualification_eligible);
+    }
+
+    #[test]
+    fn committed_v2_candidate_is_valid_but_ineligible() {
+        let summary = validate_profile(PROFILE_V2).unwrap();
+        assert_eq!(summary.schema_version, "distributed-state-qual/v2");
+        assert_eq!(summary.profile_id, "linux-nvme-v2");
+        assert_eq!(summary.status, "candidate_unapproved");
+        assert!(!summary.qualification_eligible);
+    }
+
+    #[test]
+    fn profile_versions_reject_each_others_resource_gate_vocabulary() {
+        let bytes = mutated_v2(|profile| {
+            let gates = profile["resource_gates"].as_object_mut().unwrap();
+            let value = gates
+                .remove("background_maintenance_debt_max_bytes")
+                .unwrap();
+            gates.insert("compaction_debt_max_bytes".to_owned(), value);
+        });
+        assert!(validate_profile(&bytes).is_err());
+
+        let bytes = mutated(|profile| {
+            let gates = profile["resource_gates"].as_object_mut().unwrap();
+            let value = gates.remove("compaction_debt_max_bytes").unwrap();
+            gates.insert("background_maintenance_debt_max_bytes".to_owned(), value);
+        });
+        assert!(validate_profile(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_profile_schema_version_before_semantic_checks() {
+        let bytes = mutated_v2(|profile| {
+            profile["schema_version"] = "distributed-state-qual/v3".into();
+        });
+        assert!(validate_profile(&bytes)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported"));
     }
 
     #[test]

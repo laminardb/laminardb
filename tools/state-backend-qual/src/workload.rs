@@ -1558,6 +1558,7 @@ mod tests {
     use super::*;
 
     const PROFILE: &[u8] = include_bytes!("../profiles/linux-nvme-v1.candidate.json");
+    const PROFILE_V2: &[u8] = include_bytes!("../profiles/linux-nvme-v2.candidate.json");
 
     fn profile() -> ModelProfile {
         ModelProfile::from_profile_bytes(PROFILE).unwrap()
@@ -1598,6 +1599,17 @@ mod tests {
         assert!(lowercase_sha256(&original.profile_sha256)
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+
+        let candidate_neutral_v2 = ModelProfile::from_profile_bytes(PROFILE_V2).unwrap();
+        assert_eq!(
+            lowercase_sha256(&candidate_neutral_v2.profile_sha256),
+            "58f674ef1e1d2bea94c32ebf29259934810b7cc16835eb1c9695c9b1b1e575ba"
+        );
+        assert_ne!(original.profile_sha256, candidate_neutral_v2.profile_sha256);
+        assert_eq!(
+            original.model_input_sha256,
+            candidate_neutral_v2.model_input_sha256
+        );
     }
 
     #[test]

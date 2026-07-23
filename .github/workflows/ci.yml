@@ -428,6 +428,11 @@ jobs:
           expected_output=$'NOT QUALIFICATION EVIDENCE\nVALID_INELIGIBLE_PROFILE schema=distributed-state-qual/v1 profile=linux-nvme-v1 status=candidate_unapproved'
           [[ "$profile_output" == "$expected_output" ]]
 
+          profile_v2_output="$(cargo run --quiet --locked --manifest-path tools/state-backend-qual/Cargo.toml -- validate-profile tools/state-backend-qual/profiles/linux-nvme-v2.candidate.json 2>&1)"
+          echo "$profile_v2_output"
+          expected_v2_output=$'NOT QUALIFICATION EVIDENCE\nVALID_INELIGIBLE_PROFILE schema=distributed-state-qual/v2 profile=linux-nvme-v2 status=candidate_unapproved'
+          [[ "$profile_v2_output" == "$expected_v2_output" ]]
+
           result_output="$(cargo run --quiet --locked --manifest-path tools/state-backend-qual/Cargo.toml -- validate-model-result tools/state-backend-qual/profiles/linux-nvme-v1.candidate.json tools/state-backend-qual/tests/fixtures/model-result-aggregate-v1.json 2>&1)"
           echo "$result_output"
           expected_result=$'NOT QUALIFICATION EVIDENCE\nVALID_INELIGIBLE_MODEL_RESULT profile=linux-nvme-v1 requests=2'

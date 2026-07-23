@@ -34,9 +34,10 @@ V1 reserves these printable identities:
 | runner plan schema | `state-backend-runner-plan/v1` |
 | evidence manifest schema | `state-backend-evidence-manifest/v1` |
 | latency samples | `state-backend-latency-samples/v1` |
-| resource samples | `state-backend-resource-samples/v1` |
-| resource cuts | `state-backend-resource-cuts/v1` |
-| resource formulas | `state-backend-resource-formulas/v1` |
+| common resource samples | `state-backend-resource-samples/v2` |
+| common resource cuts | `state-backend-resource-cuts/v2` |
+| resource formulas | `state-backend-resource-formulas/v2` |
+| candidate mechanism mapping | `state-backend-mechanism-mapping/v1` |
 | physical layout | `state-backend-physical-layout/v1` |
 | physical faults | `state-backend-physical-faults/v1` |
 | attempt classification | `state-backend-attempt-classification/v1` |
@@ -45,7 +46,19 @@ V1 reserves these printable identities:
 
 The canonical latency stream begins with `LDB-SBQ-LATENCY-SAMPLES-V1\0`; the zero byte is part of
 the wire domain and not the printable identity. Any incompatible encoding, formula, layout,
-classification, or schedule change requires a new identity.
+classification, or schedule change requires a new identity. The provisional common-resource v1
+wires remain executable regression fixtures, but no plan or evidence artifact ever used them. They
+are retired before approval because they made LSM compaction debt and engine stall totals mandatory
+fields for every backend. A future executable plan must bind the candidate-neutral v2 resource
+wires and a reviewed mechanism mapping; it cannot mix v1 and v2 resource identities.
+
+The comparison profile follows the same additive rule. `distributed-state-qual/v1` and
+`linux-nvme-v1` remain immutable regression fixtures. The unapproved
+`distributed-state-qual/v2`/`linux-nvme-v2` profile replaces the four LSM-shaped resource names with
+`background_maintenance_debt_max_bytes`, `resource_tail_clear_max_seconds`,
+`engine_pressure_stall_time_max_permille`, and `unexplained_storage_pause_max_ms`. The first and
+third thresholds apply only to an `observed` candidate mechanism arm; the common tail and observed-
+outcome gates apply to every candidate. Neither profile is execution-eligible.
 
 The plan binds the exact raw profile SHA-256, physical layout, and every policy identity above. C1
 adapter-conformance entries additionally bind their model-input SHA-256 plus v1 generator/model
@@ -100,10 +113,11 @@ identical named policy explicitly requires it for both candidates.
 The long-stream generator must deterministically update and expire aggregate, timer, and join
 records so actual live bytes, cardinality, and timer density stay inside each case's approved band.
 The runner checks the bands at setup, throughout warmup/measurement, and at the final digest. Leaving
-the declared residency band is FAIL. At the exact warmup horizon, approved L0/run, memtable,
-compaction-debt, and debt-slope conditions must hold; the runner neither waits longer nor forces
-quiescence to improve a candidate's result. Failure to stabilize is FAIL, while unavailable evidence
-needed to decide it is a conformance failure.
+the declared residency band is FAIL. At the exact warmup horizon, every applicable background-
+maintenance mechanism must meet its approved debt and slope conditions. L0/run and memtable
+conditions apply only when the exact candidate mapping declares those mechanisms. The runner neither
+waits longer nor forces quiescence to improve a candidate's result. Failure to stabilize is FAIL,
+while unavailable evidence needed to decide it is a conformance failure.
 
 Five requests or five million requests within one attempt are not independent repetitions. Gate
 decisions use independently reset paired repetitions. Every case/repetition/seed runs both
@@ -137,7 +151,8 @@ ceil(request_count * 1_000_000_000 * rate_denominator / rate_numerator)
 Warmup and measurement have separate exact counts/rates. Their horizons must meet the profile's
 time minima and their counts must meet its request minima. The measured elapsed interval is phase
 start through `max(schedule_horizon, last_terminal_offset)`. Drain deadline is an exact duration
-after the horizon. Throughput, CPU, and stall formulas use that conservative elapsed interval.
+after the horizon. Throughput, CPU, and applicable engine-pressure-stall formulas use that
+conservative elapsed interval.
 
 Scheduling does not wait for the preceding completion. A lightweight ordinal may enter only the
 pre-reserved bounded queue, whose byte reservation is entries times the worst exact generated
@@ -381,8 +396,12 @@ plug-in ABI or the production trait.
 Returned Fjall slices must be copied/released before the service interval ends, and snapshot or
 iterator lifetime is bounded. RocksDB native memory is included in candidate-leaf memory and child
 process PSS/RSS observations.
-An unavailable required counter is `unsupported`, never zero; a candidate that cannot expose a
-stable required pressure signal fails conformance or must upstream one before selection.
+An unavailable required observation is `unsupported`, never zero; a candidate that cannot expose a
+stable applicable pressure signal fails conformance or must upstream one before selection.
+`not_applicable` is a separate, typed, pre-approved mechanism claim, not a spelling of unavailable.
+It requires exact source/configuration proof and a bounded probe showing that the mechanism cannot
+occur in that build. A missing API, an unobserved path, or an inconvenient measurement is never
+enough to claim N/A.
 
 ## Persistence and checkpoint boundary
 
@@ -458,32 +477,69 @@ escaping the root, an unexpected project ID, or disagreement outside the approve
 tolerance invalidates the attempt. Logical mutation bytes reuse C1's exact charge: opaque key plus
 value for put and opaque key for delete.
 
+Every candidate supplies one immutable `state-backend-mechanism-mapping/v1` record bound to the
+exact candidate source archive, build flags, configuration, adapter source, and runner plan. It has
+two required typed arms:
+
+```text
+background_maintenance_debt =
+    observed { mechanism inventory, semantic unit, complete source contract,
+               sample/cut artifact descriptor }
+  | not_applicable { no-asynchronous-maintenance reason, source-proof digest,
+                     exact-configuration digest, bounded-probe evidence digest }
+
+engine_pressure_stalls =
+    observed { exhaustive delay/stop/block-path inventory, normalized interval source,
+               cumulative cross-check source, artifact descriptor }
+  | not_applicable { no-distinct-engine-pressure-stall-state reason, source-proof digest,
+                     exact-configuration digest, bounded-probe evidence digest }
+```
+
+The mapping is candidate-specific; applicability therefore does not live in the common comparison
+profile. `observed(0)` is a real measurement and is distinct from `not_applicable`. N/A carries no
+numeric payload or mechanism artifact. The plan rejects unknown mechanisms and reason codes,
+missing proof, both/neither union arms, configuration drift, or a mechanism artifact inconsistent
+with its arm. Background maintenance includes asynchronous flush, compaction, garbage collection,
+vacuum, or any other work that can remain after a request returns. Synchronous/offline maintenance
+is still charged to foreground service, operation RTO, disk, and endurance gates; calling it N/A
+does not remove its cost.
+
+The common observation set is mandatory for every backend: adapter queue/service/offered timings;
+cgroup CPU, memory, dirty/writeback, and I/O; XFS project quota; target-device writes; complete
+process-tree PSS/RSS/FDs; exact adapter snapshot/iterator/frozen-generation lifetimes; logical-live
+bytes; and pressure-case outcome gates. None can be N/A. Candidate-native cache, memtable, journal,
+level, run, and retained-version metrics are required only when an approved gate or declared
+mechanism depends on them. Approximate engine counters are diagnostic and never replace the common
+external observations.
+
 The runner records nominal one-second monotonic resource observations plus the kernel's
 whole-attempt peak. These are bracketed samples, not fictitious atomic cuts. After recording
 `observation_begin`, it reads the published C1 logical-live-byte counter and project quota, reads the
 other counters, reads quota and logical-live bytes again, then records `observation_end`. The
-resource stream starts with the 28-byte `LDB-SBQ-RESOURCE-SAMPLES-V1\0` domain, then
-`record_count_u64_be`, then 176-byte records containing these 22 `u64_be` fields in order:
+common resource stream starts with the 28-byte `LDB-SBQ-RESOURCE-SAMPLES-V2\0` domain, then
+`record_count_u64_be`, then 160-byte records containing these 20 `u64_be` fields in order:
 
 ```text
 sample_index, observation_begin_offset_ns, observation_end_offset_ns,
 cpu_usage_us, memory_current_bytes, memory_peak_bytes, io_read_bytes,
 io_write_bytes, pss_bytes, rss_bytes, open_fds,
 allocated_store_before_bytes, allocated_store_after_bytes,
-compaction_debt_bytes, write_stall_total_ns, live_snapshots,
-live_iterators, frozen_generations, file_dirty_bytes, file_writeback_bytes,
+live_snapshots, live_iterators, frozen_generations,
+file_dirty_bytes, file_writeback_bytes,
 logical_live_before_bytes, logical_live_after_bytes
 ```
 
-The exact length is `36 + 176 * record_count`, with sample indices contiguous from zero and no
+The exact length is `36 + 160 * record_count`, with sample indices contiguous from zero and no
 trailing bytes. Begin must not exceed end; read skew is exactly `end - begin` and must meet the
-plan's resource-observation gate. Unsupported required observations fail adapter conformance before
-a gate-bearing run; there is no numeric sentinel. The manifest freezes each source, read order,
-reset action, wrap behavior, sampling error, and availability.
+plan's resource-observation gate. Unsupported common observations fail adapter conformance before a
+gate-bearing run; there is no numeric sentinel. The manifest freezes each source, read order, reset
+action, wrap behavior, sampling error, and availability. Applicable maintenance gauges and engine
+stall intervals use separately bound mechanism artifacts; they cannot be smuggled back into common
+fields or inferred from one-second polling.
 
 One-second observations cannot stand in for formula boundaries. A second stream starts with the
-25-byte `LDB-SBQ-RESOURCE-CUTS-V1\0` domain, then `record_count_u64_be`, then 128-byte records. Each
-record is `cut_tag_u8`, seven zero reserved bytes, followed by these fifteen `u64_be` fields:
+25-byte `LDB-SBQ-RESOURCE-CUTS-V2\0` domain, then `record_count_u64_be`, then 112-byte records. Each
+record is `cut_tag_u8`, seven zero reserved bytes, followed by these thirteen `u64_be` fields:
 
 ```text
 observation_begin_offset_ns, observation_end_offset_ns,
@@ -491,11 +547,10 @@ cpu_usage_us, io_read_bytes, io_write_bytes,
 memory_current_bytes, memory_peak_bytes,
 allocated_store_before_bytes, allocated_store_after_bytes,
 logical_live_before_bytes, logical_live_after_bytes,
-write_stall_total_ns, compaction_debt_bytes,
 file_dirty_bytes, file_writeback_bytes
 ```
 
-The exact length is `33 + 128 * record_count`, with no trailing bytes. Tags are
+The exact length is `33 + 112 * record_count`, with no trailing bytes. Tags are
 `0x00 pre_measurement`, `0x01 write_stop`, `0x02 last_terminal`,
 `0x03 measured_elapsed_end`, `0x04 resource_tail_stable_end`, and
 `0x05 resource_tail_deadline`. A valid
@@ -509,12 +564,13 @@ write_stop_offset_ns =
 ```
 
 The `write_stop` counter observation begins at or after that event, once the mutation path is
-drained; its later bracket is not substituted for the logical offset. The debt and writeback cut
-occurs after `measured_elapsed_end` and either completion of the uninterrupted tail hold or the
-deadline. Both the deadline and hold schedule are anchored to `write_stop_offset_ns`. The plan's
-clock/resource-error gate covers every encoded skew.
+drained; its later bracket is not substituted for the logical offset. The final resource cut occurs
+after `measured_elapsed_end` and either completion of the uninterrupted tail hold or the deadline.
+Applicable maintenance-debt artifacts use the same cut tags and observation brackets. Both the
+deadline and hold schedule are anchored to `write_stop_offset_ns`. The plan's clock/resource-error
+gate covers every encoded skew.
 
-Normative v1 formulas use checked integer arithmetic. Lower-bound gates round down; upper-bound
+Normative resource-formulas v2 use checked integer arithmetic. Lower-bound gates round down; upper-bound
 gates round up:
 
 - throughput is the floor of oracle-valid completed logical rows times `1e9` divided by measured
@@ -532,19 +588,24 @@ gates round up:
   `min(logical_live_before, logical_live_after)`; the gate uses the maximum sampled ratio and reports
   the resource-tail bracket. It is explicitly a bracketed sampled gate, not an atomic filesystem
   peak;
-- write-stall permille is the ceiling of the union of normalized candidate stall intervals
-  intersected with `[pre_measurement, measured_elapsed_end]`, times 1000 divided by measured elapsed
-  ns; and
-- compaction clear time starts at `write_stop_offset_ns`, after the final queued/in-flight mutation is
-  terminal, and ends only after engine compaction debt, cgroup `memory.stat` `file_dirty` and
-  `file_writeback`, and target-device `io.stat` write-byte growth all remain within their approved
-  baselines/tolerances for the uninterrupted hold interval. Its upper-bound duration is exactly
-  `resource_tail.observation_end_offset_ns - write_stop_offset_ns`.
+- engine-pressure-stall permille, when the mapping arm is `observed`, is the ceiling of the union of
+  normalized candidate stall intervals intersected with `[pre_measurement,
+  measured_elapsed_end]`, times 1000 divided by measured elapsed ns. A cumulative scalar is only a
+  cross-check because it cannot reconstruct overlaps. A `not_applicable` arm produces a typed N/A,
+  not numeric zero; queue wait, writer acquisition, candidate service, end-to-end latency,
+  throughput, and timeout gates still charge every observed pause; and
+- resource-tail clear time starts at `write_stop_offset_ns`, after the final queued/in-flight
+  mutation is terminal, and ends only after cgroup `memory.stat` `file_dirty` and `file_writeback`
+  plus target-device `io.stat` write-byte growth remain within approved baselines/tolerances for the
+  uninterrupted hold interval. When background-maintenance debt is `observed`, every declared debt
+  gauge must also remain within its approved baseline/tolerance for the same interval; when it is
+  `not_applicable`, that conjunct and only that conjunct is absent. The upper-bound duration is
+  exactly `resource_tail.observation_end_offset_ns - write_stop_offset_ns`.
 
 The database process and candidate leaf stay alive through that tail. A named `syncfs` or
 candidate-side persistence drain is permitted only when the plan applies the identical policy to
 both candidates; its latency and writes remain in tail evidence. Reaching the deadline before the
-combined engine/kernel/device condition holds is FAIL, not a shortened numerator.
+common kernel/device plus applicable engine condition holds is FAIL, not a shortened numerator.
 
 A zero denominator in a gate-bearing case is invalid plan construction, not a zero result. The new
 leaf's `memory.peak` is the one exact hard memory peak and covers setup, warmup, measurement, and the
@@ -569,11 +630,11 @@ slope_bytes_per_hour = ceil(N * 3_600_000 / D)
 
 `D` must be positive. Signed ceiling always rounds toward the worse/higher growth result. Stable
 disk permille/hour is `ceil(slope_bytes_per_hour * 1000 / baseline_bytes)`, where baseline is the
-nonzero maximum of the first included allocation endpoints. The plan freezes compaction-debt,
-dirty/writeback and device-write baselines/tolerances, the resource-tail deadline, and uninterrupted
-hold interval. Missing/late samples, an out-of-schema final value, counter reset, or an invalid
-denominator makes the attempt INVALID unless a previously proved candidate crash has already
-classified it FAIL.
+nonzero maximum of the first included allocation endpoints. The plan freezes dirty/writeback and
+device-write baselines/tolerances, each applicable background-maintenance-debt baseline/tolerance,
+the resource-tail deadline, and uninterrupted hold interval. Missing/late samples, an out-of-schema
+final value, counter reset, or an invalid denominator makes the attempt INVALID unless a previously
+proved candidate crash has already classified it FAIL.
 
 ## Fault schedule and attempt classification
 
@@ -605,8 +666,8 @@ Attempt status is derived, never submitted:
   clock regression, sample/evidence loss, runner internal error, undeclared external interruption,
   or a scheduled fault that was not reached/actuated.
 
-After valid measurement start, memory, disk, FD, thermal, NVMe, compaction, timeout, or process
-failure is FAIL unless a declared external interruption independently invalidates the complete
+After valid measurement start, memory, disk, FD, thermal, NVMe, applicable background maintenance,
+timeout, or process failure is FAIL unless a declared external interruption independently invalidates the complete
 affected pair or campaign. Causation guesses cannot reclassify a failure. A proved candidate crash
 has precedence over candidate-side sample/log loss it caused; the external supervisor's committed
 markers preserve the FAIL. Invalid attempts never pass. Neither invalid nor failed attempts may be
@@ -665,7 +726,7 @@ resolved and independently reviewed. Backend selection additionally requires DKS
 | **DKS-Q2-003** | Define long-stream ordinals, streaming resident/spill prefill, live-byte/cardinality/timer bands and control law, exact opposite-side join fanout, stabilization, deterministic TTL/churn, and setup/post-warmup/final digests. C1's 4,096-request oracle and state-size salt cannot be repeated into a 200,000-request performance claim. |
 | **DKS-Q2-004** | Freeze exact warmup/measured counts and rates, per-case total semantics, drain/cooldown/reset, scheduler calibration/affinity, and an explicit balanced seeded order vector. The current minimum-count/minimum-duration booleans and five-pair alternation are not a complete schedule. |
 | **DKS-Q2-005** | Add service-latency, runner-overhead, scheduler, oracle-lag and observation-skew gates; freeze result-ring/raw-sample ceilings and gate-bearing telemetry control trials; and complete image/package/CPU/microcode/NUMA/NVMe identities. |
-| **DKS-Q2-006** | Prove stable mappings for compaction debt, stalls, XFS project-quota bytes, cgroup dirty/writeback, device writes, snapshots/iterators, native memory, and pressure counters. The static audit fails unmodified Fjall 3.1.8 because debt/stall signals are absent and blocks the current RocksDB binding because its stall ticker omits a verified write-buffer-manager/database-scope path. redb 4.1.0 is deferred until the contract defines non-LSM debt semantics, adapter queue/service timing, and non-interfering observations. Supply a proven complete source, patch/upstream, or reject; never encode unsupported as zero. |
+| **DKS-Q2-006** | Implement and approve exact candidate mechanism mappings plus common XFS project-quota, cgroup dirty/writeback/device I/O, process memory, adapter lifecycle, and pressure observations. The contract now distinguishes `observed` from proof-backed `not_applicable` and requires common resource-v2 wires, but no mechanism-map schema/artifact or complete candidate mapping exists. Unmodified Fjall 3.1.8 still fails because applicable debt/stall signals are absent; the current RocksDB binding remains blocked because its stall ticker omits a verified write-buffer-manager/database-scope path; redb 4.1.0 remains deferred pending proof of its N/A arms and non-interfering mapping. Supply a complete source, patch/upstream, or reject; never encode unsupported as zero. |
 | **DKS-Q2-007** | Implement and review detached approval/completion records, pinned Fjall/RocksDB persistence mappings, complete configuration dumps, and cache-loss truth-table conformance. |
 | **DKS-Q2-008** | Freeze the paired physical-fault and 24/72-hour endurance matrices, actuator and N/N-1 pins, recovery criteria, and a bounded time-resolved endurance encoding distinct from finite raw samples. |
 | **DKS-Q2-009** | Before selection, approve and pass a separate C3 shared-database concurrency contract: deterministic disjoint-vnode lanes and per-lane oracle order; hot-writer/victim and mixed point/range/snapshot traffic; victim plus aggregate tails, global stalls/resources; and barrier-controlled races with restore activation, cleanup, and pinned snapshots. |

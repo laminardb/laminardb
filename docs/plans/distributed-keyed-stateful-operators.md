@@ -132,10 +132,11 @@ Work:
    - absolute p99/p99.9 latency, throughput, checkpoint-pause, RTO, RSS, disk, artifact/decode,
      chain-depth, operator/vnode-count, and restore-staging limits.
    The candidate numerical gates live only in the machine-readable
-   [`linux-nvme-v1` candidate](../../tools/state-backend-qual/profiles/linux-nvme-v1.candidate.json),
+   [`linux-nvme-v2` candidate](../../tools/state-backend-qual/profiles/linux-nvme-v2.candidate.json),
    which remains explicitly unapproved and is not evidence. Its ownership map assigns backend,
    artifact-conformance, and product-integration sections to different executors; an LSM run cannot
-   satisfy sink, checkpoint, or failover gates.
+   satisfy sink, checkpoint, or failover gates. The v1 profile remains an immutable regression
+   fixture and cannot be used by a new runner plan.
 3. Specify the partition/state ABI and add golden vectors for every admitted key type plus explicit
    rejection vectors for floating-point, nested, and other excluded types. Persist hydrated routing
    identity separately from the artifact's Laminar-owned state contract. Treat restored routing

@@ -30,6 +30,24 @@ fn candidate_prints_ineligible_notice() {
 }
 
 #[test]
+fn candidate_neutral_v2_prints_ineligible_notice() {
+    let output = binary()
+        .arg("validate-profile")
+        .arg(manifest_path("profiles/linux-nvme-v2.candidate.json"))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!(
+            "{NOTICE}\nVALID_INELIGIBLE_PROFILE schema=distributed-state-qual/v2 \
+             profile=linux-nvme-v2 status=candidate_unapproved\n"
+        )
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn validates_only_a_matching_model_result() {
     let profile = manifest_path("profiles/linux-nvme-v1.candidate.json");
     let result = manifest_path("tests/fixtures/model-result-aggregate-v1.json");
