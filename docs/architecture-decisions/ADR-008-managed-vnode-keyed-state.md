@@ -23,7 +23,10 @@ that the current RocksDB binding also lacks a complete stall signal. Both remain
 gate-bearing run. redb 4.1.0 was also screened and deferred before implementation: its sole
 database-wide blocking writer plus not-yet-approved durability, cache, and telemetry mappings need
 a cheaper writer/commit/recovery microprobe and contract decision before expanding the bake-off.
-This is a risk-based scope decision, not an unmeasured C3 failure or a selection by API checklist.
+SurrealKV 0.21.2 is rejected unmodified because its exact source breaks snapshot-registration
+bookkeeping used by compaction and also has unresolved drain/telemetry risks; any reconsideration
+requires a correctness fork and bounded prescreen before candidate admission. These are risk-based
+scope decisions, not an unmeasured C3 failure or a selection by API checklist.
 
 The existing fixed vnode ABI, bounded shuffle, assignment/process fencing, aligned barriers,
 per-vnode checkpoint artifacts, and exact-attempt seal are retained. Cluster admission will move

@@ -1,4 +1,4 @@
-# Fjall 3.1.8, RocksDB 10.4.2, and redb 4.1.0 static backend audit
+# Fjall 3.1.8, RocksDB 10.4.2, redb 4.1.0, and SurrealKV 0.21.2 static backend audit
 
 - **Date:** 2026-07-23
 - **Scope:** exact-source API, durability, pressure, restore, and hot-path review
@@ -15,11 +15,17 @@ durability, cache, and telemetry mappings need a preliminary writer/commit/recov
 a reviewed contract mapping before deciding whether to expand the bake-off. It is deferred, not
 failed or selected against by unmeasured tail latency.
 
+SurrealKV 0.21.2 is rejected unmodified. Its exact source has a snapshot-registration invariant
+violation on a compaction-critical path, plus unresolved background-wakeup liveness, durability,
+and observability gaps. It is Apache-2.0 and patchable, but the required work is a correctness fork
+before a telemetry patch, not a low-cost third candidate.
+
 | Candidate | Required primitives | Governance/telemetry | Static disposition |
 |---|---|---|---|
 | Fjall 3.1.8 | Cross-keyspace atomic batch, consistent snapshot, ordered range/prefix iteration, and explicit journal persistence are present. | No stable compaction-debt counter, complete write-stall duration/counter, enforceable global write-buffer cap, or complete cache/pinned-memory accounting. | **FAIL DKS-Q2-006 as published.** Patch/upstream the missing stable signals and controls or remove Fjall from the campaign. |
 | `rocksdb` 0.24.0 / RocksDB 10.4.2 | Cross-column-family `WriteBatch`, snapshots, bounded iterators, multi-get, WAL flush, checkpoint, and SST ingest are present. | Pending-compaction and pressure properties exist, but the exposed stall ticker omits verified write-buffer-manager/database-scope paths. | **BLOCK DKS-Q2-006.** Supply a proven complete signal or narrow it only with pre-approved evidence that no uncovered stall class is possible. |
 | redb 4.1.0 | Atomic cross-table write transaction, snapshot reads, ordered ranges, an open-time cache budget, and immediate-durability commit are present. | A single database-wide writer blocks without a timeout/cancel API; storage statistics traverse the trees while holding that writer; the current contract has no approved non-LSM debt/stall mapping. | **DEFER.** Freeze that mapping and run a non-gating writer/commit/recovery microprobe before deciding whether to add a third C2/C3 candidate. |
+| SurrealKV 0.21.2 | One-tree atomic transactions, snapshot-filtered point/range reads, WAL sync, and internal LSM pressure machinery are present. | Snapshot registrations are not reference-counted and a temporary range snapshot unregisters a real sequence; public debt/stall telemetry is absent and background notification liveness is unproved. | **REJECT unmodified.** A pinned fork/upstream must fix and prescreen correctness/liveness before telemetry work or candidate admission. |
 
 This does not select RocksDB by elimination. Fjall remains smaller and safe-Rust, while RocksDB has
 broader operational controls at the cost of synchronous FFI, native-memory/build provenance, and
@@ -27,16 +33,16 @@ shared database write-control risk. redb's Rust-native, no-C++-engine implementa
 copy-on-write B-trees are attractive, but adding a third adapter before its cheaper risk screen
 passes would expand scope without selection evidence. Only equivalent C1/C2, C3, fault, endurance,
 and restore evidence may select between candidates admitted to the bake-off. The losing adapter is
-then removed.
+then removed. SurrealKV does not enter that comparison merely because it is Rust-native.
 
 ## Provenance and current-tree correction
 
 The candidate profile declares Fjall `=3.1.8`, `rocksdb =0.24.0`, and bundled RocksDB `10.4.2`.
 Those strings are comparison inputs, not project pins. `cargo metadata`, the root lockfile, and the
-qualification-tool lockfile contain no Fjall, RocksDB, or `librocksdb-sys` package, and no backend
-adapter exists. The current tree therefore does not “use Fjall”; the former cold tier remains
-removed. redb is not in the profile, dependency graph, or lockfiles; its 4.1.0 audit is a requested
-static alternative screen, not a silently added third candidate.
+qualification-tool lockfile contain no Fjall, RocksDB, `librocksdb-sys`, redb, or SurrealKV package,
+and no backend adapter exists. The current tree therefore does not “use Fjall”; the former cold tier
+remains removed. redb and SurrealKV are not in the profile, dependency graph, or lockfiles; their
+audits are requested static alternative screens, not silently added candidates.
 
 The audit read cached crate archives and the adjacent expanded registry sources. The hashes below
 identify the archives; they do not by themselves authenticate a subsequently mutable extraction:
@@ -48,6 +54,7 @@ identify the archives; they do not by themselves authenticate a subsequently mut
 | `rocksdb-0.24.0` | `ddb7af00d2b17dbd07d82c0063e25411959748ff03e8d4f96134c2ff41fce34f` |
 | `librocksdb-sys-0.17.3+10.4.2` | `cef2a00ee60fe526157c9023edab23943fae1ce2ab6f4abb2a807c1746835de9` |
 | `redb-4.1.0` | `8e925444704b5f17d32bf42f5b6e2df050bceebc3dcd6e71cc73dafe8092e839` |
+| `surrealkv-0.21.2` | `b0672cbbe282723a62ccee14b95232ca0b4c9bf44ea22fb520c43e7c517fb8ec` |
 
 The RocksDB wrapper and sys crate record VCS revision
 `bb7d2168eab1bc7849f23adbcb825e3aba1bd2f4`; the bundled
@@ -55,12 +62,15 @@ The RocksDB wrapper and sys crate record VCS revision
 an exact top-level Fjall constraint is not a complete build identity. redb's packaged VCS record
 and upstream `v4.1.0` tag identify `6ed1f981ba4deab0b2adbdd7bccb46ec409b2191`; its declared MSRV is
 1.89. A future candidate needs an isolated exact lockfile, package archive, SBOM, feature set,
-target, toolchain, and build flags. This Windows source audit did not exercise the target
-Linux/XFS/NVMe mappings.
+target, toolchain, and build flags. SurrealKV's annotated `v0.21.2` tag peels to
+`d7e85669f59493c9501adcf0289e497ee206ffae`; its manifest declares Apache-2.0 and Rust 1.86. This
+Windows source audit did not exercise the target Linux/XFS/NVMe mappings.
 
 Primary redb provenance is the [crates.io 4.1.0 release](https://crates.io/crates/redb/4.1.0),
 [versioned API documentation](https://docs.rs/redb/4.1.0/redb/), and the
 [matching upstream revision](https://github.com/cberner/redb/tree/6ed1f981ba4deab0b2adbdd7bccb46ec409b2191).
+Primary SurrealKV provenance is the [crates.io 0.21.2 release](https://crates.io/crates/surrealkv/0.21.2)
+and its [pinned upstream revision](https://github.com/surrealdb/surrealkv/tree/d7e85669f59493c9501adcf0289e497ee206ffae).
 
 ## Common semantic boundary
 
@@ -152,6 +162,54 @@ Savepoints retain otherwise reclaimable pages and are not portable vnode artifac
 properties make global-writer, durable-commit, crash-open, and compaction behavior the correct
 cheap microprobe targets before implementing a full third adapter.
 
+### SurrealKV correctness screen
+
+SurrealKV has one byte-key `Tree`; Laminar's four logical keyspaces would need disjoint prefixes in
+that one tree because separate trees do not provide the required cross-keyspace atomic batch. Its
+transactions provide snapshot isolation with write-write conflict detection, not general
+serializability, so the C2 adapter would retain one serialized foreground writer. WAL append and
+sequence publication are serialized, while up to seven commit bodies can be in flight and memtable
+application occurs outside the write mutex. Synchronous filesystem work runs directly in async task
+paths, so Tokio scheduling and blocking tails would require explicit qualification.
+
+The exact v0.21.2 source violates the snapshot-retention invariant before any performance question:
+
+- [`SnapshotTracker`](https://github.com/surrealdb/surrealkv/blob/d7e85669f59493c9501adcf0289e497ee206ffae/src/snapshot.rs#L42-L103)
+  stores sequence numbers in a `SkipSet<u64>`. Two live snapshots at the same visible sequence
+  collapse to one element; dropping either removes that sequence while the other is still live.
+- [`SnapshotIterator::new_from`](https://github.com/surrealdb/surrealkv/blob/d7e85669f59493c9501adcf0289e497ee206ffae/src/snapshot.rs#L918-L928)
+  constructs a temporary `Snapshot` without registering it. Its ordinary `Drop` unregisters the
+  enclosing transaction's real sequence, so merely creating a range iterator can remove retention
+  protection.
+- The [compactor consumes this tracker](https://github.com/surrealdb/surrealkv/blob/d7e85669f59493c9501adcf0289e497ee206ffae/src/compaction/compactor.rs#L167-L194)
+  when deciding which versions to preserve. This is a source-proved bookkeeping invariant failure
+  and a credible stale-snapshot/data-visibility risk; it must be fixed and exercised under forced
+  compaction before C1 semantic conformance.
+
+The background scheduler also needs a deterministic liveness test. Notifications are suppressed
+while a task is marked running, and the level worker performs one compaction per notification. The
+memtable worker drains what it sees, but concurrent rotations can race with its final empty check
+and flag clear. That is a plausible lost-wakeup/residual-debt path, not yet an empirical failure;
+the safe fix must clear-and-recheck or use non-lossy notification and prove drain-to-stability
+([task source](https://github.com/surrealdb/surrealkv/blob/d7e85669f59493c9501adcf0289e497ee206ffae/src/task.rs#L45-L176)).
+
+Other prescreen blockers are concrete:
+
+- an oversized batch is appended to WAL before the memtable rejects that it cannot fit a fresh
+  arena, while recovery can then fail on the retained record; admission must reject it before WAL;
+- `Tree` clones can each spawn close work from `Drop`; an adapter could avoid cloning the tree, but
+  safe last-owner shutdown should be fixed upstream;
+- default tolerant WAL repair is not an authoritative corruption policy; an incomplete final crash
+  tail must be distinguished from checksum corruption in the middle; and
+- exact level/run debt, immutable bytes, task state, stall episodes, cache/pinned memory, and applied
+  options are private or absent from the public API.
+
+The minimum acceptable fork first adds reference-counted/uniquely owned snapshot guards and forced-
+compaction regressions, fixes wakeup/drain and oversized-batch ordering, and tightens close/recovery.
+Only then should it expose a stable cheap stats snapshot and complete normalized stall episodes.
+Until that bounded correctness prescreen passes, SurrealKV is rejected unmodified rather than added
+to the comparison profile.
+
 ## Persistence mapping: static proposal, not durability evidence
 
 | Contract boundary | Fjall 3.1.8 | RocksDB wrapper 0.24.0 | Status |
@@ -183,6 +241,16 @@ state, an unclean open can perform extensive tree/allocator repair. There is no 
 `persist_all`/directory-sync primitive. None of these source-level mappings satisfies Laminar's
 cache-loss or failover gates without the physical truth-table testing required of retained
 candidates.
+
+SurrealKV's default/Eventual commit only appends to a 32-KiB userspace `BufWriter`; it is not the
+contract's process-death-safe `buffered_batch`. A forked adapter would need Eventual commit followed
+by public `flush_wal(false)` inside the acknowledged service interval, or a dedicated upstream
+flush-without-sync durability mode. `flush_wal(true)` is the provisional `persist_data` mapping and
+reaches WAL `sync_all`; no public online `persist_all`/flush-all primitive exists. Immediate commit
+also syncs the WAL but collapses the buffered/persist-data latency distinction. All mappings remain
+unapproved until snapshot correctness, strict recovery, and the physical truth table pass
+([transaction durability](https://github.com/surrealdb/surrealkv/blob/d7e85669f59493c9501adcf0289e497ee206ffae/src/transaction.rs#L47-L90),
+[WAL flush API](https://github.com/surrealdb/surrealkv/blob/d7e85669f59493c9501adcf0289e497ee206ffae/src/lsm.rs#L1682-L1695)).
 
 ## Pressure and resource audit
 
@@ -230,15 +298,36 @@ DKS-Q2-006 therefore stays blocked for RocksDB until a reviewed source exposes c
 events/time, or the approved configuration and fault evidence prove that every uncovered path is
 impossible. One-second polling cannot prove absence of short stalls.
 
+### SurrealKV static failure
+
+SurrealKV's leveled scheduler privately computes file-count/byte scores from exact table sizes, so a
+fork could define background-maintenance debt. Its private stall controller waits on immutable-
+memtable and L0-file thresholds and returns per-wait information, but the commit caller discards the
+result; there is no public cumulative union duration or episode stream. Cache counters are test-only,
+and configured cache/memtable capacities omit allocator, key, ownership, and pinned-block overhead.
+Memtables eagerly allocate their configured arenas and the count-based stall threshold is not a
+global byte reservation.
+
+Unmodified 0.21.2 therefore fails candidate-specific DKS-Q2-006 in addition to its correctness
+rejection. A qualifying fork needs a versioned cheap observation snapshot, complete debt formula,
+active/cumulative stall episodes by reason, background errors/jobs and I/O, cache/pinned accounting,
+and an applied configuration record. External cgroup/XFS/device/process metrics and adapter-owned
+snapshot/iterator counters remain authoritative.
+
 ### redb mapping gap
 
 redb has no background LSM compaction, so LSM debt cannot simply be demanded from it or silently
-encoded as an unsupported zero. DKS-Q2-006 needs an explicit non-LSM rule: identify which debt gate
-is not applicable, preserve authoritative external cgroup/device/quota observations, time the
-adapter-owned queue and service interval, and prohibit full-tree statistics during measurement.
-Version 4.1.0 does not expose internal read/write bytes or pinned-snapshot bytes, but the frozen
-contract has not established that candidate-internal versions of those observations are mandatory.
-The mapping is therefore **BLOCK**, not a demonstrated telemetry or latency failure.
+encoded as an unsupported zero. The amended runner contract now separates mandatory common
+resource-v2 observations from candidate-specific `observed | not_applicable` background-maintenance
+and engine-pressure arms. That corrects the former LSM-shaped contract; it does not approve redb's
+mapping. redb still needs exact source/configuration proof plus a bounded probe for both proposed N/A
+arms, authoritative external cgroup/device/quota observations, adapter-owned queue and service
+timing, and a prohibition on full-tree statistics during measurement.
+
+Version 4.1.0 does not expose internal read/write bytes or pinned-snapshot bytes, but the contract
+does not make candidate-internal versions of those observations common mandatory fields. The
+candidate remains **DEFER** pending the mechanism-map schema, reviewed redb mapping, and
+writer/commit/recovery microprobe; no telemetry or latency failure has been measured.
 
 ## Configuration, restore, and decision gates
 
@@ -260,9 +349,12 @@ The static disposition is:
 - DKS-Q2-006: **FAIL for unmodified Fjall; BLOCK for the current RocksDB binding**;
 - DKS-Q2-007: **BLOCK for both** until exact candidate locks/builds/options, approval/completion
   records, cache-loss truth-table evidence, and N/N-1 recovery exist;
-- redb 4.1.0: **DEFER before DKS-Q2-006/007 implementation**; first approve a non-LSM telemetry,
-  cache, and persistence mapping and a bounded non-gating writer/commit/recovery microprobe. Do not
-  add it to the profile or dependency graph yet;
+- redb 4.1.0: **DEFER before candidate-specific DKS-Q2-006/007 implementation**; first approve its
+  typed mechanism, cache, and persistence mapping and a bounded non-gating writer/commit/recovery
+  microprobe. Do not add it to the profile or dependency graph yet;
+- SurrealKV 0.21.2: **REJECT unmodified before C1/C2**; a pinned fork/upstream must first repair and
+  prescreen snapshot retention, background drain, oversized-batch ordering, close/recovery, and then
+  DKS-Q2-006 observability. Do not add it to the profile or dependency graph;
 - candidate execution: still blocked on the complete workload/runner approval set;
 - backend selection: still additionally blocked on C3 shared-database concurrency; and
 - production: still blocked on the vnode lifecycle, checkpoint/source/sink delivery protocol,
