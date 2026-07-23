@@ -660,8 +660,9 @@ A balanced 512-entity cohort has 870,400 row bytes and 567,296 key bytes. Fire v
 old-present/successor-absent records per entity plus the frontier: 2,561 reads and 4,352,240 bytes of
 read capacity. Its mutation roster is window put, old-timer delete/new-timer put, old-output
 delete/new-output put, and one frontier put, for 3,746,032 logical mutation bytes. A narrower
-C1-style proxy gives a 6,637,428-byte headroom estimate, but cannot prove the unfrozen v2 framing or
-encoded-request cap. An all-wide five-operation roster plus frontier needs
+C1-style proxy estimates 6,637,428 encoded bytes, leaving 1,751,180 bytes below 8 MiB, but cannot
+prove the unfrozen v2 framing or encoded-request cap. An all-wide five-operation roster plus
+frontier needs
 `3*512*5,120 + 2*512*4,096 + 240 = 12,058,864` mutation bytes and is a mandatory negative; the
 balanced-cohort invariant is required.
 
