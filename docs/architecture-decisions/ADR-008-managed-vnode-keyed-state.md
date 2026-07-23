@@ -23,6 +23,8 @@ that the current RocksDB binding also lacks a complete stall signal. Both remain
 gate-bearing run. redb 4.1.0 was also screened and deferred before implementation: its sole
 database-wide blocking writer plus not-yet-approved durability, cache, and telemetry mappings need
 a cheaper writer/commit/recovery microprobe and contract decision before expanding the bake-off.
+The proposed [bounded redb prescreen](../testing/state-backend-redb-prescreen-v1.md) is explicitly
+non-gating and can only fund later candidate-mapping review; it cannot admit redb by itself.
 SurrealKV 0.21.2 is rejected unmodified because its exact source breaks snapshot-registration
 bookkeeping used by compaction and also has unresolved drain/telemetry risks; any reconsideration
 requires a correctness fork and bounded prescreen before candidate admission. These are risk-based

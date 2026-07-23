@@ -36,24 +36,27 @@ The dependency direction is fixed:
 
 ```text
 typed generation inputs --canonical encoding--> case_stream_id
-case_stream_id + selected seed -------------> stream_instance_id
-stream instance replay ----------------------> expectations artifact
-expectations + preflight procedure ----------> preflight provenance artifact
-independent literal producer ----------------> literal corpus
-literal corpus + exact generator build ------> actual-build conformance result
-independent MPFR/interval implementation ----> numerical-audit result
-independent analysis ------------------------> retry-bound report
-case entries + expectations + preflight + four Zipf objects + schedule/gates -> runner plan
-runner plan + source/builds/environment ------> detached approval
-approved attempt -----------------------------> workload/attempt results
-attempt results and raw objects --------------> evidence manifest
-closed manifest ------------------------------> detached completion record
+case_stream_id + selected seed ----------------> stream_instance_id
+bounded static/finite-cycle analysis ----------> expectation contract
+expectation contract + preflight procedure ----> preflight provenance artifact
+independent literal producer ------------------> literal corpus
+literal corpus + exact generator build --------> actual-build conformance result
+independent MPFR/interval implementation ------> numerical-audit result
+independent analysis --------------------------> retry-bound report
+case + expectation/preflight + Zipf objects + schedule/gates -> runner plan
+runner plan + source/builds/environment --------> detached approval
+one generated request -> reference interpreter + adapter -> runtime commitments
+expected iterator + candidate export ----------> setup/final streaming merge
+attempt results and raw objects ----------------> evidence manifest
+closed manifest --------------------------------> detached completion record
 ```
 
 No arrow points back upward. In particular, generated counters, state digests, observed shares,
 candidate identities, plan hashes, approvals, and evidence cannot contribute to either stream ID.
 
-V2 reserves these printable identities:
+V2 reserves the following printable identities and exact hash domains. Rows labelled “encoding
+identity” are printable registry values, not an assertion that the string itself prefixes its future
+wire payload. Rows labelled “domain” include the shown terminating NUL byte:
 
 | Item | Identity |
 |---|---|
@@ -63,14 +66,17 @@ V2 reserves these printable identities:
 | canonical case body | `state-backend-case-body/v2` |
 | case stream ID | `state-backend-case-stream-id/v2` |
 | seeded stream instance | `state-backend-stream-instance/v2` |
-| request encoding | `LDB-SBQ-REQUEST-V2` |
-| observation encoding | `LDB-SBQ-OBSERVATION-V2` |
-| entity encoding | `LDB-SBQ-ENTITY-V2` |
-| logical state encoding/digest | `LDB-SBQ-STATE-V2` |
-| request stream digest | `LDB-SBQ-REQUEST-STREAM-V2` |
-| observation stream digest | `LDB-SBQ-OBSERVATION-STREAM-V2` |
-| request/observation trace digest | `LDB-SBQ-TRACE-V2` |
-| precomputed expectations | `state-backend-workload-expectations/v2` |
+| request encoding identity | `LDB-SBQ-REQUEST-V2` |
+| observation encoding identity | `LDB-SBQ-OBSERVATION-V2` |
+| entity encoding identity | `LDB-SBQ-ENTITY-V2` |
+| request-leaf domain | `LDB-SBQ-REQUEST-LEAF-V2\0` |
+| observation-leaf domain | `LDB-SBQ-OBSERVATION-LEAF-V2\0` |
+| request sequence/root domains | `LDB-SBQ-REQUEST-SEQUENCE-V2\0` / `LDB-SBQ-REQUEST-STREAM-V2\0` |
+| observation sequence/root domains | `LDB-SBQ-OBSERVATION-SEQUENCE-V2\0` / `LDB-SBQ-OBSERVATION-STREAM-V2\0` |
+| logical-state-leaf domain | `LDB-SBQ-STATE-LEAF-V2\0` |
+| logical-state sequence/root domains | `LDB-SBQ-STATE-SEQUENCE-V2\0` / `LDB-SBQ-STATE-STREAM-V2\0` |
+| post-warmup state-recipe domain | `LDB-SBQ-STATE-RECIPE-V2\0` |
+| expectation contract | `state-backend-workload-expectations/v2` |
 | preflight provenance | `state-backend-workload-preflight/v2` |
 | observed workload result | `state-backend-workload-result/v2` |
 | evidence-manifest binding | `state-backend-workload-evidence/v2` |
@@ -110,6 +116,7 @@ setup_policy_union
 id(churn_policy)
 retention_policy_union
 persistence_policy_union
+lifecycle_verification_union
 warmup_phase
 measured_phase
 live_state_bytes_band
@@ -139,12 +146,17 @@ The tags and payloads are:
 - setup: `id(policy) || materialization_u8 || materialized_rank_count_u64`, where materialization
   is `0x01 full` or `0x02 sparse`;
 - retention: `0x01 none`, or `0x02 request_horizon || horizon_u64`;
-- persistence: `0x01 no_explicit_persist`, or
+- persistence during warmup/measurement: `0x01 no_explicit_persist`, or
   `0x02 periodic || every_requests_u64 || at_phase_end_bool`;
+- lifecycle verification: the provisional sole arm is
+  `0x01 || id("setup-persist-close-reopen-verify-final-v1")`; it remains unregistered until owner
+  review;
 - each phase: its fixed tag, `request_count_u64`, and reduced requests-per-second rate; warmup is
   `0x01` and measurement is `0x02`; and
-- generator limits: request bytes, read rows, read bytes, mutation bytes, encoded observation
-  bytes, preflight rows, and preflight artifact bytes as seven `u64` values in that order.
+- generator/verifier limits: request bytes, read rows, read bytes, mutation bytes, encoded
+  observation bytes, static-proof entity visits, static-proof artifact bytes, state-verifier rows,
+  state-verifier logical bytes, and state-verifier canonical encoded bytes as ten `u64` values in
+  that order.
 
 `N` is a count: valid ranks are exactly `0..N-1`, so `N >= 1`. Full materialization requires
 `materialized_rank_count = N`; sparse materialization requires
@@ -155,15 +167,22 @@ Warmup/measurement requests are full batches, so each phase's raw logical rows a
 checked `request_count * batch_rows` and are not redundantly encoded. A rate is requests per second.
 Periodic persistence runs after every `every_requests` successful requests independently within
 warmup and measurement, whose cadence counters each reset to zero; `at_phase_end` adds one call
-after each nonempty phase and does not apply to setup. All selected widths and batch limits must
-also satisfy the approved profile and exact per-ordinal post-deduplication preflight.
+after each nonempty phase and does not apply to setup. The warmup call follows its last terminal.
+The measured call occurs only after drain, immediately after the logical event at
+`write_stop_offset_ns`; it is the lifecycle arm's mandatory final persist, not an additional
+consecutive call. When `at_phase_end` is false or the
+interval policy is `no_explicit_persist`, the lifecycle arm still performs exactly one final persist
+at that point. All selected widths and batch limits must
+also satisfy the approved profile, checked analytical maxima, bounded finite-cycle analysis, and
+exact validation of each emitted post-deduplication request before the adapter sees it.
 
-The seven generator maxima apply, in order, to one canonical request's encoded bytes, one returned
+The ten generator/verifier maxima apply, in order, to one canonical request's encoded bytes, one returned
 observation's logical rows, one returned observation's logical key/value bytes, one request's
-logical mutation key/value bytes, one encoded observation's bytes, all finite-preflight raw logical
-input rows, and the externally serialized expectations artifact's bytes. Each is an inclusive
-`u64` ceiling checked before allocation or iteration; the final value is a predeclared cap, never a
-derived self-length field.
+logical mutation key/value bytes, one encoded observation's bytes, bounded static-proof entity
+visits, the externally serialized expectation contract's bytes, and one setup/final verifier's
+logical rows, logical key/value bytes, and canonical encoded record bytes. Each is an inclusive
+`u64` ceiling checked before allocation or iteration; the artifact value is a predeclared cap, never
+a derived self-length field.
 
 For the current Zipf candidate, `math_source` identifies the immutable upstream
 `libm 0.2.16` crate package, and `math_source_sha256` is SHA-256 over the exact raw `.crate` package
@@ -193,10 +212,11 @@ low/target/high bands are generator state-control inputs; they are not candidate
 Slugs remain unique lowercase ASCII labels in the runner plan, and the plan rejects either one slug
 mapped to multiple bodies or duplicate canonical bodies hidden behind multiple slugs.
 
-Expected setup/post-warmup/final digests, exact post-deduplication counters, hottest-key/vnode
-shares, timer backlog, join return counts, and realized bands are generated values. Putting them in
-the body would make the stream depend on its own result. They instead live in the expectations
-artifact described below.
+Analytical setup/final facts and bounds live in the expectation contract. Exact expanded request,
+observation, and setup/final state roots; content-dependent post-deduplication counters; realized
+hottest-key/vnode shares; timer backlog; and join return counts are runtime values. Putting either
+kind in the body would make the stream depend on its own result. The expectation contract declares
+which fields are `analytical` and which are `runtime_exact`; it never fabricates a runtime value.
 
 ## Case and seeded-stream derivation
 
@@ -273,11 +293,14 @@ SHA-256(
 Setup, warmup, and measured tags are `0x00`, `0x01`, and `0x02`. Scenario tags remain aggregate
 `0x01`, timer/window `0x02`, and join `0x03`. Row ordinal addresses the raw logical input row before
 deduplication. Request-level choices reserve row `0xffffffff`. A failure to obtain a valid Zipf
-sample in 64 attempts is a preflight failure for a finite stream and INVALID if encountered in an
-executing attempt; it never consumes another row's coordinates.
+sample in 64 attempts invalidates any bounded finite-cycle analysis that evaluates that coordinate
+and makes an executing attempt INVALID. Static preflight does not expand the complete stream to
+search for it. There is no reseed, fallback, or consumption of another row's coordinates; accepting
+the analytical retry bound plus runtime fail-closed handling remains a named-owner decision under
+DKS-Q2-001.
 
-C2 entity suffixes, requests, observations, logical-state records/digests, request and observation
-streams, and combined traces use their explicit v2 domains and bind the stream instance plus phase
+C2 entity suffixes, requests, observations, logical-state records/digests, and request and
+observation streams use their explicit v2 domains and bind the stream instance plus phase
 where applicable. Reusing a C1 item layout as an inner logical-operation payload is permitted only
 if the v2 envelope explicitly length-prefixes it; phase-aware bytes are never labelled with a v1
 identity alone. The closed scenario registry must freeze exact v2 item field order before an encoder
@@ -286,39 +309,147 @@ or sample ordinal.
 
 ## Expectations, plan, result, and evidence boundary
 
-One candidate-neutral expectations artifact is created per seeded stream instance before a runner
+One candidate-neutral expectation contract is created per seeded stream instance before a runner
 plan can be approved. It has identity `state-backend-workload-expectations/v2`, the notice
-`NOT QUALIFICATION EVIDENCE`, and contains:
+`NOT QUALIFICATION EVIDENCE`, and contains the exact case body, recomputed case/instance IDs, selected
+seed, all producer/verifier/math/policy identities, static limits, and one closed mode for every
+expected field:
 
-- the exact case body bytes and recomputed case/instance IDs plus selected seed;
-- generator, counter, request/observation/entity/state/stream/trace, lifecycle-policy, sampler, and
-  math-source identities;
-- phase request/raw-row counts and request/observation/state stream digests;
-- setup, post-warmup, and final logical-state digests;
-- exact post-dedup read/range/mutation/returned-row and byte counters per phase;
-- realized low/target/high checks, distinct touched/live ranks, timer backlog/due rows, join-side
-  cardinalities, exact join return/fanout counts, and expected hottest-key/vnode shares; and
-- bounded-preflight input rows and deterministic canonical request/observation/state payload-byte
-  counters. The expectations artifact's own serialized length is excluded.
+- `analytical` carries the exact value plus the approved proof identity and witness digest; or
+- `runtime_exact` carries the exact producer, canonical encoding, comparison role, and bound, but no
+  value or digest that is unknowable before execution.
 
-The artifact has no candidate, plan, approval, machine-result, or status field. The implementation
-under test cannot serve as its independent numerical oracle. Once its bounded algorithm and quotas
-are approved, preflight runs once into a content-addressed expectations artifact reused for both
-candidates; it is not regenerated inside measured service time.
+Phase request/raw-row counts, structural bands, finite-cycle facts, and formula-derived bounds may be
+`analytical`. Expanded request/observation roots, content-dependent deduplication/share counters, and
+setup/final expected state roots are `runtime_exact`. The contract has no candidate, plan, approval,
+machine-result, or status field. The implementation under test cannot serve as its semantic oracle.
 
-A separate `state-backend-workload-preflight/v2` provenance artifact binds the expectations length
-and digest, preflight source archive/binary/lock/toolchain identities, start/end UTC timestamps,
-elapsed wall and CPU time, peak memory, host identity, exit/failure classification, and stdout/stderr
-object descriptors. Operational measurements are kept out of deterministic expectations so two
-correct reference replays can produce identical expectation bytes. The runner plan and detached
-approval bind the accepted expectations and preflight-provenance digests together.
+A separate `state-backend-workload-preflight/v2` provenance artifact binds the expectation-contract
+length/digest, static-proof source archive/binary/lock/toolchain identities, start/end UTC timestamps,
+elapsed wall and CPU time, peak memory, host identity, exit/failure classification, and bounded
+stdout/stderr descriptors. It proves structure and checked maxima; it does not replay all 6.39
+billion logical input rows. The runner plan and detached approval bind the accepted expectation and
+preflight-provenance digests plus the exact runtime generator/reference builds.
+
+During an approved attempt, the deterministic generator writes each immutable canonical request
+frame exactly once into a bounded preallocated ring. The candidate-independent reference
+interpreter and adapter consume that same sealed frame; neither calls or re-runs the generator. The
+driver and reference path independently hash the frame before decode/dispatch. The reference path
+computes expected observations and state transitions without calling the adapter or reading
+candidate state. Candidate latency, results, errors, and storage state never influence later request
+bytes. A bounded lead is allowed so reference work does not enter candidate service latency; lead,
+lag, preparation CPU, affinity, ring occupancy, and interference remain gate-bearing runner
+evidence. Generation/validation failure, reference-lead/comparison-lag overflow, or cross-candidate expected-root
+disagreement makes the attempt or pair INVALID, never candidate FAIL.
+
+Each result records driver/reference request roots, reference expected-observation roots, adapter
+actual-observation roots, and independently derived expected versus candidate setup/final state
+roots in distinct fields. Expected and actual payloads are compared in ordinal order before their
+equal root values can be asserted. The result also carries separately derived counters and bounded
+mismatch witnesses. The plan binds the producer algorithms and builds, not these future values.
+
+### One-pass commitment framing
+
+All displayed integer fields below—including lengths, ordinals, counts, and applied-request
+counts—are unsigned big-endian integers. Phase tags are setup `0x00`, warmup
+`0x01`, and measurement `0x02`; state cut tags are setup `0x00` and final `0x02`. For request,
+observation, or state payload type `X`, its leaf is:
+
+```text
+SHA-256(
+  X_leaf_domain_with_NUL ||
+  stream_instance_id[32] ||
+  phase_or_cut_tag_u8 ||
+  ordinal_u64 ||
+  canonical_payload_length_u64 ||
+  canonical_payload
+)
+```
+
+Its single-pass sequence digest and root are:
+
+```text
+sequence_digest = SHA-256(
+  X_sequence_domain_with_NUL ||
+  repeated(ordinal_u64 || canonical_payload_length_u64 || item_leaf[32])
+)
+
+stream_root = SHA-256(
+  X_stream_domain_with_NUL ||
+  stream_instance_id[32] ||
+  phase_or_cut_tag_u8 ||
+  actual_item_count_u64 ||
+  sequence_digest[32]
+)
+```
+
+Request and observation ordinals are `phase_request_ordinal`. State record ordinals are zero-based,
+contiguous positions in the canonical state order and reset independently for each producer and cut.
+A state root inserts
+`applied_runtime_request_count_u64` after the cut tag so setup and final cannot alias at an ambiguous
+ordinal. The domains are the exact terminating-NUL domains reserved above. Expected and actual
+observation fields use the same observation algorithm so equal canonical streams have equal roots;
+their artifact roles remain distinct. Expected and actual state fields follow the same rule.
+
+A complete root exists only for a complete successful stream. Each driver, reference, expected, or
+actual producer has its own failure role. Its failure record contains that producer's completed
+prefix count, prefix sequence digest, closed error tag, first failing ordinal, and a bounded witness;
+it never populates the full-root field or borrows a run-ahead peer's prefix. The strict result-schema union, canonical request and
+observation payload field order, and literal binaries remain blockers, so this framing does not yet
+authorize an encoder.
+
+### Canonical operations and state equality
+
+Scenario-specific folding consumes every raw source row before generic canonicalization. In an
+aggregate group, multiplicity contributes to the replacement value; the least source ordinal only
+selects representative provenance. Generic canonicalization is separate per collection: point reads
+sort by logical key, ranges by their complete `(start,end,row_cap,byte_cap)` tuple, and mutations by
+logical key and mutation kind. Each range endpoint is a complete logical key including role/table,
+vnode, and opaque key bytes. Byte-identical entries collapse to the least provenance ordinal. Two
+puts of different values, or a put and delete, for one key are INVALID. Timer and J2 lifecycle
+rosters are stricter: a duplicate entity/key is INVALID rather than deduplicated.
+
+Ranges are half-open `[start,end)` in logical key order and carry inclusive row and logical
+key/value-byte caps. A first row that alone exceeds the byte cap returns the closed oversized-first-
+row error and no rows. Otherwise the adapter may inspect exactly one unreturned row beyond the caps
+to set `has_more`; that I/O and service time remain charged. Endpoints, both caps, returned rows, and
+`has_more` are canonical payload fields. Exact duplicate ranges include their caps and collapse;
+ranges with different caps coexist. Lifecycle requests carry request-bound expected precondition
+values derived by the generator and independently checked by the reference interpreter. The adapter
+reads the pre-mutation cut and must abort before its one atomic mutation batch if storage does not
+match those request preconditions. A later supervisor comparison mismatch cannot undo a returned
+call; it fails the attempt and final-state verification remains mandatory.
+
+A canonical logical-state record is exactly:
+
+```text
+role_u8 || vnode_u32 || key_length_u32 || key || value_length_u32 || value
+```
+
+It is ordered strictly by `(role, vnode, unsigned opaque key)`. The role registry is closed before
+encoding. The independent expected iterator cannot inspect candidate export; the adapter exports
+logical, not physical engine records. Setup and final verification stream both iterators through an
+exact merge and reject unordered, duplicate, missing, extra, or unequal records while producing
+separate expected/actual roots. No side is spooled. Post-warmup has only a separately identified
+recipe/provenance root and literal `candidate_equality_claimed=false`; it is never compared with a
+candidate state root.
+
+The provisional lifecycle arm means: write setup, explicitly persist, cleanly close, reopen in a
+fresh child, exact-merge the setup cut, run warmup and measurement, drain, perform the mandatory
+final persist immediately after the `write_stop_offset_ns` event, then keep that measurement child
+and its cgroup alive through the resource-tail stable/deadline cut. Only after that cut does it
+cleanly close; a fresh
+verification child reopens and exact-merges the final cut, then cleans up. Post-tail close/reopen/
+merge work is separately retained lifecycle evidence, not part of resource-tail/write-amplification
+gates. This clean reopen is not cache loss, process crash, checkpoint restore, source-offset
+recovery, sink commit, or exactly once; those remain DKS-Q2-007/product gates.
 
 Four Zipf objects remain separate: a literal corpus produced without calling the implementation
 under test; actual-build conformance results from running that corpus against each exact generator
 binary/target/build; a finite-precision MPFR/interval audit independently implemented without
 calling the generator; and an analytical retry-bound report. Their exact lengths/digests,
 source/binary/toolchain/precision/rounding identities, declared target/build coverage, and reviewer
-provenance are plan and approval inputs. None enters generated case-body or expectations bytes.
+provenance are plan and approval inputs. None enters generated case-body or expectation bytes.
 
 All generator, preflight, and independent-audit source archives and binaries are finalized before
 their generated artifacts. Their explicit inclusion manifests exclude case wrappers, expectations,
@@ -326,18 +457,18 @@ preflight provenance, literal/conformance/numerical/retry results, runner plans,
 results, evidence manifests, and completion records. Generated objects are never copied back into a
 source archive whose digest they bind.
 
-The complete runner plan binds exact case wrapper bytes, every required case/seed expectations and
+The complete runner plan binds exact case wrapper bytes, every required case/seed expectation and
 preflight-provenance length/digest, schedule, candidates, gates, result-ring sizes, machine policy,
 and artifact limits. The detached approval binds that complete plan plus exact
 source/build/environment inputs.
 An observed `state-backend-workload-result/v2` then binds the approved plan, detached approval,
-slot/candidate, and matching expectations digest while recording actual counters/digests and
-artifact descriptors.
+slot/candidate, and matching expectation digest while recording reference-expected and
+candidate-actual counters/digests plus artifact descriptors.
 The evidence manifest references results; it does not repeat or mutate case semantics.
 
 Within the evidence manifest, a closed `state-backend-workload-evidence/v2` binding contains only
 the slot index, case and stream-instance IDs, selected seed, and length/SHA-256 descriptors for the
-approved expectations, preflight provenance, observed workload result, and required raw phase
+approved expectation, preflight provenance, observed workload result, and required raw phase
 objects. It contains no copied thresholds or case parameters. The manifest validator requires those
 references to equal the plan/approval/result identities and rejects unknown roles.
 
@@ -448,7 +579,53 @@ design with memory/scratch/time/artifact ceilings, isolated storage, cleanup rul
 fail-closed deadline before its feasibility can be approved. External run/sort/merge is one option,
 not a decision. Fjall and RocksDB cannot serve as the independent oracle.
 
-Raw input rows are not backend operations. Each expectations artifact separately binds requests/s,
+### M2 bounded preflight and runtime-oracle decision
+
+M2 rejects that expanded replay. Static preflight performs only schema/structural validation,
+checked analytical maxima, and enumeration of a mathematically proven finite cycle. It does not
+generate every Zipf request, observation, or post-warmup state. Across the complete proposed matrix,
+the static proof is limited to 8,388,608 entity visits, 256 MiB heap, zero disk scratch, 8 MiB per
+expectation artifact, 16 MiB of total static artifacts/logs, 600 seconds wall clock, and 60 seconds
+cleanup. Overflow, deadline, proof-closure, retry-bound, publication, or cleanup failure is
+fail-closed; a partially published object is not plan input.
+
+The setup/final verifier is a different runtime population. Each exact expected/candidate merge is
+limited to 67,108,864 logical records, 103,079,215,104 logical key/value bytes (96 GiB), and
+103,951,630,336 canonical record bytes (logical bytes plus the maximum 13-byte framing per record).
+It gets 256 MiB heap, zero disk scratch, a 4-MiB mismatch-witness ring, 64 KiB diagnostics, one
+combined 1,800-second deadline for both iterators and the merge at each cut, and 60 seconds cleanup.
+The full state is never retained as a digest input file. A case whose exact formula or codec cannot
+prove these bounds is not encodable.
+
+The aggregate cold slots admit a closed form. For cold slot `j`, request `t` selects `j=t mod M`,
+deletes its current generation, and inserts its successor, so after `T` requests its generation is
+`0` when `T<=j`, otherwise `1+floor((T-1-j)/M)`. This bounds exact setup/final iteration without
+expanded request replay. It does not decide stable hot-rank values or prove aggregate multiplicity;
+those policies remain open.
+
+The timer proof may enumerate only its `256K` deadline ring and affine generation deltas, jumping
+complete cycles and replaying a bounded remainder. It must prove that the exact, still-unfrozen
+reschedule permutation returns the roster shape to closure; the 8,388,608-visit ceiling applies.
+J2 may use its 200-row classifier period and 3,200-row/25-request batching superperiod only when a
+phase starts at `t mod 3200 = 0`; the exact
+128-row return vector is
+`[316,252,253,309,252,260,245,309,260,252,246,316,252,254,309,253,261,246,309,261,253,246,324,260,254]`.
+It sums to 6,752, has mean 270.08, and range 245--324. A differently aligned phase needs a frozen
+rotation rule and new literal proof.
+
+At runtime, every emitted request is validated against its exact post-fold/post-dedup row, byte,
+framing, fanout, and batch ceilings before the adapter sees it. A generator/reference failure makes
+the attempt INVALID. Candidate observation overflow is candidate FAIL only when the approved
+analytical proof and the runtime expected observation both establish that the correct response fits;
+otherwise it is runner INVALID. Zipf uses the approved analytical retry bound plus runtime
+fail-closed/no-reseed semantics unless owners choose a total sampler under a new identity.
+
+This closes only the infeasible-replay design choice. Exact payload codecs, field-mode schema,
+aggregate hot-value policy, timer recurrence proof, J2 routing and signed bounds, runtime ring/lead/
+lag limits, binary goldens, and named approvals remain blockers. No workload plan or backend run is
+authorized.
+
+Raw input rows are not backend operations. Each expectation contract/result pair separately binds requests/s,
 raw rows/s, post-dedup point/range/mutation operations/s, logical mutation bytes/s, and returned
 rows/bytes/s. A hot-mix case cannot claim LSM throughput from its raw row count.
 
@@ -524,16 +701,15 @@ samples. Any untested maximum is lowered in the certified profile instead of inf
 negative or smaller case. Direct-I/O preflight order and cooldown are also frozen so it cannot
 thermally or physically condition one candidate's subsequent slots.
 
-The setup candidate digest is verified and charged to setup before warmup. Final persistence and
-digest verification run after measured drain and are charged to the frozen resource tail. A
-post-warmup expectation in a performance attempt is reference-oracle provenance only: a full
-candidate scan/export at that boundary would perturb cache, I/O, snapshot, and compaction state. A
-separately classified conformance replay may cover the deterministic boundary but cannot prove
-equality for the actual performance attempt or donate performance samples. M1 therefore cannot
-claim full candidate-state equality at the warmup boundary. M2 must either bind a
-candidate-observed boundary witness whose retention and measurement interference are qualified, or
-explicitly narrow approval to setup/final full-state equality plus in-service read/observation
-validation.
+The setup expected/candidate roots are produced by the exact merge and charged to setup before
+warmup. Final persistence runs at resource-tail start and remains charged to that tail; close/reopen
+and final merge run only after its stable/deadline cut and are charged to separate lifecycle
+verification evidence. At post-warmup, only the reference recipe/provenance root is retained: a full
+candidate scan/export would perturb cache, I/O, snapshot, and maintenance state. A separately
+classified conformance replay may cover that deterministic boundary but cannot prove equality for
+the actual performance attempt or donate samples. M2 explicitly narrows its claim to setup/final
+full-state equality plus ordinal in-service read/observation validation and records
+`candidate_equality_claimed=false` for post-warmup.
 
 ## Why M1 is rejected and what M2 must close
 
@@ -715,11 +891,12 @@ join semantic.
 
 The complete matrix remains **BLOCK**. It still needs registered scenario/role/width/churn/retention
 identities and exact binary encodings; complete timer/join logical-to-physical codecs; literal
-goldens; exact dedup/conflict/range-lookahead rules; a bounded candidate-independent oracle and
-finite preflight that does not replay 6.39 billion rows without a resource/deadline proof; an
-encodable setup/reopen/final-persist procedure; setup/final equality plus non-interfering in-service
-observations; cold-I/O evidence; rates, counts, schedule, service/runner/interference/resource
-gates; campaign time/endurance budget; and named workload/operations approvals.
+goldens implementing the canonical dedup/range rules; aggregate hot-value semantics; the exact timer
+recurrence/closure proof; J2 routing/signed bounds/alignment; the runtime expectation/result union
+and ring/lead/lag caps; an encodable lifecycle arm; cold-I/O evidence; rates, counts, schedule,
+service/runner/interference/resource gates; campaign time/endurance budget; and named workload/
+operations approvals. The bounded static-proof/runtime-commitment direction is accepted only as an
+M2 design component, not as a closed oracle or executable schema.
 
 `no_explicit_persist` may describe only the same-open warmup/measurement interval. It does not by
 itself encode setup durability, close/reopen verification, final persistence, cache-loss behavior,

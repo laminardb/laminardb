@@ -351,6 +351,14 @@ physical layout, attempt classification, fault identity, provenance, and immutab
 candidate observations exist. The CLI exposes validation only and has no candidate-execution
 command.
 
+redb 4.1.0 remains outside C2. The independent optional prescreen branch may design its isolated
+[bounded redb prescreen](../testing/state-backend-redb-prescreen-v1.md), but no run is authorized
+until its exact schemas/harness and separate detached pre-run approval are implemented and signed by
+the workload and operations owners. Its Docker Desktop/WSL subset is smoke-only; a target-host
+`PRESCREEN_PASS` merely funds mechanism/persistence mapping, an additive profile/schema proposal,
+and adapter review. `PRESCREEN_NO_GO`, `DEFER`, and `REJECT_EXACT_PIN` add no candidate. No prescreen
+artifact may satisfy or be pooled into C1/C2/C3.
+
 Add exact, optional candidate pins in separate commits: Fjall `=3.1.8` and RocksDB Rust wrapper
 `=0.24.0` with its bundled RocksDB 10.4.2 engine. Build exactly one candidate per binary. The
 private qualification contract covers
@@ -369,8 +377,11 @@ Only after named owners approve the exact profile and complete runner-plan hashe
 fixed-operation workloads in the frozen candidate order and record offered end-to-end, service,
 and queue latency separately. Retain the exact raw samples required by runner v1 and derive
 p50/p90/p95/p99/p99.9/max, throughput, CPU, RSS/PSS,
-cache/memtable/journal/compaction pressure, physical writes, disk/FD use, snapshot/export overlap,
-restore/cleanup RTO, oracle digest, binary/lock/profile hashes, and target hardware identity.
+common external resource-v2 observations, conditionally applicable approved mechanism artifacts,
+physical writes, disk/FD use, snapshot/export overlap, restore/cleanup RTO, distinct reference-
+expected and candidate-actual roots/counters, binary/lock/profile hashes, and target hardware
+identity. Candidate-native cache/memtable/journal/compaction fields exist only when a reviewed
+mapping requires them; unsupported is never zero.
 
 Every quantile and maximum named under a profile latency gate is enforced; p90 is retained as an
 additional diagnostic. Candidate-local
@@ -437,9 +448,9 @@ The Cycle 5 readers remain unwired; `[LDB-4007]` remains unchanged.
 Remaining commits are kept reviewable in this dependency order:
 
 1. `tools: define candidate-neutral runner and evidence schema`
-   - pacing, histograms, invalid-run rules, resource formulas, and fault schedules/evidence policy
+   - pacing, raw samples/nearest-rank summaries, invalid-run rules, resource formulas, and fault schedules/evidence policy
      land without a runtime dependency;
-2. separate exact-pin Fjall and RocksDB adapter commits behind the private spike contract;
+2. add separate exact-pin Fjall and RocksDB adapter commits behind the private spike contract;
 3. `docs: approve keyed-state qualification profile and runner`
    - named workload/operations owners may revise the candidate before approving final thresholds,
      case matrix, Zipf sampler, runner source/build identity, and evidence rules. A separately
@@ -449,6 +460,10 @@ Remaining commits are kept reviewable in this dependency order:
 5. `docs: select managed-state backend from evidence`;
 6. `tools: remove rejected state backend spike`; and
 7. `docs: review distributed keyed state phase zero`.
+
+The optional redb prescreen is an independent side branch, not a prerequisite in this numbered
+Fjall/RocksDB sequence. Even `PRESCREEN_PASS` requires a later explicit scope decision and an
+additive profile/schema revision before any redb adapter commit.
 
 Phase 1 tracks the temporary reader-first dead-code allowances as **DKS-P1-001**. Owner:
 distributed-state lifecycle implementation. Deadline: 2026-08-31 or the first trusted,

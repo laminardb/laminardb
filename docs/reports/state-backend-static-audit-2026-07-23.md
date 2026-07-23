@@ -269,8 +269,9 @@ read/cache/filter observations rather than debt, flush/compaction writes, or sta
 is approximate and excludes allocation overhead and pinned index/filter memory. Background queues
 have fixed bounds and lossy notification paths, with no compaction I/O rate limiter.
 
-Unmodified Fjall 3.1.8 therefore cannot populate the runner's required `compaction_debt_bytes` and
-`write_stall_total_ns` honestly. A qualifying patch/upstream release needs stable applied-option,
+Unmodified Fjall 3.1.8 therefore cannot populate the v2 mapping's applicable
+`background_maintenance_debt` byte observations and `engine_pressure_stalls` interval observations
+honestly. A qualifying patch/upstream release needs stable applied-option,
 level/run bytes, active/sealed/queued memtable bytes, pending compaction input/output/debt, active
 and cumulative stalls by reason, compaction I/O, cache/pinned index/filter, journal, and retained
 version/snapshot observations. The production adapter must still supply its own pre-write
@@ -328,6 +329,12 @@ Version 4.1.0 does not expose internal read/write bytes or pinned-snapshot bytes
 does not make candidate-internal versions of those observations common mandatory fields. The
 candidate remains **DEFER** pending the mechanism-map schema, reviewed redb mapping, and
 writer/commit/recovery microprobe; no telemetry or latency failure has been measured.
+
+The proposed [bounded redb 4.1.0 prescreen](../testing/state-backend-redb-prescreen-v1.md) specifies
+that microprobe's non-gating decision boundary, exact pin, single-writer matrix, atomicity/recovery
+split, hard caps, and Docker/WSL smoke-only subset. It still requires strict schemas/harness, a
+detached pre-run approval by named owners, and review; it does not add redb to any manifest,
+lockfile, profile, adapter, or qualification population.
 
 ## Configuration, restore, and decision gates
 

@@ -7,6 +7,7 @@
   [state backend qualification model v1](state-backend-qualification-model-v1.md), and the
   [long-stream workload/identity v2](state-backend-workload-v2.md)
 - **Pinned-source findings:** [Fjall/RocksDB/redb static audit](../reports/state-backend-static-audit-2026-07-23.md)
+- **Non-gating alternative screen:** [redb 4.1.0 prescreen v1](../testing/state-backend-redb-prescreen-v1.md)
 
 ## Decision and safety boundary
 
@@ -23,6 +24,10 @@ its own qualification verdict. `[LDB-4007]` and `[LDB-0013]` remain unchanged.
 Before approval, permitted candidate-specific work is limited to exact builds and semantic adapter
 conformance against the C1 oracle. Performance, resource, physical-fault, endurance, and selection
 execution is prohibited. Calling an unapproved run “diagnostic” does not make it permissible.
+The only prospective exception is the separately identified redb prescreen, and it requires its own
+detached pre-run approval by the workload and operations owners. That approval cannot authorize C2
+or C3 or donate evidence to them. No prescreen schema, harness, approval record, or execution command
+exists today, so candidate execution remains prohibited.
 
 ## Stable identities and artifacts
 
@@ -58,14 +63,20 @@ The comparison profile follows the same additive rule. `distributed-state-qual/v
 `background_maintenance_debt_max_bytes`, `resource_tail_clear_max_seconds`,
 `engine_pressure_stall_time_max_permille`, and `unexplained_storage_pause_max_ms`. The first and
 third thresholds apply only to an `observed` candidate mechanism arm; the common tail and observed-
-outcome gates apply to every candidate. Neither profile is execution-eligible.
+outcome gates apply to every candidate. Resource-formulas v2 below currently defines only the
+engine-pressure and tail-clear fields. Maintenance debt has no approved byte-normalization/maximum
+rule, and unexplained storage pause has no objective event population or artifact. Their positive
+profile values are syntactically validated
+proposals that plan validation must not consume until DKS-Q2-006 freezes those definitions. Neither
+profile is execution-eligible.
 
 The plan binds the exact raw profile SHA-256, physical layout, and every policy identity above. C1
 adapter-conformance entries additionally bind their model-input SHA-256 plus v1 generator/model
 identities; those values are provenance and never a C2 generation input. Every C2 entry instead
 binds the exact workload-v2 case wrapper/body IDs and, for each selected seed, immutable
-expectations, preflight-provenance, and required independent-audit descriptors. It does not bind its
-containing source revision.
+expectation-contract, preflight-provenance, and required independent-audit descriptors. Runtime-exact
+roots are result fields; the plan binds their producer/verifier builds and limits, not future values.
+It does not bind its containing source revision.
 A separate, detached approval record avoids that identity cycle by binding exact profile bytes,
 plan bytes, runner source archive, lockfile, both candidate binaries/configurations, toolchain,
 target, build flags, and environment image/package manifest. The approval record is excluded from
@@ -95,17 +106,17 @@ The case matrix is an explicit list, never a Cartesian product of profile vector
   variable-width policy, batch rows, and join fanout where applicable;
 - exact setup/prefill, warmup, measured-stream, churn/retention, and persistence policy identities;
 - low/target/high logical live-state bytes and cardinality/timer-density state-control bands, plus
-  descriptors for separate per-seed expectations containing setup, post-warmup, and final state
-  digests and exact derived counters; the plan does not copy those derived values into mutable case
-  fields;
+  descriptors for separate per-seed expectation contracts whose fields are explicitly `analytical`
+  or `runtime_exact`; the latter have producer roles and bounds but no pre-execution value;
 - exact warmup and measured request counts plus rational offered requests-per-second for each phase;
 - the v1-required single foreground worker, maximum in-flight requests, queue byte/entry ceilings,
   drain deadline, and terminal timeout;
 - explicit end-to-end, service, queue, throughput, and resource gate mappings; and
-- expected request/row/mutation counters and applicable fault schedule IDs.
+- analytical or runtime-exact request/row/mutation counter roles and applicable fault schedule IDs.
 
 Each candidate starts from a fresh directory populated from the same candidate-neutral logical
-setup stream. Setup is verified through the model digest before warmup. Warmup is excluded from
+setup stream. Setup is verified by the workload-v2 independent-expected/candidate streaming merge
+after persist/close/reopen and before warmup. Warmup is excluded from
 measurement but remains in live state and the oracle. Manual compaction, candidate-specific
 quiescing, cache dropping, or reuse of the other candidate's mutated state is forbidden unless an
 identical named policy explicitly requires it for both candidates.
@@ -127,10 +138,14 @@ The profile's per-repetition minimum applies to every candidate/case/repetition,
 minimum applies independently to each candidate and case across all required repetitions. The plan
 freezes a balanced, seeded AB/BA order, predecessor-reset and cooldown schedule before results.
 
-Before a plan is accepted, a bounded static preflight checks every planned ordinal after actual
-deduplication. Canonical request bytes, point/range row and byte capacity, mutation charge, framing,
-join fanout, target batch, and hard batch limits must all fit. A scalar multiplication is useful for
-finding an impossible all-distinct shape but is not a substitute for that exact check.
+Before a plan is accepted, bounded static preflight checks structure, analytical maxima, and only
+those finite cycles whose closure is proved under workload-v2 limits. It never expands the complete
+Zipf stream. Every generated request is separately checked after scenario folding and canonical
+deduplication—request bytes, point/range row and byte capacity, mutation charge, framing, join
+fanout, target batch, and hard batch—before the adapter sees it. A scalar multiplication can reject
+an impossible all-distinct shape but cannot approve a request. Runtime generation/reference failure
+is runner INVALID; candidate overflow is FAIL only when both approved proof and runtime oracle show
+that the correct observation fits.
 
 ## Open-loop schedule and conservation
 
@@ -160,6 +175,13 @@ request charge. Request payload generation occurs after dispatch into pre-sized,
 scratch. Queue exhaustion, timeout, process exit, or work remaining at the drain deadline is a
 candidate failure, not an excuse to hide an arrival. A terminal candidate failure aborts the slot;
 future planned ordinals are counted as `not_attempted_after_abort`, not fabricated as completions.
+
+For C2, dispatch hands that ordinal to a candidate-independent preparation stage, which generates,
+validates, and seals one request frame before reference/adapter fan-out. The exact preparation-worker
+count, request-slot ownership transitions, readiness rule between the two consumers, and mapping to
+queue/preparation timestamps remain DKS-Q2-005 blockers; no executable plan may infer them from this
+prose. Request generation failure or request-ring exhaustion is runner INVALID, while exhaustion of
+the already frozen offered-work queue due to candidate backpressure remains candidate FAIL.
 The conservation identity is:
 
 ```text
@@ -247,13 +269,14 @@ other values are rejected. Outcome tags are exactly:
 
 The exact encoded length is `35 + 58 * record_count`, checked before allocation. Ordinals are
 contiguous from zero. Returned calls populate service and end-to-end order statistics; accepted and
-dispatched calls populate their corresponding queue statistics. Candidate timeouts, crashes, and an
-oversized returned observation are retained as right-censored lower bounds unless return was
-already published, and independently fail the attempt; they are not invented candidate returns.
+dispatched calls populate their corresponding queue statistics. Candidate timeouts and crashes are
+retained as right-censored lower bounds unless return was already published, and independently fail
+the attempt. An oversized adapter observation follows the candidate-versus-runner classification
+below. None is invented as a candidate return.
 Preparation timeout and runner error are runner INVALID outcomes; external interruption is INVALID.
 No latency gate is pass-eligible unless every planned request returned and matched the oracle.
 
-Terminal precedence is deterministic. Once a complete return is published, the oracle worker
+Terminal precedence is deterministic. Once a complete return is published, the comparison worker
 commits `ok`, `candidate_error`, or `oracle_mismatch`; a later child exit is a separate
 attempt-level crash marker and still makes the attempt FAIL without replacing that request record.
 Only a runner error or external interruption that prevents the required comparison may terminate a
@@ -266,29 +289,42 @@ records are immutable after commit.
 Each attempt runs the adapter in a killable child process under an external supervisor. Fjall and
 RocksDB calls are not assumed cancellable: service timeout stops scheduling, the supervisor kills
 the child, records the terminal marker, and starts no later operation against that store. The
-supervisor owns a preallocated shared-memory sample region and a bounded result ring. The plan
-freezes result-slot count, maximum encoded observation bytes per slot, total result-region bytes,
-one sequential oracle worker's control-core affinity, and maximum oracle lag in requests and ns.
-Preflight checks the exact aligned header/slot reservation with checked arithmetic against the byte
-ceiling and requires enough slots for the approved in-flight/lag bounds; there is no per-request
-result allocation.
+supervisor owns a preallocated shared-memory sample region plus bounded request/reference and result
+rings. C1 retains its sequential post-return model comparison. C2 uses the explicit workload-v2 arm:
+the generator creates and seals one canonical immutable request; the independent reference
+interpreter and adapter consume that same frame, and the reference emits the expected observation
+without reading candidate state or calling the generator. Candidate results cannot affect later
+generated bytes.
+
+The plan freezes request/result slot counts, maximum request and encoded-observation bytes per slot,
+total region bytes, generator/reference/comparison control-core affinity, maximum reference lead and
+comparison lag in both requests and nanoseconds, preparation timeout, and ring occupancy gates.
+Static preflight checks exact aligned reservations with checked arithmetic against the byte ceilings.
+Runtime validates a sealed request before dispatch. There is no per-request ring allocation, second
+generator expansion, or unbounded reference run-ahead.
 
 A result slot is reserved and bound to its ordinal before `service_start`. Its normal path is
 `free -> reserved -> child_writing -> published -> oracle_checked -> terminal_committed -> free`.
 The child publishes the complete result/status and candidate-return timestamp with release ordering;
-the oracle worker acquires it, compares the C1 observation in ordinal order, and acknowledges it
-only after the supervisor commits the terminal outcome. A slot cannot be reused before that
-acknowledgement. Missing a free slot or the oracle-lag bound is `runner_error` and makes the attempt
-INVALID rather than waiting in the candidate service interval or masquerading as candidate queue
-pressure.
+the comparison worker acquires it, compares the C1 model result or C2 reference observation in
+ordinal order, and acknowledges it only after the supervisor commits the terminal outcome. A
+request slot is released only after both consumers finish, and a result slot only after comparison.
+A missing slot or crossed preparation/reference-lead/comparison-lag bound is runner INVALID only
+when generator, reference, or comparison ownership caused it while adapter-owned occupancy remains
+within the approved in-flight bound. If unreturned/unterminated adapter calls retain the slots and
+cause the offered-work queue to exhaust, that is candidate backpressure and candidate FAIL. The
+frozen ownership counters and first-terminal rule must make the cause unambiguous; otherwise the
+attempt is INVALID, never optimistically attributed to the runner or candidate.
 
-A legitimate observation is proven to fit during ordinal preflight. If an adapter response crosses
+A legitimate observation is proven to fit by approved analytical maxima and the runtime reference
+observation. If an adapter response crosses
 the slot bound, the child never writes past it and follows
 `child_writing -> overflow_reported -> terminal_committed -> quarantined`. The fixed-size overflow
 report contains ordinal, configured capacity, and the minimum required encoded bytes at the first
 violating item. It has mask `0x07`, no candidate-return timestamp or oracle comparison, wins the
 supervisor terminal CAS as `observation_overflow`, aborts the attempt as candidate FAIL, and remains
-quarantined until teardown. Timeout/crash slots that may still have a child writer are likewise
+quarantined until teardown. If the correct reference observation itself does not fit, the attempt is
+runner INVALID instead. Timeout/crash slots that may still have a child writer are likewise
 quarantined after the child is killed. All regions are fully initialized and page-touched on the
 assigned NUMA node before warmup, and sample records use a separate commit bitmap. The surviving
 supervisor serializes them to the evidence device after child termination. An adapter child may
@@ -318,9 +354,11 @@ slope formulas may be reused only if DKS-Q2-008 explicitly freezes their enduran
 ## Candidate service interval
 
 The service timer begins immediately before the adapter primitive and ends only after returned keys
-and values are copied into runner-owned buffers. Request generation, queueing, oracle execution,
-digesting, evidence serialization, and resource polling are outside it. Their cost remains in
-offered end-to-end latency where applicable and in runner-overhead evidence.
+and values are copied into runner-owned buffers. Request generation/validation, reference execution,
+comparison, digesting, evidence serialization, and resource polling are outside it. Queueing remains
+inside due-to-return end-to-end latency. The other work is still charged to preparation,
+reference-lead/comparison-lag, scheduler, CPU, page-fault, null-control, and interference evidence;
+no measured overhead is subtracted from candidate latency.
 
 V1 requires exactly one foreground service worker, modelling one LaminarDB worker's serialized
 atomic state path and giving the sequential C1 oracle one unambiguous ordinal order. A plan with any
@@ -483,7 +521,7 @@ two required typed arms:
 
 ```text
 background_maintenance_debt =
-    observed { mechanism inventory, semantic unit, complete source contract,
+    observed { mechanism inventory, byte-normalization formula, complete source contract,
                sample/cut artifact descriptor }
   | not_applicable { no-asynchronous-maintenance reason, source-proof digest,
                      exact-configuration digest, bounded-probe evidence digest }
@@ -570,6 +608,15 @@ Applicable maintenance-debt artifacts use the same cut tags and observation brac
 deadline and hold schedule are anchored to `write_stop_offset_ns`. The plan's clock/resource-error
 gate covers every encoded skew.
 
+No v2 formula currently evaluates `background_maintenance_debt_max_bytes`: an observed mapping must
+first define an independently reviewable unsigned-byte normalization, exact sample/cut population,
+aggregation across mechanisms, and maximum rule. A non-byte engine work unit is unsupported, not
+silently compared with the byte threshold. Likewise, `unexplained_storage_pause_max_ms` has no
+normative event stream or deterministic attribution/exclusion rule; reviewer causal judgment is
+forbidden. Until additive mechanism-artifact schemas and both formulas are frozen and tested, a
+runner plan referencing either field is structurally invalid. `observed(0)`, `not_applicable`, and
+unsupported remain distinct and none supplies a placeholder value.
+
 Normative resource-formulas v2 use checked integer arithmetic. Lower-bound gates round down; upper-bound
 gates round up:
 
@@ -602,10 +649,14 @@ gates round up:
   `not_applicable`, that conjunct and only that conjunct is absent. The upper-bound duration is
   exactly `resource_tail.observation_end_offset_ns - write_stop_offset_ns`.
 
-The database process and candidate leaf stay alive through that tail. A named `syncfs` or
+The measurement database process and candidate leaf stay alive through that tail. A named `syncfs` or
 candidate-side persistence drain is permitted only when the plan applies the identical policy to
 both candidates; its latency and writes remain in tail evidence. Reaching the deadline before the
 common kernel/device plus applicable engine condition holds is FAIL, not a shortened numerator.
+Only after the stable/deadline cut is recorded may the lifecycle arm cleanly close that process and
+reopen a verification child. Post-tail close/reopen/merge latency, I/O, and physical writes are
+retained as separate lifecycle evidence and cannot alter the resource-tail or write-amplification
+population.
 
 A zero denominator in a gate-bearing case is invalid plan construction, not a zero result. The new
 leaf's `memory.peak` is the one exact hard memory peak and covers setup, warmup, measurement, and the
@@ -721,12 +772,12 @@ resolved and independently reviewed. Backend selection additionally requires DKS
 
 | ID | Blocker |
 |---|---|
-| **DKS-Q2-001** | Close the provisional [Zipf generator](state-backend-zipf-generator-v1.md) sub-blockers; approve its exact-target determinism/error/interference evidence, workload-v2 identity/goldens, and hot-mix-versus-Zipf case assignment. |
-| **DKS-Q2-002** | Freeze a nonempty exact matrix, rational offered rates, fixed/variable-width policies, gate mappings, and compatible dimensions. For an all-distinct write, `128 * (16 + 65,536) = 8,390,656` bytes before framing already exceeds 8 MiB; 1,000 compact join probes at fanout 64 declare 15,360,000 range bytes. Every actual ordinal still requires exact post-dedup preflight. |
-| **DKS-Q2-003** | Define long-stream ordinals, streaming resident/spill prefill, live-byte/cardinality/timer bands and control law, exact opposite-side join fanout, stabilization, deterministic TTL/churn, and setup/post-warmup/final digests. C1's 4,096-request oracle and state-size salt cannot be repeated into a 200,000-request performance claim. |
+| **DKS-Q2-001** | Close the provisional [Zipf generator](state-backend-zipf-generator-v1.md) sub-blockers; approve exact-target determinism/error/interference evidence, workload-v2 identity/goldens, hot-mix-versus-Zipf assignment, and either analytical-retry-plus-runtime-INVALID acceptance or a total sampler under a new identity. |
+| **DKS-Q2-002** | Freeze a nonempty exact matrix, rational offered rates, fixed/variable-width policies, gate mappings, and compatible dimensions. For an all-distinct write, `128 * (16 + 65,536) = 8,390,656` bytes before framing already exceeds 8 MiB; 1,000 compact join probes at fanout 64 declare 15,360,000 range bytes. Static analytical maxima and finite-cycle proofs must approve the shape; every emitted request is still exactly validated post-fold/dedup before dispatch. |
+| **DKS-Q2-003** | Freeze aggregate hot-value semantics, timer recurrence/closure, J2 routing/signed bounds/alignment, exact codecs and lifecycle arm, runtime expectation/result union, setup/final merge and post-warmup no-equality claim. The bounded static-proof/one-generation runtime-commitment direction is decided, but C1's 4,096-request oracle cannot be repeated or presented as this long-stream proof. |
 | **DKS-Q2-004** | Freeze exact warmup/measured counts and rates, per-case total semantics, drain/cooldown/reset, scheduler calibration/affinity, and an explicit balanced seeded order vector. The current minimum-count/minimum-duration booleans and five-pair alternation are not a complete schedule. |
-| **DKS-Q2-005** | Add service-latency, runner-overhead, scheduler, oracle-lag and observation-skew gates; freeze result-ring/raw-sample ceilings and gate-bearing telemetry control trials; and complete image/package/CPU/microcode/NUMA/NVMe identities. |
-| **DKS-Q2-006** | Implement and approve exact candidate mechanism mappings plus common XFS project-quota, cgroup dirty/writeback/device I/O, process memory, adapter lifecycle, and pressure observations. The contract now distinguishes `observed` from proof-backed `not_applicable` and requires common resource-v2 wires, but no mechanism-map schema/artifact or complete candidate mapping exists. Unmodified Fjall 3.1.8 still fails because applicable debt/stall signals are absent; the current RocksDB binding remains blocked because its stall ticker omits a verified write-buffer-manager/database-scope path; redb 4.1.0 remains deferred pending proof of its N/A arms and non-interfering mapping. Supply a complete source, patch/upstream, or reject; never encode unsupported as zero. |
+| **DKS-Q2-005** | Add service-latency, runner-overhead, scheduler, reference-lead/comparison-lag, ring occupancy and observation-skew gates; freeze request/result-ring and raw-sample ceilings plus telemetry control trials; and complete image/package/CPU/microcode/NUMA/NVMe identities. |
+| **DKS-Q2-006** | Implement and approve exact candidate mechanism mappings plus common XFS project-quota, cgroup dirty/writeback/device I/O, process memory, adapter lifecycle, and pressure observations. The contract distinguishes `observed` from proof-backed `not_applicable` and requires common resource-v2 wires, but has no mechanism-map schema/artifact or complete candidate mapping. It also lacks the maintenance-debt byte normalization/maximum formula and objective unexplained-storage-pause population, so plan validation cannot consume those profile fields. Unmodified Fjall 3.1.8 still fails because applicable debt/stall signals are absent; the current RocksDB binding remains blocked because its stall ticker omits a verified write-buffer-manager/database-scope path; redb 4.1.0 remains deferred pending proof of its N/A arms and non-interfering mapping. Supply a complete source, patch/upstream, or reject; never encode unsupported as zero. |
 | **DKS-Q2-007** | Implement and review detached approval/completion records, pinned Fjall/RocksDB persistence mappings, complete configuration dumps, and cache-loss truth-table conformance. |
 | **DKS-Q2-008** | Freeze the paired physical-fault and 24/72-hour endurance matrices, actuator and N/N-1 pins, recovery criteria, and a bounded time-resolved endurance encoding distinct from finite raw samples. |
 | **DKS-Q2-009** | Before selection, approve and pass a separate C3 shared-database concurrency contract: deterministic disjoint-vnode lanes and per-lane oracle order; hot-writer/victim and mixed point/range/snapshot traffic; victim plus aggregate tails, global stalls/resources; and barrier-controlled races with restore activation, cleanup, and pinned snapshots. |

@@ -176,9 +176,11 @@ requires a new sampler identity.
 The proposal uses the following rounded temporaries. `word >> 11` is converted exactly to
 binary64. `b = x + one_half` must satisfy `0 <= b < 2^63`; conversion to signed 64-bit truncates
 toward zero. A negative inverse is deliberately invalid even though the real-valued method cannot
-produce one. Any violation is `zipf_invalid_sample`, which makes finite plan validation fail and an
-executing attempt INVALID. Every evaluated function result and temporary through `g` must be
-finite; a non-finite value is the same error rather than an ordinary rejection.
+produce one. Any violation is `zipf_invalid_sample`: it fails a bounded static/finite-cycle proof if
+that proof evaluates the coordinate and makes an executing attempt INVALID. Static plan validation
+does not expand every setup/warmup/measurement row to search for the outcome. Every evaluated
+function result and temporary through `g` must be finite; a non-finite value is the same error rather
+than an ordinary rejection.
 
 ```text
 u_bits = word >> 11
@@ -205,13 +207,15 @@ else:
 output exact_u64(k_i64 - 1)
 ```
 
-The first accepted proposal wins. Sixty-four rejected proposals are
-`zipf_rejection_limit`, a deterministic generator failure. Exact plan preflight rejects a stream
-containing that outcome for finite setup, warmup, and measured coordinates; encountering it during
-execution makes the attempt INVALID. Clamp above is the method's normative boundary correction and
-its mass is included in the numerical audit. There is no post-rejection clamp, uniform/modulo
-fallback, seed change, or consumption of another row's coordinates. Forced cap tests inject words
-at the sampler boundary; they do not search for a convenient SHA-256 coordinate.
+The first accepted proposal wins. Sixty-four rejected proposals are `zipf_rejection_limit`, a
+deterministic generator failure. Encountering it in a bounded proof fails that proof; encountering it
+during execution makes the attempt INVALID. The approved analytical retry report must bound the
+complete planned population under its stated random-oracle assumptions, and workload/operations
+owners must explicitly accept runtime fail-closed handling. Otherwise closure requires a total
+sampler under a new identity. Clamp above is the method's normative boundary correction and its mass
+is included in the numerical audit. There is no post-rejection clamp, uniform/modulo fallback, seed
+change, or consumption of another row's coordinates. Forced cap tests inject words at the sampler
+boundary; they do not search for a convenient SHA-256 coordinate.
 
 Rank maps directly to logical group identity. This correlates popularity with key order and gives
 the hottest key's vnode natural Zipf pressure. Every case reports expected and observed hottest-key
