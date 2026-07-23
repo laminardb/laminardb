@@ -1,0 +1,171 @@
+{
+  "schema_version": "state-backend-redb-prescreen-approval/v1",
+  "notice": "NOT QUALIFICATION EVIDENCE",
+  "record_class": "synthetic_fixture",
+  "fixture_ineligible": true,
+  "approval_id": "synthetic-fixture/redb-native-prescreen-approval",
+  "status": "reviewed_pre_run_approval",
+  "schema_validation_authorizes_execution": false,
+  "external_attestation_verification_required": true,
+  "run_class": "native_prescreen_decision",
+  "subject": {
+    "crate": "redb",
+    "version": "4.1.0",
+    "crate_archive_sha256": "8e925444704b5f17d32bf42f5b6e2df050bceebc3dcd6e71cc73dafe8092e839",
+    "packaged_vcs_revision": "6ed1f981ba4deab0b2adbdd7bccb46ec409b2191",
+    "declared_msrv": "1.89",
+    "approved_toolchain": "1.95.0-x86_64-unknown-linux-gnu",
+    "target_triple": "x86_64-unknown-linux-gnu",
+    "default_features": false,
+    "features": [],
+    "storage_backend": "redb-default-linux-file-backend"
+  },
+  "bindings": {
+    "protocol_bytes": {
+      "role": "redb-prescreen-protocol",
+      "byte_length": 1111,
+      "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "media_type": "text/markdown; charset=utf-8"
+    },
+    "mechanism_note": {
+      "role": "redb-exact-source-mechanism-note",
+      "byte_length": 2222,
+      "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "media_type": "text/markdown; charset=utf-8"
+    },
+    "harness_source_archive": {
+      "role": "redb-prescreen-harness-source",
+      "byte_length": 3333,
+      "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "media_type": "application/zip"
+    },
+    "harness_binary": {
+      "role": "redb-prescreen-harness-binary",
+      "byte_length": 4444,
+      "sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+      "media_type": "application/octet-stream"
+    },
+    "cargo_lock": {
+      "role": "redb-prescreen-cargo-lock",
+      "byte_length": 5555,
+      "sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+      "media_type": "application/octet-stream"
+    },
+    "sbom": {
+      "role": "redb-prescreen-sbom",
+      "byte_length": 6666,
+      "sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+      "media_type": "application/spdx+json"
+    },
+    "build_manifest": {
+      "role": "redb-prescreen-build-manifest",
+      "byte_length": 7777,
+      "sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+      "media_type": "application/json"
+    },
+    "wire_schema_bundle": {
+      "role": "redb-prescreen-wire-schema-bundle",
+      "byte_length": 8888,
+      "sha256": "8888888888888888888888888888888888888888888888888888888888888888",
+      "media_type": "application/zip"
+    },
+    "literal_golden_bundle": {
+      "role": "redb-prescreen-literal-golden-bundle",
+      "byte_length": 9999,
+      "sha256": "9999999999999999999999999999999999999999999999999999999999999999",
+      "media_type": "application/zip"
+    },
+    "execution_plan": {
+      "role": "redb-prescreen-execution-plan",
+      "byte_length": 1010,
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "media_type": "application/json"
+    },
+    "candidate_configuration": {
+      "role": "redb-prescreen-candidate-configuration",
+      "byte_length": 1112,
+      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "media_type": "application/json"
+    },
+    "target_identity": {
+      "role": "redb-prescreen-target-identity",
+      "byte_length": 1212,
+      "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "media_type": "application/json"
+    },
+    "preflight_policy": {
+      "role": "redb-prescreen-preflight-policy",
+      "byte_length": 1313,
+      "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "media_type": "application/json"
+    },
+    "schedule_manifest": {
+      "role": "redb-prescreen-seed-order-schedule",
+      "byte_length": 1414,
+      "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "media_type": "application/json"
+    },
+    "clock_and_isolation_policy": {
+      "role": "redb-prescreen-clock-cgroup-cache-policy",
+      "byte_length": 1515,
+      "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "media_type": "application/json"
+    },
+    "trigger_and_delay_policy": {
+      "role": "redb-prescreen-trigger-delay-policy",
+      "byte_length": 1616,
+      "sha256": "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+      "media_type": "application/json"
+    },
+    "bounds_manifest": {
+      "role": "redb-prescreen-deadline-resource-artifact-bounds",
+      "byte_length": 1717,
+      "sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+      "media_type": "application/json"
+    }
+  },
+  "prior_smoke_result": {
+    "role": "redb-prescreen-reviewed-smoke-result",
+    "byte_length": 1818,
+    "sha256": "13579bdf13579bdf13579bdf13579bdf13579bdf13579bdf13579bdf13579bdf",
+    "media_type": "application/json"
+  },
+  "owners": {
+    "workload_owner": {
+      "role": "workload_owner",
+      "owner_id": "workload-owner/synthetic-fixture.invalid",
+      "decision": "approve_bounded_prescreen",
+      "approved_at_utc": "2026-07-23T12:00:00Z",
+      "attestation": {
+        "role": "redb-prescreen-workload-owner-pre-run-attestation",
+        "byte_length": 1919,
+        "sha256": "2468ace02468ace02468ace02468ace02468ace02468ace02468ace02468ace0",
+        "media_type": "application/json"
+      }
+    },
+    "operations_owner": {
+      "role": "operations_owner",
+      "owner_id": "operations-owner/synthetic-fixture.invalid",
+      "decision": "approve_bounded_prescreen",
+      "approved_at_utc": "2026-07-23T12:01:00Z",
+      "attestation": {
+        "role": "redb-prescreen-operations-owner-pre-run-attestation",
+        "byte_length": 2020,
+        "sha256": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+        "media_type": "application/json"
+      }
+    }
+  },
+  "evidence_scope": {
+    "prescreen_only": true,
+    "qualification_eligible": false,
+    "candidate_admission_eligible": false,
+    "backend_selection_eligible": false,
+    "production_eligible": false,
+    "independent_soak_eligible": false,
+    "c1_c2_c3_eligible": false,
+    "fault_endurance_eligible": false,
+    "checkpoint_exactly_once_eligible": false,
+    "source_sink_delivery_eligible": false
+  }
+}

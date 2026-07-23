@@ -1049,3 +1049,151 @@ mod tests {
         assert!(validate_profile(&bytes).is_err());
     }
 }
+
+#[cfg(test)]
+mod redb_prescreen_contract_tests {
+    use super::*;
+
+    const APPROVAL_SCHEMA: &str = include_str!("../schema/redb-prescreen-approval-v1.schema.json");
+    const RESULT_SCHEMA: &str = include_str!("../schema/redb-prescreen-result-v1.schema.json");
+    const APPROVAL_FIXTURE: &str =
+        include_str!("../tests/fixtures/redb-prescreen-approval-v1.synthetic.json");
+    const RESULT_FIXTURE: &str =
+        include_str!("../tests/fixtures/redb-prescreen-result-v1.synthetic.json");
+
+    fn strict_value(source: &str, label: &str) -> Value {
+        decode_unique_json(source.as_bytes(), 1_048_576, label).unwrap()
+    }
+
+    fn checked_schema(source: &str, label: &str) -> Value {
+        let schema = strict_value(source, label);
+        jsonschema::draft202012::meta::validate(&schema).unwrap();
+        schema
+    }
+
+    fn descriptor(role: &str, byte: char) -> Value {
+        serde_json::json!({
+            "role": role,
+            "byte_length": 1234,
+            "sha256": byte.to_string().repeat(64),
+            "media_type": "application/json"
+        })
+    }
+
+    #[test]
+    fn redb_prescreen_schemas_and_synthetic_fixtures_are_strict_and_ineligible() {
+        let approval_schema = checked_schema(APPROVAL_SCHEMA, "redb approval schema");
+        let result_schema = checked_schema(RESULT_SCHEMA, "redb result schema");
+        let approval = strict_value(APPROVAL_FIXTURE, "redb approval fixture");
+        let result = strict_value(RESULT_FIXTURE, "redb result fixture");
+
+        assert!(jsonschema::draft202012::is_valid(
+            &approval_schema,
+            &approval
+        ));
+        assert!(jsonschema::draft202012::is_valid(&result_schema, &result));
+        assert_eq!(approval["fixture_ineligible"], true);
+        assert_eq!(result["fixture_ineligible"], true);
+        assert_eq!(approval["evidence_scope"]["production_eligible"], false);
+        assert_eq!(result["evidence_scope"]["independent_soak_eligible"], false);
+
+        let duplicate = APPROVAL_FIXTURE.replacen(
+            "  \"notice\": \"NOT QUALIFICATION EVIDENCE\",",
+            "  \"notice\": \"NOT QUALIFICATION EVIDENCE\",\n  \"notice\": \"NOT QUALIFICATION EVIDENCE\",",
+            1,
+        );
+        assert!(
+            decode_unique_json(duplicate.as_bytes(), 1_048_576, "duplicate approval")
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate object key `notice`")
+        );
+    }
+
+    #[test]
+    fn redb_prescreen_approval_keeps_native_smoke_owners_and_scope_fail_closed() {
+        let schema = checked_schema(APPROVAL_SCHEMA, "redb approval schema");
+        let approval = strict_value(APPROVAL_FIXTURE, "redb approval fixture");
+
+        let mut docker = approval.clone();
+        docker["run_class"] = "docker_smoke_no_decision".into();
+        docker["prior_smoke_result"] = Value::Null;
+        assert!(jsonschema::draft202012::is_valid(&schema, &docker));
+
+        let mut missing_smoke = approval.clone();
+        missing_smoke["prior_smoke_result"] = Value::Null;
+        assert!(!jsonschema::draft202012::is_valid(&schema, &missing_smoke));
+
+        for pointer in [
+            "/evidence_scope/qualification_eligible",
+            "/evidence_scope/production_eligible",
+            "/evidence_scope/independent_soak_eligible",
+            "/evidence_scope/checkpoint_exactly_once_eligible",
+        ] {
+            let mut mutation = approval.clone();
+            *mutation.pointer_mut(pointer).unwrap() = true.into();
+            assert!(!jsonschema::draft202012::is_valid(&schema, &mutation));
+        }
+
+        let mut collapsed_owner_namespace = approval.clone();
+        collapsed_owner_namespace["owners"]["operations_owner"]["owner_id"] =
+            approval["owners"]["workload_owner"]["owner_id"].clone();
+        assert!(!jsonschema::draft202012::is_valid(
+            &schema,
+            &collapsed_owner_namespace
+        ));
+
+        let mut unknown = approval;
+        unknown["execution_authorized"] = true.into();
+        assert!(!jsonschema::draft202012::is_valid(&schema, &unknown));
+    }
+
+    #[test]
+    fn redb_prescreen_result_separates_docker_native_bounds_and_production() {
+        let schema = checked_schema(RESULT_SCHEMA, "redb result schema");
+        let docker = strict_value(RESULT_FIXTURE, "redb result fixture");
+
+        let mut docker_pass = docker.clone();
+        docker_pass["disposition"] = "PRESCREEN_PASS".into();
+        assert!(!jsonschema::draft202012::is_valid(&schema, &docker_pass));
+
+        let mut docker_probe = docker.clone();
+        docker_probe["mechanism_probe"] =
+            descriptor("redb-prescreen-bounded-mechanism-probe-result", '1');
+        assert!(!jsonschema::draft202012::is_valid(&schema, &docker_probe));
+
+        let mut native = docker.clone();
+        native["run_class"] = "native_prescreen_decision".into();
+        native["prior_smoke_result"] = descriptor("redb-prescreen-reviewed-smoke-result", '2');
+        native["mechanism_probe"] =
+            descriptor("redb-prescreen-bounded-mechanism-probe-result", '3');
+        native["disposition"] = "PRESCREEN_NO_GO".into();
+        assert!(jsonschema::draft202012::is_valid(&schema, &native));
+
+        let mut missing_probe = native.clone();
+        missing_probe["mechanism_probe"] = Value::Null;
+        assert!(!jsonschema::draft202012::is_valid(&schema, &missing_probe));
+
+        let mut bounded = native.clone();
+        bounded["bounds"]["hard_bound_hit"] = true.into();
+        bounded["bounds"]["hit_codes"] = serde_json::json!(["attempt_deadline"]);
+        assert!(!jsonschema::draft202012::is_valid(&schema, &bounded));
+        bounded["disposition"] = "DEFER".into();
+        assert!(jsonschema::draft202012::is_valid(&schema, &bounded));
+
+        for pointer in [
+            "/evidence_scope/candidate_admission_eligible",
+            "/evidence_scope/production_eligible",
+            "/evidence_scope/independent_soak_eligible",
+            "/evidence_scope/source_sink_delivery_eligible",
+        ] {
+            let mut mutation = native.clone();
+            *mutation.pointer_mut(pointer).unwrap() = true.into();
+            assert!(!jsonschema::draft202012::is_valid(&schema, &mutation));
+        }
+
+        let mut unknown = native;
+        unknown["production_ready"] = true.into();
+        assert!(!jsonschema::draft202012::is_valid(&schema, &unknown));
+    }
+}

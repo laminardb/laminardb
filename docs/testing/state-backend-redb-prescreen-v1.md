@@ -1,10 +1,14 @@
 # redb 4.1.0 bounded state-backend prescreen v1
 
 - **Identity:** `state-backend-redb-prescreen/v1`
-- **Status:** proposed, non-gating protocol; workload and operations owner review required
+- **Status:** proposed, non-gating protocol; strict detached schemas and source note exist, but owners,
+  harness, validator, and execution remain absent
 - **Evidence class:** `NOT C2/C3 QUALIFICATION EVIDENCE`
 - **Scope:** decide whether a redb adapter is worth adding to the backend qualification bake-off
 - **Production/admission effect:** none; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
+- **Detached contracts:** [pre-run approval schema](../../tools/state-backend-qual/schema/redb-prescreen-approval-v1.schema.json),
+  [reviewed-result schema](../../tools/state-backend-qual/schema/redb-prescreen-result-v1.schema.json),
+  and [exact-source mechanism note](../reports/redb-4.1.0-prescreen-mechanism-note-2026-07-23.md)
 
 ## Decision boundary
 
@@ -63,7 +67,8 @@ does not satisfy the persistence question.
 
 This proposal does not authorize execution. Any Docker smoke or native prescreen command requires a
 strict detached `state-backend-redb-prescreen-approval/v1` record signed by the named workload and
-operations owners. Its schema, validator, and harness do not exist today. The record must bind the
+operations owners. The strict record schema now exists, but no external byte/attestation verifier,
+semantic plan/result validator, or harness exists. The record must bind the
 exact protocol bytes; harness/oracle source, binary, lockfile, SBOM, toolchain, target and flags; raw
 wire/result schemas and literal goldens; complete seed/order schedule; target identity and preflight/
 noise rules; clock/cgroup/cache-reset procedures; trigger and bounded adaptive-delay rule; every
@@ -251,9 +256,10 @@ Before owners approve this prescreen, an exact-source mechanism note must invent
 wait, synchronous allocator reclamation, quick-repair allocator-state writes, clean-close
 quick-repair/shrink commit, kernel writeback, and any thread/background activity. That proof—not the
 absence of activity in a short run—decides which DKS-Q2-006 arms may be `not_applicable`. The probe
-only corroborates the pinned source/configuration mapping. The note also freezes the XFS quota query,
-units, one-second/boundary cuts, 16-GiB hard-quota setup, and error/wrap behavior used by the
-allocation gate. The current profile v3 remains Fjall/RocksDB-specific, so even a pass needs an
+only corroborates the pinned source/configuration mapping. The separately bound execution,
+preflight, and observation policies must freeze the XFS quota query, units, one-second/boundary cuts,
+16-GiB hard-quota setup, and error/wrap behavior used by the allocation gate. The current profile v3
+remains Fjall/RocksDB-specific, so even a pass needs an
 additive redb profile/schema proposal rather than editing or reinterpreting `linux-nvme-v3`;
 `linux-nvme-v2` remains an immutable regression fixture.
 

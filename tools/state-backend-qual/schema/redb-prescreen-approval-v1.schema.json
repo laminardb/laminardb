@@ -1,0 +1,361 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://laminardb.dev/schemas/state-backend-redb-prescreen-approval-v1.json",
+  "title": "LaminarDB redb 4.1.0 bounded prescreen pre-run approval v1",
+  "description": "A detached descriptor root for owner-approved prescreen inputs. Schema validation neither verifies referenced bytes or attestations nor authorizes execution.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "notice",
+    "record_class",
+    "fixture_ineligible",
+    "approval_id",
+    "status",
+    "schema_validation_authorizes_execution",
+    "external_attestation_verification_required",
+    "run_class",
+    "subject",
+    "bindings",
+    "prior_smoke_result",
+    "owners",
+    "evidence_scope"
+  ],
+  "properties": {
+    "schema_version": {"const": "state-backend-redb-prescreen-approval/v1"},
+    "notice": {"const": "NOT QUALIFICATION EVIDENCE"},
+    "record_class": {"enum": ["prescreen_record", "synthetic_fixture"]},
+    "fixture_ineligible": {"type": "boolean"},
+    "approval_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9][a-z0-9._/-]{0,127}$"
+    },
+    "status": {"const": "reviewed_pre_run_approval"},
+    "schema_validation_authorizes_execution": {"const": false},
+    "external_attestation_verification_required": {"const": true},
+    "run_class": {"enum": ["docker_smoke_no_decision", "native_prescreen_decision"]},
+    "subject": {"$ref": "#/$defs/subject"},
+    "bindings": {"$ref": "#/$defs/bindings"},
+    "prior_smoke_result": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/priorSmokeResultDescriptor"}
+      ]
+    },
+    "owners": {"$ref": "#/$defs/preRunOwners"},
+    "evidence_scope": {"$ref": "#/$defs/evidenceScope"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"record_class": {"const": "synthetic_fixture"}}, "required": ["record_class"]},
+      "then": {"properties": {"fixture_ineligible": {"const": true}}},
+      "else": {"properties": {"fixture_ineligible": {"const": false}}}
+    },
+    {
+      "if": {"properties": {"run_class": {"const": "docker_smoke_no_decision"}}, "required": ["run_class"]},
+      "then": {"properties": {"prior_smoke_result": {"type": "null"}}},
+      "else": {"properties": {"prior_smoke_result": {"$ref": "#/$defs/priorSmokeResultDescriptor"}}}
+    }
+  ],
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "not": {"const": "0000000000000000000000000000000000000000000000000000000000000000"}
+    },
+    "descriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "byte_length", "sha256", "media_type"],
+      "properties": {
+        "role": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 96,
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,95}$"
+        },
+        "byte_length": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483648
+        },
+        "sha256": {"$ref": "#/$defs/digest"},
+        "media_type": {
+          "enum": [
+            "application/json",
+            "application/octet-stream",
+            "application/spdx+json",
+            "application/vnd.cyclonedx+json",
+            "application/zip",
+            "application/zstd",
+            "text/markdown; charset=utf-8"
+          ]
+        }
+      }
+    },
+    "subject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "crate",
+        "version",
+        "crate_archive_sha256",
+        "packaged_vcs_revision",
+        "declared_msrv",
+        "approved_toolchain",
+        "target_triple",
+        "default_features",
+        "features",
+        "storage_backend"
+      ],
+      "properties": {
+        "crate": {"const": "redb"},
+        "version": {"const": "4.1.0"},
+        "crate_archive_sha256": {"const": "8e925444704b5f17d32bf42f5b6e2df050bceebc3dcd6e71cc73dafe8092e839"},
+        "packaged_vcs_revision": {"const": "6ed1f981ba4deab0b2adbdd7bccb46ec409b2191"},
+        "declared_msrv": {"const": "1.89"},
+        "approved_toolchain": {"const": "1.95.0-x86_64-unknown-linux-gnu"},
+        "target_triple": {"const": "x86_64-unknown-linux-gnu"},
+        "default_features": {"const": false},
+        "features": {"type": "array", "maxItems": 0},
+        "storage_backend": {"const": "redb-default-linux-file-backend"}
+      }
+    },
+    "bindings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_bytes",
+        "mechanism_note",
+        "harness_source_archive",
+        "harness_binary",
+        "cargo_lock",
+        "sbom",
+        "build_manifest",
+        "wire_schema_bundle",
+        "literal_golden_bundle",
+        "execution_plan",
+        "candidate_configuration",
+        "target_identity",
+        "preflight_policy",
+        "schedule_manifest",
+        "clock_and_isolation_policy",
+        "trigger_and_delay_policy",
+        "bounds_manifest"
+      ],
+      "properties": {
+        "protocol_bytes": {"$ref": "#/$defs/protocolDescriptor"},
+        "mechanism_note": {"$ref": "#/$defs/mechanismNoteDescriptor"},
+        "harness_source_archive": {"$ref": "#/$defs/harnessSourceDescriptor"},
+        "harness_binary": {"$ref": "#/$defs/harnessBinaryDescriptor"},
+        "cargo_lock": {"$ref": "#/$defs/cargoLockDescriptor"},
+        "sbom": {"$ref": "#/$defs/sbomDescriptor"},
+        "build_manifest": {"$ref": "#/$defs/buildManifestDescriptor"},
+        "wire_schema_bundle": {"$ref": "#/$defs/wireSchemaDescriptor"},
+        "literal_golden_bundle": {"$ref": "#/$defs/literalGoldenDescriptor"},
+        "execution_plan": {"$ref": "#/$defs/executionPlanDescriptor"},
+        "candidate_configuration": {"$ref": "#/$defs/candidateConfigurationDescriptor"},
+        "target_identity": {"$ref": "#/$defs/targetIdentityDescriptor"},
+        "preflight_policy": {"$ref": "#/$defs/preflightPolicyDescriptor"},
+        "schedule_manifest": {"$ref": "#/$defs/scheduleDescriptor"},
+        "clock_and_isolation_policy": {"$ref": "#/$defs/clockIsolationDescriptor"},
+        "trigger_and_delay_policy": {"$ref": "#/$defs/triggerDelayDescriptor"},
+        "bounds_manifest": {"$ref": "#/$defs/boundsDescriptor"}
+      }
+    },
+    "protocolDescriptor": {
+      "allOf": [
+        {"$ref": "#/$defs/descriptor"},
+        {"properties": {"role": {"const": "redb-prescreen-protocol"}}, "required": ["role"]}
+      ]
+    },
+    "mechanismNoteDescriptor": {
+      "allOf": [
+        {"$ref": "#/$defs/descriptor"},
+        {"properties": {"role": {"const": "redb-exact-source-mechanism-note"}}, "required": ["role"]}
+      ]
+    },
+    "harnessSourceDescriptor": {
+      "allOf": [
+        {"$ref": "#/$defs/descriptor"},
+        {"properties": {"role": {"const": "redb-prescreen-harness-source"}}, "required": ["role"]}
+      ]
+    },
+    "harnessBinaryDescriptor": {
+      "allOf": [
+        {"$ref": "#/$defs/descriptor"},
+        {"properties": {"role": {"const": "redb-prescreen-harness-binary"}}, "required": ["role"]}
+      ]
+    },
+    "cargoLockDescriptor": {
+      "allOf": [
+        {"$ref": "#/$defs/descriptor"},
+        {"properties": {"role": {"const": "redb-prescreen-cargo-lock"}}, "required": ["role"]}
+      ]
+    },
+    "sbomDescriptor": {
+      "allOf": [
+        {"$ref": "#/$defs/descriptor"},
+        {"properties": {"role": {"const": "redb-prescreen-sbom"}}, "required": ["role"]}
+      ]
+    },
+    "buildManifestDescriptor": {
+      "allOf": [
+        {"$ref": "#/$defs/descriptor"},
+        {"properties": {"role": {"const": "redb-prescreen-build-manifest"}}, "required": ["role"]}
+      ]
+    },
+    "wireSchemaDescriptor": {
+      "allOf": [
+        {"$ref": "#/$defs/descriptor"},
+        {"properties": {"role": {"const": "redb-prescreen-wire-schema-bundle"}}, "required": ["role"]}
+      ]
+    },
+    "literalGoldenDescriptor": {
+      "allOf": [
+        {"$ref": "#/$defs/descriptor"},
+        {"properties": {"role": {"const": "redb-prescreen-literal-golden-bundle"}}, "required": ["role"]}
+      ]
+    },
+    "executionPlanDescriptor": {
+      "allOf": [
+        {"$ref": "#/$defs/descriptor"},
+        {"properties": {"role": {"const": "redb-prescreen-execution-plan"}}, "required": ["role"]}
+      ]
+    },
+    "candidateConfigurationDescriptor": {
+      "allOf": [
+        {"$ref": "#/$defs/descriptor"},
+        {"properties": {"role": {"const": "redb-prescreen-candidate-configuration"}}, "required": ["role"]}
+      ]
+    },
+    "targetIdentityDescriptor": {
+      "allOf": [
+        {"$ref": "#/$defs/descriptor"},
+        {"properties": {"role": {"const": "redb-prescreen-target-identity"}}, "required": ["role"]}
+      ]
+    },
+    "preflightPolicyDescriptor": {
+      "allOf": [
+        {"$ref": "#/$defs/descriptor"},
+        {"properties": {"role": {"const": "redb-prescreen-preflight-policy"}}, "required": ["role"]}
+      ]
+    },
+    "scheduleDescriptor": {
+      "allOf": [
+        {"$ref": "#/$defs/descriptor"},
+        {"properties": {"role": {"const": "redb-prescreen-seed-order-schedule"}}, "required": ["role"]}
+      ]
+    },
+    "clockIsolationDescriptor": {
+      "allOf": [
+        {"$ref": "#/$defs/descriptor"},
+        {"properties": {"role": {"const": "redb-prescreen-clock-cgroup-cache-policy"}}, "required": ["role"]}
+      ]
+    },
+    "triggerDelayDescriptor": {
+      "allOf": [
+        {"$ref": "#/$defs/descriptor"},
+        {"properties": {"role": {"const": "redb-prescreen-trigger-delay-policy"}}, "required": ["role"]}
+      ]
+    },
+    "boundsDescriptor": {
+      "allOf": [
+        {"$ref": "#/$defs/descriptor"},
+        {"properties": {"role": {"const": "redb-prescreen-deadline-resource-artifact-bounds"}}, "required": ["role"]}
+      ]
+    },
+    "priorSmokeResultDescriptor": {
+      "allOf": [
+        {"$ref": "#/$defs/descriptor"},
+        {"properties": {"role": {"const": "redb-prescreen-reviewed-smoke-result"}}, "required": ["role"]}
+      ]
+    },
+    "workloadPreRunAttestationDescriptor": {
+      "allOf": [
+        {"$ref": "#/$defs/descriptor"},
+        {"properties": {"role": {"const": "redb-prescreen-workload-owner-pre-run-attestation"}}, "required": ["role"]}
+      ]
+    },
+    "operationsPreRunAttestationDescriptor": {
+      "allOf": [
+        {"$ref": "#/$defs/descriptor"},
+        {"properties": {"role": {"const": "redb-prescreen-operations-owner-pre-run-attestation"}}, "required": ["role"]}
+      ]
+    },
+    "workloadPreRunOwner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "owner_id", "decision", "approved_at_utc", "attestation"],
+      "properties": {
+        "role": {"const": "workload_owner"},
+        "owner_id": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 128,
+          "pattern": "^workload-owner/[a-z0-9][a-z0-9._@/-]{0,112}$"
+        },
+        "decision": {"const": "approve_bounded_prescreen"},
+        "approved_at_utc": {"type": "string", "format": "date-time"},
+        "attestation": {"$ref": "#/$defs/workloadPreRunAttestationDescriptor"}
+      }
+    },
+    "operationsPreRunOwner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "owner_id", "decision", "approved_at_utc", "attestation"],
+      "properties": {
+        "role": {"const": "operations_owner"},
+        "owner_id": {
+          "type": "string",
+          "minLength": 18,
+          "maxLength": 128,
+          "pattern": "^operations-owner/[a-z0-9][a-z0-9._@/-]{0,110}$"
+        },
+        "decision": {"const": "approve_bounded_prescreen"},
+        "approved_at_utc": {"type": "string", "format": "date-time"},
+        "attestation": {"$ref": "#/$defs/operationsPreRunAttestationDescriptor"}
+      }
+    },
+    "preRunOwners": {
+      "type": "object",
+      "description": "Role-specific ID namespaces prevent identical identifiers; the external verifier must still resolve them to two distinct authorized principals and verify both detached attestations.",
+      "additionalProperties": false,
+      "required": ["workload_owner", "operations_owner"],
+      "properties": {
+        "workload_owner": {"$ref": "#/$defs/workloadPreRunOwner"},
+        "operations_owner": {"$ref": "#/$defs/operationsPreRunOwner"}
+      }
+    },
+    "evidenceScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "prescreen_only",
+        "qualification_eligible",
+        "candidate_admission_eligible",
+        "backend_selection_eligible",
+        "production_eligible",
+        "independent_soak_eligible",
+        "c1_c2_c3_eligible",
+        "fault_endurance_eligible",
+        "checkpoint_exactly_once_eligible",
+        "source_sink_delivery_eligible"
+      ],
+      "properties": {
+        "prescreen_only": {"const": true},
+        "qualification_eligible": {"const": false},
+        "candidate_admission_eligible": {"const": false},
+        "backend_selection_eligible": {"const": false},
+        "production_eligible": {"const": false},
+        "independent_soak_eligible": {"const": false},
+        "c1_c2_c3_eligible": {"const": false},
+        "fault_endurance_eligible": {"const": false},
+        "checkpoint_exactly_once_eligible": {"const": false},
+        "source_sink_delivery_eligible": {"const": false}
+      }
+    }
+  }
+}
