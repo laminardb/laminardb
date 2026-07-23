@@ -26,8 +26,9 @@ conformance against the C1 oracle. Performance, resource, physical-fault, endura
 execution is prohibited. Calling an unapproved run “diagnostic” does not make it permissible.
 The only prospective exception is the separately identified redb prescreen, and it requires its own
 detached pre-run approval by the workload and operations owners. That approval cannot authorize C2
-or C3 or donate evidence to them. No prescreen schema, harness, approval record, or execution command
-exists today, so candidate execution remains prohibited.
+or C3 or donate evidence to them. Strict prescreen record schemas now exist, but no external
+attestation/semantic verifier, harness, owner-approved record, or execution command exists today, so
+candidate execution remains prohibited.
 
 ## Stable identities and artifacts
 
@@ -43,6 +44,7 @@ V1 reserves these printable identities:
 | common resource cuts | `state-backend-resource-cuts/v2` |
 | resource formulas | `state-backend-resource-formulas/v2` |
 | candidate mechanism mapping | `state-backend-mechanism-mapping/v1` |
+| synthetic mechanism bundle validation input | `state-backend-mechanism-bundle-validation-input/v1` |
 | maintenance-debt samples | `state-backend-maintenance-debt-samples/v1` |
 | engine-stall intervals | `state-backend-stall-intervals/v1` |
 | target-device I/O summary | `state-backend-target-device-io/v1` |
@@ -80,6 +82,33 @@ mechanism-mapping v1 validator binds v3 while this contract is reviewed. A futur
 must instead bind the then-approved additive profile, its matching mapping version, and all three
 artifact validators, while satisfying every DKS-Q2 blocker; schema validity alone cannot consume a
 threshold.
+
+Cycle 13 adds one callable integration path without inventing that future approval. The strict
+`state-backend-mechanism-bundle-validation-input/v1` record is fixed to `synthetic_fixture`,
+`fixture_ineligible=true`, `qualification_eligible=false`, and
+`validation_authorizes_execution=false`. It content-addresses the exact v3 profile, mechanism
+mapping, common samples and cuts, applicable debt/stall artifacts, and target-device artifact in one
+self-contained directory. `validate-mechanism-bundle` streams the binary artifacts with a maximum
+160-byte parser record and a fixed 64 KiB file buffer, validates their raw hashes and
+cross-population commitments, binds the claimed write-stop/last-terminal/measurement offsets to
+chronological common cuts, and has `VALID_INELIGIBLE_MECHANISM_BUNDLE` as its only successful
+status. Stable tails over the profile bound and deadline tails are adverse signals. An interval still
+active at measurement end
+must carry the canonical censored endpoint exactly; a future endpoint is invalid rather than
+silently clipped.
+
+Its `no_adverse_signal` or `candidate_failure_signal` observation state is not an attempt verdict:
+the validator has no environment classifier, precedence proof, approved runner plan, or authority to
+verify source-proof content. Device errors, incomplete requests, threshold excess, and a tail
+deadline remain well-formed candidate-failure signals; trace/accounting anomalies make the bundle
+invalid. The input binds a claimed `CLOCK_MONOTONIC_RAW` origin and checked offsets, but byte
+validation cannot derive write stop from an absent workload plan or prove which clock a producer
+actually sampled. The command accepts only regular final entries in a trusted, quiescent local
+fixture directory. Length plus SHA-256 is its content-identity boundary; pre-open regular-file and
+symlink/reparse rejection is defense in depth, not a race-free hostile-directory API. Any future
+approved validator must use no-follow, handle-relative opens and verify handle identity. This
+synthetic path therefore closes unused-code and cross-wire test gaps only; it does not close
+DKS-Q2-005/006 or authorize a candidate run.
 
 The plan binds the exact raw profile SHA-256, physical layout, and every policy identity above. C1
 adapter-conformance entries additionally bind their model-input SHA-256 plus v1 generator/model
@@ -746,9 +775,10 @@ gate is the maximum of the per-shard `maximum_duration_ns`, rounded up to whole 
 empty total or wholly untracked population cannot evaluate it. This is device-request latency, not
 a claim that it explains an application-level service pause.
 
-These formulas make v3's debt and target-device fields objectively evaluable, but DKS-Q2-006 remains open:
-there is no approved real candidate mapping, no cross-artifact plan validator, no target trace/XFS/
-cgroup implementation, and no approved source coverage. `observed(0)`, `not_applicable`,
+These formulas make v3's debt and target-device fields objectively evaluable. The Cycle 13 synthetic
+bundle validator now exercises their structural and cross-wire joins, but DKS-Q2-006 remains open:
+there is no approved real candidate mapping, approved-plan/attempt validator, target trace/XFS/cgroup
+implementation, or approved source coverage. `observed(0)`, `not_applicable`,
 unsupported, INVALID, and candidate FAIL remain distinct.
 
 Normative resource-formulas v2 use checked integer arithmetic. Lower-bound gates round down; upper-bound
@@ -913,12 +943,12 @@ resolved and independently reviewed. Backend selection additionally requires DKS
 
 | ID | Blocker |
 |---|---|
-| **DKS-Q2-001** | Close the provisional [Zipf generator](state-backend-zipf-generator-v1.md) sub-blockers; approve exact-target determinism/error/interference evidence, workload-v2 identity/goldens, hot-mix-versus-Zipf assignment, and either analytical-retry-plus-runtime-INVALID acceptance or a total sampler under a new identity. |
+| **DKS-Q2-001** | Cycle 13 moves the pre-existing literals into an explicitly synthetic, ineligible, non-independent detached corpus and provisions Rust 1.95 debug/release checks on Windows x86_64 and native GitHub-hosted Linux arm64; CI execution is still pending. Close the provisional [Zipf generator](state-backend-zipf-generator-v1.md) sub-blockers; approve independently generated exact-target determinism/error/interference evidence, workload-v2 identity/goldens, hot-mix-versus-Zipf assignment, and either analytical-retry-plus-runtime-INVALID acceptance or a total sampler under a new identity. |
 | **DKS-Q2-002** | Freeze a nonempty exact matrix, rational offered rates, fixed/variable-width policies, gate mappings, and compatible dimensions. For an all-distinct write, `128 * (16 + 65,536) = 8,390,656` bytes before framing already exceeds 8 MiB; 1,000 compact join probes at fanout 64 declare 15,360,000 range bytes. Static analytical maxima and finite-cycle proofs must approve the shape; every emitted request is still exactly validated post-fold/dedup before dispatch. |
 | **DKS-Q2-003** | Cycle 12 provisionally fixes the bounded stable/idempotent aggregate arm, timer two-ring recurrence/closure, and J2 prefix routing/signed bounds/alignment/inverse setup-final arithmetic. It deliberately does not claim cumulative SQL aggregate semantics. Freeze owner acceptance and literal proofs; identity-derived compression-resistant filler; exact key/value and timer-dictionary codecs with measured preparation/ring cost; lifecycle arm; runtime expectation/result union; ring limits; and product/soak semantics. C1's 4,096-request oracle cannot be repeated or presented as this long-stream proof. |
 | **DKS-Q2-004** | Freeze exact warmup/measured counts and rates, per-case total semantics, drain/cooldown/reset, scheduler calibration/affinity, and the literal balanced seeded order vector. Cycle 12 fixes adjacent pairs, one slot per candidate, no replacement, and the AB/BA-imbalance invariant, but the current minimum-count/minimum-duration booleans and five-pair alternation are not a complete schedule. |
 | **DKS-Q2-005** | Add numerical service-latency, runner-overhead, scheduler, reference-lead/comparison-lag, ring occupancy and observation-skew gates; freeze exact worker/ring/lead/lag and raw-sample ceilings plus telemetry/null-control limits; and complete image/package/CPU/microcode/NUMA/NVMe identities. The ownership automata, terminal precedence, bounded-region requirement, and never-subtract controls are fixed, but no executable values exist. |
-| **DKS-Q2-006** | Approve complete real candidate mappings and implement the cross-artifact plan validator plus common XFS project-quota, cgroup dirty/writeback/device I/O, process-memory, adapter-lifecycle, pressure, and target-device trace observations. Cycle 12 adds truthful profile v3, the strict mapping schema/validator, direct disjoint-byte debt population/formula, censored stall-interval wire/formula, and objective low-volume device-I/O summary/formula; synthetic validation is not candidate coverage. V2's causal `unexplained_storage_pause` field remains unusable. Unmodified Fjall 3.1.8 still fails because applicable debt/stall signals are absent; the current RocksDB binding remains blocked because its stall ticker omits a verified write-buffer-manager/database-scope path; redb 4.1.0 remains deferred until its separately approved probe can supply proof for a later redb-specific profile and mapping. Supply a complete source, patch/upstream, or reject; never encode unsupported as zero or infer causal exclusions. |
+| **DKS-Q2-006** | Approve complete real candidate mappings and implement the approved-plan/attempt validator plus common XFS project-quota, cgroup dirty/writeback/device I/O, process-memory, adapter-lifecycle, pressure, and target-device trace observations. Cycle 12 adds truthful profile v3, the strict mapping schema/validator, direct disjoint-byte debt population/formula, censored stall-interval wire/formula, and objective low-volume device-I/O summary/formula. Cycle 13 adds only a content-addressed, streaming, synthetic/ineligible bundle validator that joins common samples/cuts with those artifacts and separates invalid trace evidence from adverse candidate signals; it cannot verify source proofs, clock provenance, environment validity, or execution approval and is not candidate coverage. V2's causal `unexplained_storage_pause` field remains unusable. Unmodified Fjall 3.1.8 still fails because applicable debt/stall signals are absent; the current RocksDB binding remains blocked because its stall ticker omits a verified write-buffer-manager/database-scope path; redb 4.1.0 remains deferred until its separately approved probe can supply proof for a later redb-specific profile and mapping. Supply a complete source, patch/upstream, or reject; never encode unsupported as zero or infer causal exclusions. |
 | **DKS-Q2-007** | Implement and review detached approval/completion records, pinned Fjall/RocksDB persistence mappings, complete configuration dumps, and cache-loss truth-table conformance. |
 | **DKS-Q2-008** | Freeze the paired physical-fault and 24/72-hour endurance matrices, actuator and N/N-1 pins, recovery criteria, and a bounded time-resolved endurance encoding distinct from finite raw samples. |
 | **DKS-Q2-009** | Before selection, approve and pass a separate C3 shared-database concurrency contract: deterministic disjoint-vnode lanes and per-lane oracle order; hot-writer/victim and mixed point/range/snapshot traffic; victim plus aggregate tails, global stalls/resources; and barrier-controlled races with restore activation, cleanup, and pinned snapshots. |

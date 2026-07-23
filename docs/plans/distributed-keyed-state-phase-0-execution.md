@@ -351,10 +351,27 @@ physical layout, attempt classification, fault identity, provenance, and immutab
 candidate observations exist. The CLI exposes validation only and has no candidate-execution
 command.
 
+Cycle 13 wires the previously isolated mechanism parsers through
+`validate-mechanism-bundle`. Its content-addressed validation input is structurally fixed to a
+synthetic, qualification-ineligible fixture and streams common resource samples/cuts plus applicable
+debt, stall, and target-device artifacts through a fixed 64 KiB buffer. It enforces raw hashes,
+population equality, canonical stall censoring, claimed clock/cut chronology, and the bounded
+mechanism gates. A successfully validated bundle can report only a non-authoritative absence or
+presence of adverse mechanism signals; malformed input instead remains invalid. Claimed write stop
+and clock source are not derived or attested, and this is not the future runner-plan/approval
+verifier. It cannot execute a candidate. DKS-Q2-005/006 therefore remain open.
+
+Cycle 13 also detaches the existing Zipf feasibility literals into a record explicitly marked
+non-independent and ineligible, adds Windows release coverage, and provisions native Linux arm64
+debug/release coverage. The independent numerical corpus, MPFR/interval audit, retry proof,
+interference evidence, workload/case registry, licensing record, and named-owner sampler decision
+remain DKS-Q2-001 blockers; configured CI is not a passing target result until it runs.
+
 redb 4.1.0 remains outside C2. The independent optional prescreen branch may design its isolated
 [bounded redb prescreen](../testing/state-backend-redb-prescreen-v1.md), but no run is authorized
-until its exact schemas/harness and separate detached pre-run approval are implemented and signed by
-the workload and operations owners. Its Docker Desktop/WSL subset is smoke-only; a target-host
+until its existing schemas gain an external semantic/attestation verifier and harness and a separate
+detached pre-run approval is signed by the workload and operations owners. Its Docker Desktop/WSL
+subset is smoke-only; a target-host
 `PRESCREEN_PASS` merely funds mechanism/persistence mapping, an additive profile/schema proposal,
 and adapter review. `PRESCREEN_NO_GO`, `DEFER`, and `REJECT_EXACT_PIN` add no candidate. No prescreen
 artifact may satisfy or be pooled into C1/C2/C3.

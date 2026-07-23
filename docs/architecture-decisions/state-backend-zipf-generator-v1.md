@@ -277,6 +277,15 @@ short rank file cannot be looped silently.
 
 ## Remaining DKS-Q2-001 sub-blockers
 
+Cycle 13 extracts the pre-existing setup/proposal literals into a detached JSON corpus whose own
+fields state `qualification_eligible=false` and `independently_generated=false`. The feature-gated
+tests consume that corpus in Windows x86_64 and Linux x86_64 debug/release checks. Required CI now
+also provisions Windows release and native Linux arm64 debug/release checks, but those jobs are not
+evidence until they pass on the branch. This reduces same-function test coupling and target
+coverage debt; it does not turn transcribed literals into the independent goldens or numerical
+audit required above. The MPFR/interval audit, retry proof, interference harness, workload-v2
+registry, licensing record, and named-owner sampler/case decision all remain absent.
+
 This ADR may be committed as a provisional selection, but the reserved identities cannot be
 implemented or approved until these are closed:
 
