@@ -367,6 +367,17 @@ debug/release coverage. The independent numerical corpus, MPFR/interval audit, r
 interference evidence, workload/case registry, licensing record, and named-owner sampler decision
 remain DKS-Q2-001 blockers; configured CI is not a passing target result until it runs.
 
+Cycle 14 adds a bounded, standalone MPFR interval prototype without adding a candidate dependency
+or execution command. Its 14 tests enforce fixed domains/grid points, explicit context and runtime
+identity, outward rounding, precision escalation, caps, canonical bytes, and non-evidence flags.
+Local Windows x86_64 and pinned Docker Linux x86_64 generate the same 865,397-byte observation and
+SHA-256 `8ad14317bdb1f12d67b9f823bea0759d33034e4c01164c2dbac90ad870f2474b`. Required CI now exercises
+that prototype on Linux x86_64, Windows x86_64, and native Linux arm64 and participates in
+`ci-success`; the branch has no upstream and those hosted jobs have not run. The prototype does not
+consume candidate output or compute approved distribution/rejection/retry metrics and has not been
+independently operated by the workload and operations owners. It therefore closes no DKS-Q2 item,
+does not authorize a backend run, and cannot be reused as production or soak evidence.
+
 redb 4.1.0 remains outside C2. The independent optional prescreen branch may design its isolated
 [bounded redb prescreen](../testing/state-backend-redb-prescreen-v1.md), but no run is authorized
 until its existing schemas gain an external semantic/attestation verifier and harness and a separate

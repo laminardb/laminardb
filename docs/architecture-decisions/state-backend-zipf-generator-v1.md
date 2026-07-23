@@ -283,8 +283,23 @@ tests consume that corpus in Windows x86_64 and Linux x86_64 debug/release check
 also provisions Windows release and native Linux arm64 debug/release checks, but those jobs are not
 evidence until they pass on the branch. This reduces same-function test coupling and target
 coverage debt; it does not turn transcribed literals into the independent goldens or numerical
-audit required above. The MPFR/interval audit, retry proof, interference harness, workload-v2
-registry, licensing record, and named-owner sampler/case decision all remain absent.
+audit required above.
+
+Cycle 14 adds `tools/state-backend-zipf-oracle`, an implementation-isolated CPython 3.13 prototype
+using gmpy2 2.3.1 and MPFR 4.2.2 directed intervals. Its fixed 92-domain search emits 471 canonical
+NDJSON records (865,397 bytes, SHA-256
+`8ad14317bdb1f12d67b9f823bea0759d33034e4c01164c2dbac90ad870f2474b`) identically on the local
+Windows x86_64 host and a pinned Linux x86_64 container. It imports neither the Rust candidate nor
+its literal corpus, escalates unresolved decisions through 4,096-bit precision, and marks every
+record ineligible and non-authorizing. CI is configured for Linux x86_64, Windows x86_64, and native
+Linux arm64, but none of those hosted jobs has run on this branch.
+
+This prototype is decision input, not the independent audit or qualification corpus. It has no
+candidate-output comparator, approved head/CDF/tail/total-variation thresholds, finite-grid
+rejection or retry bound, dependency-installation attestation, native-arm result, workload-owner
+operation, or sampler/case approval. Exact-equality and one-interval-step adversarial tests are also
+required before promotion. Z4/Z5, the interference harness, workload-v2 registry, complete
+licensing/SBOM record, and named-owner sampler/case decision therefore remain open.
 
 This ADR may be committed as a provisional selection, but the reserved identities cannot be
 implemented or approved until these are closed:
@@ -328,5 +343,10 @@ implemented or approved until these are closed:
   Apache-2.0; used only for comparison.
 - Rust [`f64` precision documentation](https://doc.rust-lang.org/stable/std/primitive.f64.html) and
   [`libm` 0.2.16](https://docs.rs/crate/libm/0.2.16), published under MIT.
+- [gmpy2 2.3.1](https://pypi.org/project/gmpy2/2.3.1/) is LGPL-3.0-or-later and supplies the
+  prototype's MPFR-backed directed-rounding contexts. The exact permitted wheel hashes are pinned
+  in the tool rather than inferred from a version label.
+- [MPFR 4.2.2](https://www.mpfr.org/mpfr-current/) is LGPL-3.0-or-later. Its use here does not
+  substitute for the Z4 artifact receipt, complete attribution record, or SBOM.
 
 No paper text or third-party source is vendored by this ADR.
