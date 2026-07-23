@@ -4,6 +4,7 @@ use std::io::{Read as _, Write as _};
 use std::path::Path;
 use std::process::ExitCode;
 
+use state_backend_qual::mechanism_bundle::validate_mechanism_bundle_path;
 use state_backend_qual::mechanism_mapping::{
     validate_mechanism_mapping, MAX_MECHANISM_MAPPING_BYTES,
 };
@@ -53,7 +54,53 @@ fn main() -> ExitCode {
             }
             validate_mechanism_mapping_paths(Path::new(&profile_path), Path::new(&mapping_path))
         }
+        Some("validate-mechanism-bundle") => {
+            let Some(input_path) = arguments.next() else {
+                return usage();
+            };
+            if arguments.next().is_some() {
+                return usage();
+            }
+            validate_mechanism_bundle_input(Path::new(&input_path))
+        }
         _ => usage(),
+    }
+}
+
+fn validate_mechanism_bundle_input(input_path: &Path) -> ExitCode {
+    match validate_mechanism_bundle_path(input_path) {
+        Ok(summary) => {
+            let fail_reasons = if summary.candidate_fail_reasons.is_empty() {
+                "none".to_owned()
+            } else {
+                summary.candidate_fail_reasons.join(",")
+            };
+            let debt = summary
+                .maximum_debt_bytes
+                .map_or_else(|| "not_applicable".to_owned(), |value| value.to_string());
+            let stalls = summary
+                .stall_time_permille
+                .map_or_else(|| "not_applicable".to_owned(), |value| value.to_string());
+            println!(
+                "VALID_INELIGIBLE_MECHANISM_BUNDLE bundle={} profile={} mapping={} candidate={} \
+                 observation_state={} fail_reasons={} samples={} debt_bytes={} stall_permille={} device_ms={}",
+                summary.bundle_id,
+                summary.profile_id,
+                summary.mapping_id,
+                summary.candidate_id,
+                summary.observation_state,
+                fail_reasons,
+                summary.common_resource_samples,
+                debt,
+                stalls,
+                summary.target_device_io_maximum_ms
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("INVALID_MECHANISM_BUNDLE {error}");
+            ExitCode::from(2)
+        }
     }
 }
 
@@ -158,7 +205,8 @@ fn usage() -> ExitCode {
     eprintln!(
         "usage: state-backend-qual validate-profile <profile-json-path>\n       \
          state-backend-qual validate-model-result <profile-json-path> <result-json-path>\n       \
-         state-backend-qual validate-mechanism-mapping <profile-json-path> <mapping-json-path>"
+         state-backend-qual validate-mechanism-mapping <profile-json-path> <mapping-json-path>\n       \
+         state-backend-qual validate-mechanism-bundle <validation-input-json-path>"
     );
     ExitCode::from(64)
 }

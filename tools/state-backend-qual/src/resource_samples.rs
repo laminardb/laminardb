@@ -59,6 +59,7 @@ pub struct ResourceCutsSummary {
 pub struct CommonResourceSamplesV2Summary {
     pub record_count: u64,
     pub maximum_skew_ns: u64,
+    pub maximum_observation_end_offset_ns: u64,
     pub observation_population_sha256: [u8; 32],
 }
 
@@ -67,7 +68,14 @@ pub struct CommonResourceCutsV2Summary {
     pub record_count: u64,
     pub resource_tail_tag: u8,
     pub maximum_skew_ns: u64,
+    pub observation_brackets: [ObservationBracket; 5],
     pub observation_population_sha256: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ObservationBracket {
+    pub begin_offset_ns: u64,
+    pub end_offset_ns: u64,
 }
 
 /// Validates the provisional C2 resource-sample wire without allocating per record.
@@ -226,6 +234,7 @@ pub fn validate_common_resource_samples_v2_reader<R: Read>(
     input.require_total_length(expected_bytes)?;
 
     let mut maximum_skew = 0;
+    let mut maximum_observation_end = 0;
     let mut population = PopulationHasher::new(record_count);
     for index in 0..record_count {
         let record = input.read_array::<COMMON_SAMPLE_V2_RECORD_BYTES>()?;
@@ -248,6 +257,7 @@ pub fn validate_common_resource_samples_v2_reader<R: Read>(
             index_usize,
         )?;
         maximum_skew = maximum_skew.max(skew);
+        maximum_observation_end = maximum_observation_end.max(end);
         population.update(0, index, begin, end);
     }
     input.finish()?;
@@ -255,6 +265,7 @@ pub fn validate_common_resource_samples_v2_reader<R: Read>(
     Ok(CommonResourceSamplesV2Summary {
         record_count,
         maximum_skew_ns: maximum_skew,
+        maximum_observation_end_offset_ns: maximum_observation_end,
         observation_population_sha256: population.finish(),
     })
 }
@@ -321,6 +332,7 @@ pub fn validate_common_resource_cuts_v2_reader<R: Read>(
 
     let mut maximum_skew = 0;
     let mut tail_tag = 0;
+    let mut observation_brackets = [ObservationBracket::default(); 5];
     let mut population = PopulationHasher::new(record_count);
     for index in 0..record_count {
         let record = input.read_array::<COMMON_CUT_V2_RECORD_BYTES>()?;
@@ -363,6 +375,10 @@ pub fn validate_common_resource_cuts_v2_reader<R: Read>(
             index_usize,
         )?;
         maximum_skew = maximum_skew.max(skew);
+        observation_brackets[index_usize] = ObservationBracket {
+            begin_offset_ns: begin,
+            end_offset_ns: end,
+        };
         population.update(tag, 0, begin, end);
     }
     input.finish()?;
@@ -371,6 +387,7 @@ pub fn validate_common_resource_cuts_v2_reader<R: Read>(
         record_count,
         resource_tail_tag: tail_tag,
         maximum_skew_ns: maximum_skew,
+        observation_brackets,
         observation_population_sha256: population.finish(),
     })
 }

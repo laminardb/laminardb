@@ -127,3 +127,54 @@ impl PopulationHasher {
         self.0.finalize().into()
     }
 }
+
+pub(crate) struct HashingReader<R> {
+    inner: R,
+    hasher: Sha256,
+    bytes_read: u64,
+}
+
+impl<R> HashingReader<R> {
+    pub(crate) fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+            bytes_read: 0,
+        }
+    }
+
+    pub(crate) fn finish(self) -> ([u8; 32], u64) {
+        (self.hasher.finalize().into(), self.bytes_read)
+    }
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.inner.read(buffer)?;
+        self.hasher.update(&buffer[..count]);
+        let count_u64 = u64::try_from(count).map_err(|_| {
+            std::io::Error::new(ErrorKind::InvalidData, "reader byte count does not fit u64")
+        })?;
+        self.bytes_read = self.bytes_read.checked_add(count_u64).ok_or_else(|| {
+            std::io::Error::new(ErrorKind::InvalidData, "reader byte count overflow")
+        })?;
+        Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    #[test]
+    fn exact_reader_cap_is_inclusive_and_plus_one_fails_before_reading() {
+        assert!(ExactReader::new(Cursor::new([]), 256, 256, "fixture").is_ok());
+        assert!(ExactReader::new(Cursor::new([]), 257, 256, "fixture")
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("maximum is 256"));
+    }
+}

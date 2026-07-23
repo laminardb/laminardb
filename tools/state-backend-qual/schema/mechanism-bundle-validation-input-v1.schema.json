@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://laminardb.dev/schemas/state-backend-mechanism-bundle-validation-input-v1.json",
+  "title": "LaminarDB mechanism bundle validation input v1",
+  "description": "A content-addressed, explicitly ineligible input for structural and cross-artifact validation. It is not a runner plan or execution approval.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "notice",
+    "record_class",
+    "fixture_ineligible",
+    "status",
+    "qualification_eligible",
+    "validation_authorizes_execution",
+    "bundle_id",
+    "candidate_id",
+    "clock",
+    "limits",
+    "target_device",
+    "artifacts"
+  ],
+  "properties": {
+    "schema_version": {"const": "state-backend-mechanism-bundle-validation-input/v1"},
+    "notice": {"const": "NOT QUALIFICATION EVIDENCE"},
+    "record_class": {"const": "synthetic_fixture"},
+    "fixture_ineligible": {"const": true},
+    "status": {"const": "candidate_unapproved"},
+    "qualification_eligible": {"const": false},
+    "validation_authorizes_execution": {"const": false},
+    "bundle_id": {"$ref": "#/$defs/id"},
+    "candidate_id": {"$ref": "#/$defs/id"},
+    "clock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "origin_reading_ns",
+        "measured_phase_start_offset_ns",
+        "measured_elapsed_ns",
+        "write_stop_offset_ns",
+        "last_terminal_offset_ns",
+        "device_capture_end_offset_ns"
+      ],
+      "properties": {
+        "source": {"const": "CLOCK_MONOTONIC_RAW"},
+        "origin_reading_ns": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "measured_phase_start_offset_ns": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "measured_elapsed_ns": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615},
+        "write_stop_offset_ns": {
+          "description": "Claimed logical write-stop offset. Synthetic validation checks cut chronology but cannot derive this value without an approved workload plan.",
+          "type": "integer", "minimum": 1, "maximum": 18446744073709551615
+        },
+        "last_terminal_offset_ns": {
+          "description": "Claimed last-terminal offset. Synthetic validation checks cut chronology but cannot prove the producer's request timeline.",
+          "type": "integer", "minimum": 1, "maximum": 18446744073709551615
+        },
+        "device_capture_end_offset_ns": {"type": "integer", "minimum": 1, "maximum": 18446744073709551615}
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expected_nominal_resource_samples", "resource_observation_skew_max_ns"],
+      "properties": {
+        "expected_nominal_resource_samples": {"type": "integer", "minimum": 1, "maximum": 1677721},
+        "resource_observation_skew_max_ns": {"type": "integer", "minimum": 0, "maximum": 1000000000}
+      }
+    },
+    "target_device": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["major", "minor"],
+      "properties": {
+        "major": {"type": "integer", "minimum": 1, "maximum": 4294967295},
+        "minor": {"type": "integer", "minimum": 0, "maximum": 4294967295}
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile",
+        "mechanism_mapping",
+        "common_resource_samples",
+        "common_resource_cuts",
+        "maintenance_debt_samples",
+        "stall_intervals",
+        "target_device_io"
+      ],
+      "properties": {
+        "profile": {"$ref": "#/$defs/descriptor"},
+        "mechanism_mapping": {"$ref": "#/$defs/descriptor"},
+        "common_resource_samples": {"$ref": "#/$defs/descriptor"},
+        "common_resource_cuts": {"$ref": "#/$defs/descriptor"},
+        "maintenance_debt_samples": {
+          "oneOf": [{"type": "null"}, {"$ref": "#/$defs/descriptor"}]
+        },
+        "stall_intervals": {
+          "oneOf": [{"type": "null"}, {"$ref": "#/$defs/descriptor"}]
+        },
+        "target_device_io": {"$ref": "#/$defs/descriptor"}
+      }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9][a-z0-9._/-]{0,127}$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "not": {"const": "0000000000000000000000000000000000000000000000000000000000000000"}
+    },
+    "descriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "file_name", "byte_length", "sha256", "media_type"],
+      "properties": {
+        "role": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 96,
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,95}$"
+        },
+        "file_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+        },
+        "byte_length": {"type": "integer", "minimum": 1, "maximum": 268435456},
+        "sha256": {"$ref": "#/$defs/digest"},
+        "media_type": {"enum": ["application/json", "application/octet-stream"]}
+      }
+    }
+  }
+}

@@ -337,6 +337,11 @@ pub fn validate_stall_intervals_v1_reader<R: Read>(
                 "stall interval {index} does not intersect the measurement interval"
             )));
         }
+        if end > measurement_end {
+            return Err(CheckErrors::one(format!(
+                "stall interval {index} ends after measurement_end instead of using the canonical censored boundary"
+            )));
+        }
         let order = (start, end, mechanism, source_sequence);
         if previous_order.is_some_and(|previous| previous > order) {
             return Err(CheckErrors::one(
@@ -346,7 +351,7 @@ pub fn validate_stall_intervals_v1_reader<R: Read>(
         previous_order = Some(order);
 
         let clipped_start = start.max(measurement_start);
-        let clipped_end = end.min(measurement_end);
+        let clipped_end = end;
         match union_start {
             None => {
                 union_start = Some(clipped_start);
@@ -878,6 +883,12 @@ mod tests {
         let summary = validate_stall_intervals_v1(&active_at_end, &HASH, 2).unwrap();
         assert_eq!(summary.union_stall_ns, 80);
         assert_eq!(summary.stall_time_permille, 800);
+
+        active_at_end[last_end..last_end + 8].copy_from_slice(&201_u64.to_be_bytes());
+        assert!(validate_stall_intervals_v1(&active_at_end, &HASH, 2)
+            .unwrap_err()
+            .to_string()
+            .contains("canonical censored boundary"));
     }
 
     #[test]

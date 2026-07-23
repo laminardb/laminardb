@@ -1,2 +1,9 @@
 # Exact profile bytes participate in qualification identity hashes.
 /tools/state-backend-qual/profiles/** text eol=lf
+
+# Mechanism artifacts bind exact mapping/input bytes across Windows and Linux checkouts.
+/tools/state-backend-qual/tests/fixtures/mechanism-mapping-*.json text eol=lf
+/tools/state-backend-qual/tests/fixtures/mechanism-bundle-*/**/*.json text eol=lf
+/tools/state-backend-qual/tests/fixtures/mechanism-bundle-*/**/*.hex text eol=lf
+/tools/state-backend-qual/tests/fixtures/mechanism-bundle-*/**/*.bin binary
+/tools/state-backend-qual/tests/fixtures/zipf-candidate-*.json text eol=lf
