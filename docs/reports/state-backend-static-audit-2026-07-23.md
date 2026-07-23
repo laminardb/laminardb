@@ -327,14 +327,16 @@ timing, and a prohibition on full-tree statistics during measurement.
 
 Version 4.1.0 does not expose internal read/write bytes or pinned-snapshot bytes, but the contract
 does not make candidate-internal versions of those observations common mandatory fields. The
-candidate remains **DEFER** pending the mechanism-map schema, reviewed redb mapping, and
+candidate remains **DEFER** pending a reviewed redb-specific profile and mechanism mapping, the
+external semantic/attestation verifier and fail-closed harness, named-owner approval, and the
 writer/commit/recovery microprobe; no telemetry or latency failure has been measured.
 
 The proposed [bounded redb 4.1.0 prescreen](../testing/state-backend-redb-prescreen-v1.md) specifies
 that microprobe's non-gating decision boundary, exact pin, single-writer matrix, atomicity/recovery
-split, hard caps, and Docker/WSL smoke-only subset. It still requires strict schemas/harness, a
-detached pre-run approval by named owners, and review; it does not add redb to any manifest,
-lockfile, profile, adapter, or qualification population.
+split, hard caps, and Docker/WSL smoke-only subset. Strict schemas and synthetic fixtures now exist,
+but they have no external semantic/attestation verifier or isolated execution harness. A detached
+pre-run approval by named owners and independent review are still required; the proposal does not
+add redb to any manifest, lockfile, profile, adapter, or qualification population.
 
 ## Configuration, restore, and decision gates
 
