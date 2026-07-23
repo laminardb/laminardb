@@ -1,6 +1,6 @@
 # State backend long-stream workload and identity v2
 
-- **Status:** provisional C2 identity decision; lifecycle cases and executable schemas remain blocked
+- **Status:** provisional C2 identity plus reviewed M2 feasibility components; executable cases remain blocked
 - **Scope:** standalone `tools/state-backend-qual` qualification tooling only
 - **Not runtime code:** this does not change cluster admission, checkpointing, or operator execution
 - **Approval required before candidate execution:** workload owner and operations owner
@@ -568,6 +568,164 @@ minimum, closure must freeze:
 Every decision uses only ordinal, seed, and oracle state—not candidate latency, compaction, or
 results. The current candidate's impossible `128 * (16 + 65,536)` write and 1,000-row compact
 fanout-64 join remain mandatory negative preflight cases, not matrix entries.
+
+## M2 reviewed feasibility components
+
+M2 is not an accepted matrix or case body. Independent read-only cross-review found no arithmetic
+or lifecycle feasibility blocker in the components below and caught three defects before encoding:
+the M1 rank-correlated width rule, an over-target aggregate/timer sizing attempt, and a join fanout
+period that did not divide its retention horizon. This is not workload-owner approval, production
+review, or independent-soak evidence. DKS-Q2-002/003, Z3, owner approval, and every execution gate
+remain open. No policy name below is registered and no expectations, plan, or result object may be
+emitted from these numbers.
+
+### Balanced width and placement constraint
+
+For stable entity ordinal `e`, let `v=e mod 256`, `local=floor(e/256)`,
+`quartet=floor(local/4)`, and `lane=local mod 4`. A role- and stream-separated SHA-256 rotation
+selects the two-bit value `r`; width class is `(lane+r) mod 4`. Thus every complete quartet in every
+vnode and role has exactly one 80-, 320-, 1,280-, and 5,120-byte record, with exact mean 1,700
+bytes. The canonical domain separator, length framing, role registry, and integer widths still
+belong to Z3/Z1; concatenating informal fields is not an encoding.
+
+Width hashes are generation decisions, not candidate service work. Their implementation must use
+a bounded setup/precomputed or reviewed closed-form path; runner CPU remains charged and paired
+null controls must expose interference. Per-row SHA-256 cannot silently enter the measured service
+hot path.
+
+A hot-wide control may swap each of ranks 0 through 9 with the class-3 lane in its own `(v,
+quartet)`. Under identity-mod placement those ranks occupy distinct vnodes, and each swap preserves
+the quartet's class multiset. This fixes M1's “hottest means cheapest” defect without changing
+state bytes. It remains a reviewed transform, not a registered `selection_policy`.
+
+Aggregate and timer dimensions use complete quartets per vnode. Join has two tail rows per vnode;
+its tail rotation is `(vnode+stream_offset) mod 4`, so 64 vnodes receive each rotation and every
+class receives the same total tail count. Independently hashing each tail is forbidden: it can move
+the nominal total by up to 768,000 bytes.
+
+### Corrected under-target shapes
+
+All byte totals are logical key-plus-value bytes, not encoded artifacts, RSS, disk allocation, or
+proof of cache misses. The aggregate uses `C=N+M`, where `M=ceil(C/100)` is a disjoint rotating-cold
+slot domain. Timer `C` is the entity count, `D` is its timer-bearing subset, and its records are
+`C` window plus `C` output/bookkeeping plus `D` timer rows and 256 compact frontier rows. Join
+uses `R=W=12,800Q` live rows.
+
+| Shape | Exact dimensions | Logical records | Logical bytes | Below target |
+|---|---|---:|---:|---:|
+| Aggregate resident | `C=2,526,208`; `M=25,263`; `N=2,500,945` | 2,526,208 | 4,294,553,600 | 413,696 |
+| Aggregate spill | `C=60,634,112`; `M=606,342`; `N=60,027,770` | 60,634,112 | 103,077,990,400 | 1,224,704 |
+| Timer resident | `C=1,131,520`; `D=262,144` | 2,525,440 | 4,292,874,240 | 2,093,056 |
+| Timer spill | `C=28,219,392`; `D=4,194,304` | 60,633,344 | 103,076,311,040 | 2,904,064 |
+| Join resident | `Q=197`; `W=2,521,600` | 2,521,600 | 4,286,720,000 | 8,247,296 |
+| Join spill | `Q=4,737`; `W=60,633,600` | 60,633,600 | 103,077,120,000 | 2,095,104 |
+
+The corrected aggregate shapes place 9,868 and 236,852 records per vnode. Their worst logical
+bytes per vnode are 16,775,600 and 402,648,400; key bytes are 10,933,744 and 262,432,016. The timer
+shapes place 9,865 and 236,849 records per vnode. Their logical bytes per vnode are 16,769,040 and
+402,641,840; spill key/state bytes are 262,427,616/140,214,224. Join's reviewed allocator yields
+exactly `50Q` rows per vnode: 9,850 and 236,850. Its worst tail placement gives 16,748,000 and
+402,648,000 logical bytes, with 10,915,936 and 262,431,936 key bytes. All raw counts fit the current
+per-artifact and transition numerical ceilings, but an actual timer/join codec plus framing and
+roster proof is still required.
+
+Aggregate requests apply the 128 source rows in source order and fold repeated point updates by
+logical key, then rotate one disjoint cold slot. That gives stable cardinality while separating
+natural distribution pressure from guaranteed churn. Exact values, generations, conflict rules,
+distribution assignments, operation counts, and an all-distinct cold-read case remain to be
+frozen; a Zipf-labelled 96-GiB shape alone is not cold-I/O evidence.
+
+### Timer lifecycle candidate
+
+The reviewed `2C+D+256` M2 mapping makes `D` a subset of `C`, with one window and one
+output/bookkeeping row for every entity, one timer row for every `D` entity, and one compact
+frontier row per vnode. Every reschedule and fire must select from `D`; the earlier suggestion to
+exclude `D` from the mutation pool is rejected because those entities would have no timer row.
+
+One five-request cycle matches the profile's 600/200/200 timer mix: three reschedule requests, one
+bounded due scan, then one validated atomic fire. Each reschedule swaps 64 pairs from distinct
+not-yet-fired deadline cohorts in the same vnode, covering 128 entities and incrementing their
+generations. It selects 16 pairs of quartets and makes four same-lane deadline swaps per pair,
+preserving vnode ownership and every role's balanced width population.
+
+Deadlines use due-scan ordinals, not raw request ordinals. Let `K=D/(256*512)`, `v=q mod 256`, and
+`bucket=floor(q/256) mod K`. At setup only, cohort entity `i` is
+`v+256*(512*bucket+i)` for `0<=i<512`; rescheduling deliberately changes later rosters while
+preserving 512 timers per deadline. Resident has `K=2` and a `256K=512`-scan ring; spill has `K=32`
+and an 8,192-scan ring. Fire consumes the due scan's canonical ordered roster, re-reads and validates
+it rather than regenerating setup membership, requeues each timer at `q+256K`, and advances the
+vnode frontier in the same mutation batch.
+
+A balanced 512-entity cohort has 870,400 row bytes and 567,296 key bytes. Fire validates five
+old-present/successor-absent records per entity plus the frontier: 2,561 reads and 4,352,240 bytes of
+read capacity. Its mutation roster is window put, old-timer delete/new-timer put, old-output
+delete/new-output put, and one frontier put, for 3,746,032 logical mutation bytes. A narrower
+C1-style proxy gives a 6,637,428-byte headroom estimate, but cannot prove the unfrozen v2 framing or
+encoded-request cap. An all-wide five-operation roster plus frontier needs
+`3*512*5,120 + 2*512*4,096 + 240 = 12,058,864` mutation bytes and is a mandatory negative; the
+balanced-cohort invariant is required.
+
+The spill timer's active three-row `D` bundles plus frontiers are 21,391,011,840 logical bytes,
+above the configured 8-GiB block cache and therefore a stronger cache-pressure basis than the
+rejected 5,347,799,040-byte (4.98-GiB) active shape. It still cannot prove physical cold reads in
+the presence of OS cache, compression, prefetch, or locality. A pre-approved external device-read
+or verified cache-miss floor remains mandatory.
+
+### Dynamic two-sided join candidate J2
+
+For integer `Q`, the live horizon is `W=12,800Q`. A signed event ordinal `t` uses Euclidean
+arithmetic and `p=(11*(t mod 200)) mod 200`; bands `[0,100)`, `[100,170)`, `[170,198)`, and
+`[198,200)` select fanout 0, 1, 8, and 64. This is a permutation with exact 500/350/140/10 weights.
+Its class group counts are `n0=3,200Q`, `n1=2,240Q`, `n8=112Q`, and `n64=Q`. A class-event ordinal
+selects group modulo `n`, alternates side by occurrence, and rotates through `max(1,fanout)` slots.
+Fanout zero uses side-distinct join generations.
+
+`W` contains exactly `64Q` complete classifier periods, so advancing by `W` shifts a group's
+occurrence by exactly 2/2/16/128. The row at `t-W` is therefore the same class, group, side, and
+slot as the successor at `t`; the opposite-side scan returns exactly 0/1/8/64 rows and cardinality
+stays constant. Across aligned 128-row requests the reviewed return band is 245--324 rows with mean
+270.08. The smallest fanout-64 group population is 197, so no group repeats within one request; all
+reads may use the pre-mutation snapshot before one atomic state batch.
+
+Those reads plus a later batch are not an atomic read-modify-write transaction. C2 relies on its
+single serialized foreground state worker and must abort on any validation mismatch; this shape
+does not establish C3 concurrency or serializability.
+
+The interval is `[t-W,t)`: read first while the lower-bound row is visible, then atomically delete
+the same-side `t-W` key, insert the distinct timestamped `t` key, and append output observations.
+Both input next-time frontiers start a request `[a,b]` at `a`; after all arrivals through `b` and
+the state batch commit, both advance to `b+1`, then cleanup may run. Synthetic progress controls
+are not workload rows or samples. Endpoint sentinels cover exact lower inclusion and upper
+exclusion. This case deliberately does not qualify lateness, idleness, watermark-only idle-group
+eviction, expiry retractions, or sink commits.
+
+Whole groups of 128, 16, or 2 rows can be assigned to the least-loaded vnode and the 2-row groups
+fill every vnode to exactly `50Q`; the arithmetic is feasible. The canonical routed-group ID,
+constant-time routing formula, signed timestamp/key padding, range bounds, and globally balanced
+tail-rule stream-offset derivation remain unfrozen. The proposed setup uses negative logical
+history and an order-preserving sign-bit-biased key timestamp; it must not ambiguously apply a
+second epoch offset. The greedy allocator is a setup feasibility proof, not a measured hot-path
+operation; runtime routing needs the still-unfrozen constant-time formula, with generator overhead
+charged and controlled.
+J2 is therefore a pass for logical lifecycle feasibility only, not an accepted workload or product
+join semantic.
+
+### Remaining M2 blockers
+
+The complete matrix remains **BLOCK**. It still needs registered scenario/role/width/churn/retention
+identities and exact binary encodings; complete timer/join logical-to-physical codecs; literal
+goldens; exact dedup/conflict/range-lookahead rules; a bounded candidate-independent oracle and
+finite preflight that does not replay 6.39 billion rows without a resource/deadline proof; an
+encodable setup/reopen/final-persist procedure; setup/final equality plus non-interfering in-service
+observations; cold-I/O evidence; rates, counts, schedule, service/runner/interference/resource
+gates; campaign time/endurance budget; and named workload/operations approvals.
+
+`no_explicit_persist` may describe only the same-open warmup/measurement interval. It does not by
+itself encode setup durability, close/reopen verification, final persistence, cache-loss behavior,
+or a checkpoint. A full candidate scan at the warmup boundary remains prohibited from donating
+performance samples. Until the remaining blockers close, the CLI stays validation-only and every
+candidate execution, backend selection, admission, exactly-once claim, and production-readiness
+claim remains fail-closed.
 
 ## Product boundary
 
