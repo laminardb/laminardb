@@ -1,6 +1,9 @@
+use std::io::{Cursor, Read};
+
+use crate::artifact_reader::{ExactReader, PopulationHasher};
 use crate::CheckErrors;
 
-pub const MAX_MECHANISM_ARTIFACT_BYTES: usize = 256 * 1024 * 1024;
+pub const MAX_MECHANISM_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 
 const DEBT_DOMAIN: &[u8] = b"LDB-SBQ-MAINTENANCE-DEBT-V1\0";
 const STALL_DOMAIN: &[u8] = b"LDB-SBQ-STALL-INTERVALS-V1\0";
@@ -28,6 +31,9 @@ pub struct MaintenanceDebtSummary {
     pub maximum_total_debt_bytes: u64,
     pub maximum_observation_skew_ns: u64,
     pub tail_reached_deadline: bool,
+    pub nominal_population_sha256: [u8; 32],
+    pub cut_population_sha256: [u8; 32],
+    pub normalized_tail_tag: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,10 +41,17 @@ pub struct StallIntervalsSummary {
     pub record_count: u64,
     pub union_stall_ns: u64,
     pub stall_time_permille: u64,
+    pub measurement_start_offset_ns: u64,
+    pub measurement_end_offset_ns: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TargetDeviceIoSummary {
+    pub target_major: u32,
+    pub target_minor: u32,
+    pub measurement_start_offset_ns: u64,
+    pub measurement_end_offset_ns: u64,
+    pub capture_end_offset_ns: u64,
     pub shard_count: u32,
     pub issued_count: u64,
     pub maximum_issue_to_terminal_ns: u64,
@@ -63,12 +76,32 @@ pub fn validate_maintenance_debt_samples_v1(
     expected_nominal_samples: u64,
     maximum_skew_ns: u64,
 ) -> Result<MaintenanceDebtSummary, CheckErrors> {
+    let byte_length = u64::try_from(bytes.len())
+        .map_err(|_| CheckErrors::one("maintenance debt length does not fit u64"))?;
+    validate_maintenance_debt_samples_v1_reader(
+        Cursor::new(bytes),
+        byte_length,
+        expected_mapping_sha256,
+        mechanism_count,
+        expected_nominal_samples,
+        maximum_skew_ns,
+    )
+}
+
+/// Streams the maintenance-debt wire with one bounded record buffer.
+pub fn validate_maintenance_debt_samples_v1_reader<R: Read>(
+    reader: R,
+    byte_length: u64,
+    expected_mapping_sha256: &[u8; 32],
+    mechanism_count: u32,
+    expected_nominal_samples: u64,
+    maximum_skew_ns: u64,
+) -> Result<MaintenanceDebtSummary, CheckErrors> {
     if mechanism_count == 0 || mechanism_count > 16 {
         return Err(CheckErrors::one(
             "maintenance debt mechanism count must be in 1..=16",
         ));
     }
-    reject_oversized(bytes, "maintenance debt")?;
     let record_bytes = DEBT_FIXED_RECORD_BYTES
         .checked_add(
             usize::try_from(mechanism_count)
@@ -77,27 +110,25 @@ pub fn validate_maintenance_debt_samples_v1(
                 .ok_or_else(|| CheckErrors::one("maintenance debt record width overflow"))?,
         )
         .ok_or_else(|| CheckErrors::one("maintenance debt record width overflow"))?;
-    let header_bytes = DEBT_DOMAIN
-        .len()
-        .checked_add(DIGEST_BYTES + 4 + COUNT_BYTES)
-        .ok_or_else(|| CheckErrors::one("maintenance debt header width overflow"))?;
-    if bytes.len() < header_bytes {
-        return Err(CheckErrors::one("maintenance debt stream is truncated"));
-    }
-    if &bytes[..DEBT_DOMAIN.len()] != DEBT_DOMAIN {
+    let mut input = ExactReader::new(
+        reader,
+        byte_length,
+        MAX_MECHANISM_ARTIFACT_BYTES,
+        "maintenance debt",
+    )?;
+    if input.read_vec(DEBT_DOMAIN.len())? != DEBT_DOMAIN {
         return Err(CheckErrors::one("maintenance debt domain mismatch"));
     }
-    let digest_start = DEBT_DOMAIN.len();
-    if &bytes[digest_start..digest_start + DIGEST_BYTES] != expected_mapping_sha256 {
+    if input.read_array::<DIGEST_BYTES>()? != *expected_mapping_sha256 {
         return Err(CheckErrors::one("maintenance debt mapping sha256 mismatch"));
     }
-    let encoded_mechanisms = u32_at(bytes, digest_start + DIGEST_BYTES);
+    let encoded_mechanisms = u32::from_be_bytes(input.read_array()?);
     if encoded_mechanisms != mechanism_count {
         return Err(CheckErrors::one(format!(
             "maintenance debt mechanism count is {encoded_mechanisms}; expected {mechanism_count}"
         )));
     }
-    let record_count = u64_at(bytes, digest_start + DIGEST_BYTES + 4);
+    let record_count = u64::from_be_bytes(input.read_array()?);
     let expected_records = expected_nominal_samples
         .checked_add(5)
         .ok_or_else(|| CheckErrors::one("maintenance debt expected record count overflow"))?;
@@ -106,27 +137,33 @@ pub fn validate_maintenance_debt_samples_v1(
             "maintenance debt record count is {record_count}; expected {expected_records}"
         )));
     }
-    validate_exact_length(
-        bytes.len(),
+    let header_bytes = DEBT_DOMAIN
+        .len()
+        .checked_add(DIGEST_BYTES + 4 + COUNT_BYTES)
+        .ok_or_else(|| CheckErrors::one("maintenance debt header width overflow"))?;
+    input.require_total_length(exact_stream_length(
         header_bytes,
         record_bytes,
         record_count,
         "maintenance debt",
-    )?;
+    )?)?;
 
     let mut maximum_total = 0_u64;
     let mut maximum_skew = 0_u64;
     let mut tail_reached_deadline = false;
+    let mut nominal_population = PopulationHasher::new(expected_nominal_samples);
+    let mut cut_population = PopulationHasher::new(5);
+    let mut normalized_tail_tag = 0_u8;
+    let mut record = vec![0_u8; record_bytes];
     for index in 0..record_count {
-        let offset = record_offset(header_bytes, record_bytes, index)?;
-        let record = &bytes[offset..offset + record_bytes];
+        input.read_into(&mut record)?;
         let tag = record[0];
         if record[1..8].iter().any(|byte| *byte != 0) {
             return Err(CheckErrors::one(format!(
                 "maintenance debt record {index} has nonzero reserved bytes"
             )));
         }
-        let population_index = u64_at(record, 8);
+        let population_index = u64_at(&record, 8);
         let expected_tag = if index < expected_nominal_samples {
             DEBT_NOMINAL_SAMPLE
         } else {
@@ -156,13 +193,13 @@ pub fn validate_maintenance_debt_samples_v1(
                 "maintenance debt record {index} population index is {population_index}; expected {expected_population_index}"
             )));
         }
-        let begin = u64_at(record, 16);
-        let end = u64_at(record, 24);
+        let begin = u64_at(&record, 16);
+        let end = u64_at(&record, 24);
         let skew = validate_bracket(begin, end, maximum_skew_ns, "maintenance debt", index)?;
         maximum_skew = maximum_skew.max(skew);
         let mut total = 0_u64;
         for mechanism in 0..mechanism_count {
-            let value = u64_at(record, DEBT_FIXED_RECORD_BYTES + mechanism as usize * 8);
+            let value = u64_at(&record, DEBT_FIXED_RECORD_BYTES + mechanism as usize * 8);
             total = total.checked_add(value).ok_or_else(|| {
                 CheckErrors::one(format!(
                     "maintenance debt record {index} mechanism sum overflow"
@@ -171,13 +208,26 @@ pub fn validate_maintenance_debt_samples_v1(
         }
         maximum_total = maximum_total.max(total);
         tail_reached_deadline = tag == DEBT_TAIL_DEADLINE;
+        if tag == DEBT_NOMINAL_SAMPLE {
+            nominal_population.update(0, population_index, begin, end);
+        } else {
+            let normalized_tag = tag - DEBT_PRE_MEASUREMENT;
+            cut_population.update(normalized_tag, 0, begin, end);
+            if matches!(tag, DEBT_TAIL_STABLE | DEBT_TAIL_DEADLINE) {
+                normalized_tail_tag = normalized_tag;
+            }
+        }
     }
+    input.finish()?;
 
     Ok(MaintenanceDebtSummary {
         record_count,
         maximum_total_debt_bytes: maximum_total,
         maximum_observation_skew_ns: maximum_skew,
         tail_reached_deadline,
+        nominal_population_sha256: nominal_population.finish(),
+        cut_population_sha256: cut_population.finish(),
+        normalized_tail_tag,
     })
 }
 
@@ -187,45 +237,62 @@ pub fn validate_stall_intervals_v1(
     expected_mapping_sha256: &[u8; 32],
     mechanism_count: u32,
 ) -> Result<StallIntervalsSummary, CheckErrors> {
+    let byte_length = u64::try_from(bytes.len())
+        .map_err(|_| CheckErrors::one("stall interval length does not fit u64"))?;
+    validate_stall_intervals_v1_reader(
+        Cursor::new(bytes),
+        byte_length,
+        expected_mapping_sha256,
+        mechanism_count,
+    )
+}
+
+/// Streams the canonical stall-interval wire with bounded per-mechanism state.
+pub fn validate_stall_intervals_v1_reader<R: Read>(
+    reader: R,
+    byte_length: u64,
+    expected_mapping_sha256: &[u8; 32],
+    mechanism_count: u32,
+) -> Result<StallIntervalsSummary, CheckErrors> {
     if mechanism_count == 0 || mechanism_count > 16 {
         return Err(CheckErrors::one("stall mechanism count must be in 1..=16"));
     }
-    reject_oversized(bytes, "stall interval")?;
-    let header_bytes = STALL_DOMAIN
-        .len()
-        .checked_add(DIGEST_BYTES + 4 + 8 + 8 + COUNT_BYTES)
-        .ok_or_else(|| CheckErrors::one("stall interval header width overflow"))?;
-    if bytes.len() < header_bytes {
-        return Err(CheckErrors::one("stall interval stream is truncated"));
-    }
-    if &bytes[..STALL_DOMAIN.len()] != STALL_DOMAIN {
+    let mut input = ExactReader::new(
+        reader,
+        byte_length,
+        MAX_MECHANISM_ARTIFACT_BYTES,
+        "stall interval",
+    )?;
+    if input.read_vec(STALL_DOMAIN.len())? != STALL_DOMAIN {
         return Err(CheckErrors::one("stall interval domain mismatch"));
     }
-    let digest_start = STALL_DOMAIN.len();
-    if &bytes[digest_start..digest_start + DIGEST_BYTES] != expected_mapping_sha256 {
+    if input.read_array::<DIGEST_BYTES>()? != *expected_mapping_sha256 {
         return Err(CheckErrors::one("stall interval mapping sha256 mismatch"));
     }
-    let encoded_mechanisms = u32_at(bytes, digest_start + DIGEST_BYTES);
+    let encoded_mechanisms = u32::from_be_bytes(input.read_array()?);
     if encoded_mechanisms != mechanism_count {
         return Err(CheckErrors::one(format!(
             "stall mechanism count is {encoded_mechanisms}; expected {mechanism_count}"
         )));
     }
-    let measurement_start = u64_at(bytes, digest_start + DIGEST_BYTES + 4);
-    let measurement_end = u64_at(bytes, digest_start + DIGEST_BYTES + 12);
+    let measurement_start = u64::from_be_bytes(input.read_array()?);
+    let measurement_end = u64::from_be_bytes(input.read_array()?);
     if measurement_start >= measurement_end {
         return Err(CheckErrors::one(
             "stall measurement interval must be nonempty",
         ));
     }
-    let record_count = u64_at(bytes, digest_start + DIGEST_BYTES + 20);
-    validate_exact_length(
-        bytes.len(),
+    let record_count = u64::from_be_bytes(input.read_array()?);
+    let header_bytes = STALL_DOMAIN
+        .len()
+        .checked_add(DIGEST_BYTES + 4 + 8 + 8 + COUNT_BYTES)
+        .ok_or_else(|| CheckErrors::one("stall interval header width overflow"))?;
+    input.require_total_length(exact_stream_length(
         header_bytes,
         STALL_RECORD_BYTES,
         record_count,
         "stall interval",
-    )?;
+    )?)?;
 
     let mechanism_len = usize::try_from(mechanism_count)
         .map_err(|_| CheckErrors::one("stall mechanism count does not fit usize"))?;
@@ -236,9 +303,8 @@ pub fn validate_stall_intervals_v1(
     let mut union_ns = 0_u64;
 
     for index in 0..record_count {
-        let offset = record_offset(header_bytes, STALL_RECORD_BYTES, index)?;
-        let record = &bytes[offset..offset + STALL_RECORD_BYTES];
-        let mechanism = u32_at(record, 0);
+        let record = input.read_array::<STALL_RECORD_BYTES>()?;
+        let mechanism = u32_at(&record, 0);
         if mechanism >= mechanism_count {
             return Err(CheckErrors::one(format!(
                 "stall interval {index} mechanism index {mechanism} is outside 0..{mechanism_count}"
@@ -249,7 +315,7 @@ pub fn validate_stall_intervals_v1(
                 "stall interval {index} has nonzero reserved bytes"
             )));
         }
-        let source_sequence = u64_at(record, 8);
+        let source_sequence = u64_at(&record, 8);
         let expected_sequence = next_sequences[mechanism as usize];
         if source_sequence != expected_sequence {
             return Err(CheckErrors::one(format!(
@@ -259,8 +325,8 @@ pub fn validate_stall_intervals_v1(
         next_sequences[mechanism as usize] = expected_sequence
             .checked_add(1)
             .ok_or_else(|| CheckErrors::one("stall source sequence overflow"))?;
-        let start = u64_at(record, 16);
-        let end = u64_at(record, 24);
+        let start = u64_at(&record, 16);
+        let end = u64_at(&record, 24);
         if start >= end {
             return Err(CheckErrors::one(format!(
                 "stall interval {index} must be nonempty"
@@ -301,6 +367,7 @@ pub fn validate_stall_intervals_v1(
             .checked_add(union_end - current_start)
             .ok_or_else(|| CheckErrors::one("stall interval union overflow"))?;
     }
+    input.finish()?;
     let measurement_ns = measurement_end - measurement_start;
     let stall_time_permille = ceil_ratio_milli(union_ns, measurement_ns)?;
 
@@ -308,6 +375,8 @@ pub fn validate_stall_intervals_v1(
         record_count,
         union_stall_ns: union_ns,
         stall_time_permille,
+        measurement_start_offset_ns: measurement_start,
+        measurement_end_offset_ns: measurement_end,
     })
 }
 
@@ -324,57 +393,68 @@ pub fn validate_target_device_io_v1(
     bytes: &[u8],
     expected_profile_sha256: &[u8; 32],
 ) -> Result<TargetDeviceIoSummary, CheckErrors> {
-    reject_oversized(bytes, "target device I/O")?;
-    let header_bytes = DEVICE_IO_DOMAIN
-        .len()
-        .checked_add(DIGEST_BYTES + 4 + 4 + 8 + 8 + 8 + 4 + 4)
-        .ok_or_else(|| CheckErrors::one("target device I/O header width overflow"))?;
-    if bytes.len() < header_bytes {
-        return Err(CheckErrors::one("target device I/O stream is truncated"));
-    }
-    if &bytes[..DEVICE_IO_DOMAIN.len()] != DEVICE_IO_DOMAIN {
+    let byte_length = u64::try_from(bytes.len())
+        .map_err(|_| CheckErrors::one("target device I/O length does not fit u64"))?;
+    validate_target_device_io_v1_reader(Cursor::new(bytes), byte_length, expected_profile_sha256)
+}
+
+/// Streams the bounded per-shard target-device summary with constant parser memory.
+pub fn validate_target_device_io_v1_reader<R: Read>(
+    reader: R,
+    byte_length: u64,
+    expected_profile_sha256: &[u8; 32],
+) -> Result<TargetDeviceIoSummary, CheckErrors> {
+    let mut input = ExactReader::new(
+        reader,
+        byte_length,
+        MAX_MECHANISM_ARTIFACT_BYTES,
+        "target device I/O",
+    )?;
+    if input.read_vec(DEVICE_IO_DOMAIN.len())? != DEVICE_IO_DOMAIN {
         return Err(CheckErrors::one("target device I/O domain mismatch"));
     }
-    let digest_start = DEVICE_IO_DOMAIN.len();
-    if &bytes[digest_start..digest_start + DIGEST_BYTES] != expected_profile_sha256 {
+    if input.read_array::<DIGEST_BYTES>()? != *expected_profile_sha256 {
         return Err(CheckErrors::one(
             "target device I/O profile sha256 mismatch",
         ));
     }
-    let target_major = u32_at(bytes, digest_start + DIGEST_BYTES);
-    let _target_minor = u32_at(bytes, digest_start + DIGEST_BYTES + 4);
+    let target_major = u32::from_be_bytes(input.read_array()?);
+    let target_minor = u32::from_be_bytes(input.read_array()?);
     if target_major == 0 {
         return Err(CheckErrors::one(
             "target device I/O major number must be nonzero",
         ));
     }
-    let measurement_start = u64_at(bytes, digest_start + DIGEST_BYTES + 8);
-    let measurement_end = u64_at(bytes, digest_start + DIGEST_BYTES + 16);
-    let capture_end = u64_at(bytes, digest_start + DIGEST_BYTES + 24);
+    let measurement_start = u64::from_be_bytes(input.read_array()?);
+    let measurement_end = u64::from_be_bytes(input.read_array()?);
+    let capture_end = u64::from_be_bytes(input.read_array()?);
     if measurement_start >= measurement_end || measurement_end > capture_end {
         return Err(CheckErrors::one(
             "target device I/O requires measurement_start < measurement_end <= capture_end",
         ));
     }
-    let shard_count = u32_at(bytes, digest_start + DIGEST_BYTES + 32);
+    let shard_count = u32::from_be_bytes(input.read_array()?);
     if shard_count == 0 || shard_count > MAX_DEVICE_IO_SHARDS {
         return Err(CheckErrors::one(
             "target device I/O shard count must be in 1..=256",
         ));
     }
-    let trace_anomaly_flags = u32_at(bytes, digest_start + DIGEST_BYTES + 36);
+    let trace_anomaly_flags = u32::from_be_bytes(input.read_array()?);
     if trace_anomaly_flags & !DEVICE_IO_ANOMALY_FLAGS_MASK != 0 {
         return Err(CheckErrors::one(format!(
             "target device I/O header has unknown anomaly flags 0x{trace_anomaly_flags:08x}"
         )));
     }
-    validate_exact_length(
-        bytes.len(),
+    let header_bytes = DEVICE_IO_DOMAIN
+        .len()
+        .checked_add(DIGEST_BYTES + 4 + 4 + 8 + 8 + 8 + 4 + 4)
+        .ok_or_else(|| CheckErrors::one("target device I/O header width overflow"))?;
+    input.require_total_length(exact_stream_length(
         header_bytes,
         DEVICE_IO_RECORD_BYTES,
         u64::from(shard_count),
         "target device I/O",
-    )?;
+    )?)?;
 
     let mut issued_count = 0_u64;
     let mut maximum_ns = 0_u64;
@@ -384,26 +464,25 @@ pub fn validate_target_device_io_v1(
     let mut tracked_count = 0_u64;
     let mut untracked_count = 0_u64;
     for index in 0..u64::from(shard_count) {
-        let offset = record_offset(header_bytes, DEVICE_IO_RECORD_BYTES, index)?;
-        let record = &bytes[offset..offset + DEVICE_IO_RECORD_BYTES];
-        let shard = u32_at(record, 0);
+        let record = input.read_array::<DEVICE_IO_RECORD_BYTES>()?;
+        let shard = u32_at(&record, 0);
         if u64::from(shard) != index {
             return Err(CheckErrors::one(format!(
                 "target device I/O shard is {shard}; expected {index}"
             )));
         }
-        if u32_at(record, 4) != 0 {
+        if u32_at(&record, 4) != 0 {
             return Err(CheckErrors::one(format!(
                 "target device I/O record {index} has nonzero reserved bytes"
             )));
         }
-        let issued = u64_at(record, 8);
-        let success = u64_at(record, 16);
-        let errors = u64_at(record, 24);
-        let incomplete = u64_at(record, 32);
-        let untracked = u64_at(record, 40);
-        let orphan_completions = u64_at(record, 48);
-        let duplicate_issues = u64_at(record, 56);
+        let issued = u64_at(&record, 8);
+        let success = u64_at(&record, 16);
+        let errors = u64_at(&record, 24);
+        let incomplete = u64_at(&record, 32);
+        let untracked = u64_at(&record, 40);
+        let orphan_completions = u64_at(&record, 48);
+        let duplicate_issues = u64_at(&record, 56);
         let tracked = checked_sum_u64([success, errors, incomplete], "device tracked count")?;
         issued_count = checked_add_u64(issued_count, issued, "device issued count")?;
         tracked_count = checked_add_u64(tracked_count, tracked, "device tracked count")?;
@@ -421,11 +500,11 @@ pub fn validate_target_device_io_v1(
             "device trace anomaly count",
         )?;
 
-        let duration = u64_at(record, 64);
-        let issue = u64_at(record, 72);
-        let terminal = u64_at(record, 80);
-        let logical_bytes = u64_at(record, 88);
-        let sequence = u64_at(record, 96);
+        let duration = u64_at(&record, 64);
+        let issue = u64_at(&record, 72);
+        let terminal = u64_at(&record, 80);
+        let logical_bytes = u64_at(&record, 88);
+        let sequence = u64_at(&record, 96);
         let operation = record[104];
         let status = record[105];
         let witness_present = record[106];
@@ -498,6 +577,7 @@ pub fn validate_target_device_io_v1(
         }
         maximum_ns = maximum_ns.max(duration);
     }
+    input.finish()?;
     if issued_count == 0 {
         return Err(CheckErrors::one(
             "target device I/O population is empty and cannot evaluate the gate",
@@ -521,6 +601,11 @@ pub fn validate_target_device_io_v1(
         / 1_000_000;
 
     Ok(TargetDeviceIoSummary {
+        target_major,
+        target_minor,
+        measurement_start_offset_ns: measurement_start,
+        measurement_end_offset_ns: measurement_end,
+        capture_end_offset_ns: capture_end,
         shard_count,
         issued_count,
         maximum_issue_to_terminal_ns: maximum_ns,
@@ -543,43 +628,20 @@ fn checked_sum_u64(values: impl IntoIterator<Item = u64>, label: &str) -> Result
         .try_fold(0_u64, |sum, value| checked_add_u64(sum, value, label))
 }
 
-fn reject_oversized(bytes: &[u8], label: &str) -> Result<(), CheckErrors> {
-    if bytes.len() > MAX_MECHANISM_ARTIFACT_BYTES {
-        return Err(CheckErrors::one(format!(
-            "{label} artifact is {} bytes; maximum is {MAX_MECHANISM_ARTIFACT_BYTES}",
-            bytes.len()
-        )));
-    }
-    Ok(())
-}
-
-fn validate_exact_length(
-    actual_bytes: usize,
+fn exact_stream_length(
     header_bytes: usize,
     record_bytes: usize,
     record_count: u64,
     label: &str,
-) -> Result<(), CheckErrors> {
-    let count = usize::try_from(record_count)
-        .map_err(|_| CheckErrors::one(format!("{label} record count does not fit usize")))?;
-    let expected = record_bytes
-        .checked_mul(count)
-        .and_then(|records| header_bytes.checked_add(records))
-        .ok_or_else(|| CheckErrors::one(format!("{label} encoded length overflow")))?;
-    if expected != actual_bytes {
-        return Err(CheckErrors::one(format!(
-            "{label} stream is {actual_bytes} bytes; expected exactly {expected}"
-        )));
-    }
-    Ok(())
-}
-
-fn record_offset(header: usize, width: usize, index: u64) -> Result<usize, CheckErrors> {
-    usize::try_from(index)
-        .ok()
-        .and_then(|index| index.checked_mul(width))
-        .and_then(|offset| header.checked_add(offset))
-        .ok_or_else(|| CheckErrors::one("mechanism artifact record offset overflow"))
+) -> Result<u64, CheckErrors> {
+    let header = u64::try_from(header_bytes)
+        .map_err(|_| CheckErrors::one(format!("{label} header length does not fit u64")))?;
+    let width = u64::try_from(record_bytes)
+        .map_err(|_| CheckErrors::one(format!("{label} record length does not fit u64")))?;
+    width
+        .checked_mul(record_count)
+        .and_then(|records| header.checked_add(records))
+        .ok_or_else(|| CheckErrors::one(format!("{label} encoded length overflow")))
 }
 
 fn validate_bracket(

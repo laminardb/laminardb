@@ -6,6 +6,8 @@ use serde::de::{Error as _, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
+mod artifact_reader;
+
 pub mod latency_samples;
 pub mod mechanism_mapping;
 pub mod mechanism_samples;

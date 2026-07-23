@@ -3,7 +3,12 @@
 //! Caller-supplied bounds are assumed to come from a future validated plan. This module does not
 //! derive write-stop, tail, formula, attempt-classification, or qualification decisions.
 
+use std::io::{Cursor, Read};
+
+use crate::artifact_reader::{ExactReader, PopulationHasher};
 use crate::CheckErrors;
+
+pub const MAX_RESOURCE_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 
 const RESOURCE_SAMPLES_DOMAIN: &[u8] = b"LDB-SBQ-RESOURCE-SAMPLES-V1\0";
 const RESOURCE_CUTS_DOMAIN: &[u8] = b"LDB-SBQ-RESOURCE-CUTS-V1\0";
@@ -48,6 +53,21 @@ pub struct ResourceCutsSummary {
     pub record_count: u64,
     pub resource_tail_tag: u8,
     pub maximum_skew_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommonResourceSamplesV2Summary {
+    pub record_count: u64,
+    pub maximum_skew_ns: u64,
+    pub observation_population_sha256: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommonResourceCutsV2Summary {
+    pub record_count: u64,
+    pub resource_tail_tag: u8,
+    pub maximum_skew_ns: u64,
+    pub observation_population_sha256: [u8; 32],
 }
 
 /// Validates the provisional C2 resource-sample wire without allocating per record.
@@ -158,43 +178,84 @@ pub fn validate_common_resource_samples_v2(
     maximum_records: u64,
     maximum_skew_ns: u64,
 ) -> Result<ResourceSamplesSummary, CheckErrors> {
-    let (record_count, records) = validate_stream_envelope(
-        bytes,
-        COMMON_RESOURCE_SAMPLES_V2_DOMAIN,
-        COMMON_SAMPLE_V2_RECORD_BYTES,
+    let byte_length = u64::try_from(bytes.len())
+        .map_err(|_| CheckErrors::one("v2 common resource sample length does not fit u64"))?;
+    let summary = validate_common_resource_samples_v2_reader(
+        Cursor::new(bytes),
+        byte_length,
         maximum_records,
+        maximum_skew_ns,
+    )?;
+    Ok(ResourceSamplesSummary {
+        record_count: summary.record_count,
+        maximum_skew_ns: summary.maximum_skew_ns,
+    })
+}
+
+/// Streams the candidate-neutral v2 common resource samples with constant parser memory.
+pub fn validate_common_resource_samples_v2_reader<R: Read>(
+    reader: R,
+    byte_length: u64,
+    maximum_records: u64,
+    maximum_skew_ns: u64,
+) -> Result<CommonResourceSamplesV2Summary, CheckErrors> {
+    let mut input = ExactReader::new(
+        reader,
+        byte_length,
+        MAX_RESOURCE_ARTIFACT_BYTES,
         "v2 common resource samples",
     )?;
+    let domain = input.read_vec(COMMON_RESOURCE_SAMPLES_V2_DOMAIN.len())?;
+    if domain != COMMON_RESOURCE_SAMPLES_V2_DOMAIN {
+        return Err(CheckErrors::one(
+            "v2 common resource samples domain is invalid",
+        ));
+    }
+    let record_count = u64::from_be_bytes(input.read_array()?);
+    if record_count > maximum_records {
+        return Err(CheckErrors::one(format!(
+            "v2 common resource samples record count {record_count} exceeds caller maximum {maximum_records}"
+        )));
+    }
+    let expected_bytes = exact_stream_length(
+        COMMON_RESOURCE_SAMPLES_V2_DOMAIN.len() + COUNT_BYTES,
+        COMMON_SAMPLE_V2_RECORD_BYTES,
+        record_count,
+        "v2 common resource samples",
+    )?;
+    input.require_total_length(expected_bytes)?;
 
     let mut maximum_skew = 0;
-    for (index, record) in records
-        .chunks_exact(COMMON_SAMPLE_V2_RECORD_BYTES)
-        .enumerate()
-    {
-        let wire_index = field_u64(record, SAMPLE_INDEX);
-        let expected_index = u64::try_from(index)
-            .map_err(|_| CheckErrors::one("v2 common resource sample index does not fit u64"))?;
-        if wire_index != expected_index {
+    let mut population = PopulationHasher::new(record_count);
+    for index in 0..record_count {
+        let record = input.read_array::<COMMON_SAMPLE_V2_RECORD_BYTES>()?;
+        let wire_index = field_u64(&record, SAMPLE_INDEX);
+        if wire_index != index {
             return Err(CheckErrors::one(format!(
-                "v2 common resource sample {index} has index {wire_index}; expected {expected_index}"
+                "v2 common resource sample {index} has index {wire_index}; expected {index}"
             )));
         }
 
-        let begin = field_u64(record, SAMPLE_BEGIN_NS);
-        let end = field_u64(record, SAMPLE_END_NS);
+        let begin = field_u64(&record, SAMPLE_BEGIN_NS);
+        let end = field_u64(&record, SAMPLE_END_NS);
+        let index_usize = usize::try_from(index)
+            .map_err(|_| CheckErrors::one("v2 common resource sample index does not fit usize"))?;
         let skew = validate_bracket(
             begin,
             end,
             maximum_skew_ns,
             "v2 common resource sample",
-            index,
+            index_usize,
         )?;
         maximum_skew = maximum_skew.max(skew);
+        population.update(0, index, begin, end);
     }
+    input.finish()?;
 
-    Ok(ResourceSamplesSummary {
+    Ok(CommonResourceSamplesV2Summary {
         record_count,
         maximum_skew_ns: maximum_skew,
+        observation_population_sha256: population.finish(),
     })
 }
 
@@ -205,26 +266,68 @@ pub fn validate_common_resource_cuts_v2(
     maximum_records: u64,
     maximum_skew_ns: u64,
 ) -> Result<ResourceCutsSummary, CheckErrors> {
-    let (record_count, records) = validate_stream_envelope(
-        bytes,
-        COMMON_RESOURCE_CUTS_V2_DOMAIN,
-        COMMON_CUT_V2_RECORD_BYTES,
+    let byte_length = u64::try_from(bytes.len())
+        .map_err(|_| CheckErrors::one("v2 common resource cut length does not fit u64"))?;
+    let summary = validate_common_resource_cuts_v2_reader(
+        Cursor::new(bytes),
+        byte_length,
         maximum_records,
+        maximum_skew_ns,
+    )?;
+    Ok(ResourceCutsSummary {
+        record_count: summary.record_count,
+        resource_tail_tag: summary.resource_tail_tag,
+        maximum_skew_ns: summary.maximum_skew_ns,
+    })
+}
+
+/// Streams the candidate-neutral v2 common resource cuts with constant parser memory.
+pub fn validate_common_resource_cuts_v2_reader<R: Read>(
+    reader: R,
+    byte_length: u64,
+    maximum_records: u64,
+    maximum_skew_ns: u64,
+) -> Result<CommonResourceCutsV2Summary, CheckErrors> {
+    let mut input = ExactReader::new(
+        reader,
+        byte_length,
+        MAX_RESOURCE_ARTIFACT_BYTES,
         "v2 common resource cuts",
     )?;
+    let domain = input.read_vec(COMMON_RESOURCE_CUTS_V2_DOMAIN.len())?;
+    if domain != COMMON_RESOURCE_CUTS_V2_DOMAIN {
+        return Err(CheckErrors::one(
+            "v2 common resource cuts domain is invalid",
+        ));
+    }
+    let record_count = u64::from_be_bytes(input.read_array()?);
+    if record_count > maximum_records {
+        return Err(CheckErrors::one(format!(
+            "v2 common resource cuts record count {record_count} exceeds caller maximum {maximum_records}"
+        )));
+    }
     if record_count != REQUIRED_CUT_RECORDS {
         return Err(CheckErrors::one(format!(
             "v2 common resource cuts record count is {record_count}; expected {REQUIRED_CUT_RECORDS}"
         )));
     }
+    let expected_bytes = exact_stream_length(
+        COMMON_RESOURCE_CUTS_V2_DOMAIN.len() + COUNT_BYTES,
+        COMMON_CUT_V2_RECORD_BYTES,
+        record_count,
+        "v2 common resource cuts",
+    )?;
+    input.require_total_length(expected_bytes)?;
 
     let mut maximum_skew = 0;
     let mut tail_tag = 0;
-    for (index, record) in records.chunks_exact(COMMON_CUT_V2_RECORD_BYTES).enumerate() {
+    let mut population = PopulationHasher::new(record_count);
+    for index in 0..record_count {
+        let record = input.read_array::<COMMON_CUT_V2_RECORD_BYTES>()?;
         let tag = record[0];
         let expected_tag = u8::try_from(index)
             .map_err(|_| CheckErrors::one("v2 common resource cut index does not fit u8"))?;
-        if index < 4 {
+        if index < 4_u64 {
             if tag != expected_tag {
                 return Err(CheckErrors::one(format!(
                     "v2 common resource cut {index} has tag 0x{tag:02x}; expected 0x{expected_tag:02x}"
@@ -250,15 +353,42 @@ pub fn validate_common_resource_cuts_v2(
         let fields = &record[1 + CUT_RESERVED_BYTES..];
         let begin = field_u64(fields, CUT_BEGIN_NS);
         let end = field_u64(fields, CUT_END_NS);
-        let skew = validate_bracket(begin, end, maximum_skew_ns, "v2 common resource cut", index)?;
+        let index_usize = usize::try_from(index)
+            .map_err(|_| CheckErrors::one("v2 common resource cut index does not fit usize"))?;
+        let skew = validate_bracket(
+            begin,
+            end,
+            maximum_skew_ns,
+            "v2 common resource cut",
+            index_usize,
+        )?;
         maximum_skew = maximum_skew.max(skew);
+        population.update(tag, 0, begin, end);
     }
+    input.finish()?;
 
-    Ok(ResourceCutsSummary {
+    Ok(CommonResourceCutsV2Summary {
         record_count,
         resource_tail_tag: tail_tag,
         maximum_skew_ns: maximum_skew,
+        observation_population_sha256: population.finish(),
     })
+}
+
+fn exact_stream_length(
+    header_bytes: usize,
+    record_bytes: usize,
+    record_count: u64,
+    label: &str,
+) -> Result<u64, CheckErrors> {
+    let header = u64::try_from(header_bytes)
+        .map_err(|_| CheckErrors::one(format!("{label} header length does not fit u64")))?;
+    let width = u64::try_from(record_bytes)
+        .map_err(|_| CheckErrors::one(format!("{label} record length does not fit u64")))?;
+    width
+        .checked_mul(record_count)
+        .and_then(|records| header.checked_add(records))
+        .ok_or_else(|| CheckErrors::one(format!("{label} encoded length overflow")))
 }
 
 fn validate_stream_envelope<'a>(
