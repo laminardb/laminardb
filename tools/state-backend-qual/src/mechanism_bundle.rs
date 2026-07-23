@@ -189,7 +189,7 @@ pub fn validate_mechanism_bundle_path(
     let stalls = input
         .stalls
         .as_ref()
-        .map(|descriptor| validate_stalls(base, descriptor, &mapping_sha256, &mapping, &input))
+        .map(|descriptor| validate_stalls(base, descriptor, &mapping_sha256, &mapping))
         .transpose()?;
     if let Some(stalls) = stalls {
         require_measurement_window(
@@ -403,7 +403,6 @@ fn validate_stalls(
     descriptor: &Descriptor,
     mapping_sha256: &[u8; 32],
     mapping: &MechanismMappingSummary,
-    _input: &BundleInput,
 ) -> Result<StallIntervalsSummary, CheckErrors> {
     let mechanism_count = u32::try_from(mapping.stall_mechanism_count)
         .map_err(|_| CheckErrors::one("stall mechanism count does not fit u32"))?;
