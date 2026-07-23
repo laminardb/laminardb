@@ -6,6 +6,7 @@
 - **Related decisions:** [ADR-008](ADR-008-managed-vnode-keyed-state.md),
   [state backend qualification model v1](state-backend-qualification-model-v1.md), and the
   [long-stream workload/identity v2](state-backend-workload-v2.md)
+- **Pinned-source findings:** [Fjall/RocksDB static audit](../reports/state-backend-static-audit-2026-07-23.md)
 
 ## Decision and safety boundary
 
@@ -393,14 +394,16 @@ WAL/journal is enabled for both candidates. The logical truth table is:
 | `persist_data` | all prior batches | required | recovery-required journal/WAL contents and proved directory entries |
 | `persist_all` | all prior batches | required | all recovery-required engine data and metadata covered by an audited primitive |
 
-The published Fjall API suggests `PersistMode::Buffer`, `SyncData`, and `SyncAll` respectively, but
-the exact 3.1.8 file and directory coverage remains proposed until DKS-Q2-007 audits the pinned
-source and passes the cache-loss harness. The proposed RocksDB 10.4.2 mapping keeps WAL enabled,
-`disable_wal=false`, and `manual_wal_flush=false`: buffered batches use `WriteOptions.sync=false`,
-while `persist_data` uses the pinned binding's synchronous `FlushWAL(true)`/`SyncWAL` path. RocksDB
-`DBOptions.use_fsync` is an open-time configuration, not a per-fence switch; each setting is a
-separate candidate configuration and plan identity. `SyncWAL` alone, including under
-`use_fsync=true`, does not establish `persist_all`; that boundary is unsupported unless
+The [pinned-source audit](../reports/state-backend-static-audit-2026-07-23.md) makes the proposed
+Fjall calls explicit: `batch.durability(Some(PersistMode::Buffer)).commit()`,
+`Database::persist(PersistMode::SyncData)`, and `Database::persist(PersistMode::SyncAll)`. Their
+complete 3.1.8 file/directory ordering and target cache-loss behavior remain unproved. The proposed
+RocksDB 10.4.2 mapping keeps WAL enabled, `disable_wal=false`, and `manual_wal_flush=false`:
+buffered batches use `WriteOptions.sync=false`, while `persist_data` calls the wrapper's
+`DB::flush_wal(true)`. The wrapper exposes no separate `sync_wal`; the engine call reached by
+`flush_wal(true)` performs `FlushWAL(true)`/`SyncWAL`. `DBOptions.use_fsync` is an open-time
+configuration, not a per-fence switch; each setting is a separate candidate configuration and plan
+identity. WAL sync does not establish `persist_all`; that boundary is unsupported unless
 DKS-Q2-007 supplies and verifies an audited engine/file/directory sequence. No proposed mapping is
 normative or execution-eligible yet.
 
@@ -662,7 +665,7 @@ resolved and independently reviewed. Backend selection additionally requires DKS
 | **DKS-Q2-003** | Define long-stream ordinals, streaming resident/spill prefill, live-byte/cardinality/timer bands and control law, exact opposite-side join fanout, stabilization, deterministic TTL/churn, and setup/post-warmup/final digests. C1's 4,096-request oracle and state-size salt cannot be repeated into a 200,000-request performance claim. |
 | **DKS-Q2-004** | Freeze exact warmup/measured counts and rates, per-case total semantics, drain/cooldown/reset, scheduler calibration/affinity, and an explicit balanced seeded order vector. The current minimum-count/minimum-duration booleans and five-pair alternation are not a complete schedule. |
 | **DKS-Q2-005** | Add service-latency, runner-overhead, scheduler, oracle-lag and observation-skew gates; freeze result-ring/raw-sample ceilings and gate-bearing telemetry control trials; and complete image/package/CPU/microcode/NUMA/NVMe identities. |
-| **DKS-Q2-006** | Prove stable mappings for compaction debt, stalls, XFS project-quota bytes, cgroup dirty/writeback, device writes, snapshots/iterators, native memory, and pressure counters. Fjall must expose sufficient stable telemetry or be rejected/upstreamed. |
+| **DKS-Q2-006** | Prove stable mappings for compaction debt, stalls, XFS project-quota bytes, cgroup dirty/writeback, device writes, snapshots/iterators, native memory, and pressure counters. The static audit fails unmodified Fjall 3.1.8 because debt/stall signals are absent and blocks the current RocksDB binding because its stall ticker omits a verified write-buffer-manager/database-scope path. Supply a proven complete source, patch/upstream, or reject; never encode unsupported as zero. |
 | **DKS-Q2-007** | Implement and review detached approval/completion records, pinned Fjall/RocksDB persistence mappings, complete configuration dumps, and cache-loss truth-table conformance. |
 | **DKS-Q2-008** | Freeze the paired physical-fault and 24/72-hour endurance matrices, actuator and N/N-1 pins, recovery criteria, and a bounded time-resolved endurance encoding distinct from finite raw samples. |
 | **DKS-Q2-009** | Before selection, approve and pass a separate C3 shared-database concurrency contract: deterministic disjoint-vnode lanes and per-lane oracle order; hot-writer/victim and mixed point/range/snapshot traffic; victim plus aggregate tails, global stalls/resources; and barrier-controlled races with restore activation, cleanup, and pinned snapshots. |

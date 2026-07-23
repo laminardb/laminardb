@@ -17,6 +17,11 @@ longer contains it. An in-memory implementation remains a semantic reference and
 local-mode option. Cluster-shared object storage and the existing `StateBackend` remain the
 authoritative checkpoint/recovery layer; neither local LSM is remote recovery authority.
 
+The [exact-source static audit](../reports/state-backend-static-audit-2026-07-23.md) finds that
+unmodified Fjall 3.1.8 cannot supply the required stable compaction-debt/write-stall telemetry and
+that the current RocksDB binding also lacks a complete stall signal. Both remain blocked before a
+gate-bearing run; the audit is not a selection by API checklist.
+
 The existing fixed vnode ABI, bounded shuffle, assignment/process fencing, aligned barriers,
 per-vnode checkpoint artifacts, and exact-attempt seal are retained. Cluster admission will move
 from SQL-shape exclusions plus permissive operator hooks to a planner-certified distribution/state
