@@ -1,0 +1,12 @@
+[package]
+name = "state-backend-redb-prescreen-candidate"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+redb = { version = "=4.1.0", default-features = false }
+serde.workspace = true
+serde_json.workspace = true

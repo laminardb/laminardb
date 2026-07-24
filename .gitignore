@@ -51,7 +51,9 @@ wal/
 /tools/*
 !/tools/independent-soak-contract/
 !/tools/state-backend-qual/
+!/tools/state-backend-redb-prescreen/
 !/tools/state-backend-zipf-oracle/
+/tools/state-backend-redb-prescreen/target/
 
 # Private configs (symlinked from private repo)
 CLAUDE.md
