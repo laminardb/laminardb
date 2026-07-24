@@ -28,8 +28,10 @@ freeze candidate for review. It does not instantiate the reserved v2 identities,
 thresholds, authorize v2 validator implementation, fund candidate source changes, add an adapter,
 execute a candidate, select a backend, start Phase 1, or change production claims. A later explicit
 `APPROVE_STATE_BACKEND_RUNNER_CONTRACT_V2` from the workload and operations owners must bind the
-complete contract, schemas, formulas, thresholds, and independent reviews before v2 validation-only
-implementation.
+complete contract, reserved schema/formula semantics, exact v4 profile, threshold-ownership rules,
+and independent reviews before v2 validation-only implementation. Candidate-native numerical
+thresholds remain separately frozen in each immutable mapping and later qualification approval; the
+direction decision does not approve them.
 
 ## Current profile and work authority
 
@@ -37,7 +39,7 @@ implementation.
 |---|---|---|
 | In-memory working state | Semantic reference/conformance subject only | Separate future ADR amendment before any product profile |
 | Local-spill working state | Sole current cluster production target; backend undecided | Phase 0 contract, candidate closure, qualification, selection, and independent product soak |
-| Maintenance-health v2 | Direction approved; freeze candidate drafting permitted | Final two-owner contract approval before reserved identities or validator implementation |
+| Maintenance-health v2 | Direction approved; [freeze candidate](../architecture-decisions/state-backend-qualification-runner-v2-draft.md) unapproved | Final two-owner contract approval before reserved identities or validator implementation |
 | redb 4.1.0 prescreen | Validation-only protocol repair permitted | Detached pre-run approval only after verifier, harness, oracle, actuator, classifier, and independent review exist |
 | RocksDB/Fjall | Paper/source review only under their existing gates | Final v2 contract plus candidate-specific source authority |
 

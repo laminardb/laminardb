@@ -25,7 +25,9 @@ candidate-specific health signals while retaining common latency/resource/failur
 Cycle 18 [maintenance-health v2 proposal](state-backend-maintenance-health-v2-proposal.md) and
 [decision matrix](../reports/state-backend-contract-decision-matrix-2026-07-24.md) recommend the
 additive choice. Cycle 21 records `APPROVE_MAINTENANCE_HEALTH_V2_DIRECTION`, which permits only
-consolidated contract/schema drafting and review. It does not instantiate any reserved v2 wire
+consolidated contract/schema drafting and review. The resulting
+[runner v2 freeze candidate](state-backend-qualification-runner-v2-draft.md) is unapproved. It does
+not instantiate any reserved v2 wire
 identity, authorize validator implementation, or authorize candidate source work or execution;
 those still require the final two-owner contract and candidate-specific approvals. The existing
 v1 evidence must not be reinterpreted. No

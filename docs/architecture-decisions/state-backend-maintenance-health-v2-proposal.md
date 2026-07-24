@@ -12,6 +12,7 @@
 - **Trigger:** [Cycle 17 RocksDB source closure](../reports/rocksdb-mechanism-source-closure-2026-07-24.md)
 - **Paper mappings:** [Cycle 19 candidate designs](../reports/state-backend-maintenance-health-mapping-designs-2026-07-24.md)
 - **Direction record:** [Cycle 21 owner decisions](../reports/distributed-state-cycle-21-owner-decisions-2026-07-24.md)
+- **Stage 3 output:** [consolidated runner v2 freeze candidate](state-backend-qualification-runner-v2-draft.md)
 
 Cycle 19 confirms that sampled typed gauges/counters/booleans can express the continuous health
 obligations, while exposing additional candidate gaps. It keeps RocksDB's blocking tail wait
@@ -46,8 +47,9 @@ change is one reason v1 cannot be reinterpreted in place.
 The approved direction authorizes only the formal three-candidate mapping-design and consolidated-
 contract drafting stages. It does not instantiate a v2 identity or authorize schema implementation,
 native source construction, an adapter, or a candidate run. Those later steps retain the separate
-gates below. Cycle 19 supplies the Stage 2 paper mappings; Cycle 21 may now prepare the Stage 3
-consolidated freeze candidate for independent and owner review.
+gates below. Cycle 19 supplies the Stage 2 paper mappings; Cycle 21 prepares the Stage 3
+[consolidated freeze candidate](state-backend-qualification-runner-v2-draft.md) for independent and
+owner review.
 
 ## What does not change
 

@@ -39,6 +39,8 @@ reserved v2 identity, freeze a schema or threshold, authorize source changes, or
 `state-backend-mechanism-mapping/v2`. Signal names below remain paper-design names, not wire
 identifiers. Predicate *kinds* are proposed; all numerical limits, cadence, cut-skew, hold time,
 timeout, and observer-overhead limits must be approved before any result exists.
+Cycle 21 carries these inputs into the unapproved
+[consolidated runner v2 freeze candidate](../architecture-decisions/state-backend-qualification-runner-v2-draft.md).
 
 The candidate-native arm is a veto only. The identical C1/C2/C3 correctness, open-loop queue/service/
 end-to-end latency, throughput, memory, target-device I/O, disk growth, write/space amplification,

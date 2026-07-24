@@ -406,8 +406,9 @@ redb 4.1.0 remains outside C2. Cycle 16 adds a separately authorized, isolated
 `construction-only-no-decision` workspace and CI lane; it cannot consume approval, classify a
 prescreen, or contribute selection evidence. The optional
 [bounded redb prescreen](../testing/state-backend-redb-prescreen-v1.md) receives validation-only
-protocol work in Cycle 21. It still cannot run until its existing schemas gain an external semantic/
-attestation verifier and protocol harness and a separate
+protocol work in Cycle 21. Its former descriptor-root schemas are now synthetic-only regression
+shapes. It still cannot run until the payload/envelope, plan, raw-evidence and result schemas plus an
+external semantic/attestation verifier and protocol harness exist and a separate
 detached pre-run approval is signed by the workload and operations owners. Its Docker Desktop/WSL
 protocol subset is smoke-only; a target-host
 `PRESCREEN_PASS` merely funds mechanism/persistence mapping, an additive profile/schema proposal,
@@ -419,8 +420,9 @@ observer appears bounded but v1's debt arm requires broader engine instrumentati
 proof. The Cycle 18
 [maintenance-health v2 proposal](../architecture-decisions/state-backend-maintenance-health-v2-proposal.md)
 replaces only that debt arm. Cycle 21 records the direction approval; v1 remains unchanged and the
-approval authorizes mapping and consolidated-contract design only. Do not add a profile candidate,
-adapter,
+approval authorizes mapping and the unapproved
+[consolidated v2 freeze candidate](../architecture-decisions/state-backend-qualification-runner-v2-draft.md)
+only. Do not add a profile candidate, adapter,
 runtime pin, or native observer until both the final
 `APPROVE_STATE_BACKEND_RUNNER_CONTRACT_V2` record and a candidate-specific source-closure approval
 exist. Only then may that approved workspace pin RocksDB wrapper
