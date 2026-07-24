@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://laminardb.dev/schemas/state-backend-redb-prescreen-result-v1.json",
-  "title": "LaminarDB redb 4.1.0 bounded prescreen reviewed result v1",
-  "description": "A final reviewed descriptor root. It embeds no raw artifacts, does not derive its own disposition, and cannot qualify, admit, select, or production-enable redb.",
+  "title": "LaminarDB redb 4.1.0 legacy synthetic reviewed-result descriptor fixture v1",
+  "description": "Synthetic-only regression shape superseded before use by the Cycle 21 payload/envelope design. It cannot encode a smoke/native result or any decision.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -30,15 +30,15 @@
   "properties": {
     "schema_version": {"const": "state-backend-redb-prescreen-result/v1"},
     "notice": {"const": "NOT QUALIFICATION EVIDENCE"},
-    "record_class": {"enum": ["prescreen_record", "synthetic_fixture"]},
-    "fixture_ineligible": {"type": "boolean"},
+    "record_class": {"const": "synthetic_fixture"},
+    "fixture_ineligible": {"const": true},
     "result_id": {
       "type": "string",
       "minLength": 1,
       "maxLength": 128,
       "pattern": "^[a-z0-9][a-z0-9._/-]{0,127}$"
     },
-    "status": {"const": "reviewed_prescreen_result"},
+    "status": {"const": "synthetic_descriptor_fixture"},
     "schema_validation_authorizes_decision": {"const": false},
     "external_attestation_verification_required": {"const": true},
     "run_class": {"enum": ["docker_smoke_no_decision", "native_prescreen_decision"]},
@@ -53,16 +53,7 @@
     "run_window": {"$ref": "#/$defs/runWindow"},
     "schedule_summary": {"$ref": "#/$defs/scheduleSummary"},
     "bounds": {"$ref": "#/$defs/bounds"},
-    "disposition": {
-      "enum": [
-        "SMOKE_PASS",
-        "SMOKE_FAIL",
-        "PRESCREEN_PASS",
-        "PRESCREEN_NO_GO",
-        "DEFER",
-        "REJECT_EXACT_PIN"
-      ]
-    },
+    "disposition": {"const": "DEFER"},
     "artifacts": {"$ref": "#/$defs/artifacts"},
     "mechanism_probe": {
       "oneOf": [

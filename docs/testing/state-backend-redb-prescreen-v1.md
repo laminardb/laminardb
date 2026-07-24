@@ -1,15 +1,17 @@
 # redb 4.1.0 bounded state-backend prescreen v1
 
 - **Identity:** `state-backend-redb-prescreen/v1`
-- **Status:** proposed, non-gating protocol; a separately authorized construction-only workspace and
-  CI lane now exist, but owners, the detached attestation/semantic verifier, native harness, and
-  protocol execution remain absent
+- **Status:** Cycle 21 protocol freeze candidate; validation-only work is authorized, while the
+  detached attestation/semantic verifier, native supervisor/child/actuator/oracle, reviewed build,
+  owner approvals, and protocol execution remain absent
 - **Evidence class:** `NOT C2/C3 QUALIFICATION EVIDENCE`
 - **Scope:** decide whether a redb adapter is worth adding to the backend qualification bake-off
 - **Production/admission effect:** none; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
-- **Detached contracts:** [pre-run approval schema](../../tools/state-backend-qual/schema/redb-prescreen-approval-v1.schema.json),
-  [reviewed-result schema](../../tools/state-backend-qual/schema/redb-prescreen-result-v1.schema.json),
-  and [exact-source mechanism note](../reports/redb-4.1.0-prescreen-mechanism-note-2026-07-23.md)
+- **Existing synthetic contracts:** [pre-run descriptor-root schema](../../tools/state-backend-qual/schema/redb-prescreen-approval-v1.schema.json),
+  [reviewed-result descriptor-root schema](../../tools/state-backend-qual/schema/redb-prescreen-result-v1.schema.json),
+  and [exact-source mechanism note](../reports/redb-4.1.0-prescreen-mechanism-note-2026-07-23.md).
+  The two JSON schemas are regression inputs only and must be replaced by the payload/envelope
+  contracts below before approval or execution.
 
 ## Decision boundary
 
@@ -31,25 +33,75 @@ target. None supplies C1/C2/C3, fault, endurance, checkpoint, source/sink, exact
 or production evidence. The prescreen never selects redb by comparing its limits with Fjall or
 RocksDB results.
 
-### Open protocol-freeze blockers
+### Cycle 21 protocol-freeze resolutions
 
-The source identity and proposed experiment are bounded, but this protocol is not approval-ready.
-Before either owner signs it, a revision must:
+This revision closes the design ambiguities above, but it does not make the prescreen approval- or
+execution-ready. It freezes a candidate packet layout, non-circular signature policy, deterministic
+fixture/schedule, completion rule, separate decision and safety bounds, retained-evidence boundary,
+five-hour budget, and disposition precedence. The existing descriptor-root schemas cannot express
+that packet and remain synthetic regression inputs only.
 
-- map every descriptor role to a fixed filename/locator and bind the formal harness, verifier,
-  oracle, actuator, binaries, lockfile, SBOM, build, schemas, goldens, and fixtures;
-- define detached signature algorithm, trust registry, revocation policy, domain-separated canonical
-  preimage, and a non-circular two-principal review packet;
-- separate the resource decision threshold from the 16-GiB safety cap;
-- replace the conflicting 95% completion and every-release-return rules with one closed rule;
-- distinguish transient 4-GiB fixture/database/scan bytes from the 2-GiB retained-artifact cap and
-  freeze what audit evidence is retained;
-- freeze the exact key/value/operation fixture and complete seed/order schedule; and
-- recompute the per-step ceilings and shared overhead against the five-hour campaign limit.
+Before a pre-run owner approval can exist, validation-only work must implement and independently
+review strict approval/result payload and role-envelope schemas; exact-byte, signature, trust,
+revocation, locator, plan/result, oracle, and classifier verification; raw bounded wire schemas and
+goldens; and a redb-free fail-closed verifier. A separately authorized construction stage must then
+build and review the native supervisor, child, actuator, oracle and verifier and populate their exact
+source, lockfile, SBOM, build and binary descriptors. Only those as-built bytes can enter an owner
+approval. The current instruction does not authorize that construction or any candidate run.
 
-Until those items, the native supervisor/harness, crash actuator, external oracle/verifier, and
-result classifier exist and receive independent review, the only executable code is the separate
-construction lane and no formal disposition can be produced.
+The only executable redb code remains the separate `construction-only-no-decision` lane. No formal
+disposition can be produced from this document, the old schemas, their fixtures, or that lane.
+
+### Fixed packet root and locators
+
+Every formal descriptor is `(role, locator, byte_length, sha256, media_type)`. `locator` is a UTF-8,
+forward-slash, packet-root-relative path: no empty component, `.`, `..`, drive/UNC prefix, backslash,
+symlink, hard link, device, socket, FIFO or path escape is allowed. Each role appears exactly once at
+the fixed locator below. The verifier opens relative to an already-open packet directory with
+no-follow semantics, verifies regular-file identity before and after streaming, caps bytes before
+allocation, and rejects aliases or extra decision-bearing files.
+
+| Role | Fixed locator | Required before |
+|---|---|---|
+| protocol | `contract/protocol.md` | protocol review |
+| exact-source mechanism note | `contract/redb-mechanism-note.md` | protocol review |
+| wire schemas | `contract/wire-schemas.tar.zst` | construction approval |
+| literal goldens | `contract/literal-goldens.tar.zst` | construction approval |
+| fixture recipe and expected digests | `contract/fixture-recipe.json` | construction approval |
+| execution plan | `contract/execution-plan.json` | protocol review |
+| candidate configuration | `contract/candidate-configuration.json` | construction approval |
+| target identity policy | `contract/target-identity.json` | protocol review |
+| preflight/noise policy | `contract/preflight-policy.json` | protocol review |
+| seed and slot schedule | `contract/schedule.json` | protocol review |
+| clock/cgroup/cache-reset policy | `contract/clock-isolation-policy.json` | protocol review |
+| trigger/adaptive-delay policy | `contract/trigger-delay-policy.json` | protocol review |
+| deadline/resource/artifact bounds | `contract/bounds.json` | protocol review |
+| complete formal source | `build/source.tar.zst` | pre-run approval |
+| Cargo lockfile | `build/Cargo.lock` | pre-run approval |
+| SBOM | `build/sbom.spdx.json` | pre-run approval |
+| reproducible build receipt | `build/build-manifest.json` | pre-run approval |
+| supervisor | `build/redb-prescreen-supervisor` | pre-run approval |
+| candidate child | `build/redb-prescreen-child` | pre-run approval |
+| crash actuator | `build/redb-prescreen-actuator` | pre-run approval |
+| independent oracle | `build/redb-prescreen-oracle` | pre-run approval |
+| external verifier/classifier | `build/redb-prescreen-verifier` | pre-run approval |
+| approval payload | `approval/payload.json` | dispatch |
+| workload-owner approval envelope | `approval/workload-owner.json` | dispatch |
+| operations-owner approval envelope | `approval/operations-owner.json` | dispatch |
+| reviewed smoke result | `evidence/prior-smoke-result.json` | native dispatch only |
+| raw run manifest | `result/raw-run-manifest.json` | result review |
+| retained artifact index | `result/artifact-index.json` | result review |
+| validator report | `result/validator-report.json` | result review |
+| independent oracle report | `result/oracle-report.json` | result review |
+| bounded mechanism-probe report | `result/mechanism-probe.json` | native result review |
+| reviewed result payload | `result/payload.json` | result review |
+| workload-owner result envelope | `result/workload-owner.json` | final disposition |
+| operations-owner result envelope | `result/operations-owner.json` | final disposition |
+
+The approval/result payloads bind the redb crate archive descriptor as external subject bytes in
+addition to every applicable row above. A prior smoke result is accepted only when the verifier
+proves that it is a non-synthetic `SMOKE_PASS` over the identical subject, source/build, schemas,
+goldens and Docker-smoke plan; an opaque or synthetic descriptor never satisfies that prerequisite.
 
 ## Frozen source and build scope
 
@@ -84,26 +136,125 @@ The future formal harness must assert and record the closed setter sequence befo
 pinned-source review verifies that `QR` forces two-phase commit. `Durability::None` is outside this
 protocol because it does not satisfy the persistence question.
 
+### Deterministic fixture and operation recipe
+
+Logical bytes always mean key bytes plus value bytes; redb page/file overhead is physical. The clean
+bases contain exactly 262,144 entries for 256 MiB, 1,048,576 entries for 1 GiB, and 4,194,304
+entries for 4 GiB, divided equally across the four tables. Four same-ordinal table entries form one
+logical entity. Fixture creation uses a fresh database and bounded 4-MiB transactions. For each
+table/vnode with `P = entries_per_table / 8`, the initial live set is vnode-local slots `1..P-1` plus
+filler slot `P`; slot 0 is deliberately absent. Initial values use generation/seed zero, transaction
+ordinal equal to the slot, entity index zero, and put code. In ascending vnode/slot/table order,
+creation then deletes and reinserts every non-sentinel entity whose slot is `8 mod 16` and overwrites
+every entity whose slot is `9 mod 16`; generation 1 is used for reinsert and generation 2 for
+overwrite. This restores the exact entry count while creating deterministic allocated/free-page
+churn. It closes normally, reopens read-only, streams a canonical table/key/value digest, and records
+the exact file digest. The approved payload binds the generator binary and both digests; a copied
+fixture must match the file digest before opening and the canonical digest after scanning.
+
+The canonical scan digest is SHA-256 over `"LDB-REDB-SCAN-V1\0"`, followed by each table in the
+fixed order `state`, `timer`, `join_left`, `join_right`: `u8(table_id) || u64_be(row_count)` and then
+each entry in redb byte-key order as `u32_be(key_len) || key || u32_be(value_len) || value`. Key and
+value lengths must be 32 and 992. The read-only scan must leave the database file digest unchanged;
+otherwise fixture verification fails.
+
+Each base divides every table evenly across fixed vnodes `0..7`; all three table-entry counts are
+divisible by eight. For table ID `t` in `0..4`, vnode `v`, vnode-local logical slot `s`, generation
+`g`, seed `z`, and transaction ordinal `q`, the 32-byte key is:
+
+```text
+u16_be(v) || u64_be(s)
+|| first_22_bytes(SHA256("LDB-REDB-KEY-V1\0" || u8(t) || u16_be(v) || u64_be(s)))
+```
+
+The 992-byte value begins with `u8(t) || u16_be(v) || u64_be(s) || u32_be(g) || u64_be(z) ||
+u64_be(q) || u32_be(entity_index) || u8(operation_code)`. Operation code is `0x01` for put and
+`0x02` for delete intent. The remaining 956 bytes are consecutive SHA-256 blocks over
+`"LDB-REDB-VALUE-V1\0"` plus that 36-byte header and a `u32_be` block counter beginning at zero,
+truncated exactly; delete does not pass the value to redb but retains it in the intent/oracle. The
+verifier reimplements this recipe without redb. Integer overflow, duplicate key generation,
+unexpected pre-state, or recipe disagreement invalidates the attempt.
+
+Every mutation count is divisible by four. Entity index `e` emits the four table mutations in table
+order. Slot selection is the approved odd-multiplier permutation
+`s = (q * 65_537 + e * 17 + z) mod (entity_count_per_table / 8)`. Generation is the checked low 32
+bits of `q + 1`. The entity operation is delete exactly when `(q + e + z) mod 16 == 0`; otherwise it
+is a put of the generated value. For every crash target transaction, entity 0 is the cross-table
+insert of absent slot 0, entity 1 is the cross-table overwrite of present slot 1, and entity 2 is the
+cross-table delete of present slot 2; remaining entities use the formula. The filler keeps the pre-
+and post-transaction live entry count equal. The harness records complete pre-state and expected
+post-state digests before commit entry.
+
+The fixed steady-state vnode assignment is `W0=1`, `W1={2,3}`, `W2={hot:4,victim:5}`, and
+`HOLD={holder:6,victim:7}`. Lanes never share a key. In every `HOLD` repetition both transactions use
+the repetition's `I1`, `I2`, or `QR` setter mode; after the controlled hold, both execute one
+128-mutation transaction before commit. This freezes the previously ambiguous HOLD durability mode.
+
+### Complete seed and slot schedule
+
+Let seed index `i` enumerate `2026072301`, `2026072302`, `2026072303`; let slot `j` be `0..11`.
+For the steady matrix, mode index is `(j + i) mod 3` over `[I1,I2,QR]` and probe index is
+`(j + 2*i) mod 4` over `[W0,W1,W2,HOLD]`. The coprime periods enumerate each mode/probe pair exactly
+once per seed. Slot ID is `steady/s<seed>/n<two-digit-j>` and cannot be reused or silently rerun.
+
+Small crash slots are ordered by seed, then mode index `(m+i) mod 3` for `m=0..2`, then trigger
+`1 + ((k+2*i) mod 6)` for `k=0..5`; IDs are `atomic/s<seed>/<mode>/t<trigger>`. Six reserved
+adaptive slots have IDs
+`atomic-extra/<mode>/n<0..1>` and may be used only to obtain the required confirmed in-commit count.
+Their delay is chosen by the approved bounded rule from prior marker timing; seed, transaction bytes,
+mode and every other input remain unchanged. Unused reserved IDs are recorded as unused. Large
+recovery slots are ordered by seed and the same rotated mode order with IDs
+`recovery/s<seed>/<mode>`; there is no adaptive large-trial retry, and a missed confirmed in-commit
+kill is `DEFER`. The machine-readable schedule expands these formulas into all 99 baseline slot IDs
+plus six reserved IDs, and the semantic verifier requires exact equality rather than trusting counts.
+
 ### Separate pre-run authorization
 
 This proposal does not authorize protocol execution. Any command that claims the Docker smoke or
-native prescreen identity requires a strict detached `state-backend-redb-prescreen-approval/v1`
-record signed by the named workload and operations owners. The strict record schema now exists, but
-no external byte/attestation verifier, semantic plan/result validator, or protocol harness exists.
-The separately user-approved `construction-only-no-decision` lane does not consume this schema,
-cannot emit a prescreen disposition, and hard-codes every evidence-eligibility field false. It is
-engineering scaffolding rather than a way around the approval boundary. The formal record must bind
-the exact protocol bytes; harness/oracle source, binary, lockfile, SBOM, toolchain, target, and
-flags; raw wire/result schemas and literal goldens; complete seed/order schedule; target identity and
-preflight/
-noise rules; clock/cgroup/cache-reset procedures; trigger and bounded adaptive-delay rule; every
-deadline/resource/artifact cap; and all-false qualification/selection/production/admission fields.
-The result schema restricts every `synthetic_fixture` to `fixture_ineligible=true` and disposition
-`DEFER`; a fixture cannot encode even a smoke pass or a native prescreen decision. A real-shaped
-record still has no authority until the future semantic verifier checks its referenced bytes,
-attestations, run class, and disposition.
-The command must verify the detached record before opening redb. Any bound input change requires a
-new approval, and no prescreen approval can authorize or donate C1/C2/C3 evidence.
+native prescreen identity requires an exact `state-backend-redb-prescreen-approval-payload/v1` and
+two valid `state-backend-redb-prescreen-owner-envelope/v1` records over those identical payload
+bytes. The unsigned payload contains all decision-bearing fields and descriptors, including each
+owner's role, principal ID, approved key ID, decision and approval timestamp. It contains no
+signature or envelope descriptor, so the packet is non-circular.
+
+Each role envelope contains only its role, principal/key IDs, payload byte length and SHA-256,
+signature time, and a 64-byte Ed25519 signature. The signed message is exactly:
+
+```text
+ASCII("LAMINARDB\0REDB-PRESCREEN\0APPROVAL\0V1\0")
+|| u64_be(payload_byte_length)
+|| sha256(payload_exact_bytes)
+```
+
+Result review uses the same construction with domain
+`LAMINARDB\0REDB-PRESCREEN\0RESULT\0V1\0`. The roles must be exactly `workload_owner` and
+`operations_owner`; their principal and key IDs must be distinct and must match the payload. No JSON
+re-serialization, field exclusion, zeroing convention or signature-over-self is permitted.
+
+Trust is not nominated by the payload it authenticates. The verifier is dispatched with a
+separately protected, root-signed registry snapshot and current revocation snapshot. The registry
+maps principal, role and key ID to an Ed25519 public key and validity interval. Both snapshots have
+independent content hashes and root signatures in the protected dispatch policy, and the verifier
+requires their validity windows to cover approval time and dispatch/review time. A missing, expired,
+unknown, role-mismatched, reused, or revoked key fails closed. Revocation checked after approval also
+blocks dispatch; it does not silently rewrite retained history. Test keys and synthetic envelopes
+are permanently excluded from the production registry.
+
+The external verifier first validates schemas and exact bytes/locators, then trust and both
+signatures, then semantic equality/cross-artifact invariants, before it may invoke any executable.
+The candidate child is opened only after this check succeeds. Any bound input change requires a new
+payload and two new envelopes. The separately user-approved `construction-only-no-decision` lane
+does not consume this packet, cannot emit a prescreen disposition, and hard-codes every evidence-
+eligibility field false.
+
+The formal payload binds all fixed packet rows above, the toolchain/target/flags, complete fixture
+and seed/order schedule, target/preflight/noise rules, clock/cgroup/cache-reset procedures, trigger
+and bounded adaptive-delay rule, every deadline/resource/artifact cap, and all-false qualification/
+selection/production/admission fields. Every root uses the exact notice `NOT QUALIFICATION EVIDENCE`;
+bounded binary frames use their versioned magic and are covered by a noticed manifest rather than
+duplicating prose. Synthetic payloads/envelopes are always ineligible and can produce only `DEFER`.
+Schema validity alone has no authority, and no prescreen packet can authorize or donate C1/C2/C3
+evidence.
 
 ## Isolation and clocks
 
@@ -113,15 +264,59 @@ open-loop release times, process/cgroup sampling, intent/acknowledgement memory,
 and the independent expected-state oracle. The child cannot classify its own crash result.
 
 The target is the runner's native Linux/XFS/dedicated-NVMe class with fixed CPU affinity, an
-otherwise idle device, cgroup v2, synchronized monotonic clocks, and the same thermal and free-space
-preflight used by the future candidate campaign. Virtual disks, overlay filesystems, shared host
+otherwise idle device, cgroup v2, synchronized monotonic clocks, and the target/preflight rules
+frozen in this protocol and its bound policy files. Virtual disks, overlay filesystems, shared host
 NVMe, missing project quota, or missing device-write attribution cannot produce a prescreen outcome.
 
-For every transaction the supervisor records scheduled, enqueue, dispatch, service-before-
-`begin_write`, writer-acquired, commit-enter, candidate-return, and terminal timestamps. Queue,
-writer-acquisition, service, and end-to-end populations are separate. Oracle and sampling work run
-outside the candidate service interval; lag and result-ring overflow invalidate the attempt rather
-than being subtracted. All clocks and raw records use bounded binary framing fixed before execution.
+Supervisor and child use `clock_gettime(CLOCK_MONOTONIC_RAW)` on the same host and record the Linux
+boot ID, clock resolution, start/end raw values and matching UTC audit timestamps. UTC never enters a
+duration. Cross-process startup performs 10,000 shared-memory request/ack exchanges; maximum
+half-round-trip uncertainty must be at most 25 microseconds and every marker sequence must be
+monotonic. Failure invalidates the target before redb is opened.
+
+For every transaction the supervisor records scheduled release `S`, queue enqueue `E`, lane dispatch
+`D`, timestamp immediately before calling `begin_write` `B`, writer acquired `A`, commit entry `C`,
+candidate return `R`, and terminal result-ring observation `T`. Checked integer formulas are:
+
+```text
+scheduler_lateness = max(0, E - S)
+queue_wait          = D - E
+writer_acquisition  = A - B
+candidate_service   = R - B
+end_to_end          = T - S
+```
+
+Every timestamp must satisfy `S <= E <= D <= B <= A <= C <= R <= T`; a missing, reversed or
+overflowing timestamp invalidates the attempt. Oracle, hashing and resource sampling run outside
+`B..R`; their time is never subtracted from end-to-end latency. All event/result rings are
+preallocated for the plan's exact population plus 10%, use monotonically increasing sequence
+numbers, and may not overwrite. Loss, lag past the 10-second drain, or overflow invalidates the
+attempt.
+
+The fixed quiet-target rules are: swap disabled; no cgroup CPU throttling or memory event; no thermal
+throttle-counter increase; no kernel/block I/O error; release-lateness p99 at most 500 microseconds
+and maximum at most 5 milliseconds; non-candidate target-device writes no greater than both 64 MiB
+and 1% of candidate-attributed writes in any attempt bracket; and at least 64 GiB free beyond the
+campaign workspace quota at preflight and every boundary cut. CPU affinity, governor/frequency,
+kernel, filesystem/mount, device, cgroup and project IDs are bound in target identity. A quiet-rule
+miss is environmental `DEFER`, not a candidate pass or failure. All clocks and raw records use the
+bounded binary schemas/goldens bound before construction.
+
+The supervisor resolves the dedicated mount and block device from `/proc/self/mountinfo`, verifies
+XFS project-quota accounting and enforcement, obtains the database directory's project ID with
+`FS_IOC_FSGETXATTR`, and reads that project through `Q_XGETQUOTA`. XFS `d_bcount` is converted from
+512-byte basic blocks with checked multiplication. Project-ID change, disabled enforcement,
+unsupported query, counter regression/wrap or unit overflow invalidates the attempt. Allocation is
+sampled once per second and immediately before/after open, measured traffic, commit, kill, reopen,
+scan and cleanup. Cgroup v2 identity comes from the child PID and an already-open cgroup directory;
+memory, CPU and I/O files are sampled from that directory. Target-device major/minor must match the
+cgroup `io.stat` row and the bound block-trace filter; missing attribution invalidates evidence.
+
+Cold reopen uses a dedicated host with all packet processes closed except the supervisor: `syncfs`
+the mount, write exactly `3\n` to `/proc/sys/vm/drop_caches`, wait for two consecutive one-second
+cuts with zero target-device I/O in flight, and record the cache-reset receipt before launching the
+fresh opener. Failure, an unexpected open file, or background target-device traffic beyond the quiet
+rule yields `DEFER`. This is a process-crash/cache-loss probe, never power-loss evidence.
 
 ## Steady-state matrix
 
@@ -131,7 +326,9 @@ order rotate by a precommitted schedule; failures are retained and never silentl
 same slot identity.
 
 Each `W0`--`W2` attempt has 15 seconds warmup, 60 seconds measured open-loop traffic, 10 seconds
-drain, and 15 seconds resource tail. Its hard wall-clock cap is 120 seconds.
+drain, and 15 seconds resource tail. Its hard wall-clock cap is 120 seconds. All key/value/mutation
+frames are generated and oracle-checked before warmup; their resident bytes remain charged to the
+cgroup but generation never enters candidate service timing.
 
 | Probe | Offered traffic | Question |
 |---|---|---|
@@ -152,18 +349,28 @@ before a formal run; it combines the
 profile's 4-MiB target batch with victim work; its mutation rate is not equated with a scenario's
 source-row throughput gate.
 
-The following soft limits apply to every valid repetition. A single miss is retained and cannot be
-`REJECT_EXACT_PIN`; the final `DEFER` versus repeatable `PRESCREEN_NO_GO` rule is below:
+The measured scheduler emits exactly 6,000 releases for `W0`, 3,000 per `W1` lane, and 480 hot plus
+6,000 victim releases for `W2`. Across all modes and seeds this is exactly 166,320 measured
+transactions; warmup emits exactly 41,580 more. Every scheduled release is emitted and dispatched
+exactly once with no candidate or harness retry and must reach one successful terminal result by the
+end of the ten-second drain. Scheduler omission, duplication, a wrong sequence or a harness-dropped
+result invalidates the attempt. A candidate-attributable error or non-return is a retained soft
+liveness failure; a repeated identical mode/probe/gate failure in all three valid seeds becomes
+`PRESCREEN_NO_GO`, while one or two becomes `DEFER`. Achieved rate remains a diagnostic and is not a
+95% escape hatch.
 
-- no child, adapter, oracle, timeout, result-ring, or sampling errors and at least 95% of the offered
-  rate completed independently by every lane;
+The following soft limits apply to every otherwise valid repetition. A miss is retained and cannot
+be `REJECT_EXACT_PIN`; the final `DEFER` versus repeatable `PRESCREEN_NO_GO` rule is below:
+
+- no child, adapter, oracle, timeout, result-ring, or sampling errors other than an exactly
+  attributable candidate error/non-return classified above;
 - `W0`/`W1`: service p99 at most 10 ms, end-to-end p99 at most 25 ms, and end-to-end maximum at most
   250 ms;
 - `W2`: victim writer-acquisition p99 at most 25 ms and maximum at most 250 ms; victim end-to-end
   p99 at most 100 ms and maximum at most 500 ms; hot service p99 at most 250 ms and maximum at most
   one second; and
-- cgroup memory current/peak at most 16 GiB, process file descriptors at most 256, and every
-  bracketed XFS project-quota allocation at most four times logical live bytes.
+- cgroup memory peak at most 12 GiB, process file descriptors at most 256, and every bracketed XFS
+  project-quota allocation no greater than `min(4 * logical_live_bytes, 12 GiB)`.
 
 Latency populations contain every transaction released during the 60-second measured interval for
 that lane; a completion during the ten-second drain stays in the population. Warmup is excluded, no
@@ -193,7 +400,7 @@ supervisor triggers:
 3. 250 microseconds after commit entry;
 4. 2 milliseconds after commit entry;
 5. 10 milliseconds after commit entry; or
-6. after candidate return and durable supervisor acknowledgement.
+6. after candidate return and observed supervisor acknowledgement.
 
 After opening its private copy, the child first completes one returned priming transaction in the
 trial's `I1`, `I2`, or `QR` mode and remains open. The post-prime state becomes that trial's old-state
@@ -205,13 +412,20 @@ The intent contains the post-prime digest, complete intended mutation digest, tr
 seed, trigger identity, and sequence number. Shared memory exposes monotonic `intent`,
 `commit_entered`, `candidate_returned`, and `acknowledged` transitions. Child marker stores use
 release ordering. The supervisor writes acknowledgement only after observing candidate return, and
-trigger 6 waits until acknowledgement is visible before kill.
+trigger 6 waits until acknowledgement is visible before kill. A pre-commit barrier lets the
+supervisor arm its pidfd/timer before the child records `commit_entered` and immediately calls
+commit. Trigger 1 kills before releasing that barrier. Triggers 2--5 release it and actuate at 0,
+250 microseconds, 2 milliseconds, and 10 milliseconds respectively after the supervisor observes
+`commit_entered`. After return the child records `candidate_returned` and parks in a non-dropping
+state until killed, so scheduling cannot turn a return-boundary trial into clean `Database::drop`.
 The supervisor records the markers observed when it requests the signal, then after `waitid`/pidfd
 exit rereads their final values with acquire ordering. Final markers classify the trial because
 return may race signal delivery; a requested timed trigger is not silently called “in commit.”
 Across triggers 2--5, each mode needs at least three finally confirmed
 `commit_entered && !candidate_returned` kills. At most two extra, separately identified trials per
-mode may vary only the delay to meet that coverage; otherwise the outcome is `DEFER`.
+mode may vary only the delay to meet that coverage: extra 0 reuses seed `2026072301` at zero delay
+and extra 1 reuses seed `2026072302` at 50 microseconds. All other bytes and ordering stay fixed.
+They run in that order only until coverage is met; otherwise the outcome is `DEFER`.
 
 Shared memory is protocol state, not proof of database durability. `SIGKILL` is delivered by
 PID/pidfd and the supervisor records delivery and observed exit. The child must die without unwind
@@ -233,8 +447,10 @@ is `DEFER`.
 A separate large-recovery comparison uses one 4-GiB fragmented fixture per mode and seed: nine
 trials total, each with a confirmed in-commit kill. Independent clean-control and crash copies start
 from the same verified fixture. Both execute and retain the mode-specific priming commit while open;
-the control then closes normally, while the crash copy begins the target transaction and is killed
-without drop. It records clean-control reopen, crash reopen, and full-scan duration separately.
+the control then closes normally, while the crash copy uses the armed pre-commit barrier and is
+killed 50 microseconds after observed commit entry without drop. It records clean-control reopen,
+crash reopen, and full-scan duration separately. A return before signal or any unconfirmed
+in-commit marker makes that slot and the campaign `DEFER`; large recovery has no adaptive retry.
 Before each reopen, the dedicated host follows the same reviewed, recorded file/device quiescence
 and page-cache-reset procedure; no comparison is accepted if either side's cold state cannot be
 established. Docker Desktop/WSL results are never used here. These nine trials answer recovery cost;
@@ -250,37 +466,72 @@ maximum is `DEFER`; two or more are `PRESCREEN_NO_GO`.
 ## Bounds and disposition
 
 The performance base is 1 GiB logical, the atomicity base is 256 MiB, and the large-recovery base is
-4 GiB. Each attempt starts from a new verified directory and has a 16-GiB physical allocation cap.
-The complete prescreen is bounded to 250,000 transaction samples, 2 GiB of retained artifacts, 15
-minutes of build/environment preflight, 120 seconds per steady attempt, ten seconds per `HOLD`, 120
-seconds per crash open-and-scan pair, 60 seconds each for the nine large clean closes and clean
-reopens, at most six replacement atomicity trials, 60 aggregate minutes for fixture copies, priming,
-cache resets, and artifact finalization, 60 seconds for final cleanup, and five hours wall clock.
-Reaching a bound fails closed as `DEFER`; no partial population may be called a pass. The enumerated
-caps consume 287.5 minutes including shared overhead and cleanup, leaving 12.5 minutes of the hard
-campaign budget.
-These ceilings are materially cheaper than the 45-hour C2 sketch.
+4 GiB. Every database lives in its own XFS project with a 16-GiB hard quota; the whole transient
+campaign workspace has a separate 64-GiB hard quota. `memory.max` is 16 GiB, swap is disabled, and
+`RLIMIT_NOFILE` is 512. These protect the host and are not decision thresholds. The decision limits
+remain strictly lower: 12-GiB cgroup memory peak, 256 FDs, and per-database allocated bytes no greater
+than `min(4 * logical_live_bytes, 12 GiB)`. Checked multiplication overflow is invalid evidence.
 
-The single final outcome is:
+The 2-GiB retained-evidence cap excludes verified transient database fixtures/copies and streamed
+scan bytes. Full scans feed the redb-free oracle incrementally and are never materialized as exports.
+Retained evidence includes the exact approval/result packets, plans, manifests, schedule, raw timing/
+resource/marker frames, target/preflight/noise records, state counts and digests, at most 1 MiB per
+mismatch excerpt, process/kernel logs, validator/oracle/mechanism reports, signatures, and an artifact
+index. The index records every retained file's locator/length/hash and every verified-then-destroyed
+database's pre/post digests and destruction time. Its checked sum must equal
+`retained_artifact_bytes`. Deletion begins only after independent oracle and validator reports are
+durably indexed; missing transient-destruction evidence is `DEFER`, not a smaller claimed total.
 
-- `REJECT_EXACT_PIN` for one fully attributable atomicity/durability/corruption invariant violation
-  on a valid target; at most one bounded diagnostic repetition may follow, and it cannot downgrade
-  that outcome;
-- `PRESCREEN_NO_GO` when the same attributable candidate writer/latency/recovery/resource soft gate
-  fails in all three valid seed repetitions for a mode/probe, when a complete-population QR rule
-  above says so, or when deterministic sole-writer liveness prevents progress;
-- `DEFER` for an isolated soft-limit miss, environmental invalidity, unexplained harness error,
-  missing in-commit/cold-cache evidence, missing artifacts, or bound exhaustion; or
-- `PRESCREEN_PASS` only when every scheduled slot passes and the named workload and operations
-  owners approve the source, harness, raw artifacts, oracle, and disposition.
+No fixture is generated inside the decision campaign: the approved packet binds prebuilt canonical
+bases. The five-hour watchdog begins before build/environment verification and ends only after
+artifact finalization and cleanup. Its worst-case allocation is exact:
 
-Harness, oracle, sampler, actuator, and observation faults always map to `DEFER`, even if repeated;
-they never become candidate `PRESCREEN_NO_GO` by repetition.
+| Step | Count and ceiling | Budget |
+|---|---|---:|
+| Build/environment/fixture verification | one aggregate cap | 15 min |
+| `W0`--`W2` | 27 at 120 s | 54 min |
+| `HOLD` | 9 at 10 s | 1.5 min |
+| Crash open-and-scan pairs | 54 baseline small + 6 reserved small + 9 large, each 120 s | 138 min |
+| Large clean control close/reopen | 9 closes + 9 reopens, each 60 s | 18 min |
+| Fixture copies and hash checks | aggregate | 25 min |
+| Priming and trigger setup | aggregate | 10 min |
+| Quiescence and cache resets | aggregate | 15 min |
+| Retained-evidence finalization | aggregate | 10 min |
+| Final cleanup | aggregate | 1 min |
+| **Allocated maximum** | | **287.5 min** |
+| **Watchdog slack** | | **12.5 min** |
 
-Every artifact repeats `NOT C2/C3 QUALIFICATION EVIDENCE` and sets all qualification, selection,
-production, and admission booleans false. A pass still leaves DKS-Q2-006's mechanism-map schema and
-redb mapping, DKS-Q2-007 persistence/configuration work, the complete candidate adapter, C1/C2/C3,
-physical fault/endurance qualification, and independent production soak open.
+The campaign also caps all retained decision-bearing transaction records at 250,000. A per-step,
+aggregate, resource, sample, workspace or five-hour safety bound reached before a valid terminal
+correctness finding is `DEFER`; no partial population passes. These ceilings remain materially
+cheaper than the 45-hour C2 sketch.
+
+The redb-free classifier derives exactly one outcome in this precedence order:
+
+1. Invalid approval/trust, target, preflight, actuator, clock, harness, oracle, schedule, artifact or
+   evidence completeness yields `DEFER`; an invalid attempt cannot prove a candidate defect.
+2. One fully attributable atomicity/durability/corruption invariant violation in a valid attempt
+   seals `REJECT_EXACT_PIN` and stops decision execution. At most one separately labelled diagnostic
+   repetition may follow; its failure or bound hit cannot downgrade or erase the sealed rejection.
+3. Without a sealed rejection, a safety bound, incomplete required population, missing in-commit or
+   cold-cache proof, or mechanism-probe status other than `complete` yields `DEFER`.
+4. The same candidate writer/latency/recovery/resource/liveness soft gate failing for the same mode/
+   probe in all three valid seeds yields `PRESCREEN_NO_GO`. One or two failures yields `DEFER`.
+   Harness/oracle/sampler/actuator/observer faults never become candidate failures by repetition.
+5. The QR complete-population median/ratio/maximum rules above apply with checked integer arithmetic;
+   their explicit `DEFER`/`PRESCREEN_NO_GO` rules take the same precedence.
+6. `PRESCREEN_PASS` requires every baseline and activated replacement slot valid and passing, an
+   exact non-synthetic prior `SMOKE_PASS`, a complete mechanism probe, complete artifact
+   reconciliation, and both post-run owners accepting the derived result.
+
+Owners attest the derived payload; they cannot manually select or weaken its disposition. A
+mechanism-probe report is emitted even when preflight or an earlier terminal result prevents the
+probe and carries `not_run` or `incomplete` plus the reason; only `complete` is pass-capable.
+
+Every root/manifest uses `NOT QUALIFICATION EVIDENCE` and sets all qualification, selection,
+production, soak and admission booleans false. A pass still leaves DKS-Q2-006's mechanism-map schema
+and redb mapping, DKS-Q2-007 persistence/configuration work, the complete candidate adapter,
+C1/C2/C3, physical fault/endurance qualification, and independent production soak open.
 
 Before owners approve this prescreen, an exact-source mechanism note must inventory the sole-writer
 wait, synchronous allocator reclamation, quick-repair allocator-state writes, clean-close

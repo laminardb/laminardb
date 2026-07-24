@@ -4,7 +4,7 @@
   "record_class": "synthetic_fixture",
   "fixture_ineligible": true,
   "result_id": "synthetic-fixture/redb-docker-smoke-result",
-  "status": "reviewed_prescreen_result",
+  "status": "synthetic_descriptor_fixture",
   "schema_validation_authorizes_decision": false,
   "external_attestation_verification_required": true,
   "run_class": "docker_smoke_no_decision",

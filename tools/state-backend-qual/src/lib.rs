@@ -1181,7 +1181,7 @@ mod redb_prescreen_contract_tests {
         native["mechanism_probe"] =
             descriptor("redb-prescreen-bounded-mechanism-probe-result", '3');
         native["disposition"] = "PRESCREEN_NO_GO".into();
-        assert!(jsonschema::draft202012::is_valid(&schema, &native));
+        assert!(!jsonschema::draft202012::is_valid(&schema, &native));
 
         let mut synthetic_native_pass = native.clone();
         synthetic_native_pass["record_class"] = "synthetic_fixture".into();
@@ -1196,11 +1196,9 @@ mod redb_prescreen_contract_tests {
         missing_probe["mechanism_probe"] = Value::Null;
         assert!(!jsonschema::draft202012::is_valid(&schema, &missing_probe));
 
-        let mut bounded = native.clone();
+        let mut bounded = docker.clone();
         bounded["bounds"]["hard_bound_hit"] = true.into();
         bounded["bounds"]["hit_codes"] = serde_json::json!(["attempt_deadline"]);
-        assert!(!jsonschema::draft202012::is_valid(&schema, &bounded));
-        bounded["disposition"] = "DEFER".into();
         assert!(jsonschema::draft202012::is_valid(&schema, &bounded));
 
         for pointer in [
@@ -1209,12 +1207,12 @@ mod redb_prescreen_contract_tests {
             "/evidence_scope/independent_soak_eligible",
             "/evidence_scope/source_sink_delivery_eligible",
         ] {
-            let mut mutation = native.clone();
+            let mut mutation = docker.clone();
             *mutation.pointer_mut(pointer).unwrap() = true.into();
             assert!(!jsonschema::draft202012::is_valid(&schema, &mutation));
         }
 
-        let mut unknown = native;
+        let mut unknown = docker;
         unknown["production_ready"] = true.into();
         assert!(!jsonschema::draft202012::is_valid(&schema, &unknown));
     }

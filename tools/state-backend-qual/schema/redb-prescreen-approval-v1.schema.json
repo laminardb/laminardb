@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://laminardb.dev/schemas/state-backend-redb-prescreen-approval-v1.json",
-  "title": "LaminarDB redb 4.1.0 bounded prescreen pre-run approval v1",
-  "description": "A detached descriptor root for owner-approved prescreen inputs. Schema validation neither verifies referenced bytes or attestations nor authorizes execution.",
+  "title": "LaminarDB redb 4.1.0 legacy synthetic pre-run descriptor fixture v1",
+  "description": "Synthetic-only regression shape superseded before use by the Cycle 21 payload/envelope design. It cannot encode an approval or authorize execution.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -24,15 +24,15 @@
   "properties": {
     "schema_version": {"const": "state-backend-redb-prescreen-approval/v1"},
     "notice": {"const": "NOT QUALIFICATION EVIDENCE"},
-    "record_class": {"enum": ["prescreen_record", "synthetic_fixture"]},
-    "fixture_ineligible": {"type": "boolean"},
+    "record_class": {"const": "synthetic_fixture"},
+    "fixture_ineligible": {"const": true},
     "approval_id": {
       "type": "string",
       "minLength": 1,
       "maxLength": 128,
       "pattern": "^[a-z0-9][a-z0-9._/-]{0,127}$"
     },
-    "status": {"const": "reviewed_pre_run_approval"},
+    "status": {"const": "synthetic_descriptor_fixture"},
     "schema_validation_authorizes_execution": {"const": false},
     "external_attestation_verification_required": {"const": true},
     "run_class": {"enum": ["docker_smoke_no_decision", "native_prescreen_decision"]},

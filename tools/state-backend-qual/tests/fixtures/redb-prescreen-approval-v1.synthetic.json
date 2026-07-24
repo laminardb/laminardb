@@ -4,7 +4,7 @@
   "record_class": "synthetic_fixture",
   "fixture_ineligible": true,
   "approval_id": "synthetic-fixture/redb-native-prescreen-approval",
-  "status": "reviewed_pre_run_approval",
+  "status": "synthetic_descriptor_fixture",
   "schema_validation_authorizes_execution": false,
   "external_attestation_verification_required": true,
   "run_class": "native_prescreen_decision",
