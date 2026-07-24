@@ -110,10 +110,13 @@ XFS or dedicated NVMe. The construction report hard-codes every qualification, s
 production, delivery, fault, and soak eligibility field to false. Its construction wall-times and
 file-size ratios are deliberately excluded from this recommendation.
 
-Hosted Ubuntu execution of the checked-in workflow is still pending at this document's initial
-commit. A green job will prove only that the same bounded construction mechanics work on that
-runner. A failure must be retained and diagnosed; it cannot be rerun into backend evidence or
-treated as a redb latency verdict.
+The hosted `ubuntu-24.04` job passed on its first attempt in [run
+30072229655](https://github.com/laminardb/laminardb/actions/runs/30072229655) against commit
+`c26763a2`. The runner used Ubuntu 24.04.4, runner 2.336.0, image `20260720.247.2`, and exact Rust
+1.95.0. It reproduced the canonical row count, export size, and digest above; the complete workflow
+and required `CI Success` gate also passed on the first attempt. This proves only that the same
+bounded construction mechanics work on that hosted runner. No artifact was uploaded, and the job
+cannot become prescreen, qualification, backend-selection, latency, or production evidence.
 
 ## Delivery, exactly-once, and backend independence
 
