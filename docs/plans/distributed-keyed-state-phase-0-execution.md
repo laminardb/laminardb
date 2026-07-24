@@ -11,15 +11,15 @@
 ## Outcome
 
 Phase 0 selects and proves the contracts needed before a production working-state implementation
-can begin. It does not add an LSM to the runtime, relax `[LDB-4007]`, enable a materialized view, or
-change the cluster delivery guarantee.
+can begin. It does not add a state backend to the runtime, relax `[LDB-4007]`, enable a materialized
+view, or change the cluster delivery guarantee.
 
 The phase is complete only when maintainers can answer, with versioned evidence:
 
 1. which physical operators retain state and what distribution model each requires;
 2. which key/state ABI is durable across restore, rescale, and rolling upgrade;
 3. what numerical workload, latency, resource, checkpoint, and RTO limits define success;
-4. which one local LSM passed the same workload and fault contract;
+4. which disk-backed working-state backend passed the same workload and fault contract;
 5. which source/operator/output/sink scenario is being certified at-least-once; and
 6. how an independent black-box soak will prevent an unearned production-ready claim.
 
@@ -296,7 +296,7 @@ progress notification. The asynchronous tail may overflush post-cut output, whic
 cross-layer test must block and fail sink flush to prove that no durable decision or source
 notification escapes early.
 
-## Workstream C — Evidence-only LSM qualification
+## Workstream C — Evidence-only disk-backend qualification
 
 Create a standalone, unpublished tool at `tools/state-backend-qual` with its own workspace and
 committed lockfile. The root workspace and `crates/**` must gain no candidate dependency during the
@@ -394,28 +394,34 @@ failure remains recorded and is not a fixed defect, soak, or qualification resul
 closes only the prototype's configured-platform gap; all DKS-Q2-001 policy, numerical, provenance,
 independent-operation, and candidate-comparison blockers remain.
 
-redb 4.1.0 remains outside C2. The independent optional prescreen branch may design its isolated
-[bounded redb prescreen](../testing/state-backend-redb-prescreen-v1.md), but no run is authorized
-until its existing schemas gain an external semantic/attestation verifier and harness and a separate
+redb 4.1.0 remains outside C2. Cycle 16 adds a separately authorized, isolated
+`construction-only-no-decision` workspace and CI lane; it cannot consume approval, classify a
+prescreen, or contribute selection evidence. The optional
+[bounded redb prescreen](../testing/state-backend-redb-prescreen-v1.md) still cannot run until its
+existing schemas gain an external semantic/attestation verifier and protocol harness and a separate
 detached pre-run approval is signed by the workload and operations owners. Its Docker Desktop/WSL
-subset is smoke-only; a target-host
+protocol subset is smoke-only; a target-host
 `PRESCREEN_PASS` merely funds mechanism/persistence mapping, an additive profile/schema proposal,
 and adapter review. `PRESCREEN_NO_GO`, `DEFER`, and `REJECT_EXACT_PIN` add no candidate. No prescreen
 artifact may satisfy or be pooled into C1/C2/C3.
 
-Add exact, optional candidate pins in separate commits: Fjall `=3.1.8` and RocksDB Rust wrapper
-`=0.24.0` with its bundled RocksDB 10.4.2 engine. Build exactly one candidate per binary. The
-private qualification contract covers
+An isolated mechanism-closure workspace may pin the exact subject, build, SBOM, options, and source/
+binding under review. Do not add a profile candidate, adapter, or runtime pin until DKS-Q2-006 closes
+and the owner accepts the carry-forward decision. For the recommended primary track, the isolated
+subject is RocksDB Rust wrapper `=0.24.0` with bundled RocksDB 10.4.2. A future patched/admitted Fjall
+subject receives a separate exact identity; unmodified Fjall 3.1.8 does not. Build exactly one
+admitted candidate per binary. The private qualification contract covers
 batched reads, atomic write/delete/timer mutations, bounded range scans, consistent snapshots,
 vnode cleanup, sorted restore, explicit crash persistence, and resource/operability statistics. It
 is not the future production trait.
 
-For Fjall, test consistency and power-loss durability separately: ordinary buffered writes versus
-the proposed grouped `SyncData`/`SyncAll` boundary, retained slices, snapshot/iterator reclamation,
-prefix cleanup without a range tombstone, and every stable pressure counter. For RocksDB, test the
-chosen Rust binding's actual MultiGet behavior, DeleteRange tombstone/read cost,
-cross-column-family stall propagation, rate-limiter scope, native memory accounting, and
-SST-ingest write pauses. Pin the exact RocksDB engine and wrapper before results are accepted.
+For any later-admitted Fjall subject, test consistency and power-loss durability separately:
+ordinary buffered writes versus the proposed grouped `SyncData`/`SyncAll` boundary, retained slices,
+snapshot/iterator reclamation, prefix cleanup without a range tombstone, and every stable pressure
+counter. For an admitted RocksDB subject, test the chosen Rust binding's actual MultiGet behavior,
+DeleteRange tombstone/read cost, cross-column-family stall propagation, rate-limiter scope, native
+memory accounting, and SST-ingest write pauses. Pin the exact engine and wrapper before results are
+accepted.
 
 Only after named owners approve the exact profile and complete runner-plan hashes, run identical
 fixed-operation workloads in the frozen candidate order and record offered end-to-end, service,
@@ -440,10 +446,10 @@ lanes with a sequential oracle per lane, including a hot writer and latency-vict
 point/write/range traffic, and snapshot/export overlap. Gate victim and aggregate p99/p99.9/max,
 global stalls, CPU/memory/I/O and resource tails. Barrier-addressed cases race normal operations
 with restore activation, cleanup, and pinned-snapshot release while preserving the lifecycle-fence
-oracle. Both candidates use the same lane schedule, database/keyspace layout, seeds, barriers, and
-paired order.
+oracle. Every admitted candidate uses the same lane schedule, database/keyspace layout, seeds, and
+barriers; a comparison uses the frozen paired order.
 
-For each candidate, exercise kill during atomic write, snapshot/export, restore, and cleanup;
+For each admitted candidate, exercise kill during atomic write, snapshot/export, restore, and cleanup;
 explicit persistence recovery; corruption/truncation; wrong identity/schema; concurrent open; FD
 pressure; scoped Linux `ENOSPC`; complete local loss plus portable restore; and N/N-1 behavior. A
 24–72-hour backend churn/TTL soak measures compaction and resource slopes but is not the independent
@@ -494,7 +500,8 @@ Remaining commits are kept reviewable in this dependency order:
 1. `tools: define candidate-neutral runner and evidence schema`
    - pacing, raw samples/nearest-rank summaries, invalid-run rules, resource formulas, and fault schedules/evidence policy
      land without a runtime dependency;
-2. add separate exact-pin Fjall and RocksDB adapter commits behind the private spike contract;
+2. after mechanism closure and owner carry-forward approval, add a separate exact-pin adapter commit
+   for each admitted candidate behind the private spike contract;
 3. `docs: approve keyed-state qualification profile and runner`
    - named workload/operations owners may revise the candidate before approving final thresholds,
      case matrix, Zipf sampler, runner source/build identity, and evidence rules. A separately
@@ -506,8 +513,8 @@ Remaining commits are kept reviewable in this dependency order:
 7. `docs: review distributed keyed state phase zero`.
 
 The optional redb prescreen is an independent side branch, not a prerequisite in this numbered
-Fjall/RocksDB sequence. Even `PRESCREEN_PASS` requires a later explicit scope decision and an
-additive profile/schema revision before any redb adapter commit.
+candidate sequence. Even `PRESCREEN_PASS` requires a later explicit scope decision and an additive
+profile/schema revision before any redb adapter commit.
 
 Phase 1 tracks the temporary reader-first dead-code allowances as **DKS-P1-001**. Owner:
 distributed-state lifecycle implementation. Deadline: 2026-08-31 or the first trusted,
@@ -532,7 +539,8 @@ Required attached evidence:
 - named human owners and approvals for the target profile and soak charter;
 - operator capability inventory and exact test commands;
 - typed ABI vectors and compatibility/rollback decision;
-- raw and summarized Fjall/RocksDB results with hashes and rejected-candidate rationale;
+- raw and summarized results for every admitted candidate, with hashes and rejected-candidate
+  rationale;
 - fault/endurance results including every failed or invalid attempt;
 - source/operator/sink ALO oracle specification;
 - AI-slop, overengineering, unused-code, production-readiness, documentation, and test review; and

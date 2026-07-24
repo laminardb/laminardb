@@ -1,6 +1,7 @@
 # WSL/Docker state-qualification capability check
 
 - **Date:** 2026-07-23
+- **Inventory refreshed:** 2026-07-24
 - **Host:** current developer Windows workstation only
 - **Evidence class:** local environment capability inventory; not qualification or benchmark evidence
 - **Decision:** use for Linux correctness and recovery smoke tests; do not use for gate-bearing storage results
@@ -39,8 +40,8 @@ service configuration was changed.
 | Boundary | Observation |
 |---|---|
 | WSL | WSL `2.7.10.0`; Microsoft kernel `6.18.33.2`; default Ubuntu distribution uses WSL 2 |
-| Docker | Desktop `4.80.0`; client/server `29.6.1`; Linux x86-64 engine; overlayfs; cgroup v2 |
-| Docker allocation | 24 CPUs and 16,290,336,768 bytes (about 15.17 GiB); six other containers were running |
+| Docker | Desktop `4.83.0`; client/server `29.6.2`; Linux x86-64 engine; overlayfs; cgroup v2 |
+| Docker allocation | 24 CPUs and 16,290,353,152 bytes (about 15.17 GiB); six unrelated containers were running and used about 8.76 GiB at the refresh, so the host was not a quiet latency target |
 | Docker storage | `/var/lib/docker` on an ext4 virtual disk; the backing `docker_data.vhdx` was about 70.25 GiB on NTFS C: |
 | Ubuntu storage | Linux root is ext4; this checkout is reached through the Windows/WSL 9p/DrvFs mount, not a native Linux worktree |
 | Block identity | Linux exposes Hyper-V virtual SCSI disks, not the host NVMe namespace, controller, firmware, cache, or SMART/NVMe telemetry |
@@ -55,6 +56,11 @@ result. The repeated run explicitly reported Rust/Cargo 1.95.0 and passed all 94
 default all-targets invocation; the later exact-image `zipf-feasibility` invocation passed all 103
 tests. Future evidence manifests must record the active toolchain output; an image tag alone is
 insufficient.
+
+Cycle 16 also ran the exact redb 4.1.0 construction workspace in that pinned Linux/amd64 image. The
+[canonical result](state-backend-carry-forward-matrix-2026-07-24.md#cycle-16-redb-construction-result)
+is labelled construction-only and deliberately contributes no latency, filesystem, device, crash,
+prescreen, or selection result.
 
 The 15.17-GiB Docker memory ceiling and shared virtual disk also cannot satisfy the provisional
 64-GiB/96-GiB profile. Microsoft recommends keeping Linux-tool workloads in the Linux filesystem,

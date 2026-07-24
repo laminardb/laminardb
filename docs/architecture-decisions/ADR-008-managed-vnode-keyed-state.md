@@ -2,6 +2,7 @@
 
 - **Status:** Proposed; implementation requires the Phase 0 review gate
 - **Date:** 2026-07-22
+- **Amended:** 2026-07-24; Cycle 16 carry-forward recommendation pending owner decision
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Related:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md),
   [implementation plan](../plans/distributed-keyed-stateful-operators.md)
@@ -9,13 +10,18 @@
 ## Decision
 
 LaminarDB will add a common, byte-governed, spillable **working-state service** for keyed
-operators. Phase 0 will qualify Fjall `=3.1.8` and RocksDB Rust wrapper `=0.24.0` (bundled RocksDB
-10.4.2) behind the same narrow service and workload/fault harness, then record one production
-backend; it will not ship and maintain both by default. Fjall is the incumbent project candidate,
-not an accepted dependency—the current tree no
-longer contains it. An in-memory implementation remains a semantic reference and a small
-local-mode option. Cluster-shared object storage and the existing `StateBackend` remain the
-authoritative checkpoint/recovery layer; neither local LSM is remote recovery authority.
+operators. Phase 0 originally scoped Fjall `=3.1.8` and RocksDB Rust wrapper `=0.24.0` (bundled
+RocksDB 10.4.2) behind the same narrow service and workload/fault harness. The Cycle 16
+[carry-forward matrix](../reports/state-backend-carry-forward-matrix-2026-07-24.md) recommends
+RocksDB's bounded mechanism-closure task first and redb 4.1.0 only as a separate prescreen
+contingency, pending the owner's carry-forward decision. Unmodified Fjall can re-enter only after
+its DKS-Q2-006 patch. This recommendation is work allocation, not backend selection or candidate
+admission. Any candidates admitted later still run the common campaign, which records one
+production backend rather than maintaining multiple implementations. An in-memory implementation
+remains a semantic reference and a small local-mode option. Cluster-shared object storage and the
+existing `StateBackend` remain the
+authoritative checkpoint/recovery layer; no local working-state backend is remote recovery
+authority.
 
 The [exact-source static audit](../reports/state-backend-static-audit-2026-07-23.md) finds that
 unmodified Fjall 3.1.8 cannot supply the required stable compaction-debt/write-stall telemetry and
@@ -182,9 +188,10 @@ compact schema-versioned binary codec with schema metadata hoisted out of each v
 Arrow IPC streams are prohibited; the prior tier audit found their framing could dominate small
 accumulator payloads. Checkpoint export may re-columnarize many logical records together.
 
-#### Evidence-based local-LSM qualification
+#### Evidence-based disk-backend qualification
 
-[Fjall 3.1.8](https://docs.rs/fjall/3.1.8/fjall/) is a credible fit on paper: safe Rust, atomic
+[Fjall 3.1.8](https://docs.rs/fjall/3.1.8/fjall/) is a credible fit on paper: a Rust-native API and no
+C++ storage engine, atomic
 cross-keyspace write batches, consistent cross-keyspace snapshots, forward/reverse prefix and range
 iteration, sorted bulk ingestion, a configurable block-cache capacity, configurable
 memtables/journals and worker threads, and a documented stable disk-format policy. It also avoids
@@ -216,11 +223,12 @@ compaction can dominate the tail. The new harness must use the actual always-cur
 workload—batched group updates, timer-range scans, snapshots, and checkpoint export—on target Linux
 NVMe and report p99.9 as well as p99.
 
-Fjall passes only if it meets the precommitted performance profile, exposes or can upstream stable
-cache/memtable/journal/disk/compaction telemetry, obeys hard memory/disk/queue bounds, survives the
-crash/corruption matrix, and supports the required portable restore/upgrade policy. The Phase 0
-spike runs the same logical batches, timer scans, snapshot/export overlap, restore, cleanup, and
-fault schedule against RocksDB rather than comparing unrelated vendor microbenchmarks. RocksDB's
+Any later patched/admitted Fjall subject passes only if it meets the precommitted performance
+profile, exposes stable cache/memtable/journal/disk/compaction telemetry, obeys hard memory/disk/
+queue bounds, survives the crash/corruption matrix, and supports the required portable restore/
+upgrade policy. Every admitted candidate runs the same logical batches, timer scans, snapshot/export
+overlap, restore, cleanup, and fault schedule rather than comparing unrelated vendor microbenchmarks;
+no adapter is authorized before candidate-specific mechanism closure. RocksDB's
 multi-get, range delete, rate limiting, mature operational telemetry, and physical
 [checkpoint](https://github.com/facebook/rocksdb/wiki/Checkpoints)/SST-ingest primitives are
 advantages; its C++ build, native-memory accounting, platform burden, and compaction tuning are
@@ -234,7 +242,7 @@ RocksDB release and Rust wrapper before relying on any API behavior.
 
 The in-memory backend is required for model/differential tests and may serve explicitly bounded
 local workloads. It is not the cluster production fallback: inability to open or govern the
-qualified LSM keeps keyed cluster admission closed.
+qualified disk-backed backend keeps keyed cluster admission closed.
 
 ### 4. Resource governance
 
@@ -685,7 +693,7 @@ is the current proposed numerical contract, not a benchmark result or approval. 
 assigns backend, artifact-conformance, and product-integration sections to different executors; an
 LSM run cannot satisfy sink/checkpoint/failover gates. Its standalone validator accepts only the
 explicitly ineligible form, rejects measured/result fields, and has no runtime or backend dependency.
-Named owner approval, immutable runner identity, actual Fjall/RocksDB evidence, the product
+Named owner approval, immutable runner identity, evidence for every admitted candidate, the product
 connector/object-store profile, and the independent release soak all remain outstanding. The v1
 and v2 profiles are retained only as immutable validation/model regression fixtures.
 
@@ -820,8 +828,8 @@ checks, and admission flags that remain disabled until each vertical passes its 
 
 | System/research | Relevant fact | Decision taken here |
 |---|---|---|
-| [Fjall 3.1.8 API](https://docs.rs/fjall/3.1.8/fjall/) and [RocksDB operations](https://github.com/facebook/rocksdb/wiki/Basic-Operations) | Fjall offers safe-Rust batches/snapshots/ranges but lacks native multi-get/range tombstones and sufficient governance telemetry; RocksDB offers broader batch/operations controls at native-build/accounting cost | Run one workload/fault contract, including explicit durability and pressure tests, select one production LSM, and retain portable Laminar artifacts |
-| [Flink 2.3 keyed state](https://nightlies.apache.org/flink/flink-docs-release-2.3/docs/concepts/stateful-stream-processing/) and [state backends](https://nightlies.apache.org/flink/flink-docs-release-2.3/docs/ops/state/state_backends/) | Key groups are the atomic redistribution unit; heap is low-latency but memory-bound; EmbeddedRocksDB supports large local state and incremental checkpoints | Keep fixed vnodes; start with a local LSM and portable checkpoints |
+| [Fjall 3.1.8 API](https://docs.rs/fjall/3.1.8/fjall/) and [RocksDB operations](https://github.com/facebook/rocksdb/wiki/Basic-Operations) | Fjall offers a Rust-native API without a C++ storage engine plus batches/snapshots/ranges, but lacks native multi-get/range tombstones and sufficient governance telemetry; RocksDB offers broader batch/operations controls at native-build/accounting cost | Run one workload/fault contract, including explicit durability and pressure tests, select one production backend, and retain portable Laminar artifacts |
+| [Flink 2.3 keyed state](https://nightlies.apache.org/flink/flink-docs-release-2.3/docs/concepts/stateful-stream-processing/) and [state backends](https://nightlies.apache.org/flink/flink-docs-release-2.3/docs/ops/state/state_backends/) | Key groups are the atomic redistribution unit; heap is low-latency but memory-bound; EmbeddedRocksDB supports large local state and incremental checkpoints | Keep fixed vnodes; start with a local disk-backed backend and portable checkpoints |
 | [Flink ForSt](https://nightlies.apache.org/flink/flink-docs-release-2.3/docs/ops/state/disaggregated_state/) | Remote SSTs, local cache and async State V2 access enable lightweight checkpoints, but ForSt remains experimental; synchronous state is local unless explicitly overridden, and the current implementation is slated for replacement | Do not put object storage on LaminarDB's initial hot path |
 | [Flink checkpoint backpressure guidance](https://nightlies.apache.org/flink/flink-docs-release-2.3/docs/ops/state/checkpointing_under_backpressure/) | Unaligned capture is useful when measured alignment delay is the problem and captures in-flight data | Keep aligned barriers; instrument before adding unaligned state |
 | [RisingWave architecture](https://docs.risingwave.com/get-started/architecture), [v3.0 vnode mapping](https://github.com/risingwavelabs/risingwave/blob/v3.0.0/docs/dev/src/design/consistent-hash.md), and [v3.0 checkpoints](https://github.com/risingwavelabs/risingwave/blob/v3.0.0/docs/dev/src/design/checkpoint.md) | Key-to-vnode mapping/storage encoding stay invariant while Meta changes vnode ownership during scaling; barriers combine with Hummock cache, version, and compaction services | Reuse fixed vnode identity/barriers; do not imitate Hummock without its control/storage services |

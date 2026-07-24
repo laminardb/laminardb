@@ -1,8 +1,9 @@
 # redb 4.1.0 bounded state-backend prescreen v1
 
 - **Identity:** `state-backend-redb-prescreen/v1`
-- **Status:** proposed, non-gating protocol; strict detached schemas and source note exist, but owners,
-  harness, validator, and execution remain absent
+- **Status:** proposed, non-gating protocol; a separately authorized construction-only workspace and
+  CI lane now exist, but owners, the detached attestation/semantic verifier, native harness, and
+  protocol execution remain absent
 - **Evidence class:** `NOT C2/C3 QUALIFICATION EVIDENCE`
 - **Scope:** decide whether a redb adapter is worth adding to the backend qualification bake-off
 - **Production/admission effect:** none; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
@@ -30,6 +31,26 @@ target. None supplies C1/C2/C3, fault, endurance, checkpoint, source/sink, exact
 or production evidence. The prescreen never selects redb by comparing its limits with Fjall or
 RocksDB results.
 
+### Open protocol-freeze blockers
+
+The source identity and proposed experiment are bounded, but this protocol is not approval-ready.
+Before either owner signs it, a revision must:
+
+- map every descriptor role to a fixed filename/locator and bind the formal harness, verifier,
+  oracle, actuator, binaries, lockfile, SBOM, build, schemas, goldens, and fixtures;
+- define detached signature algorithm, trust registry, revocation policy, domain-separated canonical
+  preimage, and a non-circular two-principal review packet;
+- separate the resource decision threshold from the 16-GiB safety cap;
+- replace the conflicting 95% completion and every-release-return rules with one closed rule;
+- distinguish transient 4-GiB fixture/database/scan bytes from the 2-GiB retained-artifact cap and
+  freeze what audit evidence is retained;
+- freeze the exact key/value/operation fixture and complete seed/order schedule; and
+- recompute the per-step ceilings and shared overhead against the five-hour campaign limit.
+
+Until those items, the native supervisor/harness, crash actuator, external oracle/verifier, and
+result classifier exist and receive independent review, the only executable code is the separate
+construction lane and no formal disposition can be produced.
+
 ## Frozen source and build scope
 
 The only subject is:
@@ -39,11 +60,11 @@ The only subject is:
   `8e925444704b5f17d32bf42f5b6e2df050bceebc3dcd6e71cc73dafe8092e839`; and
 - packaged/upstream revision `6ed1f981ba4deab0b2adbdd7bccb46ec409b2191`.
 
-The harness lives in an isolated, unpublished prescreen crate. Its exact lockfile, source archive,
-SBOM, feature set, target, `1.95.0-x86_64-unknown-linux-gnu` toolchain, compiler flags, and binary
-SHA-256 are recorded. Neither the LaminarDB root workspace nor runtime crates gain a redb dependency.
-A different archive, source revision, feature set, or relevant build flag is a different subject and
-cannot inherit the result.
+The future formal harness must live in an isolated, unpublished prescreen crate. Its exact lockfile,
+source archive, SBOM, feature set, target, `1.95.0-x86_64-unknown-linux-gnu` toolchain, compiler
+flags, and binary SHA-256 must be recorded. Neither the LaminarDB root workspace nor runtime crates
+gain a redb dependency. A different archive, source revision, feature set, or relevant build flag is
+a different subject and cannot inherit the result.
 
 One redb file contains four byte-key/byte-value tables named `state`, `timer`, `join_left`, and
 `join_right`. The builder cache is 8 GiB. Measured attempts prohibit `WriteTransaction::stats`,
@@ -59,18 +80,22 @@ The three exact transaction modes are:
 | `I2` | `set_durability(Immediate)`, `set_two_phase_commit(true)`, `set_quick_repair(false)` | isolate two-phase commit cost |
 | `QR` | `set_durability(Immediate)`, `set_two_phase_commit(false)`, `set_quick_repair(true)` | save allocator state; redb forces two-phase commit during commit |
 
-The harness asserts and records the closed setter sequence before each attempt; pinned-source review
-verifies that `QR` forces two-phase commit. `Durability::None` is outside this protocol because it
-does not satisfy the persistence question.
+The future formal harness must assert and record the closed setter sequence before each attempt;
+pinned-source review verifies that `QR` forces two-phase commit. `Durability::None` is outside this
+protocol because it does not satisfy the persistence question.
 
 ### Separate pre-run authorization
 
-This proposal does not authorize execution. Any Docker smoke or native prescreen command requires a
-strict detached `state-backend-redb-prescreen-approval/v1` record signed by the named workload and
-operations owners. The strict record schema now exists, but no external byte/attestation verifier,
-semantic plan/result validator, or harness exists. The record must bind the
-exact protocol bytes; harness/oracle source, binary, lockfile, SBOM, toolchain, target and flags; raw
-wire/result schemas and literal goldens; complete seed/order schedule; target identity and preflight/
+This proposal does not authorize protocol execution. Any command that claims the Docker smoke or
+native prescreen identity requires a strict detached `state-backend-redb-prescreen-approval/v1`
+record signed by the named workload and operations owners. The strict record schema now exists, but
+no external byte/attestation verifier, semantic plan/result validator, or protocol harness exists.
+The separately user-approved `construction-only-no-decision` lane does not consume this schema,
+cannot emit a prescreen disposition, and hard-codes every evidence-eligibility field false. It is
+engineering scaffolding rather than a way around the approval boundary. The formal record must bind
+the exact protocol bytes; harness/oracle source, binary, lockfile, SBOM, toolchain, target, and
+flags; raw wire/result schemas and literal goldens; complete seed/order schedule; target identity and
+preflight/
 noise rules; clock/cgroup/cache-reset procedures; trigger and bounded adaptive-delay rule; every
 deadline/resource/artifact cap; and all-false qualification/selection/production/admission fields.
 The result schema restricts every `synthetic_fixture` to `fixture_ineligible=true` and disposition
@@ -122,7 +147,8 @@ marker is not used as the unlock instant because its thread can be descheduled a
 writer. The 500-ms bound is a prescreen soft limit, not a claim that redb provides cancellation or a
 timeout API. `HOLD` has a ten-second external process deadline. In `W1` and `W2`, both lane
 threads call `begin_write` directly; an adapter queue or dispatcher must not serialize them before
-the engine acquisition point. `W2` is an owner-approved synthetic stress point combining the
+the engine acquisition point. `W2` is a proposed synthetic stress point that must be owner-approved
+before a formal run; it combines the
 profile's 4-MiB target batch with victim work; its mutation rate is not equated with a scenario's
 source-row throughput gate.
 
@@ -279,3 +305,9 @@ managed ext4/VHDX/NTFS/shared-NVMe path (while the container root also uses over
 validate XFS quota, direct device writes, physical amplification, native-NVMe latency,
 power loss, endurance, C2/C3, or the prescreen disposition. Passing Docker smoke is a prerequisite
 for spending target-host time, not evidence that redb is suitable.
+
+Cycle 16 implements a narrower construction lane, not this smoke subset. It has no crash actuator,
+approval verifier, or result classifier. The canonical result and evidence boundary are recorded in
+the [Cycle 16 carry-forward matrix](../reports/state-backend-carry-forward-matrix-2026-07-24.md#cycle-16-redb-construction-result).
+This closes tool construction only; all writer-rate, crash, recovery, native-target, and disposition
+questions above remain open.

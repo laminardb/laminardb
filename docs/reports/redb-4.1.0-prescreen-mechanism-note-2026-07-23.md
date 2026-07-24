@@ -2,8 +2,8 @@
 
 Status: static, non-gating input to the proposed bounded prescreen. This is not a completed
 `state-backend-mechanism-mapping/v1` record, a probe result, qualification evidence, candidate
-admission, backend selection, or production approval. No redb harness or redb workload was built or
-run for this note.
+admission, backend selection, or production approval. Cycle 16 later built and ran a separately
+labelled construction-only workspace; no approval-bearing prescreen harness or workload has run.
 
 ## Exact subject
 
@@ -26,8 +26,8 @@ The proposed prescreen build is narrower: release mode,
 `default-features = false`, no features, and redb's default Linux file backend. It does not enable
 `cache_metrics` or `logging` and does not supply a custom `StorageBackend`. The eventual pre-run
 approval must bind the exact lockfile, source archive, SBOM, binary, target, compiler and linker
-flags, and canonical applied-configuration bytes. This note does not invent those not-yet-built
-artifacts.
+flags, and canonical applied-configuration bytes. The construction workspace's lock and binaries
+are not a substitute for that still-unbuilt, approval-bound artifact set.
 
 The archive digest and length were independently recomputed from the local Cargo registry cache.
 The VCS revision, MSRV, features, optional dependencies, and license were read from packaged
@@ -148,4 +148,5 @@ The static claims above were traced through these packaged files and symbols:
 The detached pre-run approval must hash this note's exact bytes along with the protocol and every
 other input. Schema validation alone does not verify any descriptor or owner attestation and cannot
 authorize a command; an external verifier and an implemented fail-closed harness gate would be
-required before execution. Neither exists in this change.
+required before execution. Neither exists; the construction-only command deliberately cannot accept
+approval or emit a prescreen result.

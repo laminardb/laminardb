@@ -6,6 +6,10 @@
 - **Selection verdict:** **BLOCK**
 - **Production/admission verdict:** **BLOCK**; `[LDB-4007]` and `[LDB-0013]` are unchanged
 
+Post-audit update (2026-07-24): Cycle 16 adds an isolated redb construction-only workspace and runs
+it on local Windows and Linux Docker. That does not change this report's static evidence class or
+any candidate disposition; the root workspace, runtime lock, profile, and adapters remain redb-free.
+
 ## Result
 
 Fjall and RocksDB expose the primitives from which a backend-neutral semantic adapter can be
@@ -24,10 +28,10 @@ before a telemetry patch, not a low-cost third candidate.
 |---|---|---|---|
 | Fjall 3.1.8 | Cross-keyspace atomic batch, consistent snapshot, ordered range/prefix iteration, and explicit journal persistence are present. | No stable compaction-debt counter, complete write-stall duration/counter, enforceable global write-buffer cap, or complete cache/pinned-memory accounting. | **FAIL DKS-Q2-006 as published.** Patch/upstream the missing stable signals and controls or remove Fjall from the campaign. |
 | `rocksdb` 0.24.0 / RocksDB 10.4.2 | Cross-column-family `WriteBatch`, snapshots, bounded iterators, multi-get, WAL flush, checkpoint, and SST ingest are present. | Pending-compaction and pressure properties exist, but the exposed stall ticker omits verified write-buffer-manager/database-scope paths. | **BLOCK DKS-Q2-006.** Supply a proven complete signal or narrow it only with pre-approved evidence that no uncovered stall class is possible. |
-| redb 4.1.0 | Atomic cross-table write transaction, snapshot reads, ordered ranges, an open-time cache budget, and immediate-durability commit are present. | A single database-wide writer blocks without a timeout/cancel API; storage statistics traverse the trees while holding that writer; the current contract has no approved non-LSM debt/stall mapping. | **DEFER.** Freeze that mapping and run a non-gating writer/commit/recovery microprobe before deciding whether to add a third C2/C3 candidate. |
+| redb 4.1.0 | Atomic cross-table write transaction, snapshot reads, ordered ranges, an open-time cache budget, and immediate-durability commit are present. | A single database-wide writer blocks without a timeout/cancel API; storage statistics traverse the trees while holding that writer; the current contract has no approved non-LSM debt/stall mapping. | **DEFER.** Freeze the prescreen's mechanism hypothesis and protocol, then run the non-gating writer/commit/recovery screen. Only `PRESCREEN_PASS` funds a formal candidate mechanism and persistence mapping; it does not admit redb to C2/C3. |
 | SurrealKV 0.21.2 | One-tree atomic transactions, snapshot-filtered point/range reads, WAL sync, and internal LSM pressure machinery are present. | Snapshot registrations are not reference-counted and a temporary range snapshot unregisters a real sequence; public debt/stall telemetry is absent and background notification liveness is unproved. | **REJECT unmodified.** A pinned fork/upstream must fix and prescreen correctness/liveness before telemetry work or candidate admission. |
 
-This does not select RocksDB by elimination. Fjall remains smaller and safe-Rust, while RocksDB has
+This does not select RocksDB by elimination. Fjall remains smaller and Rust-native, while RocksDB has
 broader operational controls at the cost of synchronous FFI, native-memory/build provenance, and
 shared database write-control risk. redb's Rust-native, no-C++-engine implementation and
 copy-on-write B-trees are attractive, but adding a third adapter before its cheaper risk screen
@@ -41,8 +45,10 @@ The candidate profile declares Fjall `=3.1.8`, `rocksdb =0.24.0`, and bundled Ro
 Those strings are comparison inputs, not project pins. `cargo metadata`, the root lockfile, and the
 qualification-tool lockfile contain no Fjall, RocksDB, `librocksdb-sys`, redb, or SurrealKV package,
 and no backend adapter exists. The current tree therefore does not “use Fjall”; the former cold tier
-remains removed. redb and SurrealKV are not in the profile, dependency graph, or lockfiles; their
-audits are requested static alternative screens, not silently added candidates.
+remains removed. Cycle 16's standalone construction workspace has its own exact redb lockfile and is
+outside the Laminar workspace/runtime graph; redb remains absent from the profile and adapters.
+SurrealKV is absent from every manifest, lockfile, profile, and adapter. These audits remain static
+alternative screens, not silently added production candidates.
 
 The audit read cached crate archives and the adjacent expanded registry sources. The hashes below
 identify the archives; they do not by themselves authenticate a subsequently mutable extraction:
@@ -334,9 +340,10 @@ writer/commit/recovery microprobe; no telemetry or latency failure has been meas
 The proposed [bounded redb 4.1.0 prescreen](../testing/state-backend-redb-prescreen-v1.md) specifies
 that microprobe's non-gating decision boundary, exact pin, single-writer matrix, atomicity/recovery
 split, hard caps, and Docker/WSL smoke-only subset. Strict schemas and synthetic fixtures now exist,
-but they have no external semantic/attestation verifier or isolated execution harness. A detached
-pre-run approval by named owners and independent review are still required; the proposal does not
-add redb to any manifest, lockfile, profile, adapter, or qualification population.
+and Cycle 16 adds a separately labelled construction-only workspace and CI lane. They are not the
+external semantic/attestation verifier or approval-bearing protocol harness. A detached pre-run
+approval by named owners and independent review are still required; the proposal does not add redb
+to the Laminar workspace, runtime lock, profile, adapter, or qualification population.
 
 ## Configuration, restore, and decision gates
 
@@ -358,9 +365,10 @@ The static disposition is:
 - DKS-Q2-006: **FAIL for unmodified Fjall; BLOCK for the current RocksDB binding**;
 - DKS-Q2-007: **BLOCK for both** until exact candidate locks/builds/options, approval/completion
   records, cache-loss truth-table evidence, and N/N-1 recovery exist;
-- redb 4.1.0: **DEFER before candidate-specific DKS-Q2-006/007 implementation**; first approve its
-  typed mechanism, cache, and persistence mapping and a bounded non-gating writer/commit/recovery
-  microprobe. Do not add it to the profile or dependency graph yet;
+- redb 4.1.0: **DEFER before candidate-specific DKS-Q2-006/007 implementation**; first approve the
+  prescreen's mechanism hypothesis, protocol, and bounded non-gating writer/commit/recovery
+  microprobe. Only `PRESCREEN_PASS` funds its formal candidate mechanism, cache, and persistence
+  mapping. Do not add it to the profile or dependency graph yet;
 - SurrealKV 0.21.2: **REJECT unmodified before C1/C2**; a pinned fork/upstream must first repair and
   prescreen snapshot retention, background drain, oversized-batch ordering, close/recovery, and then
   DKS-Q2-006 observability. Do not add it to the profile or dependency graph;

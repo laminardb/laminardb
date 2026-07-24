@@ -112,7 +112,7 @@ durable sink, then seal source positions. It measures real sink flush and state-
 the same deadline. A stable output identity is part of the state ABI so replay can be recognized,
 but at-least-once permits an externally visible duplicate after a crash. Exactly-once is a later
 per-combination program requiring an exact-certified source and leader-term-fenced external commit;
-local LSM durability is neither necessary nor sufficient for that claim.
+local backend durability is neither necessary nor sufficient for that claim.
 
 ## Phase 0 — Contract and evidence freeze
 
@@ -151,12 +151,15 @@ Work:
 5. Add the mandatory capability descriptor to design tests. Inventory every current operator as
    `Stateless`, `GlobalSingleton`, `VnodeKeyed`, `RebuildableReplicated`, or `LocalOnly` without
    changing admission.
-6. Run a bounded backend qualification against the workload profile using exact Fjall and RocksDB
-   Rust-binding pins behind the same spike-only adapter. Exercise Arrow-batch-sized atomic requests,
-   realistic hot/cold multi-key reads, timer scans, snapshot/export overlap, sorted restore, vnode
-   drop/GC, compaction/write stalls, hard memory/disk/FD limits, `kill -9`, torn/corrupt data,
-   `ENOSPC`, and N/N-1 format rehearsal. Include 24–72-hour churn/TTL soak. Select and record one
-   production LSM; discard the losing spike rather than maintaining two backends.
+6. Close the exact candidate's DKS-Q2-006 mechanism gate before adapter work. The Cycle 16 matrix
+   recommends RocksDB 10.4.2/wrapper 0.24.0 for that bounded closure and redb 4.1.0 only for its
+   separate native prescreen, pending the owner's carry-forward decision; it recommends that
+   unmodified Fjall 3.1.8 and SurrealKV 0.21.2 not proceed. Run every later-admitted
+   candidate through the same bounded profile: Arrow-batch-sized atomic requests, realistic
+   hot/cold multi-key reads, timer scans, snapshot/export overlap, sorted restore, vnode drop/GC,
+   compaction/write stalls, hard memory/disk/FD limits, `kill -9`, torn/corrupt data, `ENOSPC`, and
+   N/N-1 format rehearsal. Include 24–72-hour churn/TTL soak. Select one production backend from
+   equivalent evidence; discard losing spikes rather than maintaining multiple stores.
 7. Record the complete delivery matrix: source consistency/topology and handoff; operator update
    mode and output identity; sink durability/topology/input mode; CP-5 ordering; permitted ALO
    duplicates; and combinations that remain closed. Benchmark at least one real certified source
@@ -179,8 +182,8 @@ Exit gate:
 - ADR accepted with named reviewers and no unresolved correctness decision;
 - benchmark and numerical SLO/RTO profile is reproducible on a clean runner;
 - golden ABI/schema vectors and compatibility policy pass;
-- one LSM is selected from reproducible conformance, latency, resource, fault, and operability
-  evidence, or the ADR is reopened;
+- one disk-backed backend is selected from reproducible conformance, latency, resource, fault, and
+  operability evidence, or the ADR is reopened;
 - at least one source/operator/append-sink scenario has a complete ALO oracle and every unsupported
   output/delivery combination has a fail-closed assertion;
 - the independent production-soak charter is approved before implementation results can influence
@@ -202,7 +205,7 @@ Work packages:
   Extract a crate only if dependency direction or a second non-DB consumer requires it.
 - Add canonical physical prefixes, persisted local metadata, process locking, ABI/schema validation,
   and safe cleanup scoped to one resolved pipeline directory.
-- Provide the Phase 0-selected production LSM and an in-memory semantic reference behind the same
+- Provide the Phase 0-selected production backend and an in-memory semantic reference behind the same
   conformance suite. Do not retain the losing qualification adapter.
 - Use one worker-local database with a small fixed keyspace/column-family count and logical
   pipeline/operator/table/vnode prefixes. Do not allocate a database or physical tree per vnode.
