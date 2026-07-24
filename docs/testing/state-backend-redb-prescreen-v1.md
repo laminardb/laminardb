@@ -311,7 +311,8 @@ dispatcher after querying the configured protected-review provider; merely placi
 a packet never authorizes execution.
 
 Result review uses the same receipt schema with stage `post_run`, the exact result-payload length and
-SHA-256, two distinct current role reviews, and the immutable evidence-object identity. The result
+SHA-256, two distinct current role reviews, and the retained-evidence content root. The later result
+contract must separately bind trusted immutable storage version and retention evidence. The result
 payload contains the derived disposition plus the two required roles and exact acceptance literal,
 but no concrete reviewer/event/time fields. Its later receipt supplies those facts and binds those
 bytes; neither object hashes itself.
@@ -335,9 +336,266 @@ and bounded adaptive-delay rule, every deadline/resource/artifact cap, and all-f
 selection/production/admission fields. Every JSON packet root uses the exact notice
 `NOT QUALIFICATION EVIDENCE`;
 bounded binary frames use their versioned magic and are covered by a noticed manifest rather than
-duplicating prose. Synthetic payloads/receipts are always ineligible and can produce only `DEFER`.
-Schema validity alone has no authority, and no prescreen packet can authorize or donate C1/C2/C3
-evidence.
+duplicating prose. Synthetic payloads/receipts are always ineligible. Only the later result
+classifier may derive `DEFER`; content validation derives no disposition. Schema validity alone has
+no authority, and no prescreen packet can authorize or donate C1/C2/C3 evidence.
+
+### Cycle 22 validation-only successor contract freeze
+
+Cycle 22 may implement only bounded content validation. It does not construct a packet, dereference
+the native artifact descriptors, authenticate GitHub, dispatch a workflow, open redb, classify a
+candidate result, or seal evidence. Content validity, provider authentication, execution authority,
+and final-result sealing are four different states. The local validator can establish only the
+first and always reports `authorization_unverified`.
+
+The successor JSON identities are:
+
+| Object | Exact `schema_version` | Schema file | Current implementation scope |
+|---|---|---|---|
+| protected-review policy | `state-backend-redb-prescreen-protected-review-policy/v1` | `redb-prescreen-protected-review-policy-v1.schema.json` | pre-run content validation |
+| approval payload | `state-backend-redb-prescreen-approval-payload/v1` | `redb-prescreen-approval-payload-v1.schema.json` | pre-run content validation |
+| result payload | `state-backend-redb-prescreen-result-payload/v1` | `redb-prescreen-result-payload-v1.schema.json` | identity reserved; later validation slice |
+| protected-review receipt | `state-backend-redb-prescreen-protected-review-receipt/v1` | `redb-prescreen-protected-review-receipt-v1.schema.json` | pre-run content validation; post-run shape reserved |
+
+The exact `$id` values, in the same order, are
+`https://laminardb.dev/schemas/state-backend-redb-prescreen-protected-review-policy-v1.json`,
+`https://laminardb.dev/schemas/state-backend-redb-prescreen-approval-payload-v1.json`,
+`https://laminardb.dev/schemas/state-backend-redb-prescreen-result-payload-v1.json`, and
+`https://laminardb.dev/schemas/state-backend-redb-prescreen-protected-review-receipt-v1.json`.
+
+The exact owner decisions are `APPROVE_REDB_PRESCREEN_EXECUTION_V1` before either run class and
+`ACCEPT_REDB_PRESCREEN_RESULT_V1` after either run class. The payload digest already binds
+`docker_smoke_no_decision` or `native_prescreen_decision`; multiplying decision literals by run
+class adds no authority. These strings are requested review decisions, not bearer capabilities. A
+matching string in local JSON never authorizes execution or result sealing.
+
+The policy contains only: its identity and notice; a stable policy ID; provider contract
+`github-protected-review-export/v1`; repository full name and provider-scoped stable ID; base ref
+`refs/heads/main`; the ordered `workload_owner` and `operations_owner` review groups and their
+provider-scoped stable IDs; the two decision literals; the required immutable-change, exact-head,
+current-membership, approved-state, stale-dismissal, distinct-principal, distinct-event,
+no-self-review and no-admin-bypass controls; and the configured dispatcher workflow, job and
+protected-environment identities. It contains no URL, token, credential, signature, key,
+certificate, trust-root, registry, revocation, reviewer principal, approval event, authorization or
+disposition. The policy bytes in a packet are not a trust root: a future dispatcher must byte-match
+them to out-of-band trusted repository configuration and query the live provider.
+
+All fields below are required and every object recursively has `additionalProperties=false`; no
+successor field is optional unless its union is stated explicitly. The exact policy layout is:
+
+| JSON pointer | Type or exact value |
+|---|---|
+| `/schema_version` | `state-backend-redb-prescreen-protected-review-policy/v1` |
+| `/notice` | `NOT QUALIFICATION EVIDENCE` |
+| `/policy_id` | protocol ID |
+| `/provider/contract` | `github-protected-review-export/v1` |
+| `/provider/repository_full_name` | `laminardb/laminardb` |
+| `/provider/repository_id` | provider-scoped ID |
+| `/provider/base_ref` | `refs/heads/main` |
+| `/review_groups` | exactly two ordered objects |
+| `/review_groups/0` | `{role:"workload_owner", group_id:<provider-scoped ID>}` |
+| `/review_groups/1` | `{role:"operations_owner", group_id:<provider-scoped ID>}` |
+| `/decision_literals/pre_run` | `APPROVE_REDB_PRESCREEN_EXECUTION_V1` |
+| `/decision_literals/post_run` | `ACCEPT_REDB_PRESCREEN_RESULT_V1` |
+| `/required_controls/immutable_change_id` | `true` |
+| `/required_controls/reviews_on_exact_head` | `true` |
+| `/required_controls/current_group_membership` | `true` |
+| `/required_controls/approved_review_state` | `true` |
+| `/required_controls/dismiss_stale_reviews` | `true` |
+| `/required_controls/distinct_principals` | `true` |
+| `/required_controls/distinct_review_events` | `true` |
+| `/required_controls/self_review_allowed` | `false` |
+| `/required_controls/admin_bypass_allowed` | `false` |
+| `/protected_execution/workflow_file` | `.github/workflows/`-relative safe workflow path |
+| `/protected_execution/job_name` | protocol ID |
+| `/protected_execution/environment_id` | provider-scoped ID |
+
+`review_groups/0/group_id` and `review_groups/1/group_id` must differ. The workflow path matches
+`^\\.github/workflows/[a-z0-9][a-z0-9._-]{0,127}\\.ya?ml$`; it names future trusted code and does
+not create that workflow or authorize its execution.
+
+The repository's current [branch-protection setup](../../.github/setup-branch-protection.sh)
+requires one CODEOWNERS approval. That is useful merge protection but cannot prove this protocol's
+two role-separated approvals. A protected environment is an execution/secrets boundary, not a
+two-role proof: before any future dispatch, a default-branch trusted dispatcher must export two
+current review events over the exact head, resolve live membership in the two configured groups,
+and reject shared principals, stale/dismissed/superseded reviews and self-review. If the provider or
+repository configuration cannot expose those facts, authorization remains unavailable.
+
+The approval payload contains only: its identity and notice; payload and protocol IDs; one run
+class; the exact pre-run decision literal; the two ordered required roles; the exact ordered 28-row
+descriptor set below; a separate `prior_smoke_result` that is null for Docker smoke and is the fixed
+reviewed-smoke descriptor for native prescreen; and the all-false evidence scope. It contains no
+principal, event, review time, receipt descriptor, result, disposition, approval state, execution
+flag, or self-hash. The 28 descriptor targets are not opened by the Cycle 22 bytes-only validator.
+The exact scope is `prescreen_only=true` and `qualification_eligible`,
+`candidate_admission_eligible`, `backend_selection_eligible`, `production_eligible`,
+`independent_soak_eligible`, `c1_c2_c3_eligible`, `fault_endurance_eligible`,
+`checkpoint_exactly_once_eligible`, and `source_sink_delivery_eligible` all false.
+
+The exact approval-payload layout is:
+
+| JSON pointer | Type or exact value |
+|---|---|
+| `/schema_version` | `state-backend-redb-prescreen-approval-payload/v1` |
+| `/notice` | `NOT QUALIFICATION EVIDENCE` |
+| `/payload_id` | protocol ID |
+| `/protocol_id` | `state-backend-redb-prescreen/v1` |
+| `/run_class` | `docker_smoke_no_decision` or `native_prescreen_decision` |
+| `/required_decision_literal` | `APPROVE_REDB_PRESCREEN_EXECUTION_V1` |
+| `/required_review_roles` | exactly `["workload_owner","operations_owner"]` |
+| `/artifacts` | exactly 28 descriptors in the table order |
+| `/prior_smoke_result` | Docker: `null`; native: fixed prior-smoke descriptor |
+| `/evidence_scope` | the exact scope above |
+
+Every descriptor has exactly `{role, locator, byte_length, sha256, media_type}`. `byte_length` is a
+base-10 JSON integer from 1 through its role cap; `sha256` is 64 lowercase hexadecimal characters
+and not all zero. Role, locator and media type equal their table row without aliasing or
+normalization. Descriptor 15 additionally has exact length `188200` and SHA-256
+`8e925444704b5f17d32bf42f5b6e2df050bceebc3dcd6e71cc73dafe8092e839`. Descriptor 14's length and
+SHA-256 must equal the exact supplied policy bytes. The aggregate cap sums all 28 `byte_length`
+values plus the native prior-smoke length when present using checked `u64` arithmetic.
+
+| # | Exact role | Exact locator | Exact media type |
+|---:|---|---|---|
+| 1 | `redb-prescreen-protocol` | `contract/protocol.md` | `text/markdown; charset=utf-8` |
+| 2 | `redb-exact-source-mechanism-note` | `contract/redb-mechanism-note.md` | `text/markdown; charset=utf-8` |
+| 3 | `redb-prescreen-wire-schemas` | `contract/wire-schemas.tar.zst` | `application/zstd` |
+| 4 | `redb-prescreen-literal-goldens` | `contract/literal-goldens.tar.zst` | `application/zstd` |
+| 5 | `redb-prescreen-fixture-recipe` | `contract/fixture-recipe.json` | `application/json` |
+| 6 | `redb-prescreen-execution-plan` | `contract/execution-plan.json` | `application/json` |
+| 7 | `redb-prescreen-candidate-configuration` | `contract/candidate-configuration.json` | `application/json` |
+| 8 | `redb-prescreen-target-identity-policy` | `contract/target-identity.json` | `application/json` |
+| 9 | `redb-prescreen-preflight-policy` | `contract/preflight-policy.json` | `application/json` |
+| 10 | `redb-prescreen-schedule` | `contract/schedule.json` | `application/json` |
+| 11 | `redb-prescreen-clock-isolation-policy` | `contract/clock-isolation-policy.json` | `application/json` |
+| 12 | `redb-prescreen-trigger-delay-policy` | `contract/trigger-delay-policy.json` | `application/json` |
+| 13 | `redb-prescreen-bounds` | `contract/bounds.json` | `application/json` |
+| 14 | `redb-prescreen-protected-review-policy` | `contract/protected-review-policy.json` | `application/json` |
+| 15 | `redb-4.1.0-crate-archive` | `subject/redb-4.1.0.crate` | `application/octet-stream` |
+| 16 | `redb-prescreen-source` | `build/source.tar.zst` | `application/zstd` |
+| 17 | `redb-prescreen-cargo-lock` | `build/Cargo.lock` | `text/plain; charset=utf-8` |
+| 18 | `redb-prescreen-sbom` | `build/sbom.spdx.json` | `application/spdx+json` |
+| 19 | `redb-prescreen-build-manifest` | `build/build-manifest.json` | `application/json` |
+| 20 | `redb-prescreen-fixture-generator` | `build/redb-prescreen-fixture-generator` | `application/octet-stream` |
+| 21 | `redb-prescreen-supervisor` | `build/redb-prescreen-supervisor` | `application/octet-stream` |
+| 22 | `redb-prescreen-child` | `build/redb-prescreen-child` | `application/octet-stream` |
+| 23 | `redb-prescreen-actuator` | `build/redb-prescreen-actuator` | `application/octet-stream` |
+| 24 | `redb-prescreen-oracle` | `build/redb-prescreen-oracle` | `application/octet-stream` |
+| 25 | `redb-prescreen-verifier` | `build/redb-prescreen-verifier` | `application/octet-stream` |
+| 26 | `redb-prescreen-base-256m` | `fixtures/base-256m.redb` | `application/octet-stream` |
+| 27 | `redb-prescreen-base-1g` | `fixtures/base-1g.redb` | `application/octet-stream` |
+| 28 | `redb-prescreen-base-4g` | `fixtures/base-4g.redb` | `application/octet-stream` |
+
+The native-only prior-smoke descriptor is
+`(redb-prescreen-reviewed-smoke-result, evidence/prior-smoke-result.json, length, sha256,
+application/json)`. It is outside the fixed 28 because it does not exist before Docker smoke. The
+native payload binds it separately, and the later semantic slice must prove its subject, build,
+schemas, goldens and Docker plan equal the native payload before dispatch can be considered.
+
+The receipt contains only its fixed fields below. It has no authenticated, approved, authorized,
+executable, sealed, valid-signature, expiry or final-disposition field.
+
+| JSON pointer | Type or exact value |
+|---|---|
+| `/schema_version` | `state-backend-redb-prescreen-protected-review-receipt/v1` |
+| `/notice` | `NOT QUALIFICATION EVIDENCE` |
+| `/stage` | `pre_run` or `post_run` |
+| `/provider` | exactly the policy's `provider` object |
+| `/change/change_id` | provider-scoped immutable ID |
+| `/change/base_ref` | exactly the policy base ref |
+| `/change/head_revision` | 40 lowercase hexadecimal characters |
+| `/policy` | exact descriptor for `contract/protected-review-policy.json` |
+| `/payload` | stage-specific payload descriptor |
+| `/reviews` | exactly two ordered review objects |
+| `/protected_execution/workflow_file` | exactly the policy workflow file |
+| `/protected_execution/job_name` | exactly the policy job name |
+| `/protected_execution/environment_id` | exactly the policy environment ID |
+| `/protected_execution/workflow_run_id` | provider-scoped ID |
+| `/protected_execution/workflow_run_attempt` | JSON integer from 1 through `u64::MAX` |
+| `/protected_execution/workflow_job_id` | provider-scoped ID |
+| `/protected_execution/provider_verified_at_utc` | canonical UTC timestamp |
+| `/retained_evidence` | pre-run: `null`; post-run: retained-evidence content root |
+
+The pre-run `/payload` tuple is
+`(redb-prescreen-approval-payload, approval/payload.json, length, sha256, application/json)`; the
+post-run tuple substitutes role `redb-prescreen-result-payload` and locator `result/payload.json`.
+The `/policy` tuple uses role `redb-prescreen-protected-review-policy`, its fixed locator, and
+`application/json`. Both bind the exact supplied bytes at the applicable cap. Each ordered review
+object has exactly `{role, stable_account_id, review_event_id, provider_state, decision_literal,
+reviewed_head_revision, reviewed_payload_byte_length, reviewed_payload_sha256, reviewed_at_utc}`.
+The roles are workload then operations, `provider_state` is exactly `APPROVED`, the stage selects
+the exact decision literal, and each reviewed head and payload binding equals the receipt's change
+and payload descriptor. `stable_account_id[0] != stable_account_id[1]` and
+`review_event_id[0] != review_event_id[1]`; the two identifier namespaces are not compared. Both
+review times are no later than `/protected_execution/provider_verified_at_utc`.
+
+The trusted dispatcher accepts a provider review body only when its exact UTF-8 bytes are
+`<decision_literal>\npayload_byte_length=<canonical unsigned decimal>\npayload_sha256=<lowercase
+digest>\n`. It obtains those bytes, event state, event ID, account ID, commit ID and submission time
+from the live provider, then resolves current team membership separately. This makes both owner
+events bind the payload bytes rather than merely a related change. Local validation checks only
+that the receipt's two copied bindings equal the exact supplied payload; it cannot authenticate the
+review body or event.
+
+For pre-run content validation, `/provider`, `/change/base_ref` and the three configured protected
+execution fields equal the policy; the payload's descriptor 14 equals both the receipt policy
+descriptor and the exact policy bytes; and the receipt payload descriptor equals the exact approval
+payload bytes. The payload deliberately repeats no provider or execution identity. Post-run
+equality with result content remains part of the later result-payload slice.
+
+The post-run `/retained_evidence` content root has exactly `{kind, artifact_index}`. `kind` is
+`state-backend-redb-prescreen-retained-evidence-root/v1`, and `artifact_index` is the exact
+`(redb-prescreen-artifact-index, result/artifact-index.json, length, sha256, application/json)`
+descriptor with length from 1 through 16 MiB. The exact artifact-index bytes are the root byte
+sequence; its descriptor length and SHA-256 are the root length and digest, so there is no separate
+container, archive or root-hash algorithm. The retained index excludes itself,
+`result/payload.json`, and `result/protected-review.json`; it lists every other retained artifact in
+canonical locator order. This is content identity only. It contains no store, URL, key, version,
+retention or `immutable=true` claim. The later post-run slice must define and bind a separately
+trusted storage-version/retention record before result sealing can exist. Cycle 22 does not create
+or accept a post-run result.
+
+Bootstrap limits are compiled into the validator and never read from packet content: policy JSON
+32 KiB, approval payload JSON 64 KiB, result payload JSON 256 KiB, receipt JSON 64 KiB, JSON nesting
+depth 16, at most 4,096 decoded nodes per input, provider-scoped IDs at most 256 ASCII bytes,
+canonical UTC timestamps exactly 20 ASCII bytes, locators at most 192 UTF-8 bytes, two reviews and
+28 pre-run descriptors. Each non-fixture descriptor is at most 256 MiB; the 256-MiB, 1-GiB and
+4-GiB fixture roles are capped at 1, 4 and 12 GiB respectively; checked aggregate declared bytes
+are at most 20 GiB. The final retained total is checked as `retained_artifact_bytes +
+artifact_index.byte_length + result_payload.byte_length + post_run_receipt.byte_length` and must be
+at most 2 GiB. Declared lengths never drive
+allocation in this validation slice. Duplicate keys, unknown fields, placeholders, non-`u64` JSON
+numbers, all-zero/uppercase hashes, traversal, backslashes, overflow, stage swaps, wrong ordering
+or any authority/PKI/provider-endpoint field fail closed.
+
+A decoded node is each JSON object, array or scalar value including the root; member names do not
+count. Root depth is one and every contained value adds one. `protocol ID` means 1..128 ASCII bytes
+matching `^[a-z0-9][a-z0-9._/-]{0,127}$`. `provider-scoped ID` means 1..256 ASCII bytes matching
+`^[A-Za-z0-9][A-Za-z0-9._:=/-]{0,255}$`. A canonical UTC timestamp is exactly 20 ASCII bytes,
+matches `YYYY-MM-DDTHH:MM:SSZ`, satisfies JSON Schema `date-time`, uses seconds `00..59`, and has a
+real Gregorian calendar date. Fixed UTC second precision makes chronological comparison bytewise.
+The 20-GiB aggregate covers the 28 approval descriptors and a non-null prior-smoke descriptor.
+Schema files themselves must pass the Draft 2020-12 meta-schema before their instances are
+accepted.
+
+The Cycle 22 API consumes the three exact JSON byte strings directly. Its success value has a
+single-variant `Unverified` authority type and false execution/result-sealing accessors; the CLI
+prints only content-valid, ineligible and authorization-unverified vocabulary. Exit success means
+valid bounded content, not approval, provider verification, dispatch eligibility, a redb finding,
+backend selection or production evidence. A race-safe formal packet reader remains a later security
+boundary requiring handle-relative no-follow opens and file-identity checks; this bytes-only API
+must not be relabelled as that reader.
+
+The sole command is
+`state-backend-qual validate-redb-prescreen-pre-run-content <policy-json-path>
+<approval-payload-json-path> <receipt-json-path>`. Success exits 0, writes the repository notice then
+`VALID_INELIGIBLE_REDB_PRESCREEN_CONTENT stage=pre_run payload=<payload_id>
+authorization=authorization_unverified` to stdout, and writes no stderr. Invalid content exits 2 with the notice
+on stdout and an `INVALID_REDB_PRESCREEN_CONTENT ` stderr prefix. An unreadable input also exits 2
+with the existing `INVALID_INPUT <path>: ` prefix. Wrong arity or any unknown command exits 64 and
+prints usage. No output or public type contains `DEFER`, `SMOKE_PASS`, `PRESCREEN_PASS`,
+`PRESCREEN_NO_GO`, `REJECT_EXACT_PIN`, provider-authenticated, executable or sealed state.
 
 ## Isolation and clocks
 
@@ -575,9 +833,10 @@ scan bytes. Full scans feed the redb-free oracle incrementally and are never mat
 Retained evidence includes the exact approval/result packets, plans, manifests, schedule, raw timing/
 resource/marker frames, target/preflight/noise records, state counts and digests, at most 1 MiB per
 mismatch excerpt, process/kernel logs, validator/oracle/mechanism reports, protected-review receipts,
-and an artifact index. The index records every retained file's locator/length/hash and every
-verified-then-destroyed
-database's pre/post digests and destruction time. Its checked sum must equal
+and an artifact index. The index records every retained file's locator/length/hash except its own
+bytes, `result/payload.json`, and `result/protected-review.json`; those three objects are necessarily
+created after the indexed set closes. It also records every verified-then-destroyed database's
+pre/post digests and destruction time. Its checked sum, excluding those three objects, must equal
 `retained_artifact_bytes`. Deletion begins only after independent oracle and validator reports are
 durably indexed; missing transient-destruction evidence is `DEFER`, not a smaller claimed total.
 If a valid `REJECT_EXACT_PIN` was already sealed, later cleanup/destruction failure is retained as a
