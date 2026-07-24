@@ -39,8 +39,8 @@ execution is prohibited. Calling an unapproved run “diagnostic” does not mak
 The only prospective exception is the separately identified redb prescreen, and it requires its own
 detached pre-run approval by the workload and operations owners. That approval cannot authorize C2
 or C3 or donate evidence to them. Cycle 21 hardens the former prescreen descriptor-root schemas to
-synthetic-only regression shapes and specifies a non-circular payload/envelope successor. The
-successor schemas, external attestation/semantic verifier, native harness, owner-approved packet and
+synthetic-only regression shapes and specifies a non-circular payload/protected-review successor. The
+successor schemas, semantic/protected-review verifier, native harness, owner-approved packet and
 execution command do not exist, so candidate execution remains prohibited.
 
 ## Stable identities and artifacts

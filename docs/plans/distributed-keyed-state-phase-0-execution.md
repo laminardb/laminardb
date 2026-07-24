@@ -407,9 +407,10 @@ redb 4.1.0 remains outside C2. Cycle 16 adds a separately authorized, isolated
 prescreen, or contribute selection evidence. The optional
 [bounded redb prescreen](../testing/state-backend-redb-prescreen-v1.md) receives validation-only
 protocol work in Cycle 21. Its former descriptor-root schemas are now synthetic-only regression
-shapes. It still cannot run until the payload/envelope, plan, raw-evidence and result schemas plus an
-external semantic/attestation verifier and protocol harness exist and a separate
-detached pre-run approval is signed by the workload and operations owners. Its Docker Desktop/WSL
+shapes. It still cannot run until the approval/result payload, protected-review-receipt, plan, raw-
+evidence and result schemas plus an external semantic/authorization verifier and protocol harness
+exist and the repository's protected-review provider authenticates separate pre-run approvals from
+the workload and operations owners. Its Docker Desktop/WSL
 protocol subset is smoke-only; a target-host
 `PRESCREEN_PASS` merely funds mechanism/persistence mapping, an additive profile/schema proposal,
 and adapter review. `PRESCREEN_NO_GO`, `DEFER`, and `REJECT_EXACT_PIN` add no candidate. No prescreen

@@ -15,7 +15,7 @@ complete state from a fresh candidate process. The gate accepts no backend dispo
 all qualification, selection, production, delivery, and soak fields as false.
 
 This is not the approved Docker or native prescreen harness. In particular, it does not implement
-the detached two-principal attestation verifier, crash actuator, native target preflight,
+the detached two-principal protected-review gate, crash actuator, native target preflight,
 steady-state latency matrix, recovery comparison, or final disposition algorithm. Do not reuse its
 construction wall-times as latency evidence. It operates only on disposable files in a trusted,
 runner-owned directory: it is not hardened for attacker-controlled paths, and a failed command can

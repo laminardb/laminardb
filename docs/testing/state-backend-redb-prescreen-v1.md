@@ -2,7 +2,7 @@
 
 - **Identity:** `state-backend-redb-prescreen/v1`
 - **Status:** Cycle 21 protocol freeze candidate; validation-only work is authorized, while the
-  detached attestation/semantic verifier, native supervisor/child/actuator/oracle, reviewed build,
+  protected-review/semantic verifier, native supervisor/child/actuator/oracle, reviewed build,
   owner approvals, and protocol execution remain absent
 - **Evidence class:** `NOT C2/C3 QUALIFICATION EVIDENCE`
 - **Scope:** decide whether a redb adapter is worth adding to the backend qualification bake-off
@@ -10,7 +10,7 @@
 - **Existing synthetic contracts:** [pre-run descriptor-root schema](../../tools/state-backend-qual/schema/redb-prescreen-approval-v1.schema.json),
   [reviewed-result descriptor-root schema](../../tools/state-backend-qual/schema/redb-prescreen-result-v1.schema.json),
   and [exact-source mechanism note](../reports/redb-4.1.0-prescreen-mechanism-note-2026-07-23.md).
-  The two JSON schemas are regression inputs only and must be replaced by the payload/envelope
+  The two JSON schemas are regression inputs only and must be replaced by the payload/protected-review
   contracts below before approval or execution.
 
 ## Decision boundary
@@ -36,14 +36,14 @@ RocksDB results.
 ### Cycle 21 protocol-freeze resolutions
 
 This revision closes the design ambiguities above, but it does not make the prescreen approval- or
-execution-ready. It freezes a candidate packet layout, non-circular signature policy, deterministic
-fixture/schedule, completion rule, separate decision and safety bounds, retained-evidence boundary,
-five-hour budget, and disposition precedence. The existing descriptor-root schemas cannot express
-that packet and remain synthetic regression inputs only.
+execution-ready. It freezes a candidate packet layout, non-circular protected-review policy,
+deterministic fixture/schedule, completion rule, separate decision and safety bounds, retained-
+evidence boundary, five-hour budget, and disposition precedence. The existing descriptor-root
+schemas cannot express that packet and remain synthetic regression inputs only.
 
 Before a pre-run owner approval can exist, validation-only work must implement and independently
-review strict approval/result payload and role-envelope schemas; exact-byte, signature, trust,
-revocation, locator, plan/result, oracle, and classifier verification; raw bounded wire schemas and
+review strict approval/result payload and protected-review-receipt schemas; exact-byte, protected-
+review, locator, plan/result, oracle, and classifier verification; raw bounded wire schemas and
 goldens; and a redb-free fail-closed verifier. A separately authorized construction stage must then
 build and review the native supervisor, child, actuator, oracle and verifier and populate their exact
 source, lockfile, SBOM, build and binary descriptors. Only those as-built bytes can enter an owner
@@ -85,6 +85,7 @@ allocation, and rejects aliases or extra decision-bearing files.
 | clock/cgroup/cache-reset policy | `contract/clock-isolation-policy.json` | protocol review |
 | trigger/adaptive-delay policy | `contract/trigger-delay-policy.json` | protocol review |
 | deadline/resource/artifact bounds | `contract/bounds.json` | protocol review |
+| protected-review policy | `contract/protected-review-policy.json` | pre-run approval |
 | exact redb 4.1.0 crate archive | `subject/redb-4.1.0.crate` | fixture construction |
 | complete formal source | `build/source.tar.zst` | pre-run approval |
 | Cargo lockfile | `build/Cargo.lock` | pre-run approval |
@@ -99,21 +100,8 @@ allocation, and rejects aliases or extra decision-bearing files.
 | 256-MiB physical base | `fixtures/base-256m.redb` | pre-run approval |
 | 1-GiB physical base | `fixtures/base-1g.redb` | pre-run approval |
 | 4-GiB physical base | `fixtures/base-4g.redb` | pre-run approval |
-| approval-time owner registry snapshot | `trust/approval/registry.json` | owner approval |
-| approval-time registry root envelope | `trust/approval/registry.root.json` | owner approval |
-| approval-time revocation snapshot | `trust/approval/revocations.json` | owner approval |
-| approval-time revocation root envelope | `trust/approval/revocations.root.json` | owner approval |
-| dispatch-time owner registry snapshot | `trust/dispatch/registry.json` | native dispatch |
-| dispatch-time registry root envelope | `trust/dispatch/registry.root.json` | native dispatch |
-| dispatch-time revocation snapshot | `trust/dispatch/revocations.json` | native dispatch |
-| dispatch-time revocation root envelope | `trust/dispatch/revocations.root.json` | native dispatch |
-| result-review owner registry snapshot | `trust/result-review/registry.json` | result review |
-| result-review registry root envelope | `trust/result-review/registry.root.json` | result review |
-| result-review revocation snapshot | `trust/result-review/revocations.json` | result review |
-| result-review revocation root envelope | `trust/result-review/revocations.root.json` | result review |
 | approval payload | `approval/payload.json` | dispatch |
-| workload-owner approval envelope | `approval/workload-owner.json` | dispatch |
-| operations-owner approval envelope | `approval/operations-owner.json` | dispatch |
+| pre-run protected-review receipt | `approval/protected-review.json` | dispatch |
 | reviewed smoke result | `evidence/prior-smoke-result.json` | native dispatch only |
 | raw run manifest | `result/raw-run-manifest.json` | result review |
 | retained artifact index | `result/artifact-index.json` | result review |
@@ -121,18 +109,17 @@ allocation, and rejects aliases or extra decision-bearing files.
 | independent oracle report | `result/oracle-report.json` | result review |
 | bounded mechanism-probe report | `result/mechanism-probe.json` | native result review |
 | reviewed result payload | `result/payload.json` | result review |
-| workload-owner result envelope | `result/workload-owner.json` | final disposition |
-| operations-owner result envelope | `result/operations-owner.json` | final disposition |
+| post-run protected-review receipt | `result/protected-review.json` | final disposition |
 
 The approval payload binds every pre-run contract, subject, build, physical-fixture and target row,
-plus only the four immutable approval-time trust rows. It excludes `approval/payload.json`, both
-approval envelopes, both later trust-stage sets, and every result row. The raw run manifest binds the
-four immutable dispatch-time trust rows actually verified before child launch. The result payload
-binds the complete verified approval packet, the dispatch trust rows and raw-run-manifest binding,
-the four immutable result-review trust rows, and every applicable run/result evidence row. It
-excludes `result/payload.json` and both result envelopes. Neither payload binds itself or a signature
-over itself. The redb archive is the fixed packet row `subject/redb-4.1.0.crate`, not an unresolved
-external descriptor. A prior smoke result is accepted only when the verifier
+but excludes `approval/payload.json`, its protected-review receipt, and every result row. The pre-run
+receipt binds the approval payload's exact length and SHA-256. The raw run manifest binds the exact
+approval payload/receipt pair and the authenticated dispatch context verified before child launch.
+The result payload binds that complete approval packet plus every applicable run/result evidence row,
+but excludes `result/payload.json` and its post-run receipt. The post-run receipt binds the result
+payload's exact length and SHA-256. Neither payload binds itself or the receipt that is necessarily
+created afterward. The redb archive is the fixed packet row `subject/redb-4.1.0.crate`, not an
+unresolved external descriptor. A prior smoke result is accepted only when the verifier
 proves that it is a non-synthetic `SMOKE_PASS` over the identical subject, source/build, schemas,
 goldens and Docker-smoke plan; an opaque or synthetic descriptor never satisfies that prerequisite.
 
@@ -238,11 +225,14 @@ Every mutation count is divisible by four. Entity index `e` emits the four table
 order. Slot selection is evaluated without intermediate `u64` overflow: let
 `P = entity_count_per_table / 8`, compute
 `s128 = (u128(q)*65_537 + u128(e)*17 + u128(z)) mod u128(P)`, then losslessly convert `s128` to `u64`
-and require `s < P`. Generation is the checked low 32 bits of `q + 1`. The entity operation is
-delete exactly when the equivalent unsigned-128-bit sum `(u128(q)+u128(e)+u128(z)) mod 16` is zero;
-otherwise it is a put of the generated value. In steady/HOLD attempts, `q = (lane_id << 56) |
-lane_release_ordinal`; each lane ordinal starts at zero before warmup and continues through measured
-traffic. Lane IDs are fixed by the schedule and no `q` is reused within an attempt.
+and require `s < P`. For generated operation traffic, let `q_low32 = q & 0xffff_ffff`; require
+`q_low32 <= 0xffff_fffe`, then set generation to the lossless `u32(q_low32 + 1)`. This masks before
+addition and never attempts to convert the lane bits. The entity operation is delete exactly when
+the equivalent unsigned-128-bit sum `(u128(q)+u128(e)+u128(z)) mod 16` is zero; otherwise it is a put
+of the generated value. In steady/HOLD attempts, `q = (lane_id << 56) | lane_release_ordinal`; each
+lane ordinal starts at zero before warmup, continues through measured traffic, and is capped at
+`0xffff_fffe`, so `q_low32` equals that ordinal without wrap. Lane IDs are fixed by the schedule and
+no `q` is reused within an attempt.
 
 Small crash target transactions contain 128 mutations/32 entities on vnode 0; large-recovery targets
 contain 4,096 mutations/1,024 entities on vnode 0. In both, entity 0 inserts absent slot 0, entity 1
@@ -291,77 +281,61 @@ plus six reserved IDs, and the semantic verifier requires exact equality rather 
 
 This proposal does not authorize protocol execution. Any command that claims the Docker smoke or
 native prescreen identity requires an exact `state-backend-redb-prescreen-approval-payload/v1` and
-two valid `state-backend-redb-prescreen-owner-envelope/v1` records over those identical payload
-bytes. The unsigned payload contains all decision-bearing fields and descriptors, including each
-owner's role, principal ID, approved key ID, decision and approval timestamp. It contains no
-signature or envelope descriptor, so the packet is non-circular.
+one provider-authenticated `state-backend-redb-prescreen-protected-review-receipt/v1` over those
+identical payload bytes. The unsigned payload contains all decision-bearing fields and descriptors,
+plus the two required roles and exact required decision literal. It contains no concrete principal,
+review-event ID, review timestamp, or receipt descriptor; those facts can exist only after review,
+so the packet is non-circular.
 
-Each role envelope contains only its role, principal/key IDs, payload byte length and SHA-256, and a
-64-byte Ed25519 signature. Approval time is inside the signed payload; there is no unauthenticated
-envelope timestamp. The signed message is exactly:
+This prescreen reuses the repository's protected-review trust boundary; it does not define an
+offline key hierarchy, signature format, owner registry, revocation service, or root-rotation
+protocol. The exact `contract/protected-review-policy.json` binds the repository/provider identity,
+immutable change and head-revision requirements, the configured workload-owner and operations-owner
+review groups, stale-review dismissal, distinct-principal rule, protected execution environment,
+and the provider API fields the trusted dispatcher verifies. The pre-run receipt contains exactly:
 
-```text
-ASCII("LAMINARDB\0REDB-PRESCREEN\0APPROVAL\0V1\0")
-|| u64_be(payload_byte_length)
-|| sha256(payload_exact_bytes)
-```
+- schema/version and `pre_run` stage;
+- policy role/length/SHA-256;
+- provider, repository, immutable change ID, and reviewed head revision;
+- approval-payload role/length/SHA-256;
+- one immutable provider review-event ID, stable account ID, role, decision, and UTC time for each
+  of `workload_owner` and `operations_owner`; and
+- the authenticated dispatch workflow/environment/run identity and verification UTC time.
 
-Result review uses the same construction with domain
-`LAMINARDB\0REDB-PRESCREEN\0RESULT\0V1\0`. The roles must be exactly `workload_owner` and
-`operations_owner`; their principal and key IDs must be distinct, resolve to distinct raw public
-keys, and match the payload. The result payload contains both post-run roles, principal/key IDs,
-decisions and review timestamps before either signature is made. No JSON re-serialization, field
-exclusion, zeroing convention or signature-over-self is permitted.
+The two principals and review-event IDs are distinct. Both decisions are exact approval literals,
+both events apply to the bound head and payload digest, and neither review is stale, dismissed,
+superseded, self-approved, or outside its configured role. Unknown fields, a locally invented
+identity, a provider mismatch, mutable branch-only identity, missing protected-environment context,
+or a payload/head/configuration change fails closed. The receipt is produced only by the trusted
+dispatcher after querying the configured protected-review provider; merely placing matching JSON in
+a packet never authorizes execution.
 
-Trust is not nominated by the payload it authenticates. The formal verifier source and build receipt
-pin one 32-byte Ed25519 offline root public key and its SHA-256; changing that root requires a new
-verifier build, two-owner pre-run payload and packet lineage. The root never appears as an owner key.
-Each of the approval, dispatch and result-review stages receives its own immutable registry payload
-plus root envelope and revocation payload plus root envelope at the distinct fixed locators above.
-Root envelopes sign the same length/hash construction using domains
-`LAMINARDB\0REDB-PRESCREEN\0TRUST-REGISTRY\0V1\0` and
-`LAMINARDB\0REDB-PRESCREEN\0REVOCATIONS\0V1\0` respectively.
+Result review uses the same receipt schema with stage `post_run`, the exact result-payload length and
+SHA-256, two distinct current role reviews, and the immutable evidence-object identity. The result
+payload contains the derived disposition plus the two required roles and exact acceptance literal,
+but no concrete reviewer/event/time fields. Its later receipt supplies those facts and binds those
+bytes; neither object hashes itself.
 
-The strict registry payload contains the exact stage (`approval`, `dispatch`, or `result_review`),
-packet lineage ID, unique snapshot ID, issued/expires UTC timestamps and sorted unique
-`(principal, role, key_id, 32-byte Ed25519 public key, not_before, not_after, status)` entries. The
-strict revocation payload contains the same stage and packet lineage ID, a unique snapshot ID,
-issued/expires timestamps and sorted unique
-`(key_id, effective_at, reason_code)` entries. Both reject unknown fields and duplicate principals/
-keys; key ID is SHA-256 of the raw public key. Snapshots must be root-valid, issued no later than
-the stage action and unexpired through it. The approval pair is frozen before the approval payload
-and validates both approval keys at their signed payload timestamps. It never changes afterward.
-The dispatch pair is created independently, its revocation snapshot is at most 24 hours old at the
-recorded dispatch instant, and it must confirm that both approval keys remain authorized and
-unrevoked before child launch. The result-review pair is created independently before result-payload
-signing, its revocation snapshot is at most 24 hours old at both signed review timestamps, and it
-must authorize both result-owner keys and confirm that every approval key remains unrevoked through
-review. A stage file cannot be refreshed in place, copied to another stage, or inferred from another
-path; a refresh has a new snapshot ID and exact bytes at that stage's locator. The dispatch files are
-bound into the raw run manifest, and both later-stage sets are bound into the result payload as
-specified above.
-
-A revocation effective at or before the relevant signature invalidates that signature; a revocation
-effective at or before dispatch or review blocks that action even if approval was earlier. Missing,
-expired, future-issued, wrong-stage, wrong-lineage, unknown, role-mismatched, reused or revoked keys
-fail closed. Test keys and synthetic envelopes are permanently excluded. Root rotation is never
-accepted in-band: it needs a newly approved verifier lineage, while old packets retain their
-original root/build and three immutable trust-stage sets for historical verification.
-
-The external verifier first validates schemas and exact bytes/locators, then trust and both
-signatures, then semantic equality/cross-artifact invariants, before it may invoke any executable.
-The candidate child is opened only after this check succeeds. Any bound input change requires a new
-payload and two new envelopes. The separately user-approved `construction-only-no-decision` lane
-does not consume this packet, cannot emit a prescreen disposition, and hard-codes every evidence-
-eligibility field false.
+The redb-free semantic verifier validates schemas, exact bytes/locators, payload/receipt equality,
+and cross-artifact invariants. Outside an authenticated protected workflow it can report only
+content validity and `authorization_unverified`; it cannot turn a copied receipt into authority. The
+trusted dispatcher independently validates the live provider context before it may invoke an
+execution entry point, and the candidate child is opened only after both checks succeed. If the
+repository cannot enforce and export two role-separated reviews, the protocol remains `DEFER` and
+no command runs. Portable offline cryptographic attestations would require a separate security ADR,
+security-owner approval, threat model, and implementation budget; this prescreen does not invent
+them. Any bound input change requires a new payload and two new protected reviews. The separately
+user-approved `construction-only-no-decision` lane does not consume this packet, cannot emit a
+prescreen disposition, and hard-codes every evidence-eligibility field false.
 
 The applicable approval or result payload binds the fixed packet rows assigned to it above, the
 toolchain/target/flags, complete fixture and seed/order schedule, target/preflight/noise rules,
 clock/cgroup/cache-reset procedures, trigger
 and bounded adaptive-delay rule, every deadline/resource/artifact cap, and all-false qualification/
-selection/production/admission fields. Every root uses the exact notice `NOT QUALIFICATION EVIDENCE`;
+selection/production/admission fields. Every JSON packet root uses the exact notice
+`NOT QUALIFICATION EVIDENCE`;
 bounded binary frames use their versioned magic and are covered by a noticed manifest rather than
-duplicating prose. Synthetic payloads/envelopes are always ineligible and can produce only `DEFER`.
+duplicating prose. Synthetic payloads/receipts are always ineligible and can produce only `DEFER`.
 Schema validity alone has no authority, and no prescreen packet can authorize or donate C1/C2/C3
 evidence.
 
@@ -600,8 +574,9 @@ The 2-GiB retained-evidence cap excludes verified transient database fixtures/co
 scan bytes. Full scans feed the redb-free oracle incrementally and are never materialized as exports.
 Retained evidence includes the exact approval/result packets, plans, manifests, schedule, raw timing/
 resource/marker frames, target/preflight/noise records, state counts and digests, at most 1 MiB per
-mismatch excerpt, process/kernel logs, validator/oracle/mechanism reports, signatures, and an artifact
-index. The index records every retained file's locator/length/hash and every verified-then-destroyed
+mismatch excerpt, process/kernel logs, validator/oracle/mechanism reports, protected-review receipts,
+and an artifact index. The index records every retained file's locator/length/hash and every
+verified-then-destroyed
 database's pre/post digests and destruction time. Its checked sum must equal
 `retained_artifact_bytes`. Deletion begins only after independent oracle and validator reports are
 durably indexed; missing transient-destruction evidence is `DEFER`, not a smaller claimed total.
@@ -634,8 +609,9 @@ cheaper than the 45-hour C2 sketch.
 
 The redb-free classifier derives exactly one outcome in this precedence order:
 
-1. Before a terminal finding is sealed, invalid approval/trust, target, preflight, actuator, clock,
-   harness, oracle, schedule, artifact or evidence needed to judge that finding yields `DEFER`; an
+1. Before a terminal finding is sealed, invalid approval/protected review, target, preflight,
+   actuator, clock, harness, oracle, schedule, artifact or evidence needed to judge that finding
+   yields `DEFER`; an
    invalid finding attempt cannot prove a candidate defect.
 2. One fully attributable atomicity/durability/corruption invariant violation in a valid attempt
    seals `REJECT_EXACT_PIN` and stops all further candidate decision/diagnostic execution. Later
