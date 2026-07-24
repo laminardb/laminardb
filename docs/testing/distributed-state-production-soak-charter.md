@@ -62,8 +62,11 @@ The release Dockerfile toolchain must first match the workspace Rust requirement
 
 ## Scenario matrix
 
-Each `(scenario, working_state_profile)` pair is certified independently. A green pair cannot widen
-another profile, operator, update mode, connector, or delivery guarantee.
+The sole current production target is the local-spill working-state profile. Each proposed
+`(scenario, local-spill-profile)` pair is certified independently; a green pair cannot widen another
+operator, update mode, connector, or delivery guarantee. Bounded memory has no product-soak matrix
+under this charter. Adding any future profile requires an owner-approved charter/ADR amendment
+before a run, and prior local-spill evidence cannot be reused to certify it.
 
 | Scenario | Initial intended path | Current status |
 |---|---|---|
@@ -109,9 +112,7 @@ specifies at minimum:
   global encoded restore bytes; and separate per-task/global restore scratch;
 - common maximum RSS/PSS/cgroup memory, queue bytes/age, FD count, snapshot/iterator count, frozen
   generations, timer count and checkpoint artifacts;
-- for bounded memory, hard live/index/timer/join/output/frozen/restore-scratch reservations,
-  allocator/RSS retention, controlled-exhaustion behavior, source replay retention and cold-restore
-  RTO; for local spill, engine cache/memtable/journal/native memory, local bytes, disk utilization,
+- local-spill engine cache/memtable/journal/native memory, local bytes, disk utilization,
   maintenance debt/health and write amplification;
 - accepted steady-state slopes for every retained resource; and
 - exact repetition/fault counts and random seed.

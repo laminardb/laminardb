@@ -38,9 +38,9 @@ The Cycle 20 [working-state placement analysis](../reports/state-working-state-o
 separates the capability from a named engine but does not change sequencing authority. Phase 1
 remains blocked by the existing Phase 0 review gate. Any later gate split requires an accepted ADR/
 plan amendment with named scope and owners. The intended broad/variable-state production profile
-  still waits for one qualified local-spill backend. The project decision keeps bounded memory as a
-  reference/conformance implementation only; it has no cluster product schedule or production-soak
-  matrix under this plan.
+still waits for one qualified local-spill backend. The project decision keeps bounded memory as a
+reference/conformance implementation only; it has no cluster product schedule or production-soak
+matrix under this plan.
 
 ## Scope and non-goals
 
@@ -163,9 +163,9 @@ Work:
    Cycle 16 RocksDB stall-only recommendation at source proof because v1's maintenance-debt arm
    cannot be closed by that narrow binding. The Cycle 18
    [decision matrix](../reports/state-backend-contract-decision-matrix-2026-07-24.md) recommends an
-    additive maintenance-health successor. Cycle 21 records the direction approval, allowing only a
-    consolidated freeze candidate to be drafted; final two-owner approval is still required before
-    validation-only v2 implementation. Cycle 19's reviewed
+   additive maintenance-health successor. Cycle 21 records the direction approval, allowing only a
+   consolidated freeze candidate to be drafted; final two-owner approval is still required before
+   validation-only v2 implementation. Cycle 19's reviewed
    [candidate mappings](../reports/state-backend-maintenance-health-mapping-designs-2026-07-24.md)
    define but do not cost or authorize the RocksDB source/binding closure and Fjall scheduler/
    lifecycle closure; redb 4.1.0 remains only a separate native-prescreen hedge with unapproved

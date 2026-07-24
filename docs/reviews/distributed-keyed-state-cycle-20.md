@@ -1,5 +1,11 @@
 # Distributed keyed state Cycle 20 review
 
+> **Historical boundary:** Cycle 21's
+> [owner decision record](../reports/distributed-state-cycle-21-owner-decisions-2026-07-24.md)
+> supersedes this review's bounded-memory soak description and Cycle 21 entry questions. Bounded
+> memory is now reference/conformance-only; the current product-soak charter targets local spill
+> only. The findings below remain historical review provenance, not current execution authority.
+
 - **Date:** 2026-07-24
 - **Branch:** `feature/distributed-keyed-state-adr`
 - **Cycle commits:** `ca369bfc`, `fa9a6aac`

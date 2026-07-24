@@ -149,11 +149,11 @@ It must not reuse or reinterpret the current disk-oriented v1 or proposed v2 con
    production admission.
 5. Keep bounded memory as the semantic reference only. Any later product proposal must amend the ADR
    and restart applicability, hard-limit, recovery/RTO, and independent-soak approval before a run.
-6. Run a separately chartered independent release-candidate product soak for every profile claimed
-   production-ready. The memory profile must force near-cap skew, timer/join growth, overlapping
-   generations, allocator fragmentation, object-store faults, repeated process loss and rebalances.
-   The spill profile additionally forces cold cache, maintenance stalls, disk fill/corruption and
-   local-disk loss. A backend endurance run is not this soak.
+6. Run a separately chartered independent release-candidate product soak for the sole current
+   local-spill production profile. It forces cold cache, maintenance stalls, disk fill/corruption,
+   local-disk loss, object-store faults, repeated process loss and rebalances. A backend endurance
+   run is not this soak. A future memory product proposal must first amend the ADR and charter with
+   its own approved matrix; this reference-only decision defines no memory soak obligation.
 
 ## Research hygiene
 
