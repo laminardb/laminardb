@@ -9,6 +9,12 @@
 - **Cluster admission:** unchanged; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
 - **Predecessor:** [state backend qualification runner v1](state-backend-qualification-runner-v1.md)
 - **Trigger:** [Cycle 17 RocksDB source closure](../reports/rocksdb-mechanism-source-closure-2026-07-24.md)
+- **Paper mappings:** [Cycle 19 candidate designs](../reports/state-backend-maintenance-health-mapping-designs-2026-07-24.md)
+
+Cycle 19 confirms that sampled typed gauges/counters/booleans can express the continuous health
+obligations, while exposing additional candidate gaps. It keeps RocksDB's blocking tail wait
+non-gating rather than disguising an active command as a sampled boolean. The mappings do not
+approve this direction, instantiate v2, rank implementation cost, or authorize source work.
 
 ## Proposed decision
 

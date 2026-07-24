@@ -418,6 +418,16 @@ exist. Only then may that approved workspace pin RocksDB wrapper
 reviewed mapping design. Its immutable mapping artifact follows source construction and adversarial
 activation proof. A future
 patched/admitted Fjall subject receives a separate exact identity; unmodified Fjall 3.1.8 does not.
+
+Cycle 19's [paper mappings](../reports/state-backend-maintenance-health-mapping-designs-2026-07-24.md)
+are the reviewed source for those candidate gaps. They add no profile or wire identity. RocksDB's
+existing signals omit scheduled-bottom-compaction and complete purge/recovery/stall lifecycles;
+Fjall needs scheduler/lifecycle repair, worker/error/physical-delete health and exact stalls; redb
+needs a candidate-specific profile translation, one frozen durability mode, fail-closed close
+outcome, complete-process task/thread N/A proof and its separately approved native prescreen. Patch
+effort and interference remain unknown, so this ordering is a gate sequence rather than a backend
+rank.
+
 Build exactly one
 admitted candidate per binary. The private qualification contract covers
 batched reads, atomic write/delete/timer mutations, bounded range scans, consistent snapshots,

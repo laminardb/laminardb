@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; implementation requires the Phase 0 review gate
 - **Date:** 2026-07-22
-- **Amended:** 2026-07-24; Cycle 18 maintenance-health v2 proposal awaits owner decision
+- **Amended:** 2026-07-24; Cycle 19 candidate mappings complete, v2 owner decision pending
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Related:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md),
   [implementation plan](../plans/distributed-keyed-stateful-operators.md)
@@ -32,6 +32,14 @@ reference and a small local-mode option. Cluster-shared object storage and the e
 `StateBackend` remain the
 authoritative checkpoint/recovery layer; no local working-state backend is remote recovery
 authority.
+
+Cycle 19's reviewed [candidate mapping designs](../reports/state-backend-maintenance-health-mapping-designs-2026-07-24.md)
+find different, unmeasured closure footprints: RocksDB needs scheduled-compaction, purge,
+error/recovery, safe-binding and stall sources; Fjall needs scheduler/lifecycle repair plus coherent
+worker/error/physical-delete/stall observation; redb's whole-arm N/A is only source-plausible until
+complete-process task/thread proof and its native prescreen pass. The report ranks no patch cost and
+changes no gate. RocksDB proceeds only to a source-closure specification after a final v2 contract,
+Fjall awaits an explicit fork-ownership choice, and redb remains in the separate prescreen stage.
 
 The [exact-source static audit](../reports/state-backend-static-audit-2026-07-23.md) finds that
 unmodified Fjall 3.1.8 cannot supply the required stable compaction-debt/write-stall telemetry and

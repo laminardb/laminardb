@@ -156,8 +156,11 @@ Work:
    cannot be closed by that narrow binding. The Cycle 18
    [decision matrix](../reports/state-backend-contract-decision-matrix-2026-07-24.md) recommends an
    additive maintenance-health successor, pending the named owner decision; retaining v1 requires
-   separately funded broader engine instrumentation/configuration proof. redb 4.1.0 remains only a
-   separate native-prescreen hedge, and unmodified Fjall 3.1.8 and SurrealKV 0.21.2 do not proceed.
+   separately funded broader engine instrumentation/configuration proof. Cycle 19's reviewed
+   [candidate mappings](../reports/state-backend-maintenance-health-mapping-designs-2026-07-24.md)
+   define but do not cost or authorize the RocksDB source/binding closure and Fjall scheduler/
+   lifecycle closure; redb 4.1.0 remains only a separate native-prescreen hedge with unapproved
+   complete-process N/A. Unmodified Fjall 3.1.8 and SurrealKV 0.21.2 do not proceed to adapters.
    Run every later-admitted
    candidate through the same bounded profile: Arrow-batch-sized atomic requests, realistic
    hot/cold multi-key reads, timer scans, snapshot/export overlap, sorted restore, vnode drop/GC,
