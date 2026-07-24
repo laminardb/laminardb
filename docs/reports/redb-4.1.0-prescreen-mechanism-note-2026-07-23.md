@@ -103,8 +103,11 @@ candidate-internal observations. Docker Desktop/WSL can exercise framing and smo
 cannot establish the native XFS/device evidence or complete this bounded mechanism probe.
 
 No `bounded_probe_proof` exists today. A future native reviewed result may bind a completed bounded
-probe artifact under `state-backend-redb-prescreen-result/v1`; the Docker result shape structurally
-forbids that artifact and cannot encode `PRESCREEN_PASS`. Even native `PRESCREEN_PASS` only funds an
+probe artifact through the reserved successor `state-backend-redb-prescreen-result-payload/v1`;
+that successor schema and classifier do not exist. The legacy
+`state-backend-redb-prescreen-result/v1` shape is synthetic-only and supplies no result semantics.
+The future Docker result shape must structurally forbid the probe and cannot encode
+`PRESCREEN_PASS`. Even native `PRESCREEN_PASS` only funds an
 additive candidate profile, formal mechanism and persistence mapping, and adapter review. It cannot
 donate C1/C2/C3, qualification, selection, fault/endurance, checkpoint, exactly-once, source/sink,
 soak, or production evidence.

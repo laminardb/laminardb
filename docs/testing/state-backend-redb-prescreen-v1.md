@@ -600,6 +600,91 @@ with the existing `INVALID_INPUT <path>: ` prefix. Wrong arity or any unknown co
 prints usage. No output or public type contains `DEFER`, `SMOKE_PASS`, `PRESCREEN_PASS`,
 `PRESCREEN_NO_GO`, `REJECT_EXACT_PIN`, provider-authenticated, executable or sealed state.
 
+### Cycle 23 outer post-run binding slice
+
+A strict successor result validator is not yet implementable. The protocol has not frozen the exact
+result-payload layout, Docker outcome vocabulary, retained-index entry/destruction model, raw wire
+schemas and goldens, classifier inputs, or immutable storage-version and retention contract. The
+legacy `state-backend-redb-prescreen-result/v1` schema is synthetic regression input and supplies no
+defaults. Cycle 23 therefore validates only the outer post-run receipt and exact byte bindings. It
+does not implement `state-backend-redb-prescreen-result-payload/v1` or an artifact-index schema.
+
+The binding API consumes these six caller-supplied byte strings in order:
+
+1. protected-review policy, at most 32 KiB;
+2. approval payload, at most 64 KiB;
+3. pre-run protected-review receipt, at most 64 KiB;
+4. opaque result-payload bytes, from 1 byte through 256 KiB;
+5. opaque artifact-index bytes, from 1 byte through 16 MiB; and
+6. post-run protected-review receipt, at most 64 KiB.
+
+It first performs the complete Cycle 22 pre-run content validation. It then validates the post-run
+receipt against the closed receipt schema and requires all of the following:
+
+- `stage` is `post_run`; provider, policy descriptor, base ref, and configured workflow, job and
+  environment equal the supplied policy, and the policy descriptor binds the exact policy bytes;
+- the complete post-run `/change` object equals the pre-run receipt's `/change` object, and the
+  post-run provider object equals both the policy and pre-run provider objects;
+- the post-run payload descriptor is exactly
+  `(redb-prescreen-result-payload,result/payload.json,actual length,actual SHA-256,application/json)`;
+- the retained-evidence root has the fixed kind and its index descriptor is exactly
+  `(redb-prescreen-artifact-index,result/artifact-index.json,actual length,actual SHA-256,application/json)`;
+- the two ordered copied review records use the exact post-run decision literal, bind the post-run
+  change head and exact result bytes, have unequal copied account-ID strings and unequal event-ID
+  strings, and use canonical times no later than the post-run provider-verification time;
+- neither copied post-run event-ID string appears in the pre-run receipt; owner account strings may
+  repeat across stages; and
+- each copied post-run review time is no earlier than the pre-run provider-verification time. This
+  also requires the post-run provider-verification time to be no earlier than the pre-run one.
+
+String inequality proves only inequality of copied strings. It does not prove that an account,
+event, review, protected run or provider fact exists, that two real principals differ, or that a
+review is current. Live provider verification remains a separate unavailable authority boundary.
+The post-run workflow run/attempt/job IDs are not required to equal their pre-run values: they
+identify the copied export context, while only the configured workflow/job/environment lineage and
+change/head are fixed across stages.
+
+The result and index bytes are deliberately opaque in this slice. They are bounded and hashed but
+are not decoded as JSON, checked against a schema, dereferenced, or interpreted. Therefore success
+does not establish that the bytes conform to the copied `application/json` media-type claim, or
+establish their notice, identity, disposition, entry set, locator ordering, entry existence, digests,
+destruction records, `retained_artifact_bytes`, final 2-GiB accounting, classification, storage,
+retention, or sealing. A fully self-consistent copied and repinned chain can pass only as unverified
+binding content. The later strict result/index slice must consume exact bytes, define and check those
+facts, and still remain separate from live provider and storage trust.
+
+The public result is `RedbPrescreenPostRunBindingSummary` with only the single-variant
+`RedbPrescreenAuthorization::Unverified` authority. Its execution and result-sealing accessors
+return false unconditionally. It has no disposition, run class, payload ID, reviewer, event,
+provider, artifact root, storage, retention, backend-selection or qualification field and no
+conversion into a trusted type.
+
+The sole Cycle 23 command is
+`state-backend-qual validate-redb-prescreen-post-run-binding <policy-json-path>
+<approval-payload-json-path> <pre-run-receipt-json-path> <opaque-result-payload-path>
+<opaque-artifact-index-path> <post-run-receipt-json-path>`. Success exits 0 and writes the notice,
+then exactly:
+
+```text
+VALID_INELIGIBLE_REDB_PRESCREEN_BINDING stage=post_run authorization=authorization_unverified
+```
+
+Invalid binding content exits 2 with `INVALID_REDB_PRESCREEN_BINDING ` on stderr. An unreadable or
+over-cap input exits 2 through the existing `INVALID_INPUT <path>: ` path. Wrong arity and every
+unknown command exit 64. No `run`, `dispatch`, `approve`, `accept`, `verify`, `classify`, `seal`,
+`select` or `qualify` command is added.
+
+The strict successor remains blocked until a later reviewed freeze defines the result envelope and
+complete evidence descriptor set; Docker outcomes without importing the legacy schema; the
+artifact-index entry, destroyed-database, count, ordering, uniqueness, exclusion and sum rules; raw
+manifest/report/mechanism and binary framing schemas plus literal goldens; the final-index cleanup
+lifecycle; a classifier-derived outcome independent of the later owner receipt, with distinct names
+for that outcome, the early terminal-rejection latch, and final reviewed-and-stored result sealing;
+and an out-of-band immutable storage provider/version/atomicity/retention contract whose
+authenticated record and verifier cover the exact artifact-index bytes, result-payload bytes,
+post-run-receipt bytes, and complete retained object set. A content digest, URL, ETag, version
+string, retain-until time or packet-supplied `immutable=true` cannot prove storage retention.
+
 ## Isolation and clocks
 
 An external Linux supervisor owns the database directory and starts one child process. The child
