@@ -7,6 +7,15 @@
 - **Recommendation:** carry RocksDB into a bounded DKS-Q2-006 mechanism-closure task; carry redb
   only into its separately approved native prescreen; do not carry unmodified Fjall or SurrealKV
 
+**Cycle 17 supersession:** the bounded
+[RocksDB mechanism-source closure](rocksdb-mechanism-source-closure-2026-07-24.md) stopped at Stage
+0. An apparently bounded stall observer is plausible but unproved, and this matrix's assumption
+that the existing pending-compaction estimate could satisfy v1's direct/disjoint debt population
+was wrong. Do not start the stall-only patch from this historical recommendation. The current next
+step is an explicit choice between retaining v1 and funding broader native instrumentation and
+configuration proof, or issuing an additive qualification contract with reviewed
+candidate-specific health signals. No backend was selected.
+
 ## Recommended judgment
 
 The recommended next investment is the exact `rocksdb =0.24.0` / RocksDB 10.4.2 subject, but only

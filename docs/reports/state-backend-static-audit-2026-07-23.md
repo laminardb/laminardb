@@ -10,6 +10,14 @@ Post-audit update (2026-07-24): Cycle 16 adds an isolated redb construction-only
 it on local Windows and Linux Docker. That does not change this report's static evidence class or
 any candidate disposition; the root workspace, runtime lock, profile, and adapters remain redb-free.
 
+Cycle 17 correction (2026-07-24): the bounded
+[RocksDB mechanism-source closure](rocksdb-mechanism-source-closure-2026-07-24.md) disproves this
+report's earlier claim that `estimate-pending-compaction-bytes` can populate the published v1 debt
+arm. It is an estimate of level-rewrite work, whereas v1 requires a complete, direct,
+pairwise-disjoint byte population for every applicable background-maintenance class. Treat the
+RocksDB disposition and binding-gap section below as corrected by that report; this audit is
+retained to preserve the decision history.
+
 ## Result
 
 Fjall and RocksDB expose the primitives from which a backend-neutral semantic adapter can be
@@ -27,7 +35,7 @@ before a telemetry patch, not a low-cost third candidate.
 | Candidate | Required primitives | Governance/telemetry | Static disposition |
 |---|---|---|---|
 | Fjall 3.1.8 | Cross-keyspace atomic batch, consistent snapshot, ordered range/prefix iteration, and explicit journal persistence are present. | No stable compaction-debt counter, complete write-stall duration/counter, enforceable global write-buffer cap, or complete cache/pinned-memory accounting. | **FAIL DKS-Q2-006 as published.** Patch/upstream the missing stable signals and controls or remove Fjall from the campaign. |
-| `rocksdb` 0.24.0 / RocksDB 10.4.2 | Cross-column-family `WriteBatch`, snapshots, bounded iterators, multi-get, WAL flush, checkpoint, and SST ingest are present. | Pending-compaction and pressure properties exist, but the exposed stall ticker omits verified write-buffer-manager/database-scope paths. | **BLOCK DKS-Q2-006.** Supply a proven complete signal or narrow it only with pre-approved evidence that no uncovered stall class is possible. |
+| `rocksdb` 0.24.0 / RocksDB 10.4.2 | Cross-column-family `WriteBatch`, snapshots, bounded iterators, multi-get, WAL flush, checkpoint, and SST ingest are present. | The pending-compaction property is estimated rather than the complete direct byte population v1 requires; the exposed stall ticker also omits verified write-buffer-manager/database-scope paths. | **BLOCK DKS-Q2-006 as published.** A stall-only patch is insufficient; either fund a substantially broader native telemetry fork or approve an additive contract with candidate-typed health signals before construction work. |
 | redb 4.1.0 | Atomic cross-table write transaction, snapshot reads, ordered ranges, an open-time cache budget, and immediate-durability commit are present. | A single database-wide writer blocks without a timeout/cancel API; storage statistics traverse the trees while holding that writer; the current contract has no approved non-LSM debt/stall mapping. | **DEFER.** Freeze the prescreen's mechanism hypothesis and protocol, then run the non-gating writer/commit/recovery screen. Only `PRESCREEN_PASS` funds a formal candidate mechanism and persistence mapping; it does not admit redb to C2/C3. |
 | SurrealKV 0.21.2 | One-tree atomic transactions, snapshot-filtered point/range reads, WAL sync, and internal LSM pressure machinery are present. | Snapshot registrations are not reference-counted and a temporary range snapshot unregisters a real sequence; public debt/stall telemetry is absent and background notification liveness is unproved. | **REJECT unmodified.** A pinned fork/upstream must fix and prescreen correctness/liveness before telemetry work or candidate admission. |
 
@@ -285,9 +293,14 @@ reservation, disk/memory governor, and bounded in-flight limit.
 
 ### RocksDB binding gaps
 
-With level compaction frozen, `estimate-pending-compaction-bytes` can supply debt per column family.
-Current delayed rate, stopped state, pending flush/compaction, cache usage/pinned usage,
-write-buffer-manager usage, snapshot counts, and approximate memory builders are available.
+Cycle 17 corrects this section's original debt claim. Even with level compaction frozen,
+`estimate-pending-compaction-bytes` cannot supply v1's debt arm: it is a policy estimate of level
+rewrite work, not a direct byte inventory of disjoint queued and running maintenance tasks. It also
+does not cover immutable flush, every optional compaction trigger, or every asynchronous cleanup
+class allowed by the proposed configuration. Current delayed rate, stopped state, pending
+flush/compaction counts, cache usage/pinned usage, write-buffer-manager usage, snapshot counts, and
+approximate memory builders remain useful candidate-native health signals, but they do not acquire
+v1's stricter wire semantics by being summed.
 
 `Ticker::StallMicros` is not a complete stall total. The 10.4.2 write-controller path records its
 normal delay and stopped interval, but the separate write-buffer-manager block path has no matching
@@ -301,9 +314,11 @@ constructor and hard-space manager. Those are useful defense in depth, not requi
 the authoritative adapter reservation, cgroup memory limit, and XFS project quota. Their absence is
 not the stall-accounting blocker.
 
-DKS-Q2-006 therefore stays blocked for RocksDB until a reviewed source exposes complete stall
-events/time, or the approved configuration and fault evidence prove that every uncovered path is
-impossible. One-second polling cannot prove absence of short stalls.
+DKS-Q2-006 therefore stays blocked for RocksDB on two independent sources: complete stall
+events/time and the published direct/disjoint debt population. One-second polling cannot prove
+absence of short stalls. The exact closure report stops the bounded stall-only construction at
+Stage 0 and separates an apparently bounded but unproved stall observer from the broader
+debt-bookkeeping/configuration-proof problem.
 
 ### SurrealKV static failure
 
@@ -362,7 +377,9 @@ hot-writer/victim tails remain C2 and C3 gates.
 
 The static disposition is:
 
-- DKS-Q2-006: **FAIL for unmodified Fjall; BLOCK for the current RocksDB binding**;
+- DKS-Q2-006: **FAIL for unmodified Fjall; BLOCK for unmodified RocksDB under the published v1
+  debt and stall semantics**. Cycle 17 stops the bounded RocksDB stall-only closure at Stage 0 and
+  requires an explicit contract-or-fork decision before more construction work;
 - DKS-Q2-007: **BLOCK for both** until exact candidate locks/builds/options, approval/completion
   records, cache-loss truth-table evidence, and N/N-1 recovery exist;
 - redb 4.1.0: **DEFER before candidate-specific DKS-Q2-006/007 implementation**; first approve the

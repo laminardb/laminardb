@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; implementation requires the Phase 0 review gate
 - **Date:** 2026-07-22
-- **Amended:** 2026-07-24; Cycle 16 carry-forward recommendation pending owner decision
+- **Amended:** 2026-07-24; Cycle 17 stopped the bounded RocksDB closure at Stage 0
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Related:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md),
   [implementation plan](../plans/distributed-keyed-stateful-operators.md)
@@ -11,15 +11,22 @@
 
 LaminarDB will add a common, byte-governed, spillable **working-state service** for keyed
 operators. Phase 0 originally scoped Fjall `=3.1.8` and RocksDB Rust wrapper `=0.24.0` (bundled
-RocksDB 10.4.2) behind the same narrow service and workload/fault harness. The Cycle 16
-[carry-forward matrix](../reports/state-backend-carry-forward-matrix-2026-07-24.md) recommends
-RocksDB's bounded mechanism-closure task first and redb 4.1.0 only as a separate prescreen
-contingency, pending the owner's carry-forward decision. Unmodified Fjall can re-enter only after
-its DKS-Q2-006 patch. This recommendation is work allocation, not backend selection or candidate
-admission. Any candidates admitted later still run the common campaign, which records one
-production backend rather than maintaining multiple implementations. An in-memory implementation
-remains a semantic reference and a small local-mode option. Cluster-shared object storage and the
-existing `StateBackend` remain the
+RocksDB 10.4.2) behind the same narrow service and workload/fault harness. Cycle 16's
+[carry-forward matrix](../reports/state-backend-carry-forward-matrix-2026-07-24.md) recommended a
+bounded RocksDB mechanism closure first and redb 4.1.0 only as a separate prescreen contingency.
+Cycle 17's [exact-source closure](../reports/rocksdb-mechanism-source-closure-2026-07-24.md) stopped
+that RocksDB task at Stage 0: an apparently bounded stall observer is plausible but unproved, while
+the published v1 direct and disjoint maintenance-debt population cannot be closed by the narrow
+binding task. The next decision is therefore whether to retain v1 and explicitly fund broader
+engine instrumentation/configuration proof, or publish an additive contract using reviewed
+candidate-specific health signals while retaining common latency/resource/failure vetoes. The
+existing v1 evidence must not be reinterpreted. No backend is selected or admitted by this change;
+redb's separate prescreen track remains a contingency, and unmodified Fjall can re-enter only after
+the same contract decision defines its obligation. Any
+candidates admitted later still run the common campaign, which records one production backend
+rather than maintaining multiple implementations. An in-memory implementation remains a semantic
+reference and a small local-mode option. Cluster-shared object storage and the existing
+`StateBackend` remain the
 authoritative checkpoint/recovery layer; no local working-state backend is remote recovery
 authority.
 
