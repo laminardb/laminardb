@@ -10,18 +10,26 @@
 
 ## Outcome
 
-Phase 0 selects and proves the contracts needed before a production working-state implementation
-can begin. It does not add a state backend to the runtime, relax `[LDB-4007]`, enable a materialized
-view, or change the cluster delivery guarantee.
+Phase 0 selects and proves the contracts needed before a working-state profile can be admitted in
+production. A bounded Phase 1 placement-neutral lifecycle slice may begin with its required
+in-memory conformance implementation after the applicable contract review while Phase 0 backend
+qualification remains open; that is neither Phase 0 completion nor profile admission. This phase
+does not add a state backend to the runtime, relax `[LDB-4007]`, enable a materialized view, or change
+the cluster delivery guarantee.
 
 The phase is complete only when maintainers can answer, with versioned evidence:
 
 1. which physical operators retain state and what distribution model each requires;
 2. which key/state ABI is durable across restore, rescale, and rolling upgrade;
 3. what numerical workload, latency, resource, checkpoint, and RTO limits define success;
-4. which disk-backed working-state backend passed the same workload and fault contract;
+4. whether a hard-bounded memory profile passed its capacity/exhaustion/restore contract and which
+   disk-backed working-state backend passed the general local-spill workload and fault contract;
 5. which source/operator/output/sink scenario is being certified at-least-once; and
 6. how an independent black-box soak will prevent an unearned production-ready claim.
+
+The Cycle 20 [working-state placement review](../reports/state-working-state-options-2026-07-24.md)
+is the authority for that profile split. A local database is capacity and latency infrastructure,
+not checkpoint, ownership or exactly-once authority.
 
 ## Existing substrate to reuse
 

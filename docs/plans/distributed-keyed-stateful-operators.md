@@ -34,6 +34,14 @@ The critical path is:
 Performance, fault injection, compatibility, operational telemetry, and end-of-cycle review run
 through every phase; they are not a final cleanup sprint.
 
+The Cycle 20 [working-state placement review](../reports/state-working-state-options-2026-07-24.md)
+separates implementation sequencing from backend selection. A bounded Phase 1 lifecycle slice may
+start with its required in-memory conformance implementation after the applicable contract gate
+while Phase 0 backend qualification remains open; it cannot complete Phase 1 or admit cluster SQL.
+A broad/variable-state production profile still waits for one qualified local-spill backend. A
+bounded-memory profile, if retained, has a separate hard-limit, restore/RTO and independent-soak
+gate.
+
 ## Scope and non-goals
 
 In scope:
@@ -161,7 +169,8 @@ Work:
    define but do not cost or authorize the RocksDB source/binding closure and Fjall scheduler/
    lifecycle closure; redb 4.1.0 remains only a separate native-prescreen hedge with unapproved
    complete-process N/A. Unmodified Fjall 3.1.8 and SurrealKV 0.21.2 do not proceed to adapters.
-   Run every later-admitted
+   These engine gates apply to the general local-spill profile; they do not block placement-neutral
+   in-memory lifecycle implementation. Run every later-admitted
    candidate through the same bounded profile: Arrow-batch-sized atomic requests, realistic
    hot/cold multi-key reads, timer scans, snapshot/export overlap, sorted restore, vnode drop/GC,
    maintenance pressure/write stalls, hard memory/disk/FD limits, `kill -9`, torn/corrupt data,
@@ -190,8 +199,10 @@ Exit gate:
 - ADR accepted with named reviewers and no unresolved correctness decision;
 - benchmark and numerical SLO/RTO profile is reproducible on a clean runner;
 - golden ABI/schema vectors and compatibility policy pass;
-- one disk-backed backend is selected from reproducible conformance, latency, resource, fault, and
-  operability evidence, or the ADR is reopened;
+- the placement-neutral service/lifecycle and in-memory conformance subject are reviewable without
+  implying admission; before broad-profile admission, one disk-backed backend is selected from
+  reproducible conformance, latency, resource, fault and operability evidence, or the profile stays
+  closed; any bounded-memory admission has its own frozen capacity/exhaustion/restore/RTO evidence;
 - at least one source/operator/append-sink scenario has a complete ALO oracle and every unsupported
   output/delivery combination has a fail-closed assertion;
 - the independent production-soak charter is approved before implementation results can influence
@@ -211,12 +222,14 @@ Work packages:
 
 - Implement the smallest batched service from ADR-008 inside the existing state/database modules.
   Extract a crate only if dependency direction or a second non-DB consumer requires it.
-- Add canonical physical prefixes, persisted local metadata, process locking, ABI/schema validation,
-  and safe cleanup scoped to one resolved pipeline directory.
-- Provide the Phase 0-selected production backend and an in-memory semantic reference behind the same
-  conformance suite. Do not retain the losing qualification adapter.
-- Use one worker-local database with a small fixed keyspace/column-family count and logical
-  pipeline/operator/table/vnode prefixes. Do not allocate a database or physical tree per vnode.
+- Add canonical logical prefixes and ABI/schema validation. The local-spill implementation also adds
+  persisted metadata, process locking and safe cleanup scoped to one resolved pipeline directory.
+- Provide the in-memory semantic/lifecycle implementation first and the later-selected local-spill
+  backend behind the same contract and conformance suite. Neither implementation changes admission
+  by existing; do not retain losing disk qualification adapters.
+- For local spill, use one worker-local database with a small fixed keyspace/column-family count and
+  logical pipeline/operator/table/vnode prefixes. Do not allocate a database or physical tree per
+  vnode.
 - Encode hot values with a compact schema-versioned binary format. Do not use per-group Arrow IPC,
   live DataFusion/rkyv checkpoint types, read-before-write accounting, or the removed cold-tier
   wrapper.
@@ -239,8 +252,8 @@ Work packages:
 
 ### 1C. Resource governor
 
-- Reserve before mutation across Rust/Arrow/operator buffers, LSM cache/memtables/journal,
-  snapshots/iterators/pinned values, OS page cache, and native memory when applicable.
+- Reserve before mutation across Rust/Arrow/operator buffers and, when applicable, engine cache/
+  memtables/journal, snapshots/iterators/pinned values, OS page cache, and native memory.
 - Enforce separate memory, local bytes, restore staging, frozen-generation, and compaction-debt
   limits with one-batch documented slack.
 - Define pressure states, bounded backpressure, health transitions, and a typed controlled-fault
@@ -248,7 +261,8 @@ Work packages:
 
 ### 1D. Checkpoint bridge
 
-- Atomically journal state mutations per vnode with the logical write batch.
+- Record state mutations atomically per vnode and generation with the logical write batch; a local
+  engine journal is an implementation detail, not cluster recovery authority.
 - Rotate/freeze generations at an aligned barrier and materialize portable per-vnode deltas
   asynchronously through the existing artifact backend and exact-attempt seal.
 - Build periodic full bases, chain limits, abort/failed-capture rearming, and retained-generation
@@ -298,19 +312,20 @@ Tests:
   or out-of-order/cross-vnode keys, trailing bytes, and every restore reservation fail closed without
   passing managed artifact bytes to Arrow. Any future IPC codec owns its separate framing,
   compression, dictionary, decoded-expansion, and second-batch/EOS matrix;
-- checksum, truncated artifact, wrong ABI/schema/owner, disk full, object-store stall, compaction
-  stall, and complete local directory loss;
+- checksum, truncated artifact, wrong ABI/schema/owner, object-store stall and complete local state
+  loss; local-spill profiles also cover disk full/corruption and maintenance stalls;
 - generation/iterator leak tests and resident/native byte accounting under sustained churn;
 - scheduler saturation tests proving bounded queues, lane order, watermark holds, and no event-loop
   blocking; and
-- microbenchmarks with state both inside and outside cache, concurrent checkpoint, and restore.
+- microbenchmarks with concurrent checkpoint and restore; local-spill profiles cover state both
+  inside and outside cache.
 
 Exit gate:
 
 - zero unbounded retained collection in the substrate or test harness;
 - barrier freeze cost is independent of total state in complexity and confirmed by size scaling;
 - last sealed cut restores after local loss with exact model state;
-- memory/disk/compaction limits fail predictably without corruption or OOM;
+- applicable memory/disk/maintenance limits fail predictably without corruption or OOM;
 - no stateful SQL capability is yet enabled; and
 - Phase 1 cycle review is approved.
 
@@ -511,7 +526,8 @@ This phase does not add operator semantics. It closes cross-cutting evidence:
    binary in a production-like multi-process environment. Use real certified source, object store,
    and sink; an external oracle must check progress, output/state correctness, allowed ALO
    duplicates, recovery, and ownership fencing for every scenario proposed for GA. Track leak
-   slopes for Rust heap, LSM cache/memtables/journal and any native allocation, file descriptors,
+   slopes for Rust heap and, when applicable, engine cache/memtables/journal and native allocation,
+   file descriptors,
    iterators/snapshots, local bytes, frozen generations, timers, and checkpoint artifacts. Archive
    raw evidence and obtain independent reviewer sign-off. The backend spike, ordinary integration
    suite, or canary cannot satisfy this gate.

@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; implementation requires the Phase 0 review gate
 - **Date:** 2026-07-22
-- **Amended:** 2026-07-24; Cycle 19 candidate mappings complete, v2 owner decision pending
+- **Amended:** 2026-07-24; Cycle 20 placement review complete, backend and v2 owner decisions pending
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Related:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md),
   [implementation plan](../plans/distributed-keyed-stateful-operators.md)
@@ -25,13 +25,15 @@ Cycle 18 [maintenance-health v2 proposal](state-backend-maintenance-health-v2-pr
 additive choice but do not approve it. The existing v1 evidence must not be reinterpreted. No
 backend is selected or admitted by this change; redb's separate prescreen track remains a
 contingency, and unmodified Fjall can re-enter only after the same contract decision defines its
-obligation. Any
-candidates admitted later still run the common campaign, which records one production backend
-rather than maintaining multiple implementations. An in-memory implementation remains a semantic
-reference and a small local-mode option. Cluster-shared object storage and the existing
-`StateBackend` remain the
-authoritative checkpoint/recovery layer; no local working-state backend is remote recovery
-authority.
+obligation. Any candidates admitted later still run the common campaign, which records one
+production local-spill backend rather than maintaining multiple disk implementations. Cycle 20's
+[placement and backend-scope review](../reports/state-working-state-options-2026-07-24.md) clarifies
+that correctness and exactly-once do not require a named engine or durable local disk. The
+in-memory implementation remains the semantic reference and may proceed to a separately qualified,
+hard-bounded small-state cluster profile; it is never an implicit fallback for the general profile.
+The intended broad/variable-state profile still requires one qualified local-spill backend.
+Cluster-shared object storage and the existing `StateBackend` remain the authoritative checkpoint/
+recovery layer; no local working-state backend is remote recovery authority.
 
 Cycle 19's reviewed [candidate mapping designs](../reports/state-backend-maintenance-health-mapping-designs-2026-07-24.md)
 find different, unmeasured closure footprints: RocksDB needs scheduled-compaction, purge,
@@ -258,9 +260,12 @@ portable logical vnode artifact. SST ingest needs sorted input and may flush ove
 or briefly block writes, so it is a measured restore optimization. Qualification pins an exact
 RocksDB release and Rust wrapper before relying on any API behavior.
 
-The in-memory backend is required for model/differential tests and may serve explicitly bounded
-local workloads. It is not the cluster production fallback: inability to open or govern the
-qualified disk-backed backend keeps keyed cluster admission closed.
+The in-memory backend is required for model/differential tests and is the first placement-neutral
+lifecycle implementation. It may be certified later for an explicit bounded-memory cluster profile
+only when admission and reservations hard-bound live state, timers, joins, output bookkeeping,
+skew, active/frozen generations and restore scratch, and remote restore plus source replay meets its
+RTO. It is not the broad cluster production fallback: inability to open or govern the qualified
+disk-backed backend keeps the general local-spill profile closed.
 
 ### 4. Resource governance
 
@@ -766,6 +771,14 @@ Its remote artifact/seal semantics are intentionally attempt-scoped and asynchro
 them with hot point/range operations would put remote latency on the data path and weaken the
 meaning of checkpoint authority.
 
+### Use heap state as the unrestricted cluster default — rejected
+
+SQL key cardinality, timers, join rows, skew, frozen generations and restore scratch are not
+intrinsically bounded. A memory implementation may be admitted only as an explicitly named profile
+with pre-mutation reservations, hard limits, controlled exhaustion, portable checkpoints and a
+qualified cold-restore/source-replay RTO. It never accepts a query under the general local-spill
+profile and cannot silently evict semantic state.
+
 ### Object-store-primary LSM now — rejected
 
 RisingWave Hummock demonstrates versioned and pinned snapshots, cache tiers, and explicit
@@ -829,9 +842,12 @@ Positive consequences:
 
 Costs and risks:
 
-- either LSM adds corruption, disk, tuning, and compaction risk; Fjall additionally needs proof for
-  batched reads, cleanup, and stable governance telemetry, while RocksDB adds native build and
-  allocator accounting;
+- any embedded disk store adds corruption, disk, tuning and cold-page/sync-tail risk; an LSM also
+  adds compaction risk, Fjall needs proof for batched reads, cleanup and stable governance
+  telemetry, RocksDB adds native build/allocator accounting, and redb-like B-trees add sole-writer
+  and reclamation/resize risk;
+- a separately certified memory profile adds an admission/soak matrix and controlled-exhaustion
+  path; it is justified only if measured latency or deployment value repays that support cost;
 - portable state encodings and stable operator IDs become long-lived compatibility contracts;
 - asynchronous full/delta materialization needs strict generation retention and pressure control;
 - hot keys can still serialize one vnode/operator even when storage is bounded;
@@ -848,6 +864,7 @@ checks, and admission flags that remain disabled until each vertical passes its 
 |---|---|---|
 | [Fjall 3.1.8 API](https://docs.rs/fjall/3.1.8/fjall/) and [RocksDB operations](https://github.com/facebook/rocksdb/wiki/Basic-Operations) | Fjall offers a Rust-native API without a C++ storage engine plus batches/snapshots/ranges, but lacks native multi-get/range tombstones and sufficient governance telemetry; RocksDB offers broader batch/operations controls at native-build/accounting cost | Run one workload/fault contract, including explicit durability and pressure tests, select one production backend, and retain portable Laminar artifacts |
 | [Flink 2.3 keyed state](https://nightlies.apache.org/flink/flink-docs-release-2.3/docs/concepts/stateful-stream-processing/) and [state backends](https://nightlies.apache.org/flink/flink-docs-release-2.3/docs/ops/state/state_backends/) | Key groups are the atomic redistribution unit; heap is low-latency but memory-bound; EmbeddedRocksDB supports large local state and incremental checkpoints | Keep fixed vnodes; start with a local disk-backed backend and portable checkpoints |
+| [Arroyo state concepts](https://doc.arroyo.dev/concepts/) | The Rust engine keeps open-source working state in worker memory, explicitly limits it to worker RAM, and writes consistent remote Parquet checkpoints | Treat bounded memory plus remote recovery as a valid separately gated placement, not evidence that arbitrary state fits memory |
 | [Flink ForSt](https://nightlies.apache.org/flink/flink-docs-release-2.3/docs/ops/state/disaggregated_state/) | Remote SSTs, local cache and async State V2 access enable lightweight checkpoints, but ForSt remains experimental; synchronous state is local unless explicitly overridden, and the current implementation is slated for replacement | Do not put object storage on LaminarDB's initial hot path |
 | [Flink checkpoint backpressure guidance](https://nightlies.apache.org/flink/flink-docs-release-2.3/docs/ops/state/checkpointing_under_backpressure/) | Unaligned capture is useful when measured alignment delay is the problem and captures in-flight data | Keep aligned barriers; instrument before adding unaligned state |
 | [RisingWave architecture](https://docs.risingwave.com/get-started/architecture), [v3.0 vnode mapping](https://github.com/risingwavelabs/risingwave/blob/v3.0.0/docs/dev/src/design/consistent-hash.md), and [v3.0 checkpoints](https://github.com/risingwavelabs/risingwave/blob/v3.0.0/docs/dev/src/design/checkpoint.md) | Key-to-vnode mapping/storage encoding stay invariant while Meta changes vnode ownership during scaling; barriers combine with Hummock cache, version, and compaction services | Reuse fixed vnode identity/barriers; do not imitate Hummock without its control/storage services |
