@@ -10,7 +10,8 @@ use state_backend_qual::mechanism_mapping::{
 };
 use state_backend_qual::model_result::validate_model_result;
 use state_backend_qual::redb_prescreen::{
-    validate_redb_prescreen_pre_run_content, MAX_REDB_APPROVAL_PAYLOAD_BYTES,
+    validate_redb_prescreen_post_run_binding, validate_redb_prescreen_pre_run_content,
+    MAX_REDB_APPROVAL_PAYLOAD_BYTES, MAX_REDB_ARTIFACT_INDEX_BYTES, MAX_REDB_RESULT_PAYLOAD_BYTES,
     MAX_REDB_REVIEW_POLICY_BYTES, MAX_REDB_REVIEW_RECEIPT_BYTES,
 };
 use state_backend_qual::{validate_profile, MAX_MODEL_RESULT_BYTES, MAX_PROFILE_BYTES, NOTICE};
@@ -86,7 +87,115 @@ fn main() -> ExitCode {
                 Path::new(&receipt_path),
             )
         }
+        Some("validate-redb-prescreen-post-run-binding") => {
+            let Some(policy_path) = arguments.next() else {
+                return usage();
+            };
+            let Some(payload_path) = arguments.next() else {
+                return usage();
+            };
+            let Some(pre_run_receipt_path) = arguments.next() else {
+                return usage();
+            };
+            let Some(result_payload_path) = arguments.next() else {
+                return usage();
+            };
+            let Some(artifact_index_path) = arguments.next() else {
+                return usage();
+            };
+            let Some(post_run_receipt_path) = arguments.next() else {
+                return usage();
+            };
+            if arguments.next().is_some() {
+                return usage();
+            }
+            validate_redb_post_run_binding_paths(
+                Path::new(&policy_path),
+                Path::new(&payload_path),
+                Path::new(&pre_run_receipt_path),
+                Path::new(&result_payload_path),
+                Path::new(&artifact_index_path),
+                Path::new(&post_run_receipt_path),
+            )
+        }
         _ => usage(),
+    }
+}
+
+fn validate_redb_post_run_binding_paths(
+    policy_path: &Path,
+    payload_path: &Path,
+    pre_run_receipt_path: &Path,
+    result_payload_path: &Path,
+    artifact_index_path: &Path,
+    post_run_receipt_path: &Path,
+) -> ExitCode {
+    let policy_bytes = match read_bounded_input(policy_path, MAX_REDB_REVIEW_POLICY_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("INVALID_INPUT {}: {error}", policy_path.display());
+            return ExitCode::from(2);
+        }
+    };
+    let payload_bytes = match read_bounded_input(payload_path, MAX_REDB_APPROVAL_PAYLOAD_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("INVALID_INPUT {}: {error}", payload_path.display());
+            return ExitCode::from(2);
+        }
+    };
+    let pre_run_receipt_bytes =
+        match read_bounded_input(pre_run_receipt_path, MAX_REDB_REVIEW_RECEIPT_BYTES) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!("INVALID_INPUT {}: {error}", pre_run_receipt_path.display());
+                return ExitCode::from(2);
+            }
+        };
+    let result_payload_bytes =
+        match read_bounded_input(result_payload_path, MAX_REDB_RESULT_PAYLOAD_BYTES) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!("INVALID_INPUT {}: {error}", result_payload_path.display());
+                return ExitCode::from(2);
+            }
+        };
+    let artifact_index_bytes =
+        match read_bounded_input(artifact_index_path, MAX_REDB_ARTIFACT_INDEX_BYTES) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!("INVALID_INPUT {}: {error}", artifact_index_path.display());
+                return ExitCode::from(2);
+            }
+        };
+    let post_run_receipt_bytes =
+        match read_bounded_input(post_run_receipt_path, MAX_REDB_REVIEW_RECEIPT_BYTES) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!("INVALID_INPUT {}: {error}", post_run_receipt_path.display());
+                return ExitCode::from(2);
+            }
+        };
+
+    match validate_redb_prescreen_post_run_binding(
+        &policy_bytes,
+        &payload_bytes,
+        &pre_run_receipt_bytes,
+        &result_payload_bytes,
+        &artifact_index_bytes,
+        &post_run_receipt_bytes,
+    ) {
+        Ok(summary) => {
+            println!(
+                "VALID_INELIGIBLE_REDB_PRESCREEN_BINDING stage=post_run authorization={}",
+                summary.authorization
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("INVALID_REDB_PRESCREEN_BINDING {error}");
+            ExitCode::from(2)
+        }
     }
 }
 
@@ -270,6 +379,16 @@ fn read_bounded(path: &Path, maximum_bytes: usize) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn read_bounded_input(path: &Path, maximum_bytes: usize) -> std::io::Result<Vec<u8>> {
+    let bytes = read_bounded(path, maximum_bytes)?;
+    if bytes.len() > maximum_bytes {
+        return Err(std::io::Error::other(format!(
+            "input exceeds maximum of {maximum_bytes} bytes"
+        )));
+    }
+    Ok(bytes)
+}
+
 fn usage() -> ExitCode {
     eprintln!(
         "usage: state-backend-qual validate-profile <profile-json-path>\n       \
@@ -277,7 +396,11 @@ fn usage() -> ExitCode {
          state-backend-qual validate-mechanism-mapping <profile-json-path> <mapping-json-path>\n       \
          state-backend-qual validate-mechanism-bundle <validation-input-json-path>\n       \
          state-backend-qual validate-redb-prescreen-pre-run-content <policy-json-path> \
-         <approval-payload-json-path> <receipt-json-path>"
+         <approval-payload-json-path> <receipt-json-path>\n       \
+         state-backend-qual validate-redb-prescreen-post-run-binding <policy-json-path> \
+         <approval-payload-json-path> <pre-run-receipt-json-path> \
+         <opaque-result-payload-path> <opaque-artifact-index-path> \
+         <post-run-receipt-json-path>"
     );
     ExitCode::from(64)
 }

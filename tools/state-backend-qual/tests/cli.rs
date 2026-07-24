@@ -219,6 +219,108 @@ fn redb_review_content_is_valid_but_explicitly_authorization_unverified() {
 }
 
 #[test]
+fn redb_post_run_binding_is_opaque_ineligible_and_authorization_unverified() {
+    let fixture = |name: &str| {
+        manifest_path(&format!(
+            "tests/fixtures/redb-prescreen-successor-v1/{name}.json"
+        ))
+    };
+    let output = binary()
+        .arg("validate-redb-prescreen-post-run-binding")
+        .arg(fixture("policy"))
+        .arg(fixture("payload"))
+        .arg(fixture("receipt"))
+        .arg(fixture("opaque-result-payload"))
+        .arg(fixture("opaque-artifact-index"))
+        .arg(fixture("post-run-receipt"))
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!(
+            "{NOTICE}\nVALID_INELIGIBLE_REDB_PRESCREEN_BINDING stage=post_run \
+             authorization=authorization_unverified\n"
+        )
+    );
+    assert!(output.stderr.is_empty());
+
+    let complete_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for forbidden in [
+        "DEFER",
+        "SMOKE_PASS",
+        "PRESCREEN_PASS",
+        "PRESCREEN_NO_GO",
+        "REJECT_EXACT_PIN",
+        "provider_state",
+        "APPROVED",
+        "result_sealed",
+        "backend_selection",
+        "qualification_eligible",
+    ] {
+        assert!(!complete_output.contains(forbidden));
+    }
+}
+
+#[test]
+fn redb_post_run_binding_rejects_wrong_bytes_and_oversized_inputs() {
+    let fixture = |name: &str| {
+        manifest_path(&format!(
+            "tests/fixtures/redb-prescreen-successor-v1/{name}.json"
+        ))
+    };
+    let output = binary()
+        .arg("validate-redb-prescreen-post-run-binding")
+        .arg(fixture("policy"))
+        .arg(fixture("payload"))
+        .arg(fixture("receipt"))
+        .arg(fixture("opaque-artifact-index"))
+        .arg(fixture("opaque-result-payload"))
+        .arg(fixture("post-run-receipt"))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("{NOTICE}\n")
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).starts_with("INVALID_REDB_PRESCREEN_BINDING "));
+
+    let oversized = std::env::temp_dir().join(format!(
+        "state-backend-qual-redb-result-{}.bin",
+        std::process::id()
+    ));
+    std::fs::write(
+        &oversized,
+        vec![b'x'; state_backend_qual::redb_prescreen::MAX_REDB_RESULT_PAYLOAD_BYTES + 1],
+    )
+    .unwrap();
+    let output = binary()
+        .arg("validate-redb-prescreen-post-run-binding")
+        .arg(fixture("policy"))
+        .arg(fixture("payload"))
+        .arg(fixture("receipt"))
+        .arg(&oversized)
+        .arg(fixture("opaque-artifact-index"))
+        .arg(fixture("post-run-receipt"))
+        .output()
+        .unwrap();
+    std::fs::remove_file(oversized).unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("{NOTICE}\n")
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).starts_with("INVALID_INPUT "));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("exceeds maximum of 262144 bytes"));
+}
+
+#[test]
 fn redb_review_cli_rejects_wrong_shapes_and_has_no_run_command() {
     let fixture = |name: &str| {
         manifest_path(&format!(
@@ -243,7 +345,13 @@ fn redb_review_cli_rejects_wrong_shapes_and_has_no_run_command() {
         "run-redb-prescreen",
         "dispatch-redb-prescreen",
         "authorize-redb-prescreen",
+        "approve-redb-prescreen",
+        "accept-redb-prescreen-result",
+        "verify-redb-prescreen-result",
+        "classify-redb-prescreen-result",
         "seal-redb-prescreen-result",
+        "select-redb-backend",
+        "qualify-redb-backend",
     ] {
         let output = binary().arg(command).output().unwrap();
         assert_eq!(output.status.code(), Some(64));

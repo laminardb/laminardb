@@ -1,8 +1,10 @@
 //! Content-only validation for the redb prescreen protected-review documents.
 //!
-//! This module deliberately accepts exact JSON bytes, not a packet directory. It performs no
-//! provider access, artifact dereference, candidate execution, disposition classification, or
-//! evidence sealing. A valid copied receipt remains authorization-unverified.
+//! This module deliberately accepts caller-supplied bytes, not a packet directory. The pre-run
+//! documents are strict JSON; the bounded result and artifact-index inputs in the post-run binding
+//! slice remain opaque. It performs no provider access, descriptor-target dereference, candidate
+//! execution, disposition classification, or evidence sealing. A valid copied receipt remains
+//! authorization-unverified.
 
 use std::fmt::{Display, Write as _};
 
@@ -14,7 +16,9 @@ use crate::{decode_unique_json, reject_non_u64_numbers, reject_placeholder_strin
 
 pub const MAX_REDB_REVIEW_POLICY_BYTES: usize = 32 * 1024;
 pub const MAX_REDB_APPROVAL_PAYLOAD_BYTES: usize = 64 * 1024;
+pub const MAX_REDB_RESULT_PAYLOAD_BYTES: usize = 256 * 1024;
 pub const MAX_REDB_REVIEW_RECEIPT_BYTES: usize = 64 * 1024;
+pub const MAX_REDB_ARTIFACT_INDEX_BYTES: usize = 16 * 1024 * 1024;
 
 const POLICY_SCHEMA: &str =
     include_str!("../schema/redb-prescreen-protected-review-policy-v1.schema.json");
@@ -24,6 +28,7 @@ const RECEIPT_SCHEMA: &str =
     include_str!("../schema/redb-prescreen-protected-review-receipt-v1.schema.json");
 
 const PRE_RUN_DECISION: &str = "APPROVE_REDB_PRESCREEN_EXECUTION_V1";
+const POST_RUN_DECISION: &str = "ACCEPT_REDB_PRESCREEN_RESULT_V1";
 const MAX_JSON_DEPTH: usize = 16;
 const MAX_JSON_NODES: usize = 4_096;
 const MAX_NON_FIXTURE_BYTES: u64 = 256 * 1024 * 1024;
@@ -54,6 +59,24 @@ pub struct RedbPrescreenContentSummary {
 }
 
 impl RedbPrescreenContentSummary {
+    #[must_use]
+    pub const fn execution_authorized(&self) -> bool {
+        false
+    }
+
+    #[must_use]
+    pub const fn result_sealing_authorized(&self) -> bool {
+        false
+    }
+}
+
+/// Outcome of outer post-run byte binding only; it carries no result or trust state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RedbPrescreenPostRunBindingSummary {
+    pub authorization: RedbPrescreenAuthorization,
+}
+
+impl RedbPrescreenPostRunBindingSummary {
     #[must_use]
     pub const fn execution_authorized(&self) -> bool {
         false
@@ -312,6 +335,88 @@ pub fn validate_redb_prescreen_pre_run_content(
         payload_id: text(&payload, "/payload_id").to_owned(),
         authorization: RedbPrescreenAuthorization::Unverified,
     })
+}
+
+/// Checks copied pre/post receipt lineage and exact bounded result/index byte bindings.
+///
+/// The result payload and artifact index are intentionally not decoded or interpreted.
+pub fn validate_redb_prescreen_post_run_binding(
+    policy_bytes: &[u8],
+    approval_payload_bytes: &[u8],
+    pre_run_receipt_bytes: &[u8],
+    opaque_result_payload_bytes: &[u8],
+    opaque_artifact_index_bytes: &[u8],
+    post_run_receipt_bytes: &[u8],
+) -> Result<RedbPrescreenPostRunBindingSummary, CheckErrors> {
+    validate_redb_prescreen_pre_run_content(
+        policy_bytes,
+        approval_payload_bytes,
+        pre_run_receipt_bytes,
+    )?;
+    check_opaque_binding_bytes(
+        opaque_result_payload_bytes,
+        MAX_REDB_RESULT_PAYLOAD_BYTES,
+        "opaque redb result payload",
+    )?;
+    check_opaque_binding_bytes(
+        opaque_artifact_index_bytes,
+        MAX_REDB_ARTIFACT_INDEX_BYTES,
+        "opaque redb artifact index",
+    )?;
+
+    let policy = decode_contract(
+        policy_bytes,
+        MAX_REDB_REVIEW_POLICY_BYTES,
+        "redb protected-review policy",
+        POLICY_SCHEMA,
+    )?;
+    let pre_run_receipt = decode_contract(
+        pre_run_receipt_bytes,
+        MAX_REDB_REVIEW_RECEIPT_BYTES,
+        "redb pre-run protected-review receipt",
+        RECEIPT_SCHEMA,
+    )?;
+    let post_run_receipt = decode_contract(
+        post_run_receipt_bytes,
+        MAX_REDB_REVIEW_RECEIPT_BYTES,
+        "redb post-run protected-review receipt",
+        RECEIPT_SCHEMA,
+    )?;
+
+    let mut errors = Vec::new();
+    check_post_run_binding(
+        &policy,
+        &pre_run_receipt,
+        &post_run_receipt,
+        policy_bytes,
+        opaque_result_payload_bytes,
+        opaque_artifact_index_bytes,
+        &mut errors,
+    );
+    if !errors.is_empty() {
+        return Err(CheckErrors::many(errors));
+    }
+
+    Ok(RedbPrescreenPostRunBindingSummary {
+        authorization: RedbPrescreenAuthorization::Unverified,
+    })
+}
+
+fn check_opaque_binding_bytes(
+    bytes: &[u8],
+    maximum_bytes: usize,
+    label: &str,
+) -> Result<(), CheckErrors> {
+    if bytes.is_empty() {
+        return Err(CheckErrors::one(format!("{label} must not be empty")));
+    }
+    if bytes.len() > maximum_bytes {
+        return Err(CheckErrors::one(format!(
+            "{label} has {} bytes; maximum is {maximum_bytes}",
+            bytes.len()
+        )));
+    }
+    Ok(())
 }
 
 fn decode_contract(
@@ -635,6 +740,207 @@ fn check_pre_run_receipt(
     }
 }
 
+fn check_post_run_binding(
+    policy: &Value,
+    pre_run_receipt: &Value,
+    post_run_receipt: &Value,
+    policy_bytes: &[u8],
+    result_payload_bytes: &[u8],
+    artifact_index_bytes: &[u8],
+    errors: &mut Vec<String>,
+) {
+    if text(post_run_receipt, "/stage") != "post_run" {
+        errors.push("binding validator accepts only a post_run receipt".to_owned());
+        return;
+    }
+
+    if post_run_receipt.pointer("/provider") != policy.pointer("/provider")
+        || post_run_receipt.pointer("/provider") != pre_run_receipt.pointer("/provider")
+    {
+        errors.push(
+            "post-run receipt provider does not equal the policy and pre-run receipt".to_owned(),
+        );
+    }
+    if post_run_receipt.pointer("/change") != pre_run_receipt.pointer("/change") {
+        errors.push("post-run receipt change does not equal the pre-run receipt change".to_owned());
+    }
+    if text(post_run_receipt, "/change/base_ref") != text(policy, "/provider/base_ref") {
+        errors.push(
+            "post-run receipt base ref does not equal the protected-review policy".to_owned(),
+        );
+    }
+    for field in ["workflow_file", "job_name", "environment_id"] {
+        let pointer = format!("/protected_execution/{field}");
+        if text(post_run_receipt, &pointer) != text(policy, &pointer) {
+            errors.push(format!(
+                "post-run receipt protected execution {field} does not equal the policy"
+            ));
+        }
+    }
+
+    if let Some(descriptor) = descriptor_at(
+        post_run_receipt,
+        "/policy",
+        "post-run receipt policy",
+        errors,
+    ) {
+        check_descriptor_tuple(
+            &descriptor,
+            artifact(
+                "redb-prescreen-protected-review-policy",
+                "contract/protected-review-policy.json",
+                "application/json",
+                MAX_REDB_REVIEW_POLICY_BYTES as u64,
+            ),
+            "post-run receipt policy descriptor",
+            errors,
+        );
+        check_descriptor_bytes(
+            &descriptor,
+            policy_bytes,
+            "post-run receipt policy descriptor",
+            errors,
+        );
+    }
+
+    if let Some(descriptor) = descriptor_at(
+        post_run_receipt,
+        "/payload",
+        "post-run receipt payload",
+        errors,
+    ) {
+        check_descriptor_tuple(
+            &descriptor,
+            artifact(
+                "redb-prescreen-result-payload",
+                "result/payload.json",
+                "application/json",
+                MAX_REDB_RESULT_PAYLOAD_BYTES as u64,
+            ),
+            "post-run receipt payload descriptor",
+            errors,
+        );
+        check_descriptor_bytes(
+            &descriptor,
+            result_payload_bytes,
+            "post-run receipt payload descriptor",
+            errors,
+        );
+    }
+
+    if let Some(descriptor) = descriptor_at(
+        post_run_receipt,
+        "/retained_evidence/artifact_index",
+        "post-run receipt artifact index",
+        errors,
+    ) {
+        check_descriptor_tuple(
+            &descriptor,
+            artifact(
+                "redb-prescreen-artifact-index",
+                "result/artifact-index.json",
+                "application/json",
+                MAX_REDB_ARTIFACT_INDEX_BYTES as u64,
+            ),
+            "post-run receipt artifact-index descriptor",
+            errors,
+        );
+        check_descriptor_bytes(
+            &descriptor,
+            artifact_index_bytes,
+            "post-run receipt artifact-index descriptor",
+            errors,
+        );
+    }
+
+    let expected_result_length = u64::try_from(result_payload_bytes.len()).ok();
+    let expected_result_sha = sha256_hex(result_payload_bytes);
+    let expected_head = text(post_run_receipt, "/change/head_revision");
+    let pre_verified_at = text(
+        pre_run_receipt,
+        "/protected_execution/provider_verified_at_utc",
+    );
+    let post_verified_at = text(
+        post_run_receipt,
+        "/protected_execution/provider_verified_at_utc",
+    );
+    check_canonical_utc(
+        post_verified_at,
+        "post-run provider verification timestamp",
+        errors,
+    );
+    if post_verified_at < pre_verified_at {
+        errors.push(
+            "post-run provider verification timestamp is before pre-run verification".to_owned(),
+        );
+    }
+
+    let pre_reviews = pre_run_receipt
+        .pointer("/reviews")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| unreachable!("schema requires pre-run reviews"));
+    let pre_event_ids = pre_reviews
+        .iter()
+        .map(|review| text(review, "/review_event_id"))
+        .collect::<Vec<_>>();
+    let post_reviews = post_run_receipt
+        .pointer("/reviews")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| unreachable!("schema requires post-run reviews"));
+    if text(&post_reviews[0], "/stable_account_id") == text(&post_reviews[1], "/stable_account_id")
+    {
+        errors.push("post-run copied review account IDs must be distinct".to_owned());
+    }
+    if text(&post_reviews[0], "/review_event_id") == text(&post_reviews[1], "/review_event_id") {
+        errors.push("post-run copied review event IDs must be distinct".to_owned());
+    }
+    for (index, review) in post_reviews.iter().enumerate() {
+        if text(review, "/decision_literal") != POST_RUN_DECISION
+            || text(review, "/decision_literal") != text(policy, "/decision_literals/post_run")
+        {
+            errors.push(format!(
+                "post-run receipt review {index} decision does not equal the policy post-run decision"
+            ));
+        }
+        if text(review, "/reviewed_head_revision") != expected_head {
+            errors.push(format!(
+                "post-run receipt review {index} head does not equal the receipt change head"
+            ));
+        }
+        if Some(number(review, "/reviewed_payload_byte_length")) != expected_result_length {
+            errors.push(format!(
+                "post-run receipt review {index} payload length does not equal the exact result bytes"
+            ));
+        }
+        if text(review, "/reviewed_payload_sha256") != expected_result_sha {
+            errors.push(format!(
+                "post-run receipt review {index} payload sha256 does not equal the exact result bytes"
+            ));
+        }
+        let reviewed_at = text(review, "/reviewed_at_utc");
+        check_canonical_utc(
+            reviewed_at,
+            &format!("post-run receipt review {index} timestamp"),
+            errors,
+        );
+        if reviewed_at < pre_verified_at {
+            errors.push(format!(
+                "post-run receipt review {index} timestamp is before pre-run provider verification"
+            ));
+        }
+        if reviewed_at > post_verified_at {
+            errors.push(format!(
+                "post-run receipt review {index} timestamp is after post-run provider verification"
+            ));
+        }
+        if pre_event_ids.contains(&text(review, "/review_event_id")) {
+            errors.push(format!(
+                "post-run receipt review {index} reuses a pre-run review event ID"
+            ));
+        }
+    }
+}
+
 fn descriptor_at(
     value: &Value,
     pointer: &str,
@@ -921,11 +1227,70 @@ mod tests {
         })
     }
 
+    fn post_run_receipt(
+        policy_bytes: &[u8],
+        result_payload_bytes: &[u8],
+        artifact_index_bytes: &[u8],
+    ) -> Value {
+        let mut value = receipt(policy_bytes, result_payload_bytes);
+        value["stage"] = "post_run".into();
+        value["payload"]["role"] = "redb-prescreen-result-payload".into();
+        value["payload"]["locator"] = "result/payload.json".into();
+        value["reviews"][0]["decision_literal"] = POST_RUN_DECISION.into();
+        value["reviews"][0]["review_event_id"] = "RV_post_workload".into();
+        value["reviews"][0]["reviewed_at_utc"] = "2026-07-24T10:03:00Z".into();
+        value["reviews"][1]["decision_literal"] = POST_RUN_DECISION.into();
+        value["reviews"][1]["review_event_id"] = "RV_post_operations".into();
+        value["reviews"][1]["reviewed_at_utc"] = "2026-07-24T10:04:00Z".into();
+        value["protected_execution"]["workflow_run_id"] = "RUN_101".into();
+        value["protected_execution"]["workflow_job_id"] = "JOB_101".into();
+        value["protected_execution"]["provider_verified_at_utc"] = "2026-07-24T10:05:00Z".into();
+        value["retained_evidence"] = json!({
+            "kind": "state-backend-redb-prescreen-retained-evidence-root/v1",
+            "artifact_index": {
+                "role": "redb-prescreen-artifact-index",
+                "locator": "result/artifact-index.json",
+                "byte_length": artifact_index_bytes.len(),
+                "sha256": sha256_hex(artifact_index_bytes),
+                "media_type": "application/json"
+            }
+        });
+        value
+    }
+
     fn valid_bytes() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let policy_bytes = json_bytes(&policy());
         let payload_bytes = json_bytes(&payload(&policy_bytes));
         let receipt_bytes = json_bytes(&receipt(&policy_bytes, &payload_bytes));
         (policy_bytes, payload_bytes, receipt_bytes)
+    }
+
+    struct PostRunBindingBytes {
+        policy: Vec<u8>,
+        payload: Vec<u8>,
+        pre_receipt: Vec<u8>,
+        result: Vec<u8>,
+        index: Vec<u8>,
+        post_receipt: Vec<u8>,
+    }
+
+    fn valid_post_run_binding_bytes() -> PostRunBindingBytes {
+        let (policy_bytes, payload_bytes, pre_run_receipt_bytes) = valid_bytes();
+        let result_payload_bytes = b"opaque synthetic result bytes".to_vec();
+        let artifact_index_bytes = b"opaque synthetic artifact-index bytes".to_vec();
+        let post_run_receipt_bytes = json_bytes(&post_run_receipt(
+            &policy_bytes,
+            &result_payload_bytes,
+            &artifact_index_bytes,
+        ));
+        PostRunBindingBytes {
+            policy: policy_bytes,
+            payload: payload_bytes,
+            pre_receipt: pre_run_receipt_bytes,
+            result: result_payload_bytes,
+            index: artifact_index_bytes,
+            post_receipt: post_run_receipt_bytes,
+        }
     }
 
     fn invalid_payload_error(policy_bytes: &[u8], payload: &Value) -> String {
@@ -934,6 +1299,26 @@ mod tests {
         validate_redb_prescreen_pre_run_content(policy_bytes, &payload_bytes, &receipt_bytes)
             .unwrap_err()
             .to_string()
+    }
+
+    fn invalid_post_run_binding_error(
+        policy_bytes: &[u8],
+        payload_bytes: &[u8],
+        pre_run_receipt_bytes: &[u8],
+        result_payload_bytes: &[u8],
+        artifact_index_bytes: &[u8],
+        post_run_receipt: &Value,
+    ) -> String {
+        validate_redb_prescreen_post_run_binding(
+            policy_bytes,
+            payload_bytes,
+            pre_run_receipt_bytes,
+            result_payload_bytes,
+            artifact_index_bytes,
+            &json_bytes(post_run_receipt),
+        )
+        .unwrap_err()
+        .to_string()
     }
 
     #[test]
@@ -958,6 +1343,300 @@ mod tests {
         );
         assert!(!summary.execution_authorized());
         assert!(!summary.result_sealing_authorized());
+    }
+
+    #[test]
+    fn post_run_binding_accepts_only_opaque_repinned_bytes_as_unverified() {
+        let PostRunBindingBytes {
+            policy,
+            payload,
+            pre_receipt,
+            result,
+            index,
+            post_receipt,
+        } = valid_post_run_binding_bytes();
+        let summary = validate_redb_prescreen_post_run_binding(
+            &policy,
+            &payload,
+            &pre_receipt,
+            &result,
+            &index,
+            &post_receipt,
+        )
+        .unwrap();
+        assert_eq!(
+            summary.authorization,
+            RedbPrescreenAuthorization::Unverified
+        );
+        assert!(!summary.execution_authorized());
+        assert!(!summary.result_sealing_authorized());
+
+        let repinned_result = b"copied bytes with PRESCREEN_PASS text but no interpreted result";
+        let repinned_index = b"copied bytes with immutable=true but no storage authority";
+        let repinned_receipt =
+            json_bytes(&post_run_receipt(&policy, repinned_result, repinned_index));
+        let summary = validate_redb_prescreen_post_run_binding(
+            &policy,
+            &payload,
+            &pre_receipt,
+            repinned_result,
+            repinned_index,
+            &repinned_receipt,
+        )
+        .unwrap();
+        assert_eq!(
+            summary.authorization,
+            RedbPrescreenAuthorization::Unverified
+        );
+        assert!(!summary.execution_authorized());
+        assert!(!summary.result_sealing_authorized());
+    }
+
+    #[test]
+    fn post_run_opaque_byte_caps_are_inclusive_and_fail_before_binding() {
+        let (policy, payload, pre_receipt) = valid_bytes();
+        let result = vec![b'r'; MAX_REDB_RESULT_PAYLOAD_BYTES];
+        let index = vec![b'i'; MAX_REDB_ARTIFACT_INDEX_BYTES];
+        let post_receipt = json_bytes(&post_run_receipt(&policy, &result, &index));
+        validate_redb_prescreen_post_run_binding(
+            &policy,
+            &payload,
+            &pre_receipt,
+            &result,
+            &index,
+            &post_receipt,
+        )
+        .unwrap();
+
+        for (changed_result, changed_index, expected) in [
+            (
+                Vec::new(),
+                b"index".to_vec(),
+                "opaque redb result payload must not be empty".to_owned(),
+            ),
+            (
+                b"result".to_vec(),
+                Vec::new(),
+                "opaque redb artifact index must not be empty".to_owned(),
+            ),
+            (
+                vec![b'r'; MAX_REDB_RESULT_PAYLOAD_BYTES + 1],
+                b"index".to_vec(),
+                format!("maximum is {MAX_REDB_RESULT_PAYLOAD_BYTES}"),
+            ),
+            (
+                b"result".to_vec(),
+                vec![b'i'; MAX_REDB_ARTIFACT_INDEX_BYTES + 1],
+                format!("maximum is {MAX_REDB_ARTIFACT_INDEX_BYTES}"),
+            ),
+        ] {
+            let error = validate_redb_prescreen_post_run_binding(
+                &policy,
+                &payload,
+                &pre_receipt,
+                &changed_result,
+                &changed_index,
+                &post_receipt,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(&expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn post_run_exact_byte_tuples_and_stage_fail_closed() {
+        let PostRunBindingBytes {
+            policy,
+            payload,
+            pre_receipt,
+            result,
+            index,
+            post_receipt,
+        } = valid_post_run_binding_bytes();
+        let base: Value = serde_json::from_slice(&post_receipt).unwrap();
+
+        let mut changed_result = result.clone();
+        changed_result[0] ^= 1;
+        let error = validate_redb_prescreen_post_run_binding(
+            &policy,
+            &payload,
+            &pre_receipt,
+            &changed_result,
+            &index,
+            &post_receipt,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("payload descriptor sha256 does not equal the exact supplied bytes"));
+        assert!(error.contains("review 0 payload sha256 does not equal the exact result bytes"));
+
+        let mut changed_index = index.clone();
+        changed_index[0] ^= 1;
+        let error = validate_redb_prescreen_post_run_binding(
+            &policy,
+            &payload,
+            &pre_receipt,
+            &result,
+            &changed_index,
+            &post_receipt,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error
+            .contains("artifact-index descriptor sha256 does not equal the exact supplied bytes"));
+
+        for (pointer, replacement, expected) in [
+            (
+                "/payload/role",
+                "redb-prescreen-approval-payload",
+                "payload descriptor role must be `redb-prescreen-result-payload`",
+            ),
+            (
+                "/payload/locator",
+                "result/other.json",
+                "payload descriptor locator must be `result/payload.json`",
+            ),
+            (
+                "/retained_evidence/artifact_index/locator",
+                "result/other-index.json",
+                "schema /retained_evidence/artifact_index/locator",
+            ),
+        ] {
+            let mut changed = base.clone();
+            *changed.pointer_mut(pointer).unwrap() = replacement.into();
+            let error = invalid_post_run_binding_error(
+                &policy,
+                &payload,
+                &pre_receipt,
+                &result,
+                &index,
+                &changed,
+            );
+            assert!(error.contains(expected), "{error}");
+        }
+
+        let mut changed_policy_binding = base.clone();
+        changed_policy_binding["policy"]["sha256"] = "a".repeat(64).into();
+        let error = invalid_post_run_binding_error(
+            &policy,
+            &payload,
+            &pre_receipt,
+            &result,
+            &index,
+            &changed_policy_binding,
+        );
+        assert!(error.contains("policy descriptor sha256 does not equal the exact supplied bytes"));
+
+        let mut changed_review_binding = base.clone();
+        changed_review_binding["reviews"][0]["reviewed_payload_byte_length"] =
+            u64::try_from(result.len() + 1).unwrap().into();
+        changed_review_binding["reviews"][1]["reviewed_payload_sha256"] = "a".repeat(64).into();
+        let error = invalid_post_run_binding_error(
+            &policy,
+            &payload,
+            &pre_receipt,
+            &result,
+            &index,
+            &changed_review_binding,
+        );
+        assert!(error.contains("review 0 payload length does not equal the exact result bytes"));
+        assert!(error.contains("review 1 payload sha256 does not equal the exact result bytes"));
+
+        let mut wrong_stage = base;
+        wrong_stage["stage"] = "pre_run".into();
+        wrong_stage["retained_evidence"] = Value::Null;
+        let error = invalid_post_run_binding_error(
+            &policy,
+            &payload,
+            &pre_receipt,
+            &result,
+            &index,
+            &wrong_stage,
+        );
+        assert!(error.contains("accepts only a post_run receipt"));
+    }
+
+    #[test]
+    fn post_run_cross_stage_lineage_event_and_time_rules_fail_closed() {
+        let PostRunBindingBytes {
+            policy,
+            payload,
+            pre_receipt,
+            result,
+            index,
+            post_receipt,
+        } = valid_post_run_binding_bytes();
+        let base: Value = serde_json::from_slice(&post_receipt).unwrap();
+        for (pointer, replacement, expected) in [
+            (
+                "/change/change_id",
+                "PR_43",
+                "change does not equal the pre-run receipt change",
+            ),
+            (
+                "/provider/repository_id",
+                "R_other",
+                "provider does not equal the policy and pre-run receipt",
+            ),
+            (
+                "/protected_execution/workflow_file",
+                ".github/workflows/other.yml",
+                "workflow_file does not equal the policy",
+            ),
+            (
+                "/reviews/1/stable_account_id",
+                "U_workload",
+                "copied review account IDs must be distinct",
+            ),
+            (
+                "/reviews/1/review_event_id",
+                "RV_post_workload",
+                "copied review event IDs must be distinct",
+            ),
+            (
+                "/reviews/0/review_event_id",
+                "RV_workload",
+                "reuses a pre-run review event ID",
+            ),
+            (
+                "/reviews/0/decision_literal",
+                PRE_RUN_DECISION,
+                "decision does not equal the policy post-run decision",
+            ),
+            (
+                "/reviews/0/reviewed_head_revision",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "head does not equal the receipt change head",
+            ),
+            (
+                "/reviews/0/reviewed_at_utc",
+                "2026-07-24T10:01:59Z",
+                "timestamp is before pre-run provider verification",
+            ),
+            (
+                "/reviews/1/reviewed_at_utc",
+                "2026-07-24T10:05:01Z",
+                "timestamp is after post-run provider verification",
+            ),
+            (
+                "/protected_execution/provider_verified_at_utc",
+                "2026-07-24T10:01:59Z",
+                "timestamp is before pre-run verification",
+            ),
+        ] {
+            let mut changed = base.clone();
+            *changed.pointer_mut(pointer).unwrap() = replacement.into();
+            let error = invalid_post_run_binding_error(
+                &policy,
+                &payload,
+                &pre_receipt,
+                &result,
+                &index,
+                &changed,
+            );
+            assert!(error.contains(expected), "{pointer}: {error}");
+        }
     }
 
     #[test]
