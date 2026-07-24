@@ -10,8 +10,9 @@
 ## Purpose
 
 The soak is a separate production certification gate, not a longer unit test. It must expose
-resource leaks, compaction/tail collapse, checkpoint/rebalance errors, stale ownership, and output
-divergence using an oracle and execution environment independent of the implementation under test.
+resource leaks, storage/maintenance tail collapse when applicable, checkpoint/rebalance errors,
+stale ownership, and output divergence using an oracle and execution environment independent of the
+implementation under test.
 
 A backend qualification soak, Criterion benchmark, canary, weekly checkpoint soak, or
 implementer-run integration test cannot satisfy this charter.
@@ -24,6 +25,9 @@ A certification attempt must satisfy all of the following:
   builds LaminarDB;
 - deployment chart, rendered configuration, dependency images, charter, oracle, and fault
   controller each have immutable identities and hashes;
+- every attempt binds one exact `working_state_profile` identity. It records `bounded-memory` or
+  `local-spill`, the approved applicability-contract hash, all resource/restore thresholds and, for
+  local spill, the exact engine/build/mapping identity;
 - the oracle has no `laminar_*` crate/library dependency and uses public source, sink, checkpoint,
   health, and metrics surfaces only;
 - the charter's workload, duration, event count, thresholds, fault schedule, and invalid-run rules
@@ -33,17 +37,20 @@ A certification attempt must satisfy all of the following:
 - every attempt, including failures and invalid runs, has a permanent attempt ID and retained
   evidence. There is no silent retry or retry-until-green.
 
-Changing a relevant binary, chart, runtime configuration, dependency, charter, oracle, or fault
-controller invalidates previous evidence and requires a complete run from a clean deployment.
+Changing a relevant binary, chart, runtime configuration, dependency, working-state profile,
+charter, oracle, or fault controller invalidates previous evidence and requires a complete run from
+a clean deployment.
 
 ## Production-like environment
 
 The frozen charter must identify:
 
 - fixed Linux/kernel/container runtime/Kubernetes versions;
-- dedicated CPU, memory/cgroup, local NVMe/filesystem/mount, FD, and network limits;
+- dedicated CPU, memory/cgroup, FD and network limits plus the exact local NVMe/filesystem/mount
+  limits for a local-spill profile;
 - at least three LaminarDB processes placed across declared failure domains;
-- persistent local working-state volumes which can also be deliberately lost;
+- for local spill, isolated working-state volumes which can also be deliberately lost; bounded-
+  memory attempts must not depend on restart-visible local state;
 - cluster-shared object storage with a run-specific checkpoint prefix;
 - replayable/splittable source and durable multiwriter sink instances with production-like
   replication and durability settings;
@@ -55,8 +62,8 @@ The release Dockerfile toolchain must first match the workspace Rust requirement
 
 ## Scenario matrix
 
-Each scenario is certified independently. A green scenario cannot widen another operator, update
-mode, connector, or delivery guarantee.
+Each `(scenario, working_state_profile)` pair is certified independently. A green pair cannot widen
+another profile, operator, update mode, connector, or delivery guarantee.
 
 | Scenario | Initial intended path | Current status |
 |---|---|---|
@@ -100,9 +107,12 @@ specifies at minimum:
 - hard encoded envelope/artifact/descriptor/payload bytes; checkpoint chain links/delta depth;
   operators and vnodes per transition; rows, canonical key/state bytes, output-buffer bytes;
   global encoded restore bytes; and separate per-task/global restore scratch;
-- maximum RSS/PSS/cgroup memory, LSM cache/memtable/journal/native memory, queue bytes/age, local
-  bytes, disk utilization, FD count, snapshot/iterator count, frozen generations, timer count,
-  checkpoint artifacts, compaction debt, and write amplification;
+- common maximum RSS/PSS/cgroup memory, queue bytes/age, FD count, snapshot/iterator count, frozen
+  generations, timer count and checkpoint artifacts;
+- for bounded memory, hard live/index/timer/join/output/frozen/restore-scratch reservations,
+  allocator/RSS retention, controlled-exhaustion behavior, source replay retention and cold-restore
+  RTO; for local spill, engine cache/memtable/journal/native memory, local bytes, disk utilization,
+  maintenance debt/health and write amplification;
 - accepted steady-state slopes for every retained resource; and
 - exact repetition/fault counts and random seed.
 
@@ -118,7 +128,7 @@ offsets through frozen per-partition high-watermarks and reconciles it to intent
 ledger, including physical retries, is the oracle input:
 
 ```text
-run_id, scenario_id, intent_id, event_id, topic, partition, offset,
+run_id, scenario_id, working_state_profile, intent_id, event_id, topic, partition, offset,
 event_time, logical_key, logical_values, payload_sha256, acknowledgement_outcome
 ```
 
@@ -163,16 +173,19 @@ distinctions, the scenario is not certifiable; timestamps and Laminar logs are n
 
 ## Externally actuated fault schedule
 
-Release bits cannot depend on the test-only checkpoint kill gate. The frozen controller schedule
-includes the applicable subset of:
+Release bits cannot depend on the test-only checkpoint kill gate. Every profile runs the common
+faults, and the frozen controller schedule includes all profile-applicable faults:
 
 - active-owner, follower, and leader hard process death;
 - repeated restart/rejoin and `1 -> 3 -> 2` ownership changes;
 - control/shuffle network partition while source and sink remain reachable;
 - source broker restart and backpressure;
 - object-store latency, timeout, and temporary unavailability;
-- local disk pressure/`ENOSPC`, compaction pressure, and state larger than RAM;
-- local-volume loss followed by portable restore;
+- bounded-memory near-capacity hot-key/timer/join growth, allocator fragmentation/RSS retention,
+  overlapping frozen generations, hard reservation exhaustion with no source-cursor/output advance,
+  repeated process loss, and portable restore plus source replay within RTO;
+- local-spill cold-cache state larger than RAM, disk pressure/`ENOSPC`, corruption, applicable
+  maintenance stalls, and complete local-volume loss followed by portable restore;
 - rolling N/N-1 upgrade and rollback; and
 - faults bracketing state mutation/freeze, timer fire, output enqueue, Kafka producer fencing and
   marker commit, sink flush, durable seal, source-cut publication, and assignment activation; and
@@ -184,8 +197,8 @@ invalid rather than silently reducing coverage.
 
 ## Result classification
 
-`PASS` requires every scenario/oracle/resource/latency/progress/RTO assertion to pass and every
-required artifact to exist.
+`PASS` requires every assertion applicable to that exact `(scenario, working_state_profile)` to pass
+and every required artifact to exist. Evidence from one profile cannot certify another.
 
 The following are product `FAIL`, never invalid-run excuses:
 
@@ -207,7 +220,7 @@ from the attempt history.
 
 ## Required immutable evidence
 
-- attempt/run manifest and complete attempt history;
+- attempt/run manifest with the exact working-state-profile identity and complete attempt history;
 - archive/image/chart/SBOM, charter, oracle, controller, config, and dependency digests;
 - rendered deployment resources and redacted configuration hash;
 - durable producer-intent log, broker-readback reconciliation ledger, and frozen source cuts;
@@ -228,6 +241,8 @@ This charter remains ineligible until all of these are resolved:
 
 - [ ] named workload, operations, soak operator, and independent reviewer;
 - [ ] approved target hardware/deployment and all numerical fields;
+- [ ] approved per-scenario working-state-profile identities, applicability contracts and
+      profile-specific thresholds/faults;
 - [ ] immutable release and standalone-oracle artifact pipelines;
 - [ ] machine-readable charter schema and preflight validator;
 - [ ] stable output operation identity, assignment-generation evidence, and provider-enforced

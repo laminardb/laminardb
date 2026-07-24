@@ -34,13 +34,13 @@ The critical path is:
 Performance, fault injection, compatibility, operational telemetry, and end-of-cycle review run
 through every phase; they are not a final cleanup sprint.
 
-The Cycle 20 [working-state placement review](../reports/state-working-state-options-2026-07-24.md)
-separates implementation sequencing from backend selection. A bounded Phase 1 lifecycle slice may
-start with its required in-memory conformance implementation after the applicable contract gate
-while Phase 0 backend qualification remains open; it cannot complete Phase 1 or admit cluster SQL.
-A broad/variable-state production profile still waits for one qualified local-spill backend. A
-bounded-memory profile, if retained, has a separate hard-limit, restore/RTO and independent-soak
-gate.
+The Cycle 20 [working-state placement analysis](../reports/state-working-state-options-2026-07-24.md)
+separates the capability from a named engine but does not change sequencing authority. Phase 1
+remains blocked by the existing Phase 0 review gate. Any later gate split requires an accepted ADR/
+plan amendment with named scope and owners. The intended broad/variable-state production profile
+still waits for one qualified local-spill backend. A bounded-memory cluster profile receives no
+schedule unless product and operations owners opt into its separate hard-limit, restore/RTO and
+independent-soak matrix.
 
 ## Scope and non-goals
 
@@ -169,9 +169,9 @@ Work:
    define but do not cost or authorize the RocksDB source/binding closure and Fjall scheduler/
    lifecycle closure; redb 4.1.0 remains only a separate native-prescreen hedge with unapproved
    complete-process N/A. Unmodified Fjall 3.1.8 and SurrealKV 0.21.2 do not proceed to adapters.
-   These engine gates apply to the general local-spill profile; they do not block placement-neutral
-   in-memory lifecycle implementation. Run every later-admitted
-   candidate through the same bounded profile: Arrow-batch-sized atomic requests, realistic
+   These engine gates apply to the general local-spill profile. They are not an architectural need
+   of the in-memory reference, but the current Phase 0 gate still blocks Phase 1. Run every later-
+   admitted candidate through the same bounded profile: Arrow-batch-sized atomic requests, realistic
    hot/cold multi-key reads, timer scans, snapshot/export overlap, sorted restore, vnode drop/GC,
    maintenance pressure/write stalls, hard memory/disk/FD limits, `kill -9`, torn/corrupt data,
    `ENOSPC`, and
@@ -224,9 +224,9 @@ Work packages:
   Extract a crate only if dependency direction or a second non-DB consumer requires it.
 - Add canonical logical prefixes and ABI/schema validation. The local-spill implementation also adds
   persisted metadata, process locking and safe cleanup scoped to one resolved pipeline directory.
-- Provide the in-memory semantic/lifecycle implementation first and the later-selected local-spill
-  backend behind the same contract and conformance suite. Neither implementation changes admission
-  by existing; do not retain losing disk qualification adapters.
+- Provide the in-memory semantic/lifecycle implementation first and the Phase-0-selected local-
+  spill backend behind the same contract and conformance suite. Neither implementation changes
+  admission by existing; do not retain losing disk qualification adapters.
 - For local spill, use one worker-local database with a small fixed keyspace/column-family count and
   logical pipeline/operator/table/vnode prefixes. Do not allocate a database or physical tree per
   vnode.
@@ -254,10 +254,13 @@ Work packages:
 
 - Reserve before mutation across Rust/Arrow/operator buffers and, when applicable, engine cache/
   memtables/journal, snapshots/iterators/pinned values, OS page cache, and native memory.
-- Enforce separate memory, local bytes, restore staging, frozen-generation, and compaction-debt
-  limits with one-batch documented slack.
+- Enforce memory, restore-staging and frozen-generation limits for every profile. Local-spill
+  profiles additionally enforce local-byte and maintenance-debt limits. Every limit has at most one
+  documented batch of slack.
 - Define pressure states, bounded backpressure, health transitions, and a typed controlled-fault
-  error. Test disk full and native allocation failure; never rely on the OS OOM killer.
+  error. Every profile tests reservation exhaustion without cursor/output advance or OOM; local-
+  spill profiles additionally test disk full and applicable native allocation failure. Never rely
+  on the OS OOM killer.
 
 ### 1D. Checkpoint bridge
 
@@ -267,7 +270,8 @@ Work packages:
   asynchronously through the existing artifact backend and exact-attempt seal.
 - Build periodic full bases, chain limits, abort/failed-capture rearming, and retained-generation
   backpressure.
-- Prove full local-disk-loss recovery, checksum/corruption rejection, and N/N-1 decoding.
+- Prove complete local working-state loss recovery, checksum/corruption rejection and N/N-1
+  decoding; local-spill profiles additionally prove physical local-disk loss.
 
 ### 1E. Ownership lifecycle
 
@@ -374,7 +378,9 @@ Correctness matrix:
 - Kafka assignment handoff plus at least one admitted durable multiwriter append sink, including
   broker-enforced old-writer fencing, partition fence markers, ambiguous source acknowledgements,
   and crash before/after sink flush and source-position seal.
-- cache-resident and spill-heavy latency/throughput/compaction profiles.
+- every selected profile's cache-resident and near-capacity skew, frozen-generation, allocator/RSS
+  retention and controlled-exhaustion latency/throughput profile; and
+- local-spill-only cold-cache, spill-heavy and maintenance-pressure profiles.
 
 Exit gate:
 
@@ -382,7 +388,7 @@ Exit gate:
   `[LDB-4007]` before mutation;
 - fault/differential suites report zero state divergence;
 - numerical p99/p99.9, checkpoint, resource, and RTO targets pass on the Phase 0 profile;
-- local embedded performance has a reviewed regression result;
+- the exact selected working-state profile has a reviewed performance regression result;
 - changed-group append-snapshot versus full-changelog modes are explicit: the certified append
   scenario passes, while every unsupported retraction/changelog sink combination remains
   fail-closed;
@@ -433,8 +439,9 @@ Tests and exit gates:
 - timer selection, state mutation, timer removal/advance, emission identity, and output bookkeeping
   are one atomic transition; ALO recovery may re-fire an externally visible output but cannot lose
   or internally double-apply it;
-- skewed windows, millions of timers, disk pressure, checkpoint/rebalance with pending timers, and
-  owner change exactly at close time;
+- skewed windows, millions of timers, checkpoint/rebalance with pending timers, and owner change
+  exactly at close time; bounded-memory profiles additionally force near-capacity timer/window
+  reservations and controlled exhaustion, while local-spill profiles force disk pressure;
 - no premature fire, lost fire, unbounded retained closed window, or silent late-data policy;
 - each subphase independently meets the Phase 0 tail/resource/RTO profile and completes its cycle
   review before its admission bit changes.
@@ -480,7 +487,9 @@ Tests and exit gates:
 - differential SQL oracle over match cardinality, nulls, duplicates, equal timestamps, interval
   boundaries, out-of-order data, watermarks, and changelog weights;
 - two-input barrier/replay permutations, one-side pause/failure, network reorder/loss, owner change,
-  disk pressure, and crash around unmatched output/eviction;
+  and crash around unmatched output/eviction; bounded-memory profiles additionally force near-
+  capacity join reservations and controlled exhaustion, while local-spill profiles force disk
+  pressure;
 - hot join key and asymmetric-rate profiles with bounded probe/result batches and backpressure;
 - finite state follows from declared interval/watermark/retention semantics—an internal TTL is never
   the proof;
@@ -519,25 +528,29 @@ Exit gate:
 
 This phase does not add operator semantics. It closes cross-cutting evidence:
 
-1. Run the complete PGVal-style matrix over data rate, topology, partitions, skew, checkpoints,
-   process death, network disruption, object-store stalls, disk full/corruption, compaction stalls,
-   and rolling upgrade/rollback.
-2. Run the Phase 0-chartered independent black-box soak against the unchanged release-candidate
+1. Run the common PGVal-style matrix over data rate, topology, partitions, skew, checkpoints,
+   process death, network disruption, object-store stalls and rolling upgrade/rollback. A selected
+   bounded-memory profile additionally forces near-capacity hot-key/timer/join state, allocator/RSS
+   fragmentation, frozen-generation pressure, controlled exhaustion with no cursor/output advance,
+   repeated process loss and remote restore/source-replay RTO. A local-spill profile additionally
+   forces cold cache, disk full/corruption, maintenance stalls and complete local-disk loss.
+2. Run the Phase 0-chartered independent black-box soak for each exact scenario and
+   working-state-profile identity against the unchanged release-candidate
    binary in a production-like multi-process environment. Use real certified source, object store,
    and sink; an external oracle must check progress, output/state correctness, allowed ALO
    duplicates, recovery, and ownership fencing for every scenario proposed for GA. Track leak
    slopes for Rust heap and, when applicable, engine cache/memtables/journal and native allocation,
-   file descriptors,
-   iterators/snapshots, local bytes, frozen generations, timers, and checkpoint artifacts. Archive
+   file descriptors, iterators/snapshots, frozen generations, timers and checkpoint artifacts plus
+   local bytes when applicable. Archive
    raw evidence and obtain independent reviewer sign-off. The backend spike, ordinary integration
    suite, or canary cannot satisfy this gate.
-3. Publish reproducible p50/p95/p99/p99.9 and RTO results for cache-resident, spill-heavy, skewed,
-   checkpointing, and rebalancing workloads. A skipped external test is reported as missing
-   evidence, never a pass.
-4. Exercise operational alerts, capacity exhaustion, local disk replacement, corrupt checkpoint,
-   failed upgrade, and admission rollback runbooks.
-5. Audit security of local state directories, credentials, artifact encryption/integrity, log/error
-   redaction, and tenant/pipeline quota isolation.
+3. Publish reproducible p50/p95/p99/p99.9 and RTO results for cache-resident, near-capacity, skewed,
+   checkpointing and rebalancing workloads plus spill-heavy results when applicable. A skipped
+   profile-applicable external test is reported as missing evidence, never a pass.
+4. Exercise operational alerts, capacity exhaustion, corrupt checkpoint, failed upgrade and
+   admission rollback runbooks plus local-disk replacement for local-spill profiles.
+5. Audit credentials, artifact encryption/integrity, log/error redaction and tenant/pipeline quota
+   isolation plus local-state-directory security when applicable.
 6. Remove experimental flags only per operator matrix, with staged canary percentages and automatic
    rollback thresholds.
 
