@@ -50,7 +50,6 @@ impl Display for RedbPrescreenAuthorization {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RedbPrescreenContentSummary {
     pub payload_id: String,
-    pub run_class: String,
     pub authorization: RedbPrescreenAuthorization,
 }
 
@@ -311,7 +310,6 @@ pub fn validate_redb_prescreen_pre_run_content(
 
     Ok(RedbPrescreenContentSummary {
         payload_id: text(&payload, "/payload_id").to_owned(),
-        run_class: text(&payload, "/run_class").to_owned(),
         authorization: RedbPrescreenAuthorization::Unverified,
     })
 }
@@ -930,6 +928,14 @@ mod tests {
         (policy_bytes, payload_bytes, receipt_bytes)
     }
 
+    fn invalid_payload_error(policy_bytes: &[u8], payload: &Value) -> String {
+        let payload_bytes = json_bytes(payload);
+        let receipt_bytes = json_bytes(&receipt(policy_bytes, &payload_bytes));
+        validate_redb_prescreen_pre_run_content(policy_bytes, &payload_bytes, &receipt_bytes)
+            .unwrap_err()
+            .to_string()
+    }
+
     #[test]
     fn successor_schemas_are_valid_draft_2020_12() {
         for source in [POLICY_SCHEMA, PAYLOAD_SCHEMA, RECEIPT_SCHEMA] {
@@ -988,7 +994,6 @@ mod tests {
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             ),
             ("/reviews/1/reviewed_at_utc", "2026-07-24T10:03:00Z"),
-            ("/stage", "post_run"),
         ] {
             let mut changed = base.clone();
             *changed.pointer_mut(mutation.0).unwrap() = mutation.1.into();
@@ -999,6 +1004,26 @@ mod tests {
             )
             .is_err());
         }
+
+        let mut post_run = base;
+        post_run["stage"] = "post_run".into();
+        post_run["reviews"][0]["decision_literal"] = "ACCEPT_REDB_PRESCREEN_RESULT_V1".into();
+        post_run["reviews"][1]["decision_literal"] = "ACCEPT_REDB_PRESCREEN_RESULT_V1".into();
+        post_run["retained_evidence"] = json!({
+            "kind": "state-backend-redb-prescreen-retained-evidence-root/v1",
+            "artifact_index": {
+                "role": "redb-prescreen-artifact-index",
+                "locator": "result/artifact-index.json",
+                "byte_length": 1,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "media_type": "application/json"
+            }
+        });
+        let error =
+            validate_redb_prescreen_pre_run_content(&policy, &payload, &json_bytes(&post_run))
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("accepts only a pre_run receipt"));
     }
 
     #[test]
@@ -1006,19 +1031,18 @@ mod tests {
         let (policy, payload, receipt) = valid_bytes();
         let mut reordered: Value = serde_json::from_slice(&payload).unwrap();
         reordered["artifacts"].as_array_mut().unwrap().swap(0, 1);
-        assert!(validate_redb_prescreen_pre_run_content(
-            &policy,
-            &json_bytes(&reordered),
-            &receipt
-        )
-        .is_err());
+        let error = invalid_payload_error(&policy, &reordered);
+        assert!(error.contains("payload artifact 0 role must be `redb-prescreen-protocol`"));
 
         let mut repinned: Value = serde_json::from_slice(&payload).unwrap();
         repinned["artifacts"][14]["sha256"] = "a".repeat(64).into();
-        assert!(
-            validate_redb_prescreen_pre_run_content(&policy, &json_bytes(&repinned), &receipt)
-                .is_err()
-        );
+        let error = invalid_payload_error(&policy, &repinned);
+        assert!(error.contains("does not bind the exact 4.1.0 archive"));
+
+        let mut wrong_length: Value = serde_json::from_slice(&payload).unwrap();
+        wrong_length["artifacts"][14]["byte_length"] = (REDB_CRATE_BYTES + 1).into();
+        let error = invalid_payload_error(&policy, &wrong_length);
+        assert!(error.contains("does not bind the exact 4.1.0 archive"));
 
         let oversized = vec![b' '; MAX_REDB_REVIEW_POLICY_BYTES + 1];
         assert!(validate_redb_prescreen_pre_run_content(&oversized, &payload, &receipt).is_err());
@@ -1026,23 +1050,56 @@ mod tests {
 
     #[test]
     fn every_control_json_cap_is_inclusive_and_cap_plus_one_is_rejected() {
-        for (label, maximum, schema) in [
-            ("policy", MAX_REDB_REVIEW_POLICY_BYTES, POLICY_SCHEMA),
-            ("payload", MAX_REDB_APPROVAL_PAYLOAD_BYTES, PAYLOAD_SCHEMA),
-            ("receipt", MAX_REDB_REVIEW_RECEIPT_BYTES, RECEIPT_SCHEMA),
-        ] {
-            let at_cap = vec![b' '; maximum];
-            let error = decode_contract(&at_cap, maximum, label, schema)
-                .unwrap_err()
-                .to_string();
-            assert!(!error.contains("maximum is"));
+        let pad = |mut bytes: Vec<u8>, length: usize| {
+            assert!(bytes.len() < length);
+            bytes.resize(length, b' ');
+            bytes
+        };
 
-            let above_cap = vec![b' '; maximum + 1];
-            let error = decode_contract(&above_cap, maximum, label, schema)
+        let policy_at_cap = pad(json_bytes(&policy()), MAX_REDB_REVIEW_POLICY_BYTES);
+        let payload_bytes = json_bytes(&payload(&policy_at_cap));
+        let receipt_bytes = json_bytes(&receipt(&policy_at_cap, &payload_bytes));
+        validate_redb_prescreen_pre_run_content(&policy_at_cap, &payload_bytes, &receipt_bytes)
+            .unwrap();
+        let mut policy_above_cap = policy_at_cap;
+        policy_above_cap.push(b' ');
+        let error = validate_redb_prescreen_pre_run_content(
+            &policy_above_cap,
+            &payload_bytes,
+            &receipt_bytes,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(&format!("maximum is {MAX_REDB_REVIEW_POLICY_BYTES}")));
+
+        let policy = json_bytes(&policy());
+        let payload_at_cap = pad(
+            json_bytes(&payload(&policy)),
+            MAX_REDB_APPROVAL_PAYLOAD_BYTES,
+        );
+        let receipt_bytes = json_bytes(&receipt(&policy, &payload_at_cap));
+        validate_redb_prescreen_pre_run_content(&policy, &payload_at_cap, &receipt_bytes).unwrap();
+        let mut payload_above_cap = payload_at_cap;
+        payload_above_cap.push(b' ');
+        let error =
+            validate_redb_prescreen_pre_run_content(&policy, &payload_above_cap, &receipt_bytes)
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains(&format!("maximum is {maximum}")));
-        }
+        assert!(error.contains(&format!("maximum is {MAX_REDB_APPROVAL_PAYLOAD_BYTES}")));
+
+        let payload_bytes = json_bytes(&payload(&policy));
+        let receipt_at_cap = pad(
+            json_bytes(&receipt(&policy, &payload_bytes)),
+            MAX_REDB_REVIEW_RECEIPT_BYTES,
+        );
+        validate_redb_prescreen_pre_run_content(&policy, &payload_bytes, &receipt_at_cap).unwrap();
+        let mut receipt_above_cap = receipt_at_cap;
+        receipt_above_cap.push(b' ');
+        let error =
+            validate_redb_prescreen_pre_run_content(&policy, &payload_bytes, &receipt_above_cap)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains(&format!("maximum is {MAX_REDB_REVIEW_RECEIPT_BYTES}")));
     }
 
     #[test]
@@ -1062,12 +1119,19 @@ mod tests {
         let summary =
             validate_redb_prescreen_pre_run_content(&policy_bytes, &payload_bytes, &receipt_bytes)
                 .unwrap();
-        assert_eq!(summary.run_class, "native_prescreen_decision");
         assert_eq!(
             summary.authorization,
             RedbPrescreenAuthorization::Unverified
         );
 
+        native["prior_smoke_result"]["byte_length"] = (MAX_NON_FIXTURE_BYTES + 1).into();
+        let error = invalid_payload_error(&policy_bytes, &native);
+        assert!(error.contains(&format!(
+            "prior smoke descriptor declares {} bytes; maximum is {MAX_NON_FIXTURE_BYTES}",
+            MAX_NON_FIXTURE_BYTES + 1
+        )));
+
+        native["prior_smoke_result"]["byte_length"] = 1024.into();
         native["prior_smoke_result"]["locator"] = "evidence/other.json".into();
         let payload_bytes = json_bytes(&native);
         let receipt_bytes = json_bytes(&receipt(&policy_bytes, &payload_bytes));
@@ -1095,14 +1159,13 @@ mod tests {
             ] {
                 let mut changed = payload(&policy_bytes);
                 changed["artifacts"][index][field] = replacement.into();
-                let payload_bytes = json_bytes(&changed);
-                let receipt_bytes = json_bytes(&receipt(&policy_bytes, &payload_bytes));
-                assert!(validate_redb_prescreen_pre_run_content(
-                    &policy_bytes,
-                    &payload_bytes,
-                    &receipt_bytes
-                )
-                .is_err());
+                let error = invalid_payload_error(&policy_bytes, &changed);
+                let semantic = if field == "media_type" {
+                    "media type"
+                } else {
+                    field
+                };
+                assert!(error.contains(&format!("payload artifact {index} {semantic} must be")));
             }
         }
     }
@@ -1118,14 +1181,8 @@ mod tests {
         ] {
             let mut changed = payload(&policy_bytes);
             changed["artifacts"][index]["byte_length"] = above_cap.into();
-            let payload_bytes = json_bytes(&changed);
-            let receipt_bytes = json_bytes(&receipt(&policy_bytes, &payload_bytes));
-            assert!(validate_redb_prescreen_pre_run_content(
-                &policy_bytes,
-                &payload_bytes,
-                &receipt_bytes
-            )
-            .is_err());
+            let error = invalid_payload_error(&policy_bytes, &changed);
+            assert!(error.contains(&format!("payload artifact {index} declares")));
         }
 
         let mut aggregate = payload(&policy_bytes);

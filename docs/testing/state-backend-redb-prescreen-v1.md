@@ -416,8 +416,11 @@ not create that workflow or authorize its execution.
 
 The repository's current [branch-protection setup](../../.github/setup-branch-protection.sh)
 requires one CODEOWNERS approval. That is useful merge protection but cannot prove this protocol's
-two role-separated approvals. A protected environment is an execution/secrets boundary, not a
-two-role proof: before any future dispatch, a default-branch trusted dispatcher must export two
+two role-separated approvals.
+[GitHub's environment contract](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments)
+also advances after any one listed required reviewer approves, so a protected environment is an
+execution/secrets boundary, not a two-role proof. Before any future dispatch, a default-branch
+trusted dispatcher must export two
 current review events over the exact head, resolve live membership in the two configured groups,
 and reject shared principals, stale/dismissed/superseded reviews and self-review. If the provider or
 repository configuration cannot expose those facts, authorization remains unavailable.
