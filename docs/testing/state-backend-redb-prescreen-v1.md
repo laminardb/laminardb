@@ -52,6 +52,15 @@ approval. The current instruction does not authorize that construction or any ca
 The only executable redb code remains the separate `construction-only-no-decision` lane. No formal
 disposition can be produced from this document, the old schemas, their fixtures, or that lane.
 
+The three physical bases cannot be created by the current instruction. A later explicit
+`fixture-construction-no-decision` authorization must first approve the as-built generator, recipe,
+source/build and target scratch location. That bounded stage may open redb only to create the three
+fixed fixture files and their logical/file digests; it emits no smoke/native disposition and every
+qualification/selection/production field remains false. Independent verification then supplies the
+fixture descriptors for the two-owner pre-run payload. Fixture generation is therefore outside the
+five-hour decision campaign without being an unapproved hidden pre-run. The Cycle 16 construction
+lane does not inherit this authority.
+
 ### Fixed packet root and locators
 
 Every formal descriptor is `(role, locator, byte_length, sha256, media_type)`. `locator` is a UTF-8,
@@ -76,15 +85,32 @@ allocation, and rejects aliases or extra decision-bearing files.
 | clock/cgroup/cache-reset policy | `contract/clock-isolation-policy.json` | protocol review |
 | trigger/adaptive-delay policy | `contract/trigger-delay-policy.json` | protocol review |
 | deadline/resource/artifact bounds | `contract/bounds.json` | protocol review |
+| exact redb 4.1.0 crate archive | `subject/redb-4.1.0.crate` | fixture construction |
 | complete formal source | `build/source.tar.zst` | pre-run approval |
 | Cargo lockfile | `build/Cargo.lock` | pre-run approval |
 | SBOM | `build/sbom.spdx.json` | pre-run approval |
 | reproducible build receipt | `build/build-manifest.json` | pre-run approval |
+| fixture generator | `build/redb-prescreen-fixture-generator` | fixture construction |
 | supervisor | `build/redb-prescreen-supervisor` | pre-run approval |
 | candidate child | `build/redb-prescreen-child` | pre-run approval |
 | crash actuator | `build/redb-prescreen-actuator` | pre-run approval |
 | independent oracle | `build/redb-prescreen-oracle` | pre-run approval |
 | external verifier/classifier | `build/redb-prescreen-verifier` | pre-run approval |
+| 256-MiB physical base | `fixtures/base-256m.redb` | pre-run approval |
+| 1-GiB physical base | `fixtures/base-1g.redb` | pre-run approval |
+| 4-GiB physical base | `fixtures/base-4g.redb` | pre-run approval |
+| approval-time owner registry snapshot | `trust/approval/registry.json` | owner approval |
+| approval-time registry root envelope | `trust/approval/registry.root.json` | owner approval |
+| approval-time revocation snapshot | `trust/approval/revocations.json` | owner approval |
+| approval-time revocation root envelope | `trust/approval/revocations.root.json` | owner approval |
+| dispatch-time owner registry snapshot | `trust/dispatch/registry.json` | native dispatch |
+| dispatch-time registry root envelope | `trust/dispatch/registry.root.json` | native dispatch |
+| dispatch-time revocation snapshot | `trust/dispatch/revocations.json` | native dispatch |
+| dispatch-time revocation root envelope | `trust/dispatch/revocations.root.json` | native dispatch |
+| result-review owner registry snapshot | `trust/result-review/registry.json` | result review |
+| result-review registry root envelope | `trust/result-review/registry.root.json` | result review |
+| result-review revocation snapshot | `trust/result-review/revocations.json` | result review |
+| result-review revocation root envelope | `trust/result-review/revocations.root.json` | result review |
 | approval payload | `approval/payload.json` | dispatch |
 | workload-owner approval envelope | `approval/workload-owner.json` | dispatch |
 | operations-owner approval envelope | `approval/operations-owner.json` | dispatch |
@@ -98,8 +124,15 @@ allocation, and rejects aliases or extra decision-bearing files.
 | workload-owner result envelope | `result/workload-owner.json` | final disposition |
 | operations-owner result envelope | `result/operations-owner.json` | final disposition |
 
-The approval/result payloads bind the redb crate archive descriptor as external subject bytes in
-addition to every applicable row above. A prior smoke result is accepted only when the verifier
+The approval payload binds every pre-run contract, subject, build, physical-fixture and target row,
+plus only the four immutable approval-time trust rows. It excludes `approval/payload.json`, both
+approval envelopes, both later trust-stage sets, and every result row. The raw run manifest binds the
+four immutable dispatch-time trust rows actually verified before child launch. The result payload
+binds the complete verified approval packet, the dispatch trust rows and raw-run-manifest binding,
+the four immutable result-review trust rows, and every applicable run/result evidence row. It
+excludes `result/payload.json` and both result envelopes. Neither payload binds itself or a signature
+over itself. The redb archive is the fixed packet row `subject/redb-4.1.0.crate`, not an unresolved
+external descriptor. A prior smoke result is accepted only when the verifier
 proves that it is a non-synthetic `SMOKE_PASS` over the identical subject, source/build, schemas,
 goldens and Docker-smoke plan; an opaque or synthetic descriptor never satisfies that prerequisite.
 
@@ -141,16 +174,41 @@ protocol because it does not satisfy the persistence question.
 Logical bytes always mean key bytes plus value bytes; redb page/file overhead is physical. The clean
 bases contain exactly 262,144 entries for 256 MiB, 1,048,576 entries for 1 GiB, and 4,194,304
 entries for 4 GiB, divided equally across the four tables. Four same-ordinal table entries form one
-logical entity. Fixture creation uses a fresh database and bounded 4-MiB transactions. For each
-table/vnode with `P = entries_per_table / 8`, the initial live set is vnode-local slots `1..P-1` plus
-filler slot `P`; slot 0 is deliberately absent. Initial values use generation/seed zero, transaction
-ordinal equal to the slot, entity index zero, and put code. In ascending vnode/slot/table order,
-creation then deletes and reinserts every non-sentinel entity whose slot is `8 mod 16` and overwrites
-every entity whose slot is `9 mod 16`; generation 1 is used for reinsert and generation 2 for
-overwrite. This restores the exact entry count while creating deterministic allocated/free-page
-churn. It closes normally, reopens read-only, streams a canonical table/key/value digest, and records
-the exact file digest. The approved payload binds the generator binary and both digests; a copied
-fixture must match the file digest before opening and the canonical digest after scanning.
+logical entity. Fixture creation uses a fresh exclusive create-new regular file. The generator calls
+`Database::builder()`, then exactly one Builder setter, `set_cache_size(8_589_934_592)`, then
+`create_file`; it uses no other Builder setter. It is built with `redb =4.1.0`,
+`default-features=false`, and the exact bound archive, source, lockfile, SBOM, toolchain, target,
+profile, and flags. The generator configuration and build receipt bind that sequence and reject any
+environment or feature drift.
+
+For each table/vnode with `P = entries_per_table / 8`, the initial live set is every vnode-local slot
+from 1 through `P-1`, inclusive, plus filler slot `P`; slot 0 is deliberately absent. Initial values
+use generation/seed zero, transaction ordinal `q = v*P+s`, entity index zero, and put code. Fixture
+mutation order is four non-interleaved phases:
+
+1. put the complete initial set in ascending vnode, slot, then table order;
+2. delete every entity whose slot is 8 modulo 16 in the inclusive vnode-local range 3 through `P`,
+   in that same order;
+3. reinsert that exact deleted set in that same order; and
+4. overwrite every entity whose slot is 9 modulo 16 in the same inclusive range and order.
+
+Each phase is partitioned independently into consecutive transactions of exactly 4,096 mutations
+(4 MiB of charged logical request bytes), except its one final transaction when fewer remain; a
+four-table entity is never split because the boundary is divisible by four. Each transaction is
+opened, configured in this exact order with `set_durability(Immediate)`,
+`set_two_phase_commit(false)`, and `set_quick_repair(false)`, populated, committed, and dropped before
+the next begins. There is no empty transaction or cross-phase coalescing. All churn intents use seed
+zero and entity index zero. Phase-2 delete intents and phase-3 reinsert values use generation 1 and
+`q = (1_u64 << 56) | (v*P+s)`, differing only by operation code delete versus put. Phase-4 overwrite
+values use generation 2, put code, and `q = (2_u64 << 56) | (v*P+s)`. Deletes pass only the key to
+redb, while the fully generated delete-intent value is retained by the redb-free oracle.
+
+This restores the exact entry count while creating deterministic allocated/free-page churn. After
+the final commit the generator drops the database, records a pre-read file digest, reopens with the
+same builder settings read-only, streams the canonical table/key/value digest, drops the read-only
+database, and records a post-read file digest. The two file digests MUST be identical. The approved
+payload binds the generator binary, canonical digest, and that single physical digest; a copied
+fixture must match the physical digest before opening and the canonical digest after scanning.
 
 The canonical scan digest is SHA-256 over `"LDB-REDB-SCAN-V1\0"`, followed by each table in the
 fixed order `state`, `timer`, `join_left`, `join_right`: `u8(table_id) || u64_be(row_count)` and then
@@ -158,8 +216,9 @@ each entry in redb byte-key order as `u32_be(key_len) || key || u32_be(value_len
 value lengths must be 32 and 992. The read-only scan must leave the database file digest unchanged;
 otherwise fixture verification fails.
 
-Each base divides every table evenly across fixed vnodes `0..7`; all three table-entry counts are
-divisible by eight. For table ID `t` in `0..4`, vnode `v`, vnode-local logical slot `s`, generation
+Each base divides every table evenly across fixed vnodes 0 through 7, inclusive; all three
+table-entry counts are divisible by eight. For table ID `t` in `{0,1,2,3}`, vnode `v`, vnode-local
+logical slot `s`, generation
 `g`, seed `z`, and transaction ordinal `q`, the 32-byte key is:
 
 ```text
@@ -176,17 +235,36 @@ verifier reimplements this recipe without redb. Integer overflow, duplicate key 
 unexpected pre-state, or recipe disagreement invalidates the attempt.
 
 Every mutation count is divisible by four. Entity index `e` emits the four table mutations in table
-order. Slot selection is the approved odd-multiplier permutation
-`s = (q * 65_537 + e * 17 + z) mod (entity_count_per_table / 8)`. Generation is the checked low 32
-bits of `q + 1`. The entity operation is delete exactly when `(q + e + z) mod 16 == 0`; otherwise it
-is a put of the generated value. For every crash target transaction, entity 0 is the cross-table
-insert of absent slot 0, entity 1 is the cross-table overwrite of present slot 1, and entity 2 is the
-cross-table delete of present slot 2; remaining entities use the formula. The filler keeps the pre-
-and post-transaction live entry count equal. The harness records complete pre-state and expected
-post-state digests before commit entry.
+order. Slot selection is evaluated without intermediate `u64` overflow: let
+`P = entity_count_per_table / 8`, compute
+`s128 = (u128(q)*65_537 + u128(e)*17 + u128(z)) mod u128(P)`, then losslessly convert `s128` to `u64`
+and require `s < P`. Generation is the checked low 32 bits of `q + 1`. The entity operation is
+delete exactly when the equivalent unsigned-128-bit sum `(u128(q)+u128(e)+u128(z)) mod 16` is zero;
+otherwise it is a put of the generated value. In steady/HOLD attempts, `q = (lane_id << 56) |
+lane_release_ordinal`; each lane ordinal starts at zero before warmup and continues through measured
+traffic. Lane IDs are fixed by the schedule and no `q` is reused within an attempt.
 
-The fixed steady-state vnode assignment is `W0=1`, `W1={2,3}`, `W2={hot:4,victim:5}`, and
-`HOLD={holder:6,victim:7}`. Lanes never share a key. In every `HOLD` repetition both transactions use
+Small crash target transactions contain 128 mutations/32 entities on vnode 0; large-recovery targets
+contain 4,096 mutations/1,024 entities on vnode 0. In both, entity 0 inserts absent slot 0, entity 1
+overwrites present slot 1, entity 2 deletes present slot 2, and entity indices 3 through 31 (small)
+or 3 through 1,023 (large) overwrite the present slot equal to their entity index. Each entity emits
+tables 0 through 3 in order and carries that exact entity index. Prime entities 0 through 31
+overwrite slots `P/2` through `P/2+31`, respectively, in table order. Prime uses `q=0`; target uses
+`q=1`; both use the trial seed and checked generation `q+1`. The delete-intent header for target
+entity 2 therefore uses generation 2, the trial seed, `q=1`, entity index 2, and delete code; only its
+key reaches redb. Prime and target are separate transactions and each uses the selected mode's exact
+setter sequence once before any table opens. The sentinel insert/delete pair keeps pre/post live
+entry count equal. The independent oracle precomputes the affected-record intent digest and
+expected old/new full-scan digests by streaming the frozen fixture recipe plus prime/target mutations;
+the measured child never scans or hashes the whole database before commit.
+
+Logical request bytes charge 1,024 bytes per mutation for offered-load and sample-cap arithmetic,
+including a delete's 992-byte expected-value/intent material even though only its 32-byte key is
+passed to redb. Actual engine/device bytes remain separately measured diagnostics.
+
+The fixed steady-state vnode/lane-ID assignment is `W0=1`, `W1={2,3}`,
+`W2={hot:4,victim:5}`, and `HOLD={holder:6,victim:7}`. Lanes never share a key. In every `HOLD`
+repetition both transactions use
 the repetition's `I1`, `I2`, or `QR` setter mode; after the controlled hold, both execute one
 128-mutation transaction before commit. This freezes the previously ambiguous HOLD durability mode.
 
@@ -201,8 +279,9 @@ Small crash slots are ordered by seed, then mode index `(m+i) mod 3` for `m=0..2
 `1 + ((k+2*i) mod 6)` for `k=0..5`; IDs are `atomic/s<seed>/<mode>/t<trigger>`. Six reserved
 adaptive slots have IDs
 `atomic-extra/<mode>/n<0..1>` and may be used only to obtain the required confirmed in-commit count.
-Their delay is chosen by the approved bounded rule from prior marker timing; seed, transaction bytes,
-mode and every other input remain unchanged. Unused reserved IDs are recorded as unused. Large
+Extra 0 has parent `atomic/s2026072301/<mode>/t2`, seed `2026072301`, and zero delay; extra 1 has
+parent `atomic/s2026072302/<mode>/t3`, seed `2026072302`, and 50-microsecond delay. Transaction bytes,
+mode and every other parent input remain unchanged. Unused reserved IDs are recorded as unused. Large
 recovery slots are ordered by seed and the same rotated mode order with IDs
 `recovery/s<seed>/<mode>`; there is no adaptive large-trial retry, and a missed confirmed in-commit
 kill is `DEFER`. The machine-readable schedule expands these formulas into all 99 baseline slot IDs
@@ -217,8 +296,9 @@ bytes. The unsigned payload contains all decision-bearing fields and descriptors
 owner's role, principal ID, approved key ID, decision and approval timestamp. It contains no
 signature or envelope descriptor, so the packet is non-circular.
 
-Each role envelope contains only its role, principal/key IDs, payload byte length and SHA-256,
-signature time, and a 64-byte Ed25519 signature. The signed message is exactly:
+Each role envelope contains only its role, principal/key IDs, payload byte length and SHA-256, and a
+64-byte Ed25519 signature. Approval time is inside the signed payload; there is no unauthenticated
+envelope timestamp. The signed message is exactly:
 
 ```text
 ASCII("LAMINARDB\0REDB-PRESCREEN\0APPROVAL\0V1\0")
@@ -228,17 +308,45 @@ ASCII("LAMINARDB\0REDB-PRESCREEN\0APPROVAL\0V1\0")
 
 Result review uses the same construction with domain
 `LAMINARDB\0REDB-PRESCREEN\0RESULT\0V1\0`. The roles must be exactly `workload_owner` and
-`operations_owner`; their principal and key IDs must be distinct and must match the payload. No JSON
-re-serialization, field exclusion, zeroing convention or signature-over-self is permitted.
+`operations_owner`; their principal and key IDs must be distinct, resolve to distinct raw public
+keys, and match the payload. The result payload contains both post-run roles, principal/key IDs,
+decisions and review timestamps before either signature is made. No JSON re-serialization, field
+exclusion, zeroing convention or signature-over-self is permitted.
 
-Trust is not nominated by the payload it authenticates. The verifier is dispatched with a
-separately protected, root-signed registry snapshot and current revocation snapshot. The registry
-maps principal, role and key ID to an Ed25519 public key and validity interval. Both snapshots have
-independent content hashes and root signatures in the protected dispatch policy, and the verifier
-requires their validity windows to cover approval time and dispatch/review time. A missing, expired,
-unknown, role-mismatched, reused, or revoked key fails closed. Revocation checked after approval also
-blocks dispatch; it does not silently rewrite retained history. Test keys and synthetic envelopes
-are permanently excluded from the production registry.
+Trust is not nominated by the payload it authenticates. The formal verifier source and build receipt
+pin one 32-byte Ed25519 offline root public key and its SHA-256; changing that root requires a new
+verifier build, two-owner pre-run payload and packet lineage. The root never appears as an owner key.
+Each of the approval, dispatch and result-review stages receives its own immutable registry payload
+plus root envelope and revocation payload plus root envelope at the distinct fixed locators above.
+Root envelopes sign the same length/hash construction using domains
+`LAMINARDB\0REDB-PRESCREEN\0TRUST-REGISTRY\0V1\0` and
+`LAMINARDB\0REDB-PRESCREEN\0REVOCATIONS\0V1\0` respectively.
+
+The strict registry payload contains the exact stage (`approval`, `dispatch`, or `result_review`),
+packet lineage ID, unique snapshot ID, issued/expires UTC timestamps and sorted unique
+`(principal, role, key_id, 32-byte Ed25519 public key, not_before, not_after, status)` entries. The
+strict revocation payload contains the same stage and packet lineage ID, a unique snapshot ID,
+issued/expires timestamps and sorted unique
+`(key_id, effective_at, reason_code)` entries. Both reject unknown fields and duplicate principals/
+keys; key ID is SHA-256 of the raw public key. Snapshots must be root-valid, issued no later than
+the stage action and unexpired through it. The approval pair is frozen before the approval payload
+and validates both approval keys at their signed payload timestamps. It never changes afterward.
+The dispatch pair is created independently, its revocation snapshot is at most 24 hours old at the
+recorded dispatch instant, and it must confirm that both approval keys remain authorized and
+unrevoked before child launch. The result-review pair is created independently before result-payload
+signing, its revocation snapshot is at most 24 hours old at both signed review timestamps, and it
+must authorize both result-owner keys and confirm that every approval key remains unrevoked through
+review. A stage file cannot be refreshed in place, copied to another stage, or inferred from another
+path; a refresh has a new snapshot ID and exact bytes at that stage's locator. The dispatch files are
+bound into the raw run manifest, and both later-stage sets are bound into the result payload as
+specified above.
+
+A revocation effective at or before the relevant signature invalidates that signature; a revocation
+effective at or before dispatch or review blocks that action even if approval was earlier. Missing,
+expired, future-issued, wrong-stage, wrong-lineage, unknown, role-mismatched, reused or revoked keys
+fail closed. Test keys and synthetic envelopes are permanently excluded. Root rotation is never
+accepted in-band: it needs a newly approved verifier lineage, while old packets retain their
+original root/build and three immutable trust-stage sets for historical verification.
 
 The external verifier first validates schemas and exact bytes/locators, then trust and both
 signatures, then semantic equality/cross-artifact invariants, before it may invoke any executable.
@@ -247,8 +355,9 @@ payload and two new envelopes. The separately user-approved `construction-only-n
 does not consume this packet, cannot emit a prescreen disposition, and hard-codes every evidence-
 eligibility field false.
 
-The formal payload binds all fixed packet rows above, the toolchain/target/flags, complete fixture
-and seed/order schedule, target/preflight/noise rules, clock/cgroup/cache-reset procedures, trigger
+The applicable approval or result payload binds the fixed packet rows assigned to it above, the
+toolchain/target/flags, complete fixture and seed/order schedule, target/preflight/noise rules,
+clock/cgroup/cache-reset procedures, trigger
 and bounded adaptive-delay rule, every deadline/resource/artifact cap, and all-false qualification/
 selection/production/admission fields. Every root uses the exact notice `NOT QUALIFICATION EVIDENCE`;
 bounded binary frames use their versioned magic and are covered by a noticed manifest rather than
@@ -270,13 +379,13 @@ NVMe, missing project quota, or missing device-write attribution cannot produce 
 
 Supervisor and child use `clock_gettime(CLOCK_MONOTONIC_RAW)` on the same host and record the Linux
 boot ID, clock resolution, start/end raw values and matching UTC audit timestamps. UTC never enters a
-duration. Cross-process startup performs 10,000 shared-memory request/ack exchanges; maximum
-half-round-trip uncertainty must be at most 25 microseconds and every marker sequence must be
-monotonic. Failure invalidates the target before redb is opened.
+duration. This is one host-wide clock domain; the protocol does not mislabel IPC/scheduling latency
+as cross-clock uncertainty. Shared-memory marker sequence monotonicity is still a preflight gate.
 
-For every transaction the supervisor records scheduled release `S`, queue enqueue `E`, lane dispatch
-`D`, timestamp immediately before calling `begin_write` `B`, writer acquired `A`, commit entry `C`,
-candidate return `R`, and terminal result-ring observation `T`. Checked integer formulas are:
+For every steady/HOLD transaction the supervisor records scheduled release `S`, queue enqueue `E`,
+lane dispatch `D`, timestamp immediately before calling `begin_write` `B`, writer acquired `A`,
+commit entry `C`, optional candidate return `R`, and terminal result-ring observation `T`. Checked
+integer formulas for a returned transaction are:
 
 ```text
 scheduler_lateness = max(0, E - S)
@@ -286,9 +395,13 @@ candidate_service   = R - B
 end_to_end          = T - S
 ```
 
-Every timestamp must satisfy `S <= E <= D <= B <= A <= C <= R <= T`; a missing, reversed or
-overflowing timestamp invalidates the attempt. Oracle, hashing and resource sampling run outside
-`B..R`; their time is never subtracted from end-to-end latency. All event/result rings are
+Every returned transaction must satisfy `S <= E <= D <= B <= A <= C <= R <= T`. A planned
+candidate-timeout record has a closed prefix through its last reached stage, no `R`, and supervisor
+terminal time `T`; prefix fields remain ordered, service/end-to-end are right-censored at the
+candidate liveness cutoff, and the record is a candidate soft failure rather than a passing latency
+sample. Any other missing, reversed or overflowing timestamp invalidates the attempt. Crash-matrix
+targets use the intent/marker/signal/exit frame below, not this steady/HOLD shape. Oracle, hashing and
+resource sampling run outside `B..R`; their time is never subtracted from end-to-end latency. All event/result rings are
 preallocated for the plan's exact population plus 10%, use monotonically increasing sequence
 numbers, and may not overwrite. Loss, lag past the 10-second drain, or overflow invalidates the
 attempt.
@@ -355,7 +468,11 @@ transactions; warmup emits exactly 41,580 more. Every scheduled release is emitt
 exactly once with no candidate or harness retry and must reach one successful terminal result by the
 end of the ten-second drain. Scheduler omission, duplication, a wrong sequence or a harness-dropped
 result invalidates the attempt. A candidate-attributable error or non-return is a retained soft
-liveness failure; a repeated identical mode/probe/gate failure in all three valid seeds becomes
+liveness failure. At drain expiry the supervisor atomically commits `candidate_timeout` for each
+non-return, sends `SIGKILL`, and requires pidfd-confirmed exit plus complete prefix/actuation evidence
+within five seconds. That planned cutoff is not the 120-second attempt safety cap; successful
+actuation yields a valid candidate-failure population. Missing/ambiguous actuation or reaching the
+attempt cap is `DEFER`. A repeated identical mode/probe/gate failure in all three valid seeds becomes
 `PRESCREEN_NO_GO`, while one or two becomes `DEFER`. Achieved rate remains a diagnostic and is not a
 95% escape hatch.
 
@@ -418,6 +535,13 @@ commit. Trigger 1 kills before releasing that barrier. Triggers 2--5 release it 
 250 microseconds, 2 milliseconds, and 10 milliseconds respectively after the supervisor observes
 `commit_entered`. After return the child records `candidate_returned` and parks in a non-dropping
 state until killed, so scheduling cannot turn a return-boundary trial into clean `Database::drop`.
+The bounded crash frame contains trial/trigger/sequence IDs, intent-published, barrier-released,
+optional commit-entered, optional candidate-returned, optional acknowledgement, signal-requested,
+signal-delivered, and exit-observed raw-clock offsets plus the final marker bitmap. Present offsets
+are monotonically ordered; absent stages stay absent rather than being zero-duration returns. Trigger
+1 requires no commit/return marker, triggers 2--5 require commit entry and classify by the final
+return marker, and trigger 6 requires return plus acknowledgement. This frame is distinct from the
+steady/HOLD latency wire.
 The supervisor records the markers observed when it requests the signal, then after `waitid`/pidfd
 exit rereads their final values with acquire ordering. Final markers classify the trial because
 return may race signal delivery; a requested timed trigger is not silently called “in commit.”
@@ -481,6 +605,8 @@ index. The index records every retained file's locator/length/hash and every ver
 database's pre/post digests and destruction time. Its checked sum must equal
 `retained_artifact_bytes`. Deletion begins only after independent oracle and validator reports are
 durably indexed; missing transient-destruction evidence is `DEFER`, not a smaller claimed total.
+If a valid `REJECT_EXACT_PIN` was already sealed, later cleanup/destruction failure is retained as a
+post-seal protocol incident but cannot downgrade that rejection.
 
 No fixture is generated inside the decision campaign: the approved packet binds prebuilt canonical
 bases. The five-hour watchdog begins before build/environment verification and ends only after
@@ -508,11 +634,13 @@ cheaper than the 45-hour C2 sketch.
 
 The redb-free classifier derives exactly one outcome in this precedence order:
 
-1. Invalid approval/trust, target, preflight, actuator, clock, harness, oracle, schedule, artifact or
-   evidence completeness yields `DEFER`; an invalid attempt cannot prove a candidate defect.
+1. Before a terminal finding is sealed, invalid approval/trust, target, preflight, actuator, clock,
+   harness, oracle, schedule, artifact or evidence needed to judge that finding yields `DEFER`; an
+   invalid finding attempt cannot prove a candidate defect.
 2. One fully attributable atomicity/durability/corruption invariant violation in a valid attempt
-   seals `REJECT_EXACT_PIN` and stops decision execution. At most one separately labelled diagnostic
-   repetition may follow; its failure or bound hit cannot downgrade or erase the sealed rejection.
+   seals `REJECT_EXACT_PIN` and stops all further candidate decision/diagnostic execution. Later
+   artifact-finalization or cleanup faults are retained but cannot downgrade or erase the sealed
+   rejection; loss of evidence required to validate the original finding means it was never sealed.
 3. Without a sealed rejection, a safety bound, incomplete required population, missing in-commit or
    cold-cache proof, or mechanism-probe status other than `complete` yields `DEFER`.
 4. The same candidate writer/latency/recovery/resource/liveness soft gate failing for the same mode/
