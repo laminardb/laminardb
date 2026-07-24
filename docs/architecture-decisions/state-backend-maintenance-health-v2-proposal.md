@@ -1,6 +1,7 @@
 # State backend maintenance-health contract v2 — proposal
 
-- **Status:** Proposed; requires a direction decision and later final two-owner contract approval
+- **Status:** Direction approved on 2026-07-24; consolidated freeze candidate and later final
+  two-owner contract approval required
 - **Date:** 2026-07-24
 - **Scope:** the background-maintenance part of DKS-Q2-006 only
 - **Recommendation:** approve the additive v2 design direction described here
@@ -10,11 +11,14 @@
 - **Predecessor:** [state backend qualification runner v1](state-backend-qualification-runner-v1.md)
 - **Trigger:** [Cycle 17 RocksDB source closure](../reports/rocksdb-mechanism-source-closure-2026-07-24.md)
 - **Paper mappings:** [Cycle 19 candidate designs](../reports/state-backend-maintenance-health-mapping-designs-2026-07-24.md)
+- **Direction record:** [Cycle 21 owner decisions](../reports/distributed-state-cycle-21-owner-decisions-2026-07-24.md)
 
 Cycle 19 confirms that sampled typed gauges/counters/booleans can express the continuous health
 obligations, while exposing additional candidate gaps. It keeps RocksDB's blocking tail wait
 non-gating rather than disguising an active command as a sampled boolean. The mappings do not
-approve this direction, instantiate v2, rank implementation cost, or authorize source work.
+instantiate v2, rank implementation cost, or authorize source work. On 2026-07-24 the project owner
+recorded `APPROVE_MAINTENANCE_HEALTH_V2_DIRECTION`. That decision authorizes Stages 2 and 3 below;
+it is not the final contract approval.
 
 ## Proposed decision
 
@@ -39,12 +43,11 @@ logging and telemetry housekeeping are outside the candidate-native arm; their C
 disk, and latency effects remain inside the mandatory common observations. This deliberate scope
 change is one reason v1 cannot be reinterpreted in place.
 
-This is a proposal, not approval. A direction approval authorizes only the formal three-candidate
-mapping-design and consolidated-contract drafting stages; it does not instantiate a v2 identity or
-authorize schema implementation, native source construction, an adapter, or a candidate run. Those
-later steps have the separate gates below. Until the named owners record either the direction choice
-or the retain-v1 alternative, continue only review and non-normative read-only mapping drafts used
-as decision input; they cannot be approved artifacts.
+The approved direction authorizes only the formal three-candidate mapping-design and consolidated-
+contract drafting stages. It does not instantiate a v2 identity or authorize schema implementation,
+native source construction, an adapter, or a candidate run. Those later steps retain the separate
+gates below. Cycle 19 supplies the Stage 2 paper mappings; Cycle 21 may now prepare the Stage 3
+consolidated freeze candidate for independent and owner review.
 
 ## What does not change
 
@@ -244,9 +247,9 @@ No candidate proceeds by elimination or receives a weighted score.
 
 ## Implementation stages and approval boundaries
 
-1. **Freeze the direction.** Workload and operations owners choose the v2 design direction, retain
-   v1, or defer, and name the independent reviewers. Direction approval authorizes only Stages 2
-   and 3 design work.
+1. **Freeze the direction — complete.** On 2026-07-24 the project owner chose the v2 design direction.
+   This authorizes only Stages 2 and 3 design work; independent reviewers and the final two-owner
+   contract approval remain separate.
 2. **Draft three mappings on paper.** Produce RocksDB, Fjall, and redb mechanism/signal/N/A mapping
    designs against pinned intended builds/configurations, with every unproved source or binding gap
    explicit. These are review inputs, not `mapping/v2` artifacts. Use them to confirm the closed type

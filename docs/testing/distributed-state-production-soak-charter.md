@@ -25,9 +25,10 @@ A certification attempt must satisfy all of the following:
   builds LaminarDB;
 - deployment chart, rendered configuration, dependency images, charter, oracle, and fault
   controller each have immutable identities and hashes;
-- every attempt binds one exact `working_state_profile` identity. It records `bounded-memory` or
-  `local-spill`, the approved applicability-contract hash, all resource/restore thresholds and, for
-  local spill, the exact engine/build/mapping identity;
+- every attempt binds the exact `local-spill` working-state-profile identity, its approved
+  applicability-contract hash, all resource/restore thresholds, and exact engine/build/mapping
+  identity. Bounded memory remains reference/conformance-only and is not certifiable under this
+  charter;
 - the oracle has no `laminar_*` crate/library dependency and uses public source, sink, checkpoint,
   health, and metrics surfaces only;
 - the charter's workload, duration, event count, thresholds, fault schedule, and invalid-run rules
@@ -49,8 +50,7 @@ The frozen charter must identify:
 - dedicated CPU, memory/cgroup, FD and network limits plus the exact local NVMe/filesystem/mount
   limits for a local-spill profile;
 - at least three LaminarDB processes placed across declared failure domains;
-- for local spill, isolated working-state volumes which can also be deliberately lost; bounded-
-  memory attempts must not depend on restart-visible local state;
+- isolated local-spill working-state volumes which can also be deliberately lost;
 - cluster-shared object storage with a run-specific checkpoint prefix;
 - replayable/splittable source and durable multiwriter sink instances with production-like
   replication and durability settings;
@@ -181,9 +181,6 @@ faults, and the frozen controller schedule includes all profile-applicable fault
 - control/shuffle network partition while source and sink remain reachable;
 - source broker restart and backpressure;
 - object-store latency, timeout, and temporary unavailability;
-- bounded-memory near-capacity hot-key/timer/join growth, allocator fragmentation/RSS retention,
-  overlapping frozen generations, hard reservation exhaustion with no source-cursor/output advance,
-  repeated process loss, and portable restore plus source replay within RTO;
 - local-spill cold-cache state larger than RAM, disk pressure/`ENOSPC`, corruption, applicable
   maintenance stalls, and complete local-volume loss followed by portable restore;
 - rolling N/N-1 upgrade and rollback; and
@@ -197,8 +194,8 @@ invalid rather than silently reducing coverage.
 
 ## Result classification
 
-`PASS` requires every assertion applicable to that exact `(scenario, working_state_profile)` to pass
-and every required artifact to exist. Evidence from one profile cannot certify another.
+`PASS` requires every assertion applicable to that exact `(scenario, local-spill profile)` to pass
+and every required artifact to exist. Reference-backend test evidence is not production evidence.
 
 The following are product `FAIL`, never invalid-run excuses:
 

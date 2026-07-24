@@ -6,8 +6,8 @@
   intrinsically required
 - **Recommended broad-state profile:** one qualified worker-local embedded store plus portable
   cluster-shared checkpoints
-- **Optional profile decision:** product and operations owners may later opt into separately
-  certifying hard-bounded in-memory working state plus the same portable checkpoints
+- **Bounded-memory outcome:** reference/conformance-only under the current ADR and plan; no cluster
+  product profile or production-soak matrix
 - **Production backend selected:** none
 - **Evidence:** code inspection and current primary-source review; no candidate or product run
 - **Admission:** unchanged and fail-closed under `[LDB-4007]` and `[LDB-0013]`
@@ -28,7 +28,7 @@ is disposable after a committed cut.
 
 The production choice is therefore profile-scoped:
 
-1. **Bounded-memory:** viable only when admission and runtime reservations hard-bound live state,
+1. **Bounded-memory:** viable in principle only when admission and runtime reservations hard-bound live state,
    timers, join rows, indexes/output bookkeeping, skew, active and frozen generations, and restore/
    replay scratch within an approved worker-memory envelope. Node loss means remote restore plus
    source replay, so source retention and RTO are gates. There is no silent eviction or automatic
@@ -45,9 +45,10 @@ in-memory conformance implementation. It remains a governance prerequisite under
 ADR-008 requires the Phase 0 review gate, and Cycle 20 neither completes nor splits that gate. No
 runtime Phase 1 work is authorized by this report. A later accepted ADR/plan amendment may define a
 smaller owner-approved lifecycle-entry gate, but until then Phase 1 stays blocked. Cluster
-production admission still requires the currently intended qualified local-spill backend. A
-bounded-memory cluster profile receives no implementation or admission schedule unless product and
-operations owners explicitly opt into its separate support and certification cost.
+production admission still requires the currently intended qualified local-spill backend. Cycle 21
+keeps bounded memory reference/conformance-only. It receives no implementation or admission
+schedule unless a future ADR amendment explicitly reopens its separate support and certification
+cost.
 
 ## Authority boundaries
 
@@ -75,7 +76,7 @@ durable ingress log or stays outside the claim.
 
 | Architecture | Hot-path and capacity consequence | Recovery/rebalance consequence | Disposition |
 |---|---|---|---|
-| Hard-bounded in-memory + shared checkpoints | Lowest local access overhead, but all charged live/frozen/scratch state and worst-case skew must fit RAM; allocator retention and snapshot-copy tails still count | Cold restore and source replay after every process loss; full/delta chains and source retention must meet RTO | **Optional:** if product and operations owners opt in, prove it as a separate small-state profile. The current flat operator maps are not this service. |
+| Hard-bounded in-memory + shared checkpoints | Lowest local access overhead, but all charged live/frozen/scratch state and worst-case skew must fit RAM; allocator retention and snapshot-copy tails still count | Cold restore and source replay after every process loss; full/delta chains and source retention must meet RTO | **Reference/conformance-only:** no current product profile or admission evidence. The current flat operator maps are not this service. |
 | Embedded local store + shared checkpoints | Local cache/memtable for hot state and disk capacity for cold state; compaction, page faults, writer contention, sync and disk pressure enter p99.9 | Local files may accelerate restart but are disposable; portable vnode restore remains authoritative | **Recommended general profile**, after one engine passes the common campaign |
 | Object-store-primary embedded engine | Cold reads and durable writes are async and inherit remote latency/cost; requires caching, batching and failure isolation | Shared immutable files can reduce restore copying, but version ownership, fencing, compaction and GC become a subsystem | **Deferred architecture**, not an extra current candidate |
 | Remote transactional KV/database | Network/service queueing enters every miss/range path; client cache introduces coherence and version questions | Needs a snapshot/version that composes with Laminar's cut and a portable export; still needs vnode epoch fencing | **Reject as generic initial backend**; evaluate only a named service after measured need |
@@ -133,8 +134,9 @@ It must not reuse or reinterpret the current disk-oriented v1 or proposed v2 con
 
 1. Freeze the smallest placement-neutral `ManagedWorkingState` contract and portable vnode artifact
    bridge. Do not extend the immutable `StateBackend` into the hot-path API.
-2. Finish the approved redb prescreen and the owner-gated RocksDB/Fjall mechanism
-   decisions. Do not add `heed` unless redb fails for a redb-specific lifecycle/implementation
+2. Make the redb prescreen protocol approval-ready, then obtain its separate detached execution
+   approval; complete the owner-gated RocksDB/Fjall mechanism decisions. Do not add `heed` unless
+   an executed redb prescreen fails for a redb-specific lifecycle/implementation
    reason and LMDB could answer a stated decision question; a redb single-writer C3/tail failure
    rejects the shared B-tree architecture rather than triggering another single-writer prescreen.
 3. Select one embedded backend for the general local-spill profile only from common native-host
@@ -145,8 +147,8 @@ It must not reuse or reinterpret the current disk-oriented v1 or proposed v2 con
    implementation to prove atomic pre-mutation reads/batch writes, ordered timers/ranges, generation
    freeze, whole-graph acquire/revoke and the external oracle. This is implementation evidence, not
    production admission.
-5. Choose whether to certify a bounded-memory product profile. If chosen, freeze its hard byte/
-   cardinality/window/join/source-retention/RTO limits and fail-closed behavior before the run.
+5. Keep bounded memory as the semantic reference only. Any later product proposal must amend the ADR
+   and restart applicability, hard-limit, recovery/RTO, and independent-soak approval before a run.
 6. Run a separately chartered independent release-candidate product soak for every profile claimed
    production-ready. The memory profile must force near-cap skew, timer/join growth, overlapping
    generations, allocator fragmentation, object-store faults, repeated process loss and rebalances.

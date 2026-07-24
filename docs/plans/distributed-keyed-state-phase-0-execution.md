@@ -22,8 +22,7 @@ The phase is complete only when maintainers can answer, with versioned evidence:
 2. which key/state ABI is durable across restore, rescale, and rolling upgrade;
 3. what numerical workload, latency, resource, checkpoint, and RTO limits define success;
 4. which disk-backed working-state backend passed the intended general local-spill workload and
-   fault contract and, only if product and operations owners opt in, whether a hard-bounded memory
-   profile passed its separate capacity/exhaustion/restore contract;
+   fault contract; the in-memory subject remains reference/conformance-only;
 5. which source/operator/output/sink scenario is being certified at-least-once; and
 6. how an independent black-box soak will prevent an unearned production-ready claim.
 
@@ -406,8 +405,9 @@ independent-operation, and candidate-comparison blockers remain.
 redb 4.1.0 remains outside C2. Cycle 16 adds a separately authorized, isolated
 `construction-only-no-decision` workspace and CI lane; it cannot consume approval, classify a
 prescreen, or contribute selection evidence. The optional
-[bounded redb prescreen](../testing/state-backend-redb-prescreen-v1.md) still cannot run until its
-existing schemas gain an external semantic/attestation verifier and protocol harness and a separate
+[bounded redb prescreen](../testing/state-backend-redb-prescreen-v1.md) receives validation-only
+protocol work in Cycle 21. It still cannot run until its existing schemas gain an external semantic/
+attestation verifier and protocol harness and a separate
 detached pre-run approval is signed by the workload and operations owners. Its Docker Desktop/WSL
 protocol subset is smoke-only; a target-host
 `PRESCREEN_PASS` merely funds mechanism/persistence mapping, an additive profile/schema proposal,
@@ -418,8 +418,9 @@ Cycle 17 stopped the proposed RocksDB stall-only workspace at read-only source p
 observer appears bounded but v1's debt arm requires broader engine instrumentation/configuration
 proof. The Cycle 18
 [maintenance-health v2 proposal](../architecture-decisions/state-backend-maintenance-health-v2-proposal.md)
-replaces only that debt arm and awaits owner decision; v1 remains unchanged. A direction approval
-authorizes mapping and consolidated-contract design only. Do not add a profile candidate, adapter,
+replaces only that debt arm. Cycle 21 records the direction approval; v1 remains unchanged and the
+approval authorizes mapping and consolidated-contract design only. Do not add a profile candidate,
+adapter,
 runtime pin, or native observer until both the final
 `APPROVE_STATE_BACKEND_RUNNER_CONTRACT_V2` record and a candidate-specific source-closure approval
 exist. Only then may that approved workspace pin RocksDB wrapper
@@ -525,20 +526,22 @@ The Cycle 5 readers remain unwired; `[LDB-4007]` remains unchanged.
 
 Remaining commits are kept reviewable in this dependency order:
 
-1. `tools: define candidate-neutral runner and evidence schema`
-   - pacing, raw samples/nearest-rank summaries, invalid-run rules, resource formulas, and fault schedules/evidence policy
-     land without a runtime dependency;
-2. after mechanism closure and owner carry-forward approval, add a separate exact-pin adapter commit
+1. `docs: freeze candidate-neutral runner contract`
+   - consolidate the approved v2 direction, retained common gates, exact formulas, thresholds and
+     candidate paper mappings for final two-owner review; no reserved v2 identity is instantiated;
+2. only after `APPROVE_STATE_BACKEND_RUNNER_CONTRACT_V2`, implement its validation-only schemas and
+   synthetic, execution-ineligible fixtures without a runtime dependency;
+3. after mechanism closure and owner carry-forward approval, add a separate exact-pin adapter commit
    for each admitted candidate behind the private spike contract;
-3. `docs: approve keyed-state qualification profile and runner`
+4. `docs: approve keyed-state qualification profile and runner`
    - named workload/operations owners may revise the candidate before approving final thresholds,
      case matrix, Zipf sampler, runner source/build identity, and evidence rules. A separately
      reviewed approved-profile schema/status records signatures and hashes. The current validator
      intentionally accepts only null approvals and `qualification_eligible=false`;
-4. `test: exercise backend crash resource and endurance gates` using only the approved artifacts;
-5. `docs: select managed-state backend from evidence`;
-6. `tools: remove rejected state backend spike`; and
-7. `docs: review distributed keyed state phase zero`.
+5. `test: exercise backend crash resource and endurance gates` using only the approved artifacts;
+6. `docs: select managed-state backend from evidence`;
+7. `tools: remove rejected state backend spike`; and
+8. `docs: review distributed keyed state phase zero`.
 
 The optional redb prescreen is an independent side branch, not a prerequisite in this numbered
 candidate sequence. Even `PRESCREEN_PASS` requires a later explicit scope decision and an additive

@@ -1,7 +1,7 @@
 # State-backend contract decision matrix — Cycle 18
 
 - **Date:** 2026-07-24
-- **Decision requested:** retain DKS-Q2-006 v1 or approve the additive maintenance-health v2 direction
+- **Decision outcome:** `APPROVE_MAINTENANCE_HEALTH_V2_DIRECTION` recorded on 2026-07-24
 - **Recommendation:** approve the v2 design direction
 - **Production backend selected:** none
 - **Candidate execution authorized:** no
@@ -10,7 +10,8 @@
 
 ## Recommendation
 
-Approve the additive v2 design direction, then draft and review the three candidate mapping designs.
+The additive v2 design direction is approved. Draft and review the consolidated contract using the
+already-complete three candidate mapping designs.
 Only a later, separate two-owner approval may freeze the consolidated contract, exact schemas, and
 numerical thresholds. This keeps the common objective gates and exact foreground stall requirement
 while removing one engine-neutral exact debt quantity that the Cycle 17 source audit found neither
@@ -100,7 +101,11 @@ sink commit remain separate authorities.
 
 ## Owner decision record
 
-The immediate direction decision should record one of these outcomes:
+The project owner recorded `APPROVE_MAINTENANCE_HEALTH_V2_DIRECTION` on 2026-07-24. This funds the
+three mapping designs and consolidated contract/schema drafting only. It is not the later final
+two-owner approval and does not authorize a candidate or execution.
+
+The alternatives retained here for audit history were:
 
 - `APPROVE_MAINTENANCE_HEALTH_V2_DIRECTION`: fund the three mapping designs and consolidated
   contract/schema drafting only;

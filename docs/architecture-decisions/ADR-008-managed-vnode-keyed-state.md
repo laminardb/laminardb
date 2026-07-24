@@ -2,10 +2,12 @@
 
 - **Status:** Proposed; implementation requires the Phase 0 review gate
 - **Date:** 2026-07-22
-- **Amended:** 2026-07-24; Cycle 20 placement analysis reviewed, product/backend/v2 decisions pending
+- **Amended:** 2026-07-24; Cycle 21 keeps bounded memory reference-only and approves the
+  maintenance-health v2 design direction; final contract/backend decisions remain pending
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Related:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md),
-  [implementation plan](../plans/distributed-keyed-stateful-operators.md)
+  [implementation plan](../plans/distributed-keyed-stateful-operators.md), and
+  [Cycle 21 owner decisions](../reports/distributed-state-cycle-21-owner-decisions-2026-07-24.md)
 
 ## Decision
 
@@ -22,17 +24,22 @@ engine instrumentation/configuration proof, or publish an additive contract usin
 candidate-specific health signals while retaining common latency/resource/failure vetoes. The
 Cycle 18 [maintenance-health v2 proposal](state-backend-maintenance-health-v2-proposal.md) and
 [decision matrix](../reports/state-backend-contract-decision-matrix-2026-07-24.md) recommend the
-additive choice but do not approve it. The existing v1 evidence must not be reinterpreted. No
+additive choice. Cycle 21 records `APPROVE_MAINTENANCE_HEALTH_V2_DIRECTION`, which permits only
+consolidated contract/schema drafting and review. It does not instantiate any reserved v2 wire
+identity, authorize validator implementation, or authorize candidate source work or execution;
+those still require the final two-owner contract and candidate-specific approvals. The existing
+v1 evidence must not be reinterpreted. No
 backend is selected or admitted by this change; redb's separate prescreen track remains a
 contingency, and unmodified Fjall can re-enter only after the same contract decision defines its
 obligation. Any candidates admitted later still run the common campaign, which records one
 production local-spill backend rather than maintaining multiple disk implementations. Cycle 20's
 [placement and backend-scope analysis](../reports/state-working-state-options-2026-07-24.md) clarifies
 that correctness and exactly-once do not require a named engine or durable local disk. The
-in-memory implementation remains the semantic reference. Product and operations owners may opt in
-later to a separately qualified, hard-bounded small-state cluster profile; Cycle 20 gives that
-profile no implementation or admission schedule, and it is never an implicit fallback for the
-general profile.
+in-memory implementation remains the semantic reference. Cycle 21 keeps bounded memory
+reference/conformance-only: it has no cluster product profile, implementation/admission schedule,
+or production-soak matrix under this ADR, and it is never an implicit fallback for the general
+profile. A future product proposal would require a separate ADR amendment and fresh applicability,
+capacity, recovery/RTO, and independent-soak approvals.
 The intended broad/variable-state profile still requires one qualified local-spill backend.
 Cluster-shared object storage and the existing `StateBackend` remain the authoritative checkpoint/
 recovery layer; no local working-state backend is remote recovery authority.
@@ -263,12 +270,11 @@ or briefly block writes, so it is a measured restore optimization. Qualification
 RocksDB release and Rust wrapper before relying on any API behavior.
 
 The in-memory backend is required for model/differential tests and is the first placement-neutral
-lifecycle implementation after the existing Phase 0 review gate. Product and operations owners may
-separately opt into certifying an explicit bounded-memory cluster profile only when admission and
-reservations hard-bound live state, timers, joins, output bookkeeping, skew, active/frozen
-generations and restore scratch, and remote restore plus source replay meets its RTO. It is not the
-broad cluster production fallback: inability to open or govern the qualified disk-backed backend
-keeps the general local-spill profile closed.
+lifecycle implementation after the existing Phase 0 review gate. It remains reference/conformance-
+only and is not a cluster product profile under this ADR. It is not the broad cluster production
+fallback: inability to open or govern the qualified disk-backed backend keeps the general
+local-spill profile closed. Any future bounded-memory product proposal starts with a separate ADR
+amendment rather than inheriting the reference implementation's evidence.
 
 ### 4. Resource governance
 

@@ -38,9 +38,9 @@ The Cycle 20 [working-state placement analysis](../reports/state-working-state-o
 separates the capability from a named engine but does not change sequencing authority. Phase 1
 remains blocked by the existing Phase 0 review gate. Any later gate split requires an accepted ADR/
 plan amendment with named scope and owners. The intended broad/variable-state production profile
-still waits for one qualified local-spill backend. A bounded-memory cluster profile receives no
-schedule unless product and operations owners opt into its separate hard-limit, restore/RTO and
-independent-soak matrix.
+  still waits for one qualified local-spill backend. The project decision keeps bounded memory as a
+  reference/conformance implementation only; it has no cluster product schedule or production-soak
+  matrix under this plan.
 
 ## Scope and non-goals
 
@@ -163,8 +163,9 @@ Work:
    Cycle 16 RocksDB stall-only recommendation at source proof because v1's maintenance-debt arm
    cannot be closed by that narrow binding. The Cycle 18
    [decision matrix](../reports/state-backend-contract-decision-matrix-2026-07-24.md) recommends an
-   additive maintenance-health successor, pending the named owner decision; retaining v1 requires
-   separately funded broader engine instrumentation/configuration proof. Cycle 19's reviewed
+    additive maintenance-health successor. Cycle 21 records the direction approval, allowing only a
+    consolidated freeze candidate to be drafted; final two-owner approval is still required before
+    validation-only v2 implementation. Cycle 19's reviewed
    [candidate mappings](../reports/state-backend-maintenance-health-mapping-designs-2026-07-24.md)
    define but do not cost or authorize the RocksDB source/binding closure and Fjall scheduler/
    lifecycle closure; redb 4.1.0 remains only a separate native-prescreen hedge with unapproved
@@ -202,7 +203,7 @@ Exit gate:
 - the placement-neutral service/lifecycle and in-memory conformance subject are reviewable without
   implying admission; before broad-profile admission, one disk-backed backend is selected from
   reproducible conformance, latency, resource, fault and operability evidence, or the profile stays
-  closed; any bounded-memory admission has its own frozen capacity/exhaustion/restore/RTO evidence;
+  closed; the in-memory subject remains reference/conformance-only and supplies no admission evidence;
 - at least one source/operator/append-sink scenario has a complete ALO oracle and every unsupported
   output/delivery combination has a fail-closed assertion;
 - the independent production-soak charter is approved before implementation results can influence
@@ -439,9 +440,8 @@ Tests and exit gates:
 - timer selection, state mutation, timer removal/advance, emission identity, and output bookkeeping
   are one atomic transition; ALO recovery may re-fire an externally visible output but cannot lose
   or internally double-apply it;
-- skewed windows, millions of timers, checkpoint/rebalance with pending timers, and owner change
-  exactly at close time; bounded-memory profiles additionally force near-capacity timer/window
-  reservations and controlled exhaustion, while local-spill profiles force disk pressure;
+- skewed windows, millions of timers, checkpoint/rebalance with pending timers, owner change exactly
+  at close time, and local-spill disk pressure;
 - no premature fire, lost fire, unbounded retained closed window, or silent late-data policy;
 - each subphase independently meets the Phase 0 tail/resource/RTO profile and completes its cycle
   review before its admission bit changes.
@@ -487,9 +487,7 @@ Tests and exit gates:
 - differential SQL oracle over match cardinality, nulls, duplicates, equal timestamps, interval
   boundaries, out-of-order data, watermarks, and changelog weights;
 - two-input barrier/replay permutations, one-side pause/failure, network reorder/loss, owner change,
-  and crash around unmatched output/eviction; bounded-memory profiles additionally force near-
-  capacity join reservations and controlled exhaustion, while local-spill profiles force disk
-  pressure;
+  crash around unmatched output/eviction, and local-spill disk pressure;
 - hot join key and asymmetric-rate profiles with bounded probe/result batches and backpressure;
 - finite state follows from declared interval/watermark/retention semantics—an internal TTL is never
   the proof;
@@ -529,11 +527,9 @@ Exit gate:
 This phase does not add operator semantics. It closes cross-cutting evidence:
 
 1. Run the common PGVal-style matrix over data rate, topology, partitions, skew, checkpoints,
-   process death, network disruption, object-store stalls and rolling upgrade/rollback. A selected
-   bounded-memory profile additionally forces near-capacity hot-key/timer/join state, allocator/RSS
-   fragmentation, frozen-generation pressure, controlled exhaustion with no cursor/output advance,
-   repeated process loss and remote restore/source-replay RTO. A local-spill profile additionally
-   forces cold cache, disk full/corruption, maintenance stalls and complete local-disk loss.
+   process death, network disruption, object-store stalls and rolling upgrade/rollback. The
+   local-spill profile additionally forces cold cache, disk full/corruption, maintenance stalls and
+   complete local-disk loss.
 2. Run the Phase 0-chartered independent black-box soak for each exact scenario and
    working-state-profile identity against the unchanged release-candidate
    binary in a production-like multi-process environment. Use real certified source, object store,

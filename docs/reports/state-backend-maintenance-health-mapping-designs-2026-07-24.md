@@ -2,7 +2,8 @@
 
 - **Date:** 2026-07-24
 - **Evidence class:** non-normative, read-only exact-source design
-- **Contract basis:** proposed [maintenance-health v2 direction](../architecture-decisions/state-backend-maintenance-health-v2-proposal.md)
+- **Contract basis:** [maintenance-health v2 direction](../architecture-decisions/state-backend-maintenance-health-v2-proposal.md),
+  approved after this Stage 2 report
 - **Mapping artifacts created:** none
 - **Backend selected:** none
 - **Candidate construction or execution authorized:** no
@@ -32,12 +33,12 @@ veto signals.
 
 ## Authority and interpretation
 
-This report is Stage 2 decision input from the v2 proposal. It does not record
-`APPROVE_MAINTENANCE_HEALTH_V2_DIRECTION`, instantiate any reserved v2 identity, freeze a schema or
-threshold, authorize source changes, or emit `state-backend-mechanism-mapping/v2`. Signal names below
-are paper-design names, not wire identifiers. Predicate *kinds* are proposed; all numerical limits,
-cadence, cut-skew, hold time, timeout, and observer-overhead limits must be approved before any result
-exists.
+This report is Stage 2 decision input from the v2 proposal. The project owner subsequently recorded
+`APPROVE_MAINTENANCE_HEALTH_V2_DIRECTION` on 2026-07-24. That decision does not instantiate any
+reserved v2 identity, freeze a schema or threshold, authorize source changes, or emit
+`state-backend-mechanism-mapping/v2`. Signal names below remain paper-design names, not wire
+identifiers. Predicate *kinds* are proposed; all numerical limits, cadence, cut-skew, hold time,
+timeout, and observer-overhead limits must be approved before any result exists.
 
 The candidate-native arm is a veto only. The identical C1/C2/C3 correctness, open-loop queue/service/
 end-to-end latency, throughput, memory, target-device I/O, disk growth, write/space amplification,
@@ -401,7 +402,7 @@ requires arithmetic across unlike signals, a weighted score or candidate-defined
 
 Before `APPROVE_STATE_BACKEND_RUNNER_CONTRACT_V2`, owners still must decide and freeze:
 
-1. whether the v2 direction replaces v1's exact-debt arm;
+1. the exact consolidated wording by which the approved v2 direction replaces v1's exact-debt arm;
 2. exact signal and mechanism schemas, reset/restart rules and complete nominal/cut populations;
 3. candidate-specific numerical health limits plus common cadence, skew, tail hold/deadline, and
    telemetry-overhead limits before any candidate result;
