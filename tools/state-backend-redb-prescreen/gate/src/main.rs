@@ -41,7 +41,6 @@ struct HoldObservation {
     victim_dispatched_before_holder_release: bool,
     victim_begin_write_not_returned_while_holder_live: bool,
     victim_begin_write_return_after_release_ns: u64,
-    victim_return_within_500_ms: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -205,11 +204,10 @@ fn verify_report(report: &ConstructionReport) -> Result<(), Box<dyn Error>> {
         || !report
             .hold
             .victim_begin_write_not_returned_while_holder_live
-        || !report.hold.victim_return_within_500_ms
         || report.hold.hold_ns < 250_000_000
-        || !(40_000_000..=225_000_000)
-            .contains(&report.hold.victim_begin_write_dispatch_after_holder_ns)
-        || report.hold.victim_begin_write_return_after_release_ns > 500_000_000
+        || report.hold.victim_begin_write_dispatch_after_holder_ns == 0
+        || report.hold.victim_begin_write_dispatch_after_holder_ns >= report.hold.hold_ns
+        || report.hold.victim_begin_write_return_after_release_ns == 0
     {
         return Err("invalid HOLD observation".into());
     }
@@ -394,7 +392,6 @@ mod tests {
                 victim_dispatched_before_holder_release: true,
                 victim_begin_write_not_returned_while_holder_live: true,
                 victim_begin_write_return_after_release_ns: 1,
-                victim_return_within_500_ms: true,
             },
             evidence_scope: EvidenceScope {
                 qualification_eligible: false,

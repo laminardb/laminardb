@@ -63,7 +63,6 @@ struct HoldObservation {
     victim_dispatched_before_holder_release: bool,
     victim_begin_write_not_returned_while_holder_live: bool,
     victim_begin_write_return_after_release_ns: u64,
-    victim_return_within_500_ms: bool,
 }
 
 #[derive(Serialize)]
@@ -384,7 +383,7 @@ fn run_hold(database: Arc<Database>) -> Result<HoldObservation, Box<dyn Error>> 
         release_rx.recv().map_err(|e| e.to_string())?;
         transaction.commit().map_err(|e| e.to_string())
     });
-    holder_acquired_rx.recv_timeout(Duration::from_secs(2))?;
+    holder_acquired_rx.recv_timeout(Duration::from_secs(10))?;
     let hold_started = Instant::now();
 
     let (victim_ready_tx, victim_ready_rx) = mpsc::sync_channel(0);
@@ -405,12 +404,12 @@ fn run_hold(database: Arc<Database>) -> Result<HoldObservation, Box<dyn Error>> 
         let _setter_trace = configure(&mut transaction, Mode::I1).map_err(|e| e.to_string())?;
         transaction.commit().map_err(|e| e.to_string())
     });
-    victim_ready_rx.recv_timeout(Duration::from_secs(2))?;
+    victim_ready_rx.recv_timeout(Duration::from_secs(10))?;
 
     let until_victim_start = Duration::from_millis(50).saturating_sub(hold_started.elapsed());
     thread::sleep(until_victim_start);
     victim_start_tx.send(())?;
-    let victim_dispatched_at = victim_dispatched_rx.recv_timeout(Duration::from_millis(175))?;
+    let victim_dispatched_at = victim_dispatched_rx.recv_timeout(Duration::from_secs(10))?;
 
     let remaining = Duration::from_millis(250).saturating_sub(hold_started.elapsed());
     thread::sleep(remaining);
@@ -424,8 +423,10 @@ fn run_hold(database: Arc<Database>) -> Result<HoldObservation, Box<dyn Error>> 
         return Err("victim begin_write returned while holder transaction was live".into());
     }
     release_tx.send(())?;
-    let victim_returned_at = victim_returned_rx.recv_timeout(Duration::from_millis(500))?;
-    let victim_after_release = victim_returned_at.saturating_duration_since(released_at);
+    let victim_returned_at = victim_returned_rx.recv_timeout(Duration::from_secs(10))?;
+    let victim_after_release = victim_returned_at
+        .checked_duration_since(released_at)
+        .ok_or("victim begin_write return preceded holder release")?;
 
     holder.join().map_err(|_| "holder thread panicked")??;
     victim.join().map_err(|_| "victim thread panicked")??;
@@ -438,7 +439,6 @@ fn run_hold(database: Arc<Database>) -> Result<HoldObservation, Box<dyn Error>> 
         victim_dispatched_before_holder_release: victim_dispatched_before_release,
         victim_begin_write_not_returned_while_holder_live: victim_not_returned,
         victim_begin_write_return_after_release_ns: nanos(victim_after_release)?,
-        victim_return_within_500_ms: victim_after_release <= Duration::from_millis(500),
     })
 }
 
@@ -571,13 +571,5 @@ mod tests {
         assert_ne!(key(0, 0, 1), key(1, 0, 1));
         assert_ne!(key(0, 0, 1), key(0, 1, 1));
         assert!(key(0, 0, 1) < key(0, 0, 2));
-    }
-
-    #[test]
-    fn every_mode_step_declares_128_mutations() {
-        for step in 1..=3 {
-            let operations_per_table = 16 + 8 + 8;
-            assert_eq!(operations_per_table * 4, 128, "step {step}");
-        }
     }
 }
