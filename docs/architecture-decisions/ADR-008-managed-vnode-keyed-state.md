@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; implementation requires the Phase 0 review gate
 - **Date:** 2026-07-22
-- **Amended:** 2026-07-24; Cycle 20 placement analysis recorded, product/backend/v2 decisions pending
+- **Amended:** 2026-07-24; Cycle 20 placement analysis reviewed, product/backend/v2 decisions pending
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Related:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md),
   [implementation plan](../plans/distributed-keyed-stateful-operators.md)
