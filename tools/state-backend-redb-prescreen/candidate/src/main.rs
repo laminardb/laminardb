@@ -30,7 +30,7 @@ const TIMER: TableDefinition<&[u8], &[u8]> = TableDefinition::new("timer");
 const JOIN_LEFT: TableDefinition<&[u8], &[u8]> = TableDefinition::new("join_left");
 const JOIN_RIGHT: TableDefinition<&[u8], &[u8]> = TableDefinition::new("join_right");
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy)]
 enum Mode {
     I1,
     I2,

@@ -22,7 +22,8 @@ runner-owned directory: it is not hardened for attacker-controlled paths, and a 
 leave partial files that the caller must discard. An external runner must impose a hard deadline;
 redb's database-wide writer wait has no cancellation or timeout API.
 
-Run from this directory after building both binaries:
+Run from this directory after building both binaries, with all three outputs inside a new private
+temporary directory. Arbitrary output locations are not automatically ignored by Git:
 
 ```text
 state-backend-redb-prescreen-candidate construction-only-no-decision run <new-db> <new-report>
