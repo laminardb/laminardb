@@ -405,11 +405,20 @@ protocol subset is smoke-only; a target-host
 and adapter review. `PRESCREEN_NO_GO`, `DEFER`, and `REJECT_EXACT_PIN` add no candidate. No prescreen
 artifact may satisfy or be pooled into C1/C2/C3.
 
-An isolated mechanism-closure workspace may pin the exact subject, build, SBOM, options, and source/
-binding under review. Do not add a profile candidate, adapter, or runtime pin until DKS-Q2-006 closes
-and the owner accepts the carry-forward decision. For the recommended primary track, the isolated
-subject is RocksDB Rust wrapper `=0.24.0` with bundled RocksDB 10.4.2. A future patched/admitted Fjall
-subject receives a separate exact identity; unmodified Fjall 3.1.8 does not. Build exactly one
+Cycle 17 stopped the proposed RocksDB stall-only workspace at read-only source proof: the stall
+observer appears bounded but v1's debt arm requires broader engine instrumentation/configuration
+proof. The Cycle 18
+[maintenance-health v2 proposal](../architecture-decisions/state-backend-maintenance-health-v2-proposal.md)
+replaces only that debt arm and awaits owner decision; v1 remains unchanged. A direction approval
+authorizes mapping and consolidated-contract design only. Do not add a profile candidate, adapter,
+runtime pin, or native observer until both the final
+`APPROVE_STATE_BACKEND_RUNNER_CONTRACT_V2` record and a candidate-specific source-closure approval
+exist. Only then may that approved workspace pin RocksDB wrapper
+`=0.24.0` with bundled RocksDB 10.4.2, build/SBOM/options, and the source/binding gaps found by the
+reviewed mapping design. Its immutable mapping artifact follows source construction and adversarial
+activation proof. A future
+patched/admitted Fjall subject receives a separate exact identity; unmodified Fjall 3.1.8 does not.
+Build exactly one
 admitted candidate per binary. The private qualification contract covers
 batched reads, atomic write/delete/timer mutations, bounded range scans, consistent snapshots,
 vnode cleanup, sorted restore, explicit crash persistence, and resource/operability statistics. It

@@ -151,13 +151,18 @@ Work:
 5. Add the mandatory capability descriptor to design tests. Inventory every current operator as
    `Stateless`, `GlobalSingleton`, `VnodeKeyed`, `RebuildableReplicated`, or `LocalOnly` without
    changing admission.
-6. Close the exact candidate's DKS-Q2-006 mechanism gate before adapter work. The Cycle 16 matrix
-   recommends RocksDB 10.4.2/wrapper 0.24.0 for that bounded closure and redb 4.1.0 only for its
-   separate native prescreen, pending the owner's carry-forward decision; it recommends that
-   unmodified Fjall 3.1.8 and SurrealKV 0.21.2 not proceed. Run every later-admitted
+6. Close the exact candidate's DKS-Q2-006 mechanism gate before adapter work. Cycle 17 stopped the
+   Cycle 16 RocksDB stall-only recommendation at source proof because v1's maintenance-debt arm
+   cannot be closed by that narrow binding. The Cycle 18
+   [decision matrix](../reports/state-backend-contract-decision-matrix-2026-07-24.md) recommends an
+   additive maintenance-health successor, pending the named owner decision; retaining v1 requires
+   separately funded broader engine instrumentation/configuration proof. redb 4.1.0 remains only a
+   separate native-prescreen hedge, and unmodified Fjall 3.1.8 and SurrealKV 0.21.2 do not proceed.
+   Run every later-admitted
    candidate through the same bounded profile: Arrow-batch-sized atomic requests, realistic
    hot/cold multi-key reads, timer scans, snapshot/export overlap, sorted restore, vnode drop/GC,
-   compaction/write stalls, hard memory/disk/FD limits, `kill -9`, torn/corrupt data, `ENOSPC`, and
+   maintenance pressure/write stalls, hard memory/disk/FD limits, `kill -9`, torn/corrupt data,
+   `ENOSPC`, and
    N/N-1 format rehearsal. Include 24–72-hour churn/TTL soak. Select one production backend from
    equivalent evidence; discard losing spikes rather than maintaining multiple stores.
 7. Record the complete delivery matrix: source consistency/topology and handoff; operator update

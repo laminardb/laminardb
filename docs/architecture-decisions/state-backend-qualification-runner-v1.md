@@ -15,8 +15,11 @@ that `estimate-pending-compaction-bytes` is not the complete, direct, pairwise-d
 population required below. Closing that arm is not the bounded stall-binding task previously
 recommended; it needs broader engine instrumentation and/or exact configuration-elimination proof.
 Before any RocksDB construction resumes, owners must either retain v1 and fund that larger scope or
-approve an additive successor with typed, candidate-specific health signals and new schema/profile
-identities. V1 artifacts must not be reinterpreted under a successor.
+approve a final additive successor with typed, candidate-specific health signals and new schema/
+profile identities after its separate design-direction review. V1 artifacts must not be
+reinterpreted under a successor. Cycle 18's non-approved
+[maintenance-health v2 proposal](state-backend-maintenance-health-v2-proposal.md) specifies the
+smallest proposed delta; this document remains the normative v1 baseline until owners decide.
 
 ## Decision and safety boundary
 

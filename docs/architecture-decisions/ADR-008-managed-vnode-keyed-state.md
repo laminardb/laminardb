@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; implementation requires the Phase 0 review gate
 - **Date:** 2026-07-22
-- **Amended:** 2026-07-24; Cycle 17 stopped the bounded RocksDB closure at Stage 0
+- **Amended:** 2026-07-24; Cycle 18 maintenance-health v2 proposal awaits owner decision
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Related:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md),
   [implementation plan](../plans/distributed-keyed-stateful-operators.md)
@@ -20,9 +20,12 @@ the published v1 direct and disjoint maintenance-debt population cannot be close
 binding task. The next decision is therefore whether to retain v1 and explicitly fund broader
 engine instrumentation/configuration proof, or publish an additive contract using reviewed
 candidate-specific health signals while retaining common latency/resource/failure vetoes. The
-existing v1 evidence must not be reinterpreted. No backend is selected or admitted by this change;
-redb's separate prescreen track remains a contingency, and unmodified Fjall can re-enter only after
-the same contract decision defines its obligation. Any
+Cycle 18 [maintenance-health v2 proposal](state-backend-maintenance-health-v2-proposal.md) and
+[decision matrix](../reports/state-backend-contract-decision-matrix-2026-07-24.md) recommend the
+additive choice but do not approve it. The existing v1 evidence must not be reinterpreted. No
+backend is selected or admitted by this change; redb's separate prescreen track remains a
+contingency, and unmodified Fjall can re-enter only after the same contract decision defines its
+obligation. Any
 candidates admitted later still run the common campaign, which records one production backend
 rather than maintaining multiple implementations. An in-memory implementation remains a semantic
 reference and a small local-mode option. Cluster-shared object storage and the existing
