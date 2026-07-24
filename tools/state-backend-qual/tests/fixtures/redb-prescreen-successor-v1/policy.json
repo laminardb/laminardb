@@ -1,0 +1,41 @@
+{
+  "schema_version": "state-backend-redb-prescreen-protected-review-policy/v1",
+  "notice": "NOT QUALIFICATION EVIDENCE",
+  "policy_id": "redb-prescreen-synthetic-policy-v1",
+  "provider": {
+    "contract": "github-protected-review-export/v1",
+    "repository_full_name": "laminardb/laminardb",
+    "repository_id": "R_synthetic",
+    "base_ref": "refs/heads/main"
+  },
+  "review_groups": [
+    {
+      "role": "workload_owner",
+      "group_id": "T_synthetic_workload"
+    },
+    {
+      "role": "operations_owner",
+      "group_id": "T_synthetic_operations"
+    }
+  ],
+  "decision_literals": {
+    "pre_run": "APPROVE_REDB_PRESCREEN_EXECUTION_V1",
+    "post_run": "ACCEPT_REDB_PRESCREEN_RESULT_V1"
+  },
+  "required_controls": {
+    "immutable_change_id": true,
+    "reviews_on_exact_head": true,
+    "current_group_membership": true,
+    "approved_review_state": true,
+    "dismiss_stale_reviews": true,
+    "distinct_principals": true,
+    "distinct_review_events": true,
+    "self_review_allowed": false,
+    "admin_bypass_allowed": false
+  },
+  "protected_execution": {
+    "workflow_file": ".github/workflows/redb-prescreen.yml",
+    "job_name": "redb-prescreen",
+    "environment_id": "E_synthetic"
+  }
+}

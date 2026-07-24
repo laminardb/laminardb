@@ -1,0 +1,64 @@
+{
+  "schema_version": "state-backend-redb-prescreen-protected-review-receipt/v1",
+  "notice": "NOT QUALIFICATION EVIDENCE",
+  "stage": "pre_run",
+  "provider": {
+    "contract": "github-protected-review-export/v1",
+    "repository_full_name": "laminardb/laminardb",
+    "repository_id": "R_synthetic",
+    "base_ref": "refs/heads/main"
+  },
+  "change": {
+    "change_id": "PR_synthetic",
+    "base_ref": "refs/heads/main",
+    "head_revision": "1234567890abcdef1234567890abcdef12345678"
+  },
+  "policy": {
+    "role": "redb-prescreen-protected-review-policy",
+    "locator": "contract/protected-review-policy.json",
+    "byte_length": 1213,
+    "sha256": "f016a6ba11bf05ab88450be76a547fd102d1c628af252520481efad829af98b7",
+    "media_type": "application/json"
+  },
+  "payload": {
+    "role": "redb-prescreen-approval-payload",
+    "locator": "approval/payload.json",
+    "byte_length": 8116,
+    "sha256": "db8a961bd21f59f0cbd2e88b0ac94447fb645ee81944466c7e446a37b0e7070f",
+    "media_type": "application/json"
+  },
+  "reviews": [
+    {
+      "role": "workload_owner",
+      "stable_account_id": "U_synthetic_workload",
+      "review_event_id": "RV_synthetic_workload",
+      "provider_state": "APPROVED",
+      "decision_literal": "APPROVE_REDB_PRESCREEN_EXECUTION_V1",
+      "reviewed_head_revision": "1234567890abcdef1234567890abcdef12345678",
+      "reviewed_payload_byte_length": 8116,
+      "reviewed_payload_sha256": "db8a961bd21f59f0cbd2e88b0ac94447fb645ee81944466c7e446a37b0e7070f",
+      "reviewed_at_utc": "2026-07-24T10:00:00Z"
+    },
+    {
+      "role": "operations_owner",
+      "stable_account_id": "U_synthetic_operations",
+      "review_event_id": "RV_synthetic_operations",
+      "provider_state": "APPROVED",
+      "decision_literal": "APPROVE_REDB_PRESCREEN_EXECUTION_V1",
+      "reviewed_head_revision": "1234567890abcdef1234567890abcdef12345678",
+      "reviewed_payload_byte_length": 8116,
+      "reviewed_payload_sha256": "db8a961bd21f59f0cbd2e88b0ac94447fb645ee81944466c7e446a37b0e7070f",
+      "reviewed_at_utc": "2026-07-24T10:01:00Z"
+    }
+  ],
+  "protected_execution": {
+    "workflow_file": ".github/workflows/redb-prescreen.yml",
+    "job_name": "redb-prescreen",
+    "environment_id": "E_synthetic",
+    "workflow_run_id": "RUN_synthetic",
+    "workflow_run_attempt": 1,
+    "workflow_job_id": "JOB_synthetic",
+    "provider_verified_at_utc": "2026-07-24T10:02:00Z"
+  },
+  "retained_evidence": null
+}

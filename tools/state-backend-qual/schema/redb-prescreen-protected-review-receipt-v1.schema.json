@@ -1,0 +1,225 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://laminardb.dev/schemas/state-backend-redb-prescreen-protected-review-receipt-v1.json",
+  "title": "LaminarDB redb prescreen protected-review receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "notice",
+    "stage",
+    "provider",
+    "change",
+    "policy",
+    "payload",
+    "reviews",
+    "protected_execution",
+    "retained_evidence"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "state-backend-redb-prescreen-protected-review-receipt/v1"
+    },
+    "notice": {"const": "NOT QUALIFICATION EVIDENCE"},
+    "stage": {"enum": ["pre_run", "post_run"]},
+    "provider": {"$ref": "#/$defs/provider"},
+    "change": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["change_id", "base_ref", "head_revision"],
+      "properties": {
+        "change_id": {"$ref": "#/$defs/providerId"},
+        "base_ref": {"const": "refs/heads/main"},
+        "head_revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+      }
+    },
+    "policy": {"$ref": "#/$defs/descriptor"},
+    "payload": {"$ref": "#/$defs/descriptor"},
+    "reviews": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "prefixItems": [
+        {
+          "allOf": [
+            {"$ref": "#/$defs/review"},
+            {
+              "properties": {"role": {"const": "workload_owner"}},
+              "required": ["role"]
+            }
+          ]
+        },
+        {
+          "allOf": [
+            {"$ref": "#/$defs/review"},
+            {
+              "properties": {"role": {"const": "operations_owner"}},
+              "required": ["role"]
+            }
+          ]
+        }
+      ],
+      "items": false
+    },
+    "protected_execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workflow_file",
+        "job_name",
+        "environment_id",
+        "workflow_run_id",
+        "workflow_run_attempt",
+        "workflow_job_id",
+        "provider_verified_at_utc"
+      ],
+      "properties": {
+        "workflow_file": {
+          "type": "string",
+          "pattern": "^\\.github/workflows/[a-z0-9][a-z0-9._-]{0,127}\\.ya?ml$"
+        },
+        "job_name": {"$ref": "#/$defs/protocolId"},
+        "environment_id": {"$ref": "#/$defs/providerId"},
+        "workflow_run_id": {"$ref": "#/$defs/providerId"},
+        "workflow_run_attempt": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 18446744073709551615
+        },
+        "workflow_job_id": {"$ref": "#/$defs/providerId"},
+        "provider_verified_at_utc": {"$ref": "#/$defs/canonicalUtc"}
+      }
+    },
+    "retained_evidence": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/retainedEvidence"}
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"stage": {"const": "pre_run"}},
+        "required": ["stage"]
+      },
+      "then": {"properties": {"retained_evidence": {"type": "null"}}},
+      "else": {"properties": {"retained_evidence": {"$ref": "#/$defs/retainedEvidence"}}}
+    }
+  ],
+  "$defs": {
+    "protocolId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9][a-z0-9._/-]{0,127}$"
+    },
+    "providerId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:=/-]{0,255}$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "not": {"const": "0000000000000000000000000000000000000000000000000000000000000000"}
+    },
+    "canonicalUtc": {
+      "type": "string",
+      "minLength": 20,
+      "maxLength": 20,
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$",
+      "format": "date-time"
+    },
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract", "repository_full_name", "repository_id", "base_ref"],
+      "properties": {
+        "contract": {"const": "github-protected-review-export/v1"},
+        "repository_full_name": {"const": "laminardb/laminardb"},
+        "repository_id": {"$ref": "#/$defs/providerId"},
+        "base_ref": {"const": "refs/heads/main"}
+      }
+    },
+    "descriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "locator", "byte_length", "sha256", "media_type"],
+      "properties": {
+        "role": {"$ref": "#/$defs/protocolId"},
+        "locator": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 192,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]{0,191}$"
+        },
+        "byte_length": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16777216
+        },
+        "sha256": {"$ref": "#/$defs/digest"},
+        "media_type": {"const": "application/json"}
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "stable_account_id",
+        "review_event_id",
+        "provider_state",
+        "decision_literal",
+        "reviewed_head_revision",
+        "reviewed_payload_byte_length",
+        "reviewed_payload_sha256",
+        "reviewed_at_utc"
+      ],
+      "properties": {
+        "role": {"enum": ["workload_owner", "operations_owner"]},
+        "stable_account_id": {"$ref": "#/$defs/providerId"},
+        "review_event_id": {"$ref": "#/$defs/providerId"},
+        "provider_state": {"const": "APPROVED"},
+        "decision_literal": {
+          "enum": [
+            "APPROVE_REDB_PRESCREEN_EXECUTION_V1",
+            "ACCEPT_REDB_PRESCREEN_RESULT_V1"
+          ]
+        },
+        "reviewed_head_revision": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "reviewed_payload_byte_length": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 262144
+        },
+        "reviewed_payload_sha256": {"$ref": "#/$defs/digest"},
+        "reviewed_at_utc": {"$ref": "#/$defs/canonicalUtc"}
+      }
+    },
+    "artifactIndexDescriptor": {
+      "allOf": [
+        {"$ref": "#/$defs/descriptor"},
+        {
+          "properties": {
+            "role": {"const": "redb-prescreen-artifact-index"},
+            "locator": {"const": "result/artifact-index.json"},
+            "media_type": {"const": "application/json"}
+          },
+          "required": ["role", "locator", "media_type"]
+        }
+      ]
+    },
+    "retainedEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "artifact_index"],
+      "properties": {
+        "kind": {"const": "state-backend-redb-prescreen-retained-evidence-root/v1"},
+        "artifact_index": {"$ref": "#/$defs/artifactIndexDescriptor"}
+      }
+    }
+  }
+}

@@ -173,3 +173,84 @@ fn oversized_file_is_read_only_to_the_validation_cap() {
     );
     assert!(String::from_utf8_lossy(&output.stderr).contains("maximum is 1048576"));
 }
+
+#[test]
+fn redb_review_content_is_valid_but_explicitly_authorization_unverified() {
+    let fixture = |name: &str| {
+        manifest_path(&format!(
+            "tests/fixtures/redb-prescreen-successor-v1/{name}.json"
+        ))
+    };
+    let output = binary()
+        .arg("validate-redb-prescreen-pre-run-content")
+        .arg(fixture("policy"))
+        .arg(fixture("payload"))
+        .arg(fixture("receipt"))
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!(
+            "{NOTICE}\nVALID_INELIGIBLE_REDB_PRESCREEN_CONTENT stage=pre_run \
+             payload=redb-prescreen-synthetic-pre-run-v1 \
+             authorization=authorization_unverified\n"
+        )
+    );
+    assert!(output.stderr.is_empty());
+
+    let complete_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for forbidden in [
+        "PRESCREEN_PASS",
+        "PRESCREEN_NO_GO",
+        "REJECT_EXACT_PIN",
+        "SMOKE_PASS",
+        "authorization=verified",
+        "execution_authorized=true",
+        "result_sealed=true",
+    ] {
+        assert!(!complete_output.contains(forbidden));
+    }
+}
+
+#[test]
+fn redb_review_cli_rejects_wrong_shapes_and_has_no_run_command() {
+    let fixture = |name: &str| {
+        manifest_path(&format!(
+            "tests/fixtures/redb-prescreen-successor-v1/{name}.json"
+        ))
+    };
+    let output = binary()
+        .arg("validate-redb-prescreen-pre-run-content")
+        .arg(fixture("policy"))
+        .arg(fixture("payload"))
+        .arg(fixture("payload"))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("{NOTICE}\n")
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).starts_with("INVALID_REDB_PRESCREEN_CONTENT "));
+
+    for command in [
+        "run-redb-prescreen",
+        "dispatch-redb-prescreen",
+        "authorize-redb-prescreen",
+        "seal-redb-prescreen-result",
+    ] {
+        let output = binary().arg(command).output().unwrap();
+        assert_eq!(output.status.code(), Some(64));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            format!("{NOTICE}\n")
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).starts_with("usage:"));
+    }
+}

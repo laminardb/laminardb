@@ -14,6 +14,7 @@ pub mod mechanism_mapping;
 pub mod mechanism_samples;
 pub mod model;
 pub mod model_result;
+pub mod redb_prescreen;
 pub mod resource_samples;
 pub mod workload;
 
