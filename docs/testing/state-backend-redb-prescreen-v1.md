@@ -2783,7 +2783,7 @@ substituted under these bytes
 Replacing only `N19` with `eventfd` is forbidden because it would leave the crash-marker contract
 unproved.
 
-##### Cycle 33 N19 owner decision packet
+##### Cycle 33--34 N19 and crash-coverage owner decision packets
 
 The engineering recommendation is **reject the assembly ABI as the durable default and select a
 versioned Linux `AF_UNIX`/`SOCK_SEQPACKET` redesign**. This is a recommendation, not the missing
@@ -2844,24 +2844,48 @@ second framing protocol
 [`eventfd(2)`](https://man7.org/linux/man-pages/man2/eventfd.2.html)).
 
 The redesign must also stop calling a pre-call witness `commit_entered`. No external marker proves
-entry into redb internals. A pre-call marker-sensitive `/v2` surface may name only
-`commit_call_imminent`: the kernel accepted the complete child packet immediately before the child
-invokes the adapter commit call, with no intervening application operation. Triggers zero through
-ten milliseconds are measured from the supervisor's receipt of that packet. Receipt can occur while
-the child is still returning from the send or before it is scheduled into the adapter, so this cut
-does **not** satisfy the current three-`commit_entered && !candidate_returned` coverage gate or the
-large-recovery confirmed-in-commit gate. A no-return trial after this cut may permit exactly old or
-complete-new state, but it cannot be counted as confirmed in-adapter progress.
+entry into redb internals. Cycle 34 recommends **an in-adapter `adapter_commit_entered` direction**
+over a caller-side `commit_call_imminent` direction, subject to the same two-owner decision as the
+transport. The two choices have the same qualification-only packet count and no product hot-path
+cost, but only the adapter-entry marker eliminates the unobserved scheduling gap before the adapter
+is invoked:
 
-The successor crash contract must therefore make one separately reviewed choice. Either it adds an
-in-adapter `adapter_commit_entered` packet as the first observable action after entry to the approved
-adapter method and versions the classifier/coverage around **adapter entry, not redb-internal
-progress**, or it retains only `commit_call_imminent`, renames the coverage to post-imminent/no-return
-and makes every requirement for confirmed in-adapter progress unsatisfied. The latter cannot complete
-the current large-recovery campaign. A true redb-internal cut would require still stronger,
-candidate-specific instrumentation. Cycle 33 selects none of these crash-classifier branches; it
-recommends only the IPC transport direction, so every successor crash schema, oracle branch,
-coverage rule and trigger schedule remains blocked.
+| Property | Recommended adapter-entry direction | Caller-side alternative |
+|---|---|---|
+| proven cut | approved adapter method entered | child intends to invoke adapter |
+| redb-internal progress | none | none |
+| coverage name | `adapter_entry_observed && return_not_observed` | `call_imminent_observed && return_not_observed` |
+| no-return oracle | exactly old or exactly complete-new | exactly old or exactly complete-new |
+| current confirmed-in-commit gate | must be renamed and versioned | unsatisfied |
+| current decision-bearing large-recovery campaign | blocked pending a separate internal-progress decision | cannot complete |
+
+In the recommended direction, the exact approved non-inlined adapter method emits
+`adapter_commit_entered` as its first externally observable action. Function-prologue mechanics are
+allowed before it; allocation, logging, clock reads, candidate/file access and other application
+effects are not. Successful complete-packet enqueue is the entry cut. Marker failure is adverse and
+the adapter must not invoke redb. After the send returns, the next application operation is the exact
+candidate commit call. Immediately after that call returns, the adapter's first observable action
+emits `adapter_commit_returned_ok` or a separately frozen error stage and then parks without drop.
+After final EOF, absence of a valid return packet means only **return not observed**; it never proves
+that redb did not return. The Cycle 33 credentials, pidfd, sole-endpoint-holder, frame, ordering,
+receipt-timestamp, EOF and failure predicates apply unchanged.
+
+The successor oracle requires exactly old state for a deliberate pre-entry control, exactly old or
+complete-new state after valid adapter entry with no valid return packet, and exactly complete-new
+state after a valid successful-return packet. Torn, mixed, corrupt and out-of-domain states follow
+the existing terminal proof. Return-error, missing/ambiguous evidence, marker failure or identity/
+state-machine failure requires a separately frozen fail-closed classification and cannot be silently
+treated as an atomicity outcome. Supervisor acknowledgement strengthens observation ordering only;
+it does not strengthen durability.
+
+Every current `commit_entered && !candidate_returned` claim must become
+`adapter_entry_observed && return_not_observed` under successor bytes. Assembly-v1 populations,
+seeds, adaptive retries, trigger schedules and prior-smoke evidence do not transfer automatically.
+The resulting cut supports only a separately versioned diagnostic such as "reopen after kill timed
+from adapter entry." Neither branch proves redb-internal progress, so the current nine-trial
+decision-bearing recovery comparison and its two/five-second gates remain blocked until owners
+choose candidate-specific internal instrumentation or explicitly redefine and revalidate the
+scientific question and thresholds.
 
 No compatibility is claimed before the owners choose a mechanism and the crash-classifier branch is
 closed. If they select the sequenced-packet direction, the fail-closed minimum identity effects are:
@@ -2880,27 +2904,36 @@ logic inside already approved binary roles avoids a new artifact row, but does n
 versioning. A standalone IPC helper/trust object must be an explicit successor approval input; it
 cannot be smuggled into the current 29-row payload.
 
-Both owners must eventually accept one identical canonical UTF-8 JSON object, with keys in the shown
-order, no whitespace outside strings, no BOM and no trailing newline. The recommended bytes are:
+Both owners must eventually accept two identical canonical UTF-8 JSON objects, with keys in the
+shown order, no whitespace outside strings, no BOM and no trailing newline. The recommended
+transport bytes are:
 
 `{"schema_version":"state-backend-redb-n19-mechanism-decision/v1","notice":"DESIGN_ONLY_NO_IMPLEMENTATION_OR_EXECUTION_AUTHORITY","scope":"N19_AND_CRASH_MARKER_TRANSPORT","decision":"REJECT_N19_X86_64_ASSEMBLY_ABI_V1_AND_SELECT_SEQPACKET_REDESIGN_V2"}`
 
-The alternative changes only `decision` to
-`ACCEPT_N19_LINUX_X86_64_SYSV_ASSEMBLY_ABI_V1_DIRECTION_ONLY`. This object is embedded under the
-future `contract/target-identity.json` field `n19_mechanism_decision`, not added as a thirtieth
-artifact. Workload-owner and operations-owner acceptance must be two distinct protected review
-events over the same immutable repository head containing these exact protocol bytes. That design
-review is not the later pre-run execution approval; the future `/v2` target identity, approval
-payload `/v3` and two-role receipt `/v3` independently bind the selected object before any dispatch.
-A separate decision artifact or helper trust object must be an explicit row in that successor
-payload rather than an implicit file.
+The transport alternative changes only `decision` to
+`ACCEPT_N19_LINUX_X86_64_SYSV_ASSEMBLY_ABI_V1_DIRECTION_ONLY`. The recommended crash-coverage bytes
+are:
+
+`{"schema_version":"state-backend-redb-crash-coverage-decision/v1","notice":"DESIGN_ONLY_NO_IMPLEMENTATION_OR_EXECUTION_AUTHORITY","scope":"SEQPACKET_CRASH_COVERAGE_BOUNDARY","decision":"SELECT_ADAPTER_COMMIT_ENTERED_V2_DIRECTION_ONLY","coverage_claim":"ADAPTER_ENTRY_OBSERVED_AND_RETURN_NOT_OBSERVED","redb_internal_progress_claim":"NONE","large_recovery_authority":"BLOCKED_PENDING_SEPARATE_INTERNAL_PROGRESS_DECISION"}`
+
+The crash-coverage alternative changes only `decision` to
+`SELECT_COMMIT_CALL_IMMINENT_V2_DIRECTION_ONLY` and `coverage_claim` to
+`CALL_IMMINENT_OBSERVED_AND_RETURN_NOT_OBSERVED`. The objects are embedded under the future
+`contract/target-identity.json` fields `n19_mechanism_decision` and `crash_coverage_decision`, not
+added as artifact rows. Workload-owner and operations-owner acceptance must be two distinct
+protected review events over the same immutable repository head containing these exact protocol
+bytes. That design review is not the later pre-run execution approval; the future `/v2` target
+identity, approval payload `/v3` and two-role receipt `/v3` independently bind both selected objects
+before any dispatch. A separate decision artifact or helper trust object must be an explicit row in
+that successor payload rather than an implicit file.
 
 Either choice explicitly denies implementation, mechanism/candidate execution, provider/container
-workflow, backend selection, cluster admission, production use and soak authority. Until one is
-recorded, both implementations remain blocked. The IPC frame, queue bounds, deadlines, exact
-retry/commit rules, credentials/pidfd/holder proof, successor schemas, crash-classifier choice,
-fixtures and dummy perturbation probe also remain absent. A redesign probe does not replace backend
-qualification or independent product soak.
+workflow, backend selection, cluster admission, production use and soak authority. Until both
+objects are accepted, every implementation remains blocked. The IPC frame, queue bounds, deadlines,
+exact retry/commit rules, credentials/pidfd/holder proof, exact adapter boundary/build audit,
+entry/return/error frames, successor schemas/classifier/oracle/schedule, perturbation limits,
+hostile fixtures and the separate large-recovery progress decision remain absent. A redesign probe
+does not replace backend qualification or independent product soak.
 
 #### `N28` one-shot broker/barrier recipe
 
