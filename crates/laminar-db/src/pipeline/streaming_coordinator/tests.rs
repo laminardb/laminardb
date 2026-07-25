@@ -6687,15 +6687,21 @@ async fn recovery_cycle_error_faults_best_effort() {
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let (tx, rx) = mpsc::bounded_async::<SourceMsg>(8);
     let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(8);
-    let coordinator = test_coordinator(
+    let mut coordinator = test_coordinator(
         rx,
         control_rx,
         shutdown,
         DeliveryGuarantee::BestEffort,
-        None,
+        Some(Duration::from_millis(1)),
     );
+    coordinator.last_checkpoint = Instant::now() - Duration::from_secs(1);
     let mut callback = MockCallback::new();
     callback.recovery_at_cycle = Some(1);
+    *callback.publication_error.lock() = Some("publication must not be attempted".into());
+    let publication_error = Arc::clone(&callback.publication_error);
+    let written_rows = Arc::clone(&callback.written_rows);
+    let checkpoint_order = Arc::clone(&callback.checkpoint_order);
+    let published_barriers = Arc::clone(&callback.published_barriers);
 
     tx.send(SourceMsg::Batch {
         source_idx: 0,
@@ -6710,6 +6716,17 @@ async fn recovery_cycle_error_faults_best_effort() {
         .expect("recovery error must stop best-effort execution");
     assert!(matches!(exit, ExitReason::Fault(ref error)
         if error.contains("injected recovery")));
+    assert_eq!(
+        publication_error.lock().as_deref(),
+        Some("publication must not be attempted"),
+        "a recovery cycle result must not reach stream publication"
+    );
+    assert_eq!(written_rows.load(Ordering::SeqCst), 0);
+    assert!(
+        checkpoint_order.lock().is_empty(),
+        "a due checkpoint must not drain or capture after an indeterminate cycle"
+    );
+    assert!(published_barriers.lock().is_empty());
 }
 
 #[tokio::test]

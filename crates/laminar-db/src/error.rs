@@ -114,9 +114,10 @@ pub enum DbError {
     /// durable cut before replay.
     ShufflePartialSend(String),
 
-    /// A stateful operator admitted input before a later step in the same cycle failed. The graph
-    /// must not replay that input against the mutated local state; recovery rewinds the failure
-    /// domain to its last durable cut.
+    /// A stateful operator may have changed local state before the attempt failed. This denotes an
+    /// indeterminate apply outcome, not proof that exactly a prefix was applied. The graph must not
+    /// replay that input against the possibly changed state; recovery rewinds the failure domain to
+    /// its last durable cut.
     StatefulOperatorPartialApply(String),
 
     /// Query pipeline error — wraps a `DataFusion` error with stream context.

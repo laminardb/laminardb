@@ -271,6 +271,19 @@ pub(crate) struct SqlQueryOperator {
     aligned_replay: VecDeque<(u64, i64, crate::operator::RetainedBatch)>,
 }
 
+/// Classify a failure from a step that may already have changed operator state.
+///
+/// Ordinary errors are not safe to isolate or retry once mutation may have begun. Existing
+/// recovery and halt dispositions retain their stronger classification.
+fn stateful_apply_outcome_unknown(op_name: &str, phase: &str, error: DbError) -> DbError {
+    if error.requires_pipeline_recovery() || error.requires_pipeline_halt() {
+        return error;
+    }
+    DbError::StatefulOperatorPartialApply(format!(
+        "aggregate '{op_name}' {phase} failed after state application began; the apply outcome is unknown: {error}"
+    ))
+}
+
 impl SqlQueryOperator {
     pub fn new(
         name: &str,
@@ -689,13 +702,21 @@ impl SqlQueryOperator {
             .await?
         };
 
-        let QueryState::Agg(ref mut aggregate) = self.state else {
-            unreachable!();
-        };
-        pre_agg_batches
-            .iter()
-            .try_for_each(|batch| aggregate.process_batch(batch, watermark))?;
-        self.emit_agg_output().await
+        {
+            let op_name = self.op_name.as_ref();
+            let QueryState::Agg(ref mut aggregate) = self.state else {
+                unreachable!();
+            };
+            for batch in &pre_agg_batches {
+                aggregate.process_batch(batch, watermark).map_err(|error| {
+                    stateful_apply_outcome_unknown(op_name, "state update", error)
+                })?;
+            }
+        }
+        let output = self.emit_agg_output().await;
+        output.map_err(|error| {
+            stateful_apply_outcome_unknown(&self.op_name, "output construction", error)
+        })
     }
 
     #[cfg(feature = "cluster")]
@@ -1653,6 +1674,77 @@ mod checkpoint_tests {
 
         operator.lazy_init().await.unwrap();
         assert!(matches!(operator.state, QueryState::CachedPlan(_)));
+    }
+
+    #[test]
+    fn stateful_apply_classification_preserves_stronger_dispositions() {
+        let ordinary = stateful_apply_outcome_unknown(
+            "totals",
+            "state update",
+            DbError::Pipeline("injected update failure".into()),
+        );
+        assert!(matches!(ordinary, DbError::StatefulOperatorPartialApply(_)));
+        assert!(ordinary.requires_pipeline_recovery());
+
+        let recovery = stateful_apply_outcome_unknown(
+            "totals",
+            "state update",
+            DbError::Checkpoint("injected recovery".into()),
+        );
+        assert!(matches!(recovery, DbError::Checkpoint(_)));
+
+        let halt = stateful_apply_outcome_unknown(
+            "totals",
+            "state update",
+            DbError::BackpressureFail("injected halt".into()),
+        );
+        assert!(matches!(halt, DbError::BackpressureFail(_)));
+    }
+
+    #[tokio::test]
+    async fn later_aggregate_batch_failure_requires_recovery_after_prior_mutation() {
+        let (context, seed) = context_and_batch();
+        let schema = seed.schema();
+        let first = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["a"])),
+                Arc::new(Int64Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        let later = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["b", "c"])),
+                Arc::new(Int64Array::from(vec![2, 3])),
+            ],
+        )
+        .unwrap();
+        let mut operator = SqlQueryOperator::new(
+            "totals",
+            "SELECT key, SUM(value) AS total FROM events GROUP BY key",
+            context,
+            None,
+            false,
+        );
+        operator.lazy_init().await.unwrap();
+        let QueryState::Agg(ref mut aggregate) = operator.state else {
+            panic!("expected incremental aggregate state");
+        };
+        aggregate.set_max_groups_for_test(2);
+
+        let error = operator
+            .process(&[vec![first, later]], &[i64::MIN])
+            .await
+            .expect_err("the later batch must exceed the aggregate group limit");
+
+        assert!(matches!(
+            &error,
+            DbError::StatefulOperatorPartialApply(message)
+                if message.contains("state update") && message.contains("outcome is unknown")
+        ));
+        assert!(error.requires_pipeline_recovery());
     }
 
     #[test]

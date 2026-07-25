@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-25 during Cycle 41
+- **Last reconciled:** 2026-07-25 during Cycle 42
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -13,7 +13,7 @@
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
   [TidesDB package design](tidesdb-local-state-successor-design.md),
   [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
-  [latest completed review](../reviews/distributed-keyed-state-cycle-41.md)
+  [latest completed review](../reviews/distributed-keyed-state-cycle-42.md)
 
 ## Decision
 
@@ -217,6 +217,17 @@ and timer deletion, or both sides of a changelog join—share one atomic write b
 compact schema-versioned binary codec with schema metadata hoisted out of each value. Per-group
 Arrow IPC streams are prohibited; the prior tier audit found their framing could dominate small
 accumulator payloads. Checkpoint export may re-columnarize many logical records together.
+
+Cycle 42 closes one existing execution-layer gap without introducing the future working-state
+service. Ordinary projection or planning errors that occur ahead of aggregate mutation retain
+their existing disposition. Existing stronger dispositions also remain unchanged: a partial
+shuffle send already requires recovery and a structural terminal failure still halts. Once
+`process_batch` is entered, or aggregate output construction begins, an otherwise ordinary error
+is conservatively an indeterminate stateful apply and forces coordinated recovery. The coordinator
+publishes neither that cycle's output nor a newly due checkpoint after the recovery result. This is
+not the future backend's sticky root/process poison: that mechanism remains part of an admitted
+working-state owner and must prevent reuse of an ambiguous native root. No TidesDB dependency or
+adapter follows.
 
 #### Frozen Fjall/RocksDB evidence and selected TidesDB binding line
 

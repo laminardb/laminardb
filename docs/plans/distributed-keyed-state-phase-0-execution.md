@@ -585,7 +585,12 @@ Remaining work is kept reviewable in this dependency order:
    complete-success/failed-before-apply/unknown-poison outcome and publication-exclusion contract,
    checkpoint/rebalance exclusion, fresh-root/fenced-attempt contract, resource-admission formula,
    truthful capability flags, and fake-backend fault tests. Defer TidesDB's owner lane and
-   verified-readback machinery; do not add or execute the package in this slice;
+   verified-readback machinery; do not add or execute the package in this slice. Cycle 42 completes
+   the first runtime-consumed part: normal aggregate failures after mutation may begin now map to
+   coordinated recovery, and tests prove the recovery result reaches neither output publication nor
+   a due checkpoint. A backend-owned sticky root/process poison, resource/health admission, and
+   fresh-root fencing remain open and must land only with a real runtime consumer rather than a
+   disconnected future trait;
 4. wait for a new official Cargo package `tidesdb`, freeze its exact native pair, and repeat the
    complete one-day/zero-machine-hour T0. The repeated T0 must reconcile every later native fix and
    prove exact transaction success or explicitly accept the full-key verified-commit/fail-stop

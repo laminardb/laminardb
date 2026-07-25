@@ -9,8 +9,9 @@
 **Current authority:** the [Cycle 40 package design](../architecture-decisions/tidesdb-local-state-successor-design.md)
 selects the official `tidesdb/tidesdb-rs` binding, Cargo package `tidesdb`, as the intended
 integration line. [Cycle 41 T0](tidesdb-rs-t0-source-closure-2026-07-25.md) stops exact v0.11.1/
-native 9.3.6 pending a new official package. Neither decision changes this validation evidence or
-cluster admission.
+native 9.3.6 pending a new official package. [Cycle 42](../reviews/distributed-keyed-state-cycle-42.md)
+corrects current aggregate failure classification and proves synchronous output/checkpoint
+exclusion after an indeterminate apply. None of these decisions changes cluster admission.
 
 ## Verdict
 

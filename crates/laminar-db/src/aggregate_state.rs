@@ -848,6 +848,11 @@ impl IncrementalAggState {
         }
         None
     }
+
+    #[cfg(test)]
+    pub(crate) fn set_max_groups_for_test(&mut self, max_groups: usize) {
+        self.max_groups = max_groups;
+    }
 }
 
 /// Z-set weight column name shared between the MV producer and upsert-sink consumers.

@@ -3,7 +3,7 @@
 - **Status:** Planned and backend-gated; exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster
   operator is admitted by this document
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-25 during Cycle 41
+- **Last reconciled:** 2026-07-25 during Cycle 42
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -47,6 +47,11 @@ plan amendment with named scope and owners. The intended broad/variable-state pr
   authorization or production admission; alternatives require an explicit owner decision. The
   project decision keeps bounded memory as a reference/conformance implementation
   only; it has no cluster product schedule or production-soak matrix under this plan.
+
+Cycle 42 completes one backend-neutral, runtime-consumed correction: a normal incremental
+aggregate error after state application may have begun is recovery-required, and the coordinator
+does not publish that cycle or start a due checkpoint. It does not add managed working state,
+qualify a backend, or satisfy the future native-root poison/fresh-restore contract.
 
 ## Scope and non-goals
 

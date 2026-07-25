@@ -2108,6 +2108,29 @@ async fn partial_shuffle_send_requires_recovery_without_shutdown() {
 }
 
 #[tokio::test]
+async fn indeterminate_stateful_apply_requires_recovery_without_shutdown() {
+    use crate::pipeline::CycleError;
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let error = DbError::StatefulOperatorPartialApply(
+        "aggregate state may have changed before acknowledgement".into(),
+    );
+
+    let mapped = ConnectorPipelineCallback::map_graph_error(&error, &notify);
+
+    assert!(matches!(
+        &mapped,
+        CycleError::Recovery(message)
+            if message.contains("state may have changed before acknowledgement")
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), notify.notified())
+            .await
+            .is_err(),
+        "coordinated recovery, rather than terminal shutdown, owns the fresh-state restart"
+    );
+}
+
+#[tokio::test]
 async fn checkpoint_drain_preserves_terminal_shuffle_halt() {
     use crate::pipeline::CycleError;
     let notify = Arc::new(tokio::sync::Notify::new());

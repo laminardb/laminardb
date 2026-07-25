@@ -14,7 +14,7 @@
 - **Evidence:** code inspection and current primary-source review; no candidate or product run
 - **Admission:** unchanged and fail-closed under `[LDB-4007]` and `[LDB-0013]`
 
-**Cycle 41 current direction:** the engine-neutral placement conclusion remains authoritative. The
+**Cycle 42 current direction:** the engine-neutral placement conclusion remains authoritative. The
 project owner selected TidesDB over RocksDB and now requires the official Rust binding. The
 [package design](../architecture-decisions/tidesdb-local-state-successor-design.md) binds Cargo
 package `tidesdb v0.11.1`
@@ -165,7 +165,11 @@ validation-only implementation.
    dependency followed.
 3. Implement only the backend-neutral complete/failed-before-apply/unknown-poison publication,
    fresh-root/fencing, resource-admission, and health-capability contracts plus fake-backend fault
-   tests. Defer TidesDB's owner lane and verified readback; do not add the stopped package.
+   tests. Cycle 42 completes the current aggregate classification/publication slice: an error after
+   aggregate state application may begin requires coordinated recovery, and the recovery path
+   excludes output and a due checkpoint. The backend-owned sticky native-root poison and remaining
+   admission contracts stay open. Defer TidesDB's owner lane and verified readback; do not add the
+   stopped package.
 4. Wait for a new official Rust package, then repeat the entire
    one-day/zero-machine-hour T0. Merely rebundling native 9.3.14 is insufficient. Only after a pass
    and separately reviewed execution scope may T1 spend at most two working days/four machine-hours
