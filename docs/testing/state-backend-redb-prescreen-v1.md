@@ -1,7 +1,7 @@
 # redb 4.1.0 bounded state-backend prescreen v1
 
 - **Identity:** `state-backend-redb-prescreen/v1`
-- **Status:** Cycle 25 semantic validation-contract freeze; only bytes-only validation work is
+- **Status:** Cycle 26 formal-input content-contract freeze; only bytes-only validation work is
   authorized, while the strict run/result schemas and wires, live provider/storage/finalization
   verifiers, native supervisor/child/actuator/oracle, reviewed build, owner approvals, and execution
   remain absent
@@ -306,11 +306,12 @@ plus six reserved IDs, and the semantic verifier requires exact equality rather 
 ### Separate pre-run authorization
 
 This proposal does not authorize protocol execution. Any formal command that claims the Docker smoke
-or native prescreen identity requires the reserved additive
+or native prescreen identity requires the additive
 `state-backend-redb-prescreen-approval-payload/v2` and
 `state-backend-redb-prescreen-protected-review-receipt/v2` over identical payload bytes. Neither
-schema exists. The implemented 28-row `/v1` payload/receipt pair can never authorize dispatch. The
-receipt is copied content and is never provider-authenticated merely because its
+valid copied content nor the Cycle 26 bytes-only validator authorizes dispatch. The implemented
+28-row `/v1` payload/receipt pair can never describe the formal 29-object input set. The receipt is
+copied content and is never provider-authenticated merely because its
 JSON validates. The unsigned payload contains all
 decision-bearing fields and descriptors, plus the two required roles and exact required decision
 literal. It contains no concrete principal, review-event ID, review timestamp, or receipt
@@ -428,14 +429,17 @@ The successor JSON identities are:
 |---|---|---|---|
 | protected-review policy | `state-backend-redb-prescreen-protected-review-policy/v1` | `redb-prescreen-protected-review-policy-v1.schema.json` | pre-run content validation |
 | approval payload | `state-backend-redb-prescreen-approval-payload/v1` | `redb-prescreen-approval-payload-v1.schema.json` | pre-run content validation |
-| result payload | `state-backend-redb-prescreen-result-payload/v1` | `redb-prescreen-result-payload-v1.schema.json` | identity reserved; later validation slice |
+| result payload | `state-backend-redb-prescreen-result-payload/v1` | none; identity reserved | later validation slice |
 | protected-review receipt | `state-backend-redb-prescreen-protected-review-receipt/v1` | `redb-prescreen-protected-review-receipt-v1.schema.json` | pre-run content validation; post-run shape reserved |
 
-The exact `$id` values, in the same order, are
+The exact implemented `$id` values, in table order with the absent result entry skipped, are
 `https://laminardb.dev/schemas/state-backend-redb-prescreen-protected-review-policy-v1.json`,
 `https://laminardb.dev/schemas/state-backend-redb-prescreen-approval-payload-v1.json`,
-`https://laminardb.dev/schemas/state-backend-redb-prescreen-result-payload-v1.json`, and
 `https://laminardb.dev/schemas/state-backend-redb-prescreen-protected-review-receipt-v1.json`.
+The reserved future result-payload `$id` is
+`https://laminardb.dev/schemas/state-backend-redb-prescreen-result-payload-v1.json`; no file or
+validator currently implements it, and the legacy `redb-prescreen-result-v1.schema.json` is not an
+alias for it.
 
 The exact owner decisions are `APPROVE_REDB_PRESCREEN_EXECUTION_V1` before either run class and
 `ACCEPT_REDB_PRESCREEN_RESULT_V1` after either run class. The payload digest already binds
@@ -565,23 +569,28 @@ values plus the native prior-smoke length when present using checked `u64` arith
 | 28 | `redb-prescreen-base-4g` | `fixtures/base-4g.redb` | `application/octet-stream` |
 
 That exact 28-row layout remains the implemented Cycle 22 synthetic regression contract and is not
-silently reinterpreted. The reserved formal `state-backend-redb-prescreen-approval-payload/v2`
+silently reinterpreted. The additive formal `state-backend-redb-prescreen-approval-payload/v2`
 requires 29
 common rows: rows 1--25 above, then `redb-prescreen-base-64m` at
 `fixtures/base-64m.redb`, followed by the existing 256-MiB, 1-GiB and 4-GiB roles as rows 27--29.
 The 64-MiB fixture role has a 1-GiB declared-byte cap, and the checked aggregate cap remains 20 GiB.
 Both run classes bind the same 29 rows, so native prerequisite equality includes the exact 64-MiB
-fixture descriptor. No current schema accepts that successor, which is intentional.
+fixture descriptor. At Cycle 25 close no schema accepted that successor; the Cycle 26 slice below
+adds copied-content conformance without execution or storage authority.
 
 The 29 descriptor targets form one exact `approval_input_object_set` held in a provider-versioned,
 immutable, read-only input root. Its objects—including all four physical bases—remain outside the
 result retained set and its 2-GiB accounting; they are not deleted by result cleanup. Before
 first-stage admission, a live verifier opens that exact version through pre-authorized handles,
 rehashes every target against the payload descriptors, verifies enforced retention, and may return
-only the opaque `APPROVAL_INPUT_STORAGE_VERSION_VERIFIED` capability. The run-start records copied
-input-version identity and descriptors but no storage authority. Admission binds that capability and
-exact version; post-run storage/provenance verification must reopen the same input version as well as
-the separate result-evidence version. No descriptor, receipt, provider version string or
+only the opaque `APPROVAL_INPUT_STORAGE_VERSION_VERIFIED` capability. The future run-start embeds one
+copied input-version binding; it is not a standalone packet object, has no role or locator, and adds
+no separately indexed or retained artifact. That nested content binds the exact approval-payload
+descriptor and its ordered 29 descriptors plus provider/store/version equality identifiers, but no
+storage authority. Its exact provider fields and schema remain blocked until the live storage
+provider/version/retention contract is selected. Admission binds the live capability and exact
+version; post-run storage/provenance verification must reopen the same input version as well as the
+separate result-evidence version. No nested binding, descriptor, receipt, provider version string or
 `immutable=true` field can construct the capability.
 
 The native-only prior-smoke descriptor is
@@ -1406,7 +1415,8 @@ of producing a smoke outcome or prerequisite capability.
 
 #### Cycle 25 implementation blockers
 
-No schema or validator implementation is safe yet. The exact raw role/locator/media/cardinality and
+At Cycle 25 close no further schema or validator implementation was safe. The blockers were the
+exact raw role/locator/media/cardinality and
 per-role cap registry; additive 29-row approval schema and independently constructed 64-MiB fixture
 descriptor/digests; actual-target and preflight-cut schemas; proven run-start/raw-manifest byte,
 depth, node and descriptor caps; exact duplicate-key/number/parser and deterministic terminal-
@@ -1415,13 +1425,89 @@ mint/handoff/freshness/replay rules; root/control lease and launch-broker/dorman
 process identity and dynamic-ledger encodings; campaign-control frame, sync, parent-durability,
 torn-tail and no-resume recovery rules; pre-authorized handle lifetime;
 attempt-close, crash/scan/oracle/panic witness schemas and panic-origin proof; report-envelope and
-expected-leaf/reconciliation wires; Docker control/case roles; evidence-close durability; and complete
-positive/negative fixtures remain freeze blockers.
+expected-leaf/reconciliation wires; Docker control/case roles; evidence-close durability; and
+complete positive/negative fixtures. Cycle 26 below resolves only the structural 29-row payload and
+matching receipt schemas. The independently constructed 64-MiB descriptor/digests and every other
+listed item remain blocked.
 
 Candidate caps of 64 KiB for run-start, 256 KiB for raw manifest, 128 raw descriptors and 256 MiB per
-raw object remain non-normative until exact fixtures prove them. No current schema recognizes the
-formal 29-row packet or any reserved Cycle 25 identity, and no current code may construct a child-
-dispatch capability, control journal, terminal latch, smoke/native outcome or trusted state.
+raw object remain non-normative until exact fixtures prove them. At Cycle 25 close no schema
+recognized the formal 29-row packet or any reserved Cycle 25 identity, and no code could construct a
+child-dispatch capability, control journal, terminal latch, smoke/native outcome or trusted state.
+
+### Cycle 26 formal-input content freeze
+
+Cycle 26 is one bounded, redb-free conformance slice. It freezes and may validate only the copied
+pre-run JSON content needed to describe the common 29-object approval input set. It does not open a
+descriptor target, construct the 64-MiB fixture, authenticate a provider or storage version, collect
+target/preflight evidence, construct a run-start, dispatch a process, open redb, classify a result or
+seal evidence. Success remains `authorization_unverified`, and both execution and result-sealing
+accessors remain unconditionally false.
+
+The two additive schema identities and files are:
+
+| Object | Exact `schema_version` | Exact schema file and `$id` |
+|---|---|---|
+| formal approval payload | `state-backend-redb-prescreen-approval-payload/v2` | `redb-prescreen-approval-payload-v2.schema.json`; `https://laminardb.dev/schemas/state-backend-redb-prescreen-approval-payload-v2.json` |
+| copied protected-review receipt | `state-backend-redb-prescreen-protected-review-receipt/v2` | `redb-prescreen-protected-review-receipt-v2.schema.json`; `https://laminardb.dev/schemas/state-backend-redb-prescreen-protected-review-receipt-v2.json` |
+
+The `/v2` payload has exactly the field set and values specified for the Cycle 22 payload except for
+its schema identity and the additive artifact array. That array has exactly 29 rows: rows 1--25 of
+the legacy registry without reinterpretation; row 26
+`(redb-prescreen-base-64m,fixtures/base-64m.redb,application/octet-stream)`; then the legacy 256-MiB,
+1-GiB and 4-GiB rows as rows 27--29. Docker and native payloads must carry byte-for-byte equal 29-row
+descriptor arrays; this slice validates each array against the same registry, while the later native
+prerequisite verifier must compare the two reviewed payloads. Docker requires
+`prior_smoke_result = null`; native requires the separately fixed reviewed-smoke descriptor. The redb
+archive remains row 15 with exact length `188200` and SHA-256
+`8e925444704b5f17d32bf42f5b6e2df050bceebc3dcd6e71cc73dafe8092e839`; row 14 binds the exact
+supplied policy bytes.
+
+The formal payload cap remains 64 KiB, root depth remains one with maximum depth 16, and the decoded
+node cap remains 4,096. Non-fixture roles remain capped at 256 MiB; the 64-MiB and 256-MiB fixture
+roles are each capped at 1 GiB, the 1-GiB role at 4 GiB and the 4-GiB role at 12 GiB. Checked
+addition of all 29 declared lengths and the native prior-smoke length, when present, must not exceed
+20 GiB. The descriptor, identifier, locator, digest, media-type, unknown-field, duplicate-key,
+placeholder and unsigned-JSON-number rules remain exactly those in Cycle 22.
+
+The two JSON Schema files enforce bounded closed structure, not complete conformance by themselves.
+The redb-free semantic validator must additionally enforce every exact tuple/order/per-role and
+aggregate cap, policy/crate byte binding, run-class branch and payload-selected version pairing before
+it can return the still-ineligible content-valid summary. Schema validity alone cannot produce that
+summary or any authority.
+
+The `/v2` receipt has exactly the closed receipt field layout from Cycle 22 except for its schema
+identity. Its `post_run` branch is a reserved structural branch outside this Cycle 26 conformance
+slice. This slice accepts only `stage = pre_run`, `retained_evidence = null`, and the exact supplied
+`/v2` approval-payload length and digest. The protected-review policy remains `/v1`; therefore the
+decision literal deliberately remains `APPROVE_REDB_PRESCREEN_EXECUTION_V1`. Introducing a `_V2`
+literal would require a separately reviewed policy successor and is rejected here. Semantic
+validation selects the receipt schema from the already decoded payload version and rejects every
+mixed `/v1` payload--`/v2` receipt or `/v2` payload--`/v1` receipt pair. A receipt cannot nominate its
+own schema branch.
+
+Literal fixtures for this slice are hand-authored, LF-pinned, synthetic copied-content examples.
+They may prove only stable byte parsing and exact length/SHA bindings; they are not the future
+`contract/literal-goldens.tar.zst`, do not contain an independently constructed 64-MiB database
+digest, and cannot satisfy live provider or storage verification. The legacy 28-row schemas,
+fixtures, API output and regression behavior remain unchanged.
+
+The approval-input storage-version binding is now placed in the DAG but not given an implementing
+schema. It will be strict nested copied content inside the future run-start, never a standalone role,
+locator or retained/indexed leaf. It will bind the exact `/v2` approval-payload descriptor, the exact
+ordered 29 descriptors and provider/store/version equality identifiers. It must contain no root
+selector, URL, handle, credential, self-hash, future-object reference, retention or immutability
+claim, verification state, authorization or capability. The independently held opaque storage
+capability binds the hidden opened root/version and supplies all authority. Exact provider fields,
+identifier domains, retention proof, freshness and TOCTOU rules remain blockers, so this cycle adds
+no storage-version schema, fixture, public type or validator.
+
+Actual-target, preflight-cut, run-start, raw-manifest, campaign-control, Docker-control, report and
+evidence-close schemas remain blocked. In particular, the 64-KiB run-start, 256-KiB raw-manifest,
+128-descriptor and 4,096-node suggestions remain non-normative until the native 105-row and Docker
+ten-row role/process/cardinality registries prove their maxima. Before any Docker runner exists, a
+Docker-tagged durable launch ledger or equivalently retained broker-receipt chain must also own its
+start/armed/release ambiguity; a final JSON control object alone cannot prove the attempt cut.
 
 ## Isolation and clocks
 
@@ -1664,9 +1750,10 @@ than `min(4 * logical_live_bytes, 12 GiB)`. Checked multiplication overflow is i
 The 2-GiB retained-result-evidence cap excludes the separately immutable approval-input object set,
 transient working database copies and streamed scan bytes. Full scans feed the redb-free oracle
 incrementally and are never materialized as exports.
-Retained result evidence includes the exact approval/result payloads and receipts, copied input-
-version binding, run-start and manifests, raw timing/resource/marker frames, target/preflight/noise
-records, state counts and digests, at most 1 MiB per mismatch excerpt, process/kernel logs,
+Retained result evidence includes the exact approval/result payloads and receipts, run-start
+(including its nested copied input-version binding) and manifests, raw timing/resource/marker frames,
+target/preflight/noise records, state counts and digests, at most 1 MiB per mismatch excerpt,
+process/kernel logs,
 validator/oracle/mechanism reports, cleanup journal/report and final artifact index. It binds but
 does not duplicate/index the separately retained approval-input plans, schedule, binaries or physical
 bases. The Cycle 24 hierarchy defines the exact set relationship and retained-cap accounting.
