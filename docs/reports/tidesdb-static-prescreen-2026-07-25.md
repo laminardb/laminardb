@@ -34,8 +34,8 @@ More importantly, static prescreening finds blockers before performance executio
    although native children retain and dereference those pointers, and its commit-hook API permits
    an unsynchronized callback/context replacement race;
 3. the native default per-column-family layout explicitly is not crash-atomic for a transaction
-   spanning column families and can expose a partial multi-column-family apply before commit returns;
-   the unified-WAL alternative has fail-open recovery and ambiguous acknowledgement paths;
+   spanning column families; both layouts can expose a partial apply before commit returns and can
+   acknowledge an ordinary partially inserted batch, while unified-WAL recovery can fail open;
 4. the native online checkpoint omits unflushed shared state in unified mode and otherwise is not an
    atomic cross-column-family state cut, with unresolved lifetime, concurrent-flush,
    compaction-acquisition, publication, and retry concerns;
@@ -123,23 +123,30 @@ must therefore pin unified mode and `TDB_SYNC_FULL`; both unified mode and its s
 off/`NONE`. An ordinary transaction commit, WAL write, or commit hook is not a distributed
 checkpoint or an exactly-once receipt.
 
-Default `READ_COMMITTED` does not make the first layout runtime-atomic. Commit publishes an
-in-progress transaction before applying its column families sequentially, but point reads disable
-commit-status visibility and iterators filter by sequence rather than that status. A concurrent
-reader can therefore observe a partially applied multi-column-family transaction before commit
-returns. This contradicts the native header's runtime-atomicity statement and is a source-proved
-failure for LaminarDB's cross-namespace mutation contract.
+Default `READ_COMMITTED` does not make either layout runtime-atomic. Commit publishes an in-progress
+sequence before applying column families sequentially in per-column-family mode or inserting the
+unified skip-list batch entry by entry. Point reads disable commit-status visibility and iterators
+filter by sequence rather than that status. A concurrent reader can therefore observe a partially
+applied multi-operation or multi-column-family transaction before commit returns in either layout.
+This contradicts the native header's runtime-atomicity statement and is a source-proved failure for
+LaminarDB's cross-namespace mutation contract.
 
 The Rust commit-hook documentation calls the data fully durable before callback invocation, but
 the native sync modes explicitly allow `NONE` and interval acknowledgement without a per-commit
 stable-storage barrier. The hook is therefore not a durability receipt unless the exact FULL-sync
 path and its failure boundary are separately proved.
 
-Even in unified mode, the implementation appends and, in FULL mode, synchronizes the WAL before
-applying the batch to the in-memory skip list. A later application allocation failure can return an
-error even though restart will replay the already-written record. Some large-transaction fallback
-branches skip a failed prefixed-key allocation, ignore individual insertion failures, and can return
-success after a partial in-memory apply. Commit-error cleanup releases memtable references but does
+Both layouts' ordinary multi-operation apply helpers call `skip_list_put_batch`, whose documented
+return is the number inserted and may be less than the requested count after per-entry validation,
+allocation, or bounded-CAS failure. The callers test only for a negative result rather than exact
+count, then can mark the transaction committed and return success. Ordinary transactions can
+therefore acknowledge a partial in-memory apply. Unified large-transaction fallback branches add
+more silent paths: they can skip a failed prefixed-key allocation and ignore individual insertion
+failures before returning success.
+
+Unified mode also appends and, in FULL mode, synchronizes the WAL before applying the batch to the
+in-memory skip list. A later reported application failure can return an error even though restart
+will replay the already-written record. Commit-error cleanup releases memtable references but does
 not establish a reviewed abort/removal/reservation-release state transition. These are exact-source
 concerns, not fault-injection results. Until upstream resolves the semantics and adversarial tests
 prove them, every non-success after the WAL append must be a fatal unknown-commit-point event:
@@ -348,7 +355,7 @@ cancel memory unsafety, torn recovery, an unavailable state cut, or missing fail
 | Exact deployable subject | Rust `0.11.1` selects native `9.3.6`; current engine and benchmarks are different revisions | **FAIL** — produce a lifetime-safe wrapper pinned to the exact reviewed native release and complete provenance |
 | Legal/build adoption | MPL-2.0 is identifiable; C toolchain, bundled codecs, ABI, SBOM, notices, target flags, and redistribution package are not frozen | **BLOCK** |
 | C1 ordered KV primitives | Point operations, transactions, snapshots/isolation, ordered bidirectional iteration, seeks, deletes, and multiple CFs exist | **CONDITIONAL** — exact byte ordering, bounded scans, read-cut semantics, and canonical export/restore still need conformance |
-| Cross-namespace atomicity | Per-CF mode is crash-nonatomic; default `READ_COMMITTED` point reads and iterator paths permit partial runtime visibility; unified mode has silent/ambiguous apply paths | **FAIL** — a repaired unified+FULL path needs fault proof |
+| Cross-namespace atomicity | Per-CF mode is crash-nonatomic; both layouts permit default `READ_COMMITTED` partial visibility and can acknowledge a partial batch insertion; unified mode adds ambiguous apply paths | **FAIL** — repaired all-or-nothing unified+FULL mutation and visibility need fault proof |
 | Rust memory and FFI safety | Parent/child lifetimes are not encoded; hook replacement can race callback use; callbacks have no panic boundary | **FAIL** |
 | Portable checkpoint/restore | Native checkpoint omits shared unified state and has no atomic global cut or publication; logical export is only plausible | **FAIL native / BLOCK logical** |
 | Rebalance lifecycle | No Laminar vnode epoch, inactive-generation restore, atomic publication, fencing, resumable cleanup, or retained-cut GC | **MISSING** — backend-independent ADR work remains required |
@@ -410,10 +417,10 @@ TidesDB should be reconsidered only in this order:
 2. make the internal pressure budget cgroup-aware and safely below the external hard cgroup limit,
    prove allocator/page-cache/temporary headroom, and define a candidate unified-memtable plus
    FULL-sync profile subject to the remaining steps;
-3. fix strict unified-WAL recovery, post-WAL acknowledgement, silent/ignored apply failures, and
-   transaction cleanup; establish point/iterator commit-status visibility and immutable cross-column-
-   family read-cut semantics; then prove them with corruption, allocation, I/O, crash and cache-loss
-   faults;
+3. require exact-count, all-or-nothing batch apply; fix strict unified-WAL recovery, post-WAL
+   acknowledgement, silent/ignored apply failures, and transaction cleanup; establish point/iterator
+   commit-status visibility and immutable cross-column-family read-cut semantics; then prove them
+   with concurrency, corruption, allocation, I/O, crash, and cache-loss faults;
 4. obtain upstream answers or fixes for unified checkpoint omission, column-family lifetime and
    concurrent capture/publication; use logical export as authority only after the read-cut contract
    above closes, unless native checkpoint later proves a durable sealed atomic cut;
