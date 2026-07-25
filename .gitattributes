@@ -8,3 +8,4 @@
 /tools/state-backend-qual/tests/fixtures/mechanism-bundle-*/**/*.bin binary
 /tools/state-backend-qual/tests/fixtures/zipf-candidate-*.json text eol=lf
 /tools/state-backend-qual/tests/fixtures/redb-prescreen-successor-v1/*.json text eol=lf
+/tools/state-backend-qual/tests/fixtures/redb-prescreen-successor-v2/*.json text eol=lf

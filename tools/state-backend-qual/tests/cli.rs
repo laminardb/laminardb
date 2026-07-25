@@ -219,6 +219,34 @@ fn redb_review_content_is_valid_but_explicitly_authorization_unverified() {
 }
 
 #[test]
+fn redb_v2_review_content_reuses_the_ineligible_content_only_command() {
+    let output = binary()
+        .arg("validate-redb-prescreen-pre-run-content")
+        .arg(manifest_path(
+            "tests/fixtures/redb-prescreen-successor-v1/policy.json",
+        ))
+        .arg(manifest_path(
+            "tests/fixtures/redb-prescreen-successor-v2/payload.json",
+        ))
+        .arg(manifest_path(
+            "tests/fixtures/redb-prescreen-successor-v2/receipt.json",
+        ))
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!(
+            "{NOTICE}\nVALID_INELIGIBLE_REDB_PRESCREEN_CONTENT stage=pre_run \
+             payload=redb-prescreen-synthetic-pre-run-v2 \
+             authorization=authorization_unverified\n"
+        )
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn redb_post_run_binding_is_opaque_ineligible_and_authorization_unverified() {
     let fixture = |name: &str| {
         manifest_path(&format!(

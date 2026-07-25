@@ -413,7 +413,7 @@ jobs:
             exit 1
           fi
           dependency_tree="$(cargo tree --locked --all-features --target all --manifest-path tools/state-backend-qual/Cargo.toml --prefix none)"
-          if grep -Eqi '^(laminar([[:space:]_-]|$)|fjall([[:space:]]|$)|rocksdb([[:space:]]|$)|librocksdb[-_]|arrow([[:space:]_-]|$)|datafusion([[:space:]_-]|$))' <<< "$dependency_tree"; then
+          if grep -Eqi '^(laminar([[:space:]_-]|$)|fjall([[:space:]]|$)|redb([[:space:]]|$)|rocksdb([[:space:]]|$)|librocksdb[-_]|arrow([[:space:]_-]|$)|datafusion([[:space:]_-]|$))' <<< "$dependency_tree"; then
             echo "state qualification model tool unexpectedly has a runtime or candidate dependency"
             exit 1
           fi

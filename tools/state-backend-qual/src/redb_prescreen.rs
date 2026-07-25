@@ -22,22 +22,56 @@ pub const MAX_REDB_ARTIFACT_INDEX_BYTES: usize = 16 * 1024 * 1024;
 
 const POLICY_SCHEMA: &str =
     include_str!("../schema/redb-prescreen-protected-review-policy-v1.schema.json");
-const PAYLOAD_SCHEMA: &str =
+const PAYLOAD_V1_SCHEMA: &str =
     include_str!("../schema/redb-prescreen-approval-payload-v1.schema.json");
-const RECEIPT_SCHEMA: &str =
+const PAYLOAD_V2_SCHEMA: &str =
+    include_str!("../schema/redb-prescreen-approval-payload-v2.schema.json");
+const RECEIPT_V1_SCHEMA: &str =
     include_str!("../schema/redb-prescreen-protected-review-receipt-v1.schema.json");
+const RECEIPT_V2_SCHEMA: &str =
+    include_str!("../schema/redb-prescreen-protected-review-receipt-v2.schema.json");
 
 const PRE_RUN_DECISION: &str = "APPROVE_REDB_PRESCREEN_EXECUTION_V1";
 const POST_RUN_DECISION: &str = "ACCEPT_REDB_PRESCREEN_RESULT_V1";
 const MAX_JSON_DEPTH: usize = 16;
 const MAX_JSON_NODES: usize = 4_096;
 const MAX_NON_FIXTURE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_BASE_64M_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_BASE_256M_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_BASE_1G_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_BASE_4G_BYTES: u64 = 12 * 1024 * 1024 * 1024;
 const MAX_PRE_RUN_DECLARED_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 const REDB_CRATE_BYTES: u64 = 188_200;
 const REDB_CRATE_SHA256: &str = "8e925444704b5f17d32bf42f5b6e2df050bceebc3dcd6e71cc73dafe8092e839";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreRunContentVersion {
+    V1,
+    V2,
+}
+
+impl PreRunContentVersion {
+    const fn payload_schema(self) -> &'static str {
+        match self {
+            Self::V1 => PAYLOAD_V1_SCHEMA,
+            Self::V2 => PAYLOAD_V2_SCHEMA,
+        }
+    }
+
+    const fn receipt_schema(self) -> &'static str {
+        match self {
+            Self::V1 => RECEIPT_V1_SCHEMA,
+            Self::V2 => RECEIPT_V2_SCHEMA,
+        }
+    }
+
+    const fn expected_artifacts(self) -> &'static [ExpectedArtifact] {
+        match self {
+            Self::V1 => &EXPECTED_ARTIFACTS,
+            Self::V2 => &EXPECTED_ARTIFACTS_V2,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RedbPrescreenAuthorization {
@@ -277,6 +311,43 @@ const EXPECTED_ARTIFACTS: [ExpectedArtifact; 28] = [
     ),
 ];
 
+const EXPECTED_ARTIFACTS_V2: [ExpectedArtifact; 29] = [
+    EXPECTED_ARTIFACTS[0],
+    EXPECTED_ARTIFACTS[1],
+    EXPECTED_ARTIFACTS[2],
+    EXPECTED_ARTIFACTS[3],
+    EXPECTED_ARTIFACTS[4],
+    EXPECTED_ARTIFACTS[5],
+    EXPECTED_ARTIFACTS[6],
+    EXPECTED_ARTIFACTS[7],
+    EXPECTED_ARTIFACTS[8],
+    EXPECTED_ARTIFACTS[9],
+    EXPECTED_ARTIFACTS[10],
+    EXPECTED_ARTIFACTS[11],
+    EXPECTED_ARTIFACTS[12],
+    EXPECTED_ARTIFACTS[13],
+    EXPECTED_ARTIFACTS[14],
+    EXPECTED_ARTIFACTS[15],
+    EXPECTED_ARTIFACTS[16],
+    EXPECTED_ARTIFACTS[17],
+    EXPECTED_ARTIFACTS[18],
+    EXPECTED_ARTIFACTS[19],
+    EXPECTED_ARTIFACTS[20],
+    EXPECTED_ARTIFACTS[21],
+    EXPECTED_ARTIFACTS[22],
+    EXPECTED_ARTIFACTS[23],
+    EXPECTED_ARTIFACTS[24],
+    artifact(
+        "redb-prescreen-base-64m",
+        "fixtures/base-64m.redb",
+        "application/octet-stream",
+        MAX_BASE_64M_BYTES,
+    ),
+    EXPECTED_ARTIFACTS[25],
+    EXPECTED_ARTIFACTS[26],
+    EXPECTED_ARTIFACTS[27],
+];
+
 const fn artifact(
     role: &'static str,
     locator: &'static str,
@@ -296,28 +367,41 @@ pub fn validate_redb_prescreen_pre_run_content(
     payload_bytes: &[u8],
     receipt_bytes: &[u8],
 ) -> Result<RedbPrescreenContentSummary, CheckErrors> {
+    validate_redb_prescreen_pre_run_content_versioned(policy_bytes, payload_bytes, receipt_bytes)
+        .map(|(summary, _version)| summary)
+}
+
+fn validate_redb_prescreen_pre_run_content_versioned(
+    policy_bytes: &[u8],
+    payload_bytes: &[u8],
+    receipt_bytes: &[u8],
+) -> Result<(RedbPrescreenContentSummary, PreRunContentVersion), CheckErrors> {
     let policy = decode_contract(
         policy_bytes,
         MAX_REDB_REVIEW_POLICY_BYTES,
         "redb protected-review policy",
         POLICY_SCHEMA,
     )?;
-    let payload = decode_contract(
+    let (payload, version) = decode_versioned_payload(
         payload_bytes,
         MAX_REDB_APPROVAL_PAYLOAD_BYTES,
         "redb approval payload",
-        PAYLOAD_SCHEMA,
     )?;
     let receipt = decode_contract(
         receipt_bytes,
         MAX_REDB_REVIEW_RECEIPT_BYTES,
         "redb protected-review receipt",
-        RECEIPT_SCHEMA,
+        version.receipt_schema(),
     )?;
 
     let mut errors = Vec::new();
     check_policy(&policy, &mut errors);
-    let policy_descriptor = check_payload(&payload, policy_bytes, &mut errors);
+    let policy_descriptor = check_payload(
+        &payload,
+        policy_bytes,
+        version.expected_artifacts(),
+        &mut errors,
+    );
     check_pre_run_receipt(
         &policy,
         &payload,
@@ -331,10 +415,13 @@ pub fn validate_redb_prescreen_pre_run_content(
         return Err(CheckErrors::many(errors));
     }
 
-    Ok(RedbPrescreenContentSummary {
-        payload_id: text(&payload, "/payload_id").to_owned(),
-        authorization: RedbPrescreenAuthorization::Unverified,
-    })
+    Ok((
+        RedbPrescreenContentSummary {
+            payload_id: text(&payload, "/payload_id").to_owned(),
+            authorization: RedbPrescreenAuthorization::Unverified,
+        },
+        version,
+    ))
 }
 
 /// Checks copied pre/post receipt lineage and exact bounded result/index byte bindings.
@@ -348,11 +435,16 @@ pub fn validate_redb_prescreen_post_run_binding(
     opaque_artifact_index_bytes: &[u8],
     post_run_receipt_bytes: &[u8],
 ) -> Result<RedbPrescreenPostRunBindingSummary, CheckErrors> {
-    validate_redb_prescreen_pre_run_content(
+    let (_summary, version) = validate_redb_prescreen_pre_run_content_versioned(
         policy_bytes,
         approval_payload_bytes,
         pre_run_receipt_bytes,
     )?;
+    if version != PreRunContentVersion::V1 {
+        return Err(CheckErrors::one(
+            "outer post-run binding accepts only the copied-content /v1 pre-run contract",
+        ));
+    }
     check_opaque_binding_bytes(
         opaque_result_payload_bytes,
         MAX_REDB_RESULT_PAYLOAD_BYTES,
@@ -374,13 +466,13 @@ pub fn validate_redb_prescreen_post_run_binding(
         pre_run_receipt_bytes,
         MAX_REDB_REVIEW_RECEIPT_BYTES,
         "redb pre-run protected-review receipt",
-        RECEIPT_SCHEMA,
+        RECEIPT_V1_SCHEMA,
     )?;
     let post_run_receipt = decode_contract(
         post_run_receipt_bytes,
         MAX_REDB_REVIEW_RECEIPT_BYTES,
         "redb post-run protected-review receipt",
-        RECEIPT_SCHEMA,
+        RECEIPT_V1_SCHEMA,
     )?;
 
     let mut errors = Vec::new();
@@ -425,20 +517,42 @@ fn decode_contract(
     label: &str,
     schema_source: &str,
 ) -> Result<Value, CheckErrors> {
+    let value = decode_contract_value(bytes, maximum_bytes, label)?;
+    validate_contract_schema(&value, label, schema_source)?;
+    Ok(value)
+}
+
+fn decode_versioned_payload(
+    bytes: &[u8],
+    maximum_bytes: usize,
+    label: &str,
+) -> Result<(Value, PreRunContentVersion), CheckErrors> {
+    let value = decode_contract_value(bytes, maximum_bytes, label)?;
+    let version = match value.pointer("/schema_version").and_then(Value::as_str) {
+        Some("state-backend-redb-prescreen-approval-payload/v1") => PreRunContentVersion::V1,
+        Some("state-backend-redb-prescreen-approval-payload/v2") => PreRunContentVersion::V2,
+        Some(found) => {
+            return Err(CheckErrors::one(format!(
+                "{label} has unsupported schema_version `{found}`"
+            )))
+        }
+        None => {
+            return Err(CheckErrors::one(format!(
+                "{label} requires a string schema_version"
+            )))
+        }
+    };
+    validate_contract_schema(&value, label, version.payload_schema())?;
+    Ok((value, version))
+}
+
+fn decode_contract_value(
+    bytes: &[u8],
+    maximum_bytes: usize,
+    label: &str,
+) -> Result<Value, CheckErrors> {
     let value = decode_unique_json(bytes, maximum_bytes, label)?;
     check_json_shape(&value, label)?;
-
-    let schema: Value = serde_json::from_str(schema_source)
-        .map_err(|error| CheckErrors::one(format!("decode embedded {label} schema: {error}")))?;
-    let validator = jsonschema::validator_for(&schema)
-        .map_err(|error| CheckErrors::one(format!("compile embedded {label} schema: {error}")))?;
-    let schema_errors = validator
-        .iter_errors(&value)
-        .map(|error| format!("{label} schema {}: {error}", error.instance_path()))
-        .collect::<Vec<_>>();
-    if !schema_errors.is_empty() {
-        return Err(CheckErrors::many(schema_errors));
-    }
 
     let mut errors = Vec::new();
     reject_placeholder_strings(&value, "", &mut errors);
@@ -447,6 +561,25 @@ fn decode_contract(
         return Err(CheckErrors::many(errors));
     }
     Ok(value)
+}
+
+fn validate_contract_schema(
+    value: &Value,
+    label: &str,
+    schema_source: &str,
+) -> Result<(), CheckErrors> {
+    let schema: Value = serde_json::from_str(schema_source)
+        .map_err(|error| CheckErrors::one(format!("decode embedded {label} schema: {error}")))?;
+    let validator = jsonschema::validator_for(&schema)
+        .map_err(|error| CheckErrors::one(format!("compile embedded {label} schema: {error}")))?;
+    let schema_errors = validator
+        .iter_errors(value)
+        .map(|error| format!("{label} schema {}: {error}", error.instance_path()))
+        .collect::<Vec<_>>();
+    if !schema_errors.is_empty() {
+        return Err(CheckErrors::many(schema_errors));
+    }
+    Ok(())
 }
 
 fn check_json_shape(value: &Value, label: &str) -> Result<(), CheckErrors> {
@@ -489,6 +622,7 @@ fn check_policy(policy: &Value, errors: &mut Vec<String>) {
 fn check_payload(
     payload: &Value,
     policy_bytes: &[u8],
+    expected_artifacts: &[ExpectedArtifact],
     errors: &mut Vec<String>,
 ) -> Option<Descriptor> {
     let artifacts = payload
@@ -498,7 +632,11 @@ fn check_payload(
     let mut total = 0_u64;
     let mut policy_descriptor = None;
 
-    for (index, (value, expected)) in artifacts.iter().zip(EXPECTED_ARTIFACTS).enumerate() {
+    for (index, (value, expected)) in artifacts
+        .iter()
+        .zip(expected_artifacts.iter().copied())
+        .enumerate()
+    {
         let descriptor = descriptor(value, &format!("payload artifact {index}"), errors);
         let Some(descriptor) = descriptor else {
             continue;
@@ -1165,6 +1303,22 @@ mod tests {
         })
     }
 
+    fn payload_v2(policy_bytes: &[u8]) -> Value {
+        let mut value = payload(policy_bytes);
+        value["schema_version"] = "state-backend-redb-prescreen-approval-payload/v2".into();
+        value["payload_id"] = "redb-prescreen-synthetic-pre-run-v2".into();
+        value["artifacts"] = EXPECTED_ARTIFACTS_V2
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, expected)| descriptor_value(expected, index))
+            .collect::<Vec<_>>()
+            .into();
+        value["artifacts"][13]["byte_length"] = u64::try_from(policy_bytes.len()).unwrap().into();
+        value["artifacts"][13]["sha256"] = sha256_hex(policy_bytes).into();
+        value
+    }
+
     fn receipt(policy_bytes: &[u8], payload_bytes: &[u8]) -> Value {
         let payload_length = u64::try_from(payload_bytes.len()).unwrap();
         let payload_sha = sha256_hex(payload_bytes);
@@ -1227,6 +1381,12 @@ mod tests {
         })
     }
 
+    fn receipt_v2(policy_bytes: &[u8], payload_bytes: &[u8]) -> Value {
+        let mut value = receipt(policy_bytes, payload_bytes);
+        value["schema_version"] = "state-backend-redb-prescreen-protected-review-receipt/v2".into();
+        value
+    }
+
     fn post_run_receipt(
         policy_bytes: &[u8],
         result_payload_bytes: &[u8],
@@ -1262,6 +1422,13 @@ mod tests {
         let policy_bytes = json_bytes(&policy());
         let payload_bytes = json_bytes(&payload(&policy_bytes));
         let receipt_bytes = json_bytes(&receipt(&policy_bytes, &payload_bytes));
+        (policy_bytes, payload_bytes, receipt_bytes)
+    }
+
+    fn valid_v2_bytes() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let policy_bytes = json_bytes(&policy());
+        let payload_bytes = json_bytes(&payload_v2(&policy_bytes));
+        let receipt_bytes = json_bytes(&receipt_v2(&policy_bytes, &payload_bytes));
         (policy_bytes, payload_bytes, receipt_bytes)
     }
 
@@ -1301,6 +1468,14 @@ mod tests {
             .to_string()
     }
 
+    fn invalid_payload_v2_error(policy_bytes: &[u8], payload: &Value) -> String {
+        let payload_bytes = json_bytes(payload);
+        let receipt_bytes = json_bytes(&receipt_v2(policy_bytes, &payload_bytes));
+        validate_redb_prescreen_pre_run_content(policy_bytes, &payload_bytes, &receipt_bytes)
+            .unwrap_err()
+            .to_string()
+    }
+
     fn invalid_post_run_binding_error(
         policy_bytes: &[u8],
         payload_bytes: &[u8],
@@ -1323,7 +1498,13 @@ mod tests {
 
     #[test]
     fn successor_schemas_are_valid_draft_2020_12() {
-        for source in [POLICY_SCHEMA, PAYLOAD_SCHEMA, RECEIPT_SCHEMA] {
+        for source in [
+            POLICY_SCHEMA,
+            PAYLOAD_V1_SCHEMA,
+            PAYLOAD_V2_SCHEMA,
+            RECEIPT_V1_SCHEMA,
+            RECEIPT_V2_SCHEMA,
+        ] {
             let schema: Value = serde_json::from_str(source).unwrap();
             jsonschema::draft202012::meta::validate(&schema).unwrap();
         }
@@ -1343,6 +1524,130 @@ mod tests {
         );
         assert!(!summary.execution_authorized());
         assert!(!summary.result_sealing_authorized());
+    }
+
+    #[test]
+    fn formal_v2_shape_is_content_only_and_uses_the_exact_additive_registry() {
+        let (policy, payload, receipt) = valid_v2_bytes();
+        let summary = validate_redb_prescreen_pre_run_content(&policy, &payload, &receipt).unwrap();
+        assert_eq!(summary.payload_id, "redb-prescreen-synthetic-pre-run-v2");
+        assert_eq!(
+            summary.authorization,
+            RedbPrescreenAuthorization::Unverified
+        );
+        assert!(!summary.execution_authorized());
+        assert!(!summary.result_sealing_authorized());
+
+        let payload: Value = serde_json::from_slice(&payload).unwrap();
+        let artifacts = payload["artifacts"].as_array().unwrap();
+        assert_eq!(artifacts.len(), 29);
+        assert_eq!(artifacts[24]["role"], EXPECTED_ARTIFACTS[24].role);
+        assert_eq!(artifacts[25]["role"], "redb-prescreen-base-64m");
+        assert_eq!(artifacts[25]["locator"], "fixtures/base-64m.redb");
+        assert_eq!(artifacts[26]["role"], EXPECTED_ARTIFACTS[25].role);
+        assert_eq!(artifacts[27]["role"], EXPECTED_ARTIFACTS[26].role);
+        assert_eq!(artifacts[28]["role"], EXPECTED_ARTIFACTS[27].role);
+    }
+
+    #[test]
+    fn payload_version_selects_the_receipt_schema_and_mixed_pairs_fail_closed() {
+        let (policy_v1, payload_v1, receipt_v1_bytes) = valid_bytes();
+        let (policy_v2, payload_v2, receipt_v2_bytes) = valid_v2_bytes();
+        assert_eq!(policy_v1, policy_v2);
+
+        let error =
+            validate_redb_prescreen_pre_run_content(&policy_v2, &payload_v2, &receipt_v1_bytes)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("protected-review-receipt/v2"));
+
+        let error =
+            validate_redb_prescreen_pre_run_content(&policy_v1, &payload_v1, &receipt_v2_bytes)
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("protected-review-receipt/v1"));
+
+        let repinned_v1_receipt_for_v2 = json_bytes(&receipt(&policy_v2, &payload_v2));
+        let error = validate_redb_prescreen_pre_run_content(
+            &policy_v2,
+            &payload_v2,
+            &repinned_v1_receipt_for_v2,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("protected-review-receipt/v2"));
+
+        let repinned_v2_receipt_for_v1 = json_bytes(&receipt_v2(&policy_v1, &payload_v1));
+        let error = validate_redb_prescreen_pre_run_content(
+            &policy_v1,
+            &payload_v1,
+            &repinned_v2_receipt_for_v1,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("protected-review-receipt/v1"));
+
+        let mut unsupported: Value = serde_json::from_slice(&payload_v2).unwrap();
+        unsupported["schema_version"] = "state-backend-redb-prescreen-approval-payload/v3".into();
+        let unsupported_bytes = json_bytes(&unsupported);
+        let unsupported_receipt = json_bytes(&receipt_v2(&policy_v2, &unsupported_bytes));
+        let error = validate_redb_prescreen_pre_run_content(
+            &policy_v2,
+            &unsupported_bytes,
+            &unsupported_receipt,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unsupported schema_version"));
+    }
+
+    #[test]
+    fn structurally_valid_v2_post_run_receipt_is_outside_pre_run_conformance() {
+        let (policy, payload, _receipt) = valid_v2_bytes();
+        let mut post_run = receipt_v2(&policy, &payload);
+        post_run["stage"] = "post_run".into();
+        post_run["payload"]["role"] = "redb-prescreen-result-payload".into();
+        post_run["payload"]["locator"] = "result/payload.json".into();
+        post_run["reviews"][0]["decision_literal"] = POST_RUN_DECISION.into();
+        post_run["reviews"][1]["decision_literal"] = POST_RUN_DECISION.into();
+        post_run["retained_evidence"] = json!({
+            "kind": "state-backend-redb-prescreen-retained-evidence-root/v1",
+            "artifact_index": {
+                "role": "redb-prescreen-artifact-index",
+                "locator": "result/artifact-index.json",
+                "byte_length": 1,
+                "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                "media_type": "application/json"
+            }
+        });
+
+        validate_contract_schema(
+            &post_run,
+            "synthetic v2 post-run receipt",
+            RECEIPT_V2_SCHEMA,
+        )
+        .unwrap();
+        let error =
+            validate_redb_prescreen_pre_run_content(&policy, &payload, &json_bytes(&post_run))
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("accepts only a pre_run receipt"));
+    }
+
+    #[test]
+    fn outer_post_run_binding_does_not_promote_the_v2_pre_run_slice() {
+        let (policy, payload, receipt) = valid_v2_bytes();
+        let error = validate_redb_prescreen_post_run_binding(
+            &policy,
+            &payload,
+            &receipt,
+            b"opaque result",
+            b"opaque index",
+            b"unused post-run receipt",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("accepts only the copied-content /v1 pre-run contract"));
     }
 
     #[test]
@@ -1825,26 +2130,40 @@ mod tests {
     #[test]
     fn every_fixed_artifact_tuple_position_is_semantic_not_advisory() {
         let policy_bytes = json_bytes(&policy());
-        for index in 0..EXPECTED_ARTIFACTS.len() {
-            let media_replacement = if EXPECTED_ARTIFACTS[index].media_type == "application/json" {
-                "application/octet-stream"
-            } else {
-                "application/json"
-            };
-            for (field, replacement) in [
-                ("role", "synthetic-mutated-role"),
-                ("locator", "synthetic/mutated-locator"),
-                ("media_type", media_replacement),
-            ] {
-                let mut changed = payload(&policy_bytes);
-                changed["artifacts"][index][field] = replacement.into();
-                let error = invalid_payload_error(&policy_bytes, &changed);
-                let semantic = if field == "media_type" {
-                    "media type"
-                } else {
-                    field
-                };
-                assert!(error.contains(&format!("payload artifact {index} {semantic} must be")));
+        for (version, expected_artifacts) in [
+            (PreRunContentVersion::V1, EXPECTED_ARTIFACTS.as_slice()),
+            (PreRunContentVersion::V2, EXPECTED_ARTIFACTS_V2.as_slice()),
+        ] {
+            for index in 0..expected_artifacts.len() {
+                let media_replacement =
+                    if expected_artifacts[index].media_type == "application/json" {
+                        "application/octet-stream"
+                    } else {
+                        "application/json"
+                    };
+                for (field, replacement) in [
+                    ("role", "synthetic-mutated-role"),
+                    ("locator", "synthetic/mutated-locator"),
+                    ("media_type", media_replacement),
+                ] {
+                    let mut changed = match version {
+                        PreRunContentVersion::V1 => payload(&policy_bytes),
+                        PreRunContentVersion::V2 => payload_v2(&policy_bytes),
+                    };
+                    changed["artifacts"][index][field] = replacement.into();
+                    let error = match version {
+                        PreRunContentVersion::V1 => invalid_payload_error(&policy_bytes, &changed),
+                        PreRunContentVersion::V2 => {
+                            invalid_payload_v2_error(&policy_bytes, &changed)
+                        }
+                    };
+                    let semantic = if field == "media_type" {
+                        "media type"
+                    } else {
+                        field
+                    };
+                    assert!(error.contains(&format!("payload artifact {index} {semantic} must be")));
+                }
             }
         }
     }
@@ -1880,6 +2199,133 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(error.contains("maximum aggregate"));
+    }
+
+    #[test]
+    fn v2_64m_role_cap_and_twenty_gib_aggregate_are_inclusive() {
+        fn declared_total(payload: &Value) -> u64 {
+            payload["artifacts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|descriptor| descriptor["byte_length"].as_u64().unwrap())
+                .sum()
+        }
+
+        let policy_bytes = json_bytes(&policy());
+        let mut role_cap = payload_v2(&policy_bytes);
+        role_cap["artifacts"][25]["byte_length"] = MAX_BASE_64M_BYTES.into();
+        let payload_bytes = json_bytes(&role_cap);
+        let receipt_bytes = json_bytes(&receipt_v2(&policy_bytes, &payload_bytes));
+        validate_redb_prescreen_pre_run_content(&policy_bytes, &payload_bytes, &receipt_bytes)
+            .unwrap();
+
+        role_cap["artifacts"][25]["byte_length"] = (MAX_BASE_64M_BYTES + 1).into();
+        let error = invalid_payload_v2_error(&policy_bytes, &role_cap);
+        assert!(error.contains("payload artifact 25 declares"));
+
+        let mut aggregate = payload_v2(&policy_bytes);
+        for (index, cap) in [
+            (25, MAX_BASE_64M_BYTES),
+            (26, MAX_BASE_256M_BYTES),
+            (27, MAX_BASE_1G_BYTES),
+            (28, MAX_BASE_4G_BYTES),
+        ] {
+            aggregate["artifacts"][index]["byte_length"] = cap.into();
+        }
+        let mut remaining = MAX_PRE_RUN_DECLARED_BYTES - declared_total(&aggregate);
+        for index in (0..25).filter(|index| *index != 13 && *index != 14) {
+            let current = aggregate["artifacts"][index]["byte_length"]
+                .as_u64()
+                .unwrap();
+            let add = remaining.min(MAX_NON_FIXTURE_BYTES - current);
+            aggregate["artifacts"][index]["byte_length"] = (current + add).into();
+            remaining -= add;
+        }
+        assert_eq!(remaining, 0);
+        assert_eq!(declared_total(&aggregate), MAX_PRE_RUN_DECLARED_BYTES);
+
+        let payload_bytes = json_bytes(&aggregate);
+        let receipt_bytes = json_bytes(&receipt_v2(&policy_bytes, &payload_bytes));
+        validate_redb_prescreen_pre_run_content(&policy_bytes, &payload_bytes, &receipt_bytes)
+            .unwrap();
+
+        let mut native_over_cap = aggregate.clone();
+        native_over_cap["run_class"] = "native_prescreen_decision".into();
+        native_over_cap["prior_smoke_result"] = json!({
+            "role": "redb-prescreen-reviewed-smoke-result",
+            "locator": "evidence/prior-smoke-result.json",
+            "byte_length": 1,
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "media_type": "application/json"
+        });
+        let error = invalid_payload_v2_error(&policy_bytes, &native_over_cap);
+        assert!(error.contains("maximum aggregate"));
+
+        let increment_index = (0..25)
+            .filter(|index| *index != 13 && *index != 14)
+            .find(|index| {
+                aggregate["artifacts"][*index]["byte_length"]
+                    .as_u64()
+                    .unwrap()
+                    < MAX_NON_FIXTURE_BYTES
+            })
+            .unwrap();
+        let current = aggregate["artifacts"][increment_index]["byte_length"]
+            .as_u64()
+            .unwrap();
+        aggregate["artifacts"][increment_index]["byte_length"] = (current + 1).into();
+        let error = invalid_payload_v2_error(&policy_bytes, &aggregate);
+        assert!(error.contains("maximum aggregate"));
+    }
+
+    #[test]
+    fn v2_additive_row_and_run_class_branches_fail_closed() {
+        let policy_bytes = json_bytes(&policy());
+
+        let mut reordered = payload_v2(&policy_bytes);
+        reordered["artifacts"].as_array_mut().unwrap().swap(25, 26);
+        let error = invalid_payload_v2_error(&policy_bytes, &reordered);
+        assert!(error.contains("payload artifact 25 role must be `redb-prescreen-base-64m`"));
+
+        let mut missing = payload_v2(&policy_bytes);
+        missing["artifacts"].as_array_mut().unwrap().remove(25);
+        let error = invalid_payload_v2_error(&policy_bytes, &missing);
+        assert!(error.contains("/artifacts"), "{error}");
+
+        let mut too_many = payload_v2(&policy_bytes);
+        let extra = too_many["artifacts"][28].clone();
+        too_many["artifacts"].as_array_mut().unwrap().push(extra);
+        let error = invalid_payload_v2_error(&policy_bytes, &too_many);
+        assert!(error.contains("/artifacts"), "{error}");
+
+        let mut native = payload_v2(&policy_bytes);
+        native["run_class"] = "native_prescreen_decision".into();
+        native["prior_smoke_result"] = json!({
+            "role": "redb-prescreen-reviewed-smoke-result",
+            "locator": "evidence/prior-smoke-result.json",
+            "byte_length": 1024,
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "media_type": "application/json"
+        });
+        let payload_bytes = json_bytes(&native);
+        let receipt_bytes = json_bytes(&receipt_v2(&policy_bytes, &payload_bytes));
+        let summary =
+            validate_redb_prescreen_pre_run_content(&policy_bytes, &payload_bytes, &receipt_bytes)
+                .unwrap();
+        assert_eq!(
+            summary.authorization,
+            RedbPrescreenAuthorization::Unverified
+        );
+
+        native["prior_smoke_result"] = Value::Null;
+        let error = invalid_payload_v2_error(&policy_bytes, &native);
+        assert!(error.contains("prior_smoke_result"));
+
+        let mut wrong_decision = payload_v2(&policy_bytes);
+        wrong_decision["required_decision_literal"] = "APPROVE_REDB_PRESCREEN_EXECUTION_V2".into();
+        let error = invalid_payload_v2_error(&policy_bytes, &wrong_decision);
+        assert!(error.contains("APPROVE_REDB_PRESCREEN_EXECUTION_V1"));
     }
 
     #[test]
