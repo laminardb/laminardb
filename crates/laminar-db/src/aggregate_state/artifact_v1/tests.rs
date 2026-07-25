@@ -728,3 +728,5 @@ proptest! {
         let _ = decode(&bytes, expected, &mut budget());
     }
 }
+
+mod checkpoint_oracle;

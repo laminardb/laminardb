@@ -523,7 +523,13 @@ generic strict IPC helper because
 Arrow 57.2 can allocate from attacker-declared lengths before proving input availability; the
 initial aggregate artifact therefore uses the bounded Laminar row codec and wire contract frozen in
 [managed state artifact format v1](../architecture-decisions/managed-state-artifact-format-v1.md).
-The Cycle 5 readers remain unwired; `[LDB-4007]` remains unchanged.
+Cycle 37 freezes the aggregate-v1 journal/checkpoint-transition contract and a private, disconnected
+`BTreeMap` oracle nested under the existing artifact tests. Its literal vectors cover atomic PUT
+coalescing, immutable capture/re-emission, Commit-admitted ancestry, aborted-attempt retention,
+outcome-less allocated-ID gaps, pre/post-seal DecisionInDoubt, exact generation release,
+deterministic ordering, and the existing aggregate/V2 codec seam. It is a reference model, not a
+runtime implementation or performance result. The Cycle 5 readers remain unwired; `[LDB-4007]`
+remains unchanged.
 
 Remaining commits are kept reviewable in this dependency order:
 
@@ -531,29 +537,19 @@ Remaining commits are kept reviewable in this dependency order:
    - review the Cycle 36 packet and prepared exact v4 freeze-candidate bytes, resolve the nominal
      observation and threshold-authority decisions, name both independent reviewers, and obtain final
      two-owner approval; prepared bytes instantiate no reserved v2 identity;
-2. `docs/test: freeze aggregate-v1 journal and checkpoint-cut semantics`
-   - first write the short normative aggregate-v1 journal/checkpoint-transition contract, then add a
-     disconnected, tool/test-only BTreeMap state-machine oracle for atomic pre-cut batches, PUT
-     coalescing, freeze isolation, retained dirty generations after failed capture, identical-cut
-     same-live retry, normal adjacent sealed-parent DELTA, FULL after a burned immediately preceding
-     checkpoint-ID, unchanged REFERENCE, rejection of early release, no release after seal followed
-     by terminal Abort, release only after the exact containing attempt has both a sealed inventory
-     and durable terminal Commit, and deterministic per-vnode ordering. Round-trip only through
-     existing test-only aggregate/vnode encoders and readers. Add no public runtime trait, backend,
-     adapter, manifest dispatch, restore installation, or admission consumer;
-3. only after `APPROVE_STATE_BACKEND_RUNNER_CONTRACT_V2`, implement its validation-only schemas and
+2. only after `APPROVE_STATE_BACKEND_RUNNER_CONTRACT_V2`, implement its validation-only schemas and
    synthetic, execution-ineligible fixtures without a runtime dependency;
-4. after mechanism closure and owner carry-forward approval, add a separate exact-pin adapter commit
+3. after mechanism closure and owner carry-forward approval, add a separate exact-pin adapter commit
    for each admitted candidate behind the private spike contract;
-5. `docs: approve keyed-state qualification profile and runner`
+4. `docs: approve keyed-state qualification profile and runner`
    - named workload/operations owners may revise the candidate before approving final thresholds,
      case matrix, Zipf sampler, runner source/build identity, and evidence rules. A separately
      reviewed approved-profile schema/status records signatures and hashes. The current validator
      intentionally accepts only null approvals and `qualification_eligible=false`;
-6. `test: exercise backend crash resource and endurance gates` using only the approved artifacts;
-7. `docs: select managed-state backend from evidence`;
-8. `tools: remove rejected state backend spike`; and
-9. `docs: review distributed keyed state phase zero`.
+5. `test: exercise backend crash resource and endurance gates` using only the approved artifacts;
+6. `docs: select managed-state backend from evidence`;
+7. `tools: remove rejected state backend spike`; and
+8. `docs: review distributed keyed state phase zero`.
 
 The parked redb prescreen is not a prerequisite or active side branch in this numbered candidate
 sequence. If a future bounded charter yields a favorable administrative recommendation, a later

@@ -33,19 +33,94 @@ does not authenticate an untrusted checkpoint store.
 `vnode_count` and `vnode` are `u32` to match the assignment and sealed-partial APIs. A reader still
 requires `1 <= vnode_count <= 65_535` and `vnode < vnode_count` under partition ABI v1.
 
-An attempt is canonical only when `epoch == checkpoint_id != 0`. A DELTA parent must be canonical,
-sealed, and exactly `current - 1` in both fields. Its matching roster entry may be BODY or REFERENCE;
-when it is REFERENCE, resolution follows that additional edge to the older body. A REFERENCE parent
-must be canonical, sealed, and strictly older, but may skip checkpoints because an unchanged vnode
-can name an older sealed body. FULL and EMPTY have no parent. The transition resolver counts each
-DELTA or REFERENCE edge against `resolved_parent_links_max`; a FULL/EMPTY base has depth zero.
+An attempt is canonical only when `epoch == checkpoint_id != 0`. A parent entry is **admitted** only
+when its exact contextual digest appears in that attempt's sealed inventory and the attempt has a
+durable terminal `CheckpointVerdict::Commit` decision. Seal without Commit, including seal followed
+by Abort, is not admitted.
 
-Checkpoint IDs are never reused after a terminal failed attempt. When `current - 1` is burned and
-unsealed, no legal DELTA parent entry exists: the first later changed capture MUST emit FULL, or
-EMPTY for authoritative empty state. An unchanged vnode MAY still REFERENCE an older sealed body.
-Once an intervening sealed attempt contains that REFERENCE, a subsequent DELTA may name the
-immediately preceding sealed REFERENCE entry. A retry of the same still-live attempt may reuse its
-already frozen immutable cut, but it does not create a new checkpoint ID or weaken the parent rule.
+Initial managed v1 deliberately makes this stronger than the legacy seal-only physical-parent
+check. It may pay for a FULL after Abort, but a committed chain never depends on aborted-attempt
+retention or cleanup behavior. Reusing sealed-Abort state would require a new reviewed lineage with
+transitive pinning, garbage-collection, recovery, and fault evidence.
+
+A DELTA parent must be canonical, admitted, and exactly `current - 1` in both fields. Its matching
+roster entry may be BODY or REFERENCE; when it is REFERENCE, resolution follows that additional edge
+to the older body. A REFERENCE parent must be canonical, admitted, and strictly older, but may skip
+checkpoints because an unchanged vnode can name an older admitted BODY. FULL and EMPTY have no
+parent. The transition resolver counts each DELTA or REFERENCE edge against
+`resolved_parent_links_max`; a FULL/EMPTY base has depth zero.
+
+Once allocated, a checkpoint ID is never reused. A numeric gap may have no outcome, capture, or seal;
+the allocator/fence proves the gap burned and the transition oracle treats that proof as caller-owned
+input. When `current - 1` has no admitted entry, no legal DELTA parent exists: the first later changed
+capture MUST emit FULL, or EMPTY for authoritative empty state. An unchanged vnode MAY still
+REFERENCE an older admitted BODY. Once an intervening admitted attempt contains that REFERENCE, a
+subsequent DELTA may name the immediately preceding admitted REFERENCE entry. Re-emitting the same
+still-live cut after a lost materialization or upload response may reuse its immutable bytes, but it
+does not freeze again, create a new checkpoint ID, or weaken the parent rule.
+
+## Aggregate-v1 journal and checkpoint-transition contract
+
+This section is the normative source for the disconnected aggregate-v1 conformance oracle. It does
+not define a public runtime API, backend adapter, manifest consumer, or admission capability. The
+scope is one stable operator/state-table/vnode namespace using append-only codec 1.
+
+The logical state is a key-sorted map of current `CountSumStateV1` replacements. Inputs to this
+transition contract have already passed namespace ownership, routing-schema, vnode, and canonical
+key validation; the disconnected oracle does not repeat those checks. A fresh instance starts
+empty. Any restored nonempty instance must also install the admitted BODY provenance that produced
+it. One active mutation generation is a key-sorted, coalescing map containing only the latest PUT
+for each changed key. Nonempty frozen mutation generations are immutable and remain retained until
+the exact containing attempt is admitted. Rotating an empty active generation creates no dirty data
+or release obligation and need not add a retained generation ID.
+
+One input batch transitions atomically:
+
+1. Every distinct key is read once from the same pre-batch logical cut. Its rows are then checked in
+   source order in scratch state, including every COUNT and SUM prefix. Each internal per-key append
+   contains at least one source row; a zero-row append is invalid rather than an empty aggregate or
+   a dirty no-op.
+2. Any invalid aggregate state, COUNT overflow, or SUM overflow rejects the complete batch without
+   changing logical state or the active generation. Key validation is outside this already-validated
+   transition boundary.
+3. Success publishes every new logical value together and replaces the active-generation PUT for
+   each affected key. Repeated rows or batches therefore leave one latest replacement per key.
+
+Aggregate-v1 initially permits one live capture per namespace. The caller supplies a canonical,
+durably allocated, fenced attempt and proves any skipped IDs already burned. Beginning that attempt
+finishes the bounded in-flight batch, rotates the active generation, and freezes one cut containing
+all retained uncommitted nonempty generations plus a nonempty rotation. Later mutations enter a new
+active generation and cannot change the frozen cut. A lost materialization/upload response may
+re-emit the same already-frozen cut with identical generation IDs, logical snapshot, rows, kind,
+parent, bytes, and digest. The oracle proves semantic-view identity; existing deterministic codec
+tests separately freeze byte output. This is not a second lifecycle freeze or reuse of an allocated
+attempt ID. A different attempt cannot begin until the live attempt receives a terminal decision.
+
+The frozen cut selects exactly one canonical entry:
+
+- with dirty PUTs and an admitted `current - 1` entry, DELTA contains the sorted dirty replacements
+  and names that exact BODY or REFERENCE entry;
+- with dirty PUTs but no admitted `current - 1` entry, FULL contains the complete sorted logical
+  state; PUT-only aggregate-v1 cannot have dirty PUTs and an empty logical state;
+- without dirty PUTs and with nonempty logical state, REFERENCE names the most recent admitted
+  nonempty BODY (FULL or DELTA); missing BODY provenance is an invalid construction or restore,
+  not a reason to invent a fallback FULL; and
+- without dirty PUTs and with empty logical state, EMPTY is emitted even when an older EMPTY exists;
+  REFERENCE never denotes empty state.
+
+Encoding or upload failure does not mutate the cut. Recording the exact entry in a sealed inventory
+still releases nothing. A durable terminal Abort admits no entry, burns the attempt ID, retains every
+captured generation, and removes the live attempt. A durable terminal Commit is accepted only after
+the exact entry is sealed; it admits that entry and releases exactly the captured generation IDs.
+Post-freeze active mutations and generations owned by another attempt remain retained. Repeating an
+identical terminal observation is idempotent; a conflicting terminal observation is invalid.
+
+An ambiguous terminal-decision write enters DecisionInDoubt whether it occurs before or after seal.
+This includes an ambiguous pre-seal Abort write. It releases nothing and blocks further mutation,
+materialization retry, and new attempts until recovery observes the exact create-once outcome.
+Observed Commit is valid only with the exact validated seal and applies the release rule above;
+observed Abort needs no seal and retains the generations. Absence of an outcome remains blocked and
+is never inferred as Abort.
 
 ## Aggregate state contract
 
@@ -129,8 +204,9 @@ Sections are contiguous in routing, contract, rows order. The routing descriptor
 is compared byte-for-byte with the cached `PartitionKeySchemaV1`. The contract is the exact 64-byte
 record above. FULL and DELTA require at least one row; EMPTY is the only zero-row form and has zero
 key/state/rows lengths plus `SHA256(empty)` for the rows digest. FULL/EMPTY parent fields and parent
-digest are zero. DELTA uses the exact immediately preceding sealed attempt and a nonzero digest of
-its matching BODY or REFERENCE entry.
+digest are zero. DELTA encodes the exact immediately preceding canonical attempt and a nonzero
+digest of its matching BODY or REFERENCE entry. The isolated reader proves this structural relation;
+production composition must also prove that entry admitted under the rule above.
 
 Each row is:
 
@@ -205,9 +281,10 @@ entry vnode equals the header vnode. A directory with only references has an emp
 
 BODY has a positive body length and FULL, DELTA, or EMPTY kind. BODY ranges appear contiguously in
 directory order, start at the header body offset, and exactly cover the body region. Its body digest
-matches the exact slice. FULL/EMPTY have zero parent fields; DELTA has an immediately preceding
-canonical sealed parent and nonzero digest of its matching BODY or REFERENCE entry. The landed V2
-reader stops after this outer
+matches the exact slice. FULL/EMPTY have zero parent fields; DELTA carries an immediately preceding
+canonical parent and nonzero digest of its matching BODY or REFERENCE entry. The wire reader proves
+only that structural relation; production resolution must additionally prove the parent admitted
+under the rule above. The landed V2 reader stops after this outer
 structural validation. Production composition must first verify the complete raw V2 payload against
 the trusted seal/inventory digest, then invoke the manifest-selected inner decoder for every BODY;
 that decoder verifies that the envelope repeats the same attempt, assignment, identity, vnode, kind,

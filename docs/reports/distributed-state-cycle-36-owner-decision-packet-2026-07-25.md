@@ -73,7 +73,7 @@ operators cannot observe in production, while keeping expensive diagnostics off 
 | Provider support | LaminarDB's Rust `object_store` builder supports local, S3, GCS, and Azure targets |
 | Cluster checkpoint authority | A namespace-proof-admitted, genuinely cluster-shared store plus LaminarDB's exact-attempt inventory and seal; cloud targets provide the current shared paths, while `file://` remains embedded/test/node-durable unless separately proved shared |
 | Worker-local spill backend | Disposable local latency/capacity mechanism; no native remote-object-store feature is required |
-| TidesDB remote mode | Zero backend-selection weight and no integration authority; current FS/S3 paths and lack of a native Azure path cannot replace the provider-neutral checkpoint layer |
+| TidesDB remote mode | Zero backend-selection weight and disabled for any local-only assessment; shipped filesystem/S3-compatible paths, no native GCS/Azure path, and no Rust `object_store` injection cannot replace the provider-neutral checkpoint layer; the low-level C callback seam would be new connector engineering |
 | Future remote working-state tier | Separate ADR only after a local engine qualifies and measurements justify it; if required, provider neutrality including Azure becomes a hard gate |
 
 TidesDB's native read cut, checkpoint, or remote SST/WAL/manifest set could only be a local
@@ -98,26 +98,34 @@ Artifact v1 intentionally covers only append-only grouped `COUNT(*)`/`SUM(Int64)
 tombstones/deletes, window frontiers, manifest selection, and restore installation are not yet
 encoded. A public trait now would freeze guesses and invite unused backend abstractions.
 
-One checkpoint transition is now explicit: terminal failed attempts burn checkpoint IDs. When the
-immediately preceding attempt is burned and unsealed, the first later changed capture emits FULL, or
-EMPTY for authoritative empty state; an unchanged vnode may REFERENCE an older sealed body. A later
-DELTA may name an immediately preceding sealed REFERENCE entry and resolution follows both edges.
+One checkpoint transition is now explicit: every allocated checkpoint ID is permanently burned; a
+numeric gap may have no outcome, capture, or seal. When the immediately preceding attempt has no
+admitted entry, including an outcome-less gap, unsealed attempt, or sealed-Abort attempt, the first
+later changed capture emits FULL, or EMPTY for authoritative empty state; an unchanged nonempty
+vnode may REFERENCE an older admitted nonempty BODY, while unchanged empty state emits EMPTY. A later
+DELTA may name an immediately preceding admitted REFERENCE entry and resolution follows both edges.
+Cycle 37 defines admitted as exact sealed inventory plus durable Commit; sealed-Abort state remains
+retained but is not parent authority in initial managed v1.
 
 ## Smallest safe next implementation slice
 
 First freeze a short normative aggregate-v1 journal/checkpoint-transition contract. Then add a
-disconnected `#[cfg(test)]` or tool-only BTreeMap state-machine oracle against it. Literal vectors
+disconnected BTreeMap state-machine oracle nested under the existing `#[cfg(test)]` artifact tests.
+Literal vectors
 must prove:
 
 - one batch reads a pre-mutation cut and publishes all writes atomically;
 - repeated PUTs coalesce deterministically;
 - freeze isolates later mutations;
 - failed capture retains dirty generations;
-- same-live retry reuses the identical immutable cut;
-- a normal adjacent sealed parent permits DELTA, including a sealed REFERENCE parent;
-- a burned immediately preceding checkpoint-ID forces FULL for the first later changed state;
-- unchanged state may REFERENCE an older sealed body;
+- a lost materialization/upload response reuses the identical immutable cut without lifecycle retry;
+- a normal adjacent admitted parent permits DELTA, including an admitted REFERENCE parent;
+- a burned immediately preceding checkpoint ID, including a gap with no outcome, forces FULL for
+  the first later changed state;
+- unchanged state may REFERENCE an older admitted nonempty BODY;
 - early release is rejected, and seal followed by terminal Abort does not release generations;
+- pre-seal DecisionInDoubt blocks progress until observed Abort retains the generations, while an
+  observed Commit still requires the exact seal;
 - generations release only after the exact containing attempt has both a sealed inventory and the
   durable terminal `CheckpointVerdict::Commit` decision;
 - per-vnode output ordering is deterministic and round-trips through existing test-only aggregate

@@ -2,14 +2,14 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-25 after Cycle 36
+- **Last reconciled:** 2026-07-25 after Cycle 37
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** **NO-GO**; no working-state backend is selected or admitted
 - **Related:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md),
   [implementation plan](../plans/distributed-keyed-stateful-operators.md),
   [current owner decisions](../reports/distributed-state-cycle-21-owner-decisions-2026-07-24.md),
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
-  and [latest completed review](../reviews/distributed-keyed-state-cycle-36.md)
+  and [latest completed review](../reviews/distributed-keyed-state-cycle-37.md)
 
 ## Decision
 
@@ -41,7 +41,7 @@ seal, coordinator decision, or restore-before-activate authority.
 | RocksDB 10.4.2 via `rocksdb` 0.24.0 | Frozen v4 comparison/closure subject; v1 Stage-0 closure stopped; not selected or runnable | Final v2 contract, separate source/binding closure approval, then full common C1/C2/C3, latency/resource, persistence, fault, and endurance gates |
 | Fjall 3.1.8 | Frozen v4 comparison/closure subject; stock scheduler/lifecycle/governance signals do not close the gate; not selected or runnable | Explicit fork/upstream ownership plus candidate-specific source closure after final v2 approval, then the same common campaign |
 | redb 4.1.0 | **PARKED after Cycle 34**; administrative status, not a formal `DEFER` result; design timebox exhausted; no candidate profile, adapter, mechanism result, or execution authority | No scheduled work. Reopen only through an explicit two-day/four-machine-hour micro-prescreen charter; otherwise retain as history. A favorable observation could only fund a later mapping/profile proposal |
-| TidesDB | **STOP current exact subject**; official Rust path rejected and native 9.3.14 research-only; optional remote mode exposes FS/S3 paths but no generic connector injection or native Azure Blob path, so it has zero selection weight | Re-enter only after the recorded exact-current Rust, atomicity, recovery, checkpoint, resource, and health closures plus a new owner decision. TidesDB may be assessed only as disposable local working state; a future remote tier needs a separate ADR and provider-neutral design and cannot replace LaminarDB's local/S3/GCS/Azure checkpoint authority |
+| TidesDB | **STOP current exact subject**; official Rust path rejected and native 9.3.14 research-only; shipped remote implementations are filesystem plus S3-compatible, with no native GCS/Azure path or Rust `object_store` injection, so remote support has zero selection weight | Re-enter only after the recorded exact-current Rust, atomicity, recovery, checkpoint, resource, and health closures plus a new owner decision. TidesDB may be assessed only as disposable local working state with native remote mode disabled. Its low-level C callback seam would be new connector engineering; any future remote tier needs a separate ADR and provider-neutral design and cannot replace LaminarDB's local/S3/GCS/Azure checkpoint authority |
 | SurrealKV 0.21.2 | Rejected unmodified; no active candidate track | Correctness/liveness fork and new bounded prescreen authority before reconsideration |
 
 The current source detail and rationale live in the
@@ -512,12 +512,15 @@ all groups.
 Frozen generations remain referenced until the exact attempt containing their base/delta chain has
 both a sealed inventory and the durable terminal `CheckpointVerdict::Commit` decision. Seal alone
 cannot release them because a later durable Abort may still win. An aborted or failed capture
-cannot clear its changes; the next attempt includes their union or emits a full rebase. A retry
-within the same live attempt may reuse its immutable cut. Once a failed
-terminal attempt burns its checkpoint ID, the first later changed capture has no sealed
-immediately-preceding entry and emits FULL, or EMPTY when authoritative state is empty. An unchanged
-vnode may REFERENCE an older sealed body. If that REFERENCE is sealed, a subsequent DELTA may name
-it as the immediately preceding entry; resolution then follows both edges. Limits on concurrent
+cannot clear its changes; the next attempt includes their union or emits a full rebase. A lost
+materialization/upload response may re-emit the identical immutable cut, but does not re-enter the
+lifecycle or reuse an allocated attempt ID. Every allocated checkpoint ID is burned permanently;
+a numeric gap may have no outcome, capture, or seal. Whenever the first later changed capture has no
+admitted immediately-preceding entry it emits FULL, or EMPTY when authoritative state is empty. An
+unchanged vnode may REFERENCE an older admitted nonempty BODY.
+If an intervening REFERENCE is admitted, a subsequent DELTA may name it as the immediately preceding
+entry; resolution then follows both edges. Initial managed v1 requires sealed inventory plus durable
+Commit for admission and deliberately does not reuse sealed-Abort state. Limits on concurrent
 attempts, frozen bytes, and delta-chain length apply backpressure. A
 mutable-capture or encoding error faults the pipeline rather than retrying against partially
 consumed dirty state.
