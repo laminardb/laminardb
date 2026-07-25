@@ -2,13 +2,13 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-25 after Cycle 34
+- **Last reconciled:** 2026-07-25 after Cycle 35
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** **NO-GO**; no working-state backend is selected or admitted
 - **Related:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md),
   [implementation plan](../plans/distributed-keyed-stateful-operators.md),
   [current owner decisions](../reports/distributed-state-cycle-21-owner-decisions-2026-07-24.md),
-  and [latest completed review](../reviews/distributed-keyed-state-cycle-34.md)
+  and [latest completed review](../reviews/distributed-keyed-state-cycle-35.md)
 
 ## Decision
 
@@ -34,7 +34,7 @@ No runtime backend dependency or adapter is authorized by this ADR state.
 | RocksDB 10.4.2 via `rocksdb` 0.24.0 | Frozen v4 comparison/closure subject; v1 Stage-0 closure stopped; not selected or runnable | Final v2 contract, separate source/binding closure approval, then full common C1/C2/C3, latency/resource, persistence, fault, and endurance gates |
 | Fjall 3.1.8 | Frozen v4 comparison/closure subject; stock scheduler/lifecycle/governance signals do not close the gate; not selected or runnable | Explicit fork/upstream ownership plus candidate-specific source closure after final v2 approval, then the same common campaign |
 | redb 4.1.0 | **PARKED after Cycle 34**; administrative status, not a formal `DEFER` result; design timebox exhausted; no candidate profile, adapter, mechanism result, or execution authority | No scheduled work. Reopen only through an explicit two-day/four-machine-hour micro-prescreen charter; otherwise retain as history. A favorable observation could only fund a later mapping/profile proposal |
-| TidesDB | Current official Rust path rejected; native 9.3.14 retained as research-only; outside v4 | Re-enter only after an exact-current lifetime-safe wrapper and the recorded correctness, recovery, resource, and health closures plus a new owner decision |
+| TidesDB | **STOP current exact subject**; official Rust path rejected and native 9.3.14 research-only; optional remote mode has public Rust FS and S3 configuration paths, no generic connector injection, and zero selection weight | Re-enter only after the recorded exact-current Rust, atomicity, recovery, checkpoint, resource, and health closures plus a new owner decision. Any future remote tier needs a separate ADR and cannot replace LaminarDB's S3/GCS/Azure/local checkpoint authority |
 | SurrealKV 0.21.2 | Rejected unmodified; no active candidate track | Correctness/liveness fork and new bounded prescreen authority before reconsideration |
 
 The current source detail and rationale live in the

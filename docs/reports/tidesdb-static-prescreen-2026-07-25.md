@@ -1,7 +1,7 @@
 # TidesDB static backend prescreen and Zipf claim audit
 
 - **Date:** 2026-07-25
-- **Cycle:** 28
+- **Cycle:** 28; bounded Cycle 35 recheck
 - **Evidence class:** exact-source and published-artifact review only
 - **Native subject inspected:** TidesDB `v9.3.14`, commit
   `6fe1e83104b70255a694239d360a14bae51d0c70`
@@ -10,6 +10,8 @@
 - **Candidate installed, built, linked, or executed:** no
 - **Runtime dependency or backend added:** no
 - **Prescreen disposition:** `REJECT_CURRENT_OFFICIAL_RUST_PATH_RETAIN_NATIVE_RESEARCH_ONLY`
+- **Current track:** **STOP**; no TidesDB-specific build, benchmark, adapter, or protocol work is
+  scheduled
 - **Replacement decision:** do not replace RocksDB, Fjall, or redb with TidesDB
 - **Production and cluster admission:** **NO-GO**; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
 - **Bounded memory:** reference/conformance-only; no current product or soak profile
@@ -49,6 +51,56 @@ The current official Rust integration is therefore a hard **NO-GO**. Keep the na
 research-only option that could re-enter after a lifetime-safe, exact-version wrapper and bounded
 source closures exist. Do not insert TidesDB into the frozen Fjall/RocksDB runner lineage, change an
 ADR backend decision, add a dependency, or authorize a candidate run from this report.
+
+## Cycle 35 bounded recheck and object-store boundary
+
+The 2026-07-25 bounded recheck inspected current official release/source material and the existing
+LaminarDB checkpoint path. It did not download, build, link, configure, or execute TidesDB. Native
+`9.3.14`, Rust `0.11.1`, and the Rust default native payload `9.3.6` remain the exact subjects. The
+Rust safety, partial-apply, unified-WAL recovery, checkpoint, resource-governance, and
+maintenance-health vetoes above still stop the track before performance work.
+
+Object-store support is optional and has **zero weight** in the worker-local backend decision. Its
+role boundary is:
+
+| Possible role | Cycle 35 decision | Reason |
+|---|---|---|
+| Worker-local hot working state | **STOP current subject** | The pre-execution correctness and integration vetoes remain; remote capability cannot offset them |
+| Portable checkpoint/recovery authority | **NO** | A continuously changing engine-specific SST/WAL/manifest image does not create a sealed Laminar exact-attempt vnode cut, coordinator decision, retention lifecycle, or restore-before-activate proof |
+| Optional remote cold/capacity tier | **OUT OF SCOPE** | Consider only in a separate future ADR after the local engine qualifies and measured capacity/recovery needs justify network-coupled state |
+| Vnode ownership, rebalance fencing, or exactly-once delivery | **NO** | These remain Laminar coordinator and source/sink composition responsibilities |
+
+The native `tidesdb_objstore_t` interface is pluggable through function pointers, but its backend
+enum and shipped implementations are `FS` and `S3`; the S3 implementation targets AWS S3, MinIO,
+and compatible endpoints. The public Rust wrapper exposes a filesystem path plus feature-gated
+`S3Config`, not arbitrary connector injection. The project documentation lists GCS but also says
+only filesystem and S3 connectors ship; GCS support is therefore an S3-compatibility claim, not a
+distinct native GCS connector. No shipped Azure Blob connector or public-Rust Azure path was found.
+Therefore TidesDB object-store mode cannot replace LaminarDB's provider-neutral checkpoint path.
+
+LaminarDB already uses Rust `object_store 0.13` behind `ObjectStoreCheckpointStore`. Its builder
+accepts local `file://`, AWS `s3://`, GCS `gs://`, and Azure `az://`, `abfs://`, or `abfss://`
+schemes. That layer remains the only planned cluster-shared checkpoint authority. Provider parity is
+not required of a disposable local working-state engine because its portable artifacts are emitted
+through this separate layer.
+
+TidesDB's optional mode also automatically selects unified memtables, the exact area with unresolved
+atomic-apply, replay, and checkpoint findings in this report. Synchronous remote WAL-on-commit adds
+object-store round-trip time and availability to commit acknowledgement; without it, periodic or
+closed-WAL upload leaves a remote-copy recovery window after whole-local-volume loss, governed by
+the configured byte/flush policy. Frozen point reads can incur HTTP range requests, while iterators
+and compaction may fetch complete files. Those tradeoffs need a separate latency, outage, backlog,
+disk-headroom, and recovery analysis if a future cold-tier proposal is ever justified. They must not
+enter LaminarDB's per-record/event-loop hot path by accident.
+
+The timeboxed decision is to stop TidesDB work now. A future owner should consider reopening only
+after an upstream release plausibly closes the exact Rust lifetime/callback boundary, all-or-nothing
+cross-namespace apply and visibility, strict unified-WAL recovery, complete immutable checkpoint/read
+cuts, container-aware memory governance, and the full maintenance-health surface. Such a release
+signal only permits proposing a separately owner-authorized half-day static delta review. If every
+veto closes, an owner could then separately authorize at most a one-day local-only adapter-feasibility
+review. This report authorizes no adapter implementation, dependency, build, candidate run, or
+object-store integration.
 
 ## Exact subject boundary
 
@@ -369,14 +421,14 @@ cancel memory unsafety, torn recovery, an unavailable state cut, or missing fail
 
 ## Carry-forward decision matrix
 
-This is the Cycle 28 decision input, not a ranking result:
+This reconciles the Cycle 28 decision input with the bounded Cycle 35 recheck. It is not a ranking.
 
 | Candidate | Current role | Principal unresolved veto | Carry decision |
 |---|---|---|---|
 | RocksDB `10.4.2` through `rocksdb 0.24.0` | Mature operational LSM reference and one of the two frozen v4 comparison subjects | Exact complete pressure-stall source/binding, native memory, durable truth table, common C1/C2/C3/fault/endurance evidence | **Carry as reference/closure track; not selected.** TidesDB evidence does not justify removing it. |
 | Fjall `3.1.8` | Rust-native LSM reference and the other frozen v4 comparison subject | Stable public pressure/progress/error/resource/stall surface and global controls remain insufficient | **Retain in frozen comparison lineage; no production admission.** |
-| redb `4.1.0` | Rust-native B-tree/single-writer hedge under a separate prescreen | Global non-cancellable writer, durability/recovery/resource truth, and approved non-LSM health mapping | **Continue only its approved validation protocol; do not execute or pool it with v4.** |
-| TidesDB native `9.3.14` | New C-engine research option with interesting skew/batch performance | No safe exact-current Rust path; checkpoint, resource governance, health, failure semantics, and Laminar evidence blocked | **Do not carry into a runner or replace RocksDB. Retain research-only pending upstream/fork closure.** |
+| redb `4.1.0` | Rust-native B-tree/single-writer hedge, administratively parked after Cycle 34 | Global non-cancellable writer, durability/recovery/resource truth, and approved non-LSM health mapping | **PARKED; no scheduled protocol or execution. Reopen only through the bounded micro-prescreen charter in ADR-008.** |
+| TidesDB native `9.3.14` | C-engine research option with interesting skew/batch performance | No safe exact-current Rust path; atomic apply, replay, checkpoint, resource governance, health, and Laminar evidence fail or remain blocked | **STOP the current subject; do not add it to a runner or replace a candidate. Re-enter only on the upstream closure triggers above.** |
 
 SurrealKV `0.21.2` remains rejected unmodified by the earlier exact-source audit; adding TidesDB does
 not reopen its snapshot-retention defect. No candidate is selected by elimination.
@@ -460,6 +512,9 @@ External primary sources:
   [manifest](https://github.com/tidesdb/tidesdb-rs/blob/v0.11.1/Cargo.toml),
   [build script](https://github.com/tidesdb/tidesdb-rs/blob/v0.11.1/build.rs), and
   [exact wrapper source](https://github.com/tidesdb/tidesdb-rs/tree/e2febbc548e7f0158d1c09ea487aa0bb7c343616)
+- [native object-store connector interface](https://github.com/tidesdb/tidesdb/blob/v9.3.14/src/objstore.h),
+  [Rust connector configuration](https://github.com/tidesdb/tidesdb-rs/blob/v0.11.1/src/config.rs),
+  and [official object-store architecture](https://tidesdb.com/getting-started/how-does-tidesdb-work/)
 - [native v9.3.7](https://github.com/tidesdb/tidesdb/releases/tag/v9.3.7),
   [v9.3.9](https://github.com/tidesdb/tidesdb/releases/tag/v9.3.9),
   [v9.3.10](https://github.com/tidesdb/tidesdb/releases/tag/v9.3.10),
