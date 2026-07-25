@@ -1,11 +1,13 @@
 # redb 4.1.0 bounded state-backend prescreen v1
 
 - **Identity:** `state-backend-redb-prescreen/v1`
-- **Status:** Cycle 29 target/preflight semantic skeleton, ordered source-domain requirements,
-  scalar algebra and minimum predicates frozen; only redb-free validation work is authorized, while
-  blocked source authorities/recipes, complete target/preflight schemas and collectors, strict later
-  run/result wires, live provider/storage/finalization verifiers, native
-  supervisor/child/actuator/oracle, reviewed build, owner approvals, and execution remain absent
+- **Status:** Cycle 30 host-class and authority acceptance frozen: Docker Desktop/WSL is
+  development-only, the formal Docker successor requires a dedicated native-Linux VM and protected
+  Engine endpoint but its exact mechanism and provider remain unproved, and the native provider is
+  unselected; only redb-free validation work is authorized, while blocked source authorities/recipes, complete
+  target/preflight schemas and collectors, strict later run/result wires, live
+  provider/storage/finalization verifiers, native supervisor/child/actuator/oracle, reviewed build,
+  owner approvals, and execution remain absent
 - **Evidence class:** `NOT C2/C3 QUALIFICATION EVIDENCE`
 - **Scope:** decide whether a redb adapter is worth adding to the backend qualification bake-off
 - **Production/admission effect:** none; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
@@ -955,10 +957,15 @@ approval-input storage capability or the Docker-prerequisite capability is curre
 
 #### Docker smoke result is a separate type
 
-Docker Desktop/WSL can produce only `result_kind = docker_smoke_prerequisite` with
-`smoke_outcome = DOCKER_SMOKE_PASS` or `DOCKER_SMOKE_INCOMPLETE`. A pass has no incomplete reason;
-an incomplete result has at least one closed reason code. Cycle 25 below freezes the exact smoke
-population, reason vocabulary and conditional evidence matrix; no implementing schema exists.
+Cycle 25 froze the exact semantic matrix for a then-planned Docker Desktop/WSL result with
+`result_kind = docker_smoke_prerequisite` and `smoke_outcome = DOCKER_SMOKE_PASS` or
+`DOCKER_SMOKE_INCOMPLETE`. A pass has no incomplete reason; an incomplete result has at least one
+closed reason code. Cycle 25 below freezes the exact smoke population, reason vocabulary and
+conditional evidence matrix; no implementing schema exists. Cycle 30 supersedes Desktop/WSL as an
+eligible producer: these semantics remain superseded, unimplemented design-history/reference
+contracts and no current dispatcher can emit either formal outcome. There are no literal
+target/preflight/result fixtures to promote. A future native-Linux successor must version every
+affected identity rather than reinterpret this producer identity.
 
 Docker content has no native `derived_outcome`, `PRESCREEN_*` outcome, disposition,
 `TERMINAL_CORRECTNESS_STOP_LATCHED`, `REJECT_EXACT_PIN` or `FINAL_PRESCREEN_RESULT_SEALED` state. A
@@ -2333,6 +2340,208 @@ It cannot establish native XFS/project-quota/dedicated-NVMe identity, device att
 latency, fault endurance or independent soak. This cycle authorizes no container, candidate or
 backend execution.
 
+### Cycle 30 host-class and authority decision
+
+Cycle 30 closes the host-class choice without manufacturing an executable target. Docker
+Desktop/WSL is rejected as a formal producer and a dedicated native-Linux VM is selected as the
+successor host-class direction, while its Engine/authority mechanism and provider remain unproved.
+The native prescreen freezes provider-acceptance requirements but selects no provider. These prose
+decisions are not wire values or dispositions; they neither authorize a workflow nor satisfy a
+prior-smoke prerequisite.
+
+| Path | Cycle 30 status | Formal result or authority available now |
+|---|---|---|
+| local Docker Desktop/WSL | development-only; the formal path is rejected | none; it cannot emit `DOCKER_SMOKE_PASS`, `DOCKER_SMOKE_INCOMPLETE` or a native prerequisite |
+| frozen Cycle 25/29 Desktop contracts | superseded, unimplemented design history/reference | none; no target/preflight/result schema, literal fixture, protected dispatcher or eligible producer exists |
+| dedicated native-Linux VM and protected Engine endpoint | selected successor host-class direction; mechanism unproved | none; provider, successor wire and `D20,D21` proofs remain absent |
+| GitHub-hosted standard `ubuntu-24.04` VM | preferred validation-only feasibility/inventory subject | provisional only; not formal eligibility |
+| native XFS/dedicated-NVMe prescreen host | acceptance contract frozen, provider unselected | no `N20` lease, `N29` attestation, target schema or dispatch authority |
+| AWS I4i Dedicated Host | plausible native inventory subject only | no selected account/allocation, image, package, guest inventory, device lease or runner attestation |
+
+#### Why Desktop/WSL cannot carry a gate
+
+The current installation can expose useful development facts, but it cannot satisfy its own frozen
+authority predicates:
+
+- `D03` has no selected supported interface that binds the observed Windows, WSL, Desktop and
+  `docker-desktop` VM identities to the exact live Engine instance. Docker documents that Desktop
+  runs inside its own WSL distribution and makes its CLI available to the Windows user and enabled
+  WSL distributions; status/version observations do not mint that binding
+  ([WSL backend](https://docs.docker.com/desktop/features/wsl/),
+  [Desktop CLI](https://docs.docker.com/desktop/features/desktop-cli/)).
+- `D20` cannot retain a complete endpoint/proxy/backend/VM/`dockerd`/`containerd` epoch chain across
+  the host/managed-VM boundary. Docker documents the Engine inside a Linux VM and the Windows
+  `com.docker.backend` proxy/control plane, but no documented Desktop interface supplies a durable
+  daemon epoch or retained process chain
+  ([Desktop networking](https://docs.docker.com/desktop/features/networking/)). Engine ID is not
+  specified as an epoch. Historical event queries are capped at the last 256 events, while the live
+  event stream has no documented durable cursor, unique event ID or gap detector
+  ([Engine events](https://docs.docker.com/reference/cli/docker/system/events/)).
+- `D21` has no protected exclusive-client lease. Desktop deliberately exposes Engine control to the
+  launching user and selected WSL integrations
+  ([Windows permission requirements](https://docs.docker.com/desktop/setup/install/windows-permission-requirements/)).
+  Docker documents why only trusted users may control the root-equivalent daemon and recommends
+  dedicating a Docker server to Docker-managed workloads
+  ([Engine security](https://docs.docker.com/engine/security/)). Neither statement supplies a
+  sole-client lease. Labels, an uninterrupted event connection and an otherwise quiet `docker ps`
+  cannot prove that another same-user client was absent.
+
+The last two conclusions are conservative inferences from the documented interfaces, not claims
+that an undocumented Desktop implementation detail can never be inspected. Undocumented internals
+are not a production evidence contract. A local developer may later exercise parser, broker,
+container-profile and lifecycle mechanics only under a separately reviewed, versioned
+development-only identity; none exists now. Such a run must not use either formal smoke literal or
+satisfy `state-backend-redb-prescreen-approval-payload/v2`'s `prior_smoke_result`. Current authority
+still forbids running the candidate at all.
+
+#### Docker successor invariants and feasibility hypothesis
+
+The selected native-Linux host-class direction uses a protected host-native broker/supervisor and
+retains `container_per_process` only for candidate-bearing processes; it has no Desktop proxy or
+broker control container. That ownership change is transitive. A successor must version or
+explicitly supersede every affected Docker actual-target, preflight, run-start, launch-ledger,
+control, raw-manifest, report/evidence-close, result/post-run receipt and run-provenance identity,
+plus the prior-smoke capability/consumer binding. It must replace `windows_wsl_identity`/`D03`,
+`broker_container_identity`, the Docker check/dependency registry and role/cardinality goldens.
+Specifically, it cannot accept `state-backend-redb-prescreen-docker-launch-ledger/v1`,
+`state-backend-redb-prescreen-docker-control/v1` or old Desktop target/preflight bytes. Existing
+outer-validator fixtures remain regression-only; the missing target/preflight/result fixtures
+cannot be implied. `state-backend-redb-prescreen-approval-payload/v2` needs an explicit compatibility
+decision and is versioned only if its wire or prior-smoke semantics change. Until the successor and
+consumer verifier exist, its exact prior-smoke condition is unsatisfiable.
+
+The successor invariants are one review-bound Engine/runtime epoch, one protected endpoint, a closed
+authorized Engine-client set, candidate denial of that capability, no unaccounted daemon/runtime or
+client, and fail-closed continuity through final reconciliation. Stable evidence must bind the host
+boot and namespaces; broker/Engine/runtime process identities; executable/configuration identities;
+the endpoint; exact Engine connections; and the provider/VM lease. EOF, process exit,
+exec/reload/replacement, endpoint/configuration drift, reconnect, an unexpected process/client or a
+reconciliation gap makes the result unfinalizable only when it loses a required connection or the
+protected broker, Engine or base runtime, or prematurely loses a later process that must remain live
+through its applicable cut. A planned candidate/shim exit followed by exact lifecycle reconciliation
+remains legal. Engine events remain advisory.
+
+A private-daemon takeover is the preferred GitHub feasibility hypothesis, not a frozen mechanism.
+A redb-free probe would inventory and isolate or stop provider-preinstalled Docker services, then
+supervise reviewed `dockerd` and `containerd` binaries with private roots and Unix endpoints. It must
+demonstrate—not assume—that the opened endpoint has the expected inode without symlink/path
+substitution; broker connections reach the retained `dockerd`; `dockerd`'s actual connection reaches
+the retained `containerd`; and the containerd namespace/configuration/root/state plus every spawned
+shim/runtime identity and executable digest stay bound. The initial cut can bind only the already
+existing broker, Engine and runtime processes. Each later shim/runtime is bound after its container
+is created and before that process can be released, then retained through its reconciliation and
+the applicable evidence cut. Exact process population and the loss-detecting peer-binding mechanism
+remain blockers, with restart, replacement, socket-substitution and reconnect hostile fixtures.
+
+`D21` separately requires a provider-backed exclusive VM lease and a proved sole-client mechanism.
+One feasibility construction is a protected direct pathname socket, exact preopened bounded
+connection pool, listener sealing/unlinking or an equivalent new-client barrier, a dedicated broker
+UID, candidate denial, no other privileged actor under the live lease and no reconnect; another is
+an approved loss-detecting connection observer. Either path also needs independent bracketed
+peer/socket/process reconciliation. Exact pool cardinality, listener behavior, privileged-process
+closure and hostile foreign-client fixtures remain blockers. `SO_PEERCRED` can identify the server
+peer of a broker connection; it cannot prove that foreign clients were absent. Unix permissions,
+provider authority and the protected dispatcher each cover different parts of the proof.
+
+The standard GitHub-hosted `ubuntu-24.04` runner is the preferred first inventory subject, not an
+approved target. GitHub documents a new VM per hosted job and passwordless `sudo` on Linux, making a
+validation-only feasibility probe possible
+([hosted runner lifecycle](https://docs.github.com/en/actions/how-tos/manage-runners/github-hosted-runners/use-github-hosted-runners),
+[hosted runner specification](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)).
+Those facts and the setup-log ImageVersion are copied lifecycle/inventory observations, not an
+exclusive VM lease, provider-authenticated VM identity or attestation. Public and private standard
+runners have different CPU/RAM classes and both publish only 14 GB SSD, so the exact resource class
+must be bound. The image also changes over time and its exact software version is learned from the
+job setup log ([runner-images versioning](https://github.com/actions/runner-images#readme)).
+Eligibility therefore waits for a protected workflow/dispatcher, an exact observed standard-runner
+ImageVersion allowlist or a separately approved larger-runner custom-image policy, provider/run/VM
+identity receipts, a proved Engine/runtime and sole-client mechanism, source inventory, raw
+retention and complete `D20,D21` hostile fixtures. Workflow-runner direction is approved; candidate
+execution is not.
+
+#### Native provider and source-authority acceptance
+
+Cycle 30 selects no native provider or host. The checked-in `linux-nvme-v3` object is explicitly
+`candidate_unapproved`, `qualification_eligible=false`, has null image/package identities, and is a
+Fjall/RocksDB numerical qualification proposal. Its `aws`/`i4i.2xlarge` text and numerical operands
+are neither a redb target policy nor observed supported-host inventory. The local Windows/WSL
+inventory is also ineligible.
+
+Current AWS documentation makes I4i a plausible later inventory subject because the family offers
+local NVMe instance storage and supports Dedicated Hosts
+([storage-optimized specifications](https://docs.aws.amazon.com/ec2/latest/instancetypes/so.html)).
+AWS defines a Dedicated Host as a physical server dedicated to the customer's use with placement
+and affinity controls, but also permits optional cross-account capacity sharing
+([Dedicated Hosts](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/dedicated-hosts-overview.html)).
+Consequently a product page, SKU, tag, copied API response or guest observation proves neither a
+selected unshared allocation nor a live campaign/device lease. No account, Region, Availability
+Zone, host, tenancy, instance, image, package or device value is frozen here.
+
+Before a provider can be selected, a dated operations-owned decision must bind all of:
+
+1. the authenticated allocation/placement API and reviewed official contract revision, plus one
+   physically dedicated and unshared host allocation with no unaccounted instance during a campaign;
+2. immutable image, package and build-ABI identities and the provider-to-guest boot, process, mount
+   and NVMe identity chain;
+3. a linearizable operations/device lease acquired before target capture, held through evidence cut
+   and cleanup, and carrying exact acquisition, renewal, loss, fencing, replacement and release
+   behavior;
+4. live provider/dispatcher attestation binding that allocation and lease to the `collection_id`,
+   outer runner, boot and collector process, with freshness and TOCTOU checks; and
+5. a complete redb-free supported-host/source inventory covering every `N01`--`N29` dependency:
+   observed availability and bounded capture for selected host interfaces; exact
+   `N05,N25,N26,N27` sources and privileges; reviewed `N19,N21,N28` recipes; and separately live
+   `N20,N29` authorities.
+
+The decision feeds the existing `contract/target-identity.json` role; it is not a thirtieth packet
+row, a serializable bearer capability or a generic provider adapter. Copied content, repository
+review, an instance identity document, tags, sysfs, file locks or namespace equality alone cannot
+mint `N20` or `N29`. A selected provider would authorize only provider-specific policy/source
+contract work, not a schema, collector, dispatch or redb run.
+
+For `N29`, the protected dispatcher reobserves the allocation, lease and runner facts live, then
+holds a non-serializable, freshness-bounded, single-use capability scoped to the collection and run.
+The capability cannot be reconstructed from the dated selection decision, an identity document or
+copied provider response. No child dispatch occurs while authority is unavailable or stale. Loss,
+replacement or drift after authority-dependent execution begins makes the run unfinalizable and
+prevents a pass or sealed result; it is never reclassified as a candidate failure.
+
+The additional authority/recipe blockers requiring explicit closure are:
+
+| Class | Source IDs | Missing proof |
+|---|---|---|
+| source, authority or supported-host blocked | `N05,N20,N25,N26,N27,N29` | libc/ELF identity; live device lease; thermal, loss-detecting kernel/block and NVMe health sources; live native-host attestation |
+| recipe blocked | `N19,N21,N28` | shared marker; bounded redb-free attributed write/sync probe; inert broker/barrier state machine |
+| endpoint chosen, inventory/caps/raw retention blocked | `N22,N23,N24` | whole-device block-stat registry; cgroup `cpu.stat`; hierarchical `memory.events` capture |
+
+Provider-neutral `N19,N28` recipes can be designed next. `N21` and final `N22`--`N24` contracts
+wait for the selected host's block/filesystem/kernel inventory. This table is not the entire
+inventory: all `N01`--`N29` remain subject to supported-host availability/cardinality, complete raw
+capture, caps, retention and machine policy, and `N13` specifically needs proof of the selected
+host's NVMe namespace/controller interfaces. An absent counter is never encoded as zero, a
+timestamp/regex journal scan is not a loss-detecting kernel cursor, and guest-local state cannot
+replace provider authority.
+
+#### Repository inventory no-import decision
+
+The repository audit found no supported target or cap authority:
+
+| Existing material | Eligible reuse | Prohibited inference |
+|---|---|---|
+| `linux-nvme-v1/v2` | immutable validator/model regressions | target values, policy or cap authority |
+| unapproved v3 and unmaterialized v4 direction | candidate-neutral workload/product portions after separate review | Fjall/RocksDB comparison, store or maintenance fields; redb machine values, host selection, source maxima or execution authority |
+| dated WSL/Docker capability report | negative boundary and read-only inventory-command patterns | current identity, native evidence or formal `D03,D20,D21` proof |
+| existing redb content validators/fixtures | strict-JSON, descriptor, digest, locator and cap/cap-plus-one test patterns | target/preflight layouts or status projections, per-source caps or maximum bodies |
+| retained-evidence closure algebra and 2-GiB outer bound | final set/count/checked-sum reasoning | raw-role cardinality or any individual raw/document cap |
+
+Caps follow evidence rather than preceding it. A provider-backed native and formal-Docker source
+inventory must first fix complete source cardinalities, privilege and worst-case valid bytes; raw
+retention must then fix exact-byte versus descriptor treatment, roles, locators, media types,
+secret/privacy exclusions, durability, immutable-store provider/version, atomic publication,
+retention and freshness/TOCTOU. Only then can hand-authored minimum, simultaneous-maximum,
+mismatch, every-cause/site and cap-plus-one fixtures derive source/list/document limits. No existing
+constant is a shortcut.
+
 ## Isolation and clocks
 
 An external Linux supervisor owns the database directory and starts at most one scheduled candidate-
@@ -2672,21 +2881,23 @@ remains Fjall/RocksDB-specific, so even a pass needs an
 additive redb profile/schema proposal rather than editing or reinterpreting `linux-nvme-v3`;
 `linux-nvme-v2` remains an immutable regression fixture.
 
-## Docker Desktop/WSL smoke subset
+## Docker Desktop/WSL development subset (Cycle 30 supersession)
 
-Docker Desktop on this Windows host may run a smoke-only subset using the exact pinned Linux build
-and a Docker volume. It checks harness construction, the four-table layout, schema/golden/oracle
-agreement, one transaction in each mode, one `HOLD`, and one trial at each kill trigger against a
-64-MiB base. Two- and five-second bursts are outside this formal identity and cannot contribute a
-smoke outcome.
+Docker Desktop on this Windows host is development-only. It may later exercise the pinned Linux
+build, four-table layout, schema/golden/oracle agreement, one transaction in each mode, one `HOLD`
+and one trial at each kill trigger against a 64-MiB Docker-volume copy, but only under a separately
+reviewed and versioned development-only identity; none exists now. It may not emit `DOCKER_SMOKE_PASS`,
+`DOCKER_SMOKE_INCOMPLETE`, the Docker-prerequisite capability or any native outcome. The frozen
+Cycle 25 population/result semantics remain superseded design history/reference until the versioned
+native-Linux successor exists; there are no literal target/preflight/result fixtures and they do not
+authorize a Desktop producer. Current authority permits no such candidate run.
 
-Every such artifact uses the separate Cycle 25 Docker result type and derives only
-`DOCKER_SMOKE_PASS` or `DOCKER_SMOKE_INCOMPLETE`. A named-volume database uses Docker's managed
-ext4/VHDX/NTFS/shared-NVMe path (while the container root also uses overlayfs); it cannot
-validate XFS quota, direct device writes, physical amplification, native-NVMe latency,
-power loss, endurance, C2/C3, or the prescreen disposition. Passing Docker smoke is a prerequisite
-for spending target-host time only after separate live-review and immutable-storage verification;
-it is not evidence that redb is suitable.
+A named-volume database on this host uses Docker's managed ext4/VHDX/NTFS/shared-NVMe path while the
+container root also uses overlayfs. It cannot validate XFS quota, direct device writes, physical
+amplification, native-NVMe latency, power loss, endurance, C2/C3, the prescreen disposition or
+independent soak. A future formal native-Linux smoke pass remains a content prerequisite for
+spending target-host time only after its own protected live-review, provider/Engine authority and
+immutable-storage verification; it still would not show that redb is suitable.
 
 Cycle 16 implements a narrower construction lane, not this smoke subset. It has no crash actuator,
 approval verifier, or result classifier. The canonical result and evidence boundary are recorded in
