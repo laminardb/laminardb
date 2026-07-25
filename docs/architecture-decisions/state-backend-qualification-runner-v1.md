@@ -17,9 +17,11 @@ recommended; it needs broader engine instrumentation and/or exact configuration-
 Before any RocksDB construction resumes, owners must either retain v1 and fund that larger scope or
 approve a final additive successor with typed, candidate-specific health signals and new schema/
 profile identities after its separate design-direction review. V1 artifacts must not be
-reinterpreted under a successor. Cycle 18's non-approved
-[maintenance-health v2 proposal](state-backend-maintenance-health-v2-proposal.md) specifies the
-smallest proposed delta; this document remains the normative v1 baseline until owners decide.
+reinterpreted under a successor. Cycle 21 approved the direction described by the
+[maintenance-health v2 proposal](state-backend-maintenance-health-v2-proposal.md), but the
+[consolidated v2 freeze candidate](state-backend-qualification-runner-v2-draft.md) and exact v4
+profile remain unapproved. This document is retained as immutable predecessor-wire and regression
+lineage; it is not current candidate-execution authority.
 
 ## Decision and safety boundary
 

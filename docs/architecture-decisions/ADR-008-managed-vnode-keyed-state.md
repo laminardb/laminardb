@@ -1,71 +1,51 @@
 # ADR-008: Managed vnode-keyed working state for distributed operators
 
-- **Status:** Proposed; implementation requires the Phase 0 review gate
+- **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Amended:** 2026-07-24; Cycle 21 keeps bounded memory reference-only and approves the
-  maintenance-health v2 design direction; final contract/backend decisions remain pending
+- **Last reconciled:** 2026-07-25 after Cycle 33
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
+- **Production/backend verdict:** **NO-GO**; no working-state backend is selected or admitted
 - **Related:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md),
-  [implementation plan](../plans/distributed-keyed-stateful-operators.md), and
-  [Cycle 21 owner decisions](../reports/distributed-state-cycle-21-owner-decisions-2026-07-24.md)
+  [implementation plan](../plans/distributed-keyed-stateful-operators.md),
+  [current owner decisions](../reports/distributed-state-cycle-21-owner-decisions-2026-07-24.md),
+  and [latest completed review](../reviews/distributed-keyed-state-cycle-33.md)
 
 ## Decision
 
-LaminarDB will add a common, byte-governed, spillable **working-state service** for keyed
-operators. Phase 0 originally scoped Fjall `=3.1.8` and RocksDB Rust wrapper `=0.24.0` (bundled
-RocksDB 10.4.2) behind the same narrow service and workload/fault harness. Cycle 16's
-[carry-forward matrix](../reports/state-backend-carry-forward-matrix-2026-07-24.md) recommended a
-bounded RocksDB mechanism closure first and redb 4.1.0 only as a separate prescreen contingency.
-Cycle 17's [exact-source closure](../reports/rocksdb-mechanism-source-closure-2026-07-24.md) stopped
-that RocksDB task at Stage 0: an apparently bounded stall observer is plausible but unproved, while
-the published v1 direct and disjoint maintenance-debt population cannot be closed by the narrow
-binding task. The next decision is therefore whether to retain v1 and explicitly fund broader
-engine instrumentation/configuration proof, or publish an additive contract using reviewed
-candidate-specific health signals while retaining common latency/resource/failure vetoes. The
-Cycle 18 [maintenance-health v2 proposal](state-backend-maintenance-health-v2-proposal.md) and
-[decision matrix](../reports/state-backend-contract-decision-matrix-2026-07-24.md) recommend the
-additive choice. Cycle 21 records `APPROVE_MAINTENANCE_HEALTH_V2_DIRECTION`, which permits only
-consolidated contract/schema drafting and review. The resulting
-[runner v2 freeze candidate](state-backend-qualification-runner-v2-draft.md) is unapproved. It does
-not instantiate any reserved v2 wire
-identity, authorize validator implementation, or authorize candidate source work or execution;
-those still require the final two-owner contract and candidate-specific approvals. The existing
-v1 evidence must not be reinterpreted. No
-backend is selected or admitted by this change; redb's separate prescreen track remains a
-contingency, and unmodified Fjall can re-enter only after the same contract decision defines its
-obligation. Any candidates admitted later still run the common campaign, which records one
-production local-spill backend rather than maintaining multiple disk implementations. Cycle 20's
-[placement and backend-scope analysis](../reports/state-working-state-options-2026-07-24.md) clarifies
-that correctness and exactly-once do not require a named engine or durable local disk. The
-in-memory implementation remains the semantic reference. Cycle 21 keeps bounded memory
-reference/conformance-only: it has no cluster product profile, implementation/admission schedule,
-or production-soak matrix under this ADR, and it is never an implicit fallback for the general
-profile. A future product proposal would require a separate ADR amendment and fresh applicability,
-capacity, recovery/RTO, and independent-soak approvals.
-The intended broad/variable-state profile still requires one qualified local-spill backend.
-Cluster-shared object storage and the existing `StateBackend` remain the authoritative checkpoint/
-recovery layer; no local working-state backend is remote recovery authority.
+LaminarDB will add one common, byte-governed, batch-oriented working-state service scoped by stable
+pipeline, operator, table, vnode, and ownership identities. State access stays local; cold or
+blocking work is coalesced per Arrow batch and kept off compute/event-loop threads. The in-memory
+implementation is the semantic/lifecycle conformance subject only. The sole current broad-state
+product target uses one qualified worker-local spill backend. No named engine, and no LSM as a
+storage family, is required by the architecture.
 
-Cycle 19's reviewed [candidate mapping designs](../reports/state-backend-maintenance-health-mapping-designs-2026-07-24.md)
-find different, unmeasured closure footprints: RocksDB needs scheduled-compaction, purge,
-error/recovery, safe-binding and stall sources; Fjall needs scheduler/lifecycle repair plus coherent
-worker/error/physical-delete/stall observation; redb's whole-arm N/A is only source-plausible until
-complete-process task/thread proof and its native prescreen pass. The report ranks no patch cost and
-changes no gate. RocksDB proceeds only to a source-closure specification after a final v2 contract,
-Fjall awaits an explicit fork-ownership choice, and redb remains in the separate prescreen stage.
+Cluster-shared checkpoint storage and the existing `StateBackend` remain recovery authority. A
+local store is disposable capacity/latency infrastructure: it cannot assign a vnode, authorize an
+epoch, replace restore-before-activate/revoke fencing, or create source/sink exactly-once semantics.
+No runtime backend dependency or adapter is authorized by this ADR state.
 
-The [exact-source static audit](../reports/state-backend-static-audit-2026-07-23.md) finds that
-unmodified Fjall 3.1.8 cannot supply the required stable compaction-debt/write-stall telemetry and
-that the current RocksDB binding also lacks a complete stall signal. Both remain blocked before a
-gate-bearing run. redb 4.1.0 was also screened and deferred before implementation: its sole
-database-wide blocking writer plus not-yet-approved durability, cache, and telemetry mappings need
-a cheaper writer/commit/recovery microprobe and contract decision before expanding the bake-off.
-The proposed [bounded redb prescreen](../testing/state-backend-redb-prescreen-v1.md) is explicitly
-non-gating and can only fund later candidate-mapping review; it cannot admit redb by itself.
-SurrealKV 0.21.2 is rejected unmodified because its exact source breaks snapshot-registration
-bookkeeping used by compaction and also has unresolved drain/telemetry risks; any reconsideration
-requires a correctness fork and bounded prescreen before candidate admission. These are risk-based
-scope decisions, not an unmeasured C3 failure or a selection by API checklist.
+### Current backend and qualification state
+
+| Track | Current disposition | Required next authority/evidence |
+|---|---|---|
+| In-memory | Reference/conformance-only; no product profile, admission schedule, fallback, or soak matrix | A separate future ADR/charter amendment before any bounded-memory product claim |
+| Local-spill product profile | Sole current production target; backend undecided | Complete Phase 0 contract/profile approval, candidate source closure, identical qualification, reviewed selection, integration gates, and independent product soak |
+| Qualification contract | Maintenance-health v2 direction approved; the consolidated v2 freeze candidate and exact v4 profile remain unapproved; v1 is immutable regression lineage | Resolve every pre-final item and obtain `APPROVE_STATE_BACKEND_RUNNER_CONTRACT_V2`; that initially authorizes validation-only implementation, not source construction or execution |
+| RocksDB 10.4.2 via `rocksdb` 0.24.0 | Frozen v4 comparison/closure subject; v1 Stage-0 closure stopped; not selected or runnable | Final v2 contract, separate source/binding closure approval, then full common C1/C2/C3, latency/resource, persistence, fault, and endurance gates |
+| Fjall 3.1.8 | Frozen v4 comparison/closure subject; stock scheduler/lifecycle/governance signals do not close the gate; not selected or runnable | Explicit fork/upstream ownership plus candidate-specific source closure after final v2 approval, then the same common campaign |
+| redb 4.1.0 | Separate validation-only prescreen contingency; no candidate profile, adapter, mechanism result, or execution authority | Finish owner/mechanism/protocol closure and obtain separate pre-run approval. Even `PRESCREEN_PASS` can only fund a later mapping/profile proposal |
+| TidesDB | Current official Rust path rejected; native 9.3.14 retained as research-only; outside v4 | Re-enter only after an exact-current lifetime-safe wrapper and the recorded correctness, recovery, resource, and health closures plus a new owner decision |
+| SurrealKV 0.21.2 | Rejected unmodified; no active candidate track | Correctness/liveness fork and new bounded prescreen authority before reconsideration |
+
+The current source detail and rationale live in the
+[placement analysis](../reports/state-working-state-options-2026-07-24.md),
+[v2 direction](state-backend-maintenance-health-v2-proposal.md),
+[v2 freeze candidate](state-backend-qualification-runner-v2-draft.md),
+[candidate mapping designs](../reports/state-backend-maintenance-health-mapping-designs-2026-07-24.md),
+[RocksDB closure](../reports/rocksdb-mechanism-source-closure-2026-07-24.md),
+[redb prescreen](../testing/state-backend-redb-prescreen-v1.md), and
+[TidesDB prescreen](../reports/tidesdb-static-prescreen-2026-07-25.md). These are evidence and gate
+records, not backend selection.
 
 The existing fixed vnode ABI, bounded shuffle, assignment/process fencing, aligned barriers,
 per-vnode checkpoint artifacts, and exact-attempt seal are retained. Cluster admission will move
@@ -74,9 +54,11 @@ descriptor. Each stateful operator must declare its partition key, stable state 
 retention, output mode, checkpoint schema, and acquire/revoke behavior.
 
 The implementation order is grouped aggregates, fixed event-time windows, then bounded interval
-joins. Stateful streams may be enabled before cluster materialized views. Cluster exactly-once is
-a separate connector/commit problem and remains rejected by `[LDB-0013]`; the first keyed-state
-release targets the currently advertised cluster at-least-once contract.
+joins. Stateful streams may be enabled before cluster materialized views. `[LDB-4007]` remains
+closed for keyed/windowed/join state and `[LDB-0013]` remains closed for cluster exactly-once. The
+first keyed-state release remains at-least-once and requires a separately certified source/operator/
+output/sink combination. Production additionally requires the independently operated,
+immutable-release soak; backend qualification or a redb prescreen cannot substitute for it.
 
 ## Context
 
@@ -298,9 +280,10 @@ backpressure. If capacity is not recovered within the configured deadline, the p
 a controlled way and recovers from the last committed cut. It must not OOM, silently drop state, or
 invent eviction. TTL/retention deletes state only when it is part of the SQL/operator semantics.
 
-Memory and disk have separate hard limits. Compaction debt and write amplification are explicit
-admission/health signals because free disk alone does not prove that the state path can sustain its
-write rate. Fjall slices must release/copy retained backing buffers before a batch ends, and
+Memory and disk have separate hard limits. Common disk-growth/write-amplification gates plus the
+candidate-applicable maintenance-health and exact foreground-stall gates remain mandatory because
+free disk alone does not prove that the state path can sustain its write rate. Fjall slices must
+release/copy retained backing buffers before a batch ends, and
 snapshots/iterators have bounded lifetimes so old MVCC versions can be reclaimed. If RocksDB is
 selected, native allocations are included; [Kafka Streams' 2026 RocksDB leak
 fix](https://kafka.apache.org/blog/2026/06/25/apache-kafka-4.3.1-release-announcement/) is a useful

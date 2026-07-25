@@ -583,8 +583,8 @@ Required passes:
    that matches zero cases or needs unrecorded temporary instrumentation is a failure.
 
 The reviewer must conclude `APPROVE`, `APPROVE WITH OWNED FOLLOW-UPS`, or `BLOCK`. A block leaves the
-admission flag closed. Reviews are cumulative; the latest format/lifecycle audit is
-[Cycle 5](../reviews/distributed-keyed-state-cycle-5.md).
+admission flag closed. Reviews are cumulative; use the highest numbered completed
+`docs/reviews/distributed-keyed-state-cycle-*.md` review as the current cycle boundary.
 
 ## Commit and change discipline
 

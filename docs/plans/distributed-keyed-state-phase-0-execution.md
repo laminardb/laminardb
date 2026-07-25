@@ -457,7 +457,8 @@ accepted.
 
 Only after named owners approve the exact profile and complete runner-plan hashes, run identical
 fixed-operation workloads in the frozen candidate order and record offered end-to-end, service,
-and queue latency separately. Retain the exact raw samples required by runner v1 and derive
+and queue latency separately. Retain the exact raw-sample wire populations required by the
+ultimately approved runner contract and derive
 p50/p90/p95/p99/p99.9/max, throughput, CPU, RSS/PSS,
 common external resource-v2 observations, conditionally applicable approved mechanism artifacts,
 physical writes, disk/FD use, snapshot/export overlap, restore/cleanup RTO, distinct reference-
@@ -529,9 +530,10 @@ The Cycle 5 readers remain unwired; `[LDB-4007]` remains unchanged.
 
 Remaining commits are kept reviewable in this dependency order:
 
-1. `docs: freeze candidate-neutral runner contract`
-   - consolidate the approved v2 direction, retained common gates, exact formulas, thresholds and
-     candidate paper mappings for final two-owner review; no reserved v2 identity is instantiated;
+1. `docs: finalize candidate-neutral runner contract`
+   - resolve every pre-final item in the existing v2 freeze candidate, freeze the exact v4 profile
+     bytes, and obtain final two-owner review; no reserved v2 identity is instantiated before that
+     approval;
 2. only after `APPROVE_STATE_BACKEND_RUNNER_CONTRACT_V2`, implement its validation-only schemas and
    synthetic, execution-ineligible fixtures without a runtime dependency;
 3. after mechanism closure and owner carry-forward approval, add a separate exact-pin adapter commit
