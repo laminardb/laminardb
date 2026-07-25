@@ -1,11 +1,13 @@
 # redb 4.1.0 bounded state-backend prescreen v1
 
 - **Identity:** `state-backend-redb-prescreen/v1`
-- **Status:** Cycle 30 host-class and authority acceptance frozen: Docker Desktop/WSL is
-  development-only, the formal Docker successor requires a dedicated native-Linux VM and protected
-  Engine endpoint but its exact mechanism and provider remain unproved, and the native provider is
-  unselected; only redb-free validation work is authorized, while blocked source authorities/recipes, complete
-  target/preflight schemas and collectors, strict later run/result wires, live
+- **Status:** Cycle 31 provider-neutral probe semantics and Docker-successor compatibility frozen:
+  native `N19` selects a representative shared `memfd` marker recipe but remains blocked on an
+  explicit target-qualified process-shared publication/memory-model ABI decision, native `N28`
+  selects a one-shot anonymous sequenced-packet barrier recipe, and every affected Desktop-era
+  surface has an explicit compatibility action; only
+  redb-free validation work is authorized, while blocked source authorities/platform proofs,
+  complete target/preflight schemas and collectors, strict later run/result wires, live
   provider/storage/finalization verifiers, native supervisor/child/actuator/oracle, reviewed build,
   owner approvals, and execution remain absent
 - **Evidence class:** `NOT C2/C3 QUALIFICATION EVIDENCE`
@@ -1644,14 +1646,14 @@ The native fact registry and neutral observed values are:
 | `nofile_limit` | soft and hard `RLIMIT_NOFILE` |
 | `host_swap` | host swap configuration plus campaign-parent swap observation when applicable |
 | `filesystem_free_space` | checked `f_bavail`, fragment size and resulting unprivileged available bytes |
-| `marker_source` | shared-marker source identity and initial sequence observation |
+| `marker_source` | fresh non-executable fixed-size, sealed `memfd` and frozen `fstat`/seal identity; owner/helper/probe-parent/leaf and mapping/holder provenance; both observed initial sequence/publication-payload pairs |
 | `device_ownership_source` | dedicated-device ownership/lease source identity and observed exclusivity value |
 | `device_write_source` | target-device attribution source identity and initial counter/in-flight observations; no missing `io.stat` row is encoded as zero |
 | `cgroup_cpu_throttle_source` | campaign-parent CPU throttle counter identity and initial values |
 | `cgroup_memory_events_source` | campaign-parent memory-event counter identity and initial values |
 | `thermal_source` | bounded thermal source identities and initial counters |
 | `kernel_block_error_source` | kernel/block-error source identities, cursors and initial counters |
-| `broker_barrier_source` | inert launch-broker/barrier probe identity and observation |
+| `broker_barrier_source` | one-shot anonymous sequenced-packet endpoint/open-holder and retained collector/outer-process identities; dedicated probe-parent identity/policy/expected child set, absent deterministic N28 child locator and descendant/dying-descendant baseline; common RAW origin, policy-bound start/deadline operands and initial idle sequence-zero observation |
 
 The collector's cgroup is only in `collector_process_identity`; `campaign_parent_cgroup` is the pre-
 created parent the runner owns; later per-process children exist only in campaign-control evidence.
@@ -1778,12 +1780,19 @@ uses only the mandatory target/preflight clock headers. Checks 3--27 respectivel
 Any unavailable listed fact forces that row to `prerequisite_incomplete` even when another available
 input would have proved a mismatch.
 
-The native observation body must retain the end boot ID/clock identity; marker sequence population;
-policy-comparison facts; free-space and quota operands; selected cgroup2 mount options, ordered
+The native observation body must retain the end boot ID/clock identity; the complete marker
+transcript needed to recompute both initial observations, helper CAS prior/result, fenced live and
+post-exit sequence/payload, exact frozen `fstat`/seal/owner/helper/leaf identities, holder/mapping
+populations, metadata/reserved-byte stability, N19-owned-resource closure, empty bootstrap leaf and
+RAW bracket; policy-comparison facts; free-space and quota operands; selected cgroup2 mount options, ordered
 ancestor identity/local-limit tuples, parent `cgroup.events`, `cgroup.procs` and child-directory
 observations; cgroup throttle/memory start/end counters; swap and `RLIMIT_NOFILE` observations;
 thermal source/counter pairs; kernel/block-error cursor and delta; initial target-device in-flight/
-write observations; and broker barrier probe identity. Exact
+write observations; and the complete broker-barrier transcript needed to recompute target-idle
+endpoint/owner/probe-parent binding, frozen RAW start/deadline equality, request, opened-leaf/helper
+identities, credentials, armed-without-release cut, planned kill/wait, stop receipt, collector guard-
+release acknowledgement, task/socket/pidfd/cgroup-handle closure, leaf removal, parent descendant/
+dying-descendant reconciliation and RAW bracket. Exact
 counter sources, cursors, privileges, sampling duration and maximum-width encodings remain freeze
 blockers. `preflight_device_io_quiet` is only an initial idle observation and never evaluates the
 future one-percent-of-candidate-writes rule. A fresh campaign parent may have no target-device
@@ -2094,7 +2103,7 @@ The ordered native source-requirement registry is:
 | `N16` | `getrlimit(RLIMIT_NOFILE)` |
 | `N17` | bounded opened `/proc/swaps` capture |
 | `N18` | `fstatvfs` on the preopened workspace |
-| `N19` | selected shared marker; exact transport/recipe remains blocked |
+| `N19` | selected fresh `memfd`/`MAP_SHARED` marker recipe; target-qualified process-shared publication/memory-model ABI proof and implementation remain blocked |
 | `N20` | authoritative operations/provider device lease; provider remains blocked |
 | `N21` | campaign-parent cgroup `io.stat` plus a selected attribution probe; recipe remains blocked |
 | `N22` | selected whole-device `/sys/block/*/stat` row |
@@ -2103,7 +2112,7 @@ The ordered native source-requirement registry is:
 | `N25` | approved CPU thermal-throttle counters; supported-host source set remains blocked |
 | `N26` | approved bounded kernel/block-error cursor; source remains blocked |
 | `N27` | approved NVMe health/error observations; source and privilege remain blocked |
-| `N28` | selected inert broker/barrier probe; exact transport/recipe remains blocked |
+| `N28` | selected one-shot anonymous `AF_UNIX`/`SOCK_SEQPACKET` inert broker/barrier recipe; host capability proof and implementation remain blocked |
 | `N29` | live protected-dispatcher/provider native-host attestation bound to the collection and runner identity; exact authority remains blocked |
 
 The exact source projection is:
@@ -2159,7 +2168,7 @@ required fact being observed, the 27 checks have these minimum predicates:
 | 5 | Online CPUs contain the policy affinity; scheduler affinity and campaign-parent effective CPU/memory-node sets equal policy. |
 | 6 | Exposure is complete and every normalized policy-directory/CPU-set/driver/governor/minimum/maximum record equals policy; unsupported exposure fails. |
 | 7 | RAW resolution and current clocksource are stable and equal policy. |
-| 8 | The inert marker probe advances its checked sequence by exactly one. |
+| 8 | Both initial observer pairs equal sequence/payload zero; the sole writer publishes payload one before one strong AcqRel compare-and-exchange changes sequence zero to one; fenced read-only observations see both ones while it is parked and after clean exit, reserved bytes and the frozen `fstat`/seal subset remain stable, every N19-owned resource reconciles and the bootstrap leaf is stably empty. |
 | 9 | Opened workspace device/inode/mount/project/inherit identity and selected mount record remain equal. |
 | 10 | Filesystem is XFS, normalized `prjquota` is enabled, and no disabling quota option is present. |
 | 11 | The linear path is an NVMe namespace or partition-to-NVMe namespace, with no holder, branch or virtual layer. |
@@ -2178,7 +2187,7 @@ required fact being observed, the 27 checks have these minimum predicates:
 | 24 | Every approved thermal-throttle counter is unchanged. |
 | 25 | The complete approved kernel/block-error cursor reports zero new events; every approved NVMe monotonic error counter is unchanged and every approved critical-error bit is clear at both cuts. The exact counter/bit registry remains blocked with `N26,N27`. |
 | 26 | Across the policy quiet window, whole-device block read/write/discard/flush completion counters are unchanged and in-flight is zero at both ends. Sectors use 512-byte units; the whole NVMe is sampled because partition rows omit flushes. |
-| 27 | The inert broker returns the exact nonce/sequence, peer identity and armed-without-release state within its RAW deadline. |
+| 27 | The one-shot inert broker returns the exact collection nonce and sequence zero, authenticated process/peer identities, armed-without-release state and planned-kill receipt; the target probe-parent child set/`nr_descendants` agree and `nr_dying_descendants` is zero; helper tasks, pidfds, leaf handles, leaf and both probe transports reconcile back to those parent baselines while required broker/collector identities remain stable, all within the RAW deadline. |
 
 Check 14's probe can establish attribution only after its exact executable, cgroup, byte count,
 sync, cleanup and maximum-write recipe is reviewed. A missing `io.stat` row is never zero. Any check
@@ -2511,11 +2520,13 @@ The additional authority/recipe blockers requiring explicit closure are:
 | Class | Source IDs | Missing proof |
 |---|---|---|
 | source, authority or supported-host blocked | `N05,N20,N25,N26,N27,N29` | libc/ELF identity; live device lease; thermal, loss-detecting kernel/block and NVMe health sources; live native-host attestation |
-| recipe blocked | `N19,N21,N28` | shared marker; bounded redb-free attributed write/sync probe; inert broker/barrier state machine |
+| recipe selected, platform/build/wire blocked | `N19,N28` | shared-marker target-qualified process-shared publication/memory-model ABI and exact helper build; sequenced-packet/credential/pidfd/cgroup support; protected FD installation; deadlines, caps, raw retention, schemas and hostile fixtures |
+| recipe blocked | `N21` | bounded redb-free attributed write/sync probe |
 | endpoint chosen, inventory/caps/raw retention blocked | `N22,N23,N24` | whole-device block-stat registry; cgroup `cpu.stat`; hierarchical `memory.events` capture |
 
-Provider-neutral `N19,N28` recipes can be designed next. `N21` and final `N22`--`N24` contracts
-wait for the selected host's block/filesystem/kernel inventory. This table is not the entire
+Cycle 31 freezes the provider-neutral `N19,N28` semantic recipes below but does not make either
+source executable or pass-capable. `N21` and final `N22`--`N24` contracts wait for the selected
+host's block/filesystem/kernel inventory. This table is not the entire
 inventory: all `N01`--`N29` remain subject to supported-host availability/cardinality, complete raw
 capture, caps, retention and machine policy, and `N13` specifically needs proof of the selected
 host's NVMe namespace/controller interfaces. An absent counter is never encoded as zero, a
@@ -2541,6 +2552,373 @@ secret/privacy exclusions, durability, immutable-store provider/version, atomic 
 retention and freshness/TOCTOU. Only then can hand-authored minimum, simultaneous-maximum,
 mismatch, every-cause/site and cap-plus-one fixtures derive source/list/document limits. No existing
 constant is a shortcut.
+
+### Cycle 31 probe recipes and Docker-successor compatibility
+
+Cycle 31 freezes only provider-neutral semantic mechanisms. It adds no schema identity, wire field,
+status, result literal, bearer capability, packet role, executable or numeric policy value. State
+names below are explanatory, not a serializable vocabulary. Both probes are redb-free, execute only
+during first-stage collection after protected admission, and mint no candidate, run or result
+authority. Their implementations, exact wire encodings, caps, deadlines, fixtures and supported-host
+proofs remain absent, so neither source can currently be observed or pass.
+
+#### `N19` representative shared-marker recipe
+
+`N19` remains shared memory. A sole `eventfd` replacement is rejected for this gate because it would
+test a kernel counter rather than the shared Release/Acquire visibility used by the crash frame;
+`N28` separately tests IPC and barrier liveness. This is not a general rejection of `eventfd`. Linux
+documents that `MAP_SHARED` updates are visible to other processes and that a `memfd` can be sealed
+and transferred between processes
+([`mmap(2)`](https://man7.org/linux/man-pages/man2/mmap.2.html),
+[`memfd_create(2)`](https://man7.org/linux/man-pages/man2/memfd_create.2.html)). Rust documents
+`AtomicU64` as safely shared between threads and available where the target supports atomic 64-bit
+loads/stores, but does not state a portable interprocess contract or make ordinary payload access
+happen-before across processes through this publication chain
+([`AtomicU64`](https://doc.rust-lang.org/1.95.0/std/sync/atomic/struct.AtomicU64.html)). That gap is an
+explicit full publication/memory-model eligibility blocker, not merely an atomic-instruction check,
+and is not evidence supplied by this prose recipe.
+
+The protected first-stage collector named by `collector_process_identity` is the sole object owner
+and observer. It is neither the protected outer runner nor the later restartable campaign worker.
+Before spawning that collector, the outer runner starts a separate bounded first-stage-bootstrap
+lifecycle, creates one collection-bound preflight-probe leaf under its already-open dedicated probe
+parent, verifies its collection binding, parent, domain policy, `pids.max=1` and emptiness, retains
+independently opened parent and leaf handles, and only then atomically installs duplicates plus its
+own pidfd as fixed collector bootstrap descriptors. That lifecycle covers leaf creation, collector
+spawn, failed-spawn cleanup and, after the collector exits, final empty-leaf removal. The collector
+joins the pidfd to the outer runner's full process tuple before N19. No N19 acknowledgement or
+otherwise undeclared outer-runner/collector channel exists. The outer runner also retains the
+collector pidfd so it can perform safety cleanup if the collector dies; it receives no marker
+mapping. The leaf is a first-stage bootstrap resource, not an N19-owned object; at most one reviewed
+inert preflight helper may occupy it, and it is proven empty between helpers.
+
+The selected lifecycle is exact at the semantic level:
+
+1. Before the native actual-target cut, the collector creates one fresh anonymous `memfd` with
+   exactly `MFD_CLOEXEC|MFD_NOEXEC_SEAL`; the latter implies sealing and establishes the exact initial
+   seal set `{F_SEAL_EXEC}`. This avoids dependence on the PID-namespace `vm.memfd_noexec` default
+   ([non-executable memfd](https://docs.kernel.org/6.18/userspace-api/mfd_noexec.html)). Absence of
+   `MFD_HUGETLB` and `MAP_HUGETLB` is required; the recipe makes no physical-page/THP claim. Length is
+   the positive checked `sysconf(_SC_PAGESIZE)` result and must be large enough for the frozen layout.
+2. Offset zero is one naturally aligned `AtomicU64` sequence. Offset eight is one naturally aligned
+   plain `u64` publication payload. Both begin at zero; every later byte is reserved zero. An
+   owner-only writable shared mapping initializes the page and is removed before a read-only,
+   non-executable `MAP_SHARED` observer mapping is created. A published observation first performs an
+   eight-byte Relaxed atomic sequence load; only when it equals expected published sequence one does
+   an immediately following Acquire fence permit the plain payload read. Any other live value causes
+   stop/reconciliation before payload inspection. Plain initial-payload reads are confined to the
+   owner-only initialization cut and the helper-parked pre-advance cut, where the complete holder,
+   mapping and control state proves that no writer can run. The actual-target fact binds the latter
+   helper report and the collector's matching direct observation after final sealing and before an
+   advance. `load(Acquire)` on the OS-read-only mapping is forbidden. Sequence accesses are same-width
+   atomic; payload access follows the publication protocol; mixed-width, overlapping,
+   reset, wrap, byte-copy and object-reuse accesses are forbidden. Before transfer the collector adds
+   `F_SEAL_GROW|F_SEAL_SHRINK` and verifies exact size and seals.
+3. The collector opens and hashes the bound `redb-prescreen-supervisor` executable and creates one
+   private `AF_UNIX` `SOCK_SEQPACKET|SOCK_CLOEXEC|SOCK_NONBLOCK` pair. It directly spawns one reviewed
+   inert marker-helper mode into the precreated preflight-only cgroup outside the campaign parent.
+   Before helper spawn, the collector freshly verifies the installed leaf handle's collection-bound
+   identity, parent, policy and emptiness and joins that cut to the outer runner's retained pre-
+   collector-spawn verification. Only then may the collector use
+   `clone3(CLONE_PIDFD|CLONE_INTO_CGROUP)` with `clone_args.exit_signal=SIGCHLD`. The collector
+   is single-threaded from clone through reap, binds the clone-caller TID, keeps SIGCHLD waitable and
+   has no competing reaper. The leaf is domain type with `pids.max=1`;
+   its exact `cgroup.procs`, `cgroup.threads`, `pids.current` and descendant-directory population is
+   checked at every live cut. The async-signal-safe stub range-closes every
+   unintended descriptor, installs only the control endpoint, sets and race-checks
+   [`PR_SET_PDEATHSIG=SIGKILL`](https://man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html),
+   and executes the retained handle without a path reopen or post-spawn
+   cgroup migration. The non-set-ID/non-file-capability helper permits no credential transition and
+   post-exec rechecks `PR_GET_PDEATHSIG==SIGKILL` plus the exact parent PID/TID relationship. The
+   helper receives no database, workspace, device, provider, Engine, candidate or release authority.
+4. After joining the helper's boot/PID-namespace/PID/start-ticks/executable/cgroup tuple to its
+   retained pidfd, the collector transfers the `memfd` exactly once with `SCM_RIGHTS`. The helper
+   receives it with `MSG_CMSG_CLOEXEC`, verifies identity/size/seals/layout, creates the only shared
+   read/write/non-executable mapping, closes the descriptor, loads and reports the observed sequence
+   and payload, then parks. The collector verifies helper mappings/descriptors and adds
+   `F_SEAL_FUTURE_WRITE` followed by `F_SEAL_SEAL`. The final exact set is
+   `{F_SEAL_EXEC,F_SEAL_GROW,F_SEAL_SHRINK,F_SEAL_FUTURE_WRITE,F_SEAL_SEAL}`. The kernel rejects later
+   writable mappings and descriptor writes while preserving the helper's existing mapping
+   ([file seals](https://man7.org/linux/man-pages/man2/F_GET_SEALS.2const.html)).
+5. Seals alone do not prove sole-writer authority. The helper's single-thread/no-fork/no-exec/no-
+   migration profile, closed process/privilege and mapping/holder populations, and denial of ptrace,
+   `/proc/*/mem` and `userfaultfd` mutation are conjunctive eligibility requirements. The actual-
+   target fact then freezes collection/layout identity; the outer/collector opened probe-parent and
+   leaf identities plus holder provenance; retained object identity; the frozen `fstat`/seal subset,
+   exactly `(st_mode & S_IFMT) == S_IFREG`, no `S_IXUSR|S_IXGRP|S_IXOTH` bit, the observed remaining
+   permission-bit value, `st_dev`, `st_ino`, `st_size`, `st_uid`, `st_gid` and the complete seal set;
+   owner/helper
+   tuples and holder/mapping sets; helper-reported and collector-observed initial sequence and
+   payload; reserved-byte digest; and RAW offset. Only that subset is compared later. `st_atime`,
+   `st_mtime`, `st_ctime`, allocated-block counts, link count, names, descriptor numbers
+   and `/proc` display text are audit-only. Initial nonzero or disagreeing values remain complete
+   observations and do not make the fact unavailable.
+6. If either observer reports a nonzero initial value or their pairs disagree, preflight sends no
+   advance, retains the adverse operands, retires/reconciles the helper, and check 8 fails. Otherwise
+   it sends exactly one advance carrying
+   the same decoded 32-byte `collection_id` and probe sequence zero. The helper writes plain payload
+   one, then performs one strong compare-and-exchange of sequence zero to one with AcqRel success and
+   Acquire failure ordering. It reports the returned prior value and parks without another marker or
+   payload access. The collector requires sequence one and, after its Acquire fence, payload one;
+   stable frozen `fstat`/seal subset and unchanged reserved-byte digest are rechecked while the helper
+   lives.
+7. The collector sends one retire command, observes exact clean exit with deadline-aware pidfd
+   polling followed by nonblocking `waitid(P_PIDFD,...,WEXITED|WNOHANG)`, and reaps exactly that
+   `SIGCHLD` child. It repeats the fenced sequence/payload observation and frozen `fstat`/seal-subset/
+   reserved-byte-digest checks after exit, closes the control pair, unmaps the observer, closes the
+   anonymous object, proves no unexpected holder/mapping/descriptor remains and reobserves the retained
+   bootstrap leaf stably empty. Only then may preflight retain the observation. `N19` finishes before
+   `N21` or an attribution/quiet bracket. The protected empty leaf remains under the separate first-
+   stage-bootstrap lifecycle. There is no semantic resend/replay, reconnect, replacement, same-
+   collection restart, marker-object reuse or helper reuse.
+
+Control packets carry collection, probe sequence and expected transition and use nonblocking
+`sendmsg`/`recvmsg`. Receivers enable `SO_PASSCRED`; they require exactly one kernel-validated
+`SCM_CREDENTIALS`, while reviewed sender behavior proves that no explicit credential body was
+supplied. Only the one declared `SCM_RIGHTS` transfer is legal. Wrong credentials, unexpected
+ancillary data, missing `MSG_CMSG_CLOEXEC`, truncation, duplicate/out-of-order/trailing packet or EOF
+is adverse. Credentials corroborate endpoint provenance and retained pidfd/process identity; they do
+not replace either. Exact packet bytes and bounded continuation after EINTR/EAGAIN only while no
+packet has committed remain blocked; it cannot authorize a semantic resend.
+
+One RAW total deadline starts immediately before `memfd_create` and ends only after every N19-owned
+resource is closed and the bootstrap leaf is reobserved empty. The enclosing first-stage-bootstrap
+deadline starts before leaf creation and covers collector-spawn failure, collector loss and final
+leaf removal; its numeric operand and exact bootstrap encoding remain blocked. Every setup,
+target-held, advance, observation, retire and reconciliation transition also
+uses one stage deadline:
+`state_deadline = min(state_entry_raw + n19_stage_deadline_ns,
+n19_start_raw + n19_total_deadline_ns)`, with checked addition and inclusive equality. No wait syscall
+may block past the remaining bound. Numeric operands are not guessed before supported-host evidence.
+Expiry is `deadline_exceeded`; pidfd/cgroup safety stop and reconciliation continue under a separate
+bounded cleanup deadline but cannot rescue a pass.
+
+On collector loss, the helper's parent-death signal and the outer runner's retained-leaf
+`cgroup.kill=1` plus reconciliation are conjunctive safety paths; on outer-runner loss, the collector
+stops and reconciles its helper. Either
+authority loss prevents a preflight singleton. An authenticated live collector uses pidfd SIGKILL
+and reaping on an adverse helper path; a bare PID is never used. Failure to prove process/cgroup,
+mapping, descriptor and socket closure is unfinalizable. A stable attributable predicate mismatch is
+`failed`; the existing closed causes cover unavailable, ambiguous, over-cap, identity drift,
+regression/wrap, overflow and deadline evidence. Malformed submitted content is invalid. No path is
+a candidate failure.
+
+Required hostile fixtures include nonzero initial sequence or payload; unchanged/multi-step/
+regressed sequence; missing, late or wrong payload; publication after CAS; second or weak/retried
+operation; wrong width/alignment/order or non-atomic access; private/executable/extra writable
+mapping; missing/extra/floating seals, wrong `MFD_NOEXEC_SEAL`, resize or reserved-byte mutation;
+object/helper reuse, fork, thread, exec or migration; clone-caller parent-thread exit; cleared or
+mismatched parent-death signal after exec or a forbidden credential transition; wrong
+process/cgroup/collection/credentials;
+packet loss, duplication, reorder, truncation and extra descriptors; every stage/total/cleanup
+deadline boundary and overflow; collector/runner/helper loss; early exit; and leaked object, mapping,
+socket, process or cgroup population/descendant. Rust warns that atomic loads on OS-read-only memory
+need a target-qualified operation and recommends Relaxed load plus Acquire fence here
+([atomic read-only memory](https://doc.rust-lang.org/1.95.0/core/sync/atomic/index.html#atomic-accesses-to-read-only-memory)).
+Build fixtures inspect the exact `1.95.0-x86_64-unknown-linux-gnu` release call sites for same-width
+lock-free CAS, writer payload-before-CAS, observer load/fence/payload order and no process-local
+fallback. Cross-process message-passing litmus/stress on each admitted CPU/kernel corroborates but
+does not formally prove the ABI. If owners reject this target-qualified contract, both `N19` and the
+later crash markers require a versioned kernel-IPC or audited-shim redesign; replacing only `N19`
+with `eventfd` is forbidden.
+
+#### `N28` one-shot broker/barrier recipe
+
+`N28` selects anonymous socket pairs rather than a pathname or abstract listener. The topology has
+one known outer runner, collector and inert helper; a listener would add bind/connect, pathname,
+unlink, late-client and reconnect surfaces without a required dynamic client. Linux
+`SOCK_SEQPACKET` preserves ordered message boundaries, and `SO_PASSCRED` supplies sender credentials
+on each received message
+([`unix(7)`](https://man7.org/linux/man-pages/man7/unix.7.html)). `SO_PEERCRED` is not the peer proof
+because on a pre-fork socketpair it reports credentials from socketpair creation, not necessarily the
+later endpoint holder. Even per-message credentials remain corroboration because a privileged sender
+can nominate some credential values; endpoint provenance, pidfd/full process identity and live
+`N29` privileged-population authority remain mandatory.
+
+The semantic transcript is:
+
+1. Before spawning the collector, the protected outer runner creates one anonymous
+   `AF_UNIX`/`SOCK_SEQPACKET|SOCK_CLOEXEC|SOCK_NONBLOCK` pair and atomically installs only the intended
+   endpoint in each process, along with immutable `n28_start_raw` and deadline operands, and proves
+   every duplicate closed. The outer runner covers pair creation, collector-spawn failure and cleanup
+   under that same total deadline. Each side independently retains the other's pidfd and full boot/
+   PID-namespace/PID/start-ticks/executable/cgroup tuple. Both receivers enable `SO_PASSCRED`; each
+   receive requires exactly one kernel-validated `SCM_CREDENTIALS`, while reviewed sender behavior
+   proves that no explicit credential body was supplied. `MSG_TRUNC`, `MSG_CTRUNC`, `SCM_RIGHTS`,
+   extra control records and extra packets are forbidden. The actual-target fact freezes endpoint/
+   open-holder provenance, both retained process identities, the dedicated probe-parent identity,
+   exact expected child set, absence of the policy-derived N28 relative leaf locator and `cgroup.stat`
+   descendant/dying-descendant baseline, exact descriptor population, the common RAW origin,
+   `n28_start_raw`, policy-bound total/stage operands and idle sequence-zero state before an N28
+   request or helper exists. Those counts remain neutral observations, but check 27 requires
+   `nr_descendants` to equal the enumerated child-set cardinality and `nr_dying_descendants=0`.
+   Checked ordering requires
+   `raw_origin <= n28_start_raw <= actual_target_start_raw`; the later transcript must equal every
+   frozen value.
+2. Once, after actual-target capture and before run-start, the collector sends a request binding the
+   native class, collection ID, actual-target descriptor/digest, its `N03` identity, and expected
+   outer-runner/helper builds, exact dedicated probe-parent identity, policy-derived relative leaf
+   locator and create-new sibling-leaf policy; it cannot bind a not-yet-created leaf inode. The
+   decoded `collection_id` is the challenge nonce and probe sequence is zero, disjoint from campaign
+   ordinals. The request is non-authorizing data
+   accepted only inside the runner's already-retained admitted collection context. That bounded
+   context permits this one inert helper; no packet reconstructs admission, mints an operation or
+   borrows a later campaign/child-dispatch lease. There is no semantic resend/replay or reconnect.
+3. The outer runner is the launch broker; no additional broker process or listener exists. It creates
+   one temporary domain leaf exclusively at the bound relative locator under the opened dedicated
+   probe parent, sets `pids.max=1`, and returns its opened device/inode and effective policy. The
+   collector independently opens it relative to its retained parent handle, verifies identity/policy/
+   emptiness and the exact parent diff, and retains a cleanup handle before acknowledging preparation.
+   No helper may be spawned before that acknowledgement. The broker then creates a second anonymous
+   sequenced-packet pair under the same flags/credential/ancillary rules and uses
+   `clone3(CLONE_PIDFD|CLONE_INTO_CGROUP)` with
+   `clone_args.exit_signal=SIGCHLD` to place one reviewed `redb-prescreen-supervisor` inert barrier-
+   helper mode directly in the leaf. The broker is single-threaded from clone through reap, binds the
+   clone-caller TID, retains the helper pidfd, keeps SIGCHLD waitable and has no competing reaper. The
+   async-signal-safe child stub installs only the barrier endpoint, sets and race-checks the same
+   [`PR_SET_PDEATHSIG=SIGKILL`](https://man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html)
+   parent-thread contract, and execs the retained executable handle. Fork-then-migrate and path reopen
+   are forbidden. The non-set-ID/non-file-capability helper permits no credential
+   transition and post-exec rechecks `PR_GET_PDEATHSIG==SIGKILL` plus exact parent PID/TID identity.
+   No database/workspace, actuator, candidate payload, device, provider, Engine or release capability
+   reaches the helper.
+4. The broker reports the observed leaf and helper tuple. Before arm, the collector opens its own
+   pidfd for that exact PID, rechecks PID reuse/start ticks/executable/cgroup/descriptor identity, and
+   acknowledges that its independent cleanup guard is live. The broker then sends one arm challenge
+   and accepts one matching armed echo after its credentials join the retained helper identity. The
+   armed cut requires a live helper pidfd, domain leaf, `pids.max=1`, exactly the helper in
+   `cgroup.procs` and `cgroup.threads`, `pids.current=1`, no descendant cgroup, the exact descriptor
+   set, and no release intent/send/acknowledgement. The reviewed seccomp/permission profile denies
+   thread/process creation, cgroup migration and cgroup-control access.
+5. Without a release transition, the broker sends `SIGKILL` through its helper pidfd, uses deadline-
+   aware pidfd polling and nonblocking `waitid(P_PIDFD,...,WEXITED|WNOHANG)`, and requires
+   `CLD_KILLED/SIGKILL`. It observes helper-pair EOF and closes that pair. Both sides require
+   `cgroup.events populated=0`, empty `cgroup.procs` and `cgroup.threads`, `pids.current=0`, no child
+   cgroup and no live/unaccounted process. The broker sends one stop receipt containing the exact
+   wait and empty-task observations. The collector independently observes its helper pidfd readable,
+   joins the stopped identity and empty leaf, closes its helper pidfd plus every leaf/`cgroup.kill`
+   handle, and sends one guard-release acknowledgement. Only after that acknowledgement may the
+   broker close its helper pidfd and every leaf-specific handle, remove the leaf through its retained
+   probe-parent handle, and require the exact frozen child set plus `nr_descendants` and
+   `nr_dying_descendants` observations, with the former equal to that set's cardinality and the latter
+   exactly zero. A voluntary/premature exit, leaked handle or lingering dying cgroup cannot satisfy
+   the planned stop.
+6. The broker then sends one final receipt carrying the same nonce/sequence, ordered RAW offsets,
+   collector/broker/helper tuples and credentials, armed-without-release proof, exact wait result,
+   stop/guard-release transcript and helper/task/helper-socket/pidfd/leaf-handle/cgroup closure, and
+   closes its collector endpoint. The collector must receive exactly that receipt, then EOF, close
+   its own endpoint, recheck the retained live broker identity and probe-parent baselines, and prove
+   no duplicate endpoint. This post-receipt EOF/close is part of the observation and deadline; the
+   receipt cannot claim its own transport was already closed. `N28` runs after the
+   `N21` attribution probe but before the final CPU/memory/thermal/kernel/block/device quiet brackets
+   and preflight end cut, so its helper activity cannot make those observations stale.
+7. Collector loss is detected by the broker's retained pidfd and endpoint; it stops/reaps the helper,
+   uses `cgroup.kill=1` as an adverse-path backstop, and reconciles without a pass. Broker loss is
+   detected by the collector's retained pidfd and endpoint; the helper's parent-death signal plus the
+   collector's helper pidfd and retained-leaf `cgroup.kill=1` are conjunctive safety paths. After a
+   guard-release sequence begins, the collector retains its probe-parent handle and exact leaf
+   locator/identity: on broker loss it either securely reopens and reconciles the still-present leaf
+   or proves removal and the frozen parent baselines. If broker loss occurs before identity/handle
+   handoff, the collector compares the bounded parent enumeration with the frozen set, opens the exact
+   policy-derived new locator when present, applies `cgroup.kill=1`, proves it empty/descendant-free,
+   closes every opened handle, removes it and restores the parent baselines. Any other diff is
+   unfinalizable and every new child is safety-reconciled under the cleanup deadline. It can prove
+   exit/empty task state but cannot
+   manufacture the missing parent's wait receipt, so no preflight singleton results. Simultaneous
+   authority loss is likewise unfinalizable. There is no replacement, adoption or same-collection
+   resume.
+
+One RAW total deadline begins immediately before creating the outer-runner/collector control pair and ends only
+after the post-receipt EOF/close/recheck. Each setup, target-held, request, prepare, spawn, arm, stop,
+receipt and closure transition uses
+`state_deadline = min(state_entry_raw + n28_stage_deadline_ns,
+n28_start_raw + n28_total_deadline_ns)` with checked addition and inclusive equality. No blocking syscall
+may overrun the remaining bound. On expiry or loss, safety stop and task/cgroup/socket reconciliation
+continue under a separate bounded cleanup deadline; cleanup cannot rescue a pass. Numeric operands
+and the nonblocking EINTR/EAGAIN continuation rule while no packet has committed remain policy-
+blocked; continuation cannot authorize a second semantic packet. A complete trustworthy negative is
+a failed predicate; the existing seven
+source causes and precedence cover incomplete collection. Unknown cleanup prevents any valid
+singleton, and no N28-specific status or capability is introduced.
+
+Hostile fixtures cover wrong/replayed nonce or sequence; duplicate/reordered/extra/short/oversize/
+truncated packets; explicit, missing, duplicate or forged credentials; unexpected descriptors;
+endpoint/holder substitution; PID reuse and broker/helper exec or cgroup drift; wrong leaf/policy/
+locator/parent diff/task/fd population; broker loss before leaf handoff; helper spawn before the
+collector guard; descendant/thread creation or migration; clone-caller parent-thread exit;
+cleared or mismatched parent-death signal after exec or a forbidden credential transition; arm
+before independent guard; missing/late/duplicate arm; any release transition; collector, broker or
+helper loss at every state; parent-death race; deadline equality/plus-one/overflow; blocking-wait
+overrun; signal/wait mismatch; missing/early/duplicate guard-release; leaked helper pidfd or leaf/
+`cgroup.kill` handle; `cgroup.kill`/empty/removal failure; descendant/dying-descendant or parent drift;
+N28 after a final quiet cut; target/preflight RAW-start/deadline mismatch; final receipt before helper
+reconciliation; and pass before outer-pair EOF/close. Exact builds, protected FD install, kernel/seccomp/cgroup support,
+privileges, security profile, deadlines, caps, wire/raw roles and live `N29` remain blockers.
+
+#### Docker-successor compatibility map
+
+No Desktop-era wire is promotable by changing its producer. In the table, **conditional** means the
+existing schema or semantic may survive only after an explicit compatibility proof; **version**
+means preserve purpose under a successor identity; **replace** means the old topology concept is
+invalid; and **reject** means historical/regression input only. Reusing a role, locator, fact/check
+label or outcome word never implies byte compatibility.
+
+| Existing surface | Required successor action |
+|---|---|
+| `state-backend-redb-prescreen/v1` | Conditional on the approval-payload/protocol-ID decision; version if that binding changes. |
+| protected-review-policy `/v1` | Schema may remain conditional; its policy instance must bind the selected protected workflow, provider and environment. |
+| approval payload `/v2` | Explicit keep-or-version decision. It survives only if the exact 29-row input set and `prior_smoke_result` semantics remain compatible. |
+| protected-review receipt `/v2` | Pre-run shape is conditional; version or explicitly supersede the post-run pairing and any changed provider binding. |
+| Docker actual-target and preflight-cut `/v1` | Version and reject all old Desktop bytes. |
+| run-start binding and raw-run manifest `/v1` | Version: target/preflight, authority kinds, process/runtime tuples and raw-role population change. |
+| Docker launch-ledger and control `/v1` | Replace the broker-container ownership model, version both purposes and reject `/v1` bytes. |
+| reserved result-payload `/v1`, result/post-run receipt and evidence-close/report envelopes | Version or explicitly supersede; no existing result producer or complete schema can be inherited. |
+| retained-evidence root and artifact-index namespaces | Conditional only after a successor registry/schema proves exact descriptor closure and cardinality. |
+| legacy payload/receipt `/v1` and result `/v1` | Reject as synthetic regression input. |
+| `DOCKER_SMOKE_PASS`, `DOCKER_SMOKE_INCOMPLETE`, `docker_smoke_no_decision` | May be explicitly readopted only inside a new result identity; no current producer may emit them. |
+| dispatch and child-dispatch capabilities | Replace/rebind to the exact successor provider/VM, target, run-start and live `D20,D21` recheck. |
+| root and launch-ledger leases | Replace control-container semantics with host-native broker/endpoint/runtime ownership. |
+| Docker-prerequisite capability and consumer | Version or supersede; old Desktop evidence cannot satisfy it. |
+| approval-input storage capability | Conditional if the approval-input set remains byte-compatible; it supplies no runtime authority. |
+| Docker run-provenance authority | Missing: freeze an exact successor capability and live verifier rather than implying one. |
+
+The existing subject/source/build/fixture role strings and locators may remain only where their
+purpose, media type and validation semantics are unchanged; their exact current bytes remain bound
+by length and SHA-256. Old Desktop bytes themselves remain ineligible. Topology-sensitive contracts,
+plans, policies, configuration and goldens require new reviewed bytes. The fixed registry has no
+dedicated immutable identities for a distinct host-native broker, `dockerd`, `containerd`, their
+configurations or later shim/runtime executables;
+the successor must decide where those approval identities live before resolving `/v2` compatibility.
+Every raw binary/JSON header and role/cardinality golden must bind the versioned run-start. The
+current Docker fact and ordered-check registries are rejected wholesale: conceptually reusable facts
+and predicates move into a new registry, `windows_wsl_identity`/`D03` and
+`broker_container_identity` are replaced, and `D02,D07,D08,D20,D21` are re-specified. Candidate
+topology remains `container_per_process`; `same_container_pidfd` and control/job-container ownership
+remain rejected.
+
+#### Redb-free `D20,D21` feasibility decision matrix
+
+These are mandatory yes/no questions for a later validation-only probe, not an executable probe or
+selected mechanism:
+
+| Gate | Required question | Minimum sufficient proof | Status |
+|---|---|---|---|
+| `D20.1` takeover | Can the VM prove every preexisting Engine/containerd/shim/OCI-runtime/proxy/network or other configured helper process, endpoint, container, private-root/state object and relevant cgroup absent or isolated before target capture? | Closed process/socket/service/container/cgroup/root-state inventory tied to provider attempt, VM and boot, plus configuration-derived proof that no omitted helper kind can exist. | unproved |
+| `D20.2` broker to Engine | Can every preopened broker connection be bound through the exact protected socket object to the retained reviewed `dockerd` without path/symlink substitution? | Endpoint/open-connection/server-process identity plus retained process handle across the cut; `SO_PEERCRED` alone is not exclusivity. | unproved |
+| `D20.3` Engine to containerd | Can `dockerd`'s actual live runtime connection, not merely configuration text, be bound to retained reviewed `containerd`? | Socket/peer/process binding plus namespace, executable, configuration and private root/state identity. | unproved |
+| `D20.4` later runtime set | Can approval bind every executable/configuration/private-root input before spawn; lossless supervision capture every later short- or long-lived shim, OCI runtime, proxy, network helper, daemon helper and re-exec from creation/exec; and the candidate remain inert until every live chain is joined and every already-exited helper is historically reconciled? | Reviewed and attributed setup effects; lossless supervised historical population from private-daemon start through final cut; pre-spawn executable/config/root bindings; inert-until-joined candidate bootstrap; container/cgroup linkage and legal planned-exit handling. A post-create snapshot is insufficient. | unproved |
+| `D20.5` continuity | Conjunctively with `D20.1`--`D20.4`, can restart, replacement, exec/reload, socket substitution, reconnect, required-process loss and every observer gap fail closed? | Redb-free hostile fixtures for each transition and observation-loss point; Engine events remain advisory. | unproved |
+| `D21.1` VM authority | Does the provider expose a live exclusive VM lease bound to the exact workflow attempt, VM and boot with freshness, loss and fencing? | Provider-authenticated live lease/attestation; a setup-log image version or “new VM per job” is insufficient. | no eligible provider selected |
+| `D21.2` client-capability barrier | Can the Engine listener be closed to new clients and every existing connection/open-file-description holder be confined to one exact bounded broker set? | Proved listener sealing/unlinking or equivalent barrier, exact pool and holder population, no reconnect, and denial/detection of duplicate, fork inheritance and `SCM_RIGHTS` passing; otherwise select a continuous loss-detecting mechanism. | mechanism unselected |
+| `D21.3` sole-client observation | Can every foreign Engine connection or connection-capability holder be detected without gaps throughout authority? | Bracketed peer/process/holder reconciliation is sufficient only conjunctively with the proved `D21.2` no-new-client/no-new-holder barrier; otherwise continuous reviewed loss-detecting observation is mandatory. | unproved |
+| `D21.4` privilege closure | Can every actor able to reach/recreate the endpoint or duplicate/pass a client capability be kept in a closed trusted set while candidates are denied it? | Broker identity, capability confinement and provider lease plus continuously enforced or loss-detected privileged-process/holder closure; permissions and bounded snapshots alone are insufficient. | unproved |
+| `D21.5` hostile proof | Do same-user/root foreign connection, inherited/duplicated/`SCM_RIGHTS`-passed client, endpoint replacement and reconciliation-gap attempts prevent finalization? | Exact redb-free hostile fixtures with fail-closed expected outcomes. | absent |
+
+No successor target/preflight schema cut begins until owners decide successor identities,
+approval-payload compatibility, broker ownership, Engine/runtime approval identity, provider lease,
+`D20` peer binding, `D21` sole-client enforcement, exact process population, raw roles/cardinalities,
+derived caps, result fixtures and run-provenance authority. This cycle performs none of those
+decisions by implication.
 
 ## Isolation and clocks
 
@@ -2704,10 +3082,17 @@ an interrupted first `I1`/`I2` commit look artificially cheap. The target transa
 without closing the database.
 
 The intent contains the post-prime digest, complete intended mutation digest, transaction, mode,
-seed, trigger identity, and sequence number. Shared memory exposes monotonic `intent`,
-`commit_entered`, `candidate_returned`, and `acknowledged` transitions. Child marker stores use
-release ordering. The supervisor writes acknowledgement only after observing candidate return, and
-trigger 6 waits until acknowledgement is visible before kill. A pre-commit barrier lets the
+seed, trigger identity, and sequence number. A child-owned shared object exposes monotonic `intent`,
+`commit_entered`, and `candidate_returned` transitions; child marker stores use release ordering.
+`acknowledged` is a separate supervisor-owned evidence field and is never written through the
+read-only child-marker mapping. Cycle 31's target-qualified process-shared publication decision is
+also an eligibility gate for the child object: the supervisor first reads each marker with the
+audited eight-byte Relaxed load; only the expected published value permits an immediately following
+Acquire fence and associated payload read. Otherwise payload inspection waits until child exit.
+`load(Acquire)` is not used on that read-only mapping. `N19` corroborates that shape but does not
+prove the later multi-field layout or crash semantics. The supervisor records acknowledgement only
+after observing candidate return, and trigger 6 waits until that field is recorded in supervisor
+evidence state before kill. A pre-commit barrier lets the
 supervisor arm its pidfd/timer before the child records `commit_entered` and immediately calls
 commit. Trigger 1 kills before releasing that barrier. Triggers 2--5 release it and actuate at 0,
 250 microseconds, 2 milliseconds, and 10 milliseconds respectively after the supervisor observes
@@ -2720,8 +3105,9 @@ are monotonically ordered; absent stages stay absent rather than being zero-dura
 1 requires no commit/return marker, triggers 2--5 require commit entry and classify by the final
 return marker, and trigger 6 requires return plus acknowledgement. This frame is distinct from the
 steady/HOLD latency wire.
-The supervisor records the markers observed when it requests the signal, then after `waitid`/pidfd
-exit rereads their final values with acquire ordering. Final markers classify the trial because
+The supervisor records the child markers and its own acknowledgement state when it requests the
+signal, then after `waitid`/pidfd exit rereads the child fields with the same audited fenced
+observation. Final combined fields classify the trial because
 return may race signal delivery; a requested timed trigger is not silently called “in commit.”
 Across triggers 2--5, each mode needs at least three finally confirmed
 `commit_entered && !candidate_returned` kills. At most two extra, separately identified trials per
