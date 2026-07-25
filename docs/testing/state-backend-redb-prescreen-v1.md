@@ -1,10 +1,11 @@
 # redb 4.1.0 bounded state-backend prescreen v1
 
 - **Identity:** `state-backend-redb-prescreen/v1`
-- **Status:** Cycle 26 formal-input content-contract freeze; only bytes-only validation work is
-  authorized, while the strict run/result schemas and wires, live provider/storage/finalization
-  verifiers, native supervisor/child/actuator/oracle, reviewed build, owner approvals, and execution
-  remain absent
+- **Status:** Cycle 27 target/preflight identity, DAG and check-registry freeze; only redb-free
+  validation work is authorized, while exact predicates/sources and target/preflight schemas and
+  collectors, the strict later run/result wires, live provider/storage/finalization verifiers,
+  native supervisor/child/actuator/oracle, reviewed build, owner approvals, and execution remain
+  absent
 - **Evidence class:** `NOT C2/C3 QUALIFICATION EVIDENCE`
 - **Scope:** decide whether a redb adapter is worth adding to the backend qualification bake-off
 - **Production/admission effect:** none; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
@@ -70,7 +71,8 @@ symlink, hard link, device, socket, FIFO or path escape is allowed. Each retaine
 singleton appears exactly once at the fixed locator in this table; an expected raw leaf may instead
 reconcile as unavailable under Cycle 25. The terminal-finding row is conditionally expected
 only after the native control journal durably records a terminal-stop-pending frame. The Docker
-control row is mandatory for every stage-one-admitted Docker run. Later repeatable retained-artifact
+launch-ledger and control rows are mandatory for every stage-one-admitted Docker run. Later
+repeatable retained-artifact
 roles require a separate closed registry and cardinality. The verifier opens relative to an already-open
 role-assigned root handle with no-follow semantics, verifies regular-file identity before and after
 streaming, caps bytes before allocation, and rejects aliases or extra decision-bearing files.
@@ -114,6 +116,7 @@ streaming, caps bytes before allocation, and rejects aliases or extra decision-b
 | run-start binding | `result/run-start-binding.json` | campaign start |
 | native campaign-control journal | `result/campaign-control.bin` | native evidence close |
 | terminal finding | `result/terminal-finding.json` | native terminal-pending closure |
+| Docker launch ledger | `result/docker-launch-ledger.bin` | Docker evidence close |
 | Docker smoke control | `result/docker-smoke-control.json` | Docker evidence close |
 | raw run manifest | `result/raw-run-manifest.json` | result review |
 | evidence-close manifest | `result/evidence-close-manifest.json` | cleanup precondition |
@@ -374,8 +377,8 @@ are unconstructible.
 
 For native only, the outer protected runner—not the restartable supervisor worker—first retains a
 non-serializable `NATIVE_CAMPAIGN_ROOT_LEASE` over exact run-start, evidence/control-root handles,
-dedicated workspace/cgroup, protected run attempt and outer-runner process registry. It create-news
-and reopens the campaign-control file, then irreversibly narrows that lease to
+dedicated workspace/cgroup, protected run attempt and outer-runner process registry. It creates and
+reopens the campaign-control file, then irreversibly narrows that lease to
 `NATIVE_CAMPAIGN_CONTROL_LEASE` binding the exact file identity before a worker receives a scoped
 single-writer handle. Neither lease grants candidate start/open authority. Loss of the supervisor
 worker irrevocably closes the schedule gate; after proving the old worker exited and obtaining
@@ -963,7 +966,8 @@ smoke failure may retain diagnostics only as `DOCKER_SMOKE_INCOMPLETE`; it canno
 a backend. Only a trusted verifier may return
 `DOCKER_SMOKE_PREREQUISITE_VERIFIED_NO_DECISION`, after proving a non-synthetic
 `DOCKER_SMOKE_PASS`; identical subject/source/build/child/schemas/goldens/plan and 64-MiB fixture;
-the exact stored Docker run-start, control, raw manifest, report, evidence-close, cleanup, index,
+the exact stored Docker run-start, launch ledger, control, raw manifest, report, evidence-close,
+cleanup, index,
 result and receipt closure; current live owner review and immutable-storage version; live protected
 Docker run identity; and consumption of the exact admission and child-dispatch capabilities by that
 run. That opaque capability
@@ -986,7 +990,7 @@ timestamp symbols used later:
 approval roots + actual target/preflight
   -> run_start
   -> native campaign_control + raw leaves (+ conditional terminal_finding)
-     or Docker raw leaves + docker_control
+     or Docker launch_ledger + raw leaves + docker_control
   -> raw_manifest
   -> validator/oracle/(native mechanism) envelopes
   -> evidence_close -> cleanup_journal -> cleanup_report -> final_index
@@ -1028,8 +1032,9 @@ schedule ledger; and carries one content-only campaign cut. The run-start descri
 in either array. Each descriptor array is strictly ordered by raw UTF-8 locator bytes, locators are
 globally unique across both arrays and the dedicated run-start field, and `(role, locator)` pairs are
 unique. Native campaign-control and present terminal-finding bytes, or the Docker control object, are
-run-produced raw descriptors. Reports and all evidence-close, cleanup, index, result, review, storage
-and finalization objects are excluded. The manifest does not bind itself and contains no outcome.
+run-produced raw descriptors. The Docker launch ledger is also a mandatory run-produced raw
+descriptor. Reports and all evidence-close, cleanup, index, result, review, storage and finalization
+objects are excluded. The manifest does not bind itself and contains no outcome.
 
 Process identity is never PID alone. The future wire must include Linux boot ID, PID-namespace
 identity, PID, `/proc` start ticks, cgroup identity and exact executable digest. Empty process arrays
@@ -1104,10 +1109,12 @@ binds the exact evidence that makes its cause legal; no free-form reason is acce
 `CANDIDATE_NOT_STARTED` uses it when zero rows are attempted, and `PARTIAL_NONTERMINAL_STOP` uses it
 after any slot attempt. `harness_or_attempt_oracle_invalid` excludes bootstrap failures.
 
-At campaign level at most one database-opening process for one slot may be released across transaction
-child, reopen/scanner and large-recovery clean-control roles, plus only that slot's associated
-actuator; `W1`/`W2` lanes remain threads inside one child. No next slot may start until every process,
-scan, attempt-level oracle check and
+At campaign level only one slot may be active. Within that slot at most one released database-opening
+process may be live at an instant; the transaction child, reopen/scanner and large-recovery clean-
+control instances remain sequential and may all be required for the same slot. Only that slot's
+associated actuator may overlap the transaction child as the approved trigger requires; `W1`/`W2`
+lanes remain threads inside one child. No next slot may start until every process, scan, attempt-level
+oracle check and
 terminal check for the prior slot has closed. Missing, malformed, unchainable, torn or non-final
 campaign-control bytes make the closure unfinalizable; the journal cannot describe its own failure as
 `DEFER`.
@@ -1333,9 +1340,10 @@ incomplete, and there is no reuse or rerun. The cut is a deterministic count pro
 `partial_incomplete` for every other stage-one-admitted stopped prefix.
 
 `result/docker-smoke-control.json` is mandatory content with identity
-`state-backend-redb-prescreen-docker-control/v1`. It binds the exact run-start, ten-row final ledger,
-process identities, last attempted/completed ordinal, RAW cut offset, closed cause and exact
-not-attempted suffix. Its cut is exactly `candidate_not_started`, `partial_incomplete` or
+`state-backend-redb-prescreen-docker-control/v1`. It binds the exact run-start and launch-ledger
+descriptor/final hash, plus the checked ten-row final case-ledger projection, process identities, last
+attempted/completed ordinal, RAW cut offset, closed cause and exact not-attempted suffix. Its cut is
+exactly `candidate_not_started`, `partial_incomplete` or
 `smoke_complete`. Cause is exactly `preflight_failed`, `preflight_incomplete`,
 `child_dispatch_authorization_unavailable`, `candidate_bootstrap_failed`,
 `pre_candidate_safety_bound`, `case_incomplete`, `oracle_violation`, `harness_invalid`,
@@ -1349,8 +1357,9 @@ case, harness, oracle or safety failure closes the decision ledger and leaves th
 attempted. A violation in the final row has no suffix, so it closes as `smoke_complete` with
 `mandatory_population_closed` while the oracle envelope derives `oracle_not_passed`.
 
-Every Docker case uses the same outer launch-broker dormant/armed/release barrier, and the control
-object binds its process/release/exit receipts. Each released process gets a contiguous
+Every Docker case uses the same outer launch-broker dormant/armed/release barrier. The launch ledger
+owns its process/release/exit receipts, and the control object is a checked projection that binds
+their final root. Each released process gets a contiguous
 `process_release_ordinal`; the case's first database-opening release also assigns its
 `case_attempt_ordinal`, reused by associated process receipts. A case is attempted at that durable
 release intent; an ambiguous release is incomplete. `candidate_bootstrap_failed` is required if and
@@ -1364,7 +1373,7 @@ incomplete result.
 The Docker closure is exactly:
 
 ```text
-run_start -> raw case/copy evidence + docker_control -> raw_manifest
+run_start -> docker_launch_ledger + raw case/copy evidence + docker_control -> raw_manifest
   -> validator envelope + oracle envelope
   -> evidence_close -> cleanup_journal -> cleanup_report -> final_index
   -> Docker result payload -> post-run receipt
@@ -1372,13 +1381,14 @@ run_start -> raw case/copy evidence + docker_control -> raw_manifest
 
 The report-envelope, expected-leaf reconciliation, retained-index, 2-GiB cap and cleanup invariants
 above apply through Docker-tagged schemas. The Docker expected set derives from its exact run-start,
-Docker control and raw manifest rather than native campaign-control. Docker expected leaves contain
-only its static/case/copy leaves; native mechanism, campaign-control and terminal roles are
-inapplicable, never missing.
+Docker launch ledger, Docker control and raw manifest rather than native campaign-control. Docker
+launch ledger and control are mandatory spine objects but, like native campaign-control, are excluded
+from leaf reconciliation. Docker expected leaves contain only its static/case/copy leaves; native
+mechanism, campaign-control and terminal roles are inapplicable, never missing.
 Cleanup covers transient case copies only. Zero copies still requires a header-only cleanup journal
-and zero-row cleanup report. Missing or malformed run-start, Docker control, raw manifest, validator/
-oracle envelope, evidence-close manifest, cleanup journal/report or final index means no Docker
-result. A valid cleanup failure instead derives an incomplete smoke outcome.
+and zero-row cleanup report. Missing or malformed run-start, Docker launch ledger, Docker control,
+raw manifest, validator/oracle envelope, evidence-close manifest, cleanup journal/report or final
+index means no Docker result. A valid cleanup failure instead derives an incomplete smoke outcome.
 
 `DOCKER_SMOKE_PASS` requires all ten rows complete, preflight passed, valid layout/goldens and
 harness, completed validator, oracle `no_violation`, no retained-invalid/unavailable expected leaf,
@@ -1425,7 +1435,8 @@ mint/handoff/freshness/replay rules; root/control lease and launch-broker/dorman
 process identity and dynamic-ledger encodings; campaign-control frame, sync, parent-durability,
 torn-tail and no-resume recovery rules; pre-authorized handle lifetime;
 attempt-close, crash/scan/oracle/panic witness schemas and panic-origin proof; report-envelope and
-expected-leaf/reconciliation wires; Docker control/case roles; evidence-close durability; and
+expected-leaf/reconciliation wires; Docker launch-ledger/control/case roles; evidence-close
+durability; and
 complete positive/negative fixtures. Cycle 26 below resolves only the structural 29-row payload and
 matching receipt schemas. The independently constructed 64-MiB descriptor/digests and every other
 listed item remain blocked.
@@ -1502,12 +1513,452 @@ capability binds the hidden opened root/version and supplies all authority. Exac
 identifier domains, retention proof, freshness and TOCTOU rules remain blockers, so this cycle adds
 no storage-version schema, fixture, public type or validator.
 
-Actual-target, preflight-cut, run-start, raw-manifest, campaign-control, Docker-control, report and
-evidence-close schemas remain blocked. In particular, the 64-KiB run-start, 256-KiB raw-manifest,
+Actual-target, preflight-cut, run-start, raw-manifest, campaign-control, Docker launch-ledger/control,
+report and evidence-close schemas remain blocked. In particular, the 64-KiB run-start, 256-KiB raw-
+manifest,
 128-descriptor and 4,096-node suggestions remain non-normative until the native 105-row and Docker
 ten-row role/process/cardinality registries prove their maxima. Before any Docker runner exists, a
 Docker-tagged durable launch ledger or equivalently retained broker-receipt chain must also own its
 start/armed/release ambiguity; a final JSON control object alone cannot prove the attempt cut.
+
+### Cycle 27 tagged target identity, DAG and initial-check registry freeze
+
+Cycle 27 freezes identities, dependency direction, minimum fact records and check/status taxonomy; it
+does not yet freeze every predicate, authoritative source, sampling window or wire field. It adds no
+schema, fixture, validator, collector, provider client, launch broker, process runner, redb dependency
+or candidate command. In particular, copied content cannot prove that an observation came from the
+protected run or that a policy predicate is true. A later bytes-only validator may report only
+content conformance and unverified authority; only the future live dispatcher may reobserve the
+target and consider child dispatch.
+
+#### Identities, roles and acyclic bindings
+
+The four additive, run-class-disjoint identities are:
+
+| Run class | Object identity | Descriptor role | Fixed locator |
+|---|---|---|---|
+| `native_prescreen_decision` | `state-backend-redb-prescreen-native-actual-target/v1` | `redb-prescreen-native-actual-target` | `evidence/actual-target.json` |
+| `native_prescreen_decision` | `state-backend-redb-prescreen-native-preflight-cut/v1` | `redb-prescreen-native-preflight-cut` | `evidence/preflight-cut.json` |
+| `docker_smoke_no_decision` | `state-backend-redb-prescreen-docker-actual-target/v1` | `redb-prescreen-docker-actual-target` | `evidence/actual-target.json` |
+| `docker_smoke_no_decision` | `state-backend-redb-prescreen-docker-preflight-cut/v1` | `redb-prescreen-docker-preflight-cut` | `evidence/preflight-cut.json` |
+
+Each is a singleton `application/json` object in its run-class-specific result root. These roles are
+additive; the similarly named roles in the legacy synthetic result schema are not aliases or
+defaults. A native identity in a Docker run, a Docker identity in a native run, or both roles in one
+result root is invalid.
+
+Bindings use exact `application/json` tuples. The formal payload is
+`(redb-prescreen-approval-payload,approval/payload.json)` and the newly reserved receipt role is
+`(redb-prescreen-pre-run-protected-review-receipt,approval/protected-review.json)`. Neither role is
+part of the approval payload's 29-object array; both live in the result root and are later bound by
+run-start. Target/preflight role or media substitution is invalid.
+
+The only legal construction direction is:
+
+```text
+exact /v2 approval payload + receipt + copied protected-attempt context + bound policies
+  -> run-class actual target
+  -> run-class initial preflight cut
+  -> future run-start binding
+```
+
+The actual-target object binds no preflight or run-start object. The preflight object descriptor-
+binds the exact actual-target bytes but no run-start or later object. The future run-start binds both
+singletons. Neither singleton hashes itself. This removes a target/preflight/run-start cycle and
+prevents a later result from choosing the target on which it claims to have started.
+
+Both objects carry the exact protocol/run class/payload ID and the same dispatcher-generated
+`collection_id` encoded as exactly 64 lowercase hexadecimal characters and not all zero. They carry
+the same copied attempt context: provider contract, repository ID, change ID,
+head revision, workflow file, job name, protected environment ID, workflow run ID and attempt,
+workflow job ID, and stage-one dispatcher audit-event ID. They also carry the all-false evidence
+scope. Content validation requires the receipt-derived context fields to equal the supplied `/v2`
+payload/receipt and requires every copied field plus `collection_id` to be equal between the two
+objects. The dispatcher audit-event ID and collection ID instead compare with live dispatcher input
+because neither exists in the payload/receipt. Their generation/freshness, provider authenticity,
+single use and protected-attempt membership remain live checks; well-formed copied context has no
+authority.
+
+The actual-target `bindings` field contains exact descriptors for the approval payload, pre-run
+receipt, target-identity policy, preflight policy, clock/isolation policy, bounds and collector
+executable (the fixed `redb-prescreen-supervisor` descriptor). The preflight `bindings` field
+contains those same roots plus the exact actual-target descriptor. Descriptor equality is byte
+length, SHA-256, role, locator and media type. A mismatch is
+invalid content, not an environmental preflight failure that can close as `DEFER`.
+
+Docker target and preflight also copy one exact `broker_topology` literal,
+`same_container_pidfd` or `container_per_process`, selected by the bound target/preflight/execution
+policies before owner review. The actual-target observation, barrier-readiness probe, future run-start
+and launch-ledger header must all equal that approved value. A missing, mixed or post-run-start chosen
+topology is invalid content; the still-open implementation choice therefore blocks schema and
+execution rather than allowing runtime fallback.
+
+Both objects use one Linux boot-ID and `CLOCK_MONOTONIC_RAW` origin. The actual-target capture stores
+the positive RAW resolution, start/end offsets and matching UTC audit bracket; the preflight cut
+copies the clock identity and stores later start/end offsets. Checked ordering requires target start
+at or after the origin, target end at or after target start, preflight start at or after target end,
+and preflight end at or after preflight start. UTC is audit context only and never enters a duration.
+Failure to establish this common clock header means no valid singleton, not a self-described
+`incomplete` observation.
+
+#### Actual-target fact registries
+
+An actual-target body is discriminated by `collection_status`, but never discards successfully
+captured facts. Its `facts` array contains every run-class fact ID below exactly once in registry
+order. Each row is exactly
+`{"fact_id":<id>,"status":"observed","value":<future-closed-value>,"cause":null}` or
+`{"fact_id":<id>,"status":"unavailable","value":null,"cause":<closed-cause>}`. An observed value
+will use the neutral minimum semantics below and describes what exists, including a policy mismatch;
+its exact wire remains unfrozen. For example ext4, a virtual device, cgroup v1 or an unsupported
+quota query is observed rather than unavailable. `complete` is the exact projection
+that every fact row is observed; `incomplete` requires at least one unavailable row. Missing values
+cannot be filled with zero, `unknown`, a placeholder or a claimed default. Causes are exactly
+`source_unavailable`, `source_ambiguous`, `source_over_cap`, `identity_changed_during_capture`,
+`counter_regressed_or_wrapped`, `integer_overflow` or `deadline_exceeded`, in that precedence order.
+If multiple causes affect one fact, only the earliest is retained. A captured source identity
+change or source observation over its cap may use its closed incomplete cause; a malformed,
+unpublished, document-over-cap or file-identity-changing envelope is not a valid incomplete record.
+
+The native fact registry and neutral observed values are:
+
+| Exact fact ID | Neutral observed value |
+|---|---|
+| `collector_process_identity` | Linux boot ID, PID namespace inode, PID, `/proc` start ticks, collector-cgroup device/inode and exact supervisor digest, plus self mount/cgroup/user namespace inodes |
+| `linux_uname_identity` | `uname` system/machine and kernel release plus OS ID/version; the Rust target triple remains a build binding |
+| `libc_abi_identity` | explicitly sourced libc implementation/version and ABI observation; source selection remains blocked |
+| `pid1_namespace_identity` | PID 1 PID/mount/cgroup/user namespace inodes |
+| `cpu_sets` | normalized online, runner-affinity and campaign-parent-effective CPU/memory-node lists |
+| `cpu_frequency` | exposure kind plus bounded groups of CPU list, scaling driver, governor and minimum/maximum kHz; unsupported exposure remains an observed kind |
+| `monotonic_clock_source` | `CLOCK_MONOTONIC_RAW` resolution and current kernel clocksource identity |
+| `workspace_statx_identity` | workspace device/inode/mount ID, project ID and inherit flag |
+| `workspace_mount_record` | selected bounded mountinfo record, filesystem kind, block size, mount root/point/source and normalized options; an optional XFS body contains UUID and quota-option observations only when the kind is XFS |
+| `block_device_chain` | bounded neutral leaf-to-physical node kinds and identities; an optional NVMe body contains NSID, UUID/NGUID/EUI64 under a closed availability rule, controller serial/model/firmware, geometry, rotational flag and scheduler only when terminal kind is NVMe |
+| `campaign_parent_cgroup` | observed cgroup version and already-open parent identity; an optional v2 body contains controllers/subtree-control/type, effective CPU/memory-node sets and effective hierarchical CPU/memory/swap/PID limits only when version is v2 |
+| `project_quota_query` | query outcome `supported` or `unsupported`; only `supported` carries exact accounting/enforcement facts and checked 512-byte conversions of `d_bcount`, `d_blk_softlimit` and `d_blk_hardlimit`, while operational/query ambiguity is unavailable rather than an observed error default |
+| `nofile_limit` | soft and hard `RLIMIT_NOFILE` |
+| `host_swap` | host swap configuration plus campaign-parent swap observation when applicable |
+| `filesystem_free_space` | checked `f_bavail`, fragment size and resulting unprivileged available bytes |
+| `marker_source` | shared-marker source identity and initial sequence observation |
+| `device_ownership_source` | dedicated-device ownership/lease source identity and observed exclusivity value |
+| `device_write_source` | target-device attribution source identity and initial counter/in-flight observations; no missing `io.stat` row is encoded as zero |
+| `cgroup_cpu_throttle_source` | campaign-parent CPU throttle counter identity and initial values |
+| `cgroup_memory_events_source` | campaign-parent memory-event counter identity and initial values |
+| `thermal_source` | bounded thermal source identities and initial counters |
+| `kernel_block_error_source` | kernel/block-error source identities, cursors and initial counters |
+| `broker_barrier_source` | inert launch-broker/barrier probe identity and observation |
+
+The collector's cgroup is only in `collector_process_identity`; `campaign_parent_cgroup` is the pre-
+created parent the runner owns; later per-process children exist only in campaign-control evidence.
+Maximum CPU, frequency-group, device-chain, option, controller and source cardinalities remain
+unfrozen until maximum-width fixtures and a supported-host inventory prove them.
+
+The Docker registry is deliberately different and cannot carry native XFS/NVMe facts:
+
+| Exact fact ID | Neutral observed value |
+|---|---|
+| `collector_process_identity` | Linux boot ID, full PID/start-ticks/cgroup/executable identity and self namespace inodes |
+| `windows_wsl_identity` | Windows build, WSL version and Docker Desktop WSL2 backend identity, without credentials or raw host paths |
+| `linux_vm_identity` | Linux boot ID, architecture and kernel release |
+| `docker_engine_identity` | Desktop/Engine/API versions, Engine ID, Linux-container mode, storage driver and rootless/live-restore settings |
+| `broker_connection_receipts` | broker connection ID, contiguous broker receipt sequence and observed Docker event identity/time; Docker supplies no durable event cursor |
+| `broker_container_identity` | immutable inert broker container/image/config, full init-process, namespace and cgroup identity; it cannot open the candidate database |
+| `image_executable_bindings` | exact approved image/config, supervisor, child, actuator, oracle and verifier digests |
+| `probe_volume_mount` | neutral Docker mount type/driver/scope/options and mountinfo/filesystem/device/workspace identity for the disposable probe; expected local-volume properties are predicates, not structural constants |
+| `container_root_mount` | separate container-root mount identity and filesystem kind |
+| `resource_limits` | cgroup version and CPU/memory/swap/PID/file-descriptor limits plus probe-volume free bytes |
+| `volume_freshness_source` | disposable volume/copy freshness and exclusivity source identity/observation |
+| `process_reconciliation_source` | broker process/container enumeration source identity/observation |
+| `cleanup_root_source` | bounded cleanup-root identity and capacity observation |
+| `broker_barrier_source` | inert broker/barrier probe identity and observation |
+| `fixture_source_identity` | read-only 64-MiB fixture descriptor and opened-source identity/digest observation |
+
+Candidate child, actuator and scanner identities do not exist here; they first appear after run-start
+in the launch ledger. These facts describe a smoke target, not native storage: even a complete Docker body cannot
+claim XFS project quota, dedicated NVMe,
+device-write attribution, native latency, physical amplification, power-loss or endurance evidence.
+Engine ID alone is not a daemon-restart epoch; the trustworthy broker-connection/event-discontinuity
+rule remains a schema blocker.
+
+#### Initial-preflight status and checks
+
+The preflight cut is initial-only. It contains the exact common roots above, `status`, one fixed
+ordered `checks` array, declaration-ordered `failed_check_ids` and `incomplete_check_ids`, a bounded
+class-specific observation body, and the all-false evidence scope. Every check occurs exactly once
+and is exactly `passed`, `failed` or `incomplete`. A passed or failed row has
+`incomplete_cause = null`; an incomplete row has one source cause above or
+`prerequisite_incomplete`. The latter is legal only when a required actual-target fact is
+unavailable. When multiple unavailable preflight sources feed one check, its scalar cause is selected
+first by the seven-value cause precedence and then by that check's future closed source-registry
+order. That exact source registry remains a schema blocker; arbitrary collector discovery order is
+never accepted.
+
+`failed` means a complete, attributable observation proved the policy predicate false. `incomplete`
+means the required observation could not be established; it must never encode an adverse fact as
+missing. The two ID arrays are exact projections of non-passing rows in registry order and are not
+caller-selected reasons. Overall status is `incomplete` if any row is incomplete, otherwise `failed`
+if any row failed, otherwise `passed`. Thus `passed` requires every row passed and both arrays empty.
+Native and Docker control causes preserve the matching `preflight_incomplete` or `preflight_failed`;
+only the later derived Docker result folds either into `preflight_not_passed`. Only a live recheck of
+a content-valid `passed` cut may be considered for the separate child-dispatch capability.
+
+`actual_target_complete` is passed if and only if the bound target has
+`collection_status = complete`; an incomplete target makes that row incomplete and can never be
+relabeled failed; its `incomplete_cause` copies the cause from the first unavailable fact row in
+registry order. Every other
+check that depends on an unavailable target fact is incomplete with `prerequisite_incomplete`; it
+cannot pass or fail using another group's value. The exact live comparison behind every row remains
+a run-class-specific schema blocker.
+
+The exact native initial-check order is:
+
+1. `actual_target_complete`;
+2. `boot_id_stable`;
+3. `native_linux_host_namespace`;
+4. `kernel_identity_match`;
+5. `cpu_affinity_match`;
+6. `cpu_frequency_policy_match`;
+7. `monotonic_raw_clock_match`;
+8. `marker_sequence_monotonic`;
+9. `workspace_mount_identity_match`;
+10. `xfs_mount_policy_match`;
+11. `nonvirtual_storage_path`;
+12. `dedicated_nvme_identity_match`;
+13. `device_exclusive`;
+14. `device_write_attribution_available`;
+15. `xfs_project_quota_enforced`;
+16. `workspace_project_quota_match`;
+17. `cgroup_v2_identity_match`;
+18. `cgroup_limits_match`;
+19. `swap_disabled`;
+20. `nofile_limit_match`;
+21. `free_space_headroom`;
+22. `cpu_throttle_quiet`;
+23. `memory_events_quiet`;
+24. `thermal_quiet`;
+25. `kernel_block_errors_quiet`;
+26. `preflight_device_io_quiet`; and
+27. `broker_barrier_readiness`.
+
+The native absent-fact dependency projection is exact. Check 1 depends on every fact row. Check 2
+uses only the mandatory target/preflight clock headers. Checks 3--27 respectively depend on:
+
+| Check | Required native fact IDs |
+|---:|---|
+| 3 | `collector_process_identity`, `pid1_namespace_identity` |
+| 4 | `linux_uname_identity`, `libc_abi_identity` |
+| 5 | `cpu_sets`, `campaign_parent_cgroup` |
+| 6 | `cpu_frequency` |
+| 7 | `monotonic_clock_source` |
+| 8 | `marker_source` |
+| 9 | `workspace_statx_identity`, `workspace_mount_record` |
+| 10 | `workspace_mount_record` |
+| 11 | `workspace_mount_record`, `block_device_chain` |
+| 12 | `block_device_chain` |
+| 13 | `device_ownership_source` |
+| 14 | `device_write_source`, `block_device_chain`, `campaign_parent_cgroup` |
+| 15 | `workspace_mount_record`, `project_quota_query` |
+| 16 | `workspace_statx_identity`, `project_quota_query` |
+| 17--18 | `campaign_parent_cgroup` |
+| 19 | `host_swap`, `campaign_parent_cgroup` |
+| 20 | `nofile_limit` |
+| 21 | `filesystem_free_space`, `project_quota_query` |
+| 22 | `cgroup_cpu_throttle_source`, `campaign_parent_cgroup` |
+| 23 | `cgroup_memory_events_source`, `campaign_parent_cgroup` |
+| 24 | `thermal_source` |
+| 25 | `kernel_block_error_source`, `block_device_chain` |
+| 26 | `device_write_source`, `block_device_chain` |
+| 27 | `broker_barrier_source`, `collector_process_identity` |
+
+Any unavailable listed fact forces that row to `prerequisite_incomplete` even when another available
+input would have proved a mismatch.
+
+The native observation body must retain the end boot ID/clock identity; marker sequence population;
+policy-comparison facts; free-space and quota operands; cgroup throttle/memory start/end counters;
+swap and `RLIMIT_NOFILE` observations; thermal source/counter pairs; kernel/block-error cursor and
+delta; initial target-device in-flight/write observations; and broker barrier probe identity. Exact
+counter sources, cursors, privileges, sampling duration and maximum-width encodings remain freeze
+blockers. `preflight_device_io_quiet` is only an initial idle observation and never evaluates the
+future one-percent-of-candidate-writes rule. A fresh campaign parent may have no target-device
+`io.stat` row before I/O; absence is incomplete unless a separately approved bounded redb-free
+attribution probe establishes the row, and is never submitted as a zero counter.
+
+The exact Docker initial-check order is:
+
+1. `actual_target_complete`;
+2. `windows_wsl2_backend`;
+3. `linux_image_and_executables`;
+4. `engine_epoch_and_event_stream`;
+5. `linux_clock_and_process_identity`;
+6. `namespace_and_cgroup_v2`;
+7. `resource_limits`;
+8. `managed_volume_storage_class`;
+9. `volume_freshness_and_exclusivity`;
+10. `fixture_source_and_probe_copy`;
+11. `broker_barrier_readiness`; and
+12. `workspace_evidence_and_cleanup_bounds`.
+
+The Docker absent-fact dependency projection is exact. Check 1 depends on all rows; checks 2--12
+respectively require: `(windows_wsl_identity, linux_vm_identity)`,
+`(broker_container_identity, image_executable_bindings)`,
+`(docker_engine_identity, broker_connection_receipts)`,
+`(collector_process_identity, linux_vm_identity, broker_container_identity)`,
+`(collector_process_identity, broker_container_identity, resource_limits)`, `resource_limits`,
+`(probe_volume_mount, container_root_mount)`,
+`(probe_volume_mount, volume_freshness_source)`,
+`(probe_volume_mount, fixture_source_identity)`,
+`(collector_process_identity, docker_engine_identity, broker_connection_receipts,
+broker_container_identity, process_reconciliation_source, broker_barrier_source)`, and
+`(probe_volume_mount, resource_limits, cleanup_root_source)`. Any unavailable listed fact has the
+same prerequisite rule.
+
+The Docker observation body retains the exact comparisons, broker receipt-sequence/connection and
+observed event identity/time, clock/process identity, cgroup limits, named-volume identity/freshness,
+read-only fixture-source and disposable probe-copy digests, broker barrier probe, free-space/resource
+operands and cleanup-root bounds. The probe volume/copy is destroyed before run-start, cannot enter
+the ten-case population and grants no later copy or release authority. The preflight observation
+retains its removal/absence receipt; successful removal is a preflight-envelope publication
+prerequisite, so removal failure produces no valid preflight object rather than entering the later
+transient cleanup registry. It contains no native quiet-target, XFS, NVMe, quota or latency check.
+
+The initial cut cannot predict or satisfy release-lateness p99/maximum, per-attempt cgroup/thermal/
+kernel deltas, non-candidate writes relative to candidate writes, boundary quiescence or cache-reset
+receipts. It also cannot satisfy a real case-copy digest/scan or any process START/ARMED/RELEASE
+receipt. The ten formal case volumes/copies are created and descriptor-bound after run-start; each
+copy digest is durably recorded before its first process release. Those are later repeatable raw/
+control evidence tied to the run-start and attempt bracket. Moving them into preflight would create
+a temporal impossibility and allow a stale pass to replace ongoing target validity.
+
+#### Docker launch ledger boundary
+
+Docker requires the mandatory `application/octet-stream` role
+`redb-prescreen-docker-launch-ledger` at
+`result/docker-launch-ledger.bin`, with reserved identity
+`state-backend-redb-prescreen-docker-launch-ledger/v1`. It is created only after the run-start bytes
+exist, binds their exact SHA-256 in every frame, and is excluded from the preflight cut. The final
+Docker control object binds its exact descriptor and checked final root; it cannot replace the
+ledger.
+
+After stage-one admission the protected outer broker holds a non-serializable
+`DOCKER_SMOKE_ROOT_LEASE` over the exact attempt context, inert broker container, Docker connection,
+evidence/control-root handles and the disposable probe only until its verified preflight removal.
+The removal/absence receipt is retained, the probe is removed from the lease, and only then may
+preflight and run-start be published. The lease cannot launch or release candidate code. After exact
+run-start publication and create-new/reopen verification of the ledger, the broker irreversibly
+narrows it to `DOCKER_LAUNCH_LEDGER_LEASE`, binding that file identity and run-start. Neither lease
+replaces the single-use child-dispatch capability. Parsed bytes, labels and copied IDs cannot recreate
+either lease.
+
+The future ledger is broker-owned, append-only, single-writer, contiguous-sequence and SHA-256-chain
+protected. Create-new file and parent-directory durability plus reopen verification precede
+`LEDGER_OPENED`. Each later authority-changing frame is file-durable before broker acknowledgement;
+it does not resync the unchanged parent directory. Every frame binds campaign ID, run-start SHA-256,
+prior-frame hash and monotonic-RAW offset. Its legal top-level grammar allows either zero launch or
+repeated cases:
+
+```text
+LEDGER_OPENED -> STOP_DECIDED -> EVIDENCE_CUT
+
+LEDGER_OPENED -> (CASE_OPENED -> process-subgraph+ -> CASE_CLOSED)+
+  -> STOP_DECIDED -> EVIDENCE_CUT
+```
+
+`CASE_OPENED` first binds the exact source descriptor and approved logical-verification receipt,
+fresh volume/copy stable identity, byte-copy length/SHA-256 receipt and cleanup identity. It is durable
+before any process intent, so later evidence cannot retrospectively choose which copy was opened.
+
+Each process subgraph begins with a common deterministic, never-reused `process_intent_id` binding
+run-start hash, campaign ID, case ID/ordinal, process role and intent ordinal. The ledger header has
+one future exact `broker_topology` tag, and then uses only its matching creation/start branch:
+
+- `same_container_pidfd`: `LOCAL_SPAWN_INTENT` is followed by definite `LOCAL_SPAWN_FAILED` or
+  `PROCESS_STARTED` with the exact pidfd, `/proc` start-ticks and delegated child-cgroup identity;
+- `container_per_process`: `CONTAINER_CREATE_INTENT` additionally binds the deterministic Docker
+  create key and labels. It is followed by definite `CONTAINER_CREATE_FAILED` or
+  `CONTAINER_CREATED`; the latter is followed by `PROCESS_START_INTENT`, then definite
+  `PROCESS_START_FAILED` or `PROCESS_STARTED` with the container and in-container process identity.
+  A lost create response is reconciled by the exact key before any later frame; inability to enumerate
+  it is unfinalizable.
+
+A definite local spawn, container create or process-start failure before a bootstrap started maps to
+pre-launch `harness_invalid` unless a separately bound safety cause controls. After
+`PROCESS_STARTED`, an exit before arming records `PROCESS_EXIT_OBSERVED` and reconciliation and is
+`candidate_bootstrap_failed`. Otherwise `PROCESS_ARMED` is followed either by the unreleased stop
+path `PROCESS_STOP_INTENT -> PROCESS_STOP_OBSERVED -> PROCESS_RECONCILED`, or by
+`PROCESS_RELEASE_INTENT` and exactly one of:
+
+- the recovery-stop path above before a broker release commit; or
+- `BROKER_RELEASE_COMMITTED`, then an acknowledgement if observed, then an exit if observed, then
+  any required stop receipts and `PROCESS_RECONCILED`.
+
+COMMITTED is required before acknowledgement or release delivery. Exit without a retained
+acknowledgement is legal only after COMMITTED; acknowledgement without COMMITTED is invalid. A
+retained later receipt may not be omitted merely to manufacture an earlier prefix. `CASE_CLOSED`
+requires every subgraph reconciled; no next case may open earlier. `EVIDENCE_CUT` requires no live or
+unaccounted candidate-affecting process/container, no unresolved create key, and an empty selected
+candidate child-cgroup or per-case-container domain. The inert broker and closure-only processes are
+excluded from that domain and remain bound by the root/ledger lease.
+
+Process identity is never PID or container ID alone. Both branches bind Linux boot ID, PID namespace,
+PID, `/proc` start ticks, cgroup identity and exact executable digest. The local branch binds the
+already target-bound inert broker-container ID; the container-per-process branch binds its fresh
+container ID.
+
+Durable `PROCESS_RELEASE_INTENT` for the case's first database-opening process is the conservative
+case-attempt cut. A START/ARMED-only process is unreleased; the case is unattempted only when no first
+database-opening release intent exists. Failure of a later scanner, actuator or control bootstrap
+preserves the existing case-attempt ordinal and closes that attempted case incomplete. Release intent
+without commit/ack, committed release without acknowledgement, or missing exit is likewise attempted
+and incomplete. No ambiguous or failed process may be silently retried.
+
+After supervisor-worker loss, closure-only recovery is possible only while
+`DOCKER_LAUNCH_LEDGER_LEASE` survives: it stops the exact registered set, records
+`PROCESS_STOP_INTENT`/`PROCESS_STOP_OBSERVED`, proves the tagged candidate child-cgroup or per-case-
+container domain empty, and appends only reconciliation, stop and cut frames. The separately lease-
+bound inert broker/closure processes remain outside that emptiness predicate. Lease loss, Docker API/
+event-stream disconnect, uncertain daemon epoch or an unaccounted candidate-affecting process makes
+the closure unfinalizable and produces no result.
+
+The implementation must select one feasible Linux control topology: a same-container broker with
+pidfd and delegated per-process cgroups, or a Docker-API container-per-process broker using exact
+Docker wait/kill/event receipts. A Windows or ordinary container client cannot claim a retainable
+host pidfd, and the two topologies cannot be mixed. That selection, cgroup-empty proof, the exact
+ten-row per-case process/copy/scan/helper registry, binary frame layout, frame/byte caps, torn-tail
+recovery and literal goldens remain blocked. No 26-process or other total cap is inferred from the ten
+case rows.
+
+#### Schema and validation boundary
+
+Proposed bounds of 64 KiB per JSON object, depth 16 and 4,096 decoded nodes remain non-normative.
+Likewise, 256 expanded CPUs, 16 frequency groups, eight device-chain nodes, 32 mount options and 16
+cgroup controllers are candidate caps only. Before a schema or validator is added, hand-authored
+minimum- and maximum-width native/Docker fixtures must prove every string/list/node/byte maximum and
+cap-plus-one rejection. Positive fixtures must cover complete/passed, observed mismatch/failed and
+source-loss/incomplete for each class. Hostile fixtures must cover duplicate/unknown keys, trailing
+or bad UTF-8, non-`u64` numbers, digest/locator drift, class substitution, policy/target mismatch,
+self/future edges, wrong check order/count, false status projections, adverse-as-incomplete,
+unavailable-as-failed, dependency-projection drift, native claims in Docker, nonempty local-driver
+options, bind/tmpfs/overlay substitution, event reconnect treated as continuity, candidate identity
+before run-start, and malformed bytes pretending to be incomplete. Ledger goldens additionally cover
+torn header/tail, frame over-cap, sequence/hash/run-start drift, illegal transition, lost-create-
+response and container-created/start-response ambiguity, bootstrap exit before ARMED, release without
+ARM, acknowledgement without COMMITTED, wrong-topology frame, duplicate/gapped case or release
+ordinal, acknowledgement/exit identity mismatch, next-case start before reconciliation, final cut
+with a live process, daemon disconnect and an unaccounted container/cgroup.
+
+The remaining schema blockers are the exact approved native target scalar/identifier values,
+authoritative libc/ABI source and freshness window; campaign-parent cgroup ownership and
+hierarchical-limit rules; authoritative device exclusivity/write-attribution plus an approved bounded
+attribution-probe
+executable/recipe; thermal and kernel-error sources; XFS accounting/enforcement flags, query behavior,
+project-ID allocation and `pquota`/`prjquota` alias normalization; the checked use of `f_bavail`
+rather than privileged `f_bfree` and the meaning of 64 GiB free beyond workspace quota; cpufreq
+behavior on unsupported hosts; Docker daemon-epoch continuity, selected broker topology and feasible
+container/cgroup-empty proof; broker-barrier probe executable/recipe; raw-source retention needed for
+independent verification; live stage-two expiry/drift, provider/storage/capability TOCTOU; and maximum
+fixtures. Run-start/raw-manifest caps additionally
+remain blocked on literal 105/10 schedule goldens and complete per-row process/raw-role cardinalities.
+None of these contracts authorizes a backend, candidate run, cluster state, exactly-once claim,
+source/sink delivery claim, production use or soak claim.
 
 ## Isolation and clocks
 
