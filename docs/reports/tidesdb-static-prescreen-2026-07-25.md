@@ -1,24 +1,26 @@
 # TidesDB static backend prescreen and Zipf claim audit
 
 - **Date:** 2026-07-25
-- **Cycle:** 28; bounded Cycle 35 recheck; Cycle 38/39 priority history; Cycle 40 official-package selection
+- **Cycle:** 28; bounded Cycle 35 recheck; Cycle 38/39 priority history; Cycle 40 package selection;
+  Cycle 41 exact-package T0 stop
 - **Evidence class:** exact-source and published-artifact review only
 - **Native subject inspected:** TidesDB `v9.3.14`, commit
   `6fe1e83104b70255a694239d360a14bae51d0c70`
-- **Rust subject inspected:** `tidesdb-rs v0.11.1`, commit
-  `e2febbc548e7f0158d1c09ea487aa0bb7c343616`
+- **Rust subject inspected:** official `tidesdb/tidesdb-rs` binding, Cargo package and library
+  `tidesdb v0.11.1`, commit `e2febbc548e7f0158d1c09ea487aa0bb7c343616`
 - **Candidate installed, built, linked, or executed:** no
 - **Runtime dependency or backend added:** no
 - **Static prescreen disposition:** `REJECT_UNRESTRICTED_OFFICIAL_RUST_API`; Cycle 40 conditionally
   reopens the exact package only for restricted-facade validation
 - **Cycle 28/35 track:** **STOP** unrestricted use of the inspected official Rust subject; no build,
   benchmark, adapter, or candidate execution was authorized
-- **Cycle 40 current direction:** official `tidesdb-rs` is the sole selected integration line; the
-  exact v0.11.1/native-9.3.6 pair remains an unqualified prescreen subject
+- **Current direction:** the official TidesDB Rust binding remains the sole selected integration
+  line; the unrelated crates.io package `tidesdb-rs` is excluded; exact official Cargo package
+  `tidesdb v0.11.1`/native 9.3.6 is `STOP_WAIT_FOR_UPSTREAM` after Cycle 41 T0
 - **Production and cluster admission:** **NO-GO**; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
 - **Bounded memory:** reference/conformance-only; no current product or soak profile
 - **Maintenance-health v2:** validation contract accepted for validation-only implementation;
-  TidesDB T0/T1, successor mapping/profile, runtime integration, and execution remain gated
+  T1, successor mapping/profile, runtime integration, and execution remain closed
 
 ## Decision
 
@@ -34,15 +36,19 @@ Cycle 38 preferred TidesDB over RocksDB. Cycle 39 selected TidesDB but proposed 
 a project-private integration. Cycle 40 supersedes that integration mechanism; its historical
 rationale remains useful, but private FFI/native substitution is no longer allowed.
 
-### Cycle 40 official-package and topology amendment
+### Cycle 40 official-binding and topology amendment
 
-The project owner selects official `tidesdb-rs v0.11.1`, commit
-`e2febbc548e7f0158d1c09ea487aa0bb7c343616`, with its bundled native 9.3.6 payload as the exact
+The project owner selects the official `tidesdb/tidesdb-rs` binding, published as Cargo package
+`tidesdb v0.11.1`, commit `e2febbc548e7f0158d1c09ea487aa0bb7c343616`, with its native 9.3.6 source path as the exact
 worker-local prescreen subject and only TidesDB integration line. This is not broad API approval,
 production qualification, a runtime dependency, candidate execution, cluster admission, or a
 production-ready claim. A hard gate failure stops that package release pending a newer official
 release or an explicit owner decision; RocksDB, Fjall, redb, and bounded memory do not activate
 automatically.
+
+The official repository name and Cargo identity differ: the dependency and Rust import are
+`tidesdb`. The distinct crates.io package `tidesdb-rs` 0.1.3 is independently maintained under
+`0x6flab`; it is neither selected nor a source for code copied into Laminar.
 
 The accepted [package design](../architecture-decisions/tidesdb-local-state-successor-design.md)
 permits only a Laminar-owned restricted facade: one worker-local database, one retained fixed CF,
@@ -103,6 +109,28 @@ only the exact package behind the restricted facade and bounded T0/T1 gates. A r
 native fix or a package invariant that cannot be contained through public safe APIs stops v0.11.1
 pending a newer official release. Do not insert TidesDB into the frozen Fjall/RocksDB runner lineage,
 add a Laminar runtime dependency, or authorize a candidate run from this report.
+
+### Cycle 41 exact-package T0 result
+
+The bounded [T0 source closure](tidesdb-rs-t0-source-closure-2026-07-25.md) resolves the restricted-
+facade question for exact v0.11.1/native 9.3.6. Crate/tag/nested-archive attribution and restricted
+owner/lifetime containment pass, but the release stops on independent source gates:
+
+1. the payload predates relevant memtable-corruption, stats/read concurrency, flush-rotation, and
+   iterator fixes that the one-CF/fresh-root topology does not remove;
+2. one-CF native transaction callers accept a short non-negative batch-insertion count, mark the
+   transaction committed, and make the Rust wrapper return `Ok(())`;
+3. the native memory governor discovers host RAM and raises a lower explicit setting to 5% of host
+   RAM, so the required general cgroup envelope cannot be guaranteed without a constrained
+   admission formula and measured margin; and
+4. the safe public surface omits mandatory exact stall intervals/reasons, general local background errors,
+   cleanup/deferred-free failures, and reaper health.
+
+Native v9.3.14 retains the silent-short defect. A Laminar full-key
+readback in a fresh transaction plus whole-process fail-stop may contain that one defect, but only
+after source, fault, p99.9, and maximum gates; it cannot repair the other missing native fixes. T1 is
+cancelled; no dependency, adapter, profile, build, link, or candidate execution follows. The
+integration policy waits for a new official Cargo package, then repeats T0 in full.
 
 ## Cycle 35 bounded recheck and object-store boundary
 
@@ -170,7 +198,7 @@ The product name currently refers to three non-equivalent subjects:
 | Subject | Exact identity | Relevance |
 |---|---|---|
 | Current native engine | TidesDB `v9.3.14`, `6fe1e83104b70255a694239d360a14bae51d0c70`, C engine, MPL-2.0 plus bundled permissive components | Static native API and implementation review only |
-| Current official Rust release | `tidesdb-rs v0.11.1`, `e2febbc548e7f0158d1c09ea487aa0bb7c343616`, MPL-2.0 | The available Rust integration path |
+| Current official Rust release | `tidesdb/tidesdb-rs` repository; Cargo package/library `tidesdb v0.11.1`; `e2febbc548e7f0158d1c09ea487aa0bb7c343616`; MPL-2.0 | The selected Rust integration path; unrelated package `tidesdb-rs` excluded |
 | Rust default native payload | Cargo feature `v9_3_6` and build dependency `tidesdb-src-v9-3-6 = 0.1`; `build.rs` accepts only pkg-config version `9.3.6` or builds that archive | Not the current engine and not the recent benchmark engine |
 | Recent SQL Zipf benchmark | TidesDB `9.3.11` through TideSQL `4.5.9`, versus MyRocks in MariaDB `11.8.6` | Vendor SQL-stack evidence, not embedded Rust evidence |
 | Recent direct engine benchmark | TidesDB `9.2.1` versus RocksDB `11.1.1` | Vendor engine evidence for an older subject |
@@ -326,12 +354,13 @@ explicit lower value is clamped upward with a warning. In a small container on a
 exceed the cgroup budget. Auto mode uses 75 percent of host RAM in v9.3.14; the Rust wrapper
 documentation still says 50 percent, which is another symptom of subject drift.
 
-This blocks a container production profile until the engine honors the effective cgroup/process
-limit without an unsafe host-derived minimum. External cgroup enforcement is still mandatory, but
-an internal pressure valve configured above that hard limit is not acceptable. Qualification must
-also account for native allocator arenas, transaction buffers, iterator/snapshot retention, block
-and B-tree caches, page cache, WAL/SST construction, background concurrency, file descriptors,
-disk quota, and write/space amplification. Published RSS is not bounded-memory proof.
+This blocks the general container profile for the current release. It does not exclude a narrower
+future profile whose explicit engine budget is above the host-derived floor and whose complete
+process reserve fits below a finite cgroup-v2 hard limit. The normative `H`/`C`/`F`/`E`/`R` formula,
+failure conditions, OS observations, and FD/disk/inode reserves are in the
+[Cycle 41 source closure](tidesdb-rs-t0-source-closure-2026-07-25.md). A profile without a
+qualification-proved reserve and independent resource-plateau soak remains blocked. Published RSS
+alone is not bounded-memory proof.
 
 ### Maintenance health and DKS-Q2-006 — block
 
@@ -441,7 +470,7 @@ artifacts. It does mean the built-in generator is ineligible for LaminarDB quali
 
 ### Fair future hypothesis test
 
-If a later owner explicitly admits an official-package TidesDB subject, its comparison must use the same
+If a later owner explicitly admits an official-binding TidesDB subject, its comparison must use the same
 candidate-neutral workload and resource envelope as the retained candidates:
 
 1. exact immutable package/native/build/allocator/filesystem/device identities;
@@ -469,15 +498,15 @@ cancel memory unsafety, torn recovery, an unavailable state cut, or missing fail
 
 | Gate | Current evidence | Disposition before any run |
 |---|---|---|
-| Exact deployable subject | Rust `0.11.1` selects native `9.3.6`; current engine and benchmarks are different revisions | **FAIL before T0** — prove the exact package/native pair and restricted safe subset, or wait for a newer official package; no native substitution |
+| Exact deployable subject | Cargo package `tidesdb 0.11.1` attribution and native `9.3.6` archive are reconciled; current engine and benchmarks are different revisions; target/toolchain/link/legal closure is incomplete | **T0 FAIL** — current release stopped; wait for a new official package and repeat T0; no native substitution |
 | Legal/build adoption | MPL-2.0 is identifiable; C toolchain, bundled codecs, ABI, SBOM, notices, target flags, and redistribution package are not frozen | **BLOCK** |
 | C1 ordered KV primitives | Point operations, transactions, snapshots/isolation, ordered bidirectional iteration, seeks, deletes, and CFs exist | **CONDITIONAL** — exact byte ordering, bounded scans, one-CF read-cut semantics, and canonical export/restore still need conformance |
-| Logical-batch atomicity | Historical multi-CF layouts are crash-nonatomic; both inspected layouts can expose partial visibility and acknowledge a partial insertion | **BLOCK** — one CF scopes out cross-CF/unified replay but still needs exact-N success, no silent short success, and complete pre/post visibility proof |
-| Rust memory and FFI safety | Parent/child lifetimes are not encoded; hook replacement can race callback use; callbacks have no panic boundary | **FAIL for broad API use** — T0 must prove one-lane/one-handle facade containment without callbacks, unsafe, raw handles, patches, or leaks; otherwise wait upstream |
+| Logical-batch atomicity | Exact 9.3.6 one-CF transaction source acknowledges a short partial insertion; v9.3.14 retains the mismatch | **FAIL for current package** — prefer upstream exact success; a future fresh-transaction full-key verification plus whole-process fail-stop protocol must be separately accepted and meet fault/tail gates if the mismatch remains |
+| Rust memory and FFI safety | Parent/child lifetimes are not encoded; hook replacement can race callback use; callbacks have no panic boundary | **PASS only for the frozen one-lane/one-handle/no-callback facade**; broad API use remains rejected and graceful close still needs later evidence |
 | Portable checkpoint/restore | Native checkpoint omits shared unified state and has no atomic global cut or publication; logical export is plausible | **PROHIBIT native / BLOCK Laminar logical cut and fresh restore** |
 | Rebalance lifecycle | No Laminar vnode epoch, inactive-generation restore, atomic publication, fencing, resumable cleanup, or retained-cut GC | **MISSING** — backend-independent ADR work remains required |
-| DKS-Q2-006 maintenance health | Useful queues/pressure/progress stats; exact stalls and general local background-error coverage missing | **BLOCK** |
-| Bounded memory and resource governance | Host-RAM minimum can exceed cgroup; full native/page-cache/temporary accounting unproved | **BLOCK** |
+| DKS-Q2-006 maintenance health | Useful queues/pressure/progress stats; exact stalls, general local background errors, cleanup failures, and reaper health are absent from the safe surface | **T0 FAIL** |
+| Bounded memory and resource governance | Exact native governor uses host discovery and a 5%-of-host floor; full native/page-cache/temporary accounting is not a hard bound | **T0 FAIL** |
 | Low-latency hot path | Vendor throughput only; synchronous FFI, copies, service lanes, C2/C3 tails, and observer overhead unmeasured | **UNKNOWN** |
 | Durability and recovery | WAL and FULL sync exist, but inspected native recovery is unsafe and unproved | **NATIVE REOPEN UNSUPPORTED**; prove exclusive fresh root, portable restore, source replay/retention, corruption handling, N/N-1, and RTO |
 | Fault/endurance/upgrade | No Laminar-bound candidate evidence | **MISSING** |
@@ -487,14 +516,15 @@ cancel memory unsafety, torn recovery, an unavailable state cut, or missing fail
 ## Carry-forward decision matrix
 
 This reconciles the Cycle 28 decision input, bounded Cycle 35 recheck, Cycle 38/39 priority history,
-and Cycle 40 official-package selection. It is not qualification evidence or a production ranking.
+Cycle 40 official-binding selection, and Cycle 41 T0. It is not qualification evidence or a
+production ranking.
 
 | Candidate | Current role | Principal unresolved veto | Carry decision |
 |---|---|---|---|
 | RocksDB `10.4.2` through `rocksdb 0.24.0` | Mature operational LSM reference and one of the two frozen v4 comparison subjects | Exact complete pressure-stall source/binding, native memory, durable truth table, common C1/C2/C3/fault/endurance evidence | **Reference/regression only; not the active product track.** No new source, adapter, or run work is scheduled. |
 | Fjall `3.1.8` | Rust-native LSM reference and the other frozen v4 comparison subject | Stable public pressure/progress/error/resource/stall surface and global controls remain insufficient | **Retain in frozen comparison lineage; no fork or active product work.** |
 | redb `4.1.0` | Rust-native B-tree/single-writer hedge, administratively parked after Cycle 34 | Global non-cancellable writer, durability/recovery/resource truth, and approved non-LSM health mapping | **PARKED; no scheduled protocol or execution. Reopen only through the bounded micro-prescreen charter in ADR-008.** |
-| Official `tidesdb-rs v0.11.1` with bundled native 9.3.6 | Selected worker-local integration line and exact restricted-facade prescreen subject; not qualified or admitted | Post-9.3.6 fixes, package lifetime containment, exact-success visibility, stalled-call containment, immutable cuts, fresh restore, resource governance, stock health, and Laminar evidence remain blocked | **Run bounded T0, then separately scoped T1 only after a pass. Stop and wait for a newer official package on any uncontainable defect or need for private/native work.** |
+| Official `tidesdb/tidesdb-rs` binding, Cargo package `tidesdb v0.11.1`, native 9.3.6 | Selected worker-local integration policy; exact release stopped and unadmitted | Relevant missing native fixes, acknowledged partial transaction, constrained cgroup envelope, and missing mandatory health; immutable cuts/restore/latency/fault evidence never started | **STOP_WAIT_FOR_UPSTREAM. Do not run T1 or add its adapter. Continue backend-neutral Laminar contracts; repeat T0 for a new official package.** |
 
 SurrealKV `0.21.2` remains rejected unmodified by the earlier exact-source audit; selecting TidesDB
 does not reopen its snapshot-retention defect. TidesDB was chosen explicitly, not by elimination.
@@ -525,37 +555,43 @@ exactly-once is a later certification per exact source/state/coordinator/sink co
 requires all properties above. A local backend cannot provide any missing connector/provider commit,
 fencing, or reconciliation operation, so no backend choice may upgrade delivery implicitly.
 
-## Smallest honest official-package path
+## Smallest honest official-binding path
 
 TidesDB proceeds only in this order:
 
-1. **Complete:** the Cycle 40 docs/source-review-only design freezes official `tidesdb-rs` as the
-   integration line, exact v0.11.1/native-9.3.6 as the starting subject, the restricted one-CF
+1. **Complete:** the Cycle 40 docs/source-review-only design freezes official
+   `tidesdb/tidesdb-rs`, Cargo package `tidesdb`, as the integration line, exact
+   v0.11.1/native-9.3.6 as the starting subject, the restricted one-CF
    facade, exclusive fresh restore, portable checkpoint boundary, resource/health/hot-path
    obligations, upstream-wait stops, and successor-lineage roles without adding or executing it.
-2. Run T0 for at most one working day/eight engineer-hours and zero machine-hours. Freeze exact
-   package/native/build identity and prove post-9.3.6 fix relevance, lifetime containment, close,
-   comparator order, atomic-success/visibility feasibility, cgroup controls, public stock health,
-   legal/distribution, and immediate stops.
-3. Stop v0.11.1 and wait for an official release if T0 exposes a relevant missing fix or any need for
-   private FFI, raw handles, callbacks, patches/forks, native/system-library substitution, unsafe
-   workaround, or a package type crossing the facade.
-4. Only after T0 passes and under separately reviewed execution scope, spend at most two working days
-   and four machine-hours on T1 in a disposable workspace: exact linked identity, exclusive fresh
+2. **Complete with STOP_WAIT_FOR_UPSTREAM:** Cycle 41 T0 froze crate/tag/nested-archive attribution
+   and passed restricted ownership containment, then stopped v0.11.1 on relevant missing native
+   fixes, acknowledged partial transactions, the general cgroup/resource contract, and public
+   maintenance health. T1 is cancelled.
+3. Implement the backend-neutral complete-success/failed-before-apply/unknown-poison outcome and
+   publication-exclusion contract, fresh-root/fencing, resource-admission, health-capability, and
+   fake-backend fault tests without adding TidesDB. Defer its owner lane and verified-readback
+   machinery until an admitted package profile actually requires them.
+4. Wait for a new official Cargo package `tidesdb`. Freeze that pair and repeat the entire
+   one-day/zero-machine-hour T0. Require upstream exact success or separately accept fresh-
+   transaction full-key verification plus whole-process fail-stop; merely rebundling 9.3.14 is
+   insufficient because every relevant later fix and the resource/health surface must reconcile.
+5. Only after the repeated T0 passes and under separately reviewed execution scope, spend at most
+   two working days and four machine-hours on T1 in a disposable workspace: exact linked identity, exclusive fresh
    root, one retained fixed CF, package-safe batch/read, transaction/iterator scope, copied outputs,
    externally induced failures, diagnostics, and deterministic shutdown. This is feasibility
    evidence, not an adapter or qualification run.
-5. Only after T1 passes, estimate and separately authorize the remaining facade and proof:
+6. Only after T1 passes, estimate and separately authorize the remaining facade and proof:
    mutation/result visibility, unknown-outcome and stalled-call containment, immutable logical cuts/
    export, hostile portable restore/genesis, cgroup resources, maintenance health, concurrency,
    latency, and fault forcing. Native prior-directory state, checkpoint, and remote storage remain
    prohibited.
-6. Only after package proof closes, freeze successor profile, mapping, physical-layout/fault,
+7. Only after package proof closes, freeze successor profile, mapping, physical-layout/fault,
    profile-binding, and bundle identities; never edit or reinterpret v4. Separately authorize any
    exact run over candidate, plan, target, isolation, limits, and cost.
-7. Run the common logical, C2/C3, fault, Zipf/hot-victim, portable-restore, rebalance, RTO/source-
+8. Run the common logical, C2/C3, fault, Zipf/hot-victim, portable-restore, rebalance, RTO/source-
    retention, and 24/72-hour backend campaign, followed by product integration and delivery gates.
-8. Run the independently operated black-box production soak over the unchanged release artifact
+9. Run the independently operated black-box production soak over the unchanged release artifact
    before any production claim.
 
 A failure at any step stops the track. A pass funds the next step; it never retroactively creates
@@ -563,11 +599,12 @@ qualification or production evidence.
 
 ## Research hygiene and primary sources
 
-The Cycle 39 private-FFI design became irrelevant and was replaced in place by the official-package
+The Cycle 39 private-FFI design became irrelevant and was replaced in place by the official-binding
 design; Git history retains the superseded proposal. The dated RocksDB/Fjall/redb/SurrealKV reports
 remain relevant decision history and are not deleted. Cycle 38 superseded the earlier active RocksDB
-priority, Cycle 39 selected TidesDB, and Cycle 40 selected the official package mechanism; none
-treats vendor Zipf data as qualification evidence. All comparative performance claims remain
+priority, Cycle 39 selected TidesDB, Cycle 40 selected the official binding mechanism, and Cycle 41
+stopped its exact current release at T0; none treats vendor Zipf data as qualification evidence. All
+comparative performance claims remain
 hypotheses until an exact, common, separately authorized campaign is followed by the independent
 product soak.
 

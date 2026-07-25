@@ -30,7 +30,8 @@ ambiguous Abort, sealed ambiguous Commit, sealed-Abort gaps, exact Commit-gated 
 post-freeze mutation isolation, and one existing aggregate/V2 codec seam. It is deliberately
 disconnected from runtime state and admission.
 
-A primary-source recheck of TidesDB `v9.3.14` and `tidesdb-rs v0.11.1` confirms that shipped remote
+A primary-source recheck of TidesDB `v9.3.14` and official Cargo package `tidesdb v0.11.1`
+(`tidesdb/tidesdb-rs`) confirms that shipped remote
 implementations are filesystem plus S3-compatible. There is no native Azure Blob/ADLS or native GCS
 connector and no Rust `object_store` injection. A low-level synchronous C callback table could host
 a custom connector, but that is unimplemented integration work. Native remote support therefore has

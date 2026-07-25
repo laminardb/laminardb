@@ -17,8 +17,9 @@ does not block validation-only schemas or fixtures and still creates no backend 
 
 Cycle 38 superseded this packet's backend-priority state. The
 [Cycle 40 package design](../architecture-decisions/tidesdb-local-state-successor-design.md) selects
-exact official `tidesdb-rs v0.11.1`/native 9.3.6 only as a restricted-facade prescreen subject. T0
-is next; this historical packet authorizes neither T1 execution nor runtime, qualification,
+the official `tidesdb/tidesdb-rs` binding, published as Cargo package `tidesdb`, as the restricted
+integration policy. The later [Cycle 41 T0](tidesdb-rs-t0-source-closure-2026-07-25.md) stops exact
+v0.11.1/native 9.3.6 pending a new official package; this historical packet authorizes neither T1 execution nor runtime, qualification,
 admission, or production.
 
 The working-state design is also not ready to become a public runtime trait. This packet's proposed
@@ -151,7 +152,7 @@ redb, TidesDB, Docker/WSL, a provider API, or a cloud resource.
 | Fjall 3.1.8 | Immutable v4 reference; stock scheduler/lifecycle/governance gaps remain; no fork or active product work |
 | RocksDB 10.4.2 via rocksdb 0.24.0 | Immutable v4 reference; source/binding/operability gaps remain; no active product work |
 | redb 4.1.0 | PARKED after the bounded Cycle 34 design timebox; reopening needs a new micro-charter |
-| Official `tidesdb-rs v0.11.1` with bundled native 9.3.6 | Selected restricted-facade prescreen subject and integration line; broad API use remains STOP; T0 is next, while T1 execution, qualification, and production remain closed |
+| Official `tidesdb/tidesdb-rs` binding, Cargo package `tidesdb v0.11.1`, native 9.3.6 | Selected integration policy but exact release `STOP_WAIT_FOR_UPSTREAM` at Cycle 41 T0; T1, qualification, and production remain closed |
 
 A qualified worker-local spill backend is eventually required because bounded memory is
 reference-only, but a backend is not required for this next semantic slice. Backend qualification

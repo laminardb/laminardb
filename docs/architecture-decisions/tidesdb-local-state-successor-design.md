@@ -1,24 +1,30 @@
 # TidesDB local working-state design
 
-- **Status:** Accepted direction; package prescreen not yet passed
+- **Status:** Accepted integration direction; exact Cargo package `tidesdb v0.11.1` stopped at T0
 - **Date:** 2026-07-25
-- **Last reconciled:** 2026-07-25 during Cycle 40
-- **Selected integration line:** the official `tidesdb-rs` package only
-- **Current exact prescreen subject:** `tidesdb-rs v0.11.1`, commit
+- **Last reconciled:** 2026-07-25 during Cycle 41
+- **Selected integration line:** the official `tidesdb/tidesdb-rs` binding, published on crates.io
+  as package and library `tidesdb`; the unrelated `tidesdb-rs` crate is excluded
+- **Stopped exact prescreen subject:** Cargo package `tidesdb v0.11.1`, tag commit
   `e2febbc548e7f0158d1c09ea487aa0bb7c343616`, with its default
-  `tidesdb-src-v9-3-6 = 0.1` native payload
+  `tidesdb-src-v9-3-6 = 0.1` native source path
 - **Runtime dependency added:** no
 - **Production verdict:** **NO-GO** until package closure, qualification, integration, and the
   independent soak all pass
-- **Related evidence:** [TidesDB static prescreen](../reports/tidesdb-static-prescreen-2026-07-25.md)
-  and [ADR-008](ADR-008-managed-vnode-keyed-state.md)
+- **Related evidence:** [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md),
+  [TidesDB static prescreen](../reports/tidesdb-static-prescreen-2026-07-25.md), and
+  [ADR-008](ADR-008-managed-vnode-keyed-state.md)
 
 ## Decision
 
 LaminarDB will pursue TidesDB for worker-local keyed state through the official
-[`tidesdb-rs`](https://github.com/tidesdb/tidesdb-rs) package. The package is a private
+[`tidesdb/tidesdb-rs`](https://github.com/tidesdb/tidesdb-rs) binding, whose Cargo package and
+library are named `tidesdb`. The package is a private
 implementation dependency behind a Laminar-owned safe facade; its database, column-family,
 transaction, iterator, callback, and raw-pointer types do not become Laminar APIs.
+
+The crates.io package literally named `tidesdb-rs` is a separate third-party wrapper from
+`0x6flab`. It is not selected, copied into Laminar, or combined with the official binding.
 
 This decision explicitly rejects:
 
@@ -28,11 +34,15 @@ This decision explicitly rejects:
 - using native TidesDB object storage, checkpoint, or reopen as recovery authority; and
 - adding the package to a runtime crate before the bounded package prescreen passes.
 
-The current release is a **starting subject, not an admitted backend**. Its manifest enables only
-native 9.3.6, while later native releases contain correctness and recovery fixes. The first gate
-must determine whether the restricted Laminar surface is unaffected. If it cannot prove that, work
-stops until an official `tidesdb-rs` release carries an acceptable native version and safe surface.
-Choosing the package does not waive this gate.
+The current release was a **prescreen subject, not an admitted backend**, and failed T0 in Cycle 41.
+Its native 9.3.6 payload predates published memtable-corruption, stats/read concurrency, recovery,
+flush-rotation, and iterator fixes that an outer adapter cannot supply. Exact source also proves
+that a multi-operation transaction can acknowledge a short partial batch. A Laminar pre-output
+verification/fail-stop protocol could theoretically contain that acknowledgement gap, but it is an
+unaccepted, latency-sensitive design option rather than a fix. Host-derived memory resolution and
+the incomplete public maintenance-health surface are additional stops. Work waits for a new
+official Cargo package with a reconciled native payload and a repeated T0. T1, a runtime dependency,
+and TidesDB adapter code are not authorized for 0.11.1.
 
 ## Product boundary
 
@@ -79,7 +89,7 @@ disk-amplification gates pass.
 
 ## Restricted package facade
 
-The adapter may use only public safe APIs from the accepted official package. No package type may
+The adapter may use only public safe APIs from the accepted official binding. No package type may
 escape the adapter module. The facade owns a strict tree:
 
 ```text
@@ -120,15 +130,17 @@ means none is published, or the service enters a fail-stop state before that bat
 later output, or a checkpoint can be admitted. A timeout or unknown native outcome is fatal for that
 worker attempt.
 
-The v0.11.1/native-9.3.6 path currently has an unresolved source issue: native multi-operation apply
-can return a short non-negative count while callers treat only negative values as failure. It must
-be proved that the package's one-CF transactional surface cannot acknowledge a partial Laminar
-batch. T0 must obtain source proof, followed by adversarial evidence in T1/qualification, that the
-restricted transaction is atomic and its success result covers every operation. A final marker does
-not prove preceding mutations landed after a silent short apply. Per-key read-back, a marker-only
-publication check, a second database, global serialization across unrelated workers, or a full
-checkpoint per batch are not acceptable production repairs. If exact success and atomic visibility
-cannot be closed without them, the release fails and Laminar waits for an official upstream fix.
+Cycle 41 resolved the v0.11.1/native-9.3.6 source issue as a failure: native multi-operation apply
+can return a short non-negative count, its one-CF transaction callers treat only negative values as
+failure, and the Rust package returns `Ok(())`. The restricted transaction therefore can acknowledge
+a partial Laminar batch. A final marker alone does not prove preceding mutations landed after a
+silent short apply. Two containment designs remain possible only because local state is disposable
+and the owner lane can forbid output/checkpoint publication until verification finishes: read back
+every distinct final key and fail-stop on mismatch, or use single-mutation transactions and
+fail-stop on any error/crash. The former adds O(touched keys) point reads and copies per Arrow batch;
+the latter multiplies transaction/WAL overhead. Neither is accepted without source proof, fault
+tests, and strict p99.9/maximum evidence. A second database, global serialization across unrelated
+workers, or a full checkpoint per batch remains rejected. Native 9.3.14 retains the mismatch.
 
 Reads use one bounded command and a transaction/snapshot whose lifetime cannot outlive its owner.
 The adapter must prove repeatable point/range visibility, stable iterator bounds, no stale generation
@@ -149,12 +161,18 @@ criteria: if the single-lane profile misses throughput, p99.9, maximum, or victi
 the release fails. The design does not silently add lanes, databases, or cross-thread package use.
 
 The facade must not allocate or sample expensive engine statistics per key. Metrics are sampled at
-a bounded control-plane cadence, except lightweight counters and actual stall transitions. Any
-commit-marker check permitted by the mutation contract is one bounded check per Arrow batch and
-must pass the same tail-latency gates.
+a bounded control-plane cadence, except lightweight counters and actual stall transitions. The only
+contemplated verified-commit shim opens a fresh transaction and reads/copies every distinct touched
+key; it is not a marker check or part of the admitted normal path. Its extra queue occupancy, FFI
+calls, allocations, bytes, service time, and end-to-end tails must pass the same latency gates before
+that shim can be accepted.
 
 The inspected current engine derives memory configuration from host RAM and applies a five-percent
-floor. T0 must verify the exact bundled 9.3.6 behavior; any such behavior is not cgroup-safe.
+floor; Cycle 41 verified that behavior for the bundled 9.3.6 source. It is not a general cgroup
+governor. A future constrained profile must use the exact `H`/`C`/`F`/`E`/`R` admission formula in
+the [T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), prohibit auto mode,
+reject missing/unlimited cgroup-v2 authority, verify the resolved limit at startup, and fail closed
+unless qualification has proved the complete non-engine and unaccounted-engine reserve.
 Qualification must account for and constrain native allocations, cache,
 memtables, pinned values/iterators, journals, compression scratch, background jobs, allocator
 retention, mmap/page cache, files, temporary checkpoint data, Arrow buffers, and adapter queues.
@@ -177,8 +195,10 @@ needs enough source-proved, low-interference signals to distinguish:
 - obsolete/failed-deletion backlog and disk-growth pressure; and
 - memory/disk/FD/queue consumption versus configured limits.
 
-The current TidesDB surface has useful queue, pressure, and progress observations, but exact stalls,
-general background errors, and some cleanup/resource facts remain unclosed. The prescreen must map
+The official binding has useful queue, pressure, and progress observations, but exact stalls,
+general background errors, and some cleanup/resource facts remain unclosed. Laminar may add truthful
+owner-queue, call-latency, cgroup, PSI, disk, and FD facts; it may not relabel those as missing native
+error facts. The prescreen must map
 only signals exposed through the package's safe public API; OS/process/cgroup observations may
 supplement them but cannot invent internal errors or stalls. If the mandatory contract needs a package fork, native
 patch, callback race, raw handle, or private FFI, the release fails and waits upstream. The contract
@@ -201,7 +221,16 @@ T0 stops immediately if any required invariant depends on a fork, patch, private
 callback, system-library substitution, or an assumed upgrade to native 9.3.14. A relevant missing
 post-9.3.6 correctness fix is an automatic stop for v0.11.1.
 
-### T1 — isolated official-package feasibility
+**Cycle 41 result: STOP_WAIT_FOR_UPSTREAM.** Crate/tag/nested-archive attribution and restricted
+owner/lifetime containment closed. The exact package is stopped by relevant post-9.3.6 native
+correctness/memory-safety fixes that Laminar cannot add, plus the short-transaction acknowledgement,
+the inability to guarantee the general cgroup envelope, and missing mandatory
+stall/background-error/cleanup/reaper facts. A verified-commit/fail-stop shim is retained only as a
+future measured option for the short-transaction gap; it does not cure the other stops. The full
+evidence and re-entry contract are in the
+[T0 source-closure report](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md).
+
+### T1 — isolated official-binding feasibility (not authorized for v0.11.1)
 
 - **Cap:** two working days and four machine-hours.
 - **Location:** a disposable isolated workspace, not a Laminar runtime crate.
@@ -219,7 +248,8 @@ post-9.3.6 correctness fix is an automatic stop for v0.11.1.
 
 T1 stops on a crash, leak, race, hang, ambiguous acknowledged mutation, unsafe workaround, package
 type escaping the facade, or inability to build the exact official subject reproducibly. A stopped
-release is not replaced silently. Wait for a newer official `tidesdb-rs`, freeze it, and repeat T0.
+release is not replaced silently. Wait for a newer official Cargo package `tidesdb`, freeze it, and
+repeat T0.
 
 Passing T0/T1 authorizes only a separately reviewed adapter/profile proposal. It does not authorize
 runtime integration, candidate qualification, or cluster admission.
@@ -253,7 +283,8 @@ The TidesDB track stops for the exact release when:
 
 - the official package cannot provide a safe contained owner/lifetime surface;
 - any relevant native 9.3.6 correctness fix is missing;
-- acknowledged partial mutation or ambiguous visibility remains possible;
+- acknowledged partial mutation or ambiguous visibility remains possible without an accepted
+  pre-output verification/fail-stop boundary;
 - memory, maintenance health, shutdown, or target-platform control requires non-public/native work;
 - a backend-attributable common absolute latency, isolation, resource, fault, restore, endurance, or
   independent-soak gate fails.
@@ -263,13 +294,20 @@ run and blocks production pending cause analysis; it disqualifies the package on
 is attributable to the package/backend path.
 
 On stop, `[LDB-4007]` and `[LDB-0013]` remain fail-closed. No alternative activates automatically.
-The next action is either to wait for and re-audit a newer official `tidesdb-rs` release or record a
-new owner decision to reconsider RocksDB or another candidate. Bounded memory remains reference-only.
+The current action is to wait for a new official Cargo package `tidesdb` carrying the relevant
+native correctness/memory-safety fixes, then freeze that exact pair and repeat T0. The repeated T0
+must decide whether transaction success is exact upstream or a Laminar verified-commit/fail-stop
+protocol can meet correctness and latency; it must also close the resource/health contract. A new owner
+decision is required to reconsider RocksDB or another candidate. Bounded memory remains
+reference-only.
 
 ## Consequences
 
 This direction honors the selected TidesDB package and removes the maintenance burden of a private
-FFI or engine fork. It also makes upstream package quality and release cadence explicit schedule
-dependencies. One-CF/fresh-root confinement reduces the first safety surface but does not prove
-atomicity, memory governance, maintenance health, low tail latency, exactly-once delivery, or
-production readiness. Those remain measured gates, culminating in the independent soak.
+FFI or engine fork. It makes upstream transaction semantics, package surface, and release cadence
+explicit schedule dependencies. Cycle 41 proves that one-CF/fresh-root confinement can contain the
+ownership tree. It can support a future fail-stop verification design for ambiguous mutation, but
+cannot repair native memory corruption or manufacture missing internal maintenance-health facts;
+host-derived memory behavior also requires a constrained startup-admission formula. Low tail
+latency, exactly-once delivery, qualification, and the independent soak remain unstarted later
+gates, not implied failures or passes.

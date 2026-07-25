@@ -4,8 +4,8 @@
 - **Date:** 2026-07-24
 - **Scope:** the background-maintenance part of DKS-Q2-006 only
 - **Recorded direction:** additive v2 design approved; protected-workflow approval superseded
-- **Worker-local product target:** TidesDB through official `tidesdb-rs`; production admission
-  remains **NO-GO**
+- **Worker-local product target:** TidesDB through official `tidesdb/tidesdb-rs`, published as Cargo
+  package `tidesdb`; production admission remains **NO-GO**
 - **Execution authorized:** no
 - **Cluster admission:** unchanged; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
 - **Predecessor:** [state backend qualification runner v1](state-backend-qualification-runner-v1.md)
@@ -13,7 +13,8 @@
 - **Paper mappings:** [Cycle 19 candidate designs](../reports/state-backend-maintenance-health-mapping-designs-2026-07-24.md)
 - **Direction record:** [Cycle 21 owner decisions](../reports/distributed-state-cycle-21-owner-decisions-2026-07-24.md)
 - **Stage 3 output:** [consolidated runner v2 validation contract](state-backend-qualification-runner-v2-draft.md)
-- **TidesDB successor design:** [official-package local-state design](tidesdb-local-state-successor-design.md)
+- **TidesDB successor design:** [official-binding local-state design](tidesdb-local-state-successor-design.md)
+- **TidesDB T0 evidence:** [exact-package source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md)
 
 Cycle 19 confirms that sampled typed gauges/counters/booleans can express the continuous health
 obligations, while exposing additional candidate gaps. It keeps RocksDB's blocking tail wait
@@ -22,15 +23,18 @@ instantiate v2, rank implementation cost, or authorize source work. On 2026-07-2
 recorded `APPROVE_MAINTENANCE_HEALTH_V2_DIRECTION`. That decision authorizes Stages 2 and 3 below;
 Cycle 38 later accepts the consolidated validation contract without a protected approval workflow.
 
-## Cycle 40 current-state reconciliation
+## Cycle 41 current-state reconciliation
 
 The [consolidated runner](state-backend-qualification-runner-v2-draft.md) is the sole normative
 successor design only for immutable v4 Fjall/RocksDB validation/reference semantics. This proposal
 records that v1 -> v2 rationale and cannot override it. The
 [TidesDB package design](tidesdb-local-state-successor-design.md) is authoritative for the later
-one-CF/fresh-restore successor roles. The current exact prescreen subject is official `tidesdb-rs
-v0.11.1` with bundled native 9.3.6; successor identities remain gated on T0/T1. Redb is PARKED
-outside v4 and its older paper mapping is vocabulary provenance, not scheduled work.
+one-CF/fresh-restore successor roles. Exact official Cargo package `tidesdb v0.11.1`/native 9.3.6
+failed Cycle 41 T0: the safe public surface lacks mandatory exact
+stall/background-error/cleanup/reaper facts, in addition to missing later native fixes, ambiguous
+batch acknowledgement, and an unclosed general cgroup envelope. T1 and successor identities are
+closed pending a new official package and a repeated T0. Redb is PARKED outside v4 and its older
+paper mapping is vocabulary provenance, not scheduled work.
 References below to exact schemas mean complete normative v4 wire and schema semantics in the
 contract, not pre-approval JSON Schema or validator implementation.
 Candidate-native numerical thresholds and margins belong to immutable candidate mappings; service,
@@ -251,19 +255,21 @@ decision and are not invented by this proposal.
 
 ## Candidate implications
 
-- **[Official `tidesdb-rs v0.11.1` with bundled native 9.3.6](tidesdb-local-state-successor-design.md):**
-  the project owner selected the official package as the worker-local implementation line;
+- **[Official `tidesdb/tidesdb-rs` binding: Cargo package `tidesdb v0.11.1` with native
+  9.3.6](tidesdb-local-state-successor-design.md):** the project owner selected the official binding
+  as the worker-local implementation line;
   production admission remains closed. The restricted facade permits one fixed prefixed CF, one
   dedicated owner lane, copied values, transaction-scoped iterators, and deterministic child-before-
   parent shutdown. No callbacks, private FFI, raw handles, patch/fork, native/system-library
   substitution, or unsafe workaround is permitted. The initial profile uses an exclusive new
   directory restored only from portable Laminar artifacts; native existing-directory state,
   checkpoint, remote storage, `FULL` durability, and strict native replay stay outside the product
-  surface. T0 must reconcile later correctness fixes and prove safe containment plus required stock
-  resource/health signals; T1 may then exercise only the exact official package in isolation. A
-  relevant missing fix or a contract that needs private native work stops the release pending an
-  official upstream package. Immutable cuts, concurrency, latency, faults, delivery, qualification,
-  and independent soak remain mandatory, and v4 cannot be relabelled.
+  surface. Cycle 41 T0 passes restricted owner/lifetime containment but stops the exact release on
+  relevant missing native fixes, acknowledged partial transactions, host-based memory resolution,
+  and missing required stock health signals. A future verified-commit/fail-stop protocol may address
+  only transaction acknowledgement and must pass its latency/fault gates. T1 is cancelled. A new
+  official package must repeat T0 before any successor mapping. Immutable cuts, concurrency, latency, faults,
+  delivery, qualification, and independent soak remain mandatory, and v4 cannot be relabelled.
 - **[RocksDB 10.4.2](../reports/rocksdb-mechanism-source-closure-2026-07-24.md):** frozen v4/reference
   provenance only. The historical design would first choose the
   smallest paper-mapped set covering the fixed objectives from
@@ -300,20 +306,22 @@ No candidate proceeds by elimination or receives a weighted score.
    record the validation lineage. A later explicit run authorization must bind exact mapping, plan,
    candidate, target, isolation, limits, and cost before results. Any later semantic change creates
    a new lineage.
-4. **Design the official-package TidesDB successor — complete in Cycle 40.** The design binds exact
-   `tidesdb-rs v0.11.1`/native 9.3.6 as the prescreen subject, a restricted one-CF package facade,
+4. **Design the official-binding TidesDB successor — complete in Cycle 40.** The design binds exact
+   Cargo package `tidesdb v0.11.1`/native 9.3.6 as the prescreen subject, a restricted one-CF facade,
    portable fresh restore, immutable logical cuts, cgroup governance, stock maintenance health,
    successor-lineage roles, hard upstream-wait stops, and independent soak without adding, building,
    or executing the dependency. RocksDB and Fjall retain immutable v4/reference value but have no
    scheduled source or adapter work. redb remains parked.
-5. **Run T0 source/safe-subset closure.** Spend at most one working day and zero machine-hours on the
-   exact package/native identity, post-9.3.6 fix relevance, owner/lifetime containment, atomic-
-   success/visibility feasibility, cgroup controls, and public stock health signals. Stop and wait
-   upstream if closure needs private FFI, raw handles, callbacks, a patch/fork, native substitution,
-   or unsafe workaround.
-6. **Run T1 isolated package feasibility under separate scope.** Only after T0 passes, spend at most
-   two working days/four machine-hours building and exercising the exact official package in a
-   disposable workspace. A pass authorizes a successor mapping/profile proposal, not runtime use.
+5. **Run T0 source/safe-subset closure — complete with STOP in Cycle 41.** Crate/tag/nested-archive
+   attribution and restricted ownership containment pass; relevant later native fixes, exact or
+   verified success, the general cgroup contract, and stock health gates fail. No machine work or
+   dependency followed.
+6. **Wait for a new official package; T1 is not authorized for v0.11.1.** Its native payload must
+   contain every relevant later fix. The repeated T0 must prove exact transaction success or accept
+   a Laminar verified-commit/fail-stop protocol with explicit hot-path/fault gates, and must close
+   the resource/health contract. Only a complete pass may spend at most two working days/four machine-hours building and
+   exercising that exact package in a disposable workspace. A T1 pass would authorize only a
+   successor mapping/profile proposal, not runtime use.
 7. **Implement only successor-required validation and qualification work.** Add genuinely reusable
    parsers/evaluators, bounded readers, negative-capability tests, and the new mapping/profile after
    T0/T1. Retain exact v3→v4 regression coverage but do not instantiate unused v4-only containers.

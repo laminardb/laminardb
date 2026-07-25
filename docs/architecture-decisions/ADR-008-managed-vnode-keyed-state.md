@@ -2,16 +2,18 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-25 during Cycle 40
+- **Last reconciled:** 2026-07-25 during Cycle 41
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
-- **Production/backend verdict:** TidesDB through the official `tidesdb-rs` package is the selected
-  worker-local implementation line; no backend is production-qualified and admission is **NO-GO**
+- **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
+  published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
+  backend is production-qualified and admission is **NO-GO**
 - **Related:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md),
   [implementation plan](../plans/distributed-keyed-stateful-operators.md),
   [current owner decisions](../reports/distributed-state-cycle-21-owner-decisions-2026-07-24.md),
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
-  [TidesDB package design](tidesdb-local-state-successor-design.md), and
-  [latest completed review](../reviews/distributed-keyed-state-cycle-40.md)
+  [TidesDB package design](tidesdb-local-state-successor-design.md),
+  [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
+  [latest completed review](../reviews/distributed-keyed-state-cycle-41.md)
 
 ## Decision
 
@@ -19,7 +21,7 @@ LaminarDB will add one common, byte-governed, batch-oriented working-state servi
 pipeline, operator, table, vnode, and ownership identities. State access stays local; cold or
 blocking work is coalesced per Arrow batch and kept off compute/event-loop threads. The in-memory
 implementation is the semantic/lifecycle conformance subject only. The sole current broad-state
-product target is a TidesDB worker-local spill profile through the official `tidesdb-rs` package,
+product target is a TidesDB worker-local spill profile through the official Rust binding,
 contingent on its bounded package prescreen and full qualification. The architecture does not
 intrinsically require an LSM or make the product choice production evidence.
 
@@ -39,12 +41,12 @@ seal, coordinator decision, or restore-before-activate authority.
 | Track | Current disposition | Required next authority/evidence |
 |---|---|---|
 | In-memory | Reference/conformance-only; no product profile, admission schedule, fallback, or soak matrix | A separate future ADR/charter amendment before any bounded-memory product claim |
-| Local-spill product profile | Sole current broad-state product target; official-package TidesDB is selected for implementation but remains unqualified and unadmitted | Complete the bounded package T0/T1 gates, create a successor non-v4 profile/mapping, complete qualification and integration gates, and pass the independent product soak |
+| Local-spill product profile | Sole current broad-state product target; the official TidesDB Rust binding remains selected but Cargo package `tidesdb v0.11.1` is stopped, unqualified, and unadmitted | Continue only backend-neutral Laminar lifecycle/checkpoint work. Wait for a repaired official package, repeat T0, then—only on a pass—complete T1, successor non-v4 profile/mapping, qualification, integration, and the independent product soak |
 | Qualification contract | Cycle 38 project-owner direction accepts maintenance-health v2 and exact v4 for validation-only implementation; no GitHub approval workflow exists or is required for that scope; v1 remains immutable regression lineage | Permission is limited to standalone schemas, parsers, formulas, bounded readers, synthetic ineligible fixtures, and negative-capability tests. Candidate source construction, execution, runtime, and production remain separately closed |
 | RocksDB 10.4.2 via `rocksdb` 0.24.0 | Mature operational LSM reference and immutable v1-v4 regression/comparison subject; not the product backend | No new adapter, source-closure, or qualification work is scheduled absent a new project-owner direction |
 | Fjall 3.1.8 | Frozen v4 comparison/closure subject; stock scheduler/lifecycle/governance signals do not close the gate; no fork is planned | Reopen only through an explicit owner decision and a qualifying official upstream release |
 | redb 4.1.0 | **PARKED after Cycle 34**; administrative status, not a formal `DEFER` result; design timebox exhausted; no candidate profile, adapter, mechanism result, or execution authority | No scheduled work. Reopen only through an explicit two-day/four-machine-hour micro-prescreen charter; otherwise retain as history. A favorable observation could only fund a later mapping/profile proposal |
-| Official `tidesdb-rs v0.11.1` with bundled native 9.3.6 | **Selected implementation line and active prescreen subject**, not a production-qualified backend; known wrapper/lifetime, post-9.3.6 correctness, exact-success, resource, and health gaps remain | Run T0 source closure, then T1 isolated package feasibility. Stop and wait for an official package release if closure needs a fork, private FFI, raw handle, unsafe workaround, or native substitution. Native remote mode stays disabled and cannot replace LaminarDB's provider-neutral checkpoint transport or cluster-shared `StateBackend`; `file://` remains node-local by default |
+| Official `tidesdb/tidesdb-rs` binding: Cargo package `tidesdb v0.11.1`, native 9.3.6 | **STOP_WAIT_FOR_UPSTREAM at T0** while remaining the selected integration line: the payload misses relevant later native correctness/memory-safety fixes, and one-CF transactions can acknowledge a short partial batch; the general cgroup envelope and mandatory public maintenance-health facts also remain unclosed. Restricted owner/lifetime containment passes | Do not run T1, add the dependency, or implement its adapter. Wait for a new official package, freeze the pair, and repeat T0. The repeat may assess a pre-output verified-commit/fail-stop design for the short-batch gap, but no Laminar facade can repair the missing native fixes. Native remote/filesystem object-store modes remain disabled |
 | SurrealKV 0.21.2 | Rejected unmodified; no active candidate track | Correctness/liveness fork and new bounded prescreen authority before reconsideration |
 
 The current source detail and rationale live in the
@@ -55,10 +57,11 @@ The current source detail and rationale live in the
 [candidate mapping designs](../reports/state-backend-maintenance-health-mapping-designs-2026-07-24.md),
 [RocksDB closure](../reports/rocksdb-mechanism-source-closure-2026-07-24.md),
 [redb prescreen](../testing/state-backend-redb-prescreen-v1.md), and
-[TidesDB prescreen](../reports/tidesdb-static-prescreen-2026-07-25.md), and
-[TidesDB package design](tidesdb-local-state-successor-design.md). These are evidence and gate
-records; the implementation line is selected, but runtime dependency, qualification, and production
-admission remain evidence-gated.
+[TidesDB prescreen](../reports/tidesdb-static-prescreen-2026-07-25.md),
+[TidesDB package design](tidesdb-local-state-successor-design.md), and
+[TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md). These are evidence
+and gate records; the integration policy is selected, but the current release is stopped and no
+runtime dependency, qualification, or production admission follows.
 
 The existing fixed vnode ABI, bounded shuffle, assignment/process fencing, aligned barriers,
 per-vnode checkpoint artifacts, and exact-attempt seal are retained. Cluster admission will move
@@ -215,14 +218,15 @@ compact schema-versioned binary codec with schema metadata hoisted out of each v
 Arrow IPC streams are prohibited; the prior tier audit found their framing could dominate small
 accumulator payloads. Checkpoint export may re-columnarize many logical records together.
 
-#### Frozen Fjall/RocksDB evidence and selected TidesDB package line
+#### Frozen Fjall/RocksDB evidence and selected TidesDB binding line
 
 The Fjall/RocksDB material below is retained as exact reference and regression rationale, not the
-active product work order. Cycle 40 records the official `tidesdb-rs` package as the only selected
-TidesDB integration line. The current exact prescreen subject is v0.11.1 with bundled native 9.3.6;
-native 9.3.14 remains comparison/source evidence and cannot be substituted behind the package. The
-same common workload and absolute gates still apply; the product choice and vendor results are not
-qualification or production evidence.
+active product work order. Cycle 40 records the official `tidesdb/tidesdb-rs` binding, published as
+Cargo package `tidesdb`, as the only selected TidesDB integration line. Cycle 41 stops exact
+v0.11.1/native 9.3.6 at T0. Native 9.3.14 remains
+comparison/source evidence, retains the decisive silent-short defect, and cannot be substituted
+behind the package. The same common workload and absolute gates still apply; the product choice and
+vendor results are not qualification or production evidence.
 
 [Fjall 3.1.8](https://docs.rs/fjall/3.1.8/fjall/) is a credible fit on paper: a Rust-native API and no
 C++ storage engine, atomic
@@ -277,16 +281,19 @@ engine, wrapper/integration, source/build identity, and configuration before rel
 behavior.
 
 The accepted [TidesDB package design](tidesdb-local-state-successor-design.md) uses only the official
-package's public safe API behind a Laminar-owned restricted facade: one database, one retained fixed
+binding's public safe API behind a Laminar-owned restricted facade: one database, one retained fixed
 CF, one dedicated owner lane, lexical transactions/iterators, copied outputs, and child-before-
 parent shutdown. It prohibits a private FFI, raw handles, callbacks, forks, patches, system-library
 or native-version substitution, prior-directory reopen, native checkpoint, and native remote mode.
 A new directory is restored only from Commit-admitted Laminar artifacts and no per-batch `FULL`
-fence is added. T0 must reconcile native 9.3.6 against later correctness fixes and prove the safe
-subset; T1 may then test the exact package in isolation. Exact-success/visibility, immutable logical
-cuts, portable restore, cgroup/native-memory governance, maintenance health, latency/concurrency,
-faults, delivery integration, and independent soak remain hard gates. A gate that requires private
-native work stops the release and waits for an official upstream package.
+fence is added. Cycle 41 T0 proves owner/lifetime containment but stops v0.11.1: native 9.3.6 misses
+relevant later native correctness/memory-safety fixes, can acknowledge a short partial one-CF
+transaction, uses a host-derived memory floor, and lacks mandatory public maintenance-health facts.
+A future pre-output verified-commit/fail-stop design may address only the acknowledgement gap and
+must pay its measured hot-path cost. T1 is cancelled for this release. Immutable logical
+cuts, portable restore, latency/concurrency, faults, delivery integration, and independent soak
+remain unstarted hard gates. Re-entry requires a new official package and a complete repeated T0;
+private native work remains prohibited.
 
 The in-memory backend is required for model/differential tests and is the first placement-neutral
 lifecycle implementation after the existing Phase 0 review gate. It remains reference/conformance-
@@ -326,8 +333,8 @@ warning against relying on Rust heap metrics alone.
 
 ### 5. Checkpoint bridge
 
-The working copy is local and rebuildable. Cluster recovery authority remains the exact sealed
-checkpoint in shared storage.
+The working copy is local and rebuildable. Cluster recovery authority remains the exact
+coordinator-admitted checkpoint in shared storage with a durable terminal Commit.
 
 Each state write batch atomically updates the logical tables and a coalescing mutation journal for
 the owning vnode. At an already-aligned barrier:
@@ -675,8 +682,9 @@ partition high-watermarks and reconciles event ID/payload/offset against those i
 models the reconciled broker log, including any physical retry records; an unknown or conflicting
 record makes the run fail or invalid according to the charter.
 
-At-least-once recovery restores operator state and the source cursor from one sealed cut. It must
-not double-apply replay within recovered state, lose timer/output bookkeeping, or skip a result;
+At-least-once recovery restores operator state and the source cursor only from one
+coordinator-admitted cut with a durable terminal Commit. It must not double-apply replay within
+recovered state, lose timer/output bookkeeping, or skip a result;
 external results flushed after that cut may appear again after a crash. The checkpoint tail keeps
 the existing ordering: enqueue operator output, flush every durable sink, then seal source
 positions. State capture and real sink-flush latency share the checkpoint deadline. A stable output
@@ -753,7 +761,8 @@ Targets are chosen before optimization results are known; “fast on a laptop”
 The checked-in [`linux-nvme-v4` input](../../tools/state-backend-qual/profiles/linux-nvme-v4.freeze-candidate.json)
 is accepted only for validation and immutable Fjall/RocksDB regression. Its exact roster and
 RocksDB-specific controls cannot be relabelled as TidesDB. The selected TidesDB package line requires
-a successor profile identity and candidate mapping only after T0/T1 close. The
+a successor profile identity and candidate mapping only after a future package passes T0/T1; exact
+v0.11.1 did not. The
 standalone validator must continue to accept only explicitly ineligible forms, reject
 measured/result fields, and have no runtime or backend dependency. Exact run authorization, evidence
 for the package-admitted exact subject, the product connector/object-store profile, and the independent release
@@ -866,8 +875,8 @@ correctness and risks falsely advertising end-to-end exactly-once.
 The removed tier cached checkpoint slices and used point operations; it did not own always-current
 state, and its dirty-state coupling was unsafe. Restoring it would preserve the missing lifecycle.
 Conversely, API checklists and old single-insert or vendor benchmarks are insufficient to qualify
-Fjall, RocksDB, or TidesDB for production. The owner selected TidesDB and the official `tidesdb-rs`
-package as the implementation line; that choice does not waive package source closure or constitute
+Fjall, RocksDB, or TidesDB for production. The owner selected TidesDB and its official Rust binding
+as the implementation line; that choice does not waive package source closure or constitute
 production admission. Its absolute campaign is required because the backend directly affects the
 tail, resource governor, restore, cleanup, and operational surface; a permanent two-backend product
 is not planned.
@@ -885,9 +894,10 @@ Positive consequences:
 Costs and risks:
 
 - any embedded disk store adds corruption, disk, tuning and cold-page/sync-tail risk; an LSM also
-  adds compaction risk. The selected TidesDB path needs proof that the official package can safely
-  contain ownership and shutdown and provide exact-success visibility, portable fresh restore,
-  immutable cuts, cgroup control, and health without private native work. It also adds a C build and
+  adds compaction risk. Cycle 41 closes restricted TidesDB ownership containment but proves that the
+  current package misses non-containable native fixes and cannot guarantee the general cgroup or
+  mandatory health contract. Verified commit may contain ambiguous batch success only if it passes
+  source, fault, and latency gates; portable fresh restore and immutable cuts remain untested. The path also adds a C build and
   native allocator accounting. Frozen Fjall/RocksDB references retain their documented governance/
   native costs, and redb-like B-trees add sole-writer and reclamation/resize risk;
 - a separately certified memory profile adds an admission/soak matrix and controlled-exhaustion

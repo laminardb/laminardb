@@ -2,10 +2,11 @@
 
 - **Date:** 2026-07-25
 - **Branch:** `feature/distributed-keyed-state-adr`
-- **Cycle outcome:** official `tidesdb-rs` selected as the only TidesDB integration line; private
-  FFI, engine/package forks, patches, and native substitution rejected
-- **Exact starting subject:** `tidesdb-rs v0.11.1`, commit
-  `e2febbc548e7f0158d1c09ea487aa0bb7c343616`, with bundled native 9.3.6
+- **Cycle outcome:** the official `tidesdb/tidesdb-rs` binding (Cargo package `tidesdb`) selected
+  as the only TidesDB integration line; private FFI, engine/package forks, patches, and native
+  substitution rejected
+- **Exact starting subject:** official `tidesdb/tidesdb-rs` binding, Cargo package `tidesdb v0.11.1`, commit
+  `e2febbc548e7f0158d1c09ea487aa0bb7c343616`, with its default native-9.3.6 source path
 - **Candidate installed, built, linked, or executed:** no
 - **Runtime dependency, backend, adapter, workflow, command, or admission change:** none
 - **Independent production soak:** not run

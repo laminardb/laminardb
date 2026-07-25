@@ -7,8 +7,10 @@
 **Scope:** admission and lifecycle validation only; no cluster capability is enabled by this work.
 
 **Current authority:** the [Cycle 40 package design](../architecture-decisions/tidesdb-local-state-successor-design.md)
-selects official `tidesdb-rs` only as an unqualified prescreen subject. It does not change this
-validation evidence or cluster admission.
+selects the official `tidesdb/tidesdb-rs` binding, Cargo package `tidesdb`, as the intended
+integration line. [Cycle 41 T0](tidesdb-rs-t0-source-closure-2026-07-25.md) stops exact v0.11.1/
+native 9.3.6 pending a new official package. Neither decision changes this validation evidence or
+cluster admission.
 
 ## Verdict
 
@@ -263,8 +265,9 @@ copied returned values. Formal target-Linux/NVMe testing never ran. Current Fjal
 atomic batches, snapshots, range scans, and sorted ingestion, but lacks native multi-get/range
 delete and a mature supported memory/compaction observability surface. The ADR therefore requires
 the same real state workload and fault gates before selecting a backend rather than assuming the
-historical dependency is fit. Cycle 40 later selected official `tidesdb-rs` as the TidesDB
-integration line, with its package prescreen, qualification, and production admission outstanding.
+historical dependency is fit. Cycle 40 later selected the official `tidesdb/tidesdb-rs` binding,
+Cargo package `tidesdb`, as the TidesDB integration line. Cycle 41 stopped exact v0.11.1 at T0;
+qualification and production admission remain outstanding.
 
 ## Empirical validation
 

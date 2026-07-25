@@ -2,8 +2,9 @@
 
 - **Date:** 2026-07-24
 - **Decision scope:** choose where to spend the next backend-qualification effort
-- **Production backend selected at Cycle 16:** none; Cycle 40 later selects official `tidesdb-rs`
-  as the TidesDB integration line, not a qualified backend
+- **Production backend selected at Cycle 16:** none; Cycle 40 later selects the official
+  `tidesdb/tidesdb-rs` binding (Cargo package `tidesdb`) as the TidesDB integration line, not a
+  qualified backend
 - **Cluster admission:** unchanged; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
 - **Historical recommendation (superseded for redb):** carry RocksDB into a bounded DKS-Q2-006
   mechanism-closure task; carry redb only into its separately approved native prescreen; do not
@@ -27,9 +28,10 @@ and superseded. This matrix does not authorize further redb protocol or adapter 
 
 **Current authority:** this report remains dated source/gap history; its RocksDB work order is
 superseded. The [Cycle 40 package design](../architecture-decisions/tidesdb-local-state-successor-design.md)
-selects exact official `tidesdb-rs v0.11.1`/native 9.3.6 only as a restricted-facade prescreen
-subject. RocksDB/Fjall remain inactive v4 references, and no runtime, adapter, execution, or
-production authority follows.
+selects the official `tidesdb/tidesdb-rs` binding, Cargo package `tidesdb v0.11.1`/native 9.3.6,
+as the restricted-facade T0 subject. [Cycle 41 T0](tidesdb-rs-t0-source-closure-2026-07-25.md)
+stops that exact release pending a new official package. RocksDB/Fjall remain inactive v4
+references, and no runtime, adapter, execution, or production authority follows.
 
 ## Historical Cycle 16 recommended judgment
 

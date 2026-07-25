@@ -3,17 +3,18 @@
 - **Date:** 2026-07-24
 - **Bounded-memory decision:** reference/conformance-only
 - **Contract direction:** `APPROVE_MAINTENANCE_HEALTH_V2_DIRECTION`
-- **Backend selected at Cycle 21:** none; Cycle 40 later selects official `tidesdb-rs` as the
-  TidesDB integration line
+- **Backend selected at Cycle 21:** none; Cycle 40 later selects the official
+  `tidesdb/tidesdb-rs` binding, published as Cargo package `tidesdb`, as the TidesDB integration line
 - **Candidate execution authorized:** no
 - **Runtime/admission effect:** none; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
 
 **Current authority:** Cycle 38 replaced the proposed protected-workflow mechanism and accepts the
 [consolidated runner](../architecture-decisions/state-backend-qualification-runner-v2-draft.md) only
 for validation implementation. The [Cycle 40 package design](../architecture-decisions/tidesdb-local-state-successor-design.md)
-selects exact official `tidesdb-rs v0.11.1`/native 9.3.6 only as a restricted-facade prescreen
-subject. This historical record authorizes no T1 execution, runtime dependency, qualification,
-admission, or production approval.
+selects the official TidesDB Rust binding as the integration policy. The later
+[Cycle 41 T0](tidesdb-rs-t0-source-closure-2026-07-25.md) stops Cargo package `tidesdb v0.11.1`/
+native 9.3.6 pending a new official package. This historical record authorizes no T1 execution, runtime dependency,
+qualification, admission, or production approval.
 
 ## Recorded decisions
 
@@ -46,10 +47,10 @@ direction decision does not approve them.
 | Item | Current treatment | Next authority |
 |---|---|---|
 | In-memory working state | Semantic reference/conformance subject only | Separate future ADR amendment before any product profile |
-| Local-spill working state | Sole current broad-state product target; official-package TidesDB is selected but unqualified and unadmitted | T0/T1 package closure, successor non-v4 profile/mapping, qualification, integration, and independent product soak |
+| Local-spill working state | Sole current broad-state product target; the official TidesDB Rust binding is selected, while exact Cargo package v0.11.1 is stopped, unqualified, and unadmitted | Continue backend-neutral Laminar gaps; wait for a new official package, repeat T0, then complete T1, successor non-v4 profile/mapping, qualification, integration, and independent product soak |
 | Maintenance-health v2 | Direction approved here; [validation contract](../architecture-decisions/state-backend-qualification-runner-v2-draft.md) accepted by Cycle 38 | Validation-only implementation authorized; candidate construction and execution remain closed |
 | redb 4.1.0 prescreen | PARKED after Cycle 34; no profile, adapter, execution, or disposition | New explicitly approved bounded micro-prescreen charter before any work resumes |
-| TidesDB | Official `tidesdb-rs v0.11.1`/native 9.3.6 selected as restricted-facade prescreen subject; broad package API use remains rejected | Run bounded T0/T1; wait for a newer official package on a relevant missing fix or uncontainable safety/semantic/resource gap, then close profile, qualification, integration, and soak gates |
+| TidesDB | Official binding remains the selected integration policy; Cargo package `tidesdb v0.11.1`/native 9.3.6 is `STOP_WAIT_FOR_UPSTREAM` at T0 | No T1 or adapter for this release. Add only backend-neutral Laminar contracts; wait for a new official package and repeat T0 |
 | RocksDB/Fjall | Immutable v4/reference lineage only; no active product track or Fjall fork | No new source, adapter, or run work absent a new project-owner direction |
 
 This record does not authorize Docker smoke, native prescreen execution, or classification. The

@@ -3,8 +3,9 @@
 - **Date:** 2026-07-24
 - **Decision outcome:** `APPROVE_MAINTENANCE_HEALTH_V2_DIRECTION` recorded on 2026-07-24
 - **Recommendation:** approve the v2 design direction
-- **Production backend selected at Cycle 18:** none; Cycle 40 later selects official `tidesdb-rs`
-  as the TidesDB integration line, not a qualified backend
+- **Production backend selected at Cycle 18:** none; Cycle 40 later selects the official
+  `tidesdb/tidesdb-rs` binding (Cargo package `tidesdb`) as the TidesDB integration line, not a
+  qualified backend
 - **Candidate execution authorized:** no
 - **Cluster admission:** unchanged; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
 - **Proposal:** [maintenance-health contract v2](../architecture-decisions/state-backend-maintenance-health-v2-proposal.md)
@@ -15,8 +16,10 @@ and current ADR are authoritative; candidate execution and production gates rema
 
 **Current authority:** the dated RocksDB recommendation below remains v4/source-gap provenance only.
 The [Cycle 40 package design](../architecture-decisions/tidesdb-local-state-successor-design.md)
-selects exact official `tidesdb-rs v0.11.1`/native 9.3.6 only as a restricted-facade prescreen
-subject and creates no runtime or execution authority.
+selects the official `tidesdb/tidesdb-rs` binding, Cargo package `tidesdb v0.11.1`/native 9.3.6,
+as the restricted-facade T0 subject. [Cycle 41 T0](tidesdb-rs-t0-source-closure-2026-07-25.md)
+stops that exact release pending a new official package and creates no runtime or execution
+authority.
 
 ## Historical Cycle 18 recommendation
 

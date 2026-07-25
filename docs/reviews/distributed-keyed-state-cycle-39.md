@@ -28,8 +28,9 @@ native checkpoint, and native remote storage are outside the initial safe surfac
 batch `FULL` fence. Laminar's Rust `object_store` path remains sole portable local/S3/GCS/Azure
 checkpoint transport and recovery authority.
 
-The current official `tidesdb-rs 0.11.1` path remains rejected because it does not bind the reviewed
-native 9.3.14 subject and its ownership surface is unsafe for this use. The selected construction
+The current official `tidesdb/tidesdb-rs` binding path (Cargo package `tidesdb v0.11.1`) remains
+rejected because it does not bind the reviewed native 9.3.14 subject and its ownership surface is
+unsafe for this use. The selected construction
 shape is a narrow project-private exact-current Rust/C facade, not a broad wrapper repair. Any patch
 creates a new exact subject identity.
 
@@ -38,7 +39,7 @@ creates a new exact subject identity.
 | Track | Cycle 39 role | Current evidence | Next permitted step |
 |---|---|---|---|
 | TidesDB native 9.3.14 + narrow project-private Rust integration | Selected worker-local target; unqualified and unadmitted | Exact-source prescreen plus accepted design only; no build or run | Separately authorize the two-stage kill-fast source-construction prescreen |
-| Official `tidesdb-rs 0.11.1` | Rejected integration path | Native revision mismatch and unsafe ownership/callback surface | None; do not repair the broad wrapper |
+| Official `tidesdb/tidesdb-rs` binding (`tidesdb v0.11.1`) | Rejected integration path | Native revision mismatch and unsafe ownership/callback surface | None; do not repair the broad wrapper |
 | RocksDB 10.4.2 / Fjall 3.1.8 | Immutable v4 reference/regression lineage | Historical source and validation-contract evidence only | No active source, adapter, or run work |
 | redb 4.1.0 | Parked historical B-tree hedge | Design timebox exhausted without a formal candidate result | No work without a new bounded charter |
 | In-memory state | Semantic/lifecycle conformance reference | Model and differential value only | No product profile or fallback without an ADR amendment |

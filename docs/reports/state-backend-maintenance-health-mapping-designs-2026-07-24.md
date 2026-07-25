@@ -5,16 +5,19 @@
 - **Contract basis:** [maintenance-health v2 direction](../architecture-decisions/state-backend-maintenance-health-v2-proposal.md),
   approved after this Stage 2 report
 - **Mapping artifacts created:** none
-- **Backend selected at Cycle 19:** none; Cycle 40 later selects official `tidesdb-rs` as the
-  TidesDB integration line, not a qualified backend
+- **Backend selected at Cycle 19:** none; Cycle 40 later selects the official
+  `tidesdb/tidesdb-rs` binding (Cargo package `tidesdb`) as the TidesDB integration line, not a
+  qualified backend
 - **Candidate construction or execution authorized:** no
 - **Cluster admission:** unchanged; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
 - **Production verdict:** **NO-GO**
 
 **Current authority:** these mappings remain frozen source-gap provenance, not a product ranking.
 The [Cycle 40 package design](../architecture-decisions/tidesdb-local-state-successor-design.md)
-selects exact official `tidesdb-rs v0.11.1`/native 9.3.6 only as a restricted-facade prescreen
-subject; this report authorizes no runtime, adapter, or execution.
+selects the official `tidesdb/tidesdb-rs` binding, Cargo package `tidesdb v0.11.1`/native 9.3.6,
+as the restricted-facade T0 subject. [Cycle 41 T0](tidesdb-rs-t0-source-closure-2026-07-25.md)
+stops that exact release pending a new official package; this report authorizes no runtime,
+adapter, or execution.
 
 ## Historical Cycle 19 outcome
 

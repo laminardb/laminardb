@@ -1,8 +1,9 @@
 # Phase 0 execution plan: distributed keyed state
 
-- **Status:** In progress; official `tidesdb-rs` selected as the worker-local integration line, with
-  admission-neutral contracts, codecs, and provisional model tooling only; no runtime dependency,
-  backend qualification evidence, independent production-soak result, or admission change
+- **Status:** In progress but backend-gated; official `tidesdb/tidesdb-rs`, published as Cargo
+  package `tidesdb`, remains the worker-local integration line, while exact v0.11.1 is stopped at T0
+  pending a new official package; no runtime
+  dependency, backend qualification evidence, independent production-soak result, or admission change
 - **Started:** 2026-07-22
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
@@ -10,10 +11,13 @@
 
 ## Outcome
 
-Phase 0 proves the contracts needed before the selected official-package TidesDB working-state
-implementation can begin or a profile can be admitted in production. The exact current prescreen
-subject is `tidesdb-rs v0.11.1` with bundled native 9.3.6, not native 9.3.14 substituted behind the
-package. Cycle 20 does not split the existing Phase 0 review gate;
+Phase 0 proves the contracts needed before the selected official-binding TidesDB working-state
+implementation can begin or a profile can be admitted in production. Exact Cargo package
+`tidesdb v0.11.1` with native 9.3.6 failed Cycle 41 T0; native 9.3.14 cannot be substituted and
+retains the transaction defect. The next package attempt waits for a new official package and
+repeats T0. Backend-neutral Laminar lifecycle/checkpoint, publication-boundary, resource-admission,
+and truthful health-composition work may continue without adding the stopped dependency.
+Cycle 20 does not split the existing Phase 0 review gate;
 Phase 1 remains blocked until that gate completes or an accepted ADR/plan amendment defines a
 smaller owner-approved entry gate. This phase does not add a state backend to the runtime, relax
 `[LDB-4007]`, enable a materialized view, or change the cluster delivery guarantee.
@@ -255,8 +259,9 @@ expected. FullChangelog, mutable-key sinks, MVs, and exactly-once remain outside
 After each atomically applied input batch, output contains one current row per distinct group
 touched by that batch. Rows for one group may be coalesced, so legal intermediate count versions may
 be absent; output cost is proportional to changed input rather than total resident cardinality.
-Versions increase within a writer-authority interval. Recovery from an older sealed cut may append
-lower legal prefixes after an unsealed higher version that reached Kafka under the prior interval;
+Versions increase within a writer-authority interval. Recovery from an older coordinator-admitted
+cut with a durable terminal Commit may append lower legal prefixes after an uncommitted higher
+version that reached Kafka under the prior interval;
 provenance must show the fence/recovery boundary, and the same version must retain one operation ID
 and bit-identical payload. `COUNT(*)` is mandatory because its checked value is the
 batching-independent logical state version; `SUM` is initially only nullable `Int64` with checked
@@ -426,29 +431,37 @@ replaces only that debt arm. Cycle 21 records the direction approval; Cycle 38 r
 protected-workflow ceremony, accepts the
 [consolidated v2 validation contract](../architecture-decisions/state-backend-qualification-runner-v2-draft.md)
   for standalone validation-only implementation, and makes TidesDB the preferred local-spill product
-  candidate instead of RocksDB. Cycle 40 records the official `tidesdb-rs` package as the only
-  selected integration line. That choice is not package validation, qualification, runtime
-  admission, or a production claim.
+  candidate instead of RocksDB. Cycle 40 records the official `tidesdb/tidesdb-rs` binding,
+  published as Cargo package `tidesdb`, as the only selected integration line. Cycle 41 then stops
+  exact v0.11.1 at T0 without changing that policy.
+  The choice is not package validation, qualification, runtime admission, or a production claim.
 
 Do not add a candidate dependency to a Laminar runtime crate, freeze successor profile/mapping
 identities, add an adapter, or add a qualification command before the preceding gates pass and the
 specific later scope is reviewed. Cycle 40 completes the bounded
 [TidesDB package design](../architecture-decisions/tidesdb-local-state-successor-design.md) for exact
-official `tidesdb-rs v0.11.1` and its bundled native 9.3.6 payload. It permits only a restricted
+official Cargo package `tidesdb v0.11.1` and its native 9.3.6 source path. The build script's
+`pkg-config` probe is unavoidable; accepting a system-library match is prohibited, so a future T1
+must make the probe miss and capture link provenance. The design permits only a restricted
 package facade: one database, one retained fixed prefixed CF, a dedicated bounded blocking lane,
 copied values, transaction-scoped iterators, deterministic child-before-parent shutdown, and no
 callbacks or package types crossing the facade. Private FFI, raw handles, package/native patches or
 forks, native/system-library substitution, and unsafe workarounds are prohibited. Native existing-
 directory state, checkpoint, and remote storage remain outside the safe product surface; the initial
-profile does not require unified WAL, strict native replay, or per-batch `FULL` acknowledgement.
-T0 gets one working day and zero machine-hours to close exact identity, post-9.3.6 correctness,
-ownership, atomic-success/visibility, resource, and stock health sources. Only a T0 pass permits a
-separately scoped T1 of at most two working days/four machine-hours in an isolated workspace. A
-relevant missing fix or uncontainable safety/semantic/resource gap stops this release pending a
-newer official package. Only after T0/T1 proof may successor identities be frozen; v4 is never
-reused or relabelled. LaminarDB's `object_store` path remains provider-neutral transport for local,
-S3, GCS, and Azure artifacts; cluster recovery authority requires an admitted cluster-shared
-`StateBackend`, and `file://` is node-local by default.
+  profile does not require unified WAL, strict native replay, or per-batch `FULL` acknowledgement.
+Cycle 41 completed the bounded zero-machine-hour T0 with
+`STOP_WAIT_FOR_UPSTREAM`: relevant later native correctness/memory-safety fixes are absent; the
+package can acknowledge a short partial one-CF transaction; and the general cgroup envelope and
+mandatory public maintenance-health facts remain unclosed. Restricted owner/lifetime containment
+passes. A pre-output verified-commit/fail-stop protocol may later address only the short-batch gap
+and must use a fresh verification transaction, check every distinct final key/delete, poison on any
+ambiguity, and pass fault/p99.9/maximum gates. It cannot repair arena, flush-rotation, or iterator
+defects. T1 is cancelled, no dependency/adapter/profile identity is added, and the exact evidence is in the
+[T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md). Only a new official Cargo
+package followed by a complete T0 pass may fund T1. V4 is never reused or relabelled.
+LaminarDB's `object_store` path remains provider-neutral transport for local, S3, GCS, and Azure
+artifacts; native TidesDB filesystem/remote modes remain disabled, cluster recovery authority
+requires an admitted cluster-shared `StateBackend`, and `file://` is node-local by default.
 
 Cycle 19's [paper mappings](../reports/state-backend-maintenance-health-mapping-designs-2026-07-24.md)
   remain reviewed vocabulary and frozen Fjall/RocksDB reference provenance; they add no TidesDB profile
@@ -559,30 +572,41 @@ deterministic ordering, and the existing aggregate/V2 codec seam. It is a refere
 runtime implementation or performance result. The Cycle 5 readers remain unwired; `[LDB-4007]`
 remains unchanged.
 
-Remaining commits are kept reviewable in this dependency order:
+Remaining work is kept reviewable in this dependency order:
 
-1. `docs: select official tidesdb-rs and design its restricted successor contract` — complete in
-   Cycle 40 without adding, downloading, building, linking, or executing TidesDB;
-2. run T0's at-most-one-working-day/zero-machine-hour exact package/native and safe-subset source
-   closure. Stop this release on any relevant missing post-9.3.6 fix or need for private FFI, raw
-   handles, callbacks, fork/patch, native substitution, or unsafe workaround;
-3. only after T0 passes and under separately reviewed execution scope, run T1's at-most-two-working-
-   day/four-machine-hour official-package feasibility slice in an isolated workspace. Compilation,
-   linkage, diagnostics, and smoke execution are evidence for facade feasibility only. Freeze
-   successor identities after a pass and add an adapter only under its own later authority;
-4. after T0/T1, implement only genuinely reusable parsers/evaluators, formulas, bounded readers,
-   synthetic execution-ineligible fixtures, and negative-capability tests directly required by the
+1. `docs: select the official tidesdb/tidesdb-rs binding (Cargo package tidesdb) and design its
+   restricted successor contract` — complete in Cycle 40 without adding, downloading, building,
+   linking, or executing TidesDB;
+2. `docs: stop Cargo package tidesdb v0.11.1 at T0` — complete in Cycle 41 after exact source proved
+   missing later native fixes, silent short-transaction success, an unclosed general cgroup
+   envelope, and missing mandatory public health facts; no build, link, candidate execution, or
+   runtime code followed;
+3. implement only backend-neutral Laminar gaps already required regardless of the engine: the
+   complete-success/failed-before-apply/unknown-poison outcome and publication-exclusion contract,
+   checkpoint/rebalance exclusion, fresh-root/fenced-attempt contract, resource-admission formula,
+   truthful capability flags, and fake-backend fault tests. Defer TidesDB's owner lane and
+   verified-readback machinery; do not add or execute the package in this slice;
+4. wait for a new official Cargo package `tidesdb`, freeze its exact native pair, and repeat the
+   complete one-day/zero-machine-hour T0. The repeated T0 must reconcile every later native fix and
+   prove exact transaction success or explicitly accept the full-key verified-commit/fail-stop
+   protocol. Only after a pass and separately reviewed execution scope may T1 spend at most two
+   working days/four machine-hours in an isolated workspace; compilation, linkage, diagnostics, and
+   smoke execution are facade-feasibility evidence only. Freeze successor identities after a pass
+   and add an adapter only under its own later authority;
+5. after a future package passes T0/T1, implement only genuinely reusable parsers/evaluators,
+   formulas, bounded readers, synthetic execution-ineligible fixtures, and negative-capability tests
+   directly required by the
    successor; retain v4 fixture/delta regression tests, but do not build speculative containers;
-5. `docs: authorize an exact keyed-state qualification run`
+6. `docs: authorize an exact keyed-state qualification run`
    - the project owner may revise the candidate before explicitly authorizing exact thresholds, case
      matrix, Zipf sampler, runner source/build identity, target/isolation/limits/cost, and evidence
      rules. The current validator continues to accept only null approvals and
      `qualification_eligible=false` until that separate execution design lands;
-6. `test: exercise backend crash resource and endurance gates` using only the authorized artifacts;
-7. `docs: record the TidesDB qualification verdict`; a hard failure disqualifies the selected target
+7. `test: exercise backend crash resource and endurance gates` using only the authorized artifacts;
+8. `docs: record the TidesDB qualification verdict`; a hard failure disqualifies the selected target
    and returns alternatives to an explicit owner decision rather than silently activating one;
-8. `tools: remove rejected state backend spike`; and
-9. `docs: review distributed keyed state phase zero`.
+9. `tools: remove rejected state backend spike`; and
+10. `docs: review distributed keyed state phase zero`.
 
 The parked redb prescreen is not a prerequisite or active side branch in this numbered candidate
 sequence. If a future bounded charter yields a favorable administrative recommendation, a later

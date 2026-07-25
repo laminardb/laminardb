@@ -1,7 +1,9 @@
 # Phased plan: distributed keyed and stateful operators
 
-- **Status:** Planned; no new cluster operator is admitted by this document
+- **Status:** Planned and backend-gated; exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster
+  operator is admitted by this document
 - **Date:** 2026-07-22
+- **Last reconciled:** 2026-07-25 during Cycle 41
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -38,10 +40,12 @@ The Cycle 20 [working-state placement analysis](../reports/state-working-state-o
 separates the capability from a named engine but does not change sequencing authority. Phase 1
 remains blocked by the existing Phase 0 review gate. Any later gate split requires an accepted ADR/
 plan amendment with named scope and owners. The intended broad/variable-state production profile
-  still waits for the selected official-package TidesDB local-spill target to qualify. The package
-  choice is not runtime authorization or production admission; a hard package or qualification
-  failure waits for an official upstream release or returns alternatives to an explicit owner
-  decision. The project decision keeps bounded memory as a reference/conformance implementation
+  still waits for the selected official-binding TidesDB local-spill target to qualify. Cycle 41
+  stops exact v0.11.1/native 9.3.6 at T0 and cancels T1; backend-neutral Laminar lifecycle,
+  publication-boundary, checkpoint, resource-admission, and health-composition work may continue,
+  while the TidesDB path waits for a new official package and repeated source closure. The package choice is not runtime
+  authorization or production admission; alternatives require an explicit owner decision. The
+  project decision keeps bounded memory as a reference/conformance implementation
   only; it has no cluster product schedule or production-soak matrix under this plan.
 
 ## Scope and non-goals
@@ -113,8 +117,8 @@ isolation:
 |---|---|---|
 | Runtime guarantee | `AtLeastOnce` | `BestEffort` and `ExactlyOnce` remain rejected; the latter stays behind `[LDB-0013]` |
 | Source | Non-ephemeral, `Splittable`, assignment-scoped handoff | Kafka is the only current built-in external source path; source partitions and SQL-key vnodes remain distinct |
-| Operator state | One sealed state/timer/output-bookkeeping cut with the source cursor | Replay cannot double-apply internal state; externally flushed results may repeat |
-| Changed-group append snapshots | `DurableAtLeastOnce + MultiWriter + AppendOnly` plus externally auditable writer fencing | One current row per touched group/batch; versions increase per authority interval, while a fenced recovery interval may replay an older sealed prefix |
+| Operator state | One coordinator-admitted state/timer/output-bookkeeping cut with a durable terminal Commit and source cursor | Replay cannot double-apply internal state; externally flushed results may repeat |
+| Changed-group append snapshots | `DurableAtLeastOnce + MultiWriter + AppendOnly` plus externally auditable writer fencing | One current row per touched group/batch; versions increase per authority interval, while a fenced recovery interval may replay an older committed prefix |
 | Retraction/changelog output | `DurableAtLeastOnce + MultiWriter + FullChangelog`, or a new assignment-fenced mutable-sink contract | No current built-in cluster sink qualifies, so these combinations remain closed |
 
 Checkpoint certification preserves CP-5 ordering: drain/enqueue operator output, flush every
@@ -169,19 +173,25 @@ Work:
    additive maintenance-health successor. Cycle 21 records the direction approval, and Cycle 38
    accepts the consolidated contract for validation-only implementation without a GitHub approval
     workflow. No candidate construction or execution authority follows. Cycle 38 made TidesDB the
-    preferred local-spill candidate instead of RocksDB; Cycle 40 selects official `tidesdb-rs
-    v0.11.1` with bundled native 9.3.6 as the exact prescreen subject and only integration line,
-    without qualifying or admitting it. The accepted
+    preferred local-spill candidate instead of RocksDB; Cycle 40 selects the official
+    `tidesdb/tidesdb-rs` binding, Cargo package `tidesdb v0.11.1`, with native 9.3.6 as the exact
+    prescreen subject and only integration line, without
+    qualifying or admitting it. Cycle 41's
+    [T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md) stops that release:
+    later one-CF correctness/memory-safety fixes are absent; transactions can acknowledge a short
+    partial batch; and the general cgroup envelope and mandatory public health facts remain
+    unclosed. Restricted owner/lifetime containment passes. A future full-key verified-commit/
+    fail-stop design can address only acknowledgement and must pass hot-path/fault gates. The accepted
     [package design](../architecture-decisions/tidesdb-local-state-successor-design.md) permits only
     a restricted facade with one database, one retained fixed CF, one dedicated bounded blocking
     lane, copied values, transaction-scoped iterators, and deterministic child-before-parent
     shutdown. It prohibits callbacks, package handles crossing the facade, private FFI, raw handles,
     patches/forks, native/system-library substitution, and unsafe workarounds. Opening or serving
     prior native state, native checkpoint, remote mode, strict replay, and per-batch `FULL` are
-    outside the initial profile. T0 is a one-working-day/zero-machine-hour source and safe-subset
-    closure; only a T0 pass may fund T1's at-most-two-working-day/four-machine-hour isolated package
-    feasibility. A relevant missing post-9.3.6 fix or uncontainable ownership, exact-success,
-    visibility, resource, or health gap stops the release pending a newer official package. Cgroup
+    outside the initial profile. T1, a runtime dependency, an adapter, and successor profile
+    identities are cancelled for v0.11.1. A future official native/package release repeats the
+    complete one-working-day/zero-machine-hour T0; only a pass may fund T1's at-most-two-working-day/
+    four-machine-hour isolated package feasibility. Cgroup
     resources, maintenance health, immutable cuts, concurrency, tails, faults, portable restore,
     delivery, and independent soak remain hard gates. TidesDB native remote storage stays disabled.
     Cycle 19's reviewed
@@ -191,8 +201,8 @@ Work:
    protocol or adapter work and may reopen only under the bounded micro-prescreen charter recorded
    in its canonical protocol. Unmodified Fjall 3.1.8 and SurrealKV 0.21.2 do not proceed to adapters.
    These engine gates apply to the general local-spill profile. They are not an architectural need
-   of the in-memory reference, but the current Phase 0 gate still blocks Phase 1. Run the later
-    package-admitted TidesDB subject through the bounded successor profile: Arrow-batch-sized atomic
+   of the in-memory reference, but the current Phase 0 gate still blocks Phase 1. Run any later
+   package-admitted TidesDB subject through the bounded successor profile: Arrow-batch-sized atomic
    requests, realistic
    hot/cold multi-key reads, timer scans, snapshot/export overlap, sorted restore, vnode drop/GC,
    maintenance pressure/write stalls, hard memory/disk/FD limits, `kill -9`, torn/corrupt data,
@@ -222,7 +232,7 @@ Exit gate:
 - benchmark and numerical SLO/RTO profile is reproducible on a clean runner;
 - golden ABI/schema vectors and compatibility policy pass;
 - the placement-neutral service/lifecycle and in-memory conformance subject are reviewable without
-  implying admission; before broad-profile admission, the selected official-package TidesDB target passes
+  implying admission; before broad-profile admission, the selected official-binding TidesDB target passes
   reproducible conformance, latency, resource, fault and operability gates, or it is disqualified
   and the profile stays closed; the in-memory subject remains reference/conformance-only and
   supplies no admission evidence;
@@ -250,7 +260,8 @@ Work packages:
 - Provide the in-memory semantic/lifecycle implementation first and the Phase-0-selected local-
   spill backend behind the same contract and conformance suite. Neither implementation changes
   admission by existing; do not retain losing disk qualification adapters.
-- For TidesDB local spill, use official `tidesdb-rs` only behind the restricted package facade: one
+- For TidesDB local spill, use only the official `tidesdb/tidesdb-rs` binding (Cargo package
+  `tidesdb`) behind the restricted package facade: one
   worker-local database, one retained fixed physical managed-state CF, one dedicated bounded
   blocking lane, and logical pipeline/operator/table/vnode/generation prefixes. Do not allocate a
   database or physical tree per vnode or expose package types outside the facade.
@@ -352,7 +363,8 @@ Exit gate:
 
 - zero unbounded retained collection in the substrate or test harness;
 - barrier freeze cost is independent of total state in complexity and confirmed by size scaling;
-- last sealed cut restores after local loss with exact model state;
+- latest coordinator-admitted cut with a durable terminal Commit restores after local loss with
+  exact model state;
 - applicable memory/disk/maintenance limits fail predictably without corruption or OOM;
 - no stateful SQL capability is yet enabled; and
 - Phase 1 cycle review is approved.
