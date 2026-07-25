@@ -4,7 +4,8 @@
 - **Date:** 2026-07-24
 - **Scope:** the background-maintenance part of DKS-Q2-006 only
 - **Recorded direction:** additive v2 design approved; protected-workflow approval superseded
-- **Worker-local product target:** TidesDB; production admission remains **NO-GO**
+- **Worker-local product target:** TidesDB through official `tidesdb-rs`; production admission
+  remains **NO-GO**
 - **Execution authorized:** no
 - **Cluster admission:** unchanged; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
 - **Predecessor:** [state backend qualification runner v1](state-backend-qualification-runner-v1.md)
@@ -12,7 +13,7 @@
 - **Paper mappings:** [Cycle 19 candidate designs](../reports/state-backend-maintenance-health-mapping-designs-2026-07-24.md)
 - **Direction record:** [Cycle 21 owner decisions](../reports/distributed-state-cycle-21-owner-decisions-2026-07-24.md)
 - **Stage 3 output:** [consolidated runner v2 validation contract](state-backend-qualification-runner-v2-draft.md)
-- **TidesDB successor design:** [selected-target local-state design](tidesdb-local-state-successor-design.md)
+- **TidesDB successor design:** [official-package local-state design](tidesdb-local-state-successor-design.md)
 
 Cycle 19 confirms that sampled typed gauges/counters/booleans can express the continuous health
 obligations, while exposing additional candidate gaps. It keeps RocksDB's blocking tail wait
@@ -21,14 +22,15 @@ instantiate v2, rank implementation cost, or authorize source work. On 2026-07-2
 recorded `APPROVE_MAINTENANCE_HEALTH_V2_DIRECTION`. That decision authorizes Stages 2 and 3 below;
 Cycle 38 later accepts the consolidated validation contract without a protected approval workflow.
 
-## Cycle 39 current-state reconciliation
+## Cycle 40 current-state reconciliation
 
 The [consolidated runner](state-backend-qualification-runner-v2-draft.md) is the sole normative
 successor design only for immutable v4 Fjall/RocksDB validation/reference semantics. This proposal
 records that v1 -> v2 rationale and cannot override it. The
-[TidesDB selected-target design](tidesdb-local-state-successor-design.md) is authoritative for the
-later one-CF/fresh-restore successor roles, which require new identities after source closure. Redb
-is PARKED outside v4 and its older paper mapping is vocabulary provenance, not scheduled work.
+[TidesDB package design](tidesdb-local-state-successor-design.md) is authoritative for the later
+one-CF/fresh-restore successor roles. The current exact prescreen subject is official `tidesdb-rs
+v0.11.1` with bundled native 9.3.6; successor identities remain gated on T0/T1. Redb is PARKED
+outside v4 and its older paper mapping is vocabulary provenance, not scheduled work.
 References below to exact schemas mean complete normative v4 wire and schema semantics in the
 contract, not pre-approval JSON Schema or validator implementation.
 Candidate-native numerical thresholds and margins belong to immutable candidate mappings; service,
@@ -73,9 +75,9 @@ for immutable v4 validation/reference semantics only.
 ## What does not change
 
 Within the v1 -> v2 v4 reference lineage, the successor retains these requirements without
-weakening them. TidesDB may reuse only byte-and-semantics-identical wires after a field-by-field
-ledger; its one-CF layout, physical-fault, persistence, and fresh-restore semantics require new
-lineage:
+weakening them. An accepted official TidesDB package may reuse only byte-and-semantics-identical
+wires after a field-by-field ledger; its one-CF layout, physical-fault, persistence, and fresh-
+restore semantics require new lineage:
 
 - validation and synthetic fixtures authorize no candidate execution;
 - an exact immutable profile, source, build, configuration, adapter, runner, and approval preimage;
@@ -249,16 +251,19 @@ decision and are not invented by this proposal.
 
 ## Candidate implications
 
-- **[TidesDB native 9.3.14 with a narrow exact-current Rust integration](tidesdb-local-state-successor-design.md):**
-  the project owner selected this as the worker-local product target, while the current official
-  Rust path remains rejected and production admission remains closed. The initial profile uses one
-  fixed prefixed CF, exact-count/fail-stop mutation visibility, and an exclusive new directory
-  restored only from portable Laminar artifacts. Native existing-directory state, checkpoint, and
-  remote storage stay outside the safe surface; `FULL` durability and strict native replay are not
-  initial-product gates. Safe ownership/shutdown, immutable logical cuts, cgroup resources, exact
-  stall/background-error coverage, concurrency, latency, faults, delivery, and independent soak
-  remain mandatory. Source construction needs separate bounded authority, and v4 cannot be
-  relabelled.
+- **[Official `tidesdb-rs v0.11.1` with bundled native 9.3.6](tidesdb-local-state-successor-design.md):**
+  the project owner selected the official package as the worker-local implementation line;
+  production admission remains closed. The restricted facade permits one fixed prefixed CF, one
+  dedicated owner lane, copied values, transaction-scoped iterators, and deterministic child-before-
+  parent shutdown. No callbacks, private FFI, raw handles, patch/fork, native/system-library
+  substitution, or unsafe workaround is permitted. The initial profile uses an exclusive new
+  directory restored only from portable Laminar artifacts; native existing-directory state,
+  checkpoint, remote storage, `FULL` durability, and strict native replay stay outside the product
+  surface. T0 must reconcile later correctness fixes and prove safe containment plus required stock
+  resource/health signals; T1 may then exercise only the exact official package in isolation. A
+  relevant missing fix or a contract that needs private native work stops the release pending an
+  official upstream package. Immutable cuts, concurrency, latency, faults, delivery, qualification,
+  and independent soak remain mandatory, and v4 cannot be relabelled.
 - **[RocksDB 10.4.2](../reports/rocksdb-mechanism-source-closure-2026-07-24.md):** frozen v4/reference
   provenance only. The historical design would first choose the
   smallest paper-mapped set covering the fixed objectives from
@@ -270,8 +275,8 @@ decision and are not invented by this proposal.
 - **[Fjall 3.1.8](../reports/state-backend-static-audit-2026-07-23.md):** frozen v4/reference
   provenance only. The exact-debt requirement
   goes away, but its stable public pressure/progress, error, resource-control, and stall surface is
-  still insufficient. The mapping design must determine whether any telemetry/control patch is
-  bounded and worth funding; its size and hot-path cost are unknown.
+  still insufficient. The historical mapping identified a potential telemetry/control patch, but
+  no Fjall fork, patch, source closure, or adapter is scheduled.
 - **[redb 4.1.0](../reports/redb-4.1.0-prescreen-mechanism-note-2026-07-23.md):** PARKED outside v4
   after the Cycle 34 design timebox. Its archived N/A design informed the closed vocabulary, but no
   prescreen, profile, adapter, or execution is scheduled. Reopening requires a new bounded charter.
@@ -295,28 +300,28 @@ No candidate proceeds by elimination or receives a weighted score.
    record the validation lineage. A later explicit run authorization must bind exact mapping, plan,
    candidate, target, isolation, limits, and cost before results. Any later semantic change creates
    a new lineage.
-4. **Design the TidesDB successor — complete in Cycle 39.** The selected-target design binds a
-   narrow exact-current wrapper, one fixed CF, exact-count/fail-stop visibility, portable fresh
-   restore, immutable logical cuts, cgroup governance, maintenance health, successor-lineage roles,
-   and independent soak without downloading, building, or executing the candidate. RocksDB and
-   Fjall retain immutable v4/reference value but have no scheduled source or adapter work. redb
-   remains parked.
-5. **Implement only reusable validation primitives.** Use the successor design to identify genuinely
-   candidate-neutral parsers/evaluators, formulas, bounded readers, synthetic execution-ineligible
-   fixtures, and negative-capability tests. Retain exact v3→v4 fixture/delta regression coverage,
-   but do not instantiate unused v4-only mapping/bundle containers merely because validation work is
-   permitted. Any artifact reader still needs race-free no-follow, handle-relative opens, opened-
-   file identity verification, strict cross-reference checks, and bounded streaming.
-6. **Close candidate sources under separate authority.** Only after the design binds its proof
-   obligations and a separate candidate-specific source-construction task may an isolated workspace
-   construct and adversarially force those sources. Then define and approve the TidesDB successor
-   mapping/profile-binding identity with exact build/configuration identity and proof digests. Do
-   not reuse v4-bound `mapping/v2`. If source proof changes a contract assumption, revise the
-   contract under a new lineage before producing candidate results.
-7. **Run the TidesDB successor gates.** Only after all DKS-Q2 approvals add the exact TidesDB
-   adapter, then run the single-target logical/C2/C3, physical-fault, portable-recovery, and 24/72-
-   hour evidence on the frozen Linux/XFS/NVMe successor profile. Record pass or disqualification;
-   failure returns alternatives to an explicit owner decision and activates no fallback code.
+4. **Design the official-package TidesDB successor — complete in Cycle 40.** The design binds exact
+   `tidesdb-rs v0.11.1`/native 9.3.6 as the prescreen subject, a restricted one-CF package facade,
+   portable fresh restore, immutable logical cuts, cgroup governance, stock maintenance health,
+   successor-lineage roles, hard upstream-wait stops, and independent soak without adding, building,
+   or executing the dependency. RocksDB and Fjall retain immutable v4/reference value but have no
+   scheduled source or adapter work. redb remains parked.
+5. **Run T0 source/safe-subset closure.** Spend at most one working day and zero machine-hours on the
+   exact package/native identity, post-9.3.6 fix relevance, owner/lifetime containment, atomic-
+   success/visibility feasibility, cgroup controls, and public stock health signals. Stop and wait
+   upstream if closure needs private FFI, raw handles, callbacks, a patch/fork, native substitution,
+   or unsafe workaround.
+6. **Run T1 isolated package feasibility under separate scope.** Only after T0 passes, spend at most
+   two working days/four machine-hours building and exercising the exact official package in a
+   disposable workspace. A pass authorizes a successor mapping/profile proposal, not runtime use.
+7. **Implement only successor-required validation and qualification work.** Add genuinely reusable
+   parsers/evaluators, bounded readers, negative-capability tests, and the new mapping/profile after
+   T0/T1. Retain exact v3→v4 regression coverage but do not instantiate unused v4-only containers.
+   Any artifact reader still needs race-free no-follow, handle-relative opens, opened-file identity
+   verification, strict cross-reference checks, and bounded streaming. Then, only after all DKS-Q2
+   approvals, add the restricted adapter and run the logical/C2/C3,
+   physical-fault, portable-recovery, and 24/72-hour evidence on a frozen Linux/XFS/NVMe successor
+   profile. Failure activates no fallback code.
 8. **Integrate and certify separately.** The managed vnode lifecycle, grouped aggregates, windows,
    joins, connector delivery, exactly-once combinations, and independent release-candidate product
    soak remain later, separate release gates.

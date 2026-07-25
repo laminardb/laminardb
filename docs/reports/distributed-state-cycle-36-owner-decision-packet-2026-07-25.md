@@ -15,11 +15,11 @@ identity, protected-workflow, and signature ceremony with ordinary technical rev
 project-owner direction and freezing commit. The matrix below is retained as decision history; it
 does not block validation-only schemas or fixtures and still creates no backend execution authority.
 
-Cycle 38 superseded this packet's backend-priority state, and Cycle 39 then selected TidesDB as the
-worker-local implementation target while RocksDB/Fjall remain immutable v4 references. The
-inspected official Rust path remains rejected. The
-[selected-target design](../architecture-decisions/tidesdb-local-state-successor-design.md) is
-complete, but construction, execution, qualification, admission, and production remain closed.
+Cycle 38 superseded this packet's backend-priority state. The
+[Cycle 40 package design](../architecture-decisions/tidesdb-local-state-successor-design.md) selects
+exact official `tidesdb-rs v0.11.1`/native 9.3.6 only as a restricted-facade prescreen subject. T0
+is next; this historical packet authorizes neither T1 execution nor runtime, qualification,
+admission, or production.
 
 The working-state design is also not ready to become a public runtime trait. This packet's proposed
 next safe slice was the disconnected aggregate-v1 state-machine oracle; Cycle 37 completed that
@@ -144,14 +144,14 @@ This slice adds no public runtime trait, dependency, backend, adapter, candidate
 dispatch, restore installation, or admission consumer. It also does not execute Fjall, RocksDB,
 redb, TidesDB, Docker/WSL, a provider API, or a cloud resource.
 
-## Backend and production implications (Cycle 39 reconciliation)
+## Backend and production implications (Cycle 40 reconciliation)
 
 | Subject | Current disposition |
 |---|---|
-| Fjall 3.1.8 | Immutable v4 reference; stock scheduler/lifecycle/governance gaps remain; no active product work |
+| Fjall 3.1.8 | Immutable v4 reference; stock scheduler/lifecycle/governance gaps remain; no fork or active product work |
 | RocksDB 10.4.2 via rocksdb 0.24.0 | Immutable v4 reference; source/binding/operability gaps remain; no active product work |
 | redb 4.1.0 | PARKED after the bounded Cycle 34 design timebox; reopening needs a new micro-charter |
-| TidesDB native 9.3.14 plus narrow project-private exact-current Rust integration | Selected worker-local target; current official Rust path remains STOP; one-CF/fresh-portable-restore design complete; source proof and qualification remain closed |
+| Official `tidesdb-rs v0.11.1` with bundled native 9.3.6 | Selected restricted-facade prescreen subject and integration line; broad API use remains STOP; T0 is next, while T1 execution, qualification, and production remain closed |
 
 A qualified worker-local spill backend is eventually required because bounded memory is
 reference-only, but a backend is not required for this next semantic slice. Backend qualification

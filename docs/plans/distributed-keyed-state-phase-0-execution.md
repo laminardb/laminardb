@@ -1,8 +1,8 @@
 # Phase 0 execution plan: distributed keyed state
 
-- **Status:** In progress; TidesDB selected as the worker-local target, with admission-neutral
-  contracts, codecs, and provisional model tooling only; no backend qualification evidence, no
-  independent production-soak result, and no admission change
+- **Status:** In progress; official `tidesdb-rs` selected as the worker-local integration line, with
+  admission-neutral contracts, codecs, and provisional model tooling only; no runtime dependency,
+  backend qualification evidence, independent production-soak result, or admission change
 - **Started:** 2026-07-22
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
@@ -10,8 +10,10 @@
 
 ## Outcome
 
-Phase 0 proves the contracts needed before the selected TidesDB working-state implementation can
-begin or a profile can be admitted in production. Cycle 20 does not split the existing Phase 0 review gate;
+Phase 0 proves the contracts needed before the selected official-package TidesDB working-state
+implementation can begin or a profile can be admitted in production. The exact current prescreen
+subject is `tidesdb-rs v0.11.1` with bundled native 9.3.6, not native 9.3.14 substituted behind the
+package. Cycle 20 does not split the existing Phase 0 review gate;
 Phase 1 remains blocked until that gate completes or an accepted ADR/plan amendment defines a
 smaller owner-approved entry gate. This phase does not add a state backend to the runtime, relax
 `[LDB-4007]`, enable a materialized view, or change the cluster delivery guarantee.
@@ -423,48 +425,52 @@ The Cycle 18
 replaces only that debt arm. Cycle 21 records the direction approval; Cycle 38 removes the proposed
 protected-workflow ceremony, accepts the
 [consolidated v2 validation contract](../architecture-decisions/state-backend-qualification-runner-v2-draft.md)
-for standalone validation-only implementation, and makes TidesDB the preferred local-spill product
-candidate instead of RocksDB. Cycle 39 then records the project-owner choice of TidesDB as the
-worker-local implementation target. That choice is not qualification, runtime admission, or a
-production claim.
+  for standalone validation-only implementation, and makes TidesDB the preferred local-spill product
+  candidate instead of RocksDB. Cycle 40 records the official `tidesdb-rs` package as the only
+  selected integration line. That choice is not package validation, qualification, runtime
+  admission, or a production claim.
 
-Do not add a candidate dependency, source/build pin, or native observer without a later explicit
-candidate-specific source-construction task. Do not freeze successor profile/mapping identities
-before that task's proof, add an adapter without later authority, or add an execution command before
-exact run authorization. Cycle 39 completes the bounded
-[TidesDB selected-target design](../architecture-decisions/tidesdb-local-state-successor-design.md)
-for native `9.3.14` and a narrow project-private exact-current Rust integration. It selects one fixed
-prefixed CF, exact-count/fail-stop mutation visibility, immutable logical cuts, and exclusive fresh
-directories restored only from Commit-admitted Laminar artifacts. Native existing-directory state,
-checkpoint, and remote storage remain outside the safe API; the initial profile does not require
-unified WAL, strict native replay, or per-batch `FULL` acknowledgement. Safe parent/child ownership,
-shutdown, cgroup-aware resources, maintenance health, concurrency, latency, faults, and portable
-restore remain unproved hard gates. Only a separately authorized two-stage kill-fast construction
-task may start source work. Only after source proof may successor identities be frozen; v4 is never
-reused or relabelled. LaminarDB's provider-neutral local/S3/GCS/Azure checkpoint path remains sole
-portable recovery authority.
+Do not add a candidate dependency to a Laminar runtime crate, freeze successor profile/mapping
+identities, add an adapter, or add a qualification command before the preceding gates pass and the
+specific later scope is reviewed. Cycle 40 completes the bounded
+[TidesDB package design](../architecture-decisions/tidesdb-local-state-successor-design.md) for exact
+official `tidesdb-rs v0.11.1` and its bundled native 9.3.6 payload. It permits only a restricted
+package facade: one database, one retained fixed prefixed CF, a dedicated bounded blocking lane,
+copied values, transaction-scoped iterators, deterministic child-before-parent shutdown, and no
+callbacks or package types crossing the facade. Private FFI, raw handles, package/native patches or
+forks, native/system-library substitution, and unsafe workarounds are prohibited. Native existing-
+directory state, checkpoint, and remote storage remain outside the safe product surface; the initial
+profile does not require unified WAL, strict native replay, or per-batch `FULL` acknowledgement.
+T0 gets one working day and zero machine-hours to close exact identity, post-9.3.6 correctness,
+ownership, atomic-success/visibility, resource, and stock health sources. Only a T0 pass permits a
+separately scoped T1 of at most two working days/four machine-hours in an isolated workspace. A
+relevant missing fix or uncontainable safety/semantic/resource gap stops this release pending a
+newer official package. Only after T0/T1 proof may successor identities be frozen; v4 is never
+reused or relabelled. LaminarDB's `object_store` path remains provider-neutral transport for local,
+S3, GCS, and Azure artifacts; cluster recovery authority requires an admitted cluster-shared
+`StateBackend`, and `file://` is node-local by default.
 
 Cycle 19's [paper mappings](../reports/state-backend-maintenance-health-mapping-designs-2026-07-24.md)
-remain reviewed vocabulary and frozen Fjall/RocksDB reference provenance; they add no TidesDB profile
-or wire identity. TidesDB needs its own mapping only after the correctness, integration, resource,
-and health closures above. Redb's candidate-specific profile translation, durability mapping, close
+  remain reviewed vocabulary and frozen Fjall/RocksDB reference provenance; they add no TidesDB profile
+  or wire identity. TidesDB needs its own mapping only after the package correctness, containment,
+  resource, and health closures above. Redb's candidate-specific profile translation, durability mapping, close
 outcome and task/thread N/A proof are unscheduled while it is parked. Patch effort and interference
 remain unknown, so this ordering is a gate sequence rather than qualification evidence.
 
 Build exactly one
-admitted candidate per binary. The private qualification contract covers
+  admitted candidate per binary. The candidate qualification contract covers
 batched reads, atomic write/delete/timer mutations, bounded range scans, consistent snapshots,
 vnode cleanup, sorted restore, an explicit candidate-applicable persistence disposition, portable
 fresh restore, and resource/operability statistics. It is not the future production trait.
 
-For any later source-admitted TidesDB subject, test the exact Rust/native pair and configuration,
+For any later package-admitted TidesDB subject, test the exact official Rust/native pair and configuration,
 one-CF logical ordering, exact-count batch results, pre/post visibility, fail-stop unknown outcomes,
 immutable logical cuts, delete/cleanup cost, compaction and write-stall propagation, allocator and
 page-cache accounting, cgroup pressure, checkpoint/export overlap, corruption, complete local loss,
-and cache loss. Process/cache-loss cases must prove that a prior native directory is never opened or
+  and cache loss. Process/cache-loss cases must prove that a prior native directory is never opened or
 served and that portable export -> exclusive fresh root -> restore reproduces the logical digest.
 The successor explicitly marks native persistence/reopen arms unsupported and replaces them with
-that portable-restore truth table. Pin the exact engine, wrapper, transitive build inputs, features,
+  that portable-restore truth table. Pin the exact package, bundled engine, transitive build inputs, features,
 and asynchronous WAL policy before results are accepted. Frozen Fjall/RocksDB v4 checks remain
 regression/reference coverage only and cannot qualify TidesDB.
 
@@ -555,27 +561,28 @@ remains unchanged.
 
 Remaining commits are kept reviewable in this dependency order:
 
-1. `docs: design the bounded TidesDB remediation and successor contract delta` — complete in
-   Cycle 39 without downloading, building, linking, or executing TidesDB;
-2. implement only genuinely candidate-neutral parsers/evaluators, formulas, bounded readers,
-   synthetic execution-ineligible fixtures, and negative-capability tests justified by that design;
-   retain v4 fixture/delta regression tests, but do not build unused v4-only containers merely
-   because validation implementation is permitted;
-3. only after a separate explicit project-owner source-construction task, run the design's half-day/
-   zero-machine-hour identity/ownership/close/legal kill gate and, only if it passes, its at-most-
-   one-day/four-machine-hour narrow-wrapper feasibility slice in an isolated workspace; compilation,
-   linkage, and dynamic smoke execution must each be expressly in scope. Stop on either cap, freeze
-   successor identities only after source proof, and add an adapter only under its own later authority;
-4. `docs: authorize an exact keyed-state qualification run`
+1. `docs: select official tidesdb-rs and design its restricted successor contract` — complete in
+   Cycle 40 without adding, downloading, building, linking, or executing TidesDB;
+2. run T0's at-most-one-working-day/zero-machine-hour exact package/native and safe-subset source
+   closure. Stop this release on any relevant missing post-9.3.6 fix or need for private FFI, raw
+   handles, callbacks, fork/patch, native substitution, or unsafe workaround;
+3. only after T0 passes and under separately reviewed execution scope, run T1's at-most-two-working-
+   day/four-machine-hour official-package feasibility slice in an isolated workspace. Compilation,
+   linkage, diagnostics, and smoke execution are evidence for facade feasibility only. Freeze
+   successor identities after a pass and add an adapter only under its own later authority;
+4. after T0/T1, implement only genuinely reusable parsers/evaluators, formulas, bounded readers,
+   synthetic execution-ineligible fixtures, and negative-capability tests directly required by the
+   successor; retain v4 fixture/delta regression tests, but do not build speculative containers;
+5. `docs: authorize an exact keyed-state qualification run`
    - the project owner may revise the candidate before explicitly authorizing exact thresholds, case
      matrix, Zipf sampler, runner source/build identity, target/isolation/limits/cost, and evidence
      rules. The current validator continues to accept only null approvals and
      `qualification_eligible=false` until that separate execution design lands;
-5. `test: exercise backend crash resource and endurance gates` using only the authorized artifacts;
-6. `docs: record the TidesDB qualification verdict`; a hard failure disqualifies the selected target
+6. `test: exercise backend crash resource and endurance gates` using only the authorized artifacts;
+7. `docs: record the TidesDB qualification verdict`; a hard failure disqualifies the selected target
    and returns alternatives to an explicit owner decision rather than silently activating one;
-7. `tools: remove rejected state backend spike`; and
-8. `docs: review distributed keyed state phase zero`.
+8. `tools: remove rejected state backend spike`; and
+9. `docs: review distributed keyed state phase zero`.
 
 The parked redb prescreen is not a prerequisite or active side branch in this numbered candidate
 sequence. If a future bounded charter yields a favorable administrative recommendation, a later

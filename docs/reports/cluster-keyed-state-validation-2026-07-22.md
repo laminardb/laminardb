@@ -6,10 +6,9 @@
 
 **Scope:** admission and lifecycle validation only; no cluster capability is enabled by this work.
 
-**Cycle 39 design note:** TidesDB is now the selected worker-local implementation target. The
-[selected-target design](../architecture-decisions/tidesdb-local-state-successor-design.md) replaces
-the dated Fjall/RocksDB comparison work order below; it does not change this validation evidence or
-cluster admission.
+**Current authority:** the [Cycle 40 package design](../architecture-decisions/tidesdb-local-state-successor-design.md)
+selects official `tidesdb-rs` only as an unqualified prescreen subject. It does not change this
+validation evidence or cluster admission.
 
 ## Verdict
 
@@ -264,8 +263,8 @@ copied returned values. Formal target-Linux/NVMe testing never ran. Current Fjal
 atomic batches, snapshots, range scans, and sorted ingestion, but lacks native multi-get/range
 delete and a mature supported memory/compaction observability surface. The ADR therefore requires
 the same real state workload and fault gates before selecting a backend rather than assuming the
-historical dependency is fit. Cycle 39 later selected TidesDB as the target, with qualification and
-production admission still outstanding.
+historical dependency is fit. Cycle 40 later selected official `tidesdb-rs` as the TidesDB
+integration line, with its package prescreen, qualification, and production admission outstanding.
 
 ## Empirical validation
 

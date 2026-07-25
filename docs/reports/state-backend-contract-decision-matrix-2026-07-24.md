@@ -3,7 +3,8 @@
 - **Date:** 2026-07-24
 - **Decision outcome:** `APPROVE_MAINTENANCE_HEALTH_V2_DIRECTION` recorded on 2026-07-24
 - **Recommendation:** approve the v2 design direction
-- **Production backend selected at Cycle 18:** none; Cycle 39 later selects TidesDB as the target
+- **Production backend selected at Cycle 18:** none; Cycle 40 later selects official `tidesdb-rs`
+  as the TidesDB integration line, not a qualified backend
 - **Candidate execution authorized:** no
 - **Cluster admission:** unchanged; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
 - **Proposal:** [maintenance-health contract v2](../architecture-decisions/state-backend-maintenance-health-v2-proposal.md)
@@ -12,11 +13,10 @@
 two-owner/protected-workflow ceremony for validation-only implementation. The consolidated contract
 and current ADR are authoritative; candidate execution and production gates remain closed.
 
-**Superseded backend priority:** the dated RocksDB-primary recommendation below remains v4/source-
-gap provenance only. Cycle 39 selects TidesDB as the worker-local target and leaves RocksDB/Fjall as
-immutable v4 references. TidesDB's official Rust path remains rejected; its one-CF/fresh-restore
-[design](../architecture-decisions/tidesdb-local-state-successor-design.md) creates no construction
-or execution authority.
+**Current authority:** the dated RocksDB recommendation below remains v4/source-gap provenance only.
+The [Cycle 40 package design](../architecture-decisions/tidesdb-local-state-successor-design.md)
+selects exact official `tidesdb-rs v0.11.1`/native 9.3.6 only as a restricted-facade prescreen
+subject and creates no runtime or execution authority.
 
 ## Historical Cycle 18 recommendation
 
