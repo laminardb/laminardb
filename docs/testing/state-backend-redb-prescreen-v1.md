@@ -1991,9 +1991,10 @@ Cycle 29 narrows the remaining target/preflight work without claiming a final wi
 freezes an additive semantic skeleton, ordered source-domain requirements, portable scalar
 semantics, source-failure classification, minimum check predicates and the sole Docker v1 broker
 topology. It does not freeze complete JSON pointer/value layouts, machine-specific expected values,
-source or document caps, schemas, collectors, raw-source storage, a provider lease, or an executable
-probe. A blocked source ID reserves an ordered requirement but does not claim its authority or
-capture recipe exists. No source ID is an extension point or backend adapter.
+source or document caps, schemas, collectors, raw-source storage, an external authority term and
+provider lifecycle, or an executable probe. A blocked source ID reserves an ordered requirement but
+does not claim its authority or capture recipe exists. No source ID is an extension point or backend
+adapter.
 
 The ordered Cycle 27 fact/check registries, fact dependencies and status projections remain exact.
 This cycle freezes one additional skeleton field: both preflight bodies contain an `observations`
@@ -2243,7 +2244,7 @@ The ordered Docker source-requirement registry is:
 | `D18` | `container_per_process` inert barrier-probe create/start/arm/stop/reconcile proof; recipe remains blocked |
 | `D19` | opened read-only fixture source and probe-copy length/SHA-256/logical digest observations |
 | `D20` | protected Engine endpoint/proxy/backend/runtime epoch chain with retained process handles; Docker Desktop mechanism remains blocked |
-| `D21` | dedicated Engine/VM and protected exclusive Engine-client lease; provider remains blocked |
+| `D21` | attempt-exclusive VM, external evidence-authority term, provider lifecycle, and protected exclusive Engine-client capability; all remain blocked |
 
 The fact projection is:
 
@@ -2365,7 +2366,7 @@ prior-smoke prerequisite.
 | local Docker Desktop/WSL | development-only; the formal path is rejected | none; it cannot emit `DOCKER_SMOKE_PASS`, `DOCKER_SMOKE_INCOMPLETE` or a native prerequisite |
 | frozen Cycle 25/29 Desktop contracts | superseded, unimplemented design history/reference | none; no target/preflight/result schema, literal fixture, protected dispatcher or eligible producer exists |
 | attempt-exclusive native-Linux VM and protected Engine endpoint | selected successor host-class direction; mechanism unproved | none; provider, successor wire and `D20,D21` proofs remain absent |
-| GitHub-hosted standard `ubuntu-24.04` VM | superseded Cycle 30 feasibility/inventory idea; development-only | none; it lacks the selected provider identity/lease path |
+| GitHub-hosted standard `ubuntu-24.04` VM | superseded Cycle 30 feasibility/inventory idea; development-only | none; it lacks the selected external-term, provider-identity and final-absence path |
 | native XFS/dedicated-NVMe prescreen host | acceptance contract frozen, provider unselected | no `N20` lease, `N29` attestation, target schema or dispatch authority |
 | AWS I4i Dedicated Host | plausible native inventory subject only | no selected account/allocation, image, package, guest inventory, device lease or runner attestation |
 
@@ -2388,13 +2389,13 @@ authority predicates:
   specified as an epoch. Historical event queries are capped at the last 256 events, while the live
   event stream has no documented durable cursor, unique event ID or gap detector
   ([Engine events](https://docs.docker.com/reference/cli/docker/system/events/)).
-- `D21` has no protected exclusive-client lease. Desktop deliberately exposes Engine control to the
-  launching user and selected WSL integrations
+- `D21` has no protected exclusive-client capability barrier. Desktop deliberately exposes Engine
+  control to the launching user and selected WSL integrations
   ([Windows permission requirements](https://docs.docker.com/desktop/setup/install/windows-permission-requirements/)).
   Docker documents why only trusted users may control the root-equivalent daemon and recommends
   dedicating a Docker server to Docker-managed workloads
   ([Engine security](https://docs.docker.com/engine/security/)). Neither statement supplies a
-  sole-client lease. Labels, an uninterrupted event connection and an otherwise quiet `docker ps`
+   sole-client authority. Labels, an uninterrupted event connection and an otherwise quiet `docker ps`
   cannot prove that another same-user client was absent.
 
 The last two conclusions are conservative inferences from the documented interfaces, not claims
@@ -2425,7 +2426,8 @@ The successor invariants are one review-bound Engine/runtime epoch, one protecte
 authorized Engine-client set, candidate denial of that capability, no unaccounted daemon/runtime or
 client, and fail-closed continuity through final reconciliation. Stable evidence must bind the host
 boot and namespaces; broker/Engine/runtime process identities; executable/configuration identities;
-the endpoint; exact Engine connections; and the provider/VM lease. EOF, process exit,
+the endpoint; exact Engine connections; the external evidence-authority term; and provider
+allocation, deletion, and final absence. EOF, process exit,
 exec/reload/replacement, endpoint/configuration drift, reconnect, an unexpected process/client or a
 reconciliation gap makes the result unfinalizable only when it loses a required connection or the
 protected broker, Engine or base runtime, or prematurely loses a later process that must remain live
@@ -2445,10 +2447,12 @@ is created and before that process can be released, then retained through its re
 the applicable evidence cut. Exact process population and the loss-detecting peer-binding mechanism
 remain blockers, with restart, replacement, socket-substitution and reconnect hostile fixtures.
 
-`D21` separately requires a provider-backed exclusive VM lease and a proved sole-client mechanism.
-One feasibility construction is a protected direct pathname socket, exact preopened bounded
+`D21` separately requires an attempt-exclusive VM joined to an external evidence-authority term,
+provider deletion/final-absence proof, and a proved sole-client capability barrier. One feasibility
+construction is a protected direct pathname socket, exact preopened bounded
 connection pool, listener sealing/unlinking or an equivalent new-client barrier, a dedicated broker
-UID, candidate denial, no other privileged actor under the live lease and no reconnect; another is
+UID, candidate denial, no other privileged actor during the live evidence-authority term and no
+reconnect; another is
 an approved loss-detecting connection observer. Either path also needs independent bracketed
 peer/socket/process reconciliation. Exact pool cardinality, listener behavior, privileged-process
 closure and hostile foreign-client fixtures remain blockers. `SO_PEERCRED` can identify the server
@@ -2461,10 +2465,11 @@ passwordless `sudo` on Linux, which remains useful only for non-evidentiary deve
 ([hosted runner lifecycle](https://docs.github.com/en/actions/how-tos/manage-runners/github-hosted-runners/use-github-hosted-runners),
 [hosted runner specification](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)).
 Those facts and the setup-log ImageVersion are copied lifecycle/inventory observations, not an
-exclusive VM lease, provider-authenticated VM identity or attestation. Public and private standard
-runners have different CPU/RAM classes and both publish only 14 GB SSD, so the exact resource class
-must be bound. The image also changes over time and its exact software version is learned from the
-job setup log ([runner-images versioning](https://github.com/actions/runner-images#readme)).
+attempt-exclusive VM authority, provider-authenticated VM identity or attestation. Public and
+private standard runners have different CPU/RAM classes and both publish only 14 GB SSD, so the
+exact resource class must be bound. The image also changes over time and its exact software version
+is learned from the job setup log
+([runner-images versioning](https://github.com/actions/runner-images#readme)).
 Formal eligibility instead waits for the protected workflow to dispatch an independently identified
 GCP/AWS prescreen target, plus the provider/run/VM identity receipts, proved Engine/runtime and
 sole-client mechanism, source inventory, raw retention and complete `D20,D21` hostile fixtures below.
@@ -2904,21 +2909,26 @@ logic inside already approved binary roles avoids a new artifact row, but does n
 versioning. A standalone IPC helper/trust object must be an explicit successor approval input; it
 cannot be smuggled into the current 29-row payload.
 
-Both owners must eventually accept two identical canonical UTF-8 JSON objects, with keys in the
-shown order, no whitespace outside strings, no BOM and no trailing newline. The recommended
-transport bytes are:
+Both owners must eventually accept one identical canonical transport object. If they select the
+recommended sequenced-packet branch, they must also accept one identical compatible crash-coverage
+object. Every object is canonical UTF-8 with keys in the shown order, no whitespace outside strings,
+no BOM and no trailing newline. The recommended transport bytes are:
 
 `{"schema_version":"state-backend-redb-n19-mechanism-decision/v1","notice":"DESIGN_ONLY_NO_IMPLEMENTATION_OR_EXECUTION_AUTHORITY","scope":"N19_AND_CRASH_MARKER_TRANSPORT","decision":"REJECT_N19_X86_64_ASSEMBLY_ABI_V1_AND_SELECT_SEQPACKET_REDESIGN_V2"}`
 
 The transport alternative changes only `decision` to
-`ACCEPT_N19_LINUX_X86_64_SYSV_ASSEMBLY_ABI_V1_DIRECTION_ONLY`. The recommended crash-coverage bytes
-are:
+`ACCEPT_N19_LINUX_X86_64_SYSV_ASSEMBLY_ABI_V1_DIRECTION_ONLY`. It cannot be paired with the
+sequenced-packet-scoped crash object below. Selecting that alternative leaves implementation
+blocked until owners separately freeze and review an assembly-compatible crash-coverage object;
+neither this packet nor earlier assembly campaign semantics supplies one implicitly. The
+recommended sequenced-packet crash-coverage bytes are:
 
 `{"schema_version":"state-backend-redb-crash-coverage-decision/v1","notice":"DESIGN_ONLY_NO_IMPLEMENTATION_OR_EXECUTION_AUTHORITY","scope":"SEQPACKET_CRASH_COVERAGE_BOUNDARY","decision":"SELECT_ADAPTER_COMMIT_ENTERED_V2_DIRECTION_ONLY","coverage_claim":"ADAPTER_ENTRY_OBSERVED_AND_RETURN_NOT_OBSERVED","redb_internal_progress_claim":"NONE","large_recovery_authority":"BLOCKED_PENDING_SEPARATE_INTERNAL_PROGRESS_DECISION"}`
 
-The crash-coverage alternative changes only `decision` to
+The sequenced-packet crash-coverage alternative changes only `decision` to
 `SELECT_COMMIT_CALL_IMMINENT_V2_DIRECTION_ONLY` and `coverage_claim` to
-`CALL_IMMINENT_OBSERVED_AND_RETURN_NOT_OBSERVED`. The objects are embedded under the future
+`CALL_IMMINENT_OBSERVED_AND_RETURN_NOT_OBSERVED`. On the sequenced-packet branch, the selected
+objects are embedded under the future
 `contract/target-identity.json` fields `n19_mechanism_decision` and `crash_coverage_decision`, not
 added as artifact rows. Workload-owner and operations-owner acceptance must be two distinct
 protected review events over the same immutable repository head containing these exact protocol
@@ -2927,9 +2937,10 @@ identity, approval payload `/v3` and two-role receipt `/v3` independently bind b
 before any dispatch. A separate decision artifact or helper trust object must be an explicit row in
 that successor payload rather than an implicit file.
 
-Either choice explicitly denies implementation, mechanism/candidate execution, provider/container
-workflow, backend selection, cluster admission, production use and soak authority. Until both
-objects are accepted, every implementation remains blocked. The IPC frame, queue bounds, deadlines,
+Every transport or crash-boundary choice explicitly denies implementation, mechanism/candidate
+execution, provider/container workflow, backend selection, cluster admission, production use and
+soak authority. Implementation remains blocked until the owners accept one transport object and a
+compatible separately frozen crash-coverage object. The IPC frame, queue bounds, deadlines,
 exact retry/commit rules, credentials/pidfd/holder proof, exact adapter boundary/build audit,
 entry/return/error frames, successor schemas/classifier/oracle/schedule, perturbation limits,
 hostile fixtures and the separate large-recovery progress decision remain absent. A redesign probe
@@ -3109,7 +3120,7 @@ successor identity in an existing approval row without reinterpreting that row:
 | exact static daemon/runtime configuration bytes and argv/environment, descriptor roles, private-root/socket/cgroup locator policies, creation order, observer schemas/predicates and broker-pool plan | `contract/execution-plan.json`; only genuinely static generated files may be canonical bytes derived solely from this object and rehashed live |
 | OCI manifest/config/layer digests and preloaded content-store identity | expected values in `contract/target-identity.json`; the content store is a target input, never an unlisted approval artifact |
 | container create/start request, mounts, namespaces, security/resource profile, inert entrypoint and later candidate arguments | `contract/candidate-configuration.json` |
-| compute-lease authority identity, term and acquisition/renewal/loss receipts; VM/boot attestation; loaded kernel/module/BTF and BPF translated/JIT identities; BPF program/map/link instances; runtime FD numbers, PIDs, mount/cgroup/socket identities, daemon/runtime processes, socket peers/holders and content-store observations | versioned successor actual-target, preflight, run-start, launch-ledger, control and result evidence; copied observations carry no authority and never serialize the live lease handle or fencing capability |
+| external evidence-authority controller and etcd cluster/term identities plus acquisition/renewal/loss receipts; provider allocation/delete authority and VM/boot attestation; loaded kernel/module/BTF and BPF translated/JIT identities; BPF program/map/link instances; runtime FD numbers, PIDs, mount/cgroup/socket identities, daemon/runtime processes, socket peers/holders and content-store observations | versioned successor actual-target, preflight, run-start, launch-ledger, control and result evidence; copied observations carry no authority, never serialize the live renewal stream/lease handle or provider mutation credential, and never imply a VM execution fence |
 
 Per-run shim bootstrap messages, OCI bundles/configs, resolved descriptors, PIDs, inodes, mounts,
 cgroups, sockets and runtime-created paths cannot be pre-run artifacts or be claimed as derived
@@ -3144,13 +3155,13 @@ eligible evidence today:
 |---|---|---|---|
 | `D20.1` takeover | Can the VM prove every preexisting Engine/containerd/shim/OCI-runtime/proxy/network or other configured helper process, endpoint, container, private-root/state object and relevant cgroup absent or isolated before target capture? | Closed process/socket/service/container/cgroup/root-state inventory tied to provider attempt, VM and boot, plus configuration-derived proof that no omitted helper kind can exist. | dedicated fresh-VM/private-root direction selected; provider proof absent |
 | `D20.2` broker to Engine | Can every preopened broker connection be bound through the exact protected socket object to the retained reviewed `dockerd` without path/symlink substitution? | Endpoint/open-connection/server-process identity plus retained process handle across the cut; `SO_PEERCRED` alone is not exclusivity. | dockerd-created private listener and fixed broker-pool direction selected; probe absent |
-| `D20.3` Engine to containerd | Can the complete actual live dockerd/containerd/shim control-connection population, not merely configuration text or one sampled connection, be bound to retained reviewed processes? | Closed socket/peer/process graph plus namespace, executable, configuration and private root/state identities, including allowed lazy connections and fail-on-reconnect rules. | source-derived Moby/containerd logical graph and BPF connection-graph direction selected; physical population and probe absent |
-| `D20.4` later runtime set | Can approval bind every executable/configuration/private-root input before spawn; loss-detecting supervision capture every later short- or long-lived shim, OCI runtime, proxy, network helper, daemon helper and re-exec from creation/exec; and the candidate remain inert until every live chain is joined and every already-exited helper is historically reconciled? | Reviewed and attributed setup effects; accepted transcript with zero observer loss from private-daemon start through final cut; pre-spawn executable/config/root bindings; inert-until-joined candidate bootstrap; container/cgroup linkage and legal planned-exit handling. A post-create snapshot is insufficient. | BPF lifecycle history, source-derived transient candidates and inert gate direction selected; reachability/cardinality, exact configuration/event closure and probe absent |
+| `D20.3` Engine to containerd | Can the complete actual live dockerd/containerd/shim control-connection population, not merely configuration text or one sampled connection, be bound to retained reviewed processes? | Closed socket/peer/process graph plus namespace, executable, configuration and private root/state identities, including allowed lazy connections and fail-on-reconnect rules. | Cycle 34 classic-`vfs` graph and exact plugin-ID hypothesis recorded; default snapshotter path rejected; physical inventory/population and probe absent |
+| `D20.4` later runtime set | Can approval bind every executable/configuration/private-root input before spawn; loss-detecting supervision capture every later short- or long-lived shim, OCI runtime, proxy, network helper, daemon helper and re-exec from creation/exec; and the candidate remain inert until every live chain is joined and every already-exited helper is historically reconciled? | Reviewed and attributed setup effects; accepted transcript with zero observer loss from private-daemon start through final cut; pre-spawn executable/config/root bindings; inert-until-joined candidate bootstrap; container/cgroup linkage and legal planned-exit handling. A post-create snapshot is insufficient. | BPF history plus source-derived runc/BuildKit/AppArmor/shim population recorded; exact reachability/order, target security state and probe absent |
 | `D20.5` continuity | Conjunctively with `D20.1`--`D20.4`, can restart, replacement, exec/reload, socket substitution, reconnect, required-process loss and every observer gap fail closed? | Redb-free hostile fixtures for each transition and observation-loss point; Engine events remain advisory. | fail-on-transition direction selected; fixtures absent |
-| `D21.1` VM authority | Can a single-writer external term be joined live to the exact workflow attempt and provider-authenticated VM/boot identity, with freshness, loss and fencing? | Live external lease plus provider attestation and bounded delete/final-absence proof; a copied term, setup-log image version or “new VM per job” is insufficient. | GCP plus external etcd term conditionally recommended for owner review; fixed-deadline GCP is a weaker alternative; exact pins, timing and probe absent |
-| `D21.2` client-capability barrier | Can the Engine listener be closed to new clients and every existing connection/open-file-description holder be confined to one exact bounded broker set? | Proved atomic connect-admission seal plus unlink barrier, exact pool and holder population, no reconnect, and denial/detection of duplicate, fork inheritance and `SCM_RIGHTS` passing. | exact three-client source plan plus precreate/TSYNC/BPF-seal/reconcile/unlink direction selected; keepalive and mechanism probe absent |
+| `D21.1` VM authority | Can a single-writer external term be joined live to the exact workflow attempt and provider-authenticated VM/boot identity, with freshness, loss, fail-closed guest stop and provider deletion? | Live external evidence-authority lease plus provider attestation and bounded delete/final-absence proof; a copied term, setup-log image version or “new VM per job” is insufficient, and the lease does not fence VM execution. | GCP plus external etcd term conditionally recommended for owner review; fixed-deadline GCP is a weaker alternative; exact pins, timing and probe absent |
+| `D21.2` client-capability barrier | Can the Engine listener be closed to new clients and every existing connection/open-file-description holder be confined to one exact bounded broker set? | Proved atomic connect-admission seal plus unlink barrier, exact pool and holder population, no reconnect, and denial/detection of duplicate, fork inheritance and `SCM_RIGHTS` passing. | exact three-client 22/23-request schedule plus precreate/TSYNC/BPF-seal/reconcile/unlink direction recorded; keepalive and mechanism probe absent |
 | `D21.3` sole-client observation | Can every foreign Engine connection or connection-capability holder be detected without gaps throughout authority? | Bracketed peer/process/holder reconciliation is sufficient only conjunctively with the proved `D21.2` no-new-client/no-new-holder barrier; continuous process/socket observation remains required for barrier integrity. | `UNIX_DIAG` plus closed-holder and lifecycle-history direction selected; probe absent |
-| `D21.4` privilege closure | Can every actor able to reach/recreate the endpoint or duplicate/pass a client capability be kept in a closed trusted set while candidates are denied it? | Broker identity, post-barrier capability confinement and provider lease plus continuously enforced or loss-detected privileged-process/holder closure; permissions and bounded snapshots alone are insufficient. | confinement direction selected; provider/privilege proof absent |
+| `D21.4` privilege closure | Can every actor able to reach/recreate the endpoint or duplicate/pass a client capability be kept in a closed trusted set while candidates are denied it? | Broker identity, post-barrier capability confinement, external evidence-authority term, provider allocation/delete authority, and continuously enforced or loss-detected privileged-process/holder closure; permissions and bounded snapshots alone are insufficient. | confinement direction selected; provider/privilege proof absent |
 | `D21.5` hostile proof | Do same-user/root foreign connection, inherited/duplicated/`SCM_RIGHTS`-passed client, endpoint replacement and reconciliation-gap attempts prevent finalization? | Exact redb-free hostile fixtures with fail-closed expected outcomes. | absent |
 
 #### Selected attempt-exclusive-VM supervision and Engine-client direction
@@ -3173,7 +3184,7 @@ asynchronous delete request is not final absence. The provider shortlist is ther
 for a later provider-API prescreen; no provider, account, project, Region, zone, SKU, image, host,
 lease service or controller is selected.
 
-| Provider direction | Useful provider primitive | Unclosed execution-lease/fence gap | Current disposition |
+| Provider direction | Useful provider primitive | Unclosed external-term/execution-cessation gap | Current disposition |
 |---|---|---|---|
 | GCP AMD-SEV Confidential VM; sole-tenant only if later policy requires physical-host identity | nonce-bound managed attestation; optional sole-tenant `serverId` and instance inventory; absolute provider-scheduled `terminationTime` with `DELETE` | deletion may begin up to 30 seconds after the absolute trigger; no cessation/final-absence bound is documented, and the trigger is not atomically coupled to an external term | **conditional shortlist; strongest absolute deletion-trigger backstop among those examined** |
 | AWS NitroTPM/Attestable AMI; Dedicated Host only if later target policy requires it | nonce-bearing measured-boot attestation, signed instance identity plus explicit host placement/inventory and controls that disable host recovery/maintenance | no provider absolute deletion trigger or bounded cessation/final absence has been identified; attestation, instance/AMI/host identity, external term and termination must be joined | **conditional shortlist; strongest image/no-replacement direction among those examined** |
@@ -3223,21 +3234,24 @@ provider remains blocked until the accepted contract and a mechanism probe estab
 final-absence treatment. Maintenance, emergency failure, preemption, replacement and restart must
 never silently create a successor epoch. IAM principals, guest agents, login/serial/repair paths,
 autoscaling, sharing and alternate start/delete authority must form one reviewed closed set.
-Provider audit logs are retained retrospective evidence, not the live fence.
+Provider audit logs are retained retrospective evidence, not live authority or an execution fence.
 
 This D20/D21 dummy-mechanism VM is deliberately distinct from the eventual N20/N29 native storage
 qualification host. Because this threat model trusts the selected hypervisor, a physically
 dedicated host and dedicated NVMe are not requirements for a redb-free Engine-authority probe.
 They may remain mandatory for later device/latency qualification. Conversely, passing a sole-tenant
 provider inventory says nothing about NVMe attribution, backend tails or production soak. GitHub's
-protected-review/workflow identity also stays separate from the cloud dispatcher's compute lease;
-the two are joined by fresh run-attempt challenge equality, never treated as one principal.
+protected-review/workflow identity also stays separate from the external authority-controller term
+and provider allocation identity; they are joined by fresh run-attempt challenge equality, never
+treated as one principal.
 
-Provider policy belongs in `contract/target-identity.json`; static acquisition/renewal/fence and
-termination predicates belong in `contract/execution-plan.json`; signed attestations, live
+Provider policy belongs in `contract/target-identity.json`; static acquisition, renewal,
+fail-closed guest-stop and provider-deletion predicates belong in `contract/execution-plan.json`;
+signed attestations, live
 instance/host inventory, boot ID, term receipts, notices, termination operation and final absence
-belong in versioned live evidence. The live lease handle and current fencing capability remain
-nonserializable. The recommended etcd composition necessarily adds approval-input trust,
+belong in versioned live evidence. The controller's live renewal stream/lease handle and provider
+mutation credentials remain nonserializable and do not become a VM execution fence. The
+recommended etcd composition necessarily adds approval-input trust,
 configuration, role and controller identities, so current approval payload `/v2` cannot authorize
 it. If the N19 sequenced-packet direction is selected, those inputs must be co-frozen in its already
 required payload/receipt `/v3`; otherwise a separately reviewed successor identity is still
@@ -3373,102 +3387,62 @@ required.
    mechanism is infeasible rather than eligible for a transparent fallback
    ([`kcmp(2)`](https://man7.org/linux/man-pages/man2/kcmp.2.html)).
 
-#### Cycle 33 exact runtime/API source-audit proposal
+#### Cycle 34 Docker/runtime source-closure proposal
 
-The narrow source-audited tuple for a later redb-free dummy probe is rootful Linux/amd64 Docker
-Engine/Moby **29.6.2**, containerd **2.2.6**, `containerd-shim-runc-v2` from that same containerd
-artifact, and runc **1.3.6**. Docker 29.6.2 packages containerd 2.2.6, while Docker 29.6.0 updated
-its static runc line to 1.3.6; choosing standalone containerd 2.3.x would abandon the
-Docker-shipped dependency line. Compatibility of an externally supervised 2.2.6 artifact remains a
-dummy-probe obligation, not a result implied by packaging
-([Docker 29 release notes](https://docs.docker.com/engine/release-notes/29/),
-[Moby 29.6.2](https://github.com/moby/moby/releases/tag/docker-v29.6.2),
-[containerd 2.2.6](https://github.com/containerd/containerd/releases/tag/v2.2.6),
-[runc 1.3.6](https://github.com/opencontainers/runc/releases/tag/v1.3.6)).
+The focused
+[Docker/runtime source-closure report](../reports/redb-prescreen-docker-runtime-source-closure-2026-07-25.md)
+supersedes the stale one-client summary previously carried here. The tuple remains rootful
+Linux/amd64 Moby 29.6.2, containerd 2.2.6, its matching `containerd-shim-runc-v2`, runc 1.3.6, and
+Engine API v1.55. Tagged source and release identities are research inputs, not executable, image,
+configuration, or target identities; nothing was downloaded or executed.
 
-The currently tagged source revisions resolve to Moby
-`3d80467678f6e36325fa9ae3dd486fe91e5652e3`, containerd
-`11ce9d5f3c68c941867e82890e93e815c1304f1b`, and runc
-`491b69bab9fa206b984fb26ba07d3110d62e671f`. These source identities are not executable identities.
-Official containerd and runc release checksums can seed a later acquisition policy, but archive
-digests do not identify extracted files. Docker's official static 29.6.2 archive has no adjacent
-primary checksum in its download index. Final opened executable, ELF interpreter/DSO, archive,
-extraction and image identities therefore remain blocked; no file was downloaded or executed in
-this source audit.
+Docker 29's default containerd image-store branch is rejected for this mechanism hypothesis because
+unconditional BuildKit construction creates a second external containerd client. The only narrower
+direction carried forward explicitly disables `containerd-snapshotter`, `containerd-migration`,
+CDI, NRI, daemon/container networking, telemetry export, live restore, and builder GC; it selects
+the classic `vfs` graphdriver, a private externally supervised containerd, a sealed executable path,
+and a host with AppArmor and `binfmt_misc` absent/empty. `vfs` is chosen only to minimize one inert
+dummy probe's dependency surface; it is not a LaminarDB state-backend recommendation.
 
-Engine API negotiation is disabled and every request pins **v1.55** over raw HTTP/1.1. Exactly three
-already-created sockets are admitted and connected before the atomic seal:
+The expected containerd population is now an exact-ID hypothesis covering content, events,
+metadata, GC, leases, mount manager, warnings, shim/runtime-v2 task management, the local
+containers/content/namespaces/tasks services, and only the containers/content/events/leases/
+namespaces/tasks/version/health gRPC facades. Moby's first container-create path requires a
+namespace-label read before its explicit runtime option is applied. The corrected mount-manager ID is
+`io.containerd.mount-manager.v1.bolt`. Snapshotter, image, snapshot, diff, transfer, CRI, NRI,
+sandbox, restart, streaming, introspection, network, task-monitor, tracing, and mounts-
+facade plugins remain excluded. Containerd has no allowlist mode, so tagged source alone cannot
+prove this population; any later probe must compare the initialized inventory exactly and reject an
+extra component.
 
-| Socket | Single role | Concurrency/reuse rule |
-|---|---|---|
-| `E1` | one lifetime `GET /v1.55/events` stream | never used for another request |
-| `E2` | one `POST /v1.55/containers/{id}/wait?condition=not-running` | never shared; retained idle after its response through evidence close |
-| `E3` | all finite control requests | sequential, at most one outstanding; no pipeline, redirect, retry, upgrade or hijack |
+Exactly three already-connected Engine sockets remain proposed. `E1` owns one type-and-unique-label
+filtered container-event stream, `E2` owns one outstanding wait, and `E3` serializes every finite
+control request. The corrected normal order is events; initial version/info and absence checks;
+volume and container create; created inspect; start; authenticated non-Engine armed report; running
+inspect; wait; post-start version/info; non-Engine release; wait/event; exited inspect; container and
+volume cleanup/absence; final version/info. That is exactly 22 requests (`E1=1,E2=1,E3=20`). The
+only hostile variant adds one `SIGKILL` request after the post-start cut without releasing the gate,
+for 23 (`E3=21`). A reconnect, retry, additional request/action/client, early close, or ambiguous
+response poisons the VM.
 
-The normal one-dummy-attempt budget is exactly 22 requests: events once; `/version` three times;
-`/info` three times; image inspect once; label-filtered all-container list twice; label-filtered
-volume list twice; volume create/inspect/delete once each; container create/start/wait/delete once
-each; and container inspect three times. One explicitly selected hostile/unreleased-stop case may
-add one container `kill?signal=KILL`, for a maximum of 23. `E1` and `E2` each carry one request;
-`E3` carries 20 or 21. Names, IDs and nonces remain live values, while method, path template,
-percent encoding, query-key order, header set/order, content length and body bytes require exact
-goldens. `_ping`, logs, stats, top, archive/copy, attach, exec, hijack, build, pull/load/push, plugin,
-network-management, swarm and authentication routes are closed. Docker documents 1.55 as the
-current 29.6 API, but does not guarantee that these three connections stay open for the schedule;
-any EOF, `Connection: close`, timeout, reconnect, new socket, ambiguous response or early close
-poisons the VM rather than authorizing fallback
-([Engine API versioning](https://docs.docker.com/reference/api/engine/),
-[Moby 29.6.2 API](https://github.com/moby/moby/blob/docker-v29.6.2/api/swagger.yaml)).
+The source-derived helper set is larger than Cycle 33 recorded: two startup `runc features`
+executions; six `runc --version`, six `docker-init --version`, and six containerd Version RPCs across
+the three info/version cuts; one native amd64 plus ten non-amd64 BuildKit architecture-check payload
+attempts; possible
+`apparmor_parser` when AppArmor is active; the transient shim launcher, persistent shim, exact runc
+lifecycle children and reverse shim-event publisher connection. The narrow target chooses AppArmor
+and `binfmt_misc` absence, but the native payload executes to report the amd64 ISA level and the
+`386` probe can still execute through native compatibility. Every attempt/child, lazy connection,
+async containerd GC effect, the scheduled BuildKit no-policy GC callback, descriptor, mount,
+cgroup, and planned exit remains a runtime-ledger obligation.
 
-The tagged sources imply this logical runtime graph, not fixed physical socket counts:
-
-1. dockerd constructs one main containerd client for the explicit address and `moby` namespace and
-   uses it for task events. The separate lazy `plugins.moby` client must remain unreachable because
-   plugin APIs/configuration are absent. The main gRPC `ClientConn` is lazy and its event loop can
-   resubscribe after failure; source therefore cannot prove one permanent AF_UNIX transport. The
-   dummy probe must observe the complete stable baseline, then treat any reconnect as poison
-   ([Moby daemon client construction](https://github.com/moby/moby/blob/docker-v29.6.2/daemon/daemon.go),
-   [Moby remote client](https://github.com/moby/moby/blob/docker-v29.6.2/daemon/internal/libcontainerd/remote/client.go),
-   [vendored containerd client](https://github.com/moby/moby/blob/docker-v29.6.2/vendor/github.com/containerd/containerd/v2/client/client.go)).
-2. containerd executes a transient `containerd-shim-runc-v2 ... start`; its JSON-v3/ttrpc result
-   describes the persistent shim and inherited listener. With grouping annotations forbidden, one
-   dummy container has one persistent shim and one containerd-to-shim ttrpc client. The start
-   helper's exit is planned and must be historically reconciled
-   ([runtime-v2 binary](https://github.com/containerd/containerd/blob/v2.2.6/core/runtime/v2/binary.go),
-   [runc-v2 manager](https://github.com/containerd/containerd/blob/v2.2.6/cmd/containerd-shim-runc-v2/manager/manager_linux.go)).
-3. The persistent shim's event publisher lazily opens a distinct reverse shim-to-containerd ttrpc
-   connection on first publish and its source supports retry/reconnect. That planned first edge must
-   appear before inert-gate release; any later retry/reconnect is poison. Private containerd thus
-   needs separately identified gRPC and ttrpc listeners
-   ([containerd ttrpc client](https://github.com/containerd/containerd/blob/v2.2.6/pkg/ttrpcutil/client.go),
-   [shim publisher](https://github.com/containerd/containerd/blob/v2.2.6/pkg/shim/publisher.go)).
-4. The legitimate runtime-process candidates are the shim `start` helper, possible shim `-info` and
-   `runc features` probes, the persistent shim, its runc operation children and the terminal shim
-   `delete` helper. Source exposes these routes but does not prove which occur for the selected
-   Moby/configuration path. Exact reachability, order, occurrence cardinality, runc subcommands,
-   socketpairs, inherited descriptors and input/mount opens remain gate/probe obligations
-   ([runtime-v2 delete lifecycle](https://github.com/containerd/containerd/blob/v2.2.6/core/runtime/v2/README.md),
-   [runc-v2 manager](https://github.com/containerd/containerd/blob/v2.2.6/cmd/containerd-shim-runc-v2/manager/manager_linux.go)).
-   Containerd restart can rediscover shims and the shim publisher can reconnect; both transitions
-   are forbidden after the accepted baseline.
-5. Moby's embedded containerd supervisor is forbidden because it creates another monitoring client
-   and supports restart. The future reviewed external supervisor must start containerd first, then
-   give dockerd the explicit socket, and must create no health connection. Readiness uses only
-   non-connecting process/socket evidence
-   ([Moby containerd supervisor](https://github.com/moby/moby/blob/docker-v29.6.2/daemon/internal/libcontainerd/supervisor/remote_daemon.go)).
-
-Rootless mode is not a fallback. It adds RootlessKit, user/mount/network namespaces, UID/GID maps
-and proxy/network helpers and cannot close the selected host-global BPF, cgroup, pidfd,
-`UNIX_DIAG`/`KCMP_FILE` authority. The dummy candidate container nevertheless remains unprivileged:
-no Engine descriptor, host PID/IPC/network namespace, container network, published port, device,
-privileged flag or added capability.
-
-This proposal remains NOT approval-ready. Provider/kernel/image/lease identity, Docker executable
-digest, exact minimal containerd plugin/snapshotter configuration, physical gRPC/ttrpc socket
-population, three-connection keepalive behavior, shim/runc argv/environment/descriptors, API
-body/response caps, deadlines and byte goldens are absent. If the observed tuple reconnects or
-cannot finish the exact API schedule on the sealed pool, `D20,D21` is infeasible; the protocol does
-not add connections or retries.
+This proposal is still **not approval-ready**. Exact executable/ELF/DSO and embedded-probe bytes,
+OCI image/PID1, daemon/containerd configuration and parser result, initialized plugins, physical
+gRPC/ttrpc graph, request/response goldens, deadlines, keepalive behavior, helper order, security
+state, provider/kernel/external-term identity, and a separately approved redb-free hostile dummy
+probe remain absent. If the tuple cannot complete the exact schedule using this closed population
+and the sealed socket pool, `D20,D21` is infeasible; there is no automatic plugin, helper,
+connection, or retry fallback.
 
 #### Cycle 33 kernel-ledger and gate predicate proposal
 
@@ -3599,10 +3573,10 @@ program/helper viability, provider choice, binary/image hashes, physical runtime
 privileges, deadlines, caps, raw roles/cardinalities, schemas, byte goldens and run-provenance
 authority remain blocked.
 
-No successor target/preflight schema cut begins until the remaining provider lease, exact pins,
-mechanism probe, process/event populations, raw roles/cardinalities, derived caps, result fixtures
-and run-provenance authority are independently reviewed. Cycle 33 adds no implementation or
-executable authority.
+No successor target/preflight schema cut begins until the remaining external-term/provider-absence
+contract, exact pins, mechanism probe, process/event populations, raw roles/cardinalities, derived
+caps, result fixtures and run-provenance authority are independently reviewed. Cycle 33 adds no
+implementation or executable authority.
 
 ## Isolation and clocks
 

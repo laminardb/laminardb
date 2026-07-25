@@ -44,14 +44,16 @@ workflow/repository IDs, run ID/attempt, fresh challenge, project number, zone, 
 numeric instance ID, boot ID, image/attestation policy, evidence-grant deadline `E`, and requested/
 observed GCP termination time `H`, with `E < H`.
 
-One controller would create exactly one standalone VM with a stable UUID `requestId`, absolute
-`terminationTime=H`, `instanceTerminationAction=DELETE`, `automaticRestart=false`, and
+One controller would create exactly one standalone VM with a distinct nonzero UUID
+`create_request_id`, absolute `terminationTime=H`, `instanceTerminationAction=DELETE`,
+`automaticRestart=false`, and
 `deletionProtection=false`. MIG, autohealer, autoscaler, replacement, metadata/IAM mutation,
 start/reset/resume, alternate deletion, and deadline-extension paths are denied. Bootstrap remains
 inert until the create operation completes without error and an exact provider GET, numeric instance
 ID, attestation, boot, image, and challenge all join. Authority expires at `E` and cannot renew.
-Cancellation uses delete with one stable UUID `requestId`; ambiguous create/delete calls may repeat
-only that documented idempotent request identity.
+Cancellation uses a different nonzero UUID `delete_request_id`. Each ID is stable only across
+retries of its own logical operation; create and delete never share an ID. Both IDs and their
+operation identities are bound to evidence.
 
 A successor remains forbidden until the delete operation is terminal without error, exact GET
 returns genuine not-found, complete inventory excludes both name and numeric ID, and an independent
@@ -109,9 +111,12 @@ live authority.
 ### Acquire, activate, renew, and observe
 
 1. `LeaseGrant` returns a server-selected TTL and lease ID. A default-linearizable read first selects
-   exactly one acquisition shape: bootstrap compares both `G,L` at version zero; successor compares
-   `G` at the exact prior `CLOSED` value/mod revision and `L` at version zero. The selected transaction
-   writes unleased `G=PREPARING` and leased `L=PREPARING`. Its top-level revision is the term revision.
+   exactly one acquisition shape: bootstrap compares both `G,L` at version zero; successor first
+   retrieves the independent final-absence receipt named by the exact prior `CLOSED` value and
+   verifies its schema/version, signer, signature, content hash, prior-term/provider binding and
+   retention, then compares that exact `G` value/mod revision and `L` at version zero. The selected
+   transaction writes unleased `G=PREPARING` and leased `L=PREPARING`. Its top-level revision is the
+   term revision.
    A following default-linearizable read must prove the exact values/mod revisions plus `G.lease=0`
    and `L.lease=T.lease_id`. A failure branch, any other population, or a stale/non-closed gate rejects
    the attempt; there is no logical-OR comparison hidden inside one transaction.
@@ -133,11 +138,12 @@ live authority.
    `G=ACTIVE`, `G.lease=0`, `L=ACTIVE` and `L.lease=T.lease_id`. Lease expiry deletes `L`, while
    non-closed `G` durably prevents a successor. False-positive stop/delete is safe; continuing on
    uncertainty is not.
-6. Only after every possibly created provider identity is independently absent may the sole
-   controller select one closure transaction. It compares `G` at the exact current `PREPARING`,
-   `ACTIVE` or `POISONED` value/mod revision (one concrete branch, never an OR), compares `L` absent,
-   and writes a new `CLOSED` value that binds the prior term and independent final-absence receipt
-   identity/hash. No gate deletion/reuse is allowed.
+6. Only after every possibly created provider identity is independently absent and the controller
+   has verified the independent final-absence receipt's schema/version, signer, signature, content
+   hash, prior-term/provider binding and retention may it select one closure transaction. It compares
+   `G` at the exact current `PREPARING`, `ACTIVE` or `POISONED` value/mod revision (one concrete
+   branch, never an OR), compares `L` absent, and writes a new `CLOSED` value that binds the prior
+   term and receipt identity/hash. No gate deletion/reuse is allowed.
 
 Exact server-selected TTL `Tttl`, keepalive interval `K`, response/read deadline `R`, guest polling
 period `P`, guest stop bound `Gstop`, evidence deadline `E`, provider trigger `H`, and measured
@@ -170,8 +176,9 @@ does not restore authority. Because the guest accepts only exact active `G,L`, a
 it immediately, while loss of `L` stops it after the bounded watchdog path. Any controller restart
 may reconcile and tear down only; it can never resume an open attempt.
 
-GCP create/delete ambiguity may retry only the same UUID `requestId` and must reconcile the zonal
-operation identity, client operation ID, target link, target numeric ID, terminal status and error.
+GCP create/delete ambiguity may retry only the corresponding stable `create_request_id` or
+`delete_request_id` for that same logical operation and must reconcile the zonal operation identity,
+client operation ID, target link, target numeric ID, terminal status and error.
 A `403`, timeout, malformed response, empty list, accepted delete request, terminal operation alone,
 guest shutdown, etcd key loss, or audit record is not provider absence. The absolute deletion
 schedule is the last trigger backstop if controller/guest coordination fails, but GCP documents only
@@ -187,8 +194,8 @@ open attempts. No new term starts until every previously bound provider identity
 ## Pins, versioning, and remaining blockers
 
 This packet deliberately does not pin an etcd release. Official releases v3.7.1 and v3.6.14 were
-published on 2026-07-23, so v3.6.11 is already stale; the patch release includes security fixes and a
-client lease-cache race correction
+published on 2026-07-23; the patch release includes security fixes and a client lease-cache race
+correction
 ([official patch-release notice](https://etcd.io/blog/2026/july-23-patch-release/)). The current v3.7
 API documentation is useful for interface reasoning, but exact server/client patch, release
 signatures/SBOM, member count and failure domains, storage/fsync policy, quorum/corruption checks,
