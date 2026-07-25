@@ -1,16 +1,11 @@
 # redb 4.1.0 bounded state-backend prescreen v1
 
 - **Identity:** `state-backend-redb-prescreen/v1`
-- **Status:** Cycle 33 validation-only prescreen directions frozen: the engineering recommendation
-  rejects the Cycle 32 Linux/x86-64 `N19` assembly ABI in favour of a versioned sequenced-packet
-  redesign, with owner acceptance still absent; GCP and conditional AWS remain unselected provider
-  finalists;
-  and the attempt-exclusive-VM Docker successor has a source-derived dummy runtime/API proposal plus
-  BPF/gate/holder proof predicates, but no eligible binary/host tuple or mechanism evidence; only
-  redb-free validation work is authorized, while blocked source authorities/platform proofs,
-  complete target/preflight schemas and collectors, strict later run/result wires, live
-  provider/storage/finalization verifiers, native supervisor/child/actuator/oracle, reviewed build,
-  owner approvals, and execution remain absent
+- **Status:** **PARKED after Cycle 34**; this is an administrative stop, not the formal `DEFER`
+  classifier. The design/research timebox is exhausted. The sequenced-packet,
+  adapter-entry, conditional GCP-plus-etcd, and classic-`vfs` Docker directions are unaccepted static
+  recommendations only. No further protocol, provider, Docker, IPC, schema, collector, or mechanism
+  work is scheduled; no eligible target, result, owner approval, or execution authority exists
 - **Evidence class:** `NOT C2/C3 QUALIFICATION EVIDENCE`
 - **Scope:** decide whether a redb adapter is worth adding to the backend qualification bake-off
 - **Production/admission effect:** none; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
@@ -39,6 +34,27 @@ justify that investment. `DEFER` means the experiment or environment could not d
 target. None supplies C1/C2/C3, fault, endurance, checkpoint, source/sink, exactly-once, selection,
 or production evidence. The prescreen never selects redb by comparing its limits with Fjall or
 RocksDB results.
+
+### Cycle 34 timebox and stop rule
+
+Active redb design work stops here. The accumulated protocol remains decision provenance, not an
+implementation backlog. Do not add another redb-specific schema, provider construction, Docker/
+kernel mechanism, helper, adapter, or research cycle under the current authority.
+
+Redb may be reopened only through one owner-approved, one-page **micro-prescreen charter** capped at
+two engineering days and four machine-hours end to end. It may answer only the four questions above
+on one already-qualified target by reusing an already-approved harness. It cannot fund new cloud,
+IPC, container, evidence-wire, or target-qualification infrastructure.
+
+That charter must have a new identity and explicitly supersede rather than satisfy the five-hour
+campaign, schedules, evidence wires, and formal result classifiers retained below. It produces only
+an administrative invest/stop recommendation; it cannot emit `PRESCREEN_PASS`,
+`PRESCREEN_NO_GO`, `DEFER`, or `REJECT_EXACT_PIN`. If decisive observations cannot be obtained
+inside the cap, redb returns to `PARKED`. A suspected exact-pin correctness defect stops investment;
+calling it `REJECT_EXACT_PIN` would still require the separate formal proof that this abbreviated
+charter does not provide. A favorable observation only funds a later common-profile mapping
+proposal. Reopening also requires explicit candidate-execution authority, which does not exist
+today. Every later section is archival design provenance and is non-normative for the micro-charter.
 
 ### Cycle 21 protocol-freeze resolutions
 
@@ -3575,8 +3591,9 @@ authority remain blocked.
 
 No successor target/preflight schema cut begins until the remaining external-term/provider-absence
 contract, exact pins, mechanism probe, process/event populations, raw roles/cardinalities, derived
-caps, result fixtures and run-provenance authority are independently reviewed. Cycle 33 adds no
-implementation or executable authority.
+caps, result fixtures and run-provenance authority are independently reviewed. This retained design
+grants no implementation or executable authority and is not active work while the prescreen is
+parked.
 
 ## Isolation and clocks
 

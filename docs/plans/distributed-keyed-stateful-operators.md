@@ -168,8 +168,9 @@ Work:
    validation-only v2 implementation. Cycle 19's reviewed
    [candidate mappings](../reports/state-backend-maintenance-health-mapping-designs-2026-07-24.md)
    define but do not cost or authorize the RocksDB source/binding closure and Fjall scheduler/
-   lifecycle closure; redb 4.1.0 remains only a separate native-prescreen hedge with unapproved
-   complete-process N/A. Unmodified Fjall 3.1.8 and SurrealKV 0.21.2 do not proceed to adapters.
+   lifecycle closure. Redb 4.1.0 is parked after its Cycle 34 design timebox; it has no scheduled
+   protocol or adapter work and may reopen only under the bounded micro-prescreen charter recorded
+   in its canonical protocol. Unmodified Fjall 3.1.8 and SurrealKV 0.21.2 do not proceed to adapters.
    These engine gates apply to the general local-spill profile. They are not an architectural need
    of the in-memory reference, but the current Phase 0 gate still blocks Phase 1. Run every later-
    admitted candidate through the same bounded profile: Arrow-batch-sized atomic requests, realistic

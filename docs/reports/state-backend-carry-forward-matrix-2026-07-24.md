@@ -4,8 +4,9 @@
 - **Decision scope:** choose where to spend the next backend-qualification effort
 - **Production backend selected:** none
 - **Cluster admission:** unchanged; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
-- **Recommendation:** carry RocksDB into a bounded DKS-Q2-006 mechanism-closure task; carry redb
-  only into its separately approved native prescreen; do not carry unmodified Fjall or SurrealKV
+- **Historical recommendation (superseded for redb):** carry RocksDB into a bounded DKS-Q2-006
+  mechanism-closure task; carry redb only into its separately approved native prescreen; do not
+  carry unmodified Fjall or SurrealKV
 
 **Cycle 17 supersession:** the bounded
 [RocksDB mechanism-source closure](rocksdb-mechanism-source-closure-2026-07-24.md) stopped at Stage
@@ -15,6 +16,13 @@ was wrong. Do not start the stall-only patch from this historical recommendation
 step is an explicit choice between retaining v1 and funding broader native instrumentation and
 configuration proof, or issuing an additive qualification contract with reviewed
 candidate-specific health signals. No backend was selected.
+
+**Cycle 34 redb supersession:** redb is now `PARKED`, an administrative stop rather than a formal
+`DEFER` result. Its design timebox is exhausted and the native prescreen is no longer active work.
+Reopening requires the separately recorded one-page, two-engineering-day/four-machine-hour,
+separately versioned micro-prescreen charter and new candidate-execution authority. Every later redb
+imperative, recommendation, work-order step, and “hedge” statement in this dated report is historical
+and superseded. This matrix does not authorize further redb protocol or adapter work.
 
 ## Recommended judgment
 

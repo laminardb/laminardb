@@ -402,19 +402,17 @@ failure remains recorded and is not a fixed defect, soak, or qualification resul
 closes only the prototype's configured-platform gap; all DKS-Q2-001 policy, numerical, provenance,
 independent-operation, and candidate-comparison blockers remain.
 
-redb 4.1.0 remains outside C2. Cycle 16 adds a separately authorized, isolated
+redb 4.1.0 remains outside C2. Cycle 16 added a separately authorized, isolated
 `construction-only-no-decision` workspace and CI lane; it cannot consume approval, classify a
 prescreen, or contribute selection evidence. The optional
-[bounded redb prescreen](../testing/state-backend-redb-prescreen-v1.md) receives validation-only
-protocol work in Cycle 21. Its former descriptor-root schemas are now synthetic-only regression
-shapes. It still cannot run until the approval/result payload, protected-review-receipt, plan, raw-
-evidence and result schemas plus an external semantic/authorization verifier and protocol harness
-exist and the repository's protected-review provider authenticates separate pre-run approvals from
-the workload and operations owners. Its Docker Desktop/WSL
-protocol subset is smoke-only; a target-host
-`PRESCREEN_PASS` merely funds mechanism/persistence mapping, an additive profile/schema proposal,
-and adapter review. `PRESCREEN_NO_GO`, `DEFER`, and `REJECT_EXACT_PIN` add no candidate. No prescreen
-artifact may satisfy or be pooled into C1/C2/C3.
+[bounded redb prescreen](../testing/state-backend-redb-prescreen-v1.md) is **PARKED after Cycle 34**;
+this is an administrative stop, not a formal `DEFER` result. Its design timebox is exhausted, and
+its descriptor-root schemas remain synthetic-only
+regression shapes. No further protocol, provider, Docker, IPC, schema, collector, mechanism, or
+adapter work is scheduled. It may reopen only through the protocol's one-page, two-engineering-day/
+four-machine-hour, separately versioned micro-prescreen charter and separate candidate-execution
+authority. A favorable observation merely funds mechanism/persistence mapping, an additive profile/
+schema proposal, and adapter review; no prescreen artifact may satisfy or be pooled into C1/C2/C3.
 
 Cycle 17 stopped the proposed RocksDB stall-only workspace at read-only source proof: the stall
 observer appears bounded but v1's debt arm requires broader engine instrumentation/configuration
@@ -435,11 +433,10 @@ patched/admitted Fjall subject receives a separate exact identity; unmodified Fj
 Cycle 19's [paper mappings](../reports/state-backend-maintenance-health-mapping-designs-2026-07-24.md)
 are the reviewed source for those candidate gaps. They add no profile or wire identity. RocksDB's
 existing signals omit scheduled-bottom-compaction and complete purge/recovery/stall lifecycles;
-Fjall needs scheduler/lifecycle repair, worker/error/physical-delete health and exact stalls; redb
-needs a candidate-specific profile translation, one frozen durability mode, fail-closed close
-outcome, complete-process task/thread N/A proof and its separately approved native prescreen. Patch
-effort and interference remain unknown, so this ordering is a gate sequence rather than a backend
-rank.
+Fjall needs scheduler/lifecycle repair, worker/error/physical-delete health and exact stalls. Redb's
+candidate-specific profile translation, durability mapping, close outcome and task/thread N/A proof
+are unscheduled while it is parked. Patch effort and interference remain unknown, so this ordering
+is a gate sequence rather than a backend rank.
 
 Build exactly one
 admitted candidate per binary. The private qualification contract covers
@@ -548,9 +545,10 @@ Remaining commits are kept reviewable in this dependency order:
 7. `tools: remove rejected state backend spike`; and
 8. `docs: review distributed keyed state phase zero`.
 
-The optional redb prescreen is an independent side branch, not a prerequisite in this numbered
-candidate sequence. Even `PRESCREEN_PASS` requires a later explicit scope decision and an additive
-profile/schema revision before any redb adapter commit.
+The parked redb prescreen is not a prerequisite or active side branch in this numbered candidate
+sequence. If a future bounded charter yields a favorable administrative recommendation, a later
+explicit scope decision and additive profile/schema revision are still required before any redb
+adapter commit.
 
 Phase 1 tracks the temporary reader-first dead-code allowances as **DKS-P1-001**. Owner:
 distributed-state lifecycle implementation. Deadline: 2026-08-31 or the first trusted,
