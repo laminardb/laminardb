@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-25 during Cycle 42
+- **Last reconciled:** 2026-07-25 during Cycle 43
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -13,7 +13,7 @@
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
   [TidesDB package design](tidesdb-local-state-successor-design.md),
   [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
-  [latest completed review](../reviews/distributed-keyed-state-cycle-42.md)
+  [latest completed review](../reviews/distributed-keyed-state-cycle-43.md)
 
 ## Decision
 
@@ -228,6 +228,15 @@ publishes neither that cycle's output nor a newly due checkpoint after the recov
 not the future backend's sticky root/process poison: that mechanism remains part of an admitted
 working-state owner and must prevent reuse of an ambiguous native root. No TidesDB dependency or
 adapter follows.
+
+Cycle 43 applies the stronger failed-before-apply outcome where the operator already has a natural
+commit point. The analytic window-frame operator now computes its candidate retained tail, runs the
+fallible residual projection, and replaces logical history only after that projection succeeds. A
+projection error or cancellation while it is pending therefore leaves the prior history unchanged
+and remains an ordinary pre-commit failure; replay cannot append the same rows twice. The successful
+path performs the same tail calculation and projection as before, with no additional copy, scan,
+lock, atomic, task, or I/O. This local correction does not supply vnode ownership, durable state,
+rebalance, or cluster admission; broader EOWC and join mutation boundaries remain open.
 
 #### Frozen Fjall/RocksDB evidence and selected TidesDB binding line
 

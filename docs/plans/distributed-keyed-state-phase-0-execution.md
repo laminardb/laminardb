@@ -588,9 +588,11 @@ Remaining work is kept reviewable in this dependency order:
    verified-readback machinery; do not add or execute the package in this slice. Cycle 42 completes
    the first runtime-consumed part: normal aggregate failures after mutation may begin now map to
    coordinated recovery, and tests prove the recovery result reaches neither output publication nor
-   a due checkpoint. A backend-owned sticky root/process poison, resource/health admission, and
-   fresh-root fencing remain open and must land only with a real runtime consumer rather than a
-   disconnected future trait;
+   a due checkpoint. Cycle 43 completes a second narrow part without recovery: analytic window-frame
+   history is committed only after residual projection succeeds, so a failed/cancelled projection
+   leaves the prior history replay-safe. A backend-owned sticky root/process poison,
+   resource/health admission, and fresh-root fencing remain open and must land only with a real
+   runtime consumer rather than a disconnected future trait;
 4. wait for a new official Cargo package `tidesdb`, freeze its exact native pair, and repeat the
    complete one-day/zero-machine-hour T0. The repeated T0 must reconcile every later native fix and
    prove exact transaction success or explicitly accept the full-key verified-commit/fail-stop

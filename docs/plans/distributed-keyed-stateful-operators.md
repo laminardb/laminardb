@@ -3,7 +3,7 @@
 - **Status:** Planned and backend-gated; exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster
   operator is admitted by this document
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-25 during Cycle 42
+- **Last reconciled:** 2026-07-25 during Cycle 43
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -52,6 +52,11 @@ Cycle 42 completes one backend-neutral, runtime-consumed correction: a normal in
 aggregate error after state application may have begun is recovery-required, and the coordinator
 does not publish that cycle or start a due checkpoint. It does not add managed working state,
 qualify a backend, or satisfy the future native-root poison/fresh-restore contract.
+
+Cycle 43 makes analytic frame-history advancement transactional with its residual projection. The
+candidate tail is installed only after projection succeeds, so an ordinary projection failure or
+cancellation remains failed-before-apply and cannot double-append on replay. This changes neither
+the cluster rejection nor any backend gate.
 
 ## Scope and non-goals
 
