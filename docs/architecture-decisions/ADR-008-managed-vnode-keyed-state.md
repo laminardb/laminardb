@@ -2,13 +2,13 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-25 after Cycle 33
+- **Last reconciled:** 2026-07-25 after Cycle 34
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** **NO-GO**; no working-state backend is selected or admitted
 - **Related:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md),
   [implementation plan](../plans/distributed-keyed-stateful-operators.md),
   [current owner decisions](../reports/distributed-state-cycle-21-owner-decisions-2026-07-24.md),
-  and [latest completed review](../reviews/distributed-keyed-state-cycle-33.md)
+  and [latest completed review](../reviews/distributed-keyed-state-cycle-34.md)
 
 ## Decision
 
