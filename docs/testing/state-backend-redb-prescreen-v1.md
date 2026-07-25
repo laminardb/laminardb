@@ -3147,7 +3147,7 @@ eligible evidence today:
 | `D20.3` Engine to containerd | Can the complete actual live dockerd/containerd/shim control-connection population, not merely configuration text or one sampled connection, be bound to retained reviewed processes? | Closed socket/peer/process graph plus namespace, executable, configuration and private root/state identities, including allowed lazy connections and fail-on-reconnect rules. | source-derived Moby/containerd logical graph and BPF connection-graph direction selected; physical population and probe absent |
 | `D20.4` later runtime set | Can approval bind every executable/configuration/private-root input before spawn; loss-detecting supervision capture every later short- or long-lived shim, OCI runtime, proxy, network helper, daemon helper and re-exec from creation/exec; and the candidate remain inert until every live chain is joined and every already-exited helper is historically reconciled? | Reviewed and attributed setup effects; accepted transcript with zero observer loss from private-daemon start through final cut; pre-spawn executable/config/root bindings; inert-until-joined candidate bootstrap; container/cgroup linkage and legal planned-exit handling. A post-create snapshot is insufficient. | BPF lifecycle history, source-derived transient candidates and inert gate direction selected; reachability/cardinality, exact configuration/event closure and probe absent |
 | `D20.5` continuity | Conjunctively with `D20.1`--`D20.4`, can restart, replacement, exec/reload, socket substitution, reconnect, required-process loss and every observer gap fail closed? | Redb-free hostile fixtures for each transition and observation-loss point; Engine events remain advisory. | fail-on-transition direction selected; fixtures absent |
-| `D21.1` VM authority | Can a single-writer external term be joined live to the exact workflow attempt and provider-authenticated VM/boot identity, with freshness, loss and fencing? | Live external lease plus provider attestation and bounded delete/final-absence proof; a copied term, setup-log image version or “new VM per job” is insufficient. | GCP and conditional-AWS prescreen shortlist; external renewable term and eligible provider tuple absent |
+| `D21.1` VM authority | Can a single-writer external term be joined live to the exact workflow attempt and provider-authenticated VM/boot identity, with freshness, loss and fencing? | Live external lease plus provider attestation and bounded delete/final-absence proof; a copied term, setup-log image version or “new VM per job” is insufficient. | GCP plus external etcd term conditionally recommended for owner review; fixed-deadline GCP is a weaker alternative; exact pins, timing and probe absent |
 | `D21.2` client-capability barrier | Can the Engine listener be closed to new clients and every existing connection/open-file-description holder be confined to one exact bounded broker set? | Proved atomic connect-admission seal plus unlink barrier, exact pool and holder population, no reconnect, and denial/detection of duplicate, fork inheritance and `SCM_RIGHTS` passing. | exact three-client source plan plus precreate/TSYNC/BPF-seal/reconcile/unlink direction selected; keepalive and mechanism probe absent |
 | `D21.3` sole-client observation | Can every foreign Engine connection or connection-capability holder be detected without gaps throughout authority? | Bracketed peer/process/holder reconciliation is sufficient only conjunctively with the proved `D21.2` no-new-client/no-new-holder barrier; continuous process/socket observation remains required for barrier integrity. | `UNIX_DIAG` plus closed-holder and lifecycle-history direction selected; probe absent |
 | `D21.4` privilege closure | Can every actor able to reach/recreate the endpoint or duplicate/pass a client capability be kept in a closed trusted set while candidates are denied it? | Broker identity, post-barrier capability confinement and provider lease plus continuously enforced or loss-detected privileged-process/holder closure; permissions and bounded snapshots alone are insufficient. | confinement direction selected; provider/privilege proof absent |
@@ -3165,7 +3165,7 @@ does not claim to withstand a trusted root that deliberately removes the observe
 Across the three examined providers--GCP, AWS and Azure--Cycle 33 finds no single primitive that
 atomically supplies the whole required chain:
 
-`protected workflow attempt -> renewable fencing term -> VM instance -> guest boot/image -> bounded termination`
+`protected workflow attempt -> renewable evidence-authority term -> VM instance -> guest boot/image -> stop/delete and final-absence proof`
 
 Provider identity/attestation, a coordination lease and a delete API are separate authorities. A
 database/blob lock does not stop a VM, an attestation token does not renew a lease, and an
@@ -3173,10 +3173,10 @@ asynchronous delete request is not final absence. The provider shortlist is ther
 for a later provider-API prescreen; no provider, account, project, Region, zone, SKU, image, host,
 lease service or controller is selected.
 
-| Provider direction | Useful provider primitive | Unclosed execution-lease/fence gap | Cycle 33 disposition |
+| Provider direction | Useful provider primitive | Unclosed execution-lease/fence gap | Current disposition |
 |---|---|---|---|
-| GCP AMD-SEV Confidential VM; sole-tenant only if later policy requires physical-host identity | nonce-bound managed attestation; optional sole-tenant `serverId` and instance inventory; absolute provider-enforced `terminationTime` with `DELETE` | deletion may begin up to 30 seconds after the absolute deadline and is not atomically coupled to an external fencing term; restart-relative `maxRunDuration` is recalculated and is not the hard-expiry authority | **shortlist; strongest hard-expiry backstop among those examined** |
-| AWS NitroTPM/Attestable AMI; Dedicated Host only if later target policy requires it | nonce-bearing measured-boot attestation, signed instance identity plus explicit host placement/inventory and controls that disable host recovery/maintenance | no provider-enforced hard expiry has been identified; attestation, instance/AMI/host identity, external lease and termination must be joined | **conditional shortlist; strongest image/no-replacement direction among those examined** |
+| GCP AMD-SEV Confidential VM; sole-tenant only if later policy requires physical-host identity | nonce-bound managed attestation; optional sole-tenant `serverId` and instance inventory; absolute provider-scheduled `terminationTime` with `DELETE` | deletion may begin up to 30 seconds after the absolute trigger; no cessation/final-absence bound is documented, and the trigger is not atomically coupled to an external term | **conditional shortlist; strongest absolute deletion-trigger backstop among those examined** |
+| AWS NitroTPM/Attestable AMI; Dedicated Host only if later target policy requires it | nonce-bearing measured-boot attestation, signed instance identity plus explicit host placement/inventory and controls that disable host recovery/maintenance | no provider absolute deletion trigger or bounded cessation/final absence has been identified; attestation, instance/AMI/host identity, external term and termination must be joined | **conditional shortlist; strongest image/no-replacement direction among those examined** |
 | Azure Trusted Launch/Dedicated Host | signed nonce-bearing IMDS attestation, host/VM inventory and optional finite Blob lease | Blob lease fences blob mutation rather than VM execution; host and exact custom-image measurement are not one attested claim, and Guest Attestation adds a privileged service/extension | hold |
 
 The comparison is grounded in current provider interfaces
@@ -3197,17 +3197,33 @@ The comparison is grounded in current provider interfaces
 [Azure extension security](https://learn.microsoft.com/en-us/azure/virtual-machines/extensions/features-linux),
 [Azure Blob lease](https://learn.microsoft.com/en-us/rest/api/storageservices/lease-blob)).
 
-The later prescreen must define one external monotonic term, renewal deadline and single writer;
-bind a fresh challenge to workflow run/attempt, dispatcher identity, provider instance, guest boot,
-immutable image/PCR policy and current term; make expiry/revocation trigger provider deletion within
-a stated bound; retain an absolute provider-enforced hard-expiry backstop; and reconcile the delete
-operation to terminal state plus live instance/inventory absence. A provider without that backstop,
-including the current AWS direction, remains conditional unless a later safety review explicitly
-replaces the requirement. Maintenance, emergency failure,
-preemption, replacement and restart must never silently create a successor epoch. IAM principals,
-guest agents, login/serial/repair paths, autoscaling, sharing and alternate start/delete authority
-must form one reviewed closed set. Provider audit logs are retained retrospective evidence, not the
-live fence.
+Cycle 34's focused
+[external execution-term options](../reports/redb-prescreen-external-execution-term-2026-07-25.md)
+recommend, for owner review only, composing GCP's absolute deletion trigger with an external etcd
+lease plus CAS acquisition-transaction-revision term. A fixed, nonrenewable GCP deadline is the
+simpler alternative but does not satisfy the current renewable-term requirement. No etcd
+deployment/version/client, controller, provider tuple, numeric deadline or mechanism is selected or
+executable.
+The recommended minimum is one unleased durable gate plus one lease-attached live key; its term is
+`(cluster_id, acquisition_txn_revision, lease_id, attempt_nonce)`. Lease expiry removes only the live
+key, leaving a non-closed gate that blocks a successor until provider absence is independently
+reconciled. Etcd invalidates evidence authority and drives cooperative stop/delete; it does not fence
+GCP VM execution directly.
+
+The later prescreen must bind a fresh challenge to workflow run/attempt, dispatcher identity,
+provider instance, guest boot, immutable image/PCR policy and the current term; make uncertainty,
+expiry or revocation stop guest work and issue the provider DELETE request within the controller's
+stated bound; retain an absolute provider deletion-trigger backstop; and reconcile the delete
+operation to terminal state plus live instance/inventory absence. Neither issue-DELETE bound nor
+provider trigger is a proved execution-cessation or final-absence bound. Watch is absent from the
+safety path and transport keepalive alone is advisory;
+live authority requires bounded linearizable reads/CAS. A provider without even the absolute
+trigger, including the current AWS direction, remains more weakly conditional. Every examined
+provider remains blocked until the accepted contract and a mechanism probe establish cessation/
+final-absence treatment. Maintenance, emergency failure, preemption, replacement and restart must
+never silently create a successor epoch. IAM principals, guest agents, login/serial/repair paths,
+autoscaling, sharing and alternate start/delete authority must form one reviewed closed set.
+Provider audit logs are retained retrospective evidence, not the live fence.
 
 This D20/D21 dummy-mechanism VM is deliberately distinct from the eventual N20/N29 native storage
 qualification host. Because this threat model trusts the selected hypervisor, a physically
@@ -3221,15 +3237,15 @@ Provider policy belongs in `contract/target-identity.json`; static acquisition/r
 termination predicates belong in `contract/execution-plan.json`; signed attestations, live
 instance/host inventory, boot ID, term receipts, notices, termination operation and final absence
 belong in versioned live evidence. The live lease handle and current fencing capability remain
-nonserializable. For provider-only placement, approval payload `/v2` stays possible only while this
-policy remains inside the existing rows and controller/verifier logic remains in existing
-source/build identities; a new approval-input trust bundle or lease executable requires a successor
-payload. If the N19 sequenced-packet direction is selected, its transitive payload `/v3` requirement
-above overrides this provider-only compatibility result.
+nonserializable. The recommended etcd composition necessarily adds approval-input trust,
+configuration, role and controller identities, so current approval payload `/v2` cannot authorize
+it. If the N19 sequenced-packet direction is selected, those inputs must be co-frozen in its already
+required payload/receipt `/v3`; otherwise a separately reviewed successor identity is still
+required.
 
 `D20` uses this closed sequence:
 
-1. The dispatcher establishes the external fencing term, and the provider supplies a fresh,
+1. The dispatcher establishes the external evidence-authority term, and the provider supplies a fresh,
    attempt-exclusive native-Linux VM whose authenticated instance, image and boot identity bind the
    protected workflow attempt and current term. System Docker/containerd services are absent or
    masked, no foreign login or management agent has Engine authority, and fresh mutable daemon/exec roots,
@@ -3575,7 +3591,7 @@ blocked:
 | verifier token | wrong source-pidfd/target-fd operand, receiver, file, generation or nonce; duplicate call; token not consumed/revoked; protected file received by another actor | deny and poison; no retry or alternative diagnostic route |
 | runtime graph | extra/plugin/health client, missing planned lazy shim publisher, dockerd-containerd or shim-containerd reconnect, raw-address shim fallback, grouped shim, unplanned runc/helper/socketpair | poison and no release; planned transient exits must reconcile exactly |
 | gate/TOCTOU | omitted shim/runc/PID1 gate; malformed/truncated/trailing bootstrap; stdin/config/argv/environment/descriptor mutation; writable bundle alias; requested/actual mount mismatch; premature/replayed release | gate refuses official exec or candidate release and poisons; a pre-hash never rescues the case |
-| provider/authority | stale/wrong attestation nonce, IAM/agent/login drift, renewal loss, hard expiry, preemption/maintenance/replacement, delete timeout, final inventory still contains VM | poison, bounded safety stop and provider fence; no copied receipt or successor VM resumes the attempt |
+| provider/authority | stale/wrong attestation nonce, IAM/agent/login drift, renewal loss, scheduled-deletion trigger miss/late start, continued execution, preemption/maintenance/replacement, delete timeout, or final inventory still contains VM | poison, bounded safety stop and provider deletion; no copied receipt or successor VM resumes the attempt |
 | evidence boundary | observation/release/stop/final-cut/cleanup interruption, event-stream EOF, broker response ambiguity, cleanup needing a new Engine socket | unfinalizable; provider teardown is cleanup, never a passing continuation |
 
 Each destructive case uses a fresh VM and can produce only mechanism evidence. Exact kernel

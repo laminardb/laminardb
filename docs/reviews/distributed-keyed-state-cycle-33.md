@@ -32,9 +32,12 @@ require protocol/policy `/v2`, approval payload/receipt `/v3`, and successor mar
 identities; assembly-v1 evidence cannot cross that boundary.
 
 For the redb-free Docker mechanism, GCP is the unselected provider shortlist leader because an
-AMD-SEV attested VM can use absolute `terminationTime` plus deletion as a hard-expiry backstop. AWS
-is an unselected conditional finalist for NitroTPM/Attestable-AMI and no-replacement controls, but no
-provider-enforced hard expiry has been identified. Azure remains on hold. None supplies the whole
+AMD-SEV attested VM can use absolute `terminationTime` plus deletion as a provider-scheduled
+trigger. **Cycle 34 correction:** the source bounds how late stop/delete may begin, not execution
+cessation or final absence, so the earlier “hard-expiry” shorthand was too strong and GCP remains
+conditional. AWS is an unselected conditional finalist for NitroTPM/Attestable-AMI and
+no-replacement controls, but no equivalent absolute provider trigger has been identified. Azure
+remains on hold. None supplies the whole
 workflow-attempt, renewable-term, VM/boot/image, bounded-termination chain atomically; the external
 single-writer term, provider identity, delete operation and final absence must be composed and
 proved. GitHub-hosted Ubuntu is superseded as the evidence target, while the approved protected-
