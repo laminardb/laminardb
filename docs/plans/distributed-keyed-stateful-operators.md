@@ -161,14 +161,21 @@ Work:
    changing admission.
 6. Close the exact candidate's DKS-Q2-006 mechanism gate before adapter work. Cycle 17 stopped the
    Cycle 16 RocksDB stall-only recommendation at source proof because v1's maintenance-debt arm
-   cannot be closed by that narrow binding. The Cycle 18
+   cannot be closed by that narrow binding. That work now remains frozen v4/reference provenance,
+   not an active product track. The Cycle 18
    [decision matrix](../reports/state-backend-contract-decision-matrix-2026-07-24.md) recommends an
-   additive maintenance-health successor. Cycle 21 records the direction approval, allowing only a
-   consolidated freeze candidate to be drafted; final two-owner approval is still required before
-   validation-only v2 implementation. Cycle 19's reviewed
+   additive maintenance-health successor. Cycle 21 records the direction approval, and Cycle 38
+   accepts the consolidated contract for validation-only implementation without a GitHub approval
+   workflow. No candidate construction or execution authority follows. Cycle 38 also makes TidesDB
+   the preferred local-spill product candidate instead of RocksDB, without selecting or admitting
+   it. The next candidate-specific phase is a bounded remediation/source-closure design for native
+   9.3.14 plus a repaired exact-current Rust integration: safe ownership and callbacks,
+   all-or-nothing apply, strict recovery and acknowledgement, immutable read cuts, cgroup-aware
+   resource control, and maintenance health. It must produce a new non-v4 profile only after those
+   gates close; TidesDB native remote storage stays disabled. Cycle 19's reviewed
    [candidate mappings](../reports/state-backend-maintenance-health-mapping-designs-2026-07-24.md)
-   define but do not cost or authorize the RocksDB source/binding closure and Fjall scheduler/
-   lifecycle closure. Redb 4.1.0 is parked after its Cycle 34 design timebox; it has no scheduled
+   define the historical RocksDB source/binding closure and Fjall scheduler/lifecycle closure used
+   by the immutable v4 reference lineage. Redb 4.1.0 is parked after its Cycle 34 design timebox; it has no scheduled
    protocol or adapter work and may reopen only under the bounded micro-prescreen charter recorded
    in its canonical protocol. Unmodified Fjall 3.1.8 and SurrealKV 0.21.2 do not proceed to adapters.
    These engine gates apply to the general local-spill profile. They are not an architectural need

@@ -8,12 +8,23 @@
 - **Cluster admission:** unchanged; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
 - **Proposal:** [maintenance-health contract v2](../architecture-decisions/state-backend-maintenance-health-v2-proposal.md)
 
-## Recommendation
+**Superseded approval mechanism:** Cycle 38 retains this technical direction but removes the later
+two-owner/protected-workflow ceremony for validation-only implementation. The consolidated contract
+and current ADR are authoritative; candidate execution and production gates remain closed.
+
+**Superseded backend priority:** the dated RocksDB-primary recommendation below remains v4/source-
+gap provenance only. Cycle 38 makes TidesDB the preferred local-spill product candidate and leaves
+RocksDB/Fjall as immutable v4 references. TidesDB's official Rust path remains rejected; only a
+bounded remediation/source-closure design is scheduled, with no construction or execution authority.
+
+## Historical Cycle 18 recommendation
 
 The additive v2 design direction is approved. Draft and review the consolidated contract using the
 already-complete three candidate mapping designs.
-Only a later, separate two-owner approval may freeze the consolidated contract, exact schemas, and
-numerical thresholds. This keeps the common objective gates and exact foreground stall requirement
+At the time of this Cycle 18 recommendation, a later separate approval was expected to freeze the
+consolidated contract, exact schemas, and numerical thresholds. Cycle 38 replaced that proposed
+ceremony with a project-owner direction and ordinary technical review for validation-only work.
+This keeps the common objective gates and exact foreground stall requirement
 while removing one engine-neutral exact debt quantity that the Cycle 17 source audit found neither
 narrowly implementable nor justified by the reviewed production monitoring contracts.
 
@@ -60,7 +71,7 @@ advantage before owners fund a candidate closure.
 | Add every exposed engine property | Increases overhead and review surface without proving a production objective |
 | Select the last candidate not blocked by the contract | Contract shape is not performance, correctness, durability, or operability evidence |
 
-## Backend carry consequence
+## Historical Cycle 18 backend carry consequence
 
 | Candidate | If v1 is retained | If v2 is approved | Disposition before common evidence |
 |---|---|---|---|
@@ -69,7 +80,7 @@ advantage before owners fund a candidate closure.
 | redb 4.1.0 | Complete the native prescreen; a proved N/A arm does not admit it | Same prescreen first, then complete N/A/source and synchronous-contention mappings | **Prescreen hedge; deferred** |
 | SurrealKV 0.21.2 | Correct snapshot retention and liveness before telemetry | Same correctness/liveness requirement | **Rejected unmodified** |
 
-Under v2, RocksDB remains the recommended next paper-mapping investment because its operational
+At Cycle 18, RocksDB was the recommended next paper-mapping investment because its operational
 surface is mature and the reviewed stall gap appears plausibly bounded. That is a source-audit
 hypothesis and work-allocation judgment, not a measured patch estimate or backend choice. redb
 remains useful as an architectural hedge against native/C++ complexity, but only its independent
@@ -102,8 +113,9 @@ sink commit remain separate authorities.
 ## Owner decision record
 
 The project owner recorded `APPROVE_MAINTENANCE_HEALTH_V2_DIRECTION` on 2026-07-24. This funds the
-three mapping designs and consolidated contract/schema drafting only. It is not the later final
-two-owner approval and does not authorize a candidate or execution.
+three mapping designs and consolidated contract/schema drafting only. Cycle 38 later authorized
+validation-only implementation without the proposed two-owner workflow; it still does not authorize
+a candidate or execution.
 
 The alternatives retained here for audit history were:
 
@@ -114,12 +126,11 @@ The alternatives retained here for audit history were:
 - `DEFER_CONTRACT_CHOICE`: continue only independently authorized work such as repairing the redb
   prescreen protocol, while cluster keyed/stateful admission remains closed.
 
-After mapping-design and independent review, a separate
-`APPROVE_STATE_BACKEND_RUNNER_CONTRACT_V2` record from both named owners must bind the complete
-consolidated contract, schemas, formulas, and pre-result thresholds before validation-only
-implementation. It still does not authorize native source construction, an adapter, or candidate
-execution; each retains its existing separate gate.
+After mapping-design and independent review, Cycle 38 accepted the complete consolidated contract,
+schemas, formulas, and pre-result threshold ownership for validation-only implementation through the
+project-owner direction and freezing commit. It still does not authorize native source
+construction, an adapter, or candidate execution; each retains its separate gate.
 
-Silence or a generic “continue” must not be encoded as one of these owner outcomes. The next safe
-work without that decision is limited to review of this proposal, the three read-only mapping
-designs, and existing ineligible validator design; it does not include backend construction.
+At that time, silence or a generic “continue” could not be encoded as an owner outcome. Cycle 38 now
+records the explicit project-owner validation-only direction. It still does not include backend
+construction or candidate execution.

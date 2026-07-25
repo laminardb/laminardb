@@ -12,8 +12,8 @@
 [RocksDB mechanism-source closure](rocksdb-mechanism-source-closure-2026-07-24.md) stopped at Stage
 0. An apparently bounded stall observer is plausible but unproved, and this matrix's assumption
 that the existing pending-compaction estimate could satisfy v1's direct/disjoint debt population
-was wrong. Do not start the stall-only patch from this historical recommendation. The current next
-step is an explicit choice between retaining v1 and funding broader native instrumentation and
+was wrong. Do not start the stall-only patch from this historical recommendation. The Cycle 17 next
+step was an explicit choice between retaining v1 and funding broader native instrumentation and
 configuration proof, or issuing an additive qualification contract with reviewed
 candidate-specific health signals. No backend was selected.
 
@@ -24,7 +24,14 @@ separately versioned micro-prescreen charter and new candidate-execution authori
 imperative, recommendation, work-order step, and “hedge” statement in this dated report is historical
 and superseded. This matrix does not authorize further redb protocol or adapter work.
 
-## Recommended judgment
+**Cycle 38 product-direction supersession:** this report remains exact dated source/gap history, but
+its RocksDB-primary work-allocation recommendation is no longer current. The project owner prefers
+TidesDB for the local-spill product path. RocksDB and Fjall remain immutable v4 reference/regression
+subjects with no active source, adapter, or run track. TidesDB's inspected official Rust path is
+still rejected; the only scheduled candidate-specific work is a bounded remediation/source-closure
+design for an exact-current safe integration. No backend is selected or executable.
+
+## Historical Cycle 16 recommended judgment
 
 The recommended next investment is the exact `rocksdb =0.24.0` / RocksDB 10.4.2 subject, but only
 for closing its known observation and control gap. This is not a production selection and does not
@@ -75,7 +82,7 @@ The detailed source basis is the [exact-source backend audit](state-backend-stat
 the [redb mechanism note](redb-4.1.0-prescreen-mechanism-note-2026-07-23.md), and the complete
 [DKS-Q2-001 through DKS-Q2-009 checklist](../architecture-decisions/state-backend-qualification-runner-v1.md#blocking-execution-and-selection-issues).
 
-## Cost to the next honest decision
+## Historical Cycle 16 cost to the next honest decision
 
 | Track | Smallest decision-producing work | Stop condition | What a pass permits |
 |---|---|---|---|

@@ -1,10 +1,9 @@
 # State backend maintenance-health contract v2 — proposal
 
-- **Status:** Direction approved on 2026-07-24; consolidated freeze candidate and later final
-  two-owner contract approval required
+- **Status:** Direction approved on 2026-07-24; consolidated validation contract accepted by Cycle 38
 - **Date:** 2026-07-24
 - **Scope:** the background-maintenance part of DKS-Q2-006 only
-- **Recorded direction:** additive v2 design approved; final contract approval remains pending
+- **Recorded direction:** additive v2 design approved; protected-workflow approval superseded
 - **Production backend selected:** none
 - **Execution authorized:** no
 - **Cluster admission:** unchanged; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
@@ -12,16 +11,16 @@
 - **Trigger:** [Cycle 17 RocksDB source closure](../reports/rocksdb-mechanism-source-closure-2026-07-24.md)
 - **Paper mappings:** [Cycle 19 candidate designs](../reports/state-backend-maintenance-health-mapping-designs-2026-07-24.md)
 - **Direction record:** [Cycle 21 owner decisions](../reports/distributed-state-cycle-21-owner-decisions-2026-07-24.md)
-- **Stage 3 output:** [consolidated runner v2 freeze candidate](state-backend-qualification-runner-v2-draft.md)
+- **Stage 3 output:** [consolidated runner v2 validation contract](state-backend-qualification-runner-v2-draft.md)
 
 Cycle 19 confirms that sampled typed gauges/counters/booleans can express the continuous health
 obligations, while exposing additional candidate gaps. It keeps RocksDB's blocking tail wait
 non-gating rather than disguising an active command as a sampled boolean. The mappings do not
 instantiate v2, rank implementation cost, or authorize source work. On 2026-07-24 the project owner
 recorded `APPROVE_MAINTENANCE_HEALTH_V2_DIRECTION`. That decision authorizes Stages 2 and 3 below;
-it is not the final contract approval.
+Cycle 38 later accepts the consolidated validation contract without a protected approval workflow.
 
-## Cycle 36 current-state reconciliation
+## Cycle 38 current-state reconciliation
 
 The [consolidated runner](state-backend-qualification-runner-v2-draft.md) is the sole normative
 successor design. This proposal records rationale and cannot override it. V4 contains only the
@@ -60,13 +59,11 @@ logging and telemetry housekeeping are outside the candidate-native arm; their C
 disk, and latency effects remain inside the mandatory common observations. This deliberate scope
 change is one reason v1 cannot be reinterpreted in place.
 
-The approved direction authorized the historical three-mapping design input and the current
-two-candidate consolidated-contract drafting stage. It does not instantiate a v2 identity or
-authorize schema implementation, native source construction, an adapter, or a candidate run. Those
-later steps retain the separate gates below. Cycle 19 supplies the Stage 2 paper mappings; Cycle 21
-prepares the Stage 3
-[consolidated freeze candidate](state-backend-qualification-runner-v2-draft.md) for independent and
-owner review.
+The approved direction authorized the historical three-mapping design input and two-candidate
+consolidated-contract drafting stage. Cycle 38 now authorizes only its validation implementation;
+native source construction, adapters, and candidate runs retain separate gates. Cycle 19 supplies
+the Stage 2 paper mappings, and the Stage 3
+[consolidated validation contract](state-backend-qualification-runner-v2-draft.md) is authoritative.
 
 ## What does not change
 
@@ -105,13 +102,12 @@ instantiated by a direction approval:
 | Resource formulas | `state-backend-resource-formulas/v3` | Removes debt sum/maximum/tail conjuncts and adds health predicates |
 | Synthetic bundle | `state-backend-mechanism-bundle-validation-input/v2` | Binds v4, mapping v2, health samples, stalls, common resources, and device I/O |
 
-This document is a delta proposal. After mapping-design review, a later signed workload-owner and
-operations-owner approval must freeze `state-backend-runner-contract/v2` as one consolidated,
-complete contract incorporating the retained requirements and this delta, including exact wire/
-schema semantics, formula semantics, and threshold-ownership rules. Exact candidate- and plan-owned
-numbers remain bound by their separately approved artifacts before execution. Only final contract
-approval instantiates the v2 identity and may authorize validation-only implementation. An
-executable plan must not depend on readers mentally composing two mutable Markdown files. V1's
+This document is a delta proposal. At proposal time it expected a later signed workload/operations
+approval to freeze one consolidated contract. Cycle 38 supersedes that ceremony: project-owner
+direction, ordinary technical review, and the freezing commit now authorize validation-only
+implementation of the complete wire/schema/formula and threshold-ownership contract. Exact
+candidate- and plan-owned numbers remain frozen separately before execution. An executable plan
+must not depend on readers mentally composing two mutable Markdown files. V1's
 normative semantics remain unchanged, but its document contains chronological amendments and is not
 claimed to have an immutable file hash.
 
@@ -245,14 +241,23 @@ decision and are not invented by this proposal.
 
 ## Candidate implications
 
-- **[RocksDB 10.4.2](../reports/rocksdb-mechanism-source-closure-2026-07-24.md):** first choose the
+- **[TidesDB native 9.3.14 with a repaired exact-current Rust integration](../reports/tidesdb-static-prescreen-2026-07-25.md):**
+  the project owner now prefers this as the local-spill product candidate, but the current official
+  Rust path remains rejected. The bounded design must bind lifetime/callback, all-or-nothing apply,
+  strict unified-WAL recovery/acknowledgement, immutable read-cut, cgroup-resource, and exact stall/
+  background-error proof obligations. A separately authorized construction task must implement and
+  prove them before successor mapping/profile identities are proposed; v4 cannot be relabelled.
+  Native remote storage is disabled and is not checkpoint/recovery authority.
+- **[RocksDB 10.4.2](../reports/rocksdb-mechanism-source-closure-2026-07-24.md):** frozen v4/reference
+  provenance only. The historical design would first choose the
   smallest paper-mapped set covering the fixed objectives from
   its typed estimate, pending/running state, L0/file pressure, progress, and background-error
   surfaces; keep other cache/memtable/SST/version/cleanup properties diagnostic unless a concrete
   objective requires them. Do not relabel any estimate as exact debt. The known complete-pressure
   stall gap still appears to need a bounded WBM/controller slow-path observer and safe bindings,
   but its mapping design may identify additional source or binding work.
-- **[Fjall 3.1.8](../reports/state-backend-static-audit-2026-07-23.md):** the exact-debt requirement
+- **[Fjall 3.1.8](../reports/state-backend-static-audit-2026-07-23.md):** frozen v4/reference
+  provenance only. The exact-debt requirement
   goes away, but its stable public pressure/progress, error, resource-control, and stall surface is
   still insufficient. The mapping design must determine whether any telemetry/control patch is
   bounded and worth funding; its size and hot-path cost are unknown.
@@ -268,31 +273,35 @@ No candidate proceeds by elimination or receives a weighted score.
 ## Implementation stages and approval boundaries
 
 1. **Freeze the direction — complete.** On 2026-07-24 the project owner chose the v2 design direction.
-   This authorizes only Stages 2 and 3 design work; independent reviewers and the final two-owner
-   contract approval remain separate.
+   This originally authorized only Stages 2 and 3 design work. Cycle 38 later authorized
+   validation-only implementation through ordinary technical review and the freezing commit.
 2. **Draft mappings on paper — complete historical input.** The RocksDB, Fjall, and redb designs
    confirmed the closed vocabulary. Only RocksDB and Fjall remain v4 comparison inputs; the redb
    design is archived provenance and authorizes no further work.
-3. **Freeze the complete contract.** Incorporate the reviewed designs into one consolidated runner
-   contract with exact wire/schema and formula semantics plus explicit mapping-owned and plan-owned
-   threshold boundaries. Independent reviewers recheck it; workload and operations owners accept
-   those boundaries in the final contract approval. Later detached qualification approval binds the
-   exact mapping and plan bytes before results. Any later semantic change creates a new lineage.
-4. **Implement validation only.** Add v4, mapping v2, health-samples v1, formulas v3, and bundle v2
-   to the standalone tool. Keep all fixtures synthetic and execution-ineligible. Test strict schema,
-   ordering/cross-reference, mixed-version rejection, N/A, estimate labelling, missing/reset/wrap/
-   loss/overflow, conjunctive predicates, tail behavior, bounded streaming, and exact v3→v4 delta.
-   An approved artifact reader also needs race-free no-follow, handle-relative opens and opened-file
-   identity verification; the current trusted-fixture boundary is insufficient.
-5. **Close candidate sources under separate authority.** Only after the final contract and a
-   candidate-specific source-closure approval, build and adversarially force the RocksDB sources
-   identified by its design, including the known complete-stall observer, in an isolated
-   exact-source workspace. For Fjall, use its design to decide whether a patch is worth funding; its
-   size is not yet known. redb remains parked unless a new bounded charter is explicitly approved.
-6. **Freeze the candidate mapping artifact.** After source construction and adversarial activation
-   proof, finalize and approve the immutable `mapping/v2` artifact with exact build/configuration
-   identity and proof digests. If source proof changes a contract assumption, revise and reapprove
-   the contract before producing candidate results.
+3. **Freeze the complete contract — complete in Cycle 38.** Incorporate the reviewed designs into one
+   consolidated runner contract with exact wire/schema and formula semantics plus explicit mapping-
+   owned and plan-owned threshold boundaries. Ordinary technical review and the freezing commit
+   record the validation lineage. A later explicit run authorization must bind exact mapping, plan,
+   candidate, target, isolation, limits, and cost before results. Any later semantic change creates
+   a new lineage.
+4. **Design the TidesDB successor — current next priority.** Write a bounded remediation/source-
+   closure and successor-contract delta for native 9.3.14 plus a repaired exact-current Rust
+   integration. Bind safe wrapper ownership, atomic/recovery/read-cut semantics, cgroup governance,
+   maintenance health, and successor profile/mapping/profile-binding/bundle identities without
+   downloading, building, or executing the candidate. RocksDB and Fjall retain immutable v4/
+   reference value but have no scheduled source or adapter work. redb remains parked.
+5. **Implement only reusable validation primitives.** Use the successor design to identify genuinely
+   candidate-neutral parsers/evaluators, formulas, bounded readers, synthetic execution-ineligible
+   fixtures, and negative-capability tests. Retain exact v3→v4 fixture/delta regression coverage,
+   but do not instantiate unused v4-only mapping/bundle containers merely because validation work is
+   permitted. Any artifact reader still needs race-free no-follow, handle-relative opens, opened-
+   file identity verification, strict cross-reference checks, and bounded streaming.
+6. **Close candidate sources under separate authority.** Only after the design binds its proof
+   obligations and a separate candidate-specific source-construction task may an isolated workspace
+   construct and adversarially force those sources. Then define and approve the TidesDB successor
+   mapping/profile-binding identity with exact build/configuration identity and proof digests. Do
+   not reuse v4-bound `mapping/v2`. If source proof changes a contract assumption, revise the
+   contract under a new lineage before producing candidate results.
 7. **Resume the existing gates.** Only after all DKS-Q2 approvals add exact candidate adapters, then
    run C1/C2/C3, physical fault, recovery, and 24/72-hour endurance evidence on the frozen Linux/XFS/
    NVMe profile. Select one backend and remove losing adapter/dependency code.

@@ -12,6 +12,14 @@
 - **Evidence:** code inspection and current primary-source review; no candidate or product run
 - **Admission:** unchanged and fail-closed under `[LDB-4007]` and `[LDB-0013]`
 
+**Cycle 38 current direction:** the engine-neutral placement conclusion remains authoritative. The
+project owner prefers TidesDB over RocksDB as the local-spill product candidate, subject to a
+bounded remediation/source-closure design, new non-v4 profile/mapping, common qualification,
+selection, integration, and independent product soak. The current official Rust integration remains
+rejected, no backend is selected or executable, and TidesDB native remote storage is not LaminarDB
+checkpoint/recovery authority. Every later `current`, `continue`, `keep`, or `should` imperative in
+the Cycle 20 engine screen is historical and superseded by the current implementation order below.
+
 ## Decision
 
 LaminarDB needs the behavior of a state engine, not RocksDB or Fjall by name. Keyed aggregates,
@@ -92,11 +100,12 @@ but also documents the remote latency/API-cost tradeoff and uses asynchronous du
 and local caching. These are evidence that each placement is viable in principle, not LaminarDB
 qualification evidence.
 
-## Embedded-engine screen
+## Historical Cycle 20 embedded-engine screen
 
-The current active work should not expand into a many-engine benchmark. Candidate count is not risk
+At Cycle 20, active work was not to expand into a many-engine benchmark. Candidate count is not risk
 coverage: every engine still has to close the same atomicity, hot-writer/victim tail, byte/resource,
-persistence, export/restore, fault and endurance obligations.
+persistence, export/restore, fault and endurance obligations. The dispositions below are dated
+evidence and are not the Cycle 38 work order.
 
 | Engine or family | Useful fit | Blocking concern | Cycle 20 disposition |
 |---|---|---|---|
@@ -128,28 +137,32 @@ background worker may prove that maintenance arm not applicable, but sole-writer
 page/file growth, snapshot retention, terminal errors and recovery remain common vetoes. A memory
 profile would need a separately versioned and owner-approved applicability contract for hard
 reservation, allocator/RSS, frozen-generation, checkpoint-copy and controlled-exhaustion evidence.
-It must not reuse or reinterpret the current disk-oriented v1 or proposed v2 contract.
+It must not reuse or reinterpret the current disk-oriented v1 or the v2 contract accepted for
+validation-only implementation.
 
-## Recommended implementation and decision order
+## Current implementation and decision order
 
-1. Freeze the smallest placement-neutral `ManagedWorkingState` contract and portable vnode artifact
-   bridge. Do not extend the immutable `StateBackend` into the hot-path API.
-2. Make the redb prescreen protocol approval-ready, then obtain its separate detached execution
-   approval; complete the owner-gated RocksDB/Fjall mechanism decisions. Do not add `heed` unless
-   an executed redb prescreen fails for a redb-specific lifecycle/implementation
-   reason and LMDB could answer a stated decision question; a redb single-writer C3/tail failure
-   rejects the shared B-tree architecture rather than triggering another single-writer prescreen.
-3. Select one embedded backend for the general local-spill profile only from common native-host
-   evidence and remove losing spike adapters. Complete the existing Phase 0 review gate only after
-   every other Phase 0 exit condition also passes.
-4. Then implement the already-required in-memory semantic backend as the first lifecycle consumer,
+1. Write the bounded TidesDB remediation/source-closure and successor-contract design for native
+   9.3.14 plus a repaired exact-current Rust integration. Resolve ownership/callback safety,
+   atomicity, recovery/read cuts, cgroup resources, maintenance health, and successor wire identities
+   without building or running the candidate. RocksDB/Fjall remain reference-only and redb remains
+   parked.
+2. Implement only genuinely candidate-neutral validation primitives justified by that design,
+   retaining v4 fixture/delta regression coverage without creating unused v4-only containers.
+3. Only after the design binds its proof obligations and a separate source-construction task,
+   construct and adversarially prove the exact source path. A later exact run authorization binds
+   candidate, profile, plan, target, isolation, limits, and cost before common native-host evidence
+   exists.
+4. Select one embedded backend for the general local-spill profile only from that common evidence,
+   remove losing spike code, and complete the Phase 0 review gate after every other exit condition.
+5. Then implement the already-required in-memory semantic backend as the first lifecycle consumer,
    followed by the Phase-0-selected local-spill backend behind the same contract. Use the memory
    implementation to prove atomic pre-mutation reads/batch writes, ordered timers/ranges, generation
    freeze, whole-graph acquire/revoke and the external oracle. This is implementation evidence, not
    production admission.
-5. Keep bounded memory as the semantic reference only. Any later product proposal must amend the ADR
+6. Keep bounded memory as the semantic reference only. Any later product proposal must amend the ADR
    and restart applicability, hard-limit, recovery/RTO, and independent-soak approval before a run.
-6. Run a separately chartered independent release-candidate product soak for the sole current
+7. Run a separately chartered independent release-candidate product soak for the sole current
    local-spill production profile. It forces cold cache, maintenance stalls, disk fill/corruption,
    local-disk loss, object-store faults, repeated process loss and rebalances. A backend endurance
    run is not this soak. A future memory product proposal must first amend the ADR and charter with

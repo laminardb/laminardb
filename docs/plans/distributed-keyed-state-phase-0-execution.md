@@ -321,7 +321,7 @@ workflow. The next tool commit adds:
 - an in-memory semantic model and digest oracle; and
 - structured deterministic model-replay identity and result output.
 
-That second slice still contains no Fjall or RocksDB adapter and no candidate-execution workflow.
+That second slice still contains no backend adapter and no candidate-execution workflow.
 Tests prove deterministic request bytes, batch atomicity, model results, and rejection of malformed
 profiles/results.
 
@@ -334,18 +334,19 @@ The C1 reference implementation is complete against the provisional v1 contract.
 deterministic aggregate, timer/window, and join generation; bounded preflight; an in-memory
 semantic and lifecycle oracle; occurrence-addressed lifecycle cuts; immutable snapshot export;
 independently checked literal wire/result fixtures; strict deterministic result regeneration; and
-a validation-only CLI. The CLI cannot execute a backend candidate. The profile and protocol remain
-unapproved and `qualification_eligible=false`. C1 selects no backend, supplies no candidate
+a validation-only CLI. The CLI cannot execute a backend candidate. The v1 profile/protocol remain
+historical provisional inputs, and every checked-in profile remains `qualification_eligible=false`.
+Cycle 38 accepts runner v2 only as permission for validation implementation. C1 selects no backend, supplies no candidate
 performance, resource, fault, endurance, checkpoint, source/sink, admission, or exactly-once
 evidence, and changes neither `[LDB-4007]` nor `[LDB-0013]`.
 
 The provisional C1 semantics, encoding, digest, result, and fault vocabulary are specified in
 [state backend qualification model v1](../architecture-decisions/state-backend-qualification-model-v1.md).
-Model/conformance scaffolding may be implemented while the checked-in candidate remains unapproved
-because it cannot produce qualification evidence. Named owners may revise the candidate or model
-before approval. Exact candidate builds and semantic adapter-conformance tests may follow, but
-candidate performance, resource, fault, endurance, selection, and qualification execution are
-prohibited until the final profile and runner are approved.
+Model/conformance and candidate-neutral validation scaffolding may be implemented because it cannot
+produce qualification evidence. Contract acceptance alone never authorizes a candidate dependency,
+source or native build, adapter, conformance run, benchmark, or execution command. Each needs the
+separate candidate-specific source and exact-run authorities below; performance, resource, fault,
+endurance, selection, and qualification execution remain prohibited until those gates close.
 There is no implicit workload cross-product or pacing policy in C1.
 
 ### C2. Runner contract, then candidate adapters
@@ -415,28 +416,37 @@ authority. A favorable observation merely funds mechanism/persistence mapping, a
 schema proposal, and adapter review; no prescreen artifact may satisfy or be pooled into C1/C2/C3.
 
 Cycle 17 stopped the proposed RocksDB stall-only workspace at read-only source proof: the stall
-observer appears bounded but v1's debt arm requires broader engine instrumentation/configuration
-proof. The Cycle 18
+observer appeared bounded but v1's debt arm required broader engine instrumentation/configuration
+proof. That work remains historical v4/reference provenance and is not the active product track.
+The Cycle 18
 [maintenance-health v2 proposal](../architecture-decisions/state-backend-maintenance-health-v2-proposal.md)
-replaces only that debt arm. Cycle 21 records the direction approval; v1 remains unchanged and the
-approval authorizes mapping and the unapproved
-[consolidated v2 freeze candidate](../architecture-decisions/state-backend-qualification-runner-v2-draft.md)
-only. Do not add a profile candidate, adapter,
-runtime pin, or native observer until both the final
-`APPROVE_STATE_BACKEND_RUNNER_CONTRACT_V2` record and a candidate-specific source-closure approval
-exist. Only then may that approved workspace pin RocksDB wrapper
-`=0.24.0` with bundled RocksDB 10.4.2, build/SBOM/options, and the source/binding gaps found by the
-reviewed mapping design. Its immutable mapping artifact follows source construction and adversarial
-activation proof. A future
-patched/admitted Fjall subject receives a separate exact identity; unmodified Fjall 3.1.8 does not.
+replaces only that debt arm. Cycle 21 records the direction approval; Cycle 38 removes the proposed
+protected-workflow ceremony, accepts the
+[consolidated v2 validation contract](../architecture-decisions/state-backend-qualification-runner-v2-draft.md)
+for standalone validation-only implementation, and makes TidesDB the preferred local-spill product
+candidate instead of RocksDB. This preference is not backend selection or admission.
+
+Do not add a candidate dependency, source/build pin, or native observer without a later explicit
+candidate-specific source-construction task. Do not propose successor profile/mapping identities
+before that task's proof, add an adapter without its later authority, or add an execution command
+before exact run authorization. The next candidate-specific step is a bounded TidesDB remediation/
+source-closure design against native
+`9.3.14` and a repaired, exact-current Rust integration. It must bind proof obligations for parent
+and child lifetimes, shutdown and callback safety, exact-count all-or-nothing apply, strict
+unified-WAL recovery,
+acknowledgement truth, immutable cross-column-family read cuts, cgroup-aware resource governance,
+and maintenance-health observations. Only a separately authorized construction task may implement
+and prove those obligations. Only after proof may a new profile and mapping identity be proposed;
+it must not reuse or relabel v4. TidesDB native
+remote storage remains disabled: LaminarDB's provider-neutral local/S3/GCS/Azure checkpoint path
+remains the sole portable recovery authority.
 
 Cycle 19's [paper mappings](../reports/state-backend-maintenance-health-mapping-designs-2026-07-24.md)
-are the reviewed source for those candidate gaps. They add no profile or wire identity. RocksDB's
-existing signals omit scheduled-bottom-compaction and complete purge/recovery/stall lifecycles;
-Fjall needs scheduler/lifecycle repair, worker/error/physical-delete health and exact stalls. Redb's
-candidate-specific profile translation, durability mapping, close outcome and task/thread N/A proof
-are unscheduled while it is parked. Patch effort and interference remain unknown, so this ordering
-is a gate sequence rather than a backend rank.
+remain reviewed vocabulary and frozen Fjall/RocksDB reference provenance; they add no TidesDB profile
+or wire identity. TidesDB needs its own mapping only after the correctness, integration, resource,
+and health closures above. Redb's candidate-specific profile translation, durability mapping, close
+outcome and task/thread N/A proof are unscheduled while it is parked. Patch effort and interference
+remain unknown, so this ordering is a gate sequence rather than qualification evidence.
 
 Build exactly one
 admitted candidate per binary. The private qualification contract covers
@@ -444,15 +454,16 @@ batched reads, atomic write/delete/timer mutations, bounded range scans, consist
 vnode cleanup, sorted restore, explicit crash persistence, and resource/operability statistics. It
 is not the future production trait.
 
-For any later-admitted Fjall subject, test consistency and power-loss durability separately:
-ordinary buffered writes versus the proposed grouped `SyncData`/`SyncAll` boundary, retained slices,
-snapshot/iterator reclamation, prefix cleanup without a range tombstone, and every stable pressure
-counter. For an admitted RocksDB subject, test the chosen Rust binding's actual MultiGet behavior,
-DeleteRange tombstone/read cost, cross-column-family stall propagation, rate-limiter scope, native
-memory accounting, and SST-ingest write pauses. Pin the exact engine and wrapper before results are
-accepted.
+For any later source-admitted TidesDB subject, test the exact Rust/native pair and configuration,
+multi-key and range behavior, cross-column-family atomicity and read cuts, unified-WAL strict replay,
+FULL-sync acknowledgement, delete/cleanup cost, compaction and write-stall propagation, allocator
+and page-cache accounting, cgroup pressure, checkpoint/export overlap, corruption, process loss, and
+cache loss. Pin the exact engine, wrapper, build inputs, features, and options before results are
+accepted. Frozen Fjall/RocksDB v4 checks remain regression/reference coverage only and cannot qualify
+TidesDB.
 
-Only after named owners approve the exact profile and complete runner-plan hashes, run identical
+Only after a separate project-owner authorization binds the exact candidate, profile, complete
+runner-plan hashes, target, isolation, limits, and cost, run identical
 fixed-operation workloads in the frozen candidate order and record offered end-to-end, service,
 and queue latency separately. Retain the exact raw-sample wire populations required by the
 ultimately approved runner contract and derive
@@ -533,20 +544,25 @@ remains unchanged.
 
 Remaining commits are kept reviewable in this dependency order:
 
-1. `docs: finalize candidate-neutral runner contract`
-   - review the Cycle 36 packet and prepared exact v4 freeze-candidate bytes, resolve the nominal
-     observation and threshold-authority decisions, name both independent reviewers, and obtain final
-     two-owner approval; prepared bytes instantiate no reserved v2 identity;
-2. only after `APPROVE_STATE_BACKEND_RUNNER_CONTRACT_V2`, implement its validation-only schemas and
-   synthetic, execution-ineligible fixtures without a runtime dependency;
-3. after mechanism closure and owner carry-forward approval, add a separate exact-pin adapter commit
-   for each admitted candidate behind the private spike contract;
-4. `docs: approve keyed-state qualification profile and runner`
-   - named workload/operations owners may revise the candidate before approving final thresholds,
-     case matrix, Zipf sampler, runner source/build identity, and evidence rules. A separately
-     reviewed approved-profile schema/status records signatures and hashes. The current validator
-     intentionally accepts only null approvals and `qualification_eligible=false`;
-5. `test: exercise backend crash resource and endurance gates` using only the approved artifacts;
+1. `docs: design the bounded TidesDB remediation, source closure, and successor contract delta`
+   - bind native 9.3.14 and the proposed repaired exact-current Rust integration; resolve safe
+     ownership/callbacks, all-or-nothing apply, recovery/acknowledgement, immutable read cuts,
+     cgroup resources, maintenance health, and successor profile/mapping/profile-binding/bundle
+     identities without downloading, building, or executing the candidate;
+2. implement only genuinely candidate-neutral parsers/evaluators, formulas, bounded readers,
+   synthetic execution-ineligible fixtures, and negative-capability tests justified by that design;
+   retain v4 fixture/delta regression tests, but do not build unused v4-only containers merely
+   because validation implementation is permitted;
+3. only after the design binds its proof obligations and a separate explicit project-owner
+   source-construction task, construct
+   and adversarially prove the exact sources in an isolated workspace; freeze the successor mapping
+   only after proof, and add an adapter only under its own later authority;
+4. `docs: authorize an exact keyed-state qualification run`
+   - the project owner may revise the candidate before explicitly authorizing exact thresholds, case
+     matrix, Zipf sampler, runner source/build identity, target/isolation/limits/cost, and evidence
+     rules. The current validator continues to accept only null approvals and
+     `qualification_eligible=false` until that separate execution design lands;
+5. `test: exercise backend crash resource and endurance gates` using only the authorized artifacts;
 6. `docs: select managed-state backend from evidence`;
 7. `tools: remove rejected state backend spike`; and
 8. `docs: review distributed keyed state phase zero`.

@@ -1,6 +1,9 @@
 # Exact profile bytes participate in qualification identity hashes.
 /tools/state-backend-qual/profiles/** text eol=lf
 
+# The accepted runner contract records an exact cross-platform byte identity.
+/docs/architecture-decisions/state-backend-qualification-runner-v2-draft.md text eol=lf
+
 # Mechanism artifacts bind exact mapping/input bytes across Windows and Linux checkouts.
 /tools/state-backend-qual/tests/fixtures/mechanism-mapping-*.json text eol=lf
 /tools/state-backend-qual/tests/fixtures/mechanism-bundle-*/**/*.json text eol=lf

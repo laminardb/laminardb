@@ -10,7 +10,13 @@
 - **Cluster admission:** unchanged; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
 - **Production verdict:** **NO-GO**
 
-## Outcome
+**Cycle 38 current direction:** the mappings below remain frozen Fjall/RocksDB/redb vocabulary and
+source-gap provenance; they are not the active product ranking. TidesDB is now the preferred
+local-spill candidate, but its current official Rust path remains rejected. It requires a bounded
+remediation/source-closure design and later new mapping/profile identities. No candidate source,
+adapter, or execution is authorized by this report.
+
+## Historical Cycle 19 outcome
 
 The proposed sampled-signal vocabulary can describe the continuous health obligations without a
 generic metrics DSL or a cross-engine score. A blocking tail-wait command is not silently recast as
@@ -21,9 +27,9 @@ and contract review. No unmodified candidate is ready to run:
 |---|---|---|---|
 | RocksDB 10.4.2 / `rocksdb` 0.24.0 | `observed` | Flush and compaction expose a useful core set. Scheduled bottom-priority compaction, asynchronous purge, complete background-error/recovery observation, and exact foreground stalls remain unsupported. | Under a later approved v2 contract and separate source-closure authority, specify and adversarially prove the enumerated native/C/safe-Rust closure; effort and interference are unknown. |
 | Fjall 3.1.8 / `lsm-tree` 3.1.8 | `observed` | Existing hidden gauges are diagnostics only. Scheduler correctness/liveness, complete background failure, physical cleanup tail, strategy pressure, resource control, and exact stalls remain unsupported. | Decide whether to fund a lossless scheduler/lifecycle repair plus stable maintenance/error/stall surface; effort and interference are unknown. |
-| redb 4.1.0 | whole-arm `not_applicable` is source-plausible | The exact crate creates no runtime maintenance worker, but complete-process proof and a bounded native forced probe do not exist. | Run the separately governed native writer/commit/recovery prescreen and N/A probe before considering a full adapter. |
+| redb 4.1.0 | whole-arm `not_applicable` is source-plausible | The exact crate creates no runtime maintenance worker, but complete-process proof and a bounded native forced probe do not exist. | Cycle 19 proposed a separately governed native prescreen; redb is now parked and no probe is scheduled. |
 
-This narrows the next decisions without ranking unbuilt patches. RocksDB has a concrete multi-layer
+At Cycle 19 this narrowed the next decisions without ranking unbuilt patches. RocksDB had a concrete multi-layer
 native/C/safe-Rust closure to specify. Fjall has a different Rust scheduler/lifecycle and telemetry
 closure whose cost is also unknown. redb has a separately bounded prescreen for its global writer,
 durability, recovery and N/A premise. If native C++ ownership is prohibited, there is still no ready
@@ -38,9 +44,9 @@ This report is Stage 2 decision input from the v2 proposal. The project owner su
 reserved v2 identity, freeze a schema or threshold, authorize source changes, or emit
 `state-backend-mechanism-mapping/v2`. Signal names below remain paper-design names, not wire
 identifiers. Predicate *kinds* are proposed; all numerical limits, cadence, cut-skew, hold time,
-timeout, and observer-overhead limits must be approved before any result exists.
-Cycle 21 carries these inputs into the unapproved
-[consolidated runner v2 freeze candidate](../architecture-decisions/state-backend-qualification-runner-v2-draft.md).
+timeout, and observer-overhead limits must be frozen before any result exists. Cycle 38 carries these
+inputs into the accepted
+[consolidated runner v2 validation contract](../architecture-decisions/state-backend-qualification-runner-v2-draft.md).
 
 The candidate-native arm is a veto only. The identical C1/C2/C3 correctness, open-loop queue/service/
 end-to-end latency, throughput, memory, target-device I/O, disk growth, write/space amplification,
@@ -372,7 +378,7 @@ cannot inherit maintenance-health N/A.
 native prescreen first. An approved N/A would remove only candidate-native health samples; it would
 not admit redb or compensate for its global-writer, durability, recovery, or close behavior.
 
-## Carry decision matrix
+## Historical Cycle 19 carry decision matrix
 
 | Decision factor | RocksDB 10.4.2 | Fjall 3.1.8 | redb 4.1.0 |
 |---|---|---|---|
@@ -393,7 +399,7 @@ earned implementation-cost rank. No candidate should consume adapter work until 
 closes. Only comparable measured correctness, latency, resources, persistence, fault and endurance
 evidence may eventually choose a backend.
 
-## Contract feedback and next gates
+## Historical Cycle 19 contract feedback and next gates
 
 The sampled gauge/counter/boolean vocabulary remains sufficient for the mappings as corrected. The
 RocksDB blocking wait stays non-gating; it is not encoded as a boolean. If owners later require an
@@ -402,7 +408,7 @@ collector invalid—plus cardinality, clocks, cancellation/late-return, non-muta
 overhead rules. That review is still smaller than a generic expression language. No candidate
 requires arithmetic across unlike signals, a weighted score or candidate-defined aggregation.
 
-Before `APPROVE_STATE_BACKEND_RUNNER_CONTRACT_V2`, owners still must decide and freeze:
+Before Cycle 38 accepted the validation contract, owners still had to decide and freeze:
 
 1. the exact consolidated wording by which the approved v2 direction replaces v1's exact-debt arm;
 2. exact signal and mechanism schemas, reset/restart rules and complete nominal/cut populations;

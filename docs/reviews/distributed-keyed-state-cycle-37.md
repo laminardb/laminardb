@@ -107,9 +107,10 @@ tests separately prove byte stability; the oracle does not claim an independent 
 
 ## Cycle 38 entry boundary
 
-The next Phase 0 dependency is human owner closure of the exact v4 runner contract: both distinct
-formal review receipts, named workload/operations principals, and
-`APPROVE_STATE_BACKEND_RUNNER_CONTRACT_V2`. Do not fabricate those identities or treat preparatory
-AI review as approval. If that authority arrives, the next implementation is validation-only
-schemas and execution-ineligible fixtures. It still does not authorize candidate source
-construction, adapter work, execution, backend selection, runtime admission, or a production claim.
+**Superseded by the Cycle 38 project-owner direction.** No DKS GitHub approval workflow existed, and
+the documented PF4/PF5 protected-receipt ceremony was removed as unnecessary for validation-only
+work. Cycle 38 also makes TidesDB the preferred conditional local-spill candidate and leaves
+RocksDB/Fjall as immutable v4 references. The next work is the bounded TidesDB remediation/source-
+closure and successor-contract design for the still-rejected official Rust path, followed only by
+genuinely reusable validation primitives. Candidate source construction, adapter work, execution,
+backend selection, runtime admission, and production claims remain separately closed.

@@ -1,7 +1,7 @@
 # Distributed-state Cycle 36 owner decision packet
 
 - **Date:** 2026-07-25
-- **Status:** review input; not an approval record
+- **Status:** historical review input; PF4/PF5 approval mechanism superseded by Cycle 38
 - **Scope:** maintenance-health v2 final-contract decisions and the next candidate-neutral state step
 - **Backend selected or executed:** none
 - **Runtime dependency, adapter, or admission change:** none
@@ -9,15 +9,22 @@
 
 ## Outcome
 
-The v4 profile bytes and preparatory independent exact-delta evidence are ready for owner review. Four
-contract decisions and the final protected two-owner approval remain open. No backend should be
-chosen or implemented while those gates are open.
+The v4 profile bytes and preparatory independent exact-delta evidence were ready for owner review.
+Cycle 38 subsequently accepted PF1-PF3 for validation-only implementation and replaced PF4/PF5
+identity, protected-workflow, and signature ceremony with ordinary technical review plus the
+project-owner direction and freezing commit. The matrix below is retained as decision history; it
+does not block validation-only schemas or fixtures and still creates no backend execution authority.
 
-The working-state design is also not ready to become a public runtime trait. Its next safe slice is
-a disconnected aggregate-v1 state-machine oracle that freezes mutation-journal and checkpoint-cut
-semantics without selecting or exercising a storage engine.
+Cycle 38 also supersedes this packet's backend-priority state: TidesDB is now the preferred
+local-spill product candidate, while RocksDB/Fjall remain immutable v4 references. The inspected
+official TidesDB Rust path remains rejected. Only a bounded exact-current remediation/source-closure
+design is scheduled; construction, execution, selection, admission, and production remain closed.
 
-## Final-contract decision matrix
+The working-state design is also not ready to become a public runtime trait. This packet's proposed
+next safe slice was the disconnected aggregate-v1 state-machine oracle; Cycle 37 completed that
+slice without selecting or exercising a storage engine.
+
+## Historical final-contract decision matrix (superseded)
 
 | Gate | Prepared evidence or proposed decision | Owner action | Authority created now |
 |---|---|---|---|
@@ -54,9 +61,9 @@ has:
 Independent reconstruction from v3 produced identical bytes and zero residual semantic differences.
 `notice=NOT QUALIFICATION EVIDENCE`, `status=candidate_unapproved`,
 `qualification_eligible=false`, all owner/approval fields, and image/package fields remain
-unchanged and ineligible. The existing validator is expected to reject v4 until final approval
-authorizes validation-only implementation. This reconstruction is preparatory: the named PF4
-schema/evidence reviewer must reproduce or explicitly accept it over the final immutable head.
+unchanged and ineligible. Cycle 38 accepts these exact bytes only as an ineligible validation input;
+ordinary technical review replaces PF4 receipt machinery. The profile remains no run,
+qualification, selection, or production evidence.
 
 ## Production-minimal maintenance visibility
 
@@ -107,10 +114,11 @@ DELTA may name an immediately preceding admitted REFERENCE entry and resolution 
 Cycle 37 defines admitted as exact sealed inventory plus durable Commit; sealed-Abort state remains
 retained but is not parent authority in initial managed v1.
 
-## Smallest safe next implementation slice
+## Historical smallest safe slice — completed in Cycle 37
 
-First freeze a short normative aggregate-v1 journal/checkpoint-transition contract. Then add a
-disconnected BTreeMap state-machine oracle nested under the existing `#[cfg(test)]` artifact tests.
+Cycle 36 recommended first freezing a short normative aggregate-v1 journal/checkpoint-transition
+contract, then adding a disconnected BTreeMap state-machine oracle nested under the existing
+`#[cfg(test)]` artifact tests.
 Literal vectors
 must prove:
 
@@ -139,10 +147,10 @@ redb, TidesDB, Docker/WSL, a provider API, or a cloud resource.
 
 | Subject | Current disposition |
 |---|---|
-| Fjall 3.1.8 | v4 comparison subject; stock scheduler/lifecycle/governance gaps remain; not runnable or selected |
-| RocksDB 10.4.2 via rocksdb 0.24.0 | v4 comparison subject; source/binding/operability closure remains; not runnable or selected |
+| Fjall 3.1.8 | Immutable v4 reference; stock scheduler/lifecycle/governance gaps remain; no active product work |
+| RocksDB 10.4.2 via rocksdb 0.24.0 | Immutable v4 reference; source/binding/operability gaps remain; no active product work |
 | redb 4.1.0 | PARKED after the bounded Cycle 34 design timebox; reopening needs a new micro-charter |
-| TidesDB | current exact subject STOP; remote mode does not cure local correctness/integration vetoes |
+| TidesDB native 9.3.14 plus repaired exact-current Rust integration | Preferred conditional product candidate; current official Rust path remains STOP; bounded remediation/source-closure design is next |
 
 A qualified worker-local spill backend is eventually required because bounded memory is
 reference-only, but a backend is not required for this next semantic slice. Backend qualification

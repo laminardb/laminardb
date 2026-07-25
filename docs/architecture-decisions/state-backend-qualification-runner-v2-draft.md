@@ -1,10 +1,13 @@
-# State backend qualification runner and evidence contract v2 — Stage 3 freeze candidate
+# State backend qualification runner and evidence contract v2 — validation contract
 
-- **Status:** direction approved; consolidated freeze candidate; final contract approval pending
+- **Status:** approved for validation-only implementation; candidate execution remains prohibited
 - **Direction approval recorded:** 2026-07-24
-- **Final approval required:** workload owner and operations owner over the exact document bytes
+- **Validation scope accepted:** 2026-07-25 project-owner direction recorded by Cycle 38
+- **Approval workflow for validation-only implementation:** none; ordinary repository review and the
+  freezing commit provide the audit trail
 - **Scope:** standalone tools/state-backend-qual validation and later qualification tooling
-- **Comparison scope:** Fjall 3.1.8 and RocksDB 10.4.2 through rocksdb 0.24.0 only
+- **Frozen v4 validation scope:** Fjall 3.1.8 and RocksDB 10.4.2 through rocksdb 0.24.0 reference lineage
+- **Preferred future product candidate:** TidesDB, subject to a new profile and all source-closure gates
 - **Production backend selected:** none
 - **Execution authorized:** no
 - **Reserved schemas instantiated:** none
@@ -16,60 +19,58 @@
 
 ## Decision state and authority
 
-The workload/operations direction APPROVE_MAINTENANCE_HEALTH_V2_DIRECTION authorizes this
-consolidated Stage 3 design. It does not approve this contract, instantiate any identity below,
-authorize schema or validator implementation, authorize native source or adapter construction,
-authorize a candidate run, select a backend, or change cluster admission.
+The workload/operations direction `APPROVE_MAINTENANCE_HEALTH_V2_DIRECTION`, the earlier project-owner
+approval of the DKS runner direction, and the 2026-07-25 Cycle 38 instruction to remove the proposed
+GitHub approval ceremony authorize this consolidated contract for validation-only implementation.
+The freezing commit records the exact reviewed bytes. This authority permits only standalone
+schemas, parsers, formulas, bounded readers, deterministic synthetic fixtures, and negative-
+capability tests. It does not authorize native source or adapter construction, candidate execution,
+backend selection, runtime integration, cluster admission, or a production claim.
 
-Stage 3 design authority does permit preparation and independent review of exact, permanently
-standalone-execution-ineligible v4 freeze-candidate bytes. Preparation does not instantiate the
-reserved v4 identity, and those bytes acquire no schema identity,
-consumability, profile-use authority, or qualification meaning before final contract approval.
-Preparing them authorizes no v4 schema, parser, validator, formula, envelope, source, adapter,
-observer, candidate command, or result.
+No DKS approval workflow existed under `.github/workflows`; ordinary CI only checks the standalone,
+explicitly ineligible validator. This contract requires no protected GitHub environment, provider
+receipt, detached signature, named reviewer receipt, or multi-principal approval for validation-only
+work. Independent review remains a technical quality check. Candidate construction, execution,
+selection, runtime, and production retain the separate gates below.
 
-This document is the complete v2 freeze candidate. Its normative rules do not require a reader to
+This document is the complete v2 validation contract. Its normative rules do not require a reader to
 compose the v1 runner with the maintenance-health proposal. The v1 contract and its fixtures remain
 unchanged regression lineage and have no interpretive authority over a future v2 artifact.
 
 The words MUST, MUST NOT, REQUIRED, SHALL, SHALL NOT, SHOULD, SHOULD NOT, and MAY are normative in
-this document. A statement marked unresolved is not a placeholder value and is not frozen. Final
-approval is prohibited while any item in Pre-final unresolved decisions remains unresolved.
+this document. The Cycle 38 review records the revised contract/profile lengths and SHA-256 values,
+the closed review findings, and the validation-only scope. The commit containing that record freezes
+this contract lineage. A repository field or validator process still cannot approve candidate
+construction, execution, a result, or backend selection.
 
-Final approval requires a detached protected-review record from both named owners containing:
-
-- the literal decision APPROVE_STATE_BACKEND_RUNNER_CONTRACT_V2;
-- this document's exact byte length and lowercase SHA-256;
-- the independently reviewed exact v4 profile bytes and their length and SHA-256;
-- the explicit scope validation-only implementation authorized, with candidate source, adapter,
-  execution, and selection authority excluded; and
-- both independent review outcome/receipt descriptors over these exact contract and profile hashes,
-  proving no unresolved stop condition, plus reviewer identities and UTC review times.
-
-The workload and operations owners MUST be distinct authenticated principals and their approvals
-MUST be separate authenticated events over the same immutable bytes. Acceptable authority is a
-protected workflow/provider receipt or a preapproved detached-signature process. Repository JSON,
-Markdown, a self-declared approval field, or one principal acting twice is not approval authority.
-
-Only that approval instantiates the reserved v2 contract lineage and may authorize validation-only
-schema/parser/formula work. It still authorizes no native observer, candidate adapter, execution
-command, candidate result, or backend selection. Candidate source construction requires a later,
-candidate-specific source-closure approval. Candidate execution requires the complete qualification
-approval described below. The later qualification approval, not this contract-direction record,
-binds exact validator/runner source, lockfile, toolchain, target, and build bytes.
+Validation-only implementation MUST mechanically preserve all of these negative capabilities: no
+run/dispatch/approve/select/qualify command; no backend, candidate, cloud, network, or process-
+spawning dependency; no runtime crate or admission consumer; and no output that claims qualification
+or production evidence. Candidate source construction requires a later candidate-specific explicit
+project-owner task. Candidate execution requires separate authorization over the exact candidate,
+run plan, target, isolation, limits, and cost. Selection, runtime integration, and production each
+retain their own reviewed decision and evidence gates.
 
 Any predecessor reference to freezing "exact schemas" means freezing the complete normative wire
-and schema semantics in this contract. It does not require JSON Schema files, parsers, validators,
-or plan/evidence/approval/completion schemas before final contract approval. Those remain
-validation-only implementation after approval and, for the latter four containers, pre-execution
-work.
+and schema semantics in this contract. JSON Schema files, parsers, validators, formulas, and
+synthetic fixtures are the newly authorized validation-only implementation. Plan, evidence,
+authorization, and completion containers remain later pre-execution work.
 
 ## Comparison boundary and redb separation
 
-The reserved distributed-state-qual/v4 and linux-nvme-v4 profile is an exact-delta successor to the
-v3 Fjall/RocksDB comparison profile. Its comparison candidates and the common 8 GiB block-cache,
-2 GiB write-buffer, and six-background-worker controls remain the Fjall/RocksDB subject. V4 MUST
-NOT be represented as a redb profile.
+The frozen distributed-state-qual/v4 and linux-nvme-v4 profile is an exact-delta successor to the
+v3 Fjall/RocksDB comparison profile. Its common 8 GiB block-cache, 2 GiB write-buffer, and six-
+background-worker controls remain regression/reference data for those exact subjects. The 2026-07-25
+project-owner direction makes TidesDB the preferred product candidate instead of RocksDB, but MUST
+NOT relabel or reinterpret v4. RocksDB remains a mature reference only, not an intended product
+backend. A TidesDB campaign requires a new profile identity and mapping after its exact native/Rust,
+atomicity, recovery, checkpoint, resource-governance, and maintenance-health source closures. Native
+remote storage remains disabled. No TidesDB source construction or execution is authorized here.
+
+V4 MUST NOT be represented as a TidesDB or redb profile. Candidate-neutral bounds, primitive
+parsers/evaluators, formulas, and negative-capability patterns may be reused by a later TidesDB
+lineage. The exact profile-binding, mapping, and bundle wire identities in this contract bind v4 and
+must receive successor identities or an explicit successor contract for TidesDB.
 
 redb 4.1.0 is PARKED after its bounded Cycle 34 design timebox and is outside v4. Its archived paper
 mapping and prescreen are vocabulary provenance only: they cannot instantiate this contract,
@@ -78,11 +79,12 @@ three-candidate ranking. Only a new, separately owner-authorized bounded micro-p
 reopen it; a favorable observation could at most justify a later additive profile/control and
 mapping proposal.
 
-## Reserved identities and migration
+## Frozen validation identities and migration
 
-The following identities are reserved, not instantiated:
+The following identities are frozen for validation-only implementation. Their schemas and readers
+are not instantiated until their implementation commits land, and none creates execution authority:
 
-| Item | Reserved identity |
+| Item | Frozen identity |
 |---|---|
 | runner contract | state-backend-runner-contract/v2 |
 | comparison profile/schema | distributed-state-qual/v4 |
@@ -127,8 +129,8 @@ are 7,838 bytes with lowercase SHA-256
 `94652d30153d998628d4e1d2b5da87bce59f5064192eeba9e9331f3f40507392`. A preparatory independent
 reconstruction reproduced the bytes from v3 using only the three transformations above, found zero
 residual decoded differences, and confirmed UTF-8 without BOM, LF-only line endings, and one
-trailing LF. This is preparatory decision evidence, not the formal PF4 receipt, owner acceptance,
-or an instantiated profile.
+trailing LF. Cycle 38 accepts these exact bytes as an explicitly ineligible validation input. This
+does not approve the profile for a candidate run or make it qualification evidence.
 
 Its schema identifier/title change only as required to describe those bytes. Every other value,
 field, order-insensitive JSON meaning, threshold, and gate remains equal. An exact-delta test MUST
@@ -137,8 +139,9 @@ compare the complete decoded values after applying only those three transformati
 Consequently, v4 deliberately retains v3's `notice=NOT QUALIFICATION EVIDENCE`,
 `status=candidate_unapproved`, `qualification_eligible=false`, null owner approvals, and null
 environment image/package values. Those fields are immutable historical provenance; no parser,
-plan, flag, or later record may rewrite, reinterpret, or silently override them. V4 bytes become
-consumable only as one member of an externally approved pair:
+plan, flag, or later record may rewrite, reinterpret, or silently override them. Validation-only
+readers may consume v4 solely as an ineligible fixture. A future execution command may consume it
+only as one member of an explicitly authorized pair:
 
 1. the unchanged profile bytes; and
 2. a detached `state-backend-profile-use-approval/v1` envelope.
@@ -146,14 +149,14 @@ consumable only as one member of an externally approved pair:
 The strict envelope is an unsigned, result-free declaration. It binds the exact profile role, byte
 length, and SHA-256; this runner-contract descriptor; the independently generated exact-delta proof;
 the named environment image and package-snapshot descriptors that replace neither null profile
-field; the literal decision `APPROVE_PROFILE_V4_FOR_QUALIFICATION_PLAN`; and an explicit
+field; the plan's explicit profile-use decision; and an explicit
 acknowledgement that the embedded false/null fields remain false/null. It contains no signature or
-self-approval field and has no authority by itself. The approved plan binds the envelope separately,
-and the later detached, two-owner `qualification-approval/v1` binds both profile and envelope
-directly as well as through the plan. An execution command MUST verify all three bindings and that
-approval's two protected signatures before consuming v4. Profile bytes alone, or profile plus an
-unsigned envelope, remain execution-ineligible; an envelope cannot approve another profile, fill a
-profile field, select a backend, or make the profile itself qualification evidence.
+self-approval field and has no authority by itself. A later, separate execution-design ADR must
+define how an explicit project-owner run authorization binds the profile, envelope, plan, exact
+candidate, target, isolation, limits, and cost before any execution command exists. This contract
+does not prescribe GitHub approvals or signatures for that future boundary. Profile bytes alone, or
+profile plus an unsigned envelope, remain execution-ineligible; an envelope cannot approve another
+profile, fill a profile field, select a backend, or make the profile itself qualification evidence.
 
 Profile v3, mapping v1, maintenance-debt samples v1, resource formulas v2, and bundle v1 remain
 immutable, execution-ineligible regression fixtures. V2 readers MUST reject them, mixed versions,
@@ -169,9 +172,8 @@ candidate-specific numerical health limits.
 Each immutable mechanism-mapping/v2 object freezes the exact candidate signal inventory, proof
 descriptors, predicate instances, and every candidate-specific numerical threshold before any
 candidate result exists. A mapping never approves itself. It carries no qualification-eligible
-boolean and no approved status. The exact runner plan binds its length and SHA-256, and the detached
-qualification-approval/v1 record MUST bind it directly as well as through the plan. Only that
-detached two-owner approval makes the mapping consumable by an execution command.
+boolean and no approved status. The exact runner plan binds its length and SHA-256. Only the future
+explicit run authorization described above may make it consumable by an execution command.
 
 This separates neutral evaluator semantics from candidate-native numbers without permitting
 result-driven threshold choice. Source construction may reveal that a paper signal is unsound; in
@@ -923,10 +925,11 @@ The campaign binds source/binary/lock/SBOM/compiler/target/flags/options/profile
 kernel/libc/CPU/microcode/governor/NUMA, cgroup, device/firmware/SMART/scheduler, filesystem/mount,
 preflight, schedule/seeds, raw samples, resources, logs, roots/counters, and every result.
 
-After closure, a detached completion record binds approval, all exact inputs/binaries, manifest
-length/digest, schedule, validator-derived status, immutable object version/retention, UTC time, and
-runner/independent-review signer provenance. The independent validator recomputes all classification
-and digests. Selection consumes the completion digest, never a mutable path.
+After closure, a detached completion record binds the explicit run authorization, all exact inputs/
+binaries, manifest length/digest, schedule, validator-derived status, immutable object version/
+retention, UTC time, runner identity, and independent-review provenance. The independent validator
+recomputes all classification and digests. Selection consumes the completion digest, never a mutable
+path.
 
 Object lock is at least 365 days after completion and before selection extends through product
 support sunset plus 365 days. Availability is checked at least every 30 days and retained for pass,
@@ -934,8 +937,8 @@ fail, and invalid lineages. Any semantic/input/environment change creates a new 
 
 ## Validation-only implementation acceptance tests
 
-These tests are requirements for a later validation-only implementation after final contract
-approval. They do not authorize that implementation now.
+These tests are requirements for the Cycle 38-authorized validation-only implementation. They do
+not authorize candidate construction or execution.
 
 1. Exact-delta tests transform decoded v3/profile bytes only by the three permitted v4 changes,
    compare every remaining value, and reject v4 with any extra numerical or candidate change.
@@ -987,39 +990,36 @@ independently operated immutable release-candidate soak remain independent vetoe
 
 ## Required independent contract review
 
-Two distinct independent reviewers inspect the same immutable contract/profile head. One owns
-schema, wire, arithmetic, evidence, and exact-delta correctness; the other owns operations, resource
-governance, hot-path/latency, and production boundary correctness. Both repeat the six-pass review.
-Review stops on any unresolved placeholder, cross-document conflict, unbounded parser or hot-path
-operation, fail-open or ambiguous N/A rule, unchecked arithmetic/wire ambiguity, digest drift,
-self-authority, or weakened exactly-once/production/independent-soak gate. An unresolved stop remains
-a veto; neither owner approval nor majority vote may waive it silently.
+Ordinary repository review must cover both schema/wire/arithmetic/evidence/exact-delta correctness
+and operations/resource/hot-path/production-boundary correctness. It needs no named-person receipt,
+protected provider event, or signature. Review stops on any unresolved placeholder, cross-document
+conflict, unbounded parser or hot-path operation, fail-open or ambiguous N/A rule, unchecked
+arithmetic/wire ambiguity, digest drift, self-authority, or weakened exactly-once, production, or
+independent-soak gate. An unresolved stop remains a veto.
 
-## Pre-final unresolved decisions
+## Resolved validation-contract decisions
 
-This freeze candidate MUST NOT receive final contract approval until owners resolve:
+Cycle 38 freezes these decisions for validation-only implementation:
 
-1. owner acceptance of the prepared exact v4 profile bytes and independent exact-delta review
-   recorded above; preparation alone does not resolve this item;
-2. whether, after setup persist/close/reopen and independent setup verification both complete
-   successfully, the first gate-bearing common bracket and its paired candidate-health bracket both
-   complete before the first warmup mutation, with both observations then uninterrupted through the
-   resource-tail cut; this boundary is recommended because complete counter predicates otherwise
-   have no unambiguous baseline, but it is not frozen by this draft;
-3. owner acceptance of the four-way threshold-authority split: this contract owns closed
-   types/units/predicates/formulas/validity/failure/wire bounds; v4 retains the common v3 numerical
-   gates; each candidate mapping owns candidate-native limits, bases, and safety margins; and the
-   approved plan owns service/cadence/skew/tail/calibration/occupancy/observer-overhead values, all
-   bound by detached approval before results;
-4. owner acceptance of the review procedure above, the names of its two distinct independent
-   reviewers, and completed immutable outcome/receipt records from both over the exact final
-   contract/profile hashes with no unresolved stop condition; and
-5. the final approval record from distinct authenticated workload and operations owners using the
-   protected receipt or preapproved detached-signature process above.
+1. accept the exact 7,838-byte v4 profile and independently reconstructed three-change delta above;
+2. after setup persist/close/reopen and independent setup verification both succeed, require the
+   first gate-bearing common bracket and paired candidate-health bracket before the first warmup
+   mutation, then keep both uninterrupted through the resource-tail cut;
+3. use the four-way threshold-authority split: this contract owns closed types, units, predicates,
+   formulas, validity/failure rules, and wire bounds; v4 retains common v3 numerical gates; candidate
+   mappings own candidate-native limits, bases, and safety margins; and the future explicitly
+   authorized plan owns service, cadence, skew, tail, calibration, occupancy, and observer-overhead
+   values, all frozen before results;
+4. use ordinary independent technical review with recorded findings instead of PF4 identity and
+   immutable-receipt machinery; and
+5. accept the project-owner direction and freezing commit instead of PF5 protected workflow,
+   detached-signature, or multi-principal approval.
 
 The following are deliberately post-contract, pre-execution blockers. They do not prevent approval
-of a neutral validation contract, but validation-only implementation cannot satisfy them and no
-candidate command may exist until they close:
+of a neutral validation contract, but validation-only implementation cannot satisfy them. Items 1-3
+and 9-12 are universal. Items 4-6 apply only if a later owner reopens exact v4 reference execution;
+items 7-8 apply to the preferred TidesDB lineage. No candidate command may exist until its universal
+and candidate-branch blockers close; an inactive branch is never a prerequisite:
 
 1. the complete workload/case/rate/order matrix and DKS-Q2-001 through Q2-004 proofs;
 2. service latency, scheduler/calibration, ring/lead/lag/occupancy, null-control and telemetry-
@@ -1027,19 +1027,25 @@ candidate command may exist until they close:
 3. candidate_health_to_common_max_skew_ns,
    candidate_health_observation_max_skew_ns, resource_tail_hold_ns, and every other exact plan
    value named above;
-4. source-closed mapping signal IDs/scopes/qualities, numerical predicates, threshold/safety proofs,
-   and exact configuration for every admitted v4 candidate;
-5. RocksDB's scheduled-low/bottom, purge, background-error/recovery, safe binding, and complete
-   pressure-stall sources and exact purge/recovery policy;
-6. an explicit Fjall scheduler/lifecycle fork/upstream ownership decision; stock Fjall 3.1.8 remains
-   unsupported;
-7. exact plan/evidence/approval/completion schemas and validators, including hostile artifact
+4. for the frozen v4/reference lineage, source-closed mapping signal IDs/scopes/qualities,
+   numerical predicates, threshold/safety proofs, and exact configuration for each exact subject;
+5. for the frozen v4/reference RocksDB subject, scheduled-low/bottom, purge, background-error/
+   recovery, safe-binding, complete pressure-stall sources, and exact purge/recovery policy;
+6. for the frozen v4/reference Fjall subject, an explicit scheduler/lifecycle fork/upstream ownership
+   decision; stock Fjall 3.1.8 remains unsupported and no active product source work is scheduled;
+7. for a future TidesDB lineage, an exact-current lifetime-safe Rust/native integration,
+   all-or-nothing apply, strict
+   recovery and acknowledgement, immutable read cuts, cgroup-aware resource controls, and complete
+   pressure-stall/background-error sources;
+8. a new TidesDB profile plus successor mapping/profile-binding/bundle identities or contract after
+   those closures; v4 remains immutable reference data;
+9. exact plan/evidence/approval/completion schemas and validators, including hostile artifact
    handling;
-8. exact target-device tracer program/source/build, attach points, map capacity/layout, issue-state
+10. exact target-device tracer program/source/build, attach points, map capacity/layout, issue-state
    bound, atomic operations, capture lifecycle, saturation/loss handling, and observer-overhead
    controls under DKS-Q2-005/006;
-9. physical persistence/cache-loss, C3 concurrency, and bounded 24/72-hour endurance contracts; and
-10. every source, mapping, execution, selection, integration, exactly-once, and independent-soak
+11. physical persistence/cache-loss, C3 concurrency, and bounded 24/72-hour endurance contracts; and
+12. every source, mapping, execution, selection, integration, exactly-once, and independent-soak
    approval.
 
 No unresolved numerical value may be inferred from v1 fixtures, candidate defaults, paper mappings,
