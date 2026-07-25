@@ -7,6 +7,12 @@
 - **Candidate execution authorized:** no
 - **Runtime/admission effect:** none; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
 
+**Current-state note (Cycle 36):** the direction decision below remains authoritative, but later
+bounded review PARKED redb after Cycle 34. The
+[consolidated runner](../architecture-decisions/state-backend-qualification-runner-v2-draft.md) and
+the [Cycle 36 owner packet](distributed-state-cycle-36-owner-decision-packet-2026-07-25.md) are the
+current contract-review inputs; this chronological record does not reactivate older redb work.
+
 ## Recorded decisions
 
 The project owner supplied both decisions explicitly:
@@ -40,9 +46,9 @@ direction decision does not approve them.
 | In-memory working state | Semantic reference/conformance subject only | Separate future ADR amendment before any product profile |
 | Local-spill working state | Sole current cluster production target; backend undecided | Phase 0 contract, candidate closure, qualification, selection, and independent product soak |
 | Maintenance-health v2 | Direction approved; [freeze candidate](../architecture-decisions/state-backend-qualification-runner-v2-draft.md) unapproved | Final two-owner contract approval before reserved identities or validator implementation |
-| redb 4.1.0 prescreen | Validation-only protocol repair permitted | Detached pre-run approval only after verifier, harness, oracle, actuator, classifier, and independent review exist |
+| redb 4.1.0 prescreen | PARKED after Cycle 34; no profile, adapter, execution, or disposition | New explicitly approved bounded micro-prescreen charter before any work resumes |
 | RocksDB/Fjall | Paper/source review only under their existing gates | Final v2 contract plus candidate-specific source authority |
 
-This record does not turn the user-approved redb validation work into approval to run Docker smoke or
-the native prescreen. The Cycle 16 `construction-only-no-decision` lane remains the only executable
-redb code and cannot emit a prescreen disposition.
+This record does not authorize Docker smoke, native prescreen execution, or classification. The
+Cycle 16 construction-only lane is historical and cannot emit a prescreen disposition; parking
+supersedes its scheduled-work status.

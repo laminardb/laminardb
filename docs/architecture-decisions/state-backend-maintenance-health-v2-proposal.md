@@ -4,7 +4,7 @@
   two-owner contract approval required
 - **Date:** 2026-07-24
 - **Scope:** the background-maintenance part of DKS-Q2-006 only
-- **Recommendation:** approve the additive v2 design direction described here
+- **Recorded direction:** additive v2 design approved; final contract approval remains pending
 - **Production backend selected:** none
 - **Execution authorized:** no
 - **Cluster admission:** unchanged; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
@@ -20,6 +20,22 @@ non-gating rather than disguising an active command as a sampled boolean. The ma
 instantiate v2, rank implementation cost, or authorize source work. On 2026-07-24 the project owner
 recorded `APPROVE_MAINTENANCE_HEALTH_V2_DIRECTION`. That decision authorizes Stages 2 and 3 below;
 it is not the final contract approval.
+
+## Cycle 36 current-state reconciliation
+
+The [consolidated runner](state-backend-qualification-runner-v2-draft.md) is the sole normative
+successor design. This proposal records rationale and cannot override it. V4 contains only the
+Fjall/RocksDB comparison; redb is PARKED outside v4 and its older paper mapping is vocabulary
+provenance, not scheduled work. References below to exact schemas mean complete normative wire and
+schema semantics in the contract, not pre-approval JSON Schema or validator implementation.
+Candidate-native numerical thresholds and margins belong to immutable candidate mappings; service,
+cadence, skew, tail, calibration, occupancy, and observer-overhead values belong to the approved
+plan. Detached approval binds those values before results.
+
+For each observed maintenance mechanism, production-minimal signals must expose both backlog or
+in-flight pressure and background failure. Tail-quiescence instrumentation may remain
+qualification-only. This closes the proposal's production-operability intent without moving source,
+adapter, observer, execution, selection, or admission authority.
 
 ## Proposed decision
 
@@ -44,10 +60,11 @@ logging and telemetry housekeeping are outside the candidate-native arm; their C
 disk, and latency effects remain inside the mandatory common observations. This deliberate scope
 change is one reason v1 cannot be reinterpreted in place.
 
-The approved direction authorizes only the formal three-candidate mapping-design and consolidated-
-contract drafting stages. It does not instantiate a v2 identity or authorize schema implementation,
-native source construction, an adapter, or a candidate run. Those later steps retain the separate
-gates below. Cycle 19 supplies the Stage 2 paper mappings; Cycle 21 prepares the Stage 3
+The approved direction authorized the historical three-mapping design input and the current
+two-candidate consolidated-contract drafting stage. It does not instantiate a v2 identity or
+authorize schema implementation, native source construction, an adapter, or a candidate run. Those
+later steps retain the separate gates below. Cycle 19 supplies the Stage 2 paper mappings; Cycle 21
+prepares the Stage 3
 [consolidated freeze candidate](state-backend-qualification-runner-v2-draft.md) for independent and
 owner review.
 
@@ -90,11 +107,13 @@ instantiated by a direction approval:
 
 This document is a delta proposal. After mapping-design review, a later signed workload-owner and
 operations-owner approval must freeze `state-backend-runner-contract/v2` as one consolidated,
-complete contract incorporating the retained requirements and this delta, including exact schemas,
-formulas, and numerical thresholds. Only that final approval instantiates the v2 identity and may
-authorize validation-only implementation. An executable plan must not depend on readers mentally
-composing two mutable Markdown files. V1's normative semantics remain unchanged, but its document
-contains chronological amendments and is not claimed to have an immutable file hash.
+complete contract incorporating the retained requirements and this delta, including exact wire/
+schema semantics, formula semantics, and threshold-ownership rules. Exact candidate- and plan-owned
+numbers remain bound by their separately approved artifacts before execution. Only final contract
+approval instantiates the v2 identity and may authorize validation-only implementation. An
+executable plan must not depend on readers mentally composing two mutable Markdown files. V1's
+normative semantics remain unchanged, but its document contains chronological amendments and is not
+claimed to have an immutable file hash.
 
 Unchanged byte contracts retain their versions: latency samples v1; common resource samples/cuts
 v2; stall intervals v1; target-device I/O v1; physical layout/fault/attempt-classification v1; C1
@@ -207,15 +226,15 @@ metrics; the signals exist to show it remains operable under the common workload
 
 ## Hot-path and production telemetry profiles
 
-Candidate mappings distinguish three activation profiles without requiring every production
+The contract distinguishes two gate-bearing activation profiles without requiring every production
 deployment to run qualification-cost statistics continuously:
 
 - `production-minimal`: bounded counters/gauges and operational alerts, with an allocation-free
   normal-request update path and no per-key or unbounded vnode labels;
 - `qualification`: production-minimal plus the loss-detecting monotonic-clock stall and health
   observations required by the approved mapping; and
-- `debug`: expensive statistics, full scans, or high-cardinality diagnostics which cannot satisfy a
-  qualification gate.
+- `debug` is outside mapping and gate artifacts: expensive statistics, full scans, or
+  high-cardinality diagnostics can never satisfy a qualification gate.
 
 Gate-bearing reads run off the event loop. No per-row FFI call, metric query, allocation, lock, I/O,
 or task spawn is allowed. Synchronous slow-path callbacks use preallocated bounded storage, never
@@ -237,10 +256,9 @@ decision and are not invented by this proposal.
   goes away, but its stable public pressure/progress, error, resource-control, and stall surface is
   still insufficient. The mapping design must determine whether any telemetry/control patch is
   bounded and worth funding; its size and hot-path cost are unknown.
-- **[redb 4.1.0](../reports/redb-4.1.0-prescreen-mechanism-note-2026-07-23.md):** a
-  maintenance-health N/A claim is possible only after complete-process proof. Its global writer and
-  synchronous work remain common latency/C3/persistence risks, so the separately governed
-  prescreen still comes first.
+- **[redb 4.1.0](../reports/redb-4.1.0-prescreen-mechanism-note-2026-07-23.md):** PARKED outside v4
+  after the Cycle 34 design timebox. Its archived N/A design informed the closed vocabulary, but no
+  prescreen, profile, adapter, or execution is scheduled. Reopening requires a new bounded charter.
 - **[SurrealKV 0.21.2](../reports/state-backend-static-audit-2026-07-23.md):** the
   snapshot-retention correctness defect remains disqualifying regardless of telemetry-contract
   choice.
@@ -252,14 +270,14 @@ No candidate proceeds by elimination or receives a weighted score.
 1. **Freeze the direction — complete.** On 2026-07-24 the project owner chose the v2 design direction.
    This authorizes only Stages 2 and 3 design work; independent reviewers and the final two-owner
    contract approval remain separate.
-2. **Draft three mappings on paper.** Produce RocksDB, Fjall, and redb mechanism/signal/N/A mapping
-   designs against pinned intended builds/configurations, with every unproved source or binding gap
-   explicit. These are review inputs, not `mapping/v2` artifacts. Use them to confirm the closed type
-   and predicate vocabulary; reject a generic DSL or exhaustive property dump.
+2. **Draft mappings on paper — complete historical input.** The RocksDB, Fjall, and redb designs
+   confirmed the closed vocabulary. Only RocksDB and Fjall remain v4 comparison inputs; the redb
+   design is archived provenance and authorizes no further work.
 3. **Freeze the complete contract.** Incorporate the reviewed designs into one consolidated runner
-   contract, exact schemas/formulas, and pre-result numerical telemetry-overhead and health
-   thresholds. Independent reviewers recheck it; workload and operations owners sign the separate
-   final contract approval. Any later semantic change creates a new lineage.
+   contract with exact wire/schema and formula semantics plus explicit mapping-owned and plan-owned
+   threshold boundaries. Independent reviewers recheck it; workload and operations owners accept
+   those boundaries in the final contract approval. Later detached qualification approval binds the
+   exact mapping and plan bytes before results. Any later semantic change creates a new lineage.
 4. **Implement validation only.** Add v4, mapping v2, health-samples v1, formulas v3, and bundle v2
    to the standalone tool. Keep all fixtures synthetic and execution-ineligible. Test strict schema,
    ordering/cross-reference, mixed-version rejection, N/A, estimate labelling, missing/reset/wrap/
@@ -270,7 +288,7 @@ No candidate proceeds by elimination or receives a weighted score.
    candidate-specific source-closure approval, build and adversarially force the RocksDB sources
    identified by its design, including the known complete-stall observer, in an isolated
    exact-source workspace. For Fjall, use its design to decide whether a patch is worth funding; its
-   size is not yet known. For redb, complete its separately approved prescreen first.
+   size is not yet known. redb remains parked unless a new bounded charter is explicitly approved.
 6. **Freeze the candidate mapping artifact.** After source construction and adversarial activation
    proof, finalize and approve the immutable `mapping/v2` artifact with exact build/configuration
    identity and proof digests. If source proof changes a contract assumption, revise and reapprove
@@ -319,8 +337,8 @@ error gates rather than treating any debt or health signal as sufficient.
 
 Valid if the organization treats a direct, pairwise-disjoint outstanding-work byte population as a
 hard requirement and accepts a maintained engine fork plus hot-path/scheduler risk. RocksDB and
-Fjall remain blocked until their exact sources close. redb still cannot be selected without its
-writer/durability prescreen and common evidence.
+Fjall remain blocked until their exact sources close. redb remains parked outside the comparison;
+even a future prescreen could not select it without a later profile and the same common evidence.
 
 ### Relabel the RocksDB estimate as exact
 

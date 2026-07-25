@@ -21,6 +21,13 @@ consolidated Stage 3 design. It does not approve this contract, instantiate any 
 authorize schema or validator implementation, authorize native source or adapter construction,
 authorize a candidate run, select a backend, or change cluster admission.
 
+Stage 3 design authority does permit preparation and independent review of exact, permanently
+standalone-execution-ineligible v4 freeze-candidate bytes. Preparation does not instantiate the
+reserved v4 identity, and those bytes acquire no schema identity,
+consumability, profile-use authority, or qualification meaning before final contract approval.
+Preparing them authorizes no v4 schema, parser, validator, formula, envelope, source, adapter,
+observer, candidate command, or result.
+
 This document is the complete v2 freeze candidate. Its normative rules do not require a reader to
 compose the v1 runner with the maintenance-health proposal. The v1 contract and its fixtures remain
 unchanged regression lineage and have no interpretive authority over a future v2 artifact.
@@ -36,7 +43,13 @@ Final approval requires a detached protected-review record from both named owner
 - the independently reviewed exact v4 profile bytes and their length and SHA-256;
 - the explicit scope validation-only implementation authorized, with candidate source, adapter,
   execution, and selection authority excluded; and
-- the independent reviewer identities and UTC approval time.
+- both independent review outcome/receipt descriptors over these exact contract and profile hashes,
+  proving no unresolved stop condition, plus reviewer identities and UTC review times.
+
+The workload and operations owners MUST be distinct authenticated principals and their approvals
+MUST be separate authenticated events over the same immutable bytes. Acceptable authority is a
+protected workflow/provider receipt or a preapproved detached-signature process. Repository JSON,
+Markdown, a self-declared approval field, or one principal acting twice is not approval authority.
 
 Only that approval instantiates the reserved v2 contract lineage and may authorize validation-only
 schema/parser/formula work. It still authorizes no native observer, candidate adapter, execution
@@ -45,6 +58,12 @@ candidate-specific source-closure approval. Candidate execution requires the com
 approval described below. The later qualification approval, not this contract-direction record,
 binds exact validator/runner source, lockfile, toolchain, target, and build bytes.
 
+Any predecessor reference to freezing "exact schemas" means freezing the complete normative wire
+and schema semantics in this contract. It does not require JSON Schema files, parsers, validators,
+or plan/evidence/approval/completion schemas before final contract approval. Those remain
+validation-only implementation after approval and, for the latter four containers, pre-execution
+work.
+
 ## Comparison boundary and redb separation
 
 The reserved distributed-state-qual/v4 and linux-nvme-v4 profile is an exact-delta successor to the
@@ -52,13 +71,12 @@ v3 Fjall/RocksDB comparison profile. Its comparison candidates and the common 8 
 2 GiB write-buffer, and six-background-worker controls remain the Fjall/RocksDB subject. V4 MUST
 NOT be represented as a redb profile.
 
-redb 4.1.0 remains in its separately governed prescreen. Prescreen construction or execution
-authority, result classes, and artifacts cannot instantiate this contract or satisfy C1, C2, C3,
-fault, endurance, or selection gates. A target-host prescreen pass may fund a later additive
-redb-specific profile/control translation and mapping lineage. It cannot be translated into v4,
-pooled with v4 evidence, or used to make a three-candidate ranking. This resolves the conflict
-between v4's promised exact delta and redb's different cache, writer, durability, repair, and
-lifecycle controls without weakening either contract.
+redb 4.1.0 is PARKED after its bounded Cycle 34 design timebox and is outside v4. Its archived paper
+mapping and prescreen are vocabulary provenance only: they cannot instantiate this contract,
+satisfy any qualification gate, be translated into v4, be pooled with v4 evidence, or create a
+three-candidate ranking. Only a new, separately owner-authorized bounded micro-prescreen charter may
+reopen it; a favorable observation could at most justify a later additive profile/control and
+mapping proposal.
 
 ## Reserved identities and migration
 
@@ -103,6 +121,14 @@ Profile v4 differs from the exact v3 JSON value only in:
 1. schema_version becomes distributed-state-qual/v4;
 2. profile_id becomes linux-nvme-v4; and
 3. resource_gates.background_maintenance_debt_max_bytes is absent.
+
+The prepared [v4 freeze-candidate bytes](../../tools/state-backend-qual/profiles/linux-nvme-v4.freeze-candidate.json)
+are 7,838 bytes with lowercase SHA-256
+`94652d30153d998628d4e1d2b5da87bce59f5064192eeba9e9331f3f40507392`. A preparatory independent
+reconstruction reproduced the bytes from v3 using only the three transformations above, found zero
+residual decoded differences, and confirmed UTF-8 without BOM, LF-only line endings, and one
+trailing LF. This is preparatory decision evidence, not the formal PF4 receipt, owner acceptance,
+or an instantiated profile.
 
 Its schema identifier/title change only as required to describe those bytes. Every other value,
 field, order-insensitive JSON meaning, threshold, and gate remains equal. An exact-delta test MUST
@@ -604,6 +630,12 @@ summed or normalized. The observed object also binds one
 inventory_proof descriptor with role maintenance-mechanism-inventory-proof covering the complete
 enabled mechanism inventory.
 
+For every mechanism, its referenced `production_minimal` signal subset MUST be nonempty and MUST
+cover both backlog_or_in_flight_pressure and background_failure. Tail-quiescence evidence MAY be
+qualification-only. Qualification activation samples the production-minimal subset plus any
+qualification-only signals; it never substitutes a qualification-only pressure or failure signal
+for a production-operability surface. This requirement has no unsupported or per-signal N/A waiver.
+
 A signal contains exactly:
 
 - signal_id and source_contract;
@@ -912,7 +944,8 @@ approval. They do not authorize that implementation now.
    trailing JSON, over-limit input, and mapping/profile hash drift.
 3. Mapping graph tests reject unsorted/duplicate mechanism, signal, objective, reference, and
    predicate arrays; dangling or unreferenced signals; uncovered per-mechanism objectives; dynamic
-   scopes; debug signals; wrong kind/unit or kind/predicate combinations; more than 16 mechanisms,
+   scopes; any mechanism whose production-minimal subset does not cover both pressure and background
+   failure; debug signals; wrong kind/unit or kind/predicate combinations; more than 16 mechanisms,
    64 signals, or five predicates; and custom expression/aggregation fields.
 4. N/A tests require exact complete-process reason/scope/proof roles, prohibit partial N/A, require
    health artifact absence, and prove that common resources, stall applicability, device I/O,
@@ -952,20 +985,37 @@ upgrade, grouped/window/join semantics, end-to-end exactly once, admission, or p
 C3 concurrency, connector capability combinations, distributed lifecycle fault testing, and an
 independently operated immutable release-candidate soak remain independent vetoes.
 
+## Required independent contract review
+
+Two distinct independent reviewers inspect the same immutable contract/profile head. One owns
+schema, wire, arithmetic, evidence, and exact-delta correctness; the other owns operations, resource
+governance, hot-path/latency, and production boundary correctness. Both repeat the six-pass review.
+Review stops on any unresolved placeholder, cross-document conflict, unbounded parser or hot-path
+operation, fail-open or ambiguous N/A rule, unchecked arithmetic/wire ambiguity, digest drift,
+self-authority, or weakened exactly-once/production/independent-soak gate. An unresolved stop remains
+a veto; neither owner approval nor majority vote may waive it silently.
+
 ## Pre-final unresolved decisions
 
 This freeze candidate MUST NOT receive final contract approval until owners resolve:
 
-1. the exact v4 profile bytes and an independent exact-delta review result;
-2. whether the first gate-bearing common/health nominal observation occurs after verified setup
-   reopen and before the first warmup mutation, with uninterrupted nominal observation continuing
-   through the resource-tail cut; this boundary is recommended because complete counter predicates
-   otherwise have no unambiguous baseline, but it is not frozen by this draft;
-3. whether plan-owned candidate-specific thresholds and detached qualification approval, rather
-   than candidate values embedded in this neutral contract, are accepted as the final threshold
-   authority split;
-4. the independent contract reviewers, their review procedure, and any stop condition they add; and
-5. the final two-owner contract approval record.
+1. owner acceptance of the prepared exact v4 profile bytes and independent exact-delta review
+   recorded above; preparation alone does not resolve this item;
+2. whether, after setup persist/close/reopen and independent setup verification both complete
+   successfully, the first gate-bearing common bracket and its paired candidate-health bracket both
+   complete before the first warmup mutation, with both observations then uninterrupted through the
+   resource-tail cut; this boundary is recommended because complete counter predicates otherwise
+   have no unambiguous baseline, but it is not frozen by this draft;
+3. owner acceptance of the four-way threshold-authority split: this contract owns closed
+   types/units/predicates/formulas/validity/failure/wire bounds; v4 retains the common v3 numerical
+   gates; each candidate mapping owns candidate-native limits, bases, and safety margins; and the
+   approved plan owns service/cadence/skew/tail/calibration/occupancy/observer-overhead values, all
+   bound by detached approval before results;
+4. owner acceptance of the review procedure above, the names of its two distinct independent
+   reviewers, and completed immutable outcome/receipt records from both over the exact final
+   contract/profile hashes with no unresolved stop condition; and
+5. the final approval record from distinct authenticated workload and operations owners using the
+   protected receipt or preapproved detached-signature process above.
 
 The following are deliberately post-contract, pre-execution blockers. They do not prevent approval
 of a neutral validation contract, but validation-only implementation cannot satisfy them and no

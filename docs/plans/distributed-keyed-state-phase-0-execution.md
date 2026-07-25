@@ -528,22 +528,32 @@ The Cycle 5 readers remain unwired; `[LDB-4007]` remains unchanged.
 Remaining commits are kept reviewable in this dependency order:
 
 1. `docs: finalize candidate-neutral runner contract`
-   - resolve every pre-final item in the existing v2 freeze candidate, freeze the exact v4 profile
-     bytes, and obtain final two-owner review; no reserved v2 identity is instantiated before that
-     approval;
-2. only after `APPROVE_STATE_BACKEND_RUNNER_CONTRACT_V2`, implement its validation-only schemas and
+   - review the Cycle 36 packet and prepared exact v4 freeze-candidate bytes, resolve the nominal
+     observation and threshold-authority decisions, name both independent reviewers, and obtain final
+     two-owner approval; prepared bytes instantiate no reserved v2 identity;
+2. `docs/test: freeze aggregate-v1 journal and checkpoint-cut semantics`
+   - first write the short normative aggregate-v1 journal/checkpoint-transition contract, then add a
+     disconnected, tool/test-only BTreeMap state-machine oracle for atomic pre-cut batches, PUT
+     coalescing, freeze isolation, retained dirty generations after failed capture, identical-cut
+     same-live retry, normal adjacent sealed-parent DELTA, FULL after a burned immediately preceding
+     checkpoint-ID, unchanged REFERENCE, rejection of early release, no release after seal followed
+     by terminal Abort, release only after the exact containing attempt has both a sealed inventory
+     and durable terminal Commit, and deterministic per-vnode ordering. Round-trip only through
+     existing test-only aggregate/vnode encoders and readers. Add no public runtime trait, backend,
+     adapter, manifest dispatch, restore installation, or admission consumer;
+3. only after `APPROVE_STATE_BACKEND_RUNNER_CONTRACT_V2`, implement its validation-only schemas and
    synthetic, execution-ineligible fixtures without a runtime dependency;
-3. after mechanism closure and owner carry-forward approval, add a separate exact-pin adapter commit
+4. after mechanism closure and owner carry-forward approval, add a separate exact-pin adapter commit
    for each admitted candidate behind the private spike contract;
-4. `docs: approve keyed-state qualification profile and runner`
+5. `docs: approve keyed-state qualification profile and runner`
    - named workload/operations owners may revise the candidate before approving final thresholds,
      case matrix, Zipf sampler, runner source/build identity, and evidence rules. A separately
      reviewed approved-profile schema/status records signatures and hashes. The current validator
      intentionally accepts only null approvals and `qualification_eligible=false`;
-5. `test: exercise backend crash resource and endurance gates` using only the approved artifacts;
-6. `docs: select managed-state backend from evidence`;
-7. `tools: remove rejected state backend spike`; and
-8. `docs: review distributed keyed state phase zero`.
+6. `test: exercise backend crash resource and endurance gates` using only the approved artifacts;
+7. `docs: select managed-state backend from evidence`;
+8. `tools: remove rejected state backend spike`; and
+9. `docs: review distributed keyed state phase zero`.
 
 The parked redb prescreen is not a prerequisite or active side branch in this numbered candidate
 sequence. If a future bounded charter yields a favorable administrative recommendation, a later

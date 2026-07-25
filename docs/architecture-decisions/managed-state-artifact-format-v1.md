@@ -33,11 +33,19 @@ does not authenticate an untrusted checkpoint store.
 `vnode_count` and `vnode` are `u32` to match the assignment and sealed-partial APIs. A reader still
 requires `1 <= vnode_count <= 65_535` and `vnode < vnode_count` under partition ABI v1.
 
-An attempt is canonical only when `epoch == checkpoint_id != 0`. A DELTA parent must be canonical
-and exactly `current - 1` in both fields. A REFERENCE parent must be canonical and strictly older,
-but may skip checkpoints because an unchanged vnode can name an older sealed body. FULL and EMPTY
-have no parent. The transition resolver counts each DELTA or REFERENCE edge against
-`resolved_parent_links_max`; a FULL/EMPTY base has depth zero.
+An attempt is canonical only when `epoch == checkpoint_id != 0`. A DELTA parent must be canonical,
+sealed, and exactly `current - 1` in both fields. Its matching roster entry may be BODY or REFERENCE;
+when it is REFERENCE, resolution follows that additional edge to the older body. A REFERENCE parent
+must be canonical, sealed, and strictly older, but may skip checkpoints because an unchanged vnode
+can name an older sealed body. FULL and EMPTY have no parent. The transition resolver counts each
+DELTA or REFERENCE edge against `resolved_parent_links_max`; a FULL/EMPTY base has depth zero.
+
+Checkpoint IDs are never reused after a terminal failed attempt. When `current - 1` is burned and
+unsealed, no legal DELTA parent entry exists: the first later changed capture MUST emit FULL, or
+EMPTY for authoritative empty state. An unchanged vnode MAY still REFERENCE an older sealed body.
+Once an intervening sealed attempt contains that REFERENCE, a subsequent DELTA may name the
+immediately preceding sealed REFERENCE entry. A retry of the same still-live attempt may reuse its
+already frozen immutable cut, but it does not create a new checkpoint ID or weaken the parent rule.
 
 ## Aggregate state contract
 
@@ -121,8 +129,8 @@ Sections are contiguous in routing, contract, rows order. The routing descriptor
 is compared byte-for-byte with the cached `PartitionKeySchemaV1`. The contract is the exact 64-byte
 record above. FULL and DELTA require at least one row; EMPTY is the only zero-row form and has zero
 key/state/rows lengths plus `SHA256(empty)` for the rows digest. FULL/EMPTY parent fields and parent
-digest are zero. DELTA uses the exact immediately preceding attempt and a nonzero parent-entry
-digest.
+digest are zero. DELTA uses the exact immediately preceding sealed attempt and a nonzero digest of
+its matching BODY or REFERENCE entry.
 
 Each row is:
 
@@ -198,7 +206,8 @@ entry vnode equals the header vnode. A directory with only references has an emp
 BODY has a positive body length and FULL, DELTA, or EMPTY kind. BODY ranges appear contiguously in
 directory order, start at the header body offset, and exactly cover the body region. Its body digest
 matches the exact slice. FULL/EMPTY have zero parent fields; DELTA has an immediately preceding
-canonical parent and nonzero parent-entry digest. The landed V2 reader stops after this outer
+canonical sealed parent and nonzero digest of its matching BODY or REFERENCE entry. The landed V2
+reader stops after this outer
 structural validation. Production composition must first verify the complete raw V2 payload against
 the trusted seal/inventory digest, then invoke the manifest-selected inner decoder for every BODY;
 that decoder verifies that the envelope repeats the same attempt, assignment, identity, vnode, kind,

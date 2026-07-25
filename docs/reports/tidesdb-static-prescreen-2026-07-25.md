@@ -78,11 +78,18 @@ only filesystem and S3 connectors ship; GCS support is therefore an S3-compatibi
 distinct native GCS connector. No shipped Azure Blob connector or public-Rust Azure path was found.
 Therefore TidesDB object-store mode cannot replace LaminarDB's provider-neutral checkpoint path.
 
-LaminarDB already uses Rust `object_store 0.13` behind `ObjectStoreCheckpointStore`. Its builder
-accepts local `file://`, AWS `s3://`, GCS `gs://`, and Azure `az://`, `abfs://`, or `abfss://`
-schemes. That layer remains the only planned cluster-shared checkpoint authority. Provider parity is
-not required of a disposable local working-state engine because its portable artifacts are emitted
-through this separate layer.
+LaminarDB already uses Rust `object_store 0.13` behind `ObjectStoreCheckpointStore` and its
+object-store `StateBackend`. Their shared builder accepts local `file://`, AWS `s3://`, GCS `gs://`,
+and Azure `az://`, `abfs://`, or `abfss://` schemes. Only namespace-proof-admitted exact checkpoint
+and state handles may provide cluster authority, and `file://` remains node-durable rather than
+cluster-shared. Provider parity is not required of a disposable local working-state engine because
+its portable artifacts are emitted through these separate LaminarDB paths.
+
+If a later product requirement makes an engine-native remote working-state tier mandatory, local,
+S3, GCS, and Azure portability becomes a separate hard gate. The current TidesDB FS/S3 surface does
+not pass that gate; an S3-compatible endpoint claim is not a native Azure Blob contract. That future
+requirement would need a separate provider-neutral design and evidence rather than weakening the
+existing checkpoint abstraction.
 
 TidesDB's optional mode also automatically selects unified memtables, the exact area with unresolved
 atomic-apply, replay, and checkpoint findings in this report. Synchronous remote WAL-on-commit adds
@@ -473,9 +480,11 @@ TidesDB should be reconsidered only in this order:
    acknowledgement, silent/ignored apply failures, and transaction cleanup; establish point/iterator
    commit-status visibility and immutable cross-column-family read-cut semantics; then prove them
    with concurrency, corruption, allocation, I/O, crash, and cache-loss faults;
-4. obtain upstream answers or fixes for unified checkpoint omission, column-family lifetime and
-   concurrent capture/publication; use logical export as authority only after the read-cut contract
-   above closes, unless native checkpoint later proves a durable sealed atomic cut;
+4. obtain upstream answers or fixes for unified checkpoint omission, column-family lifetime, and
+   concurrent capture/publication; treat any TidesDB read cut or native checkpoint only as input to,
+   or a local capture/restore optimization for, LaminarDB's portable export. Neither native
+   directories nor remote SST/WAL/manifest state becomes recovery authority; only the proof-admitted
+   Laminar exact-attempt inventory and seal does;
 5. write a TidesDB maintenance-health-v2 paper mapping and close exact stall/background-error
    sources with bounded off-hot-path collection;
 6. obtain a new owner decision for an additive TidesDB profile and candidate source construction;

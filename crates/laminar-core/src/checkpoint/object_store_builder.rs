@@ -1,8 +1,8 @@
 //! Factory for building `ObjectStore` instances from URL schemes.
 //!
 //! Detects the cloud provider from the URL scheme (`s3://`, `gs://`, `az://`,
-//! `file://`) and constructs the appropriate backend. Cloud providers require
-//! their respective feature flags (`aws`, `gcs`, `azure`).
+//! `abfs://`, `abfss://`, `file://`) and constructs the appropriate backend.
+//! Cloud providers require their respective feature flags (`aws`, `gcs`, `azure`).
 //!
 //! Credentials are resolved via `from_env()` (reads standard env vars like
 //! `AWS_ACCESS_KEY_ID`) with explicit overrides from the `options` map.
@@ -56,7 +56,7 @@ impl From<object_store::Error> for ObjectStoreBuilderError {
 /// | `file://` | (always) | `LocalFileSystem` |
 /// | `s3://` | `aws` | `AmazonS3Builder` |
 /// | `gs://` | `gcs` | `GoogleCloudStorageBuilder` |
-/// | `az://`, `abfs://` | `azure` | `MicrosoftAzureBuilder` |
+/// | `az://`, `abfs://`, `abfss://` | `azure` | `MicrosoftAzureBuilder` |
 ///
 /// The URL's path (everything after the bucket/container) is applied as a
 /// key prefix on the returned store, so every consumer — checkpoint
