@@ -111,7 +111,7 @@ Resume validation-only native and Docker actual-target/preflight contract work:
    maxima;
 3. keep approval-input storage-version authority blocked pending a provider, version, retention,
    freshness, and TOCTOU contract;
-4. preserve the reviewed Docker broker topology and durable launch-ledger prerequisites before
+4. preserve the reviewed Docker topology-selection and durable launch-ledger prerequisites before
    implementation; and
 5. add no runtime backend, candidate dependency, candidate execution, cluster-admission change,
    backend selection, or production claim.

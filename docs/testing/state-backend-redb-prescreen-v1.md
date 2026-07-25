@@ -1,11 +1,11 @@
 # redb 4.1.0 bounded state-backend prescreen v1
 
 - **Identity:** `state-backend-redb-prescreen/v1`
-- **Status:** Cycle 27 target/preflight identity, DAG and check-registry freeze; only redb-free
-  validation work is authorized, while exact predicates/sources and target/preflight schemas and
-  collectors, the strict later run/result wires, live provider/storage/finalization verifiers,
-  native supervisor/child/actuator/oracle, reviewed build, owner approvals, and execution remain
-  absent
+- **Status:** Cycle 29 target/preflight semantic skeleton, ordered source-domain requirements,
+  scalar algebra and minimum predicates frozen; only redb-free validation work is authorized, while
+  blocked source authorities/recipes, complete target/preflight schemas and collectors, strict later
+  run/result wires, live provider/storage/finalization verifiers, native
+  supervisor/child/actuator/oracle, reviewed build, owner approvals, and execution remain absent
 - **Evidence class:** `NOT C2/C3 QUALIFICATION EVIDENCE`
 - **Scope:** decide whether a redb adapter is worth adding to the backend qualification bake-off
 - **Production/admission effect:** none; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
@@ -1586,12 +1586,11 @@ contains those same roots plus the exact actual-target descriptor. Descriptor eq
 length, SHA-256, role, locator and media type. A mismatch is
 invalid content, not an environmental preflight failure that can close as `DEFER`.
 
-Docker target and preflight also copy one exact `broker_topology` literal,
-`same_container_pidfd` or `container_per_process`, selected by the bound target/preflight/execution
-policies before owner review. The actual-target observation, barrier-readiness probe, future run-start
-and launch-ledger header must all equal that approved value. A missing, mixed or post-run-start chosen
-topology is invalid content; the still-open implementation choice therefore blocks schema and
-execution rather than allowing runtime fallback.
+Docker target and preflight also copy one exact `broker_topology` literal. Cycle 27 reserved
+`same_container_pidfd` and `container_per_process`; the Cycle 29 clause below narrows v1 to
+`container_per_process`. The actual-target observation, barrier-readiness probe, future run-start and
+launch-ledger header must all equal that approved value. A missing, mixed or post-run-start chosen
+topology is invalid content; there is no runtime fallback.
 
 Both objects use one Linux boot-ID and `CLOCK_MONOTONIC_RAW` origin. The actual-target capture stores
 the positive RAW resolution, start/end offsets and matching UTC audit bracket; the preflight cut
@@ -1628,12 +1627,12 @@ The native fact registry and neutral observed values are:
 | `libc_abi_identity` | explicitly sourced libc implementation/version and ABI observation; source selection remains blocked |
 | `pid1_namespace_identity` | PID 1 PID/mount/cgroup/user namespace inodes |
 | `cpu_sets` | normalized online, runner-affinity and campaign-parent-effective CPU/memory-node lists |
-| `cpu_frequency` | exposure kind plus bounded groups of CPU list, scaling driver, governor and minimum/maximum kHz; unsupported exposure remains an observed kind |
+| `cpu_frequency` | exposure kind plus one bounded record per sorted cpufreq policy-directory identity with affected CPU set, scaling driver/governor and exact scaling minimum/maximum kHz; equal-setting directories are not merged, and unsupported exposure remains an observed kind |
 | `monotonic_clock_source` | `CLOCK_MONOTONIC_RAW` resolution and current kernel clocksource identity |
 | `workspace_statx_identity` | workspace device/inode/mount ID, project ID and inherit flag |
 | `workspace_mount_record` | selected bounded mountinfo record, filesystem kind, block size, mount root/point/source and normalized options; an optional XFS body contains UUID and quota-option observations only when the kind is XFS |
 | `block_device_chain` | bounded neutral leaf-to-physical node kinds and identities; an optional NVMe body contains NSID, UUID/NGUID/EUI64 under a closed availability rule, controller serial/model/firmware, geometry, rotational flag and scheduler only when terminal kind is NVMe |
-| `campaign_parent_cgroup` | observed cgroup version and already-open parent identity; an optional v2 body contains controllers/subtree-control/type, effective CPU/memory-node sets and effective hierarchical CPU/memory/swap/PID limits only when version is v2 |
+| `campaign_parent_cgroup` | observed cgroup version and already-open parent identity; an optional v2 body contains selected cgroup2 mount identity/options, ordered opened ancestor identities/local CPU/memory/swap/PID limit tuples, parent controllers/subtree-control/type, full `cgroup.events`, effective CPU/memory-node sets, empty `cgroup.procs` observation and bounded child-directory enumeration only when version is v2 |
 | `project_quota_query` | query outcome `supported` or `unsupported`; only `supported` carries exact accounting/enforcement facts and checked 512-byte conversions of `d_bcount`, `d_blk_softlimit` and `d_blk_hardlimit`, while operational/query ambiguity is unavailable rather than an observed error default |
 | `nofile_limit` | soft and hard `RLIMIT_NOFILE` |
 | `host_swap` | host swap configuration plus campaign-parent swap observation when applicable |
@@ -1661,7 +1660,7 @@ The Docker registry is deliberately different and cannot carry native XFS/NVMe f
 | `linux_vm_identity` | Linux boot ID, architecture and kernel release |
 | `docker_engine_identity` | Desktop/Engine/API versions, Engine ID, Linux-container mode, storage driver and rootless/live-restore settings |
 | `broker_connection_receipts` | broker connection ID, contiguous broker receipt sequence and observed Docker event identity/time; Docker supplies no durable event cursor |
-| `broker_container_identity` | immutable inert broker container/image/config, full init-process, namespace and cgroup identity; it cannot open the candidate database |
+| `broker_container_identity` | immutable control-only broker container/image/config and full init-process, namespace and cgroup identity; protocol forbids a candidate database mount, but Engine authority enforcement remains a blocker |
 | `image_executable_bindings` | exact approved image/config, supervisor, child, actuator, oracle and verifier digests |
 | `probe_volume_mount` | neutral Docker mount type/driver/scope/options and mountinfo/filesystem/device/workspace identity for the disposable probe; expected local-volume properties are predicates, not structural constants |
 | `container_root_mount` | separate container-root mount identity and filesystem kind |
@@ -1688,9 +1687,9 @@ and is exactly `passed`, `failed` or `incomplete`. A passed or failed row has
 `incomplete_cause = null`; an incomplete row has one source cause above or
 `prerequisite_incomplete`. The latter is legal only when a required actual-target fact is
 unavailable. When multiple unavailable preflight sources feed one check, its scalar cause is selected
-first by the seven-value cause precedence and then by that check's future closed source-registry
-order. That exact source registry remains a schema blocker; arbitrary collector discovery order is
-never accepted.
+first by the seven-value cause precedence and then by the Cycle 29 source-ID derivation. The exact
+capture recipes and blocked authorities, rather than ordering, remain schema blockers; arbitrary
+collector discovery order is never accepted.
 
 `failed` means a complete, attributable observation proved the policy predicate false. `incomplete`
 means the required observation could not be established; it must never encode an adverse fact as
@@ -1773,9 +1772,11 @@ Any unavailable listed fact forces that row to `prerequisite_incomplete` even wh
 input would have proved a mismatch.
 
 The native observation body must retain the end boot ID/clock identity; marker sequence population;
-policy-comparison facts; free-space and quota operands; cgroup throttle/memory start/end counters;
-swap and `RLIMIT_NOFILE` observations; thermal source/counter pairs; kernel/block-error cursor and
-delta; initial target-device in-flight/write observations; and broker barrier probe identity. Exact
+policy-comparison facts; free-space and quota operands; selected cgroup2 mount options, ordered
+ancestor identity/local-limit tuples, parent `cgroup.events`, `cgroup.procs` and child-directory
+observations; cgroup throttle/memory start/end counters; swap and `RLIMIT_NOFILE` observations;
+thermal source/counter pairs; kernel/block-error cursor and delta; initial target-device in-flight/
+write observations; and broker barrier probe identity. Exact
 counter sources, cursors, privileges, sampling duration and maximum-width encodings remain freeze
 blockers. `preflight_device_io_quiet` is only an initial idle observation and never evaluates the
 future one-percent-of-candidate-writes rule. A fresh campaign parent may have no target-device
@@ -1838,15 +1839,25 @@ exist, binds their exact SHA-256 in every frame, and is excluded from the prefli
 Docker control object binds its exact descriptor and checked final root; it cannot replace the
 ledger.
 
-After stage-one admission the protected outer broker holds a non-serializable
-`DOCKER_SMOKE_ROOT_LEASE` over the exact attempt context, inert broker container, Docker connection,
-evidence/control-root handles and the disposable probe only until its verified preflight removal.
+The protected outer broker is the exact Linux process identified as PID 1 by
+`broker_container_identity`. It is the sole ledger writer and owns the RAW-clock domain, Engine/event
+connections, control/evidence-root handles, leases and recovery authority. It never executes a
+candidate, and candidate containers never receive the Engine endpoint or broker control/evidence
+mounts. Broker loss is unfinalizable; ownership cannot move to a replacement process.
+
+After stage-one admission that broker holds a non-serializable
+`DOCKER_SMOKE_ROOT_LEASE` over the exact attempt context, control-only broker container, Docker
+connection, evidence/control-root handles and the disposable probe only until its verified preflight
+removal.
 The removal/absence receipt is retained, the probe is removed from the lease, and only then may
-preflight and run-start be published. The lease cannot launch or release candidate code. After exact
-run-start publication and create-new/reopen verification of the ledger, the broker irreversibly
-narrows it to `DOCKER_LAUNCH_LEDGER_LEASE`, binding that file identity and run-start. Neither lease
-replaces the single-use child-dispatch capability. Parsed bytes, labels and copied IDs cannot recreate
-either lease.
+preflight and run-start be published. The root lease grants no protocol authority to launch or
+release candidate code; because raw Docker access is physically stronger than this logical type, a
+dedicated Engine/VM and exclusive Engine-client lease is a separate mandatory enforcement blocker.
+After exact run-start publication and create-new plus reopen verification of the ledger, the broker
+irreversibly narrows the lease to
+`DOCKER_LAUNCH_LEDGER_LEASE`, binding that file identity and run-start. Neither lease replaces the
+single-use child-dispatch capability. Parsed bytes, labels and copied IDs cannot recreate either
+lease.
 
 The future ledger is broker-owned, append-only, single-writer, contiguous-sequence and SHA-256-chain
 protected. Create-new file and parent-directory durability plus reopen verification precede
@@ -1867,20 +1878,17 @@ fresh volume/copy stable identity, byte-copy length/SHA-256 receipt and cleanup 
 before any process intent, so later evidence cannot retrospectively choose which copy was opened.
 
 Each process subgraph begins with a common deterministic, never-reused `process_intent_id` binding
-run-start hash, campaign ID, case ID/ordinal, process role and intent ordinal. The ledger header has
-one future exact `broker_topology` tag, and then uses only its matching creation/start branch:
+run-start hash, campaign ID, case ID/ordinal, process role and intent ordinal. The ledger header is
+exactly `broker_topology = container_per_process`. `CONTAINER_CREATE_INTENT` additionally binds the
+deterministic Docker create key and labels. It is followed by definite `CONTAINER_CREATE_FAILED` or
+`CONTAINER_CREATED`; the latter is followed by `PROCESS_START_INTENT`, then definite
+`PROCESS_START_FAILED` or `PROCESS_STARTED` with the container and in-container process identity.
+A lost or ambiguous create, start, wait, kill/stop, inspect or remove response is reconciled against
+the same intent and exact container identity before a later authority-changing frame. Inability to
+establish one outcome is unfinalizable; no retry can become a fresh attempt.
 
-- `same_container_pidfd`: `LOCAL_SPAWN_INTENT` is followed by definite `LOCAL_SPAWN_FAILED` or
-  `PROCESS_STARTED` with the exact pidfd, `/proc` start-ticks and delegated child-cgroup identity;
-- `container_per_process`: `CONTAINER_CREATE_INTENT` additionally binds the deterministic Docker
-  create key and labels. It is followed by definite `CONTAINER_CREATE_FAILED` or
-  `CONTAINER_CREATED`; the latter is followed by `PROCESS_START_INTENT`, then definite
-  `PROCESS_START_FAILED` or `PROCESS_STARTED` with the container and in-container process identity.
-  A lost create response is reconciled by the exact key before any later frame; inability to enumerate
-  it is unfinalizable.
-
-A definite local spawn, container create or process-start failure before a bootstrap started maps to
-pre-launch `harness_invalid` unless a separately bound safety cause controls. After
+A definite container-create or process-start failure before a bootstrap started maps to pre-launch
+`harness_invalid` unless a separately bound safety cause controls. After
 `PROCESS_STARTED`, an exit before arming records `PROCESS_EXIT_OBSERVED` and reconciliation and is
 `candidate_bootstrap_failed`. Otherwise `PROCESS_ARMED` is followed either by the unreleased stop
 path `PROCESS_STOP_INTENT -> PROCESS_STOP_OBSERVED -> PROCESS_RECONCILED`, or by
@@ -1895,13 +1903,12 @@ acknowledgement is legal only after COMMITTED; acknowledgement without COMMITTED
 retained later receipt may not be omitted merely to manufacture an earlier prefix. `CASE_CLOSED`
 requires every subgraph reconciled; no next case may open earlier. `EVIDENCE_CUT` requires no live or
 unaccounted candidate-affecting process/container, no unresolved create key, and an empty selected
-candidate child-cgroup or per-case-container domain. The inert broker and closure-only processes are
+candidate child-cgroup or per-case-container domain. The control-only broker and closure-only processes are
 excluded from that domain and remain bound by the root/ledger lease.
 
-Process identity is never PID or container ID alone. Both branches bind Linux boot ID, PID namespace,
-PID, `/proc` start ticks, cgroup identity and exact executable digest. The local branch binds the
-already target-bound inert broker-container ID; the container-per-process branch binds its fresh
-container ID.
+Process identity is never PID or container ID alone. Every process binds Linux boot ID, PID
+namespace, PID, `/proc` start ticks, cgroup identity, exact executable digest and its fresh container
+ID.
 
 Durable `PROCESS_RELEASE_INTENT` for the case's first database-opening process is the conservative
 case-attempt cut. A START/ARMED-only process is unreleased; the case is unattempted only when no first
@@ -1912,19 +1919,18 @@ and incomplete. No ambiguous or failed process may be silently retried.
 
 After supervisor-worker loss, closure-only recovery is possible only while
 `DOCKER_LAUNCH_LEDGER_LEASE` survives: it stops the exact registered set, records
-`PROCESS_STOP_INTENT`/`PROCESS_STOP_OBSERVED`, proves the tagged candidate child-cgroup or per-case-
-container domain empty, and appends only reconciliation, stop and cut frames. The separately lease-
-bound inert broker/closure processes remain outside that emptiness predicate. Lease loss, Docker API/
+`PROCESS_STOP_INTENT`/`PROCESS_STOP_OBSERVED`, proves the per-case-container domain empty, and appends
+only reconciliation, stop and cut frames. The separately lease-
+bound control-only broker/closure processes remain outside that emptiness predicate. Lease loss, Docker API/
 event-stream disconnect, uncertain daemon epoch or an unaccounted candidate-affecting process makes
 the closure unfinalizable and produces no result.
 
-The implementation must select one feasible Linux control topology: a same-container broker with
-pidfd and delegated per-process cgroups, or a Docker-API container-per-process broker using exact
-Docker wait/kill/event receipts. A Windows or ordinary container client cannot claim a retainable
-host pidfd, and the two topologies cannot be mixed. That selection, cgroup-empty proof, the exact
-ten-row per-case process/copy/scan/helper registry, binary frame layout, frame/byte caps, torn-tail
-recovery and literal goldens remain blocked. No 26-process or other total cap is inferred from the ten
-case rows.
+Cycle 29 selects the Docker-API container-per-process topology using exact create, inspect, start,
+wait, kill and reconciliation receipts. Cycle 27's `same_container_pidfd` alternative is superseded
+decision history: no v1 policy, ledger or parser accepts its tag or local-spawn frames. Daemon-epoch
+continuity, independent container/cgroup-empty proof, the exact ten-case and per-case
+process/copy/scan/helper registries, binary frame layout, frame/byte caps, torn-tail recovery and
+literal goldens remain blocked. No 26-process or other total cap is inferred from the ten case rows.
 
 #### Schema and validation boundary
 
@@ -1940,25 +1946,392 @@ unavailable-as-failed, dependency-projection drift, native claims in Docker, non
 options, bind/tmpfs/overlay substitution, event reconnect treated as continuity, candidate identity
 before run-start, and malformed bytes pretending to be incomplete. Ledger goldens additionally cover
 torn header/tail, frame over-cap, sequence/hash/run-start drift, illegal transition, lost-create-
-response and container-created/start-response ambiguity, bootstrap exit before ARMED, release without
-ARM, acknowledgement without COMMITTED, wrong-topology frame, duplicate/gapped case or release
-ordinal, acknowledgement/exit identity mismatch, next-case start before reconciliation, final cut
-with a live process, daemon disconnect and an unaccounted container/cgroup.
+response and create/start/wait/kill/inspect/remove ambiguity, bootstrap exit before ARMED, release
+without ARM, acknowledgement without COMMITTED, wrong-topology/local-spawn frame, duplicate/gapped
+case or release ordinal, acknowledgement/exit identity mismatch, next-case start before
+reconciliation, final cut with a live process, daemon disconnect, candidate Engine-socket/control-
+root mount, missing exclusive Engine authority and an unaccounted container/cgroup.
 
 The remaining schema blockers are the exact approved native target scalar/identifier values,
-authoritative libc/ABI source and freshness window; campaign-parent cgroup ownership and
-hierarchical-limit rules; authoritative device exclusivity/write-attribution plus an approved bounded
-attribution-probe
-executable/recipe; thermal and kernel-error sources; XFS accounting/enforcement flags, query behavior,
+authoritative libc/ABI source and freshness window; native-host authority and campaign-parent cgroup
+ownership and hierarchical-limit rules; authoritative device exclusivity/write-attribution plus an
+approved bounded attribution-probe executable/recipe; thermal and kernel-error sources; XFS
+accounting/enforcement flags, query behavior,
 project-ID allocation and `pquota`/`prjquota` alias normalization; the checked use of `f_bavail`
 rather than privileged `f_bfree` and the meaning of 64 GiB free beyond workspace quota; cpufreq
-behavior on unsupported hosts; Docker daemon-epoch continuity, selected broker topology and feasible
-container/cgroup-empty proof; broker-barrier probe executable/recipe; raw-source retention needed for
+behavior on unsupported hosts; Docker daemon-epoch continuity, exclusive Engine authority, exact
+container security profile and feasible container/cgroup-empty proof; broker-barrier probe
+executable/recipe; raw-source retention needed for
 independent verification; live stage-two expiry/drift, provider/storage/capability TOCTOU; and maximum
 fixtures. Run-start/raw-manifest caps additionally
 remain blocked on literal 105/10 schedule goldens and complete per-row process/raw-role cardinalities.
 None of these contracts authorizes a backend, candidate run, cluster state, exactly-once claim,
 source/sink delivery claim, production use or soak claim.
+
+### Cycle 29 candidate-neutral source, scalar and predicate freeze
+
+Cycle 29 narrows the remaining target/preflight work without claiming a final wire contract. It
+freezes an additive semantic skeleton, ordered source-domain requirements, portable scalar
+semantics, source-failure classification, minimum check predicates and the sole Docker v1 broker
+topology. It does not freeze complete JSON pointer/value layouts, machine-specific expected values,
+source or document caps, schemas, collectors, raw-source storage, a provider lease, or an executable
+probe. A blocked source ID reserves an ordered requirement but does not claim its authority or
+capture recipe exists. No source ID is an extension point or backend adapter.
+
+The ordered Cycle 27 fact/check registries, fact dependencies and status projections remain exact.
+This cycle freezes one additional skeleton field: both preflight bodies contain an `observations`
+array with the same fact IDs and order as their run class's actual target. A row uses the same
+observed-value/unavailable-cause union, but its future closed value is phase-specific: stable
+identities are re-read, quiet sources carry begin/end samples, and marker, attribution and barrier
+sources carry bounded probe receipts. Check rows remain exactly `check_id`, `status` and
+`incomplete_cause`. Every predicate operand must be recoverable from the exact bound policy, ordered
+observations and any explicitly listed live authority source; it may not be replaced by a
+caller-supplied `matched=true`. Complete pointer and observation-value shapes remain blocked with the
+schemas.
+
+#### Scalar algebra
+
+Every future target/preflight schema and fixture uses these rules:
+
+- A JSON integer has lexical form `0|[1-9][0-9]{0,19}`, parses at most `u64::MAX`, and is never
+  accepted through float coercion. Negative zero, signs, fractions and exponents are invalid.
+  Units appear in field names, including `_ns`, `_bytes`, `_khz` and `_512b_blocks`; conversions,
+  sums, products and differences use checked arithmetic.
+- A Linux path or other OS byte string is represented losslessly as an even-length lowercase hex
+  string plus its decoded `byte_length`; it is never normalized as Unicode. Protocol IDs, source
+  IDs, field keys and closed enums are ASCII literals. SHA-256 values are 64 lowercase hexadecimal
+  characters; only an existing descriptor type with an explicit nonzero rule rejects the valid
+  all-zero bit pattern. Linux boot IDs are canonical lowercase UUID text.
+- A device identity is `{major:u64,minor:u64}`. CPU and memory-node sets are arrays of
+  sorted, nonoverlapping and nonadjacent inclusive `{first,last}` ranges. Their expanded count is
+  checked without allocating from the claimed count. An empty observed set is representable and
+  fails a predicate that requires CPUs or nodes; it is not encoded as unavailable.
+- A kernel limit is exactly `{"kind":"max"}` or
+  `{"kind":"value","value":<u64>}`. Zero, `u64::MAX`, `-1`, `null`, `unknown` and empty text are
+  never absence or unlimited sentinels. A source-defined value wider than `u64`, if one is later
+  approved, uses a fixed-width lowercase big-endian hex type rather than a JSON number.
+- Keyed kernel files are parsed by key, not line order, and represented as key-sorted unique arrays.
+  CPU/memory range strings and cgroup `io.stat` rows are normalized before comparison; `io.stat`
+  rows are keyed by device major/minor. Unknown source keys are retained within the future source
+  cap rather than silently discarded. Mount options are sorted unique `(ASCII name, raw-byte value
+  or null)` pairs. XFS `pquota` and `prjquota` normalize to `prjquota`; observing both aliases after
+  normalization is ambiguous rather than two independent facts.
+- A counter observation binds its source identity and begin/end unsigned values. It cannot contain
+  only a delta. UTC and Docker event timestamps are audit fields, never monotonic ordering evidence;
+  native durations and deadlines use nonnegative `CLOCK_MONOTONIC_RAW` nanosecond offsets.
+- Every compound predicate has a fixed clause order. Evidence retains the observed operands and
+  binds the exact expected policy; it cannot retain only comparison booleans. Arrays are ordered
+  where this protocol declares an order. JSON object member order is not semantic, and accepted
+  bytes need not use JCS; literal goldens use compact deterministic property order while the
+  separate document-byte cap bounds whitespace.
+
+The existing exact descriptor, protocol-ID, provider-ID, locator and canonical UTC definitions are
+imported unchanged where those types occur. Bounds not already exact remain intentionally absent.
+
+#### Source-failure classification
+
+An implementation may acquire independent sources concurrently, but classification order is the
+registry order below, never task-completion or filesystem-enumeration order. Within a fact or check,
+the seven Cycle 27 causes win first by their frozen cause precedence and then by source ID. The
+classification is exact:
+
+| Cause | Meaning |
+|---|---|
+| `source_unavailable` | The selected required interface, open, syscall, privilege or required keyed row is definitively absent and no approved alternative exists. A closed policy-relevant `unsupported` value, such as unsupported cpufreq or quota capability, is observed and can fail instead. |
+| `source_ambiguous` | A complete bounded raw source is malformed, has an out-of-domain or duplicate normalized record, finds more than one match, or contains disagreement that prevents one authoritative interpretation. A missing endpoint or required keyed row is `source_unavailable`. |
+| `source_over_cap` | A valid collector reaches a bound source byte/list/population cap before complete capture. It emits no truncated observed value. |
+| `identity_changed_during_capture` | Begin/end identity reads differ or a source field declared stable for that capture changes; expected counter movement is classified by its predicate instead. |
+| `counter_regressed_or_wrapped` | A selected externally monotonic counter has `end < begin`, a proved wrap, or saturation that prevents a safe comparison. A stable positive marker jump is an observed predicate failure, not this cause. |
+| `integer_overflow` | Lexical parsing, unit conversion or checked arithmetic cannot be represented by its frozen output type. |
+| `deadline_exceeded` | The bound RAW-clock source/probe deadline expires before complete capture. |
+
+Malformed JSON, duplicate/unknown envelope keys, bad UTF-8, an invalid mandatory header, broker
+receipt-chain corruption, a submitted document above its global cap or a file identity change while
+reading the envelope is invalid content and produces no singleton. It is not a fact-level
+`incomplete` result. A stable actual-target observation A and stable preflight observation B with
+`A != B` fails the applicable comparison; instability inside A or B is incomplete with
+`identity_changed_during_capture`. A positive quiet-counter delta fails; a regression is incomplete.
+Docker currently has no approved external monotonic counter for which
+`counter_regressed_or_wrapped` is legal: its broker sequence is envelope integrity and event
+`timeNano` is wall time.
+
+For a fact, source order is its projection row below. For a check-local capture, source order is the
+deduplicated union of its required facts' projected sources in ascending run-class source-ID order;
+the boot/clock header check uses native `N01,N02`, native-host check 3 appends check-local `N29`, and
+`actual_target_complete` uses fact-registry order rather than a source registry. An unavailable
+actual-target dependency still wins as `prerequisite_incomplete`. Otherwise a preflight source
+failure uses the cause/source precedence above. This derivation is closed; a collector cannot insert
+a discovered source into the order.
+
+#### Native source requirements and fact projection
+
+The ordered native source-requirement registry is:
+
+| ID | Reserved source requirement |
+|---|---|
+| `N01` | opened `/proc/sys/kernel/random/boot_id` |
+| `N02` | `clock_gettime` and `clock_getres` for `CLOCK_MONOTONIC_RAW` |
+| `N03` | `getpid`, `/proc/self/stat` field 22, opened self namespace/cgroup/executable identities and executable SHA-256 |
+| `N04` | `uname(2)` plus opened `/etc/os-release`, falling back only when absent to opened `/usr/lib/os-release` |
+| `N05` | selected libc/ELF ABI observation; exact source remains blocked |
+| `N06` | opened PID 1 namespace identities |
+| `N07` | CPU online sysfs and `sched_getaffinity` |
+| `N08` | every sorted cpufreq `policy*` directory identity, affected CPU set, scaling driver/governor and exact `scaling_min_freq`/`scaling_max_freq` files; equal settings are not merged |
+| `N09` | opened kernel current-clocksource sysfs |
+| `N10` | preopened workspace `fstat`/`statx`/`fstatfs`, `FS_IOC_FSGETXATTR`, and conditional `XFS_IOC_FSGEOMETRY` block-size/UUID query |
+| `N11` | bounded opened `/proc/self/mountinfo` capture |
+| `N12` | bounded block sysfs holder/slave/partition topology only |
+| `N13` | NVMe namespace/controller identity interfaces |
+| `N14` | preopened campaign-parent cgroup directory, selected cgroup2 mount record, verified opened ancestor chain carrying relevant keyed cgroup v2 configuration/effective files, and bounded parent process/child-directory emptiness capture |
+| `N15` | XFS project-quota query and accounting/enforcement state |
+| `N16` | `getrlimit(RLIMIT_NOFILE)` |
+| `N17` | bounded opened `/proc/swaps` capture |
+| `N18` | `fstatvfs` on the preopened workspace |
+| `N19` | selected shared marker; exact transport/recipe remains blocked |
+| `N20` | authoritative operations/provider device lease; provider remains blocked |
+| `N21` | campaign-parent cgroup `io.stat` plus a selected attribution probe; recipe remains blocked |
+| `N22` | selected whole-device `/sys/block/*/stat` row |
+| `N23` | campaign-parent `cpu.stat` |
+| `N24` | campaign-parent hierarchical `memory.events` |
+| `N25` | approved CPU thermal-throttle counters; supported-host source set remains blocked |
+| `N26` | approved bounded kernel/block-error cursor; source remains blocked |
+| `N27` | approved NVMe health/error observations; source and privilege remain blocked |
+| `N28` | selected inert broker/barrier probe; exact transport/recipe remains blocked |
+| `N29` | live protected-dispatcher/provider native-host attestation bound to the collection and runner identity; exact authority remains blocked |
+
+The exact source projection is:
+
+| Fact ID | Ordered source IDs |
+|---|---|
+| `collector_process_identity` | `N01,N03` |
+| `linux_uname_identity` | `N04` |
+| `libc_abi_identity` | `N05` |
+| `pid1_namespace_identity` | `N06` |
+| `cpu_sets` | `N07,N14` |
+| `cpu_frequency` | `N08` |
+| `monotonic_clock_source` | `N02,N09` |
+| `workspace_statx_identity` | `N10` |
+| `workspace_mount_record` | `N10,N11` |
+| `block_device_chain` | `N11,N12,N13` |
+| `campaign_parent_cgroup` | `N14` |
+| `project_quota_query` | `N10,N11,N15` |
+| `nofile_limit` | `N16` |
+| `host_swap` | `N17,N14` |
+| `filesystem_free_space` | `N18` |
+| `marker_source` | `N19` |
+| `device_ownership_source` | `N20,N11,N12` |
+| `device_write_source` | `N12,N14,N21,N22` |
+| `cgroup_cpu_throttle_source` | `N23` |
+| `cgroup_memory_events_source` | `N24` |
+| `thermal_source` | `N25` |
+| `kernel_block_error_source` | `N26,N27` |
+| `broker_barrier_source` | `N28,N03` |
+
+Unsupported cpufreq exposure, a non-XFS filesystem, a virtual device, cgroup v1 or an unsupported
+quota query is a complete observed tagged kind and can fail policy. Operational ambiguity or loss is
+unavailable. Mount IDs can be reused and therefore never identify a mount without the opened
+workspace and selected mount record. Kernel keyed-file line order is never identity. These choices
+follow the Linux kernel's [cgroup v2](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html),
+[block-statistics](https://www.kernel.org/doc/html/latest/block/stat.html) and
+[mountinfo](https://www.kernel.org/doc/html/v6.8/filesystems/proc.html#proc-pid-mountinfo-information-about-mounts)
+semantics, plus the XFS userspace API's
+[filesystem-geometry query](https://man7.org/linux/man-pages/man2/ioctl_xfs_fsgeometry.2.html).
+
+#### Native minimum predicates
+
+Machine-specific identity operands come from the reviewed target/preflight policies; they are not
+copied from the ineligible Fjall/RocksDB profile or inferred from this workstation. Subject to every
+required fact being observed, the 27 checks have these minimum predicates:
+
+| Check(s) | Frozen minimum predicate |
+|---|---|
+| 1 | Every target fact is observed. |
+| 2 | Boot ID and RAW-clock origin/resolution are stable and all target/preflight offsets are checked and ordered. |
+| 3 | Collector and PID 1 namespace clauses match and check-local `N29` attests the same collection/runner as a protected native host. Namespace equality alone can also occur in a container and is insufficient. |
+| 4 | Stable uname/libc/ELF observations equal the reviewed policy and build ABI. |
+| 5 | Online CPUs contain the policy affinity; scheduler affinity and campaign-parent effective CPU/memory-node sets equal policy. |
+| 6 | Exposure is complete and every normalized policy-directory/CPU-set/driver/governor/minimum/maximum record equals policy; unsupported exposure fails. |
+| 7 | RAW resolution and current clocksource are stable and equal policy. |
+| 8 | The inert marker probe advances its checked sequence by exactly one. |
+| 9 | Opened workspace device/inode/mount/project/inherit identity and selected mount record remain equal. |
+| 10 | Filesystem is XFS, normalized `prjquota` is enabled, and no disabling quota option is present. |
+| 11 | The linear path is an NVMe namespace or partition-to-NVMe namespace, with no holder, branch or virtual layer. |
+| 12 | Namespace/controller identifiers, firmware, geometry, nonrotational flag and scheduler equal policy. |
+| 13 | The authoritative lease is current, held and exclusive for that exact device chain. |
+| 14 | An approved bounded redb-free synced write probe produces exactly one allowed-chain `io.stat` row with both `wbytes` and `wios` increasing and freezes that major/minor as the attribution source; every other row's write fields remain unchanged. Read/discard fields are retained but neither establish nor change write attribution. Zero matches are unavailable; multiple matches are ambiguous. |
+| 15 | XFS project accounting and enforcement are enabled and the exact project query is supported. |
+| 16 | Workspace project ID is nonzero, inherit is set, query and inode project IDs match, and the hard quota is exactly 64 GiB after checked 512-byte conversion. |
+| 17 | The preopened parent and ancestor chain are stable cgroup v2; parent `cgroup.events populated=0`, `cgroup.procs` is empty, bounded enumeration finds no child cgroup directory, the parent is domain type, the cgroup2 mount does not enable `memory_localevents`, and policy-required CPU/cpuset/I/O/memory/PID controllers and subtree state match. |
+| 18 | Every bound ancestor/local limit tuple and the kernel-reported effective CPU/memory-node sets equal policy; existing fixed parent operands include `memory.max = 16 GiB` and `memory.swap.max = 0`. Ancestor CPU constraints and remaining CPU/PID values are policy inputs, not inferred effective scalars. |
+| 19 | `/proc/swaps` has no active rows and the effective campaign-parent swap limit is zero. |
+| 20 | Soft and hard `RLIMIT_NOFILE` equal 512. |
+| 21 | Quota use does not exceed its hard limit and checked `f_bavail * f_frsize >= (quota_hard_bytes - quota_used_bytes) + 64 GiB`. |
+| 22 | `nr_throttled` and `throttled_usec` do not increase across the policy quiet window. |
+| 23 | Every bounded hierarchical `memory.events` key/value is unchanged; a key-set change inside the bracket is source-identity change. |
+| 24 | Every approved thermal-throttle counter is unchanged. |
+| 25 | The complete approved kernel/block-error cursor reports zero new events; every approved NVMe monotonic error counter is unchanged and every approved critical-error bit is clear at both cuts. The exact counter/bit registry remains blocked with `N26,N27`. |
+| 26 | Across the policy quiet window, whole-device block read/write/discard/flush completion counters are unchanged and in-flight is zero at both ends. Sectors use 512-byte units; the whole NVMe is sampled because partition rows omit flushes. |
+| 27 | The inert broker returns the exact nonce/sequence, peer identity and armed-without-release state within its RAW deadline. |
+
+Check 14's probe can establish attribution only after its exact executable, cgroup, byte count,
+sync, cleanup and maximum-write recipe is reviewed. A missing `io.stat` row is never zero. Any check
+with a blocked authority, source, policy operand or probe recipe cannot pass until that dependency
+exists.
+
+#### Docker v1 source requirements and topology decision
+
+Docker v1 uses only `broker_topology = container_per_process`. The Linux broker owns the durable
+ledger, RAW clock, version-pinned Engine/event connections and recovery state; it creates one
+candidate-affecting container per process using deterministic create keys and exact campaign labels.
+Container startup does not enter backend-latency evidence because this lane is functional smoke, but
+it remains subject to harness deadlines and reliability classification. `same_container_pidfd` is
+rejected for v1 because writable child-cgroup delegation and local PID lifecycle reconciliation
+after supervisor-worker loss are unproved; the selected path instead retains Engine-owned container
+identity/state while the protected broker remains live. Broker loss is unfinalizable in either
+design. There is no fallback or mixed run.
+
+Every candidate container uses `AutoRemove=false`, restart policy `no`, an exact platform image and
+config digest with no tag resolution or pull, and an exact reviewed resource/mount/security profile.
+The profile forbids privileged mode, host PID/IPC namespaces, unreviewed devices or mounts, the
+Engine endpoint, and broker control/evidence roots. The exact network/user/capability/seccomp and
+case-volume clauses remain policy blockers. Engine access is root-equivalent authority, so a passed
+cut additionally requires a dedicated Engine/VM with a protected exclusive-client lease. Labels and
+reviewed broker code alone do not enforce that exclusivity.
+
+These are post-run-start launch conditions, not predictions made by initial preflight. After each
+create and before start, the broker durably records an inspect receipt and proves the exact profile;
+a mismatch is a definite pre-launch harness failure and the container is reconciled without start.
+
+The ordered Docker source-requirement registry is:
+
+| ID | Reserved source requirement |
+|---|---|
+| `D01` | Linux boot ID and `CLOCK_MONOTONIC_RAW` identity |
+| `D02` | collector/broker `/proc` start ticks, opened namespaces/cgroup/executable and executable SHA-256 |
+| `D03` | locale-independent Windows/WSL/Desktop backend identity; authoritative source remains blocked |
+| `D04` | Linux VM `uname(2)` identity |
+| `D05` | raw exact-version Engine `/version` and `/info` request/response captures with API negotiation disabled |
+| `D06` | one uninterrupted, no-reconnect raw Engine `/events` observation stream and event tuple digests; advisory, never a completeness cursor |
+| `D07` | broker receipt chain binding connection/peer identity, method, versioned path/canonical query, request length/SHA-256, status, response length/SHA-256 and RAW send/receive bracket |
+| `D08` | raw container inspect plus in-container process/namespace/cgroup observations |
+| `D09` | platform-specific image manifest and config digests |
+| `D10` | opened supervisor/child/actuator/oracle/verifier executable SHA-256 values |
+| `D11` | raw volume create/list/inspect/remove API responses |
+| `D12` | probe-container Mounts inspect plus opened mountinfo/statx/statvfs observations |
+| `D13` | separate opened container-root mountinfo/statx observation |
+| `D14` | opened cgroup v2 CPU/cpuset/memory/swap/PID files, `prlimit`, and probe `statvfs` |
+| `D15` | create-new label/name bracket, opened empty volume root, all-container volume-filter/list/inspect and foreign-reference reconciliation |
+| `D16` | exact-intent container list/inspect/wait reconciliation plus independent host-cgroup enumeration |
+| `D17` | preopened no-follow cleanup-root statx/statvfs and bounded directory enumeration |
+| `D18` | `container_per_process` inert barrier-probe create/start/arm/stop/reconcile proof; recipe remains blocked |
+| `D19` | opened read-only fixture source and probe-copy length/SHA-256/logical digest observations |
+| `D20` | protected Engine endpoint/proxy/backend/runtime epoch chain with retained process handles; Docker Desktop mechanism remains blocked |
+| `D21` | dedicated Engine/VM and protected exclusive Engine-client lease; provider remains blocked |
+
+The fact projection is:
+
+| Fact ID | Ordered source IDs |
+|---|---|
+| `collector_process_identity` | `D01,D02` |
+| `windows_wsl_identity` | `D03` |
+| `linux_vm_identity` | `D01,D04` |
+| `docker_engine_identity` | `D05,D20` |
+| `broker_connection_receipts` | `D06,D07,D20,D21` |
+| `broker_container_identity` | `D08,D02` |
+| `image_executable_bindings` | `D09,D10` |
+| `probe_volume_mount` | `D11,D12` |
+| `container_root_mount` | `D13` |
+| `resource_limits` | `D14` |
+| `volume_freshness_source` | `D11,D15,D21` |
+| `process_reconciliation_source` | `D06,D16,D20,D21` |
+| `cleanup_root_source` | `D17` |
+| `broker_barrier_source` | `D05,D06,D07,D08,D16,D18,D20,D21` |
+| `fixture_source_identity` | `D19` |
+
+The broker disables redirects, API negotiation, automatic retries and reconnects. A future daemon-
+epoch witness must bind the Engine endpoint and complete proxy/backend/runtime server chain to Linux
+boot ID, PID namespace, PID, start ticks and executable digest, retain the necessary process handles
+through evidence cut, and require `live_restore=false`. Raw exact-version `/version` and `/info`
+responses are retained at collection, run-start and evidence-cut, but only a future closed stable
+identity projection is compared; volatile fields such as server time, container counts and runtime
+telemetry are explicitly excluded from equality and may not become identity. If Docker Desktop's
+backend chain cannot be bound through its stable proxy, Docker v1 remains unsupported. An ordinary
+container's self namespace and socket-peer observation is insufficient; `D20` must bind the
+authorized host helper, its visibility/privileges and every process hop it relies on.
+
+One no-reconnect `/events` connection remains open across the same interval. EOF or reconnect is
+terminal, but uninterrupted transport is not a completeness or ordering witness: Docker documents
+timestamped event tuples, not a durable cursor, unique event ID or gap detector. Boundary marker
+events prove only that those markers were received. Durable intent plus exact request/response,
+wait/inspect/list and independent cgroup reconciliation are lifecycle authority; the contiguous
+broker sequence orders only receipts the broker actually obtained. Engine ID, volume `CreatedAt`,
+event timestamps and a `(Type,Action,Actor.ID,sorted attributes,scope,time,timeNano)` digest remain
+audit observations, not daemon epochs or cursors. Docker documents both the explicitly versioned
+[Engine API](https://docs.docker.com/reference/api/engine/) and timestamp-streamed
+[event endpoint](https://docs.docker.com/reference/api/engine/version/v1.45/). Its
+[security guidance](https://docs.docker.com/engine/security/) is why Engine access remains protected
+authority rather than a capability supplied to candidate code.
+
+#### Docker minimum predicates
+
+| Check | Frozen minimum predicate |
+|---:|---|
+| 1 | Every Docker target fact is observed. |
+| 2 | Exact reviewed Windows, WSL2, Docker Desktop backend and Linux-VM linkage operands match. |
+| 3 | Platform is the reviewed Linux architecture; platform manifest, image config and every opened executable digest match policy. A tag or multi-platform index alone is insufficient. |
+| 4 | The closed stable `/version`/`/info` projection and complete `D20` backend epoch chain match between target and initial-preflight cuts, and the advisory event transport has remained connected without reconnect so far. Later cuts must recheck continuity separately. |
+| 5 | Boot, process, namespace, cgroup, executable and RAW-clock identities remain stable and equal policy. |
+| 6 | Collector, control broker and inert probe use the reviewed unified cgroup v2 placement, namespace relations, controllers and preflight security configuration. Candidate-container configuration is checked after create and before start, not predicted here. |
+| 7 | CPU/cpuset/memory/swap/PID/nofile operands equal policy and checked unprivileged probe bytes meet its bound. Exact numeric smoke values remain blocked policy inputs. |
+| 8 | The probe is a Docker-managed named `volume` using local scope/driver with empty driver options, distinct from the container-root overlay and on the approved smoke filesystem class. Bind, tmpfs and overlay substitution fail. |
+| 9 | Under live `D21` exclusive Engine authority: exact-name pre-create absence, create receipt inside the RAW bracket, exact labels, opened empty root, and `all=true` volume-filter/list plus inspect find zero foreign container/mount references at the cut. Without `D21`, labels and enumeration cannot prove exclusivity. `CreatedAt` alone is audit context. |
+| 10 | Opened source is read-only and source/copy byte lengths, SHA-256 values and logical digests match. |
+| 11 | Under `D20,D21`, the exact `container_per_process` inert probe reaches create/start/armed, records release commitment before acknowledgement where release is tested, exits/reconciles, and leaves its selected container/cgroup domain empty. Exact recipe and independent emptiness proof remain blockers. |
+| 12 | Opened evidence/cleanup-root identities and capacity/entry operands satisfy policy, and probe removal plus post-removal absence is retained. |
+
+Raw Engine API responses, not localized CLI rendering, are the source. Only a complete stable
+semantic projection that differs from policy is failed. A malformed, truncated, contradictory,
+transport-ambiguous or unavailable source is incomplete under the closed source causes; malformed
+submitted evidence remains invalid. Events never replace list/inspect and independent cgroup
+reconciliation.
+
+#### Maximum-width evidence and remaining blockers
+
+Final caps are derived from evidence, not guessed from this workstation. Before adding any of the
+four schemas or validators:
+
+1. Approve a redb-free supported-host/source inventory, exact machine policy values, per-source
+   byte/list/population caps, sampling windows and deadlines.
+2. Hand-author, per run class, minimum complete/pass, simultaneous eligible maximum/pass, maximum
+   neutral mismatch/failed, every-fact unavailable/incomplete, maximum incomplete, and mixed
+   failed-plus-incomplete fixtures. Add one fixture for each legal cause/site and each mutually
+   exclusive maximum union arm.
+3. Saturate every compatible string, raw-byte, range, keyed-row, list, numeric and tagged-limit
+   bound. Independently recompute compact byte length/SHA-256, decoded node/depth counts and expanded
+   cardinalities without trusting declared counts.
+4. Test exact-at-cap acceptance and cap-plus-one rejection for every dimension. A collector source
+   cap-plus-one becomes `source_over_cap` without truncation; a submitted envelope, depth or node
+   cap-plus-one is invalid. Cover integer maxima, unsafe conversions, status projections, stable
+   same/stable mismatch/intra-capture change and no-delta/positive-delta/regression triples.
+5. Only then freeze JSON property layouts, semantic validators and global byte/node/depth caps. The
+   current 64-KiB/4,096-node/depth-16 and list suggestions remain non-normative; run-start/raw-
+   manifest caps remain separately blocked on literal native 105-row and Docker ten-row goldens.
+
+Native blockers are `N29` protected native-host authority; exact libc/ABI observation; provider
+device lease; attribution-probe executable/recipe; complete thermal/kernel/block/NVMe error source
+set and exact error-bit/counter registry; marker/barrier transports; raw-source retention; machine
+policy bytes and supported-host inventory. Docker blockers are the locale-independent
+Windows/Desktop identity source; `D20` complete backend-epoch chain and stable Engine projection;
+`D21` dedicated/exclusive Engine authority; exact container security/resource profile; barrier and
+independent container/cgroup-empty recipe; numeric resource policy; approved image/executable
+values; fixture storage-version authority; raw-source retention; and volume-exclusivity TOCTOU
+proof. These blockers prevent a valid passed cut, schema or collector; they do not invite a generic
+plugin framework, errno taxonomy, arbitrary sysfs snapshot or guessed cap.
+
+The local Windows/WSL/Docker installation may be used later only for non-gating functional smoke.
+It cannot establish native XFS/project-quota/dedicated-NVMe identity, device attribution, production
+latency, fault endurance or independent soak. This cycle authorizes no container, candidate or
+backend execution.
 
 ## Isolation and clocks
 
