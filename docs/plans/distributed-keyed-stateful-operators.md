@@ -3,7 +3,7 @@
 - **Status:** Planned and backend-gated; exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster
   operator is admitted by this document
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-25 during Cycle 43
+- **Last reconciled:** 2026-07-25 during Cycle 44
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -57,6 +57,11 @@ Cycle 43 makes analytic frame-history advancement transactional with its residua
 candidate tail is installed only after projection succeeds, so an ordinary projection failure or
 cancellation remains failed-before-apply and cannot double-append on replay. This changes neither
 the cluster rejection nor any backend gate.
+
+Cycle 44 makes returned ASOF failures replay-safe: ingest errors remain pre-apply; join/projection
+errors become recovery-required only after current-cycle right state or schema changes; and a
+returned eviction error is recovery-required after pruning begins. Panic/cancellation poisoning and
+empty-buffer right-schema checkpoint/restore remain open. No cluster capability is admitted.
 
 ## Scope and non-goals
 

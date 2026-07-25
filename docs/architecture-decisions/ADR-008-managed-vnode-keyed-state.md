@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-25 during Cycle 43
+- **Last reconciled:** 2026-07-25 during Cycle 44
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -13,7 +13,7 @@
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
   [TidesDB package design](tidesdb-local-state-successor-design.md),
   [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
-  [latest completed review](../reviews/distributed-keyed-state-cycle-43.md)
+  [latest completed review](../reviews/distributed-keyed-state-cycle-44.md)
 
 ## Decision
 
@@ -237,6 +237,16 @@ and remains an ordinary pre-commit failure; replay cannot append the same rows t
 path performs the same tail calculation and projection as before, with no additional copy, scan,
 lock, atomic, task, or I/O. This local correction does not supply vnode ownership, durable state,
 rebalance, or cluster admission; broader EOWC and join mutation boundaries remain open.
+
+Cycle 44 makes the current ASOF join's returned-error boundary explicit. Right-buffer ingest now
+reports whether it installed rows only after every fallible preflight step; learning the right
+schema is also treated as logical state change. A returned join/projection error requires recovery
+only if that cycle changed either state, while a left-only error against unchanged retained state
+remains ordinary. Every returned eviction error requires recovery because index pruning precedes
+fallible compaction. Existing recovery/halt dispositions remain stronger. This covers returned
+errors, not panic or cancellation after ingest; sticky attempt/root poison remains open. ASOF's
+learned right schema is also not yet represented when an empty buffer is checkpointed, so complete
+restore remains open and cluster admission remains unchanged.
 
 #### Frozen Fjall/RocksDB evidence and selected TidesDB binding line
 

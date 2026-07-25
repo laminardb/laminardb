@@ -312,14 +312,18 @@ pub(crate) struct AsofRightBuffer {
 }
 
 impl AsofRightBuffer {
+    /// Ingest one cycle's right-side batches.
+    ///
+    /// Returns `true` only after retained rows are installed. Every returned error occurs before
+    /// `index`, `right_concat`, or `ingest_count` is changed.
     pub fn ingest(
         &mut self,
         batches: &[RecordBatch],
         key_col: &str,
         time_col: &str,
-    ) -> Result<(), DbError> {
+    ) -> Result<bool, DbError> {
         if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
-            return Ok(());
+            return Ok(false);
         }
 
         let filtered: Vec<RecordBatch> = batches
@@ -328,14 +332,14 @@ impl AsofRightBuffer {
             .collect::<Result<Vec<_>, _>>()?;
         let batches = &filtered[..];
         if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
-            return Ok(());
+            return Ok(false);
         }
 
         let schema = batches[0].schema();
         let new_batch = arrow::compute::concat_batches(&schema, batches)
             .map_err(|e| DbError::query_pipeline_arrow("ASOF right buffer concat", &e))?;
         if new_batch.num_rows() == 0 {
-            return Ok(());
+            return Ok(false);
         }
 
         let timestamps = extract_column_as_timestamps(&new_batch, time_col)?;
@@ -367,7 +371,7 @@ impl AsofRightBuffer {
 
         self.right_concat = Some(merged);
         self.ingest_count += 1;
-        Ok(())
+        Ok(true)
     }
 
     pub fn evict_before(&mut self, cutoff: i64) -> Result<(), DbError> {

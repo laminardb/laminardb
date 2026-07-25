@@ -12,8 +12,10 @@ integration line. [Cycle 41 T0](tidesdb-rs-t0-source-closure-2026-07-25.md) stop
 native 9.3.6 pending a new official package. [Cycle 42](../reviews/distributed-keyed-state-cycle-42.md)
 corrects current aggregate failure classification and proves synchronous output/checkpoint
 exclusion after an indeterminate apply. [Cycle 43](../reviews/distributed-keyed-state-cycle-43.md)
-keeps analytic frame history unchanged until residual projection succeeds. None of these decisions
-changes cluster admission.
+keeps analytic frame history unchanged until residual projection succeeds. [Cycle 44](../reviews/distributed-keyed-state-cycle-44.md)
+classifies returned ASOF failures after right-state mutation while retaining ordinary errors before
+mutation; panic/cancellation poisoning and right-schema checkpoint completeness remain open. None
+of these decisions changes cluster admission.
 
 ## Verdict
 
