@@ -8,17 +8,20 @@
   cluster-shared checkpoints
 - **Bounded-memory outcome:** reference/conformance-only under the current ADR and plan; no cluster
   product profile or production-soak matrix
-- **Production backend selected:** none
+- **Worker-local product target selected:** TidesDB; production qualification/admission remains open
 - **Evidence:** code inspection and current primary-source review; no candidate or product run
 - **Admission:** unchanged and fail-closed under `[LDB-4007]` and `[LDB-0013]`
 
-**Cycle 38 current direction:** the engine-neutral placement conclusion remains authoritative. The
-project owner prefers TidesDB over RocksDB as the local-spill product candidate, subject to a
-bounded remediation/source-closure design, new non-v4 profile/mapping, common qualification,
-selection, integration, and independent product soak. The current official Rust integration remains
-rejected, no backend is selected or executable, and TidesDB native remote storage is not LaminarDB
-checkpoint/recovery authority. Every later `current`, `continue`, `keep`, or `should` imperative in
-the Cycle 20 engine screen is historical and superseded by the current implementation order below.
+**Cycle 39 current direction:** the engine-neutral placement conclusion remains authoritative. The
+project owner selected TidesDB over RocksDB as the worker-local implementation target. The
+[selected-target design](../architecture-decisions/tidesdb-local-state-successor-design.md) uses one
+fixed prefixed CF and always-fresh restore from portable Laminar artifacts; it does not use TidesDB
+native reopen, checkpoint, or remote storage and adds no per-batch `FULL` fence. The current official
+Rust integration remains rejected, and selection is not qualification, runtime admission, or a
+production claim. A successor non-v4 profile, source proof, common qualification, integration, and
+independent product soak remain mandatory. Every later `current`, `continue`, `keep`, or `should`
+imperative in the Cycle 20 engine screen is historical and superseded by the current implementation
+order below.
 
 ## Decision
 
@@ -85,7 +88,7 @@ durable ingress log or stays outside the claim.
 | Architecture | Hot-path and capacity consequence | Recovery/rebalance consequence | Disposition |
 |---|---|---|---|
 | Hard-bounded in-memory + shared checkpoints | Lowest local access overhead, but all charged live/frozen/scratch state and worst-case skew must fit RAM; allocator retention and snapshot-copy tails still count | Cold restore and source replay after every process loss; full/delta chains and source retention must meet RTO | **Reference/conformance-only:** no current product profile or admission evidence. The current flat operator maps are not this service. |
-| Embedded local store + shared checkpoints | Local cache/memtable for hot state and disk capacity for cold state; compaction, page faults, writer contention, sync and disk pressure enter p99.9 | Local files may accelerate restart but are disposable; portable vnode restore remains authoritative | **Recommended general profile**, after one engine passes the common campaign |
+| Embedded local store + shared checkpoints | Local cache/memtable for hot state and disk capacity for cold state; compaction, page faults, writer contention, sync and disk pressure enter p99.9 | Local files are disposable; the selected TidesDB profile always uses portable vnode restore into a fresh root | **Recommended general profile**, after TidesDB passes the successor campaign |
 | Object-store-primary embedded engine | Cold reads and durable writes are async and inherit remote latency/cost; requires caching, batching and failure isolation | Shared immutable files can reduce restore copying, but version ownership, fencing, compaction and GC become a subsystem | **Deferred architecture**, not an extra current candidate |
 | Remote transactional KV/database | Network/service queueing enters every miss/range path; client cache introduces coherence and version questions | Needs a snapshot/version that composes with Laminar's cut and a portable export; still needs vnode epoch fencing | **Reject as generic initial backend**; evaluate only a named service after measured need |
 | Kafka state changelog | Fast local state is still required; mutation traffic and recovery become Kafka-coupled | Coherent when source partitions, tasks, changelog and transactions all use Kafka; creates dual authority for other connectors | **Reject as connector-neutral authority** |
@@ -140,21 +143,22 @@ reservation, allocator/RSS, frozen-generation, checkpoint-copy and controlled-ex
 It must not reuse or reinterpret the current disk-oriented v1 or the v2 contract accepted for
 validation-only implementation.
 
-## Current implementation and decision order
+## Current implementation and qualification order
 
-1. Write the bounded TidesDB remediation/source-closure and successor-contract design for native
-   9.3.14 plus a repaired exact-current Rust integration. Resolve ownership/callback safety,
-   atomicity, recovery/read cuts, cgroup resources, maintenance health, and successor wire identities
-   without building or running the candidate. RocksDB/Fjall remain reference-only and redb remains
-   parked.
+1. The bounded TidesDB remediation/successor-contract design for native 9.3.14 and a narrow project-
+   private exact-current Rust integration is complete in Cycle 39. It freezes one-CF logical state,
+   exact-count/fail-stop visibility, always-fresh portable restore, immutable cuts, resource/health
+   obligations, and successor-lineage roles without building or running the candidate.
 2. Implement only genuinely candidate-neutral validation primitives justified by that design,
    retaining v4 fixture/delta regression coverage without creating unused v4-only containers.
-3. Only after the design binds its proof obligations and a separate source-construction task,
-   construct and adversarially prove the exact source path. A later exact run authorization binds
-   candidate, profile, plan, target, isolation, limits, and cost before common native-host evidence
-   exists.
-4. Select one embedded backend for the general local-spill profile only from that common evidence,
-   remove losing spike code, and complete the Phase 0 review gate after every other exit condition.
+3. Only after a separate source-construction task, run the half-day/zero-machine-hour identity/
+   ownership/close/legal kill gate and, if it passes, the at-most-one-day/four-machine-hour narrow-
+   wrapper feasibility slice. Compilation, linkage, and smoke execution must be expressly scoped.
+   Later closure and exact-run authorities separately bind source, candidate, profile, plan, target,
+   isolation, limits, and cost before qualification evidence exists.
+4. Qualify TidesDB for the general local-spill profile only through the successor common evidence.
+   A hard failure disqualifies the target and returns alternatives to an explicit owner decision;
+   it never silently activates RocksDB, Fjall, redb, or bounded memory.
 5. Then implement the already-required in-memory semantic backend as the first lifecycle consumer,
    followed by the Phase-0-selected local-spill backend behind the same contract. Use the memory
    implementation to prove atomic pre-mutation reads/batch writes, ordered timers/ranges, generation

@@ -38,9 +38,10 @@ The Cycle 20 [working-state placement analysis](../reports/state-working-state-o
 separates the capability from a named engine but does not change sequencing authority. Phase 1
 remains blocked by the existing Phase 0 review gate. Any later gate split requires an accepted ADR/
 plan amendment with named scope and owners. The intended broad/variable-state production profile
-still waits for one qualified local-spill backend. The project decision keeps bounded memory as a
-reference/conformance implementation only; it has no cluster product schedule or production-soak
-matrix under this plan.
+still waits for the selected TidesDB local-spill target to qualify. The product choice is not
+production admission; a hard qualification failure returns alternatives to an explicit owner
+decision. The project decision keeps bounded memory as a reference/conformance implementation only;
+it has no cluster product schedule or production-soak matrix under this plan.
 
 ## Scope and non-goals
 
@@ -166,26 +167,32 @@ Work:
    [decision matrix](../reports/state-backend-contract-decision-matrix-2026-07-24.md) recommends an
    additive maintenance-health successor. Cycle 21 records the direction approval, and Cycle 38
    accepts the consolidated contract for validation-only implementation without a GitHub approval
-   workflow. No candidate construction or execution authority follows. Cycle 38 also makes TidesDB
-   the preferred local-spill product candidate instead of RocksDB, without selecting or admitting
-   it. The next candidate-specific phase is a bounded remediation/source-closure design for native
-   9.3.14 plus a repaired exact-current Rust integration: safe ownership and callbacks,
-   all-or-nothing apply, strict recovery and acknowledgement, immutable read cuts, cgroup-aware
-   resource control, and maintenance health. It must produce a new non-v4 profile only after those
-   gates close; TidesDB native remote storage stays disabled. Cycle 19's reviewed
+   workflow. No candidate construction or execution authority follows. Cycle 38 made TidesDB the
+   preferred local-spill candidate instead of RocksDB; Cycle 39 records TidesDB as the selected
+   worker-local implementation target without qualifying or admitting it. The accepted
+   [selected-target design](../architecture-decisions/tidesdb-local-state-successor-design.md) uses
+   native 9.3.14 through a narrow project-private exact-current Rust integration, one fixed prefixed
+   CF, exact-count/fail-stop mutation visibility, immutable logical cuts, and a new local directory
+   restored only from Laminar portable artifacts. Opening or serving prior native state, native
+   checkpoint, remote mode,
+   strict replay, and per-batch `FULL` are outside the initial safe profile. Safe ownership/shutdown,
+   cgroup resources, maintenance health, concurrency, tails, faults, and portable restore remain
+   hard gates. It receives a successor non-v4 profile only after separately authorized source proof;
+   TidesDB native remote storage stays disabled. Cycle 19's reviewed
    [candidate mappings](../reports/state-backend-maintenance-health-mapping-designs-2026-07-24.md)
    define the historical RocksDB source/binding closure and Fjall scheduler/lifecycle closure used
    by the immutable v4 reference lineage. Redb 4.1.0 is parked after its Cycle 34 design timebox; it has no scheduled
    protocol or adapter work and may reopen only under the bounded micro-prescreen charter recorded
    in its canonical protocol. Unmodified Fjall 3.1.8 and SurrealKV 0.21.2 do not proceed to adapters.
    These engine gates apply to the general local-spill profile. They are not an architectural need
-   of the in-memory reference, but the current Phase 0 gate still blocks Phase 1. Run every later-
-   admitted candidate through the same bounded profile: Arrow-batch-sized atomic requests, realistic
+   of the in-memory reference, but the current Phase 0 gate still blocks Phase 1. Run the later
+   source-admitted TidesDB subject through the bounded successor profile: Arrow-batch-sized atomic
+   requests, realistic
    hot/cold multi-key reads, timer scans, snapshot/export overlap, sorted restore, vnode drop/GC,
    maintenance pressure/write stalls, hard memory/disk/FD limits, `kill -9`, torn/corrupt data,
-   `ENOSPC`, and
-   N/N-1 format rehearsal. Include 24–72-hour churn/TTL soak. Select one production backend from
-   equivalent evidence; discard losing spikes rather than maintaining multiple stores.
+   `ENOSPC`, and N/N-1 format rehearsal. Include 24–72-hour churn/TTL soak. A pass qualifies the
+   chosen target for later integration; a hard failure disqualifies it and returns backend choice to
+   an explicit owner decision.
 7. Record the complete delivery matrix: source consistency/topology and handoff; operator update
    mode and output identity; sink durability/topology/input mode; CP-5 ordering; permitted ALO
    duplicates; and combinations that remain closed. Benchmark at least one real certified source
@@ -209,9 +216,10 @@ Exit gate:
 - benchmark and numerical SLO/RTO profile is reproducible on a clean runner;
 - golden ABI/schema vectors and compatibility policy pass;
 - the placement-neutral service/lifecycle and in-memory conformance subject are reviewable without
-  implying admission; before broad-profile admission, one disk-backed backend is selected from
-  reproducible conformance, latency, resource, fault and operability evidence, or the profile stays
-  closed; the in-memory subject remains reference/conformance-only and supplies no admission evidence;
+  implying admission; before broad-profile admission, the selected TidesDB target passes
+  reproducible conformance, latency, resource, fault and operability gates, or it is disqualified
+  and the profile stays closed; the in-memory subject remains reference/conformance-only and
+  supplies no admission evidence;
 - at least one source/operator/append-sink scenario has a complete ALO oracle and every unsupported
   output/delivery combination has a fail-closed assertion;
 - the independent production-soak charter is approved before implementation results can influence
@@ -236,9 +244,9 @@ Work packages:
 - Provide the in-memory semantic/lifecycle implementation first and the Phase-0-selected local-
   spill backend behind the same contract and conformance suite. Neither implementation changes
   admission by existing; do not retain losing disk qualification adapters.
-- For local spill, use one worker-local database with a small fixed keyspace/column-family count and
-  logical pipeline/operator/table/vnode prefixes. Do not allocate a database or physical tree per
-  vnode.
+- For TidesDB local spill, use one worker-local database, one fixed physical managed-state CF, and
+  logical pipeline/operator/table/vnode/generation prefixes. Do not allocate a database or physical
+  tree per vnode.
 - Encode hot values with a compact schema-versioned binary format. Do not use per-group Arrow IPC,
   live DataFusion/rkyv checkpoint types, read-before-write accounting, or the removed cold-tier
   wrapper.

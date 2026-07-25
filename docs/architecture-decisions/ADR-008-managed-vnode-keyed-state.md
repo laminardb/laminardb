@@ -2,14 +2,16 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-25 after Cycle 38
+- **Last reconciled:** 2026-07-25 during Cycle 39
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
-- **Production/backend verdict:** **NO-GO**; no working-state backend is selected or admitted
+- **Production/backend verdict:** TidesDB is the selected worker-local target; **NO-GO** for
+  production admission until qualification, integration, and independent soak pass
 - **Related:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md),
   [implementation plan](../plans/distributed-keyed-stateful-operators.md),
   [current owner decisions](../reports/distributed-state-cycle-21-owner-decisions-2026-07-24.md),
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
-  and [latest completed review](../reviews/distributed-keyed-state-cycle-38.md)
+  [TidesDB selected-target design](tidesdb-local-state-successor-design.md), and
+  [latest completed review](../reviews/distributed-keyed-state-cycle-39.md)
 
 ## Decision
 
@@ -17,8 +19,8 @@ LaminarDB will add one common, byte-governed, batch-oriented working-state servi
 pipeline, operator, table, vnode, and ownership identities. State access stays local; cold or
 blocking work is coalesced per Arrow batch and kept off compute/event-loop threads. The in-memory
 implementation is the semantic/lifecycle conformance subject only. The sole current broad-state
-product target uses one qualified worker-local spill backend. No named engine, and no LSM as a
-storage family, is required by the architecture.
+product target is a TidesDB worker-local spill profile, contingent on qualification. The
+architecture does not intrinsically require an LSM or make the product choice production evidence.
 
 Cluster-shared checkpoint storage and the existing `StateBackend` remain recovery authority. A
 local store is disposable capacity/latency infrastructure: it cannot assign a vnode, authorize an
@@ -36,12 +38,12 @@ seal, coordinator decision, or restore-before-activate authority.
 | Track | Current disposition | Required next authority/evidence |
 |---|---|---|
 | In-memory | Reference/conformance-only; no product profile, admission schedule, fallback, or soak matrix | A separate future ADR/charter amendment before any bounded-memory product claim |
-| Local-spill product profile | Sole current production target; TidesDB is the project-owner-preferred candidate, while production selection remains open | Bind the remediation/source-closure design, separately authorize construction and proof, create a new non-v4 profile/mapping, complete identical qualification, reviewed selection, integration gates, and independent product soak |
-| Qualification contract | Cycle 38 project-owner direction accepts maintenance-health v2 and exact v4 for validation-only implementation; no GitHub approval workflow exists or is required for that scope; v1 remains immutable regression lineage | Permission is limited to standalone schemas, parsers, formulas, bounded readers, synthetic ineligible fixtures, and negative-capability tests. Candidate source construction, execution, selection, runtime, and production remain separately closed |
-| RocksDB 10.4.2 via `rocksdb` 0.24.0 | Mature operational LSM reference and immutable v1-v4 regression/comparison subject; not the intended product backend | No new adapter, source-closure, or qualification work is scheduled absent a new project-owner direction |
+| Local-spill product profile | Sole current production target; TidesDB is selected for implementation, but remains unqualified and unadmitted | Separately authorize bounded source construction and proof, create a successor non-v4 profile/mapping, complete qualification and integration gates, and pass the independent product soak |
+| Qualification contract | Cycle 38 project-owner direction accepts maintenance-health v2 and exact v4 for validation-only implementation; no GitHub approval workflow exists or is required for that scope; v1 remains immutable regression lineage | Permission is limited to standalone schemas, parsers, formulas, bounded readers, synthetic ineligible fixtures, and negative-capability tests. Candidate source construction, execution, runtime, and production remain separately closed |
+| RocksDB 10.4.2 via `rocksdb` 0.24.0 | Mature operational LSM reference and immutable v1-v4 regression/comparison subject; not the product backend | No new adapter, source-closure, or qualification work is scheduled absent a new project-owner direction |
 | Fjall 3.1.8 | Frozen v4 comparison/closure subject; stock scheduler/lifecycle/governance signals do not close the gate; not selected or runnable | Explicit fork/upstream ownership plus a separate candidate-specific source-closure task, then exact run authorization and the same common campaign |
 | redb 4.1.0 | **PARKED after Cycle 34**; administrative status, not a formal `DEFER` result; design timebox exhausted; no candidate profile, adapter, mechanism result, or execution authority | No scheduled work. Reopen only through an explicit two-day/four-machine-hour micro-prescreen charter; otherwise retain as history. A favorable observation could only fund a later mapping/profile proposal |
-| TidesDB native 9.3.14 with repaired exact-current Rust integration | **Project-owner-preferred local-spill product candidate**, not production-selected or admitted; the current official Rust path remains rejected and every recorded native correctness/operations veto remains open | Priority is a bounded source/remediation design for lifetime-safe exact-version Rust ownership, all-or-nothing apply, strict recovery, immutable read cuts, cgroup-aware resources, and maintenance health. Only after a separately authorized construction task proves those obligations may a new non-v4 profile/mapping and separately authorized run be proposed. Native remote mode stays disabled and cannot replace LaminarDB's local/S3/GCS/Azure checkpoint authority |
+| TidesDB native 9.3.14 with a project-private exact-current Rust integration | **Selected worker-local product target**, not production-qualified or admitted; the current official Rust path remains rejected | Follow the accepted one-fixed-CF, exact-count/fail-stop, always-fresh portable-restore design. A separately authorized kill-fast construction task must prove safe ownership/shutdown, visibility, immutable cuts, cgroup resources, and maintenance health before a successor profile or run. Native remote mode stays disabled and cannot replace LaminarDB's local/S3/GCS/Azure checkpoint authority |
 | SurrealKV 0.21.2 | Rejected unmodified; no active candidate track | Correctness/liveness fork and new bounded prescreen authority before reconsideration |
 
 The current source detail and rationale live in the
@@ -52,8 +54,9 @@ The current source detail and rationale live in the
 [candidate mapping designs](../reports/state-backend-maintenance-health-mapping-designs-2026-07-24.md),
 [RocksDB closure](../reports/rocksdb-mechanism-source-closure-2026-07-24.md),
 [redb prescreen](../testing/state-backend-redb-prescreen-v1.md), and
-[TidesDB prescreen](../reports/tidesdb-static-prescreen-2026-07-25.md). These are evidence and gate
-records, not backend selection.
+[TidesDB prescreen](../reports/tidesdb-static-prescreen-2026-07-25.md), and
+[TidesDB selected-target design](tidesdb-local-state-successor-design.md). These are evidence and
+gate records; the product target is selected, but production admission remains evidence-gated.
 
 The existing fixed vnode ABI, bounded shuffle, assignment/process fencing, aligned barriers,
 per-vnode checkpoint artifacts, and exact-attempt seal are retained. Cluster admission will move
@@ -178,10 +181,11 @@ key.
 
 The physical key prefix is ordered by pipeline, operator/state-table, and vnode before the logical
 key. This permits bounded vnode scans, bulk restore, range deletion, and quota attribution. The
-initial layout uses one worker-local database with a small fixed set of physical keyspaces;
-pipeline, operator, table, and vnode are logical prefixes, never separate databases. Phase 0 must
-confirm that this layout gives acceptable failure isolation and cleanup cost. A database or keyspace per
-vnode is forbidden; Fjall keyspaces are physical LSM trees with their own write buffers.
+selected TidesDB layout uses one worker-local database and one fixed physical managed-state column
+family; pipeline, operator, table, vnode, and generation are logical prefixes, never separate
+databases. Phase 0 must confirm acceptable isolation, cleanup cost, and hot-writer/disjoint-vnode
+tails. A database or column family per vnode is forbidden. The frozen v4 Fjall/RocksDB reference
+layout retains its distinct historical physical-keyspace semantics.
 
 ### 3. Batched local working-state service
 
@@ -209,12 +213,12 @@ compact schema-versioned binary codec with schema metadata hoisted out of each v
 Arrow IPC streams are prohibited; the prior tier audit found their framing could dominate small
 accumulator payloads. Checkpoint export may re-columnarize many logical records together.
 
-#### Frozen Fjall/RocksDB evidence and current TidesDB qualification direction
+#### Frozen Fjall/RocksDB evidence and selected TidesDB target
 
 The Fjall/RocksDB material below is retained as exact reference and regression rationale, not the
-active product work order. Cycle 38 makes TidesDB native 9.3.14 with a repaired exact-current Rust
-integration the preferred conditional candidate. The same common workload and absolute gates still
-apply; vendor results and preference are not selection evidence.
+active product work order. Cycle 39 records TidesDB native 9.3.14 with a narrow project-private
+exact-current Rust integration as the selected target. The same common workload and absolute gates
+still apply; the product choice and vendor results are not qualification or production evidence.
 
 [Fjall 3.1.8](https://docs.rs/fjall/3.1.8/fjall/) is a credible fit on paper: a Rust-native API and no
 C++ storage engine, atomic
@@ -268,13 +272,16 @@ or briefly block writes, so it is a measured restore optimization. Qualification
 engine, wrapper/integration, source/build identity, and configuration before relying on any API
 behavior.
 
-The current design step must bind a repaired official-Rust integration to the reviewed native
-version plus safe parent/child ownership, shutdown, callback, thread-safety, panic, exact-count
-all-or-nothing mutation, fail-closed replay/acknowledgement, immutable read, portable export,
-cgroup/native-memory, and bounded off-hot-path health proof obligations. Only a separately
-authorized construction task may implement and prove them. Only after proof may successor profile/
-mapping identities and a separately authorized common run be proposed. Native remote mode remains
-disabled.
+The accepted [TidesDB selected-target design](tidesdb-local-state-successor-design.md) deliberately
+does not repair the broad official Rust wrapper or depend on native restart recovery. It uses one
+fixed CF, a narrow project-private exact-current integration, exact-count mutation with a visibility
+gate and fail-stop ambiguity, and a new directory restored only from Commit-admitted Laminar
+artifacts. Native existing-directory state, checkpoint, and remote storage are outside the safe
+surface; there is no per-batch `FULL` fence. Safe ownership/shutdown, immutable logical cuts,
+portable restore, cgroup/native-memory governance, maintenance health, latency/concurrency, faults,
+delivery integration, and independent soak remain hard gates. Only a separately authorized kill-
+fast construction task may begin source work, and only closed source proof may fund a successor
+profile and separately authorized run.
 
 The in-memory backend is required for model/differential tests and is the first placement-neutral
 lifecycle implementation after the existing Phase 0 review gate. It remains reference/conformance-
@@ -308,7 +315,7 @@ candidate-applicable maintenance-health and exact foreground-stall gates remain 
 free disk alone does not prove that the state path can sustain its write rate. All retained backing
 buffers must release or copy before a batch ends, and snapshots/iterators have bounded lifetimes so
 old versions can be reclaimed. Native allocations are included for any C/C++ candidate, including
-the preferred conditional TidesDB path; [Kafka Streams' 2026 RocksDB leak
+the selected TidesDB path; [Kafka Streams' 2026 RocksDB leak
 fix](https://kafka.apache.org/blog/2026/06/25/apache-kafka-4.3.1-release-announcement/) is a useful
 warning against relying on Rust heap metrics alone.
 
@@ -740,9 +747,9 @@ Targets are chosen before optimization results are known; “fast on a laptop”
 
 The checked-in [`linux-nvme-v4` input](../../tools/state-backend-qual/profiles/linux-nvme-v4.freeze-candidate.json)
 is accepted only for validation and immutable Fjall/RocksDB regression. Its exact roster and
-RocksDB-specific controls cannot be relabelled as TidesDB. The project-owner-preferred TidesDB
-candidate requires a new profile identity and candidate mapping after its source/remediation gates
-close. The standalone validator must continue to accept only explicitly ineligible forms, reject
+RocksDB-specific controls cannot be relabelled as TidesDB. The selected TidesDB target requires a
+successor profile identity and candidate mapping after its source/remediation gates close. The
+standalone validator must continue to accept only explicitly ineligible forms, reject
 measured/result fields, and have no runtime or backend dependency. Exact run authorization, evidence
 for the repaired candidate, the product connector/object-store profile, and the independent release
 soak all remain outstanding. The v1-v3 profiles remain immutable validation/model regression
@@ -853,11 +860,11 @@ correctness and risks falsely advertising end-to-end exactly-once.
 
 The removed tier cached checkpoint slices and used point operations; it did not own always-current
 state, and its dirty-state coupling was unsafe. Restoring it would preserve the missing lifecycle.
-Conversely, API checklists and old single-insert or vendor benchmarks are insufficient to select
-Fjall, RocksDB, or TidesDB for production. The owner preference for TidesDB sets remediation and
-qualification priority; it does not waive source closure or constitute production selection. A
-bounded common campaign is justified because backend choice directly affects the tail, resource
-governor, restore, cleanup, and operational surface; a permanent two-backend product is not.
+Conversely, API checklists and old single-insert or vendor benchmarks are insufficient to qualify
+Fjall, RocksDB, or TidesDB for production. The owner selected TidesDB as the implementation target;
+that choice does not waive source closure or constitute production admission. Its absolute campaign
+is required because the backend directly affects the tail, resource governor, restore, cleanup, and
+operational surface; a permanent two-backend product is not planned.
 
 ## Consequences and risks
 
@@ -872,10 +879,11 @@ Positive consequences:
 Costs and risks:
 
 - any embedded disk store adds corruption, disk, tuning and cold-page/sync-tail risk; an LSM also
-  adds compaction risk. The preferred TidesDB path currently needs a repaired safe exact-current
-  Rust integration plus atomicity, recovery, read-cut, cgroup, and health closure; it also adds a C
-  build and native allocator accounting. Frozen Fjall/RocksDB references retain their documented
-  governance/native costs, and redb-like B-trees add sole-writer and reclamation/resize risk;
+  adds compaction risk. The selected TidesDB path needs a safe narrow exact-current Rust integration
+  plus exact-count visibility, portable fresh restore, immutable-cut, cgroup, and health closure; it
+  also adds a C build and native allocator accounting. Frozen Fjall/RocksDB references retain their
+  documented governance/native costs, and redb-like B-trees add sole-writer and reclamation/resize
+  risk;
 - a separately certified memory profile adds an admission/soak matrix and controlled-exhaustion
   path; it is justified only if measured latency or deployment value repays that support cost;
 - portable state encodings and stable operator IDs become long-lived compatibility contracts;
@@ -892,7 +900,7 @@ checks, and admission flags that remain disabled until each vertical passes its 
 
 | System/research | Relevant fact | Decision taken here |
 |---|---|---|
-| [Fjall 3.1.8 API](https://docs.rs/fjall/3.1.8/fjall/) and [RocksDB operations](https://github.com/facebook/rocksdb/wiki/Basic-Operations) | Fjall offers a Rust-native API without a C++ storage engine plus batches/snapshots/ranges, but lacks native multi-get/range tombstones and sufficient governance telemetry; RocksDB offers broader batch/operations controls at native-build/accounting cost | Run one workload/fault contract, including explicit durability and pressure tests, select one production backend, and retain portable Laminar artifacts |
+| [Fjall 3.1.8 API](https://docs.rs/fjall/3.1.8/fjall/) and [RocksDB operations](https://github.com/facebook/rocksdb/wiki/Basic-Operations) | Fjall offers a Rust-native API without a C++ storage engine plus batches/snapshots/ranges, but lacks native multi-get/range tombstones and sufficient governance telemetry; RocksDB offers broader batch/operations controls at native-build/accounting cost | Retain the common workload/fault lessons and portable Laminar artifacts; qualify the separately selected target against absolute gates |
 | [Flink 2.3 keyed state](https://nightlies.apache.org/flink/flink-docs-release-2.3/docs/concepts/stateful-stream-processing/) and [state backends](https://nightlies.apache.org/flink/flink-docs-release-2.3/docs/ops/state/state_backends/) | Key groups are the atomic redistribution unit; heap is low-latency but memory-bound; EmbeddedRocksDB supports large local state and incremental checkpoints | Keep fixed vnodes; start with a local disk-backed backend and portable checkpoints |
 | [Arroyo state concepts](https://doc.arroyo.dev/concepts/) | The Rust engine keeps open-source working state in worker memory, explicitly limits it to worker RAM, and writes consistent remote Parquet checkpoints | Treat bounded memory plus remote recovery as a valid separately gated placement, not evidence that arbitrary state fits memory |
 | [Flink ForSt](https://nightlies.apache.org/flink/flink-docs-release-2.3/docs/ops/state/disaggregated_state/) | Remote SSTs, local cache and async State V2 access enable lightweight checkpoints, but ForSt remains experimental; synchronous state is local unless explicitly overridden, and the current implementation is slated for replacement | Do not put object storage on LaminarDB's initial hot path |

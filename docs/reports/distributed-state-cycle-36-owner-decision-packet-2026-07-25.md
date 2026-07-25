@@ -3,7 +3,7 @@
 - **Date:** 2026-07-25
 - **Status:** historical review input; PF4/PF5 approval mechanism superseded by Cycle 38
 - **Scope:** maintenance-health v2 final-contract decisions and the next candidate-neutral state step
-- **Backend selected or executed:** none
+- **Backend selected or executed at Cycle 36:** none
 - **Runtime dependency, adapter, or admission change:** none
 - **Production verdict:** **NO-GO**; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
 
@@ -15,10 +15,11 @@ identity, protected-workflow, and signature ceremony with ordinary technical rev
 project-owner direction and freezing commit. The matrix below is retained as decision history; it
 does not block validation-only schemas or fixtures and still creates no backend execution authority.
 
-Cycle 38 also supersedes this packet's backend-priority state: TidesDB is now the preferred
-local-spill product candidate, while RocksDB/Fjall remain immutable v4 references. The inspected
-official TidesDB Rust path remains rejected. Only a bounded exact-current remediation/source-closure
-design is scheduled; construction, execution, selection, admission, and production remain closed.
+Cycle 38 superseded this packet's backend-priority state, and Cycle 39 then selected TidesDB as the
+worker-local implementation target while RocksDB/Fjall remain immutable v4 references. The
+inspected official Rust path remains rejected. The
+[selected-target design](../architecture-decisions/tidesdb-local-state-successor-design.md) is
+complete, but construction, execution, qualification, admission, and production remain closed.
 
 The working-state design is also not ready to become a public runtime trait. This packet's proposed
 next safe slice was the disconnected aggregate-v1 state-machine oracle; Cycle 37 completed that
@@ -143,14 +144,14 @@ This slice adds no public runtime trait, dependency, backend, adapter, candidate
 dispatch, restore installation, or admission consumer. It also does not execute Fjall, RocksDB,
 redb, TidesDB, Docker/WSL, a provider API, or a cloud resource.
 
-## Backend and production implications
+## Backend and production implications (Cycle 39 reconciliation)
 
 | Subject | Current disposition |
 |---|---|
 | Fjall 3.1.8 | Immutable v4 reference; stock scheduler/lifecycle/governance gaps remain; no active product work |
 | RocksDB 10.4.2 via rocksdb 0.24.0 | Immutable v4 reference; source/binding/operability gaps remain; no active product work |
 | redb 4.1.0 | PARKED after the bounded Cycle 34 design timebox; reopening needs a new micro-charter |
-| TidesDB native 9.3.14 plus repaired exact-current Rust integration | Preferred conditional product candidate; current official Rust path remains STOP; bounded remediation/source-closure design is next |
+| TidesDB native 9.3.14 plus narrow project-private exact-current Rust integration | Selected worker-local target; current official Rust path remains STOP; one-CF/fresh-portable-restore design complete; source proof and qualification remain closed |
 
 A qualified worker-local spill backend is eventually required because bounded memory is
 reference-only, but a backend is not required for this next semantic slice. Backend qualification

@@ -3,18 +3,20 @@
 - **Date:** 2026-07-24
 - **Bounded-memory decision:** reference/conformance-only
 - **Contract direction:** `APPROVE_MAINTENANCE_HEALTH_V2_DIRECTION`
-- **Backend selected:** none
+- **Backend selected at Cycle 21:** none; Cycle 39 later selects TidesDB as the implementation target
 - **Candidate execution authorized:** no
 - **Runtime/admission effect:** none; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
 
-**Current-state note (Cycle 38):** the direction decision below remains authoritative, but Cycle 38
+**Current-state note (Cycle 39):** the direction decision below remains authoritative, but Cycle 38
 supersedes the later proposed two-owner/protected-workflow mechanism and accepts the
 [consolidated runner](../architecture-decisions/state-backend-qualification-runner-v2-draft.md) for
 validation-only implementation through ordinary technical review and the freezing commit. This
 chronological record does not reactivate older redb work or authorize candidate execution. The
-project owner also makes TidesDB the preferred local-spill product candidate instead of RocksDB;
-this prioritizes a bounded remediation/source-closure design but is not backend selection,
-construction, execution, runtime admission, or production approval.
+project owner first made TidesDB the preferred local-spill candidate instead of RocksDB, then in
+Cycle 39 selected it as the worker-local implementation target. The
+[selected-target design](../architecture-decisions/tidesdb-local-state-successor-design.md) does not
+authorize construction or execution, and the selection is not qualification, runtime admission, or
+production approval.
 
 ## Recorded decisions
 
@@ -47,10 +49,10 @@ direction decision does not approve them.
 | Item | Current treatment | Next authority |
 |---|---|---|
 | In-memory working state | Semantic reference/conformance subject only | Separate future ADR amendment before any product profile |
-| Local-spill working state | Sole current cluster production target; TidesDB is preferred, but no backend is selected | Bounded TidesDB remediation/source-closure design, new non-v4 profile/mapping after closure, qualification, selection, and independent product soak |
+| Local-spill working state | Sole current cluster production target; TidesDB is the selected implementation target but is unqualified and unadmitted | Bounded source construction/closure, successor non-v4 profile/mapping, qualification, integration, and independent product soak |
 | Maintenance-health v2 | Direction approved here; [validation contract](../architecture-decisions/state-backend-qualification-runner-v2-draft.md) accepted by Cycle 38 | Validation-only implementation authorized; candidate construction and execution remain closed |
 | redb 4.1.0 prescreen | PARKED after Cycle 34; no profile, adapter, execution, or disposition | New explicitly approved bounded micro-prescreen charter before any work resumes |
-| TidesDB | Preferred conditional candidate; current official Rust path remains rejected | Exact-current safe Rust/native design plus atomicity, recovery, read-cut, cgroup, health, profile, and separate execution gates |
+| TidesDB | Selected worker-local target; current official Rust path remains rejected | Follow the one-CF/fresh-portable-restore design; close safe integration, visibility, cut, cgroup, health, profile, execution, and soak gates |
 | RocksDB/Fjall | Immutable v4/reference lineage only; no active product track | No new source, adapter, or run work absent a new project-owner direction |
 
 This record does not authorize Docker smoke, native prescreen execution, or classification. The

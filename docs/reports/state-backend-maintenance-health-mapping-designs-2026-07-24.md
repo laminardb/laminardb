@@ -5,16 +5,17 @@
 - **Contract basis:** [maintenance-health v2 direction](../architecture-decisions/state-backend-maintenance-health-v2-proposal.md),
   approved after this Stage 2 report
 - **Mapping artifacts created:** none
-- **Backend selected:** none
+- **Backend selected at Cycle 19:** none; Cycle 39 later selects TidesDB as the target
 - **Candidate construction or execution authorized:** no
 - **Cluster admission:** unchanged; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
 - **Production verdict:** **NO-GO**
 
-**Cycle 38 current direction:** the mappings below remain frozen Fjall/RocksDB/redb vocabulary and
-source-gap provenance; they are not the active product ranking. TidesDB is now the preferred
-local-spill candidate, but its current official Rust path remains rejected. It requires a bounded
-remediation/source-closure design and later new mapping/profile identities. No candidate source,
-adapter, or execution is authorized by this report.
+**Cycle 39 current direction:** the mappings below remain frozen Fjall/RocksDB/redb vocabulary and
+source-gap provenance; they are not the active product ranking. TidesDB is the selected worker-local
+target, but its current official Rust path remains rejected. Its one-CF/fresh-restore
+[design](../architecture-decisions/tidesdb-local-state-successor-design.md) requires successor
+mapping/profile identities only after source closure. No candidate source, adapter, or execution is
+authorized by this report.
 
 ## Historical Cycle 19 outcome
 

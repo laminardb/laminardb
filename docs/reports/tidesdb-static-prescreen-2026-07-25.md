@@ -1,7 +1,7 @@
 # TidesDB static backend prescreen and Zipf claim audit
 
 - **Date:** 2026-07-25
-- **Cycle:** 28; bounded Cycle 35 recheck; Cycle 38 product-direction supersession
+- **Cycle:** 28; bounded Cycle 35 recheck; Cycle 38 priority supersession; Cycle 39 target selection
 - **Evidence class:** exact-source and published-artifact review only
 - **Native subject inspected:** TidesDB `v9.3.14`, commit
   `6fe1e83104b70255a694239d360a14bae51d0c70`
@@ -9,11 +9,12 @@
   `e2febbc548e7f0158d1c09ea487aa0bb7c343616`
 - **Candidate installed, built, linked, or executed:** no
 - **Runtime dependency or backend added:** no
-- **Prescreen disposition:** `REJECT_CURRENT_OFFICIAL_RUST_PATH_RETAIN_NATIVE_RESEARCH_ONLY`
+- **Static prescreen disposition:** `REJECT_CURRENT_OFFICIAL_RUST_PATH`; Cycle 39 separately selects
+  a narrow exact-current native integration as the conditional construction target
 - **Cycle 28/35 track:** **STOP** the inspected official Rust subject; no build, benchmark, adapter,
   or candidate execution was authorized
-- **Cycle 38 current direction:** TidesDB replaces RocksDB as the preferred local-spill product
-  candidate; only a bounded remediation/source-closure design is scheduled
+- **Cycle 39 current direction:** TidesDB replaces RocksDB as the selected worker-local target; the
+  accepted successor design is documentation/source-review-only and production remains gated
 - **Production and cluster admission:** **NO-GO**; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
 - **Bounded memory:** reference/conformance-only; no current product or soak profile
 - **Maintenance-health v2:** validation contract accepted for validation-only implementation;
@@ -37,8 +38,38 @@ provider-neutral Rust `object_store` path for local/S3/GCS/Azure checkpoint arti
 portable checkpoint and recovery authority. Production and cluster admission remain **NO-GO**, and
 the independent release-candidate soak remains mandatory.
 
+### Cycle 39 selected-target and topology amendment
+
+The project owner now selects TidesDB as LaminarDB's worker-local state implementation target. This
+is a product direction, not approval of `tidesdb-rs 0.11.1`, production qualification, a dependency,
+source construction, candidate execution, cluster admission, or a production-ready claim. A hard
+gate failure disqualifies TidesDB and returns alternatives to an explicit owner decision; RocksDB,
+Fjall, redb, and bounded memory do not activate automatically.
+
+The accepted [selected-target design](../architecture-decisions/tidesdb-local-state-successor-design.md)
+uses one worker-local database and one fixed prefixed CF for all Laminar logical tables. It treats
+local files as asynchronous disposable capacity. Every incarnation uses an exclusive new root and
+restores only a coordinator-admitted portable Laminar cut; no existing native state, native
+checkpoint, or TidesDB remote object becomes recovery authority. Laminar's Rust `object_store` path
+remains sole portable local/S3/GCS/Azure artifact transport.
+
+This topology narrows, but does not invalidate, the dated source findings below. Cross-CF sequential
+WAL, unified-WAL replay, native checkpoint, and per-batch `FULL` defects remain true for the inspected
+four-CF/local-recovery shape, but those mechanisms are prohibited rather than recorded as passed in
+the initial product profile. A fresh native open may internally traverse empty recovery code, so the
+proof claim is exclusive create-new plus no prior WAL/state becoming servable—not unproven call-
+graph absence.
+
+The remaining hard gates include the narrow exact-current Rust integration and deterministic close,
+built-in byte-comparator equivalence, exact-N mutation success, no silent short success, atomic
+pre/post visibility, safe containment of stalled native calls, fail-stop post-admission ambiguity,
+immutable logical cuts, hostile-stream fresh restore, explicit cgroup/resource bounds, complete
+off-hot-path maintenance health, C2/C3 p99.9/maximum tails, faults, RTO/source retention, delivery
+integration, and the separately operated unchanged-release product soak.
+
 The reported TidesDB Zipf advantages are credible enough to preserve as a hypothesis, but they do
-not support a backend choice. The strongest recent comparison disables durability, measures a
+not qualify the selected target or support production admission. The strongest recent comparison
+disables durability and measures a
 MariaDB/TideSQL stack rather than LaminarDB state access, emphasizes TPS and p95 transaction latency
 without a consistent tail distribution, and does not exercise checkpoint, restore, rebalance,
 source/sink composition, or sustained maintenance
@@ -65,10 +96,10 @@ More importantly, static prescreening finds blockers before performance executio
    memory rather than Linux cgroup limits, and raises an explicit lower value to five percent of
    host RAM.
 
-The current official Rust integration is therefore a hard **NO-GO**. Keep the native C engine as a
-research-only option that could re-enter after a lifetime-safe, exact-version wrapper and bounded
-source closures exist. Do not insert TidesDB into the frozen Fjall/RocksDB runner lineage, change an
-ADR backend decision, add a dependency, or authorize a candidate run from this report.
+The current official Rust integration is therefore a hard **NO-GO**. The native C engine is now the
+selected construction target only through a lifetime-safe, exact-version, narrow project-private
+integration and bounded source closures. Do not insert TidesDB into the frozen Fjall/RocksDB runner
+lineage, add a dependency, or authorize a candidate run from this report.
 
 ## Cycle 35 bounded recheck and object-store boundary
 
@@ -118,17 +149,16 @@ and compaction may fetch complete files. Those tradeoffs need a separate latency
 disk-headroom, and recovery analysis if a future cold-tier proposal is ever justified. They must not
 enter LaminarDB's per-record/event-loop hot path by accident.
 
-The historical Cycle 35 timeboxed decision was to stop TidesDB work. Cycle 38 supersedes that work-
-priority decision by authorizing the bounded remediation/source-closure design described above, but
-does not weaken its technical triggers. Candidate construction should be considered only after a
-proposed upstream release or maintained exact-current integration plausibly closes the Rust
-lifetime/callback boundary, all-or-nothing
-cross-namespace apply and visibility, strict unified-WAL recovery, complete immutable checkpoint/read
-cuts, container-aware memory governance, and the full maintenance-health surface. Such a release
-signal only permits proposing a separately owner-authorized half-day static delta review. If every
-veto closes, an owner could then separately authorize at most a one-day local-only adapter-feasibility
-review. This report authorizes no adapter implementation, dependency, build, candidate run, or
-object-store integration.
+The historical Cycle 35 timeboxed decision was to stop TidesDB work. Cycle 38 reopened only bounded
+design, and Cycle 39 completes that design with the narrower one-CF/fresh-restore shape. A later
+source-construction task still needs explicit scope and cost. Its first kill gate is at most half an
+engineering day and zero candidate machine hours for exact source/build identity, ownership/close,
+legal/distribution, and immediate stops. Only a pass permits at most one engineering day for a
+create-new-root, fixed-CF, exact-count
+apply/read, deterministic-shutdown wrapper feasibility slice. Either cap returns
+`INSUFFICIENT_CLOSURE`; broader visibility, cut, restore, resource, health, latency, and fault proof
+is separately estimated. This report authorizes no adapter implementation, dependency, build,
+candidate run, or object-store integration.
 
 ## Exact subject boundary
 
@@ -198,10 +228,11 @@ The current native header explicitly distinguishes two layouts:
 - in unified-memtable mode, one shared WAL batch is intended to make a cross-column-family
   transaction crash-atomic.
 
-LaminarDB's four logical state/timer/join namespaces require the second property. Any future profile
-must therefore pin unified mode and `TDB_SYNC_FULL`; both unified mode and its sync mode default to
-off/`NONE`. An ordinary transaction commit, WAL write, or commit hook is not a distributed
-checkpoint or an exactly-once receipt.
+The historically considered four-physical-CF/native-reopen profile would require the second
+property and therefore unified mode plus `TDB_SYNC_FULL`; both unified mode and its sync mode default
+to off/`NONE`. Cycle 39 does not use that profile: all logical namespaces share one CF, local state
+is disposable, and native reopen is unsupported. In either profile, an ordinary transaction commit,
+WAL write, or commit hook is not a distributed checkpoint or an exactly-once receipt.
 
 Default `READ_COMMITTED` does not make either layout runtime-atomic. Commit publishes an in-progress
 sequence before applying column families sequentially in per-column-family mode or inserting the
@@ -434,33 +465,33 @@ cancel memory unsafety, torn recovery, an unavailable state cut, or missing fail
 |---|---|---|
 | Exact deployable subject | Rust `0.11.1` selects native `9.3.6`; current engine and benchmarks are different revisions | **FAIL** — produce a lifetime-safe wrapper pinned to the exact reviewed native release and complete provenance |
 | Legal/build adoption | MPL-2.0 is identifiable; C toolchain, bundled codecs, ABI, SBOM, notices, target flags, and redistribution package are not frozen | **BLOCK** |
-| C1 ordered KV primitives | Point operations, transactions, snapshots/isolation, ordered bidirectional iteration, seeks, deletes, and multiple CFs exist | **CONDITIONAL** — exact byte ordering, bounded scans, read-cut semantics, and canonical export/restore still need conformance |
-| Cross-namespace atomicity | Per-CF mode is crash-nonatomic; both layouts permit default `READ_COMMITTED` partial visibility and can acknowledge a partial batch insertion; unified mode adds ambiguous apply paths | **FAIL** — repaired all-or-nothing unified+FULL mutation and visibility need fault proof |
+| C1 ordered KV primitives | Point operations, transactions, snapshots/isolation, ordered bidirectional iteration, seeks, deletes, and CFs exist | **CONDITIONAL** — exact byte ordering, bounded scans, one-CF read-cut semantics, and canonical export/restore still need conformance |
+| Logical-batch atomicity | Historical multi-CF layouts are crash-nonatomic; both inspected layouts can expose partial visibility and acknowledge a partial insertion | **BLOCK** — one CF scopes out cross-CF/unified replay but still needs exact-N success, no silent short success, and complete pre/post visibility proof |
 | Rust memory and FFI safety | Parent/child lifetimes are not encoded; hook replacement can race callback use; callbacks have no panic boundary | **FAIL** |
-| Portable checkpoint/restore | Native checkpoint omits shared unified state and has no atomic global cut or publication; logical export is only plausible | **FAIL native / BLOCK logical** |
+| Portable checkpoint/restore | Native checkpoint omits shared unified state and has no atomic global cut or publication; logical export is plausible | **PROHIBIT native / BLOCK Laminar logical cut and fresh restore** |
 | Rebalance lifecycle | No Laminar vnode epoch, inactive-generation restore, atomic publication, fencing, resumable cleanup, or retained-cut GC | **MISSING** — backend-independent ADR work remains required |
 | DKS-Q2-006 maintenance health | Useful queues/pressure/progress stats; exact stalls and general local background-error coverage missing | **BLOCK** |
 | Bounded memory and resource governance | Host-RAM minimum can exceed cgroup; full native/page-cache/temporary accounting unproved | **BLOCK** |
 | Low-latency hot path | Vendor throughput only; synchronous FFI, copies, service lanes, C2/C3 tails, and observer overhead unmeasured | **UNKNOWN** |
-| Durability and recovery | WAL and FULL sync exist, but unified replay fails open and stable acknowledgement, strict corruption, process/cache-loss truth table, N/N-1 and RTO are unproved | **FAIL current / BLOCK repaired** |
+| Durability and recovery | WAL and FULL sync exist, but inspected native recovery is unsafe and unproved | **NATIVE REOPEN UNSUPPORTED**; prove exclusive fresh root, portable restore, source replay/retention, corruption handling, N/N-1, and RTO |
 | Fault/endurance/upgrade | No Laminar-bound candidate evidence | **MISSING** |
 | Source/sink delivery | A local store cannot supply source replay/fencing or sink publication semantics | **SEPARATE CLOSED GATE** |
 | Independent production soak | Not run | **MISSING; production NO-GO** |
 
 ## Carry-forward decision matrix
 
-This reconciles the Cycle 28 decision input, bounded Cycle 35 recheck, and Cycle 38 product
-direction. It is not qualification evidence or a production ranking.
+This reconciles the Cycle 28 decision input, bounded Cycle 35 recheck, Cycle 38 priority, and Cycle
+39 target selection. It is not qualification evidence or a production ranking.
 
 | Candidate | Current role | Principal unresolved veto | Carry decision |
 |---|---|---|---|
 | RocksDB `10.4.2` through `rocksdb 0.24.0` | Mature operational LSM reference and one of the two frozen v4 comparison subjects | Exact complete pressure-stall source/binding, native memory, durable truth table, common C1/C2/C3/fault/endurance evidence | **Reference/regression only; not the active product track.** No new source, adapter, or run work is scheduled. |
 | Fjall `3.1.8` | Rust-native LSM reference and the other frozen v4 comparison subject | Stable public pressure/progress/error/resource/stall surface and global controls remain insufficient | **Retain in frozen comparison lineage; no production admission.** |
 | redb `4.1.0` | Rust-native B-tree/single-writer hedge, administratively parked after Cycle 34 | Global non-cancellable writer, durability/recovery/resource truth, and approved non-LSM health mapping | **PARKED; no scheduled protocol or execution. Reopen only through the bounded micro-prescreen charter in ADR-008.** |
-| TidesDB native `9.3.14` plus a repaired exact-current Rust integration | Project-owner-preferred local-spill candidate with interesting skew/batch hypotheses; not selected or admitted | No safe exact-current Rust path; atomic apply, replay, checkpoint/read-cut, resource governance, health, and Laminar evidence fail or remain blocked | **Prioritize the bounded remediation/source-closure design. STOP the current official Rust subject; do not build or run it.** |
+| TidesDB native `9.3.14` plus a narrow project-private exact-current Rust integration | Selected worker-local product target; not qualified or admitted | No safe exact-current Rust path; exact-count visibility, stalled-call containment, immutable cuts, fresh restore, resource governance, health, and Laminar evidence remain blocked | **Design complete. STOP the official Rust subject; next is only the separately authorized two-stage source-construction kill gate.** |
 
-SurrealKV `0.21.2` remains rejected unmodified by the earlier exact-source audit; adding TidesDB does
-not reopen its snapshot-retention defect. No candidate is selected by elimination.
+SurrealKV `0.21.2` remains rejected unmodified by the earlier exact-source audit; selecting TidesDB
+does not reopen its snapshot-retention defect. TidesDB was chosen explicitly, not by elimination.
 
 ## Checkpoint, exactly-once, source, and sink boundary
 
@@ -476,9 +507,9 @@ exact-certified, replay-stable, assignment-fenced source position
 + ambiguous-commit recovery
 ```
 
-TidesDB's unified WAL does not provide source offsets, coordinator consensus, sink transactions,
-old-owner fencing, or portable vnode artifacts. Native object-store features also do not inherit
-LaminarDB's manifest, retention, restore-before-serve, or connector capability contracts.
+No TidesDB WAL mode provides source offsets, coordinator consensus, sink transactions, old-owner
+fencing, or portable vnode artifacts. Native object-store features also do not inherit LaminarDB's
+manifest, retention, restore-before-serve, or connector capability contracts.
 
 The initial distributed-state release remains **at-least-once**. Its concrete source/sink profile
 must still be certified: the source must be partitionable, replayable, assignment-fenced, and
@@ -488,38 +519,34 @@ exactly-once is a later certification per exact source/state/coordinator/sink co
 requires all properties above. A local backend cannot provide any missing connector/provider commit,
 fencing, or reconciliation operation, so no backend choice may upgrade delivery implicitly.
 
-## Smallest honest re-entry path
+## Smallest honest selected-target path
 
-TidesDB should be reconsidered only in this order:
+TidesDB proceeds only in this order:
 
-1. write a bounded docs/source-review-only remediation and successor-contract design. It binds the
-   exact proposed Rust/native/build identity, safe ownership/callback proof, atomicity and strict
-   replay/acknowledgement obligations, immutable read cut and portable export boundary, cgroup and
-   complete resource accounting, maintenance health, fault matrix, and new non-v4 wire identities;
-   it downloads, builds, modifies, or executes nothing;
-2. only after that design is reviewed, obtain a separate explicit source-construction task binding
-   the exact fork/upstream subject, isolated workspace, scope, time/cost limits, and stop conditions;
-3. under that task, construct or repair the exact-current Rust integration and prove parent/duplicate-
-   handle lifetimes, ordered shutdown, synchronized callback ownership, justified thread-safety,
-   panic containment, and sanitizer/Miri evidence;
-4. under the same bounded authority, make internal pressure cgroup-aware below the external hard
-   limit and prove allocator/page-cache/temporary headroom; repair and prove exact-count all-or-
-   nothing apply, strict unified-WAL recovery, post-WAL acknowledgement, transaction cleanup,
-   point/iterator visibility, and immutable cross-column-family reads under concurrency, corruption,
-   allocation, I/O, crash, and cache-loss faults;
-5. repair or prohibit native checkpoint omissions and unsafe concurrent capture/publication. Treat
-   any native read cut or checkpoint only as input to, or a local optimization for, LaminarDB's
-   portable export. Close a TidesDB maintenance-health mapping with bounded off-hot-path exact stall
-   and background-error observation. Native directories and remote SST/WAL/manifest state never
-   become recovery authority;
-6. only after the source proofs close, propose the successor TidesDB profile, mapping, profile-
-   binding, and bundle lineage; do not edit or reinterpret the v4 Fjall/RocksDB lineage. Obtain a
-   separate exact run authorization over candidate, plan, target, isolation, limits, and cost;
-7. only after all static, source, profile, and run-authorization gates close, run the common C1/C2/C3, durability,
-   fault, Zipf/hot-victim, restore, rebalance, and 24/72-hour backend campaign; and
-8. after one backend is selected and the complete feature is integrated, run the separately
-   operated black-box production soak over the unchanged release artifact before any production
-   claim.
+1. **Complete:** the Cycle 39 docs/source-review-only design freezes one CF, exact-count/fail-stop
+   visibility, exclusive fresh restore, the portable checkpoint boundary, resource/health/hot-path
+   obligations, and successor-lineage roles without constructing or executing the candidate.
+2. Obtain a separate explicit source-construction task binding the exact native subject or patch
+   identity, isolated workspace, targets, toolchain, scope, time/machine cost, and stop conditions.
+3. Spend at most half an engineering day on exact-source/static-link/build identity, transitive
+   inputs, owner/borrower/destroyer and close feasibility, comparator order, and legal/distribution
+   gates. Any open hard question returns `INSUFFICIENT_CLOSURE`.
+4. Only after step 3 passes, spend at most one engineering day and four machine hours on the
+   smallest narrow-wrapper slice: exclusive create-new root, fixed CF, exact-count batch/read,
+   duplicate-handle ownership, and deterministic shutdown. Compilation, linkage, and dynamic smoke
+   execution each require express scope in that later task. This is feasibility evidence, not an
+   adapter or qualification run.
+5. Estimate and separately authorize the remaining construction proof: mutation/result visibility,
+   unknown-outcome and stalled-call containment, immutable logical cuts/export, hostile portable
+   restore/genesis, cgroup resources, maintenance health, concurrency, latency, and fault forcing.
+   Native prior-directory state, checkpoint, and remote storage remain prohibited.
+6. Only after source proof closes, freeze successor profile, mapping, physical-layout/fault,
+   profile-binding, and bundle identities; never edit or reinterpret v4. Separately authorize any
+   exact run over candidate, plan, target, isolation, limits, and cost.
+7. Run the common logical, C2/C3, fault, Zipf/hot-victim, portable-restore, rebalance, RTO/source-
+   retention, and 24/72-hour backend campaign, followed by product integration and delivery gates.
+8. Run the independently operated black-box production soak over the unchanged release artifact
+   before any production claim.
 
 A failure at any step stops the track. A pass funds the next step; it never retroactively creates
 qualification or production evidence.
@@ -527,10 +554,11 @@ qualification or production evidence.
 ## Research hygiene and primary sources
 
 No existing project research document became irrelevant because of this prescreen. The dated
-RocksDB/Fjall/redb/SurrealKV reports remain decision history and are not deleted. Cycle 38 supersedes
-the earlier active RocksDB priority by explicit product direction, not by treating vendor Zipf data
-as qualification evidence. All comparative performance claims remain hypotheses until an exact,
-common, separately authorized campaign is followed by the independent product soak.
+RocksDB/Fjall/redb/SurrealKV reports remain decision history and are not deleted. Cycle 38 superseded
+the earlier active RocksDB priority, and Cycle 39 explicitly selected TidesDB; neither decision
+treats vendor Zipf data as qualification evidence. All comparative performance claims remain
+hypotheses until an exact, common, separately authorized campaign is followed by the independent
+product soak.
 
 Project contracts used for the decision:
 

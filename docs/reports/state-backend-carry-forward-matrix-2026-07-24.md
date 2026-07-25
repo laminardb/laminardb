@@ -2,7 +2,7 @@
 
 - **Date:** 2026-07-24
 - **Decision scope:** choose where to spend the next backend-qualification effort
-- **Production backend selected:** none
+- **Production backend selected at Cycle 16:** none; Cycle 39 later selects TidesDB as the target
 - **Cluster admission:** unchanged; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
 - **Historical recommendation (superseded for redb):** carry RocksDB into a bounded DKS-Q2-006
   mechanism-closure task; carry redb only into its separately approved native prescreen; do not
@@ -24,12 +24,13 @@ separately versioned micro-prescreen charter and new candidate-execution authori
 imperative, recommendation, work-order step, and “hedge” statement in this dated report is historical
 and superseded. This matrix does not authorize further redb protocol or adapter work.
 
-**Cycle 38 product-direction supersession:** this report remains exact dated source/gap history, but
+**Cycle 39 product-direction supersession:** this report remains exact dated source/gap history, but
 its RocksDB-primary work-allocation recommendation is no longer current. The project owner prefers
-TidesDB for the local-spill product path. RocksDB and Fjall remain immutable v4 reference/regression
-subjects with no active source, adapter, or run track. TidesDB's inspected official Rust path is
-still rejected; the only scheduled candidate-specific work is a bounded remediation/source-closure
-design for an exact-current safe integration. No backend is selected or executable.
+and has now selected TidesDB for the worker-local product path. RocksDB and Fjall remain immutable
+v4 reference/regression subjects with no active source, adapter, or run track. TidesDB's inspected
+official Rust path is still rejected; its one-CF/fresh-restore
+[design](../architecture-decisions/tidesdb-local-state-successor-design.md) creates no source,
+adapter, or execution authority. Production qualification remains closed.
 
 ## Historical Cycle 16 recommended judgment
 

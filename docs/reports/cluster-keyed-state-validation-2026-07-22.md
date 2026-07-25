@@ -6,6 +6,11 @@
 
 **Scope:** admission and lifecycle validation only; no cluster capability is enabled by this work.
 
+**Cycle 39 design note:** TidesDB is now the selected worker-local implementation target. The
+[selected-target design](../architecture-decisions/tidesdb-local-state-successor-design.md) replaces
+the dated Fjall/RocksDB comparison work order below; it does not change this validation evidence or
+cluster admission.
+
 ## Verdict
 
 The reported fail-closed boundary is genuine, with three qualifications:
@@ -258,8 +263,9 @@ point inserts and uniform cold reads; the wrapper also read before write/remove 
 copied returned values. Formal target-Linux/NVMe testing never ran. Current Fjall 3.1.8 has useful
 atomic batches, snapshots, range scans, and sorted ingestion, but lacks native multi-get/range
 delete and a mature supported memory/compaction observability surface. The ADR therefore requires
-the same real state workload and fault gates against Fjall and RocksDB, then selects one production
-backend rather than assuming the historical dependency is fit.
+the same real state workload and fault gates before selecting a backend rather than assuming the
+historical dependency is fit. Cycle 39 later selected TidesDB as the target, with qualification and
+production admission still outstanding.
 
 ## Empirical validation
 
