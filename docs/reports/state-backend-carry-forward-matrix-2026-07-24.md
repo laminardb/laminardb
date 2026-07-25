@@ -76,11 +76,14 @@ the [redb mechanism note](redb-4.1.0-prescreen-mechanism-note-2026-07-23.md), an
 | Fjall alternative | Patch/upstream stable cheap complete debt/stall/compaction-I/O/cache/pinned/snapshot/applied-option observations plus global pressure controls | Any applicable signal is still private, sampled too slowly, incomplete, or encoded as a false zero/N/A | Re-entry as a candidate subject; not inheritance of old benchmarks |
 | SurrealKV alternative | First fix reference-counted snapshot retention, range-snapshot ownership, wakeup/drain, oversized-batch WAL ordering, close/recovery; only then add governance telemetry | Any forced-compaction snapshot or recovery invariant fails | A new bounded prescreen proposal, not candidate admission |
 
-The redb protocol and its proposed five-hour ceiling are not ready for signatures or execution. It
-still needs fixed descriptor-to-filename resolution; a non-circular signature preimage, algorithm,
-trust-root and revocation policy; distinct decision and safety caps; consistent completion and
-artifact retention rules; reconciled five-hour arithmetic; and a frozen key/operation fixture. The
-construction lane deliberately does not paper over these approval blockers.
+**Cycle 24 supersession note (2026-07-25):** the redb protocol remains unready for approval or
+execution, but the Cycle 16 offline-signature work item is no longer the selected direction. The
+protected-provider design deliberately avoids inventing a local signature preimage, trust root or
+revocation service. Current blockers are the exact result/evidence wires, cleanup recovery and
+deletion-safety contract, live dispatch/run/review provenance, immutable-storage proof and trusted
+finalization-registry linearization. The construction lane does not paper over those blockers; see
+the current [redb prescreen protocol](../testing/state-backend-redb-prescreen-v1.md) for the normative
+boundary.
 
 The recommended work order is therefore:
 

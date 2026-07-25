@@ -1,9 +1,9 @@
 # redb 4.1.0 bounded state-backend prescreen v1
 
 - **Identity:** `state-backend-redb-prescreen/v1`
-- **Status:** Cycle 21 protocol freeze candidate; validation-only work is authorized, while the
-  protected-review/semantic verifier, native supervisor/child/actuator/oracle, reviewed build,
-  owner approvals, and protocol execution remain absent
+- **Status:** Cycle 24 validation-contract freeze; only bytes-only validation work is authorized,
+  while the strict result/classifier schemas, live provider/storage/finalization verifiers, native
+  supervisor/child/actuator/oracle, reviewed build, owner approvals, and execution remain absent
 - **Evidence class:** `NOT C2/C3 QUALIFICATION EVIDENCE`
 - **Scope:** decide whether a redb adapter is worth adding to the backend qualification bake-off
 - **Production/admission effect:** none; `[LDB-4007]` and `[LDB-0013]` remain fail-closed
@@ -66,7 +66,8 @@ lane does not inherit this authority.
 Every formal descriptor is `(role, locator, byte_length, sha256, media_type)`. `locator` is a UTF-8,
 forward-slash, packet-root-relative path: no empty component, `.`, `..`, drive/UNC prefix, backslash,
 symlink, hard link, device, socket, FIFO or path escape is allowed. Each role appears exactly once at
-the fixed locator below. The verifier opens relative to an already-open packet directory with
+the fixed locator in this table; later repeatable retained-artifact roles require a separate closed
+registry and cardinality. The verifier opens relative to an already-open packet directory with
 no-follow semantics, verifies regular-file identity before and after streaming, caps bytes before
 allocation, and rejects aliases or extra decision-bearing files.
 
@@ -104,12 +105,15 @@ allocation, and rejects aliases or extra decision-bearing files.
 | pre-run protected-review receipt | `approval/protected-review.json` | dispatch |
 | reviewed smoke result | `evidence/prior-smoke-result.json` | native dispatch only |
 | raw run manifest | `result/raw-run-manifest.json` | result review |
+| evidence-close manifest | `result/evidence-close-manifest.json` | cleanup precondition |
+| crash-recoverable cleanup journal | `result/cleanup-journal.bin` | cleanup recovery |
+| cleanup report | `result/cleanup-report.json` | result classification |
 | retained artifact index | `result/artifact-index.json` | result review |
 | validator report | `result/validator-report.json` | result review |
 | independent oracle report | `result/oracle-report.json` | result review |
 | bounded mechanism-probe report | `result/mechanism-probe.json` | native result review |
-| reviewed result payload | `result/payload.json` | result review |
-| post-run protected-review receipt | `result/protected-review.json` | final disposition |
+| derived result payload | `result/payload.json` | owner result review |
+| post-run protected-review receipt | `result/protected-review.json` | immutable closure publication |
 
 The approval payload binds every pre-run contract, subject, build, physical-fixture and target row,
 but excludes `approval/payload.json`, its protected-review receipt, and every result row. The pre-run
@@ -120,8 +124,11 @@ but excludes `result/payload.json` and its post-run receipt. The post-run receip
 payload's exact length and SHA-256. Neither payload binds itself or the receipt that is necessarily
 created afterward. The redb archive is the fixed packet row `subject/redb-4.1.0.crate`, not an
 unresolved external descriptor. A prior smoke result is accepted only when the verifier
-proves that it is a non-synthetic `SMOKE_PASS` over the identical subject, source/build, schemas,
-goldens and Docker-smoke plan; an opaque or synthetic descriptor never satisfies that prerequisite.
+proves that it is a non-synthetic, reviewed-and-stored `DOCKER_SMOKE_PASS` over the identical
+subject, source/build, schemas, goldens and Docker-smoke plan and returns the opaque
+`DOCKER_SMOKE_PREREQUISITE_VERIFIED_NO_DECISION` capability. An opaque or synthetic descriptor
+never satisfies that prerequisite, and the capability does not replace the separate native pre-run
+approval.
 
 ## Frozen source and build scope
 
@@ -281,11 +288,15 @@ plus six reserved IDs, and the semantic verifier requires exact equality rather 
 
 This proposal does not authorize protocol execution. Any command that claims the Docker smoke or
 native prescreen identity requires an exact `state-backend-redb-prescreen-approval-payload/v1` and
-one provider-authenticated `state-backend-redb-prescreen-protected-review-receipt/v1` over those
-identical payload bytes. The unsigned payload contains all decision-bearing fields and descriptors,
-plus the two required roles and exact required decision literal. It contains no concrete principal,
-review-event ID, review timestamp, or receipt descriptor; those facts can exist only after review,
-so the packet is non-circular.
+one content-valid `state-backend-redb-prescreen-protected-review-receipt/v1` over those identical
+payload bytes. Docker dispatch additionally requires the live opaque
+`DOCKER_SMOKE_DISPATCH_AUTHORIZATION_VERIFIED` capability; native dispatch instead requires the
+disjoint `NATIVE_DISPATCH_AUTHORIZATION_VERIFIED` capability and consumes the exact
+`DOCKER_SMOKE_PREREQUISITE_VERIFIED_NO_DECISION` capability. The receipt is copied content and is
+never provider-authenticated merely because its JSON validates. The unsigned payload contains all
+decision-bearing fields and descriptors, plus the two required roles and exact required decision
+literal. It contains no concrete principal, review-event ID, review timestamp, or receipt
+descriptor; those copied fields can exist only in the later receipt, so the packet is non-circular.
 
 This prescreen reuses the repository's protected-review trust boundary; it does not define an
 offline key hierarchy, signature format, owner registry, revocation service, or root-rotation
@@ -298,32 +309,41 @@ and the provider API fields the trusted dispatcher verifies. The pre-run receipt
 - policy role/length/SHA-256;
 - provider, repository, immutable change ID, and reviewed head revision;
 - approval-payload role/length/SHA-256;
-- one immutable provider review-event ID, stable account ID, role, decision, and UTC time for each
+- one copied provider-scoped review-event ID, stable account ID, role, decision, and UTC time for each
   of `workload_owner` and `operations_owner`; and
-- the authenticated dispatch workflow/environment/run identity and verification UTC time.
+- the copied dispatch workflow/environment/run identity and verification UTC time.
 
-The two principals and review-event IDs are distinct. Both decisions are exact approval literals,
-both events apply to the bound head and payload digest, and neither review is stale, dismissed,
-superseded, self-approved, or outside its configured role. Unknown fields, a locally invented
-identity, a provider mismatch, mutable branch-only identity, missing protected-environment context,
-or a payload/head/configuration change fails closed. The receipt is produced only by the trusted
-dispatcher after querying the configured protected-review provider; merely placing matching JSON in
-a packet never authorizes execution.
+Content validation requires unequal principal and review-event ID strings, exact approval literals,
+and bindings to the head and payload digest, but proves none of those provider facts. Unknown fields,
+a locally invented identity, a provider mismatch, mutable branch-only identity, missing protected-
+environment context, or a payload/head/configuration change fails content validation closed. The
+trusted dispatcher separately queries the live provider, verifies current distinct non-self owners,
+event bodies/states/times, head, policy and protected workflow identity, then mints exactly one
+non-serializable, exact-byte-bound, run-class-specific dispatch capability. Native issuance also
+consumes the exact verified Docker-prerequisite capability; Docker issuance neither consumes nor
+produces native authority. The applicable child can start only when its exact-class capability and
+content validation succeed; merely placing matching JSON in a packet never authorizes execution.
+Each future dispatch capability must additionally bind the exact approval payload, receipt, change,
+head, workflow, job, environment, protected run attempt and child identity; be freshness-bounded and
+single-use in that same protected dispatch attempt; and reject cross-class substitution. Until the
+exact TOCTOU, freshness and hand-off rules are frozen, both dispatch capabilities are unconstructible.
 
 Result review uses the same receipt schema with stage `post_run`, the exact result-payload length and
-SHA-256, two distinct current role reviews, and the retained-evidence content root. The later result
-contract must separately bind trusted immutable storage version and retention evidence. The result
-payload contains the derived disposition plus the two required roles and exact acceptance literal,
-but no concrete reviewer/event/time fields. Its later receipt supplies those facts and binds those
-bytes; neither object hashes itself.
+SHA-256, two copied role-review records, and the retained-evidence content root. A native payload
+carries `derived_outcome`; a Docker payload carries `smoke_outcome` and no native outcome. The
+receipt binds the exact payload and artifact-index bytes, but neither payload nor receipt contains
+future storage or review authority. The live verifiers later cover the immutable closure and current
+provider facts. Neither payload nor receipt hashes itself.
 
 The redb-free semantic verifier validates schemas, exact bytes/locators, payload/receipt equality,
-and cross-artifact invariants. Outside an authenticated protected workflow it can report only
-content validity and `authorization_unverified`; it cannot turn a copied receipt into authority. The
-trusted dispatcher independently validates the live provider context before it may invoke an
-execution entry point, and the candidate child is opened only after both checks succeed. If the
-repository cannot enforce and export two role-separated reviews, the protocol remains `DEFER` and
-no command runs. Portable offline cryptographic attestations would require a separate security ADR,
+and cross-artifact invariants. It reports only content validity and `authorization_unverified`; it
+cannot turn a copied receipt into authority even when a protected workflow invokes it. The trusted
+dispatcher independently validates the live provider context before it may invoke an execution
+entry point, and the candidate child is opened only after both checks succeed. If the
+repository cannot enforce and export two role-separated pre-run reviews, dispatch is unavailable:
+no campaign runs and no prescreen outcome exists. Missing post-run review instead blocks final
+sealing without changing an already-derived outcome. Portable offline cryptographic attestations
+would require a separate security ADR,
 security-owner approval, threat model, and implementation budget; this prescreen does not invent
 them. Any bound input change requires a new payload and two new protected reviews. The separately
 user-approved `construction-only-no-decision` lane does not consume this packet, cannot emit a
@@ -565,9 +585,9 @@ depth 16, at most 4,096 decoded nodes per input, provider-scoped IDs at most 256
 canonical UTC timestamps exactly 20 ASCII bytes, locators at most 192 UTF-8 bytes, two reviews and
 28 pre-run descriptors. Each non-fixture descriptor is at most 256 MiB; the 256-MiB, 1-GiB and
 4-GiB fixture roles are capped at 1, 4 and 12 GiB respectively; checked aggregate declared bytes
-are at most 20 GiB. The final retained total is checked as `retained_artifact_bytes +
-artifact_index.byte_length + result_payload.byte_length + post_run_receipt.byte_length` and must be
-at most 2 GiB. Declared lengths never drive
+are at most 20 GiB. The future classifier first applies the conservative Cycle 24 retained-cap
+formula, and the later storage verifier checks the exact actual closure total at most 2 GiB.
+Declared lengths never drive
 allocation in this validation slice. Duplicate keys, unknown fields, placeholders, non-`u64` JSON
 numbers, all-zero/uppercase hashes, traversal, backslashes, overflow, stage swaps, wrong ordering
 or any authority/PKI/provider-endpoint field fail closed.
@@ -597,8 +617,9 @@ The sole command is
 authorization=authorization_unverified` to stdout, and writes no stderr. Invalid content exits 2 with the notice
 on stdout and an `INVALID_REDB_PRESCREEN_CONTENT ` stderr prefix. An unreadable input also exits 2
 with the existing `INVALID_INPUT <path>: ` prefix. Wrong arity or any unknown command exits 64 and
-prints usage. No output or public type contains `DEFER`, `SMOKE_PASS`, `PRESCREEN_PASS`,
-`PRESCREEN_NO_GO`, `REJECT_EXACT_PIN`, provider-authenticated, executable or sealed state.
+prints usage. No output or public type contains `DEFER`, `DOCKER_SMOKE_PASS`,
+`DOCKER_SMOKE_INCOMPLETE`, `PRESCREEN_PASS`, `PRESCREEN_NO_GO`, `REJECT_EXACT_PIN`,
+provider-authenticated, executable or sealed state.
 
 ### Cycle 23 outer post-run binding slice
 
@@ -674,16 +695,184 @@ over-cap input exits 2 through the existing `INVALID_INPUT <path>: ` path. Wrong
 unknown command exit 64. No `run`, `dispatch`, `approve`, `accept`, `verify`, `classify`, `seal`,
 `select` or `qualify` command is added.
 
-The strict successor remains blocked until a later reviewed freeze defines the result envelope and
-complete evidence descriptor set; Docker outcomes without importing the legacy schema; the
-artifact-index entry, destroyed-database, count, ordering, uniqueness, exclusion and sum rules; raw
-manifest/report/mechanism and binary framing schemas plus literal goldens; the final-index cleanup
-lifecycle; a classifier-derived outcome independent of the later owner receipt, with distinct names
-for that outcome, the early terminal-rejection latch, and final reviewed-and-stored result sealing;
-and an out-of-band immutable storage provider/version/atomicity/retention contract whose
-authenticated record and verifier cover the exact artifact-index bytes, result-payload bytes,
-post-run-receipt bytes, and complete retained object set. A content digest, URL, ETag, version
-string, retain-until time or packet-supplied `immutable=true` cannot prove storage retention.
+At Cycle 23 close, the strict successor remained blocked on the result/finalization and cleanup
+hierarchies. Cycle 24 freezes those semantic boundaries below. Schema or classifier implementation
+is still blocked on the enumerated exact-wire, evidence-matrix and trusted-provider decisions.
+
+### Cycle 24 result, cleanup and finalization contract
+
+Native result finalization has one operational stop state, one derived content outcome, one local
+copied binding state, three post-run live verification capabilities and one registry-held final
+state. These names are disjoint and cannot be substituted for one another; the earlier Docker and
+native dispatch capabilities are separate pre-run gates.
+
+| Plane | Exact state or value | Authority and effect |
+|---|---|---|
+| native runtime stop | `TERMINAL_CORRECTNESS_STOP_LATCHED` | Campaign-scoped irreversible stop triggered by one fully attributable attempt; authorizes only stopping all remaining candidate/diagnostic execution and closing evidence |
+| classifier content | `derived_outcome` = `PRESCREEN_PASS`, `PRESCREEN_NO_GO`, `DEFER`, or `REJECT_EXACT_PIN` | Deterministic redb-free classification of the closed native evidence, before post-run owner review |
+| copied review content | `POST_RUN_REVIEW_BINDINGS_COPIED_UNVERIFIED` | Cycle 23 local equality/chronology result; grants no provider authority |
+| live run authority | `NATIVE_RUN_PROVENANCE_VERIFIED` | Opaque capability binding the protected runner and exact authorized native execution to the stored manifest/index/payload/receipt bytes |
+| live review authority | `POST_RUN_REVIEWS_PROVIDER_VERIFIED` | Opaque capability binding the exact stored receipt and its copied events to current live provider facts and the exact frozen payload |
+| live storage authority | `EVIDENCE_STORAGE_VERSION_VERIFIED` | Opaque capability covering one exact immutable object-set version and its enforced retention policy |
+| final native result | `FINAL_PRESCREEN_RESULT_SEALED` | Registry-held state only; its outcome must equal an independently recomputed `derived_outcome` over the exact stored closure |
+
+`TERMINAL_CORRECTNESS_STOP_LATCHED` is never a disposition or a seal. It is not representable by
+deserializing result content and cannot be raised by a candidate child. If evidence-close,
+cleanup-report or final-index validation before payload freeze cannot validate all evidence required
+for the finding, the classifier derives `DEFER`; the historical fact that the campaign stopped
+remains unchanged. A cleanup failure also derives `DEFER` for an otherwise pass/no-go campaign. It
+may coexist with `REJECT_EXACT_PIN` only when the latched correctness proof remains complete,
+attributable and retained despite that failure. After payload freeze, evidence mutation or loss
+invalidates the chain and blocks finalization; it never silently rewrites that frozen outcome.
+
+The frozen campaign dependency order has two phases. The five-hour native watchdog covers only the
+local campaign phase:
+
+1. finish the campaign or latch the terminal correctness stop, stop every candidate writer and
+   close all campaign measurement, oracle and report producers;
+2. durably close the evidence set, then perform crash-recoverable cleanup and close its report;
+3. construct and independently validate the final artifact index;
+4. run the redb-free classifier and freeze a result payload carrying exactly one `derived_outcome`.
+
+The asynchronous governance phase then:
+
+5. obtains the two owner review events over those exact payload bytes and exports the local post-run
+   receipt, which remains `POST_RUN_REVIEW_BINDINGS_COPIED_UNVERIFIED`;
+6. atomically publishes the exact retained closure, index, payload and receipt to the approved
+   immutable store, then obtains `EVIDENCE_STORAGE_VERSION_VERIFIED` from a live verifier;
+7. reruns the strict redb-free result/index/artifact verifier and classifier over the exact immutable
+   stored closure and requires the recomputed outcome and every payload/index/receipt digest to
+   match;
+8. obtains `NATIVE_RUN_PROVENANCE_VERIFIED` by verifying the live protected-run identity,
+   authenticated dispatch, consumption of the exact Docker-prerequisite capability, subject,
+   source/build/target and supervisor execution against the raw manifest and exact stored
+   index/payload/receipt hashes; then re-reads the live review provider to obtain
+   `POST_RUN_REVIEWS_PROVIDER_VERIFIED`; and
+9. immediately has the trusted registry atomically consume the semantic result and all three live
+   capabilities and enter `FINAL_PRESCREEN_RESULT_SEALED` for that one storage version.
+
+Missing, refused, dismissed or stale owner review, provider drift, failed storage verification,
+failed provenance or semantic revalidation, or registry failure blocks finalization. None rewrites a
+valid already-derived candidate outcome to `DEFER`. `POST_RUN_REVIEWS_PROVIDER_VERIFIED` must bind
+the exact stored receipt length/hash, policy, change/head, payload length/hash, copied event
+IDs/bodies/states/times, current distinct non-self role membership, and verifier/protected-workflow
+identity. The registry must follow the exact descriptor chain and require one identical manifest,
+index, payload, receipt and retained object set across semantic validation, run provenance, storage
+authority and the review receipt/capability as applicable. Provider storage-version identity is
+authenticated only by the storage capability and registry, never by the redb-free semantic verifier.
+
+The exact provider point-in-time and TOCTOU linearization, capability freshness/lifetime and retry
+rules, immutable-storage provider/version/atomic-publish/object-set/retention/admin-bypass proof, and
+registry authority, idempotency/conflict and exported-proof semantics are not yet selected. The
+three capabilities must eventually be non-serializable, digest-bound, freshness-bounded, single-use
+within one finalization attempt; a retry must reverify every live fact. Until those exact rules are
+frozen, `FINAL_PRESCREEN_RESULT_SEALED` is unconstructible. Any exported or copied final record is
+unverified content until an approved live or cryptographic registry verifier proves it. No packet-
+supplied field, digest, URL, ETag, version string, timestamp, approval word or `immutable=true`
+value can mint a trusted capability or registry state, and no conversion from the Cycle 22/23
+content summaries to a trusted type is permitted.
+
+The indexed `result/validator-report.json` validates the pre-close campaign evidence only. The
+step-7 strict verifier runs after immutable closure and records its result in the trusted registry,
+not as another indexed packet object; this avoids a final-index/result self-hash cycle.
+
+#### Evidence close and cleanup hierarchy
+
+Let `R` be the exact set of retained artifact descriptors that exists after all native evidence
+producers and independent reports have closed but before transient database deletion. Each
+descriptor remains exactly `{role, locator, byte_length, sha256, media_type}`. Let `M`, `J`, `C` and
+`F` denote the exact evidence-close-manifest, final cleanup-journal, cleanup-report and final-index
+byte strings respectively.
+
+1. `result/evidence-close-manifest.json` lists `R`, including the raw run manifest and the exact
+   validator, oracle and mechanism-probe reports; the latter is present exactly once even when its
+   status is `not_run` or `incomplete`. It also lists the complete transient database cleanup set
+   with stable identities, workspace locators, `post_scan_file_byte_length`, and required pre-cleanup
+   logical and file digests. The manifest is written durably, reopened and rehashed before cleanup.
+   It is a content precondition, never bearer authority: only the trusted supervisor's already-held,
+   pre-authorized handle-relative scratch-root capability can select deletion targets. Manifest
+   identities and locators are equality constraints and cannot redirect deletion.
+2. `result/cleanup-journal.bin` is initialized only after that check. Its first durable frame binds
+   the campaign identity and exact `(role, locator, byte_length, sha256, media_type)` descriptor for
+   `M`. Before each destructive action it durably records intent; after the action it durably records
+   either verified destruction or a closed failure observation. Recovery first revalidates that
+   header against the exact reopened manifest and supervisor-owned handles, then resumes without
+   silently omitting an interrupted database.
+3. `result/cleanup-report.json` binds the exact close-manifest and final journal bytes and is a
+   deterministic projection with exactly one terminal cleanup record per database in the close
+   manifest. Its records, rather than duplicated index entries, carry the per-database intent,
+   completion/failure and absence evidence.
+4. `result/artifact-index.json` is generated after the journal and report close. Its retained entry
+   set is exactly `R` plus the descriptors of the evidence-close manifest, final cleanup journal and
+   cleanup report. It excludes only itself, `result/payload.json` and
+   `result/protected-review.json`.
+
+The final index stores checked summary counts, not a second copy of the cleanup records. At minimum
+they are `retained_artifact_count`, `retained_artifact_bytes`, `database_to_clean_count`,
+`database_cleanup_record_count`, `destroyed_database_count`, `cleanup_failure_count` and
+`database_bytes_to_clean`. Validation requires all of the following:
+
+- artifact entries are strictly ordered by raw UTF-8 locator bytes; locators are globally unique,
+  `(role, locator)` pairs are unique, and equal content digests are allowed;
+- every singleton role occurs exactly once and every repeatable role has an explicit closed
+  cardinality; checked counts equal the applicable array lengths and sums;
+- the cleanup-report database set equals the close-manifest cleanup set, with exactly one terminal
+  `destroyed` or `failed` record per identity, so destroyed and failed records partition that set;
+- the index summary counts are recomputed from the bound report; missing or unresolved cleanup is
+  never represented as a smaller set;
+- `retained_artifact_count = |R| + 3` and `retained_artifact_bytes = checked_sum(R.byte_length) +
+  byte_length(M) + byte_length(J) + byte_length(C)`; transient database bytes are excluded from
+  that retained total;
+- `database_cleanup_record_count = database_to_clean_count = destroyed_database_count +
+  cleanup_failure_count`, and `database_bytes_to_clean` is the checked sum of
+  `post_scan_file_byte_length` across the close-manifest database set; and
+- no indexed artifact changes after final-index publication. Any byte change invalidates the
+  index, derived payload, review receipt and later storage closure.
+
+The classifier checks the retained cap before the result and receipt exist by reserving both
+maximum future sizes rather than creating a result-size fixed point:
+
+```text
+retained_artifact_bytes
++ actual_final_index_byte_length
++ 256 KiB maximum result-payload bytes
++ 64 KiB maximum post-run receipt bytes
+<= 2 GiB
+```
+
+The live storage verifier later checks the exact actual closure total: all index-listed object
+bytes plus the actual final-index, result-payload and post-run-receipt bytes, again at most 2 GiB.
+
+This lifecycle freezes the hash DAG and removes the old pre/post-cleanup index circularity; it does
+not yet authorize implementation. The exact evidence-close durability primitive, cleanup-journal
+wire/goldens and recovery protocol, scratch-root identity, no-follow deletion, parent-directory
+durability, absence proof, retry/deadline/failure codes, database digest cuts, artifact-role
+registry/cardinalities and numeric entry/database caps remain freeze blockers. The raw manifest,
+validator/oracle/mechanism report schemas, binary framing registry, conditional evidence matrix,
+terminal-finding record/invariant codes/stop acknowledgement, and exact constructible-`DEFER`
+minimum also remain undefined. The exact Docker/native dispatch-capability and Docker-prerequisite
+freshness, single-use hand-off, live Docker run-provenance/replay/TOCTOU verifier and trusted-
+consumption rules are likewise unfrozen; neither dispatch capability nor the Docker-prerequisite
+capability is currently constructible.
+
+#### Docker smoke result is a separate type
+
+Docker Desktop/WSL can produce only `result_kind = docker_smoke_prerequisite` with
+`smoke_outcome = DOCKER_SMOKE_PASS` or `DOCKER_SMOKE_INCOMPLETE`. A pass has no incomplete reason;
+an incomplete result has at least one closed reason code. The exact reason-code vocabulary and its
+conditional evidence matrix are still a freeze blocker.
+
+Docker content has no native `derived_outcome`, `PRESCREEN_*` outcome, disposition,
+`TERMINAL_CORRECTNESS_STOP_LATCHED`, `REJECT_EXACT_PIN` or `FINAL_PRESCREEN_RESULT_SEALED` state. A
+smoke failure may retain diagnostics only as `DOCKER_SMOKE_INCOMPLETE`; it cannot reject or select
+a backend. Only a trusted verifier may return
+`DOCKER_SMOKE_PREREQUISITE_VERIFIED_NO_DECISION`, after proving a non-synthetic
+`DOCKER_SMOKE_PASS`; identical subject/source/build/child/schemas/goldens/plan; exact Docker raw-run
+manifest, result, receipt and immutable storage hashes; current live owner review; live protected
+Docker run identity; and consumption of the exact
+`DOCKER_SMOKE_DISPATCH_AUTHORIZATION_VERIFIED` capability by that run. That opaque capability
+permits consideration for a separately approved native dispatch and supplies no native result,
+qualification or production evidence.
 
 ## Isolation and clocks
 
@@ -921,18 +1110,19 @@ scan bytes. Full scans feed the redb-free oracle incrementally and are never mat
 Retained evidence includes the exact approval/result packets, plans, manifests, schedule, raw timing/
 resource/marker frames, target/preflight/noise records, state counts and digests, at most 1 MiB per
 mismatch excerpt, process/kernel logs, validator/oracle/mechanism reports, protected-review receipts,
-and an artifact index. The index records every retained file's locator/length/hash except its own
-bytes, `result/payload.json`, and `result/protected-review.json`; those three objects are necessarily
-created after the indexed set closes. It also records every verified-then-destroyed database's
-pre/post digests and destruction time. Its checked sum, excluding those three objects, must equal
-`retained_artifact_bytes`. Deletion begins only after independent oracle and validator reports are
-durably indexed; missing transient-destruction evidence is `DEFER`, not a smaller claimed total.
-If a valid `REJECT_EXACT_PIN` was already sealed, later cleanup/destruction failure is retained as a
-post-seal protocol incident but cannot downgrade that rejection.
+the evidence-close manifest, cleanup journal/report, and final artifact index. The Cycle 24
+hierarchy defines their exact set relationship and retained-cap accounting. Deletion begins only
+after the close manifest containing the independent oracle and validator reports is durably written,
+reopened and rehashed. Missing cleanup evidence is never a smaller claimed set. A cleanup incident
+normally makes the classifier derive `DEFER`; after a valid terminal correctness stop it may preserve
+`REJECT_EXACT_PIN` only when the complete proof for the original finding remains valid and retained.
 
 No fixture is generated inside the decision campaign: the approved packet binds prebuilt canonical
 bases. The five-hour watchdog begins before build/environment verification and ends only after
-artifact finalization and cleanup. Its worst-case allocation is exact:
+evidence close, crash-recoverable cleanup, final-index validation and local result-payload freeze.
+Human owner review, immutable publication, live authority checks and registry finalization are
+outside that native watchdog and cannot extend or rerun its campaign. Its worst-case allocation is
+exact:
 
 | Step | Count and ceiling | Budget |
 |---|---|---:|
@@ -944,38 +1134,53 @@ artifact finalization and cleanup. Its worst-case allocation is exact:
 | Fixture copies and hash checks | aggregate | 25 min |
 | Priming and trigger setup | aggregate | 10 min |
 | Quiescence and cache resets | aggregate | 15 min |
-| Retained-evidence finalization | aggregate | 10 min |
-| Final cleanup | aggregate | 1 min |
-| **Allocated maximum** | | **287.5 min** |
-| **Watchdog slack** | | **12.5 min** |
+| Evidence close, reopen and rehash | aggregate | 5 min |
+| Journaled cleanup and absence checks | aggregate | 5 min |
+| Cleanup report, final index, classification and local payload freeze | aggregate | 5 min |
+| **Allocated maximum** | | **291.5 min** |
+| **Watchdog slack** | | **8.5 min** |
 
 The campaign also caps all retained decision-bearing transaction records at 250,000. A per-step,
 aggregate, resource, sample, workspace or five-hour safety bound reached before a valid terminal
 correctness finding is `DEFER`; no partial population passes. These ceilings remain materially
-cheaper than the 45-hour C2 sketch.
+cheaper than the 45-hour C2 sketch. The cleanup allocation includes the required journal-header,
+per-database intent/terminal durability and absence checks; exceeding it follows the same cleanup
+classification rules. Separate governance-finalization deadlines remain part of the unfrozen
+capability/TOCTOU contract and cannot produce `FINAL_PRESCREEN_RESULT_SEALED` after they expire.
 
-The redb-free classifier derives exactly one outcome in this precedence order:
+After final-index validation, the redb-free classifier derives exactly one outcome in this
+precedence order. Post-run owner review is deliberately not a classifier input:
 
-1. Before a terminal finding is sealed, invalid approval/protected review, target, preflight,
-   actuator, clock, harness, oracle, schedule, artifact or evidence needed to judge that finding
-   yields `DEFER`; an
-   invalid finding attempt cannot prove a candidate defect.
+1. Before a terminal correctness stop is latched, invalid bound approval or copied pre-run receipt
+   content, target, preflight, actuator, clock, harness, oracle, schedule, artifact or evidence
+   needed to judge that finding yields `DEFER`; an invalid finding attempt cannot prove a candidate
+   defect. Failure to obtain live pre-run authorization permits no dispatch and no outcome instead.
 2. One fully attributable atomicity/durability/corruption invariant violation in a valid attempt
-   seals `REJECT_EXACT_PIN` and stops all further candidate decision/diagnostic execution. Later
-   artifact-finalization or cleanup faults are retained but cannot downgrade or erase the sealed
-   rejection; loss of evidence required to validate the original finding means it was never sealed.
-3. Without a sealed rejection, a safety bound, incomplete required population, missing in-commit or
+   latches `TERMINAL_CORRECTNESS_STOP_LATCHED` and stops all further candidate
+   decision/diagnostic execution. The final classifier derives `REJECT_EXACT_PIN` only if the
+   complete attributable proof remains valid and retained; otherwise it derives `DEFER`.
+3. Without such valid retained rejection proof, a safety bound, incomplete required population,
+   cleanup failure, missing in-commit or
    cold-cache proof, or mechanism-probe status other than `complete` yields `DEFER`.
-4. The same candidate writer/latency/recovery/resource/liveness soft gate failing for the same mode/
-   probe in all three valid seeds yields `PRESCREEN_NO_GO`. One or two failures yields `DEFER`.
-   Harness/oracle/sampler/actuator/observer faults never become candidate failures by repetition.
-5. The QR complete-population median/ratio/maximum rules above apply with checked integer arithmetic;
-   their explicit `DEFER`/`PRESCREEN_NO_GO` rules take the same precedence.
+4. The QR complete-population median/ratio/maximum rules above apply first with checked integer
+   arithmetic; their explicit `DEFER`/`PRESCREEN_NO_GO` thresholds override the general repetition
+   rule below.
+5. Excluding those QR-specific thresholds, the same candidate writer/latency/recovery/resource/
+   liveness soft gate failing for the same mode/probe in all three valid seeds yields
+   `PRESCREEN_NO_GO`. One or two failures yields `DEFER`. Harness/oracle/sampler/actuator/observer
+   faults never become candidate failures by repetition.
 6. `PRESCREEN_PASS` requires every baseline and activated replacement slot valid and passing, an
-   exact non-synthetic prior `SMOKE_PASS`, a complete mechanism probe, complete artifact
-   reconciliation, and both post-run owners accepting the derived result.
+   exact matching prior Docker result whose content is non-synthetic `DOCKER_SMOKE_PASS`, a raw run
+   manifest recording its dispatch binding, a complete mechanism probe and complete artifact
+   reconciliation.
 
-Owners attest the derived payload; they cannot manually select or weaken its disposition. A
+That Docker predicate is content-only and cannot authorize or retroactively legitimize a native
+run. Final sealing separately requires `NATIVE_RUN_PROVENANCE_VERIFIED` to prove that the exact
+`DOCKER_SMOKE_PREREQUISITE_VERIFIED_NO_DECISION` capability was consumed at dispatch.
+
+Owners attest the frozen derived payload after classification; they cannot manually select, change
+or weaken its outcome. Refusal or loss of current review prevents final sealing without changing the
+derived outcome. A
 mechanism-probe report is emitted even when preflight or an earlier terminal result prevents the
 probe and carries `not_run` or `incomplete` plus the reason; only `complete` is pass-capable.
 
@@ -1002,11 +1207,13 @@ and a Docker volume. It checks harness construction, the four-table layout, sche
 agreement, one transaction in each mode, one `HOLD`, and one trial at each kill trigger against a
 64-MiB base. Optional two- and five-second lane bursts may catch gross deadlocks.
 
-Every such artifact is labelled `SMOKE_ONLY / NO_DECISION`. A named-volume database uses Docker's
-managed ext4/VHDX/NTFS/shared-NVMe path (while the container root also uses overlayfs); it cannot
+Every such artifact uses the separate Cycle 24 Docker result type and derives only
+`DOCKER_SMOKE_PASS` or `DOCKER_SMOKE_INCOMPLETE`. A named-volume database uses Docker's managed
+ext4/VHDX/NTFS/shared-NVMe path (while the container root also uses overlayfs); it cannot
 validate XFS quota, direct device writes, physical amplification, native-NVMe latency,
 power loss, endurance, C2/C3, or the prescreen disposition. Passing Docker smoke is a prerequisite
-for spending target-host time, not evidence that redb is suitable.
+for spending target-host time only after separate live-review and immutable-storage verification;
+it is not evidence that redb is suitable.
 
 Cycle 16 implements a narrower construction lane, not this smoke subset. It has no crash actuator,
 approval verifier, or result classifier. The canonical result and evidence boundary are recorded in
