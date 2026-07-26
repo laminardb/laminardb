@@ -204,6 +204,63 @@ impl FaultyReadyReadKv {
     }
 }
 
+struct EvidenceReadGateKv {
+    inner: InMemoryKv,
+    armed: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+impl EvidenceReadGateKv {
+    fn new(local_id: NodeId) -> Self {
+        Self {
+            inner: InMemoryKv::new(local_id),
+            armed: std::sync::atomic::AtomicBool::new(false),
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    fn arm(&self) {
+        assert!(!self.armed.swap(true, Ordering::AcqRel));
+    }
+
+    async fn wait_until_blocked(&self) {
+        self.entered.acquire().await.unwrap().forget();
+    }
+
+    fn release_blocked_read(&self) {
+        self.release.add_permits(1);
+    }
+}
+
+#[async_trait::async_trait]
+impl ClusterKv for EvidenceReadGateKv {
+    async fn write(&self, key: &str, value: String) {
+        self.inner.write(key, value).await;
+    }
+
+    async fn read_from(&self, who: NodeId, key: &str) -> Option<String> {
+        self.inner.read_from(who, key).await
+    }
+
+    async fn read_from_checked(&self, who: NodeId, key: &str) -> Result<Option<String>, String> {
+        if key == ADOPTED_ASSIGNMENT_KEY && self.armed.swap(false, Ordering::AcqRel) {
+            self.entered.add_permits(1);
+            self.release
+                .acquire()
+                .await
+                .map_err(|error| error.to_string())?
+                .forget();
+        }
+        Ok(self.inner.read_from(who, key).await)
+    }
+
+    async fn scan(&self, key: &str) -> Vec<(NodeId, String)> {
+        self.inner.scan(key).await
+    }
+}
+
 impl DelayedRecoveryKv {
     fn new(local_id: NodeId) -> Self {
         Self {
@@ -296,6 +353,35 @@ fn ctl(self_id: u64, peers: Vec<NodeInfo>) -> ClusterController {
     let (_tx, rx) = watch::channel(peers);
     let kv: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(NodeId(self_id)));
     ClusterController::new(NodeId(self_id), kv, None, rx)
+}
+
+fn assignment_adoption(
+    controller: &ClusterController,
+    assignment_version: u64,
+) -> CheckpointAssignmentAdoption {
+    let owners = [controller.instance_id().0; 3];
+    CheckpointAssignmentAdoption {
+        participant: CheckpointParticipant {
+            node_id: controller.instance_id().0,
+            boot_incarnation: controller.recovery_incarnation(),
+        },
+        assignment_version,
+        partitioning_abi_version: crate::state::PARTITIONING_ABI_VERSION,
+        vnode_count: u32::try_from(owners.len()).unwrap(),
+        assignment_digest: CheckpointAssignmentFence::owner_map_digest(3, &owners),
+    }
+}
+
+fn assignment_fence_for_adoption(
+    adoption: &CheckpointAssignmentAdoption,
+) -> CheckpointAssignmentFence {
+    let owners = vec![adoption.participant.node_id; usize::try_from(adoption.vnode_count).unwrap()];
+    CheckpointAssignmentFence::from_owner_map(
+        adoption.assignment_version,
+        &owners,
+        vec![adoption.participant],
+    )
+    .unwrap()
 }
 
 fn checkpoint_fence_and_drain(
@@ -2029,6 +2115,275 @@ async fn adopted_assignment_report_binds_the_current_process_and_exact_map() {
     let mut restarted = report;
     restarted.participant.boot_incarnation = Uuid::new_v4();
     assert!(c.announce_adopted_assignment(&restarted).await.is_err());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn local_process_authority_evidence_is_exact_compact_and_round_trips() {
+    let node = NodeId(1);
+    let boot = Uuid::from_u128(101);
+    let kv = Arc::new(InMemoryKv::new(node));
+    let control: Arc<dyn ClusterKv> = kv.clone();
+    let recovery: Arc<dyn ClusterKv> = kv.clone();
+    let controller = ClusterController::new_with_recovery_incarnation(
+        node,
+        control,
+        recovery,
+        None,
+        watch::channel(Vec::new()).1,
+        boot,
+    );
+    let (_authority, proof) = install_recovery_authority(&controller, 1_000).await;
+    let adoption = assignment_adoption(&controller, 7);
+    controller
+        .announce_adopted_assignment(&adoption)
+        .await
+        .unwrap();
+    controller.publish_checkpoint_assignment_fence(Some(assignment_fence_for_adoption(&adoption)));
+
+    let evidence = controller
+        .read_local_process_authority_evidence()
+        .await
+        .unwrap();
+    assert_eq!(evidence.participant, adoption.participant);
+    assert_eq!(evidence.process_term, proof.owner.process_term);
+    assert_eq!(evidence.adopted_assignment, adoption);
+
+    let encoded = serde_json::to_vec(&evidence).unwrap();
+    assert!(encoded.len() <= 4 * 1_024, "{} bytes", encoded.len());
+    assert_eq!(
+        serde_json::from_slice::<LocalProcessAuthorityEvidence>(&encoded).unwrap(),
+        evidence
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn local_process_authority_evidence_requires_the_live_exact_assignment_fence() {
+    let node = NodeId(1);
+    let boot = Uuid::from_u128(151);
+    let kv = Arc::new(InMemoryKv::new(node));
+    let control: Arc<dyn ClusterKv> = kv.clone();
+    let recovery: Arc<dyn ClusterKv> = kv;
+    let controller = ClusterController::new_with_recovery_incarnation(
+        node,
+        control,
+        recovery,
+        None,
+        watch::channel(Vec::new()).1,
+        boot,
+    );
+    install_recovery_authority(&controller, 1_000).await;
+    let error = controller
+        .read_local_process_authority_evidence()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            LocalProcessAuthorityEvidenceError::Unavailable(reason)
+                if reason.contains("no durable assignment adoption")
+        ),
+        "{error}"
+    );
+    let adoption = assignment_adoption(&controller, 7);
+    controller
+        .announce_adopted_assignment(&adoption)
+        .await
+        .unwrap();
+    controller.publish_checkpoint_assignment_fence(Some(assignment_fence_for_adoption(&adoption)));
+    assert_eq!(
+        controller
+            .read_local_process_authority_evidence()
+            .await
+            .unwrap()
+            .adopted_assignment,
+        adoption.clone()
+    );
+
+    controller.publish_checkpoint_assignment_fence(None);
+    let error = controller
+        .read_local_process_authority_evidence()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            LocalProcessAuthorityEvidenceError::Unavailable(reason)
+                if reason.contains("audited assignment fence is unavailable")
+        ),
+        "durable publication alone must not survive local watcher suspension: {error}"
+    );
+
+    let mismatched_fence = CheckpointAssignmentFence::from_owner_map(
+        adoption.assignment_version,
+        &[node.0, node.0],
+        vec![adoption.participant],
+    )
+    .unwrap();
+    controller.publish_checkpoint_assignment_fence(Some(mismatched_fence));
+    let error = controller
+        .read_local_process_authority_evidence()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            LocalProcessAuthorityEvidenceError::Invalid(reason)
+                if reason.contains("contradicts the same-version")
+        ),
+        "{error}"
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn local_process_authority_evidence_ignores_canonical_prior_boot_adoption() {
+    let node = NodeId(1);
+    let boot = Uuid::from_u128(201);
+    let prior_boot = Uuid::from_u128(200);
+    let kv = Arc::new(InMemoryKv::new(node));
+    let control: Arc<dyn ClusterKv> = kv.clone();
+    let recovery: Arc<dyn ClusterKv> = kv.clone();
+    let controller = ClusterController::new_with_recovery_incarnation(
+        node,
+        control,
+        recovery,
+        None,
+        watch::channel(Vec::new()).1,
+        boot,
+    );
+    install_recovery_authority(&controller, 1_000).await;
+
+    let current_adoption = assignment_adoption(&controller, 6);
+    controller.publish_checkpoint_assignment_fence(Some(assignment_fence_for_adoption(
+        &current_adoption,
+    )));
+    let mut stale_adoption = current_adoption;
+    stale_adoption.participant.boot_incarnation = prior_boot;
+    kv.seed(
+        node,
+        ADOPTED_ASSIGNMENT_KEY,
+        serde_json::to_string(&stale_adoption).unwrap(),
+    );
+    let error = controller
+        .read_local_process_authority_evidence()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            LocalProcessAuthorityEvidenceError::Unavailable(reason)
+                if reason.contains("prior local boot")
+        ),
+        "{error}"
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn local_process_authority_evidence_rejects_noncanonical_or_oversized_adoption() {
+    let node = NodeId(1);
+    let boot = Uuid::from_u128(301);
+    let kv = Arc::new(InMemoryKv::new(node));
+    let control: Arc<dyn ClusterKv> = kv.clone();
+    let recovery: Arc<dyn ClusterKv> = kv.clone();
+    let controller = ClusterController::new_with_recovery_incarnation(
+        node,
+        control,
+        recovery,
+        None,
+        watch::channel(Vec::new()).1,
+        boot,
+    );
+    install_recovery_authority(&controller, 1_000).await;
+    let adoption = assignment_adoption(&controller, 7);
+    let mut adoption_with_unknown_field = serde_json::to_value(&adoption).unwrap();
+    adoption_with_unknown_field
+        .as_object_mut()
+        .unwrap()
+        .insert("unexpected".into(), serde_json::json!(true));
+    kv.seed(
+        node,
+        ADOPTED_ASSIGNMENT_KEY,
+        serde_json::to_string(&adoption_with_unknown_field).unwrap(),
+    );
+    let error = controller
+        .read_local_process_authority_evidence()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            LocalProcessAuthorityEvidenceError::Invalid(reason)
+                if reason.contains("not canonically encoded")
+        ),
+        "{error}"
+    );
+
+    kv.seed(
+        node,
+        ADOPTED_ASSIGNMENT_KEY,
+        "x".repeat(MAX_ADOPTED_ASSIGNMENT_BYTES + 1),
+    );
+    let error = controller
+        .read_local_process_authority_evidence()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            LocalProcessAuthorityEvidenceError::Invalid(reason)
+                if reason.contains("expected 1..=")
+        ),
+        "{error}"
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn local_process_authority_evidence_revalidates_lease_after_point_reads() {
+    let node = NodeId(1);
+    let boot = Uuid::from_u128(401);
+    let recovery = Arc::new(EvidenceReadGateKv::new(node));
+    let control: Arc<dyn ClusterKv> = recovery.clone();
+    let recovery_kv: Arc<dyn ClusterKv> = recovery.clone();
+    let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
+        node,
+        control,
+        recovery_kv,
+        None,
+        watch::channel(Vec::new()).1,
+        boot,
+    ));
+    install_recovery_authority(&controller, 1_000).await;
+    let adoption = assignment_adoption(&controller, 7);
+    controller
+        .announce_adopted_assignment(&adoption)
+        .await
+        .unwrap();
+    controller.publish_checkpoint_assignment_fence(Some(assignment_fence_for_adoption(&adoption)));
+
+    recovery.arm();
+    let reading = {
+        let controller = Arc::clone(&controller);
+        tokio::spawn(async move { controller.read_local_process_authority_evidence().await })
+    };
+    tokio::time::timeout(Duration::from_secs(1), recovery.wait_until_blocked())
+        .await
+        .expect("local evidence read did not reach the injected point-read gate");
+    controller.fence_process_lease();
+    recovery.release_blocked_read();
+
+    let error = reading.await.unwrap().unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            LocalProcessAuthorityEvidenceError::Unavailable(reason)
+                if reason.contains("lease authority")
+        ),
+        "{error}"
+    );
 }
 
 #[cfg(feature = "cluster")]

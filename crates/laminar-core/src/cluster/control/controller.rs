@@ -26,6 +26,7 @@ use crate::state::CheckpointAttempt;
 use crate::state::Locality;
 
 const RECOVERY_INCARNATION_KEY: &str = "control:recovery-incarnation";
+const ADOPTED_ASSIGNMENT_KEY: &str = "control:adopted-assignment";
 const DRAIN_ACK_KEY: &str = "control:drain-ack";
 const DRAIN_ACK_PROTOCOL_VERSION: u16 = 1;
 const RELEASE_READY_ACK_KEY: &str = "control:recovery-release-ready";
@@ -38,6 +39,7 @@ const MAX_RECOVERY_STOPPED_REPORT_BYTES: usize = 32 * 1_024;
 /// Shared ceiling for mutable recovery intents and immutable release terminals.
 pub(super) const MAX_RECOVERY_ANNOUNCEMENT_BYTES: usize = 256 * 1_024;
 const RECOVERY_CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_ADOPTED_ASSIGNMENT_BYTES: usize = 1_024;
 const MAX_DRAIN_ACK_BYTES: usize = 1_024;
 const MAX_RELEASE_READY_ACK_BYTES: usize = 1_024;
 const CONTROL_ROSTER_IO_CONCURRENCY: usize = 32;
@@ -424,6 +426,37 @@ impl RecoveryAnnouncement {
             .map_err(|error| format!("could not encode recovery announcement: {error}"))?;
         validate_recovery_announcement_size(encoded.len())
     }
+}
+
+/// Failure to obtain a trustworthy local-process authority view.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum LocalProcessAuthorityEvidenceError {
+    /// Authority is temporarily unavailable because startup, lease, identity, or bounded storage
+    /// evidence is incomplete or changed during the read. Every checked storage read failure is
+    /// classified here, including backends that report a malformed outer envelope as an I/O
+    /// failure rather than returning its logical value.
+    #[error("local process authority evidence is unavailable: {0}")]
+    Unavailable(String),
+    /// Logical payload bytes successfully returned by checked storage are malformed,
+    /// non-canonical, or contradict their current-process slot or same-version audited fence.
+    #[error("local process authority evidence is invalid: {0}")]
+    Invalid(String),
+}
+
+/// One bounded, current-process view of locally retained cluster-control evidence.
+///
+/// A successful read samples the lease as live before and after the durable point read; it is not
+/// a future authority grant.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalProcessAuthorityEvidence {
+    /// Stable node slot and boot incarnation sampled for this view.
+    pub participant: CheckpointParticipant,
+    /// Stable-node process term bound to `participant` by durable lease publication.
+    pub process_term: u64,
+    /// Exact report durably published by this boot and matched to the sampled locally audited
+    /// assignment fence.
+    pub adopted_assignment: CheckpointAssignmentAdoption,
 }
 
 /// Boot-bound phase-one acknowledgement and unresolved prepared-checkpoint inventory.
@@ -927,6 +960,33 @@ fn parse_recovery_announcement_ack(
         ));
     }
     Ok(ack.announcement)
+}
+
+fn parse_local_adopted_assignment(
+    raw: &str,
+    participant: CheckpointParticipant,
+) -> Result<Option<CheckpointAssignmentAdoption>, String> {
+    if raw.is_empty() || raw.len() > MAX_ADOPTED_ASSIGNMENT_BYTES {
+        return Err(format!(
+            "local adopted assignment is {} bytes; expected 1..={MAX_ADOPTED_ASSIGNMENT_BYTES}",
+            raw.len()
+        ));
+    }
+    let adoption: CheckpointAssignmentAdoption = serde_json::from_str(raw)
+        .map_err(|error| format!("invalid local adopted assignment: {error}"))?;
+    if !adoption.is_canonical() || adoption.participant.node_id != participant.node_id {
+        return Err("local adopted assignment has a non-canonical publisher".into());
+    }
+    let canonical = serde_json::to_string(&adoption).map_err(|error| {
+        format!("could not canonically encode local adopted assignment: {error}")
+    })?;
+    if canonical != raw {
+        return Err("local adopted assignment is not canonically encoded".into());
+    }
+    if adoption.participant.boot_incarnation != participant.boot_incarnation {
+        return Ok(None);
+    }
+    Ok(Some(adoption))
 }
 
 fn encode_release_ready_ack(ack: &RecoveryReleaseReadyAck) -> Result<String, String> {
@@ -2028,6 +2088,93 @@ impl ClusterController {
         self.recovery_incarnation
     }
 
+    /// Point-read this process's exact local assignment evidence.
+    ///
+    /// Only the local stable-node slot is read; this method never scans shared assignment or
+    /// recovery records. The process identity and sampled lease are captured before the read, the
+    /// retained report is validated against the current boot, and identity is revalidated
+    /// afterward. A canonical report from an older boot makes the view unavailable rather than
+    /// being attributed to this process. A returned adoption also matches the exact locally audited
+    /// assignment fence sampled before and after identity revalidation.
+    ///
+    /// # Errors
+    /// Fails closed when the process term is unpublished, the lease is not live, the bounded
+    /// durable read fails or times out, retained bytes are malformed or non-canonical, a
+    /// current-boot record contradicts the local identity, or identity changes during the read.
+    /// Checked-storage errors are unavailable even when a backend internally conflates a malformed
+    /// outer envelope with I/O. `Invalid` is reserved for logical values returned successfully to
+    /// this method that then fail payload bounds, canonicality, current-slot validation, or the
+    /// sampled same-version audited fence.
+    pub async fn read_local_process_authority_evidence(
+        &self,
+    ) -> Result<LocalProcessAuthorityEvidence, LocalProcessAuthorityEvidenceError> {
+        let before = self
+            .capture_live_local_process_authority()
+            .map_err(LocalProcessAuthorityEvidenceError::Unavailable)?;
+        let node = NodeId(before.participant.node_id);
+        let adopted_raw = self
+            .read_recovery_value(node, ADOPTED_ASSIGNMENT_KEY)
+            .await
+            .map_err(LocalProcessAuthorityEvidenceError::Unavailable)?;
+
+        let adopted_raw = adopted_raw.ok_or_else(|| {
+            LocalProcessAuthorityEvidenceError::Unavailable(
+                "local process has no durable assignment adoption".into(),
+            )
+        })?;
+        let adoption = parse_local_adopted_assignment(&adopted_raw, before.participant)
+            .map_err(LocalProcessAuthorityEvidenceError::Invalid)?
+            .ok_or_else(|| {
+                LocalProcessAuthorityEvidenceError::Unavailable(
+                    "durable assignment adoption belongs to a prior local boot".into(),
+                )
+            })?;
+        let expected_fence = match self.checkpoint_assignment_fence(adoption.assignment_version) {
+            Some(fence) if adoption.matches_fence(&fence) => fence,
+            Some(_) => {
+                return Err(LocalProcessAuthorityEvidenceError::Invalid(
+                    "durable local adoption contradicts the same-version audited assignment fence"
+                        .into(),
+                ));
+            }
+            None => {
+                return Err(LocalProcessAuthorityEvidenceError::Unavailable(
+                    "matching locally audited assignment fence is unavailable".into(),
+                ));
+            }
+        };
+
+        let after = self
+            .capture_live_local_process_authority()
+            .map_err(LocalProcessAuthorityEvidenceError::Unavailable)?;
+        if after != before {
+            return Err(LocalProcessAuthorityEvidenceError::Unavailable(
+                "local process authority changed while reading retained evidence".into(),
+            ));
+        }
+        match self.checkpoint_assignment_fence(adoption.assignment_version) {
+            Some(fence) if fence == expected_fence && adoption.matches_fence(&fence) => {}
+            Some(_) => {
+                return Err(LocalProcessAuthorityEvidenceError::Invalid(
+                    "locally audited assignment fence changed or contradicted its durable adoption at the same version"
+                        .into(),
+                ));
+            }
+            None => {
+                return Err(LocalProcessAuthorityEvidenceError::Unavailable(
+                    "matching locally audited assignment fence changed during evidence capture"
+                        .into(),
+                ));
+            }
+        }
+
+        Ok(LocalProcessAuthorityEvidence {
+            participant: after.participant,
+            process_term: after.process_term,
+            adopted_assignment: adoption,
+        })
+    }
+
     /// Publish and read back this process's incarnation metadata.
     ///
     /// This does not grant recovery-write authority. Cluster startup must use
@@ -2156,6 +2303,18 @@ impl ClusterController {
             process_term: self.recovery_process_term.load(Ordering::Acquire),
         };
         publisher.validate()?;
+        Ok(publisher)
+    }
+
+    fn capture_live_local_process_authority(&self) -> Result<RecoveryFaultPublisher, String> {
+        let _transition = self.process_authority_transition.lock();
+        if !self.recovery_process_lease_is_live() {
+            return Err("local process lease authority is not live".into());
+        }
+        let publisher = self.recovery_fault_publisher()?;
+        if !self.recovery_process_lease_is_live() {
+            return Err("local process lease authority changed while sampling identity".into());
+        }
         Ok(publisher)
     }
 
@@ -2931,7 +3090,7 @@ impl ClusterController {
         }
         let encoded = serde_json::to_string(adoption)
             .map_err(|error| format!("could not encode adopted assignment: {error}"))?;
-        self.write_recovery_value_exact("control:adopted-assignment", encoded)
+        self.write_recovery_value_exact(ADOPTED_ASSIGNMENT_KEY, encoded)
             .await
     }
 
@@ -2942,7 +3101,7 @@ impl ClusterController {
     pub async fn read_adopted_assignments(
         &self,
     ) -> Result<Vec<(NodeId, CheckpointAssignmentAdoption)>, String> {
-        self.scan_recovery_values("control:adopted-assignment")
+        self.scan_recovery_values(ADOPTED_ASSIGNMENT_KEY)
             .await?
             .into_iter()
             .map(|(node, raw)| {

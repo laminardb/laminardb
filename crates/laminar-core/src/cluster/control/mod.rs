@@ -22,9 +22,10 @@ pub use barrier::{
 #[cfg(feature = "cluster")]
 pub use controller::CheckpointPrepareObservation;
 pub use controller::{
-    ClusterController, RecoverPhase, RecoveryAdmissionSnapshot, RecoveryAnnouncement,
-    RecoveryControlError, RecoveryFault, RecoveryFaultReportOutcome, RecoveryFaultRequest,
-    RecoveryRound, RecoveryRoundId, RecoveryStoppedReport, ReleaseCommitStatus,
+    ClusterController, LocalProcessAuthorityEvidence, LocalProcessAuthorityEvidenceError,
+    RecoverPhase, RecoveryAdmissionSnapshot, RecoveryAnnouncement, RecoveryControlError,
+    RecoveryFault, RecoveryFaultReportOutcome, RecoveryFaultRequest, RecoveryRound,
+    RecoveryRoundId, RecoveryStoppedReport, ReleaseCommitStatus,
 };
 // Re-exported from `crate::checkpoint_decision` (lives outside the
 // cluster gate because single-instance also relies on it for crash-safe
