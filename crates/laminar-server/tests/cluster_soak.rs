@@ -3987,6 +3987,7 @@ fn checkpoint_barrier_timing_authority(
     let process = local_process_identity(evidence);
     if !process.is_canonical()
         || !fence.is_canonical()
+        || evidence.adopted_assignment.participant != evidence.participant
         || !evidence.adopted_assignment.matches_fence(fence)
         || fence.participant_incarnation(process.participant.node_id)
             != Some(process.participant.boot_incarnation)
@@ -5946,6 +5947,35 @@ fn checkpoint_timing_authority_uses_certificate_digest_domain() {
         authority.assignment_certificate_digest, local.adopted_assignment.assignment_digest,
         "certificate and owner-map digests are intentionally separate domains"
     );
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn checkpoint_timing_authority_rejects_cross_domain_and_identity_substitution() {
+    let (snapshot, evidence) = local_assignment_cut_fixture();
+    let fence = snapshot.assignment_fence().unwrap();
+    let local = evidence.get(&0).unwrap();
+
+    let mut substituted_reporter = local.clone();
+    substituted_reporter.adopted_assignment.participant = evidence.get(&1).unwrap().participant;
+    assert!(checkpoint_barrier_timing_authority(&substituted_reporter, &fence).is_err());
+
+    let mut substituted_owner_map = local.clone();
+    substituted_owner_map.adopted_assignment.assignment_digest[0] ^= 0xff;
+    assert!(checkpoint_barrier_timing_authority(&substituted_owner_map, &fence).is_err());
+
+    let mut wrong_boot = local.clone();
+    wrong_boot.participant.boot_incarnation = uuid::Uuid::from_u128(999);
+    wrong_boot.adopted_assignment.participant = wrong_boot.participant;
+    assert!(checkpoint_barrier_timing_authority(&wrong_boot, &fence).is_err());
+
+    let mut noncanonical_process = local.clone();
+    noncanonical_process.process_term = 0;
+    assert!(checkpoint_barrier_timing_authority(&noncanonical_process, &fence).is_err());
+
+    let mut noncanonical_fence = fence.clone();
+    noncanonical_fence.assignment_version = 0;
+    assert!(checkpoint_barrier_timing_authority(local, &noncanonical_fence).is_err());
 }
 
 #[cfg(feature = "kafka")]
