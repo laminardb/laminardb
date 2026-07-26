@@ -19,8 +19,10 @@ right schema after full eviction through a bounded, conditionally v1-compatible 
 validates restored index/schema coherence. [Cycle 46](../reviews/distributed-keyed-state-cycle-46.md)
 reproduces retained-owner cancellation/panic after real ASOF mutation and permanently fences that
 in-memory graph generation from execution or checkpoint capture. The future native-backend owner,
-checkpoint-delivery cancellation, and independent soak remain open. None of these decisions changes
-cluster admission.
+checkpoint-delivery cancellation, and independent soak remain open. [Cycle 47](../reviews/distributed-keyed-state-cycle-47.md)
+empirically reproduces the post-graph sink-publication drop on a retained private callback, proves
+that no production owner performs that cancellation today, and freezes the owner contract instead
+of adding a checkpoint-only fence. None of these decisions changes cluster admission.
 
 ## Verdict
 
@@ -122,6 +124,38 @@ make a checkpoint-delivery await cancellable, or fence a future TidesDB operatio
 after its Rust request/graph is gone. Those require the callback/native owner to poison the complete
 publication/root generation. Cluster delivery also remains at-least-once only: best-effort and
 exactly-once cluster configurations are still rejected independently.
+
+### Callback drain publication is owner-non-cancellable today
+
+Cycle 47 traced the complete checkpoint-drain pass after graph execution: materialized views and
+subscriptions publish synchronously, sink filter compilation and bounded actor enqueue await, the
+sink FIFO fence completes before capture, and source offsets are materialized only after operator
+state capture. The durable tail later performs the contract-required phase-one flush or pre-commit
+before persisting that source cut; checkpoint-committable sinks finalize only after the durable
+decision. A transient red probe used three real output batches and a one-slot gated sink actor.
+The first write blocked in the connector, the second occupied the queue, the third remained pending,
+and dropping the borrowed drain future left the retained callback without a fault after its graph
+input had been consumed. At-least-once recovery could duplicate the already accepted first two
+batches; the unsafe result is allowing a later cut to omit the third.
+
+That drop is not reachable through the current production owner chain. Leader, source-less, and
+follower checkpoints await the complete drain directly. The nested checkpoint-deadline and cluster-
+lease wrappers are supported because control returns to `write_to_sinks`. Publication in replay-
+required and cluster modes records a sink/checkpoint fault and returns `Recovery`; local best-effort
+enqueue loss records `sink_timed_out`, and the subsequent fence blocks capture: `Skipped` after a
+successful FIFO sync, otherwise `Failed`; overall drain-deadline expiry returns `Recovery`. The pre-
+capture FIFO sync rejects an unresolved accepted command; the later phase-one flush or pre-commit
+establishes the contract-required sink fence before the source cut is persisted. Transactional
+sinks finalize only after the durable decision. Root panic destroys the callback and graph before
+supervisor recovery.
+
+No runtime guard was added. A drain-only graph fence would leave the analogous normal-cycle output
+publication boundary and coordinator source-barrier/exact-attempt ownership unresolved. The trait
+contract now requires callers to await an explicit drain result or destroy the complete owner
+generation. Before any outer timeout, `select!`, or task abort is introduced, one coordinator-owned
+attempt transaction must cover the frozen input cut, graph/MV/stream/sink publication, source
+barriers, offsets, and exact-attempt cleanup. This is not exactly-once certification and does not
+address native work that can complete after its Rust owner is gone.
 
 ### Aggregate support is partial substrate, not an admitted feature
 

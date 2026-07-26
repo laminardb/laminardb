@@ -455,9 +455,19 @@ pub trait PipelineCallback: Send + 'static {
 
     /// Drain every graph input that belongs to the frozen checkpoint cut.
     ///
-    /// Implementations must deliver each drain pass's outputs before returning and must not
-    /// cancel an in-progress graph pass: operators may temporarily own their input buffers across
-    /// an await. The absolute deadline is checked between complete passes.
+    /// Implementations must deliver each drain pass's outputs before returning. The returned
+    /// future is one owner transaction: its caller must await an explicit result or destroy the
+    /// complete callback/coordinator generation. It must not drop the future while retaining that
+    /// generation. Operators may temporarily own graph input across an await, and a completed graph
+    /// pass may have partially published materialized-view, stream, or sink output.
+    ///
+    /// An implementation may cancel a nested operation for its absolute deadline or process lease
+    /// only when it regains control and records or returns a disposition that prevents checkpoint
+    /// capture from passing incomplete publication. A future caller that needs an outer timeout,
+    /// `select!`, or task abort must first add a coordinator-owned attempt transaction covering
+    /// graph/output publication, source-barrier ownership, and attempt cleanup. The current
+    /// implementation checks its absolute deadline between complete graph passes and inside
+    /// sink-publication awaits whose outcomes are consumed before capture.
     async fn drain_checkpoint_edges_until(
         &mut self,
         deadline: tokio::time::Instant,

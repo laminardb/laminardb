@@ -3,7 +3,7 @@
 - **Status:** Planned and backend-gated; exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster
   operator is admitted by this document
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-25 during Cycle 46
+- **Last reconciled:** 2026-07-25 during Cycle 47
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -83,6 +83,20 @@ fault. It adds one atomic check and one `Arc` clone/drop per graph cycle, not pe
 future cancellable checkpoint-delivery path and any native operation that can outlive the graph still
 need their own owner-level poison/publication fence. Distribution, rebalance, source/sink delivery,
 TidesDB qualification, cluster admission, and the independent soak remain open.
+
+Cycle 47 closes the audit—not the implementation—of post-graph drain publication cancellation. A
+one-slot real sink-actor probe reproduced an unclassified retained-callback drop after graph input
+was consumed and while the third output batch awaited enqueue. No production owner cancels and
+retains this future today. Supported deadline/lease interruption regains control: publication in
+replay-required and cluster modes returns recovery, while local best-effort enqueue loss records a
+sink timeout whose subsequent fence blocks capture: `Skipped` after successful FIFO sync, otherwise
+`Failed`, while overall drain-deadline expiry returns recovery. A checkpoint-only guard would miss
+the equivalent normal-cycle publication boundary and would not own source barriers or exact-attempt
+cleanup, so it is not added. The callback contract now requires an explicit drain result or
+destruction of the complete callback/coordinator generation. If a cancellable caller is introduced,
+its prerequisite is a coordinator-owned attempt transaction over input-cut ownership, graph/MV/
+stream/sink publication, offsets/barriers, and attempt cleanup. This adds no hot-path cost and makes
+no exactly-once or native-backend cancellation claim.
 
 ## Scope and non-goals
 

@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-25 during Cycle 46
+- **Last reconciled:** 2026-07-25 during Cycle 47
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -13,7 +13,7 @@
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
   [TidesDB package design](tidesdb-local-state-successor-design.md),
   [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
-  [latest completed review](../reviews/distributed-keyed-state-cycle-46.md)
+  [latest completed review](../reviews/distributed-keyed-state-cycle-47.md)
 
 ## Decision
 
@@ -283,6 +283,28 @@ after a checkpoint-drain graph pass returns while sink publication is pending, a
 future backend-owned poison needed when a native operation may outlive the Rust graph. Those
 delivery/native-owner boundaries, vnode ownership, backend qualification, and independent soak
 remain open; cluster admission is unchanged.
+
+Cycle 47 audits the next await boundary rather than adding a partial fence. A deterministic red
+probe let one checkpoint-drain pass consume three buffered output batches, blocked the first batch
+inside a real sink actor with a one-slot command queue, queued the second, and dropped the drain
+future while the third awaited admission. The retained callback had no pipeline fault. This proves
+the private borrowed future is not cancellation-safe after graph completion, but the production
+owner chain never performs that drop: leader, source-less, and follower checkpoint paths directly
+await the whole drain; nested deadline and process-lease cancellations return to the callback;
+publication in replay-required and cluster modes records a fault and returns recovery, while local
+best-effort enqueue loss records a sink timeout whose later fence blocks capture (`Skipped` after a
+successful FIFO sync, otherwise `Failed`; overall drain-deadline expiry returns recovery); and root
+unwind destroys the callback generation.
+
+A checkpoint-drain-only graph guard is rejected for now. It would not cover the same hypothetical
+normal-cycle MV/stream/sink publication boundary and cannot resolve coordinator-owned source
+barriers or exact-attempt cleanup. The callback contract instead requires the whole drain future to
+reach an explicit result or the complete callback/coordinator generation to be destroyed. Any
+future outer timeout, `select!`, or task abort must first introduce one coordinator-owned attempt
+transaction spanning the frozen input cut, graph and output publication, source-barrier ownership,
+and exact-attempt cleanup. This decision adds no runtime or hot-path work and does not make native
+backend calls cancellation-safe. Already accepted at-least-once sink output may duplicate after a
+future recovery; cluster exactly-once remains rejected.
 
 #### Frozen Fjall/RocksDB evidence and selected TidesDB binding line
 

@@ -600,9 +600,14 @@ Remaining work is kept reviewable in this dependency order:
    blocks graph execution and checkpoint capture until a fresh graph restores the last committed
    cut. The current compute-root panic path already destroys its owned graph, so this is a borrowed-
    API/future-refactor fence, not backend qualification. Cancellation during a future checkpoint-
-   delivery await after graph completion remains separate. A backend-owned sticky root/process
-   poison, resource/health admission, and fresh-native-root fencing must land only with a real
-   runtime consumer rather than a disconnected future trait;
+   delivery await after graph completion remains separate. Cycle 47 reproduces that private-
+   callback ambiguity during a real bounded sink enqueue, but confirms no production owner cancels
+   and retains the drain future. The contract now requires an explicit result or destruction of the
+   whole owner generation; a future cancellable caller first needs a coordinator-owned transaction
+   covering input-cut publication, source barriers, and exact-attempt cleanup. A drain-only guard is
+   deliberately not added because normal publication has the same hypothetical boundary. A backend-
+   owned sticky root/process poison, resource/health admission, and fresh-native-root fencing must
+   land only with a real runtime consumer rather than a disconnected future trait;
 4. wait for a new official Cargo package `tidesdb`, freeze its exact native pair, and repeat the
    complete one-day/zero-machine-hour T0. The repeated T0 must reconcile every later native fix and
    prove exact transaction success or explicitly accept the full-key verified-commit/fail-stop
