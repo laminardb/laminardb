@@ -356,6 +356,141 @@ controller. Full-checkpoint/restorable-gate exact evidence and an instrumentatio
 All CVR scenarios remain **BLOCKED**, no Cycle 59 independent soak ran, and
 `certification_eligible` remains `false`.
 
+### Cycle 60 instrumentation A/B protocol
+
+Protocol v1 is frozen before measurement and is engineering-only. It estimates two effects that
+must not be combined:
+
+1. **A — recorder control / B — recorder treatment:** compare `40e3637b` with a derived source tree
+   containing only the patch content of `6084462b` and `3909f4d4`. Do not add a runtime,
+   configuration, Cargo-feature, or checkpoint-path branch to manufacture the control. Both arms
+   run with diagnostic polling disabled. Archive and hash the derived tree and patch series before
+   building; `034b14e9` is deliberately absent. Checkout `3909f4d4` itself includes `034b14e9`, so
+   it is not the recorder-only treatment.
+2. **C — polling control / D — polling treatment:** run one immutable binary built from
+   `3909f4d4` in both arms. A separate observer process runs in both arms, pinned outside
+   LaminarDB's CPU and memory allocation. The control executes the schedule without issuing
+   requests; the treatment performs the Cycle 59 local-evidence and exact-timing requests. Freeze
+   request deadlines, retry ceilings, response parsing, and retention before dispatch. Observer
+   results may change request count only as the frozen retry policy declares; they must not control
+   fault timing, progress waits, or run termination.
+
+The recorder estimand is `B - A`; it excludes route installation and, because neither arm exposes
+the ledger, is an intent-to-install comparison of the frozen recorder patches. C's endpoint can
+confirm that the code-equivalent recorder mechanism activates, but that observation is not a B
+runtime measurement. The polling estimand is `D - C`, conditional on recorder plus route already
+being installed. Exact records exported only by D are arm-specific diagnostics, not an A/B
+estimand: C can lose an unexported killed generation before any final read. `C - B` may be reported
+as a descriptive route-install difference, but none of these contrasts may be summed or used to
+infer an unmeasured interaction.
+
+The fixed workload retains Cycle 59's three-node static topology, 64 key groups, 96 Kafka
+partitions, and 400-record/s target, but replaces its response-timed unbounded producer with one
+content-addressed trace. The trace contains exactly 80,000 records: ID `n`, decimal key `n`, payload
+`{"seq":n}`, partition `n mod 96`, and monotonic target time
+`t0 + n * 1_000_000_000 / 400` nanoseconds for `0 <= n < 80,000`. Generate and hash the complete
+manifest before building any arm. `t0` follows three-node readiness, stable assignment, one durable
+bootstrap checkpoint, and the first resource/Prometheus scrape. The measured window is exactly
+`[t0, t0 + 290 seconds]`: the last target send is before 200 seconds and the remaining 90 seconds
+is the fixed tail. Broker acknowledgements may lag but cannot change dispatch or the end anchor.
+
+Set the periodic checkpoint interval to one hour and have the common driver issue manual
+checkpoints in fixed absolute one-based slots: ordinals 1 through 80 at
+`t0 + ordinal * 1.5 seconds`, ordinal 80 is the fault attempt, no requests are scheduled during the
+predeclared fault/recovery gap, and ordinals 81 through 101 run at
+`t0 + 255 seconds + (ordinal - 80) * 1.5 seconds`. The external scheduler must initiate within 50 ms
+of a slot or make it `INVALID`; a still-running prior SUT request or unavailable serving SUT at a
+slot is `FAIL`. Arm the observed leader before ordinal 80 and hard-kill it only after the existing
+debug gate proves that exact attempt entered leader `Snapshotting`. Its 45-second gate deadline
+starts when ordinal 80 is initiated; recovery and rejoin have 90 seconds from hard-kill actuation.
+Missing either deadline, or failure to complete every scheduled request before `t0 + 290 seconds`,
+is `FAIL`. Diagnostic observations cannot select the leader, ordinal, phase, timeout, input cut, or
+window boundary.
+
+A common external driver, configuration, dependency images, CPU/memory limits, topic layout,
+object-store layout, fault controller, and correctness oracle apply to every arm. Materialize B as
+a synthetic Git commit whose parent/tree/patch identities are retained. Build A, B, and the shared
+C/D executable once each in clean identical builders with the workspace `soak` profile, identical
+features, flags,
+linker, `Cargo.lock`, and Rust toolchain; archive them by SHA-256 and reuse the same arm SHA in every
+slot. Each run gets fresh topics and storage prefixes. The observer schedule is fixed at lifecycle
+boundaries and once per five-second steady round; local-assignment retries use the existing 500-ms
+cadence. Every arm uses the same non-diagnostic health, progress, durable-assignment, source, sink,
+and external resource observations.
+
+The current `cluster_soak` target couples diagnostic evidence to its control flow and therefore is
+not this common driver. Before execution, the driver and observer must be separate hashed artifacts,
+and review must show that arm selection cannot change workload, faults, or correctness decisions.
+The polling arms must spawn the same binary; the recorder arms may differ only by the two frozen
+source/build identities declared above.
+
+Use eight complete temporal blocks. Each contains recorder control, recorder treatment, polling
+control, and polling treatment. Precompute a two-replicate four-sequence Williams order, including
+the arm-to-letter mapping and replicate order, from seed `0x4c44422d41423031`; record the resulting
+schedule before warm-up. Perform and retain one unscored warm-up per arm. A run is the unit of
+replication: checkpoint observations within a run must not be pooled as independent samples.
+Retain every valid, invalid, failed, and warm-up attempt; never silently rerun a bad result.
+
+Every attempt records source-tree/patch identities, executable SHA-256, `Cargo.lock` and Rust
+toolchain identities, rendered configuration and observer hashes, run order/seed, host and
+dependency telemetry, input/output cuts, exact fault evidence, and every timing surface available
+to that arm. Only independently proved external host, dependency, driver, or evidence-collector
+failure can make a slot `INVALID`; SUT-caused overload, telemetry loss, incomplete consumption, or
+failure to reach the fault gate is `FAIL`. If the SUT reaches the declared gate but the external
+controller fails to actuate, the slot is `INVALID`. One invalid slot invalidates its entire paired
+block. Before warm-up, precompute two reserve instances of each of the four Williams sequences; a
+rejected block may be replaced only by the next reserve with the identical within-block order.
+Exhausting a sequence's reserves makes the experiment inconclusive. A valid product `FAIL` blocks
+the gate and remains in the report; it is never excluded as an outlier.
+
+Define one value per run before pairing: SUT completion throughput
+`80,000 / (first complete distinct sink-output cut - t0)`; end-window distinct-output backlog;
+total LaminarDB CPU seconds per wall second; maximum one-second sum of node RSS and median steady-
+state sum after warm-up; worst-node bucket-derived p99 and p99.9 estimates computed by Prometheus
+`histogram_quantile` interpolation after summing that node's process-generation pipeline-stall
+bucket deltas; minimum per-node membership in the 1,024-ms bucket; and failover and rejoin time.
+Also report checkpoint counts, every raw per-generation bucket, and producer-to-Kafka acknowledged
+throughput as workload-conformance diagnostics. All 80,000 acknowledgements and distinct sink IDs
+must arrive by the fixed window end; missing or conflicting output is `FAIL`.
+
+Neither recorder arm provides comparable exact evidence. D may export exact records before the hard
+kill while C loses that generation's in-memory ledger; therefore no full-run exact record or maximum
+is an A/B estimand in v1. Retain any arm-specific exact record only as a labelled diagnostic. CPU,
+RSS, checkpoint histograms, checkpoint count, and output throughput/backlog use only the fixed
+measured window; failover and rejoin start at the recorded hard-kill actuation.
+
+The external driver assigns each spawn a `{node ordinal, process-generation ordinal, OS process
+identity}` and scrapes metrics/resources at `t0` and every integer second through `t0 + 290
+seconds`, plus one required scrape immediately before hard-kill. Initial generations start at the
+`t0` boundary; a restarted generation starts at its first serving scrape. They end at the required
+pre-kill or `t0 + 290 seconds` boundary. Compute bucket/count/sum deltas only within one generation;
+never subtract across a restart or counter decrease. A missing required boundary caused by the
+external scraper is `INVALID`; an unavailable or regressed SUT metric while the process is serving
+is `FAIL`. Sum nonnegative generation deltas per node before deriving its quantiles and 1,024-ms
+ratio. The ratio numerator is the node's summed bucket delta and the denominator is its summed
+`_count` delta. Every serving generation must contribute at least one observation and every node at
+least 100; otherwise the run is `FAIL`.
+
+For each block report the raw treatment-minus-control contrasts `B - A` and `D - C`. Separately
+report adverse-oriented absolute and relative effects with positive meaning worse: use the raw
+contrast for lower-is-better metrics, negate it for higher-is-better metrics, and divide the adverse
+absolute effect by the control. A zero control makes the relative effect undefined and prevents a
+relative-equivalence conclusion for that metric. Report all raw run values, every paired effect,
+the median paired effect, and its percentile 95% interval from 100,000 paired-block bootstrap
+resamples using seed `0x4c44422d41423031`. With eight blocks this interval is descriptive, not a
+powered equivalence test. Derive the recorder effect only from `B - A` and the polling effect only
+from `D - C`.
+Cycle 57's two red runs remain historical observations: their binaries, evidence, and attempt
+attribution differ, so they are not samples in either A/B population.
+
+Protocol v1 cannot close the perturbation gate. Before any equivalence run, workload and operations
+owners must approve absolute and relative margins for throughput, CPU, RSS, checkpoint tails, and
+recovery, and a v2 protocol must freeze a prospective sample-size/precision justification plus a
+simultaneous/multiplicity decision rule. Any future green conclusion is limited to that exact
+engineering workload, build, and environment. It cannot qualify a backend, admit keyed state,
+establish exactly once, generalize to production keyed workloads, or replace the independent
+immutable release-binary soak.
+
 ## Frozen numerical contract
 
 An eligible machine-readable charter contains no `TBD`, zero, or results-derived threshold. It

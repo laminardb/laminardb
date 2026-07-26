@@ -236,3 +236,22 @@ same-snapshot durable outcome/capsule evidence remain open. The run used the cur
 Kafka path and therefore establishes no exactly-once claim. No keyed runtime, state backend,
 admission flag, source/sink capability, or independent immutable release-binary soak changed;
 production remains **NO-GO**.
+
+## Cycle 60 disposition
+
+The exact finalizer now has a deterministic test-target proof that independently changes only the
+metric snapshots, then only the exact cursor/metadata cut, before permitting one stable
+finalization. This closes the retry-interleaving unit gap without changing runtime code.
+
+The direct nonempty paginated HTTP route test remains open by explicit proportionality decision.
+Ledger paging, DB process/cursor binding, HTTP auth/gates/errors/empty and maximum-envelope mapping,
+collector pagination, and real nonempty continuation polling are already covered. Producing 65
+records through public APIs would duplicate a checkpoint-capable one-node cluster plus a custom
+connector; no injector or widened production API was added.
+
+The [Cycle 60 A/B v1](../testing/distributed-state-production-soak-charter.md#cycle-60-instrumentation-ab-protocol)
+freezes separate recorder-installation and diagnostic-polling contrasts over common metrics, a
+content-addressed 80,000-record trace, a fixed 290-second window, and one exact manual-checkpoint
+fault ordinal. It has not run. The current harness is not an eligible common driver, v1 is effect-
+estimation-only, and a powered equivalence v2 remains open. Exact full-checkpoint/restorable-gate
+and same-snapshot outcome/capsule authority remain separate blockers; production is **NO-GO**.

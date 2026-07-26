@@ -65,9 +65,16 @@ passes a corrected one-kill engineering run: 392 exact records across four proce
 zero deadline exhaustion, 100% membership in each three-family diagnostic `le=1.024` bucket, a
 passing existing pipeline-stall gate, loss-detecting JSONL through each observed cut, and exact
 reconciliation with the corresponding observed Prometheus cut. It anchors sampled converged
-assignment versions rather than unsampled history, still needs an instrumentation A/B and direct
-nonempty paginated HTTP test, and adds no full-checkpoint/restorable-gate, durable outcome/capsule,
-exactly-once, backend, admission, or independent-soak authority.
+assignment versions rather than unsampled history and adds no full-checkpoint/restorable-gate,
+durable outcome/capsule, exactly-once, backend, admission, or independent-soak authority.
+[Cycle 60](../reviews/distributed-keyed-state-cycle-60.md) adds a deterministic three-attempt test
+which independently forces metrics-only and exact-cursor/metadata-only coherent-cut retries. It
+also freezes an engineering effect-estimation protocol which separates recorder installation from
+diagnostic polling; no A/B run or common external driver exists yet. A direct nonempty HTTP route
+test remains deliberately deferred: deterministic ledger pagination, process-bound DB continuation,
+HTTP mapping/bounds, and real Cycle 59 nonempty continuation polling are covered, while a valid
+direct seed would duplicate a live checkpoint-capable cluster. The run does not prove that one HTTP
+snapshot returned a `has_more` page. No seeding API was added.
 
 ## Verdict
 
@@ -644,6 +651,8 @@ The current branch's admission-neutral hardening was then checked separately:
 | Cycle 58 checkpoint-attempt authority audit | PASS for design boundary; no runtime claim | Exact outcome/capsule retention, two-floor compaction, orphan-capsule, source-offset, lookup-side-effect, timing, and response-bound limits were mapped; implementation stopped before an untruthful route |
 | Cycle 59 exact barrier-timing implementation | PASS, focused/unit/lint gates | Preallocated three-family ledger, protected bounded route, exact process plus sampled-converged-version certificate binding, bounded-memory collector, JSONL streaming through coherent observed cuts, safe exported eviction, unread-loss rejection, and exact Prometheus reconciliation |
 | Cycle 59 real static run, one leader kill, 90-second tail | **PASS engineering gate** | All 79,996 IDs present; 2,758 duplicate IDs tolerated/counted but not proven byte-identical legal replay; 392 exact records across four process generations; zero deadline exhaustion and 100% membership in all three diagnostic `le=1.024` buckets; existing pipeline-stall gate passed; 43.43-s failover and 34.51-s rejoin; not an instrumentation A/B or independent release soak |
+| Cycle 60 coherent-cut retry proof | PASS, focused/full/lint gates | Metrics-only and exact-cursor/metadata-only instability independently force retries before one stable finalization; test-target seam only |
+| Cycle 60 instrumentation A/B | DESIGN ONLY; not run | Frozen v1 separates recorder installation from polling with common metrics and fixed workload/fault anchors; it estimates effects only and still needs a separate driver plus powered v2 |
 
 Both cluster and no-feature `cargo check` and `cargo clippy -D warnings` configurations passed, as
 did formatting and diff checks. These focused results do not exercise keyed cluster restore.
@@ -664,6 +673,14 @@ duplicate output IDs without proving their byte identity or sealed-cut replay le
 therefore does not satisfy the charter's at-least-once duplicate-legality oracle and does not close
 `[LDB-0013]`. The later `1a6dff80` substitution defense has focused deterministic test/lint
 coverage but was not part of the empirical subject.
+
+Cycle 60 adds no empirical sample. Its deterministic finalizer test proves that metrics-only and
+exact-cut-only instability independently force retry. The direct nonempty HTTP route test remains a
+documented composition gap because production-path seeding would recreate an entire live cluster;
+no injection API or fake handler was added. The frozen instrumentation A/B v1 uses common metrics,
+a content-addressed input trace, fixed manual-checkpoint fault ordinal, balanced temporal blocks,
+and named nonadditive contrasts. The current coupled soak harness cannot execute it, and v1 cannot
+support an equivalence conclusion.
 
 These are admission and focused operator tests, not a production certification. No existing test
 demonstrates a distributed keyed operator processing remote rows through crash, restore, and

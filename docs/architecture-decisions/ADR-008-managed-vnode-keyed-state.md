@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 59
+- **Last reconciled:** 2026-07-26 during Cycle 60
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -13,7 +13,7 @@
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
   [TidesDB package design](tidesdb-local-state-successor-design.md),
   [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
-  [latest completed review](../reviews/distributed-keyed-state-cycle-59.md)
+  [latest completed review](../reviews/distributed-keyed-state-cycle-60.md)
 
 ## Decision
 
@@ -1312,9 +1312,13 @@ and 100% of each three-family diagnostic `le=1.024` bucket. Its oracle accounted
 expected IDs while tolerating and counting 2,758 duplicates; it did not prove duplicate byte
 identity or sealed-cut replay legality and supplies no exactly-once evidence. The later
 substitution-defense change in `1a6dff80` has focused deterministic coverage but was not part of
-that empirical subject. The instrumentation A/B, exact full-checkpoint/restorable-gate
-families, and read-only same-snapshot outcome/capsule audit remain open. `[LDB-4007]`,
-`[LDB-0013]`, and the production **NO-GO** verdict are unchanged.
+that empirical subject. Cycle 60 independently proves metrics-only and exact-cut-only finalization
+retries in the test harness, then freezes an engineering A/B v1 which separates recorder
+installation from endpoint polling using common metrics and fixed workload/fault anchors. It has
+not run, the current harness is not its common driver, and it is effect-estimation-only. The direct
+nonempty HTTP route test remains a documented composition gap; no seed API was added. Exact full-
+checkpoint/restorable-gate families and the read-only same-snapshot outcome/capsule audit remain
+open. `[LDB-4007]`, `[LDB-0013]`, and the production **NO-GO** verdict are unchanged.
 
 Selected attempts may then be joined at low cadence only through a new read-only, same-snapshot
 core audit of the exact outcome, both retention floors, and validated live capsule reference;

@@ -5,7 +5,7 @@
   pending a new official package; no runtime
   dependency, backend qualification evidence, independent production-soak result, or admission change
 - **Started:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 59
+- **Last reconciled:** 2026-07-26 during Cycle 60
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline:** `1e2f8429`; working branch `feature/distributed-keyed-state-adr`
@@ -438,6 +438,15 @@ bucket contained 100% of its samples. The post-run `1a6dff80` defense has focuse
 coverage only. This was not an instrumentation A/B or an independent immutable release-binary soak.
 Full-checkpoint/restorable-gate evidence and a non-creating, read-only same-snapshot durable audit
 remain separate blockers.
+
+Cycle 60 closes only the deterministic coherent-cut retry interleaving: metrics-only instability
+and exact cursor/metadata-only instability independently retry before one stable finalization. It
+adds no runtime code. A direct nonempty HTTP route test remains deliberately deferred rather than
+adding a ledger injector or duplicate live-cluster fixture. The
+[engineering A/B v1](../testing/distributed-state-production-soak-charter.md#cycle-60-instrumentation-ab-protocol)
+now freezes separate recorder and polling contrasts with a fixed trace, time window, manual-
+checkpoint fault ordinal, common metrics, and balanced order. It has not run, the current harness
+cannot execute it without treatment-dependent control flow, and v1 cannot support equivalence.
 
 The existing output path satisfies none of the new provenance/fence fields: it passes only a batch
 and deadline and uses an idempotent, non-transactional Kafka producer. The supported evidence APIs

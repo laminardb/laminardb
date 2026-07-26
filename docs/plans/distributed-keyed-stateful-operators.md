@@ -3,7 +3,7 @@
 - **Status:** Planned and backend-gated; exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster
   operator is admitted by this document
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 59
+- **Last reconciled:** 2026-07-26 during Cycle 60
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -220,6 +220,13 @@ level at-least-once duplicate legality nor exactly-once composition. The post-ru
 defense has focused deterministic coverage only. Instrumentation A/B, exact full-checkpoint/
 restorable-gate evidence, and a read-only same-snapshot durable audit remain separate blockers;
 this is not the independent immutable release-binary soak.
+
+Cycle 60 adds a test-target-only three-attempt proof for coherent-cut retries and freezes the
+[engineering A/B v1](../testing/distributed-state-production-soak-charter.md#cycle-60-instrumentation-ab-protocol).
+The protocol uses named recorder/polling contrasts, common metrics, fixed input/time/fault anchors,
+and balanced temporal blocks. No A/B ran; the coupled soak harness is not its common driver and v1
+is effect-estimation-only. The direct nonempty HTTP route test remains an explicit low-risk
+composition gap rather than justification for a seeding API or duplicate live-cluster unit fixture.
 
 ## Scope and non-goals
 
