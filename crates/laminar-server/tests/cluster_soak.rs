@@ -75,12 +75,21 @@ const LOCAL_AUTHORITY_EVIDENCE_MAX_BYTES: usize = 4 * 1_024;
 #[cfg(feature = "kafka")]
 const LOCAL_CHECKPOINT_BARRIER_TIMINGS_MAX_BYTES: usize = 64 * 1_024;
 #[cfg(feature = "kafka")]
+const CHECKPOINT_BARRIER_TIMING_DIAGNOSTIC_WITNESSES: usize = 8;
+#[cfg(feature = "kafka")]
+const CHECKPOINT_BARRIER_TIMING_MAX_PROCESS_GENERATIONS: usize = 1_024;
+#[cfg(feature = "kafka")]
+const CHECKPOINT_BARRIER_TIMING_MAX_ASSIGNMENTS_PER_PROCESS: usize = 1_024;
+#[cfg(feature = "kafka")]
 const ASSIGNMENT_SNAPSHOT_MAX_BYTES: usize = 4 * 1_024 * 1_024;
 #[cfg(feature = "kafka")]
 const LOCAL_AUTHORITY_EVIDENCE_SCHEMA: &str = "laminardb-local-authority-evidence/v1";
 #[cfg(feature = "kafka")]
 const LOCAL_CHECKPOINT_BARRIER_TIMINGS_SCHEMA: &str =
     "laminardb-local-checkpoint-barrier-timings/v1";
+#[cfg(feature = "kafka")]
+const CHECKPOINT_BARRIER_TIMING_ARTIFACT_SCHEMA: &str =
+    "laminardb-soak-checkpoint-barrier-timing/v1";
 #[cfg(feature = "kafka")]
 const DEFAULT_CLUSTER_KEY_GROUPS: u32 = 64;
 #[cfg(feature = "kafka")]
@@ -255,7 +264,7 @@ enum LocalAuthorityObservation {
 }
 
 #[cfg(feature = "kafka")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 enum CheckpointBarrierTimingRole {
     Leader,
@@ -263,7 +272,7 @@ enum CheckpointBarrierTimingRole {
 }
 
 #[cfg(feature = "kafka")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct CheckpointBarrierTimingRecord {
     sequence: u64,
@@ -1451,18 +1460,81 @@ struct CheckpointBarrierTimingGeneration {
     last_attempt: Option<CheckpointAttempt>,
     last_assignment_version: Option<u64>,
     assignment_digests: BTreeMap<u64, [u8; 32]>,
-    records: Vec<CheckpointBarrierTimingRecord>,
+    converged_assignment_digests: BTreeMap<u64, [u8; 32]>,
+    record_count: u64,
+    aligned_resume_count: u64,
+    pipeline_stall_within_slo: u64,
+    barrier_local_within_slo: u64,
+    aligned_resume_within_slo: u64,
+    leader_count: u64,
+    follower_count: u64,
+    no_handoff_count: u64,
+    deadline_exhausted_count: u64,
+    pipeline_stall_max: Option<CheckpointBarrierTimingRecord>,
+    barrier_local_max: Option<CheckpointBarrierTimingRecord>,
+    aligned_resume_max: Option<CheckpointBarrierTimingRecord>,
+    violation_count: u64,
+    violation_witnesses: Vec<CheckpointBarrierTimingViolation>,
+    artifact: Option<CheckpointBarrierTimingArtifact>,
     metadata: Option<CheckpointBarrierTimingMetadata>,
     finalized: bool,
 }
 
 #[cfg(feature = "kafka")]
+#[derive(Debug, Clone, Copy)]
+struct CheckpointBarrierTimingViolation {
+    stage: &'static str,
+    record: CheckpointBarrierTimingRecord,
+    duration_ns: u64,
+}
+
+#[cfg(feature = "kafka")]
+struct CheckpointBarrierTimingArtifact {
+    path: PathBuf,
+    writer: Option<std::io::BufWriter<std::fs::File>>,
+}
+
+#[cfg(feature = "kafka")]
+#[derive(serde::Serialize)]
+struct CheckpointBarrierTimingArtifactLine<'a> {
+    schema_version: &'static str,
+    node_ordinal: usize,
+    process_generation: u64,
+    record: &'a CheckpointBarrierTimingRecord,
+}
+
+#[cfg(feature = "kafka")]
 impl CheckpointBarrierTimingGeneration {
+    fn with_artifact(directory: &Path, generation: ProcessGeneration) -> Result<Self, String> {
+        let path = directory.join(format!(
+            "checkpoint-timing-node{}-generation{}.jsonl.log",
+            generation.node_id, generation.generation
+        ));
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .map_err(|error| {
+                format!(
+                    "could not create checkpoint timing artifact {}: {error}",
+                    path.display()
+                )
+            })?;
+        Ok(Self {
+            artifact: Some(CheckpointBarrierTimingArtifact {
+                path,
+                writer: Some(std::io::BufWriter::new(file)),
+            }),
+            ..Self::default()
+        })
+    }
+
     fn bind_authority(
         &mut self,
         generation: ProcessGeneration,
-        expected: LocalProcessAuthorityIdentity,
+        evidence: &LocalProcessAuthorityEvidence,
     ) -> Result<(), String> {
+        let expected = local_process_identity(evidence);
         if !expected.is_canonical() {
             return Err(format!(
                 "node{} process generation {} received non-canonical authority evidence",
@@ -1475,7 +1547,48 @@ impl CheckpointBarrierTimingGeneration {
                 generation.node_id, generation.generation
             ));
         }
+        let adoption = &evidence.adopted_assignment;
+        if !adoption.is_canonical() || adoption.participant != evidence.participant {
+            return Err(format!(
+                "node{} process generation {} received non-canonical converged assignment evidence",
+                generation.node_id, generation.generation
+            ));
+        }
+        if self
+            .converged_assignment_digests
+            .get(&adoption.assignment_version)
+            .is_some_and(|digest| *digest != adoption.assignment_digest)
+        {
+            return Err(format!(
+                "node{} process generation {} converged assignment version {} mapped to conflicting digests",
+                generation.node_id, generation.generation, adoption.assignment_version
+            ));
+        }
+        if !self
+            .converged_assignment_digests
+            .contains_key(&adoption.assignment_version)
+            && self.converged_assignment_digests.len()
+                == CHECKPOINT_BARRIER_TIMING_MAX_ASSIGNMENTS_PER_PROCESS
+        {
+            return Err(format!(
+                "node{} process generation {} exceeded the bounded converged-assignment evidence budget",
+                generation.node_id, generation.generation
+            ));
+        }
+        if self
+            .assignment_digests
+            .get(&adoption.assignment_version)
+            .is_some_and(|digest| *digest != adoption.assignment_digest)
+        {
+            return Err(format!(
+                "node{} process generation {} timing digest conflicts with converged assignment version {}",
+                generation.node_id, generation.generation, adoption.assignment_version
+            ));
+        }
         self.process.get_or_insert(expected);
+        self.converged_assignment_digests
+            .entry(adoption.assignment_version)
+            .or_insert(adoption.assignment_digest);
         self.authority_bound = true;
         Ok(())
     }
@@ -1668,6 +1781,30 @@ impl CheckpointBarrierTimingGeneration {
                     generation.node_id, generation.generation, record.assignment_version
                 ));
             }
+            if !self
+                .assignment_digests
+                .contains_key(&record.assignment_version)
+                && self.assignment_digests.len()
+                    == CHECKPOINT_BARRIER_TIMING_MAX_ASSIGNMENTS_PER_PROCESS
+            {
+                return Err(format!(
+                    "node{} process generation {} exceeded the bounded observed-assignment evidence budget",
+                    generation.node_id, generation.generation
+                ));
+            }
+            if self
+                .converged_assignment_digests
+                .get(&record.assignment_version)
+                .is_some_and(|digest| *digest != record.assignment_digest)
+            {
+                return Err(format!(
+                    "node{} process generation {} timing record {} conflicts with converged assignment version {}",
+                    generation.node_id,
+                    generation.generation,
+                    record.sequence,
+                    record.assignment_version
+                ));
+            }
             let combined = record
                 .local_barrier_ns
                 .checked_add(record.aligned_resume_ns.unwrap_or(0));
@@ -1685,6 +1822,7 @@ impl CheckpointBarrierTimingGeneration {
             self.last_assignment_version = Some(record.assignment_version);
             self.last_attempt = Some(record.attempt);
             self.cursor = record.sequence;
+            self.record_observation(generation, *record)?;
         }
         if !page.has_more && self.cursor != page.next_sequence - 1 {
             return Err(format!(
@@ -1693,9 +1831,170 @@ impl CheckpointBarrierTimingGeneration {
             ));
         }
         self.process.get_or_insert(process);
-        self.records.extend(page.records);
         self.metadata = Some(metadata);
         Ok(page.has_more)
+    }
+
+    fn record_observation(
+        &mut self,
+        generation: ProcessGeneration,
+        record: CheckpointBarrierTimingRecord,
+    ) -> Result<(), String> {
+        let increment = |value: u64, name: &str| {
+            value.checked_add(1).ok_or_else(|| {
+                format!(
+                    "node{} process generation {} {name} exhausted",
+                    generation.node_id, generation.generation
+                )
+            })
+        };
+        let aligned_resume_count = if record.aligned_resume_ns.is_some() {
+            increment(self.aligned_resume_count, "aligned-resume count")?
+        } else {
+            self.aligned_resume_count
+        };
+        let pipeline_stall_within_slo =
+            if record.pipeline_stall_ns <= CHECKPOINT_PIPELINE_STALL_SLO_NS {
+                increment(self.pipeline_stall_within_slo, "pipeline-stall SLO count")?
+            } else {
+                self.pipeline_stall_within_slo
+            };
+        let barrier_local_within_slo =
+            if record.local_barrier_ns <= CHECKPOINT_PIPELINE_STALL_SLO_NS {
+                increment(self.barrier_local_within_slo, "local-barrier SLO count")?
+            } else {
+                self.barrier_local_within_slo
+            };
+        let aligned_resume_within_slo = if record
+            .aligned_resume_ns
+            .is_some_and(|duration| duration <= CHECKPOINT_PIPELINE_STALL_SLO_NS)
+        {
+            increment(self.aligned_resume_within_slo, "aligned-resume SLO count")?
+        } else {
+            self.aligned_resume_within_slo
+        };
+        let (leader_count, follower_count) = match record.role {
+            CheckpointBarrierTimingRole::Leader => (
+                increment(self.leader_count, "leader count")?,
+                self.follower_count,
+            ),
+            CheckpointBarrierTimingRole::Follower => (
+                self.leader_count,
+                increment(self.follower_count, "follower count")?,
+            ),
+        };
+        let no_handoff_count = if record.durable_tail_handoff {
+            self.no_handoff_count
+        } else {
+            increment(self.no_handoff_count, "no-handoff count")?
+        };
+        let deadline_exhausted_count = if record.deadline_exhausted {
+            increment(self.deadline_exhausted_count, "deadline-exhausted count")?
+        } else {
+            self.deadline_exhausted_count
+        };
+        let violations = [
+            ("pipeline_stall", Some(record.pipeline_stall_ns)),
+            ("local_barrier", Some(record.local_barrier_ns)),
+            ("aligned_resume", record.aligned_resume_ns),
+        ];
+        let new_violations = u64::try_from(
+            violations
+                .iter()
+                .filter(|(_, duration)| {
+                    duration.is_some_and(|duration| duration > CHECKPOINT_PIPELINE_STALL_SLO_NS)
+                })
+                .count(),
+        )
+        .map_err(|_| "checkpoint timing violation count exceeds u64".to_string())?;
+        let violation_count = self
+            .violation_count
+            .checked_add(new_violations)
+            .ok_or_else(|| "checkpoint timing violation count exhausted".to_string())?;
+
+        if let Some(artifact) = self.artifact.as_mut() {
+            let writer = artifact
+                .writer
+                .as_mut()
+                .ok_or_else(|| "checkpoint timing artifact was already closed".to_string())?;
+            let artifact_line = CheckpointBarrierTimingArtifactLine {
+                schema_version: CHECKPOINT_BARRIER_TIMING_ARTIFACT_SCHEMA,
+                node_ordinal: generation.node_id,
+                process_generation: generation.generation,
+                record: &record,
+            };
+            serde_json::to_writer(&mut *writer, &artifact_line).map_err(|error| {
+                format!(
+                    "could not write checkpoint timing artifact {}: {error}",
+                    artifact.path.display()
+                )
+            })?;
+            writer.write_all(b"\n").map_err(|error| {
+                format!(
+                    "could not delimit checkpoint timing artifact {}: {error}",
+                    artifact.path.display()
+                )
+            })?;
+        }
+
+        self.record_count = record.sequence;
+        self.aligned_resume_count = aligned_resume_count;
+        self.pipeline_stall_within_slo = pipeline_stall_within_slo;
+        self.barrier_local_within_slo = barrier_local_within_slo;
+        self.aligned_resume_within_slo = aligned_resume_within_slo;
+        self.leader_count = leader_count;
+        self.follower_count = follower_count;
+        self.no_handoff_count = no_handoff_count;
+        self.deadline_exhausted_count = deadline_exhausted_count;
+        self.violation_count = violation_count;
+        if self
+            .pipeline_stall_max
+            .is_none_or(|maximum| record.pipeline_stall_ns > maximum.pipeline_stall_ns)
+        {
+            self.pipeline_stall_max = Some(record);
+        }
+        if self
+            .barrier_local_max
+            .is_none_or(|maximum| record.local_barrier_ns > maximum.local_barrier_ns)
+        {
+            self.barrier_local_max = Some(record);
+        }
+        if record.aligned_resume_ns.is_some_and(|duration| {
+            self.aligned_resume_max
+                .and_then(|maximum| maximum.aligned_resume_ns)
+                .is_none_or(|maximum| duration > maximum)
+        }) {
+            self.aligned_resume_max = Some(record);
+        }
+        for (stage, duration) in violations {
+            if let Some(duration_ns) =
+                duration.filter(|duration| *duration > CHECKPOINT_PIPELINE_STALL_SLO_NS)
+            {
+                if self.violation_witnesses.len() < CHECKPOINT_BARRIER_TIMING_DIAGNOSTIC_WITNESSES {
+                    self.violation_witnesses
+                        .push(CheckpointBarrierTimingViolation {
+                            stage,
+                            record,
+                            duration_ns,
+                        });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn flush_artifact(&mut self) -> Result<(), String> {
+        if let Some(artifact) = self.artifact.as_mut() {
+            if let Some(mut writer) = artifact.writer.take() {
+                writer.flush().map_err(|error| {
+                    format!(
+                        "could not flush checkpoint timing artifact {}: {error}",
+                        artifact.path.display()
+                    )
+                })?;
+            }
+        }
+        Ok(())
     }
 
     fn validate_against_metrics(
@@ -1721,6 +2020,26 @@ impl CheckpointBarrierTimingGeneration {
                 generation.node_id, generation.generation
             ));
         }
+        for (version, expected_digest) in &self.converged_assignment_digests {
+            match self.assignment_digests.get(version) {
+                Some(observed_digest) if observed_digest == expected_digest => {}
+                Some(observed_digest) => {
+                    return Err(format!(
+                        "node{} process generation {} timing digest {:?} conflicts with converged digest {:?} for assignment version {version}",
+                        generation.node_id,
+                        generation.generation,
+                        observed_digest,
+                        expected_digest
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "node{} process generation {} has no exact timing record under converged assignment version {version}",
+                        generation.node_id, generation.generation
+                    ));
+                }
+            }
+        }
         if metadata.capacity != laminar_db::checkpoint_timing::CHECKPOINT_BARRIER_TIMING_CAPACITY
             || metadata.recording_loss_count != 0
             || metadata.metadata_exhausted
@@ -1730,8 +2049,7 @@ impl CheckpointBarrierTimingGeneration {
                 generation.node_id, generation.generation
             ));
         }
-        let record_count = u64::try_from(self.records.len())
-            .map_err(|_| "checkpoint timing record count exceeds u64".to_string())?;
+        let record_count = self.record_count;
         if self.cursor != record_count {
             return Err(format!(
                 "node{} process generation {} collected {record_count} records through cursor {}",
@@ -1762,35 +2080,6 @@ impl CheckpointBarrierTimingGeneration {
                 generation.node_id, generation.generation, record_count, metadata.next_sequence
             ));
         }
-        let aligned_count = u64::try_from(
-            self.records
-                .iter()
-                .filter(|record| record.aligned_resume_ns.is_some())
-                .count(),
-        )
-        .map_err(|_| "checkpoint aligned timing count exceeds u64".to_string())?;
-        let stall_within = u64::try_from(
-            self.records
-                .iter()
-                .filter(|record| record.pipeline_stall_ns <= CHECKPOINT_PIPELINE_STALL_SLO_NS)
-                .count(),
-        )
-        .map_err(|_| "checkpoint stall bucket count exceeds u64".to_string())?;
-        let local_within = u64::try_from(
-            self.records
-                .iter()
-                .filter(|record| record.local_barrier_ns <= CHECKPOINT_PIPELINE_STALL_SLO_NS)
-                .count(),
-        )
-        .map_err(|_| "checkpoint local bucket count exceeds u64".to_string())?;
-        let aligned_within = u64::try_from(
-            self.records
-                .iter()
-                .filter_map(|record| record.aligned_resume_ns)
-                .filter(|duration| *duration <= CHECKPOINT_PIPELINE_STALL_SLO_NS)
-                .count(),
-        )
-        .map_err(|_| "checkpoint aligned bucket count exceeds u64".to_string())?;
         for (name, prometheus, exact) in [
             (
                 "pipeline-stall count",
@@ -1805,22 +2094,22 @@ impl CheckpointBarrierTimingGeneration {
             (
                 "aligned-resume count",
                 metrics.aligned_resume_observations,
-                aligned_count,
+                self.aligned_resume_count,
             ),
             (
                 "pipeline-stall SLO bucket",
                 metrics.pipeline_stall_within_slo,
-                stall_within,
+                self.pipeline_stall_within_slo,
             ),
             (
                 "local-barrier SLO bucket",
                 metrics.barrier_local_within_slo,
-                local_within,
+                self.barrier_local_within_slo,
             ),
             (
                 "aligned-resume SLO bucket",
                 metrics.aligned_resume_within_slo,
-                aligned_within,
+                self.aligned_resume_within_slo,
             ),
         ] {
             let prometheus = exact_prometheus_count(prometheus, name)?;
@@ -1839,38 +2128,32 @@ impl CheckpointBarrierTimingGeneration {
     }
 
     fn violation_summary(&self, limit: usize) -> String {
-        let mut violations = Vec::new();
-        let mut total = 0usize;
-        for record in &self.records {
-            for (stage, duration) in [
-                ("pipeline_stall", Some(record.pipeline_stall_ns)),
-                ("local_barrier", Some(record.local_barrier_ns)),
-                ("aligned_resume", record.aligned_resume_ns),
-            ] {
-                if let Some(duration) =
-                    duration.filter(|duration| *duration > CHECKPOINT_PIPELINE_STALL_SLO_NS)
-                {
-                    total += 1;
-                    if violations.len() == limit {
-                        continue;
-                    }
-                    violations.push(format!(
-                        "stage={stage} sequence={} attempt={}/{} role={:?} assignment_version={} handoff={} process={:?} duration_ns={duration}",
-                        record.sequence,
-                        record.attempt.epoch,
-                        record.attempt.checkpoint_id,
-                        record.role,
-                        record.assignment_version,
-                        record.durable_tail_handoff,
-                        record.process,
-                    ));
-                }
-            }
-        }
+        let violations = self
+            .violation_witnesses
+            .iter()
+            .take(limit)
+            .map(|violation| {
+                let record = violation.record;
+                format!(
+                    "stage={} sequence={} attempt={}/{} role={:?} assignment_version={} handoff={} process={:?} duration_ns={}",
+                    violation.stage,
+                    record.sequence,
+                    record.attempt.epoch,
+                    record.attempt.checkpoint_id,
+                    record.role,
+                    record.assignment_version,
+                    record.durable_tail_handoff,
+                    record.process,
+                    violation.duration_ns,
+                )
+            })
+            .collect::<Vec<_>>();
         if violations.is_empty() {
             "no exact observations exceeded the SLO".into()
         } else {
-            let omitted = total.saturating_sub(violations.len());
+            let omitted = self
+                .violation_count
+                .saturating_sub(u64::try_from(violations.len()).unwrap_or(u64::MAX));
             if omitted == 0 {
                 violations.join("; ")
             } else {
@@ -1898,6 +2181,7 @@ fn exact_prometheus_count(value: f64, name: &str) -> Result<u64, String> {
 #[derive(Default)]
 struct CheckpointBarrierTimingEvidence {
     generations: BTreeMap<ProcessGeneration, CheckpointBarrierTimingGeneration>,
+    artifact_directory: Option<PathBuf>,
 }
 
 #[cfg(feature = "kafka")]
@@ -2161,6 +2445,13 @@ impl CheckpointLatencyEvidence {
 
 #[cfg(feature = "kafka")]
 impl CheckpointBarrierTimingEvidence {
+    fn with_artifact_directory(directory: PathBuf) -> Self {
+        Self {
+            artifact_directory: Some(directory),
+            ..Self::default()
+        }
+    }
+
     fn generation(node: &Node) -> ProcessGeneration {
         ProcessGeneration {
             node_id: node.id,
@@ -2171,20 +2462,37 @@ impl CheckpointBarrierTimingEvidence {
     fn capture_node(
         &mut self,
         node: &Node,
-        expected_process: Option<LocalProcessAuthorityIdentity>,
+        expected_authority: Option<&LocalProcessAuthorityEvidence>,
         deadline: Instant,
     ) -> Result<(), String> {
         let generation = Self::generation(node);
+        if !self.generations.contains_key(&generation) {
+            if self.generations.len() == CHECKPOINT_BARRIER_TIMING_MAX_PROCESS_GENERATIONS {
+                return Err(format!(
+                    "checkpoint timing evidence exceeded the bounded {}-generation budget",
+                    CHECKPOINT_BARRIER_TIMING_MAX_PROCESS_GENERATIONS
+                ));
+            }
+            let state = if let Some(directory) = &self.artifact_directory {
+                CheckpointBarrierTimingGeneration::with_artifact(directory, generation)?
+            } else {
+                CheckpointBarrierTimingGeneration::default()
+            };
+            self.generations.insert(generation, state);
+        }
         loop {
-            let state = self.generations.entry(generation).or_default();
+            let state = self
+                .generations
+                .get_mut(&generation)
+                .expect("timing generation was inserted before collection");
             if state.finalized {
                 return Err(format!(
                     "node{} process generation {} timing evidence was already finalized",
                     generation.node_id, generation.generation
                 ));
             }
-            if let Some(expected) = expected_process {
-                state.bind_authority(generation, expected)?;
+            if let Some(evidence) = expected_authority {
+                state.bind_authority(generation, evidence)?;
             }
             let request_process = state.process;
             let after_sequence = state.cursor;
@@ -2243,8 +2551,7 @@ impl CheckpointBarrierTimingEvidence {
                     node.id,
                 )
             });
-            let expected_process = local_process_identity(evidence);
-            self.capture_node(node, Some(expected_process), deadline)
+            self.capture_node(node, Some(evidence), deadline)
                 .unwrap_or_else(|error| {
                     panic!(
                         "{label}: failed to capture node{} exact checkpoint timings: {error}",
@@ -2257,7 +2564,7 @@ impl CheckpointBarrierTimingEvidence {
     fn finalize_node(
         &mut self,
         node: &Node,
-        expected_process: LocalProcessAuthorityIdentity,
+        expected_authority: &LocalProcessAuthorityEvidence,
         latency: &mut CheckpointLatencyEvidence,
         deadline: Instant,
     ) -> Result<(), String> {
@@ -2273,7 +2580,7 @@ impl CheckpointBarrierTimingEvidence {
             ));
         }
         loop {
-            self.capture_node(node, Some(expected_process), deadline)?;
+            self.capture_node(node, Some(expected_authority), deadline)?;
             let (cursor_before, metadata_before) = self
                 .generations
                 .get(&generation)
@@ -2289,7 +2596,7 @@ impl CheckpointBarrierTimingEvidence {
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
             };
-            self.capture_node(node, Some(expected_process), deadline)?;
+            self.capture_node(node, Some(expected_authority), deadline)?;
             let (cursor_after, metadata_after) = self
                 .generations
                 .get(&generation)
@@ -2305,7 +2612,7 @@ impl CheckpointBarrierTimingEvidence {
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
             };
-            self.capture_node(node, Some(expected_process), deadline)?;
+            self.capture_node(node, Some(expected_authority), deadline)?;
             let (cursor_confirmed, metadata_confirmed) = self
                 .generations
                 .get(&generation)
@@ -2324,6 +2631,10 @@ impl CheckpointBarrierTimingEvidence {
                     .validate_against_metrics(generation, metrics_after)
                 {
                     Ok(()) => {
+                        self.generations
+                            .get_mut(&generation)
+                            .expect("validated timing generation must exist")
+                            .flush_artifact()?;
                         latency.record_generation(generation, metrics_after)?;
                         self.generations
                             .get_mut(&generation)
@@ -2393,55 +2704,40 @@ impl CheckpointBarrierTimingEvidence {
     }
 
     fn report(&self) {
-        fn max_record(
-            records: &[CheckpointBarrierTimingRecord],
-            duration: impl Fn(&CheckpointBarrierTimingRecord) -> Option<u64>,
-        ) -> Option<(&CheckpointBarrierTimingRecord, u64)> {
-            records
-                .iter()
-                .filter_map(|record| Some((record, duration(record)?)))
-                .max_by_key(|(_, duration)| *duration)
-        }
-
         for (generation, timing) in &self.generations {
             let process = timing
                 .process
                 .expect("reported exact timing generation has a process identity");
-            let leader_count = timing
-                .records
-                .iter()
-                .filter(|record| record.role == CheckpointBarrierTimingRole::Leader)
-                .count();
-            let follower_count = timing.records.len().saturating_sub(leader_count);
-            let no_handoff_count = timing
-                .records
-                .iter()
-                .filter(|record| !record.durable_tail_handoff)
-                .count();
-            let deadline_exhausted_count = timing
-                .records
-                .iter()
-                .filter(|record| record.deadline_exhausted)
-                .count();
             eprintln!(
-                "soak: EXACT node{} process generation {} {:?}: {} records (leader={leader_count}, follower={follower_count}, no_handoff={no_handoff_count}, deadline_exhausted={deadline_exhausted_count})",
+                "soak: EXACT node{} process generation {} {:?}: {} records (leader={}, follower={}, no_handoff={}, deadline_exhausted={}, slo_violations={})",
                 generation.node_id,
                 generation.generation,
                 process,
-                timing.records.len()
+                timing.record_count,
+                timing.leader_count,
+                timing.follower_count,
+                timing.no_handoff_count,
+                timing.deadline_exhausted_count,
+                timing.violation_count,
             );
             for (stage, maximum) in [
                 (
                     "pipeline_stall",
-                    max_record(&timing.records, |record| Some(record.pipeline_stall_ns)),
+                    timing
+                        .pipeline_stall_max
+                        .map(|record| (record, record.pipeline_stall_ns)),
                 ),
                 (
                     "local_barrier",
-                    max_record(&timing.records, |record| Some(record.local_barrier_ns)),
+                    timing
+                        .barrier_local_max
+                        .map(|record| (record, record.local_barrier_ns)),
                 ),
                 (
                     "aligned_resume",
-                    max_record(&timing.records, |record| record.aligned_resume_ns),
+                    timing
+                        .aligned_resume_max
+                        .and_then(|record| Some((record, record.aligned_resume_ns?))),
                 ),
             ] {
                 if let Some((record, duration_ns)) = maximum {
@@ -2461,50 +2757,21 @@ impl CheckpointBarrierTimingEvidence {
                     );
                 }
             }
-            for record in timing
-                .records
-                .iter()
-                .filter(|record| record.deadline_exhausted)
-            {
+            if timing.violation_count != 0 {
                 eprintln!(
-                    "soak: EXACT DEADLINE node{} generation {} sequence={} attempt={}/{} role={:?} assignment_version={} assignment_digest={:?} handoff={} process={:?}",
+                    "soak: EXACT SLO VIOLATION SUMMARY node{} generation {}: {}",
                     generation.node_id,
                     generation.generation,
-                    record.sequence,
-                    record.attempt.epoch,
-                    record.attempt.checkpoint_id,
-                    record.role,
-                    record.assignment_version,
-                    record.assignment_digest,
-                    record.durable_tail_handoff,
-                    record.process,
+                    timing.violation_summary(CHECKPOINT_BARRIER_TIMING_DIAGNOSTIC_WITNESSES),
                 );
             }
-            for record in &timing.records {
-                for (stage, duration) in [
-                    ("pipeline_stall", Some(record.pipeline_stall_ns)),
-                    ("local_barrier", Some(record.local_barrier_ns)),
-                    ("aligned_resume", record.aligned_resume_ns),
-                ] {
-                    if let Some(duration_ns) =
-                        duration.filter(|duration| *duration > CHECKPOINT_PIPELINE_STALL_SLO_NS)
-                    {
-                        eprintln!(
-                            "soak: EXACT SLO VIOLATION node{} generation {} stage={stage} sequence={} attempt={}/{} role={:?} assignment_version={} assignment_digest={:?} handoff={} process={:?} duration_ns={duration_ns} deadline_exhausted={}",
-                            generation.node_id,
-                            generation.generation,
-                            record.sequence,
-                            record.attempt.epoch,
-                            record.attempt.checkpoint_id,
-                            record.role,
-                            record.assignment_version,
-                            record.assignment_digest,
-                            record.durable_tail_handoff,
-                            record.process,
-                            record.deadline_exhausted,
-                        );
-                    }
-                }
+            if let Some(artifact) = &timing.artifact {
+                eprintln!(
+                    "soak: EXACT ARTIFACT node{} generation {}: {}",
+                    generation.node_id,
+                    generation.generation,
+                    artifact.path.display()
+                );
             }
         }
     }
@@ -4618,7 +4885,8 @@ fn three_node_kill9_soak() {
         })
         .collect();
     let mut latency_evidence = CheckpointLatencyEvidence::default();
-    let mut exact_timing_evidence = CheckpointBarrierTimingEvidence::default();
+    let mut exact_timing_evidence =
+        CheckpointBarrierTimingEvidence::with_artifact_directory(log_dir.clone());
     for n in &mut nodes {
         n.spawn();
         // Stagger process startup to reduce formation churn; role is observed from the API below.
@@ -4892,7 +5160,7 @@ fn three_node_kill9_soak() {
         exact_timing_evidence
             .finalize_node(
                 &nodes[victim],
-                local_process_identity(&previous_victim_evidence),
+                &previous_victim_evidence,
                 &mut latency_evidence,
                 Instant::now() + Duration::from_secs(10),
             )
@@ -4925,17 +5193,16 @@ fn three_node_kill9_soak() {
             "post-kill survivor local assignment",
         );
         for survivor in &survivor_nodes {
-            let expected_process = survivor_convergence
+            let expected_authority = survivor_convergence
                 .evidence_by_node
                 .get(survivor)
-                .map(local_process_identity)
                 .unwrap_or_else(|| {
                     panic!("kill-{round} converged authority omitted survivor node{survivor}")
                 });
             exact_timing_evidence
                 .capture_node(
                     &nodes[*survivor],
-                    Some(expected_process),
+                    Some(expected_authority),
                     Instant::now() + Duration::from_secs(10),
                 )
                 .unwrap_or_else(|error| {
@@ -5212,15 +5479,14 @@ fn three_node_kill9_soak() {
     );
 
     for node in &nodes {
-        let expected_process = local_convergence
+        let expected_authority = local_convergence
             .evidence_by_node
             .get(&node.id)
-            .map(local_process_identity)
             .unwrap_or_else(|| panic!("final converged authority omitted node{}", node.id));
         exact_timing_evidence
             .finalize_node(
                 node,
-                expected_process,
+                expected_authority,
                 &mut latency_evidence,
                 Instant::now() + Duration::from_secs(10),
             )
@@ -5997,6 +6263,26 @@ fn timing_test_process(process_term: u64) -> LocalProcessAuthorityIdentity {
 }
 
 #[cfg(feature = "kafka")]
+fn timing_test_authority(
+    process_term: u64,
+    assignment_version: u64,
+    assignment_digest: [u8; 32],
+) -> LocalProcessAuthorityEvidence {
+    let process = timing_test_process(process_term);
+    LocalProcessAuthorityEvidence {
+        participant: process.participant,
+        process_term,
+        adopted_assignment: CheckpointAssignmentAdoption {
+            participant: process.participant,
+            assignment_version,
+            partitioning_abi_version: laminar_core::state::PARTITIONING_ABI_VERSION,
+            vnode_count: u32::from(laminar_core::state::DEFAULT_CLUSTER_KEY_GROUP_COUNT),
+            assignment_digest,
+        },
+    }
+}
+
+#[cfg(feature = "kafka")]
 fn timing_test_record(sequence: u64) -> CheckpointBarrierTimingRecord {
     let aligned_resume_ns = sequence.is_multiple_of(2).then_some(5);
     CheckpointBarrierTimingRecord {
@@ -6055,7 +6341,8 @@ fn timing_test_generation(record_count: u64) -> CheckpointBarrierTimingGeneratio
     };
     let process = timing_test_process(1);
     let mut timing = CheckpointBarrierTimingGeneration::default();
-    timing.bind_authority(generation, process).unwrap();
+    let authority = timing_test_authority(1, 4, [44; 32]);
+    timing.bind_authority(generation, &authority).unwrap();
     let page_size =
         u64::try_from(laminar_db::checkpoint_timing::MAX_CHECKPOINT_BARRIER_TIMING_PAGE_RECORDS)
             .expect("test page size fits u64");
@@ -6083,36 +6370,19 @@ fn timing_test_generation(record_count: u64) -> CheckpointBarrierTimingGeneratio
 
 #[cfg(feature = "kafka")]
 fn timing_test_metrics(timing: &CheckpointBarrierTimingGeneration) -> CheckpointLatencySnapshot {
-    let count = timing.records.len() as f64;
-    let aligned = timing
-        .records
-        .iter()
-        .filter(|record| record.aligned_resume_ns.is_some())
-        .count() as f64;
+    let count = timing.record_count as f64;
+    let aligned = timing.aligned_resume_count as f64;
     CheckpointLatencySnapshot {
         checkpoint_seconds: count * 0.1,
         checkpoint_observations: count,
         pipeline_stall_observations: count,
-        pipeline_stall_within_slo: timing
-            .records
-            .iter()
-            .filter(|record| record.pipeline_stall_ns <= CHECKPOINT_PIPELINE_STALL_SLO_NS)
-            .count() as f64,
+        pipeline_stall_within_slo: timing.pipeline_stall_within_slo as f64,
         barrier_local_seconds: count * 0.01,
         barrier_local_observations: count,
-        barrier_local_within_slo: timing
-            .records
-            .iter()
-            .filter(|record| record.local_barrier_ns <= CHECKPOINT_PIPELINE_STALL_SLO_NS)
-            .count() as f64,
+        barrier_local_within_slo: timing.barrier_local_within_slo as f64,
         aligned_resume_seconds: aligned * 0.005,
         aligned_resume_observations: aligned,
-        aligned_resume_within_slo: timing
-            .records
-            .iter()
-            .filter_map(|record| record.aligned_resume_ns)
-            .filter(|duration| *duration <= CHECKPOINT_PIPELINE_STALL_SLO_NS)
-            .count() as f64,
+        aligned_resume_within_slo: timing.aligned_resume_within_slo as f64,
         ..CheckpointLatencySnapshot::default()
     }
 }
@@ -6124,17 +6394,30 @@ fn exact_timing_collector_accepts_pagination_and_exact_metric_boundary() {
         node_id: 0,
         generation: 1,
     };
-    let mut timing = timing_test_generation(65);
+    let timing = timing_test_generation(65);
     assert_eq!(timing.cursor, 65);
-    assert_eq!(timing.records.len(), 65);
+    assert_eq!(timing.record_count, 65);
     assert_eq!(timing.metadata.unwrap().next_sequence, 66);
-
-    timing.records[64].pipeline_stall_ns = CHECKPOINT_PIPELINE_STALL_SLO_NS;
-    timing.records[64].local_barrier_ns = CHECKPOINT_PIPELINE_STALL_SLO_NS;
-    timing.records[64].aligned_resume_ns = None;
-    let metrics = timing_test_metrics(&timing);
     timing
-        .validate_against_metrics(generation, metrics)
+        .validate_against_metrics(generation, timing_test_metrics(&timing))
+        .unwrap();
+
+    let process = timing_test_process(1);
+    let authority = timing_test_authority(1, 4, [44; 32]);
+    let mut boundary = CheckpointBarrierTimingGeneration::default();
+    boundary.bind_authority(generation, &authority).unwrap();
+    let mut record = timing_test_record(1);
+    record.pipeline_stall_ns = CHECKPOINT_PIPELINE_STALL_SLO_NS;
+    record.local_barrier_ns = CHECKPOINT_PIPELINE_STALL_SLO_NS;
+    record.aligned_resume_ns = None;
+    boundary
+        .apply_page(
+            generation,
+            timing_test_envelope(process, 0, vec![record], 2, false),
+        )
+        .unwrap();
+    boundary
+        .validate_against_metrics(generation, timing_test_metrics(&boundary))
         .unwrap();
 }
 
@@ -6316,21 +6599,45 @@ fn exact_timing_reconciliation_requires_authority_binding_and_integer_metrics() 
     unbound
         .apply_page(
             generation,
-            timing_test_envelope(process, 0, Vec::new(), 1, false),
+            timing_test_envelope(process, 0, vec![timing_test_record(1)], 2, false),
         )
         .unwrap();
     assert!(unbound
-        .validate_against_metrics(generation, CheckpointLatencySnapshot::default())
+        .validate_against_metrics(generation, timing_test_metrics(&unbound))
         .unwrap_err()
         .contains("never bound"));
+    let wrong_process = timing_test_authority(2, 4, [44; 32]);
     assert!(unbound
-        .bind_authority(generation, timing_test_process(2))
+        .bind_authority(generation, &wrong_process)
         .unwrap_err()
         .contains("does not match"));
-    unbound.bind_authority(generation, process).unwrap();
+    let authority = timing_test_authority(1, 4, [44; 32]);
+    unbound.bind_authority(generation, &authority).unwrap();
     unbound
-        .validate_against_metrics(generation, CheckpointLatencySnapshot::default())
+        .validate_against_metrics(generation, timing_test_metrics(&unbound))
         .unwrap();
+
+    let mut conflicting_assignment = CheckpointBarrierTimingGeneration::default();
+    conflicting_assignment
+        .apply_page(
+            generation,
+            timing_test_envelope(process, 0, vec![timing_test_record(1)], 2, false),
+        )
+        .unwrap();
+    let conflicting_authority = timing_test_authority(1, 4, [45; 32]);
+    assert!(conflicting_assignment
+        .bind_authority(generation, &conflicting_authority)
+        .unwrap_err()
+        .contains("timing digest conflicts"));
+    let mut missing_assignment = timing_test_generation(1);
+    let later_authority = timing_test_authority(1, 5, [55; 32]);
+    missing_assignment
+        .bind_authority(generation, &later_authority)
+        .unwrap();
+    assert!(missing_assignment
+        .validate_against_metrics(generation, timing_test_metrics(&missing_assignment))
+        .unwrap_err()
+        .contains("no exact timing record under converged assignment version 5"));
 
     for invalid in [-1.0, 0.5, f64::NAN, 9_007_199_254_740_994.0, f64::INFINITY] {
         assert!(exact_prometheus_count(invalid, "test count").is_err());
@@ -6344,13 +6651,27 @@ fn exact_timing_reconciliation_requires_authority_binding_and_integer_metrics() 
 #[cfg(feature = "kafka")]
 #[test]
 fn exact_timing_violation_diagnostic_is_exact_and_bounded() {
-    let mut timing = timing_test_generation(2);
-    for record in &mut timing.records {
+    let generation = ProcessGeneration {
+        node_id: 0,
+        generation: 1,
+    };
+    let process = timing_test_process(1);
+    let authority = timing_test_authority(1, 4, [44; 32]);
+    let mut timing = CheckpointBarrierTimingGeneration::default();
+    timing.bind_authority(generation, &authority).unwrap();
+    let mut records = (1..=2).map(timing_test_record).collect::<Vec<_>>();
+    for record in &mut records {
         record.pipeline_stall_ns = CHECKPOINT_PIPELINE_STALL_SLO_NS + record.sequence;
         record.local_barrier_ns = CHECKPOINT_PIPELINE_STALL_SLO_NS + record.sequence;
         record.aligned_resume_ns = None;
         record.deadline_exhausted = true;
     }
+    timing
+        .apply_page(
+            generation,
+            timing_test_envelope(process, 0, records, 3, false),
+        )
+        .unwrap();
     let diagnostic = timing.violation_summary(1);
     assert!(diagnostic.contains("sequence=1"), "{diagnostic}");
     assert!(diagnostic.contains("attempt=1/1"), "{diagnostic}");
@@ -6359,6 +6680,60 @@ fn exact_timing_violation_diagnostic_is_exact_and_bounded() {
         diagnostic.contains("3 additional violations"),
         "{diagnostic}"
     );
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn exact_timing_collector_streams_complete_artifact_with_bounded_memory() {
+    let directory = tempfile::tempdir().unwrap();
+    let generation = ProcessGeneration {
+        node_id: 0,
+        generation: 1,
+    };
+    let process = timing_test_process(1);
+    let authority = timing_test_authority(1, 4, [44; 32]);
+    let mut timing =
+        CheckpointBarrierTimingGeneration::with_artifact(directory.path(), generation).unwrap();
+    timing.bind_authority(generation, &authority).unwrap();
+    let mut records = (1..=65).map(timing_test_record).collect::<Vec<_>>();
+    for record in records.iter_mut().take(9) {
+        record.pipeline_stall_ns = CHECKPOINT_PIPELINE_STALL_SLO_NS + record.sequence;
+    }
+    let tail = records.split_off(64);
+    timing
+        .apply_page(
+            generation,
+            timing_test_envelope(process, 0, records, 66, true),
+        )
+        .unwrap();
+    timing
+        .apply_page(
+            generation,
+            timing_test_envelope(process, 64, tail, 66, false),
+        )
+        .unwrap();
+    assert_eq!(timing.record_count, 65);
+    assert_eq!(timing.violation_count, 9);
+    assert_eq!(
+        timing.violation_witnesses.len(),
+        CHECKPOINT_BARRIER_TIMING_DIAGNOSTIC_WITNESSES
+    );
+    let artifact_path = timing.artifact.as_ref().unwrap().path.clone();
+    timing.flush_artifact().unwrap();
+    assert!(timing.artifact.as_ref().unwrap().writer.is_none());
+    let artifact = std::fs::read_to_string(artifact_path).unwrap();
+    let lines = artifact.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 65);
+    let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    let last: serde_json::Value = serde_json::from_str(lines[64]).unwrap();
+    assert_eq!(
+        first["schema_version"],
+        CHECKPOINT_BARRIER_TIMING_ARTIFACT_SCHEMA
+    );
+    assert_eq!(first["node_ordinal"], 0);
+    assert_eq!(first["process_generation"], 1);
+    assert_eq!(first["record"]["sequence"], 1);
+    assert_eq!(last["record"]["sequence"], 65);
 }
 
 #[cfg(feature = "kafka")]
