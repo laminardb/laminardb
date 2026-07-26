@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 
-use super::wire_v1;
+use super::{provenance_v1, wire_v1};
 
 use super::{expect_equal, CheckErrors, FixtureSummary, NOTICE};
 
@@ -35,6 +35,7 @@ struct Fixture {
     key_vnode_abi: String,
     vnode_count: u16,
     wire_id_map: WireIdMap,
+    operation_group_keys: Vec<OperationGroupKey>,
     expected_run: RunIdentity,
     source_topology: SourceTopology,
     sink_topology: SinkTopology,
@@ -86,6 +87,13 @@ struct WireHexId {
 struct WireU64Id {
     label: String,
     value: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperationGroupKey {
+    logical_key: String,
+    canonical_hex: String,
 }
 
 #[derive(Debug)]
@@ -362,6 +370,112 @@ fn decode_fixed_hex<const N: usize>(hex: &str) -> Result<[u8; N], String> {
     Ok(decoded)
 }
 
+fn decode_variable_hex(hex: &str) -> Result<Vec<u8>, String> {
+    if !hex.len().is_multiple_of(2) {
+        return Err("must contain an even number of lowercase hexadecimal characters".to_owned());
+    }
+    let byte_len = hex.len() / 2;
+    u32::try_from(byte_len)
+        .map_err(|_| "exceeds the operation identity u32 key-length field".to_owned())?;
+    let mut decoded = Vec::new();
+    decoded
+        .try_reserve_exact(byte_len)
+        .map_err(|_| "could not allocate canonical group-key bytes".to_owned())?;
+    for pair in hex.as_bytes().chunks_exact(2) {
+        let high = hex_nibble(pair[0])
+            .ok_or_else(|| "must contain only lowercase hexadecimal characters".to_owned())?;
+        let low = hex_nibble(pair[1])
+            .ok_or_else(|| "must contain only lowercase hexadecimal characters".to_owned())?;
+        decoded.push((high << 4) | low);
+    }
+    Ok(decoded)
+}
+
+fn validate_operation_group_keys(
+    fixture: &Fixture,
+) -> Result<BTreeMap<String, Vec<u8>>, CheckErrors> {
+    let mut errors = Vec::new();
+    let mut keys = BTreeMap::new();
+    let mut labels_by_bytes = BTreeMap::new();
+    for entry in &fixture.operation_group_keys {
+        if entry.logical_key.is_empty() {
+            errors.push("fixture.operation_group_keys contains an empty logical key".to_owned());
+            continue;
+        }
+        let decoded = match decode_variable_hex(&entry.canonical_hex) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                errors.push(format!(
+                    "fixture.operation_group_keys logical key {:?} {error}",
+                    entry.logical_key
+                ));
+                continue;
+            }
+        };
+        if let Some(previous) = labels_by_bytes.insert(decoded.clone(), entry.logical_key.clone()) {
+            errors.push(format!(
+                "fixture.operation_group_keys logical keys {previous:?} and {:?} map to the same bytes",
+                entry.logical_key
+            ));
+        }
+        if keys.insert(entry.logical_key.clone(), decoded).is_some() {
+            errors.push(format!(
+                "fixture.operation_group_keys contains duplicate logical key {:?}",
+                entry.logical_key
+            ));
+        }
+    }
+
+    let required = fixture
+        .ledger
+        .iter()
+        .map(|record| record.logical_key.as_str())
+        .collect::<BTreeSet<_>>();
+    let actual = keys.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    for missing in required.difference(&actual) {
+        errors.push(format!(
+            "fixture.operation_group_keys is missing logical key {missing:?}"
+        ));
+    }
+    for unused in actual.difference(&required) {
+        errors.push(format!(
+            "fixture.operation_group_keys contains unused logical key {unused:?}"
+        ));
+    }
+    if errors.is_empty() {
+        Ok(keys)
+    } else {
+        Err(CheckErrors::many(errors))
+    }
+}
+
+fn operation_id_context(
+    fixture: &Fixture,
+    wire_ids: &WireIdLookup,
+) -> Result<provenance_v1::GroupedCountSumOperationIdContextV1, CheckErrors> {
+    let deployment_uuid = wire_ids
+        .ids_16
+        .get(&fixture.expected_run.deployment_id)
+        .ok_or_else(|| CheckErrors::one("operation identity deployment UUID is unmapped"))?;
+    let pipeline_incarnation_id = wire_ids
+        .ids_16
+        .get(&fixture.expected_run.pipeline_incarnation)
+        .ok_or_else(|| CheckErrors::one("operation identity pipeline incarnation is unmapped"))?;
+    let pipeline_identity_sha256 = wire_ids
+        .ids_32
+        .get(&fixture.expected_run.pipeline_identity)
+        .ok_or_else(|| CheckErrors::one("operation identity pipeline digest is unmapped"))?;
+    provenance_v1::GroupedCountSumOperationIdContextV1::new(
+        deployment_uuid,
+        pipeline_incarnation_id,
+        pipeline_identity_sha256,
+        &fixture.expected_run.sink_id,
+        &fixture.expected_run.operator_id,
+        &fixture.expected_run.output_id,
+    )
+    .map_err(|error| CheckErrors::one(format!("invalid operation identity context: {error}")))
+}
+
 fn insert_hex_mapping<const N: usize>(
     entry: &WireHexId,
     category: &str,
@@ -553,7 +667,7 @@ pub(super) fn verify(bytes: &[u8]) -> Result<FixtureSummary, CheckErrors> {
         &mut errors,
         "fixture.operation_identity_model",
         &fixture.operation_identity_model,
-        "fixture_only_logical_group_and_count_version",
+        "operation-id-v1-with-explicit-abi-v1-group-key-bytes",
     );
     if fixture.certification_eligible {
         errors.push("fixture.certification_eligible must remain false".to_owned());
@@ -594,6 +708,20 @@ pub(super) fn verify(bytes: &[u8]) -> Result<FixtureSummary, CheckErrors> {
     }
     let wire_ids = match validate_wire_id_map(&fixture) {
         Ok(wire_ids) => wire_ids,
+        Err(error) => {
+            errors.push(error.to_string());
+            return Err(CheckErrors::many(errors));
+        }
+    };
+    let operation_group_keys = match validate_operation_group_keys(&fixture) {
+        Ok(keys) => keys,
+        Err(error) => {
+            errors.push(error.to_string());
+            return Err(CheckErrors::many(errors));
+        }
+    };
+    let operation_id_context = match operation_id_context(&fixture, &wire_ids) {
+        Ok(context) => context,
         Err(error) => {
             errors.push(error.to_string());
             return Err(CheckErrors::many(errors));
@@ -651,7 +779,13 @@ pub(super) fn verify(bytes: &[u8]) -> Result<FixtureSummary, CheckErrors> {
         match evaluate_case(&fixture, &source_partitions, &topology, case) {
             Ok(mut outcome) => {
                 if outcome.classification != Classification::RunInvalid {
-                    let wire_diagnostics = evaluate_wire_envelopes(&fixture, case, &wire_ids);
+                    let wire_diagnostics = evaluate_wire_envelopes(
+                        &fixture,
+                        case,
+                        &wire_ids,
+                        &operation_group_keys,
+                        &operation_id_context,
+                    );
                     if !wire_diagnostics.is_empty() {
                         outcome.classification = Classification::ProductFail;
                         outcome.diagnostics.extend(wire_diagnostics);
@@ -788,6 +922,8 @@ fn evaluate_wire_envelopes(
     _fixture: &Fixture,
     case: &Case,
     wire_ids: &WireIdLookup,
+    operation_group_keys: &BTreeMap<String, Vec<u8>>,
+    operation_id_context: &provenance_v1::GroupedCountSumOperationIdContextV1,
 ) -> BTreeSet<String> {
     let mut diagnostics = BTreeSet::new();
     let mut common_marker_bytes = BTreeMap::<(String, String), (&IntervalMarker, &str)>::new();
@@ -944,6 +1080,16 @@ fn evaluate_wire_envelopes(
             wire_ids,
             &mut diagnostics,
         );
+        if let Ok(payload) = serde_json::from_str::<AggregatePayload>(&record.raw_payload) {
+            if let Some(canonical_group_key) = operation_group_keys.get(&payload.logical_key) {
+                match operation_id_context.derive(canonical_group_key, payload.count) {
+                    Ok(expected) if decoded.operation_id == &expected => {}
+                    Ok(_) | Err(_) => {
+                        diagnostics.insert("wire_operation_identity_mismatch".to_owned());
+                    }
+                }
+            }
+        }
         compare_wire_id_16(
             decoded.writer_interval_id,
             &record.writer_interval,
@@ -2104,10 +2250,18 @@ mod tests {
         let source_partitions = validate_source_topology(&fixture).unwrap();
         let topology = validate_topology(&fixture).unwrap();
         let wire_ids = validate_wire_id_map(&fixture).unwrap();
+        let operation_group_keys = validate_operation_group_keys(&fixture).unwrap();
+        let operation_id_context = operation_id_context(&fixture, &wire_ids).unwrap();
         let case = &fixture.cases[0];
         let mut outcome = evaluate_case(&fixture, &source_partitions, &topology, case).unwrap();
         if outcome.classification != Classification::RunInvalid {
-            let diagnostics = evaluate_wire_envelopes(&fixture, case, &wire_ids);
+            let diagnostics = evaluate_wire_envelopes(
+                &fixture,
+                case,
+                &wire_ids,
+                &operation_group_keys,
+                &operation_id_context,
+            );
             if !diagnostics.is_empty() {
                 outcome.classification = Classification::ProductFail;
                 outcome.diagnostics.extend(diagnostics);
@@ -2120,6 +2274,8 @@ mod tests {
     fn canonical_wire_envelopes_match_the_test_encoder_and_common_markers() {
         let fixture: Fixture = serde_json::from_slice(FIXTURE).unwrap();
         let wire_ids = validate_wire_id_map(&fixture).unwrap();
+        let operation_group_keys = validate_operation_group_keys(&fixture).unwrap();
+        let operation_id_context = operation_id_context(&fixture, &wire_ids).unwrap();
         for marker in &fixture.cases[0].interval_markers {
             assert_eq!(
                 marker.wire_envelope_hex,
@@ -2141,11 +2297,24 @@ mod tests {
                 decode_wire_hex(&record.wire_envelope_hex, wire_v1::DATA_ENCODED_LEN).unwrap();
             let decoded = wire_v1::decode_data(&bytes).unwrap();
             assert_eq!(wire_v1::encode_data(&decoded).unwrap().as_slice(), bytes);
+            let payload: AggregatePayload = serde_json::from_str(&record.raw_payload).unwrap();
+            let derived = operation_id_context
+                .derive(&operation_group_keys[&payload.logical_key], payload.count)
+                .unwrap();
+            assert_eq!(wire_ids.ids_32[&record.operation_id], derived);
+            assert_eq!(decoded.operation_id, &derived);
         }
         let markers = &fixture.cases[0].interval_markers;
         assert_eq!(markers[0].wire_envelope_hex, markers[1].wire_envelope_hex);
         assert_eq!(markers[2].wire_envelope_hex, markers[3].wire_envelope_hex);
-        assert!(evaluate_wire_envelopes(&fixture, &fixture.cases[0], &wire_ids).is_empty());
+        assert!(evaluate_wire_envelopes(
+            &fixture,
+            &fixture.cases[0],
+            &wire_ids,
+            &operation_group_keys,
+            &operation_id_context,
+        )
+        .is_empty());
     }
 
     #[test]
@@ -2198,6 +2367,75 @@ mod tests {
     }
 
     #[test]
+    fn operation_group_keys_are_explicit_canonical_and_bijective() {
+        for (expected, mutate) in [
+            (
+                "missing field `operation_group_keys`",
+                Box::new(|value: &mut Value| {
+                    value
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("operation_group_keys");
+                }) as Box<dyn Fn(&mut Value)>,
+            ),
+            (
+                "lowercase hexadecimal",
+                Box::new(|value: &mut Value| {
+                    value["operation_group_keys"][0]["canonical_hex"] =
+                        Value::String("AA".to_owned());
+                }),
+            ),
+            (
+                "even number",
+                Box::new(|value: &mut Value| {
+                    value["operation_group_keys"][0]["canonical_hex"] =
+                        Value::String("0".to_owned());
+                }),
+            ),
+            (
+                "duplicate logical key",
+                Box::new(|value: &mut Value| {
+                    let duplicate = value["operation_group_keys"][0].clone();
+                    value["operation_group_keys"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(duplicate);
+                }),
+            ),
+            (
+                "map to the same bytes",
+                Box::new(|value: &mut Value| {
+                    value["operation_group_keys"][1]["canonical_hex"] =
+                        value["operation_group_keys"][0]["canonical_hex"].clone();
+                }),
+            ),
+            (
+                "missing logical key \"beta\"",
+                Box::new(|value: &mut Value| {
+                    value["operation_group_keys"].as_array_mut().unwrap().pop();
+                }),
+            ),
+            (
+                "unused logical key \"gamma\"",
+                Box::new(|value: &mut Value| {
+                    value["operation_group_keys"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(serde_json::json!({
+                            "logical_key": "gamma",
+                            "canonical_hex": "00"
+                        }));
+                }),
+            ),
+        ] {
+            assert!(
+                mutated_verify_error(mutate).contains(expected),
+                "expected {expected:?}"
+            );
+        }
+    }
+
+    #[test]
     fn wire_u64_ids_are_typed_and_equal_values_remain_legal() {
         let mut value: Value = serde_json::from_slice(FIXTURE).unwrap();
         for entry in value["wire_id_map"]["u64_values"].as_array_mut().unwrap() {
@@ -2211,6 +2449,8 @@ mod tests {
 
         let mut fixture: Fixture = serde_json::from_value(value).unwrap();
         let wire_ids = validate_wire_id_map(&fixture).unwrap();
+        let operation_group_keys = validate_operation_group_keys(&fixture).unwrap();
+        let operation_id_context = operation_id_context(&fixture, &wire_ids).unwrap();
         let encoded_markers = fixture.cases[0]
             .interval_markers
             .iter()
@@ -2223,7 +2463,14 @@ mod tests {
         {
             marker.wire_envelope_hex = encoded;
         }
-        assert!(evaluate_wire_envelopes(&fixture, &fixture.cases[0], &wire_ids).is_empty());
+        assert!(evaluate_wire_envelopes(
+            &fixture,
+            &fixture.cases[0],
+            &wire_ids,
+            &operation_group_keys,
+            &operation_id_context,
+        )
+        .is_empty());
 
         let mut diagnostics = BTreeSet::new();
         compare_wire_u64(45, "node-a", &wire_ids, &mut diagnostics);
@@ -2257,7 +2504,10 @@ mod tests {
         assert_eq!(data_mismatch.classification, Classification::ProductFail);
         assert_eq!(
             data_mismatch.diagnostics,
-            BTreeSet::from(["wire_envelope_mismatch".to_owned()])
+            BTreeSet::from([
+                "wire_envelope_mismatch".to_owned(),
+                "wire_operation_identity_mismatch".to_owned(),
+            ])
         );
 
         let marker_mismatch = mutated_wire_outcome(|value| {
@@ -2284,8 +2534,62 @@ mod tests {
         assert_eq!(unknown_id.classification, Classification::ProductFail);
         assert_eq!(
             unknown_id.diagnostics,
-            BTreeSet::from(["wire_envelope_unknown_id".to_owned()])
+            BTreeSet::from([
+                "wire_envelope_unknown_id".to_owned(),
+                "wire_operation_identity_mismatch".to_owned(),
+            ])
         );
+    }
+
+    #[test]
+    fn operation_identity_is_derived_independently_of_fixture_labels() {
+        let changed_map_and_wire = mutated_wire_outcome(|value| {
+            let replacement = "aa".repeat(32);
+            let entry = value["wire_id_map"]["ids_32"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|entry| entry["label"] == "fixture/alpha/count/1")
+                .unwrap();
+            entry["hex"] = Value::String(replacement.clone());
+            let mut wire = value["cases"][0]["data_records"][0]["wire_envelope_hex"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            wire.replace_range(20..84, &replacement);
+            value["cases"][0]["data_records"][0]["wire_envelope_hex"] = Value::String(wire);
+        });
+        assert_eq!(
+            changed_map_and_wire.diagnostics,
+            BTreeSet::from(["wire_operation_identity_mismatch".to_owned()])
+        );
+
+        let changed_canonical_key = mutated_wire_outcome(|value| {
+            value["operation_group_keys"][0]["canonical_hex"] =
+                Value::String("02616c70686100000004".to_owned());
+        });
+        assert_eq!(
+            changed_canonical_key.diagnostics,
+            BTreeSet::from(["wire_operation_identity_mismatch".to_owned()])
+        );
+
+        let changed_sum = mutated_wire_outcome(|value| {
+            value["cases"][0]["data_records"][0]["raw_payload"] =
+                Value::String("{\"logical_key\":\"alpha\",\"count\":1,\"sum\":11}".to_owned());
+        });
+        assert!(changed_sum.diagnostics.contains("raw_payload_mismatch"));
+        assert!(changed_sum.diagnostics.contains("aggregate_divergence"));
+        assert!(!changed_sum
+            .diagnostics
+            .contains("wire_operation_identity_mismatch"));
+
+        let changed_count = mutated_wire_outcome(|value| {
+            value["cases"][0]["data_records"][0]["raw_payload"] =
+                Value::String("{\"logical_key\":\"alpha\",\"count\":2,\"sum\":10}".to_owned());
+        });
+        assert!(changed_count
+            .diagnostics
+            .contains("wire_operation_identity_mismatch"));
     }
 
     #[test]
@@ -3059,7 +3363,7 @@ mod tests {
             .contains("certification_eligible"));
 
         let fixture = std::str::from_utf8(FIXTURE).unwrap();
-        assert!(fixture.contains("fixture_only_logical_group_and_count_version"));
+        assert!(fixture.contains("operation-id-v1-with-explicit-abi-v1-group-key-bytes"));
         assert!(fixture.contains(NOTICE));
     }
 }

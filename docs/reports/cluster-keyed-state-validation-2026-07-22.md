@@ -35,7 +35,9 @@ decisions changes cluster admission. [Cycle 51](../reviews/distributed-keyed-sta
 implements only a synthetic v2 semantic oracle for the missing output-authority relationships; it
 is not runtime or certification evidence. [Cycle 52](../reviews/distributed-keyed-state-cycle-52.md)
 freezes its compact standalone wire representation and hostile decoder without changing Kafka,
-runtime admission, delivery guarantees, or certification status.
+runtime admission, delivery guarantees, or certification status. [Cycle 53](../reviews/distributed-keyed-state-cycle-53.md)
+adds standalone grouped operation-ID derivation and pure authority projection, while leaving
+pipeline-incarnation, interval, producer, and public-evidence lifecycles unwired.
 
 ## Verdict
 
@@ -443,7 +445,14 @@ independently derived vnode/shard ownership. It also proves that missing or wron
 assignment/process view is pre-reconciled test data and its ABI stops at vnode-to-shard semantics.
 Cycle 52 adds exact standalone envelope bytes, literal goldens, strict caps, and hostile decoding,
 but the current Kafka path still emits none of those bytes and no supported evidence endpoint or
-broker fence exists. Neither fixture version is independent production evidence.
+broker fence exists. Cycle 53 replaces v2's arbitrary operation-ID bytes with the sole ADR-defined
+grouped `COUNT(*)`/`SUM(Int64)` derivation over deployment, pipeline identity/incarnation,
+sink/operator/output scope, exact ABI-v1 group bytes, and checked count. A pure projection rejects
+contradictory current assignment, live process, recovery Commit, shard ownership, and interval
+inputs before producing the already-frozen marker/data headers. It independently reconstructs the
+production owner-map and full assignment-certificate digests, including canonical participant
+boots, rather than trusting an arbitrary hash label. Production still supplies none of these new
+lifecycle inputs to the sink command. Neither fixture version is independent production evidence.
 
 The missing minimum is not another state backend. It is the already-designed delivery/evidence
 vertical: an operator-specific replay-stable operation ID; compact data-record provenance; a stable

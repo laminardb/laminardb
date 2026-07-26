@@ -5,7 +5,7 @@
   pending a new official package; no runtime
   dependency, backend qualification evidence, independent production-soak result, or admission change
 - **Started:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 52
+- **Last reconciled:** 2026-07-26 during Cycle 53
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline:** `1e2f8429`; working branch `feature/distributed-keyed-state-adr`
@@ -341,7 +341,7 @@ Cycle 50's implementation audit freezes the dependency order and prevents connec
 6. only then wire the three-node engineering harness. The independent release-binary soak remains a
    later gate.
 
-Cycles 51 and 52 complete only items 1 and 2. Fixture v1 remains unchanged, while explicit v2 stays
+Cycles 51 through 53 complete only items 1 through 3. Fixture v1 remains unchanged, while explicit v2 stays
 synthetic, root-workspace-excluded, and `certification_eligible=false`. Its positive case covers a
 zero-input bootstrap, a later recovery cut, assignment 7 to 8 ownership change, cross-interval
 byte-identical replay at the raw source offset equal to that cut, predecessor output before the
@@ -350,8 +350,14 @@ incomplete evidence (`RUN_INVALID`) from complete conflicting product output (`P
 fixture now consumes the frozen standalone data-header and marker envelopes and rejects malformed,
 noncanonical, unknown, or semantically contradictory bytes. The sole normative layout is in
 [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#distributed-output-envelope-v1);
-no Kafka connector or runtime code uses it. Item 3—pure operation identity and assignment-authority
-propagation—is next; items 4 through 6 remain open.
+no Kafka connector or runtime code uses it. Cycle 53 adds the sole grouped `COUNT(*)`/`SUM(Int64)`
+[operation-ID definition](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#grouped-countsum-operation-identity-v1),
+independently derives every v2 data ID from explicit ABI-v1 group bytes, and pure-tests projection
+from a current assignment certificate plus complete owner/participant view, separate live process
+lease, and immutable recovery Commit. The standalone projection independently recomputes the full
+certificate digest. Pipeline incarnation and interval allocation still have no production
+lifecycle. Item 4's
+fake transactional-producer state machine is next; items 4 through 6 remain open.
 
 The existing output path satisfies none of the new provenance/fence fields: it passes only a batch
 and deadline and uses an idempotent, non-transactional Kafka producer. The supported evidence APIs

@@ -4,7 +4,7 @@
   "scope": "semantic_fixture_only",
   "certification_eligible": false,
   "model": "grouped_count_star_sum_exact_integer_snapshot_at_least_once",
-  "operation_identity_model": "fixture_only_logical_group_and_count_version",
+  "operation_identity_model": "operation-id-v1-with-explicit-abi-v1-group-key-bytes",
   "key_vnode_abi": "fixture-utf8-byte-sum-mod-v1",
   "vnode_count": 4,
   "wire_id_map": {
@@ -23,11 +23,11 @@
       { "label": "sha256:assignment-8", "hex": "1414141414141414141414141414141414141414141414141414141414141414" },
       { "label": "sha256:capsule-44", "hex": "1515151515151515151515151515151515151515151515151515151515151515" },
       { "label": "sha256:capsule-45", "hex": "1616161616161616161616161616161616161616161616161616161616161616" },
-      { "label": "fixture/alpha/count/1", "hex": "2121212121212121212121212121212121212121212121212121212121212121" },
-      { "label": "fixture/alpha/count/2", "hex": "2222222222222222222222222222222222222222222222222222222222222222" },
-      { "label": "fixture/alpha/count/3", "hex": "2323232323232323232323232323232323232323232323232323232323232323" },
-      { "label": "fixture/beta/count/1", "hex": "2424242424242424242424242424242424242424242424242424242424242424" },
-      { "label": "fixture/beta/count/2", "hex": "2525252525252525252525252525252525252525252525252525252525252525" }
+      { "label": "fixture/alpha/count/1", "hex": "3844390d6a67555e44abc5188f5ed26bb713fcb7723ed72c06756d30ad6e0d01" },
+      { "label": "fixture/alpha/count/2", "hex": "4056d8612f8e221245d58c00b3fd4e06deb6ae588029a8dc8a0d444c8e6f45b3" },
+      { "label": "fixture/alpha/count/3", "hex": "c4942ec648521d7eda08b683b2ac5bf6aff02edbcb52f160e68c8de32b7e22c0" },
+      { "label": "fixture/beta/count/1", "hex": "c7108b853b99d93f1fd2830a9fe06ae90bcac442039a452f54fb7113d9839ad0" },
+      { "label": "fixture/beta/count/2", "hex": "77e34882e988d10a33475018fce217ae201ff045b413c3d6c8aec410ef3c2966" }
     ],
     "u64_values": [
       { "label": "node-a", "value": 1 },
@@ -38,6 +38,10 @@
       { "label": "checkpoint-45", "value": 45 }
     ]
   },
+  "operation_group_keys": [
+    { "logical_key": "alpha", "canonical_hex": "02616c70686100000005" },
+    { "logical_key": "beta", "canonical_hex": "026265746100000004" }
+  ],
   "expected_run": {
     "deployment_id": "deployment-a",
     "pipeline_incarnation": "pipeline-incarnation-a",
@@ -336,7 +340,7 @@
       "data_records": [
         {
           "broker": { "topic": "fixture-output", "partition": 0, "offset": 1 },
-          "wire_envelope_hex": "4c44424f0101000000382121212121212121212121212121212121212121212121212121212121212121030303030303030303030303030303030000000000000000",
+          "wire_envelope_hex": "4c44424f0101000000383844390d6a67555e44abc5188f5ed26bb713fcb7723ed72c06756d30ad6e0d01030303030303030303030303030303030000000000000000",
           "envelope_version": 1,
           "envelope_kind": "data",
           "operation_id": "fixture/alpha/count/1",
@@ -346,7 +350,7 @@
         },
         {
           "broker": { "topic": "fixture-output", "partition": 1, "offset": 1 },
-          "wire_envelope_hex": "4c44424f0101000000382424242424242424242424242424242424242424242424242424242424242424030303030303030303030303030303030000000000000001",
+          "wire_envelope_hex": "4c44424f010100000038c7108b853b99d93f1fd2830a9fe06ae90bcac442039a452f54fb7113d9839ad0030303030303030303030303030303030000000000000001",
           "envelope_version": 1,
           "envelope_kind": "data",
           "operation_id": "fixture/beta/count/1",
@@ -356,7 +360,7 @@
         },
         {
           "broker": { "topic": "fixture-output", "partition": 0, "offset": 2 },
-          "wire_envelope_hex": "4c44424f0101000000382222222222222222222222222222222222222222222222222222222222222222030303030303030303030303030303030000000000000003",
+          "wire_envelope_hex": "4c44424f0101000000384056d8612f8e221245d58c00b3fd4e06deb6ae588029a8dc8a0d444c8e6f45b3030303030303030303030303030303030000000000000003",
           "envelope_version": 1,
           "envelope_kind": "data",
           "operation_id": "fixture/alpha/count/2",
@@ -366,7 +370,7 @@
         },
         {
           "broker": { "topic": "fixture-output", "partition": 1, "offset": 3 },
-          "wire_envelope_hex": "4c44424f0101000000382525252525252525252525252525252525252525252525252525252525252525040404040404040404040404040404040000000000000001",
+          "wire_envelope_hex": "4c44424f01010000003877e34882e988d10a33475018fce217ae201ff045b413c3d6c8aec410ef3c2966040404040404040404040404040404040000000000000001",
           "envelope_version": 1,
           "envelope_kind": "data",
           "operation_id": "fixture/beta/count/2",
@@ -376,7 +380,7 @@
         },
         {
           "broker": { "topic": "fixture-output", "partition": 0, "offset": 4 },
-          "wire_envelope_hex": "4c44424f0101000000382222222222222222222222222222222222222222222222222222222222222222040404040404040404040404040404040000000000000000",
+          "wire_envelope_hex": "4c44424f0101000000384056d8612f8e221245d58c00b3fd4e06deb6ae588029a8dc8a0d444c8e6f45b3040404040404040404040404040404040000000000000000",
           "envelope_version": 1,
           "envelope_kind": "data",
           "operation_id": "fixture/alpha/count/2",
@@ -386,7 +390,7 @@
         },
         {
           "broker": { "topic": "fixture-output", "partition": 0, "offset": 5 },
-          "wire_envelope_hex": "4c44424f0101000000382323232323232323232323232323232323232323232323232323232323232323040404040404040404040404040404040000000000000003",
+          "wire_envelope_hex": "4c44424f010100000038c4942ec648521d7eda08b683b2ac5bf6aff02edbcb52f160e68c8de32b7e22c0040404040404040404040404040404040000000000000003",
           "envelope_version": 1,
           "envelope_kind": "data",
           "operation_id": "fixture/alpha/count/3",

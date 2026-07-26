@@ -3,7 +3,7 @@
 - **Status:** Planned and backend-gated; exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster
   operator is admitted by this document
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 52
+- **Last reconciled:** 2026-07-26 during Cycle 53
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -156,8 +156,12 @@ representation: a fixed 66-byte per-record header and a bounded marker whose com
 not repeated per row. V2 consumes those exact bytes, but no runtime or Kafka connector does. The
 sole normative byte table is
 [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#distributed-output-envelope-v1).
-These cycles close no public-evidence, Kafka-fencing, backend, admission, exactly-once, latency, or
-production-soak gate; pure operation identity and authority propagation are next.
+Cycle 53 then freezes one sink-scoped grouped `COUNT(*)`/`SUM(Int64)` operation identity, derives
+fixture IDs from explicit ABI-v1 group bytes and checked count, and projects marker/data inputs only
+after pure current-assignment, live-process, and committed-recovery checks. Pipeline incarnation and
+writer intervals remain opaque inputs without a production lifecycle. These cycles close no
+public-evidence, Kafka-fencing, backend, admission, exactly-once, latency, or production-soak gate;
+the fake transactional-producer state machine is next.
 
 ## Scope and non-goals
 

@@ -223,6 +223,29 @@ writer-interval identities, fences a producer, or exposes the required authority
 cluster admission, delivery guarantee, or certification flag changed. All CVR scenarios remain
 **BLOCKED**, no Cycle 52 soak ran, and `certification_eligible` remains `false`.
 
+### Cycle 53 evidence disposition
+
+The standalone v2 oracle now derives its grouped `COUNT(*)`/`SUM(Int64)` operation IDs from the
+exact ADR-defined preimage and an explicit logical-key-to-ABI-v1-byte map. Matching changes to a
+fixture label and wire header cannot hide a wrong ID. `SUM` and payload bytes deliberately do not
+change identity; the existing byte-equality rule turns different bytes under one group/count ID
+into a conflict. Identity derivation prehashes invariant scope and appends borrowed group bytes plus
+count, but this structural property is not a production allocation or latency measurement.
+
+A separate pure projection accepts a current assignment version/full-certificate-digest reference
+plus complete vnode owner and canonical participant views, a current process lease, an immutable
+committed recovery base, an opaque current/predecessor interval, and the exact planned shard vnodes.
+It independently reconstructs the owner-map and full certificate digests, including participant
+boots and the 129-participant cap. It rejects an inner digest, stale or same-version-conflicting
+certificate, wrong node/boot or term, mixed ownership, and contradictory recovery evidence before
+projecting marker and data headers. It does not allocate, rotate, durably persist, or broker-fence
+an interval.
+
+No runtime command carries the canonical group bytes/count or a durable pipeline incarnation, and
+no transactional producer, supported authority endpoint, backend, admission, guarantee, or
+certification flag changed. All CVR scenarios remain **BLOCKED**, no Cycle 53 soak ran, and
+`certification_eligible` remains `false`.
+
 ## Frozen numerical contract
 
 An eligible machine-readable charter contains no `TBD`, zero, or results-derived threshold. It

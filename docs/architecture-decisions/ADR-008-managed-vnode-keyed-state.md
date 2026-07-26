@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 52
+- **Last reconciled:** 2026-07-26 during Cycle 53
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -13,7 +13,7 @@
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
   [TidesDB package design](tidesdb-local-state-successor-design.md),
   [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
-  [latest completed review](../reviews/distributed-keyed-state-cycle-52.md)
+  [latest completed review](../reviews/distributed-keyed-state-cycle-53.md)
 
 ## Decision
 
@@ -813,8 +813,9 @@ identity and two-level provenance envelope must be added before the initial rele
 record carries only envelope version/kind, replay-stable operation ID, writer-interval ID, and
 checked admission sequence. For the narrow append-only `COUNT(*)`/`SUM(Int64)` vertical, the checked
 count is the batching-independent logical state version; identity binds that version and canonical
-group to deployment, pipeline **incarnation**, and operator identity. It excludes payload and
-checkpoint attempt because replay can cross attempts and owners. The serialized Kafka payload bytes
+group to deployment, pipeline identity and **incarnation**, and the exact sink/operator/output
+scope. It excludes payload and checkpoint attempt because replay can cross attempts and owners. The
+serialized Kafka payload bytes
 are the comparison authority: the independent reader computes their SHA-256, so no duplicate digest
 is transmitted on every record. Equal operation IDs require bit-identical bytes; different bytes
 are a conflict.
@@ -946,9 +947,9 @@ The complete data header is therefore exactly **66 bytes**. Both IDs are nonzero
 the full `u64` sequence range because checked range reservation and overflow are state-machine
 semantics, not alternate wire encodings. The Kafka payload stays separate and byte-for-byte
 unchanged. No payload digest, key, vnode, shard, ABI, assignment, process, checkpoint, source
-position, or broker metadata is repeated in this per-record header. `operation_id_v1` and writer-
-interval derivation remain the next pure identity/authority step; this cycle freezes only their
-widths and transport representation.
+position, or broker metadata is repeated in this per-record header. Cycle 53 freezes the grouped
+operation identity and pure writer-authority projection below; interval creation/rotation remains
+part of the later transactional-producer state machine. This section freezes only transport bytes.
 
 Marker flag bit 0 is `HAS_PREDECESSOR`; every other bit is invalid. Its body begins with this fixed
 296-byte block:
@@ -1004,6 +1005,74 @@ to each affected partition; its common envelope bytes are identical across those
 Broker topic, partition, offset, and timestamp remain capture metadata. Missing or duplicate
 reserved headers fail closed; unrelated application headers remain allowed. This freezes intended
 placement only—no current connector encodes, publishes, reads, or fences this contract.
+
+### Grouped COUNT/SUM operation identity v1
+
+The first managed-output vertical uses one sink-scoped logical operation identity only for keyed,
+append-envelope `COUNT(*)` plus nullable `SUM(Int64)`. Windows, joins, changelog rows, and the single
+global aggregate must define different semantic domains rather than reuse a count-version tuple.
+For this vertical:
+
+```text
+operation_id_v1 = SHA256(operation_id_v1_preimage)
+```
+
+The preimage is the following exact concatenation. All integers are unsigned big-endian:
+
+| Order | Width | Field |
+| ---: | ---: | --- |
+| 1 | 44 | ASCII `laminardb/grouped-count-sum/operation-id/v1\0` |
+| 2 | 16 | non-nil deployment UUID bytes |
+| 3 | 16 | nonzero pipeline-incarnation ID |
+| 4 | 2 | pipeline-identity canonical version, exactly `3` |
+| 5 | 32 | raw pipeline-identity SHA-256 |
+| 6 | 1 | sink-ID byte length |
+| 7 | variable | exact sink-ID UTF-8 bytes |
+| 8 | 1 | operator-ID byte length |
+| 9 | variable | exact operator-ID UTF-8 bytes |
+| 10 | 1 | output-ID byte length |
+| 11 | variable | exact output-ID UTF-8 bytes |
+| 12 | 4 | canonical group-key byte length |
+| 13 | variable | exact partition-key ABI-v1 Arrow-row bytes |
+| 14 | 8 | checked `COUNT(*)` state version |
+
+The three text identifiers use the envelope-v1 128-byte caps, are nonempty, contain no NUL, and
+receive no Unicode normalization. The key length must fit `u32`; the key bytes are the already-owned
+`PartitionKeyCodecV1` representation, not logical display text or a reconstruction from the output
+batch. Zero key bytes are valid for a nonempty ABI-v1 `Null` grouping schema; this keyed domain is
+never used for the ungrouped aggregate. Count is in `1..=i64::MAX` and is the batching-independent
+state version. The raw 32-byte SHA-256 result is the data envelope's operation ID.
+
+Deployment reset, intentional rewind/recreate, pipeline compatibility, and sink/operator/output
+scope therefore change the ID. Payload bytes, `SUM`, checkpoint/recovery attempt, assignment,
+vnode, shard, writer node/boot/process term, writer interval, admission sequence, and broker
+position do not. Excluding those authority facts keeps a legal crash/rebalance replay stable;
+excluding payload and `SUM` makes two serialized results for the same group/count an observable
+conflict rather than two identities. A fixed SHA-256 context through output ID is prepared once,
+then cloned once per distinct group actually emitted after successful atomic state and payload
+construction. The row path appends only the borrowed key length/key and count; it performs no key
+re-encoding, payload hash, coordination, or preimage allocation.
+
+Cycle 53 models pipeline incarnation and stable operator/output identity as validated opaque inputs.
+Production manifests/capsules do not yet provide a crash-stable, recreate-rotating pipeline-
+incarnation lifecycle, and the current sink command has already lost the canonical group row and
+checked count. The standalone derivation is therefore not runtime or certification evidence.
+
+The companion pure authority projection keeps three sources distinct. Current assignment uses the
+full `CheckpointAssignmentFence::digest()` certificate reference and complete vnode-to-`(node,
+boot)` view; current durable process term comes separately from that writer's live process lease;
+and recovery attempt/capsule/base assignment come from one immutable cluster Commit. It never uses
+the older checkpoint leader term as the current writer term. Every planned shard vnode must be
+owned by the current process. Current assignment may be newer than the recovery base, but not
+older; equal versions require the same certificate digest. The current interval and optional
+predecessor remain opaque nonzero 16-byte IDs, and the current ID is copied unchanged to marker and
+data headers. The independent projection reconstructs the canonical owner-map digest and full
+certificate digest from assignment version, ABI, ordered owners, and the sorted node/boot
+participant roster, enforces the production 129-participant cap, and requires the supplied reference
+to match. An inner owner-map digest, repeated-node boot disagreement, or stale digest after boot
+rotation therefore fails. Interval allocation, rotation after ambiguous marker outcomes,
+predecessor lifecycle, and checked sequence reservation belong to the next fake-producer state
+machine.
 
 The controller also needs supported, bounded evidence projections rather than private object-store
 paths or text-log parsing. One local-node view must expose boot/process identity, locally adopted
