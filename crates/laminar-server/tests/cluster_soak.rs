@@ -58,8 +58,8 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "kafka")]
 use laminar_core::cluster::control::{
-    AssignmentSnapshot, CheckpointAssignmentAdoption, CheckpointParticipant,
-    LocalProcessAuthorityEvidence, LocalProcessAuthorityIdentity,
+    AssignmentSnapshot, CheckpointAssignmentAdoption, CheckpointAssignmentFence,
+    CheckpointParticipant, LocalProcessAuthorityEvidence, LocalProcessAuthorityIdentity,
 };
 #[cfg(feature = "kafka")]
 use laminar_core::state::{CheckpointAttempt, CheckpointAttemptRelation};
@@ -329,6 +329,14 @@ struct CheckpointBarrierTimingMetadata {
     overwritten_record_count: u64,
     recording_loss_count: u64,
     metadata_exhausted: bool,
+}
+
+#[cfg(feature = "kafka")]
+#[derive(Debug, Clone, Copy)]
+struct CheckpointBarrierTimingAuthority {
+    process: LocalProcessAuthorityIdentity,
+    assignment_version: u64,
+    assignment_certificate_digest: [u8; 32],
 }
 
 #[cfg(feature = "kafka")]
@@ -1532,9 +1540,9 @@ impl CheckpointBarrierTimingGeneration {
     fn bind_authority(
         &mut self,
         generation: ProcessGeneration,
-        evidence: &LocalProcessAuthorityEvidence,
+        authority: CheckpointBarrierTimingAuthority,
     ) -> Result<(), String> {
-        let expected = local_process_identity(evidence);
+        let expected = authority.process;
         if !expected.is_canonical() {
             return Err(format!(
                 "node{} process generation {} received non-canonical authority evidence",
@@ -1547,26 +1555,25 @@ impl CheckpointBarrierTimingGeneration {
                 generation.node_id, generation.generation
             ));
         }
-        let adoption = &evidence.adopted_assignment;
-        if !adoption.is_canonical() || adoption.participant != evidence.participant {
+        if authority.assignment_version == 0 || authority.assignment_certificate_digest == [0; 32] {
             return Err(format!(
-                "node{} process generation {} received non-canonical converged assignment evidence",
+                "node{} process generation {} received non-canonical converged assignment-certificate evidence",
                 generation.node_id, generation.generation
             ));
         }
         if self
             .converged_assignment_digests
-            .get(&adoption.assignment_version)
-            .is_some_and(|digest| *digest != adoption.assignment_digest)
+            .get(&authority.assignment_version)
+            .is_some_and(|digest| *digest != authority.assignment_certificate_digest)
         {
             return Err(format!(
                 "node{} process generation {} converged assignment version {} mapped to conflicting digests",
-                generation.node_id, generation.generation, adoption.assignment_version
+                generation.node_id, generation.generation, authority.assignment_version
             ));
         }
         if !self
             .converged_assignment_digests
-            .contains_key(&adoption.assignment_version)
+            .contains_key(&authority.assignment_version)
             && self.converged_assignment_digests.len()
                 == CHECKPOINT_BARRIER_TIMING_MAX_ASSIGNMENTS_PER_PROCESS
         {
@@ -1577,18 +1584,18 @@ impl CheckpointBarrierTimingGeneration {
         }
         if self
             .assignment_digests
-            .get(&adoption.assignment_version)
-            .is_some_and(|digest| *digest != adoption.assignment_digest)
+            .get(&authority.assignment_version)
+            .is_some_and(|digest| *digest != authority.assignment_certificate_digest)
         {
             return Err(format!(
                 "node{} process generation {} timing digest conflicts with converged assignment version {}",
-                generation.node_id, generation.generation, adoption.assignment_version
+                generation.node_id, generation.generation, authority.assignment_version
             ));
         }
         self.process.get_or_insert(expected);
         self.converged_assignment_digests
-            .entry(adoption.assignment_version)
-            .or_insert(adoption.assignment_digest);
+            .entry(authority.assignment_version)
+            .or_insert(authority.assignment_certificate_digest);
         self.authority_bound = true;
         Ok(())
     }
@@ -2462,7 +2469,7 @@ impl CheckpointBarrierTimingEvidence {
     fn capture_node(
         &mut self,
         node: &Node,
-        expected_authority: Option<&LocalProcessAuthorityEvidence>,
+        expected_authority: Option<CheckpointBarrierTimingAuthority>,
         deadline: Instant,
     ) -> Result<(), String> {
         let generation = Self::generation(node);
@@ -2491,8 +2498,8 @@ impl CheckpointBarrierTimingEvidence {
                     generation.node_id, generation.generation
                 ));
             }
-            if let Some(evidence) = expected_authority {
-                state.bind_authority(generation, evidence)?;
+            if let Some(authority) = expected_authority {
+                state.bind_authority(generation, authority)?;
             }
             let request_process = state.process;
             let after_sequence = state.cursor;
@@ -2540,18 +2547,27 @@ impl CheckpointBarrierTimingEvidence {
     fn capture_nodes_bound(
         &mut self,
         nodes: &[Node],
-        authority_by_node: &BTreeMap<usize, LocalProcessAuthorityEvidence>,
+        convergence: &LocalAssignmentConvergence,
         deadline: Instant,
         label: &str,
     ) {
+        let fence = convergence
+            .snapshot
+            .assignment_fence()
+            .unwrap_or_else(|error| panic!("{label}: converged assignment is invalid: {error}"));
         for node in nodes {
-            let evidence = authority_by_node.get(&node.id).unwrap_or_else(|| {
-                panic!(
-                    "{label}: converged local authority omitted live node{}",
-                    node.id,
-                )
-            });
-            self.capture_node(node, Some(evidence), deadline)
+            let evidence = convergence
+                .evidence_by_node
+                .get(&node.id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{label}: converged local authority omitted live node{}",
+                        node.id,
+                    )
+                });
+            let authority = checkpoint_barrier_timing_authority(evidence, &fence)
+                .unwrap_or_else(|error| panic!("{label}: node{}: {error}", node.id));
+            self.capture_node(node, Some(authority), deadline)
                 .unwrap_or_else(|error| {
                     panic!(
                         "{label}: failed to capture node{} exact checkpoint timings: {error}",
@@ -2564,7 +2580,7 @@ impl CheckpointBarrierTimingEvidence {
     fn finalize_node(
         &mut self,
         node: &Node,
-        expected_authority: &LocalProcessAuthorityEvidence,
+        expected_authority: CheckpointBarrierTimingAuthority,
         latency: &mut CheckpointLatencyEvidence,
         deadline: Instant,
     ) -> Result<(), String> {
@@ -3964,6 +3980,27 @@ fn local_process_identity(
 }
 
 #[cfg(feature = "kafka")]
+fn checkpoint_barrier_timing_authority(
+    evidence: &LocalProcessAuthorityEvidence,
+    fence: &CheckpointAssignmentFence,
+) -> Result<CheckpointBarrierTimingAuthority, String> {
+    let process = local_process_identity(evidence);
+    if !process.is_canonical()
+        || !fence.is_canonical()
+        || !evidence.adopted_assignment.matches_fence(fence)
+        || fence.participant_incarnation(process.participant.node_id)
+            != Some(process.participant.boot_incarnation)
+    {
+        return Err("local authority does not match the converged assignment fence".into());
+    }
+    Ok(CheckpointBarrierTimingAuthority {
+        process,
+        assignment_version: fence.assignment_version,
+        assignment_certificate_digest: fence.digest(),
+    })
+}
+
+#[cfg(feature = "kafka")]
 fn classify_local_assignment_cut(
     before: &AssignmentSnapshot,
     evidence_by_node: BTreeMap<usize, LocalProcessAuthorityEvidence>,
@@ -4963,7 +5000,7 @@ fn three_node_kill9_soak() {
     );
     exact_timing_evidence.capture_nodes_bound(
         &nodes,
-        &local_convergence.evidence_by_node,
+        &local_convergence,
         Instant::now() + Duration::from_secs(10),
         "stable startup",
     );
@@ -5052,7 +5089,7 @@ fn three_node_kill9_soak() {
         );
         exact_timing_evidence.capture_nodes_bound(
             &nodes,
-            &local_convergence.evidence_by_node,
+            &local_convergence,
             Instant::now() + Duration::from_secs(10),
             "post-recovery",
         );
@@ -5136,6 +5173,15 @@ fn three_node_kill9_soak() {
             .get(&victim)
             .unwrap_or_else(|| panic!("node{victim} was absent from the converged local cut"))
             .clone();
+        let previous_assignment_fence = local_convergence
+            .snapshot
+            .assignment_fence()
+            .expect("pre-kill converged assignment is canonical");
+        let previous_victim_timing_authority = checkpoint_barrier_timing_authority(
+            &previous_victim_evidence,
+            &previous_assignment_fence,
+        )
+        .unwrap_or_else(|error| panic!("kill-{round} victim timing authority: {error}"));
         let pre_arm_latency = nodes[victim]
             .checkpoint_latency_metrics()
             .expect("kill victim did not expose checkpoint latency metrics");
@@ -5160,7 +5206,7 @@ fn three_node_kill9_soak() {
         exact_timing_evidence
             .finalize_node(
                 &nodes[victim],
-                &previous_victim_evidence,
+                previous_victim_timing_authority,
                 &mut latency_evidence,
                 Instant::now() + Duration::from_secs(10),
             )
@@ -5192,12 +5238,20 @@ fn three_node_kill9_soak() {
             failover_deadline,
             "post-kill survivor local assignment",
         );
+        let survivor_fence = survivor_convergence
+            .snapshot
+            .assignment_fence()
+            .expect("converged survivor assignment is canonical");
         for survivor in &survivor_nodes {
-            let expected_authority = survivor_convergence
+            let evidence = survivor_convergence
                 .evidence_by_node
                 .get(survivor)
                 .unwrap_or_else(|| {
                     panic!("kill-{round} converged authority omitted survivor node{survivor}")
+                });
+            let expected_authority = checkpoint_barrier_timing_authority(evidence, &survivor_fence)
+                .unwrap_or_else(|error| {
+                    panic!("kill-{round} survivor node{survivor} timing authority: {error}")
                 });
             exact_timing_evidence
                 .capture_node(
@@ -5216,10 +5270,6 @@ fn three_node_kill9_soak() {
             "kill-{round} survivor assignment did not advance beyond {previous_assignment_version}"
         );
         let old_stable_node = previous_victim_evidence.participant.node_id;
-        let survivor_fence = survivor_convergence
-            .snapshot
-            .assignment_fence()
-            .expect("converged survivor assignment is canonical");
         assert!(
             !survivor_fence.contains(old_stable_node)
                 && survivor_convergence
@@ -5284,7 +5334,7 @@ fn three_node_kill9_soak() {
         );
         exact_timing_evidence.capture_nodes_bound(
             &nodes,
-            &rejoined_convergence.evidence_by_node,
+            &rejoined_convergence,
             Instant::now() + Duration::from_secs(10),
             &format!("kill-{round} rejoin"),
         );
@@ -5371,7 +5421,7 @@ fn three_node_kill9_soak() {
         );
         exact_timing_evidence.capture_nodes_bound(
             &nodes,
-            &local_convergence.evidence_by_node,
+            &local_convergence,
             Instant::now() + Duration::from_secs(10),
             &format!("steady round {round}"),
         );
@@ -5398,7 +5448,7 @@ fn three_node_kill9_soak() {
     );
     exact_timing_evidence.capture_nodes_bound(
         &nodes,
-        &local_convergence.evidence_by_node,
+        &local_convergence,
         Instant::now() + Duration::from_secs(10),
         "active-load boundary",
     );
@@ -5447,7 +5497,7 @@ fn three_node_kill9_soak() {
     );
     exact_timing_evidence.capture_nodes_bound(
         &nodes,
-        &local_convergence.evidence_by_node,
+        &local_convergence,
         Instant::now() + Duration::from_secs(10),
         "final durable input cut",
     );
@@ -5473,16 +5523,22 @@ fn three_node_kill9_soak() {
     );
     exact_timing_evidence.capture_nodes_bound(
         &nodes,
-        &local_convergence.evidence_by_node,
+        &local_convergence,
         Instant::now() + Duration::from_secs(10),
         "final output validation",
     );
 
+    let final_fence = local_convergence
+        .snapshot
+        .assignment_fence()
+        .expect("final converged assignment is canonical");
     for node in &nodes {
-        let expected_authority = local_convergence
+        let evidence = local_convergence
             .evidence_by_node
             .get(&node.id)
             .unwrap_or_else(|| panic!("final converged authority omitted node{}", node.id));
+        let expected_authority = checkpoint_barrier_timing_authority(evidence, &final_fence)
+            .unwrap_or_else(|error| panic!("final node{} timing authority: {error}", node.id));
         exact_timing_evidence
             .finalize_node(
                 node,
@@ -5877,6 +5933,23 @@ fn local_assignment_cut_fixture() -> (
 
 #[cfg(feature = "kafka")]
 #[test]
+fn checkpoint_timing_authority_uses_certificate_digest_domain() {
+    let (snapshot, evidence) = local_assignment_cut_fixture();
+    let fence = snapshot.assignment_fence().unwrap();
+    let local = evidence.get(&0).unwrap();
+    let authority = checkpoint_barrier_timing_authority(local, &fence).unwrap();
+
+    assert_eq!(authority.process, local_process_identity(local));
+    assert_eq!(authority.assignment_version, fence.assignment_version);
+    assert_eq!(authority.assignment_certificate_digest, fence.digest());
+    assert_ne!(
+        authority.assignment_certificate_digest, local.adopted_assignment.assignment_digest,
+        "certificate and owner-map digests are intentionally separate domains"
+    );
+}
+
+#[cfg(feature = "kafka")]
+#[test]
 fn local_assignment_cut_classifier_separates_pending_from_contradiction() {
     let (snapshot, mut evidence) = local_assignment_cut_fixture();
     let converged = classify_local_assignment_cut(&snapshot, evidence.clone(), &snapshot)
@@ -6267,18 +6340,11 @@ fn timing_test_authority(
     process_term: u64,
     assignment_version: u64,
     assignment_digest: [u8; 32],
-) -> LocalProcessAuthorityEvidence {
-    let process = timing_test_process(process_term);
-    LocalProcessAuthorityEvidence {
-        participant: process.participant,
-        process_term,
-        adopted_assignment: CheckpointAssignmentAdoption {
-            participant: process.participant,
-            assignment_version,
-            partitioning_abi_version: laminar_core::state::PARTITIONING_ABI_VERSION,
-            vnode_count: u32::from(laminar_core::state::DEFAULT_CLUSTER_KEY_GROUP_COUNT),
-            assignment_digest,
-        },
+) -> CheckpointBarrierTimingAuthority {
+    CheckpointBarrierTimingAuthority {
+        process: timing_test_process(process_term),
+        assignment_version,
+        assignment_certificate_digest: assignment_digest,
     }
 }
 
@@ -6342,7 +6408,7 @@ fn timing_test_generation(record_count: u64) -> CheckpointBarrierTimingGeneratio
     let process = timing_test_process(1);
     let mut timing = CheckpointBarrierTimingGeneration::default();
     let authority = timing_test_authority(1, 4, [44; 32]);
-    timing.bind_authority(generation, &authority).unwrap();
+    timing.bind_authority(generation, authority).unwrap();
     let page_size =
         u64::try_from(laminar_db::checkpoint_timing::MAX_CHECKPOINT_BARRIER_TIMING_PAGE_RECORDS)
             .expect("test page size fits u64");
@@ -6405,7 +6471,7 @@ fn exact_timing_collector_accepts_pagination_and_exact_metric_boundary() {
     let process = timing_test_process(1);
     let authority = timing_test_authority(1, 4, [44; 32]);
     let mut boundary = CheckpointBarrierTimingGeneration::default();
-    boundary.bind_authority(generation, &authority).unwrap();
+    boundary.bind_authority(generation, authority).unwrap();
     let mut record = timing_test_record(1);
     record.pipeline_stall_ns = CHECKPOINT_PIPELINE_STALL_SLO_NS;
     record.local_barrier_ns = CHECKPOINT_PIPELINE_STALL_SLO_NS;
@@ -6608,11 +6674,11 @@ fn exact_timing_reconciliation_requires_authority_binding_and_integer_metrics() 
         .contains("never bound"));
     let wrong_process = timing_test_authority(2, 4, [44; 32]);
     assert!(unbound
-        .bind_authority(generation, &wrong_process)
+        .bind_authority(generation, wrong_process)
         .unwrap_err()
         .contains("does not match"));
     let authority = timing_test_authority(1, 4, [44; 32]);
-    unbound.bind_authority(generation, &authority).unwrap();
+    unbound.bind_authority(generation, authority).unwrap();
     unbound
         .validate_against_metrics(generation, timing_test_metrics(&unbound))
         .unwrap();
@@ -6626,13 +6692,13 @@ fn exact_timing_reconciliation_requires_authority_binding_and_integer_metrics() 
         .unwrap();
     let conflicting_authority = timing_test_authority(1, 4, [45; 32]);
     assert!(conflicting_assignment
-        .bind_authority(generation, &conflicting_authority)
+        .bind_authority(generation, conflicting_authority)
         .unwrap_err()
         .contains("timing digest conflicts"));
     let mut missing_assignment = timing_test_generation(1);
     let later_authority = timing_test_authority(1, 5, [55; 32]);
     missing_assignment
-        .bind_authority(generation, &later_authority)
+        .bind_authority(generation, later_authority)
         .unwrap();
     assert!(missing_assignment
         .validate_against_metrics(generation, timing_test_metrics(&missing_assignment))
@@ -6658,7 +6724,7 @@ fn exact_timing_violation_diagnostic_is_exact_and_bounded() {
     let process = timing_test_process(1);
     let authority = timing_test_authority(1, 4, [44; 32]);
     let mut timing = CheckpointBarrierTimingGeneration::default();
-    timing.bind_authority(generation, &authority).unwrap();
+    timing.bind_authority(generation, authority).unwrap();
     let mut records = (1..=2).map(timing_test_record).collect::<Vec<_>>();
     for record in &mut records {
         record.pipeline_stall_ns = CHECKPOINT_PIPELINE_STALL_SLO_NS + record.sequence;
@@ -6694,7 +6760,7 @@ fn exact_timing_collector_streams_complete_artifact_with_bounded_memory() {
     let authority = timing_test_authority(1, 4, [44; 32]);
     let mut timing =
         CheckpointBarrierTimingGeneration::with_artifact(directory.path(), generation).unwrap();
-    timing.bind_authority(generation, &authority).unwrap();
+    timing.bind_authority(generation, authority).unwrap();
     let mut records = (1..=65).map(timing_test_record).collect::<Vec<_>>();
     for record in records.iter_mut().take(9) {
         record.pipeline_stall_ns = CHECKPOINT_PIPELINE_STALL_SLO_NS + record.sequence;
