@@ -5,7 +5,7 @@
   pending a new official package; no runtime
   dependency, backend qualification evidence, independent production-soak result, or admission change
 - **Started:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 55
+- **Last reconciled:** 2026-07-26 during Cycle 56
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline:** `1e2f8429`; working branch `feature/distributed-keyed-state-adr`
@@ -378,6 +378,34 @@ No protocol-aware actuator dropped a matched `EndTxn` response after request del
 ambiguous-marker/data reconciliation remains the next item-5 slice. Broker size/timeout/pressure,
 replication/failover, TLS/auth, runtime interval non-reuse, item 6, latency, and the independent soak
 remain open.
+
+Cycle 56 timeboxes that slice around the ADR's validation-only matched-`EndTxn` contract. The exact
+pinned client negotiates non-flexible `EndTxn` v1, allowing one bounded Rust TCP actuator to retain
+and correlate only the selected request/response while forwarding complete non-target frames during
+the active lifecycle. The host exposes the broker origin at loopback port 19194 while the broker
+advertises the actuator at 19192, so metadata and coordinator reconnects cannot bypass it. Existing
+proxy frameworks remain out of scope because none supplies this exact fault without a custom
+extension and substantially larger codec/routing/runtime dependencies.
+
+Implementation order is fail-closed: parser/state-machine and fake-socket tests; route-inventory
+preflight; then four unique-topic real-broker cases for `{marker,data} x {applied,unapplied}`. The
+applied case requires a full same-connection/correlation success response withheld byte-for-byte;
+the unapplied case requires a full request and zero upstream target bytes. Both require a retriable
+caller timeout, target-producer connection retirement before same-ID successor initialization, and
+separate RU/RC consumers reaching a frozen high-watermark cut on every partition. No three-node,
+runtime, backend, limit, latency, or certification work starts if any part of that proof is absent.
+
+The completed [Cycle 56 evidence](../reviews/distributed-keyed-state-cycle-56.md) passes all four
+isolated cases on the frozen one-node PLAINTEXT subject. The applied actuator retained the exact
+same-connection/correlation error-zero response and forwarded zero response bytes; the unapplied
+actuator retained the complete request and forwarded zero request bytes. After every target-client
+connection closed, the same-ID successor reconciled complete frozen cuts. Marker selection chose
+the candidate only in the applied case. `read_committed` exposed the predecessor only in the
+applied case and the successor replay in both cases; `read_uncommitted` retained both staged
+branches. This closes the controlled single-broker ambiguity slice of item 5, not generic broker
+or runtime correctness. Durable interval allocation/non-reuse,
+item 6 integration, production topology/limits/security, replicated failover, source/state/sink
+atomicity, hot-path/tail-latency evidence, a qualified backend, and independent soak remain open.
 
 The existing output path satisfies none of the new provenance/fence fields: it passes only a batch
 and deadline and uses an idempotent, non-transactional Kafka producer. The supported evidence APIs

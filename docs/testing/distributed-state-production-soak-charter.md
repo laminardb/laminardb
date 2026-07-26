@@ -279,6 +279,23 @@ restart/disk durability, authentication, limit/pressure qualification, latency d
 release-candidate soak evidence. All CVR scenarios remain **BLOCKED**, no Cycle 55 soak ran, and
 `certification_eligible` remains `false`.
 
+### Cycle 56 evidence disposition
+
+The root-workspace-excluded probe adds a validation-only, one-broker matched-`EndTxn` v1 actuator.
+Its four isolated marker/data cases deliberately distinguish a complete request followed by an
+error-zero matching response withheld downstream from a complete request withheld upstream. Every
+target-client connection closes before the same-ID successor reconciles separate read-committed and
+read-uncommitted captures to frozen per-partition cuts. Read-committed evidence selects the
+candidate marker and exposes predecessor data only in applied cases; it selects the last confirmed
+marker or omits predecessor data in unapplied cases. Successor replay is visible in both data cases.
+
+This closes a controlled ambiguity-proof gap in the standalone protocol evidence. It is not an
+independent controller, release artifact, production topology, Laminar source/state/sink atomic
+commit, durable interval allocator, replicated failover, authenticated connector, limit/pressure
+test, or latency distribution. No backend, runtime connector, cluster admission, delivery
+guarantee, or certification flag changed. `[LDB-4007]` and `[LDB-0013]` remain closed. All CVR
+scenarios remain **BLOCKED**, no Cycle 56 soak ran, and `certification_eligible` remains `false`.
+
 ## Frozen numerical contract
 
 An eligible machine-readable charter contains no `TBD`, zero, or results-derived threshold. It

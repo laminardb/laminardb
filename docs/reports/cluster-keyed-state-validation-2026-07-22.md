@@ -41,8 +41,10 @@ pipeline-incarnation, interval, producer, and public-evidence lifecycles unwired
 adds only a unit-test transactional protocol model; real Kafka fencing and ambiguous-marker
 reconciliation remain open. [Cycle 55](../reviews/distributed-keyed-state-cycle-55.md) freezes a
 stable transactional-ID encoding and proves the deterministic fencing/visibility subset on one
-real disposable Redpanda broker; ambiguous `EndTxn`, runtime wiring, production limits, replicated
-durability, latency, and soak evidence remain open.
+real disposable Redpanda broker, leaving ambiguous `EndTxn` open at that point. [Cycle 56](../reviews/distributed-keyed-state-cycle-56.md)
+then proves applied and unapplied matched-`EndTxn` marker/data reconciliation on that same bounded
+one-node subject; it adds no runtime connector, durable interval authority, production topology,
+exactly-once composition, backend qualification, latency result, or soak evidence.
 
 ## Verdict
 
@@ -480,12 +482,24 @@ non-null payload. Data retained its exact key/payload and an unrelated `trace-id
 carrying exactly one 66-byte `__ldb` value. The successor replay retained operation/key/payload,
 changed interval, and restarted sequence zero.
 
+Cycle 56 extends only this standalone probe boundary with a matched `EndTxn` v1 actuator. On four
+isolated topics it retained the exact target request plus either the same-connection/correlation
+error-zero broker response with zero response bytes sent downstream (`applied`) or zero target
+bytes sent upstream (`unapplied`). The expected retriable local timeout completed, all connections
+observed for producer A's exact client ID closed, and producer B initialized the same transactional
+ID before separate consumers reached frozen cuts on all three partitions. Read-committed evidence
+selected the applied marker and fell back to the last confirmed predecessor for the unapplied
+marker. Applied data was read-committed-visible before replay, unapplied data was absent there, and
+successor replay was read-committed-visible in both cases; read-uncommitted retained both staged
+branches.
+
 This proves only the exact tested Kafka-protocol behavior, not generic production inventory or
-atomic source/state/sink delivery. No fault proved that a particular `EndTxn` reached the broker
-while its matching response was lost, so ambiguous marker/data reconciliation remains untested.
-The probe also omits replication/failover, restart/disk durability, TLS/auth, broker limit and
-pressure cases, runtime interval non-reuse, production hot-path/tail latency, and the independent
-release-binary soak. The current connector remains nontransactional and unchanged.
+atomic source/state/sink delivery. The probe still omits replication/failover, restart/disk
+durability, TLS/auth, broker limit and pressure cases, durable runtime interval non-reuse,
+production hot-path/tail latency, and the independent release-binary soak. Redpanda's success
+response was treated as an accepted coordinator decision; semantic claims came from bounded
+read-committed reconciliation, not the timeout. The current connector remains nontransactional and
+unchanged.
 
 The missing minimum is not another state backend. It is the already-designed delivery/evidence
 vertical: an operator-specific replay-stable operation ID; compact data-record provenance; a stable
@@ -501,9 +515,10 @@ charter. The initial interval must first reference a zero-input bootstrap checkp
 from exact pre-delivery source baselines while readiness, graph work, and sink writes remain closed;
 there is no null/genesis authority shortcut. Implementation must start with semantic model and byte-
 golden tests, then a fake producer state machine, deterministic real-broker fencing/isolation,
-and controlled ambiguous-outcome reconciliation. Cycle 55 closes only the deterministic broker
-slice. The current three-node engineering harness is upgraded only after the ambiguity layer
-passes; the independent soak remains later and separately operated.
+and controlled ambiguous-outcome reconciliation. Cycle 55 closes the deterministic broker slice;
+Cycle 56 closes the deliberately controlled one-broker ambiguity slice. The current three-node
+engineering harness still requires durable interval authority and admission-neutral runtime
+integration. The independent soak remains later and separately operated.
 
 ### Fjall is historical, not current infrastructure
 

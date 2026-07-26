@@ -3,7 +3,7 @@
 - **Status:** Planned and backend-gated; exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster
   operator is admitted by this document
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 55
+- **Last reconciled:** 2026-07-26 during Cycle 56
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -179,6 +179,19 @@ outcome needs a protocol-aware matched-response-loss actuator; generic timeouts 
 not accepted. Runtime connector wiring, durable interval allocation/non-reuse, production broker
 limits, multi-broker durability, hot-path/latency evidence, source/state/sink atomicity, and the
 independent soak remain absent.
+
+Cycle 56 closes only that controlled ambiguity subset. A validation-only Rust actuator asserts the
+exact pinned `EndTxn` v1 request and same-connection response, then deliberately proves either a
+broker-accepted commit whose complete success response is withheld or a complete request held with
+zero upstream bytes. Four isolated marker/data cases retire every target-client connection before
+same-ID successor fencing and reconcile separate `read_uncommitted`/`read_committed` captures to
+frozen per-partition cuts. The marker candidate and predecessor data are `read_committed`-visible
+only in the applied cases while `read_uncommitted` sees both staged branches; replay under the
+successor interval is `read_committed`-visible in both data cases. This is evidence
+for one RF=1 Redpanda/PLAINTEXT/client-version subject, not runtime code or an exactly-once claim.
+It leaves durable interval non-reuse, runtime integration, production broker limits/security,
+replicated failover, source/state/sink atomicity, latency, backend qualification, and independent
+soak unresolved.
 
 ## Scope and non-goals
 

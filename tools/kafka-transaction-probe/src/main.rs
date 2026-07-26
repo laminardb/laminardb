@@ -3,12 +3,16 @@
 //! This executable is deliberately excluded from the LaminarDB workspace. It is a narrow
 //! qualification aid, not runtime code and not certification evidence.
 
+mod endtxn_proxy;
+
 use std::array;
 use std::collections::BTreeSet;
 use std::env;
 use std::fmt::Write as _;
+use std::net::SocketAddr;
 use std::process;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_executor::block_on;
@@ -22,12 +26,16 @@ use rdkafka::producer::{BaseProducer, BaseRecord, Producer, ProducerContext};
 use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 use sha2::{Digest, Sha256};
 
+use endtxn_proxy::{EndTxnEvidence, EndTxnProxy, FaultOutcome, TargetSpec};
+
 const PARTITIONS: [i32; 3] = [0, 1, 2];
 const HEADER_NAME: &str = "__ldb";
 const TRACE_HEADER_NAME: &str = "trace-id";
 const TRACE_HEADER_VALUE: &[u8] = b"cycle55-preserved";
+const DETERMINISTIC_PRODUCER_CLIENT_ID: &str = "ldb-kafka-transaction-probe-producer";
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(30);
+const AMBIGUOUS_COMMIT_TIMEOUT: Duration = Duration::from_millis(750);
 const TX_ID_DOMAIN: &[u8] = b"laminardb/kafka/transactional-id/v1\0";
 const TX_ID_PREFIX: &str = "ldb.tx.v1.";
 
@@ -40,6 +48,8 @@ const TEST_INTERVAL: [u8; 16] = [0xb2; 16];
 
 const STABLE_KEY: &[u8] = b"stable-key";
 const STABLE_PAYLOAD: &[u8] = b"stable-payload";
+const SELECTION_KEY: &[u8] = b"selection-key";
+const SELECTION_PAYLOAD: &[u8] = b"selection-payload";
 const ABORT_KEYS: [&[u8]; 3] = [b"abort-key-0", b"abort-key-1", b"abort-key-2"];
 const ABORT_PAYLOADS: [&[u8]; 3] = [b"abort-payload-0", b"abort-payload-1", b"abort-payload-2"];
 const FENCED_KEYS: [&[u8]; 3] = [b"fenced-key-0", b"fenced-key-1", b"fenced-key-2"];
@@ -83,8 +93,36 @@ struct Cli {
     run_id: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AmbiguityKind {
+    Marker,
+    Data,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AmbiguityOutcome {
+    Applied,
+    Unapplied,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AmbiguityScenario {
+    kind: AmbiguityKind,
+    outcome: AmbiguityOutcome,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct AmbiguityCli {
+    brokers: String,
+    proxy_listen: SocketAddr,
+    proxy_upstream: SocketAddr,
+    run_id: String,
+    scenario: AmbiguityScenario,
+}
+
 enum Command {
     Run(Cli),
+    RunAmbiguity(AmbiguityCli),
     Help,
 }
 
@@ -149,7 +187,7 @@ struct DataFanout<'a> {
 fn main() {
     println!("NOT CERTIFICATION EVIDENCE");
     println!(
-        "scope=single-broker deterministic protocol probe; excludes ambiguous commit, replication, failover, durability, latency, soak, and end-to-end exactly-once"
+        "scope=validation-only single-broker protocol probes; excludes runtime wiring, replication, failover, durability, latency, soak, and end-to-end exactly-once"
     );
 
     let command = match parse_cli(env::args().skip(1)) {
@@ -169,12 +207,19 @@ fn main() {
                 process::exit(1);
             }
         },
+        Command::RunAmbiguity(cli) => match run_ambiguity_probe(&cli) {
+            Ok(()) => println!("PASS matched-endtxn-ambiguity-probe"),
+            Err(error) => {
+                eprintln!("FAIL: {error}");
+                process::exit(1);
+            }
+        },
     }
 }
 
 fn print_usage() {
     println!(
-        "usage: kafka-transaction-probe --brokers <host:port[,host:port...]> [--run-id <safe-label>]"
+        "usage:\n  kafka-transaction-probe --brokers <host:port[,host:port...]> [--run-id <safe-label>]\n  kafka-transaction-probe --brokers <loopback-host:proxy-port> --run-id <safe-label> --ambiguity <marker-applied|marker-unapplied|data-applied|data-unapplied> --proxy-upstream <loopback-host:broker-port>"
     );
 }
 
@@ -186,6 +231,8 @@ fn parse_cli(arguments: impl IntoIterator<Item = String>) -> ProbeResult<Command
 
     let mut brokers = None;
     let mut run_id = None;
+    let mut ambiguity = None;
+    let mut proxy_upstream = None;
     let mut index = 0;
     while index < arguments.len() {
         let flag = &arguments[index];
@@ -195,16 +242,75 @@ fn parse_cli(arguments: impl IntoIterator<Item = String>) -> ProbeResult<Command
         match flag.as_str() {
             "--brokers" if brokers.is_none() => brokers = Some(validate_brokers(value)?),
             "--run-id" if run_id.is_none() => run_id = Some(validate_run_id(value)?),
-            "--brokers" | "--run-id" => return Err(format!("duplicate option {flag}")),
+            "--ambiguity" if ambiguity.is_none() => {
+                ambiguity = Some(parse_ambiguity_scenario(value)?)
+            }
+            "--proxy-upstream" if proxy_upstream.is_none() => {
+                proxy_upstream = Some(validate_loopback_socket("--proxy-upstream", value)?)
+            }
+            "--brokers" | "--run-id" | "--ambiguity" | "--proxy-upstream" => {
+                return Err(format!("duplicate option {flag}"));
+            }
             _ => return Err(format!("unknown option {flag}")),
         }
         index += 2;
     }
 
-    Ok(Command::Run(Cli {
-        brokers: brokers.ok_or_else(|| "--brokers is required".to_owned())?,
-        run_id,
-    }))
+    let brokers = brokers.ok_or_else(|| "--brokers is required".to_owned())?;
+    match (ambiguity, proxy_upstream) {
+        (None, None) => Ok(Command::Run(Cli { brokers, run_id })),
+        (Some(scenario), Some(proxy_upstream)) => {
+            let run_id = run_id.ok_or_else(|| "ambiguity mode requires --run-id".to_owned())?;
+            let proxy_listen = validate_loopback_socket("--brokers", &brokers)?;
+            if proxy_listen == proxy_upstream {
+                return Err("proxy listen and upstream endpoints must differ".to_owned());
+            }
+            Ok(Command::RunAmbiguity(AmbiguityCli {
+                brokers,
+                proxy_listen,
+                proxy_upstream,
+                run_id,
+                scenario,
+            }))
+        }
+        (Some(_), None) => Err("ambiguity mode requires --proxy-upstream".to_owned()),
+        (None, Some(_)) => Err("--proxy-upstream requires --ambiguity".to_owned()),
+    }
+}
+
+fn parse_ambiguity_scenario(value: &str) -> ProbeResult<AmbiguityScenario> {
+    match value {
+        "marker-applied" => Ok(AmbiguityScenario {
+            kind: AmbiguityKind::Marker,
+            outcome: AmbiguityOutcome::Applied,
+        }),
+        "marker-unapplied" => Ok(AmbiguityScenario {
+            kind: AmbiguityKind::Marker,
+            outcome: AmbiguityOutcome::Unapplied,
+        }),
+        "data-applied" => Ok(AmbiguityScenario {
+            kind: AmbiguityKind::Data,
+            outcome: AmbiguityOutcome::Applied,
+        }),
+        "data-unapplied" => Ok(AmbiguityScenario {
+            kind: AmbiguityKind::Data,
+            outcome: AmbiguityOutcome::Unapplied,
+        }),
+        _ => Err(
+            "--ambiguity must be marker-applied, marker-unapplied, data-applied, or data-unapplied"
+                .to_owned(),
+        ),
+    }
+}
+
+fn validate_loopback_socket(field: &str, value: &str) -> ProbeResult<SocketAddr> {
+    let address = value
+        .parse::<SocketAddr>()
+        .map_err(|error| format!("{field} must be one numeric socket address: {error}"))?;
+    if !address.ip().is_loopback() || address.port() == 0 {
+        return Err(format!("{field} must be a nonzero loopback socket address"));
+    }
+    Ok(address)
 }
 
 fn validate_brokers(value: &str) -> ProbeResult<String> {
@@ -235,10 +341,7 @@ fn validate_run_id(value: &str) -> ProbeResult<String> {
 }
 
 fn run_probe(cli: &Cli) -> ProbeResult<()> {
-    let (librdkafka_number, librdkafka_version) = rdkafka::util::get_rdkafka_version();
-    println!(
-        "rdkafka_crate=0.39.0 librdkafka_version={librdkafka_version} librdkafka_number={librdkafka_number:#x}"
-    );
+    print_client_version();
     let first_marker = decode_and_validate_marker(FIRST_MARKER_GOLDEN_HEX, false)?;
     let successor_marker = decode_and_validate_marker(SUCCESSOR_MARKER_GOLDEN_HEX, true)?;
     let tx_id = derive_transactional_id(&DEPLOYMENT, &INCARNATION, "sink", "shard")?;
@@ -253,7 +356,7 @@ fn run_probe(cli: &Cli) -> ProbeResult<()> {
     require_topic_inventory(&admin, &topic)?;
     println!("step=topic-inventory partitions=0,1,2 result=PASS");
 
-    let old = create_producer(&cli.brokers, &tx_id)?;
+    let old = create_producer(&cli.brokers, &tx_id, DETERMINISTIC_PRODUCER_CLIENT_ID)?;
     old.init_transactions(IO_TIMEOUT)
         .map_err(|error| format!("old producer init_transactions failed: {error}"))?;
 
@@ -283,7 +386,7 @@ fn run_probe(cli: &Cli) -> ProbeResult<()> {
     };
     stage_data(&old, &topic, fenced)?;
 
-    let successor = create_producer(&cli.brokers, &tx_id)?;
+    let successor = create_producer(&cli.brokers, &tx_id, DETERMINISTIC_PRODUCER_CLIENT_ID)?;
     successor
         .init_transactions(IO_TIMEOUT)
         .map_err(|error| format!("successor init_transactions failed: {error}"))?;
@@ -312,6 +415,286 @@ fn run_probe(cli: &Cli) -> ProbeResult<()> {
     require_topic_inventory(&admin, &topic)?;
     println!("step=topic-inventory-post partitions=0,1,2 result=PASS");
     Ok(())
+}
+
+fn run_ambiguity_probe(cli: &AmbiguityCli) -> ProbeResult<()> {
+    print_client_version();
+    let (kind_label, outcome_label, proxy_outcome) = match cli.scenario {
+        AmbiguityScenario {
+            kind: AmbiguityKind::Marker,
+            outcome: AmbiguityOutcome::Applied,
+        } => ("marker", "applied", FaultOutcome::AppliedResponseLost),
+        AmbiguityScenario {
+            kind: AmbiguityKind::Marker,
+            outcome: AmbiguityOutcome::Unapplied,
+        } => ("marker", "unapplied", FaultOutcome::UnappliedRequestHeld),
+        AmbiguityScenario {
+            kind: AmbiguityKind::Data,
+            outcome: AmbiguityOutcome::Applied,
+        } => ("data", "applied", FaultOutcome::AppliedResponseLost),
+        AmbiguityScenario {
+            kind: AmbiguityKind::Data,
+            outcome: AmbiguityOutcome::Unapplied,
+        } => ("data", "unapplied", FaultOutcome::UnappliedRequestHeld),
+    };
+    let first_marker = decode_and_validate_marker(FIRST_MARKER_GOLDEN_HEX, false)?;
+    let successor_marker = decode_and_validate_marker(SUCCESSOR_MARKER_GOLDEN_HEX, true)?;
+    let shard_id = format!("ambiguity-{}", cli.run_id);
+    let tx_id = derive_transactional_id(&DEPLOYMENT, &INCARNATION, "sink", &shard_id)?;
+    let topic = unique_topic(Some(&cli.run_id))?;
+    let old_client_id = format!("ldb-kafka-ambiguity-{kind_label}-{outcome_label}-a");
+    let successor_client_id = format!("ldb-kafka-ambiguity-{kind_label}-{outcome_label}-b");
+
+    println!(
+        "scenario={kind_label}-{outcome_label} brokers={} proxy_upstream={} topic={topic} transactional_id={tx_id}",
+        cli.brokers, cli.proxy_upstream
+    );
+    let proxy = EndTxnProxy::start(
+        cli.proxy_listen,
+        cli.proxy_upstream,
+        TargetSpec {
+            client_id: old_client_id.clone(),
+            transactional_id: tx_id.clone(),
+            outcome: proxy_outcome,
+        },
+    )?;
+    let admin = create_admin(&cli.brokers)?;
+    create_topic(&admin, &topic)?;
+    require_topic_inventory(&admin, &topic)?;
+    require_proxy_route(&admin, cli.proxy_listen)?;
+    println!(
+        "step=proxy-route advertised={} origin={} partitions=0,1,2 result=PASS",
+        cli.proxy_listen, cli.proxy_upstream
+    );
+
+    let old = create_producer(&cli.brokers, &tx_id, &old_client_id)?;
+    old.init_transactions(IO_TIMEOUT)
+        .map_err(|error| format!("ambiguity producer A init failed: {error}"))?;
+    commit_marker(&old, &topic, &first_marker)?;
+    match cli.scenario.kind {
+        AmbiguityKind::Marker => stage_marker(&old, &topic, &successor_marker)?,
+        AmbiguityKind::Data => stage_replay_data(&old, &topic, &FIRST_INTERVAL)?,
+    }
+    proxy.arm()?;
+
+    let (actuation, commit_join) = thread::scope(|scope| {
+        let commit = scope.spawn(|| old.commit_transaction(AMBIGUOUS_COMMIT_TIMEOUT));
+        let actuation = proxy.wait_for_actuation(IO_TIMEOUT);
+        (actuation, commit.join())
+    });
+    actuation?;
+    let commit_result = commit_join.map_err(|_| "ambiguity commit thread panicked".to_owned())?;
+    require_ambiguity_timeout(commit_result)?;
+    println!(
+        "step=caller-ambiguity code=OperationTimedOut retriable=true fatal=false abortable=false result=PASS"
+    );
+
+    drop(old);
+    proxy.wait_for_target_connections_closed(IO_TIMEOUT)?;
+    let evidence = proxy.finish_target()?;
+    require_endtxn_evidence(&evidence, proxy_outcome, &old_client_id, &tx_id)?;
+    print_endtxn_evidence(&evidence);
+
+    let successor = create_producer(&cli.brokers, &tx_id, &successor_client_id)?;
+    successor
+        .init_transactions(IO_TIMEOUT)
+        .map_err(|error| format!("ambiguity producer B init failed: {error}"))?;
+    println!("step=same-id-successor-after-a-close result=PASS");
+
+    let intermediate_cut = freeze_high_watermarks(&admin, &topic)?;
+    let intermediate_uncommitted =
+        capture_at_cut(&cli.brokers, &topic, "read_uncommitted", &intermediate_cut)?;
+    let intermediate_committed =
+        capture_at_cut(&cli.brokers, &topic, "read_committed", &intermediate_cut)?;
+    let expected_intermediate_uncommitted = expected_ambiguity_intermediate(
+        cli.scenario.kind,
+        cli.scenario.outcome,
+        true,
+        &first_marker,
+        &successor_marker,
+    )?;
+    let expected_intermediate_committed = expected_ambiguity_intermediate(
+        cli.scenario.kind,
+        cli.scenario.outcome,
+        false,
+        &first_marker,
+        &successor_marker,
+    )?;
+    require_capture(
+        "ambiguity intermediate read_uncommitted",
+        &intermediate_uncommitted,
+        &expected_intermediate_uncommitted,
+    )?;
+    require_capture(
+        "ambiguity intermediate read_committed",
+        &intermediate_committed,
+        &expected_intermediate_committed,
+    )?;
+
+    match cli.scenario.kind {
+        AmbiguityKind::Marker => {
+            let selected = reconcile_marker_candidate(&intermediate_committed, &successor_marker)?;
+            let expected = if cli.scenario.outcome == AmbiguityOutcome::Applied {
+                &SUCCESSOR_INTERVAL
+            } else {
+                &FIRST_INTERVAL
+            };
+            if selected != expected {
+                return Err(format!(
+                    "marker reconciliation selected {selected:02x?}, expected {expected:02x?}"
+                ));
+            }
+            commit_selection_data(&successor, &topic, selected)?;
+            println!(
+                "step=marker-reconciliation selected_interval={} result=PASS",
+                if selected == &SUCCESSOR_INTERVAL {
+                    "candidate"
+                } else {
+                    "last-confirmed"
+                }
+            );
+        }
+        AmbiguityKind::Data => {
+            let candidate_visible = reconcile_data_candidate(&intermediate_committed)?;
+            let expected_visible = cli.scenario.outcome == AmbiguityOutcome::Applied;
+            if candidate_visible != expected_visible {
+                return Err(format!(
+                    "data reconciliation visibility was {candidate_visible}, expected {expected_visible}"
+                ));
+            }
+            commit_marker(&successor, &topic, &successor_marker)?;
+            commit_replay_data(&successor, &topic, &SUCCESSOR_INTERVAL)?;
+            println!(
+                "step=data-reconciliation predecessor_visible={candidate_visible} successor_replay=true result=PASS"
+            );
+        }
+    }
+
+    let final_cut = freeze_high_watermarks(&admin, &topic)?;
+    let final_uncommitted = capture_at_cut(&cli.brokers, &topic, "read_uncommitted", &final_cut)?;
+    let final_committed = capture_at_cut(&cli.brokers, &topic, "read_committed", &final_cut)?;
+    let expected_final_uncommitted = expected_ambiguity_final(
+        cli.scenario.kind,
+        cli.scenario.outcome,
+        true,
+        &first_marker,
+        &successor_marker,
+    )?;
+    let expected_final_committed = expected_ambiguity_final(
+        cli.scenario.kind,
+        cli.scenario.outcome,
+        false,
+        &first_marker,
+        &successor_marker,
+    )?;
+    require_capture(
+        "ambiguity final read_uncommitted",
+        &final_uncommitted,
+        &expected_final_uncommitted,
+    )?;
+    require_capture(
+        "ambiguity final read_committed",
+        &final_committed,
+        &expected_final_committed,
+    )?;
+    require_topic_inventory(&admin, &topic)?;
+    println!(
+        "step=frozen-cut intermediate={intermediate_cut:?} final={final_cut:?} ru_counts={:?} rc_counts={:?} result=PASS",
+        final_uncommitted.each_ref().map(Vec::len),
+        final_committed.each_ref().map(Vec::len)
+    );
+
+    drop(successor);
+    drop(admin);
+    proxy.shutdown()?;
+    Ok(())
+}
+
+fn require_endtxn_evidence(
+    evidence: &EndTxnEvidence,
+    expected_outcome: FaultOutcome,
+    expected_client_id: &str,
+    expected_tx_id: &str,
+) -> ProbeResult<()> {
+    if evidence.classification != expected_outcome.classification()
+        || evidence.api_version != 1
+        || evidence.client_id != expected_client_id
+        || evidence.transactional_id != expected_tx_id
+        || !evidence.committed
+        || evidence.request_frame.len() != 27 + expected_client_id.len() + expected_tx_id.len()
+        || evidence.response_downstream_bytes != 0
+    {
+        return Err(format!(
+            "matched EndTxn evidence identity drift: {evidence:?}"
+        ));
+    }
+    match expected_outcome {
+        FaultOutcome::AppliedResponseLost
+            if evidence.request_upstream_bytes == evidence.request_frame.len()
+                && evidence
+                    .response_frame
+                    .as_ref()
+                    .is_some_and(|frame| frame.len() == 14)
+                && evidence.response_throttle_ms.is_some()
+                && evidence.response_error_code == Some(0)
+                && evidence.response_sha256.is_some() =>
+        {
+            Ok(())
+        }
+        FaultOutcome::UnappliedRequestHeld
+            if evidence.request_upstream_bytes == 0
+                && evidence.response_frame.is_none()
+                && evidence.response_throttle_ms.is_none()
+                && evidence.response_error_code.is_none()
+                && evidence.response_sha256.is_none() =>
+        {
+            Ok(())
+        }
+        _ => Err(format!(
+            "matched EndTxn byte disposition did not prove {}: {evidence:?}",
+            expected_outcome.classification()
+        )),
+    }
+}
+
+fn print_client_version() {
+    let (librdkafka_number, librdkafka_version) = rdkafka::util::get_rdkafka_version();
+    println!(
+        "rdkafka_crate=0.39.0 librdkafka_version={librdkafka_version} librdkafka_number={librdkafka_number:#x}"
+    );
+}
+
+fn print_endtxn_evidence(evidence: &EndTxnEvidence) {
+    println!(
+        "step=endtxn-actuation classification={} connection={} api_key=26 api_version={} correlation={} client_id={} transactional_id={} producer_id={} producer_epoch={} committed={} request_bytes={} request_upstream_bytes={} request_sha256={} response_bytes={} response_downstream_bytes={} response_throttle_ms={} response_error={} response_sha256={} result=PASS",
+        evidence.classification,
+        evidence.connection_id,
+        evidence.api_version,
+        evidence.correlation_id,
+        evidence.client_id,
+        evidence.transactional_id,
+        evidence.producer_id,
+        evidence.producer_epoch,
+        evidence.committed,
+        evidence.request_frame.len(),
+        evidence.request_upstream_bytes,
+        evidence.request_sha256,
+        evidence.response_frame.as_ref().map_or(0, Vec::len),
+        evidence.response_downstream_bytes,
+        evidence
+            .response_throttle_ms
+            .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+        evidence
+            .response_error_code
+            .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+        evidence.response_sha256.as_deref().unwrap_or("none"),
+    );
+    println!("endtxn_request_hex={}", evidence.request_hex());
+    println!(
+        "endtxn_response_hex={}",
+        evidence.response_hex().as_deref().unwrap_or("none")
+    );
+    println!("endtxn_events={}", evidence.events.join("|"));
 }
 
 fn create_admin(brokers: &str) -> ProbeResult<AdminClient<DefaultClientContext>> {
@@ -392,13 +775,60 @@ fn require_topic_inventory(
     }
 }
 
+fn require_proxy_route(
+    admin: &AdminClient<DefaultClientContext>,
+    expected: SocketAddr,
+) -> ProbeResult<()> {
+    let metadata = admin
+        .inner()
+        .fetch_metadata(None, Duration::from_secs(2))
+        .map_err(|error| format!("proxy-route metadata failed: {error}"))?;
+    let brokers = metadata.brokers();
+    if brokers.len() != 1
+        || brokers[0].host() != expected.ip().to_string()
+        || brokers[0].port() != i32::from(expected.port())
+    {
+        let observed = brokers
+            .iter()
+            .map(|broker| format!("{}:{}", broker.host(), broker.port()))
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "broker metadata could bypass proxy: expected [{expected}], observed {observed:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn freeze_high_watermarks(
+    admin: &AdminClient<DefaultClientContext>,
+    topic: &str,
+) -> ProbeResult<[i64; 3]> {
+    let mut high = [0_i64; 3];
+    for (index, partition) in PARTITIONS.into_iter().enumerate() {
+        let (low, partition_high) = admin
+            .inner()
+            .fetch_watermarks(topic, partition, IO_TIMEOUT)
+            .map_err(|error| {
+                format!("watermark fetch failed for partition {partition}: {error}")
+            })?;
+        if low != 0 || partition_high < 0 {
+            return Err(format!(
+                "unexpected frozen cut for partition {partition}: low={low} high={partition_high}"
+            ));
+        }
+        high[index] = partition_high;
+    }
+    Ok(high)
+}
+
 fn create_producer(
     brokers: &str,
     transactional_id: &str,
+    client_id: &str,
 ) -> ProbeResult<BaseProducer<ProbeProducerContext>> {
     ClientConfig::new()
         .set("bootstrap.servers", brokers)
-        .set("client.id", "ldb-kafka-transaction-probe-producer")
+        .set("client.id", client_id)
         .set("transactional.id", transactional_id)
         .set("enable.idempotence", "true")
         .set("acks", "all")
@@ -422,16 +852,24 @@ fn commit_marker(
     topic: &str,
     marker: &[u8],
 ) -> ProbeResult<()> {
+    stage_marker(producer, topic, marker)?;
+    producer
+        .commit_transaction(IO_TIMEOUT)
+        .map_err(|error| format!("commit marker transaction failed: {error}"))
+}
+
+fn stage_marker(
+    producer: &BaseProducer<ProbeProducerContext>,
+    topic: &str,
+    marker: &[u8],
+) -> ProbeResult<()> {
     producer
         .begin_transaction()
         .map_err(|error| format!("begin marker transaction failed: {error}"))?;
     for partition in PARTITIONS {
         send_record(producer, topic, partition, None, &[], marker, false)?;
     }
-    require_deliveries(producer, "marker", &PARTITIONS)?;
-    producer
-        .commit_transaction(IO_TIMEOUT)
-        .map_err(|error| format!("commit marker transaction failed: {error}"))
+    require_deliveries(producer, "marker", &PARTITIONS)
 }
 
 fn commit_replay_data(
@@ -456,6 +894,51 @@ fn commit_replay_data(
     producer
         .commit_transaction(IO_TIMEOUT)
         .map_err(|error| format!("commit data transaction failed: {error}"))
+}
+
+fn stage_replay_data(
+    producer: &BaseProducer<ProbeProducerContext>,
+    topic: &str,
+    interval: &[u8; 16],
+) -> ProbeResult<()> {
+    producer
+        .begin_transaction()
+        .map_err(|error| format!("begin staged data transaction failed: {error}"))?;
+    let header = encode_data_header(&[0xa1; 32], interval, 0)?;
+    send_record(
+        producer,
+        topic,
+        PARTITIONS[0],
+        Some(STABLE_KEY),
+        STABLE_PAYLOAD,
+        &header,
+        true,
+    )?;
+    require_deliveries(producer, "staged data", &[PARTITIONS[0]])
+}
+
+fn commit_selection_data(
+    producer: &BaseProducer<ProbeProducerContext>,
+    topic: &str,
+    selected_interval: &[u8; 16],
+) -> ProbeResult<()> {
+    producer
+        .begin_transaction()
+        .map_err(|error| format!("begin selection-data transaction failed: {error}"))?;
+    let header = encode_data_header(&[0xb1; 32], selected_interval, 0)?;
+    send_record(
+        producer,
+        topic,
+        PARTITIONS[0],
+        Some(SELECTION_KEY),
+        SELECTION_PAYLOAD,
+        &header,
+        true,
+    )?;
+    require_deliveries(producer, "selection data", &[PARTITIONS[0]])?;
+    producer
+        .commit_transaction(IO_TIMEOUT)
+        .map_err(|error| format!("commit selection-data transaction failed: {error}"))
 }
 
 fn commit_data_fanout(
@@ -637,7 +1120,49 @@ fn is_fence_code(code: RDKafkaErrorCode) -> bool {
     )
 }
 
+fn require_ambiguity_timeout(result: Result<(), KafkaError>) -> ProbeResult<()> {
+    match result {
+        Err(KafkaError::Transaction(error))
+            if error.code() == RDKafkaErrorCode::OperationTimedOut
+                && error.is_retriable()
+                && !error.is_fatal()
+                && !error.txn_requires_abort() =>
+        {
+            Ok(())
+        }
+        Err(KafkaError::Transaction(error)) => Err(format!(
+            "ambiguous commit did not return the exact retriable local timeout: code={:?} fatal={} retriable={} abortable={} error={error}",
+            error.code(),
+            error.is_fatal(),
+            error.is_retriable(),
+            error.txn_requires_abort()
+        )),
+        Err(error) => Err(format!(
+            "ambiguous commit did not return a transaction timeout: {error}"
+        )),
+        Ok(()) => Err("ambiguous commit unexpectedly returned success to producer A".to_owned()),
+    }
+}
+
 fn capture(brokers: &str, topic: &str, isolation: &str) -> ProbeResult<[Vec<Record>; 3]> {
+    capture_inner(brokers, topic, isolation, None)
+}
+
+fn capture_at_cut(
+    brokers: &str,
+    topic: &str,
+    isolation: &str,
+    frozen_high: &[i64; 3],
+) -> ProbeResult<[Vec<Record>; 3]> {
+    capture_inner(brokers, topic, isolation, Some(frozen_high))
+}
+
+fn capture_inner(
+    brokers: &str,
+    topic: &str,
+    isolation: &str,
+    frozen_high: Option<&[i64; 3]>,
+) -> ProbeResult<[Vec<Record>; 3]> {
     let group_id = format!("ldb-tx-probe-{isolation}-{}", process::id());
     let consumer: BaseConsumer = ClientConfig::new()
         .set("bootstrap.servers", brokers)
@@ -706,6 +1231,23 @@ fn capture(brokers: &str, topic: &str, isolation: &str) -> ProbeResult<[Vec<Reco
                 }
                 last_offsets[index] = message.offset();
                 records[index].push(detach_record(&message, isolation)?);
+            }
+        }
+    }
+    if let Some(expected) = frozen_high {
+        let positions = consumer
+            .position()
+            .map_err(|error| format!("{isolation} position fetch failed: {error}"))?;
+        for (index, partition) in PARTITIONS.into_iter().enumerate() {
+            let observed = positions
+                .find_partition(topic, partition)
+                .ok_or_else(|| format!("{isolation} position omitted partition {partition}"))?
+                .offset();
+            if observed != Offset::Offset(expected[index]) {
+                return Err(format!(
+                    "{isolation} did not reach frozen cut in partition {partition}: expected={} observed={observed:?}",
+                    expected[index]
+                ));
             }
         }
     }
@@ -829,6 +1371,105 @@ fn expected_records(
         }
     }
     Ok(expected)
+}
+
+fn expected_ambiguity_intermediate(
+    kind: AmbiguityKind,
+    outcome: AmbiguityOutcome,
+    include_aborted: bool,
+    first_marker: &[u8],
+    successor_marker: &[u8],
+) -> ProbeResult<[Vec<Record>; 3]> {
+    let candidate_visible = outcome == AmbiguityOutcome::Applied || include_aborted;
+    let mut expected: [Vec<Record>; 3] = array::from_fn(|_| Vec::new());
+    for (index, records) in expected.iter_mut().enumerate() {
+        records.push(marker_record(first_marker));
+        match kind {
+            AmbiguityKind::Marker if candidate_visible => {
+                records.push(marker_record(successor_marker));
+            }
+            AmbiguityKind::Data if candidate_visible && index == 0 => {
+                records.push(stable_replay_record(&FIRST_INTERVAL)?);
+            }
+            AmbiguityKind::Marker | AmbiguityKind::Data => {}
+        }
+    }
+    Ok(expected)
+}
+
+fn expected_ambiguity_final(
+    kind: AmbiguityKind,
+    outcome: AmbiguityOutcome,
+    include_aborted: bool,
+    first_marker: &[u8],
+    successor_marker: &[u8],
+) -> ProbeResult<[Vec<Record>; 3]> {
+    let mut expected = expected_ambiguity_intermediate(
+        kind,
+        outcome,
+        include_aborted,
+        first_marker,
+        successor_marker,
+    )?;
+    match kind {
+        AmbiguityKind::Marker => {
+            let selected = if outcome == AmbiguityOutcome::Applied {
+                &SUCCESSOR_INTERVAL
+            } else {
+                &FIRST_INTERVAL
+            };
+            expected[0].push(selection_record(selected)?);
+        }
+        AmbiguityKind::Data => {
+            for records in &mut expected {
+                records.push(marker_record(successor_marker));
+            }
+            expected[0].push(stable_replay_record(&SUCCESSOR_INTERVAL)?);
+        }
+    }
+    Ok(expected)
+}
+
+fn selection_record(selected_interval: &[u8; 16]) -> ProbeResult<Record> {
+    Ok(Record {
+        key: Some(SELECTION_KEY.to_vec()),
+        payload: Some(SELECTION_PAYLOAD.to_vec()),
+        header: encode_data_header(&[0xb1; 32], selected_interval, 0)?.to_vec(),
+        other_headers: trace_header(),
+    })
+}
+
+fn reconcile_marker_candidate(
+    committed: &[Vec<Record>; 3],
+    successor_marker: &[u8],
+) -> ProbeResult<&'static [u8; 16]> {
+    let counts = committed.each_ref().map(|records| {
+        records
+            .iter()
+            .filter(|record| record.header == successor_marker)
+            .count()
+    });
+    match counts {
+        [1, 1, 1] => Ok(&SUCCESSOR_INTERVAL),
+        [0, 0, 0] => Ok(&FIRST_INTERVAL),
+        _ => Err(format!(
+            "candidate marker reconciliation was partial, duplicate, or conflicting: {counts:?}"
+        )),
+    }
+}
+
+fn reconcile_data_candidate(committed: &[Vec<Record>; 3]) -> ProbeResult<bool> {
+    let expected = stable_replay_record(&FIRST_INTERVAL)?;
+    let counts = committed
+        .each_ref()
+        .map(|records| records.iter().filter(|record| **record == expected).count());
+    match counts {
+        [1, 0, 0] => Ok(true),
+        [0, 0, 0] => Ok(false),
+        _ => Err(format!(
+            "ambiguous data reconciliation was partial, duplicate, or conflicting: {counts:?}"
+        )),
+    }
 }
 
 fn marker_record(marker: &[u8]) -> Record {
@@ -1059,6 +1700,7 @@ mod tests {
                     run_id: Some("run_1".to_owned())
                 }
             ),
+            Command::RunAmbiguity(_) => panic!("valid deterministic arguments returned ambiguity"),
             Command::Help => panic!("valid arguments returned help"),
         }
         for hostile in [
@@ -1069,6 +1711,99 @@ mod tests {
             vec!["--brokers=x"],
             vec!["--brokers", " x"],
             vec!["--brokers", "x", "--run-id", "bad/id"],
+        ] {
+            assert!(parse_cli(hostile.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
+    fn ambiguity_cli_is_explicit_loopback_and_fail_closed() {
+        let command = parse_cli(
+            [
+                "--brokers",
+                "127.0.0.1:19192",
+                "--run-id",
+                "cycle56-a",
+                "--ambiguity",
+                "marker-applied",
+                "--proxy-upstream",
+                "127.0.0.1:19194",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap();
+        match command {
+            Command::RunAmbiguity(cli) => {
+                assert_eq!(cli.proxy_listen, "127.0.0.1:19192".parse().unwrap());
+                assert_eq!(cli.proxy_upstream, "127.0.0.1:19194".parse().unwrap());
+                assert_eq!(cli.run_id, "cycle56-a");
+                assert_eq!(
+                    cli.scenario,
+                    AmbiguityScenario {
+                        kind: AmbiguityKind::Marker,
+                        outcome: AmbiguityOutcome::Applied,
+                    }
+                );
+            }
+            Command::Run(_) | Command::Help => panic!("valid ambiguity arguments misclassified"),
+        }
+
+        for hostile in [
+            vec![
+                "--brokers",
+                "127.0.0.1:19192",
+                "--run-id",
+                "x",
+                "--ambiguity",
+                "marker-applied",
+            ],
+            vec![
+                "--brokers",
+                "127.0.0.1:19192",
+                "--proxy-upstream",
+                "127.0.0.1:19194",
+            ],
+            vec![
+                "--brokers",
+                "0.0.0.0:19192",
+                "--run-id",
+                "x",
+                "--ambiguity",
+                "data-unapplied",
+                "--proxy-upstream",
+                "127.0.0.1:19194",
+            ],
+            vec![
+                "--brokers",
+                "127.0.0.1:19192,127.0.0.1:19193",
+                "--run-id",
+                "x",
+                "--ambiguity",
+                "data-applied",
+                "--proxy-upstream",
+                "127.0.0.1:19194",
+            ],
+            vec![
+                "--brokers",
+                "127.0.0.1:19192",
+                "--run-id",
+                "x",
+                "--ambiguity",
+                "marker-applied",
+                "--proxy-upstream",
+                "127.0.0.1:19192",
+            ],
+            vec![
+                "--brokers",
+                "127.0.0.1:19192",
+                "--run-id",
+                "x",
+                "--ambiguity",
+                "unknown",
+                "--proxy-upstream",
+                "127.0.0.1:19194",
+            ],
         ] {
             assert!(parse_cli(hostile.into_iter().map(str::to_owned)).is_err());
         }
@@ -1107,6 +1842,15 @@ mod tests {
         assert!(derive_transactional_id(&DEPLOYMENT, &[0; 16], "sink", "shard").is_err());
         assert!(derive_transactional_id(&DEPLOYMENT, &INCARNATION, "", "shard").is_err());
         assert!(derive_transactional_id(&DEPLOYMENT, &INCARNATION, "sink", "").is_err());
+        assert!(derive_transactional_id(&DEPLOYMENT, &INCARNATION, "a\0b", "shard").is_err());
+        assert!(derive_transactional_id(&DEPLOYMENT, &INCARNATION, "sink", "a\0b").is_err());
+        assert!(
+            derive_transactional_id(&DEPLOYMENT, &INCARNATION, "sink", &"h".repeat(65)).is_err()
+        );
+        assert_ne!(
+            derive_transactional_id(&DEPLOYMENT, &INCARNATION, "é", "shard").unwrap(),
+            derive_transactional_id(&DEPLOYMENT, &INCARNATION, "e\u{301}", "shard").unwrap()
+        );
     }
 
     #[test]

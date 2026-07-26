@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 55
+- **Last reconciled:** 2026-07-26 during Cycle 56
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -13,7 +13,7 @@
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
   [TidesDB package design](tidesdb-local-state-successor-design.md),
   [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
-  [latest completed review](../reviews/distributed-keyed-state-cycle-55.md)
+  [latest completed review](../reviews/distributed-keyed-state-cycle-56.md)
 
 ## Decision
 
@@ -1181,6 +1181,63 @@ externally prove that a specific `EndTxn` request reached the broker while its m
 lost, retire that producer, and reconcile the complete read-committed marker set through a fenced
 successor. A broker kill, tiny client timeout, or generic proxy disconnect is not that proof.
 
+### Matched EndTxn ambiguity actuator v1 (validation only)
+
+The controlled ambiguity test is restricted to the exact Cycle 55 client and broker subject:
+`rdkafka 0.39.0` / librdkafka `2.12.1`, Redpanda `v26.1.13`, one broker, loopback-only
+PLAINTEXT, and no SASL. Librdkafka offers only `EndTxn` versions 0 and 1 and the tested broker offers
+versions 0 through 3, so negotiation must produce non-flexible version 1. The actuator observes and
+asserts that version; it never forces an API downgrade and fails closed on version drift.
+
+Kafka frames are read as a signed big-endian `i32` length followed by exactly that many bytes under
+a fixed validation-only cap. The selected request is API key 26 with request-header v1 and the exact
+client ID, transactional ID, producer ID, producer epoch, and `committed=true`. Its v1 response is
+response-header v0 plus `throttle_time_ms: i32` and `error_code: i16`. Correlation IDs are scoped by
+the accepted connection generation. The proxy retains the complete bounded target request/response
+bytes and SHA-256 values; it neither scans arbitrary TCP chunks nor remaps correlations. Complete
+non-target frames during the active lifecycle are forwarded byte-for-byte over a dedicated
+upstream connection.
+
+Only these two deliberate classifications are valid:
+
+- `FORWARDED_SUCCESS_RESPONSE_LOST`: the complete target request was written upstream; a complete
+  response with the same connection-scoped correlation ID and error zero was read; and zero bytes
+  of that response were written downstream.
+- `PRE_FORWARD_REJECTION`: the complete target request was read, but zero target bytes were written
+  upstream and no target response exists.
+
+A completed upstream write without the exact response is still `FORWARDED_OUTCOME_UNKNOWN`.
+Nonzero broker errors are `BROKER_REJECTED`. Unexpected partial frames outside signalled connection
+teardown, a second target attempt, an unknown or mismatched correlation, target-version drift, or
+any targeted downstream byte invalidate the run. Traffic from the exact target client after
+evidence finalization is also fatal rather than forwarded.
+The broker must advertise the proxy endpoint; using a proxy only as `bootstrap.servers` is invalid
+because coordinator discovery could bypass it.
+
+The matched actuation and the expected retriable local commit timeout must both complete before the
+target producer is destroyed while the actuator remains armed, and every
+connection observed with its exact client ID must close before a same-transactional-ID successor is
+initialized. This order prevents a background retry from deciding the experiment. A successful
+Redpanda `EndTxn` response proves the coordinator accepted the commit decision, not instantaneous
+data-partition marker visibility, so the semantic verdict comes only from bounded eventual
+reconciliation.
+
+Reconciliation freezes each test partition's high watermark after successor fencing and before new
+writes, directly assigns separate `read_committed` and `read_uncommitted` consumers from the
+beginning, and requires every final consumer position to equal that frozen cut. The candidate
+marker is selected only when it appears exactly once on every affected partition; absence on every
+partition selects the last confirmed predecessor. Partial, duplicate, conflicting, or incomplete
+capture admits no data. Four isolated topics cover marker and data transactions crossed with the
+two classifications. The data cases always commit a successor marker and replay the same logical
+record under its successor interval, so the exact committed/uncommitted transcript—not a client
+timeout—decides which predecessor attempt was visible.
+
+This actuator is deliberately not a reusable Kafka proxy. Multi-broker routing, TLS/SASL, arbitrary
+protocol versions, or address rewriting require a framework re-evaluation rather than expansion of
+this parser. Passing it still supplies no runtime connector, durable interval allocator, production
+topology/limits, replicated durability, source/state/sink atomicity, latency result, backend
+qualification, or independent soak evidence; production remains **NO-GO**.
+
 The controller also needs supported, bounded evidence projections rather than private object-store
 paths or text-log parsing. One local-node view must expose boot/process identity, locally adopted
 assignment version/digest, source-gate/recovery phase, and last applied recovery round. One
@@ -1191,9 +1248,10 @@ for the five checkpoint latency families; aggregate Prometheus histograms remain
 telemetry, not exact attempt evidence. Implement the delivery vertical in this order: executable
 oracle semantics, byte-golden envelopes/markers, pure identity/authority tests, fake transactional
 producer state-machine tests, deterministic real Kafka/Redpanda fencing/isolation, controlled
-ambiguous-outcome reconciliation, then engineering-harness wiring. Cycle 55 closes only the
-deterministic broker slice. Only the later independently operated release-binary soak can certify
-the completed vertical.
+ambiguous-outcome reconciliation, then engineering-harness wiring. Cycle 55 closes the deterministic
+broker slice and Cycle 56 closes the controlled one-broker ambiguity slice. Durable runtime interval
+authority and engineering integration remain open. Only the later independently operated
+release-binary soak can certify the completed vertical.
 
 End-to-end exactly-once is a later certification per concrete source/state/sink combination. It
 requires an exact-certified source and a checkpoint-committable external sink whose transaction
