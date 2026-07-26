@@ -83,6 +83,32 @@ impl crate::operator_graph::GraphOperator for DrainingCaptureOperator {
     }
 }
 
+struct PendingGraphPassOperator {
+    entered: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[async_trait::async_trait]
+impl crate::operator_graph::GraphOperator for PendingGraphPassOperator {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::test_probe()
+    }
+
+    async fn process(
+        &mut self,
+        _inputs: &[Vec<RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        if let Some(entered) = self.entered.take() {
+            let _ = entered.send(());
+        }
+        std::future::pending().await
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<crate::operator_graph::OperatorCheckpoint>, DbError> {
+        Ok(None)
+    }
+}
+
 #[cfg(feature = "cluster")]
 struct FollowerCheckpointEvidenceOperator;
 
@@ -187,6 +213,41 @@ fn empty_callback_fixture() -> ConnectorPipelineCallback {
         checkpoint_committable_sinks: false,
         intake_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }
+}
+
+#[tokio::test]
+async fn cancelled_graph_pass_is_a_sticky_pipeline_fault() {
+    let mut callback = empty_callback_fixture();
+    let (entered_tx, mut entered_rx) = tokio::sync::oneshot::channel();
+    callback.graph.push_test_node(
+        "pending-graph-pass",
+        Box::new(PendingGraphPassOperator {
+            entered: Some(entered_tx),
+        }),
+    );
+    let sources = FxHashMap::default();
+    let mut cycle = Box::pin(crate::pipeline::PipelineCallback::execute_cycle(
+        &mut callback,
+        &sources,
+        i64::MIN,
+    ));
+    tokio::select! {
+        entered = &mut entered_rx => entered.expect("pending operator dropped its signal"),
+        _ = &mut cycle => panic!("graph pass completed before cancellation"),
+        () = tokio::time::sleep(Duration::from_secs(5)) => {
+            panic!("graph pass did not reach the pending operator")
+        }
+    }
+    drop(cycle);
+
+    let first = crate::pipeline::PipelineCallback::take_pipeline_fault(&mut callback)
+        .expect("the callback must expose graph-generation poison");
+    assert!(first.contains("cancelled or panicked"), "{first}");
+    assert_eq!(
+        crate::pipeline::PipelineCallback::take_pipeline_fault(&mut callback),
+        Some(first),
+        "taking the supervisor fault must not clear the graph-generation fence"
+    );
 }
 
 #[test]

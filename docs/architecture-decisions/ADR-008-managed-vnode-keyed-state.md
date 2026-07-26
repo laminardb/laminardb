@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-25 during Cycle 45
+- **Last reconciled:** 2026-07-25 during Cycle 46
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -13,7 +13,7 @@
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
   [TidesDB package design](tidesdb-local-state-successor-design.md),
   [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
-  [latest completed review](../reviews/distributed-keyed-state-cycle-45.md)
+  [latest completed review](../reviews/distributed-keyed-state-cycle-46.md)
 
 ## Decision
 
@@ -264,6 +264,25 @@ recover prior learned-schema history. Pointer-identical live schemas stay on the
 and drift is rejected before ingest. This is operator-local checkpoint correctness: cancellation/
 panic poisoning, vnode ownership, rebalance, sink/source delivery contracts, backend qualification,
 and cluster admission remain open.
+
+Cycle 46 separates the current compute-root lifecycle from the borrowed graph API. Production
+normal/shutdown/checkpoint paths await each graph pass without timeout or `select!`; an operator
+panic unwinds and destroys the callback and graph before the compute-root supervisor faults and
+restores. A directly borrowed `OperatorGraph::execute_cycle` future could nevertheless be dropped
+after an operator mutated while graph inputs and partial results were future-local, leaving the same
+graph reusable and checkpointable. A real ASOF/downstream-pending test reproduced that retained-
+owner ambiguity before the fix. Each graph generation now owns a sticky atomic fence. One cycle-
+level guard arms after the cluster rotation read fence but before input/state admission, disarms on
+every explicit `Result`, and poisons on cancellation or unwind. A poisoned generation rejects
+normal execution, checkpoint drain, whole-state capture, and per-vnode capture as an indeterminate
+stateful apply; the callback exposes the same sticky condition to its existing pipeline-fault
+consumer. Only a newly built graph restored from the last committed checkpoint can replay. The
+normal path adds one atomic read and one `Arc` clone/drop per graph cycle, never per row/operator,
+and adds no task, timeout, lock, or I/O. This fence does not cover a future cancellation introduced
+after a checkpoint-drain graph pass returns while sink publication is pending, and it is not the
+future backend-owned poison needed when a native operation may outlive the Rust graph. Those
+delivery/native-owner boundaries, vnode ownership, backend qualification, and independent soak
+remain open; cluster admission is unchanged.
 
 #### Frozen Fjall/RocksDB evidence and selected TidesDB binding line
 

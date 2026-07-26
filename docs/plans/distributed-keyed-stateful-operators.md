@@ -3,7 +3,7 @@
 - **Status:** Planned and backend-gated; exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster
   operator is admitted by this document
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-25 during Cycle 45
+- **Last reconciled:** 2026-07-25 during Cycle 46
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -69,6 +69,20 @@ deriving that shape, while ambiguous empty v1 LEFT checkpoints fail recovery-clo
 checks buffer/index/schema coherence before one atomic install, and live right-schema drift fails
 before ingest. This does not solve cancellation/panic poisoning, distribution, rebalance, delivery,
 backend qualification, or independent soak, and admits no cluster capability.
+
+Cycle 46 closes the retained in-memory graph-generation ambiguity without adding a backend. A
+deterministic ASOF test proved that dropping a borrowed graph future after right-state mutation and
+downstream routing previously left the same graph checkpointable. A cycle-level cancellation guard
+now permanently fences that generation on drop/unwind; execute, drain, whole-state capture, and
+per-vnode capture all require a fresh graph restored from the last committed cut. Explicit returned
+errors retain their existing recovery/halt classification, and cancellation while waiting for the
+cluster rotation fence does not poison because no input/state has been admitted. Current production
+already awaits graph passes non-preemptively and destroys the graph on compute-root panic, so this is
+a direct-API/future-refactor invariant rather than evidence of a formerly reachable normal shutdown
+fault. It adds one atomic check and one `Arc` clone/drop per graph cycle, not per row/operator. A
+future cancellable checkpoint-delivery path and any native operation that can outlive the graph still
+need their own owner-level poison/publication fence. Distribution, rebalance, source/sink delivery,
+TidesDB qualification, cluster admission, and the independent soak remain open.
 
 ## Scope and non-goals
 

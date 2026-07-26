@@ -16,8 +16,11 @@ keeps analytic frame history unchanged until residual projection succeeds. [Cycl
 classifies returned ASOF failures after right-state mutation while retaining ordinary errors before
 mutation. [Cycle 45](../reviews/distributed-keyed-state-cycle-45.md) preserves the learned ASOF
 right schema after full eviction through a bounded, conditionally v1-compatible checkpoint v2 and
-validates restored index/schema coherence. Panic/cancellation poisoning remains open. None of
-these decisions changes cluster admission.
+validates restored index/schema coherence. [Cycle 46](../reviews/distributed-keyed-state-cycle-46.md)
+reproduces retained-owner cancellation/panic after real ASOF mutation and permanently fences that
+in-memory graph generation from execution or checkpoint capture. The future native-backend owner,
+checkpoint-delivery cancellation, and independent soak remain open. None of these decisions changes
+cluster admission.
 
 ## Verdict
 
@@ -82,6 +85,43 @@ Evidence:
 Startup is a second enforcement point. Persisted catalog entries are revalidated before connector
 creation, and residual cluster materialized state prevents startup. This prevents an old manifest
 or injected in-memory catalog from bypassing current DDL admission.
+
+### Graph execution cancellation and panic are now generation-fenced
+
+The production owner chain is intentionally non-preemptive at this boundary: the coordinator owns
+its callback and graph, directly awaits normal, shutdown-drain, and checkpoint graph passes, and
+checks shutdown/deadlines only between complete passes. A process panic unwinds through that owner
+chain; the outer compute-thread boundary catches it only after the callback and graph generation are
+destroyed, then fences intake and restores from durable authority. Therefore ordinary production
+shutdown did not cancel and retain a dirty graph before Cycle 46.
+
+The borrowed graph API had a distinct correctness hole. `execute_single_operator` moves graph input
+buffers into future-local vectors before awaiting `GraphOperator::process`. ASOF can install right
+rows and later await projection; a downstream operator can also suspend after ASOF routed its
+output. Dropping the borrowed cycle at that point discarded the taken inputs and partial results but
+left advanced ASOF state in a reusable graph. The Cycle 46 red test first checkpointed one right-side
+cut, admitted a newer quote plus a trade, waited for the real ASOF output at a downstream pending
+probe, dropped the cycle, and demonstrated that the same graph still accepted `snapshot_state`.
+A caught downstream panic reproduced the same retained-owner result.
+
+One graph-generation `Arc<AtomicBool>` and an armed cycle guard now close that boundary. The guard is
+created after the cluster rotation read fence is acquired and before restore closure, vnode apply,
+source priming, or operator execution. Any explicit `Ok` or `Err` disarms it, preserving existing
+recovery/halt dispositions; cancellation or unwind sets it permanently. Normal execution,
+checkpoint drain, whole-graph capture, and per-vnode capture check the fence and return
+`StatefulOperatorPartialApply`, which the existing callback maps to recovery. The callback's
+existing `take_pipeline_fault` consumer also observes the sticky graph condition. The fixed test
+proves that the old graph cannot execute or checkpoint and that a fresh graph restored from the
+preceding cut emits the newer ASOF match on one explicit replay invocation. It does not exercise a
+source cursor, callback output publication, sink epoch, or end-to-end exactly-once. Cancellation
+while merely waiting for vnode rotation remains usable because no input/state was admitted.
+
+This adds one atomic load and one `Arc` clone/drop per graph cycle, never per row/operator; there is
+no timeout, task spawn, lock, or I/O in the execution guard. It does not add bounded working state,
+make a checkpoint-delivery await cancellable, or fence a future TidesDB operation that can complete
+after its Rust request/graph is gone. Those require the callback/native owner to poison the complete
+publication/root generation. Cluster delivery also remains at-least-once only: best-effort and
+exactly-once cluster configurations are still rejected independently.
 
 ### Aggregate support is partial substrate, not an admitted feature
 

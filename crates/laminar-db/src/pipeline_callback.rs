@@ -5061,6 +5061,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         self.sink_fault
             .take()
             .or_else(|| self.checkpoint_fault.lock().take())
+            .or_else(|| self.graph.execution_poison_reason().map(str::to_owned))
     }
 
     async fn settle_checkpoint_tail_tasks(&mut self, abort: bool) -> Result<(), String> {

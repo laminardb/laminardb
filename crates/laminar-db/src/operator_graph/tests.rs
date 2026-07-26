@@ -1,5 +1,5 @@
 use super::*;
-use arrow::array::{Float64Array, Int64Array, StringArray};
+use arrow::array::{Array, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 
 fn test_schema() -> Arc<Schema> {
@@ -2329,6 +2329,64 @@ impl GraphOperator for DelayOperator {
     }
 }
 
+struct SignalThenPendingOperator {
+    entered: Option<tokio::sync::oneshot::Sender<(usize, Option<f64>)>>,
+}
+
+fn asof_probe_observation(inputs: &[Vec<RecordBatch>]) -> (usize, Option<f64>) {
+    let batches = inputs.iter().flat_map(|port| port.iter());
+    let rows = batches.clone().map(RecordBatch::num_rows).sum();
+    let bid = batches
+        .filter_map(|batch| batch.column_by_name("bid"))
+        .filter_map(|column| column.as_any().downcast_ref::<Float64Array>())
+        .find_map(|column| (!column.is_empty()).then(|| column.value(0)));
+    (rows, bid)
+}
+
+#[async_trait]
+impl GraphOperator for SignalThenPendingOperator {
+    fn cluster_capability(&self) -> OperatorCapability {
+        OperatorCapability::test_probe()
+    }
+
+    async fn process(
+        &mut self,
+        inputs: &[Vec<RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        if let Some(entered) = self.entered.take() {
+            let _ = entered.send(asof_probe_observation(inputs));
+        }
+        std::future::pending().await
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+        Ok(None)
+    }
+}
+
+struct PanicAfterInputOperator(Arc<parking_lot::Mutex<Option<(usize, Option<f64>)>>>);
+
+#[async_trait]
+impl GraphOperator for PanicAfterInputOperator {
+    fn cluster_capability(&self) -> OperatorCapability {
+        OperatorCapability::test_probe()
+    }
+
+    async fn process(
+        &mut self,
+        inputs: &[Vec<RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        *self.0.lock() = Some(asof_probe_observation(inputs));
+        panic!("injected panic after stateful upstream output");
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+        Ok(None)
+    }
+}
+
 /// Helper: total row count from result batches.
 fn total_rows(results: &FxHashMap<Arc<str>, Vec<RecordBatch>>, key: &str) -> usize {
     results
@@ -2344,6 +2402,92 @@ fn test_graph() -> OperatorGraph {
     // Debug builds are slow — use a generous budget for tests.
     graph.set_query_budget_ns(5_000_000_000); // 5 seconds
     graph
+}
+
+fn asof_execution_test_graph() -> OperatorGraph {
+    let mut graph = test_graph();
+    let config = laminar_sql::translator::AsofJoinTranslatorConfig {
+        left_table: "trades".to_string(),
+        right_table: "quotes".to_string(),
+        key_column: "symbol".to_string(),
+        left_time_column: "trade_ts".to_string(),
+        right_time_column: "quote_ts".to_string(),
+        direction: laminar_sql::parser::join_parser::AsofSqlDirection::Backward,
+        tolerance: None,
+        join_type: laminar_sql::translator::AsofSqlJoinType::Left,
+    };
+    let operator =
+        crate::operator::asof_join::AsofJoinOperator::new("asof", config, None, graph.ctx.clone());
+    let asof = graph
+        .place_operator_node("asof", Box::new(operator), 2)
+        .unwrap();
+    let trades = graph.ensure_source_node("trades");
+    let quotes = graph.ensure_source_node("quotes");
+    graph.add_edge(trades, asof, 0);
+    graph.add_edge(quotes, asof, 1);
+    graph.output_map.insert(Arc::from("asof"), asof);
+    graph.topo_dirty = true;
+    graph
+}
+
+fn append_asof_downstream_probe(graph: &mut OperatorGraph, operator: Box<dyn GraphOperator>) {
+    let asof = *graph.output_map.get("asof").expect("ASOF output node");
+    let probe = graph
+        .place_operator_node("asof_probe", operator, 1)
+        .unwrap();
+    graph.add_edge(asof, probe, 0);
+    graph.topo_dirty = true;
+}
+
+fn asof_trade_batch() -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("symbol", DataType::Utf8, false),
+        Field::new("trade_ts", DataType::Int64, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["AAPL"])),
+            Arc::new(Int64Array::from(vec![25])),
+        ],
+    )
+    .unwrap()
+}
+
+fn asof_quote_batch(quote_ts: i64, bid: f64) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("symbol", DataType::Utf8, false),
+        Field::new("quote_ts", DataType::Int64, false),
+        Field::new("bid", DataType::Float64, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["AAPL"])),
+            Arc::new(Int64Array::from(vec![quote_ts])),
+            Arc::new(Float64Array::from(vec![bid])),
+        ],
+    )
+    .unwrap()
+}
+
+fn asof_sources(trades: bool, quote: Option<(i64, f64)>) -> FxHashMap<Arc<str>, Vec<RecordBatch>> {
+    let mut sources = FxHashMap::default();
+    if trades {
+        sources.insert(Arc::from("trades"), vec![asof_trade_batch()]);
+    }
+    if let Some((quote_ts, bid)) = quote {
+        sources.insert(Arc::from("quotes"), vec![asof_quote_batch(quote_ts, bid)]);
+    }
+    sources
+}
+
+fn assert_graph_execution_poison(error: &DbError) {
+    let DbError::StatefulOperatorPartialApply(reason) = error else {
+        panic!("expected graph execution poison, got {error}");
+    };
+    assert!(reason.contains("cancelled or panicked"), "{reason}");
+    assert!(reason.contains("last committed checkpoint"), "{reason}");
 }
 
 struct AlwaysFailOperator;
@@ -3502,6 +3646,10 @@ async fn checkpoint_drain_failure_or_no_progress_preserves_pending_edges() {
         .await
         .expect_err("the checkpoint drain must preserve Fail backpressure semantics");
     assert!(matches!(error, DbError::BackpressureFail(_)));
+    assert!(
+        graph.execution_poison_reason().is_none(),
+        "an explicit returned error must retain its disposition without looking like cancellation"
+    );
     assert_eq!(graph.checkpoint_pending_input_bytes(), pending_before);
     assert!(!graph.checkpoint_is_quiescent());
 
@@ -3521,6 +3669,147 @@ async fn checkpoint_drain_failure_or_no_progress_preserves_pending_edges() {
         "an operator that declined buffered input must not advance its output watermark"
     );
     assert!(!graph.checkpoint_is_quiescent());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn cancellation_while_waiting_for_rotation_does_not_poison_graph() {
+    let mut graph = test_graph();
+    let fence = Arc::new(tokio::sync::RwLock::new(()));
+    graph.set_rotation_execution_fence(Arc::clone(&fence));
+    let rotation = fence.write().await;
+    let empty = FxHashMap::default();
+    let mut cycle = Box::pin(graph.execute_cycle(&empty, i64::MIN, None));
+
+    assert!(
+        matches!(futures::poll!(&mut cycle), std::task::Poll::Pending),
+        "the graph cycle must be waiting behind vnode rotation"
+    );
+    drop(cycle);
+    drop(rotation);
+
+    assert!(graph.execution_poison_reason().is_none());
+    graph
+        .execute_cycle(&empty, i64::MIN, None)
+        .await
+        .expect("no state or graph input was admitted before the rotation fence");
+}
+
+#[tokio::test]
+async fn cancelled_stateful_cycle_poison_requires_fresh_graph_restore() {
+    let mut graph = asof_execution_test_graph();
+    graph
+        .execute_cycle(&asof_sources(false, Some((10, 10.0))), i64::MIN, None)
+        .await
+        .unwrap();
+    let checkpoint = graph
+        .snapshot_state()
+        .unwrap()
+        .expect("ASOF right state should be checkpointed");
+    let checkpoint = OperatorGraph::serialize_checkpoint_bounded(&checkpoint, u64::MAX).unwrap();
+
+    let (entered_tx, mut entered_rx) = tokio::sync::oneshot::channel();
+    append_asof_downstream_probe(
+        &mut graph,
+        Box::new(SignalThenPendingOperator {
+            entered: Some(entered_tx),
+        }),
+    );
+    let replay = asof_sources(true, Some((20, 20.0)));
+    let mut cycle = Box::pin(graph.execute_cycle(&replay, i64::MIN, None));
+    let observation = tokio::select! {
+        entered = &mut entered_rx => entered.expect("pending probe dropped its signal"),
+        result = &mut cycle => panic!("cycle completed before cancellation: {result:?}"),
+        () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+            panic!("stateful output did not reach the pending probe")
+        }
+    };
+    assert_eq!(
+        observation,
+        (1, Some(20.0)),
+        "the cancelled pass must route the newly admitted ASOF quote"
+    );
+    drop(cycle);
+
+    let snapshot_error = match graph.snapshot_state() {
+        Err(error) => error,
+        Ok(_) => panic!("cancelled graph generation accepted a checkpoint"),
+    };
+    assert_graph_execution_poison(&snapshot_error);
+    #[cfg(feature = "cluster")]
+    {
+        let vnode_error = graph
+            .snapshot_state_by_vnode()
+            .expect_err("cancelled graph generation accepted a vnode checkpoint");
+        assert_graph_execution_poison(&vnode_error);
+    }
+
+    let execution_error = graph
+        .execute_cycle(&FxHashMap::default(), i64::MIN, None)
+        .await
+        .expect_err("cancelled graph generation executed again");
+    assert_graph_execution_poison(&execution_error);
+    let drain_error = graph
+        .execute_checkpoint_drain_cycle(i64::MIN, None)
+        .await
+        .expect_err("cancelled graph generation entered checkpoint drain");
+    assert_graph_execution_poison(&drain_error);
+
+    let (mut restored, restored_operators) = asof_execution_test_graph()
+        .restore_from_bytes(&checkpoint)
+        .unwrap();
+    assert_eq!(restored_operators, 1);
+    let output = restored
+        .execute_cycle(&replay, i64::MIN, None)
+        .await
+        .unwrap();
+    let batches = output.get("asof").expect("replayed ASOF output");
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    let bid = batches[0]
+        .column_by_name("bid")
+        .expect("ASOF bid")
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("Float64 bid");
+    assert_eq!(
+        bid.value(0),
+        20.0,
+        "fresh prior-cut restore must observe the newer replayed quote"
+    );
+}
+
+#[tokio::test]
+async fn caught_stateful_cycle_panic_poison_prevents_graph_reuse() {
+    use futures::FutureExt as _;
+
+    let mut graph = asof_execution_test_graph();
+    graph
+        .execute_cycle(&asof_sources(false, Some((10, 10.0))), i64::MIN, None)
+        .await
+        .unwrap();
+    let observation = Arc::new(parking_lot::Mutex::new(None));
+    append_asof_downstream_probe(
+        &mut graph,
+        Box::new(PanicAfterInputOperator(Arc::clone(&observation))),
+    );
+    let replay = asof_sources(true, Some((20, 20.0)));
+
+    let panic = std::panic::AssertUnwindSafe(graph.execute_cycle(&replay, i64::MIN, None))
+        .catch_unwind()
+        .await;
+    assert!(panic.is_err(), "the downstream probe must panic");
+    assert_eq!(*observation.lock(), Some((1, Some(20.0))));
+
+    let snapshot_error = match graph.snapshot_state() {
+        Err(error) => error,
+        Ok(_) => panic!("panicked graph generation accepted a checkpoint"),
+    };
+    assert_graph_execution_poison(&snapshot_error);
+    let execution_error = graph
+        .execute_cycle(&FxHashMap::default(), i64::MIN, None)
+        .await
+        .expect_err("panicked graph generation executed again");
+    assert_graph_execution_poison(&execution_error);
 }
 
 #[tokio::test]

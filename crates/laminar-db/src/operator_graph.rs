@@ -1,6 +1,7 @@
 //! Operator graph: wires streaming SQL operators into a DAG and drives them in topological order.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
@@ -141,6 +142,39 @@ enum GateDecision {
 enum GraphExecutionMode {
     Normal,
     CheckpointDrain,
+}
+
+const GRAPH_EXECUTION_POISON_REASON: &str =
+    "operator graph execution was cancelled or panicked after potentially mutating state; recovery \
+     from the last committed checkpoint is required";
+
+/// A graph cycle may hold operator mutation and graph-owned input in different futures. Only an
+/// explicit `Result` proves that the cycle reached its classification/cleanup boundary; unwind or
+/// cancellation permanently fences this graph generation.
+struct GraphExecutionAttemptGuard {
+    poisoned: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl GraphExecutionAttemptGuard {
+    fn new(poisoned: Arc<AtomicBool>) -> Self {
+        Self {
+            poisoned,
+            armed: true,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for GraphExecutionAttemptGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.poisoned.store(true, Ordering::Release);
+        }
+    }
 }
 
 const STATS_SAMPLE_INTERVAL: u64 = 32;
@@ -452,6 +486,9 @@ pub(crate) struct OperatorGraph {
     build_errors: Vec<DbError>,
     // Whole-graph restore is a one-shot startup transition and closes before the first cycle.
     whole_restore_open: bool,
+    // Sticky for this in-memory graph generation. A dropped/panicking execution attempt may have
+    // advanced operator state while losing graph-local inputs/results; only fresh restore is safe.
+    execution_poisoned: Arc<AtomicBool>,
     #[cfg(feature = "cluster")]
     cluster_shuffle: Option<crate::operator::sql_query::ClusterShuffleConfig>,
     #[cfg(feature = "cluster")]
@@ -541,6 +578,7 @@ impl OperatorGraph {
             reference_tables: FxHashSet::default(),
             build_errors: Vec::new(),
             whole_restore_open: true,
+            execution_poisoned: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -2272,12 +2310,31 @@ impl OperatorGraph {
         source_watermarks: Option<&FxHashMap<Arc<str>, i64>>,
         mode: GraphExecutionMode,
     ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
-        self.whole_restore_open = false;
+        self.ensure_execution_not_poisoned()?;
         #[cfg(feature = "cluster")]
         let _rotation_guard = match self.rotation_execution_fence.as_ref() {
             Some(fence) => Some(Arc::clone(fence).read_owned().await),
             None => None,
         };
+
+        // Waiting for the cluster rotation fence has not admitted input or touched operator state.
+        // Arm only after it is held so cancellation while ownership is rotating is not poisoned.
+        let mut attempt = GraphExecutionAttemptGuard::new(Arc::clone(&self.execution_poisoned));
+        let result = self
+            .execute_cycle_attempt(source_batches, current_watermark, source_watermarks, mode)
+            .await;
+        attempt.complete();
+        result
+    }
+
+    async fn execute_cycle_attempt(
+        &mut self,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        current_watermark: i64,
+        source_watermarks: Option<&FxHashMap<Arc<str>, i64>>,
+        mode: GraphExecutionMode,
+    ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
+        self.whole_restore_open = false;
 
         #[cfg(feature = "cluster")]
         {
@@ -2409,6 +2466,19 @@ impl OperatorGraph {
         self.complete_cycle(&failed_domains, first_error)?;
 
         Ok(results)
+    }
+
+    fn ensure_execution_not_poisoned(&self) -> Result<(), DbError> {
+        match self.execution_poison_reason() {
+            Some(reason) => Err(DbError::StatefulOperatorPartialApply(reason.to_string())),
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn execution_poison_reason(&self) -> Option<&'static str> {
+        self.execution_poisoned
+            .load(Ordering::Acquire)
+            .then_some(GRAPH_EXECUTION_POISON_REASON)
     }
 
     fn complete_cycle(
@@ -3314,6 +3384,7 @@ impl OperatorGraph {
     }
 
     pub fn snapshot_state(&mut self) -> Result<Option<GraphCheckpoint>, DbError> {
+        self.ensure_execution_not_poisoned()?;
         let mut operators = OperatorStateMap::new();
         for node in &mut self.nodes {
             if node.removed {
@@ -3338,6 +3409,7 @@ impl OperatorGraph {
     pub fn snapshot_state_by_vnode(
         &mut self,
     ) -> Result<crate::checkpoint_coordinator::StagedVnodeStates, DbError> {
+        self.ensure_execution_not_poisoned()?;
         let Some(vnode_count) = self.vnode_count else {
             return Ok(std::collections::HashMap::new());
         };
