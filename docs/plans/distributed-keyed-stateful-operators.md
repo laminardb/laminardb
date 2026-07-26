@@ -3,7 +3,7 @@
 - **Status:** Planned and backend-gated; exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster
   operator is admitted by this document
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-25 during Cycle 44
+- **Last reconciled:** 2026-07-25 during Cycle 45
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -62,6 +62,13 @@ Cycle 44 makes returned ASOF failures replay-safe: ingest errors remain pre-appl
 errors become recovery-required only after current-cycle right state or schema changes; and a
 returned eviction error is recovery-required after pruning begins. Panic/cancellation poisoning and
 empty-buffer right-schema checkpoint/restore remain open. No cluster capability is admitted.
+
+Cycle 45 versions the ASOF operator checkpoint without changing its v1 buffer body. A bounded schema
+appendix preserves learned right-side shape when no rows remain; non-empty v1 checkpoints migrate by
+deriving that shape, while ambiguous empty v1 LEFT checkpoints fail recovery-closed. Restore also
+checks buffer/index/schema coherence before one atomic install, and live right-schema drift fails
+before ingest. This does not solve cancellation/panic poisoning, distribution, rebalance, delivery,
+backend qualification, or independent soak, and admits no cluster capability.
 
 ## Scope and non-goals
 

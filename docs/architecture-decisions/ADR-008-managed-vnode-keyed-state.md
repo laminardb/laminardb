@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-25 during Cycle 44
+- **Last reconciled:** 2026-07-25 during Cycle 45
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -13,7 +13,7 @@
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
   [TidesDB package design](tidesdb-local-state-successor-design.md),
   [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
-  [latest completed review](../reviews/distributed-keyed-state-cycle-44.md)
+  [latest completed review](../reviews/distributed-keyed-state-cycle-45.md)
 
 ## Decision
 
@@ -247,6 +247,23 @@ fallible compaction. Existing recovery/halt dispositions remain stronger. This c
 errors, not panic or cancellation after ingest; sticky attempt/root poison remains open. ASOF's
 learned right schema is also not yet represented when an empty buffer is checkpointed, so complete
 restore remains open and cluster admission remains unchanged.
+
+Cycle 45 closes that local ASOF restore gap without changing the v1 rkyv buffer body. Checkpoint v2
+adds a length-delimited, header-only Arrow schema appendix only when compaction leaves no retained
+right rows; a retained batch remains the sole schema authority. Source-schema memory, appendix wire,
+and decoded-schema memory are bounded at 256 KiB, 512 KiB, and 1 MiB. Byte-level frame preflight
+checks declared Arrow bodies against the available payload before Arrow may allocate; schema streams
+must contain only a schema plus EOS, and retained buffers exactly one batch plus EOS. Restore validates
+schema/key/time compatibility and every persisted index-to-row mapping and tie order before atomically
+replacing buffer, watermark, and learned schema. Checkpointability is enforced before first ingest
+and during restore: first admission executes the exact bounded schema encoder and framing preflight,
+while later pointer-distinct schemas recheck memory before structural equality because equality omits
+allocation capacity. In-limit non-empty v1 checkpoints derive their schema; ambiguous empty v1 LEFT
+checkpoints fail recovery-closed, while empty v1 INNER checkpoints remain compatible but cannot
+recover prior learned-schema history. Pointer-identical live schemas stay on the immediate fast path
+and drift is rejected before ingest. This is operator-local checkpoint correctness: cancellation/
+panic poisoning, vnode ownership, rebalance, sink/source delivery contracts, backend qualification,
+and cluster admission remain open.
 
 #### Frozen Fjall/RocksDB evidence and selected TidesDB binding line
 

@@ -14,8 +14,10 @@ corrects current aggregate failure classification and proves synchronous output/
 exclusion after an indeterminate apply. [Cycle 43](../reviews/distributed-keyed-state-cycle-43.md)
 keeps analytic frame history unchanged until residual projection succeeds. [Cycle 44](../reviews/distributed-keyed-state-cycle-44.md)
 classifies returned ASOF failures after right-state mutation while retaining ordinary errors before
-mutation; panic/cancellation poisoning and right-schema checkpoint completeness remain open. None
-of these decisions changes cluster admission.
+mutation. [Cycle 45](../reviews/distributed-keyed-state-cycle-45.md) preserves the learned ASOF
+right schema after full eviction through a bounded, conditionally v1-compatible checkpoint v2 and
+validates restored index/schema coherence. Panic/cancellation poisoning remains open. None of
+these decisions changes cluster admission.
 
 ## Verdict
 

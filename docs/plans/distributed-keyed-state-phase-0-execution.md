@@ -592,9 +592,12 @@ Remaining work is kept reviewable in this dependency order:
    history is committed only after residual projection succeeds, so a failed/cancelled projection
    leaves the prior history replay-safe. Cycle 44 precisely separates ASOF pre-ingest failures from
    returned failures after right state changes and recovery-classifies fallible eviction after
-   pruning. Panic/cancellation poisoning and the missing empty-buffer right-schema checkpoint remain
-   open. A backend-owned sticky root/process poison, resource/health admission, and fresh-root
-   fencing must land only with a real runtime consumer rather than a disconnected future trait;
+   pruning. Cycle 45 preserves the learned ASOF right schema across complete eviction by adding a
+   bounded v2 schema appendix around the unchanged v1 buffer body, conditionally migrates v1, and
+   validates restored index/schema coherence before atomic installation. Panic/cancellation
+   poisoning remains open. A backend-owned sticky root/process poison, resource/health admission,
+   and fresh-root fencing must land only with a real runtime consumer rather than a disconnected
+   future trait;
 4. wait for a new official Cargo package `tidesdb`, freeze its exact native pair, and repeat the
    complete one-day/zero-machine-hour T0. The repeated T0 must reconcile every later native fix and
    prove exact transaction success or explicitly accept the full-key verified-commit/fail-stop

@@ -432,9 +432,17 @@ impl AsofRightBuffer {
             idx_map.insert(old_idx, new_idx);
         }
 
-        #[allow(clippy::cast_possible_truncation)]
         let take_indices = arrow::array::UInt32Array::from(
-            live_rows.iter().map(|&i| i as u32).collect::<Vec<_>>(),
+            live_rows
+                .iter()
+                .copied()
+                .map(u32::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| {
+                    DbError::Pipeline(
+                        "ASOF compaction row index exceeds the u32 take limit".to_string(),
+                    )
+                })?,
         );
         let schema = batch.schema();
         let columns: Result<Vec<ArrayRef>, _> = (0..batch.num_columns())
@@ -554,10 +562,128 @@ pub(crate) fn execute_asof_join_with_state(
     )
 }
 
-/// Serializable checkpoint for `AsofRightBuffer`. Row indices are `u32` (half the footprint of `usize`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IpcStreamShape {
+    SchemaOnly,
+    OneBatch,
+}
+
+/// Validate message boundaries before Arrow's reader allocates each declared message body.
+fn validate_ipc_stream_shape(
+    bytes: &[u8],
+    max_schema_metadata_bytes: usize,
+    expected: IpcStreamShape,
+) -> Result<(), String> {
+    const CONTINUATION_MARKER: [u8; 4] = [0xff; 4];
+
+    let mut offset = 0usize;
+    let mut saw_schema = false;
+    let mut record_batches = 0usize;
+    loop {
+        let prefix_end = offset
+            .checked_add(8)
+            .ok_or_else(|| "Arrow IPC message prefix overflow".to_string())?;
+        if prefix_end > bytes.len() {
+            return Err("Arrow IPC stream is missing a complete message prefix or EOS".to_string());
+        }
+        if bytes[offset..offset + 4] != CONTINUATION_MARKER {
+            return Err("Arrow IPC stream requires modern continuation markers".to_string());
+        }
+        let metadata_len = usize::try_from(u32::from_le_bytes(
+            bytes[offset + 4..prefix_end]
+                .try_into()
+                .expect("validated Arrow IPC metadata-length prefix"),
+        ))
+        .map_err(|_| "Arrow IPC metadata length does not fit this process".to_string())?;
+        if metadata_len == 0 {
+            if prefix_end != bytes.len() {
+                return Err("Arrow IPC stream has bytes after EOS".to_string());
+            }
+            if !saw_schema {
+                return Err("Arrow IPC stream reached EOS before its schema".to_string());
+            }
+            let expected_batches = usize::from(expected == IpcStreamShape::OneBatch);
+            if record_batches != expected_batches {
+                return Err(format!(
+                    "Arrow IPC stream contains {record_batches} record batches; expected {expected_batches}"
+                ));
+            }
+            return Ok(());
+        }
+        if !saw_schema && metadata_len > max_schema_metadata_bytes {
+            return Err(format!(
+                "Arrow IPC schema metadata is {metadata_len} bytes; maximum is {max_schema_metadata_bytes}"
+            ));
+        }
+        let metadata_end = prefix_end
+            .checked_add(metadata_len)
+            .ok_or_else(|| "Arrow IPC metadata length overflow".to_string())?;
+        if metadata_end > bytes.len() {
+            return Err("Arrow IPC metadata exceeds the stream".to_string());
+        }
+        let message = arrow_ipc::root_as_message(&bytes[prefix_end..metadata_end])
+            .map_err(|error| format!("invalid Arrow IPC message metadata: {error}"))?;
+        let body_len = usize::try_from(message.bodyLength())
+            .map_err(|_| "Arrow IPC body length is negative or unaddressable".to_string())?;
+        let body_end = metadata_end
+            .checked_add(body_len)
+            .ok_or_else(|| "Arrow IPC body length overflow".to_string())?;
+        if body_end > bytes.len() {
+            return Err("Arrow IPC body exceeds the stream".to_string());
+        }
+
+        if saw_schema {
+            match message.header_type() {
+                arrow_ipc::MessageHeader::DictionaryBatch
+                    if expected == IpcStreamShape::OneBatch
+                        && record_batches == 0
+                        && message.header_as_dictionary_batch().is_some() => {}
+                arrow_ipc::MessageHeader::RecordBatch
+                    if expected == IpcStreamShape::OneBatch
+                        && record_batches == 0
+                        && message.header_as_record_batch().is_some() =>
+                {
+                    record_batches = 1;
+                }
+                arrow_ipc::MessageHeader::DictionaryBatch => {
+                    return Err(
+                        "Arrow IPC dictionary message is not canonical in this position"
+                            .to_string(),
+                    );
+                }
+                arrow_ipc::MessageHeader::RecordBatch => {
+                    return Err("Arrow IPC stream contains an unexpected record batch".to_string());
+                }
+                _ => {
+                    return Err("Arrow IPC stream contains an unexpected message type".to_string());
+                }
+            }
+        } else {
+            if message.header_type() != arrow_ipc::MessageHeader::Schema
+                || message.header_as_schema().is_none()
+                || body_len != 0
+            {
+                return Err("Arrow IPC first message is not a bodyless schema".to_string());
+            }
+            saw_schema = true;
+        }
+        offset = body_end;
+    }
+}
+
+pub(crate) fn validate_schema_only_ipc(
+    bytes: &[u8],
+    max_schema_metadata_bytes: usize,
+) -> Result<(), String> {
+    validate_ipc_stream_shape(bytes, max_schema_metadata_bytes, IpcStreamShape::SchemaOnly)
+}
+
+/// Version-1 wire body for `AsofRightBuffer`; fields and field order are persisted ABI.
+/// Row indices are `u32` (half the footprint of `usize`).
 #[derive(
     serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
+#[cfg_attr(test, derive(Clone, Debug))]
 pub(crate) struct AsofBufferCheckpoint {
     #[serde(default)]
     pub right_buffer_ipc: Vec<u8>,
@@ -593,8 +719,16 @@ impl AsofRightBuffer {
         let mut index_entries = Vec::new();
         for (&key_hash, btree) in &self.index {
             for (&ts, indices) in btree {
-                #[allow(clippy::cast_possible_truncation)]
-                let narrow: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
+                let narrow = indices
+                    .iter()
+                    .copied()
+                    .map(u32::try_from)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| {
+                        DbError::Pipeline(
+                            "ASOF checkpoint row index exceeds the u32 wire format".to_string(),
+                        )
+                    })?;
                 index_entries.push((key_hash, ts, narrow));
             }
         }
@@ -606,10 +740,23 @@ impl AsofRightBuffer {
         })
     }
 
-    pub fn from_checkpoint(cp: &AsofBufferCheckpoint) -> Result<(Self, i64), DbError> {
+    pub fn from_checkpoint(
+        cp: &AsofBufferCheckpoint,
+        key_col: &str,
+        time_col: &str,
+        max_schema_metadata_bytes: usize,
+    ) -> Result<(Self, i64), DbError> {
         let right_concat = if cp.right_buffer_ipc.is_empty() {
             None
         } else {
+            validate_ipc_stream_shape(
+                &cp.right_buffer_ipc,
+                max_schema_metadata_bytes,
+                IpcStreamShape::OneBatch,
+            )
+            .map_err(|error| {
+                DbError::Pipeline(format!("ASOF checkpoint right buffer framing: {error}"))
+            })?;
             Some(
                 laminar_core::serialization::deserialize_batch_stream(&cp.right_buffer_ipc)
                     .map_err(|e| {
@@ -621,9 +768,95 @@ impl AsofRightBuffer {
         };
 
         let mut index: RightIndex = FxHashMap::default();
-        for (key_hash, ts, indices) in &cp.index_entries {
-            let widened: Vec<usize> = indices.iter().map(|&i| i as usize).collect();
-            index.entry(*key_hash).or_default().insert(*ts, widened);
+        if let Some(batch) = right_concat.as_ref() {
+            if batch.num_rows() == 0 {
+                return Err(DbError::Pipeline(
+                    "ASOF checkpoint retained an empty right batch".to_string(),
+                ));
+            }
+            let keys = extract_key_column(batch, key_col)?;
+            let timestamps = extract_column_as_timestamps(batch, time_col)?;
+            let indexed_rows =
+                cp.index_entries
+                    .iter()
+                    .try_fold(0usize, |total, (_, _, indices)| {
+                        total.checked_add(indices.len()).ok_or_else(|| {
+                            DbError::Pipeline(
+                                "ASOF checkpoint index row-count overflow".to_string(),
+                            )
+                        })
+                    })?;
+            if indexed_rows != batch.num_rows() {
+                return Err(DbError::Pipeline(format!(
+                    "ASOF checkpoint index contains {indexed_rows} rows for a {}-row right buffer",
+                    batch.num_rows()
+                )));
+            }
+            let mut seen = vec![false; batch.num_rows()];
+
+            for (key_hash, ts, indices) in &cp.index_entries {
+                if indices.is_empty() {
+                    return Err(DbError::Pipeline(
+                        "ASOF checkpoint index contains an empty row list".to_string(),
+                    ));
+                }
+                if !indices.windows(2).all(|pair| pair[0] < pair[1]) {
+                    return Err(DbError::Pipeline(
+                        "ASOF checkpoint index rows are not strictly increasing".to_string(),
+                    ));
+                }
+                let mut widened = Vec::with_capacity(indices.len());
+                for &narrow in indices {
+                    let row = usize::try_from(narrow).map_err(|_| {
+                        DbError::Pipeline(
+                            "ASOF checkpoint row index does not fit this process".to_string(),
+                        )
+                    })?;
+                    if row >= batch.num_rows() {
+                        return Err(DbError::Pipeline(format!(
+                            "ASOF checkpoint row index {row} exceeds the {}-row right buffer",
+                            batch.num_rows()
+                        )));
+                    }
+                    if seen[row] {
+                        return Err(DbError::Pipeline(format!(
+                            "ASOF checkpoint row index {row} is duplicated"
+                        )));
+                    }
+                    let actual_hash = keys.hash_at(row).ok_or_else(|| {
+                        DbError::Pipeline(format!(
+                            "ASOF checkpoint indexed null key at right-buffer row {row}"
+                        ))
+                    })?;
+                    if actual_hash != *key_hash || timestamps[row] != *ts {
+                        return Err(DbError::Pipeline(format!(
+                            "ASOF checkpoint index does not match right-buffer row {row}"
+                        )));
+                    }
+                    seen[row] = true;
+                    widened.push(row);
+                }
+                if index
+                    .entry(*key_hash)
+                    .or_default()
+                    .insert(*ts, widened)
+                    .is_some()
+                {
+                    return Err(DbError::Pipeline(
+                        "ASOF checkpoint repeats a key/timestamp index entry".to_string(),
+                    ));
+                }
+            }
+
+            if let Some(row) = seen.iter().position(|was_seen| !was_seen) {
+                return Err(DbError::Pipeline(format!(
+                    "ASOF checkpoint right-buffer row {row} is missing from the index"
+                )));
+            }
+        } else if !cp.index_entries.is_empty() {
+            return Err(DbError::Pipeline(
+                "ASOF checkpoint has index entries without a right buffer".to_string(),
+            ));
         }
 
         Ok((
@@ -634,6 +867,16 @@ impl AsofRightBuffer {
             },
             cp.last_evicted_watermark,
         ))
+    }
+
+    #[must_use]
+    pub fn retained_schema(&self) -> Option<SchemaRef> {
+        self.right_concat.as_ref().map(RecordBatch::schema)
+    }
+
+    #[must_use]
+    pub fn is_logically_empty(&self) -> bool {
+        self.index.is_empty()
     }
 }
 
