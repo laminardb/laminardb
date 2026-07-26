@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 51
+- **Last reconciled:** 2026-07-26 during Cycle 52
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -13,7 +13,7 @@
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
   [TidesDB package design](tidesdb-local-state-successor-design.md),
   [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
-  [latest completed review](../reviews/distributed-keyed-state-cycle-51.md)
+  [latest completed review](../reviews/distributed-keyed-state-cycle-52.md)
 
 ## Decision
 
@@ -911,9 +911,99 @@ derives vnode-to-shard ownership, and distinguishes missing evidence (`RUN_INVAL
 evidence proving malformed or stale output (`PRODUCT_FAIL`). Assignment ownership and process term
 are deliberately pre-reconciled fixture evidence; production still needs the separate supported
 assignment and local-process views described below. The fixture ABI checks vnode-to-shard routing,
-not final Kafka partition bytes. It adds no wire encoding, Kafka transaction, runtime dependency,
-public endpoint, delivery guarantee, or certification evidence; compact byte freezing and hostile
-wire decoding remain the next step.
+not final Kafka partition bytes. Cycle 51 added no wire encoding, Kafka transaction, runtime
+dependency, public endpoint, delivery guarantee, or certification evidence. Cycle 52 adds only the
+standalone byte contract and hostile decoding described next; the production gaps remain.
+
+### Distributed output envelope v1
+
+Cycle 52 freezes one admission-neutral binary envelope for the future Kafka output contract. This
+is the sole normative byte table; the root-excluded standalone codec and other documents must
+conform to it rather than define another format. It does not mean that current Kafka records carry
+these bytes.
+
+Every integer is unsigned big-endian. The common ten-byte prefix is:
+
+| Offset | Width | Field |
+| ---: | ---: | --- |
+| 0 | 4 | magic `LDBO` |
+| 4 | 1 | wire version, exactly `1` |
+| 5 | 1 | kind: `1` data header, `2` partition marker |
+| 6 | 2 | flags |
+| 8 | 2 | body byte length, excluding this prefix |
+
+The supplied slice must be exactly `10 + body_length` bytes. Unknown magic, version, kind, or flag;
+truncation; a declared-length mismatch; and trailing bytes are errors with no fallback. The data
+kind permits no flags and has this fixed 56-byte body:
+
+| Body offset | Width | Field |
+| ---: | ---: | --- |
+| 0 | 32 | opaque replay-stable operation ID |
+| 32 | 16 | nonzero writer-interval ID |
+| 48 | 8 | checked sink-admission sequence |
+
+The complete data header is therefore exactly **66 bytes**. Both IDs are nonzero; the codec accepts
+the full `u64` sequence range because checked range reservation and overflow are state-machine
+semantics, not alternate wire encodings. The Kafka payload stays separate and byte-for-byte
+unchanged. No payload digest, key, vnode, shard, ABI, assignment, process, checkpoint, source
+position, or broker metadata is repeated in this per-record header. `operation_id_v1` and writer-
+interval derivation remain the next pure identity/authority step; this cycle freezes only their
+widths and transport representation.
+
+Marker flag bit 0 is `HAS_PREDECESSOR`; every other bit is invalid. Its body begins with this fixed
+296-byte block:
+
+| Body offset | Width | Field |
+| ---: | ---: | --- |
+| 0 | 16 | nonzero current/successor interval ID |
+| 16 | 16 | predecessor interval ID, or all zero |
+| 32 | 16 | non-nil deployment UUID bytes |
+| 48 | 16 | nonzero pipeline-incarnation ID |
+| 64 | 2 | pipeline-identity canonical version, exactly `3` |
+| 66 | 32 | pipeline-identity SHA-256 |
+| 98 | 2 | key-to-vnode ABI version, exactly `1` |
+| 100 | 2 | sink-partitioning ABI version, exactly `1` |
+| 102 | 2 | vnode count, `1..=65_535` |
+| 104 | 8 | nonzero current assignment version |
+| 112 | 32 | current assignment-certificate SHA-256 evidence reference |
+| 144 | 8 | nonzero writer node ID |
+| 152 | 16 | non-nil writer boot UUID bytes |
+| 168 | 8 | nonzero durable writer-process term |
+| 176 | 8 | nonzero recovery epoch |
+| 184 | 8 | nonzero recovery checkpoint ID |
+| 192 | 32 | recovery-capsule SHA-256 |
+| 224 | 8 | nonzero recovery-base assignment version |
+| 232 | 32 | recovery-base assignment-certificate SHA-256 evidence reference |
+| 264 | 32 | sink-topology SHA-256 |
+
+Every SHA-256 field is raw 32-byte output and cannot be all zero. The fixed block is followed, in
+order, by four `u8 byte_length | UTF-8 bytes` fields: sink ID (maximum 128 bytes), operator ID
+(128), output ID (128), and sink-writer shard ID (64). Each is nonempty and contains no NUL byte;
+identity is exact UTF-8 bytes and this format performs no Unicode normalization. The final section
+is an owned-vnode bitmap of exactly `ceil(vnode_count / 8)` bytes. Vnode `n` uses
+`bitmap[n / 8] & (1 << (n % 8))`; at least one bit is set and unused high bits in the final byte are
+zero. Recovery epoch and checkpoint ID are the same nonzero canonical attempt number. A first marker
+clears `HAS_PREDECESSOR` and has an all-zero predecessor ID. A successor sets the flag and has a
+nonzero predecessor ID different from its current interval.
+
+The maximum marker body is **8,940 bytes**: 296 fixed bytes, four length bytes, 448 identifier bytes,
+and the 8,192-byte bitmap for 65,535 vnodes. The complete marker is at most **8,950 bytes**. A
+standalone batch characterization is capped before decoding at 65,536 data headers and 4,325,376
+header bytes; payload bytes are outside that figure. Readers return borrowed identifier/bitmap
+views, check caps and arithmetic before allocation or indexing, and consume the complete slice.
+The cap applies to one codec-facing transport batch; a fixture case models a whole capture and may
+contain multiple such batches. This is structural characterization, not a latency benchmark or an
+allocator-instrumented production measurement.
+There is no envelope checksum because Kafka's record-batch CRC protects the transported record;
+the independent reader still compares the untouched payload bytes separately.
+
+The intended Kafka placement reserves the case-sensitive header key `__ldb`. A future conforming
+data record has exactly one such header whose value is the 66-byte envelope. A marker has exactly
+one such header, a null Kafka key, and an empty but non-null Kafka value, and is written explicitly
+to each affected partition; its common envelope bytes are identical across those partitions.
+Broker topic, partition, offset, and timestamp remain capture metadata. Missing or duplicate
+reserved headers fail closed; unrelated application headers remain allowed. This freezes intended
+placement only—no current connector encodes, publishes, reads, or fences this contract.
 
 The controller also needs supported, bounded evidence projections rather than private object-store
 paths or text-log parsing. One local-node view must expose boot/process identity, locally adopted

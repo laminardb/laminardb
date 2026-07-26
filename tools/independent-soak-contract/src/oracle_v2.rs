@@ -2,12 +2,16 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 
+use super::wire_v1;
+
 use super::{expect_equal, CheckErrors, FixtureSummary, NOTICE};
 
 const SCHEMA_VERSION: &str = "independent-oracle-fixture/v2";
 const ABI: &str = "fixture-utf8-byte-sum-mod-v1";
 const PARTITIONING_ABI: &str = "fixture-sink-shard-partition-map-v1";
 const ENVELOPE_VERSION: u16 = 1;
+const PIPELINE_IDENTITY_VERSION: u16 = 3;
+const WIRE_ABI_VERSION: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 enum Classification {
@@ -30,6 +34,7 @@ struct Fixture {
     operation_identity_model: String,
     key_vnode_abi: String,
     vnode_count: u16,
+    wire_id_map: WireIdMap,
     expected_run: RunIdentity,
     source_topology: SourceTopology,
     sink_topology: SinkTopology,
@@ -59,6 +64,38 @@ struct RunIdentity {
     sink_id: String,
     operator_id: String,
     output_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireIdMap {
+    ids_16: Vec<WireHexId>,
+    ids_32: Vec<WireHexId>,
+    u64_values: Vec<WireU64Id>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireHexId {
+    label: String,
+    hex: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireU64Id {
+    label: String,
+    value: u64,
+}
+
+#[derive(Debug)]
+struct WireIdLookup {
+    ids_16: BTreeMap<String, [u8; 16]>,
+    labels_16: BTreeMap<[u8; 16], String>,
+    ids_32: BTreeMap<String, [u8; 32]>,
+    labels_32: BTreeMap<[u8; 32], String>,
+    u64_values: BTreeMap<String, u64>,
+    known_u64_values: BTreeSet<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -186,6 +223,7 @@ struct BrokerPosition {
 #[serde(deny_unknown_fields)]
 struct IntervalMarker {
     broker: BrokerPosition,
+    wire_envelope_hex: String,
     envelope_version: u16,
     envelope_kind: String,
     interval_id: String,
@@ -229,6 +267,7 @@ struct RecoveryReference {
 #[serde(deny_unknown_fields)]
 struct DataRecord {
     broker: BrokerPosition,
+    wire_envelope_hex: String,
     envelope_version: u16,
     envelope_kind: String,
     operation_id: String,
@@ -292,6 +331,199 @@ struct CheckpointView<'a> {
 struct AssignmentView<'a> {
     evidence: &'a AssignmentAuthority,
     owner_by_vnode: BTreeMap<u16, &'a VnodeOwner>,
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn decode_fixed_hex<const N: usize>(hex: &str) -> Result<[u8; N], String> {
+    if hex.len() != N * 2 {
+        return Err(format!(
+            "must contain exactly {} lowercase hexadecimal characters",
+            N * 2
+        ));
+    }
+    let mut decoded = [0_u8; N];
+    for (index, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
+        let high = hex_nibble(pair[0])
+            .ok_or_else(|| "must contain only lowercase hexadecimal characters".to_owned())?;
+        let low = hex_nibble(pair[1])
+            .ok_or_else(|| "must contain only lowercase hexadecimal characters".to_owned())?;
+        decoded[index] = (high << 4) | low;
+    }
+    if decoded.iter().all(|byte| *byte == 0) {
+        return Err("must not encode the all-zero value".to_owned());
+    }
+    Ok(decoded)
+}
+
+fn insert_hex_mapping<const N: usize>(
+    entry: &WireHexId,
+    category: &str,
+    all_labels: &mut BTreeSet<String>,
+    by_label: &mut BTreeMap<String, [u8; N]>,
+    by_value: &mut BTreeMap<[u8; N], String>,
+    errors: &mut Vec<String>,
+) {
+    if entry.label.is_empty() {
+        errors.push(format!(
+            "fixture.wire_id_map.{category} contains an empty label"
+        ));
+        return;
+    }
+    if !all_labels.insert(entry.label.clone()) {
+        errors.push(format!(
+            "fixture.wire_id_map contains duplicate label {:?}",
+            entry.label
+        ));
+        return;
+    }
+    let decoded = match decode_fixed_hex::<N>(&entry.hex) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            errors.push(format!(
+                "fixture.wire_id_map.{category} label {:?} {error}",
+                entry.label
+            ));
+            return;
+        }
+    };
+    if let Some(previous) = by_value.insert(decoded, entry.label.clone()) {
+        errors.push(format!(
+            "fixture.wire_id_map.{category} labels {previous:?} and {:?} map to the same value",
+            entry.label
+        ));
+    }
+    by_label.insert(entry.label.clone(), decoded);
+}
+
+fn validate_wire_id_map(fixture: &Fixture) -> Result<WireIdLookup, CheckErrors> {
+    let mut errors = Vec::new();
+    if fixture.wire_id_map.ids_16.is_empty()
+        || fixture.wire_id_map.ids_32.is_empty()
+        || fixture.wire_id_map.u64_values.is_empty()
+    {
+        errors.push("fixture.wire_id_map categories must not be empty".to_owned());
+    }
+
+    let mut all_labels = BTreeSet::new();
+    let mut ids_16 = BTreeMap::new();
+    let mut labels_16 = BTreeMap::new();
+    for entry in &fixture.wire_id_map.ids_16 {
+        insert_hex_mapping(
+            entry,
+            "ids_16",
+            &mut all_labels,
+            &mut ids_16,
+            &mut labels_16,
+            &mut errors,
+        );
+    }
+    let mut ids_32 = BTreeMap::new();
+    let mut labels_32 = BTreeMap::new();
+    for entry in &fixture.wire_id_map.ids_32 {
+        insert_hex_mapping(
+            entry,
+            "ids_32",
+            &mut all_labels,
+            &mut ids_32,
+            &mut labels_32,
+            &mut errors,
+        );
+    }
+    let mut u64_values = BTreeMap::new();
+    let mut known_u64_values = BTreeSet::new();
+    for entry in &fixture.wire_id_map.u64_values {
+        if entry.label.is_empty() {
+            errors.push("fixture.wire_id_map.u64_values contains an empty label".to_owned());
+            continue;
+        }
+        if !all_labels.insert(entry.label.clone()) {
+            errors.push(format!(
+                "fixture.wire_id_map contains duplicate label {:?}",
+                entry.label
+            ));
+            continue;
+        }
+        if entry.value == 0 {
+            errors.push(format!(
+                "fixture.wire_id_map.u64_values label {:?} must not map to zero",
+                entry.label
+            ));
+        }
+        known_u64_values.insert(entry.value);
+        u64_values.insert(entry.label.clone(), entry.value);
+    }
+
+    let mut required_16 = BTreeSet::new();
+    let mut required_32 = BTreeSet::new();
+    let mut required_u64 = BTreeSet::new();
+    for case in &fixture.cases {
+        for marker in &case.interval_markers {
+            required_16.insert(marker.interval_id.as_str());
+            if let Some(predecessor) = &marker.predecessor_interval {
+                required_16.insert(predecessor.as_str());
+            }
+            required_16.insert(marker.provenance.deployment_id.as_str());
+            required_16.insert(marker.provenance.pipeline_incarnation.as_str());
+            required_16.insert(marker.writer.boot_incarnation.as_str());
+
+            required_32.insert(marker.provenance.pipeline_identity.as_str());
+            required_32.insert(marker.current_assignment.digest.as_str());
+            required_32.insert(marker.recovery.capsule_digest.as_str());
+            required_32.insert(marker.recovery.base_assignment.digest.as_str());
+            required_32.insert(marker.abi.topology_digest.as_str());
+
+            required_u64.insert(marker.writer.node_id.as_str());
+            required_u64.insert(marker.writer.process_term.as_str());
+            required_u64.insert(marker.recovery.checkpoint_id.as_str());
+        }
+        for record in &case.data_records {
+            required_16.insert(record.writer_interval.as_str());
+            required_32.insert(record.operation_id.as_str());
+        }
+    }
+
+    validate_exact_mapping_keys("ids_16", ids_16.keys(), &required_16, &mut errors);
+    validate_exact_mapping_keys("ids_32", ids_32.keys(), &required_32, &mut errors);
+    validate_exact_mapping_keys("u64_values", u64_values.keys(), &required_u64, &mut errors);
+
+    if errors.is_empty() {
+        Ok(WireIdLookup {
+            ids_16,
+            labels_16,
+            ids_32,
+            labels_32,
+            u64_values,
+            known_u64_values,
+        })
+    } else {
+        Err(CheckErrors::many(errors))
+    }
+}
+
+fn validate_exact_mapping_keys<'a>(
+    category: &str,
+    actual: impl Iterator<Item = &'a String>,
+    required: &BTreeSet<&str>,
+    errors: &mut Vec<String>,
+) {
+    let actual = actual.map(String::as_str).collect::<BTreeSet<_>>();
+    for missing in required.difference(&actual) {
+        errors.push(format!(
+            "fixture.wire_id_map.{category} is missing label {missing:?}"
+        ));
+    }
+    for unused in actual.difference(required) {
+        errors.push(format!(
+            "fixture.wire_id_map.{category} contains unused label {unused:?}"
+        ));
+    }
 }
 
 pub(super) fn verify(bytes: &[u8]) -> Result<FixtureSummary, CheckErrors> {
@@ -360,6 +592,13 @@ pub(super) fn verify(bytes: &[u8]) -> Result<FixtureSummary, CheckErrors> {
     {
         errors.push("fixture.expected_run fields must not be empty".to_owned());
     }
+    let wire_ids = match validate_wire_id_map(&fixture) {
+        Ok(wire_ids) => wire_ids,
+        Err(error) => {
+            errors.push(error.to_string());
+            return Err(CheckErrors::many(errors));
+        }
+    };
     let source_partitions = match validate_source_topology(&fixture) {
         Ok(partitions) => partitions,
         Err(error) => {
@@ -410,7 +649,14 @@ pub(super) fn verify(bytes: &[u8]) -> Result<FixtureSummary, CheckErrors> {
             continue;
         }
         match evaluate_case(&fixture, &source_partitions, &topology, case) {
-            Ok(outcome) => {
+            Ok(mut outcome) => {
+                if outcome.classification != Classification::RunInvalid {
+                    let wire_diagnostics = evaluate_wire_envelopes(&fixture, case, &wire_ids);
+                    if !wire_diagnostics.is_empty() {
+                        outcome.classification = Classification::ProductFail;
+                        outcome.diagnostics.extend(wire_diagnostics);
+                    }
+                }
                 let expected_diagnostics = case
                     .expected
                     .diagnostics
@@ -443,6 +689,273 @@ pub(super) fn verify(bytes: &[u8]) -> Result<FixtureSummary, CheckErrors> {
     } else {
         Err(CheckErrors::many(errors))
     }
+}
+
+fn decode_wire_hex(hex: &str, maximum_bytes: usize) -> Result<Vec<u8>, ()> {
+    if !hex.len().is_multiple_of(2) || hex.len() > maximum_bytes.saturating_mul(2) {
+        return Err(());
+    }
+    let mut decoded = Vec::with_capacity(hex.len() / 2);
+    for pair in hex.as_bytes().chunks_exact(2) {
+        let high = hex_nibble(pair[0]).ok_or(())?;
+        let low = hex_nibble(pair[1]).ok_or(())?;
+        decoded.push((high << 4) | low);
+    }
+    Ok(decoded)
+}
+
+fn compare_wire_id_16(
+    observed: &[u8; 16],
+    expected_label: &str,
+    wire_ids: &WireIdLookup,
+    diagnostics: &mut BTreeSet<String>,
+) {
+    let expected = wire_ids
+        .ids_16
+        .get(expected_label)
+        .expect("wire ID map coverage was validated");
+    if observed == expected {
+        return;
+    }
+    match wire_ids.labels_16.get(observed) {
+        None => {
+            diagnostics.insert("wire_envelope_unknown_id".to_owned());
+        }
+        Some(_) => {
+            diagnostics.insert("wire_envelope_mismatch".to_owned());
+        }
+    }
+}
+
+fn compare_wire_id_32(
+    observed: &[u8; 32],
+    expected_label: &str,
+    wire_ids: &WireIdLookup,
+    diagnostics: &mut BTreeSet<String>,
+) {
+    let expected = wire_ids
+        .ids_32
+        .get(expected_label)
+        .expect("wire ID map coverage was validated");
+    if observed == expected {
+        return;
+    }
+    match wire_ids.labels_32.get(observed) {
+        None => {
+            diagnostics.insert("wire_envelope_unknown_id".to_owned());
+        }
+        Some(_) => {
+            diagnostics.insert("wire_envelope_mismatch".to_owned());
+        }
+    }
+}
+
+fn compare_wire_u64(
+    observed: u64,
+    expected_label: &str,
+    wire_ids: &WireIdLookup,
+    diagnostics: &mut BTreeSet<String>,
+) {
+    let expected = wire_ids
+        .u64_values
+        .get(expected_label)
+        .expect("wire ID map coverage was validated");
+    if observed == *expected {
+        return;
+    }
+    if wire_ids.known_u64_values.contains(&observed) {
+        diagnostics.insert("wire_envelope_mismatch".to_owned());
+    } else {
+        diagnostics.insert("wire_envelope_unknown_id".to_owned());
+    }
+}
+
+fn vnode_bitmap(vnode_count: u16, vnodes: &[u16]) -> Option<Vec<u8>> {
+    if vnode_count == 0 {
+        return None;
+    }
+    let mut bitmap = vec![0_u8; usize::from(vnode_count).div_ceil(8)];
+    for vnode in vnodes {
+        if *vnode >= vnode_count {
+            return None;
+        }
+        bitmap[usize::from(*vnode) / 8] |= 1 << (*vnode % 8);
+    }
+    Some(bitmap)
+}
+
+fn evaluate_wire_envelopes(
+    _fixture: &Fixture,
+    case: &Case,
+    wire_ids: &WireIdLookup,
+) -> BTreeSet<String> {
+    let mut diagnostics = BTreeSet::new();
+    let mut common_marker_bytes = BTreeMap::<(String, String), (&IntervalMarker, &str)>::new();
+
+    for marker in &case.interval_markers {
+        let common_key = (marker.shard_id.clone(), marker.interval_id.clone());
+        if let Some((previous, previous_hex)) =
+            common_marker_bytes.insert(common_key, (marker, &marker.wire_envelope_hex))
+        {
+            if same_common_marker(previous, marker)
+                && previous_hex != marker.wire_envelope_hex.as_str()
+            {
+                diagnostics.insert("wire_common_marker_bytes_mismatch".to_owned());
+            }
+        }
+
+        let bytes =
+            match decode_wire_hex(&marker.wire_envelope_hex, wire_v1::MAX_MARKER_ENCODED_LEN) {
+                Ok(bytes) => bytes,
+                Err(()) => {
+                    diagnostics.insert("wire_envelope_malformed".to_owned());
+                    continue;
+                }
+            };
+        let decoded = match wire_v1::decode_marker(&bytes) {
+            Ok(decoded) => decoded,
+            Err(_) => {
+                diagnostics.insert("wire_envelope_malformed".to_owned());
+                continue;
+            }
+        };
+
+        compare_wire_id_16(
+            decoded.current_interval_id,
+            &marker.interval_id,
+            wire_ids,
+            &mut diagnostics,
+        );
+        match (
+            decoded.predecessor_interval_id,
+            marker.predecessor_interval.as_deref(),
+        ) {
+            (Some(observed), Some(expected)) => {
+                compare_wire_id_16(observed, expected, wire_ids, &mut diagnostics);
+            }
+            (None, None) => {}
+            _ => {
+                diagnostics.insert("wire_envelope_mismatch".to_owned());
+            }
+        }
+        compare_wire_id_16(
+            decoded.deployment_uuid,
+            &marker.provenance.deployment_id,
+            wire_ids,
+            &mut diagnostics,
+        );
+        compare_wire_id_16(
+            decoded.pipeline_incarnation_id,
+            &marker.provenance.pipeline_incarnation,
+            wire_ids,
+            &mut diagnostics,
+        );
+        compare_wire_id_32(
+            decoded.pipeline_identity_sha256,
+            &marker.provenance.pipeline_identity,
+            wire_ids,
+            &mut diagnostics,
+        );
+        compare_wire_id_32(
+            decoded.current_assignment_sha256,
+            &marker.current_assignment.digest,
+            wire_ids,
+            &mut diagnostics,
+        );
+        compare_wire_u64(
+            decoded.writer_node_id,
+            &marker.writer.node_id,
+            wire_ids,
+            &mut diagnostics,
+        );
+        compare_wire_id_16(
+            decoded.writer_boot_uuid,
+            &marker.writer.boot_incarnation,
+            wire_ids,
+            &mut diagnostics,
+        );
+        compare_wire_u64(
+            decoded.durable_process_term,
+            &marker.writer.process_term,
+            wire_ids,
+            &mut diagnostics,
+        );
+        compare_wire_u64(
+            decoded.recovery_checkpoint_id,
+            &marker.recovery.checkpoint_id,
+            wire_ids,
+            &mut diagnostics,
+        );
+        compare_wire_id_32(
+            decoded.capsule_sha256,
+            &marker.recovery.capsule_digest,
+            wire_ids,
+            &mut diagnostics,
+        );
+        compare_wire_id_32(
+            decoded.recovery_base_assignment_sha256,
+            &marker.recovery.base_assignment.digest,
+            wire_ids,
+            &mut diagnostics,
+        );
+        compare_wire_id_32(
+            decoded.topology_sha256,
+            &marker.abi.topology_digest,
+            wire_ids,
+            &mut diagnostics,
+        );
+
+        let expected_bitmap = vnode_bitmap(marker.abi.vnode_count, &marker.vnodes);
+        if decoded.pipeline_identity_version != PIPELINE_IDENTITY_VERSION
+            || decoded.key_to_vnode_abi_version != WIRE_ABI_VERSION
+            || decoded.sink_partitioning_abi_version != WIRE_ABI_VERSION
+            || decoded.vnode_count != marker.abi.vnode_count
+            || decoded.current_assignment_version != marker.current_assignment.version
+            || decoded.recovery_epoch != marker.recovery.checkpoint_epoch
+            || decoded.recovery_base_assignment_version != marker.recovery.base_assignment.version
+            || decoded.sink_id != marker.provenance.sink_id
+            || decoded.operator_id != marker.provenance.operator_id
+            || decoded.output_id != marker.provenance.output_id
+            || decoded.shard_id != marker.shard_id
+            || expected_bitmap.as_deref() != Some(decoded.vnode_bitmap)
+        {
+            diagnostics.insert("wire_envelope_mismatch".to_owned());
+        }
+    }
+
+    for record in &case.data_records {
+        let bytes = match decode_wire_hex(&record.wire_envelope_hex, wire_v1::DATA_ENCODED_LEN) {
+            Ok(bytes) => bytes,
+            Err(()) => {
+                diagnostics.insert("wire_envelope_malformed".to_owned());
+                continue;
+            }
+        };
+        let decoded = match wire_v1::decode_data(&bytes) {
+            Ok(decoded) => decoded,
+            Err(_) => {
+                diagnostics.insert("wire_envelope_malformed".to_owned());
+                continue;
+            }
+        };
+        compare_wire_id_32(
+            decoded.operation_id,
+            &record.operation_id,
+            wire_ids,
+            &mut diagnostics,
+        );
+        compare_wire_id_16(
+            decoded.writer_interval_id,
+            &record.writer_interval,
+            wire_ids,
+            &mut diagnostics,
+        );
+        if decoded.admission_sequence != record.admission_sequence {
+            diagnostics.insert("wire_envelope_mismatch".to_owned());
+        }
+    }
+
+    diagnostics
 }
 
 fn validate_source_topology(fixture: &Fixture) -> Result<BTreeSet<CutKey>, CheckErrors> {
@@ -1500,6 +2013,281 @@ mod tests {
         value["cases"][0]["data_records"][3]["admission_sequence"] = Value::from(0);
     }
 
+    fn encoded_hex(bytes: &[u8]) -> String {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            encoded.push(char::from(DIGITS[usize::from(byte >> 4)]));
+            encoded.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+        }
+        encoded
+    }
+
+    fn encoded_data_record(record: &DataRecord, wire_ids: &WireIdLookup) -> String {
+        let encoded = wire_v1::encode_data(&wire_v1::DataHeaderRef {
+            operation_id: wire_ids.ids_32.get(&record.operation_id).unwrap(),
+            writer_interval_id: wire_ids.ids_16.get(&record.writer_interval).unwrap(),
+            admission_sequence: record.admission_sequence,
+        })
+        .unwrap();
+        encoded_hex(&encoded)
+    }
+
+    fn encoded_interval_marker(marker: &IntervalMarker, wire_ids: &WireIdLookup) -> String {
+        let bitmap = vnode_bitmap(marker.abi.vnode_count, &marker.vnodes).unwrap();
+        let encoded_marker = wire_v1::MarkerRef {
+            current_interval_id: wire_ids.ids_16.get(&marker.interval_id).unwrap(),
+            predecessor_interval_id: marker
+                .predecessor_interval
+                .as_ref()
+                .map(|label| wire_ids.ids_16.get(label).unwrap()),
+            deployment_uuid: wire_ids
+                .ids_16
+                .get(&marker.provenance.deployment_id)
+                .unwrap(),
+            pipeline_incarnation_id: wire_ids
+                .ids_16
+                .get(&marker.provenance.pipeline_incarnation)
+                .unwrap(),
+            pipeline_identity_version: PIPELINE_IDENTITY_VERSION,
+            pipeline_identity_sha256: wire_ids
+                .ids_32
+                .get(&marker.provenance.pipeline_identity)
+                .unwrap(),
+            key_to_vnode_abi_version: WIRE_ABI_VERSION,
+            sink_partitioning_abi_version: WIRE_ABI_VERSION,
+            vnode_count: marker.abi.vnode_count,
+            current_assignment_version: marker.current_assignment.version,
+            current_assignment_sha256: wire_ids
+                .ids_32
+                .get(&marker.current_assignment.digest)
+                .unwrap(),
+            writer_node_id: *wire_ids.u64_values.get(&marker.writer.node_id).unwrap(),
+            writer_boot_uuid: wire_ids
+                .ids_16
+                .get(&marker.writer.boot_incarnation)
+                .unwrap(),
+            durable_process_term: *wire_ids
+                .u64_values
+                .get(&marker.writer.process_term)
+                .unwrap(),
+            recovery_epoch: marker.recovery.checkpoint_epoch,
+            recovery_checkpoint_id: *wire_ids
+                .u64_values
+                .get(&marker.recovery.checkpoint_id)
+                .unwrap(),
+            capsule_sha256: wire_ids
+                .ids_32
+                .get(&marker.recovery.capsule_digest)
+                .unwrap(),
+            recovery_base_assignment_version: marker.recovery.base_assignment.version,
+            recovery_base_assignment_sha256: wire_ids
+                .ids_32
+                .get(&marker.recovery.base_assignment.digest)
+                .unwrap(),
+            topology_sha256: wire_ids.ids_32.get(&marker.abi.topology_digest).unwrap(),
+            sink_id: &marker.provenance.sink_id,
+            operator_id: &marker.provenance.operator_id,
+            output_id: &marker.provenance.output_id,
+            shard_id: &marker.shard_id,
+            vnode_bitmap: &bitmap,
+        };
+        let mut encoded = Vec::with_capacity(wire_v1::encoded_marker_len(&encoded_marker).unwrap());
+        wire_v1::encode_marker_into(&encoded_marker, &mut encoded).unwrap();
+        encoded_hex(&encoded)
+    }
+
+    fn mutated_wire_outcome(mutate: impl FnOnce(&mut Value)) -> Outcome {
+        let mut value: Value = serde_json::from_slice(FIXTURE).unwrap();
+        mutate(&mut value);
+        let fixture: Fixture = serde_json::from_value(value).unwrap();
+        let source_partitions = validate_source_topology(&fixture).unwrap();
+        let topology = validate_topology(&fixture).unwrap();
+        let wire_ids = validate_wire_id_map(&fixture).unwrap();
+        let case = &fixture.cases[0];
+        let mut outcome = evaluate_case(&fixture, &source_partitions, &topology, case).unwrap();
+        if outcome.classification != Classification::RunInvalid {
+            let diagnostics = evaluate_wire_envelopes(&fixture, case, &wire_ids);
+            if !diagnostics.is_empty() {
+                outcome.classification = Classification::ProductFail;
+                outcome.diagnostics.extend(diagnostics);
+            }
+        }
+        outcome
+    }
+
+    #[test]
+    fn canonical_wire_envelopes_match_the_test_encoder_and_common_markers() {
+        let fixture: Fixture = serde_json::from_slice(FIXTURE).unwrap();
+        let wire_ids = validate_wire_id_map(&fixture).unwrap();
+        for marker in &fixture.cases[0].interval_markers {
+            assert_eq!(
+                marker.wire_envelope_hex,
+                encoded_interval_marker(marker, &wire_ids)
+            );
+            let bytes = decode_wire_hex(&marker.wire_envelope_hex, wire_v1::MAX_MARKER_ENCODED_LEN)
+                .unwrap();
+            let decoded = wire_v1::decode_marker(&bytes).unwrap();
+            let mut reencoded = Vec::new();
+            wire_v1::encode_marker_into(&decoded, &mut reencoded).unwrap();
+            assert_eq!(reencoded, bytes);
+        }
+        for record in &fixture.cases[0].data_records {
+            assert_eq!(
+                record.wire_envelope_hex,
+                encoded_data_record(record, &wire_ids)
+            );
+            let bytes =
+                decode_wire_hex(&record.wire_envelope_hex, wire_v1::DATA_ENCODED_LEN).unwrap();
+            let decoded = wire_v1::decode_data(&bytes).unwrap();
+            assert_eq!(wire_v1::encode_data(&decoded).unwrap().as_slice(), bytes);
+        }
+        let markers = &fixture.cases[0].interval_markers;
+        assert_eq!(markers[0].wire_envelope_hex, markers[1].wire_envelope_hex);
+        assert_eq!(markers[2].wire_envelope_hex, markers[3].wire_envelope_hex);
+        assert!(evaluate_wire_envelopes(&fixture, &fixture.cases[0], &wire_ids).is_empty());
+    }
+
+    #[test]
+    fn wire_map_rejects_missing_noncanonical_nonbijective_and_unused_entries() {
+        for (expected, mutate) in [
+            (
+                "missing field `wire_id_map`",
+                Box::new(|value: &mut Value| {
+                    value.as_object_mut().unwrap().remove("wire_id_map");
+                }) as Box<dyn Fn(&mut Value)>,
+            ),
+            (
+                "lowercase hexadecimal",
+                Box::new(|value: &mut Value| {
+                    value["wire_id_map"]["ids_16"][0]["hex"] =
+                        Value::String("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned());
+                }),
+            ),
+            (
+                "map to the same value",
+                Box::new(|value: &mut Value| {
+                    value["wire_id_map"]["ids_16"][1]["hex"] =
+                        value["wire_id_map"]["ids_16"][0]["hex"].clone();
+                }),
+            ),
+            (
+                "must not map to zero",
+                Box::new(|value: &mut Value| {
+                    value["wire_id_map"]["u64_values"][0]["value"] = Value::from(0);
+                }),
+            ),
+            (
+                "contains unused label",
+                Box::new(|value: &mut Value| {
+                    value["wire_id_map"]["ids_32"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(serde_json::json!({
+                            "label": "unused",
+                            "hex": "3131313131313131313131313131313131313131313131313131313131313131"
+                        }));
+                }),
+            ),
+        ] {
+            assert!(
+                mutated_verify_error(mutate).contains(expected),
+                "{expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn wire_u64_ids_are_typed_and_equal_values_remain_legal() {
+        let mut value: Value = serde_json::from_slice(FIXTURE).unwrap();
+        for entry in value["wire_id_map"]["u64_values"].as_array_mut().unwrap() {
+            if matches!(
+                entry["label"].as_str().unwrap(),
+                "node-a" | "term-a-1" | "checkpoint-44"
+            ) {
+                entry["value"] = Value::from(44);
+            }
+        }
+
+        let mut fixture: Fixture = serde_json::from_value(value).unwrap();
+        let wire_ids = validate_wire_id_map(&fixture).unwrap();
+        let encoded_markers = fixture.cases[0]
+            .interval_markers
+            .iter()
+            .map(|marker| encoded_interval_marker(marker, &wire_ids))
+            .collect::<Vec<_>>();
+        for (marker, encoded) in fixture.cases[0]
+            .interval_markers
+            .iter_mut()
+            .zip(encoded_markers)
+        {
+            marker.wire_envelope_hex = encoded;
+        }
+        assert!(evaluate_wire_envelopes(&fixture, &fixture.cases[0], &wire_ids).is_empty());
+
+        let mut diagnostics = BTreeSet::new();
+        compare_wire_u64(45, "node-a", &wire_ids, &mut diagnostics);
+        assert_eq!(
+            diagnostics,
+            BTreeSet::from(["wire_envelope_mismatch".to_owned()])
+        );
+    }
+
+    #[test]
+    fn malformed_noncanonical_and_oversized_wire_hex_are_product_failures() {
+        for replacement in ["AA".to_owned(), "00".repeat(wire_v1::DATA_ENCODED_LEN + 1)] {
+            let outcome = mutated_wire_outcome(|value| {
+                value["cases"][0]["data_records"][0]["wire_envelope_hex"] =
+                    Value::String(replacement);
+            });
+            assert_eq!(outcome.classification, Classification::ProductFail);
+            assert_eq!(
+                outcome.diagnostics,
+                BTreeSet::from(["wire_envelope_malformed".to_owned()])
+            );
+        }
+    }
+
+    #[test]
+    fn decoded_wire_mismatches_and_unknown_ids_fail_deterministically() {
+        let data_mismatch = mutated_wire_outcome(|value| {
+            value["cases"][0]["data_records"][0]["wire_envelope_hex"] =
+                value["cases"][0]["data_records"][1]["wire_envelope_hex"].clone();
+        });
+        assert_eq!(data_mismatch.classification, Classification::ProductFail);
+        assert_eq!(
+            data_mismatch.diagnostics,
+            BTreeSet::from(["wire_envelope_mismatch".to_owned()])
+        );
+
+        let marker_mismatch = mutated_wire_outcome(|value| {
+            value["cases"][0]["interval_markers"][0]["wire_envelope_hex"] =
+                value["cases"][0]["interval_markers"][2]["wire_envelope_hex"].clone();
+        });
+        assert_eq!(marker_mismatch.classification, Classification::ProductFail);
+        assert_eq!(
+            marker_mismatch.diagnostics,
+            BTreeSet::from([
+                "wire_common_marker_bytes_mismatch".to_owned(),
+                "wire_envelope_mismatch".to_owned(),
+            ])
+        );
+
+        let unknown_id = mutated_wire_outcome(|value| {
+            let mut hex = value["cases"][0]["data_records"][0]["wire_envelope_hex"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            hex.replace_range(20..22, "fe");
+            value["cases"][0]["data_records"][0]["wire_envelope_hex"] = Value::String(hex);
+        });
+        assert_eq!(unknown_id.classification, Classification::ProductFail);
+        assert_eq!(
+            unknown_id.diagnostics,
+            BTreeSet::from(["wire_envelope_unknown_id".to_owned()])
+        );
+    }
+
     #[test]
     fn canonical_fixture_proves_rebalance_replay_gaps_and_exact_duplicate() {
         assert_eq!(
@@ -1599,6 +2387,7 @@ mod tests {
                 .unwrap()
                 .push(serde_json::json!({
                     "broker": {"topic": "fixture-output", "partition": 1, "offset": 4},
+                    "wire_envelope_hex": "",
                     "envelope_version": 1,
                     "envelope_kind": "data",
                     "operation_id": "fixture/gamma/count/1",

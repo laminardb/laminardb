@@ -208,6 +208,21 @@ evidence endpoint, state backend, cluster admission, exactly-once claim, or inde
 CVR scenarios therefore remain **BLOCKED**, no Cycle 51 soak ran, and `certification_eligible`
 remains `false`.
 
+### Cycle 52 evidence disposition
+
+The root-excluded standalone tool now owns a strict envelope-v1 codec and the v2 fixture consumes
+literal data-header and marker bytes. The exact layout remains defined only in
+[ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#distributed-output-envelope-v1).
+Tests cover literal goldens, all prefixes and small trailing suffixes, version/kind/flag and length
+rejection, bounded strings and vnode bitmaps, maximum sizes, deterministic hostile mutation, and a
+65,536-header structural batch characterization. Data decoding borrows the supplied 66-byte slice;
+marker decoding borrows variable fields; this is not a production latency or allocation benchmark.
+
+No LaminarDB runtime or Kafka connector emits or reads the envelope, derives stable operation or
+writer-interval identities, fences a producer, or exposes the required authority views. No backend,
+cluster admission, delivery guarantee, or certification flag changed. All CVR scenarios remain
+**BLOCKED**, no Cycle 52 soak ran, and `certification_eligible` remains `false`.
+
 ## Frozen numerical contract
 
 An eligible machine-readable charter contains no `TBD`, zero, or results-derived threshold. It

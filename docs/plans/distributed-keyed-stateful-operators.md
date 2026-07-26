@@ -3,7 +3,7 @@
 - **Status:** Planned and backend-gated; exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster
   operator is admitted by this document
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 51
+- **Last reconciled:** 2026-07-26 during Cycle 52
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -151,8 +151,13 @@ It permits byte-identical cross-interval replay only when the raw causal source 
 the resolved exclusive cut, while versions must rise within one interval. Evidence selected from a
 wrong run or missing a required cut is `RUN_INVALID`; complete Kafka-shaped evidence proving a bad
 marker, owner, replay, payload, or result is `PRODUCT_FAIL`. Assignment/process evidence is
-synthetically reconciled and no wire/partition ABI is frozen, so this closes no public-evidence,
-Kafka-fencing, backend, admission, exactly-once, or production-soak gate.
+synthetically reconciled. Cycle 52 then freezes and hostile-tests a minimal standalone binary
+representation: a fixed 66-byte per-record header and a bounded marker whose common provenance is
+not repeated per row. V2 consumes those exact bytes, but no runtime or Kafka connector does. The
+sole normative byte table is
+[ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#distributed-output-envelope-v1).
+These cycles close no public-evidence, Kafka-fencing, backend, admission, exactly-once, latency, or
+production-soak gate; pure operation identity and authority propagation are next.
 
 ## Scope and non-goals
 

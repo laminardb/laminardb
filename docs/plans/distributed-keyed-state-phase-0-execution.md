@@ -5,7 +5,7 @@
   pending a new official package; no runtime
   dependency, backend qualification evidence, independent production-soak result, or admission change
 - **Started:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 51
+- **Last reconciled:** 2026-07-26 during Cycle 52
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline:** `1e2f8429`; working branch `feature/distributed-keyed-state-adr`
@@ -341,15 +341,17 @@ Cycle 50's implementation audit freezes the dependency order and prevents connec
 6. only then wire the three-node engineering harness. The independent release-binary soak remains a
    later gate.
 
-Cycle 51 completes only item 1. Fixture v1 remains unchanged, while explicit v2 stays synthetic,
-root-workspace-excluded, and `certification_eligible=false`. Its positive case covers a zero-input
-bootstrap, a later recovery cut, assignment 7 to 8 ownership change, cross-interval byte-identical
-replay at the raw source offset equal to that cut, predecessor output before the successor marker,
-sequence gaps, and exact final grouped state. Mutation tests distinguish absent/incomplete evidence
-(`RUN_INVALID`) from complete conflicting product output (`PRODUCT_FAIL`), including empty source
-partitions and nonzero start baselines. The fixture synthetically pre-reconciles assignment ownership
-with process term and validates vnode-to-shard rather than final partition bytes. Item 2—compact
-byte-golden headers/markers, caps, and hostile decoding—is next; items 3 through 6 remain open.
+Cycles 51 and 52 complete only items 1 and 2. Fixture v1 remains unchanged, while explicit v2 stays
+synthetic, root-workspace-excluded, and `certification_eligible=false`. Its positive case covers a
+zero-input bootstrap, a later recovery cut, assignment 7 to 8 ownership change, cross-interval
+byte-identical replay at the raw source offset equal to that cut, predecessor output before the
+successor marker, sequence gaps, and exact final grouped state. Mutation tests distinguish absent/
+incomplete evidence (`RUN_INVALID`) from complete conflicting product output (`PRODUCT_FAIL`). The
+fixture now consumes the frozen standalone data-header and marker envelopes and rejects malformed,
+noncanonical, unknown, or semantically contradictory bytes. The sole normative layout is in
+[ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#distributed-output-envelope-v1);
+no Kafka connector or runtime code uses it. Item 3—pure operation identity and assignment-authority
+propagation—is next; items 4 through 6 remain open.
 
 The existing output path satisfies none of the new provenance/fence fields: it passes only a batch
 and deadline and uses an idempotent, non-transactional Kafka producer. The supported evidence APIs

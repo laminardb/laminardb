@@ -33,7 +33,9 @@ logical operation or fenced writer interval, and the public checkpoint/assignmen
 yet prove every process's local adoption or reconstruct exact per-attempt latency. None of these
 decisions changes cluster admission. [Cycle 51](../reviews/distributed-keyed-state-cycle-51.md)
 implements only a synthetic v2 semantic oracle for the missing output-authority relationships; it
-is not runtime or certification evidence.
+is not runtime or certification evidence. [Cycle 52](../reviews/distributed-keyed-state-cycle-52.md)
+freezes its compact standalone wire representation and hostile decoder without changing Kafka,
+runtime admission, delivery guarantees, or certification status.
 
 ## Verdict
 
@@ -438,9 +440,10 @@ bootstrap/recovery checkpoint references, separately resolved current writer ass
 predecessor/successor markers, checked per-interval sequences, raw-offset replay causality, and
 independently derived vnode/shard ownership. It also proves that missing or wrong-run authority is
 `RUN_INVALID`, while complete evidence of conflicting or stale output is `PRODUCT_FAIL`. Its
-assignment/process view is pre-reconciled test data and its ABI stops at vnode-to-shard semantics;
-no production bytes, supported evidence endpoint, or broker fence exists. Neither fixture version
-is independent production evidence.
+assignment/process view is pre-reconciled test data and its ABI stops at vnode-to-shard semantics.
+Cycle 52 adds exact standalone envelope bytes, literal goldens, strict caps, and hostile decoding,
+but the current Kafka path still emits none of those bytes and no supported evidence endpoint or
+broker fence exists. Neither fixture version is independent production evidence.
 
 The missing minimum is not another state backend. It is the already-designed delivery/evidence
 vertical: an operator-specific replay-stable operation ID; compact data-record provenance; a stable
