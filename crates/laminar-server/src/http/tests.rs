@@ -243,6 +243,83 @@ async fn local_evidence_fixture(
     }
 }
 
+#[cfg(feature = "cluster")]
+async fn local_checkpoint_barrier_timings_fixture(
+    token: Option<&str>,
+    serving_gate: Arc<ServingGate>,
+) -> LocalEvidenceFixture {
+    use laminar_core::cluster::control::{
+        prove_shared_object_store_namespaces, ClusterKv, InMemoryKv,
+    };
+
+    let mut fixture = local_evidence_fixture(token, serving_gate, false).await;
+    let participant = fixture.adoption.participant;
+    let proof_control: Arc<dyn ClusterKv> = Arc::new(InMemoryKv::new(
+        laminar_core::cluster::discovery::NodeId(participant.node_id),
+    ));
+    let checkpoint_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let state_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let namespaces = prove_shared_object_store_namespaces(
+        participant,
+        &[participant],
+        proof_control,
+        checkpoint_store,
+        state_store,
+        std::time::Duration::from_secs(1),
+    )
+    .await
+    .unwrap();
+    let vnode_count = u32::from(laminar_core::state::DEFAULT_CLUSTER_KEY_GROUP_COUNT);
+    let state_backend: Arc<dyn laminar_core::state::StateBackend> =
+        Arc::new(laminar_core::state::ObjectStoreBackend::cluster_shared(
+            namespaces.state_store(),
+            "http-timing-test",
+            vnode_count,
+        ));
+    let db = laminar_db::LaminarDbBuilder::new()
+        .profile(laminar_db::Profile::Cluster)
+        .cluster_controller(Arc::clone(&fixture.controller))
+        .verified_cluster_namespaces(namespaces)
+        .state_backend(state_backend)
+        .vnode_registry(Arc::new(laminar_core::state::VnodeRegistry::new(
+            vnode_count,
+        )))
+        .build()
+        .await
+        .unwrap();
+    Arc::get_mut(&mut fixture.state)
+        .expect("the fixture must retain the only app-state reference")
+        .db = db;
+    fixture
+}
+
+#[cfg(feature = "cluster")]
+fn local_checkpoint_barrier_timings_uri(
+    fixture: &LocalEvidenceFixture,
+    after_sequence: u64,
+) -> String {
+    format!(
+        "/api/v1/cluster/local-checkpoint-barrier-timings?after_sequence={after_sequence}&expected_node_id={}&expected_boot_incarnation={}&expected_process_term={}",
+        fixture.adoption.participant.node_id,
+        fixture.adoption.participant.boot_incarnation,
+        fixture.process_term,
+    )
+}
+
+#[cfg(feature = "cluster")]
+fn local_checkpoint_barrier_timings_request(uri: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .header(
+            axum::http::header::AUTHORIZATION,
+            "Bearer supersecret-token",
+        )
+        .body(Body::empty())
+        .unwrap()
+}
+
 #[test]
 fn terminal_serving_fence_wins_a_concurrent_startup_open() {
     for _ in 0..64 {
@@ -1820,6 +1897,341 @@ async fn cluster_local_evidence_preserves_startup_recovery_and_terminal_gates() 
     fenced.controller.fence_process_lease();
     let fenced_response = build_router(fenced.state).oneshot(request()).await.unwrap();
     assert_eq!(fenced_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn test_cluster_local_checkpoint_barrier_timings_404_when_not_cluster() {
+    let response = build_router(test_state())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/cluster/local-checkpoint-barrier-timings")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn cluster_local_checkpoint_barrier_timings_requires_a_configured_bearer() {
+    let unconfigured = local_checkpoint_barrier_timings_fixture(None, ready_serving_gate()).await;
+    let uri = local_checkpoint_barrier_timings_uri(&unconfigured, 0);
+    let response = build_router(unconfigured.state)
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let configured =
+        local_checkpoint_barrier_timings_fixture(Some("supersecret-token"), ready_serving_gate())
+            .await;
+    let uri = local_checkpoint_barrier_timings_uri(&configured, 0);
+    let app = build_router(configured.state);
+    for authorization in [None, Some("Bearer wrong-token")] {
+        let mut request = Request::builder().uri(&uri);
+        if let Some(authorization) = authorization {
+            request = request.header(axum::http::header::AUTHORIZATION, authorization);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    let query_token = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("{uri}&token=supersecret-token"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(query_token.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn cluster_local_checkpoint_barrier_timings_rejects_closed_or_noncanonical_queries() {
+    let fixture =
+        local_checkpoint_barrier_timings_fixture(Some("supersecret-token"), ready_serving_gate())
+            .await;
+    let valid = local_checkpoint_barrier_timings_uri(&fixture, 0);
+    let app = build_router(fixture.state);
+    for uri in [
+        "/api/v1/cluster/local-checkpoint-barrier-timings".to_string(),
+        "/api/v1/cluster/local-checkpoint-barrier-timings?after_sequence=1".to_string(),
+        "/api/v1/cluster/local-checkpoint-barrier-timings?after_sequence=0&expected_node_id=61"
+            .to_string(),
+        format!("{valid}&unexpected=true"),
+        valid.replace("expected_node_id=61", "expected_node_id=0"),
+        valid.replace(&uuid::Uuid::from_u128(610).to_string(), "not-a-uuid"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(local_checkpoint_barrier_timings_request(&uri))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn cluster_local_checkpoint_barrier_timings_returns_exact_empty_no_store_envelope() {
+    let fixture =
+        local_checkpoint_barrier_timings_fixture(Some("supersecret-token"), ready_serving_gate())
+            .await;
+    let uri = "/api/v1/cluster/local-checkpoint-barrier-timings?after_sequence=0";
+    let response = build_router(fixture.state)
+        .oneshot(local_checkpoint_barrier_timings_request(uri))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    let body = axum::body::to_bytes(
+        response.into_body(),
+        MAX_LOCAL_CHECKPOINT_BARRIER_TIMINGS_RESPONSE_BYTES + 1,
+    )
+    .await
+    .unwrap();
+    assert!(body.len() <= MAX_LOCAL_CHECKPOINT_BARRIER_TIMINGS_RESPONSE_BYTES);
+    let envelope: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(envelope.as_object().unwrap().len(), 4);
+    assert_eq!(
+        envelope["schema_version"],
+        LOCAL_CHECKPOINT_BARRIER_TIMINGS_SCHEMA_VERSION
+    );
+    assert_eq!(envelope["after_sequence"], 0);
+    assert_eq!(envelope["process_identity"]["participant"]["node_id"], 61);
+    assert_eq!(
+        envelope["process_identity"]["participant"]["boot_incarnation"],
+        uuid::Uuid::from_u128(610).to_string()
+    );
+    assert_eq!(
+        envelope["process_identity"]["process_term"],
+        fixture.process_term
+    );
+    assert_eq!(
+        envelope["page"],
+        serde_json::json!({
+            "capacity": laminar_db::checkpoint_timing::CHECKPOINT_BARRIER_TIMING_CAPACITY,
+            "oldest_retained_sequence": null,
+            "next_sequence": 1,
+            "overwritten_record_count": 0,
+            "recording_loss_count": 0,
+            "metadata_exhausted": false,
+            "has_more": false,
+            "records": [],
+        })
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn cluster_local_checkpoint_barrier_timings_rejects_stale_or_ahead_cursors() {
+    let fixture =
+        local_checkpoint_barrier_timings_fixture(Some("supersecret-token"), ready_serving_gate())
+            .await;
+    let current = local_checkpoint_barrier_timings_uri(&fixture, 0);
+    let stale = current.replace(
+        &format!("expected_process_term={}", fixture.process_term),
+        &format!("expected_process_term={}", fixture.process_term + 1),
+    );
+    let ahead = local_checkpoint_barrier_timings_uri(&fixture, 1);
+    let app = build_router(fixture.state);
+
+    for uri in [stale, ahead] {
+        let response = app
+            .clone()
+            .oneshot(local_checkpoint_barrier_timings_request(&uri))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT, "{uri}");
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn cluster_local_checkpoint_barrier_timings_preserves_all_serving_gates() {
+    let fixture = local_checkpoint_barrier_timings_fixture(
+        Some("supersecret-token"),
+        Arc::new(ServingGate::starting()),
+    )
+    .await;
+    let uri = local_checkpoint_barrier_timings_uri(&fixture, 0);
+    let state = Arc::clone(&fixture.state);
+    let app = build_router(Arc::clone(&state));
+
+    let startup = app
+        .clone()
+        .oneshot(local_checkpoint_barrier_timings_request(&uri))
+        .await
+        .unwrap();
+    assert_eq!(startup.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    assert!(state.open_startup_gate());
+    fixture.controller.set_recovering(true);
+    let recovering = app
+        .clone()
+        .oneshot(local_checkpoint_barrier_timings_request(&uri))
+        .await
+        .unwrap();
+    assert_eq!(recovering.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    fixture.controller.set_recovering(false);
+    fixture.controller.fence_process_lease();
+    let fenced = app
+        .oneshot(local_checkpoint_barrier_timings_request(&uri))
+        .await
+        .unwrap();
+    assert_eq!(fenced.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[cfg(feature = "cluster")]
+#[test]
+fn local_checkpoint_barrier_timing_errors_have_closed_status_mapping() {
+    use laminar_db::checkpoint_timing::{
+        CheckpointBarrierTimingReadError as ReadError,
+        CheckpointBarrierTimingSnapshotError as SnapshotError,
+    };
+
+    let process = laminar_core::cluster::control::LocalProcessAuthorityIdentity {
+        participant: laminar_core::checkpoint::CheckpointParticipant {
+            node_id: 1,
+            boot_incarnation: uuid::Uuid::from_u128(1),
+        },
+        process_term: 1,
+    };
+    let mut other = process;
+    other.process_term = 2;
+    let cases = [
+        (
+            ReadError::ProcessIdentityMismatch {
+                expected: process,
+                actual: other,
+            },
+            StatusCode::CONFLICT,
+        ),
+        (
+            ReadError::Snapshot(SnapshotError::CursorAhead {
+                after_sequence: 2,
+                next_sequence: 2,
+            }),
+            StatusCode::CONFLICT,
+        ),
+        (
+            ReadError::Snapshot(SnapshotError::CursorOverwritten {
+                after_sequence: 1,
+                oldest_retained_sequence: 3,
+            }),
+            StatusCode::GONE,
+        ),
+        (
+            ReadError::Snapshot(SnapshotError::Busy),
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+        (
+            ReadError::ProcessIdentityChanged {
+                before: process,
+                after: other,
+            },
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+        (
+            ReadError::Snapshot(SnapshotError::InvalidLimit { limit: 0 }),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+        (
+            ReadError::LedgerProcessMismatch {
+                expected: process,
+                actual: other,
+            },
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    ];
+
+    for (error, expected) in cases {
+        assert_eq!(
+            local_checkpoint_barrier_timing_error_response(&error).0,
+            expected
+        );
+    }
+}
+
+#[cfg(feature = "cluster")]
+#[test]
+fn maximum_checkpoint_barrier_timing_envelope_fits_the_response_cap() {
+    use laminar_db::checkpoint_timing::{
+        CheckpointBarrierRole, CheckpointBarrierTimingPage, CheckpointBarrierTimingRecord,
+        CheckpointBarrierTimingSnapshot, MAX_CHECKPOINT_BARRIER_TIMING_PAGE_RECORDS,
+    };
+
+    let process = laminar_core::cluster::control::LocalProcessAuthorityIdentity {
+        participant: laminar_core::checkpoint::CheckpointParticipant {
+            node_id: u64::MAX,
+            boot_incarnation: uuid::Uuid::from_u128(u128::MAX),
+        },
+        process_term: u64::MAX,
+    };
+    let records = (1..=MAX_CHECKPOINT_BARRIER_TIMING_PAGE_RECORDS)
+        .map(|sequence| CheckpointBarrierTimingRecord {
+            sequence: u64::try_from(sequence).unwrap(),
+            process,
+            attempt: laminar_core::state::CheckpointAttempt::canonical(u64::MAX),
+            role: CheckpointBarrierRole::Follower,
+            assignment_version: u64::MAX,
+            assignment_digest: [u8::MAX; 32],
+            pipeline_stall_ns: u64::MAX,
+            local_barrier_ns: u64::MAX / 2,
+            aligned_resume_ns: Some(u64::MAX / 2),
+            durable_tail_handoff: true,
+            deadline_exhausted: true,
+        })
+        .collect();
+    let timing_page = CheckpointBarrierTimingPage {
+        process,
+        snapshot: CheckpointBarrierTimingSnapshot {
+            process: Some(process),
+            capacity: laminar_db::checkpoint_timing::CHECKPOINT_BARRIER_TIMING_CAPACITY,
+            oldest_retained_sequence: Some(u64::MAX),
+            next_sequence: u64::MAX,
+            overwritten_record_count: u64::MAX,
+            recording_loss_count: u64::MAX,
+            metadata_exhausted: true,
+            has_more: true,
+            records,
+        },
+    };
+    let public_page = serde_json::to_value(&timing_page).unwrap();
+    assert_eq!(public_page["process"]["process_term"], u64::MAX);
+    assert_eq!(public_page["snapshot"]["process"]["process_term"], u64::MAX);
+    let envelope = LocalCheckpointBarrierTimingsResponse::new(u64::MAX, &timing_page);
+    let encoded = serde_json::to_vec(&envelope).unwrap();
+
+    assert!(
+        encoded.len() <= MAX_LOCAL_CHECKPOINT_BARRIER_TIMINGS_RESPONSE_BYTES,
+        "maximum legal response is {} bytes",
+        encoded.len()
+    );
 }
 
 #[tokio::test]

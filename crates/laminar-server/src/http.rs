@@ -233,6 +233,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/v1/cluster/local-evidence",
             get(cluster_local_evidence),
         )
+        .route(
+            "/api/v1/cluster/local-checkpoint-barrier-timings",
+            get(cluster_local_checkpoint_barrier_timings),
+        )
         .route("/api/v1/cluster/leader", get(cluster_leader))
         .route("/api/v1/cluster/checkpoints", get(cluster_checkpoints))
         .route("/api/v1/pipeline/stop", post(stop_pipeline))
@@ -1042,12 +1046,133 @@ const LOCAL_EVIDENCE_TOKEN_REQUIRED_MSG: &str =
 const LOCAL_EVIDENCE_UNAVAILABLE_MSG: &str = "local process authority evidence is unavailable";
 #[cfg(feature = "cluster")]
 const LOCAL_EVIDENCE_INVALID_MSG: &str = "local process authority evidence is invalid";
+#[cfg(feature = "cluster")]
+const LOCAL_CHECKPOINT_BARRIER_TIMINGS_SCHEMA_VERSION: &str =
+    "laminardb-local-checkpoint-barrier-timings/v1";
+#[cfg(feature = "cluster")]
+const MAX_LOCAL_CHECKPOINT_BARRIER_TIMINGS_RESPONSE_BYTES: usize = 64 * 1_024;
+#[cfg(feature = "cluster")]
+const LOCAL_CHECKPOINT_BARRIER_TIMINGS_TOKEN_REQUIRED_MSG: &str =
+    "local checkpoint barrier timings require server.console_token";
+#[cfg(feature = "cluster")]
+const LOCAL_CHECKPOINT_BARRIER_TIMINGS_UNAVAILABLE_MSG: &str =
+    "local checkpoint barrier timings are unavailable";
+#[cfg(feature = "cluster")]
+const LOCAL_CHECKPOINT_BARRIER_TIMINGS_INVALID_MSG: &str =
+    "local checkpoint barrier timings are invalid";
+#[cfg(feature = "cluster")]
+const LOCAL_CHECKPOINT_BARRIER_TIMINGS_QUERY_MSG: &str =
+    "invalid local checkpoint barrier timing query";
+#[cfg(feature = "cluster")]
+const LOCAL_CHECKPOINT_BARRIER_TIMINGS_CONFLICT_MSG: &str =
+    "local checkpoint barrier timing cursor conflicts with this process";
+#[cfg(feature = "cluster")]
+const LOCAL_CHECKPOINT_BARRIER_TIMINGS_OVERWRITTEN_MSG: &str =
+    "local checkpoint barrier timing cursor has been overwritten";
 
 #[cfg(feature = "cluster")]
 #[derive(Serialize)]
 struct LocalEvidenceResponse {
     schema_version: &'static str,
     evidence: laminar_core::cluster::control::LocalProcessAuthorityEvidence,
+}
+
+#[cfg(feature = "cluster")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalCheckpointBarrierTimingsQuery {
+    after_sequence: u64,
+    expected_node_id: Option<u64>,
+    expected_boot_incarnation: Option<String>,
+    expected_process_term: Option<u64>,
+}
+
+#[cfg(feature = "cluster")]
+#[derive(Serialize)]
+struct LocalCheckpointBarrierTimingsResponse<'a> {
+    schema_version: &'static str,
+    process_identity: laminar_core::cluster::control::LocalProcessAuthorityIdentity,
+    after_sequence: u64,
+    page: LocalCheckpointBarrierTimingsPage<'a>,
+}
+
+#[cfg(feature = "cluster")]
+#[derive(Serialize)]
+struct LocalCheckpointBarrierTimingsPage<'a> {
+    capacity: usize,
+    oldest_retained_sequence: Option<u64>,
+    next_sequence: u64,
+    overwritten_record_count: u64,
+    recording_loss_count: u64,
+    metadata_exhausted: bool,
+    has_more: bool,
+    records: &'a [laminar_db::checkpoint_timing::CheckpointBarrierTimingRecord],
+}
+
+#[cfg(feature = "cluster")]
+impl<'a> LocalCheckpointBarrierTimingsResponse<'a> {
+    fn new(
+        after_sequence: u64,
+        timing_page: &'a laminar_db::checkpoint_timing::CheckpointBarrierTimingPage,
+    ) -> Self {
+        let snapshot = &timing_page.snapshot;
+        Self {
+            schema_version: LOCAL_CHECKPOINT_BARRIER_TIMINGS_SCHEMA_VERSION,
+            process_identity: timing_page.process,
+            after_sequence,
+            page: LocalCheckpointBarrierTimingsPage {
+                capacity: snapshot.capacity,
+                oldest_retained_sequence: snapshot.oldest_retained_sequence,
+                next_sequence: snapshot.next_sequence,
+                overwritten_record_count: snapshot.overwritten_record_count,
+                recording_loss_count: snapshot.recording_loss_count,
+                metadata_exhausted: snapshot.metadata_exhausted,
+                has_more: snapshot.has_more,
+                records: &snapshot.records,
+            },
+        }
+    }
+}
+
+#[cfg(feature = "cluster")]
+fn local_checkpoint_barrier_timing_error_response(
+    error: &laminar_db::checkpoint_timing::CheckpointBarrierTimingReadError,
+) -> (StatusCode, &'static str) {
+    use laminar_db::checkpoint_timing::{
+        CheckpointBarrierTimingReadError, CheckpointBarrierTimingSnapshotError,
+    };
+
+    match error {
+        CheckpointBarrierTimingReadError::ProcessIdentityMismatch { .. }
+        | CheckpointBarrierTimingReadError::Snapshot(
+            CheckpointBarrierTimingSnapshotError::CursorAhead { .. },
+        ) => (
+            StatusCode::CONFLICT,
+            LOCAL_CHECKPOINT_BARRIER_TIMINGS_CONFLICT_MSG,
+        ),
+        CheckpointBarrierTimingReadError::Snapshot(
+            CheckpointBarrierTimingSnapshotError::CursorOverwritten { .. },
+        ) => (
+            StatusCode::GONE,
+            LOCAL_CHECKPOINT_BARRIER_TIMINGS_OVERWRITTEN_MSG,
+        ),
+        CheckpointBarrierTimingReadError::ProcessIdentityUnavailable
+        | CheckpointBarrierTimingReadError::ProcessIdentityChanged { .. }
+        | CheckpointBarrierTimingReadError::Snapshot(CheckpointBarrierTimingSnapshotError::Busy) => {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                LOCAL_CHECKPOINT_BARRIER_TIMINGS_UNAVAILABLE_MSG,
+            )
+        }
+        CheckpointBarrierTimingReadError::ProcessIdentityRequired
+        | CheckpointBarrierTimingReadError::LedgerProcessMismatch { .. }
+        | CheckpointBarrierTimingReadError::Snapshot(
+            CheckpointBarrierTimingSnapshotError::InvalidLimit { .. },
+        ) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            LOCAL_CHECKPOINT_BARRIER_TIMINGS_INVALID_MSG,
+        ),
+    }
 }
 
 /// `GET /api/v1/cluster/nodes` — current cluster membership.
@@ -1239,6 +1364,185 @@ async fn cluster_local_evidence(
         let _ = (state, headers);
         error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response()
     }
+}
+
+/// `GET /api/v1/cluster/local-checkpoint-barrier-timings` — bounded local pause evidence.
+///
+/// This route reads only the process-local fixed-capacity ledger. Sequence zero bootstraps the
+/// current identity; every continuation cursor is inseparable from that returned identity,
+/// preventing an old process's cursor from skipping records after a restart. It does not read
+/// checkpoint authority or imply durable settlement.
+#[cfg(feature = "cluster")]
+async fn cluster_local_checkpoint_barrier_timings(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    query: Result<
+        Query<LocalCheckpointBarrierTimingsQuery>,
+        axum::extract::rejection::QueryRejection,
+    >,
+) -> impl IntoResponse {
+    #[cfg(feature = "cluster")]
+    {
+        use laminar_db::checkpoint_timing::MAX_CHECKPOINT_BARRIER_TIMING_PAGE_RECORDS;
+
+        let Some(_cluster) = state.cluster.as_ref() else {
+            return error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response();
+        };
+
+        // The router has already authenticated configured tokens. This evidence route is stricter:
+        // it is disabled without a token and accepts only the bearer header. Repeat this check
+        // immediately before 200 to close a concurrent configuration-reload race.
+        let expected_token = state.current_config.read().server.console_token.clone();
+        let Some(expected_token) = expected_token else {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                LOCAL_CHECKPOINT_BARRIER_TIMINGS_TOKEN_REQUIRED_MSG,
+            )
+            .into_response();
+        };
+        if !bearer_token(&headers).is_some_and(|token| ct_eq(token, expected_token.expose())) {
+            return error_response(StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        }
+
+        let Query(query) = match query {
+            Ok(query) => query,
+            Err(error) => {
+                warn!(%error, "rejected local checkpoint barrier timing query");
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    LOCAL_CHECKPOINT_BARRIER_TIMINGS_QUERY_MSG,
+                )
+                .into_response();
+            }
+        };
+        let expected_process = match (
+            query.expected_node_id,
+            query.expected_boot_incarnation.as_deref(),
+            query.expected_process_term,
+        ) {
+            (None, None, None) if query.after_sequence == 0 => None,
+            (Some(node_id), Some(boot_incarnation), Some(process_term)) => {
+                let Ok(boot_incarnation) = uuid::Uuid::parse_str(boot_incarnation) else {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        LOCAL_CHECKPOINT_BARRIER_TIMINGS_QUERY_MSG,
+                    )
+                    .into_response();
+                };
+                let process = laminar_core::cluster::control::LocalProcessAuthorityIdentity {
+                    participant: laminar_core::checkpoint::CheckpointParticipant {
+                        node_id,
+                        boot_incarnation,
+                    },
+                    process_term,
+                };
+                if !process.is_canonical() {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        LOCAL_CHECKPOINT_BARRIER_TIMINGS_QUERY_MSG,
+                    )
+                    .into_response();
+                }
+                Some(process)
+            }
+            _ => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    LOCAL_CHECKPOINT_BARRIER_TIMINGS_QUERY_MSG,
+                )
+                .into_response();
+            }
+        };
+
+        let timing_page = match state.db.checkpoint_barrier_timing_snapshot(
+            expected_process,
+            query.after_sequence,
+            MAX_CHECKPOINT_BARRIER_TIMING_PAGE_RECORDS,
+        ) {
+            Ok(page) => page,
+            Err(error) => {
+                let (status, message) = local_checkpoint_barrier_timing_error_response(&error);
+                if status == StatusCode::INTERNAL_SERVER_ERROR {
+                    warn!(%error, "local checkpoint barrier timing page violated its contract");
+                }
+                return error_response(status, message).into_response();
+            }
+        };
+
+        if expected_process.is_some_and(|expected| timing_page.process != expected)
+            || timing_page
+                .snapshot
+                .records
+                .iter()
+                .any(|record| record.process != timing_page.process)
+        {
+            warn!("local checkpoint barrier timing response mixed process identities");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                LOCAL_CHECKPOINT_BARRIER_TIMINGS_INVALID_MSG,
+            )
+            .into_response();
+        }
+        let envelope =
+            LocalCheckpointBarrierTimingsResponse::new(query.after_sequence, &timing_page);
+        let encoded = match serde_json::to_vec(&envelope) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                warn!(%error, "failed to serialize local checkpoint barrier timings");
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    LOCAL_CHECKPOINT_BARRIER_TIMINGS_INVALID_MSG,
+                )
+                .into_response();
+            }
+        };
+        if encoded.len() > MAX_LOCAL_CHECKPOINT_BARRIER_TIMINGS_RESPONSE_BYTES {
+            warn!(
+                encoded_bytes = encoded.len(),
+                maximum_bytes = MAX_LOCAL_CHECKPOINT_BARRIER_TIMINGS_RESPONSE_BYTES,
+                "local checkpoint barrier timing response exceeded its bound"
+            );
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                LOCAL_CHECKPOINT_BARRIER_TIMINGS_INVALID_MSG,
+            )
+            .into_response();
+        }
+
+        if let Some(reason) = state.serving_rejection() {
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, reason).into_response();
+        }
+        let expected_token = state.current_config.read().server.console_token.clone();
+        let Some(expected_token) = expected_token else {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                LOCAL_CHECKPOINT_BARRIER_TIMINGS_TOKEN_REQUIRED_MSG,
+            )
+            .into_response();
+        };
+        if !bearer_token(&headers).is_some_and(|token| ct_eq(token, expected_token.expose())) {
+            return error_response(StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        }
+
+        let mut response = (StatusCode::OK, encoded).into_response();
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+        response
+    }
+}
+
+#[cfg(not(feature = "cluster"))]
+async fn cluster_local_checkpoint_barrier_timings(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let _ = state;
+    error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response()
 }
 
 /// `GET /api/v1/cluster/leader` — the current leader's `NodeInfo` (if known)
