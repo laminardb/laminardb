@@ -3,7 +3,7 @@
 - **Status:** Planned and backend-gated; exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster
   operator is admitted by this document
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 56
+- **Last reconciled:** 2026-07-26 during Cycle 57
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -193,6 +193,22 @@ It leaves durable interval non-reuse, runtime integration, production broker lim
 replicated failover, source/state/sink atomicity, latency, backend qualification, and independent
 soak unresolved.
 
+Cycle 57 closes only the stable-serving local-adoption evidence portion of the public-observability
+gap. Its authenticated, 4-KiB-capped, cache-disabled endpoint uses one bounded checked-KV operation
+to read this stable-node slot's current-boot durable adoption, requires it to match the locally
+audited assignment fence, then
+rechecks that fence and the live node/boot/process-term identity. The existing three-node engineering
+harness sandwiches every expected live assignment-participant sample between durable assignment
+reads and requires old-boot removal, same-node new-boot adoption, and a higher process term across
+hard kill/rejoin. It cannot report an exact current recovery phase or committed-`Release`
+consumption because neither is retained. This adds no row/checkpoint hot-path work, state backend,
+admission, delivery guarantee, qualifying latency result, or independent production-soak evidence.
+
+Both Cycle 57 Windows/WSL2 engineering commands passed the new exact local convergence and
+kill/rejoin assertions but failed their encompassing terminal profile gate. The substantive rerun
+recorded 98.81% rather than 99.00% of one node's checkpoint stalls within 1024 ms. The miss is kept
+as NO-GO evidence; aggregate metrics cannot identify its exact attempts or establish cause.
+
 ## Scope and non-goals
 
 In scope:
@@ -360,9 +376,10 @@ Work:
    and sink rather than only an in-memory harness. Kafka output needs broker-enforced writer fencing
    plus partition fence markers bound to the exact recovery-base attempt, capsule digest, and
    assignment certificate; the source oracle derives its ledger by reconciling durable intents
-   with actual broker records rather than acknowledgement callbacks. Freeze supported, versioned
-   local-adoption and exact checkpoint-attempt evidence projections; polling the shared durable
-   `/vnodes` head, aggregate histograms, private object paths, or text-log substrings is not proof.
+   with actual broker records rather than acknowledgement callbacks. Cycle 57 freezes and consumes
+   the supported stable-serving local-adoption projection. Still freeze the exact checkpoint-attempt
+   outcome/capsule and timing projections; polling the shared durable `/vnodes` head, aggregate
+   histograms, private object paths, or text-log substrings is not proof.
 8. Freeze a fault-point vocabulary and output-oracle format shared by later phases. Cross source
    drain/replay, state mutation/freeze, timer fire, output enqueue, sink flush, durable decision,
    external publication, assignment rotation, and ambiguous commit.

@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 56
+- **Last reconciled:** 2026-07-26 during Cycle 57
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -13,7 +13,7 @@
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
   [TidesDB package design](tidesdb-local-state-successor-design.md),
   [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
-  [latest completed review](../reviews/distributed-keyed-state-cycle-56.md)
+  [latest completed review](../reviews/distributed-keyed-state-cycle-57.md)
 
 ## Decision
 
@@ -1235,23 +1235,64 @@ timeout—decides which predecessor attempt was visible.
 This actuator is deliberately not a reusable Kafka proxy. Multi-broker routing, TLS/SASL, arbitrary
 protocol versions, or address rewriting require a framework re-evaluation rather than expansion of
 this parser. Passing it still supplies no runtime connector, durable interval allocator, production
-topology/limits, replicated durability, source/state/sink atomicity, latency result, backend
+topology/limits, replicated durability, source/state/sink atomicity, qualifying latency result, backend
 qualification, or independent soak evidence; production remains **NO-GO**.
 
 The controller also needs supported, bounded evidence projections rather than private object-store
-paths or text-log parsing. One local-node view must expose boot/process identity, locally adopted
-assignment version/digest, source-gate/recovery phase, and last applied recovery round. One
-versioned checkpoint-attempt view must project the existing create-once outcome and recovery
-capsule, including terminal disposition, assignment certificate, normalized exclusive source cuts,
-and capsule digest. Exact per-process-generation maxima and deadline-exhaustion counts are required
-for the five checkpoint latency families; aggregate Prometheus histograms remain operational
-telemetry, not exact attempt evidence. Implement the delivery vertical in this order: executable
+paths or text-log parsing. Cycle 57 adds the first such projection at authenticated
+`GET /api/v1/cluster/local-evidence`. A successful, cache-disabled response is capped at 4 KiB and
+contains only this exact process's live node/boot/process-term sample and its canonical boot-bound
+durable `CheckpointAssignmentAdoption`. The controller performs one bounded checked-KV operation
+for only that current stable-node slot, validates canonical encoding, requires it to match the
+locally audited assignment fence, and rechecks process identity, lease, and the same fence after the
+read. The route remains behind normal
+startup/recovery serving gates and returns no evidence without a configured bearer token. It does
+not scan `/cluster/vnodes`, expose the vnode owner vector or private storage paths, or relabel shared
+durable publication as current local adoption.
+
+Every checked-storage timeout/failure is unavailable (`503`), including the current object-store KV
+adapter's inability to distinguish a malformed outer control envelope from I/O failure. `500` is
+reserved for a logical value returned successfully to this method that then fails payload bounds,
+canonicality, or same-version fence validation. The engineering consumer retries `503` only within
+its absolute convergence deadline, so this diagnostic ambiguity cannot produce a pass; it remains an
+operability limitation rather than independent invalid-state classification evidence.
+
+Bearer authentication does not add transport encryption or request throttling. Production-like use
+must therefore keep this route on loopback/a trusted network or behind a TLS ingress, and consumers
+must poll at bounded control-plane cadence: every probe performs one logical checked-KV operation
+plus local authority checks. The object-store KV implementation may need several physical metadata
+and object requests to validate that operation's lease-bound control envelope. It is outside row
+processing and checkpoint mutation, but it is not a high-frequency monitoring endpoint.
+
+No retained authority currently records an exact local recovery phase or proves that this process
+consumed a committed `Release`; the retained successful-`Start` acknowledgement is historical and
+can remain unchanged across a later recovery, while `RecoveryMonitor::applied_gen` is a suppression/
+settlement counter that can advance for missed or rejected rounds. Those facts must not be
+reconstructed from coarse gates. Cycle 57 therefore narrows the earlier planned schema instead of
+inventing or exposing weak lifecycle state.
+
+Its existing three-node engineering harness sandwiches per-process evidence between stable durable
+assignment reads and checks removal plus same-node boot/term rotation across hard kill/rejoin. This
+closes only stable-serving local-adoption observability; it adds no row, state-mutation, rebalance,
+or checkpoint hot-path work and is not independent soak evidence.
+
+Two Windows/WSL2 Docker engineering runs satisfied those new convergence assertions, but neither
+complete test passed: a zero-tail preflight missed the existing minimum sample count, then a
+90-second run recorded only 98.81% of node1 checkpoint stalls at or below 1024 ms against the 99.00%
+gate. Aggregate histograms cannot identify or correlate the two violating attempts, so no causality
+is assigned to this endpoint. The red result and exact-attempt observability gap remain NO-GO
+evidence.
+
+One versioned checkpoint-attempt view must still project the existing create-once outcome and
+recovery capsule, including terminal disposition, assignment certificate, normalized exclusive
+source cuts, and capsule digest. Exact per-process-generation maxima and deadline-exhaustion counts
+remain required for the five checkpoint latency families; aggregate Prometheus histograms are
+operational telemetry, not exact attempt evidence. The delivery sequence has completed executable
 oracle semantics, byte-golden envelopes/markers, pure identity/authority tests, fake transactional
-producer state-machine tests, deterministic real Kafka/Redpanda fencing/isolation, controlled
-ambiguous-outcome reconciliation, then engineering-harness wiring. Cycle 55 closes the deterministic
-broker slice and Cycle 56 closes the controlled one-broker ambiguity slice. Durable runtime interval
-authority and engineering integration remain open. Only the later independently operated
-release-binary soak can certify the completed vertical.
+producer modeling, deterministic real Kafka/Redpanda fencing/isolation, controlled ambiguous-
+outcome reconciliation, and the local-adoption engineering consumer. Durable runtime interval
+authority and runtime transactional source/state/sink integration remain open. Only the later
+independently operated release-binary soak can certify the completed vertical.
 
 End-to-end exactly-once is a later certification per concrete source/state/sink combination. It
 requires an exact-certified source and a checkpoint-committable external sink whose transaction

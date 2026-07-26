@@ -44,7 +44,16 @@ stable transactional-ID encoding and proves the deterministic fencing/visibility
 real disposable Redpanda broker, leaving ambiguous `EndTxn` open at that point. [Cycle 56](../reviews/distributed-keyed-state-cycle-56.md)
 then proves applied and unapplied matched-`EndTxn` marker/data reconciliation on that same bounded
 one-node subject; it adds no runtime connector, durable interval authority, production topology,
-exactly-once composition, backend qualification, latency result, or soak evidence.
+exactly-once composition, backend qualification, qualifying latency result, or soak evidence.
+[Cycle 57](../reviews/distributed-keyed-state-cycle-57.md) adds an authenticated, 4-KiB-capped
+stable-serving projection of the exact process identity and current-boot durable assignment
+adoption only while it matches the locally audited assignment fence. The existing three-node
+engineering harness consumes it across hard kill/rejoin. No retained record proves current recovery
+phase or exact committed-`Release` consumption, and this slice changes no data hot path, admission,
+delivery guarantee, backend, qualifying latency result, or independent-soak status.
+The new convergence assertions passed twice against real processes, Kafka, and MinIO, but both
+encompassing Windows/WSL2 engineering tests remained red on their existing latency-profile terminal
+gate; details are retained below and in the Cycle 57 review.
 
 ## Verdict
 
@@ -435,7 +444,7 @@ The exact evidence inventory is:
 | Sink admission order | One actor consumes a bounded FIFO | Broker offset orders actual appends per partition | No checked Laminar sequence and no cross-writer authority boundary |
 | Legal replay interval | Committed recovery capsule binds exact source cuts and assignment | Engineering soak observes advisory consumer-group commits | Exact cut is derivable from retained checkpoint authority, not from group offsets; current oracle does not consume it |
 | Checkpoint terminal/assignment evidence | Create-once outcome, seal inventory, and recovery capsule bind the exact attempt and assignment | `/api/v1/cluster/checkpoints` exposes only the latest ID/epoch/time/names/count; raw authority requires separate bounded parsing | Partially observable; no stable per-attempt evidence view |
-| Local assignment convergence | Each runtime has an adopted registry version/digest | `/api/v1/cluster/vnodes` loads the shared durable snapshot, so identical replies do not prove each process adopted it | Missing public local-adoption evidence |
+| Local assignment convergence | Each assignment participant durably publishes a boot-bound canonical `CheckpointAssignmentAdoption`, while the watcher separately maintains the current locally audited assignment fence | Cycle 57's authenticated `/api/v1/cluster/local-evidence` reads the exact local adoption through one bounded checked-KV operation, requires it to match that live fence, rechecks fence/process authority, caps/no-stores the response, and is compared with a durable-before/after assignment sandwich by the engineering harness | Stable-serving local adoption is now observable; zero-vnode nonparticipants have no current matching adoption evidence and are outside the positive-evidence set, while recovery phase and committed-`Release` consumption remain absent |
 | Latency attempt/max evidence | Aggregate histograms and selected lifecycle logs exist | Prometheus supports distributions, but not an exact per-attempt maximum or complete stage/terminal correlation | Insufficient for the frozen soak fields |
 
 The live engineering oracle currently accepts any number of duplicate `seq` values once the
@@ -510,15 +519,17 @@ which the oracle can resolve. The data header contains only version/kind, operat
 and sequence; interval-wide pipeline/operator/sink, ABI, shard/vnode, assignment, process, and
 recovery provenance lives in the marker. The reader hashes the raw payload bytes and derives the
 expected vnode from the canonical key and frozen ABI rather than trusting duplicated row metadata.
-A public local-adoption identity and per-attempt timing evidence are also required for the rotation
-charter. The initial interval must first reference a zero-input bootstrap checkpoint/capsule created
+Cycle 57 closes the public stable-serving local-adoption identity only; per-attempt checkpoint and
+timing evidence are still required for the rotation charter. The initial interval must first
+reference a zero-input bootstrap checkpoint/capsule created
 from exact pre-delivery source baselines while readiness, graph work, and sink writes remain closed;
 there is no null/genesis authority shortcut. Implementation must start with semantic model and byte-
 golden tests, then a fake producer state machine, deterministic real-broker fencing/isolation,
 and controlled ambiguous-outcome reconciliation. Cycle 55 closes the deterministic broker slice;
-Cycle 56 closes the deliberately controlled one-broker ambiguity slice. The current three-node
-engineering harness still requires durable interval authority and admission-neutral runtime
-integration. The independent soak remains later and separately operated.
+Cycle 56 closes the deliberately controlled one-broker ambiguity slice, and Cycle 57 makes the
+current three-node engineering harness consume exact local adoption evidence. Durable interval
+authority and admission-neutral transactional runtime integration remain open. The independent
+soak remains later and separately operated.
 
 ### Fjall is historical, not current infrastructure
 
@@ -609,9 +620,20 @@ The current branch's admission-neutral hardening was then checked separately:
 | `pipeline::streaming_coordinator::tests::recovery_cycle_error_faults_best_effort` | PASS, 1/1 | A recovery-classified partial apply publishes no output/cut and destroys the callback/graph generation before returning |
 | standalone Kafka transaction probe unit tests | PASS, 6/6 | Transactional-ID golden/axes/bounds, probe-local encoder checked against the copied frozen data-header golden, marker linkage, exact visibility transcript, hostile CLI/identity/topic bounds |
 | standalone Kafka transaction probe, debug and optimized binaries | PASS, repeated | Redpanda v26.1.13/RF=1: exact three-partition inventory/fanout, fatal `Fenced`, confirmed abort/retry, fence-aborted open transaction, separate RC/RU visibility captures, and exact header/key/payload capture; protocol-only, not latency/durability/soak evidence |
+| Cycle 57 core/HTTP local-authority gates | PASS | 5/5 core tests, 6/6 cluster HTTP tests, 1/1 non-cluster test, both server feature matrices and core warnings-denied Clippy; exact schema/auth/bounds/stale-boot/live-fence/lease-race coverage |
+| Cycle 57 exact-cut classifier | PASS, 1/1 | Stable success; changing/draining durable head, trailing/missing/ahead/conflicting local adoption, and duplicate-process branches; `cluster,kafka` warnings-denied Clippy passed |
+| Cycle 57 real static run, one leader kill, zero-second tail | **FAIL terminal gate** | Exact survivor/rejoin convergence passed in 44.95/34.21 s and all 43,473 IDs reached the ALO sink; only 72 node0 latency observations were available versus the existing minimum 100 |
+| Cycle 57 real static run, one leader kill, 90-second tail | **FAIL terminal gate** | Exact survivor/rejoin convergence passed in 43.46/37.53 s and all 80,260 IDs reached the ALO sink; node1 met the 1024-ms stall bound for 98.81% of 168 observations versus the required 99.00% |
 
 Both cluster and no-feature `cargo check` and `cargo clippy -D warnings` configurations passed, as
 did formatting and diff checks. These focused results do not exercise keyed cluster restore.
+
+Cycle 57's real commands used a Windows optimized soak-profile binary with Docker Desktop's WSL2
+engine, static discovery, MinIO, Redpanda v26.1.13, 64 key groups, 96 input partitions, shared
+S3-compatible state/checkpoint prefixes, and 400 rps. They are engineering evidence, not the
+independent immutable release subject. The second run's aggregate histogram cannot identify the two
+violating attempts or correlate their stages with assignment and terminal outcome; rerunning merely
+to dilute the ratio was rejected.
 
 These are admission and focused operator tests, not a production certification. No existing test
 demonstrates a distributed keyed operator processing remote rows through crash, restore, and
@@ -669,13 +691,11 @@ hot get/put/scan/write-batch/timer interface and is correctly kept as remote rec
 | former `.claude/fix-plans/state-backend.md` | Removed outside the tracked tree | Stale Claude plan conflated artifact `StateBackend` with live state and proposed unrelated control-plane work; none of it is used as design authority |
 | private `docs/research/extensible-schema-traits.md` and `schema-inference-design.md` | Reject as current evidence; public copies already removed in `52daf683` | They describe removed/unwired registries plus unsupported DDL, format, inference, zero-copy, and latency claims; neither reflects the current connector implementation |
 
-No tracked `docs/research` artifact exists on this baseline. The visible path and `.claude` are
-ignored Windows junctions into a separate, already-dirty private configuration repository.
-Deleting through either path would silently mutate context outside this branch, so Cycle 3 did not
-do so. The two obsolete
-research files need a separately authorized private-repository archive/removal commit; they are not
-copied, cited, or treated as evidence here. Relevant primary sources live as citations in the ADR,
-not another research dump.
+No tracked `docs/research` artifact exists on this baseline, and the ignored `docs/research`
+junction is currently empty. The two obsolete private files previously named here are no longer
+present. Cycle 57's tracked-document audit found no further obsolete research file: backend reports
+remain reverse-linked frozen decision/regression provenance rather than active recommendations.
+Relevant primary sources live as citations in the ADR, not another research dump.
 
 ## Confidence and limitations
 

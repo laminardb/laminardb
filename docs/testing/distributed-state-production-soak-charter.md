@@ -296,6 +296,35 @@ test, or latency distribution. No backend, runtime connector, cluster admission,
 guarantee, or certification flag changed. `[LDB-4007]` and `[LDB-0013]` remain closed. All CVR
 scenarios remain **BLOCKED**, no Cycle 56 soak ran, and `certification_eligible` remains `false`.
 
+### Cycle 57 evidence disposition
+
+The existing real-binary three-node engineering harness now consumes authenticated, bounded
+stable-serving evidence from every expected live assignment participant. Each response binds the
+exact node, boot, nonzero process term, and current-boot durable assignment adoption that still
+matches the locally audited assignment fence; HTTP 200 itself means the process lease was sampled
+live around the bounded checked-KV operation. A zero-vnode nonparticipant has no current matching
+adoption evidence and is outside this positive-evidence set; an older durable slot record may remain.
+
+The harness takes a durable assignment read before and after local samples, retries draining or
+changing cuts, and rejects same-version digest/participant contradictions. Across hard kill/rejoin
+it requires the durable assignment to advance, remove the killed boot, then bind the same stable
+node to a new boot and higher process term with owned vnodes.
+
+This is an engineering oracle extension, not the independent soak defined by this charter. The
+route is unavailable during startup/recovery serving fences and records neither exact committed-
+`Release` consumption nor current recovery phase. It provides no checkpoint-attempt history,
+per-attempt timing maxima, output writer intervals/fencing, transactional source/state/sink
+composition, backend qualification, immutable release subject, or independent operator. All CVR
+scenarios remain **BLOCKED**, no Cycle 57 independent soak ran, and `certification_eligible` remains
+`false`.
+
+Two Windows/WSL2 Docker engineering commands exercised the new oracle with one in-checkpoint leader
+kill. Both passed exact survivor and rejoin convergence plus complete ALO output-prefix accounting;
+both complete tests still failed the existing terminal profile gate. The meaningful 90-second rerun
+measured 98.81% rather than the required 99.00% of node1 checkpoint stalls within 1024 ms. It is
+retained as a red engineering result, not retried until a favourable aggregate ratio appears, and
+does not satisfy any CVR scenario.
+
 ## Frozen numerical contract
 
 An eligible machine-readable charter contains no `TBD`, zero, or results-derived threshold. It

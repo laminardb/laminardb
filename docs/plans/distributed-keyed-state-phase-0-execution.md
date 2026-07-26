@@ -5,7 +5,7 @@
   pending a new official package; no runtime
   dependency, backend qualification evidence, independent production-soak result, or admission change
 - **Started:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 56
+- **Last reconciled:** 2026-07-26 during Cycle 57
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline:** `1e2f8429`; working branch `feature/distributed-keyed-state-adr`
@@ -407,12 +407,31 @@ or runtime correctness. Durable interval allocation/non-reuse,
 item 6 integration, production topology/limits/security, replicated failover, source/state/sink
 atomicity, hot-path/tail-latency evidence, a qualified backend, and independent soak remain open.
 
+Cycle 57 completes only the stable-serving local-adoption projection and its admission-neutral
+engineering consumer. Authenticated `GET /api/v1/cluster/local-evidence` returns a 4-KiB-capped,
+cache-disabled current-process sample: node/boot/process term, exact boot-bound durable assignment
+adoption, and no inferred recovery state. It reads no shared `/vnodes` head, requires the adoption to
+match the locally audited assignment fence, and rechecks the process lease and fence after the one
+bounded checked-KV current-slot operation. The three-node kill/rejoin harness compares every expected live
+assignment participant with a durable-before/after assignment cut and requires a new boot plus
+higher process term on restart.
+Current recovery phase and exact
+committed-`Release` consumption are not retained and are deliberately absent. Checkpoint outcome/
+capsule projection, exact latency-attempt/max evidence, durable writer intervals, transactional
+runtime integration, backend qualification, and independent soak all remain open.
+
+The new convergence assertions passed in two real Windows/WSL2 engineering runs. The full tests did
+not: the first deliberately short run lacked the required latency sample count, and the 90-second
+rerun measured 98.81% rather than the required 99.00% of node1 checkpoint stalls within 1024 ms.
+This result is retained; aggregate histograms cannot identify the exact violating attempts, so
+exact attempt/timing projection is the next authority audit rather than a threshold adjustment.
+
 The existing output path satisfies none of the new provenance/fence fields: it passes only a batch
 and deadline and uses an idempotent, non-transactional Kafka producer. The supported evidence APIs
-also need bounded versioned projections of local assignment adoption and the existing immutable
-checkpoint outcome/capsule, plus exact max/deadline telemetry. Raw object-store records and tracing
-fields are implementation evidence, not a frozen external API. These tasks do not depend on which
-local working-state engine eventually qualifies.
+still need a bounded versioned projection of the existing immutable checkpoint outcome/capsule plus
+exact max/deadline telemetry. Raw object-store records and tracing fields are implementation
+evidence, not a frozen external API. These tasks do not depend on which local working-state engine
+eventually qualifies.
 
 The expected checkpoint order is source position capture followed by a FIFO sink synchronization
 fence and successful durable flush before manifest readiness, durable decision, and external source
@@ -727,10 +746,12 @@ Remaining work is kept reviewable in this dependency order:
    abortable encoder under the assignment token. The encoder keeps its original permit/fault
    lifecycle, while a queued assignment writer proceeds as soon as rejected capture unwinds. The
    removed async timeout wrappers could not preempt the synchronous snapshots; their duration and
-   full checkpoint-versus-rotation distributions remain independent-soak gates. This adds no normal
-   row-path work, backend, admission, or exactly-once capability. A backend-owned sticky root/process poison, resource/health admission,
-   and fresh-native-root fencing must
-   land only with a real runtime consumer rather than a disconnected future trait;
+   full checkpoint-versus-rotation distributions remain independent-soak gates. Cycle 57 later adds
+   only authenticated, bounded local-process adoption evidence plus the existing three-node
+   engineering consumer; it adds no recovery-Release record, row/checkpoint hot-path work, backend,
+   admission, delivery guarantee, or independent-soak result. A backend-owned sticky root/process
+   poison, resource/health admission, and fresh-native-root fencing must land only with a real
+   runtime consumer rather than a disconnected future trait;
 4. wait for a new official Cargo package `tidesdb`, freeze its exact native pair, and repeat the
    complete one-day/zero-machine-hour T0. The repeated T0 must reconcile every later native fix and
    prove exact transaction success or explicitly accept the full-key verified-commit/fail-stop
