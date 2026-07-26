@@ -273,6 +273,10 @@ fn empty_callback_fixture() -> ConnectorPipelineCallback {
         prom: Arc::new(crate::engine_metrics::EngineMetrics::new(
             &prometheus::Registry::new(),
         )),
+        #[cfg(feature = "cluster")]
+        checkpoint_barrier_timings: Arc::new(
+            crate::checkpoint_timing::CheckpointBarrierTimingLedger::new(),
+        ),
         pipeline_watermark: Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN)),
         coordinator: Arc::new(tokio::sync::Mutex::new(None)),
         table_store: Arc::new(parking_lot::RwLock::new(
@@ -477,7 +481,7 @@ async fn authoritative_local_leader(
     use laminar_core::checkpoint::{CheckpointAssignmentFence, CheckpointParticipant};
     use laminar_core::cluster::control::{
         ClusterController, LeaderLeaseOwner, LeaderLeaseStore, LeaseDeadline, LeaseOutcome,
-        ProcessLease,
+        ProcessLeaseAuthority, ProcessLeaseOutcome,
     };
     use laminar_core::cluster::discovery::{NodeId, NodeInfo};
 
@@ -497,13 +501,36 @@ async fn authoritative_local_leader(
         .set_process_lease_deadline(Arc::clone(&deadline))
         .unwrap();
 
+    let process_authority = Arc::new(
+        ProcessLeaseAuthority::new(
+            Arc::new(object_store::memory::InMemory::new()),
+            Duration::from_secs(30),
+        )
+        .unwrap(),
+    );
+    let ProcessLeaseOutcome::Acquired(process_lease) = process_authority
+        .store_for(node)
+        .try_acquire(boot, 0)
+        .await
+        .unwrap()
+    else {
+        panic!("test leader must acquire its stable-node process lease");
+    };
+    controller
+        .set_process_lease_authority(process_authority)
+        .unwrap();
+    controller
+        .publish_leased_recovery_incarnation(&process_lease)
+        .await
+        .unwrap();
+
     let backing: Arc<dyn object_store::ObjectStore> =
         Arc::new(object_store::memory::InMemory::new());
     let authority = Arc::new(LeaderLeaseStore::new(backing, 1_000));
     let owner = LeaderLeaseOwner {
         node,
         boot,
-        process_term: 1,
+        process_term: process_lease.term,
     };
     let LeaseOutcome::Acquired(grant) = authority.begin_new_term(&owner, 0).await.unwrap() else {
         panic!("test leader must acquire its durable term");
@@ -515,17 +542,7 @@ async fn authoritative_local_leader(
     controller.set_leader_lease_store(authority);
     controller.install_local_leader_proof_provider();
     controller
-        .start_leased_barrier_server(
-            "127.0.0.1:0".parse().unwrap(),
-            None,
-            &ProcessLease {
-                node,
-                owner: boot,
-                term: 1,
-                seq: 1,
-                expires_at_ms: i64::MAX,
-            },
-        )
+        .start_leased_barrier_server("127.0.0.1:0".parse().unwrap(), None, &process_lease)
         .await
         .unwrap();
 
@@ -615,6 +632,12 @@ async fn source_less_leader_holds_rotation_fence_through_whole_and_vnode_capture
     let (rotation_fence, whole_capture_observed, vnode_capture_observed) =
         install_checkpoint_rotation_fence_audit(&mut callback);
     let attempt = CheckpointAttempt::new(9, 9);
+    let expected_assignment_version = leader.fence.assignment_version;
+    let expected_assignment_digest = leader.fence.digest();
+    let expected_process = leader
+        .controller
+        .try_live_local_process_authority_identity()
+        .unwrap();
     callback
         .checkpoint_leader_proofs
         .insert(attempt, leader.proof);
@@ -631,6 +654,30 @@ async fn source_less_leader_holds_rotation_fence_through_whole_and_vnode_capture
     assert!(matches!(outcome, crate::pipeline::BarrierOutcome::Async));
     assert!(whole_capture_observed.load(std::sync::atomic::Ordering::Acquire));
     assert!(vnode_capture_observed.load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(
+        callback
+            .prom
+            .checkpoint_pipeline_stall_duration
+            .get_sample_count(),
+        1
+    );
+    let timing = callback
+        .checkpoint_barrier_timings
+        .snapshot_after(0, 1)
+        .unwrap();
+    assert_eq!(timing.recording_loss_count, 0);
+    assert_eq!(timing.records.len(), 1);
+    let record = timing.records[0];
+    assert_eq!(record.process, expected_process);
+    assert_eq!(record.attempt, attempt);
+    assert_eq!(
+        record.role,
+        crate::checkpoint_timing::CheckpointBarrierRole::Leader
+    );
+    assert_eq!(record.assignment_version, expected_assignment_version);
+    assert_eq!(record.assignment_digest, expected_assignment_digest);
+    assert!(record.durable_tail_handoff);
+    assert!(record.local_barrier_ns <= record.pipeline_stall_ns);
     assert!(
         Arc::clone(&rotation_fence).try_write_owned().is_ok(),
         "the capture token must be released before the durable tail runs"
@@ -1683,6 +1730,9 @@ fn cluster_callback_fixture(
             prom: Arc::new(crate::engine_metrics::EngineMetrics::new(
                 &prometheus::Registry::new(),
             )),
+            checkpoint_barrier_timings: Arc::new(
+                crate::checkpoint_timing::CheckpointBarrierTimingLedger::new(),
+            ),
             pipeline_watermark,
             coordinator: Arc::new(tokio::sync::Mutex::new(None)),
             table_store: Arc::new(parking_lot::RwLock::new(

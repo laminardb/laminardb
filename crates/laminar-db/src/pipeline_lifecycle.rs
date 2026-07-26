@@ -4454,6 +4454,8 @@ impl LaminarDB {
             source_wms_buf,
             tracker,
             prom,
+            #[cfg(feature = "cluster")]
+            checkpoint_barrier_timings: Arc::clone(&self.checkpoint_barrier_timings),
             pipeline_watermark: Arc::clone(&self.pipeline_watermark),
             coordinator: Arc::clone(&self.coordinator),
             table_store: self.table_store.clone(),

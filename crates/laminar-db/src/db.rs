@@ -291,6 +291,11 @@ pub struct LaminarDB {
     pub(crate) runtime_shutdown: parking_lot::RwLock<tokio_util::sync::CancellationToken>,
     pub(crate) engine_metrics:
         parking_lot::Mutex<Option<Arc<crate::engine_metrics::EngineMetrics>>>,
+    /// Process-lifetime, fixed-capacity barrier timing evidence. Pipeline recovery generations share
+    /// this ledger; an OS process restart creates a new sequence domain.
+    #[cfg(feature = "cluster")]
+    pub(crate) checkpoint_barrier_timings:
+        Arc<crate::checkpoint_timing::CheckpointBarrierTimingLedger>,
     pub(crate) prometheus_registry: parking_lot::Mutex<Option<Arc<prometheus::Registry>>>,
     pub(crate) start_time: std::time::Instant,
     pub(crate) session_properties: parking_lot::Mutex<HashMap<String, String>>,
@@ -1054,6 +1059,10 @@ impl LaminarDB {
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
             runtime_shutdown: parking_lot::RwLock::new(tokio_util::sync::CancellationToken::new()),
             engine_metrics: parking_lot::Mutex::new(None),
+            #[cfg(feature = "cluster")]
+            checkpoint_barrier_timings: Arc::new(
+                crate::checkpoint_timing::CheckpointBarrierTimingLedger::new(),
+            ),
             prometheus_registry: parking_lot::Mutex::new(None),
             start_time: std::time::Instant::now(),
             session_properties: parking_lot::Mutex::new(HashMap::new()),

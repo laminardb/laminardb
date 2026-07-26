@@ -68,6 +68,9 @@ mod changelog_filter;
 /// Unified checkpoint coordination.
 #[doc(hidden)]
 pub mod checkpoint_coordinator;
+/// Bounded process-local evidence for cluster checkpoint barrier pauses.
+#[cfg(feature = "cluster")]
+pub mod checkpoint_timing;
 #[cfg(feature = "cluster")]
 mod cluster_recovery_capsule;
 mod config;
