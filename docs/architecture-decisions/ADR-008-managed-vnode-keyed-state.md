@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 57
+- **Last reconciled:** 2026-07-26 during Cycle 58
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -1283,16 +1283,30 @@ gate. Aggregate histograms cannot identify or correlate the two violating attemp
 is assigned to this endpoint. The red result and exact-attempt observability gap remain NO-GO
 evidence.
 
-One versioned checkpoint-attempt view must still project the existing create-once outcome and
-recovery capsule, including terminal disposition, assignment certificate, normalized exclusive
-source cuts, and capsule digest. Exact per-process-generation maxima and deadline-exhaustion counts
-remain required for the five checkpoint latency families; aggregate Prometheus histograms are
-operational telemetry, not exact attempt evidence. The delivery sequence has completed executable
-oracle semantics, byte-golden envelopes/markers, pure identity/authority tests, fake transactional
-producer modeling, deterministic real Kafka/Redpanda fencing/isolation, controlled ambiguous-
-outcome reconciliation, and the local-adoption engineering consumer. Durable runtime interval
-authority and runtime transactional source/state/sink integration remain open. Only the later
-independently operated release-binary soak can certify the completed vertical.
+The [Cycle 58 checkpoint-attempt evidence audit](../reports/checkpoint-attempt-evidence-audit-2026-07-26.md)
+separates durable recovery authority from local performance evidence. Existing create-once outcomes
+and content-addressed recovery capsules retain exact authority for some attempts subject to both
+retention floors; current APIs cannot classify an arbitrary requested attempt without inference or
+racing reads. They contain no stage timing. Aggregate Prometheus histograms cannot supply exact
+attempts, maxima, process generations, or loss detection. Timing must not be added to recovery-
+critical outcome/capsule wire formats or unbounded per-attempt metric labels.
+
+The required first slice is instead a preallocated process-local ledger with one bounded record per
+pipeline-stall observation, exact attempt/assignment/process authority and stage nanoseconds, plus
+sequence, overwrite, and recording-loss evidence. It covers pipeline stall, local barrier, and
+aligned resume only; exact full-checkpoint and restorable-gate evidence remain open. Its consumer
+performs no shared-store read.
+Selected attempts may then be joined at low cadence only through a new read-only, same-snapshot
+core audit of the exact outcome, both retention floors, and validated live capsule reference;
+compacted continuity must remain explicit and no later outcome may be relabelled as the requested
+attempt. That audit also requires non-creating deployment-identity validation; current helpers may
+create it. Capsule connector maps are provider-specific values, not normalized exclusive source
+cuts, so that versioned per-connector projection remains open. The delivery sequence has completed
+executable oracle semantics, byte-golden envelopes/markers, pure
+identity/authority tests, fake transactional producer modeling, deterministic real Kafka/Redpanda
+fencing/isolation, controlled ambiguous-outcome reconciliation, and the local-adoption engineering
+consumer. Durable runtime interval authority and transactional source/state/sink integration remain
+open. Only the later independently operated release-binary soak can certify the completed vertical.
 
 End-to-end exactly-once is a later certification per concrete source/state/sink combination. It
 requires an exact-certified source and a checkpoint-committable external sink whose transaction

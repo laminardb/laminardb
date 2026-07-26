@@ -54,6 +54,11 @@ delivery guarantee, backend, qualifying latency result, or independent-soak stat
 The new convergence assertions passed twice against real processes, Kafka, and MinIO, but both
 encompassing Windows/WSL2 engineering tests remained red on their existing latency-profile terminal
 gate; details are retained below and in the Cycle 57 review.
+[Cycle 58](checkpoint-attempt-evidence-audit-2026-07-26.md) audits the resulting exact-attempt gap
+and deliberately adds no endpoint. Current recovery outcomes/capsules and anonymous aggregate
+timing cannot form a truthful stable response. The next slice is a bounded process-local timing
+three-family barrier-pause ledger consumed by the existing harness. Exact full-checkpoint and
+restorable-gate evidence plus a non-creating, read-only same-snapshot durable audit remain open.
 
 ## Verdict
 
@@ -442,10 +447,10 @@ The exact evidence inventory is:
 | Assignment and writer process | Checkpoint assignment fence binds version/digest, node, and boot incarnation; process lease fences local sink work | Current assignment and membership are queryable, but output carries none of them | Missing from output |
 | Sink shard/writer interval | Kafka partition is selected at send; actor/connector generations are local lifetimes | Broker topic/partition/offset only | No stable Laminar shard, predecessor/successor interval, or interval marker |
 | Sink admission order | One actor consumes a bounded FIFO | Broker offset orders actual appends per partition | No checked Laminar sequence and no cross-writer authority boundary |
-| Legal replay interval | Committed recovery capsule binds exact source cuts and assignment | Engineering soak observes advisory consumer-group commits | Exact cut is derivable from retained checkpoint authority, not from group offsets; current oracle does not consume it |
-| Checkpoint terminal/assignment evidence | Create-once outcome, seal inventory, and recovery capsule bind the exact attempt and assignment | `/api/v1/cluster/checkpoints` exposes only the latest ID/epoch/time/names/count; raw authority requires separate bounded parsing | Partially observable; no stable per-attempt evidence view |
+| Legal replay interval | Committed recovery capsule binds connector-specific retained positions and assignment | Engineering soak observes advisory consumer-group commits | The provider-specific recovery position is authoritative, but no provider-neutral exclusive-cut projection exists and the current oracle consumes neither form |
+| Checkpoint terminal/assignment evidence | Create-once outcome, seal inventory, and recovery capsule bind the exact attempt and assignment | `/api/v1/cluster/checkpoints` exposes only the latest ID/epoch/time/names/count; current internal reads cannot supply one read-only same-snapshot outcome/floors/capsule classification | Partially observable; no stable per-attempt evidence view |
 | Local assignment convergence | Each assignment participant durably publishes a boot-bound canonical `CheckpointAssignmentAdoption`, while the watcher separately maintains the current locally audited assignment fence | Cycle 57's authenticated `/api/v1/cluster/local-evidence` reads the exact local adoption through one bounded checked-KV operation, requires it to match that live fence, rechecks fence/process authority, caps/no-stores the response, and is compared with a durable-before/after assignment sandwich by the engineering harness | Stable-serving local adoption is now observable; zero-vnode nonparticipants have no current matching adoption evidence and are outside the positive-evidence set, while recovery phase and committed-`Release` consumption remain absent |
-| Latency attempt/max evidence | Aggregate histograms and selected lifecycle logs exist | Prometheus supports distributions, but not an exact per-attempt maximum or complete stage/terminal correlation | Insufficient for the frozen soak fields |
+| Latency attempt/max evidence | Aggregate histograms and selected lifecycle logs exist; `CheckpointResult` is exact but ephemeral | Prometheus supports distributions, but not an exact per-attempt maximum, process generation, loss detection, or complete stage/terminal correlation | Cycle 58 freezes a bounded ledger only for pipeline stall, local barrier, and aligned resume; exact full-checkpoint/restorable-gate evidence and every implementation remain open |
 
 The live engineering oracle currently accepts any number of duplicate `seq` values once the
 expected set is present. It does not compare bytes for repeated IDs, bind a duplicate to the sealed
@@ -519,8 +524,10 @@ which the oracle can resolve. The data header contains only version/kind, operat
 and sequence; interval-wide pipeline/operator/sink, ABI, shard/vnode, assignment, process, and
 recovery provenance lives in the marker. The reader hashes the raw payload bytes and derives the
 expected vnode from the canonical key and frozen ABI rather than trusting duplicated row metadata.
-Cycle 57 closes the public stable-serving local-adoption identity only; per-attempt checkpoint and
-timing evidence are still required for the rotation charter. The initial interval must first
+Cycle 57 closes the public stable-serving local-adoption identity only. Cycle 58 proves that
+per-attempt timing must first come from a bounded local ledger and that durable joining cannot use
+the current racy/inferred lookup composition; both remain required for the rotation charter. The
+initial interval must first
 reference a zero-input bootstrap checkpoint/capsule created
 from exact pre-delivery source baselines while readiness, graph work, and sink writes remain closed;
 there is no null/genesis authority shortcut. Implementation must start with semantic model and byte-
@@ -624,6 +631,7 @@ The current branch's admission-neutral hardening was then checked separately:
 | Cycle 57 exact-cut classifier | PASS, 1/1 | Stable success; changing/draining durable head, trailing/missing/ahead/conflicting local adoption, and duplicate-process branches; `cluster,kafka` warnings-denied Clippy passed |
 | Cycle 57 real static run, one leader kill, zero-second tail | **FAIL terminal gate** | Exact survivor/rejoin convergence passed in 44.95/34.21 s and all 43,473 IDs reached the ALO sink; only 72 node0 latency observations were available versus the existing minimum 100 |
 | Cycle 57 real static run, one leader kill, 90-second tail | **FAIL terminal gate** | Exact survivor/rejoin convergence passed in 43.46/37.53 s and all 80,260 IDs reached the ALO sink; node1 met the 1024-ms stall bound for 98.81% of 168 observations versus the required 99.00% |
+| Cycle 58 checkpoint-attempt authority audit | PASS for design boundary; no runtime claim | Exact outcome/capsule retention, two-floor compaction, orphan-capsule, source-offset, lookup-side-effect, timing, and response-bound limits were mapped; implementation stopped before an untruthful route |
 
 Both cluster and no-feature `cargo check` and `cargo clippy -D warnings` configurations passed, as
 did formatting and diff checks. These focused results do not exercise keyed cluster restore.

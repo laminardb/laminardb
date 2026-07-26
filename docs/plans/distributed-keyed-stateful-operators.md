@@ -3,7 +3,7 @@
 - **Status:** Planned and backend-gated; exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster
   operator is admitted by this document
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 57
+- **Last reconciled:** 2026-07-26 during Cycle 58
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -209,6 +209,11 @@ kill/rejoin assertions but failed their encompassing terminal profile gate. The 
 recorded 98.81% rather than 99.00% of one node's checkpoint stalls within 1024 ms. The miss is kept
 as NO-GO evidence; aggregate metrics cannot identify its exact attempts or establish cause.
 
+The [Cycle 58 checkpoint-attempt evidence audit](../reports/checkpoint-attempt-evidence-audit-2026-07-26.md)
+timeboxes the gap without adding an endpoint. The next slice is the bounded three-family local
+barrier-pause ledger and existing-harness consumer; full-checkpoint/restorable-gate evidence and a
+read-only same-snapshot durable audit remain separate blockers.
+
 ## Scope and non-goals
 
 In scope:
@@ -377,9 +382,12 @@ Work:
    plus partition fence markers bound to the exact recovery-base attempt, capsule digest, and
    assignment certificate; the source oracle derives its ledger by reconciling durable intents
    with actual broker records rather than acknowledgement callbacks. Cycle 57 freezes and consumes
-   the supported stable-serving local-adoption projection. Still freeze the exact checkpoint-attempt
-   outcome/capsule and timing projections; polling the shared durable `/vnodes` head, aggregate
-   histograms, private object paths, or text-log substrings is not proof.
+   the supported stable-serving local-adoption projection. Cycle 58 freezes the three-family local
+   barrier-pause ledger requirements but stops durable projection until one read-only core audit can
+   return exact retained authority and both floors from a stable snapshot. Full-checkpoint and
+   restorable-gate evidence plus provider-neutral source-cut normalization remain open. Polling the
+   shared durable `/vnodes` head, aggregate histograms, private object paths, or text-log substrings
+   is not proof.
 8. Freeze a fault-point vocabulary and output-oracle format shared by later phases. Cross source
    drain/replay, state mutation/freeze, timer fire, output enqueue, sink flush, durable decision,
    external publication, assignment rotation, and ambiguous commit.

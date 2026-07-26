@@ -5,7 +5,7 @@
   pending a new official package; no runtime
   dependency, backend qualification evidence, independent production-soak result, or admission change
 - **Started:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 57
+- **Last reconciled:** 2026-07-26 during Cycle 58
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline:** `1e2f8429`; working branch `feature/distributed-keyed-state-adr`
@@ -426,12 +426,18 @@ rerun measured 98.81% rather than the required 99.00% of node1 checkpoint stalls
 This result is retained; aggregate histograms cannot identify the exact violating attempts, so
 exact attempt/timing projection is the next authority audit rather than a threshold adjustment.
 
+The [Cycle 58 audit](../reports/checkpoint-attempt-evidence-audit-2026-07-26.md) adds no route. The next
+slice is a process-local ledger for pipeline-stall, local-barrier, and aligned-resume evidence,
+consumed by the existing harness without shared-store reads. Full-checkpoint/restorable-gate
+evidence and a non-creating, read-only same-snapshot durable audit remain separate blockers.
+
 The existing output path satisfies none of the new provenance/fence fields: it passes only a batch
 and deadline and uses an idempotent, non-transactional Kafka producer. The supported evidence APIs
-still need a bounded versioned projection of the existing immutable checkpoint outcome/capsule plus
-exact max/deadline telemetry. Raw object-store records and tracing fields are implementation
-evidence, not a frozen external API. These tasks do not depend on which local working-state engine
-eventually qualifies.
+still need the frozen local barrier-pause ledger, exact full-checkpoint/restorable-gate evidence,
+and, later, the same-snapshot immutable outcome/capsule projection. Raw object-store records,
+provider-specific connector offsets, and
+tracing fields are implementation evidence, not a frozen external API. These tasks do not depend on
+which local working-state engine eventually qualifies.
 
 The expected checkpoint order is source position capture followed by a FIFO sink synchronization
 fence and successful durable flush before manifest readiness, durable decision, and external source
