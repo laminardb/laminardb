@@ -133,6 +133,116 @@ fn test_state_with_token(token: &str) -> Arc<AppState> {
     test_state_with_token_and_gate(token, ready_serving_gate())
 }
 
+#[cfg(feature = "cluster")]
+struct LocalEvidenceFixture {
+    state: Arc<AppState>,
+    controller: Arc<laminar_core::cluster::control::ClusterController>,
+    control: Arc<laminar_core::cluster::control::InMemoryKv>,
+    adoption: laminar_core::cluster::control::CheckpointAssignmentAdoption,
+    process_term: u64,
+}
+
+#[cfg(feature = "cluster")]
+async fn local_evidence_fixture(
+    token: Option<&str>,
+    serving_gate: Arc<ServingGate>,
+    publish_adoption: bool,
+) -> LocalEvidenceFixture {
+    use laminar_core::cluster::control::{
+        CheckpointAssignmentAdoption, CheckpointAssignmentFence, ClusterController, ClusterKv,
+        InMemoryKv, LeaseDeadline, ProcessLeaseAuthority, ProcessLeaseOutcome,
+    };
+
+    let node = laminar_core::cluster::discovery::NodeId(61);
+    let boot = uuid::Uuid::from_u128(610);
+    let control = Arc::new(InMemoryKv::new(node));
+    let control_kv: Arc<dyn ClusterKv> = control.clone();
+    let assignment_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let snapshot_store =
+        Arc::new(laminar_core::cluster::control::AssignmentSnapshotStore::new(assignment_store));
+    let (_members_tx, members_rx) = tokio::sync::watch::channel(Vec::new());
+    let controller = Arc::new(ClusterController::new_with_recovery_incarnation(
+        node,
+        Arc::clone(&control_kv),
+        control_kv,
+        Some(Arc::clone(&snapshot_store)),
+        members_rx.clone(),
+        boot,
+    ));
+
+    let process_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let process_authority = Arc::new(
+        ProcessLeaseAuthority::new(process_store, std::time::Duration::from_secs(60)).unwrap(),
+    );
+    let ProcessLeaseOutcome::Acquired(process_lease) = process_authority
+        .store_for(node)
+        .try_acquire(boot, 0)
+        .await
+        .unwrap()
+    else {
+        panic!("empty process authority must be acquired");
+    };
+    controller
+        .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(
+            std::time::Duration::from_secs(60),
+        )))
+        .unwrap();
+    controller
+        .set_process_lease_authority(process_authority)
+        .unwrap();
+    controller
+        .publish_leased_recovery_incarnation(&process_lease)
+        .await
+        .unwrap();
+
+    let owners = [node.0, node.0, node.0];
+    let adoption = CheckpointAssignmentAdoption {
+        participant: laminar_core::checkpoint::CheckpointParticipant {
+            node_id: node.0,
+            boot_incarnation: boot,
+        },
+        assignment_version: 7,
+        partitioning_abi_version: laminar_core::state::PARTITIONING_ABI_VERSION,
+        vnode_count: u32::try_from(owners.len()).unwrap(),
+        assignment_digest: CheckpointAssignmentFence::owner_map_digest(3, &owners),
+    };
+    if publish_adoption {
+        controller
+            .announce_adopted_assignment(&adoption)
+            .await
+            .unwrap();
+        controller.publish_checkpoint_assignment_fence(Some(
+            CheckpointAssignmentFence::from_owner_map(
+                adoption.assignment_version,
+                &owners,
+                vec![adoption.participant],
+            )
+            .unwrap(),
+        ));
+    }
+
+    let mut state = match token {
+        Some(token) => test_state_with_token_and_gate(token, serving_gate),
+        None => test_state_with_gate(serving_gate),
+    };
+    state.current_config.write().server.mode = crate::config::ServerMode::Cluster;
+    Arc::get_mut(&mut state).unwrap().cluster = Some(ClusterComponents {
+        controller: Arc::clone(&controller),
+        snapshot_store,
+        membership_rx: members_rx,
+    });
+
+    LocalEvidenceFixture {
+        state,
+        controller,
+        control,
+        adoption,
+        process_term: process_lease.term,
+    }
+}
+
 #[test]
 fn terminal_serving_fence_wins_a_concurrent_startup_open() {
     for _ in 0..64 {
@@ -1433,6 +1543,283 @@ async fn test_get_graph_empty() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(json["nodes"].as_array().unwrap().is_empty());
     assert!(json["edges"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_cluster_local_evidence_404_when_not_cluster() {
+    let app = build_router(test_state());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/cluster/local-evidence")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn cluster_local_evidence_requires_a_configured_token() {
+    let fixture = local_evidence_fixture(None, ready_serving_gate(), true).await;
+    let response = build_router(fixture.state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/cluster/local-evidence")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({ "error": LOCAL_EVIDENCE_TOKEN_REQUIRED_MSG })
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn cluster_local_evidence_requires_the_current_bearer() {
+    let fixture =
+        local_evidence_fixture(Some("supersecret-token"), ready_serving_gate(), true).await;
+    let app = build_router(fixture.state);
+
+    for authorization in [None, Some("Bearer wrong-token")] {
+        let mut request = Request::builder().uri("/api/v1/cluster/local-evidence");
+        if let Some(authorization) = authorization {
+            request = request.header(axum::http::header::AUTHORIZATION, authorization);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    let query_token = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/cluster/local-evidence?token=supersecret-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(query_token.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn cluster_local_evidence_returns_exact_bounded_no_store_envelope() {
+    let fixture =
+        local_evidence_fixture(Some("supersecret-token"), ready_serving_gate(), true).await;
+    let expected_adoption = fixture.adoption.clone();
+    let expected_process_term = fixture.process_term;
+    let response = build_router(fixture.state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/cluster/local-evidence")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    "Bearer supersecret-token",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-store")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    let body = axum::body::to_bytes(response.into_body(), MAX_LOCAL_EVIDENCE_RESPONSE_BYTES + 1)
+        .await
+        .unwrap();
+    assert!(body.len() <= MAX_LOCAL_EVIDENCE_RESPONSE_BYTES);
+    let envelope: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let envelope_fields = envelope.as_object().unwrap();
+    assert_eq!(envelope_fields.len(), 2);
+    assert_eq!(
+        envelope["schema_version"],
+        serde_json::Value::String(LOCAL_EVIDENCE_SCHEMA_VERSION.into())
+    );
+    let evidence = envelope["evidence"].as_object().unwrap();
+    assert_eq!(evidence.len(), 3);
+    assert_eq!(evidence["participant"]["node_id"], 61);
+    assert_eq!(
+        evidence["participant"]["boot_incarnation"],
+        uuid::Uuid::from_u128(610).to_string()
+    );
+    assert_eq!(evidence["process_term"], expected_process_term);
+    assert_eq!(
+        serde_json::from_value::<laminar_core::cluster::control::CheckpointAssignmentAdoption>(
+            evidence["adopted_assignment"].clone()
+        )
+        .unwrap(),
+        expected_adoption
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn cluster_local_evidence_requires_the_live_audited_assignment_fence() {
+    let fixture =
+        local_evidence_fixture(Some("supersecret-token"), ready_serving_gate(), true).await;
+
+    // SnapshotWatcher clears this projection when it suspends local checkpoint authority. The
+    // durable current-boot adoption remains retained, but it must no longer authorize HTTP 200.
+    fixture.controller.publish_checkpoint_assignment_fence(None);
+    let response = build_router(fixture.state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/cluster/local-evidence")
+                .header(
+                    axum::http::header::AUTHORIZATION,
+                    "Bearer supersecret-token",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({ "error": LOCAL_EVIDENCE_UNAVAILABLE_MSG })
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn cluster_local_evidence_fails_closed_for_missing_stale_or_malformed_logical_adoption() {
+    let missing =
+        local_evidence_fixture(Some("supersecret-token"), ready_serving_gate(), false).await;
+    let request = || {
+        Request::builder()
+            .uri("/api/v1/cluster/local-evidence")
+            .header(
+                axum::http::header::AUTHORIZATION,
+                "Bearer supersecret-token",
+            )
+            .body(Body::empty())
+            .unwrap()
+    };
+    let missing_response = build_router(missing.state)
+        .oneshot(request())
+        .await
+        .unwrap();
+    assert_eq!(missing_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let stale =
+        local_evidence_fixture(Some("supersecret-token"), ready_serving_gate(), false).await;
+    stale.controller.publish_checkpoint_assignment_fence(Some(
+        laminar_core::cluster::control::CheckpointAssignmentFence::from_owner_map(
+            stale.adoption.assignment_version,
+            &[61, 61, 61],
+            vec![stale.adoption.participant],
+        )
+        .unwrap(),
+    ));
+    let mut stale_adoption = stale.adoption;
+    stale_adoption.participant.boot_incarnation = uuid::Uuid::from_u128(611);
+    stale.control.seed(
+        laminar_core::cluster::discovery::NodeId(61),
+        "control:adopted-assignment",
+        serde_json::to_string(&stale_adoption).unwrap(),
+    );
+    let stale_response = build_router(stale.state).oneshot(request()).await.unwrap();
+    assert_eq!(stale_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let malformed_logical =
+        local_evidence_fixture(Some("supersecret-token"), ready_serving_gate(), false).await;
+    // The KV read succeeds and returns malformed logical payload bytes. Object-store/control
+    // envelope failures remain storage uncertainty and are mapped to 503 by the core API.
+    malformed_logical.control.seed(
+        laminar_core::cluster::discovery::NodeId(61),
+        "control:adopted-assignment",
+        "not-json".into(),
+    );
+    let malformed_response = build_router(malformed_logical.state)
+        .oneshot(request())
+        .await
+        .unwrap();
+    assert_eq!(
+        malformed_response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let body = axum::body::to_bytes(malformed_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({ "error": LOCAL_EVIDENCE_INVALID_MSG })
+    );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn cluster_local_evidence_preserves_startup_recovery_and_terminal_gates() {
+    let startup = local_evidence_fixture(
+        Some("supersecret-token"),
+        Arc::new(ServingGate::starting()),
+        true,
+    )
+    .await;
+    let request = || {
+        Request::builder()
+            .uri("/api/v1/cluster/local-evidence")
+            .header(
+                axum::http::header::AUTHORIZATION,
+                "Bearer supersecret-token",
+            )
+            .body(Body::empty())
+            .unwrap()
+    };
+    let startup_response = build_router(startup.state)
+        .oneshot(request())
+        .await
+        .unwrap();
+    assert_eq!(startup_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let recovering =
+        local_evidence_fixture(Some("supersecret-token"), ready_serving_gate(), true).await;
+    recovering.controller.set_recovering(true);
+    let recovery_response = build_router(recovering.state)
+        .oneshot(request())
+        .await
+        .unwrap();
+    assert_eq!(recovery_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let fenced =
+        local_evidence_fixture(Some("supersecret-token"), ready_serving_gate(), true).await;
+    fenced.controller.fence_process_lease();
+    let fenced_response = build_router(fenced.state).oneshot(request()).await.unwrap();
+    assert_eq!(fenced_response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]

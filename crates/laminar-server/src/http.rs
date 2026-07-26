@@ -11,7 +11,7 @@ use prometheus::Registry;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -229,6 +229,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/cluster", get(cluster_status))
         .route("/api/v1/cluster/nodes", get(cluster_nodes))
         .route("/api/v1/cluster/vnodes", get(cluster_vnodes))
+        .route(
+            "/api/v1/cluster/local-evidence",
+            get(cluster_local_evidence),
+        )
         .route("/api/v1/cluster/leader", get(cluster_leader))
         .route("/api/v1/cluster/checkpoints", get(cluster_checkpoints))
         .route("/api/v1/pipeline/stop", post(stop_pipeline))
@@ -1027,6 +1031,25 @@ const CLUSTER_DISABLED_MSG: &str = "cluster endpoints are only available in clus
 #[cfg(not(feature = "cluster"))]
 const CLUSTER_DISABLED_MSG: &str = "cluster endpoints require the `cluster` feature";
 
+#[cfg(feature = "cluster")]
+const LOCAL_EVIDENCE_SCHEMA_VERSION: &str = "laminardb-local-authority-evidence/v1";
+#[cfg(feature = "cluster")]
+const MAX_LOCAL_EVIDENCE_RESPONSE_BYTES: usize = 4_096;
+#[cfg(feature = "cluster")]
+const LOCAL_EVIDENCE_TOKEN_REQUIRED_MSG: &str =
+    "local process authority evidence requires server.console_token";
+#[cfg(feature = "cluster")]
+const LOCAL_EVIDENCE_UNAVAILABLE_MSG: &str = "local process authority evidence is unavailable";
+#[cfg(feature = "cluster")]
+const LOCAL_EVIDENCE_INVALID_MSG: &str = "local process authority evidence is invalid";
+
+#[cfg(feature = "cluster")]
+#[derive(Serialize)]
+struct LocalEvidenceResponse {
+    schema_version: &'static str,
+    evidence: laminar_core::cluster::control::LocalProcessAuthorityEvidence,
+}
+
 /// `GET /api/v1/cluster/nodes` — current cluster membership.
 async fn cluster_nodes(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     #[cfg(feature = "cluster")]
@@ -1076,6 +1099,144 @@ async fn cluster_vnodes(State(state): State<Arc<AppState>>) -> impl IntoResponse
     #[cfg(not(feature = "cluster"))]
     {
         let _ = state;
+        error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response()
+    }
+}
+
+/// `GET /api/v1/cluster/local-evidence` — bounded evidence retained by this exact process.
+///
+/// This route intentionally remains behind the normal startup/recovery serving gate. It never
+/// rereads the durable assignment snapshot or treats shared publication as local convergence.
+async fn cluster_local_evidence(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    #[cfg(feature = "cluster")]
+    {
+        let Some(cluster) = state.cluster.as_ref() else {
+            return error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response();
+        };
+
+        // The protected router authenticates this request first. Require a configured token for
+        // this sensitive route and accept only the bearer form before capturing evidence. The
+        // same checks are repeated immediately before 200 to close a configuration-reload race.
+        let expected = state.current_config.read().server.console_token.clone();
+        let Some(expected) = expected else {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                LOCAL_EVIDENCE_TOKEN_REQUIRED_MSG,
+            )
+            .into_response();
+        };
+        if !bearer_token(&headers).is_some_and(|token| ct_eq(token, expected.expose())) {
+            return error_response(StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        }
+
+        let evidence = match cluster
+            .controller
+            .read_local_process_authority_evidence()
+            .await
+        {
+            Ok(evidence) => evidence,
+            Err(
+                laminar_core::cluster::control::LocalProcessAuthorityEvidenceError::Unavailable(
+                    error,
+                ),
+            ) => {
+                warn!(%error, "local process authority evidence is unavailable");
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    LOCAL_EVIDENCE_UNAVAILABLE_MSG,
+                )
+                .into_response();
+            }
+            Err(laminar_core::cluster::control::LocalProcessAuthorityEvidenceError::Invalid(
+                error,
+            )) => {
+                warn!(%error, "local process authority evidence is invalid");
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    LOCAL_EVIDENCE_INVALID_MSG,
+                )
+                .into_response();
+            }
+        };
+
+        let adoption = &evidence.adopted_assignment;
+        if evidence.participant.node_id == 0
+            || evidence.participant.boot_incarnation.is_nil()
+            || evidence.process_term == 0
+            || !adoption.is_canonical()
+            || adoption.participant != evidence.participant
+        {
+            warn!("local process authority evidence violated its canonical response contract");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                LOCAL_EVIDENCE_INVALID_MSG,
+            )
+            .into_response();
+        }
+
+        let envelope = LocalEvidenceResponse {
+            schema_version: LOCAL_EVIDENCE_SCHEMA_VERSION,
+            evidence,
+        };
+        let encoded = match serde_json::to_vec(&envelope) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                warn!(%error, "failed to serialize local process authority evidence");
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    LOCAL_EVIDENCE_INVALID_MSG,
+                )
+                .into_response();
+            }
+        };
+        if encoded.len() > MAX_LOCAL_EVIDENCE_RESPONSE_BYTES {
+            warn!(
+                encoded_bytes = encoded.len(),
+                maximum_bytes = MAX_LOCAL_EVIDENCE_RESPONSE_BYTES,
+                "local process authority evidence exceeded its response bound"
+            );
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                LOCAL_EVIDENCE_INVALID_MSG,
+            )
+            .into_response();
+        }
+
+        // Close a capture/response race with terminal fencing or a newly started recovery. The
+        // middleware performs the same check before capture; neither check grants data authority.
+        if let Some(reason) = state.serving_rejection() {
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, reason).into_response();
+        }
+
+        let expected = state.current_config.read().server.console_token.clone();
+        let Some(expected) = expected else {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                LOCAL_EVIDENCE_TOKEN_REQUIRED_MSG,
+            )
+            .into_response();
+        };
+        if !bearer_token(&headers).is_some_and(|token| ct_eq(token, expected.expose())) {
+            return error_response(StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        }
+
+        let mut response = (StatusCode::OK, encoded).into_response();
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+        response
+    }
+    #[cfg(not(feature = "cluster"))]
+    {
+        let _ = (state, headers);
         error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response()
     }
 }
