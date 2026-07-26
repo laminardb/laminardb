@@ -3,7 +3,7 @@
 - **Status:** Planned and backend-gated; exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster
   operator is admitted by this document
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 60
+- **Last reconciled:** 2026-07-26 during Cycle 61
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -227,6 +227,10 @@ The protocol uses named recorder/polling contrasts, common metrics, fixed input/
 and balanced temporal blocks. No A/B ran; the coupled soak harness is not its common driver and v1
 is effect-estimation-only. The direct nonempty HTTP route test remains an explicit low-risk
 composition gap rather than justification for a seeding API or duplicate live-cluster unit fixture.
+
+Cycle 61 adds only the [chartered prebuilt-executable binding](../testing/distributed-state-production-soak-charter.md#cycle-61-executable-binding-seam)
+to the ignored engineering harness. No real-process run or A/B occurred; the coupled target remains
+ineligible as the common driver and cannot replace the independent release-binary soak.
 
 ## Scope and non-goals
 

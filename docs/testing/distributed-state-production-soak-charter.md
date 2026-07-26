@@ -491,6 +491,46 @@ engineering workload, build, and environment. It cannot qualify a backend, admit
 establish exactly once, generalize to production keyed workloads, or replace the independent
 immutable release-binary soak.
 
+### Cycle 61 executable-binding seam
+
+The ignored `cluster_soak` target can now select a prebuilt server only through the all-or-nothing
+`LAMINAR_SOAK_LAMINARDB_EXE` and `LAMINAR_SOAK_LAMINARDB_SHA256` environment pair. The path must be
+absolute; the harness executes its canonical regular-file target; and the digest must be exactly 64
+lowercase hexadecimal characters. With both variables absent, Cargo's test-built `laminardb`
+remains the default. Any partial, empty, malformed, missing, non-file, mismatched, or subsequently
+changed selection fails closed. On PowerShell, canonical lowercase input can be prepared as:
+
+```powershell
+$laminarSoakExe = (Resolve-Path -LiteralPath .\target\soak\laminardb.exe).Path
+$laminarSoakSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $laminarSoakExe).Hash.ToLowerInvariant()
+$env:LAMINAR_SOAK_LAMINARDB_EXE = $laminarSoakExe
+$env:LAMINAR_SOAK_LAMINARDB_SHA256 = $laminarSoakSha
+```
+
+Identity validation does not predict OS executability. A regular file with the declared digest but
+missing execute permission, wrong executable format, or wrong architecture is rejected only by
+`Command::spawn`; the cluster path may already have created its isolated topics/dependency clients.
+The runner must classify it as a failed attempt, retain any created evidence, and never fall back
+to Cargo's binary.
+
+Resolution occurs before dependency or process side effects. Every initial and restart spawn then
+requires a fresh hash check and consumes a private permit tied to that same resolved identity.
+Restart checks occur immediately before the existing recovery/rejoin timer starts, so hash I/O is
+not charged to the reported RTO. Spawn receipts bind node, PID, and digest; Kafka-feature cluster
+receipts additionally bind process generation.
+
+This is a controlled-run substitution guard, not process-image attestation. A portable path-based
+spawn retains a verify/exec TOCTOU window; the runner must stage the executable read-only and retain
+pre/post hashes. Hashing also warms the executable cache and uses host I/O during the workload, so
+the resulting recovery values are common-harness relative measurements, not cold-start production
+latency. The current harness still lets diagnostic collection affect control flow and is not the
+Cycle 60 A/B common driver. Its fault gates are test-only, so selecting an ordinary release binary
+also does not satisfy this charter's independent release-candidate fault soak.
+
+No standalone observer was added in Cycle 61. It must land with a consuming driver dry run that
+proves observer exit, hang, or malformed output cannot alter the immutable checkpoint, fault, or
+end schedule; a schedule generator tested only by itself would not prove non-interference.
+
 ## Frozen numerical contract
 
 An eligible machine-readable charter contains no `TBD`, zero, or results-derived threshold. It

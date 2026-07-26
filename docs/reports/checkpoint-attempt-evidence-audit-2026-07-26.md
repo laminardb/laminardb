@@ -255,3 +255,11 @@ content-addressed 80,000-record trace, a fixed 290-second window, and one exact 
 fault ordinal. It has not run. The current harness is not an eligible common driver, v1 is effect-
 estimation-only, and a powered equivalence v2 remains open. Exact full-checkpoint/restorable-gate
 and same-snapshot outcome/capsule authority remain separate blockers; production is **NO-GO**.
+
+## Cycle 61 disposition
+
+Cycle 61 adds the [chartered prebuilt-executable binding](../testing/distributed-state-production-soak-charter.md#cycle-61-executable-binding-seam)
+to both ignored harness paths. The focused suite rejects partial configuration, relative, missing,
+and non-regular directory paths, malformed/mismatched digests, and later byte changes. The resolver
+also rejects unreadable files; executable permission, format, and architecture remain OS spawn
+checks. No A/B, backend trial, or real-process run occurred; production remains **NO-GO**.

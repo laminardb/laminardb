@@ -5,7 +5,7 @@
   pending a new official package; no runtime
   dependency, backend qualification evidence, independent production-soak result, or admission change
 - **Started:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 60
+- **Last reconciled:** 2026-07-26 during Cycle 61
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline:** `1e2f8429`; working branch `feature/distributed-keyed-state-adr`
@@ -447,6 +447,10 @@ adding a ledger injector or duplicate live-cluster fixture. The
 now freezes separate recorder and polling contrasts with a fixed trace, time window, manual-
 checkpoint fault ordinal, common metrics, and balanced order. It has not run, the current harness
 cannot execute it without treatment-dependent control flow, and v1 cannot support equivalence.
+
+Cycle 61 adds only the [chartered prebuilt-executable binding](../testing/distributed-state-production-soak-charter.md#cycle-61-executable-binding-seam)
+to the existing engineering harness. It does not decouple diagnostics from control flow. No
+standalone observer, A/B, or real-process soak was added or run.
 
 The existing output path satisfies none of the new provenance/fence fields: it passes only a batch
 and deadline and uses an idempotent, non-transactional Kafka producer. The supported evidence APIs

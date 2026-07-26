@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 60
+- **Last reconciled:** 2026-07-26 during Cycle 61
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -13,7 +13,7 @@
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
   [TidesDB package design](tidesdb-local-state-successor-design.md),
   [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
-  [latest completed review](../reviews/distributed-keyed-state-cycle-60.md)
+  [latest completed review](../reviews/distributed-keyed-state-cycle-61.md)
 
 ## Decision
 
@@ -1318,7 +1318,13 @@ installation from endpoint polling using common metrics and fixed workload/fault
 not run, the current harness is not its common driver, and it is effect-estimation-only. The direct
 nonempty HTTP route test remains a documented composition gap; no seed API was added. Exact full-
 checkpoint/restorable-gate families and the read-only same-snapshot outcome/capsule audit remain
-open. `[LDB-4007]`, `[LDB-0013]`, and the production **NO-GO** verdict are unchanged.
+open.
+
+Cycle 61 adds only a SHA-bound prebuilt-executable seam to the ignored engineering harness; its
+scope and threat model are frozen in the [soak charter](../testing/distributed-state-production-soak-charter.md#cycle-61-executable-binding-seam).
+No real-process run or A/B occurred, the coupled target is not the common driver, and it cannot
+replace the independent production soak.
+`[LDB-4007]`, `[LDB-0013]`, and the production **NO-GO** verdict are unchanged.
 
 Selected attempts may then be joined at low cadence only through a new read-only, same-snapshot
 core audit of the exact outcome, both retention floors, and validated live capsule reference;
