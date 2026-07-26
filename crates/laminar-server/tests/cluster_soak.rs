@@ -57,11 +57,25 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "kafka")]
+use laminar_core::cluster::control::{
+    AssignmentSnapshot, CheckpointAssignmentAdoption, CheckpointParticipant,
+    LocalProcessAuthorityEvidence,
+};
+#[cfg(feature = "kafka")]
 use laminar_core::state::{CheckpointAttempt, CheckpointAttemptRelation};
 
 const NODES: usize = 3;
 /// Per-node ports: http = BASE + i, gossip = BASE + 100 + i.
 const BASE_PORT: u16 = 19310;
+const SOAK_CONSOLE_TOKEN: &str = "laminardb-cluster-soak";
+#[cfg(feature = "kafka")]
+const SOAK_HTTP_HEADER_MAX_BYTES: usize = 16 * 1_024;
+#[cfg(feature = "kafka")]
+const LOCAL_AUTHORITY_EVIDENCE_MAX_BYTES: usize = 4 * 1_024;
+#[cfg(feature = "kafka")]
+const ASSIGNMENT_SNAPSHOT_MAX_BYTES: usize = 4 * 1_024 * 1_024;
+#[cfg(feature = "kafka")]
+const LOCAL_AUTHORITY_EVIDENCE_SCHEMA: &str = "laminardb-local-authority-evidence/v1";
 #[cfg(feature = "kafka")]
 const DEFAULT_CLUSTER_KEY_GROUPS: u32 = 64;
 #[cfg(feature = "kafka")]
@@ -126,9 +140,10 @@ fn cluster_key_group_count() -> u32 {
         u64::from(DEFAULT_CLUSTER_KEY_GROUPS),
     );
     let key_groups = u32::try_from(key_groups).expect("LAMINAR_SOAK_KEY_GROUPS must fit in a u32");
+    let minimum = u32::try_from(NODES).expect("soak node count must fit in a u32");
     assert!(
-        (1..=65_535).contains(&key_groups),
-        "LAMINAR_SOAK_KEY_GROUPS must be in 1..=65535"
+        (minimum..=65_535).contains(&key_groups),
+        "LAMINAR_SOAK_KEY_GROUPS must be in {minimum}..=65535 so every soak node can own a vnode"
     );
     key_groups
 }
@@ -200,6 +215,36 @@ struct Node {
     fault_trigger_path: Option<PathBuf>,
     /// Debug checkpoint handshake used to prove a hard kill landed inside an active phase.
     checkpoint_gate_path: Option<PathBuf>,
+}
+
+#[cfg(feature = "kafka")]
+#[derive(Debug)]
+struct BoundedHttpResponse {
+    status: u16,
+    body: Vec<u8>,
+}
+
+#[cfg(feature = "kafka")]
+#[derive(Debug)]
+enum BoundedHttpError {
+    Unavailable(String),
+    Invalid(String),
+}
+
+#[cfg(feature = "kafka")]
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalAuthorityEvidenceEnvelope {
+    schema_version: String,
+    evidence: LocalProcessAuthorityEvidence,
+}
+
+#[cfg(feature = "kafka")]
+#[derive(Debug)]
+enum LocalAuthorityObservation {
+    Pending(String),
+    Available(LocalProcessAuthorityEvidence),
+    Contradiction(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -622,7 +667,7 @@ impl Node {
         stream.set_read_timeout(Some(timeout)).ok()?;
         let body = body.unwrap_or_default();
         let request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {SOAK_CONSOLE_TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         stream.write_all(request.as_bytes()).ok()?;
@@ -637,6 +682,240 @@ impl Node {
 
     fn http_get(&self, path: &str) -> Option<String> {
         self.http_request("GET", path, None, Duration::from_secs(2))
+    }
+
+    #[cfg(feature = "kafka")]
+    fn bounded_http_get(
+        &self,
+        path: &str,
+        body_cap: usize,
+        deadline: Instant,
+    ) -> Result<BoundedHttpResponse, BoundedHttpError> {
+        let remaining = || {
+            remaining_at(deadline, Instant::now())
+                .map(|duration| duration.min(Duration::from_secs(6)))
+                .ok_or_else(|| {
+                    BoundedHttpError::Unavailable(format!(
+                        "node{} HTTP evidence deadline was exhausted",
+                        self.id
+                    ))
+                })
+        };
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], self.http_port));
+        let mut stream = TcpStream::connect_timeout(&address, remaining()?).map_err(|error| {
+            BoundedHttpError::Unavailable(format!("node{} HTTP connect failed: {error}", self.id))
+        })?;
+        stream
+            .set_write_timeout(Some(remaining()?))
+            .map_err(|error| {
+                BoundedHttpError::Unavailable(format!(
+                    "node{} HTTP write-timeout setup failed: {error}",
+                    self.id
+                ))
+            })?;
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {SOAK_CONSOLE_TOKEN}\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).map_err(|error| {
+            BoundedHttpError::Unavailable(format!("node{} HTTP request failed: {error}", self.id))
+        })?;
+        let response_cap = SOAK_HTTP_HEADER_MAX_BYTES
+            .checked_add(body_cap)
+            .and_then(|cap| cap.checked_add(1))
+            .ok_or_else(|| {
+                BoundedHttpError::Invalid("bounded HTTP response cap overflow".to_string())
+            })?;
+        let mut response = Vec::with_capacity(response_cap.min(64 * 1_024));
+        let mut chunk = [0_u8; 8 * 1_024];
+        loop {
+            stream
+                .set_read_timeout(Some(remaining()?))
+                .map_err(|error| {
+                    BoundedHttpError::Unavailable(format!(
+                        "node{} HTTP read-timeout setup failed: {error}",
+                        self.id
+                    ))
+                })?;
+            let available = response_cap - response.len();
+            let read_cap = available.min(chunk.len());
+            let read = stream.read(&mut chunk[..read_cap]).map_err(|error| {
+                BoundedHttpError::Unavailable(format!(
+                    "node{} HTTP response read failed: {error}",
+                    self.id
+                ))
+            })?;
+            if read == 0 {
+                break;
+            }
+            response.extend_from_slice(&chunk[..read]);
+            if response.len() == response_cap {
+                return Err(BoundedHttpError::Invalid(format!(
+                    "node{} HTTP response exceeded the {body_cap}-byte body budget",
+                    self.id
+                )));
+            }
+        }
+        let _remaining = remaining()?;
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|offset| offset + 4)
+            .ok_or_else(|| {
+                BoundedHttpError::Invalid(format!(
+                    "node{} HTTP response lacked a header terminator",
+                    self.id
+                ))
+            })?;
+        if header_end > SOAK_HTTP_HEADER_MAX_BYTES {
+            return Err(BoundedHttpError::Invalid(format!(
+                "node{} HTTP headers exceeded {SOAK_HTTP_HEADER_MAX_BYTES} bytes",
+                self.id
+            )));
+        }
+        let headers = std::str::from_utf8(&response[..header_end]).map_err(|error| {
+            BoundedHttpError::Invalid(format!(
+                "node{} HTTP headers were not UTF-8: {error}",
+                self.id
+            ))
+        })?;
+        let status = headers
+            .lines()
+            .next()
+            .and_then(|line| line.split_ascii_whitespace().nth(1))
+            .ok_or_else(|| {
+                BoundedHttpError::Invalid(format!("node{} HTTP status line was malformed", self.id))
+            })?
+            .parse::<u16>()
+            .map_err(|error| {
+                BoundedHttpError::Invalid(format!(
+                    "node{} HTTP status was malformed: {error}",
+                    self.id
+                ))
+            })?;
+        let body = response.split_off(header_end);
+        if body.len() > body_cap {
+            return Err(BoundedHttpError::Invalid(format!(
+                "node{} HTTP body was {} bytes; maximum is {body_cap}",
+                self.id,
+                body.len()
+            )));
+        }
+        Ok(BoundedHttpResponse { status, body })
+    }
+
+    #[cfg(feature = "kafka")]
+    fn local_authority_observation(&self, deadline: Instant) -> LocalAuthorityObservation {
+        let response = match self.bounded_http_get(
+            "/api/v1/cluster/local-evidence",
+            LOCAL_AUTHORITY_EVIDENCE_MAX_BYTES,
+            deadline,
+        ) {
+            Ok(response) => response,
+            Err(BoundedHttpError::Unavailable(error)) => {
+                return LocalAuthorityObservation::Pending(error);
+            }
+            Err(BoundedHttpError::Invalid(error)) => {
+                return LocalAuthorityObservation::Contradiction(error);
+            }
+        };
+        if response.status == 503 {
+            return LocalAuthorityObservation::Pending(format!(
+                "node{} local evidence is temporarily unavailable",
+                self.id
+            ));
+        }
+        if response.status != 200 {
+            return LocalAuthorityObservation::Contradiction(format!(
+                "node{} local evidence returned HTTP {}: {}",
+                self.id,
+                response.status,
+                String::from_utf8_lossy(&response.body)
+            ));
+        }
+        let envelope: LocalAuthorityEvidenceEnvelope = match serde_json::from_slice(&response.body)
+        {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                return LocalAuthorityObservation::Contradiction(format!(
+                    "node{} local evidence JSON was invalid: {error}",
+                    self.id
+                ));
+            }
+        };
+        if envelope.schema_version != LOCAL_AUTHORITY_EVIDENCE_SCHEMA {
+            return LocalAuthorityObservation::Contradiction(format!(
+                "node{} local evidence schema was {:?}; expected {LOCAL_AUTHORITY_EVIDENCE_SCHEMA:?}",
+                self.id, envelope.schema_version
+            ));
+        }
+        let evidence = envelope.evidence;
+        if evidence.participant.node_id == 0
+            || evidence.participant.boot_incarnation.is_nil()
+            || evidence.process_term == 0
+        {
+            return LocalAuthorityObservation::Contradiction(format!(
+                "node{} local evidence carried a non-canonical process identity",
+                self.id
+            ));
+        }
+        let adoption = &evidence.adopted_assignment;
+        if !adoption.is_canonical() || adoption.participant != evidence.participant {
+            return LocalAuthorityObservation::Contradiction(format!(
+                "node{} local adoption did not bind its top-level process identity",
+                self.id
+            ));
+        }
+        if remaining_at(deadline, Instant::now()).is_none() {
+            return LocalAuthorityObservation::Pending(format!(
+                "node{} local evidence deadline was exhausted",
+                self.id
+            ));
+        }
+        LocalAuthorityObservation::Available(evidence)
+    }
+
+    #[cfg(feature = "kafka")]
+    fn durable_assignment_observation(
+        &self,
+        deadline: Instant,
+    ) -> Result<Option<AssignmentSnapshot>, String> {
+        let response = match self.bounded_http_get(
+            "/api/v1/cluster/vnodes",
+            ASSIGNMENT_SNAPSHOT_MAX_BYTES,
+            deadline,
+        ) {
+            Ok(response) => response,
+            Err(BoundedHttpError::Unavailable(_)) => return Ok(None),
+            Err(BoundedHttpError::Invalid(error)) => return Err(error),
+        };
+        if response.status == 503 {
+            return Ok(None);
+        }
+        if response.status != 200 {
+            return Err(format!(
+                "node{} durable assignment returned HTTP {}: {}",
+                self.id,
+                response.status,
+                String::from_utf8_lossy(&response.body)
+            ));
+        }
+        let snapshot: AssignmentSnapshot =
+            serde_json::from_slice(&response.body).map_err(|error| {
+                format!(
+                    "node{} durable assignment JSON was invalid: {error}",
+                    self.id
+                )
+            })?;
+        snapshot.assignment_fence().map_err(|error| {
+            format!(
+                "node{} durable assignment was non-canonical: {error}",
+                self.id
+            )
+        })?;
+        if remaining_at(deadline, Instant::now()).is_none() {
+            return Ok(None);
+        }
+        Ok(Some(snapshot))
     }
 
     #[cfg(feature = "kafka")]
@@ -2246,6 +2525,7 @@ mode = "cluster"
 bind = "127.0.0.1:{http}"
 delivery = "at_least_once"
 key_groups = {key_groups}
+console_token = "{SOAK_CONSOLE_TOKEN}"
 [discovery]
 strategy = "{discovery}"
 seeds = [{seeds}]
@@ -2424,6 +2704,160 @@ fn wait_for(what: &str, deadline: Duration, mut pred: impl FnMut() -> bool) {
         }
     }
     panic!("soak: timed out after {deadline:?} waiting for: {what}");
+}
+
+#[cfg(feature = "kafka")]
+#[derive(Debug)]
+struct LocalAssignmentConvergence {
+    snapshot: AssignmentSnapshot,
+    evidence_by_node: BTreeMap<usize, LocalProcessAuthorityEvidence>,
+}
+
+#[cfg(feature = "kafka")]
+fn classify_local_assignment_cut(
+    before: &AssignmentSnapshot,
+    evidence_by_node: BTreeMap<usize, LocalProcessAuthorityEvidence>,
+    after: &AssignmentSnapshot,
+) -> Result<Option<LocalAssignmentConvergence>, String> {
+    if before != after || before.draining {
+        return Ok(None);
+    }
+    let fence = before
+        .assignment_fence()
+        .map_err(|error| format!("durable assignment is non-canonical: {error}"))?;
+    let mut evidence_participants = BTreeMap::new();
+    for (node, evidence) in &evidence_by_node {
+        let adoption = &evidence.adopted_assignment;
+        if adoption.assignment_version < fence.assignment_version {
+            return Ok(None);
+        }
+        if adoption.assignment_version > fence.assignment_version {
+            return Err(format!(
+                "node{node} local assignment {} is ahead of stable durable head {}",
+                adoption.assignment_version, fence.assignment_version
+            ));
+        }
+        if !adoption.matches_fence(&fence) {
+            return Err(format!(
+                "node{node} local adoption conflicts with durable assignment {}",
+                fence.assignment_version
+            ));
+        }
+        if evidence_participants
+            .insert(evidence.participant.node_id, evidence.participant)
+            .is_some()
+        {
+            return Err(format!(
+                "multiple live processes reported stable node {}",
+                evidence.participant.node_id
+            ));
+        }
+    }
+    let durable_participants: BTreeMap<_, _> = fence
+        .participants
+        .iter()
+        .map(|participant| (participant.node_id, *participant))
+        .collect();
+    if evidence_participants != durable_participants {
+        return Ok(None);
+    }
+    Ok(Some(LocalAssignmentConvergence {
+        snapshot: before.clone(),
+        evidence_by_node,
+    }))
+}
+
+#[cfg(feature = "kafka")]
+fn sleep_until_local_evidence_poll(deadline: Instant) {
+    if let Some(remaining) = remaining_at(deadline, Instant::now()) {
+        std::thread::sleep(remaining.min(Duration::from_millis(500)));
+    }
+}
+
+#[cfg(feature = "kafka")]
+fn wait_for_local_assignment_convergence(
+    nodes: &mut [Node],
+    live_nodes: &BTreeSet<usize>,
+    deadline: Instant,
+    context: &str,
+) -> LocalAssignmentConvergence {
+    assert!(
+        !live_nodes.is_empty(),
+        "local evidence requires a live node"
+    );
+    let probe = *live_nodes.first().expect("live node set is nonempty");
+    let mut last_pending = "no sample completed".to_string();
+    while remaining_at(deadline, Instant::now()).is_some() {
+        for node in live_nodes {
+            nodes[*node].assert_running();
+        }
+        let before = match nodes[probe].durable_assignment_observation(deadline) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                last_pending = format!("node{probe} durable assignment was unavailable");
+                sleep_until_local_evidence_poll(deadline);
+                continue;
+            }
+            Err(error) => panic!("{context}: invalid durable-before sample: {error}"),
+        };
+        if before.draining {
+            last_pending = format!("durable assignment {} was still draining", before.version);
+            sleep_until_local_evidence_poll(deadline);
+            continue;
+        }
+
+        let mut evidence_by_node = BTreeMap::new();
+        let mut pending = None;
+        for node in live_nodes {
+            match nodes[*node].local_authority_observation(deadline) {
+                LocalAuthorityObservation::Available(evidence) => {
+                    evidence_by_node.insert(*node, evidence);
+                }
+                LocalAuthorityObservation::Pending(reason) => {
+                    pending = Some(reason);
+                    break;
+                }
+                LocalAuthorityObservation::Contradiction(error) => {
+                    panic!("{context}: contradictory node{node} local evidence: {error}");
+                }
+            }
+        }
+        if let Some(reason) = pending {
+            last_pending = reason;
+            sleep_until_local_evidence_poll(deadline);
+            continue;
+        }
+
+        let after = match nodes[probe].durable_assignment_observation(deadline) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                last_pending = format!("node{probe} durable-after sample was unavailable");
+                sleep_until_local_evidence_poll(deadline);
+                continue;
+            }
+            Err(error) => panic!("{context}: invalid durable-after sample: {error}"),
+        };
+        match classify_local_assignment_cut(&before, evidence_by_node, &after) {
+            Ok(Some(convergence)) if remaining_at(deadline, Instant::now()).is_some() => {
+                return convergence;
+            }
+            Ok(Some(_)) => {
+                last_pending = "exact convergence was first observed after the deadline".into();
+                break;
+            }
+            Ok(None) => {
+                last_pending = format!(
+                    "durable/local assignment cut had not converged (before={}, after={})",
+                    before.version, after.version
+                );
+            }
+            Err(error) => panic!("{context}: contradictory assignment evidence: {error}"),
+        }
+        sleep_until_local_evidence_poll(deadline);
+    }
+    panic!(
+        "soak: {context} did not reach exact local assignment convergence before its existing deadline: {last_pending}"
+    );
 }
 
 fn validate_local_exact_snapshot(
@@ -3253,6 +3687,13 @@ fn three_node_kill9_soak() {
         commit_oracle.committed_offset_sum().unwrap_or(0)
     );
     assert_every_node_ingests(&mut nodes, &mut producer, Duration::from_secs(60));
+    let all_live_nodes: BTreeSet<usize> = (0..NODES).collect();
+    let mut local_convergence = wait_for_local_assignment_convergence(
+        &mut nodes,
+        &all_live_nodes,
+        Instant::now() + Duration::from_secs(60),
+        "stable startup local assignment",
+    );
 
     let mut explicit_fault_evidence = None;
     if let Some(role) = fault_role.as_deref() {
@@ -3330,6 +3771,12 @@ fn three_node_kill9_soak() {
             "progress after coordinated recovery",
             Some(latest_checkpoint),
         );
+        local_convergence = wait_for_local_assignment_convergence(
+            &mut nodes,
+            &all_live_nodes,
+            recovery_deadline,
+            "post-recovery local assignment",
+        );
         let failure_snapshot = capture_checkpoint_failure_snapshot(&nodes, Duration::from_secs(5));
         let checkpoint_failure_totals = failure_snapshot.totals.clone();
         let fault_logs = failure_snapshot
@@ -3404,6 +3851,12 @@ fn three_node_kill9_soak() {
             (victim, "follower")
         };
         nodes[victim].assert_running();
+        let previous_assignment_version = local_convergence.snapshot.version;
+        let previous_victim_evidence = local_convergence
+            .evidence_by_node
+            .get(&victim)
+            .unwrap_or_else(|| panic!("node{victim} was absent from the converged local cut"))
+            .clone();
         let pre_arm_latency = nodes[victim]
             .checkpoint_latency_metrics()
             .expect("kill victim did not expose checkpoint latency metrics");
@@ -3442,13 +3895,38 @@ fn three_node_kill9_soak() {
             "progress after kill",
             Some(latest_checkpoint),
         );
+        let survivor_nodes: BTreeSet<usize> = (0..NODES).filter(|node| *node != victim).collect();
+        let survivor_convergence = wait_for_local_assignment_convergence(
+            &mut nodes,
+            &survivor_nodes,
+            failover_deadline,
+            "post-kill survivor local assignment",
+        );
+        assert!(
+            survivor_convergence.snapshot.version > previous_assignment_version,
+            "kill-{round} survivor assignment did not advance beyond {previous_assignment_version}"
+        );
+        let old_stable_node = previous_victim_evidence.participant.node_id;
+        let survivor_fence = survivor_convergence
+            .snapshot
+            .assignment_fence()
+            .expect("converged survivor assignment is canonical");
+        assert!(
+            !survivor_fence.contains(old_stable_node)
+                && survivor_convergence
+                    .snapshot
+                    .vnodes
+                    .values()
+                    .all(|owner| owner.0 != old_stable_node),
+            "kill-{round} survivor assignment retained old victim process authority"
+        );
         let failover_elapsed = assert_recovery_within(
             failover_started,
             recovery_ceiling,
-            "kill-9 to survivor progress",
+            "kill-9 to survivor progress and exact local assignment convergence",
         );
         eprintln!(
-            "soak round {round}: survivors advanced to checkpoint {} epoch {} in {failover_elapsed:?}",
+            "soak round {round}: survivors advanced to checkpoint {} epoch {} with exact local assignment evidence in {failover_elapsed:?}",
             latest_checkpoint.checkpoint_id, latest_checkpoint.epoch
         );
 
@@ -3489,14 +3967,62 @@ fn three_node_kill9_soak() {
             "progress after rejoin",
             Some(latest_checkpoint),
         );
+        let rejoined_convergence = wait_for_local_assignment_convergence(
+            &mut nodes,
+            &all_live_nodes,
+            rejoin_deadline,
+            "rejoined local assignment",
+        );
+        assert!(
+            rejoined_convergence.snapshot.version > survivor_convergence.snapshot.version,
+            "kill-{round} rejoin assignment did not advance beyond survivor version {}",
+            survivor_convergence.snapshot.version
+        );
+        let current_victim_evidence = rejoined_convergence
+            .evidence_by_node
+            .get(&victim)
+            .unwrap_or_else(|| panic!("rejoined node{victim} was absent from local evidence"));
+        assert_eq!(
+            current_victim_evidence.participant.node_id, old_stable_node,
+            "rejoined node{victim} changed stable node identity"
+        );
+        assert_ne!(
+            current_victim_evidence.participant.boot_incarnation,
+            previous_victim_evidence.participant.boot_incarnation,
+            "rejoined node{victim} reused its killed boot incarnation"
+        );
+        assert!(
+            current_victim_evidence.process_term > previous_victim_evidence.process_term,
+            "rejoined node{victim} process term {} did not exceed killed term {}",
+            current_victim_evidence.process_term,
+            previous_victim_evidence.process_term
+        );
+        let rejoined_fence = rejoined_convergence
+            .snapshot
+            .assignment_fence()
+            .expect("converged rejoin assignment is canonical");
+        assert_eq!(
+            rejoined_fence.participant_incarnation(old_stable_node),
+            Some(current_victim_evidence.participant.boot_incarnation),
+            "rejoin assignment did not bind the new victim boot"
+        );
+        assert!(
+            rejoined_convergence
+                .snapshot
+                .vnodes
+                .values()
+                .any(|owner| owner.0 == old_stable_node),
+            "rejoined node{victim} did not own any vnode"
+        );
         let rejoin_elapsed = assert_recovery_within(
             rejoin_started,
             recovery_ceiling,
-            "restarted node to durable owned-work progress",
+            "restarted node to durable owned-work progress and exact local assignment convergence",
         );
         eprintln!(
-            "soak round {round}: node {victim} rejoined and resumed durable work in {rejoin_elapsed:?}"
+            "soak round {round}: node {victim} rejoined and resumed durable work with exact local assignment evidence in {rejoin_elapsed:?}"
         );
+        local_convergence = rejoined_convergence;
     }
     assert_eq!(
         kills, max_kills,
@@ -3933,6 +4459,133 @@ fn recovery_checkpoint_failure_evidence_binds_the_interrupted_attempt() {
     )
     .unwrap_err();
     assert!(error.contains("not strictly newer"), "{error}");
+}
+
+#[cfg(feature = "kafka")]
+fn local_assignment_cut_fixture() -> (
+    AssignmentSnapshot,
+    BTreeMap<usize, LocalProcessAuthorityEvidence>,
+) {
+    let participants = vec![
+        CheckpointParticipant {
+            node_id: 11,
+            boot_incarnation: uuid::Uuid::from_u128(11),
+        },
+        CheckpointParticipant {
+            node_id: 22,
+            boot_incarnation: uuid::Uuid::from_u128(22),
+        },
+    ];
+    let snapshot = AssignmentSnapshot {
+        version: 7,
+        partitioning_abi_version: laminar_core::state::PARTITIONING_ABI_VERSION,
+        vnodes: [
+            (0, laminar_core::cluster::discovery::NodeId(11)),
+            (1, laminar_core::cluster::discovery::NodeId(22)),
+        ]
+        .into_iter()
+        .collect(),
+        participants: participants.clone(),
+        updated_at_ms: 1,
+        draining: false,
+        drain_transition: None,
+    };
+    let fence = snapshot.assignment_fence().unwrap();
+    let evidence = participants
+        .into_iter()
+        .enumerate()
+        .map(|(node, participant)| {
+            (
+                node,
+                LocalProcessAuthorityEvidence {
+                    participant,
+                    process_term: u64::try_from(node).unwrap() + 1,
+                    adopted_assignment: CheckpointAssignmentAdoption {
+                        participant,
+                        assignment_version: fence.assignment_version,
+                        partitioning_abi_version: fence.partitioning_abi_version,
+                        vnode_count: fence.vnode_count,
+                        assignment_digest: fence.assignment_digest,
+                    },
+                },
+            )
+        })
+        .collect();
+    (snapshot, evidence)
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn local_assignment_cut_classifier_separates_pending_from_contradiction() {
+    let (snapshot, mut evidence) = local_assignment_cut_fixture();
+    let converged = classify_local_assignment_cut(&snapshot, evidence.clone(), &snapshot)
+        .unwrap()
+        .unwrap();
+    assert_eq!(converged.snapshot.version, 7);
+
+    let mut changed_after = snapshot.clone();
+    changed_after.updated_at_ms += 1;
+    assert!(
+        classify_local_assignment_cut(&snapshot, evidence.clone(), &changed_after)
+            .unwrap()
+            .is_none()
+    );
+
+    let mut draining = snapshot.clone();
+    draining.draining = true;
+    assert!(
+        classify_local_assignment_cut(&draining, evidence.clone(), &draining)
+            .unwrap()
+            .is_none()
+    );
+
+    let mut trailing = evidence.clone();
+    trailing
+        .get_mut(&0)
+        .unwrap()
+        .adopted_assignment
+        .assignment_version -= 1;
+    assert!(
+        classify_local_assignment_cut(&snapshot, trailing, &snapshot)
+            .unwrap()
+            .is_none()
+    );
+
+    let mut missing = evidence.clone();
+    missing.remove(&0);
+    assert!(classify_local_assignment_cut(&snapshot, missing, &snapshot)
+        .unwrap()
+        .is_none());
+
+    let mut ahead = evidence.clone();
+    ahead
+        .get_mut(&0)
+        .unwrap()
+        .adopted_assignment
+        .assignment_version += 1;
+    let error = classify_local_assignment_cut(&snapshot, ahead, &snapshot).unwrap_err();
+    assert!(error.contains("is ahead of stable durable head"), "{error}");
+
+    let mut conflicting = evidence.clone();
+    conflicting
+        .get_mut(&0)
+        .unwrap()
+        .adopted_assignment
+        .assignment_digest[0] ^= 0xff;
+    let error = classify_local_assignment_cut(&snapshot, conflicting, &snapshot).unwrap_err();
+    assert!(
+        error.contains("conflicts with durable assignment"),
+        "{error}"
+    );
+
+    let participant = evidence.get(&0).unwrap().participant;
+    evidence.get_mut(&1).unwrap().participant = participant;
+    evidence.get_mut(&1).unwrap().adopted_assignment.participant = participant;
+    let error = classify_local_assignment_cut(&snapshot, evidence, &snapshot).unwrap_err();
+    assert!(
+        error.contains("multiple live processes reported stable node"),
+        "{error}"
+    );
 }
 
 #[test]
