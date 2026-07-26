@@ -164,9 +164,9 @@ The two sourceful ALO scenarios are **BLOCKED**, not merely unexecuted: current 
 Laminar operation identity, writer interval, checked sink sequence, stable shard, or successor fence
 marker. The live engineering oracle accepts any duplicate user `seq` once the expected set is
 present and does not retain repeated payload bytes or bind them to an exact sealed source cut. The
-standalone fixture supplies synthetic operation IDs, byte comparison, and frozen/durable source-cut
-checks, but has no writer, assignment, shard, marker, or binding from those cuts to a recovery-
-authority interval.
+then-current standalone fixture v1 supplies synthetic operation IDs, byte comparison, and
+frozen/durable source-cut checks, but has no writer, assignment, shard, marker, or binding from
+those cuts to a recovery-authority interval.
 
 The two source-less scenarios are also **BLOCKED** on supported evidence. `/api/v1/cluster/vnodes`
 reads the shared durable assignment snapshot on every node; identical replies do not prove that
@@ -184,6 +184,29 @@ maximum/deadline counters or events for the five checkpoint latency families. Th
 additionally requires the already-specified broker-enforced writer fence and record/marker
 provenance. Missing evidence is `INVALID`; complete evidence showing malformed, conflicting, or
 stale output is product `FAIL`. No Cycle 50 soak ran and `certification_eligible` remains `false`.
+
+### Cycle 51 evidence disposition
+
+The root-excluded standalone tool now has a schema-v2 semantic oracle, but it remains synthetic and
+explicitly `certification_eligible=false`. Its canonical case fixes the exact source and sink
+partition inventories, including an empty source partition with a nonzero pre-delivery baseline;
+separates the zero-input bootstrap checkpoint, later recovery checkpoint, recovery-base assignment,
+and successor's current assignment; and checks predecessor/successor markers across every sink
+partition. It also checks per-writer-interval admission sequences, raw source-offset replay
+causality, byte equality for a repeated logical operation, increasing group-result versions within
+an interval, independently derived vnode-to-shard ownership, and the final grouped result.
+
+Missing, incomplete, or wrong-run checkpoint/assignment authority makes the attempt `INVALID`.
+Given complete sink capture and authority, a wrong-run marker or complete evidence of stale,
+conflicting, misordered, misowned, or otherwise malformed product output is product `FAIL`.
+Assignment ownership and local process term are pre-reconciled in fixture evidence even though the
+production design obtains them from separate supported views. The v2 fixture validates a frozen
+key-to-vnode and vnode-to-shard semantic mapping, not the final Kafka partition/header bytes.
+
+Cycle 51 adds no runtime header or marker encoder, Kafka transaction or producer fencing, supported
+evidence endpoint, state backend, cluster admission, exactly-once claim, or independent runner. All
+CVR scenarios therefore remain **BLOCKED**, no Cycle 51 soak ran, and `certification_eligible`
+remains `false`.
 
 ## Frozen numerical contract
 

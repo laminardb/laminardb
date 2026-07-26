@@ -1,0 +1,360 @@
+{
+  "schema_version": "independent-oracle-fixture/v2",
+  "notice": "NOT CERTIFICATION EVIDENCE",
+  "scope": "semantic_fixture_only",
+  "certification_eligible": false,
+  "model": "grouped_count_star_sum_exact_integer_snapshot_at_least_once",
+  "operation_identity_model": "fixture_only_logical_group_and_count_version",
+  "key_vnode_abi": "fixture-utf8-byte-sum-mod-v1",
+  "vnode_count": 4,
+  "expected_run": {
+    "deployment_id": "deployment-a",
+    "pipeline_incarnation": "pipeline-incarnation-a",
+    "pipeline_identity": "pipeline-identity-a",
+    "sink_id": "sink-a",
+    "operator_id": "operator-grouped-aggregate-a",
+    "output_id": "output-a"
+  },
+  "source_topology": {
+    "partitions": [
+      { "topic": "fixture-input", "partition": 0 },
+      { "topic": "fixture-input", "partition": 1 },
+      { "topic": "fixture-input", "partition": 2 }
+    ]
+  },
+  "sink_topology": {
+    "topic": "fixture-output",
+    "partitioning_abi": "fixture-sink-shard-partition-map-v1",
+    "topology_digest": "sha256:fixture-topology-a",
+    "baseline": [
+      { "topic": "fixture-output", "partition": 0, "exclusive_end": 0 },
+      { "topic": "fixture-output", "partition": 1, "exclusive_end": 0 }
+    ],
+    "shards": [
+      {
+        "shard_id": "sink-shard-0",
+        "partitions": [0, 1],
+        "vnodes": [0, 1, 2, 3]
+      }
+    ]
+  },
+  "ledger": [
+    { "event_id": "a-0", "topic": "fixture-input", "partition": 0, "offset": 0, "logical_key": "alpha", "value": 10 },
+    { "event_id": "a-1", "topic": "fixture-input", "partition": 0, "offset": 1, "logical_key": "alpha", "value": -3 },
+    { "event_id": "a-2", "topic": "fixture-input", "partition": 0, "offset": 2, "logical_key": "alpha", "value": 4 },
+    { "event_id": "b-0", "topic": "fixture-input", "partition": 1, "offset": 0, "logical_key": "beta", "value": 5 },
+    { "event_id": "b-1", "topic": "fixture-input", "partition": 1, "offset": 1, "logical_key": "beta", "value": 2 }
+  ],
+  "cases": [
+    {
+      "id": "rebalance-with-legal-predecessor-replay-and-alo-duplicate",
+      "frozen_source_cut": [
+        { "topic": "fixture-input", "partition": 0, "exclusive_end": 3 },
+        { "topic": "fixture-input", "partition": 1, "exclusive_end": 2 },
+        { "topic": "fixture-input", "partition": 2, "exclusive_end": 9 }
+      ],
+      "durable_source_cut": [
+        { "topic": "fixture-input", "partition": 0, "exclusive_end": 3 },
+        { "topic": "fixture-input", "partition": 1, "exclusive_end": 2 },
+        { "topic": "fixture-input", "partition": 2, "exclusive_end": 9 }
+      ],
+      "frozen_sink_cut": [
+        { "topic": "fixture-output", "partition": 0, "exclusive_end": 6 },
+        { "topic": "fixture-output", "partition": 1, "exclusive_end": 4 }
+      ],
+      "consumed_sink_cut": [
+        { "topic": "fixture-output", "partition": 0, "exclusive_end": 6 },
+        { "topic": "fixture-output", "partition": 1, "exclusive_end": 4 }
+      ],
+      "checkpoint_evidence": [
+        {
+          "immutable": true,
+          "run": {
+            "deployment_id": "deployment-a",
+            "pipeline_incarnation": "pipeline-incarnation-a",
+            "pipeline_identity": "pipeline-identity-a",
+            "sink_id": "sink-a",
+            "operator_id": "operator-grouped-aggregate-a",
+            "output_id": "output-a"
+          },
+          "checkpoint_id": "checkpoint-44",
+          "epoch": 44,
+          "terminal": "Commit",
+          "purpose": "zero_input_bootstrap",
+          "capsule_digest": "sha256:capsule-44",
+          "base_assignment": { "version": 7, "digest": "sha256:assignment-7" },
+          "sealed_source_cut": [
+            { "topic": "fixture-input", "partition": 0, "exclusive_end": 0 },
+            { "topic": "fixture-input", "partition": 1, "exclusive_end": 0 },
+            { "topic": "fixture-input", "partition": 2, "exclusive_end": 9 }
+          ]
+        },
+        {
+          "immutable": true,
+          "run": {
+            "deployment_id": "deployment-a",
+            "pipeline_incarnation": "pipeline-incarnation-a",
+            "pipeline_identity": "pipeline-identity-a",
+            "sink_id": "sink-a",
+            "operator_id": "operator-grouped-aggregate-a",
+            "output_id": "output-a"
+          },
+          "checkpoint_id": "checkpoint-45",
+          "epoch": 45,
+          "terminal": "Commit",
+          "purpose": "recovery_base",
+          "capsule_digest": "sha256:capsule-45",
+          "base_assignment": { "version": 7, "digest": "sha256:assignment-7" },
+          "sealed_source_cut": [
+            { "topic": "fixture-input", "partition": 0, "exclusive_end": 1 },
+            { "topic": "fixture-input", "partition": 1, "exclusive_end": 0 },
+            { "topic": "fixture-input", "partition": 2, "exclusive_end": 9 }
+          ]
+        }
+      ],
+      "assignment_authority_evidence": [
+        {
+          "run": {
+            "deployment_id": "deployment-a",
+            "pipeline_incarnation": "pipeline-incarnation-a",
+            "pipeline_identity": "pipeline-identity-a",
+            "sink_id": "sink-a",
+            "operator_id": "operator-grouped-aggregate-a",
+            "output_id": "output-a"
+          },
+          "version": 7,
+          "digest": "sha256:assignment-7",
+          "owners": [
+            { "vnode": 0, "node_id": "node-a", "boot_incarnation": "boot-a", "process_term": "term-a-1" },
+            { "vnode": 1, "node_id": "node-a", "boot_incarnation": "boot-a", "process_term": "term-a-1" },
+            { "vnode": 2, "node_id": "node-a", "boot_incarnation": "boot-a", "process_term": "term-a-1" },
+            { "vnode": 3, "node_id": "node-a", "boot_incarnation": "boot-a", "process_term": "term-a-1" }
+          ]
+        },
+        {
+          "run": {
+            "deployment_id": "deployment-a",
+            "pipeline_incarnation": "pipeline-incarnation-a",
+            "pipeline_identity": "pipeline-identity-a",
+            "sink_id": "sink-a",
+            "operator_id": "operator-grouped-aggregate-a",
+            "output_id": "output-a"
+          },
+          "version": 8,
+          "digest": "sha256:assignment-8",
+          "owners": [
+            { "vnode": 0, "node_id": "node-b", "boot_incarnation": "boot-b", "process_term": "term-b-2" },
+            { "vnode": 1, "node_id": "node-b", "boot_incarnation": "boot-b", "process_term": "term-b-2" },
+            { "vnode": 2, "node_id": "node-b", "boot_incarnation": "boot-b", "process_term": "term-b-2" },
+            { "vnode": 3, "node_id": "node-b", "boot_incarnation": "boot-b", "process_term": "term-b-2" }
+          ]
+        }
+      ],
+      "bootstrap_observation": {
+        "observed_source_baseline": [
+          { "topic": "fixture-input", "partition": 0, "exclusive_end": 0 },
+          { "topic": "fixture-input", "partition": 1, "exclusive_end": 0 },
+          { "topic": "fixture-input", "partition": 2, "exclusive_end": 9 }
+        ],
+        "source_deliveries": 0,
+        "state_items": 0,
+        "timer_items": 0,
+        "outputs_computed": 0,
+        "outputs_queued": 0,
+        "sink_records_admitted": 0,
+        "sink_records_flushed": 0,
+        "checkpoint_id": "checkpoint-44",
+        "checkpoint_epoch": 44,
+        "first_marker_interval": "writer-old",
+        "baseline_observed_order": 10,
+        "empty_unactivated_flush_order": 20,
+        "checkpoint_commit_order": 30,
+        "first_marker_confirmation_order": 40,
+        "data_admission_opened_order": 50
+      },
+      "interval_markers": [
+        {
+          "broker": { "topic": "fixture-output", "partition": 0, "offset": 0 },
+          "envelope_version": 1,
+          "envelope_kind": "interval_marker",
+          "interval_id": "writer-old",
+          "predecessor_interval": null,
+          "provenance": {
+            "deployment_id": "deployment-a",
+            "pipeline_incarnation": "pipeline-incarnation-a",
+            "pipeline_identity": "pipeline-identity-a",
+            "sink_id": "sink-a",
+            "operator_id": "operator-grouped-aggregate-a",
+            "output_id": "output-a"
+          },
+          "shard_id": "sink-shard-0",
+          "vnodes": [0, 1, 2, 3],
+          "writer": { "node_id": "node-a", "boot_incarnation": "boot-a", "process_term": "term-a-1" },
+          "current_assignment": { "version": 7, "digest": "sha256:assignment-7" },
+          "recovery": {
+            "checkpoint_id": "checkpoint-44",
+            "checkpoint_epoch": 44,
+            "capsule_digest": "sha256:capsule-44",
+            "base_assignment": { "version": 7, "digest": "sha256:assignment-7" }
+          },
+          "abi": {
+            "key_vnode_abi": "fixture-utf8-byte-sum-mod-v1",
+            "vnode_count": 4,
+            "partitioning_abi": "fixture-sink-shard-partition-map-v1",
+            "topology_digest": "sha256:fixture-topology-a"
+          }
+        },
+        {
+          "broker": { "topic": "fixture-output", "partition": 1, "offset": 0 },
+          "envelope_version": 1,
+          "envelope_kind": "interval_marker",
+          "interval_id": "writer-old",
+          "predecessor_interval": null,
+          "provenance": {
+            "deployment_id": "deployment-a",
+            "pipeline_incarnation": "pipeline-incarnation-a",
+            "pipeline_identity": "pipeline-identity-a",
+            "sink_id": "sink-a",
+            "operator_id": "operator-grouped-aggregate-a",
+            "output_id": "output-a"
+          },
+          "shard_id": "sink-shard-0",
+          "vnodes": [0, 1, 2, 3],
+          "writer": { "node_id": "node-a", "boot_incarnation": "boot-a", "process_term": "term-a-1" },
+          "current_assignment": { "version": 7, "digest": "sha256:assignment-7" },
+          "recovery": {
+            "checkpoint_id": "checkpoint-44",
+            "checkpoint_epoch": 44,
+            "capsule_digest": "sha256:capsule-44",
+            "base_assignment": { "version": 7, "digest": "sha256:assignment-7" }
+          },
+          "abi": {
+            "key_vnode_abi": "fixture-utf8-byte-sum-mod-v1",
+            "vnode_count": 4,
+            "partitioning_abi": "fixture-sink-shard-partition-map-v1",
+            "topology_digest": "sha256:fixture-topology-a"
+          }
+        },
+        {
+          "broker": { "topic": "fixture-output", "partition": 0, "offset": 3 },
+          "envelope_version": 1,
+          "envelope_kind": "interval_marker",
+          "interval_id": "writer-new",
+          "predecessor_interval": "writer-old",
+          "provenance": {
+            "deployment_id": "deployment-a",
+            "pipeline_incarnation": "pipeline-incarnation-a",
+            "pipeline_identity": "pipeline-identity-a",
+            "sink_id": "sink-a",
+            "operator_id": "operator-grouped-aggregate-a",
+            "output_id": "output-a"
+          },
+          "shard_id": "sink-shard-0",
+          "vnodes": [0, 1, 2, 3],
+          "writer": { "node_id": "node-b", "boot_incarnation": "boot-b", "process_term": "term-b-2" },
+          "current_assignment": { "version": 8, "digest": "sha256:assignment-8" },
+          "recovery": {
+            "checkpoint_id": "checkpoint-45",
+            "checkpoint_epoch": 45,
+            "capsule_digest": "sha256:capsule-45",
+            "base_assignment": { "version": 7, "digest": "sha256:assignment-7" }
+          },
+          "abi": {
+            "key_vnode_abi": "fixture-utf8-byte-sum-mod-v1",
+            "vnode_count": 4,
+            "partitioning_abi": "fixture-sink-shard-partition-map-v1",
+            "topology_digest": "sha256:fixture-topology-a"
+          }
+        },
+        {
+          "broker": { "topic": "fixture-output", "partition": 1, "offset": 2 },
+          "envelope_version": 1,
+          "envelope_kind": "interval_marker",
+          "interval_id": "writer-new",
+          "predecessor_interval": "writer-old",
+          "provenance": {
+            "deployment_id": "deployment-a",
+            "pipeline_incarnation": "pipeline-incarnation-a",
+            "pipeline_identity": "pipeline-identity-a",
+            "sink_id": "sink-a",
+            "operator_id": "operator-grouped-aggregate-a",
+            "output_id": "output-a"
+          },
+          "shard_id": "sink-shard-0",
+          "vnodes": [0, 1, 2, 3],
+          "writer": { "node_id": "node-b", "boot_incarnation": "boot-b", "process_term": "term-b-2" },
+          "current_assignment": { "version": 8, "digest": "sha256:assignment-8" },
+          "recovery": {
+            "checkpoint_id": "checkpoint-45",
+            "checkpoint_epoch": 45,
+            "capsule_digest": "sha256:capsule-45",
+            "base_assignment": { "version": 7, "digest": "sha256:assignment-7" }
+          },
+          "abi": {
+            "key_vnode_abi": "fixture-utf8-byte-sum-mod-v1",
+            "vnode_count": 4,
+            "partitioning_abi": "fixture-sink-shard-partition-map-v1",
+            "topology_digest": "sha256:fixture-topology-a"
+          }
+        }
+      ],
+      "data_records": [
+        {
+          "broker": { "topic": "fixture-output", "partition": 0, "offset": 1 },
+          "envelope_version": 1,
+          "envelope_kind": "data",
+          "operation_id": "fixture/alpha/count/1",
+          "writer_interval": "writer-old",
+          "admission_sequence": 0,
+          "raw_payload": "{\"logical_key\":\"alpha\",\"count\":1,\"sum\":10}"
+        },
+        {
+          "broker": { "topic": "fixture-output", "partition": 1, "offset": 1 },
+          "envelope_version": 1,
+          "envelope_kind": "data",
+          "operation_id": "fixture/beta/count/1",
+          "writer_interval": "writer-old",
+          "admission_sequence": 1,
+          "raw_payload": "{\"logical_key\":\"beta\",\"count\":1,\"sum\":5}"
+        },
+        {
+          "broker": { "topic": "fixture-output", "partition": 0, "offset": 2 },
+          "envelope_version": 1,
+          "envelope_kind": "data",
+          "operation_id": "fixture/alpha/count/2",
+          "writer_interval": "writer-old",
+          "admission_sequence": 3,
+          "raw_payload": "{\"logical_key\":\"alpha\",\"count\":2,\"sum\":7}"
+        },
+        {
+          "broker": { "topic": "fixture-output", "partition": 1, "offset": 3 },
+          "envelope_version": 1,
+          "envelope_kind": "data",
+          "operation_id": "fixture/beta/count/2",
+          "writer_interval": "writer-new",
+          "admission_sequence": 1,
+          "raw_payload": "{\"logical_key\":\"beta\",\"count\":2,\"sum\":7}"
+        },
+        {
+          "broker": { "topic": "fixture-output", "partition": 0, "offset": 4 },
+          "envelope_version": 1,
+          "envelope_kind": "data",
+          "operation_id": "fixture/alpha/count/2",
+          "writer_interval": "writer-new",
+          "admission_sequence": 0,
+          "raw_payload": "{\"logical_key\":\"alpha\",\"count\":2,\"sum\":7}"
+        },
+        {
+          "broker": { "topic": "fixture-output", "partition": 0, "offset": 5 },
+          "envelope_version": 1,
+          "envelope_kind": "data",
+          "operation_id": "fixture/alpha/count/3",
+          "writer_interval": "writer-new",
+          "admission_sequence": 3,
+          "raw_payload": "{\"logical_key\":\"alpha\",\"count\":3,\"sum\":11}"
+        }
+      ],
+      "expected": { "classification": "MODEL_MATCH", "diagnostics": [] }
+    }
+  ]
+}

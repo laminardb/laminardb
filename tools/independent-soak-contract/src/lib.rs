@@ -6,6 +6,8 @@ use std::fmt::{Display, Formatter};
 use serde::Deserialize;
 use serde_json::Value;
 
+mod oracle_v2;
+
 pub const NOTICE: &str = "NOT CERTIFICATION EVIDENCE";
 
 const CONTRACT_SCHEMA: &str = include_str!("../schema/contract-v1alpha1.schema.json");
@@ -618,7 +620,24 @@ fn fixture_operation_id(logical_key: &str, count: u64) -> String {
     format!("fixture/{logical_key}/count/{count}")
 }
 
+#[derive(Deserialize)]
+struct FixtureVersionProbe {
+    schema_version: String,
+}
+
 pub fn verify_oracle_fixture(bytes: &[u8]) -> Result<FixtureSummary, CheckErrors> {
+    let version: FixtureVersionProbe = serde_json::from_slice(bytes)
+        .map_err(|error| CheckErrors::one(format!("decode oracle fixture: {error}")))?;
+    match version.schema_version.as_str() {
+        "independent-oracle-fixture/v1" => verify_oracle_fixture_v1(bytes),
+        "independent-oracle-fixture/v2" => oracle_v2::verify(bytes),
+        unsupported => Err(CheckErrors::one(format!(
+            "unsupported oracle fixture schema_version {unsupported:?}"
+        ))),
+    }
+}
+
+fn verify_oracle_fixture_v1(bytes: &[u8]) -> Result<FixtureSummary, CheckErrors> {
     let fixture: OracleFixture = serde_json::from_slice(bytes)
         .map_err(|error| CheckErrors::one(format!("decode oracle fixture: {error}")))?;
     let mut errors = Vec::new();

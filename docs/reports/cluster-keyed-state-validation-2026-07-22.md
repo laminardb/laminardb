@@ -31,7 +31,9 @@ state mutation instead of awaiting a retained encoder while holding that fence. 
 audits Kafka output and supported public evidence end to end: current ALO records cannot identify a
 logical operation or fenced writer interval, and the public checkpoint/assignment surfaces cannot
 yet prove every process's local adoption or reconstruct exact per-attempt latency. None of these
-decisions changes cluster admission.
+decisions changes cluster admission. [Cycle 51](../reviews/distributed-keyed-state-cycle-51.md)
+implements only a synthetic v2 semantic oracle for the missing output-authority relationships; it
+is not runtime or certification evidence.
 
 ## Verdict
 
@@ -428,10 +430,17 @@ The exact evidence inventory is:
 The live engineering oracle currently accepts any number of duplicate `seq` values once the
 expected set is present. It does not compare bytes for repeated IDs, bind a duplicate to the sealed
 source cut, read assignment evidence, or identify a predecessor record after successor activation.
-The standalone semantic fixture does compare duplicate bytes, aggregate prefixes, and frozen versus
+The legacy standalone fixture v1 compares duplicate bytes, aggregate prefixes, and frozen versus
 durable source-cut completeness, but invents fixture operation IDs and has no assignment, writer
-interval, marker, or recovery-cut-to-writer-interval binding. Neither is independent production
-evidence.
+interval, marker, or recovery-cut-to-writer-interval binding. Cycle 51's fixture v2 adds those
+relationships synthetically: explicit source and sink inventories, exact pre-delivery baselines,
+bootstrap/recovery checkpoint references, separately resolved current writer assignments,
+predecessor/successor markers, checked per-interval sequences, raw-offset replay causality, and
+independently derived vnode/shard ownership. It also proves that missing or wrong-run authority is
+`RUN_INVALID`, while complete evidence of conflicting or stale output is `PRODUCT_FAIL`. Its
+assignment/process view is pre-reconciled test data and its ABI stops at vnode-to-shard semantics;
+no production bytes, supported evidence endpoint, or broker fence exists. Neither fixture version
+is independent production evidence.
 
 The missing minimum is not another state backend. It is the already-designed delivery/evidence
 vertical: an operator-specific replay-stable operation ID; compact data-record provenance; a stable

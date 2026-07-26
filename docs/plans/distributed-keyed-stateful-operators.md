@@ -3,7 +3,7 @@
 - **Status:** Planned and backend-gated; exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster
   operator is admitted by this document
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 50
+- **Last reconciled:** 2026-07-26 during Cycle 51
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -142,6 +142,17 @@ the current pipeline/assignment identity, then confirm a `predecessor = none` ma
 readiness or data admission. Only that proved-empty bootstrap may bypass an unactivated sink flush.
 Sources unable to expose a checkpointable pre-delivery baseline remain closed, and bootstrap/marker
 time is measured as startup/RTO latency.
+
+Cycle 51 completes the first executable-oracle slice without touching production. Standalone
+fixture v2 freezes semantic relationships among exact source/sink inventories, bootstrap and
+recovery cuts, historical assignment authority, writer intervals, cross-partition successor
+markers, admission sequences, raw payload bytes, and independently derived vnode/shard ownership.
+It permits byte-identical cross-interval replay only when the raw causal source offset is at or after
+the resolved exclusive cut, while versions must rise within one interval. Evidence selected from a
+wrong run or missing a required cut is `RUN_INVALID`; complete Kafka-shaped evidence proving a bad
+marker, owner, replay, payload, or result is `PRODUCT_FAIL`. Assignment/process evidence is
+synthetically reconciled and no wire/partition ABI is frozen, so this closes no public-evidence,
+Kafka-fencing, backend, admission, exactly-once, or production-soak gate.
 
 ## Scope and non-goals
 

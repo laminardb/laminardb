@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 50
+- **Last reconciled:** 2026-07-26 during Cycle 51
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -13,7 +13,7 @@
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
   [TidesDB package design](tidesdb-local-state-successor-design.md),
   [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
-  [latest completed review](../reviews/distributed-keyed-state-cycle-50.md)
+  [latest completed review](../reviews/distributed-keyed-state-cycle-51.md)
 
 ## Decision
 
@@ -902,6 +902,18 @@ forced old producer rejection form the retained proof—timestamps or Laminar lo
 provider-enforced fencing is qualified for latency and failure behavior but does not make delivery
 exactly-once because source cursor, managed state, and Kafka transaction are not one atomic commit.
 If this topology cannot meet the profile, the Kafka scenario stays closed.
+
+Cycle 51 makes only those verdict semantics executable in the root-excluded
+`tools/independent-soak-contract` fixture v2. The synthetic model has an explicit source-partition
+inventory and pre-delivery baselines, resolves bootstrap and later recovery checkpoints separately
+from each marker's current writer assignment, checks monotonic assignment/interval authority,
+derives vnode-to-shard ownership, and distinguishes missing evidence (`RUN_INVALID`) from complete
+evidence proving malformed or stale output (`PRODUCT_FAIL`). Assignment ownership and process term
+are deliberately pre-reconciled fixture evidence; production still needs the separate supported
+assignment and local-process views described below. The fixture ABI checks vnode-to-shard routing,
+not final Kafka partition bytes. It adds no wire encoding, Kafka transaction, runtime dependency,
+public endpoint, delivery guarantee, or certification evidence; compact byte freezing and hostile
+wire decoding remain the next step.
 
 The controller also needs supported, bounded evidence projections rather than private object-store
 paths or text-log parsing. One local-node view must expose boot/process identity, locally adopted
