@@ -3,7 +3,7 @@
 - **Status:** Planned and backend-gated; exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster
   operator is admitted by this document
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 61
+- **Last reconciled:** 2026-07-27 during Cycle 62
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -231,6 +231,15 @@ composition gap rather than justification for a seeding API or duplicate live-cl
 Cycle 61 adds only the [chartered prebuilt-executable binding](../testing/distributed-state-production-soak-charter.md#cycle-61-executable-binding-seam)
 to the ignored engineering harness. No real-process run or A/B occurred; the coupled target remains
 ineligible as the common driver and cannot replace the independent release-binary soak.
+
+Cycle 62 adds only the [standalone schedule scaffold](../testing/distributed-state-production-soak-charter.md#cycle-62-schedule-scaffold).
+It proves, across C/D and four observer outcomes, that the reviewed driver materializes identical
+plan/trace bytes before interpreting observer status or bounded output. It performs no HTTP,
+workload, fault, checkpoint, latency measurement, A/B, or soak. Before live polling, design and
+review a route-scoped read-only credential or a content-bound GET-only broker; the current console
+bearer also authorizes checkpoint and pipeline control. Then add a loopback fake-server state
+machine for exact method/path/origin, deadline, retry, page, cursor, identity, and response-bound
+behavior before any real cluster is contacted.
 
 ## Scope and non-goals
 

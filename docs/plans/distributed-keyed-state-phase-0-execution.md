@@ -5,7 +5,7 @@
   pending a new official package; no runtime
   dependency, backend qualification evidence, independent production-soak result, or admission change
 - **Started:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 61
+- **Last reconciled:** 2026-07-27 during Cycle 62
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline:** `1e2f8429`; working branch `feature/distributed-keyed-state-adr`
@@ -451,6 +451,17 @@ cannot execute it without treatment-dependent control flow, and v1 cannot suppor
 Cycle 61 adds only the [chartered prebuilt-executable binding](../testing/distributed-state-production-soak-charter.md#cycle-61-executable-binding-seam)
 to the existing engineering harness. It does not decouple diagnostics from control flow. No
 standalone observer, A/B, or real-process soak was added or run.
+
+Cycle 62 adds the isolated
+[`tools/distributed-state-ab`](../../tools/distributed-state-ab/) schedule scaffold and no product
+dependency. One raw-manifest-bound base plan fixes 104 driver actions and 58 observer slots. The
+driver's private end seal exists only after the exact materialized trace is validated and
+file-synced; observer outcome and retained capped output are consumed afterward. Ten Windows tests
+pass with one ignored subprocess fixture, including identical C/D traces across success, exit,
+hang, and malformed output and bounded kill/reap. This is logical schedule non-feedback evidence,
+not execution of the opaque trace/control artifacts, a live observer, A/B, or a real-process soak.
+Live work remains blocked until diagnostic reads can be delegated without also delegating the
+console bearer's checkpoint/pipeline mutation authority.
 
 The existing output path satisfies none of the new provenance/fence fields: it passes only a batch
 and deadline and uses an idempotent, non-transactional Kafka producer. The supported evidence APIs

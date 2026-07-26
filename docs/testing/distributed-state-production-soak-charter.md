@@ -531,6 +531,68 @@ No standalone observer was added in Cycle 61. It must land with a consuming driv
 proves observer exit, hang, or malformed output cannot alter the immutable checkpoint, fault, or
 end schedule; a schedule generator tested only by itself would not prove non-interference.
 
+### Cycle 62 schedule scaffold
+
+Cycle 62 adds [`tools/distributed-state-ab`](../../tools/distributed-state-ab/) as an unpublished,
+standalone Cargo workspace with a committed lockfile. Its direct normal dependencies are
+`serde`, `serde_json`, and `sha2`; it has no LaminarDB, async-runtime, network, Kafka, backend, or
+candidate dependency. The driver and observer are separate executable byte identities. This is a
+contract dry run labelled `NOT A/B OR CERTIFICATION EVIDENCE`, not the Cycle 60 experiment.
+
+One strict manifest binds the exact driver, observer, server, trace manifest, declared-redacted
+configuration, dependency manifest, virtual-control script, and protocol bytes by canonical
+regular-file path, length, and SHA-256. Its raw hash is part of the common base plan, so limits,
+authentication, C/D mapping, and every other manifest field are common too. Arm and injected child
+behavior are command inputs and cannot enter that plan. Referenced trace, protocol, and control
+artifacts are opaque provenance in v1; the tool does not parse or execute them.
+
+The frozen driver schedule contains start, 101 checkpoint declarations, the input-target-end
+declaration, and end at scheduled 290 seconds: 104 actions in all. The observer schedule contains
+58 five-second slots from zero through 285 seconds, three nodes, and two route labels, for 348
+planned probes. Slots at zero, 120, 200, and 255 seconds carry fixed schedule-anchor labels; those
+labels are not observations that a kill, recovery, or rejoin happened. C suppresses all planned
+probes and D serializes them in slot/node/route order with response-byte caps. Neither arm opens a
+socket, issues HTTP, implements retries/pages/cursors, parses a response, executes the declared
+workload/faults, contacts a SUT, or waits 290 wall-clock seconds.
+
+The driver spawns the observer with an empty environment, piped stdin carrying only one fixed
+one-way start signal, and piped stdout/stderr. Dedicated threads necessarily drain pipe bytes
+concurrently but retain at most the manifest caps in memory, so stdout/stderr cannot grow the
+driver's retained output artifacts beyond those caps. Only after the end seal does the driver
+receive the captures, inspect process status, classify output, and create stdout/stderr artifacts. A valid
+treatment result is preflighted against the stdout cap. The completion budget is separately bound
+to 100--60,000 ms because observer artifact hashing is not part of the virtual schedule.
+
+The driver materializes, rather than executes, the common action trace. It validates the complete
+trace against the sealed plan, writes it with `create_new`, calls `sync_all`, and only then obtains
+a private non-cloneable plan-bound end seal. Collection consumes that seal by value. Status, kill,
+capture reception, and JSON interpretation occur afterward. Kill/reap and a second cleanup attempt
+are bounded; a true cleanup failure is retained as `TerminationFailed` with the observer PID. The
+base-plan and trace bytes are reread after collection before the final record is written.
+
+The consuming Windows test matrix runs `{C,D} x {success,exit,hang,malformed}` from the same raw
+manifest and requires byte-identical base plans and driver traces plus identical plan/trace hashes.
+It also covers spawn failure without a changed driver trace, minimum valid stdout cap, exclusive
+artifact directories, changed input identity, strict credential/unknown-field rejection, paths
+containing spaces, capped pipe retention, and a parked-child kill/reap fixture. The resulting proof
+is reviewed-code logical separation. There is no OS sandbox: a hostile same-user process can still
+inspect or mutate accessible resources, path verification retains verify/open and verify/spawn
+TOCTOU windows, and pipe-drain CPU/I/O is not an instrumentation-cost measurement.
+
+The live observer remains blocked. LaminarDB currently places diagnostic GET routes and mutation
+routes such as checkpoint, SQL/reload, and pipeline start/stop behind the same console bearer and
+protected router. Giving that bearer to a polling process would give it control authority. A live
+v2 must instead use an independently reviewed route-scoped read-only token or a content-bound
+GET-only broker, receive a sanitized observer plan rather than the full manifest, and first pass a
+loopback fake-server protocol test covering exact origin/method/path, deadlines, retry ceilings,
+pagination/cursor transitions, response bounds, process identity, and zero C connections. No live
+HTTP or cluster attempt is authorized by Cycle 62.
+
+No A/B ran, no perturbation or latency was measured, and no production source/state/sink delivery
+claim changed. Powered instrumentation equivalence, exactly-once composition, backend
+qualification, and the independently operated immutable release-binary soak remain separate open
+gates. `certification_eligible` remains `false`.
+
 ## Frozen numerical contract
 
 An eligible machine-readable charter contains no `TBD`, zero, or results-derived threshold. It

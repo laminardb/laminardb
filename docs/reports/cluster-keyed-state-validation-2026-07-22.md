@@ -78,6 +78,11 @@ snapshot returned a `has_more` page. No seeding API was added.
 [Cycle 61](../reviews/distributed-keyed-state-cycle-61.md) adds a SHA-bound prebuilt-executable seam
 to both ignored real-process harness paths. No real-process run or A/B occurred; it is not the
 common driver or independent release-binary soak.
+[Cycle 62](../reviews/distributed-keyed-state-cycle-62.md) adds a separate, root-workspace-excluded
+driver/observer schedule scaffold. Its Windows matrix proves byte-identical common plans and traces
+across C/D and observer success, exit, hang, and malformed output, with bounded capture and process
+cleanup. The driver only materializes a static schedule and D only emits planned probes: no SUT,
+HTTP, workload, fault, latency, A/B, backend, or soak was executed.
 
 ## Verdict
 
@@ -657,6 +662,7 @@ The current branch's admission-neutral hardening was then checked separately:
 | Cycle 60 coherent-cut retry proof | PASS, focused/full/lint gates | Metrics-only and exact-cursor/metadata-only instability independently force retries before one stable finalization; test-target seam only |
 | Cycle 60 instrumentation A/B | DESIGN ONLY; not run | Frozen v1 separates recorder installation from polling with common metrics and fixed workload/fault anchors; it estimates effects only and still needs a separate driver plus powered v2 |
 | Cycle 61 executable provenance seam | PASS, focused/full/lint gates; no real-process run | Canonical regular-file path plus exact SHA-256 fail closed on partial configuration, relative/missing/unreadable/non-regular paths, malformed or mismatched digest, and post-resolution mutation; executable permission/format/architecture remain OS spawn checks |
+| Cycle 62 schedule scaffold | PASS for logical schedule isolation; 10 tests passed, one ignored subprocess fixture; no real-process run | Separate driver/observer bytes, raw-manifest-bound common plan, exact file-synced end seal, capped pipe retention, bounded kill/reap, and identical C/D traces across four observer outcomes; static planned probes only, with no HTTP, SUT, workload execution, timing, or A/B evidence |
 
 Both cluster and no-feature `cargo check` and `cargo clippy -D warnings` configurations passed, as
 did formatting and diff checks. These focused results do not exercise keyed cluster restore.
@@ -690,6 +696,14 @@ Cycle 61 also adds no empirical sample. Four executable-resolution tests and the
 passed: 38 Kafka-feature tests were non-ignored and two real-process tests remained ignored. The
 [charter](../testing/distributed-state-production-soak-charter.md#cycle-61-executable-binding-seam)
 retains the timing, staging, and release-gate limitations.
+
+Cycle 62 also adds no empirical product sample. Its standalone Windows suite passed ten tests with
+one ignored subprocess fixture, strict Clippy, formatting, and diff checks. Those tests exercise
+schedule serialization and supervisor failure isolation only. The
+[scaffold contract](../testing/distributed-state-production-soak-charter.md#cycle-62-schedule-scaffold)
+keeps live HTTP blocked because the current console bearer grants both diagnostic-read and
+checkpoint/pipeline mutation authority. The independent immutable release-binary soak has still
+not run.
 
 These are admission and focused operator tests, not a production certification. No existing test
 demonstrates a distributed keyed operator processing remote rows through crash, restore, and

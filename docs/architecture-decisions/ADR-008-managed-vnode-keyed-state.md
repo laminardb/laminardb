@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 61
+- **Last reconciled:** 2026-07-27 during Cycle 62
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -13,7 +13,7 @@
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
   [TidesDB package design](tidesdb-local-state-successor-design.md),
   [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
-  [latest completed review](../reviews/distributed-keyed-state-cycle-61.md)
+  [latest completed review](../reviews/distributed-keyed-state-cycle-62.md)
 
 ## Decision
 
@@ -1325,6 +1325,18 @@ scope and threat model are frozen in the [soak charter](../testing/distributed-s
 No real-process run or A/B occurred, the coupled target is not the common driver, and it cannot
 replace the independent production soak.
 `[LDB-4007]`, `[LDB-0013]`, and the production **NO-GO** verdict are unchanged.
+
+Cycle 62 adds the root-workspace-excluded
+[`distributed-state-ab`](../../tools/distributed-state-ab/) schedule scaffold. Its common driver
+materializes one immutable 104-action schedule and consumes observer status/output only after an
+exact, file-synced, single-use end seal. Windows tests produce identical plan and trace bytes for
+C/D and for observer success, exit, hang, and malformed output. D only declares 348 bounded
+planned probes; neither arm opens a connection, parses a response, executes a workload, contacts a
+SUT, or measures time. The scaffold is therefore not an instrumentation A/B result. A live
+observer also cannot receive the current console bearer: that token authenticates diagnostic GETs
+and checkpoint/pipeline control POSTs on one protected router. Route-scoped read-only authority or
+a separately hashed GET-only broker is required first. The independent immutable release-binary
+soak and the **NO-GO** verdict remain unchanged.
 
 Selected attempts may then be joined at low cadence only through a new read-only, same-snapshot
 core audit of the exact outcome, both retention floors, and validated live capsule reference;
