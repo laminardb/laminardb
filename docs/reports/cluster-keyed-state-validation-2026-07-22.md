@@ -37,7 +37,9 @@ is not runtime or certification evidence. [Cycle 52](../reviews/distributed-keye
 freezes its compact standalone wire representation and hostile decoder without changing Kafka,
 runtime admission, delivery guarantees, or certification status. [Cycle 53](../reviews/distributed-keyed-state-cycle-53.md)
 adds standalone grouped operation-ID derivation and pure authority projection, while leaving
-pipeline-incarnation, interval, producer, and public-evidence lifecycles unwired.
+pipeline-incarnation, interval, producer, and public-evidence lifecycles unwired. [Cycle 54](../reviews/distributed-keyed-state-cycle-54.md)
+adds only a unit-test transactional protocol model; real Kafka fencing and ambiguous-marker
+reconciliation remain open.
 
 ## Verdict
 
@@ -453,6 +455,14 @@ inputs before producing the already-frozen marker/data headers. It independently
 production owner-map and full assignment-certificate digests, including canonical participant
 boots, rather than trusting an arbitrary hash label. Production still supplies none of these new
 lifecycle inputs to the sink command. Neither fixture version is independent production evidence.
+
+Cycle 54's synchronous fake consumes the Cycle 53 authority and Cycle 52 bytes. It models confirmed
+marker-before-data over a supplied partition set, unsplit marker fanout, explicit bounded data transactions, global checked
+sequences including `u64::MAX`, terminal ambiguity, and immediate confirmed-predecessor replay. It
+does not contact Kafka, serialize a transactional ID, establish actual visibility, allocate durable
+intervals, prove a complete broker partition inventory, reject reuse across fake chains/restarts,
+or change the current nontransactional sink. An ambiguous marker can be present or absent;
+Cycle 55 must reconcile the read-committed log before choosing the successor predecessor.
 
 The missing minimum is not another state backend. It is the already-designed delivery/evidence
 vertical: an operator-specific replay-stable operation ID; compact data-record provenance; a stable

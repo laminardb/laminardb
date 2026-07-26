@@ -885,11 +885,12 @@ exposed by the immutable checkpoint-evidence view. The successor admits no data 
 commit is known successful. All subsequent output also uses transactions from that fenced producer
 and is captured read-committed; transaction batching is bounded and must meet the latency profile.
 
-Failure before bootstrap Commit retries startup because no data was admitted. Failure after that
-Commit but before a confirmed marker restores the same bootstrap cut and creates/fences a new
-interval. An ambiguous marker commit terminates that writer; the successor fences it and references
-the same bootstrap cut. No path fabricates a later source position or admits data between these
-steps.
+Failure before bootstrap Commit retries startup because no data was admitted. After that Commit, an
+exact marker transaction may retry in the same live writer interval only when the provider proves
+the attempt was definitely rejected or successfully aborted. Any unproved outcome or writer
+retirement restores the same bootstrap cut and creates/fences a new interval. An ambiguous marker
+commit terminates that writer; the successor fences it and references the same bootstrap cut. No
+path fabricates a later source position or admits data between these steps.
 
 The oracle reads committed records, resolves each marker's recovery-base reference through the
 immutable checkpoint view, uses the first valid marker for the successor as the immutable partition
@@ -1073,6 +1074,67 @@ to match. An inner owner-map digest, repeated-node boot disagreement, or stale d
 rotation therefore fails. Interval allocation, rotation after ambiguous marker outcomes,
 predecessor lifecycle, and checked sequence reservation belong to the next fake-producer state
 machine.
+
+### Validation-only transactional writer model v1
+
+Cycle 54 adds a synchronous protocol model only in the root-workspace-excluded independent tool.
+It consumes one already-prepared authority, an ordered nonempty affected-partition set, and explicit
+nonzero transaction limits. It does not allocate interval IDs, serialize Kafka `transactional.id`,
+contact a broker, wire a connector, or establish latency, allocation, fencing, delivery, or
+production evidence. The five modeled states are `Uninitialized`, `MarkerPending`, `DataOpen`,
+`TransactionInFlight { kind, phase, return_state }`, and terminal `TerminalPoison { point }`.
+
+| From | Simulated result | To and externally visible model effect |
+| --- | --- | --- |
+| `Uninitialized`, initialize | confirmed / definitely rejected / ambiguous | `MarkerPending` / unchanged / terminal poison |
+| stable state, begin | confirmed / definitely rejected / ambiguous | `TransactionInFlight(Begun)` / unchanged / terminal poison |
+| `TransactionInFlight(Begun)`, send | confirmed / confirmed abort / ambiguous | `TransactionInFlight(Staged)` / prior stable state / terminal poison |
+| `TransactionInFlight(Staged)`, commit | confirmed / confirmed abort / ambiguous | publish all staged records and return/open `DataOpen` / publish none and return to the prior stable state / terminal poison |
+
+Initialization never opens data. The interval marker is encoded once and one identical value is
+staged for every partition in the caller-supplied canonical affected set in one unsplittable
+transaction. The fake cannot prove that this set is the complete broker-topology inventory. Only
+its confirmed commit opens data; it is never co-batched with the first data transaction. Each data
+transaction is independently all-or-none. A pure planner reports maximal in-order input ranges, but
+execution takes exactly one planned range per call so a confirmed prefix cannot be hidden behind
+the outcome of a later range.
+
+Limits are inputs to this validation model, not new production constants. Record count is
+additionally capped by the frozen 65,536-header codec limit. Modeled data bytes are exactly the
+checked sum of `66 + payload_length` for each record; modeled marker bytes are
+`encoded_marker_length * partition_count`. These figures exclude Kafka keys, record/request framing,
+compression, broker limits, and allocator behavior. Zero records, noncanonical/unknown partitions,
+an oversized singleton, arithmetic overflow, and count or byte excess fail before begin, sequence
+reservation, or transcript mutation. Payloads remain borrowed while the model prepares inline
+66-byte headers; its owned confirmed transcript is test bookkeeping and is not hot-path evidence.
+
+One shard-local counter covers all partitions in an interval. A bounded data range provisionally
+reserves contiguous sequences once, then derives row `i` as `start + i` without a lock or per-row
+reservation. `Some(n)` means `n` is next and `None` means exhausted; the inclusive last value is
+checked, so a one-record range at `u64::MAX` is legal and then exhausts the interval. A confirmed
+commit advances the counter. A confirmed abort publishes nothing and retries the same borrowed
+range and provisional sequence inside the same model call; an ambiguous result poisons the writer.
+Scripts that would return control with an unresolved provisional range are invalid. This keeps the
+first visible sequence at zero while permitting later capture gaps, as required by the v2 oracle.
+
+The stable producer scope is the structured tuple `(deployment UUID, pipeline incarnation, sink ID,
+shard ID)`; no Kafka string encoding is frozen here. A first interval requires no predecessor. A
+successor test may consume a token from a confirmed predecessor, must retain that scope, use a
+different caller-supplied interval, name the exact predecessor, and restart sequence zero. This
+proves only immediate linkage in the model, not durable global interval uniqueness: a new fake chain
+can reuse an ID, and `A -> B -> A` is not rejected across separately constructed writers. Production
+must durably reject reused confirmed, aborted, ambiguous, and retired interval IDs.
+
+Every ambiguous initialize, begin, send, or commit result is terminal and all later writer calls
+fail inertly. The confirmed-only model transcript does not advance after an ambiguous marker or data
+commit; that absence is deliberately no visibility verdict. A marker may be present on every
+supplied partition or absent, but data remains closed either way. The correct successor predecessor
+is therefore the ambiguous interval only when read-committed reconciliation finds that marker;
+otherwise it is the last visible predecessor (or none). Cycle 55 must prove that
+reconciliation, actual producer-epoch fencing, atomic visibility, old-producer abortion, reserved
+header placement, and broker limits against real Kafka/Redpanda. Until then the product remains
+fail-closed and **NO-GO**; even successful broker qualification would remain at-least-once because
+source/state and Kafka do not share one atomic commit.
 
 The controller also needs supported, bounded evidence projections rather than private object-store
 paths or text-log parsing. One local-node view must expose boot/process identity, locally adopted

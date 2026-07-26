@@ -246,6 +246,21 @@ no transactional producer, supported authority endpoint, backend, admission, gua
 certification flag changed. All CVR scenarios remain **BLOCKED**, no Cycle 53 soak ran, and
 `certification_eligible` remains `false`.
 
+### Cycle 54 evidence disposition
+
+The root-workspace-excluded tool now unit-tests a synchronous fake writer around the frozen
+authority and envelope. Confirmed marker fanout over every supplied affected partition opens data
+atomically in the model; completeness of that partition inventory remains unproved. Each explicit
+bounded data slice receives one checked shard/interval sequence range, and ambiguity poisons the
+writer. The fake has no broker, timestamps, offsets, real fencing, public evidence, or measured
+latency. In particular, an ambiguous marker has no visibility verdict until Cycle 55 read-committed
+reconciliation, so it cannot choose a production successor chain. Durable interval non-reuse across
+fake chains, restarts, and `A -> B -> A` rotation is also unproved.
+
+No backend, runtime connector, source/sink capability, cluster admission, delivery guarantee, or
+certification flag changed. All CVR scenarios remain **BLOCKED**, no Cycle 54 soak ran, and
+`certification_eligible` remains `false`.
+
 ## Frozen numerical contract
 
 An eligible machine-readable charter contains no `TBD`, zero, or results-derived threshold. It
@@ -334,8 +349,9 @@ exclusive start baselines and committed a zero-input bootstrap checkpoint/capsul
 timers and the current pipeline/assignment identity. The unactivated sink may acknowledge only this
 proved-empty flush. Its first marker has `predecessor = none` and references the bootstrap capsule;
 readiness/data admission remain closed until that transaction is confirmed. Failure before the
-bootstrap Commit retries startup. Failure or ambiguous marker outcome after Commit creates a new
-fenced interval against the same cut. A source that cannot expose the pre-delivery baseline is not
+bootstrap Commit retries startup. After Commit, the exact marker may retry in the same live interval
+only after a definitely rejected attempt or confirmed abort; an unproved outcome or writer
+retirement creates a new fenced interval against the same cut. A source that cannot expose the pre-delivery baseline is not
 certifiable. The controller measures bootstrap and first-marker time as startup/RTO latency.
 
 ## Externally actuated fault schedule

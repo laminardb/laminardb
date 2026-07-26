@@ -3,7 +3,7 @@
 - **Status:** Planned and backend-gated; exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster
   operator is admitted by this document
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 53
+- **Last reconciled:** 2026-07-26 during Cycle 54
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -160,8 +160,13 @@ Cycle 53 then freezes one sink-scoped grouped `COUNT(*)`/`SUM(Int64)` operation 
 fixture IDs from explicit ABI-v1 group bytes and checked count, and projects marker/data inputs only
 after pure current-assignment, live-process, and committed-recovery checks. Pipeline incarnation and
 writer intervals remain opaque inputs without a production lifecycle. These cycles close no
-public-evidence, Kafka-fencing, backend, admission, exactly-once, latency, or production-soak gate;
-the fake transactional-producer state machine is next.
+public-evidence, Kafka-fencing, backend, admission, exactly-once, latency, or production-soak gate.
+Cycle 54 adds only the
+[validation-only transactional writer model](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#validation-only-transactional-writer-model-v1):
+confirmed marker-before-data, bounded explicit transaction slices, checked global sequence ranges,
+terminal ambiguity, and confirmed-predecessor replay are executable without a broker. It explicitly
+defers complete partition-inventory proof, durable interval non-reuse, ambiguous-marker
+reconciliation, and real fencing.
 
 ## Scope and non-goals
 

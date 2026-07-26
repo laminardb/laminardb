@@ -8,6 +8,8 @@ use serde_json::Value;
 
 mod oracle_v2;
 mod provenance_v1;
+#[cfg(test)]
+mod transactional_writer_v1;
 mod wire_v1;
 
 pub const NOTICE: &str = "NOT CERTIFICATION EVIDENCE";
