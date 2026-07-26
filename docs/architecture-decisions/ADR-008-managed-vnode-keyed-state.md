@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 49
+- **Last reconciled:** 2026-07-26 during Cycle 50
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -13,7 +13,7 @@
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
   [TidesDB package design](tidesdb-local-state-successor-design.md),
   [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
-  [latest completed review](../reviews/distributed-keyed-state-cycle-49.md)
+  [latest completed review](../reviews/distributed-keyed-state-cycle-50.md)
 
 ## Decision
 
@@ -809,20 +809,24 @@ recovered state, lose timer/output bookkeeping, or skip a result;
 external results flushed after that cut may appear again after a crash. The checkpoint tail keeps
 the existing ordering: enqueue operator output, flush every durable sink, then seal source
 positions. State capture and real sink-flush latency share the checkpoint deadline. A stable output
-identity and provenance envelope must be added before the initial release. For the narrow
-append-only `COUNT(*)`/`SUM(Int64)` vertical, the checked count is the batching-independent logical
-state version;
-identity binds that version and canonical group to deployment, pipeline **incarnation**, and
-operator identity,
-while a separate canonical payload digest detects conflicting values at one version. The input
-contract maps each logical group to one Kafka partition so group-local broker order is stable, and
-the planner rejects any expression that cannot reproduce the same group/SUM prefix from replay.
-Intentional rewind/recreate gets a new incarnation; ordinary crash recovery retains it. SUM checks
-every source-ordered prefix and faults the whole input batch atomically rather than wrapping.
-Vnode and partition ABI, assignment
-version, node ID, boot UUID, and process term accompany the identity. A checkpoint attempt alone is
-insufficient because replay can cross attempts and owners. This is evidence for at-least-once
-correctness; it is not presented as exactly-once.
+identity and two-level provenance envelope must be added before the initial release. Each data
+record carries only envelope version/kind, replay-stable operation ID, writer-interval ID, and
+checked admission sequence. For the narrow append-only `COUNT(*)`/`SUM(Int64)` vertical, the checked
+count is the batching-independent logical state version; identity binds that version and canonical
+group to deployment, pipeline **incarnation**, and operator identity. It excludes payload and
+checkpoint attempt because replay can cross attempts and owners. The serialized Kafka payload bytes
+are the comparison authority: the independent reader computes their SHA-256, so no duplicate digest
+is transmitted on every record. Equal operation IDs require bit-identical bytes; different bytes
+are a conflict.
+
+The input contract maps each logical group to one Kafka partition so group-local broker order is
+stable, and the planner rejects any expression that cannot reproduce the same group/SUM prefix from
+replay. Intentional rewind/recreate gets a new incarnation; ordinary crash recovery retains it. SUM
+checks every source-ordered prefix and faults the whole input batch atomically rather than wrapping.
+Partition ABI, assignment/process provenance, sink shard, and owned vnode set live once in the
+referenced interval marker. The oracle derives the expected vnode from the canonical key and frozen
+ABI and verifies that the resolved marker owns it; it does not trust a row-supplied vnode. This is
+evidence for at-least-once correctness; it is not presented as exactly-once.
 
 A cluster sink used by this release must be `DurableAtLeastOnce + MultiWriter` and accept the
 operator's declared output mode. The first candidate is Kafka `envelope=append`; broker topic,
@@ -841,6 +845,28 @@ fail-closed until either a multiwriter changelog-log sink is certified or mutabl
 key-affine assignment, old-writer fencing, deterministic operation IDs, and vnode handoff. Merely
 marking a mutable sink `MultiWriter` is not sufficient.
 
+Cycle 50 confirms that this is a design requirement, not a description of the current Kafka path.
+Graph execution returns batches by stream name and publication retains internal sink selection and
+output-contract checks, but `SinkCommand::WriteBatch` carries only a row batch under a deadline.
+Main Kafka records contain a payload, optional user key, and optional broker partition, but no
+Laminar header, operation ID, assignment/process identity, writer interval, shard, or admission
+sequence. The producer is idempotent with `acks=all`, but has no `transactional.id`; no successor
+marker exists. Actor FIFO orders one process locally and broker offsets order appends within one
+partition, but neither is an external Laminar authority boundary. Therefore this path remains
+useful ALO infrastructure and is not eligible for the stale-writer certification gate.
+
+The initial writer interval is not a null-authority exception. For the certified vertical, startup
+opens sources only far enough to resolve the exact partition inventory and numeric exclusive start
+baselines while readiness, source delivery, graph execution, and `WriteBatch` admission remain
+closed. It then commits a zero-input bootstrap checkpoint/capsule containing those baselines, empty
+managed state/timers, pipeline identity, and the assignment certificate. The future sink state
+machine must permit this one unactivated empty checkpoint flush only after proving that no output was
+computed, queued, or accepted. The first writer uses `predecessor = none`, commits its marker against
+that bootstrap authority, and releases data admission only after confirmation. A source unable to
+expose an exact checkpointable baseline before delivery remains closed. This one-time startup and
+restart cost is part of the latency/RTO profile; a separate genesis authority would require a later
+ADR amendment.
+
 A stale-owner append is defined by computation or sink admission after the writer lost process or
 vnode authority, not by broker acknowledgement time. Assignment/node/process metadata alone cannot
 prove that boundary. Every output carries a writer-interval ID and a sink-admission sequence that
@@ -850,20 +876,44 @@ has a stable
 transactional ID derived from deployment, pipeline incarnation, sink, and shard—not the ephemeral
 writer interval—so successor initialization broker-fences the old producer. In one confirmed
 transaction the successor then writes a deterministic predecessor/successor interval marker to
-every affected output partition; it admits no data before that commit is known successful. All
-subsequent output also uses transactions from that fenced producer and is captured read-committed;
-transaction batching is bounded and must meet the latency profile.
+every affected output partition. That marker carries deployment; pipeline incarnation and identity;
+operator/output and sink identity; partition ABI; sink shard and owned vnode set; assignment
+certificate/digest; owner node, boot incarnation, and durable process term; predecessor/successor
+interval IDs; and the exact recovery-base `{epoch, checkpoint_id}` plus recovery-capsule digest
+exposed by the immutable checkpoint-evidence view. The successor admits no data before the marker
+commit is known successful. All subsequent output also uses transactions from that fenced producer
+and is captured read-committed; transaction batching is bounded and must meet the latency profile.
 
-The oracle reads committed records, uses the first valid marker for the successor as the immutable
-partition cut, and rejects an old-interval record after it. A predecessor transaction committed
-before the marker remains legal even if its acknowledgement arrived later; an in-flight transaction
-aborted by fencing is invisible. Ambiguous marker commit is fatal to that writer process and a new
-interval must fence it before retry; crash/fault tests bracket initialization and marker commit.
-Broker configuration, transactional-ID derivation, markers, read-committed capture, and forced old
-producer rejection form the retained proof—timestamps or Laminar logs alone do not. This
+Failure before bootstrap Commit retries startup because no data was admitted. Failure after that
+Commit but before a confirmed marker restores the same bootstrap cut and creates/fences a new
+interval. An ambiguous marker commit terminates that writer; the successor fences it and references
+the same bootstrap cut. No path fabricates a later source position or admits data between these
+steps.
+
+The oracle reads committed records, resolves each marker's recovery-base reference through the
+immutable checkpoint view, uses the first valid marker for the successor as the immutable partition
+cut, and rejects an old-interval record after it or replay whose causal source position precedes the
+resolved sealed cut. A predecessor transaction committed before the marker remains legal even if
+its acknowledgement arrived later; an in-flight transaction aborted by fencing is invisible.
+Ambiguous marker commit is fatal to that writer process and a new interval must fence it before
+retry; crash/fault tests bracket initialization and marker commit. Broker configuration,
+transactional-ID derivation, markers, read-committed capture, exact recovery-base resolution, and
+forced old producer rejection form the retained proof—timestamps or Laminar logs alone do not. This
 provider-enforced fencing is qualified for latency and failure behavior but does not make delivery
 exactly-once because source cursor, managed state, and Kafka transaction are not one atomic commit.
 If this topology cannot meet the profile, the Kafka scenario stays closed.
+
+The controller also needs supported, bounded evidence projections rather than private object-store
+paths or text-log parsing. One local-node view must expose boot/process identity, locally adopted
+assignment version/digest, source-gate/recovery phase, and last applied recovery round. One
+versioned checkpoint-attempt view must project the existing create-once outcome and recovery
+capsule, including terminal disposition, assignment certificate, normalized exclusive source cuts,
+and capsule digest. Exact per-process-generation maxima and deadline-exhaustion counts are required
+for the five checkpoint latency families; aggregate Prometheus histograms remain operational
+telemetry, not exact attempt evidence. Implement the delivery vertical in this order: executable
+oracle semantics, byte-golden envelopes/markers, pure identity/authority tests, fake transactional
+producer state-machine tests, real Kafka/Redpanda fencing tests, then engineering-harness wiring.
+Only the later independently operated release-binary soak can certify it.
 
 End-to-end exactly-once is a later certification per concrete source/state/sink combination. It
 requires an exact-certified source and a checkpoint-committable external sink whose transaction

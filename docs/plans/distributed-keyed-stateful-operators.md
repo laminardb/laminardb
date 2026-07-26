@@ -3,7 +3,7 @@
 - **Status:** Planned and backend-gated; exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster
   operator is admitted by this document
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 49
+- **Last reconciled:** 2026-07-26 during Cycle 50
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -120,6 +120,28 @@ retains its permit and fault lifecycle. Removing the redundant async timeout wra
 synchronous snapshots preemptible, which was already the case. There is no row-path change, new
 backend, or delivery widening. The independent soak charter now names exact source-less/sourceful
 leader/follower rotation scenarios and latency distributions, but no qualifying soak has run.
+
+Cycle 50 closes the output/evidence inventory without implementing it. Current Kafka output has no
+replay-stable operation ID, Laminar provenance, checked admission sequence, transactional writer
+fence, or successor marker bound to an exact recovery-base capsule. Supported HTTP and metrics
+expose durable assignment publication and aggregate timing, but not each process's locally adopted
+assignment, immutable attempt history,
+exact attempt maxima, or deadline-exhaustion counts. Private object-store outcomes, capsules,
+adoption reports, and process leases remain the internal authority; the production contract needs
+small versioned projections rather than coupling an independent controller to private paths or text
+logs. Delivery work starts with executable oracle semantics and byte/state-machine tests, then real
+broker fencing, then engineering integration. Per-record headers stay limited to version/kind,
+operation ID, interval ID, and sequence; interval-wide provenance lives in the referenced marker,
+while the reader hashes payload bytes and derives vnode ownership from the canonical key/ABI. This
+evidence gap is independent of the local-state backend gate and does not justify relaxing
+`[LDB-4007]` or claiming exactly-once.
+
+The first writer interval requires the same proof: resolve exact numeric source-start baselines
+without delivering records, commit a zero-input bootstrap checkpoint/capsule with empty state and
+the current pipeline/assignment identity, then confirm a `predecessor = none` marker before opening
+readiness or data admission. Only that proved-empty bootstrap may bypass an unactivated sink flush.
+Sources unable to expose a checkpointable pre-delivery baseline remain closed, and bootstrap/marker
+time is measured as startup/RTO latency.
 
 ## Scope and non-goals
 
@@ -286,8 +308,11 @@ Work:
    mode and output identity; sink durability/topology/input mode; CP-5 ordering; permitted ALO
    duplicates; and combinations that remain closed. Benchmark at least one real certified source
    and sink rather than only an in-memory harness. Kafka output needs broker-enforced writer fencing
-   plus partition fence markers; the source oracle derives its ledger by reconciling durable intents
-   with actual broker records rather than acknowledgement callbacks.
+   plus partition fence markers bound to the exact recovery-base attempt, capsule digest, and
+   assignment certificate; the source oracle derives its ledger by reconciling durable intents
+   with actual broker records rather than acknowledgement callbacks. Freeze supported, versioned
+   local-adoption and exact checkpoint-attempt evidence projections; polling the shared durable
+   `/vnodes` head, aggregate histograms, private object paths, or text-log substrings is not proof.
 8. Freeze a fault-point vocabulary and output-oracle format shared by later phases. Cross source
    drain/replay, state mutation/freeze, timer fire, output enqueue, sink flush, durable decision,
    external publication, assignment rotation, and ambiguous commit.
@@ -485,8 +510,9 @@ Correctness matrix:
 - output oracle under the advertised at-least-once boundary: no lost state/result, documented
   replay duplicates only, and no double-application inside restored state.
 - Kafka assignment handoff plus at least one admitted durable multiwriter append sink, including
-  broker-enforced old-writer fencing, partition fence markers, ambiguous source acknowledgements,
-  and crash before/after sink flush and source-position seal.
+  broker-enforced old-writer fencing, partition fence markers resolvable to exact recovery-base
+  checkpoint/capsule authority, ambiguous source acknowledgements, and crash before/after sink
+  flush and source-position seal.
 - every selected profile's cache-resident and near-capacity skew, frozen-generation, allocator/RSS
   retention and controlled-exhaustion latency/throughput profile; and
 - local-spill-only cold-cache, spill-heavy and maintenance-pressure profiles.

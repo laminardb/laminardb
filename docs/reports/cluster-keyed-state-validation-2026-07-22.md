@@ -27,7 +27,10 @@ then closes a live assignment/capture race: staged vnode transitions now enter c
 and the existing rotation fence spans shuffle alignment plus whole/vnode mutable capture.
 [Cycle 49](../reviews/distributed-keyed-state-cycle-49.md) proves the same span on both follower
 routes and removes a rebalance latency inversion by rejecting an overlapping mutable capture before
-state mutation instead of awaiting a retained encoder while holding that fence. None of these
+state mutation instead of awaiting a retained encoder while holding that fence. [Cycle 50](../reviews/distributed-keyed-state-cycle-50.md)
+audits Kafka output and supported public evidence end to end: current ALO records cannot identify a
+logical operation or fenced writer interval, and the public checkpoint/assignment surfaces cannot
+yet prove every process's local adoption or reconstruct exact per-attempt latency. None of these
 decisions changes cluster admission.
 
 ## Verdict
@@ -389,12 +392,63 @@ but external records flushed after that cut may repeat. Local LSM durability can
 end-to-end exactly-once; that later guarantee needs connector/provider commits fenced by the same
 leader/assignment proof already used by the checkpoint coordinator.
 
-The first candidate Kafka-to-Kafka append path has one more certification blocker. Kafka source is
-replayable and splittable, and the append sink declares durable at-least-once multiwriter
-capability, but aggregate output is currently serialized without a replay-stable logical operation
-ID or ownership-provenance envelope. The independent oracle therefore cannot tell a legal replay
-from internal double application or work admitted by a stale owner. Sink flush ordering and
-connector capability flags do not replace that evidence.
+### Current Kafka output and independent-evidence boundary
+
+Cycle 50 traced the first Kafka-to-Kafka candidate from graph output to the broker. Graph execution
+returns batches by stream name, and publication still selects the configured sink input and output
+contract. At the connector boundary, however, `SinkCommand` wraps `SinkOperation::WriteBatch` with
+only a `RecordBatch` and deadline; the current epoch remains actor-local error/checkpoint state. The
+Kafka append connector serializes each row and sets a payload, optional configured key, and optional
+partition. Main records have no Laminar headers. The single bounded actor supplies implicit
+process-local FIFO, but no externally visible sink admission sequence.
+
+Kafka source is replayable and splittable, and the append sink truthfully declares durable
+at-least-once multiwriter capability. Its producer uses `enable.idempotence=true`, `acks=all`, and a
+bounded in-flight count. It deliberately has no `transactional.id`, blocks users from injecting
+one, and does not expose the broker-assigned producer identity as Laminar authority. Each successful
+write already awaits every accepted delivery report, so checkpoint `flush()` is then a no-op. An
+ambiguous write retires that connector generation. These are useful durability/failure properties,
+but producer idempotence covers one producer session; it neither fences a successor nor identifies
+recovery replay.
+
+The exact evidence inventory is:
+
+| Required fact | Current internal authority | External evidence today | Disposition |
+|---|---|---|---|
+| Logical operation and payload | User row only; no engine operation ID reaches `SinkCommand` | Broker payload/key; the engineering soak parses user `seq` but does not retain bytes by identity | Missing as a product contract; workload `seq` is not a general operation identity |
+| Pipeline/operator/sink identity | Pipeline digest, graph/operator names, and configured sink name exist separately | None is attached to the main Kafka record | Missing |
+| Assignment and writer process | Checkpoint assignment fence binds version/digest, node, and boot incarnation; process lease fences local sink work | Current assignment and membership are queryable, but output carries none of them | Missing from output |
+| Sink shard/writer interval | Kafka partition is selected at send; actor/connector generations are local lifetimes | Broker topic/partition/offset only | No stable Laminar shard, predecessor/successor interval, or interval marker |
+| Sink admission order | One actor consumes a bounded FIFO | Broker offset orders actual appends per partition | No checked Laminar sequence and no cross-writer authority boundary |
+| Legal replay interval | Committed recovery capsule binds exact source cuts and assignment | Engineering soak observes advisory consumer-group commits | Exact cut is derivable from retained checkpoint authority, not from group offsets; current oracle does not consume it |
+| Checkpoint terminal/assignment evidence | Create-once outcome, seal inventory, and recovery capsule bind the exact attempt and assignment | `/api/v1/cluster/checkpoints` exposes only the latest ID/epoch/time/names/count; raw authority requires separate bounded parsing | Partially observable; no stable per-attempt evidence view |
+| Local assignment convergence | Each runtime has an adopted registry version/digest | `/api/v1/cluster/vnodes` loads the shared durable snapshot, so identical replies do not prove each process adopted it | Missing public local-adoption evidence |
+| Latency attempt/max evidence | Aggregate histograms and selected lifecycle logs exist | Prometheus supports distributions, but not an exact per-attempt maximum or complete stage/terminal correlation | Insufficient for the frozen soak fields |
+
+The live engineering oracle currently accepts any number of duplicate `seq` values once the
+expected set is present. It does not compare bytes for repeated IDs, bind a duplicate to the sealed
+source cut, read assignment evidence, or identify a predecessor record after successor activation.
+The standalone semantic fixture does compare duplicate bytes, aggregate prefixes, and frozen versus
+durable source-cut completeness, but invents fixture operation IDs and has no assignment, writer
+interval, marker, or recovery-cut-to-writer-interval binding. Neither is independent production
+evidence.
+
+The missing minimum is not another state backend. It is the already-designed delivery/evidence
+vertical: an operator-specific replay-stable operation ID; compact data-record provenance; a stable
+sink-writer shard and checked per-interval admission sequence; broker-enforced predecessor fencing
+plus a committed successor marker bound to the exact recovery-base attempt, capsule digest, and
+assignment certificate; and a versioned read-only projection of that existing checkpoint authority
+which the oracle can resolve. The data header contains only version/kind, operation ID, interval ID,
+and sequence; interval-wide pipeline/operator/sink, ABI, shard/vnode, assignment, process, and
+recovery provenance lives in the marker. The reader hashes the raw payload bytes and derives the
+expected vnode from the canonical key and frozen ABI rather than trusting duplicated row metadata.
+A public local-adoption identity and per-attempt timing evidence are also required for the rotation
+charter. The initial interval must first reference a zero-input bootstrap checkpoint/capsule created
+from exact pre-delivery source baselines while readiness, graph work, and sink writes remain closed;
+there is no null/genesis authority shortcut. Implementation must start with semantic model and byte-
+golden tests, then a fake producer state machine, then real Kafka/Redpanda fencing tests. The current
+three-node engineering harness is upgraded only after those layers pass; the independent soak
+remains later and separately operated.
 
 ### Fjall is historical, not current infrastructure
 

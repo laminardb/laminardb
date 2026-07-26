@@ -5,6 +5,7 @@
   pending a new official package; no runtime
   dependency, backend qualification evidence, independent production-soak result, or admission change
 - **Started:** 2026-07-22
+- **Last reconciled:** 2026-07-26 during Cycle 50
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline:** `1e2f8429`; working branch `feature/distributed-keyed-state-adr`
@@ -274,36 +275,78 @@ and evidence-retention settings as part of the contract.
 Do not certify the path from connector flags or Kafka producer idempotence alone. Current records
 lack replay-stable operation identity and ownership provenance. Before the scenario is eligible,
 add golden-tested `operation_id_v1` derived from domain, deployment/pipeline/operator identities,
-pipeline incarnation, canonical group key, and count state version; carry its separate canonical
-payload digest, vnode and partition ABI, assignment version, node ID, boot UUID, and process term.
-Excluding the payload
-from the identity makes two payloads for one logical state version a detectable conflict. The same
-ID and payload is a legal replay; the same ID with a different payload is a failure. “Stale” means
-work computed or admitted after the writer's authority was fenced. A predecessor transaction
-committed before the successor's partition marker remains an ordinary at-least-once record even if
-its acknowledgement arrives later; fencing aborts any still-open transaction, so it is invisible.
-Checkpoint-attempt identity is not stable across source replay. Ordinary recovery retains pipeline
-incarnation; an intentional rewind/recreate changes it.
+pipeline incarnation, canonical group key, and count state version. Its compact data header carries
+only envelope version/kind, operation ID, writer-interval ID, and checked admission sequence. The
+serialized Kafka payload bytes are authoritative; the independent reader computes their SHA-256,
+so payload digest, vnode/ABI, assignment, and process provenance are not repeated on every row.
+Excluding payload and checkpoint attempt from the identity makes two byte payloads for one logical
+state version a detectable conflict across replay. The same ID and bytes is only a byte-consistent
+replay candidate; it is legal only when the resolved interval marker and recovery cut permit it. The
+same ID with different bytes is a failure. “Stale” means work computed or admitted after the writer's
+authority was fenced. A predecessor transaction committed before the successor's partition marker
+remains an ordinary at-least-once record even if its acknowledgement arrives later; fencing aborts
+any still-open transaction, so it is invisible. Ordinary recovery retains pipeline incarnation; an
+intentional rewind/recreate changes it.
 
 Metadata cannot prove whether admission preceded a fence. Each output therefore carries a
 writer-interval ID and a sink-admission sequence that starts at zero and strictly increases within
 each `(sink-writer shard, writer interval)`, and the certified sink supplies an external fence cut.
+Before the first interval, open sources only far enough to resolve exact partition inventory and
+numeric exclusive start baselines. Keep readiness, source delivery, graph execution, and sink-write
+admission closed; commit a zero-input bootstrap checkpoint/capsule with those baselines, empty state/
+timers, pipeline identity, and assignment certificate. The unactivated sink may satisfy that
+checkpoint's flush only after proving that no output was computed, queued, or accepted. The first
+marker has `predecessor = none`, references the bootstrap authority, and must commit before data
+admission opens. A source unable to expose a checkpointable baseline before delivery stays closed.
 The Kafka candidate derives a
 stable transactional ID from deployment, pipeline incarnation, sink, and bounded writer shard. The
 successor initializes it to broker-fence the predecessor, then commits deterministic
 predecessor/successor markers to all affected output partitions in one confirmed transaction before
-admitting data. Every output record then uses transactions from that fenced producer. An ambiguous
-marker commit kills that writer; a new interval fences it before retry. A read-committed oracle
-rejects any old-interval row after the marker and the fault suite brackets
+admitting data. Each marker carries deployment; pipeline incarnation and identity; operator/output
+and sink identity; partition ABI; sink shard and owned vnode set; assignment certificate/digest;
+owner node, boot incarnation, and durable process term; predecessor/successor interval IDs; and the
+exact recovery-base `{epoch, checkpoint_id}` plus recovery-capsule digest. The oracle resolves that
+reference through the immutable checkpoint-evidence view, derives each row's expected vnode from
+its canonical key and the frozen ABI, and verifies marker ownership before classifying replay. Every
+output record then uses transactions from that fenced producer. An ambiguous marker commit kills
+that writer; a new interval fences it before retry. A read-committed oracle rejects any old-interval
+row after the marker and any replay causally before the resolved sealed cut; the fault suite brackets
 producer initialization and marker commit. This is provider-enforced stale-writer exclusion, not
 exactly-once; source cursor/state and Kafka transaction remain separate commits. Plain multiwriter
 append without this proof stays closed.
+
+Failure before bootstrap Commit retries startup. Failure after Commit but before a confirmed marker
+restores the bootstrap cut and creates/fences a new interval against it. An ambiguous marker commit
+terminates the writer; its successor fences it and references that same cut. The one-time bootstrap
+and initial-marker latency is part of startup/RTO qualification, not hidden from the profile.
 
 The input oracle likewise cannot use acknowledgement callbacks as its ledger: Kafka may persist a
 record whose acknowledgement is lost. The producer durably records stable intents, then the
 controller reads and reconciles every actual input record through the frozen partition cuts. The
 model consumes that broker-derived ledger, including physical retries, and rejects unknown or
 conflicting records.
+
+Cycle 50's implementation audit freezes the dependency order and prevents connector-first work:
+
+1. extend the execution-ineligible independent semantic fixture with writer intervals, checked
+   sequences, ownership/shard checks, predecessor/successor marker rules, and an exact marker-to-
+   recovery-base/capsule binding over its existing source cuts, including the zero-input bootstrap
+   base and `predecessor = none` first interval;
+2. freeze compact data-header and marker bytes, version/cap limits, and hostile decoding;
+3. prove operation identity and assignment-authority propagation with pure tests;
+4. prove initialization, marker-before-data, ambiguous-commit failure, batching, and overflow with a
+   fake transactional-producer state machine;
+5. prove broker fencing, atomic marker/data visibility, aborted predecessor invisibility, and
+   `read_committed` behavior against real Kafka/Redpanda; and
+6. only then wire the three-node engineering harness. The independent release-binary soak remains a
+   later gate.
+
+The existing output path satisfies none of the new provenance/fence fields: it passes only a batch
+and deadline and uses an idempotent, non-transactional Kafka producer. The supported evidence APIs
+also need bounded versioned projections of local assignment adoption and the existing immutable
+checkpoint outcome/capsule, plus exact max/deadline telemetry. Raw object-store records and tracing
+fields are implementation evidence, not a frozen external API. These tasks do not depend on which
+local working-state engine eventually qualifies.
 
 The expected checkpoint order is source position capture followed by a FIFO sink synchronization
 fence and successful durable flush before manifest readiness, durable decision, and external source

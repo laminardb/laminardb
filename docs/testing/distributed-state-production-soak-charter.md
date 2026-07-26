@@ -158,6 +158,33 @@ is not a deployment, fault, or evidence runner. The available WSL 2/Docker envir
 labelled functional smoke only. No Cycle 49 independent soak or production soak ran, and
 `certification_eligible` remains `false`.
 
+### Cycle 50 evidence disposition
+
+The two sourceful ALO scenarios are **BLOCKED**, not merely unexecuted: current Kafka records have no
+Laminar operation identity, writer interval, checked sink sequence, stable shard, or successor fence
+marker. The live engineering oracle accepts any duplicate user `seq` once the expected set is
+present and does not retain repeated payload bytes or bind them to an exact sealed source cut. The
+standalone fixture supplies synthetic operation IDs, byte comparison, and frozen/durable source-cut
+checks, but has no writer, assignment, shard, marker, or binding from those cuts to a recovery-
+authority interval.
+
+The two source-less scenarios are also **BLOCKED** on supported evidence. `/api/v1/cluster/vnodes`
+reads the shared durable assignment snapshot on every node; identical replies do not prove that
+each process adopted it. `/api/v1/cluster/checkpoints` exposes only latest summary metadata, and
+Prometheus checkpoint histograms cannot recover an exact attempt maximum or deadline-exhaustion
+count. Exact outcomes, recovery capsules, process leases, and adopted-assignment reports exist in
+the object store, but their private paths, pruning, and envelopes are not a production evidence API.
+Human-formatted tracing events remain diagnostic corroboration only. `CVR-EO-REJECT-v1` is publicly
+observable, but its independent runner and frozen attempt contract do not yet exist, so it remains
+ineligible and unexecuted.
+
+Before any CVR dispatch, add a bounded versioned local-node evidence view, a bounded versioned
+checkpoint-attempt/outcome view over the existing authority, and exact per-process-generation
+maximum/deadline counters or events for the five checkpoint latency families. The sourceful path
+additionally requires the already-specified broker-enforced writer fence and record/marker
+provenance. Missing evidence is `INVALID`; complete evidence showing malformed, conflicting, or
+stale output is product `FAIL`. No Cycle 50 soak ran and `certification_eligible` remains `false`.
+
 ## Frozen numerical contract
 
 An eligible machine-readable charter contains no `TBD`, zero, or results-derived threshold. It
@@ -214,24 +241,41 @@ digests plus missing, extra, malformed, duplicate, conflicting, and stale-genera
 
 For at-least-once, an external duplicate is allowed only when it is bit-equivalent and carries the
 same replay-stable logical operation identity. That identity is tied to deterministic emission
-causality and cannot be a checkpoint attempt alone. Each record also carries deployment, pipeline
-incarnation, operator, vnode, assignment generation, writer interval, sink-writer shard, and a
-sink-admission sequence that starts at zero and strictly increases within each `(shard, interval)`,
-plus writer-process provenance. Intentional rewind or recreate changes pipeline incarnation; crash
-replay does not.
+causality and cannot be a checkpoint attempt alone. Each compact data header carries only envelope
+version/kind, operation ID, writer-interval ID, and a sink-admission sequence that starts at zero and
+strictly increases within each `(shard, interval)`. The serialized Kafka payload bytes are the
+comparison authority and the independent reader computes their SHA-256; no separate digest is
+transmitted per record. Intentional rewind or recreate changes pipeline incarnation; crash replay
+does not.
 
 Metadata alone cannot prove pre-fence admission. Each bounded Kafka sink-writer shard uses a stable
 transactional ID derived from deployment, pipeline incarnation, sink, and shard. A successor
 initializes it to broker-fence the predecessor, then commits deterministic predecessor/successor
-markers to all affected output partitions in one confirmed transaction before admitting data. Every
-output record then uses transactions from that fenced producer. The oracle reads committed data and
-rejects an old-interval record after the marker. A predecessor
+markers to all affected output partitions in one confirmed transaction before admitting data. Each
+marker carries deployment; pipeline incarnation and identity; operator/output and sink identity;
+partition ABI; sink shard and owned vnode set; assignment certificate/digest; owner node, boot
+incarnation, and durable process term; predecessor/successor interval IDs; and the exact recovery-
+base `{epoch, checkpoint_id}` plus recovery-capsule digest. Every output record then uses
+transactions from that fenced producer. The oracle resolves that immutable checkpoint reference,
+derives the expected vnode from the canonical key and frozen ABI, verifies marker ownership, reads
+committed data, rejects replay causally before its sealed source cut, and rejects an old-interval
+record after the marker. A predecessor
 transaction committed before the marker remains legal even if its acknowledgement arrived later;
 an open transaction aborted by fencing is invisible. An ambiguous marker commit terminates that
 writer and a new interval fences it before retry. Missing output, state double application, two
 payloads sharing an operation identity, old-interval output after its partition marker, or output
 beyond the frozen boundary is a failure. If provider-enforced fencing and markers cannot prove these
 distinctions, the scenario is not certifiable; timestamps and Laminar logs are not substitutes.
+
+The first interval follows the same authority rule. Before source delivery, graph execution, or sink
+write admission, the controller proves that Laminar resolved exact source partitions and numeric
+exclusive start baselines and committed a zero-input bootstrap checkpoint/capsule with empty state/
+timers and the current pipeline/assignment identity. The unactivated sink may acknowledge only this
+proved-empty flush. Its first marker has `predecessor = none` and references the bootstrap capsule;
+readiness/data admission remain closed until that transaction is confirmed. Failure before the
+bootstrap Commit retries startup. Failure or ambiguous marker outcome after Commit creates a new
+fenced interval against the same cut. A source that cannot expose the pre-delivery baseline is not
+certifiable. The controller measures bootstrap and first-marker time as startup/RTO latency.
 
 ## Externally actuated fault schedule
 
