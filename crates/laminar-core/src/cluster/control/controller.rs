@@ -2088,14 +2088,15 @@ impl ClusterController {
         self.recovery_incarnation
     }
 
-    /// Point-read this process's exact local assignment evidence.
+    /// Read this process's exact local assignment evidence with one bounded checked-KV operation.
     ///
     /// Only the local stable-node slot is read; this method never scans shared assignment or
-    /// recovery records. The process identity and sampled lease are captured before the read, the
-    /// retained report is validated against the current boot, and identity is revalidated
-    /// afterward. A canonical report from an older boot makes the view unavailable rather than
-    /// being attributed to this process. A returned adoption also matches the exact locally audited
-    /// assignment fence sampled before and after identity revalidation.
+    /// recovery records. The process identity and sampled lease are captured before the read and
+    /// revalidated immediately afterward. The retained report is then validated against the current
+    /// boot, and identity is revalidated again around the sampled assignment fence. A canonical
+    /// report from an older boot makes the view unavailable rather than being attributed to this
+    /// process. A returned adoption also matches the exact locally audited assignment fence sampled
+    /// before and after the final identity revalidation.
     ///
     /// # Errors
     /// Fails closed when the process term is unpublished, the lease is not live, the bounded
@@ -2116,6 +2117,15 @@ impl ClusterController {
             .read_recovery_value(node, ADOPTED_ASSIGNMENT_KEY)
             .await
             .map_err(LocalProcessAuthorityEvidenceError::Unavailable)?;
+
+        let after_read = self
+            .capture_live_local_process_authority()
+            .map_err(LocalProcessAuthorityEvidenceError::Unavailable)?;
+        if after_read != before {
+            return Err(LocalProcessAuthorityEvidenceError::Unavailable(
+                "local process authority changed while reading retained evidence".into(),
+            ));
+        }
 
         let adopted_raw = adopted_raw.ok_or_else(|| {
             LocalProcessAuthorityEvidenceError::Unavailable(
