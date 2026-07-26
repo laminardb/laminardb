@@ -41,8 +41,8 @@
 //! - `LAMINAR_SOAK_MAX_RECOVERY_MS`  maximum time for each failover or restarted-node recovery
 //!   phase (default and upper bound 90s, matching the liveness window)
 //! - `LAMINAR_SOAK_LAMINARDB_EXE` / `LAMINAR_SOAK_LAMINARDB_SHA256`  optional all-or-nothing
-//!   absolute prebuilt server path and exact lowercase SHA-256; invalid overrides fail before the
-//!   soak creates dependencies
+//!   absolute prebuilt server path and exact lowercase SHA-256; path/digest validation precedes
+//!   dependency creation, while executable-format/permission errors remain OS spawn failures
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -250,6 +250,18 @@ fn resolve_executable(
     let canonical_path = path
         .canonicalize()
         .map_err(|error| format!("cannot canonicalize executable {}: {error}", path.display()))?;
+    let path_metadata = canonical_path.metadata().map_err(|error| {
+        format!(
+            "cannot inspect executable path {}: {error}",
+            canonical_path.display()
+        )
+    })?;
+    if !path_metadata.is_file() {
+        return Err(format!(
+            "executable path is not a regular file: {}",
+            canonical_path.display()
+        ));
+    }
     let mut file = std::fs::File::open(&canonical_path).map_err(|error| {
         format!(
             "cannot open executable {}: {error}",
