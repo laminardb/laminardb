@@ -135,10 +135,9 @@ pub(crate) struct CheckpointBarrierTimingGuard {
     context: Option<CheckpointBarrierTimingContext>,
     stall_started: Instant,
     local_started: Instant,
-    local_finished: bool,
-    local_barrier_ns: Option<u64>,
+    local_barrier_duration: Option<Duration>,
     aligned_started: Option<Instant>,
-    aligned_resume_ns: Option<u64>,
+    aligned_resume_duration: Option<Duration>,
     durable_tail_handoff: bool,
     absolute_deadline: tokio::time::Instant,
     invalid_duration_state: bool,
@@ -161,10 +160,9 @@ impl CheckpointBarrierTimingGuard {
             context,
             stall_started: started,
             local_started: started,
-            local_finished: false,
-            local_barrier_ns: None,
+            local_barrier_duration: None,
             aligned_started: None,
-            aligned_resume_ns: None,
+            aligned_resume_duration: None,
             durable_tail_handoff: false,
             absolute_deadline,
             invalid_duration_state: false,
@@ -177,7 +175,7 @@ impl CheckpointBarrierTimingGuard {
     }
 
     pub(crate) fn begin_aligned_resume(&mut self) {
-        if self.aligned_started.is_some() || self.aligned_resume_ns.is_some() {
+        if self.aligned_started.is_some() || self.aligned_resume_duration.is_some() {
             self.invalid_duration_state = true;
             return;
         }
@@ -189,25 +187,14 @@ impl CheckpointBarrierTimingGuard {
             self.invalid_duration_state = true;
             return;
         };
-        let elapsed = started.elapsed();
-        self.aligned_histogram.observe(elapsed.as_secs_f64());
-        match duration_ns(elapsed) {
-            Some(elapsed_ns) => self.aligned_resume_ns = Some(elapsed_ns),
-            None => self.invalid_duration_state = true,
-        }
+        self.aligned_resume_duration = Some(started.elapsed());
     }
 
     fn finish_local_barrier(&mut self) {
-        if self.local_finished {
+        if self.local_barrier_duration.is_some() {
             return;
         }
-        self.local_finished = true;
-        let elapsed = self.local_started.elapsed();
-        self.local_histogram.observe(elapsed.as_secs_f64());
-        match duration_ns(elapsed) {
-            Some(elapsed_ns) => self.local_barrier_ns = Some(elapsed_ns),
-            None => self.invalid_duration_state = true,
-        }
+        self.local_barrier_duration = Some(self.local_started.elapsed());
     }
 }
 
@@ -218,19 +205,45 @@ impl Drop for CheckpointBarrierTimingGuard {
             self.finish_aligned_resume();
         }
         let stall = self.stall_started.elapsed();
+        let local_barrier_duration = self
+            .local_barrier_duration
+            .expect("local barrier duration is closed before observation");
+
+        // Publish every duration only when the complete barrier scope closes. In particular, a
+        // process killed after the durable-tail handoff must not leave a local/aligned sample
+        // without the corresponding stall sample and exact ledger record.
+        self.local_histogram
+            .observe(local_barrier_duration.as_secs_f64());
+        if let Some(aligned_resume_duration) = self.aligned_resume_duration {
+            self.aligned_histogram
+                .observe(aligned_resume_duration.as_secs_f64());
+        }
         self.stall_histogram.observe(stall.as_secs_f64());
         let Some(pipeline_stall_ns) = duration_ns(stall) else {
             self.ledger.note_recording_loss();
             return;
         };
-        let (Some(context), Some(local_barrier_ns)) = (self.context, self.local_barrier_ns) else {
+        let Some(local_barrier_ns) = duration_ns(local_barrier_duration) else {
             self.ledger.note_recording_loss();
             return;
+        };
+        let aligned_resume_ns = if let Some(duration) = self.aligned_resume_duration {
+            let Some(duration_ns) = duration_ns(duration) else {
+                self.ledger.note_recording_loss();
+                return;
+            };
+            Some(duration_ns)
+        } else {
+            None
         };
         if self.invalid_duration_state {
             self.ledger.note_recording_loss();
             return;
         }
+        let Some(context) = self.context else {
+            self.ledger.note_recording_loss();
+            return;
+        };
         self.ledger.try_record(CheckpointBarrierTimingObservation {
             process: context.process,
             attempt: context.attempt,
@@ -239,7 +252,7 @@ impl Drop for CheckpointBarrierTimingGuard {
             assignment_digest: context.assignment_digest,
             pipeline_stall_ns,
             local_barrier_ns,
-            aligned_resume_ns: self.aligned_resume_ns,
+            aligned_resume_ns,
             durable_tail_handoff: self.durable_tail_handoff,
             deadline_exhausted: tokio::time::Instant::now() >= self.absolute_deadline,
         });
@@ -555,6 +568,17 @@ mod tests {
             guard.finish_local_barrier_with_handoff();
             guard.begin_aligned_resume();
             guard.finish_aligned_resume();
+            assert_eq!(
+                metrics
+                    .checkpoint_pipeline_stall_duration
+                    .get_sample_count(),
+                0
+            );
+            assert_eq!(
+                metrics.checkpoint_barrier_local_duration.get_sample_count(),
+                0
+            );
+            assert_eq!(metrics.checkpoint_aligned_resume_wait.get_sample_count(), 0);
         }
         {
             let _early_return = CheckpointBarrierTimingGuard::start_with_context(
