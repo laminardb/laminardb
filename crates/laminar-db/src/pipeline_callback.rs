@@ -1768,6 +1768,7 @@ impl ConnectorPipelineCallback {
         &mut self,
         request: crate::checkpoint_coordinator::CheckpointRequest,
         operator_state: CapturedOperatorState,
+        vnode_states: crate::checkpoint_coordinator::StagedVnodeStates,
         identity: CertifiedCheckpointAttempt,
         fan_out: FxHashMap<String, SourceCheckpoint>,
         attempt_started: std::time::Instant,
@@ -1789,7 +1790,6 @@ impl ConnectorPipelineCallback {
                 "[LDB-6055] follower durable tail has an invalid assignment certificate".into(),
             );
         }
-        let vnode_states = self.capture_vnode_states(identity.attempt.epoch)?;
         let operator_state_encoded_budget = encoded_operator_state_budget(
             self.checkpoint_state_cap_bytes,
             operator_state.estimated_bytes(),
@@ -2980,7 +2980,18 @@ impl ConnectorPipelineCallback {
         if let Err(error) = self.fence_follower_sinks_until(attempt_deadline).await {
             return self.fail_pending_follower_control(attempt, error).await;
         }
+        let checkpoint_rotation_guard = match self
+            .checkpoint_capture_rotation_guard_until(Some(assignment_fence), attempt_deadline)
+            .await
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                tracing::info!(%error, "follower checkpoint capture was superseded before shuffle staging");
+                return self.cancel_pending_follower_control(attempt).await;
+            }
+        };
         if let Err(error) = self.require_process_authority("follower shuffle alignment") {
+            drop(checkpoint_rotation_guard);
             return self
                 .fail_pending_follower_control(attempt, error.to_string())
                 .await;
@@ -3002,6 +3013,7 @@ impl ConnectorPipelineCallback {
             Ok(ShuffleAlignmentOutcome::ScopeCancelledBeforeStaging) => {
                 if let Err(error) = self.require_process_authority("follower shuffle cancellation")
                 {
+                    drop(checkpoint_rotation_guard);
                     return self
                         .fail_pending_follower_control(attempt, error.to_string())
                         .await;
@@ -3011,16 +3023,28 @@ impl ConnectorPipelineCallback {
                     epoch = attempt.epoch,
                     "follower shuffle scope closed before checkpoint staging"
                 );
+                drop(checkpoint_rotation_guard);
                 return self.cancel_pending_follower_control(attempt).await;
             }
             Err(error) => {
                 tracing::warn!(%error, "follower shuffle alignment failed — skipping");
                 let error = error.to_string();
                 set_checkpoint_fault(&self.checkpoint_fault, error.clone());
+                drop(checkpoint_rotation_guard);
                 return self.fail_pending_follower_control(attempt, error).await;
             }
         }
+        if let Err(error) = self.validate_checkpoint_assignment(Some(assignment_fence)) {
+            let error = format!(
+                "follower assignment changed after shuffle staging and before state capture: \
+                 {error}"
+            );
+            set_checkpoint_fault(&self.checkpoint_fault, error.clone());
+            drop(checkpoint_rotation_guard);
+            return self.fail_pending_follower_control(attempt, error).await;
+        }
         if let Err(error) = self.require_process_authority("follower state capture") {
+            drop(checkpoint_rotation_guard);
             return self
                 .fail_pending_follower_control(attempt, error.to_string())
                 .await;
@@ -3035,6 +3059,7 @@ impl ConnectorPipelineCallback {
                 .clone()
                 .unwrap_or_else(|| "follower shuffle loss before capture".into());
             tracing::warn!("follower: shuffle loss before capture; failing the epoch for replay");
+            drop(checkpoint_rotation_guard);
             return self.fail_pending_follower_control(attempt, error).await;
         }
 
@@ -3046,10 +3071,26 @@ impl ConnectorPipelineCallback {
         {
             Ok(request) => request,
             Err(error) => {
+                drop(checkpoint_rotation_guard);
                 return self.fail_pending_follower_control(attempt, error).await;
             }
         };
+        let vnode_states = match self.capture_vnode_states(attempt.epoch) {
+            Ok(states) => states,
+            Err(error) => {
+                drop(checkpoint_rotation_guard);
+                return self.fail_pending_follower_control(attempt, error).await;
+            }
+        };
+        if let Err(error) = self.validate_checkpoint_assignment(Some(assignment_fence)) {
+            let error =
+                format!("follower assignment changed during mutable state capture: {error}");
+            set_checkpoint_fault(&self.checkpoint_fault, error.clone());
+            drop(checkpoint_rotation_guard);
+            return self.fail_pending_follower_control(attempt, error).await;
+        }
         if let Err(error) = self.require_process_authority("follower durable-tail handoff") {
+            drop(checkpoint_rotation_guard);
             return self
                 .fail_pending_follower_control(attempt, error.to_string())
                 .await;
@@ -3059,15 +3100,18 @@ impl ConnectorPipelineCallback {
         let tail = match self.follower_tail_future(
             request,
             operator_state,
+            vnode_states,
             identity.clone(),
             source_offsets,
             attempt_started,
         ) {
             Ok(tail) => tail,
             Err(error) => {
+                drop(checkpoint_rotation_guard);
                 return self.fail_pending_follower_control(attempt, error).await;
             }
         };
+        drop(checkpoint_rotation_guard);
         if let Err(error) = self.clear_pending_follower_checkpoint(attempt) {
             set_checkpoint_fault(&self.checkpoint_fault, error.clone());
             return CheckpointControlOutcome::Failed { attempt, error };
@@ -3140,6 +3184,16 @@ impl ConnectorPipelineCallback {
             tracing::warn!(%error, "follower deferred checkpoint sink fence failed");
             return BarrierOutcome::Failed;
         }
+        let checkpoint_rotation_guard = match self
+            .checkpoint_capture_rotation_guard_until(Some(assignment_fence), attempt_deadline)
+            .await
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                tracing::info!(%error, "deferred follower capture was superseded before shuffle staging");
+                return BarrierOutcome::CancelledBeforeCapture;
+            }
+        };
         if self
             .require_process_authority("deferred follower shuffle alignment")
             .is_err()
@@ -3172,6 +3226,15 @@ impl ConnectorPipelineCallback {
                 return BarrierOutcome::Failed;
             }
         }
+        if let Err(error) = self.validate_checkpoint_assignment(Some(assignment_fence)) {
+            let error = format!(
+                "deferred follower assignment changed after shuffle staging and before state \
+                 capture: {error}"
+            );
+            set_checkpoint_fault(&self.checkpoint_fault, error.clone());
+            tracing::warn!(%error);
+            return BarrierOutcome::Failed;
+        }
         if self
             .require_process_authority("deferred follower state capture")
             .is_err()
@@ -3189,6 +3252,21 @@ impl ConnectorPipelineCallback {
                 return BarrierOutcome::Failed;
             }
         };
+        let vnode_states = match self.capture_vnode_states(attempt.epoch) {
+            Ok(states) => states,
+            Err(error) => {
+                tracing::warn!(%error, "follower deferred vnode-state capture failed");
+                return BarrierOutcome::Failed;
+            }
+        };
+        if let Err(error) = self.validate_checkpoint_assignment(Some(assignment_fence)) {
+            let error = format!(
+                "deferred follower assignment changed during mutable state capture: {error}"
+            );
+            set_checkpoint_fault(&self.checkpoint_fault, error.clone());
+            tracing::warn!(%error);
+            return BarrierOutcome::Failed;
+        }
         if self
             .require_process_authority("deferred follower durable-tail handoff")
             .is_err()
@@ -3200,6 +3278,7 @@ impl ConnectorPipelineCallback {
         let tail = match self.follower_tail_future(
             request,
             operator_state,
+            vnode_states,
             identity.clone(),
             source_checkpoints,
             attempt_started,
@@ -3210,6 +3289,7 @@ impl ConnectorPipelineCallback {
                 return BarrierOutcome::Failed;
             }
         };
+        drop(checkpoint_rotation_guard);
         drop(local_barrier_timer);
         if self.checkpoint_committable_sinks {
             tail.await;
@@ -3488,6 +3568,32 @@ impl ConnectorPipelineCallback {
                 Ok(Some(admitted.clone()))
             }
         }
+    }
+
+    /// Acquire the existing graph/assignment read fence only for shuffle alignment and mutable
+    /// state capture. Sink fencing runs before this token and encoding/durable checkpoint-tail I/O
+    /// runs after it. Alignment remains inside the token and may perform bounded transport and
+    /// authority-settlement reads because its staged channel state belongs to the same cut.
+    #[cfg(feature = "cluster")]
+    async fn checkpoint_capture_rotation_guard_until(
+        &mut self,
+        assignment_fence: Option<&laminar_core::cluster::control::CheckpointAssignmentFence>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<tokio::sync::OwnedRwLockReadGuard<()>>, String> {
+        let guard = self
+            .graph
+            .checkpoint_rotation_guard_until(deadline)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.validate_checkpoint_assignment(assignment_fence)?;
+        if !self.graph.checkpoint_is_quiescent() {
+            return Err(
+                "[LDB-6051] checkpoint capture found graph input or a vnode assignment \
+                 transition that was not drained"
+                    .into(),
+            );
+        }
+        Ok(guard)
     }
 
     #[cfg(feature = "cluster")]
@@ -5452,11 +5558,34 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
 
         #[cfg(feature = "cluster")]
+        let checkpoint_rotation_guard = match self
+            .checkpoint_capture_rotation_guard_until(assignment_fence.as_ref(), attempt_deadline)
+            .await
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                tracing::info!(%error, "checkpoint capture was superseded before shuffle staging");
+                return BarrierOutcome::CancelledBeforeCapture;
+            }
+        };
+
+        #[cfg(feature = "cluster")]
         if let Err(outcome) = self
             .align_leader_shuffle(attempt, assignment_fence.as_ref(), attempt_deadline)
             .await
         {
             return outcome;
+        }
+
+        #[cfg(feature = "cluster")]
+        if let Err(error) = self.validate_checkpoint_assignment(assignment_fence.as_ref()) {
+            let error = format!(
+                "checkpoint assignment changed after shuffle staging and before state capture: \
+                 {error}"
+            );
+            set_checkpoint_fault(&self.checkpoint_fault, error.clone());
+            tracing::warn!(%error);
+            return BarrierOutcome::Failed;
         }
 
         let (operator_state, vnode_states, operator_state_encoded_budget) = match self
@@ -5466,6 +5595,16 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             Ok(capture) => capture,
             Err(outcome) => return outcome,
         };
+        #[cfg(feature = "cluster")]
+        if let Err(error) = self.validate_checkpoint_assignment(assignment_fence.as_ref()) {
+            let error =
+                format!("checkpoint assignment changed during mutable state capture: {error}");
+            set_checkpoint_fault(&self.checkpoint_fault, error.clone());
+            tracing::warn!(%error);
+            return BarrierOutcome::Failed;
+        }
+        #[cfg(feature = "cluster")]
+        drop(checkpoint_rotation_guard);
         #[cfg(feature = "cluster")]
         let leader_proof = match self.take_checkpoint_leader_proof(attempt) {
             Ok(proof) => proof,

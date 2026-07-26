@@ -2626,6 +2626,114 @@ fn vnode_revoke_failure_faults_and_retains_pending_work() {
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
+async fn checkpoint_capture_guard_excludes_assignment_publication() {
+    let mut graph = test_graph();
+    let fence = Arc::new(tokio::sync::RwLock::new(()));
+    graph.set_rotation_execution_fence(Arc::clone(&fence));
+    let writer = Arc::clone(&fence).write_owned().await;
+
+    let mut capture = Box::pin(graph.checkpoint_rotation_guard_until(
+        tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(10), &mut capture)
+            .await
+            .is_err(),
+        "capture must wait while assignment publication owns the write fence"
+    );
+    drop(writer);
+
+    let reader = capture
+        .await
+        .expect("capture should acquire the released rotation fence")
+        .expect("configured graph should return a rotation token");
+    assert!(
+        Arc::clone(&fence).try_write_owned().is_err(),
+        "assignment publication must remain excluded through mutable capture"
+    );
+    drop(reader);
+    assert!(Arc::clone(&fence).try_write_owned().is_ok());
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn checkpoint_quiescence_requires_staged_vnode_transitions_to_apply() {
+    let partial = crate::vnode_partial::VnodePartial {
+        operators: vec![("global".to_string(), vec![1])],
+        base: None,
+        deltas: Vec::new(),
+    };
+    let (mut graph, registry) = rehydration_test_graph(vec![encoded_vnode_partial(&partial)]).await;
+    let applied = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    graph.push_test_node(
+        "global",
+        Box::new(RehydrationApplyOperator {
+            applied: Arc::clone(&applied),
+            failure: None,
+        }),
+    );
+
+    assert!(
+        !graph.checkpoint_is_quiescent(),
+        "staged acquire state must enter the checkpoint drain loop"
+    );
+    assert!(matches!(
+        graph.snapshot_state(),
+        Err(DbError::Checkpoint(_))
+    ));
+    assert!(matches!(
+        graph.snapshot_state_by_vnode(),
+        Err(DbError::Checkpoint(_))
+    ));
+    graph
+        .execute_checkpoint_drain_cycle(i64::MAX, None)
+        .await
+        .expect("checkpoint drain should apply staged acquire state");
+    assert_eq!(&*applied.lock(), &[0]);
+    assert!(graph.checkpoint_is_quiescent());
+    assert!(graph.snapshot_state().unwrap().is_none());
+    assert!(graph.snapshot_state_by_vnode().unwrap().is_empty());
+
+    let revoked = Arc::new(parking_lot::Mutex::new(
+        [0u32].into_iter().collect::<FxHashSet<u32>>(),
+    ));
+    graph.set_revoke_handle(Arc::clone(&revoked));
+    assert!(
+        !graph.checkpoint_is_quiescent(),
+        "staged revoke state must enter the checkpoint drain loop"
+    );
+    assert!(matches!(
+        graph.snapshot_state(),
+        Err(DbError::Checkpoint(_))
+    ));
+    assert!(matches!(
+        graph.snapshot_state_by_vnode(),
+        Err(DbError::Checkpoint(_))
+    ));
+    graph
+        .execute_checkpoint_drain_cycle(i64::MAX, None)
+        .await
+        .expect("checkpoint drain should apply staged revoke state");
+    assert!(revoked.lock().is_empty());
+    assert!(graph.checkpoint_is_quiescent());
+
+    registry.set_assignment(vec![laminar_core::state::NodeId(1)].into());
+    assert!(
+        !graph.checkpoint_is_quiescent(),
+        "capture must wait for graph execution to validate the new assignment"
+    );
+    assert!(matches!(
+        graph.snapshot_state(),
+        Err(DbError::Checkpoint(_))
+    ));
+    assert!(matches!(
+        graph.snapshot_state_by_vnode(),
+        Err(DbError::Checkpoint(_))
+    ));
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
 async fn corrupt_rehydration_chain_faults_and_keeps_vnode_restoring() {
     let (mut graph, registry) =
         rehydration_test_graph(vec![bytes::Bytes::from_static(b"not-rkyv")]).await;

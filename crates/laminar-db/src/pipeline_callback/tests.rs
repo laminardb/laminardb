@@ -134,6 +134,57 @@ impl crate::operator_graph::GraphOperator for FollowerCheckpointEvidenceOperator
     }
 }
 
+#[cfg(feature = "cluster")]
+struct CheckpointRotationFenceAuditOperator {
+    fence: Arc<tokio::sync::RwLock<()>>,
+    whole_capture_observed: Arc<std::sync::atomic::AtomicBool>,
+    vnode_capture_observed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(feature = "cluster")]
+#[async_trait::async_trait]
+impl crate::operator_graph::GraphOperator for CheckpointRotationFenceAuditOperator {
+    fn cluster_capability(&self) -> crate::operator::capability::OperatorCapability {
+        crate::operator::capability::OperatorCapability::test_probe()
+    }
+
+    async fn process(
+        &mut self,
+        _inputs: &[Vec<RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        Ok(Vec::new())
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<crate::operator_graph::OperatorCheckpoint>, DbError> {
+        if Arc::clone(&self.fence).try_write_owned().is_ok() {
+            return Err(DbError::Checkpoint(
+                "whole-state capture escaped the assignment rotation fence".into(),
+            ));
+        }
+        self.whole_capture_observed
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(None)
+    }
+
+    fn checkpoint_by_vnode(
+        &mut self,
+        _vnode_count: u32,
+    ) -> Result<
+        Option<std::collections::HashMap<u32, crate::checkpoint_coordinator::StagedSlice>>,
+        DbError,
+    > {
+        if Arc::clone(&self.fence).try_write_owned().is_ok() {
+            return Err(DbError::Checkpoint(
+                "vnode-state capture escaped the assignment rotation fence".into(),
+            ));
+        }
+        self.vnode_capture_observed
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(None)
+    }
+}
+
 fn empty_callback_fixture() -> ConnectorPipelineCallback {
     let (_sink_event_tx, sink_event_rx) =
         laminar_core::streaming::channel::channel::<crate::sink_task::SinkEvent>(1);
@@ -475,6 +526,62 @@ async fn leader_only_prepare_quorum_admits_exact_aligned() {
         serde_json::from_str::<BarrierAnnouncement>(&durable).unwrap(),
         aligned
     );
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn source_less_leader_holds_rotation_fence_through_whole_and_vnode_capture() {
+    use laminar_core::cluster::control::{ClusterKv, InMemoryKv};
+    use laminar_core::cluster::discovery::NodeId;
+    use laminar_core::state::VnodeRegistry;
+
+    let node = NodeId(1);
+    let kv = Arc::new(InMemoryKv::new(node));
+    let control_kv: Arc<dyn ClusterKv> = kv;
+    let leader = authoritative_local_leader(control_kv).await;
+    let registry = Arc::new(VnodeRegistry::new_unassigned(1));
+    registry.set_assignment_and_version(vec![node].into(), leader.fence.assignment_version);
+
+    let rotation_fence = Arc::new(tokio::sync::RwLock::new(()));
+    let whole_capture_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let vnode_capture_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut callback = empty_callback_fixture();
+    callback.cluster_controller = Some(Arc::clone(&leader.controller));
+    callback.vnode_registry = Some(registry);
+    callback
+        .graph
+        .set_rotation_execution_fence(Arc::clone(&rotation_fence));
+    callback.graph.set_test_vnode_count(1);
+    callback.graph.push_test_node(
+        "checkpoint-rotation-fence-audit",
+        Box::new(CheckpointRotationFenceAuditOperator {
+            fence: Arc::clone(&rotation_fence),
+            whole_capture_observed: Arc::clone(&whole_capture_observed),
+            vnode_capture_observed: Arc::clone(&vnode_capture_observed),
+        }),
+    );
+    let attempt = CheckpointAttempt::new(9, 9);
+    callback
+        .checkpoint_leader_proofs
+        .insert(attempt, leader.proof);
+
+    let outcome = crate::pipeline::PipelineCallback::checkpoint_with_barrier(
+        &mut callback,
+        FxHashMap::default(),
+        attempt,
+        std::time::Instant::now(),
+        Some(leader.fence),
+    )
+    .await;
+
+    assert!(matches!(outcome, crate::pipeline::BarrierOutcome::Async));
+    assert!(whole_capture_observed.load(std::sync::atomic::Ordering::Acquire));
+    assert!(vnode_capture_observed.load(std::sync::atomic::Ordering::Acquire));
+    assert!(
+        Arc::clone(&rotation_fence).try_write_owned().is_ok(),
+        "the capture token must be released before the durable tail runs"
+    );
+    callback.checkpoint_tail_tasks.abort_all();
 }
 
 #[cfg(feature = "cluster")]

@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-25 during Cycle 47
+- **Last reconciled:** 2026-07-26 during Cycle 48
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -305,6 +305,32 @@ transaction spanning the frozen input cut, graph and output publication, source-
 and exact-attempt cleanup. This decision adds no runtime or hot-path work and does not make native
 backend calls cancellation-safe. Already accepted at-least-once sink output may duplicate after a
 future recovery; cluster exactly-once remains rejected.
+
+Cycle 48 closes a separate, production-reachable checkpoint/assignment race without changing this
+future managed-state protocol. Staged vnode acquire/revoke work and an unexecuted current assignment
+now make the graph non-quiescent and both snapshot APIs fail closed until one drain pass applies the
+transition. After the sink FIFO fence, leader and follower capture paths take the existing rotation
+read token before shuffle alignment, revalidate the admitted assignment certificate, and retain the
+token through whole plus vnode mutable capture. Assignment adoption takes the opposing write token
+before staging or publication. Post-shuffle supersession is recovery-required; proven pre-staging
+supersession cancels without capture. The token is released before encoding, checkpoint-tail I/O,
+or awaited cleanup; deadline-bounded shuffle transport and authority-settlement reads remain inside
+because aligned channel state belongs to the cut.
+
+The current global-aggregate exception is compositional: separate admitted stream queries can put
+multiple vnode-0 aggregate operators in one graph. A later transition-apply failure can follow an
+earlier mutation, but the existing checkpoint error maps to whole-generation recovery, publishes no
+output/cut, and destroys that graph before returning. This containment justifies no second poison
+for explicit returned errors. It does not authorize reuse of the sequential apply loop for future
+keyed/window/join/MV state. Those operators still require the authoritative roster, complete
+off-side prepare, and infallible whole-graph publish specified below.
+
+Cycle 48 adds no normal row-path operation and no new lock, atomic, task, backend, or abstraction.
+Checkpoint capture adds short staging-map/version checks and a deadline-bounded read acquisition on
+the existing fence. Healthy one-in-flight admission makes the serialization permit immediately
+available; anomalous retained-encoder contention and checkpoint-versus-rotation wait distributions
+are Cycle 49 and independent-soak gates. Delivery remains cluster at-least-once, and no source,
+sink, exactly-once, or `[LDB-4007]` capability changes.
 
 #### Frozen Fjall/RocksDB evidence and selected TidesDB binding line
 

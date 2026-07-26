@@ -605,8 +605,17 @@ Remaining work is kept reviewable in this dependency order:
    and retains the drain future. The contract now requires an explicit result or destruction of the
    whole owner generation; a future cancellable caller first needs a coordinator-owned transaction
    covering input-cut publication, source barriers, and exact-attempt cleanup. A drain-only guard is
-   deliberately not added because normal publication has the same hypothetical boundary. A backend-
-   owned sticky root/process poison, resource/health admission, and fresh-native-root fencing must
+   deliberately not added because normal publication has the same hypothetical boundary. Cycle 48
+   then closes the independent live checkpoint/rotation race: staged acquire/revoke and an
+   unexecuted current assignment enter graph drain; whole and vnode capture reject a pending
+   transition; and every leader/follower capture retains the existing assignment read fence from
+   pre-shuffle alignment through both mutable images. The assignment certificate is revalidated
+   under that token, which is dropped before encoding, durable tail I/O, or awaited cleanup. A
+   callback audit proves the real leader/source-less capture span. Cycle 49 adds follower-route and
+   anomalous serialization-permit contention coverage, and independent soak must measure
+   checkpoint-versus-rotation waits. This adds no normal row-path work, backend, admission, or
+   exactly-once capability. A backend-owned sticky root/process poison, resource/health admission,
+   and fresh-native-root fencing must
    land only with a real runtime consumer rather than a disconnected future trait;
 4. wait for a new official Cargo package `tidesdb`, freeze its exact native pair, and repeat the
    complete one-day/zero-machine-hour T0. The repeated T0 must reconcile every later native fix and

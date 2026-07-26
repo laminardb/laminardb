@@ -22,7 +22,10 @@ in-memory graph generation from execution or checkpoint capture. The future nati
 checkpoint-delivery cancellation, and independent soak remain open. [Cycle 47](../reviews/distributed-keyed-state-cycle-47.md)
 empirically reproduces the post-graph sink-publication drop on a retained private callback, proves
 that no production owner performs that cancellation today, and freezes the owner contract instead
-of adding a checkpoint-only fence. None of these decisions changes cluster admission.
+of adding a checkpoint-only fence. [Cycle 48](../reviews/distributed-keyed-state-cycle-48.md)
+then closes a live assignment/capture race: staged vnode transitions now enter checkpoint drain,
+and the existing rotation fence spans shuffle alignment plus whole/vnode mutable capture. None of
+these decisions changes cluster admission.
 
 ## Verdict
 
@@ -156,6 +159,53 @@ generation. Before any outer timeout, `select!`, or task abort is introduced, on
 attempt transaction must cover the frozen input cut, graph/MV/stream/sink publication, source
 barriers, offsets, and exact-attempt cleanup. This is not exactly-once certification and does not
 address native work that can complete after its Rust owner is gone.
+
+### Checkpoint capture is now atomic with vnode assignment publication
+
+Cycle 48 found a live gap in today's admitted global-aggregate path. Checkpoint quiescence checked
+only graph input buffers. An idle, source-less, or follower pipeline could therefore stage vnode
+acquire/revoke work, report quiescence before a graph pass applied it, and capture the old or absent
+vnode state. A transient red probe removed the fix and reproduced the defect: the staged-acquire
+assertion failed in 0.02 seconds because the checkpoint drain loop did not run.
+
+Staged revoke/rehydration maps and the registry's current assignment version are now checkpoint
+work. A stable transition must complete one graph drain pass before either whole-state or per-vnode
+snapshot APIs will capture. The standalone pending check holds both staging mutexes at once in the
+same revoke-then-rehydrate order as assignment adoption, preventing a mixed sample.
+
+The final quiescence sample alone was insufficient because assignment adoption could still win
+between it and mutable capture. Leader, source-less leader, immediate follower, and deferred
+follower now reuse the existing assignment-rotation read fence after sink FIFO synchronization,
+before shuffle alignment, and retain it through both whole and vnode snapshots. The admitted
+assignment certificate is revalidated after token acquisition, after shuffle staging, and after
+mutable capture. Any change after staging is recovery-required; a proven pre-staging supersession
+is cancelled without capture. Follower vnode capture was moved out of the durable-tail constructor,
+so both images are made under the same token. The token is dropped before encoding, durable
+checkpoint-tail I/O, or async cleanup. Alignment remains inside it and may perform deadline-bounded
+transport and authority-settlement reads because its staged channel state belongs to the cut.
+
+A callback-level source-less leader regression drives the production checkpoint method. Its audit
+operator proves that assignment write publication is excluded inside both `checkpoint()` and
+`checkpoint_by_vnode()`, then proves the write token is available after capture returns. Sourceful
+leader uses the same method. The two follower routes have separate cleanup contracts but now pass
+already-captured vnode images into the tail; explicit awaited cleanup first drops the token.
+
+This changes only checkpoint/rotation work. The normal graph/row path gains no branch, lock,
+allocation, task, or I/O. Checkpoint sampling adds two short staging-map reads, an assignment-version
+comparison, and one deadline-bounded read acquisition on an existing lock. Healthy admission allows
+one in-flight checkpoint, so the serialization permit is expected to be immediately available;
+an anomalously retained encoder remains bounded but needs explicit contention/rotation coverage in
+Cycle 49 and the independent soak. Cluster delivery remains at-least-once: recovery can duplicate
+already accepted output, exactly-once remains rejected, and no source/sink capability widened.
+
+The admitted multi-operator reachability question is also now explicit. More than one stream query
+may each contain its one permitted global aggregate, so one graph can contain multiple vnode-0
+aggregate operators. A later operator can fail after an earlier transition apply, but the returned
+checkpoint-class error maps to coordinated recovery, publishes no output or cut, and destroys the
+callback/graph generation before the coordinator returns. The replacement graph restores the last
+committed cut. No second explicit-error poison was added. Future keyed/window/join/MV admission
+still requires authoritative operator rosters, off-side preparation, and infallible whole-graph
+publication; the current sequential apply loop is not that lifecycle.
 
 ### Aggregate support is partial substrate, not an admitted feature
 
@@ -407,9 +457,12 @@ The current branch's admission-neutral hardening was then checked separately:
 | `aggregate_state::vnode_partition_tests` (cluster lib-test binary) | PASS, 4/4 | Existing raw capture/merge/idempotence plus new shuffle/capture/drop parity and pre-mutation drift rejection; not keyed-envelope validation |
 | `aggregate_state::tests::drop_vnodes_purges_revoked_keeps_sibling` | PASS, 1/1 | Revoke retains sibling-vnode state after the fallible count check was added |
 | `aggregate_state::tests::global_changelog_delta_checkpoint_roundtrips` | PASS, 1/1 | The admitted global aggregate remains pinned to vnode 0 |
-| `db::tests::cluster_query_shape_admission_is_pre_mutation_and_mode_derived` | PASS, 1/1 | The `[LDB-4007]` feature matrix remains closed while stateless/global shapes remain admitted |
+| `db::tests::cluster_query_shape_admission_is_pre_mutation_and_mode_derived` | PASS, 1/1 | The `[LDB-4007]` feature matrix remains closed while stateless/global shapes remain admitted; two independent global aggregate streams prove admission is per query |
 | `aggregate_state::tests::embedded_float_grouping_remains_supported_without_partition_codec_gate` (`--no-default-features`) | PASS, 1/1 | Embedded planning and execution still accept a float key excluded from cluster partition ABI v1 |
 | `operator_graph::tests::rehydration_apply_failure_faults_without_activating_vnode` | PASS, 1/1 | Empirically confirms the current unsafe boundary: the first operator is mutated before a later failure, although the vnode stays `Restoring`; this is blocker evidence, not a desired regression contract |
+| `operator_graph::tests::checkpoint_quiescence_requires_staged_vnode_transitions_to_apply` | PASS, 1/1 | Acquire, revoke, and assignment-version changes block both snapshot APIs until graph drain applies the transition |
+| `pipeline_callback::tests::source_less_leader_holds_rotation_fence_through_whole_and_vnode_capture` | PASS, 1/1 | Production leader/source-less callback holds the existing rotation read token across both mutable capture callbacks and releases it before the tail |
+| `pipeline::streaming_coordinator::tests::recovery_cycle_error_faults_best_effort` | PASS, 1/1 | A recovery-classified partial apply publishes no output/cut and destroys the callback/graph generation before returning |
 
 Both cluster and no-feature `cargo check` and `cargo clippy -D warnings` configurations passed, as
 did formatting and diff checks. These focused results do not exercise keyed cluster restore.

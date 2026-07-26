@@ -704,14 +704,62 @@ impl OperatorGraph {
     }
 
     /// Whether an aligned checkpoint can snapshot without leaving queued graph input outside the
-    /// cut. Buffer presence is checked separately from bytes because Arrow permits positive-row
-    /// record batches whose arrays occupy zero bytes.
+    /// cut. A staged vnode transition is pending graph work too: an idle pipeline must run one
+    /// drain pass to revoke old state and install acquired state before capture. Buffer presence is
+    /// checked separately from bytes because Arrow permits positive-row record batches whose
+    /// arrays occupy zero bytes.
     pub(crate) fn checkpoint_is_quiescent(&self) -> bool {
+        #[cfg(feature = "cluster")]
+        if !self.checkpoint_transition_is_applied() {
+            return false;
+        }
         self.nodes
             .iter()
             .enumerate()
             .filter(|(_, node)| !node.removed)
             .all(|(node_id, _)| !self.node_has_checkpoint_pending_work(node_id))
+    }
+
+    #[cfg(feature = "cluster")]
+    fn has_pending_vnode_transition(&self) -> bool {
+        // Assignment adoption holds these in the same order while staging both halves of the
+        // transition. Taking both here prevents a checkpoint sample from observing an impossible
+        // mixed staging point.
+        match (
+            self.pending_revoke_vnodes.as_ref(),
+            self.rehydrated_vnode_state.as_ref(),
+        ) {
+            (Some(revoked), Some(rehydrated)) => {
+                let revoked = revoked.lock();
+                let rehydrated = rehydrated.lock();
+                !revoked.is_empty() || !rehydrated.is_empty()
+            }
+            (Some(revoked), None) => !revoked.lock().is_empty(),
+            (None, Some(rehydrated)) => !rehydrated.lock().is_empty(),
+            (None, None) => false,
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    fn checkpoint_transition_is_applied(&self) -> bool {
+        !self.has_pending_vnode_transition()
+            && self.cluster_shuffle.as_ref().is_none_or(|shuffle| {
+                self.last_execution_assignment_version
+                    == Some(shuffle.registry.assignment_version())
+            })
+    }
+
+    #[cfg(feature = "cluster")]
+    fn ensure_checkpoint_transition_is_applied(&self) -> Result<(), DbError> {
+        if self.checkpoint_transition_is_applied() {
+            Ok(())
+        } else {
+            Err(DbError::Checkpoint(
+                "[LDB-6051] checkpoint capture requires the current vnode assignment transition \
+                 to complete in a graph drain pass"
+                    .into(),
+            ))
+        }
     }
 
     fn node_has_checkpoint_pending_work(&self, node_id: usize) -> bool {
@@ -802,6 +850,29 @@ impl OperatorGraph {
     #[cfg(feature = "cluster")]
     pub fn set_rotation_execution_fence(&mut self, fence: Arc<tokio::sync::RwLock<()>>) {
         self.rotation_execution_fence = Some(fence);
+    }
+
+    /// Hold assignment publication out of shuffle alignment and mutable checkpoint capture.
+    /// The caller must drop the token before encoding or durable checkpoint-tail I/O and must not
+    /// re-enter graph execution while it is held. Shuffle alignment remains inside the token and
+    /// may perform bounded transport and authority-settlement reads.
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn checkpoint_rotation_guard_until(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<tokio::sync::OwnedRwLockReadGuard<()>>, DbError> {
+        let Some(fence) = self.rotation_execution_fence.as_ref().map(Arc::clone) else {
+            return Ok(None);
+        };
+        tokio::time::timeout_at(deadline, fence.read_owned())
+            .await
+            .map(Some)
+            .map_err(|_| {
+                DbError::Checkpoint(
+                    "[LDB-6051] checkpoint capture timed out waiting for vnode assignment rotation"
+                        .into(),
+                )
+            })
     }
 
     /// Drop in-memory state for vnodes lost since the last cycle, before `apply_rehydrated_vnodes`
@@ -3385,6 +3456,8 @@ impl OperatorGraph {
 
     pub fn snapshot_state(&mut self) -> Result<Option<GraphCheckpoint>, DbError> {
         self.ensure_execution_not_poisoned()?;
+        #[cfg(feature = "cluster")]
+        self.ensure_checkpoint_transition_is_applied()?;
         let mut operators = OperatorStateMap::new();
         for node in &mut self.nodes {
             if node.removed {
@@ -3410,6 +3483,7 @@ impl OperatorGraph {
         &mut self,
     ) -> Result<crate::checkpoint_coordinator::StagedVnodeStates, DbError> {
         self.ensure_execution_not_poisoned()?;
+        self.ensure_checkpoint_transition_is_applied()?;
         let Some(vnode_count) = self.vnode_count else {
             return Ok(std::collections::HashMap::new());
         };

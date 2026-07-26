@@ -3,7 +3,7 @@
 - **Status:** Planned and backend-gated; exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster
   operator is admitted by this document
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-25 during Cycle 47
+- **Last reconciled:** 2026-07-26 during Cycle 48
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -97,6 +97,20 @@ destruction of the complete callback/coordinator generation. If a cancellable ca
 its prerequisite is a coordinator-owned attempt transaction over input-cut ownership, graph/MV/
 stream/sink publication, offsets/barriers, and attempt cleanup. This adds no hot-path cost and makes
 no exactly-once or native-backend cancellation claim.
+
+Cycle 48 fixes a distinct live cut error. Staged vnode acquire/revoke work and a registry assignment
+not yet observed by graph execution now force checkpoint drain and block both snapshot APIs.
+Leader/source-less and immediate/deferred follower capture paths reuse the assignment rotation
+read token from after sink FIFO fencing, through shuffle alignment and both whole/vnode mutable
+images, with assignment-certificate checks at acquisition, post-alignment, and post-capture. The
+token ends before encoding, durable tail I/O, or awaited cleanup. This closes assignment publication
+between final quiescence and capture without adding row-path work or a second lock. Multiple
+admitted global-aggregate queries also prove sequential vnode-0 partial apply is structurally
+reachable, but an explicit apply error already forces whole-generation recovery and no output/cut;
+the future managed lifecycle still needs roster-complete off-side prepare/publish. Cluster admission,
+at-least-once delivery, backend status, and source/sink capability remain unchanged. Cycle 49 must
+add immediate/deferred follower guard-span coverage and anomalous serialization-permit versus
+rotation latency probes; independent soak must measure the same race before production readiness.
 
 ## Scope and non-goals
 

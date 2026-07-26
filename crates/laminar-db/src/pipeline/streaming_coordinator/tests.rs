@@ -260,6 +260,7 @@ struct MockCallback {
     written_rows: Arc<AtomicU64>,
     published_barriers_observed_at_close: Arc<AtomicU64>,
     invalidated_subscriptions: Arc<Mutex<Vec<String>>>,
+    drop_audit: Option<Arc<AtomicBool>>,
     shutdown_sink_order: Arc<Mutex<Vec<&'static str>>>,
     settle_sink_epoch_error: Option<String>,
     close_error: Option<String>,
@@ -331,6 +332,7 @@ impl MockCallback {
             written_rows: Arc::new(AtomicU64::new(0)),
             published_barriers_observed_at_close: Arc::new(AtomicU64::new(0)),
             invalidated_subscriptions: Arc::new(Mutex::new(Vec::new())),
+            drop_audit: None,
             shutdown_sink_order: Arc::new(Mutex::new(Vec::new())),
             settle_sink_epoch_error: None,
             close_error: None,
@@ -358,6 +360,14 @@ impl MockCallback {
         };
         if let Some(controller) = controller {
             controller.fence_process_lease();
+        }
+    }
+}
+
+impl Drop for MockCallback {
+    fn drop(&mut self) {
+        if let Some(audit) = &self.drop_audit {
+            audit.store(true, Ordering::Release);
         }
     }
 }
@@ -6702,6 +6712,8 @@ async fn recovery_cycle_error_faults_best_effort() {
     let written_rows = Arc::clone(&callback.written_rows);
     let checkpoint_order = Arc::clone(&callback.checkpoint_order);
     let published_barriers = Arc::clone(&callback.published_barriers);
+    let generation_dropped = Arc::new(AtomicBool::new(false));
+    callback.drop_audit = Some(Arc::clone(&generation_dropped));
 
     tx.send(SourceMsg::Batch {
         source_idx: 0,
@@ -6727,6 +6739,10 @@ async fn recovery_cycle_error_faults_best_effort() {
         "a due checkpoint must not drain or capture after an indeterminate cycle"
     );
     assert!(published_barriers.lock().is_empty());
+    assert!(
+        generation_dropped.load(Ordering::Acquire),
+        "a recovery exit must destroy the callback/graph generation before returning"
+    );
 }
 
 #[tokio::test]

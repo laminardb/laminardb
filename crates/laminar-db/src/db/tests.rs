@@ -7069,6 +7069,13 @@ async fn cluster_query_shape_admission_is_pre_mutation_and_mode_derived() {
             .await
             .expect("a constructible global incremental aggregate is cluster-safe");
             assert!(db.catalog.get_stream_entry("global_sum_ok").is_some());
+            db.execute(
+                "CREATE STREAM global_count_ok AS \
+                 SELECT COUNT(*) AS total FROM right_events",
+            )
+            .await
+            .expect("global aggregate admission is per query, not per cluster graph");
+            assert!(db.catalog.get_stream_entry("global_count_ok").is_some());
         })
         .await;
 
