@@ -3,7 +3,7 @@
 - **Status:** Planned and backend-gated; exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster
   operator is admitted by this document
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 48
+- **Last reconciled:** 2026-07-26 during Cycle 49
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -108,9 +108,18 @@ between final quiescence and capture without adding row-path work or a second lo
 admitted global-aggregate queries also prove sequential vnode-0 partial apply is structurally
 reachable, but an explicit apply error already forces whole-generation recovery and no output/cut;
 the future managed lifecycle still needs roster-complete off-side prepare/publish. Cluster admission,
-at-least-once delivery, backend status, and source/sink capability remain unchanged. Cycle 49 must
-add immediate/deferred follower guard-span coverage and anomalous serialization-permit versus
-rotation latency probes; independent soak must measure the same race before production readiness.
+at-least-once delivery, backend status, and source/sink capability remain unchanged.
+
+Cycle 49 completes the local follower and anomalous-contention probes. Both immediate and deferred
+follower routes hold the rotation read token across whole/vnode mutable capture and release it before
+their durable tails while preserving exact pending-attempt cleanup. The held-permit probe exposed a
+latency inversion: a retained non-abortable encoder could make capture wait for the checkpoint
+timeout under the token while an assignment writer had a shorter deadline. A contending capture now
+uses a semaphore try-acquire and returns `[LDB-6017]` before state mutation; the original encoder
+retains its permit and fault lifecycle. Removing the redundant async timeout wrappers does not make
+synchronous snapshots preemptible, which was already the case. There is no row-path change, new
+backend, or delivery widening. The independent soak charter now names exact source-less/sourceful
+leader/follower rotation scenarios and latency distributions, but no qualifying soak has run.
 
 ## Scope and non-goals
 

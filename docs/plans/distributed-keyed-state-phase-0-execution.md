@@ -611,10 +611,15 @@ Remaining work is kept reviewable in this dependency order:
    transition; and every leader/follower capture retains the existing assignment read fence from
    pre-shuffle alignment through both mutable images. The assignment certificate is revalidated
    under that token, which is dropped before encoding, durable tail I/O, or awaited cleanup. A
-   callback audit proves the real leader/source-less capture span. Cycle 49 adds follower-route and
-   anomalous serialization-permit contention coverage, and independent soak must measure
-   checkpoint-versus-rotation waits. This adds no normal row-path work, backend, admission, or
-   exactly-once capability. A backend-owned sticky root/process poison, resource/health admission,
+   callback audit proves the real leader/source-less capture span. Cycle 49 proves the same span on
+   immediate and deferred follower routes, including release before their durable tails and pending-
+   attempt cleanup. Its held-permit probe finds and closes a latency inversion: overlapping mutable
+   capture now rejects with `[LDB-6017]` before state mutation instead of awaiting a retained non-
+   abortable encoder under the assignment token. The encoder keeps its original permit/fault
+   lifecycle, while a queued assignment writer proceeds as soon as rejected capture unwinds. The
+   removed async timeout wrappers could not preempt the synchronous snapshots; their duration and
+   full checkpoint-versus-rotation distributions remain independent-soak gates. This adds no normal
+   row-path work, backend, admission, or exactly-once capability. A backend-owned sticky root/process poison, resource/health admission,
    and fresh-native-root fencing must
    land only with a real runtime consumer rather than a disconnected future trait;
 4. wait for a new official Cargo package `tidesdb`, freeze its exact native pair, and repeat the

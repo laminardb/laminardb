@@ -3067,7 +3067,6 @@ impl ConnectorPipelineCallback {
         // aggregate channel replay and every non-vnode operator for both follower entry paths.
         let (request, operator_state) = match self
             .build_follower_checkpoint_request_until(assignment_fence, attempt_deadline)
-            .await
         {
             Ok(request) => request,
             Err(error) => {
@@ -3244,7 +3243,6 @@ impl ConnectorPipelineCallback {
 
         let (request, operator_state) = match self
             .build_follower_checkpoint_request_until(assignment_fence, attempt_deadline)
-            .await
         {
             Ok(request) => request,
             Err(error) => {
@@ -3347,7 +3345,7 @@ impl ConnectorPipelineCallback {
     }
 
     #[cfg(feature = "cluster")]
-    async fn build_follower_checkpoint_request_until(
+    fn build_follower_checkpoint_request_until(
         &mut self,
         assignment_fence: &laminar_core::cluster::control::CheckpointAssignmentFence,
         deadline: tokio::time::Instant,
@@ -3363,12 +3361,7 @@ impl ConnectorPipelineCallback {
                 "follower operator-state capture exhausted the checkpoint deadline".to_string(),
             );
         }
-        let operator_state =
-            tokio::time::timeout_at(deadline, self.capture_operator_state_until(deadline))
-                .await
-                .map_err(|_| {
-                    "follower operator-state capture exhausted the checkpoint deadline".to_string()
-                })??;
+        let operator_state = self.capture_operator_state_until(deadline)?;
         let mut request = self.build_checkpoint_request();
         request.assignment_fence = Some(assignment_fence.clone());
         Ok((request, operator_state))
@@ -3677,7 +3670,7 @@ impl ConnectorPipelineCallback {
         reason
     }
 
-    async fn capture_operator_state_until(
+    fn capture_operator_state_until(
         &mut self,
         attempt_deadline: tokio::time::Instant,
     ) -> Result<CapturedOperatorState, String> {
@@ -3686,17 +3679,22 @@ impl ConnectorPipelineCallback {
                 "[LDB-6017] checkpoint deadline expired before operator-state capture".into(),
             );
         }
-        let timeout = self.serialization_timeout;
-        let gate_deadline = attempt_deadline.min(tokio::time::Instant::now() + timeout);
-        let serialization_permit = tokio::time::timeout_at(
-            gate_deadline,
-            Arc::clone(&self.checkpoint_serialization_gate).acquire_owned(),
-        )
-        .await
-        .map_err(|_| {
-            format!("[LDB-6017] prior checkpoint serialization did not exit within {timeout:?}")
-        })?
-        .map_err(|_| "checkpoint serialization gate was closed".to_string())?;
+        // Healthy admission permits only one checkpoint tail. Contention therefore means a
+        // non-abortable encoder from a failed attempt still owns the image, or that the admission
+        // invariant was breached. Waiting while the assignment read fence is held can exhaust a
+        // rebalance writer's shorter deadline, so reject before touching mutable operator state.
+        let serialization_permit = Arc::clone(&self.checkpoint_serialization_gate)
+            .try_acquire_owned()
+            .map_err(|error| match error {
+                tokio::sync::TryAcquireError::NoPermits => {
+                    "[LDB-6017] prior checkpoint serialization is still active; refusing an \
+                     overlapping mutable capture"
+                        .to_string()
+                }
+                tokio::sync::TryAcquireError::Closed => {
+                    "checkpoint serialization gate was closed".to_string()
+                }
+            })?;
 
         let graph = match self.graph.snapshot_state() {
             Ok(checkpoint) => checkpoint,
@@ -3781,7 +3779,7 @@ impl ConnectorPipelineCallback {
         &mut self,
     ) -> Result<std::collections::HashMap<String, bytes::Bytes>, String> {
         let deadline = tokio::time::Instant::now() + self.serialization_timeout;
-        let capture = self.capture_operator_state_until(deadline).await?;
+        let capture = self.capture_operator_state_until(deadline)?;
         let encoded_budget = encoded_operator_state_budget(
             self.checkpoint_state_cap_bytes,
             capture.estimated_bytes(),
@@ -4436,7 +4434,7 @@ impl ConnectorPipelineCallback {
         Ok(())
     }
 
-    async fn capture_leader_checkpoint_state(
+    fn capture_leader_checkpoint_state(
         &mut self,
         attempt: CheckpointAttempt,
         attempt_deadline: tokio::time::Instant,
@@ -4453,22 +4451,10 @@ impl ConnectorPipelineCallback {
         #[cfg(not(feature = "cluster"))]
         let _ = attempt;
 
-        let operator_state = match tokio::time::timeout_at(
-            attempt_deadline,
-            self.capture_operator_state_until(attempt_deadline),
-        )
-        .await
-        {
-            Ok(Ok(capture)) => capture,
-            Ok(Err(error)) => {
+        let operator_state = match self.capture_operator_state_until(attempt_deadline) {
+            Ok(capture) => capture,
+            Err(error) => {
                 tracing::warn!(%error, "Stream executor barrier checkpoint failed");
-                return Err(BarrierOutcome::Failed);
-            }
-            Err(_) => {
-                tracing::warn!(
-                    timeout = ?self.checkpoint_timeout,
-                    "state capture exhausted the end-to-end checkpoint deadline"
-                );
                 return Err(BarrierOutcome::Failed);
             }
         };
@@ -5588,13 +5574,11 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             return BarrierOutcome::Failed;
         }
 
-        let (operator_state, vnode_states, operator_state_encoded_budget) = match self
-            .capture_leader_checkpoint_state(attempt, attempt_deadline)
-            .await
-        {
-            Ok(capture) => capture,
-            Err(outcome) => return outcome,
-        };
+        let (operator_state, vnode_states, operator_state_encoded_budget) =
+            match self.capture_leader_checkpoint_state(attempt, attempt_deadline) {
+                Ok(capture) => capture,
+                Err(outcome) => return outcome,
+            };
         #[cfg(feature = "cluster")]
         if let Err(error) = self.validate_checkpoint_assignment(assignment_fence.as_ref()) {
             let error =

@@ -185,6 +185,73 @@ impl crate::operator_graph::GraphOperator for CheckpointRotationFenceAuditOperat
     }
 }
 
+#[cfg(feature = "cluster")]
+type CheckpointRotationFenceAudit = (
+    Arc<tokio::sync::RwLock<()>>,
+    Arc<std::sync::atomic::AtomicBool>,
+    Arc<std::sync::atomic::AtomicBool>,
+);
+
+#[cfg(feature = "cluster")]
+fn install_checkpoint_rotation_fence_audit(
+    callback: &mut ConnectorPipelineCallback,
+) -> CheckpointRotationFenceAudit {
+    let fence = Arc::new(tokio::sync::RwLock::new(()));
+    let whole_capture_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let vnode_capture_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    callback
+        .graph
+        .set_rotation_execution_fence(Arc::clone(&fence));
+    callback.graph.set_test_vnode_count(1);
+    callback.graph.push_test_node(
+        "checkpoint-rotation-fence-audit",
+        Box::new(CheckpointRotationFenceAuditOperator {
+            fence: Arc::clone(&fence),
+            whole_capture_observed: Arc::clone(&whole_capture_observed),
+            vnode_capture_observed: Arc::clone(&vnode_capture_observed),
+        }),
+    );
+    (fence, whole_capture_observed, vnode_capture_observed)
+}
+
+#[cfg(feature = "cluster")]
+async fn assignment_writer_after_checkpoint_tail_handoff<F>(
+    route: &str,
+    mut checkpoint: std::pin::Pin<&mut F>,
+    checkpoint_in_flight: &std::sync::atomic::AtomicU64,
+    rotation_fence: &Arc<tokio::sync::RwLock<()>>,
+) -> tokio::sync::OwnedRwLockWriteGuard<()>
+where
+    F: std::future::Future + ?Sized,
+{
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if checkpoint_in_flight.load(std::sync::atomic::Ordering::Acquire) == 1 {
+                break;
+            }
+            tokio::select! {
+                _ = checkpoint.as_mut() => {
+                    panic!("{route} completed before its durable tail blocked")
+                }
+                () = tokio::task::yield_now() => {}
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{route} did not hand off its durable tail"));
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::select! {
+            guard = Arc::clone(rotation_fence).write_owned() => guard,
+            _ = checkpoint.as_mut() => {
+                panic!("{route} completed before the blocked tail released")
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{route} retained the rotation token in its durable tail"))
+}
+
 fn empty_callback_fixture() -> ConnectorPipelineCallback {
     let (_sink_event_tx, sink_event_rx) =
         laminar_core::streaming::channel::channel::<crate::sink_task::SinkEvent>(1);
@@ -542,24 +609,11 @@ async fn source_less_leader_holds_rotation_fence_through_whole_and_vnode_capture
     let registry = Arc::new(VnodeRegistry::new_unassigned(1));
     registry.set_assignment_and_version(vec![node].into(), leader.fence.assignment_version);
 
-    let rotation_fence = Arc::new(tokio::sync::RwLock::new(()));
-    let whole_capture_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let vnode_capture_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut callback = empty_callback_fixture();
     callback.cluster_controller = Some(Arc::clone(&leader.controller));
     callback.vnode_registry = Some(registry);
-    callback
-        .graph
-        .set_rotation_execution_fence(Arc::clone(&rotation_fence));
-    callback.graph.set_test_vnode_count(1);
-    callback.graph.push_test_node(
-        "checkpoint-rotation-fence-audit",
-        Box::new(CheckpointRotationFenceAuditOperator {
-            fence: Arc::clone(&rotation_fence),
-            whole_capture_observed: Arc::clone(&whole_capture_observed),
-            vnode_capture_observed: Arc::clone(&vnode_capture_observed),
-        }),
-    );
+    let (rotation_fence, whole_capture_observed, vnode_capture_observed) =
+        install_checkpoint_rotation_fence_audit(&mut callback);
     let attempt = CheckpointAttempt::new(9, 9);
     callback
         .checkpoint_leader_proofs
@@ -795,6 +849,78 @@ async fn follower_rejection_validates_identity_before_cancelling_source_command(
 
 #[cfg(feature = "cluster")]
 #[tokio::test]
+async fn source_less_immediate_follower_holds_rotation_fence_through_capture() {
+    use laminar_core::cluster::control::{
+        BarrierAnnouncement, LeaseDeadline, Phase, ANNOUNCEMENT_KEY,
+    };
+    use laminar_core::cluster::discovery::NodeId;
+    use laminar_core::state::VnodeRegistry;
+
+    let (kv, controller, leader_id, _members_tx, _decision_store) = gate_controller().await;
+    controller
+        .set_process_lease_deadline(Arc::new(LeaseDeadline::live_for(Duration::from_secs(60))))
+        .unwrap();
+    let controller = Arc::new(controller);
+    let fence = assignment_fence(19, &[1, 7]);
+    controller.publish_checkpoint_assignment_fence(Some(fence.clone()));
+    let registry = Arc::new(VnodeRegistry::new_unassigned(2));
+    registry.set_assignment_and_version(vec![NodeId(1), NodeId(7)].into(), 19);
+    let attempt = CheckpointAttempt::new(30, 30);
+    let announcement = BarrierAnnouncement {
+        epoch: attempt.epoch,
+        checkpoint_id: attempt.checkpoint_id,
+        assignment_fence: Some(fence),
+        leader_proof: Some(leader_proof(1)),
+        phase: Phase::Prepare,
+        flags: 0,
+    };
+    kv.seed(
+        leader_id,
+        ANNOUNCEMENT_KEY,
+        serde_json::to_string(&announcement).unwrap(),
+    );
+
+    let mut callback = empty_callback_fixture();
+    callback.cluster_controller = Some(controller);
+    callback.vnode_registry = Some(registry);
+    callback.checkpoint_committable_sinks = true;
+    let (rotation_fence, whole_capture_observed, vnode_capture_observed) =
+        install_checkpoint_rotation_fence_audit(&mut callback);
+    let checkpoint_in_flight = Arc::clone(&callback.checkpoint_in_flight);
+    let coordinator = Arc::clone(&callback.coordinator);
+    let coordinator_guard = coordinator.lock().await;
+
+    let checkpoint = crate::pipeline::PipelineCallback::service_checkpoint_control(
+        &mut callback,
+        FxHashMap::default(),
+    );
+    tokio::pin!(checkpoint);
+    let assignment_writer = assignment_writer_after_checkpoint_tail_handoff(
+        "immediate follower",
+        checkpoint.as_mut(),
+        &checkpoint_in_flight,
+        &rotation_fence,
+    )
+    .await;
+    assert!(whole_capture_observed.load(std::sync::atomic::Ordering::Acquire));
+    assert!(vnode_capture_observed.load(std::sync::atomic::Ordering::Acquire));
+
+    drop(coordinator_guard);
+    let outcome = tokio::time::timeout(Duration::from_secs(1), &mut checkpoint)
+        .await
+        .expect("immediate follower tail did not finish after coordinator release");
+    assert!(matches!(
+        outcome,
+        crate::pipeline::CheckpointControlOutcome::Started {
+            attempt: observed,
+            captured: true,
+        } if observed == attempt
+    ));
+    drop(assignment_writer);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
 async fn retained_follower_capture_keeps_ownership_after_promotion() {
     use laminar_core::cluster::control::{LeaseDeadline, Phase};
     use laminar_core::state::{NodeId, VnodeRegistry};
@@ -813,6 +939,8 @@ async fn retained_follower_capture_keeps_ownership_after_promotion() {
     controller.publish_checkpoint_assignment_fence(Some(fence.clone()));
     let mut fixture = cluster_callback_fixture(registry, Arc::clone(&controller), None, None);
     fixture.callback.checkpoint_committable_sinks = true;
+    let (rotation_fence, whole_capture_observed, vnode_capture_observed) =
+        install_checkpoint_rotation_fence_audit(&mut fixture.callback);
 
     let attempt = CheckpointAttempt::new(26, 26);
     let announcement = certified_barrier(
@@ -832,17 +960,34 @@ async fn retained_follower_capture_keeps_ownership_after_promotion() {
         Ok(FollowerAdmission::Reserved)
     );
     fixture.callback.pending_follower_checkpoint = Some(announcement);
+    let checkpoint_in_flight = Arc::clone(&fixture.callback.checkpoint_in_flight);
+    let coordinator = Arc::clone(&fixture.callback.coordinator);
+    let coordinator_guard = coordinator.lock().await;
 
-    let outcome = crate::pipeline::PipelineCallback::checkpoint_with_barrier(
+    let mut checkpoint = Box::pin(crate::pipeline::PipelineCallback::checkpoint_with_barrier(
         &mut fixture.callback,
         FxHashMap::default(),
         attempt,
         std::time::Instant::now(),
         None,
+    ));
+    let assignment_writer = assignment_writer_after_checkpoint_tail_handoff(
+        "deferred follower",
+        checkpoint.as_mut(),
+        &checkpoint_in_flight,
+        &rotation_fence,
     )
     .await;
+    assert!(whole_capture_observed.load(std::sync::atomic::Ordering::Acquire));
+    assert!(vnode_capture_observed.load(std::sync::atomic::Ordering::Acquire));
 
+    drop(coordinator_guard);
+    let outcome = tokio::time::timeout(Duration::from_secs(1), &mut checkpoint)
+        .await
+        .expect("deferred follower tail did not finish after coordinator release");
     assert!(matches!(outcome, crate::pipeline::BarrierOutcome::Async));
+    drop(assignment_writer);
+    drop(checkpoint);
     assert!(fixture.callback.pending_follower_checkpoint.is_none());
 }
 
@@ -1365,7 +1510,6 @@ async fn follower_capture_request_includes_whole_operator_graph_state() {
             &assignment_fence,
             tokio::time::Instant::now() + Duration::from_secs(1),
         )
-        .await
         .unwrap();
     assert!(
         request.operator_states.is_empty(),
@@ -1410,7 +1554,6 @@ async fn follower_capture_request_rejects_an_expired_deadline() {
             &assignment_fence,
             tokio::time::Instant::now() - Duration::from_millis(1),
         )
-        .await
         .err()
         .expect("an expired deadline must reject follower capture");
 
@@ -2020,10 +2163,10 @@ async fn failure_after_destructive_operator_capture_faults_runtime() {
 }
 
 #[tokio::test]
-async fn busy_serialization_gate_times_out_before_mutating_operator_state() {
+async fn busy_serialization_gate_rejects_synchronously_before_mutating_operator_state() {
     let live_rows = Arc::new(std::sync::atomic::AtomicUsize::new(17));
     let mut callback = empty_callback_fixture();
-    callback.serialization_timeout = Duration::from_millis(10);
+    callback.serialization_timeout = Duration::from_secs(1);
     callback.graph.push_test_node(
         "draining-capture",
         Box::new(DrainingCaptureOperator {
@@ -2035,18 +2178,71 @@ async fn busy_serialization_gate_times_out_before_mutating_operator_state() {
         .await
         .unwrap();
 
-    let error = callback
-        .capture_operator_state_until(tokio::time::Instant::now() + Duration::from_millis(100))
-        .await
-        .err()
-        .expect("a busy serialization gate must reject a second capture");
+    let error = match callback
+        .capture_operator_state_until(tokio::time::Instant::now() + Duration::from_secs(10))
+    {
+        Ok(_) => panic!("a busy serialization gate must reject synchronously"),
+        Err(error) => error,
+    };
 
+    assert!(error.contains("[LDB-6017]"), "{error}");
+    assert!(error.contains("still active"), "{error}");
+    assert_eq!(live_rows.load(std::sync::atomic::Ordering::Acquire), 17);
+    assert!(
+        crate::pipeline::PipelineCallback::take_pipeline_fault(&mut callback).is_none(),
+        "serialization contention must reject before mutable capture"
+    );
+    drop(held_permit);
+}
+
+#[cfg(feature = "cluster")]
+#[tokio::test]
+async fn busy_serialization_gate_does_not_hold_assignment_writer_until_timeout() {
+    let live_rows = Arc::new(std::sync::atomic::AtomicUsize::new(17));
+    let mut callback = empty_callback_fixture();
+    callback.serialization_timeout = Duration::from_secs(1);
+    callback.graph.push_test_node(
+        "draining-capture",
+        Box::new(DrainingCaptureOperator {
+            live_rows: Arc::clone(&live_rows),
+        }),
+    );
+    let rotation_fence = Arc::new(tokio::sync::RwLock::new(()));
+    callback
+        .graph
+        .set_rotation_execution_fence(Arc::clone(&rotation_fence));
+    let held_permit = Arc::clone(&callback.checkpoint_serialization_gate)
+        .acquire_owned()
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let capture_guard = callback
+        .checkpoint_capture_rotation_guard_until(None, deadline)
+        .await
+        .unwrap()
+        .expect("configured callback must acquire its rotation token");
+
+    let error = match callback.capture_operator_state_until(deadline) {
+        Ok(_) => panic!("serialization contention must not wait under the rotation token"),
+        Err(error) => error,
+    };
     assert!(error.contains("[LDB-6017]"), "{error}");
     assert_eq!(live_rows.load(std::sync::atomic::Ordering::Acquire), 17);
     assert!(
         crate::pipeline::PipelineCallback::take_pipeline_fault(&mut callback).is_none(),
-        "waiting for an earlier encoder must fail before mutable capture"
+        "contention rejects before mutable capture and must not create a second fault"
     );
+
+    let mut assignment_writer = Box::pin(Arc::clone(&rotation_fence).write_owned());
+    assert!(matches!(
+        futures::poll!(&mut assignment_writer),
+        std::task::Poll::Pending
+    ));
+    drop(capture_guard);
+    let assignment_writer = tokio::time::timeout(Duration::from_secs(1), assignment_writer)
+        .await
+        .expect("assignment publication remained blocked after capture rejection");
+    drop(assignment_writer);
     drop(held_permit);
 }
 
@@ -2061,10 +2257,7 @@ async fn dropping_serialized_destructive_image_before_commit_faults_runtime() {
         }),
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-    let capture = callback
-        .capture_operator_state_until(deadline)
-        .await
-        .unwrap();
+    let capture = callback.capture_operator_state_until(deadline).unwrap();
     let budget = encoded_operator_state_budget(
         callback.checkpoint_state_cap_bytes,
         capture.estimated_bytes(),

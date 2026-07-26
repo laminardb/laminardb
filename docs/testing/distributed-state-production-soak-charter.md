@@ -97,6 +97,67 @@ partition-ABI-v1 grouping columns. Aggregate filters/HAVING/derived or multiple 
 part of this scenario. The planner must reject every volatile, time-relative, AI, or unclassified
 upstream expression so the same Kafka prefix reproduces the same key and SUM payload.
 
+## Cycle 49 checkpoint-versus-rotation pre-certification
+
+This race-specific family is a prerequisite for, but cannot itself certify, keyed state. Its five
+immutable scenario IDs are:
+
+| ID | Workload and externally actuated membership change |
+|---|---|
+| `CVR-SL-F-ALO-v1` | Source-less logical input plus an idle admitted global aggregate; kill and rejoin an observed follower |
+| `CVR-SL-L-ALO-v1` | The same source-less path; kill and rejoin the observed leader |
+| `CVR-SF-F-ALO-v1` | Replayable Kafka source -> stateless projection -> Kafka append sink; kill and rejoin an observed follower |
+| `CVR-SF-L-ALO-v1` | The same sourceful path; kill and rejoin the observed leader |
+| `CVR-EO-REJECT-v1` | Cluster startup with `delivery = "exactly_once"`; negative admission control |
+
+Each ALO attempt first proves one stable three-node assignment and committed checkpoint. The
+controller then records a manual checkpoint reservation, actuates the selected hard process death
+before that attempt reaches a terminal state, proves survivor recovery and a newer assignment,
+restarts the victim, and records another checkpoint overlapping its rejoin rotation before proving
+full membership and a further durable checkpoint. The checkpoint interval is reservation through
+its unique terminal outcome; the rotation interval is external death/rejoin actuation through
+convergence of every live node on the resulting durable assignment. They overlap only when those
+half-open intervals intersect. A missing reservation, missed actuation, non-overlap, incomplete
+membership/assignment boundary, or lost controller evidence makes that permanent attempt
+`INVALID`; it is retained and never silently retried. A completed overlap with a product anomaly is
+`FAIL`.
+
+Every valid ALO attempt requires exactly one terminal outcome per reserved canonical checkpoint,
+strictly increasing checkpoint and assignment identities, one exact assignment certificate and
+participant roster per seal, no seal for a failed/aborted/superseded attempt, and convergence on the
+same assignment. After recovery, the interrupted attempt must never complete, the first newly
+reserved attempt must complete, each surviving node must apply exactly one recovery round without a
+recovery failure, its process identity must remain unchanged, and source/sink progress must resume
+within the frozen deadline. These public effects are the black-box callback-generation recovery
+proof; object-lifetime regressions remain implementation tests.
+
+For sourceful ALO, missing, extra, malformed, conflicting, stale-owner, or post-boundary output is
+a failure. A duplicate is legal only when its replay-stable operation identity and payload bytes
+are identical and the preceding sealed source cut proves that its offset belongs to that recovery
+interval. Sink-admission sequence must strictly increase within each `(shard, writer interval)`,
+and no predecessor record may follow its successor fence marker. `CVR-EO-REJECT-v1` passes only if
+the unchanged release exits nonzero with `[LDB-0013]` before readiness or source, sink, checkpoint,
+or state I/O.
+
+For every node and process generation the evidence reports count, p50, p95, p99, p99.9, maximum,
+and deadline-exhaustion count for `checkpoint_duration_seconds`,
+`checkpoint_pipeline_stall_duration_seconds`, `checkpoint_barrier_local_duration_seconds`,
+`checkpoint_aligned_resume_wait_seconds`, and `checkpoint_restorable_gate_wait_seconds`. The
+external controller reports the same distribution fields for actuation-to-assignment publication,
+publication-to-cluster convergence, recovery start-to-release, release-to-first durable checkpoint,
+release-to-source/sink progress, and sink-cut-to-frozen-output completion. All repetition counts and
+numerical limits must be approved in the frozen contract before dispatch; local measurements cannot
+set them retrospectively.
+
+`crates/laminar-server/tests/cluster_soak.rs` is reusable engineering scaffolding for the sourceful
+path, role selection, cuts, recovery checks, and checkpoint histograms. It builds the test binary,
+uses test-only gates, and lacks the source-less case, exact rotation-overlap controller, complete
+duplicate/writer-fence oracle, and exactly-once negative case, so it is not independent evidence.
+`tools/independent-soak-contract` validates an explicitly ineligible draft and semantic fixture; it
+is not a deployment, fault, or evidence runner. The available WSL 2/Docker environment can run a
+labelled functional smoke only. No Cycle 49 independent soak or production soak ran, and
+`certification_eligible` remains `false`.
+
 ## Frozen numerical contract
 
 An eligible machine-readable charter contains no `TBD`, zero, or results-derived threshold. It

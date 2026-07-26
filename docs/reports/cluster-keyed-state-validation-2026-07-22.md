@@ -24,8 +24,11 @@ empirically reproduces the post-graph sink-publication drop on a retained privat
 that no production owner performs that cancellation today, and freezes the owner contract instead
 of adding a checkpoint-only fence. [Cycle 48](../reviews/distributed-keyed-state-cycle-48.md)
 then closes a live assignment/capture race: staged vnode transitions now enter checkpoint drain,
-and the existing rotation fence spans shuffle alignment plus whole/vnode mutable capture. None of
-these decisions changes cluster admission.
+and the existing rotation fence spans shuffle alignment plus whole/vnode mutable capture.
+[Cycle 49](../reviews/distributed-keyed-state-cycle-49.md) proves the same span on both follower
+routes and removes a rebalance latency inversion by rejecting an overlapping mutable capture before
+state mutation instead of awaiting a retained encoder while holding that fence. None of these
+decisions changes cluster admission.
 
 ## Verdict
 
@@ -192,11 +195,23 @@ already-captured vnode images into the tail; explicit awaited cleanup first drop
 
 This changes only checkpoint/rotation work. The normal graph/row path gains no branch, lock,
 allocation, task, or I/O. Checkpoint sampling adds two short staging-map reads, an assignment-version
-comparison, and one deadline-bounded read acquisition on an existing lock. Healthy admission allows
-one in-flight checkpoint, so the serialization permit is expected to be immediately available;
-an anomalously retained encoder remains bounded but needs explicit contention/rotation coverage in
-Cycle 49 and the independent soak. Cluster delivery remains at-least-once: recovery can duplicate
-already accepted output, exactly-once remains rejected, and no source/sink capability widened.
+comparison, and one deadline-bounded read acquisition on an existing lock. Cycle 49 found that the
+serialization permit was then awaited under that read token for up to the checkpoint/serialization
+deadline (120 seconds by default), while the default rebalance writer deadline is 15 seconds. A
+timed-out blocking encoder is intentionally non-abortable and can retain the sole permit, so this
+was a real recovery-path latency inversion.
+
+Healthy admission permits only one checkpoint tail and callback capture already has exclusive
+`&mut self` ownership. Permit contention therefore denotes the retained encoder or an invariant
+breach, not useful steady-state queuing. Capture now uses one synchronous `try_acquire_owned` before
+either snapshot: `NoPermits` returns `[LDB-6017]` immediately without touching operator state or
+creating a second sticky fault, while the old encoder keeps its permit until it exits. Dropping the
+capture read token then lets a queued assignment writer proceed. The removed async timeout wrappers
+could not preempt the synchronous snapshot calls and supplied no stronger cancellation guarantee.
+Deterministic tests cover this rejection and the leader, immediate-follower, and deferred-follower
+token spans. The independent checkpoint-versus-rotation soak remains required for latency
+distributions. Cluster delivery remains at-least-once: recovery can duplicate already accepted
+output, exactly-once remains rejected, and no source/sink capability widened.
 
 The admitted multi-operator reachability question is also now explicit. More than one stream query
 may each contain its one permitted global aggregate, so one graph can contain multiple vnode-0
@@ -462,6 +477,10 @@ The current branch's admission-neutral hardening was then checked separately:
 | `operator_graph::tests::rehydration_apply_failure_faults_without_activating_vnode` | PASS, 1/1 | Empirically confirms the current unsafe boundary: the first operator is mutated before a later failure, although the vnode stays `Restoring`; this is blocker evidence, not a desired regression contract |
 | `operator_graph::tests::checkpoint_quiescence_requires_staged_vnode_transitions_to_apply` | PASS, 1/1 | Acquire, revoke, and assignment-version changes block both snapshot APIs until graph drain applies the transition |
 | `pipeline_callback::tests::source_less_leader_holds_rotation_fence_through_whole_and_vnode_capture` | PASS, 1/1 | Production leader/source-less callback holds the existing rotation read token across both mutable capture callbacks and releases it before the tail |
+| `pipeline_callback::tests::source_less_immediate_follower_holds_rotation_fence_through_capture` | PASS, 1/1 | The real source-less `CaptureNow` follower route holds the token through both images and releases it before its blocked durable tail |
+| `pipeline_callback::tests::retained_follower_capture_keeps_ownership_after_promotion` | PASS, 1/1 | The deferred source-barrier follower route preserves attempt cleanup while releasing the token before its blocked durable tail |
+| `pipeline_callback::tests::busy_serialization_gate_rejects_synchronously_before_mutating_operator_state` | PASS, 1/1 | A retained encoder causes immediate `[LDB-6017]`; destructive graph state and the current fault slot are unchanged |
+| `pipeline_callback::tests::busy_serialization_gate_does_not_hold_assignment_writer_until_timeout` | PASS, 1/1 | A queued assignment writer is blocked by capture ownership, then proceeds as soon as the rejected capture drops its token rather than after the serialization timeout |
 | `pipeline::streaming_coordinator::tests::recovery_cycle_error_faults_best_effort` | PASS, 1/1 | A recovery-classified partial apply publishes no output/cut and destroys the callback/graph generation before returning |
 
 Both cluster and no-feature `cargo check` and `cargo clippy -D warnings` configurations passed, as

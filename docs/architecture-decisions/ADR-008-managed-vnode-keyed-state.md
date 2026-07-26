@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 48
+- **Last reconciled:** 2026-07-26 during Cycle 49
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -13,7 +13,7 @@
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
   [TidesDB package design](tidesdb-local-state-successor-design.md),
   [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
-  [latest completed review](../reviews/distributed-keyed-state-cycle-47.md)
+  [latest completed review](../reviews/distributed-keyed-state-cycle-49.md)
 
 ## Decision
 
@@ -327,10 +327,17 @@ off-side prepare, and infallible whole-graph publish specified below.
 
 Cycle 48 adds no normal row-path operation and no new lock, atomic, task, backend, or abstraction.
 Checkpoint capture adds short staging-map/version checks and a deadline-bounded read acquisition on
-the existing fence. Healthy one-in-flight admission makes the serialization permit immediately
-available; anomalous retained-encoder contention and checkpoint-versus-rotation wait distributions
-are Cycle 49 and independent-soak gates. Delivery remains cluster at-least-once, and no source,
-sink, exactly-once, or `[LDB-4007]` capability changes.
+the existing fence. Cycle 49 proves that immediate and deferred follower routes hold that token
+through whole/vnode capture and release it before their durable tails. It also removes a latency
+inversion: a non-abortable encoder can retain the sole serialization permit after its originating
+attempt times out, so awaiting that permit under the rotation token could outlive the rebalance
+writer's deadline. Because valid one-in-flight admission has no steady-state waiter, a contending
+capture now returns `[LDB-6017]` synchronously before state mutation; the old encoder remains owned
+and fenced until it exits, and no second sticky fault is created. The removed timeout wrappers
+could not preempt the synchronous snapshot calls. This replaces one checkpoint-only await/timer
+with a semaphore try-acquire and changes no normal row path. Synchronous capture duration and full
+checkpoint-versus-rotation wait distributions remain independent-soak gates. Delivery remains
+cluster at-least-once, and no source, sink, exactly-once, or `[LDB-4007]` capability changes.
 
 #### Frozen Fjall/RocksDB evidence and selected TidesDB binding line
 
