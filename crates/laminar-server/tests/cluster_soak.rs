@@ -2585,6 +2585,27 @@ impl CheckpointBarrierTimingEvidence {
         deadline: Instant,
     ) -> Result<(), String> {
         let generation = Self::generation(node);
+        self.finalize_generation_with(
+            generation,
+            latency,
+            deadline,
+            |timing| timing.capture_node(node, Some(expected_authority), deadline),
+            || node.checkpoint_latency_metrics(),
+        )
+    }
+
+    fn finalize_generation_with<C, M>(
+        &mut self,
+        generation: ProcessGeneration,
+        latency: &mut CheckpointLatencyEvidence,
+        deadline: Instant,
+        mut capture: C,
+        mut read_metrics: M,
+    ) -> Result<(), String>
+    where
+        C: FnMut(&mut Self) -> Result<(), String>,
+        M: FnMut() -> Option<CheckpointLatencySnapshot>,
+    {
         if self
             .generations
             .get(&generation)
@@ -2596,13 +2617,13 @@ impl CheckpointBarrierTimingEvidence {
             ));
         }
         loop {
-            self.capture_node(node, Some(expected_authority), deadline)?;
+            capture(self)?;
             let (cursor_before, metadata_before) = self
                 .generations
                 .get(&generation)
                 .and_then(|state| state.metadata.map(|metadata| (state.cursor, metadata)))
                 .ok_or_else(|| "timing capture produced no metadata".to_string())?;
-            let Some(metrics_before) = node.checkpoint_latency_metrics() else {
+            let Some(metrics_before) = read_metrics() else {
                 if remaining_at(deadline, Instant::now()).is_none() {
                     return Err(format!(
                         "node{} process generation {} did not expose checkpoint latency metrics",
@@ -2612,13 +2633,13 @@ impl CheckpointBarrierTimingEvidence {
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
             };
-            self.capture_node(node, Some(expected_authority), deadline)?;
+            capture(self)?;
             let (cursor_after, metadata_after) = self
                 .generations
                 .get(&generation)
                 .and_then(|state| state.metadata.map(|metadata| (state.cursor, metadata)))
                 .ok_or_else(|| "timing confirmation produced no metadata".to_string())?;
-            let Some(metrics_after) = node.checkpoint_latency_metrics() else {
+            let Some(metrics_after) = read_metrics() else {
                 if remaining_at(deadline, Instant::now()).is_none() {
                     return Err(format!(
                         "node{} process generation {} lost checkpoint latency metrics during finalization",
@@ -2628,7 +2649,7 @@ impl CheckpointBarrierTimingEvidence {
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
             };
-            self.capture_node(node, Some(expected_authority), deadline)?;
+            capture(self)?;
             let (cursor_confirmed, metadata_confirmed) = self
                 .generations
                 .get(&generation)
@@ -6681,6 +6702,86 @@ fn exact_timing_reconciliation_rejects_each_count_and_bucket_disagreement() {
     assert_mismatch!(pipeline_stall_within_slo, "pipeline-stall SLO bucket");
     assert_mismatch!(barrier_local_within_slo, "local-barrier SLO bucket");
     assert_mismatch!(aligned_resume_within_slo, "aligned-resume SLO bucket");
+}
+
+#[cfg(feature = "kafka")]
+#[test]
+fn exact_timing_finalization_retries_transient_incoherent_cut() {
+    let generation = ProcessGeneration {
+        node_id: 0,
+        generation: 1,
+    };
+    let process = timing_test_process(1);
+    let initial = timing_test_generation(1);
+    let one_record_metrics_before = timing_test_metrics(&initial);
+    let mut one_record_metrics_after = one_record_metrics_before;
+    one_record_metrics_after.checkpoint_seconds += 0.001;
+    let two_record_metrics = timing_test_metrics(&timing_test_generation(2));
+    let mut timing = CheckpointBarrierTimingEvidence::default();
+    timing.generations.insert(generation, initial);
+    let mut latency = CheckpointLatencyEvidence::default();
+    let mut capture_calls = 0_u8;
+    let mut metric_calls = 0_u8;
+
+    timing
+        .finalize_generation_with(
+            generation,
+            &mut latency,
+            Instant::now() + Duration::from_secs(1),
+            |evidence| {
+                capture_calls += 1;
+                let state = evidence
+                    .generations
+                    .get_mut(&generation)
+                    .expect("scripted timing generation exists");
+                if matches!(capture_calls, 1 | 4 | 7) {
+                    assert!(
+                        !state.finalized,
+                        "an incoherent cut must not commit transient evidence"
+                    );
+                }
+                let after_sequence = state.cursor;
+                let records = if capture_calls == 6 {
+                    vec![timing_test_record(2)]
+                } else {
+                    Vec::new()
+                };
+                let next_sequence = if records.is_empty() {
+                    after_sequence + 1
+                } else {
+                    3
+                };
+                let has_more = state.apply_page(
+                    generation,
+                    timing_test_envelope(process, after_sequence, records, next_sequence, false),
+                )?;
+                if has_more {
+                    return Err("scripted coherent-cut page unexpectedly continued".into());
+                }
+                Ok(())
+            },
+            || {
+                metric_calls += 1;
+                Some(match metric_calls {
+                    1 => one_record_metrics_before,
+                    2 => one_record_metrics_after,
+                    3..=6 => two_record_metrics,
+                    _ => panic!("coherent-cut script read too many metric snapshots"),
+                })
+            },
+        )
+        .unwrap();
+
+    assert_eq!(capture_calls, 9, "both incoherent cuts must retry");
+    assert_eq!(metric_calls, 6, "both incoherent cuts must retry");
+    let finalized = timing.generations.get(&generation).unwrap();
+    assert!(finalized.finalized);
+    assert_eq!(finalized.cursor, 2);
+    assert_eq!(finalized.record_count, 2);
+    assert_eq!(
+        latency.generations.get(&generation),
+        Some(&two_record_metrics)
+    );
 }
 
 #[cfg(feature = "kafka")]
