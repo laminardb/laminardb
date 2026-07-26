@@ -5,7 +5,7 @@
   pending a new official package; no runtime
   dependency, backend qualification evidence, independent production-soak result, or admission change
 - **Started:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 54
+- **Last reconciled:** 2026-07-26 during Cycle 55
 - **Parent plan:** [distributed keyed/stateful operators](distributed-keyed-stateful-operators.md)
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline:** `1e2f8429`; working branch `feature/distributed-keyed-state-adr`
@@ -363,7 +363,21 @@ hide transaction splits,
 checks one global sequence range through `u64::MAX`, retries only confirmed-aborted attempts inside
 the same borrowed call, and poisons every ambiguous phase. It neither selects the correct successor
 after an ambiguous marker, nor proves a complete broker partition inventory, nor rejects interval
-reuse across fake chains/restarts. Those item 4 lifecycle gaps and items 5 and 6 remain open.
+reuse across fake chains/restarts.
+
+Cycle 55 freezes
+[`transactional_id_v1`](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#kafka-transactional-identity-v1-and-real-broker-evidence-boundary)
+and exercises the deterministic subset of item 5 with a root-workspace-excluded synchronous
+`rdkafka` probe against the repository's one-node Redpanda service. On a unique RF=1 topic it proves
+the exact pre/post partition inventory `[0,1,2]`, byte-identical marker fanout, confirmed abort plus
+byte-identical retry, fatal same-ID predecessor fencing, and separate `read_uncommitted`/
+`read_committed` visibility. It also verifies the exact reserved header, an unrelated preserved
+header, marker null key and empty non-null payload, unchanged data key/payload, predecessor-visible
+data, and interval-reset replay. This closes neither a production topology nor item 5 as a whole.
+No protocol-aware actuator dropped a matched `EndTxn` response after request delivery, so
+ambiguous-marker/data reconciliation remains the next item-5 slice. Broker size/timeout/pressure,
+replication/failover, TLS/auth, runtime interval non-reuse, item 6, latency, and the independent soak
+remain open.
 
 The existing output path satisfies none of the new provenance/fence fields: it passes only a batch
 and deadline and uses an idempotent, non-transactional Kafka producer. The supported evidence APIs

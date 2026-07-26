@@ -3,7 +3,7 @@
 - **Status:** Planned and backend-gated; exact Cargo package `tidesdb v0.11.1` stopped at T0; no new cluster
   operator is admitted by this document
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 54
+- **Last reconciled:** 2026-07-26 during Cycle 55
 - **Decision:** [ADR-008](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md)
 - **Baseline evidence:** [validation report](../reports/cluster-keyed-state-validation-2026-07-22.md)
 - **Phase 0 execution:** [file-level implementation plan](distributed-keyed-state-phase-0-execution.md)
@@ -167,6 +167,18 @@ confirmed marker-before-data, bounded explicit transaction slices, checked globa
 terminal ambiguity, and confirmed-predecessor replay are executable without a broker. It explicitly
 defers complete partition-inventory proof, durable interval non-reuse, ambiguous-marker
 reconciliation, and real fencing.
+
+Cycle 55 then freezes the 74-byte stable Kafka
+[`transactional_id_v1`](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#kafka-transactional-identity-v1-and-real-broker-evidence-boundary)
+and runs the smallest deterministic real-broker slice. Repeated clean runs, including an optimized
+standalone binary, prove same-ID fatal predecessor fencing, confirmed-abort invisibility plus
+byte-identical retry, fence-aborted open-transaction invisibility, exact marker fanout over a
+synthetic three-partition inventory, and reserved/unrelated header and key/payload preservation on
+the exact one-node Redpanda subject. This is only partial item-5 evidence. An ambiguous `EndTxn`
+outcome needs a protocol-aware matched-response-loss actuator; generic timeouts or broker kills are
+not accepted. Runtime connector wiring, durable interval allocation/non-reuse, production broker
+limits, multi-broker durability, hot-path/latency evidence, source/state/sink atomicity, and the
+independent soak remain absent.
 
 ## Scope and non-goals
 

@@ -253,12 +253,30 @@ authority and envelope. Confirmed marker fanout over every supplied affected par
 atomically in the model; completeness of that partition inventory remains unproved. Each explicit
 bounded data slice receives one checked shard/interval sequence range, and ambiguity poisons the
 writer. The fake has no broker, timestamps, offsets, real fencing, public evidence, or measured
-latency. In particular, an ambiguous marker has no visibility verdict until Cycle 55 read-committed
-reconciliation, so it cannot choose a production successor chain. Durable interval non-reuse across
-fake chains, restarts, and `A -> B -> A` rotation is also unproved.
+latency. In particular, an ambiguous marker has no visibility verdict until a future controlled
+read-committed reconciliation test, so it cannot choose a production successor chain. Durable
+interval non-reuse across fake chains, restarts, and `A -> B -> A` rotation is also unproved.
 
 No backend, runtime connector, source/sink capability, cluster admission, delivery guarantee, or
 certification flag changed. All CVR scenarios remain **BLOCKED**, no Cycle 54 soak ran, and
+`certification_eligible` remains `false`.
+
+### Cycle 55 evidence disposition
+
+The root-workspace-excluded Kafka transaction probe uses the ADR-defined stable
+[`transactional_id_v1`](../architecture-decisions/ADR-008-managed-vnode-keyed-state.md#kafka-transactional-identity-v1-and-real-broker-evidence-boundary)
+against a disposable one-node Redpanda topic. Repeated clean runs prove only deterministic broker
+protocol behavior: exact synthetic three-partition marker fanout, provider-confirmed delivery,
+confirmed abort followed by byte-identical retry, fatal predecessor fencing, and separate
+read-committed/read-uncommitted visibility. Captures also check exact reserved-header cardinality,
+an unrelated preserved header, marker null key and empty non-null payload, and unchanged data
+key/payload. The broker subject is replication factor one and the probe does not run LaminarDB.
+
+No matched `EndTxn` response was deliberately lost after request delivery, so an ambiguous marker
+or data commit still has no tested reconciliation branch. The probe also provides no production
+partition topology, source/state/sink atomic commit, interval-ID persistence, broker failover,
+restart/disk durability, authentication, limit/pressure qualification, latency distribution, or
+release-candidate soak evidence. All CVR scenarios remain **BLOCKED**, no Cycle 55 soak ran, and
 `certification_eligible` remains `false`.
 
 ## Frozen numerical contract

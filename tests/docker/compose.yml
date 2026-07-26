@@ -30,7 +30,7 @@ services:
     image: docker.redpanda.com/redpandadata/redpanda:v26.1.13
     container_name: laminardb-redpanda
     ports:
-      - "19092:19092"
+      - "127.0.0.1:19092:19092"
     command:
       - redpanda
       - start

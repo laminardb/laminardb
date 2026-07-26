@@ -50,6 +50,7 @@ checkpoints/
 wal/
 /tools/*
 !/tools/independent-soak-contract/
+!/tools/kafka-transaction-probe/
 !/tools/state-backend-qual/
 !/tools/state-backend-redb-prescreen/
 !/tools/state-backend-zipf-oracle/

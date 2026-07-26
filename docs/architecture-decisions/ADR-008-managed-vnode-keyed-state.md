@@ -2,7 +2,7 @@
 
 - **Status:** Proposed; Phase 0 remains open and cluster admission is unchanged
 - **Date:** 2026-07-22
-- **Last reconciled:** 2026-07-26 during Cycle 53
+- **Last reconciled:** 2026-07-26 during Cycle 55
 - **Decision scope:** Cluster `CREATE STREAM` aggregates, windows, and joins
 - **Production/backend verdict:** TidesDB through the official `tidesdb/tidesdb-rs` binding,
   published as Cargo package `tidesdb`, is the selected worker-local implementation line; no
@@ -13,7 +13,7 @@
   [Cycle 36 owner packet](../reports/distributed-state-cycle-36-owner-decision-packet-2026-07-25.md),
   [TidesDB package design](tidesdb-local-state-successor-design.md),
   [TidesDB T0 source closure](../reports/tidesdb-rs-t0-source-closure-2026-07-25.md), and
-  [latest completed review](../reviews/distributed-keyed-state-cycle-53.md)
+  [latest completed review](../reviews/distributed-keyed-state-cycle-55.md)
 
 ## Decision
 
@@ -1118,7 +1118,7 @@ Scripts that would return control with an unresolved provisional range are inval
 first visible sequence at zero while permitting later capture gaps, as required by the v2 oracle.
 
 The stable producer scope is the structured tuple `(deployment UUID, pipeline incarnation, sink ID,
-shard ID)`; no Kafka string encoding is frozen here. A first interval requires no predecessor. A
+shard ID)`. Its Kafka string encoding is frozen below. A first interval requires no predecessor. A
 successor test may consume a token from a confirmed predecessor, must retain that scope, use a
 different caller-supplied interval, name the exact predecessor, and restart sequence zero. This
 proves only immediate linkage in the model, not durable global interval uniqueness: a new fake chain
@@ -1130,11 +1130,56 @@ fail inertly. The confirmed-only model transcript does not advance after an ambi
 commit; that absence is deliberately no visibility verdict. A marker may be present on every
 supplied partition or absent, but data remains closed either way. The correct successor predecessor
 is therefore the ambiguous interval only when read-committed reconciliation finds that marker;
-otherwise it is the last visible predecessor (or none). Cycle 55 must prove that
-reconciliation, actual producer-epoch fencing, atomic visibility, old-producer abortion, reserved
-header placement, and broker limits against real Kafka/Redpanda. Until then the product remains
-fail-closed and **NO-GO**; even successful broker qualification would remain at-least-once because
-source/state and Kafka do not share one atomic commit.
+otherwise it is the last visible predecessor (or none). Cycle 55 proves only the deterministic
+real-broker subset: same-ID producer fencing, old open-transaction abortion, committed/aborted
+consumer isolation, complete synthetic-topic marker fanout, and reserved-header placement. It does
+not actuate or resolve an ambiguous `EndTxn`, qualify broker limits, or prove a production topology.
+Those gaps remain fail-closed and **NO-GO**; even complete broker qualification would remain
+at-least-once because source/state and Kafka do not share one atomic commit.
+
+### Kafka transactional identity v1 and real-broker evidence boundary
+
+Every bounded Kafka sink-writer shard derives one stable broker fencing identity as follows. `||`
+means byte concatenation; lengths are unsigned one-byte values; and `lowercase_hex` emits two ASCII
+characters per digest byte:
+
+```text
+transactional_id_v1 =
+    "ldb.tx.v1." || lowercase_hex(SHA256(transactional_id_v1_preimage))
+
+transactional_id_v1_preimage =
+    ASCII("laminardb/kafka/transactional-id/v1\0")
+    || deployment_uuid[16]
+    || pipeline_incarnation[16]
+    || u8(sink_id_utf8_length) || sink_id_utf8
+    || u8(shard_id_utf8_length) || shard_id_utf8
+```
+
+The domain separator is exactly 36 bytes. Deployment and pipeline-incarnation values are the same
+canonical nonzero 16-byte identities carried by marker v1. Sink and shard IDs use the marker-v1
+rules: exact UTF-8 bytes, no normalization, nonempty, no NUL, and respective maxima of 128 and 64
+bytes. The result is exactly 74 ASCII bytes: the ten-byte prefix and 64 lowercase hexadecimal
+characters. For the sample scope `([0x22; 16], [0x33; 16], "sink", "shard")`, the frozen value is
+`ldb.tx.v1.c49ace6d02eb21ec7a2dc4424d8c3b9680fc3cd828cd754fec079b800a37411a`.
+
+Assignment, node, boot, process term, recovery attempt, checkpoint, writer interval, operator,
+output, and topic partition are intentionally excluded. A replacement for the same stable shard
+must reproduce the same value so broker initialization fences any predecessor generation. The
+runtime must therefore make `shard_id` unique among concurrent writers in `(deployment, pipeline
+incarnation, sink)`; otherwise intended peers would deliberately fence one another. If one shard
+later needs concurrent producer authorities for distinct outputs, this scope must be revised before
+runtime wiring rather than silently widening the tuple.
+
+Cycle 55's root-workspace-excluded probe is protocol evidence, not connector code. On one disposable
+three-partition, replication-factor-one Redpanda topic it may establish that a successor initialized
+with this same identity fences an older producer, that a flushed open predecessor transaction is
+hidden from `read_committed`, and that committed markers/data are visible across the complete
+synthetic topic inventory with their exact wire headers. It cannot establish generic affected-topic
+inventory, replicated durability/failover, timeout or size limits, TLS/authentication, hot-path
+latency, source/state/sink atomicity, or an ambiguous commit outcome. A true ambiguity test must
+externally prove that a specific `EndTxn` request reached the broker while its matching response was
+lost, retire that producer, and reconcile the complete read-committed marker set through a fenced
+successor. A broker kill, tiny client timeout, or generic proxy disconnect is not that proof.
 
 The controller also needs supported, bounded evidence projections rather than private object-store
 paths or text-log parsing. One local-node view must expose boot/process identity, locally adopted
@@ -1145,8 +1190,10 @@ and capsule digest. Exact per-process-generation maxima and deadline-exhaustion 
 for the five checkpoint latency families; aggregate Prometheus histograms remain operational
 telemetry, not exact attempt evidence. Implement the delivery vertical in this order: executable
 oracle semantics, byte-golden envelopes/markers, pure identity/authority tests, fake transactional
-producer state-machine tests, real Kafka/Redpanda fencing tests, then engineering-harness wiring.
-Only the later independently operated release-binary soak can certify it.
+producer state-machine tests, deterministic real Kafka/Redpanda fencing/isolation, controlled
+ambiguous-outcome reconciliation, then engineering-harness wiring. Cycle 55 closes only the
+deterministic broker slice. Only the later independently operated release-binary soak can certify
+the completed vertical.
 
 End-to-end exactly-once is a later certification per concrete source/state/sink combination. It
 requires an exact-certified source and a checkpoint-committable external sink whose transaction

@@ -39,7 +39,10 @@ runtime admission, delivery guarantees, or certification status. [Cycle 53](../r
 adds standalone grouped operation-ID derivation and pure authority projection, while leaving
 pipeline-incarnation, interval, producer, and public-evidence lifecycles unwired. [Cycle 54](../reviews/distributed-keyed-state-cycle-54.md)
 adds only a unit-test transactional protocol model; real Kafka fencing and ambiguous-marker
-reconciliation remain open.
+reconciliation remain open. [Cycle 55](../reviews/distributed-keyed-state-cycle-55.md) freezes a
+stable transactional-ID encoding and proves the deterministic fencing/visibility subset on one
+real disposable Redpanda broker; ambiguous `EndTxn`, runtime wiring, production limits, replicated
+durability, latency, and soak evidence remain open.
 
 ## Verdict
 
@@ -462,7 +465,27 @@ sequences including `u64::MAX`, terminal ambiguity, and immediate confirmed-pred
 does not contact Kafka, serialize a transactional ID, establish actual visibility, allocate durable
 intervals, prove a complete broker partition inventory, reject reuse across fake chains/restarts,
 or change the current nontransactional sink. An ambiguous marker can be present or absent;
-Cycle 55 must reconcile the read-committed log before choosing the successor predecessor.
+the successor must reconcile the read-committed log before choosing its predecessor.
+
+Cycle 55's standalone probe freezes `transactional_id_v1` over `(deployment, pipeline
+incarnation, sink, shard)` and contacts only the repository's disposable one-node Redpanda service.
+On a newly created RF=1 topic, metadata before and after returned exactly partitions `[0,1,2]` with
+one in-sync replica each. A second producer initialized with the same stable ID; the old producer's
+later commit and fatal state both reported `Fenced`. Separate captures showed committed markers
+and data visible under both isolation levels; a flushed confirmed-abort attempt and a flushed open
+transaction aborted by fencing were physical under `read_uncommitted` and absent under
+`read_committed`; the confirmed-abort retry was byte-identical and visible. Marker values matched
+the frozen 325-byte first/successor literals on all partitions with one `__ldb`, null key, and empty
+non-null payload. Data retained its exact key/payload and an unrelated `trace-id` header while
+carrying exactly one 66-byte `__ldb` value. The successor replay retained operation/key/payload,
+changed interval, and restarted sequence zero.
+
+This proves only the exact tested Kafka-protocol behavior, not generic production inventory or
+atomic source/state/sink delivery. No fault proved that a particular `EndTxn` reached the broker
+while its matching response was lost, so ambiguous marker/data reconciliation remains untested.
+The probe also omits replication/failover, restart/disk durability, TLS/auth, broker limit and
+pressure cases, runtime interval non-reuse, production hot-path/tail latency, and the independent
+release-binary soak. The current connector remains nontransactional and unchanged.
 
 The missing minimum is not another state backend. It is the already-designed delivery/evidence
 vertical: an operator-specific replay-stable operation ID; compact data-record provenance; a stable
@@ -477,9 +500,10 @@ A public local-adoption identity and per-attempt timing evidence are also requir
 charter. The initial interval must first reference a zero-input bootstrap checkpoint/capsule created
 from exact pre-delivery source baselines while readiness, graph work, and sink writes remain closed;
 there is no null/genesis authority shortcut. Implementation must start with semantic model and byte-
-golden tests, then a fake producer state machine, then real Kafka/Redpanda fencing tests. The current
-three-node engineering harness is upgraded only after those layers pass; the independent soak
-remains later and separately operated.
+golden tests, then a fake producer state machine, deterministic real-broker fencing/isolation,
+and controlled ambiguous-outcome reconciliation. Cycle 55 closes only the deterministic broker
+slice. The current three-node engineering harness is upgraded only after the ambiguity layer
+passes; the independent soak remains later and separately operated.
 
 ### Fjall is historical, not current infrastructure
 
@@ -541,11 +565,12 @@ Clean targeted commands use `--no-default-features --features cluster` throughou
 | `failures::zero_vnode_workers_start_idle_without_joining_assignment_quorum` (`--test cluster_integration --exact`) | PASS, 1/1 | Three-node stateless stream runs with zero-vnode workers |
 | `failures::sealed_materialized_view_manifest_is_rejected_by_every_node_after_restart` (`--test cluster_integration --exact`) | PASS, 1/1 | Persisted unsupported MV is rejected by every node before and after restart |
 
-The exact invocations and timings are repeated in the Cycle 0 review. Real multi-process soak,
-MinIO/object-store integration, Kafka/Docker, and server HTTP/Flight admission suites were not run;
-they require heavier process or external-service setup and are not represented as passing evidence.
-The ADR/plan consequently forbid a production-ready claim until an independently reviewed,
-black-box release-candidate soak passes with real source/object-store/sink dependencies.
+The exact invocations and timings are repeated in the Cycle 0 review. At that baseline, real
+multi-process soak, MinIO/object-store integration, Kafka/Docker, and server HTTP/Flight admission
+suites were not run. Cycle 55 later runs only the narrow one-broker Kafka protocol probe recorded
+below; it is not a LaminarDB pipeline or soak. The ADR/plan consequently forbid a production-ready
+claim until an independently reviewed black-box release-candidate soak passes with real
+source/object-store/sink dependencies.
 
 The current branch's admission-neutral hardening was then checked separately:
 
@@ -567,6 +592,8 @@ The current branch's admission-neutral hardening was then checked separately:
 | `pipeline_callback::tests::busy_serialization_gate_rejects_synchronously_before_mutating_operator_state` | PASS, 1/1 | A retained encoder causes immediate `[LDB-6017]`; destructive graph state and the current fault slot are unchanged |
 | `pipeline_callback::tests::busy_serialization_gate_does_not_hold_assignment_writer_until_timeout` | PASS, 1/1 | A queued assignment writer is blocked by capture ownership, then proceeds as soon as the rejected capture drops its token rather than after the serialization timeout |
 | `pipeline::streaming_coordinator::tests::recovery_cycle_error_faults_best_effort` | PASS, 1/1 | A recovery-classified partial apply publishes no output/cut and destroys the callback/graph generation before returning |
+| standalone Kafka transaction probe unit tests | PASS, 6/6 | Transactional-ID golden/axes/bounds, probe-local encoder checked against the copied frozen data-header golden, marker linkage, exact visibility transcript, hostile CLI/identity/topic bounds |
+| standalone Kafka transaction probe, debug and optimized binaries | PASS, repeated | Redpanda v26.1.13/RF=1: exact three-partition inventory/fanout, fatal `Fenced`, confirmed abort/retry, fence-aborted open transaction, separate RC/RU visibility captures, and exact header/key/payload capture; protocol-only, not latency/durability/soak evidence |
 
 Both cluster and no-feature `cargo check` and `cargo clippy -D warnings` configurations passed, as
 did formatting and diff checks. These focused results do not exercise keyed cluster restore.
